@@ -672,6 +672,9 @@ def _run_cake_gdn_prefill(
         use_state_indices=state_indices is not None,
         gates_present=gates_present,
         host_seq_lens=seq_lens,
+        # The count the launch grid below is sized with: the resolver keeps a gate-stream
+        # twin without its initial-state prefetch where that grid gives each CTA one tile.
+        sm_count=_cake_gdn_sm_count(device_index),
     )
     entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
     dvsplit = route.route_id.endswith(".dvsplit")

@@ -1032,13 +1032,23 @@ class MoKForwardMXFP8:
 
     Launch-invariant geometry is memoised per geometry; the counters are one
     zero-filled slab per call.
+
+    On sm_107a the multimacro program is loaded beside the default one
+    (``multimacro=True`` launches it): the same contract and bitwise the same
+    results for any schedule, faster when the schedule holds two macro batches
+    (it streams macro batch 0's rows ahead of macro batch 1's combine).
     """
 
     def __init__(self, clamped=False):
-        from .jit import load_kernel
+        from .jit import load_kernel, target_arch
 
         self.clamped = clamped
         self.module = load_kernel(_role("forward_mxfp8", clamped))
+        self.multimacro_module = (
+            load_kernel(_role("forward_mxfp8", clamped) + "_multimacro")
+            if target_arch() == "sm_107a"
+            else None
+        )
         self.layout_module = load_kernel("expert_layout")
         self._peer_tables = {}
         self._geometry = {}
@@ -1066,10 +1076,16 @@ class MoKForwardMXFP8:
         mini_size,
         *,
         layout=None,
+        multimacro=False,
     ):
         import torch
 
         check_swiglu_limit(swiglu_limit, self.clamped)
+        module = self.multimacro_module if multimacro else self.module
+        if module is None:
+            raise ValueError(
+                "The multimacro MXFP8 forward is generated for sm_107a only"
+            )
         local_tokens, hidden = x.shape
         intermediate, experts = shared_gate.shape[0], counts.numel()
         capacity = peer_rank.numel()
@@ -1155,7 +1171,7 @@ class MoKForwardMXFP8:
         elif layout.numel() != 3 * experts + capacity // 256:
             raise ValueError("layout does not match the schedule geometry")
         with _ffi_stream():
-            self.module.launch(
+            module.launch(
                 grid=(2 * (g.shared_tasks + g.minis * g.mini_tasks) + comm_sms, 1, 1),
                 x_shared=x,
                 wg_shared=shared_gate.unsqueeze(0),
@@ -1650,7 +1666,7 @@ class MoKBackwardMXFP8:
             rows,
             g.routed_rows * g.ib,
             g.routed_rows,
-            g.macros,
+            g.macros * (experts + 1),
             g.macros,
         )
         if layout is None:

@@ -26,6 +26,7 @@ and ``bwd_token_program``: which mapping-pass, coefficient-pass and token-owner
 form a call launches, by token count, SM count and architecture;
 ``FWD_MAP_CLAIM``: the mapping pass's schedule form by its K units per CTA;
 ``FWD_MAP_XNRM``: the token-count bands of its X-read L2 hint form ``_xn``;
+``BWD_DPL_BANDS``: the bands of the column-slab / reduction forms ``_dpl`` (dfn_part kept in L2);
 ``bwd_reduce_program`` / ``bwd_reduce_grid``: the reduction form and its fixed
 grid per token count and architecture; ``fn_split_program`` the fn split's form per
 architecture and route (``want_t`` 0 = the forward operand layout, 1 = the
@@ -67,7 +68,7 @@ import pytest
 
 from tests.test_helpers.cake_package import cake_package
 
-loader = cake_package("cake_mhc_det_train", "cake_jit")
+loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 # The tables of record of this module describe the hidden size 4096: the H 4096 records, their routes and record
 # scalars. The sizes 5120 / 7168 are checked in test_cake_mhc_det_train_rules_hidden.py.
 H4096_MODULES = {
@@ -155,6 +156,9 @@ SLAB_LIBRARY = {
     "xrsg_p160": "cake_mhc_det_train_bwd_slab__xrsg_p160",
     "dynr": "cake_mhc_det_train_bwd_slab__dynr",
     "dynl": "cake_mhc_det_train_bwd_slab__dynl",
+    # the dfn_part L2 hint forms of BWD_DPL_BANDS
+    "dynr_dpl": "cake_mhc_det_train_bwd_slab__dynr_dpl",
+    "dynl_dpl": "cake_mhc_det_train_bwd_slab__dynl_dpl",
 }
 REDUCE_LIBRARY = {
     "pt64": "cake_mhc_det_train_bwd_reduce__pt64",
@@ -168,6 +172,12 @@ REDUCE_LIBRARY = {
     "pt32_trows": "cake_mhc_det_train_bwd_reduce__pt32_trows",
     "wpu4_fadd_trows": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows",
     "wpu4_spred_trows": "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows",
+    # the dfn_part L2 hint forms of BWD_DPL_BANDS (ahead of the group-row suffix)
+    "s27_wcvt_fadd_fshfl_dpl": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl",
+    "wpu4_fadd_dpl": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl",
+    "wpu4_spred_dpl": "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl",
+    "wpu4_fadd_dpl_trows": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows",
+    "wpu4_spred_dpl_trows": "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows",
 }
 COEF_TOKENS_PER_CTA = {
     "qe_mb10": 8,
@@ -194,6 +204,11 @@ REDUCE_GRID = {
     "pt32_trows": 3099,
     "wpu4_fadd_trows": 411,
     "wpu4_spred_trows": 411,
+    "s27_wcvt_fadd_fshfl_dpl": 411,
+    "wpu4_fadd_dpl": 411,
+    "wpu4_spred_dpl": 411,
+    "wpu4_fadd_dpl_trows": 411,
+    "wpu4_spred_dpl_trows": 411,
 }
 FINISH_LIBRARY = {
     "production": "cake_mhc_det_train_fwd_finish",
@@ -207,14 +222,21 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_reduce__pt32_trows": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__pt64": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__wpu4": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_slab__dynl_dpl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_bwd_slab__dynr_dpl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__xrsg": ("sm_107a",),
     "cake_mhc_det_train_bwd_slab__xrsg_p160": ("sm_100a",),
     "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": (
@@ -337,7 +359,7 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 79, 61
+N_RECORDS, N_LIBRARIES = 86, 68
 # the tail forms each architecture routes beside their X-hint forms (FWD_MAP_XNRM)
 XN_KEPT_TAILS = {"sm_100a": ("ns96_g2_ol2l_ct",), "sm_103a": ("nsx_ct",)}
 RECORD_SCALARS = {
@@ -384,7 +406,7 @@ TABLES = {
         "sm_107a": (),
     },
     "FWD_MAP_XNRM": {
-        "sm_100a": ((64, 6144),),
+        "sm_100a": ((64, 7168),),
         "sm_103a": ((64, 6144),),
         "sm_107a": ((64, 14928), (15288, 65536)),
     },
@@ -447,6 +469,11 @@ TABLES = {
         "s27_wcvt_fadd_fshfl_trows": 411,
         "wpu4_fadd_trows": 411,
         "wpu4_spred_trows": 411,
+        "s27_wcvt_fadd_fshfl_dpl": 411,
+        "wpu4_fadd_dpl": 411,
+        "wpu4_spred_dpl": 411,
+        "wpu4_fadd_dpl_trows": 411,
+        "wpu4_spred_dpl_trows": 411,
     },
     "BWD_REDUCE_PARTS": {
         "sm_100a": {
@@ -490,6 +517,22 @@ TABLES = {
         "sm_107a": ((0, 65536, "t128"),),
     },
     "K5_FORM_ROWS": {"production": 2, "t128": 1},
+    "BWD_DPL_BANDS": {
+        "sm_100a": ((4095, 8192),),
+        "sm_103a": (),
+        "sm_107a": (),
+    },
+    "BWD_DPL_SLABS": ("dynl", "dynr"),
+    "BWD_DPL_PATHS": {
+        "sm_100a": {"backward": ((8192, 15590), (16132, 16263))},
+        "sm_103a": {},
+        "sm_107a": {},
+    },
+    "FWD_MAP_XNRM_PATHS": {
+        "sm_100a": {"checkpoint": ((7168, 7680),)},
+        "sm_103a": {},
+        "sm_107a": {},
+    },
 }
 # The token counts that exercise every band boundary of the dispatch at the SM counts of record (the kernel-tests
 # rules test's DISPATCH_T).
@@ -765,47 +808,47 @@ DISPATCH_EXPECTED = (
     (4095, 'sm_103a', 152, 8, 256, 'nsx_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (4095, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l_xn', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4095, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l_xn', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411),
+    (4096, 'sm_100a', 148, 8, 256, 'ns96_g2_ol2l_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'dynl_dpl', 'wpu4_fadd_dpl', 411),
     (4096, 'sm_103a', 152, 8, 256, 'nsx_ct_xn', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (4096, 'sm_107a', 208, 32, 1024, 'nsx_g2_ol2l_xn', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (4096, 'sm_107a', 216, 32, 1024, 'nsx_g2_ol2l_xn', 'pfl2_qmt', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (5328, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (5328, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_spred_dpl', 411),
     (5328, 'sm_103a', 152, 16, 672, 'nsx_xn', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (5328, 'sm_107a', 208, 8, 336, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5328, 'sm_107a', 216, 8, 336, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5329, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (5329, 'sm_100a', 148, 16, 672, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_spred_dpl', 411),
     (5329, 'sm_103a', 152, 16, 672, 'nsx_xn', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (5329, 'sm_107a', 208, 8, 336, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5329, 'sm_107a', 216, 8, 336, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5472, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (5472, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_spred_dpl', 411),
     (5472, 'sm_103a', 152, 16, 688, 'nsx_xn', 'qe_mb10_tree', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (5472, 'sm_107a', 208, 8, 344, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5472, 'sm_107a', 216, 8, 344, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (5473, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (5473, 'sm_100a', 148, 16, 688, 'ns96_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_spred_dpl', 411),
     (5473, 'sm_103a', 152, 16, 688, 'nsx_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (5473, 'sm_107a', 208, 8, 344, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (5473, 'sm_107a', 216, 8, 344, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 16, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (7488, 'sm_100a', 148, 16, 944, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (7488, 'sm_100a', 148, 16, 944, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_spred_dpl', 411),
     (7488, 'sm_103a', 152, 16, 944, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (7488, 'sm_107a', 208, 16, 944, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7488, 'sm_107a', 216, 16, 944, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (7489, 'sm_100a', 148, 16, 944, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (7489, 'sm_100a', 148, 16, 944, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_spred_dpl', 411),
     (7489, 'sm_103a', 152, 16, 944, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (7489, 'sm_107a', 208, 16, 944, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7489, 'sm_107a', 216, 16, 944, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (7776, 'sm_100a', 148, 16, 976, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (7776, 'sm_100a', 148, 16, 976, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_spred_dpl', 411),
     (7776, 'sm_103a', 152, 16, 976, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (7776, 'sm_107a', 208, 16, 976, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7776, 'sm_107a', 216, 16, 976, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (7777, 'sm_100a', 148, 16, 976, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (7777, 'sm_100a', 148, 16, 976, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_spred_dpl', 411),
     (7777, 'sm_103a', 152, 16, 976, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (7777, 'sm_107a', 208, 16, 976, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (7777, 'sm_107a', 216, 16, 976, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (8191, 'sm_100a', 148, 16, 1024, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_fadd', 411),
+    (8191, 'sm_100a', 148, 16, 1024, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_fadd_dpl', 411),
     (8191, 'sm_103a', 152, 16, 1024, 'nsx', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (8191, 'sm_107a', 208, 16, 1024, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (8191, 'sm_107a', 216, 16, 1024, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
-    (8192, 'sm_100a', 148, 16, 1024, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_fadd', 411),
+    (8192, 'sm_100a', 148, 16, 1024, 'ns96_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_fadd_dpl', 411),
     (8192, 'sm_103a', 152, 16, 1024, 'nsx_g2_ol2l', 'st16_lp2_as_el_qd', 32, 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099),
     (8192, 'sm_107a', 208, 16, 1024, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
     (8192, 'sm_107a', 216, 16, 1024, 'nsx_g2_ol2l_xn', 'st16_lp2_as_el_qd', 24, 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411),
@@ -1154,11 +1197,11 @@ RULES_ROWS = (
     (2049, 152, 'sm_103a', 2176, True, 8, 136, 136, 7, 448, 152, 320, 257, 8, 129, 608, 4098, 1025, 2049, 4886784, 14815744, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_st5_mb1_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563, 't128', 'production'),
     (2049, 208, 'sm_107a', 2176, True, 32, 544, 416, 3, 192, 192, 704, 257, 8, 129, 832, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l_xn', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (2049, 216, 'sm_107a', 2176, True, 32, 544, 432, 3, 192, 192, 704, 257, 8, 129, 864, 4098, 2049, 2049, 10109184, 8524288, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l_xn', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l_ct_xn', 'ao22_rae7_pd1_tma_ntr', 'dynl', 'wpu4_fadd', 411, 't128', 'production'),
+    (4096, 148, 'sm_100a', 4096, True, 8, 256, 256, 16, 1024, 148, 256, 296, 16, 256, 592, 8192, 2048, 4096, 6422784, 29529344, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'ns96_g2_ol2l_ct_xn', 'ao22_rae7_pd1_tma_ntr', 'dynl_dpl', 'wpu4_fadd_dpl', 411, 't128', 'production'),
     (4096, 152, 'sm_103a', 4096, True, 8, 256, 256, 16, 1024, 152, 256, 304, 16, 256, 608, 8192, 2048, 4096, 6422784, 29530368, 'b16', 'tv128', 256, 256, 'qe_mb10_tree', 'nsx_ct_xn', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
     (4096, 208, 'sm_107a', 4096, True, 32, 1024, 416, 13, 832, 208, 320, 416, 16, 256, 832, 8192, 4096, 4096, 16253184, 24826112, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l_xn', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (4096, 216, 'sm_107a', 4096, True, 32, 1024, 432, 13, 832, 216, 320, 432, 16, 256, 864, 8192, 4096, 4096, 16253184, 24828160, 'b16', 'tv128_t128', 256, 512, 'pfl2_qmt', 'nsx_g2_ol2l_xn', 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (8192, 148, 'sm_100a', 8192, True, 16, 1024, 296, 16, 1024, 148, 512, 296, 32, 512, 592, 16384, 4096, 8192, 16253184, 30708992, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'dynr', 'wpu4_fadd', 411, 't128', 'production'),
+    (8192, 148, 'sm_100a', 8192, True, 16, 1024, 296, 16, 1024, 148, 512, 296, 32, 512, 592, 16384, 4096, 8192, 16253184, 30708992, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'ns96_g2_ol2l', 'ao22_rae7_pd1_tma_ntr', 'dynr_dpl', 'wpu4_fadd_dpl', 411, 't128', 'production'),
     (8192, 152, 'sm_103a', 8192, True, 16, 1024, 304, 7, 448, 152, 1216, 304, 32, 512, 608, 16384, 4096, 8192, 16253184, 16554240, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
     (8192, 208, 'sm_107a', 8192, True, 16, 1024, 416, 13, 832, 208, 640, 416, 24, 512, 832, 16384, 8192, 8192, 16253184, 26005760, 'b16', 'tv128_t128', 256, 512, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l_xn', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (8192, 216, 'sm_107a', 8192, True, 16, 1024, 432, 10, 640, 216, 832, 432, 24, 512, 864, 16384, 8192, 8192, 16253184, 21289216, 'b16', 'tv128_t128', 256, 512, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l_xn', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
@@ -1280,17 +1323,24 @@ LAUNCH_FACTS = {
     "cake_mhc_det_train_bwd_token__dot_ao8_l2l": ((256, 1, 1), 91136, 2),
     "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7": ((256, 1, 1), 91136, 2),
     "cake_mhc_det_train_bwd_slab__dynl": ((384, 1, 1), 228480, 1),
+    "cake_mhc_det_train_bwd_slab__dynl_dpl": ((384, 1, 1), 228480, 1),
     "cake_mhc_det_train_bwd_slab__dynr": ((384, 1, 1), 228480, 1),
+    "cake_mhc_det_train_bwd_slab__dynr_dpl": ((384, 1, 1), 228480, 1),
     "cake_mhc_det_train_bwd_slab__xrsg_p160": ((384, 1, 1), 230912, 1),
     "cake_mhc_det_train_bwd_slab__xrsg__a7": ((384, 1, 1), 232448, 1),
     "cake_mhc_det_train_bwd_reduce__pt64": ((64, 1, 1), 2688, 1),
     "cake_mhc_det_train_bwd_reduce__pt32": ((32, 1, 1), 2432, 1),
     "cake_mhc_det_train_bwd_reduce__pt32_trows": ((32, 1, 1), 128, 1),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": ((256, 1, 1), 4224, 1),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl": ((256, 1, 1), 4224, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred": ((256, 1, 1), 4224, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl": ((256, 1, 1), 4224, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ((256, 1, 1), 4224, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl": ((256, 1, 1), 4224, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ((256, 1, 1), 128, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows": ((256, 1, 1), 128, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows": ((256, 1, 1), 128, 1),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows": ((256, 1, 1), 128, 1),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ((256, 1, 1), 4224, 1),
     "cake_mhc_det_train_bwd_reduce__wpu4": ((256, 1, 1), 4224, 1),
 }
@@ -1361,16 +1411,23 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7": ("sm_107a",),
     "cake_mhc_det_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_slab__dynl_dpl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_bwd_slab__dynr_dpl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__xrsg_p160": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__xrsg__a7": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__pt64": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__pt32": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__pt32_trows": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_dpl": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_dpl_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_dpl_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__wpu4": ("sm_107a",),
@@ -1415,8 +1472,15 @@ PDL_OFF_BANDS = {
             "checkpoint": ((0, 4096),),
         },
     },
-    "sm_107a": {},
+    "sm_107a": {
+        "K6->K7": {
+            "checkpoint": ((3583, 4096),),
+        },
+    },
 }
+# band edges measured between the rows of record (the sm_107a K6->K7 checkpoint band's lower edge: on 216 SMs the
+# checkpoint path reads faster than main in both 4-arm input-placement probes from 3584 tokens on)
+PDL_EDGES_OFF_ROWS = {("sm_107a", "K6->K7", "checkpoint"): {3583}}
 EVERYWHERE = {
     "cake_mhc_det_train_fwd_collapse",
     "cake_mhc_det_train_bwd_prepare",
@@ -1709,7 +1773,9 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     assert loader.fwd_map_program(32768, 148, "sm_100a") == "tk_nsx_g2_ol2l_ct"
     assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l_ct_xn"
     assert loader.fwd_map_program(6144, 148, "sm_100a") == "ns96_g2_ol2l_xn"
-    assert loader.fwd_map_program(6145, 148, "sm_100a") == "ns96_g2_ol2l"
+    assert loader.fwd_map_program(6145, 148, "sm_100a") == "ns96_g2_ol2l_xn"
+    assert loader.fwd_map_program(7168, 148, "sm_100a") == "ns96_g2_ol2l_xn"
+    assert loader.fwd_map_program(7169, 148, "sm_100a") == "ns96_g2_ol2l"
     assert loader.fwd_map_program(1024, 148, "sm_100a") == "nsx_st5_mb1_xn"
     assert loader.fwd_map_program(1024, 208, "sm_107a") == "nsx_st5_mb1_xn"
     assert loader.fwd_map_program(64, 208, "sm_107a") == "nsx_st5_mb1"
@@ -1789,7 +1855,7 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
         "BWD_TOKEN_REGIMES", "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_SLAB_FIT", "BWD_REDUCE_PROGRAM",
         "BWD_REDUCE_REGIMES",
         "K5_GRID_BANDS", "K5_FORM_BANDS", "BWD_TOKEN_BANDS", "BWD_REDUCE_PARTS", "FWD_FINISH_PROGRAM", "PDL_OFF_BANDS",
-        "FWD_MAP_CLAIM", "FWD_MAP_XNRM",
+        "FWD_MAP_CLAIM", "FWD_MAP_XNRM", "BWD_DPL_BANDS",
     ):  # fmt: skip
         assert tuple(getattr(loader, table)) == ARCHES, table
     assert set(loader.FN_SPLIT_GRID) == {
@@ -1859,15 +1925,32 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
                     or (P == 19 and 3584 < T <= 3648)
                 )
                 k7 = "xrsg_p160" if units <= sm or run else "dynl"
+            # BWD_DPL_BANDS (sm_100a)
+            dpl_band = 4095 < T <= 8192
+            if k7 in ("dynl", "dynr") and dpl_band:
+                k7 += "_dpl"
             slab = [loader.bwd_slab_program(T, sm, arch) for arch in ARCHES]
             assert slab == [k7, "dynr", "xrsg"], (T, sm)
     # the band's edges on 148 SMs (xrsg_p160 from 1025 to 2048 tokens, dynl from 2049: P = 11; 4096: P = 16) and the
     # P = 7 / P = 19 rows of the 152-SM sm_100a board (dynl at 1216, 2560, 4032; xrsg_p160 at 1728, 2048, 3616)
     assert [
-        loader.bwd_slab_program(T, 148, "sm_100a") for T in (1, 1024, 1025, 2048, 2049, 4096, 4097, 65536)
+        loader.bwd_slab_program(T, 148, "sm_100a") for T in (1, 1024, 1025, 2048, 2049, 4095, 4096, 4097, 16263, 16264, 65536)
     ] == [
-        "dynr", "dynr", "xrsg_p160", "xrsg_p160", "dynl", "dynl", "dynr", "dynr"
+        "dynr", "dynr", "xrsg_p160", "xrsg_p160", "dynl", "dynl", "dynl_dpl", "dynr_dpl", "dynr", "dynr", "dynr"
     ]  # fmt: skip
+    # the reduction follows the column-slab pass into its _dpl form, ahead of the group-row suffix
+    # the upper edges of BWD_DPL_BANDS and the measured token counts around them
+    gap = (8193, 15288, 15289, 15566, 15590, 16114, 16132, 16164, 16165)
+    for T in (4096, 5120, 8192, 14928, *gap, 16263, 16264):
+        for sm in SM_COUNTS:
+            slab = loader.bwd_slab_program(T, sm, "sm_100a")
+            red = loader.bwd_reduce_program(T, sm, "sm_100a")
+            dpl = slab.endswith("_dpl")
+            band = 4095 < T <= 8192
+            assert ("_dpl" in red) == dpl == band, (T, sm, slab, red)
+            assert "_trows_dpl" not in red, red
+    assert loader.bwd_reduce_program(4096, 148, "sm_100a") == "wpu4_fadd_dpl"
+    assert loader.bwd_slab_program(8192, 152, "sm_103a") == "dynr"  # no band on sm_103a
     assert [
         loader.bwd_slab_program(T, 152, "sm_100a") for T in (1216, 1728, 2048, 2560, 3616, 4032)
     ] == [
@@ -1910,6 +1993,73 @@ def _literals() -> dict:
 
 
 @pytest.mark.cpu_only
+def test_path_bands_of_record() -> None:
+    # The path-keyed bands of record: the call path (forward / backward / checkpoint) selects the _dpl column slab
+    # and reduction (BWD_DPL_PATHS) and the _xn mapping pass (FWD_MAP_XNRM_PATHS) inside its band; path None reads
+    # the path-free tables only.
+    assert loader.PATH_PROGRAM_RULES == (
+        "fwd_map_program",
+        "bwd_slab_program",
+        "bwd_reduce_program",
+    )
+    inside = (8193, 12288, 14928, 15590, 16133, 16263)  # bands are (above, at_most]
+    outside = (15591, 16114, 16130, 16131, 16132, 16264)
+    for sm in SM_COUNTS:
+        for T in inside + outside:
+            slab = loader.bwd_slab_program(T, sm, "sm_100a", path="backward")
+            red = loader.bwd_reduce_program(T, sm, "sm_100a", path="backward")
+            band = any(
+                a < T <= b for a, b in TABLES["BWD_DPL_PATHS"]["sm_100a"]["backward"]
+            )
+            assert band == (T in inside), T
+            base = loader.bwd_slab_program(
+                T, sm, "sm_100a"
+            )  # path None: the path-free plan (no _dpl from 8193)
+            assert not base.endswith("_dpl"), (T, sm, base)
+            assert slab == (
+                base + "_dpl" if band and base in loader.BWD_DPL_SLABS else base
+            ), (T, sm, base, slab)
+            assert ("_dpl" in red) == slab.endswith("_dpl"), (T, sm, slab, red)
+            for path in ("checkpoint", None):
+                assert loader.bwd_slab_program(
+                    T, sm, "sm_100a", path=path
+                ) == loader.bwd_slab_program(T, sm, "sm_100a")
+                assert loader.bwd_reduce_program(
+                    T, sm, "sm_100a", path=path
+                ) == loader.bwd_reduce_program(T, sm, "sm_100a")
+    assert [loader.bwd_reduce_program(T, 148, "sm_100a", path="backward") for T in (8193, 14928, 15288)] == [
+        "wpu4_spred_dpl", "wpu4_spred_dpl_trows", "wpu4_fadd_dpl_trows"
+    ]  # fmt: skip
+    for sm in SM_COUNTS:
+        for T in (7168, 7169, 7424, 7680, 7681):
+            base = loader.fwd_map_program(T, sm, "sm_100a")
+            ckpt = loader.fwd_map_program(T, sm, "sm_100a", path="checkpoint")
+            assert loader.fwd_map_program(T, sm, "sm_100a", path="forward") == base, (
+                T,
+                sm,
+            )
+            if 7168 < T <= 7680 and not base.endswith("_xn"):
+                assert ckpt == base + "_xn", (T, sm, base, ckpt)
+            else:
+                assert ckpt == base, (T, sm, base, ckpt)
+    # sm_103a / sm_107a: every path reads the path-free plan
+    for arch in ("sm_103a", "sm_107a"):
+        for sm in SM_COUNTS:
+            for T in range(64, 70000, 389):
+                for rule in loader.PATH_PROGRAM_RULES:
+                    f = getattr(loader, rule)
+                    base = f(T, sm, arch)
+                    for path in loader.PDL_PATHS:
+                        assert f(T, sm, arch, path=path) == base, (
+                            rule,
+                            arch,
+                            sm,
+                            T,
+                            path,
+                        )
+
+
+@pytest.mark.cpu_only
 def test_registry_tables_are_literals() -> None:
     literals = _literals()
     for name in (
@@ -1943,6 +2093,10 @@ def test_registry_tables_are_literals() -> None:
         "K5_GRID_BANDS",
         "K5_FORM_BANDS",
         "K5_FORM_ROWS",
+        "BWD_DPL_BANDS",
+        "BWD_DPL_SLABS",
+        "BWD_DPL_PATHS",
+        "FWD_MAP_XNRM_PATHS",
         "FN_SPLIT_CARRY",
         "PDL_PATHS",
         "PDL_EDGES",
@@ -2192,7 +2346,16 @@ def test_records_are_consistent() -> None:
             ]
         else:
             slabs = [SLAB_LIBRARY[loader.BWD_SLAB_PROGRAM[arch]]]
-        reduces = _first_programs(loader.bwd_reduce_program, arch, sms)
+        reduces = _first_programs(
+            lambda T, sm, a: loader.bwd_reduce_program(T, sm, a, path="backward"),
+            arch,
+            sms,
+        )  # the backward path's first-T order (BWD_DPL_PATHS), then the programs only the path-free rule reaches
+        reduces += [
+            p
+            for p in _first_programs(loader.bwd_reduce_program, arch, sms)
+            if p not in reduces
+        ]
         # the token-owner run-time-count record closes the token-owner records
         assert libs(H4096_ROUTES[arch]["bwd_finish_h4096"]) == [
             split, *tokens, "cake_mhc_det_train_bwd_token__rt64", *slabs, *[REDUCE_LIBRARY[p] for p in reduces]
@@ -2217,14 +2380,15 @@ def test_records_are_consistent() -> None:
             for n in libs(H4096_ROUTES[arch]["fwd_prepare_h4096"])
             if n.startswith("cake_mhc_det_train_fwd_coef")
         ]
-        # the tail forms stay routed beside their X-hint forms: the rule names them above the FWD_MAP_XNRM band on
-        # 208-216 SMs, at token counts between the DISPATCH_T rows
+        # the tail forms stay routed beside their X-hint forms: the rule names them above the FWD_MAP_XNRM band at
+        # token counts between the DISPATCH_T rows (sm_103a: on 208-216 SMs; sm_100a, whose band runs further: at
+        # larger SM counts)
         kept = XN_KEPT_TAILS.get(arch, ())
         for program in kept:
             assert any(
                 loader.fwd_map_program(T, sm, arch) == program
+                for sm in range(100, 301)
                 for T in range(6145, 8193)
-                for sm in SM_COUNTS
             ), (arch, program)
         # and the program right above DISPATCH_T's top: sm_107a's production mapping pass
         # above its FWD_MAP_XNRM band
@@ -2453,7 +2617,9 @@ def test_pdl_bands_of_record() -> None:
                     isinstance(band, tuple) and len(band) == 2 for band in bands
                 ), (arch, edge, path, bands)
                 for index, (above, at_most) in enumerate(bands):
-                    assert above < at_most and {above, at_most} <= rows_of_record, (
+                    key = (arch, edge, path)
+                    allowed = rows_of_record | PDL_EDGES_OFF_ROWS.get(key, set())
+                    assert above < at_most and {above, at_most} <= allowed, (
                         arch,
                         edge,
                         path,
@@ -2588,6 +2754,8 @@ def test_launch_facts_of_record() -> None:
         "pt32_trows": ((32, 1, 1), 128, 1),
         "wpu4_fadd_trows": ((256, 1, 1), 128, 1),
         "wpu4_spred_trows": ((256, 1, 1), 128, 1),
+        "wpu4_fadd_dpl_trows": ((256, 1, 1), 128, 1),
+        "wpu4_spred_dpl_trows": ((256, 1, 1), 128, 1),
     }
     for program, name in REDUCE_LIBRARY.items():
         if program in (
@@ -2596,6 +2764,9 @@ def test_launch_facts_of_record() -> None:
             "s27_wcvt_fadd_fshfl",
             "wpu4_fadd",
             "wpu4_spred",
+            "s27_wcvt_fadd_fshfl_dpl",
+            "wpu4_fadd_dpl",
+            "wpu4_spred_dpl",
         ):
             # the sm_107a and sm_100a per-P-band reduction forms: their pools are the render's figures (LAUNCH_FACTS)
             assert facts[name][0] == (256, 1, 1) and facts[name][2] == 1, name

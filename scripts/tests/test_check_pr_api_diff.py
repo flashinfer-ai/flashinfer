@@ -635,6 +635,88 @@ class ExperimentalTrackExclusionTest(unittest.TestCase):
         )
 
 
+class LazyExportTableTest(unittest.TestCase):
+    """Rows of ``_LAZY_EXPORTS`` in flashinfer/__init__.py are top-level exports."""
+
+    eager = textwrap.dedent(
+        """
+        from . import facade
+        from .impl import api
+        """
+    )
+    lazy = textwrap.dedent(
+        """
+        _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
+            **{name: (".runtime", name) for name in sorted(_RUNTIME_NAMES)},
+            "facade": (".facade", None),
+            "api": (".impl", "api"),
+            "renamed": ("flashinfer.impl", "api"),
+            "outside": ("torch", "api"),
+        }
+        """
+    )
+
+    def test_rows_resolve_like_imports(self) -> None:
+        self.assertEqual(
+            api_diff.exported_names(self.lazy),
+            {
+                "facade": "flashinfer",
+                "api": "flashinfer.impl",
+                "renamed": "flashinfer.impl",
+            },
+        )
+
+    def test_relative_and_absolute_spellings_agree(self) -> None:
+        relative = (
+            '_LAZY_EXPORTS = {"a": (".impl", "api"), "m": (".pkg.mod", None),'
+            ' "up": ("..x", None)}'
+        )
+        absolute = (
+            '_LAZY_EXPORTS = {"a": ("flashinfer.impl", "api"),'
+            ' "m": ("flashinfer.pkg.mod", None)}'
+        )
+        self.assertEqual(
+            api_diff.exported_names(relative), api_diff.exported_names(absolute)
+        )
+        self.assertEqual(
+            api_diff.exported_names('_LAZY_EXPORTS = {"m": (".", None)}'),
+            api_diff.exported_names('_LAZY_EXPORTS = {"m": ("flashinfer", None)}'),
+        )
+
+    def test_moving_names_into_rows_is_not_a_removal(self) -> None:
+        impl = "@flashinfer_api\ndef api(value: int) -> None:\n    pass\n"
+        base = {
+            "flashinfer/__init__.py": self.eager,
+            "flashinfer/impl.py": impl,
+            "flashinfer/facade.py": "",
+        }
+        head = dict(base, **{"flashinfer/__init__.py": self.lazy})
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_dropping_a_row_is_a_removal(self) -> None:
+        base = {"flashinfer/__init__.py": self.lazy, "flashinfer/facade.py": ""}
+        head = {
+            "flashinfer/__init__.py": self.lazy.replace(
+                '    "facade": (".facade", None),\n', ""
+            ),
+            "flashinfer/facade.py": "",
+        }
+        findings = compare_snapshots(base, head)
+        self.assertEqual(
+            [
+                (f.check, f.message)
+                for f in findings
+                if f.check == "public_export_removed"
+            ],
+            [
+                (
+                    "public_export_removed",
+                    "Public top-level export `facade` was removed.",
+                )
+            ],
+        )
+
+
 class ListApisExperimentalExclusionTest(unittest.TestCase):
     """scripts/list_apis.sh feeds the release API diff and applies the same rule."""
 

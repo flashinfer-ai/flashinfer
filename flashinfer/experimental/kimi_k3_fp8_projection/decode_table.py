@@ -49,7 +49,9 @@ limitations under the License.
 # program whose MMA warp allocates the pair's tensor memory, the load warp left
 # out of the allocation rendezvous; ``_pre`` a single-CTA fused decode program
 # whose load warp issues the first ring stage of its first work item before the
-# tensor memory allocation, which its MMA warp makes), measured faster on that
+# tensor memory allocation, which its MMA warp makes; ``_rg4_a2`` a 192-wide
+# 128-K TMA-store GEMM program walking its tiles in raster groups of 4 CTA row
+# tiles with two tensor-memory accumulators), measured faster on that
 # architecture's rows of the cell; ``route_twins(arch)`` reads it.
 # ``DECODE_TABLE_M_RANGES`` holds, per architecture and cell, in-bucket row
 # ranges ``(lo, hi, entry)`` whose rows take ``entry`` instead of the cell's
@@ -1478,6 +1480,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "12,28,4096": {
             "quant:u4": "quant:u4_xef_qel",
+        },
+        "12,28,16384": {
+            "gemm_tstore_n192_k128": "gemm_tstore_n192_k128_rg4_a2",
         },
         "17,28,64": {
             "quant:u1": "quant:u1_cv100",

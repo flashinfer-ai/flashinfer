@@ -292,10 +292,10 @@ def test_build_manifest_lists_the_kcp_programs() -> None:
 def test_backward_launch_form_selects_the_route(monkeypatch) -> None:
     """The host's ``cooperative`` argument (FlashInfer issue #8365): ``None`` is the package default, a bool picks the
     ``kcp_bwd`` (cooperative) or ``kcp_bwd_split`` route, anything else is refused; the split records launch
-    ``ctas_per_sm x (SMs - reserve_sms)`` CTAs (:func:`kcp.launch_grid`), the cooperative ones the co-resident count."""
+    ``ctas_per_sm x (SMs - reserve_sms)`` CTAs (:func:`kcp._launch_grid`), the cooperative ones the co-resident count."""
 
     kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
-    assert kcp.COOPERATIVE_DEFAULT is True
+    assert kcp.COOPERATIVE_DEFAULT is False
     assert kcp._cooperative(None) is kcp.COOPERATIVE_DEFAULT
     assert kcp._cooperative(True) is True and kcp._cooperative(False) is False
     for bad in (0, 1, "split", 1.0):
@@ -310,7 +310,7 @@ def test_backward_launch_form_selects_the_route(monkeypatch) -> None:
         full = (ctas_per_sm * 148, 1, 1)  # the co-resident grid of a 148-SM device
         reserve = 1 if role == "kcp_bwd_split" else 0
         monkeypatch.setattr(kcp, "_record_launch_grid", lambda record, **_kw: full)
-        assert kcp.launch_grid(record, device_index=0) == (
+        assert kcp._launch_grid(record, device_index=0) == (
             ctas_per_sm * (148 - reserve),
             1,
             1,
