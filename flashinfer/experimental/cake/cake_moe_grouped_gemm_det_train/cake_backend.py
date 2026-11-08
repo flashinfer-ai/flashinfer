@@ -1734,7 +1734,9 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
     # pitch above K included), so bound the span, not E times the expert stride; the binding also
     # takes each stride as a 32-bit value (a one-group out's expert stride adds nothing to the span).
     out_span = 1 + sum(
-        (size - 1) * stride for size, stride in zip(out.shape, out.stride()) if size > 0
+        (size - 1) * stride
+        for size, stride in zip(out.shape, out.stride(), strict=True)
+        if size > 0
     )
     if out_span > int(c["int32_elems"]) or max(out.stride()) > int(c["int32_elems"]):
         raise ValueError(
