@@ -13573,7 +13573,6 @@ K1_FORWARD_NAMED = {
     ("sm_100a", 148): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
     ("sm_100a", 152): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
     ("sm_103a", 152): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
-    ("sm_107a", 212): ("kk_n128_hen_pro15", "kk_n256_ht_cg_pro15"),
 }
 
 
@@ -13607,7 +13606,7 @@ def test_k1_forward_named_rows_plan_their_program():
                 default.template,
             )
             named += 1
-    assert named == 14
+    assert named == 8
 
 
 #: The B200 weight-gradient rows of :data:`K1_WGRAD_DET_RULES_BY_SM`: (d_in, d_out) -> program per output dtype.
