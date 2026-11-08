@@ -571,10 +571,12 @@ HOST_TRIM_DEFAULT = (
 # (the A/B record).  The same kernels with the same arguments but data pointers in the same order: bitwise.
 DEFAULT_WS_VALUES = (0, 1)
 DEFAULT_WS_DEFAULT = 1
-# Kept-set pool: 1 (shipped) = the kept set of a checkpoint pass (the hand-off's tape set or rows set, :func:`_tape_alloc`)
-# comes from a package-private CUDA memory pool per device (:func:`_kept_pool`), so the set that lives from a recompute
-# to the node's backward never splits a block the caching allocator's default pool frees and reallocates around it
-# (the arena of a workspace=None call); 0 = the default pool (the previous form), via _kcp_test_knobs only (the A/B
+# Kept-set pool: 1 (shipped) = the kept set of a checkpoint pass of a workspace=None call (the hand-off's tape set or
+# rows set, :func:`_tape_alloc`) comes from a package-private CUDA memory pool per device (:func:`_kept_pool`), each
+# tensor's leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`), so the set that lives from a
+# recompute to the node's backward never splits a block the caching allocator's default pool frees and reallocates
+# around it (the arena of a workspace=None call); a caller-held workspace's arena is not freed per call, so its calls
+# keep the default pool; 0 = the default pool everywhere (the previous form), via _kcp_test_knobs only (the A/B
 # record).  Placement only, the same kernels with the same arguments but data pointers: bitwise.
 KEPT_POOLS = (0, 1)
 KEPT_POOL_DEFAULT = 1
@@ -5086,7 +5088,8 @@ class CakeKDANondetKcpOptions:
     remaining launches, bitwise; ``_kcp_test_knobs`` only), ``default_ws`` (``1`` shipped: a ``workspace=None`` call
     runs on a workspace the package keeps, whose device storage lives for the call alone, :func:`_default_acquire`;
     ``0`` = a new workspace per call, the same launches, bitwise; ``_kcp_test_knobs`` only), ``kept_pool`` (``1``
-    shipped: a checkpoint pass's kept set comes from the package-private pool of its device, :func:`_kept_pool`; ``0`` =
+    shipped: a checkpoint pass's kept set of a ``workspace=None`` call comes from the package-private pool of its
+    device, :func:`_kept_pool`; ``0`` =
     the caching allocator's default pool, the same launches, bitwise; ``_kcp_test_knobs`` only), ``bwd_tape_order``
     (``"under_b1"`` shipped: the saved-mode backward's K1 tape replay after the b1 issue where :func:`_tape_order`
     admits it, else before ``kcp_dav``; ``"first"`` = before ``kcp_dav`` in every backward, the same launches,
@@ -5131,7 +5134,7 @@ class CakeKDANondetKcpOptions:
     saved_carry: int = SAVED_CARRY_DEFAULT  # shipped 1 = the forward's carry plane stays in the saved set and the saved-mode backward skips the P > 1 re-walk + carry merges; 0 = the re-walk, _kcp_test_knobs only
     fwd_o_fuse: int = FWD_O_FUSE_DEFAULT  # shipped 1 = the forward that keeps no tape runs kcp_fwdh_o (out, no tape) in place of the tape walk(s) + fwd_o; 0 = the tape walk(s) + fwd_o, _kcp_test_knobs only
     default_ws: int = DEFAULT_WS_DEFAULT  # shipped 1 = a workspace=None call runs on a package-kept workspace (host objects kept, device storage per call); 0 = a new workspace per call, _kcp_test_knobs only
-    kept_pool: int = KEPT_POOL_DEFAULT  # shipped 1 = a checkpoint pass's kept set comes from the package-private pool of its device (_kept_pool); 0 = the default pool, _kcp_test_knobs only
+    kept_pool: int = KEPT_POOL_DEFAULT  # shipped 1 = a checkpoint pass's kept set of a workspace=None call comes from the package-private pool of its device (_kept_pool); 0 = the default pool, _kcp_test_knobs only
     fwd_prologue: str = FWD_PROLOGUE_DEFAULT  # "trim2" shipped = "trim" with less host work before the first launch; "trim" = the operand checks once per operand signature; "base" = the previous host prologue; the same checks and launches (FWD_PROLOGUES), _kcp_test_knobs only
 
     def check(self) -> CakeKDANondetKcpOptions:
@@ -6407,24 +6410,39 @@ def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
 # GB300, CP4, H = 64, 65536 tokens per pack: +5.0 GiB steady with the gate, +10.1 GiB with the raw gate, the allocated
 # peak +0.8 GiB).  In its own pool the set reuses its own blocks: the pool holds the largest set kept at a time (the wy
 # rows: 768 B per internal token-head, about 0.8 GiB per rank at 16384 tokens and H = 64), which the default pool's
-# other allocations cannot use.  A saving forward outside a checkpoint (saved_rows="intra" / "wy" on a plain autograd
-# call) keeps its rows in the default pool: they live until each layer's backward, and their blocks then serve the
-# next step's other allocations.
+# other allocations cannot use.  The row count of a set changes from pack to pack (each document's rows are padded to
+# whole chunks), and a block cut for one pack's rows does not fit a slightly larger set; so each kept tensor is
+# allocated with its leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`, at most 1/16
+# more) and the call binds the leading [:n] view, so packs of nearby sizes take the same blocks.  A caller-held
+# workspace's arena stays allocated between calls, so nothing is freed and reallocated around its kept set: its calls
+# keep the default pool, whose blocks the set then shares with the step's other allocations.  A saving forward
+# outside a checkpoint (saved_rows="intra" / "wy" on a plain autograd call) keeps its rows in the default pool: they
+# live until each layer's backward, and their blocks then serve the next step's other allocations.
 _MEM_POOL = getattr(torch.cuda, "MemPool", None)
 _USE_MEM_POOL = getattr(torch.cuda, "use_mem_pool", None)
 _KEPT_POOLS: dict[int, Any] = {}
 
 
+def _kept_extent(n: int) -> int:
+    """The leading extent a kept tensor of ``n`` rows (token rows; chunks for the ``h`` tape) is allocated with in the
+    package-private pool: ``n`` rounded up to a multiple of ``2 ** (bit_length(n) - 5)`` (16 steps per power of two,
+    at most 1/16 more), so the sets of packs of nearby sizes take the same blocks."""
+    step = 1 << max(n.bit_length() - 5, 0)
+    return -(-n // step) * step
+
+
 def _kept_pool(call: CakeKDANondetKcpCall) -> Any:
     """The pool the kept set of ``call`` comes from: the package-private pool of its device (:data:`_KEPT_POOLS`)
-    when the knob ``kept_pool`` is 1, this thread runs a checkpoint pass (:func:`_checkpoint_pass`) outside a
-    CUDA-graph capture and the torch has ``torch.cuda.MemPool``; ``None`` (the caching allocator's default pool)
-    otherwise.  Placement only: the launches and their arguments but the data pointers are the same."""
+    when the knob ``kept_pool`` is 1, the call has no caller-held workspace (``scratch["default_ws"]`` set: a
+    ``workspace=None`` call), this thread runs a checkpoint pass (:func:`_checkpoint_pass`) outside a CUDA-graph
+    capture and the torch has ``torch.cuda.MemPool``; ``None`` (the caching allocator's default pool) otherwise.
+    Placement only: the launches and their arguments but the data pointers are the same."""
     if (
         not call.opts.kept_pool
         or _MEM_POOL is None
         or _USE_MEM_POOL is None
         or call.device.type != "cuda"
+        or call.scratch.get("default_ws") is None
     ):
         return None
     if torch.cuda.is_current_stream_capturing() or _checkpoint_pass() is None:
@@ -6451,9 +6469,13 @@ def _tape_alloc(
     call.scratch["kept_pool"] = pool is not None
     if pool is None:
         tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
-    else:
+    else:  # the leading extent rounded up (_kept_extent); the call binds the [:n] view, contiguous at offset 0
+        tape = {}
         with _USE_MEM_POOL(pool, call.device):
-            tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
+            for n in names:
+                rows, *rest = shapes[n]
+                full = _alloc((_kept_extent(rows), *rest), torch.bfloat16, call.device)
+                tape[n] = full[:rows]
     if _HANDOFF_POISON:
         for t in tape.values():
             t.fill_(float("nan"))
