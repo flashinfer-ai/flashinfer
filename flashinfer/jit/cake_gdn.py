@@ -1872,9 +1872,9 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # The fp32-state T=1 K-major (nontranspose) bodies (`direct_fp32_t1_nontranspose_*`) are
 # routed per (architecture, rule band): the shipped `_small` body (eight CTAs per state
 # head) below 32 batch rows and the shipped large body (one CTA per state head) from 32
-# on, except on Rubin (sm_107a), which runs the `mid4` twin below 21 rows -- four CTAs
+# on, except on Rubin (sm_107a), which runs the `mid4` twin below 10 rows -- four CTAs
 # per state head, each owning one Kx32 value panel over 128-byte state segments -- and the
-# `hqsplit_tma3` twin from 21 rows on (the upper small band 21 <= B < 32 and the whole
+# `hqsplit_tma3` twin from 10 rows on (the upper small band 10 <= B < 32 and the whole
 # large band B >= 32): the large body's update loop split in two (`hqsplit`), with each
 # 32-wide V panel of the state loaded and stored by TMA through a three-stage ring of
 # 128-byte-swizzled shared-memory panels instead of cp.async loads and per-thread
@@ -1898,8 +1898,8 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` of the
 # Cake decode kernel program; they are kept in step by hand (no test compares them).
 CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
-# First batch size of the upper small band (21 <= B < 32).
-CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START = 21
+# First batch size of the upper small band (10 <= B < 32; 21 before 2026-11-08).
+CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START = 10
 CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = (
     37  # 35 -> 37; see the Cake launcher
 )
@@ -1919,8 +1919,11 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
     # Adopted 2026-11-02: the `_rc_kq128` twin of `mid4` (q/k fetched from shared memory
     # as 128-bit loads into registers; bitwise-identical output).
     ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
-    # Adopted 2026-11-03: the upper small band 21 <= B < 32 (formerly `mid4_rc_kq128`)
-    # runs the TMA-state `hqsplit_tma3` twin on sm_107a where it ships a record.
+    # Adopted 2026-11-03: the upper small band (formerly `mid4_rc_kq128`) runs the
+    # TMA-state `hqsplit_tma3` twin on sm_107a where it ships a record; the band starts at
+    # B = 10 since 2026-11-08 (21 before), when the TMA-state host shim began to reuse the
+    # tensor map it encoded for the same state and the public nontranspose decode began to
+    # reuse its launch per row (``gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES``).
     ("sm_107a", "small_upper"): "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
     # Adopted 2026-11-03: the whole large band (B >= 32; formerly `tilev32_x2` for
     # 32 <= B < 37 and the ``hqsplit`` recurrence twin from 37) runs the TMA-state
@@ -1962,7 +1965,7 @@ CAKE_GDN_DECODE_TMA_STATE_SCHEDULES = frozenset(
 
 
 def cake_gdn_nontranspose_fp32_t1_rule_band(batch_size: int) -> str:
-    """Rule band of ``batch_size`` rows: ``small`` (B < 21), ``small_upper`` (21 <= B < 32), ``large_wavefit`` (32 <= B < 37) or ``large``."""
+    """Rule band of ``batch_size`` rows: ``small`` (B < 10), ``small_upper`` (10 <= B < 32), ``large_wavefit`` (32 <= B < 37) or ``large``."""
 
     if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START:
         return "small"
@@ -2363,7 +2366,7 @@ def select_cake_gdn_decode_variant(
         )
     elif layout == "nontranspose":
         # The body follows the batch band per architecture (sm_107a runs the `mid4`
-        # twin below 21 rows); the route id names a twin and the host reads the
+        # twin below 10 rows); the route id names a twin and the host reads the
         # record's CTAs per state head for the grid.  A band whose twin ships no
         # record for the row's specializations keeps its fallback band's body; a row
         # listed in the per-row table runs the body of the band it names.
