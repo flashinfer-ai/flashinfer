@@ -37,14 +37,19 @@ sm_103a every kernel moves 64-bit vectors (4 BF16 values) per thread and is
 built for one hidden size (the ``_h<hidden>`` libraries; the record's
 ``hidden``): the forward in 256-thread CTAs on sm_100a and 128-thread CTAs on
 sm_103a, the backward in 512-thread CTAs (256 on sm_100a at hidden 5120 and
-7168) and the accumulating backward in 1024-thread CTAs.  The unsuffixed
-libraries take any hidden size (``hidden`` 0), with 128-bit forward vectors (8
-values) and 256-bit backward vectors (16 values) in 256-thread CTAs: every
-role runs one on sm_107a, and the backward that writes ``dX`` runs one on
-sm_100a and sm_103a for a small problem (:data:`SMALL_ROUTES`).  Each output
-element is one fixed chain of operations of one thread, the same chain in
-every build, so the outputs are the same bits whichever library and grid
-compute them.
+7168) and the accumulating backward in 1024-thread CTAs.  On sm_107a the
+hidden-4096 forward and writing backward move 256-bit vectors (16 values) in
+128-thread CTAs, and the accumulating backward has L2 do its additions (bulk
+reductions from a shared-memory segment of 128-bit vectors, 256-thread CTAs).
+The unsuffixed libraries take any hidden size (``hidden`` 0), with 128-bit
+forward vectors (8 values) and 256-bit backward vectors (16 values) in
+256-thread CTAs; they serve a small problem (:data:`SMALL_ROUTES`): every role
+on sm_107a, the backward that writes ``dX`` on sm_100a and sm_103a.  Each
+output element is one fixed chain of operations, the same chain in every
+build (the one addition of an accumulating element is L2's in the bulk-reduce
+library and the thread's in the others, both a BF16 addition rounded to
+nearest), so the outputs are the same bits whichever library and grid compute
+them.
 
 Each kernel moves one vector of ``vector_elems`` BF16 values per thread on a
 plain (non-persistent) grid of ``ceil(T * hv / threads)`` CTAs, where ``hv =
@@ -302,6 +307,40 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_fwd",
     },
+    "cake_mhc_det_train_head_fwd__lw256_t128_h4096": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "y"],
+            ["parameter", "T"],
+            ["parameter", "hv"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "vectors", "threads": 128, "vector_elems": 16},
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_head_fwd__lw256_t128_h4096",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_fwd__lw256_t128_h4096",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_head_fwd__lw256_t128_h4096",
+        "logical": {
+            "T": "rows",
+            "hv": "hv",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "head_fwd",
+    },
     "cake_mhc_det_train_head_bwd": {
         "arches": [
             "sm_100a",
@@ -509,6 +548,40 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_bwd",
     },
+    "cake_mhc_det_train_head_bwd__lw256_t128_h4096": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["parameter", "T"],
+            ["parameter", "hv"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "vectors", "threads": 128, "vector_elems": 16},
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_head_bwd__lw256_t128_h4096",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__lw256_t128_h4096",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_head_bwd__lw256_t128_h4096",
+        "logical": {
+            "T": "rows",
+            "dx": "dx",
+            "dy": "dy",
+            "hv": "hv",
+        },
+        "role": "head_bwd",
+    },
     "cake_mhc_det_train_head_bwd__acc": {
         "arches": [
             "sm_107a",
@@ -648,6 +721,40 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "head_bwd_acc",
     },
+    "cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["parameter", "T"],
+            ["parameter", "hv"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "vectors", "threads": 256, "vector_elems": 8},
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096",
+        "kernel_symbol": "kernel_cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 4096,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096",
+        "logical": {
+            "T": "rows",
+            "dx": "dx",
+            "dy": "dy",
+            "hv": "hv",
+        },
+        "role": "head_bwd_acc",
+    },
 }
 # The record a public call launches on each architecture, by role and hidden
 # size: the forward (``head_fwd``), the backward that writes ``dX``
@@ -691,24 +798,31 @@ ROUTES: dict[str, dict[str, dict[int, str]]] = {
     },
     "sm_107a": {
         "head_fwd": {
-            4096: "cake_mhc_det_train_head_fwd",
+            4096: "cake_mhc_det_train_head_fwd__lw256_t128_h4096",
         },
         "head_bwd": {
-            4096: "cake_mhc_det_train_head_bwd",
+            4096: "cake_mhc_det_train_head_bwd__lw256_t128_h4096",
         },
         "head_bwd_acc": {
-            4096: "cake_mhc_det_train_head_bwd__acc",
+            4096: "cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096",
         },
     },
 }
-# On sm_100a and sm_103a the backward that writes ``dX`` of at most
-# ``SMALL_BWD_ELEMENTS`` values of ``dY`` (T 2048 at hidden 4096) runs the
-# unsuffixed library, at any hidden size: its 256-bit vectors keep more bytes
-# in flight per thread when the grid is small.
-SMALL_BWD_ELEMENTS = 2048 * 4096
+# A call of a served hidden size with at most ``SMALL_ELEMENTS`` values per
+# stream (T 2048 at hidden 4096) runs the unsuffixed library of its role where
+# this names one: on sm_100a and sm_103a the backward that writes ``dX`` (its
+# 256-bit vectors keep more bytes in flight per thread when the grid is small),
+# and on sm_107a every role, whose hidden-4096 libraries are timed on the large
+# problems.
+SMALL_ELEMENTS = 2048 * 4096
 SMALL_ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {"head_bwd": "cake_mhc_det_train_head_bwd"},
     "sm_103a": {"head_bwd": "cake_mhc_det_train_head_bwd"},
+    "sm_107a": {
+        "head_fwd": "cake_mhc_det_train_head_fwd",
+        "head_bwd": "cake_mhc_det_train_head_bwd",
+        "head_bwd_acc": "cake_mhc_det_train_head_bwd__acc",
+    },
 }
 
 # The architectures the head ships for: B200 (``sm_100a``), B300 (``sm_103a``)
@@ -757,9 +871,6 @@ def route_module(arch: str, role: str, hidden: int, rows: int) -> str:
     """The module of ``role`` on ``arch`` for ``rows`` tokens of ``hidden``
     values (``ValueError`` when none is exported)."""
 
-    small = SMALL_ROUTES.get(arch, {}).get(role)
-    if small is not None and int(rows) * int(hidden) <= SMALL_BWD_ELEMENTS:
-        return small
     name = ROUTES.get(arch, {}).get(role, {}).get(int(hidden))
     if name is None:
         raise ValueError(
@@ -767,6 +878,9 @@ def route_module(arch: str, role: str, hidden: int, rows: int) -> str:
             f"hidden {hidden}; exported architectures: {ARCHES}, hidden sizes: "
             f"{HIDDEN_SIZES}"
         )
+    small = SMALL_ROUTES.get(arch, {}).get(role)
+    if small is not None and int(rows) * int(hidden) <= SMALL_ELEMENTS:
+        return small
     return name
 
 

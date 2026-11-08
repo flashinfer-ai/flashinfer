@@ -292,7 +292,7 @@ def test_the_registry_is_the_det_head_registry_renamed() -> None:
     for arch, roles in routes.items():
         for role, by_hidden in roles.items():
             for hidden, name in by_hidden.items():
-                for rows in (1, ours.SMALL_BWD_ELEMENTS // hidden + 1):
+                for rows in (1, ours.SMALL_ELEMENTS // hidden + 1):
                     assert ours.route_module(arch, role, hidden, rows) == _renamed(
                         det.route_module(arch, role, hidden, rows)
                     )
@@ -307,7 +307,7 @@ def test_the_registry_is_the_det_head_registry_renamed() -> None:
         "HIDDEN_SIZES",
         "MAX_TOKENS",
         "MAX_VECTORS",
-        "SMALL_BWD_ELEMENTS",
+        "SMALL_ELEMENTS",
     ):
         assert getattr(ours, name) == getattr(det, name), name
 

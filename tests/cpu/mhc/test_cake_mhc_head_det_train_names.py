@@ -22,7 +22,7 @@ callable takes a ``deterministic`` keyword (the ``forward`` / ``backward`` of
 the autograd ``Function`` classes included), the former modules and names are
 gone (no module, no alias, no top-level name), the module imports its backend
 on first use only, the registry routes each architecture and hidden size to its
-own libraries (``ROUTES[arch][role][hidden]``, the small-problem backward of
+own libraries (``ROUTES[arch][role][hidden]``, the small-problem libraries of
 ``SMALL_ROUTES``; ``build.json`` builds exactly the records' architectures),
 and the package is wired at its path (test-helper key, package data, ignored
 ``aot/``, pre-commit exclude, manifest checker row).
@@ -71,8 +71,10 @@ REMOVED_NAMES = ("route_key", "route_modules")
 # The registry's records: library -> (role, architectures, CTA threads, BF16 values per vector, the hidden size the
 # build is for, 0 for any).  On sm_100a and sm_103a a 64-bit library per hidden size: the forward in 256-thread CTAs
 # on sm_100a and 128-thread CTAs on sm_103a, the backward in 512-thread CTAs (256 on sm_100a at 5120 and 7168), the
-# accumulating backward in 1024-thread CTAs.  The unsuffixed libraries take any hidden size: 128-bit forward and
-# 256-bit backward vectors in 256-thread CTAs, on sm_107a (and the backward on sm_100a / sm_103a for a small problem).
+# accumulating backward in 1024-thread CTAs.  On sm_107a the hidden-4096 forward and writing backward move 256-bit
+# vectors in 128-thread CTAs and the accumulating backward is the L2 bulk-reduce library (128-bit vectors, 256-thread
+# CTAs).  The unsuffixed libraries take any hidden size: 128-bit forward and 256-bit backward vectors in 256-thread
+# CTAs, for a small problem on sm_107a (and the backward on sm_100a / sm_103a).
 _LW64 = ("sm_100a", "sm_103a")
 RECORDS = {
     "cake_mhc_det_train_head_fwd": ("head_fwd", ("sm_107a",), 256, 8, 0),
@@ -84,18 +86,29 @@ RECORDS = {
         f"cake_mhc_det_train_head_fwd__lw64_t256_h{h}": ("head_fwd", ("sm_100a",), 256, 4, h)
         for h in (4096, 5120, 7168)
     },
+    "cake_mhc_det_train_head_fwd__lw256_t128_h4096": ("head_fwd", ("sm_107a",), 128, 16, 4096),
     "cake_mhc_det_train_head_bwd": ("head_bwd", (*_LW64, "sm_107a"), 256, 16, 0),
     "cake_mhc_det_train_head_bwd__lw64_t512_h4096": ("head_bwd", _LW64, 512, 4, 4096),
     "cake_mhc_det_train_head_bwd__lw64_t512_h5120": ("head_bwd", ("sm_103a",), 512, 4, 5120),
     "cake_mhc_det_train_head_bwd__lw64_t512_h7168": ("head_bwd", ("sm_103a",), 512, 4, 7168),
     "cake_mhc_det_train_head_bwd__lw64_t256_h5120": ("head_bwd", ("sm_100a",), 256, 4, 5120),
     "cake_mhc_det_train_head_bwd__lw64_t256_h7168": ("head_bwd", ("sm_100a",), 256, 4, 7168),
+    "cake_mhc_det_train_head_bwd__lw256_t128_h4096": ("head_bwd", ("sm_107a",), 128, 16, 4096),
     "cake_mhc_det_train_head_bwd__acc": ("head_bwd_acc", ("sm_107a",), 256, 16, 0),
     **{
         f"cake_mhc_det_train_head_bwd__acc_lw64_t1024_h{h}": ("head_bwd_acc", _LW64, 1024, 4, h)
         for h in (4096, 5120, 7168)
     },
+    "cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096": (
+        "head_bwd_acc",
+        ("sm_107a",),
+        256,
+        8,
+        4096,
+    ),
 }
+# The dynamic shared memory of a record's launch: the L2 bulk-reduce backward's segment of 256 16-byte vectors.
+SMEM = {"cake_mhc_det_train_head_bwd__acc_l2red_lw128_t256_h4096": 4096}
 ROLES = ("head_fwd", "head_bwd", "head_bwd_acc")
 
 _CHILD = r"""
@@ -220,8 +233,8 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
     whose thread count is the CTA's, ``kernel`` / ``library`` the record name, ``kernel_symbol``
     ``kernel_<library>``).  ``ROUTES[arch][role]`` maps every hidden size the architecture serves to the record of
     the role delivered for the architecture and built for that hidden size, or built for any where none is;
-    ``SMALL_ROUTES`` sends the backward of at most ``SMALL_BWD_ELEMENTS`` values on sm_100a and sm_103a to the
-    unsuffixed backward; :func:`route_module` follows both and refuses any other call, and a record refuses a hidden
+    ``SMALL_ROUTES`` sends a call of at most ``SMALL_ELEMENTS`` values per stream to the unsuffixed library of its
+    role (the writing backward on sm_100a and sm_103a, every role on sm_107a); :func:`route_module` follows both and refuses any other call, and a record refuses a hidden
     size it is not built for.  Every route stays inside the kernels' ``hv <= MAX_VECTORS`` and its largest grid
     inside 31 bits."""
     loader = importlib.import_module(f"{BACKEND}.cake_jit")
@@ -236,6 +249,7 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
             "vector_elems": elems,
         }, name
         assert tuple(record["launch"]["block"]) == (threads, 1, 1), name
+        assert record["launch"]["dynamic_smem_bytes"] == SMEM.get(name, 0), name
         assert record["kernel"] == record["library"] == name
         assert record["kernel_symbol"] == f"kernel_{name}"
 
@@ -267,12 +281,17 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
     assert loader.SMALL_ROUTES == {
         "sm_100a": {"head_bwd": small},
         "sm_103a": {"head_bwd": small},
+        "sm_107a": {
+            "head_fwd": "cake_mhc_det_train_head_fwd",
+            "head_bwd": small,
+            "head_bwd_acc": "cake_mhc_det_train_head_bwd__acc",
+        },
     }
-    assert loader.SMALL_BWD_ELEMENTS == 2048 * 4096
+    assert loader.SMALL_ELEMENTS == 2048 * 4096
     for arch in loader.ARCHES:
         for role in ROLES:
             for hidden in loader.supported_hidden_sizes(arch):
-                largest = loader.SMALL_BWD_ELEMENTS // hidden
+                largest = loader.SMALL_ELEMENTS // hidden
                 routed = loader.ROUTES[arch][role][hidden]
                 to_small = loader.SMALL_ROUTES.get(arch, {}).get(role, routed)
                 assert loader.route_module(arch, role, hidden, largest + 1) == routed
