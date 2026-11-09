@@ -47,8 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LAUNCH_MIN_BLOCKS 4
-
 #include <math_constants.h>
 
 __device__ __forceinline__ float approx_exp2(float x) {
@@ -137,8 +135,8 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 
 extern "C" {
 
-__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gated_act_mxfp8_68e8964981e7c6a09da3(__nv_bfloat16* __restrict__ gated_input, uint8_t* __restrict__ row_output, uint8_t* __restrict__ col_output, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
+__global__ __launch_bounds__(256) void
+kernel_cake_gated_act_mxfp8_31deb882beba0de9d64a(__nv_bfloat16* __restrict__ gated_input, uint8_t* __restrict__ row_output, uint8_t* __restrict__ col_output, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

@@ -47,7 +47,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LAUNCH_MIN_BLOCKS 8
+#define LAUNCH_MIN_BLOCKS 12
 
 #include <math_constants.h>
 
@@ -231,7 +231,7 @@ __device__ __noinline__ unsigned long long band_pair(__nv_bfloat16* src, __nv_bf
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gated_act_mxfp8_ed129000e41a06bb7475(__nv_bfloat16* __restrict__ gated_input, __nv_bfloat16* __restrict__ grad, uint8_t* __restrict__ row_output, uint8_t* __restrict__ col_output, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
+kernel_cake_gated_act_mxfp8_ca9917264bb212d23139(__nv_bfloat16* __restrict__ gated_input, __nv_bfloat16* __restrict__ grad, uint8_t* __restrict__ row_output, uint8_t* __restrict__ col_output, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
