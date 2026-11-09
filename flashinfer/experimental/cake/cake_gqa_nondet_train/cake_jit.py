@@ -570,7 +570,11 @@ def grid(
     if stage == "bwd_plan":
         return (1, 1, 1)
     if stage == "bwd_pre":
-        return (rows_pad(total_q, num_segments) // PRE_ROWS_PER_CTA, num_heads_q // 2, 1)
+        return (
+            rows_pad(total_q, num_segments) // PRE_ROWS_PER_CTA,
+            num_heads_q // 2,
+            1,
+        )
     if stage in ("bwd_main_fp32", "bwd_main_bf16"):
         return (BWD_CLUSTER * chunk_blocks, chunk_heads, num_segments)
     if stage == "bwd_dq":
