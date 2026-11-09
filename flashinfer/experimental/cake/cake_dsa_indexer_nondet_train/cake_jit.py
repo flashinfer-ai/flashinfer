@@ -728,7 +728,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": [32, 500],
         "sample_long_rule": [["l6"], 500],
-        "lsf_programs": False,
+        "lsf_programs": True,
         "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,

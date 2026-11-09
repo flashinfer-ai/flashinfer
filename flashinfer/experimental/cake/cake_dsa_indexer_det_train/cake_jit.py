@@ -1211,7 +1211,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": [32, 500],
         "sample_long_rule": [["l6"], 500],
-        "lsf_programs": False,
+        "lsf_programs": True,
         "lsf_single_rule": None,
         "static_scan_kinds": [],
         "far_sample": 0,
@@ -1282,7 +1282,10 @@ POLICY: dict[str, dict[str, Any]] = {
 # FP8 split counts stay as measured (no split-resident rule) whatever the BF16
 # split rule becomes.  The sm_107a FP8 record keeps no sampling class or
 # long-unit rule (sample_class_rule, sample_long_rule): the BF16 record's
-# #7549 rules were measured on the BF16 ticket programs.
+# #7549 rules were measured on the BF16 ticket programs.  Nor does it run a
+# longest-first copy (lsf_programs False): its FP8 programs keep the static unit
+# enumeration, which draws no tickets to order, while the BF16 record runs the
+# :lsf copies of its l6 ticket programs.
 POLICY_FP8: dict[str, dict[str, Any]] = {
     "sm_100a": {
         "static_scan_kinds": [],
@@ -1333,6 +1336,7 @@ POLICY_FP8: dict[str, dict[str, Any]] = {
         "static_scan_kinds": ["l6", "narrow", "split_narrow", "wide"],
         "sample_class_rule": None,
         "sample_long_rule": None,
+        "lsf_programs": False,
         "split_max": 16,
         "split_min_range_tiles": 32,
         "split_wave_rule": [1000, 0.12],
