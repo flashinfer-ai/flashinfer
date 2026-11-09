@@ -782,16 +782,18 @@ token-head).  `saved_rows="tape"` keeps the tape set.
 
 Kept-set pool: in a checkpoint pass of a `workspace=None` call the kept set
 (the tape set or a rows set) comes from a package-private `torch.cuda.MemPool`
-per device, each tensor's leading extent rounded up to 16 steps per power of
-two (at most 1/16 more), so packs of nearby sizes reuse its blocks.  Such a
-call allocates its arena at its start and frees it at its end; in the caching
-allocator's default pool the set, which lives from the recompute to the node's
-backward, would take the rest of the forward arena's freed block, the backward
-arena a new segment, and the reserved memory would grow over the steps.  A
-caller-held workspace's arena stays allocated, so its calls keep the default
-pool.  Reserved memory per rank on GB300 (CP4, H 64, packs of 65536 tokens,
-max over ranks, MiB; first step after `torch.cuda.empty_cache()` and the
-steady state of the next 3 steps; outputs and gradients bitwise unchanged):
+per device, each tensor's block cut for its leading extent rounded up to 16
+steps per power of two (at most 1/16 more), so packs of nearby sizes reuse its
+blocks; once a block of that size exists, a tensor takes its exact shape from
+it.  Such a call allocates its arena at its start and frees it at its end; in
+the caching allocator's default pool the set, which lives from the recompute
+to the node's backward, would take the rest of the forward arena's freed
+block, the backward arena a new segment, and the reserved memory would grow
+over the steps.  A caller-held workspace's arena stays allocated, so its calls
+keep the default pool.  Reserved memory per rank on GB300 (CP4, H 64, packs of
+65536 tokens, max over ranks, MiB; first step after `torch.cuda.empty_cache()`
+and the steady state of the next 3 steps; outputs and gradients bitwise
+unchanged):
 
 | gate | recompute | first step: before / pool | steady: before / pool | steady, `checkpoint_handoff="off"` |
 | --- | --- | --- | --- | --- |
@@ -802,11 +804,12 @@ steady state of the next 3 steps; outputs and gradients bitwise unchanged):
 | raw, L2 norm | plain | 30540 / 30556 | 39718 / 30556 | 29740 |
 | raw, L2 norm | handle | 30540 / 30556 | 39558 / 30556 | 29740 |
 
-The pool costs one kept set over `"off"` (816 MiB here) and the allocated
-peak 10-12 MiB (the rounding).  It keeps its blocks reserved between calls,
-and `torch.cuda.empty_cache()` does not release the blocks of a live pool:
-measured after the `workspace=None` steps, caller-held calls in the same
-process reserve those 816 MiB more.  A process that stops making
+The pool costs one kept set over `"off"` (816 MiB here); the allocated peak
+stays within 3 MiB of the default pool's, and the host time of a kept set's
+allocation within 2 us of it (measured on GB300).  It keeps its blocks reserved
+between calls, and `torch.cuda.empty_cache()` does not release the blocks of a
+live pool: measured after the `workspace=None` steps, caller-held calls in the
+same process reserve those 816 MiB more.  A process that stops making
 `workspace=None` checkpointed calls drops the pools with
 `cake_kcp.default_workspace_cache_clear()`, after which `empty_cache()`
 releases them.
