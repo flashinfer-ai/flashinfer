@@ -1444,7 +1444,9 @@ def memory_plan(
             vb_ip = largest(lambda vb: tail_ip(vb) <= budget, V - split)
             if vb_ip:
                 k = largest(
-                    lambda v: peak("partial_ip", split + v - step, min(vb_ip, V - split - v + step))
+                    lambda v: peak(
+                        "partial_ip", split + v - step, min(vb_ip, V - split - v + step)
+                    )
                     <= budget,
                     V - split,
                 )
@@ -3731,10 +3733,9 @@ class _Binding:
         kernels with the same operands on the same stream; the early launches neither read nor write what moved
         behind them, so every output is bitwise the in-order sequence's."""
         p, plan = self.plan.problem, self.plan
-        T, H, V = (
+        T, H = (
             plan.rows,
             p.hidden,
-            p.vocab,
         )  # rows of the chunk loop (the valid rows when compacted)
         self._check_hidden(hidden)
         early = hidden is None and bool(self.forward_early or self.forward_early_labels)
