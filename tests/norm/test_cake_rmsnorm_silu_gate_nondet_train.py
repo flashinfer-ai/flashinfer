@@ -1661,9 +1661,12 @@ def test_empty_and_errors():
 # (9e8bf507c9563bb24193, 348592b55aa04975cc33) and of sm_107a (3 slots:
 # f5a44b8ba8bccb590488 of a BF16, de4ac875a4e07bb547fd of an FP32 weight
 # gradient), the static backward of a BF16 weight gradient on sm_100a and
-# sm_103a (7e9f1c0cadbc18c390d2), and the forwards without the split gate
+# sm_103a (7e9f1c0cadbc18c390d2), the forwards without the split gate
 # (c7919260b39b69e4e646, 83fe9e25ce0d01cc3ab1, c6151f64f22ae65a48eb,
-# cf7a87977aaad1a9822f, 3cb6aa31e140d9b13052, 04bb67629537ef270bd4).
+# cf7a87977aaad1a9822f, 3cb6aa31e140d9b13052, 04bb67629537ef270bd4), and the
+# static backward of an FP32 weight gradient on sm_100a and sm_103a whose
+# last CTA reads its windows by fetching adds (f2915438ea54b487d93f; the
+# build that reads them by exchanges ships, with the same bits).
 REMOVED_PROGRAMS = tuple(
     f"cake_rmsnorm_silu_gate_train_{digest}"
     for digest in (
@@ -1678,6 +1681,7 @@ REMOVED_PROGRAMS = tuple(
         "cf7a87977aaad1a9822f",
         "3cb6aa31e140d9b13052",
         "04bb67629537ef270bd4",
+        "f2915438ea54b487d93f",
     )
 )
 
