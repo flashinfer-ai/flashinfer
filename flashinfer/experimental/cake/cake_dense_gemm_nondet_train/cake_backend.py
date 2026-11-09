@@ -1824,8 +1824,15 @@ def _k1_dgrad_knobs_of(G: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> t
 #: (:data:`K1_DGRAD_PROGRAM_RULES_BY_SM`): row stores, or TMA stores of the tile from shared memory (``tma_store``),
 #: both loading the output gradient with the L2 evict-first hint; ``lean_free``: TMA stores without that hint, the
 #: start path of cuBLAS's nvjet kernels (each role waiting on the cluster barrier only before its first operation that
-#: needs it) and the epilogue freeing the tensor memory (``tma_store`` implied).
-def dgrad_program_template(tma_store: bool, lean_free: bool = False) -> str:
+#: needs it) and the epilogue freeing the tensor memory (``tma_store`` implied); ``resident``: that form with the
+#: evict-first hint and the tile row's whole output gradient held in shared memory as ``resident`` slices of 64
+#: features for the CTA pair's run of tiles (``lean_free`` and ``tma_store`` implied), a program for a reduction of
+#: exactly ``64 * resident`` output features only.
+def dgrad_program_template(
+    tma_store: bool, lean_free: bool = False, resident: int = 0
+) -> str:
+    if resident:
+        return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_ef_tma_lean_free_r{int(resident)}"
     if lean_free:
         return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_tma_lean_free"
     return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_ef" + (
@@ -1837,6 +1844,9 @@ _WAVE_LEAN_N224_PF2_ST = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st"
 _DGRAD_N = "dense_proj_gemm_dgrad_kn_n256_f32_ef"
 _DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
 _DGRAD_N_TMA_LEAN_FREE = "dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free"
+_DGRAD_N_EF_TMA_LEAN_FREE_R9 = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma_lean_free_r9"
+#: The token counts of the 148-SM ``sm_100a`` input-gradient windows of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`.
+_DGRAD_WINDOW_TOKENS = range(16172, 16385)
 
 #: The K1 forward rows that run a program of this package instead of the deterministic package's,
 #: ``(arch, sm_count) -> {(K, N, T): template}``: on a part of exactly ``sm_count`` SMs,
@@ -1894,18 +1904,22 @@ K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int],
 #: deterministic plan.  Measured at exactly these rows and token counts on one part of each SM count against this
 #: package's program of the row in the same process: faster in eager launches and in CUDA graph replays in 5 of 5 paired
 #: groups, the output equal to the deterministic plan's bit for bit, and the same bits on 20 repeats.  On 148-SM
-#: ``sm_100a`` parts ``4096 -> 512``, ``5120 -> 512`` and ``6144 -> 576`` at 16231 tokens run the program without the
-#: evict-first hint (``dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free``): on a B200 part 0.93 to 0.95 times the time
-#: of the program these rows ran before, 5 of 5 paired groups in eager launches and in CUDA graph replays, the same bits.
+#: ``sm_100a`` parts ``4096 -> 512`` and ``5120 -> 512`` run the program without the evict-first hint
+#: (``dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free``), and ``6144 -> 576`` its evict-first form with the tile row's
+#: output gradient resident in shared memory (``dense_proj_gemm_dgrad_kn_n256_f32_ef_tma_lean_free_r9``, nine slices
+#: of 64 features: a reduction of exactly 576 features only), at every token count from 16172 to 16384
+#: (:data:`_DGRAD_WINDOW_TOKENS`).  On one B200 part, two GPUs, 17 paired groups in eager launches and in CUDA graph
+#: replays each, the same bits as the deterministic plan and on 20 repeats: at 16172 and 16384 tokens the 512-feature
+#: rows took 0.95 to 0.97 times the time of the evict-first TMA form they ran before and ``6144 -> 576`` 0.94 to 0.96
+#: times that of the deterministic plan; at 16231 tokens the form without the hint took 0.93 to 0.95 times the time of
+#: the evict-first TMA form in 5 of 5 paired groups.
 # fmt: off
 K1_DGRAD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
     ("sm_100a", 148): {
         (4096, 1024, 16172, "f32"): _DGRAD_N, (4096, 1024, 16231, "f32"): _DGRAD_N, (4096, 1024, 16384, "f32"): _DGRAD_N,
         (5120, 1024, 16172, "f32"): _DGRAD_N, (5120, 1024, 16231, "f32"): _DGRAD_N, (5120, 1024, 16384, "f32"): _DGRAD_N,
-        (4096, 512, 16172, "f32"): _DGRAD_N_TMA, (4096, 512, 16231, "f32"): _DGRAD_N_TMA_LEAN_FREE,
-        (4096, 512, 16384, "f32"): _DGRAD_N_TMA, (5120, 512, 16172, "f32"): _DGRAD_N_TMA,
-        (5120, 512, 16231, "f32"): _DGRAD_N_TMA_LEAN_FREE, (5120, 512, 16384, "f32"): _DGRAD_N_TMA,
-        (6144, 576, 16231, "f32"): _DGRAD_N_TMA_LEAN_FREE,
+        **{(K, 512, T, "f32"): _DGRAD_N_TMA_LEAN_FREE for K in (4096, 5120) for T in _DGRAD_WINDOW_TOKENS},
+        **{(6144, 576, T, "f32"): _DGRAD_N_EF_TMA_LEAN_FREE_R9 for T in _DGRAD_WINDOW_TOKENS},
     },
     ("sm_100a", 152): {
         (4096, 1024, 16172, "f32"): _DGRAD_N_TMA, (4096, 1024, 16231, "f32"): _DGRAD_N_TMA,
@@ -2149,9 +2163,16 @@ def _launch_dgrad_program(
     ``N = K`` columns and ``K = N`` reduction, ``W`` as ``[1, N, K]``; ``out`` stored through its own pointer and row
     stride (a padded ``out`` as the contiguous 1-D alias of its span, ``flat_alias``: the binding checks the
     pointer's contiguity), and through ``[1, T, K]`` TMA maps (the map of the other dtype a per-device dummy the
-    program never touches)."""
+    program never touches).  A program with a resident output gradient of ``r`` slices (``resident``) takes a
+    reduction of exactly ``64 * r`` features; another ``N`` raises ``ValueError``."""
     det = deterministic_backend()
     T, N, K = int(G.shape[0]), int(W.shape[0]), int(W.shape[1])
+    resident = int(MODULES[module]["build"]["kwargs"].get("resident", 0))
+    if resident and N != 64 * resident:
+        raise ValueError(
+            f"cake_dense_gemm_nondet_train: {module} holds {resident} slices of 64 features of the output gradient, "
+            f"a reduction of {64 * resident} features, not {N}"
+        )
     f32 = out.dtype == torch.float32
     other = torch.bfloat16 if f32 else torch.float32
     spare, flat = det._dummy_map(out.device, other), det._dummy(out.device, other)
