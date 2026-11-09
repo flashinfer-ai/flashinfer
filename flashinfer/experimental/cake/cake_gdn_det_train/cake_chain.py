@@ -4040,19 +4040,26 @@ class CakeGDNDetFunction(torch.autograd.Function):
                                          tape=tape)  # fmt: skip
         # a fixed saved list of 13: the state the architecture's tape level keeps under save_state
         # (cake_plan.tape_state: w, h and v_new under T_full), a placeholder of the same shape, dtype and device for
-        # the rest and for everything without a tape (a checkpoint's first pass compares the two passes' saved
-        # lists); the backward reads only the state the level keeps (CakeGDNDetFunction.backward)
+        # the rest (a checkpoint's first pass compares the two passes' saved lists); the backward reads only the state
+        # the level keeps (CakeGDNDetFunction.backward).  A forward without a tape (a checkpoint's first pass, whose
+        # saved list is dropped, or a call that records no backward) saves the state it formed anyway, which retains
+        # nothing, and placeholders only for the state it did not form
         kept = cake_plan.tape_state(arch, options.save_state) if tape else ()
         state_tensors = [
-            fwd[name]
-            if name in kept
-            else cake_plan.placeholder(shape, dtype, fwd["qn"].device)
-            for name, (shape, dtype) in zip(
-                cake_plan.STATE_NAMES,
-                _forward_state(meta, fwd["kn"], fwd["v"]),
-                strict=True,
-            )
+            fwd.get(name) if not tape or name in kept else None
+            for name in cake_plan.STATE_NAMES
         ]
+        if any(t is None for t in state_tensors):
+            state_tensors = [
+                cake_plan.placeholder(shape, dtype, fwd["qn"].device)
+                if t is None
+                else t
+                for t, (shape, dtype) in zip(
+                    state_tensors,
+                    _forward_state(meta, fwd["kn"], fwd["v"]),
+                    strict=True,
+                )
+            ]
         ctx.save_for_backward(fwd["qn"], fwd["kn"], fwd["rstd_q"], fwd["rstd_k"], fwd["v"], fwd["g_cs"],
                               fwd["beta32"], fwd["A"], initial_state, *state_tensors)  # fmt: skip
         ctx.meta, ctx.arch, ctx.scale = meta, arch, float(scale)
@@ -4173,8 +4180,13 @@ def cake_gdn_det(
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
     # a call that records no backward (grad mode off, or no input that requires grad) keeps no forward tape
-    records = torch.is_grad_enabled() and any(
-        t is not None and t.requires_grad for t in (q, k, v, g, beta, initial_state)
+    records = torch.is_grad_enabled() and (
+        q.requires_grad
+        or k.requires_grad
+        or v.requires_grad
+        or g.requires_grad
+        or beta.requires_grad
+        or (initial_state is not None and initial_state.requires_grad)
     )
     token = None if records else _RECORDS_BACKWARD.set(False)
     try:

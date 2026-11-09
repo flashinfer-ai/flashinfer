@@ -33,6 +33,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from types import MappingProxyType
+from typing import Any
 
 import torch
 
@@ -197,6 +198,10 @@ def tape_state(arch: str, save_state: bool) -> tuple[str, ...]:
 
 # the one-element tensor every placeholder of a (device, dtype) expands, made at its first placeholder
 _PLACEHOLDER_BASES: dict[tuple[torch.device | str, torch.dtype], torch.Tensor] = {}
+# the placeholders made so far, by (shape, dtype, device), oldest first: a call whose state shapes repeat (a layout
+# seen before) takes the same view again instead of expanding a new one (host time only; a placeholder is never written)
+_PLACEHOLDERS: dict[tuple[Any, ...], torch.Tensor] = {}
+_PLACEHOLDERS_LIMIT = 64
 
 
 def placeholder(
@@ -206,14 +211,23 @@ def placeholder(
     stands in a saved list for an entry the call does not save, so the list keeps its arity and its metadata
     (``torch.utils.checkpoint``'s ``determinism_check`` compares them between a checkpoint's two passes).  Consumers
     decide from the plan (:func:`tape_state`), never by reading a placeholder.  Every placeholder of a (device, dtype)
-    is a view of the same element, made once, so a call allocates nothing for it."""
+    is a view of the same element, made once, so a call allocates nothing for it; a (shape, dtype, device) seen
+    before returns the view made then."""
+    key = (tuple(shape), dtype, device)
+    cached = _PLACEHOLDERS.get(key)
+    if cached is not None:
+        return cached
     base = _PLACEHOLDER_BASES.get((device, dtype))
     if base is None:
         base = _PLACEHOLDER_BASES[(device, dtype)] = torch.empty(
             1, dtype=dtype, device=device
         )
-    shape = tuple(int(s) for s in shape)
-    return base.expand(shape) if shape else base.view(())
+    dims = tuple(int(s) for s in shape)
+    view = base.expand(dims) if dims else base.view(())
+    if len(_PLACEHOLDERS) >= _PLACEHOLDERS_LIMIT:
+        del _PLACEHOLDERS[next(iter(_PLACEHOLDERS))]
+    _PLACEHOLDERS[key] = view
+    return view
 
 
 def is_placeholder(t: torch.Tensor) -> bool:
