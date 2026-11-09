@@ -693,5 +693,6 @@ def test_fc2_input_out_bypasses_trace_apply():
         torch.cuda.synchronize()
         assert len(calls) == seen, "the solution ran for a call with fc2_input_out"
         assert not (codes == 0xFF).all(), "fc2_input_out was not written"
+        assert ta.stats().get(key, {}).get("fallback_fc2_input_out", 0) >= 1
     finally:
         ta.disable_apply()
