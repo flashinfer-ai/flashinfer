@@ -561,8 +561,8 @@ def test_deep_gemm_validate_transformed_weights_accepts_preprocess_output():
     intermediate = 128
     hidden = 128
     weights = MoEWeightPack(
-        w13=torch.randn(num_experts, 2 * intermediate, hidden),
-        w2=torch.randn(num_experts, hidden, intermediate),
+        w13=torch.randn(num_experts, 2 * intermediate, hidden, device="cuda"),
+        w2=torch.randn(num_experts, hidden, intermediate, device="cuda"),
     )
     transformed = preprocess_mega_weights(
         weights,

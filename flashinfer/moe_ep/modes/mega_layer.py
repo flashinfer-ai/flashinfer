@@ -107,6 +107,23 @@ class MoEEpMegaLayer(nn.Module):
     the one the graph writes on every replay — consume that same tensor
     across replays (standard graph practice). Lazy compile/alloc/autotune
     paths raise if they would fire mid-capture instead of corrupting it.
+
+    Training value-forward: call this same inference forward under
+    ``torch.no_grad()`` and let the training framework recompute its own
+    differentiable forward for backward. This layer does not register autograd
+    or save expert intermediates. It owns the entire EP dispatch/compute/combine;
+    already-dispatched expert rows instead belong at a local routed-MoE entry.
+    See :meth:`refresh_weights` for optimizer-step and checkpoint/refit updates.
+
+    Forward equality requires the same weight snapshot, ordered expert IDs and
+    routing probabilities, activation/quantization recipe, backend, fixed knobs,
+    capacity, EP partition and finalization policy. Pin ``fast_math`` and disable
+    ``enable_in_kernel_fc2_reduce`` for deterministic comparisons. Early routing
+    multiplies before FC2 (and its input quantization); late routing multiplies
+    the completed expert output. These are different finite-precision contracts.
+    External finalization must preserve routing precision, FMA order and any
+    per-rank rounding. No equality across backends/recipes/releases or equality
+    of the framework's recomputed gradient is implied.
     """
 
     def __init__(
@@ -160,6 +177,7 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_kernel: MegaKernelBackend | None = None
         self._staged_workspace: Any = None
         self._staged_transformed: Any = None
+        self._stage_pending = False
 
         if backend.transformed_weights is not None:
             self._transformed = backend.transformed_weights
@@ -182,6 +200,54 @@ class MoEEpMegaLayer(nn.Module):
         )
         self._preprocessing_count += 1
         self._weights = None
+
+    @property
+    def supports_weight_refresh(self) -> bool:
+        """Whether this backend supports :meth:`refresh_weights`."""
+        return self._kernel.supports_weight_refresh
+
+    def refresh_weights(self, weights: MoEWeightPack) -> None:
+        """Refresh this rank's prepared snapshot after optimizer updates or refit.
+
+        Supported by SM100/SM103 CuTe-DSL BF16 and MXFP8 E4M3/E5M2 backends
+        (legacy, standard and GenPhase MXFP8). Supply canonical gate||up ``w13``
+        and down ``w2``, including both unswizzled scale planes for prequantized
+        MXFP8. Prequantized payloads are repacked without requantization.
+
+        Shapes, layout, dtype and device stay fixed. All weight/scale tensor
+        addresses remain unchanged, including those referenced by captured
+        graphs and explicit workspaces. Existing knobs are retained. Preparation
+        may allocate scratch and must run outside capture, between complete
+        forwards, never between ``stage_inputs`` and ``compute_staged``.
+
+        This is rank-local and asynchronous on the current stream. The caller
+        orders it after all readers and parameter writes, and before subsequent
+        forwards/replays on every reader stream. Every EP rank must finish its
+        refresh successfully before entering the next collective forward. The
+        trainer explicitly calls this after optimizer steps, checkpoint loads
+        and parameter swaps; tensor version counters are not monitored.
+        Externally supplied ``MegaConfig.transformed_weights`` are updated too
+        and must be exclusively writable by the caller during refresh.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError("MegaMoE layer has been destroyed")
+        if not self.supports_weight_refresh:
+            raise MoEEpConfigError(
+                f"{self._kernel.kernel_name()} does not support weight refresh"
+            )
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise MoEEpConfigError(
+                "weight refresh cannot run during CUDA graph capture"
+            )
+        if self._stage_pending:
+            raise MoEEpConfigError(
+                "weight refresh cannot run between stage and compute"
+            )
+        validate_fleet_weights(weights, self._fleet_params, self._bootstrap.world_size)
+        self._kernel.refresh_weights(
+            weights, self._fleet_params, self._get_transformed_weights()
+        )
+        self._preprocessing_count += 1
 
     def _ensure_workspace(self) -> Any:
         if self._default_workspace_handle is not None:
@@ -397,7 +463,7 @@ class MoEEpMegaLayer(nn.Module):
         return kernel.workspace_output(backend_workspace)
 
     def _get_transformed_weights(self) -> Any:
-        """Return this layer's one-time backend weight transformation."""
+        """Return this layer's prepared weights, retaining their addresses on refresh."""
         if self._transformed is None:
             if not self._mega_config.preprocess_weights:
                 raise MoEEpConfigError(
@@ -544,6 +610,26 @@ class MoEEpMegaLayer(nn.Module):
         return True
 
     @staticmethod
+    def _forward_value_inputs(t: "MoEEpTensors") -> "MoEEpTensors":
+        # no_grad() does not clear requires_grad on an existing tensor, and
+        # DLPack refuses to export such tensors. These read-only aliases keep
+        # the trainer's storage and leave its original autograd inputs intact.
+        detached = {}
+        for name in (
+            "hidden_states",
+            "topk_weights",
+            "scales",
+            "fc1_alpha",
+            "fc2_alpha",
+            "fc1_norm_const",
+            "fc1_activation_per_token_scale",
+        ):
+            tensor = getattr(t, name)
+            if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+                detached[name] = tensor.detach()
+        return dataclasses.replace(t, **detached) if detached else t
+
+    @staticmethod
     def _input_signature(t: "MoEEpTensors") -> tuple[Any, ...]:
         return (
             t.hidden_states.device,
@@ -680,7 +766,7 @@ class MoEEpMegaLayer(nn.Module):
         without changing the selected workspace capacity. Every EP rank must
         use the same bucket for an invocation.
         """
-
+        t = self._forward_value_inputs(t)
         (
             _,
             backend_workspace,
@@ -700,6 +786,7 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_kernel = kernel
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
+        self._stage_pending = True
 
     def compute_staged(self, *, output: torch.Tensor | None) -> torch.Tensor:
         """Launch the kernel using inputs staged by :meth:`stage_inputs`."""
@@ -712,11 +799,13 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "compute_staged() requires a prior warmup/stage_inputs() call"
             )
-        return self._staged_kernel.compute(
+        result = self._staged_kernel.compute(
             self._staged_workspace,
             self._staged_transformed,
             output=output,
         )
+        self._stage_pending = False
+        return result
 
     def forward(
         self,
@@ -732,7 +821,11 @@ class MoEEpMegaLayer(nn.Module):
         ``return_workspace_view=True`` explicitly opts into a borrowed view on
         backends that support one. A view remains valid under stream ordering
         until the next launch reuses the pooled physical workspace.
+
+        This is a value-only forward. Differentiable inputs are read through
+        detached aliases; a trainer must supply backward through recomputation.
         """
+        t = self._forward_value_inputs(t)
         if self._kernel.supports_unfinalized_output:
             raise MoEEpConfigError("finalize_mode=NONE requires forward_unfinalized()")
         if return_workspace_view and t.output is not None:
@@ -781,6 +874,7 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_kernel = kernel
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
+        self._stage_pending = True
         return self.compute_staged(output=output)
 
     def forward_unfinalized(
@@ -803,6 +897,7 @@ class MoEEpMegaLayer(nn.Module):
         before caller finalization; zero-token ranks still participate in the
         full collective launch. Warm up on all ranks before capture.
         """
+        t = self._forward_value_inputs(t)
         if not self._kernel.supports_unfinalized_output:
             raise MoEEpConfigError(
                 "forward_unfinalized() requires finalize_mode=FinalizeMode.NONE"
@@ -811,7 +906,10 @@ class MoEEpMegaLayer(nn.Module):
             self._prepare_inputs(t, workspace=workspace)
         )
         kernel.stage_inputs(t, backend_workspace, quantize_input=quantize_input)
-        return kernel.compute_unfinalized(backend_workspace, transformed_weights)
+        self._stage_pending = True
+        result = kernel.compute_unfinalized(backend_workspace, transformed_weights)
+        self._stage_pending = False
+        return result
 
     def destroy(self) -> None:
         """Collectively release all profiles and runtime resources.

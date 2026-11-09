@@ -40,6 +40,7 @@ def _clamp(config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
 )
 class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
+    supports_weight_refresh = True
 
     @classmethod
     def kernel_name(cls) -> str:

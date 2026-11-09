@@ -130,6 +130,8 @@ class MegaKernelBackend(ABC):
     supports_unfinalized_output: bool = False
     supports_live_token_tuning: bool = False
     supports_auto_workspaces: bool = False
+    # Opt-in backends prepare owned ((data, scale), (data, scale)) snapshots.
+    supports_weight_refresh: bool = False
     _knob_cache_module: str
 
     def __init__(self, config: object) -> None:
@@ -241,6 +243,23 @@ class MegaKernelBackend(ABC):
     ) -> Any:
         """Transform canonical weights into the layout this kernel expects."""
         return weights
+
+    def refresh_weights(
+        self,
+        weights: "MoEWeightPack",
+        fleet_params: "FleetParams",
+        transformed_weights: Any,
+    ) -> None:
+        """Refresh an opted-in backend's snapshot without replacing its tensors."""
+        if not self.supports_weight_refresh:
+            raise NotImplementedError(
+                f"{self.kernel_name()} does not support weight refresh"
+            )
+        from .weight_snapshot import check_weight_refresh, finish_weight_snapshot
+
+        check_weight_refresh(transformed_weights)
+        prepared = self.preprocess_weights(weights, fleet_params)
+        finish_weight_snapshot(prepared, weights, out=transformed_weights)
 
     def prepare_workspace(
         self,

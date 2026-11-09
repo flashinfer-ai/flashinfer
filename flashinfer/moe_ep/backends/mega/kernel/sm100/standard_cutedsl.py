@@ -9,6 +9,7 @@ import torch
 from .....config import FinalizeMode
 from .....core.kernel.base import MegaKernelBackend
 from .....core.kernel.registry import register_mega_kernel
+from .....core.kernel.weight_snapshot import finish_weight_snapshot
 from .....core.runtime import (
     mxfp8_cutedsl_runtime_requirements,
     nvfp4_cutedsl_runtime_requirements,
@@ -55,6 +56,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         if config.knobs not in (None, "auto") and not isinstance(config.knobs, dict):
             raise MoEEpConfigError("knobs must be a dictionary, 'auto', or None.")
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
+        self.supports_weight_refresh = self._kind() in ("mxfp8_e4m3", "mxfp8_e5m2")
         if config.kernel_variant == "inference" and any(
             getattr(config, name, None) is not None
             for name in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
@@ -240,6 +242,13 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         return config
 
     def preprocess_weights(self, weights, fleet_params):
+        if not self.supports_weight_refresh:
+            return self._preprocess_weights(weights, fleet_params)
+        with torch.no_grad():
+            prepared = self._preprocess_weights(weights, fleet_params)
+            return finish_weight_snapshot(prepared, weights)
+
+    def _preprocess_weights(self, weights, fleet_params):
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
             preprocess_block_scaled_weights,
             preprocess_prequantized_block_scaled_weights,

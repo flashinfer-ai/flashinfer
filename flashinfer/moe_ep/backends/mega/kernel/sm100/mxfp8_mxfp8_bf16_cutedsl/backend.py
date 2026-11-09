@@ -74,6 +74,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                 "kernel_name='sm100_mxfp8_mxfp8_bf16_cutedsl_next'."
             )
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
+        self.supports_weight_refresh = config.kind in ("mxfp8_e4m3", "mxfp8_e5m2")
         if config.kernel_variant not in ("inference", "genphase"):
             raise MoEEpConfigError(
                 f"unsupported kernel_variant {config.kernel_variant!r}"

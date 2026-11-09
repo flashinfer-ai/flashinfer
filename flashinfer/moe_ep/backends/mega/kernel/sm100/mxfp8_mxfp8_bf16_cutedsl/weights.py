@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, Tuple
 
+from ......core.kernel.weight_snapshot import (
+    check_weight_refresh,
+    finish_weight_snapshot,
+)
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
 from ..common.mxfp8_weight_utils import (
     as_mxfp8_scale as _as_mxfp8_scale,
@@ -70,6 +74,46 @@ def _is_mxfp8_weight(weight: "torch.Tensor", *, kind: Mxfp8Kind) -> bool:
 
 
 def preprocess_mega_weights(
+    weights: "MoEWeightPack",
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    kind: Mxfp8Kind = "mxfp8_e4m3",
+    gate_up_clamp: float | None = None,
+    activation_clamp: float | None = None,
+    kernel_variant: Literal["inference", "genphase"] = "inference",
+    out: TransformedMegaWeights | None = None,
+) -> TransformedMegaWeights:
+    """Prepare an owned MXFP8 snapshot, optionally refreshing ``out`` in place.
+
+    Canonical FC1 is gate||up. Prequantized inputs carry unswizzled UE8M0
+    per-32 K scales; their payload and scale bits are repacked, never requantized.
+    BF16 sources are quantized with the selected variant's MXFP8 recipe.
+    The result retains neither source storage nor an autograd graph.
+
+    ``out`` must be a previous result for the same variant, kind and geometry,
+    with matching tensor shapes, strides, dtypes and devices, 16-byte aligned
+    and disjoint from the source. Refresh outside capture, ordered between uses
+    on all reader streams.
+    Temporary allocation is allowed; destination addresses remain unchanged.
+    """
+    import torch
+
+    check_weight_refresh(out)
+    with torch.no_grad():
+        prepared = _preprocess_mega_weights(
+            weights,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            kind=kind,
+            gate_up_clamp=gate_up_clamp,
+            activation_clamp=activation_clamp,
+            kernel_variant=kernel_variant,
+        )
+        return finish_weight_snapshot(prepared, weights, out=out)
+
+
+def _preprocess_mega_weights(
     weights: "MoEWeightPack",
     *,
     intermediate_size: int,
@@ -169,8 +213,8 @@ def preprocess_mega_weights(
                     f"packed MXFP8 weights must have dtype {data_dtype}; got "
                     f"{weights.w13.dtype} / {weights.w2.dtype}"
                 )
-            fc1_weight = weights.w13
-            fc2_weight = weights.w2
+            fc1_weight = weights.w13.contiguous()
+            fc2_weight = weights.w2.contiguous()
             w13_scale = w13_scale_in
         elif (
             weights.w13.shape == logical_w13_shape
