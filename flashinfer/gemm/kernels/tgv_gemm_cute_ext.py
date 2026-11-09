@@ -46,9 +46,12 @@ Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 GEMM:
                     waits for phase 0 before its phase-1 arrival):
                       phase 0→1 = MMA finished alloc_tmem
                       phase 1→0 = EPILOG finished tcgen05.ld (safe to dealloc)
-                    Both 1-CTA and 2-CTA: the handshake is within-CTA only —
-                    2-CTA dealloc is per-CTA (each CTA owns its physical TMEM
-                    half; the cluster-shared accumulator is just a view).
+                    Within-CTA only: each CTA's EPILOG releases its own TMEM.
+  bar_tmem_dealloc  2-CTA only (not allocated in 1-CTA). 32 arrivals from the
+                    PEER CTA's MMA warp (remote arrive on the peer's copy);
+                    each MMA warp waits on its own copy before the collective
+                    tcgen05.dealloc.cta_group::2, for which the PTX ISA
+                    requires both CTAs to synchronize their TMEM accesses.
 
 A 1-element Int32 SMEM slot (tmem_base_ptr) is written by alloc_tmem and read
 by retrieve_tmem_ptr in MMA + EPILOG.
@@ -114,6 +117,7 @@ import cutlass.utils as utils
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cute.nvgpu import tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import llvm
 
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -176,6 +180,20 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     (128, 128, 6, True),  # 46
 ]
 _TGV_CUTE_EXT_FIRST_SM107_TACTIC: int = 29
+
+
+def _tcgen05_fence(*, before: bool) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 def _is_sm107(device: torch.device) -> bool:
@@ -875,8 +893,8 @@ class TgvGemmCuteExtKernel:
         # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
         # The release arrival must land in phase 1. Made while phase 0 is still
         # open (an EPILOG warp has not arrived yet), it counts toward phase 0 and
-        # the parity-1 wait passes before the EPILOG's tcgen05.ld. Same fix as
-        # flashinfer PR 7443 for the split-K kernel.
+        # the parity-1 wait passes before the EPILOG's tcgen05.ld. Phase-0 wait
+        # and tcgen05 fences as in flashinfer PR 7443 for the split-K kernel.
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
@@ -887,6 +905,9 @@ class TgvGemmCuteExtKernel:
             # cutlass.utils.TmemAllocator.free does.
             cute.arch.mbarrier_arrive(bar_tmem_dealloc, cta_rank_in_cluster ^ 1)
             cute.arch.mbarrier_wait(bar_tmem_dealloc, 0)
+        # tcgen05.fence::after_thread_sync: order the dealloc after the tcgen05
+        # work handed off through the waits above.
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
@@ -1037,6 +1058,9 @@ class TgvGemmCuteExtKernel:
         # rAcc.load() below and (b) MMA's dealloc_tmem after we arrive
         # on bar_tmem_alloc phase 1.
         cute.arch.fence_view_async_tmem_load()
+        # tcgen05.fence::before_thread_sync: publish the retired tcgen05.ld to
+        # MMA's dealloc across the mbarrier hand-off.
+        _tcgen05_fence(before=True)
 
         # Phase 1 of bar_tmem_alloc: 128 from this warp + 32 from MMA = 160.
         # MMA's mbarrier_wait(bar_tmem_alloc, 1) clears and it dealloc's.

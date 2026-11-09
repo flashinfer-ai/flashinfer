@@ -71,6 +71,7 @@ import cutlass.testing
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_ptr
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass._mlir.dialects import llvm
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.utils.gemm.tensor_utils import decode_float4e2m1fn
@@ -85,6 +86,20 @@ from cutlass.pipeline import (
     make_pipeline_state,
     PipelineUserType,
 )
+
+
+def _tcgen05_fence(*, before: bool) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 class WorkTileInfo(NamedTuple):
@@ -1385,7 +1400,9 @@ class LowLatencyBlockscaledGemmKernel:
             ab_observer.advance()
             sfb_state.advance()
 
-        # Join the TMEM release phase
+        # Join the TMEM release phase (tcgen05.fence::before_thread_sync publishes
+        # the retired tcgen05.st to the MMA warp's dealloc)
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
 
     @cute.jit
@@ -1628,6 +1645,9 @@ class LowLatencyBlockscaledGemmKernel:
         cute.arch.mbarrier_wait(tmem_alloc_result_bar, 0)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
         cute.arch.mbarrier_wait(tmem_alloc_result_bar, 1)
+        # tcgen05.fence::after_thread_sync orders the dealloc after the
+        # epilogue's and SFB warps' tcgen05 work handed off by the wait
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols)
 
     @cute.jit
@@ -1798,6 +1818,9 @@ class LowLatencyBlockscaledGemmKernel:
             if k_tile_count == 0:
                 tDrAcc.fill(0.0)
 
+        # tcgen05.fence::before_thread_sync publishes the retired tcgen05.ld to
+        # the MMA warp's dealloc across the mbarrier hand-off
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
 
         # Type conversion and GMEM store (with optional DSMEM split-k reduction)

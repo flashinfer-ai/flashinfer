@@ -56,6 +56,7 @@ from cutlass.pipeline import (
 from flashinfer.gemm.kernels.cute_dsl.low_latency_blockscaled_gemm import (
     LowLatencyBlockscaledGemmKernel as _Base,
     WorkTileInfo,
+    _tcgen05_fence,
 )
 
 
@@ -884,4 +885,7 @@ class RoutedBlockscaledGemm(_Base):
         cute.arch.mbarrier_wait(tmem_alloc_result_bar, 0)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
         cute.arch.mbarrier_wait(tmem_alloc_result_bar, 1)
+        # tcgen05.fence::after_thread_sync orders the dealloc after the
+        # epilogue's and SFB warps' tcgen05 work handed off by the wait
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols)
