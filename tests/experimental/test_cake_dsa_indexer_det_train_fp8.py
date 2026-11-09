@@ -23,7 +23,7 @@ limitations under the License.
 # registered FP8 programs and skip otherwise.
 #
 # Like ``test_cake_dsa_indexer_det_train.py`` this suite names the package once, through
-# ``tests.test_helpers.cake_package``, and imports nothing else from flashinfer.
+# ``tests.cake.test_helpers.cake_package``, and imports nothing else from flashinfer.
 
 import copy
 import importlib.util
@@ -32,8 +32,8 @@ import itertools
 import pytest
 import torch
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_indexer_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_dsa_indexer_det_train", "cake_jit")

@@ -58,7 +58,7 @@ import torch
 pytest.importorskip("tvm_ffi")
 
 import flashinfer.cake_moe_grouped_gemm_nondet_train as facade
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cb = cake_package("cake_moe_grouped_gemm_nondet_train", "cake_backend")
 cake_jit = cake_package("cake_moe_grouped_gemm_nondet_train", "cake_jit")

@@ -28,7 +28,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.test_helpers.spec_tree import (
+from tests.gdn.test_helpers.spec_tree import (
     CHAIN_8,
     TREES,
     ancestors,

@@ -58,7 +58,7 @@ from flashinfer.experimental.cake import cake_kda_nondet_train as pkg
 from flashinfer.experimental.cake.cake_kda_det_train import cake_backend as det_backend
 from flashinfer.experimental.cake.cake_kda_det_train import cake_jit as det_jit
 from flashinfer.experimental.cake.cake_kda_nondet_train import cake_backend, cake_jit
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     make_inputs,
     make_raw_inputs,

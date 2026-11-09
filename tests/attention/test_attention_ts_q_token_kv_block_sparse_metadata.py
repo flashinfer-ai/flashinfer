@@ -5172,7 +5172,7 @@ def test_qtoken_global_scales_graph_replay():
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("updated_scale", (0, 1), ids=("qk", "v"))
 def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale):
-    from tests.test_helpers.pdl import late_store
+    from tests.utils.test_helpers.pdl import late_store
 
     values = (0.125, 0.75)
     scales = tuple(torch.tensor(value, device="cuda") for value in values)
@@ -5198,7 +5198,7 @@ def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale):
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 def test_qtoken_direct_q1_pdl_query_offsets():
-    from tests.test_helpers.pdl import late_store
+    from tests.utils.test_helpers.pdl import late_store
 
     wrapper, run, check, offsets, out = _global_scale_qtoken_case(
         (0.125, 0.75),

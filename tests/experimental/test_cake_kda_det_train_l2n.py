@@ -27,7 +27,7 @@ import types
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
@@ -582,7 +582,9 @@ def _bits(x: torch.Tensor) -> torch.Tensor:
 
 
 def test_kda_reference_is_bitwise_the_shared_gdn_reference() -> None:
-    from tests.test_helpers import cake_kda_det_train_reference_l2n as kda_l2n
+    from tests.experimental.test_helpers import (
+        cake_kda_det_train_reference_l2n as kda_l2n,
+    )
 
     gdn = _cake_l2n()
     assert not gdn.flush_denormal_active()
@@ -613,7 +615,9 @@ def test_kda_reference_is_bitwise_the_shared_gdn_reference() -> None:
 def test_kda_reference_normalizes_and_pulls_back_like_fp64() -> None:
     """The device-order FP32 reference is within a few FP32 ulps of the FP64 normalization and its exact pullback
     (a guard against an order that is bitwise equal to a wrong formula)."""
-    from tests.test_helpers import cake_kda_det_train_reference_l2n as kda_l2n
+    from tests.experimental.test_helpers import (
+        cake_kda_det_train_reference_l2n as kda_l2n,
+    )
 
     g = torch.Generator().manual_seed(1)
     x = (torch.randn(256, 2, D, generator=g) * 3).to(torch.bfloat16)
@@ -702,14 +706,14 @@ def test_fallback_replay_counts_no_qk_apply(arch: str) -> None:
 # ---------------------------------------------------------------------------------------------------------------
 # device rows (skip without an exported device or without the l2n records of its architecture)
 
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     elementwise_gate,
     error_metrics,
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n  # noqa: E402
+from tests.experimental.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n  # noqa: E402
 
 ATOL = RTOL = (
     1e-2  # the package's declared elementwise gate (test_cake_kda_det_train.py)

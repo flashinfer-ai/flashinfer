@@ -37,7 +37,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     # builds via task_test_nightly_build.sh) does not cause an unrecognized-
     # argument error in collection or execution subprocesses where
     # tests/conftest.py may not be on the conftest discovery path.
-    # When conftest discovery also loads tests/test_helpers/parametrize.py,
+    # When conftest discovery also loads tests/infra/test_helpers/parametrize.py,
     # --full is already registered — silently skip the duplicate.
     import argparse
     import contextlib

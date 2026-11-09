@@ -28,7 +28,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
+from tests.experimental.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
     make_inputs,
     make_nope_inputs,
     reference_fp64,
@@ -36,7 +36,7 @@ from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import 
     rel_l2,
     rel_l2_rows,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_sparse_attention_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_dsa_sparse_attention_det_train", "cake_jit")
@@ -1916,8 +1916,12 @@ def test_nonfinite_dout_writes_nan_rows(nope, mode, value):
 @pytest.mark.parametrize("form", ["rope", "rope_acc_map", "nope", "nope_acc"])
 def test_autograd_step_does_not_synchronize(form):
     """An autograd step (forward + backward) of the entries makes no pageable host-to-device copy, no synchronizing
-    call, and returns while device work queued before it still runs (``tests/test_helpers/cake_host_sync.py``)."""
-    from tests.test_helpers.cake_host_sync import census, nonblocking, summary
+    call, and returns while device work queued before it still runs (``tests/experimental/test_helpers/cake_host_sync.py``)."""
+    from tests.experimental.test_helpers.cake_host_sync import (
+        census,
+        nonblocking,
+        summary,
+    )
 
     nope = form.startswith("nope")
     _require_program(
@@ -1967,7 +1971,11 @@ def test_autograd_step_does_not_synchronize(form):
 
 
 def test_runner_step_does_not_synchronize_or_allocate():
-    from tests.test_helpers.cake_host_sync import census, nonblocking, summary
+    from tests.experimental.test_helpers.cake_host_sync import (
+        census,
+        nonblocking,
+        summary,
+    )
 
     _require_program(backward=True)
     inp = make_inputs([256], [1024], seed=SEED + 28, topk=256)

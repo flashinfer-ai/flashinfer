@@ -20,7 +20,7 @@ import torch
 from flashinfer.gdn_decode import gated_delta_rule_mtp
 from flashinfer.utils import get_compute_capability
 
-from tests.test_helpers.spec_tree import CHAIN_8 as CHAIN, TREES, ancestors
+from tests.gdn.test_helpers.spec_tree import CHAIN_8 as CHAIN, TREES, ancestors
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
