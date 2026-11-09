@@ -7,6 +7,7 @@
 import pytest
 import torch
 
+from flashinfer.cute_dsl.availability import is_cute_dsl_available
 from flashinfer.kda import recurrent_kda
 from flashinfer.utils import get_compute_capability
 
@@ -49,6 +50,8 @@ def test_small_bh_ignores_nonfinite_v_of_next_sequence(lengths, poison):
         torch.device("cuda")
     ) not in ((10, 0), (10, 3)):
         pytest.skip("small-bh KDA prefill requires SM100/SM103")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL is not available")
     torch.manual_seed(0)
     device = "cuda"
     total = sum(lengths)
@@ -66,11 +69,11 @@ def test_small_bh_ignores_nonfinite_v_of_next_sequence(lengths, poison):
         dtype=torch.int64,
     )
 
+    clean_end = int(cu[-2])
     v_poisoned = v.clone()
-    v_poisoned[:, cu[-2] :] = poison
+    v_poisoned[:, clean_end:] = poison
     out, state = _run(q, k, v_poisoned, g, beta, seed_state.clone(), cu)
 
-    clean_end = int(cu[-2])
     ref_out, ref_state = _run(
         q[:, :clean_end].contiguous(),
         k[:, :clean_end].contiguous(),
@@ -82,5 +85,5 @@ def test_small_bh_ignores_nonfinite_v_of_next_sequence(lengths, poison):
     )
     assert torch.isfinite(out[:, :clean_end]).all()
     assert torch.isfinite(state[:-1].float()).all()
-    torch.testing.assert_close(out[:, :clean_end], ref_out)
-    torch.testing.assert_close(state[:-1], ref_state)
+    torch.testing.assert_close(out[:, :clean_end], ref_out, atol=0, rtol=0)
+    torch.testing.assert_close(state[:-1], ref_state, atol=0, rtol=0)
