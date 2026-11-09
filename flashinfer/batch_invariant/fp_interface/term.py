@@ -187,6 +187,8 @@ def sexpr(t: Term) -> str:
             out = f"(b {A[0]} {A[1]})"  # B's column n at step t
         elif op == "op:bias_col":
             out = f"(bias {A[0]})"  # the bias of output column n, widened to binary32 exactly
+        elif op == "op:kv_widen":
+            out = f"(widen {A[0]} {A[1]})"  # a low-bit K / V leaf widened to bf16 exactly (the attention fp8-KV classes)
         elif op == "op:mma_mxfp8_k32":
             out = f"(mma32mx {A[0]} {A[1]})"  # one kind::mxf8f6f4 block-scaled K-step of 32 fp8 elements
         elif op == "op:mma_mxfp8_k64":

@@ -53,17 +53,18 @@ from ..gemm.batch_invariant.spec import MMA_K_OF, GemmSpec, reduction
 LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "Cases.lean")
 
-# attention toy cases: (name, D, T, C, p, window_left, row id, d) -- T = 16 (one PV step per tile) and C = 32 keep the printed
-# terms small; D = 64 / 128 / 256 are the three classes (4 / 8 / 16 MMA steps per score)
+# attention toy cases: (name, D, T, C, p, window_left, row id, d, kv format) -- T = 16 (one PV step per tile) and C = 32 keep the
+# printed terms small; D = 64 / 128 / 256 are the three head-dim classes (4 / 8 / 16 MMA steps per score); the KV format "bf16"
+# is the bf16 class, "e4m3" / "e5m2" the fp8-KV classes (widened leaves, the scaled epilogue)
 ATTN_CASES = [
-    ("a0", 64, 16, 32, 40, -1, 0, 0),
-    ("a1", 64, 16, 32, 40, 20, 0, 1),
-    ("a2", 64, 16, 32, 7, -1, 3, 0),
-    ("a3", 64, 16, 32, 33, 5, 1, 2),
-    ("a4", 128, 16, 32, 40, -1, 0, 0),
-    ("a5", 128, 16, 32, 33, 5, 1, 2),
-    ("a6", 256, 16, 32, 40, -1, 0, 0),
-    ("a7", 256, 16, 32, 33, 5, 1, 2),
+    ("a0", 64, 16, 32, 40, -1, 0, 0, "bf16"),
+    ("a1", 64, 16, 32, 40, 20, 0, 1, "bf16"),
+    ("a2", 64, 16, 32, 7, -1, 3, 0, "bf16"),
+    ("a3", 64, 16, 32, 33, 5, 1, 2, "bf16"),
+    ("a4", 128, 16, 32, 40, -1, 0, 0, "bf16"),
+    ("a5", 128, 16, 32, 33, 5, 1, 2, "bf16"),
+    ("a6", 256, 16, 32, 40, -1, 0, 0, "bf16"),
+    ("a7", 256, 16, 32, 33, 5, 1, 2, "bf16"),
     (
         "a8",
         64,
@@ -73,8 +74,32 @@ ATTN_CASES = [
         0,
         0,
         0,
+        "bf16",
     ),  # the window starts past the first chunks: chunks 0-2 absent, key 100 alone visible
-    ("a9", 64, 32, 64, 40, -1, 0, 0),  # two PV slices per tile (T = 2 x MMA_K)
+    ("a9", 64, 32, 64, 40, -1, 0, 0, "bf16"),  # two PV slices per tile (T = 2 x MMA_K)
+    (
+        "a10",
+        128,
+        16,
+        32,
+        40,
+        -1,
+        0,
+        0,
+        "e4m3",
+    ),  # the e4m3-KV class: widened leaves, the value scale in the epilogue
+    ("a11", 64, 16, 32, 33, 5, 1, 2, "e5m2"),  # the e5m2-KV class with a window
+    (
+        "a12",
+        256,
+        32,
+        64,
+        40,
+        -1,
+        0,
+        0,
+        "e4m3",
+    ),  # two PV slices per tile at D = 256 over an e4m3 cache
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
 
@@ -447,6 +472,11 @@ DECIDED_THEOREMS = (
     + tuple(
         f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
     )
+    + tuple(
+        f"attn_space_lowbit_d{D}_{what}"
+        for D in ATTN_HEAD_DIMS
+        for what in ("size", "ok")
+    )
 )
 #: `native_decide` theorems of the hand-written modules (not of the generated `Cases.lean`): the attention class-separation
 #: statements on toy rows; listed in `lean/Axioms.lean` with the generated ones.
@@ -454,6 +484,8 @@ MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_C",
     "Attn.output_depends_on_D",
     "Attn.output_depends_on_D_64",
+    "Attn.output_depends_on_kv",
+    "Attn.output_depends_on_kv_fmt",
 )
 
 
@@ -503,27 +535,30 @@ def bias_cases() -> List[Tuple[int, int, str]]:
     ]
 
 
-def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, str]]:
+def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, str, str]]:
     """The attention toy cases with the Python spec's S-expression of the output element."""
     from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
     from .fp_interface.term import sexpr
 
     out = []
-    for name, D, T, C, p, win, rid, d in ATTN_CASES:
+    for name, D, T, C, p, win, rid, d, kv in ATTN_CASES:
         sx = sexpr(
-            AttentionSpec(D, T=T, C=C).output(RowSpec(p=p, window_left=win, row=rid), d)
+            AttentionSpec(D, T=T, C=C, kv_fmt=kv).output(
+                RowSpec(p=p, window_left=win, row=rid), d
+            )
         )
-        out.append((name, D, T, C, p, win, rid, d, sx))
+        out.append((name, D, T, C, p, win, rid, d, kv, sx))
     return out
 
 
-def attn_spaces() -> Dict[int, list]:
-    """The attention kernel's configuration space per head dim (`engine.all_valid_configs`)."""
+def attn_spaces(lowbit: bool = False) -> Dict[int, list]:
+    """The attention kernel's configuration space per head dim (`engine.all_valid_configs`): the bf16 class's, or the fp8-KV
+    classes' (one softmax warpgroup, the row body for small units)."""
     from ..attention.batch_invariant.engine import all_valid_configs
 
-    spaces = {D: all_valid_configs(D) for D in ATTN_HEAD_DIMS}
+    spaces = {D: all_valid_configs(D, lowbit=lowbit) for D in ATTN_HEAD_DIMS}
     for D, cfgs in spaces.items():
-        assert all(c.well_formed(D) for c in cfgs), D
+        assert all(c.well_formed(D, lowbit=lowbit) for c in cfgs), D
     return spaces
 
 
@@ -855,10 +890,11 @@ def _render_attention(L: List[str]) -> None:
         "score): the Python spec's output element (`attention/batch_invariant/spec.py`) reproduced by `Attention.lean` node for node, "
         "and the split kernel's equality to it instantiated on every case. -/"
     )
-    for name, D, T, C, p, win, rid, d, sx in attn_cases():
+    for name, D, T, C, p, win, rid, d, kv, sx in attn_cases():
         tb = T.bit_length() - 1
+        kv_lean = '""' if kv == "bf16" else f'"{kv}"'
         L.append(
-            f"def attnP_{name} : Attn.Params := ⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}⟩"
+            f"def attnP_{name} : Attn.Params := ⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}, {kv_lean}⟩"
         )
         L.append(
             f"theorem attn_{name}_spec : (Attn.output attnP_{name}).sexpr = {lean_str(sx)} := by native_decide"
@@ -893,6 +929,28 @@ def _render_attention(L: List[str]) -> None:
             f"theorem attn_space_d{D}_invariant : ∀ b₁ ∈ attnSpaceD{D}, ∀ b₂ ∈ attnSpaceD{D}, "
             "∀ (f₁ f₂ : Bool) (P : Attn.Params) (σ τ : Nat → Nat), Attn.kernel b₁ f₁ P σ = Attn.kernel b₂ f₂ P τ := "
             f"Attn.space_invariant attnSpaceD{D}"
+        )
+    L.append("")
+    L.append(
+        "/-! The fp8-KV classes' configuration space per head dim (`engine.all_valid_configs(D, lowbit=True)`): the row body with "
+        "one softmax warpgroup and the replicated-row small-unit placement (`ConfigOKLowbit`); every record computes the class. -/"
+    )
+    for D, cfgs in attn_spaces(lowbit=True).items():
+        L.append(
+            f"def attnSpaceLowbitD{D} : List Attn.Config := ["
+            + ", ".join(c.lean() for c in cfgs)
+            + "]"
+        )
+        L.append(
+            f"theorem attn_space_lowbit_d{D}_size : attnSpaceLowbitD{D}.length = {len(cfgs)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_space_lowbit_d{D}_ok : attnSpaceLowbitD{D}.all (Attn.ConfigOKLowbit {D}) = true := by native_decide"
+        )
+        L.append(
+            f"theorem attn_space_lowbit_d{D}_invariant : ∀ b₁ ∈ attnSpaceLowbitD{D}, ∀ b₂ ∈ attnSpaceLowbitD{D}, "
+            "∀ (f₁ f₂ : Bool) (P : Attn.Params) (σ τ : Nat → Nat), Attn.kernel b₁ f₁ P σ = Attn.kernel b₂ f₂ P τ := "
+            f"Attn.space_invariant attnSpaceLowbitD{D}"
         )
     L.append("")
 
@@ -937,6 +995,7 @@ def summary() -> str:
         + "; ".join(parts)
         + f"; bias cases={len(GEMM_BIAS_CASES)}; native_decide theorems={len(DECIDED_THEOREMS)}"
         + f"; attention cases={len(ATTN_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
+        + f" lowbit spaces={[len(v) for v in attn_spaces(lowbit=True).values()]}"
     )
 
 

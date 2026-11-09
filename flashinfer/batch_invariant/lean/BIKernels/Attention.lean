@@ -4,7 +4,8 @@ import BIKernels.GEMM
 import BIKernels.Export
 
 /-!
-# Paged-KV attention: the class `attention.bf16` (per head dim) and the batch-invariance guarantees
+# Paged-KV attention: the classes `attention.bf16` / `attention.e4m3kv` / `attention.e5m2kv` (per head dim) and the
+batch-invariance guarantees
 
 Mirrors `flashinfer/attention/batch_invariant/spec.py`. The model is per logical row: the row's identity (its query token and
 head, hence its own K / V) is the leaf index of every score and value term, so rows of different KV heads or requests are
@@ -19,6 +20,12 @@ column `d` the dataflow is
 * a **chunk**: the tile steps of its present tiles, ascending, from the init `(-inf, +0, +0)`;
 * the **row**: the present chunks merged in index order from the init state (`merge`);
 * the epilogue `cvt_bf16(add(mul(O, div(1, l)), +0))`.
+
+The fp8-KV classes (`Params.kv = "e4m3"` / `"e5m2"`; `""` is the bf16 class) are the same dataflow over an fp8 cache: every K
+and V leaf is the cache value widened to bf16 exactly (`(widen <fmt> leaf)`), the key scale is inside the host constant `c`
+(`c = fp32(sm_scale * k_scale * log2 e)`, a leaf of the term either way) and the epilogue multiplies the normalised row by
+the value scale once before the rounding: `cvt_bf16(add(mul(mul(O, div(1, l)), v_scale), +0))`. Different leaves and a
+different chain: different terms (`output_depends_on_kv`, `output_depends_on_kv_fmt`), hence different classes.
 
 Tile and chunk boundaries are absolute multiples of `T` and `C`, functions of `D` only: the term of
 a token depends on its position `p`, the window and the head, never on the batch, the page table
@@ -41,7 +48,7 @@ Commutative nodes print their operands sorted, as the Python printer does. -/
 inductive ATerm where
   | const (c : String)
   | sym (s : String)
-  | score (row k steps : Nat)
+  | score (kv : String) (row k steps : Nat)
   | add (a b : ATerm)
   | mul (a b : ATerm)
   | fma (a b c : ATerm)
@@ -49,13 +56,23 @@ inductive ATerm where
   | fmax (a b : ATerm)
   | ex2 (a : ATerm)
   | cvt (fmt : String) (a : ATerm)
-  | mma (acc : ATerm) (pslice : String) (vt d : Nat)
+  | mma (acc : ATerm) (pslice : String) (kv : String) (vt d : Nat)
   deriving DecidableEq, Repr, Inhabited
+
+/-- The score fold of the fp8-KV classes: the GEMM's `kfold` (`steps` `mma16` K-steps from +0) whose B (key) slice of every
+step is the widened fp8 key, printed as `term.sexpr` prints `(ab (a m t) (widen <fmt> (b t n)))`. -/
+def scoreW (kv : String) (row k : Nat) : Nat → String
+  | 0 => "(const 0.0)"
+  | n+1 => s!"(mma16 {scoreW kv row k n} (ab (a {row} {n}) (widen {kv} (b {n} {k}))))"
+
+/-- The V slice leaf of one PV step: the cache's bf16 values (`kv = ""`) or the fp8 values widened exactly. -/
+def vLeaf (kv : String) (vt d : Nat) : String :=
+  if kv == "" then s!"(op:v_slice {vt} {d})" else s!"(widen {kv} (op:v_slice {vt} {d}))"
 
 def ATerm.sexpr : ATerm → String
   | .const c => s!"(const {c})"
   | .sym s => s!"(sym {s})"
-  | .score row k steps => (kfold ⟨row⟩ ⟨k⟩ steps).sexpr
+  | .score kv row k steps => if kv == "" then (kfold ⟨row⟩ ⟨k⟩ steps).sexpr else scoreW kv row k steps
   | .add a b => let (p, q) := sortPair a.sexpr b.sexpr; s!"(add {p} {q})"
   | .mul a b => let (p, q) := sortPair a.sexpr b.sexpr; s!"(mul {p} {q})"
   | .fma a b c => let (p, q) := sortPair a.sexpr b.sexpr; s!"(fma {p} {q} {c.sexpr})"
@@ -63,7 +80,7 @@ def ATerm.sexpr : ATerm → String
   | .fmax a b => let (p, q) := sortPair a.sexpr b.sexpr; s!"(fmax {p} {q})"
   | .ex2 a => s!"(ex2 {a.sexpr})"
   | .cvt f a => s!"(cvt {f} {a.sexpr})"
-  | .mma acc ps vt d => s!"(mma16 {acc.sexpr} (op:pv_kslice (op:p_slice{ps}) (op:v_slice {vt} {d})))"
+  | .mma acc ps kv vt d => s!"(mma16 {acc.sexpr} (op:pv_kslice (op:p_slice{ps}) {vLeaf kv vt d}))"
 
 /-! ## Pairwise trees over the key digit (`canon._pairwise`: adjacent pairs, low index first,
 absent leaves dropped) -/
@@ -86,7 +103,8 @@ def ptree (f : ATerm → ATerm → ATerm) : Nat → List (Option ATerm) → Opti
 
 /-- The fixed data of one logical row's dataflow: head dim as `steps = D/16`, tile `T = 2^tbits`,
 chunk `C`, the row's position `p` (so `L = p + 1`), FlashInfer's `window_left` (negative = none),
-the row id of the Q leaves, the output column `d`. -/
+the row id of the Q leaves, the output column `d`, and the KV cache format `kv` (`""` the bf16 class,
+`"e4m3"` / `"e5m2"` the fp8-KV classes). -/
 structure Params where
   steps : Nat
   tbits : Nat
@@ -95,6 +113,7 @@ structure Params where
   win : Int
   row : Nat
   d : Nat
+  kv : String
 
 /-! The geometry of a row (visible keys, present tiles, present chunks) as functions of
 `(tbits, C, p, win)` alone: the page table, the batch and the configuration do not enter. -/
@@ -132,16 +151,16 @@ def alphaTerm (mOld mNew : ATerm) : ATerm := .ex2 (.add (.mul mOld c) (.mul mNew
 
 /-- The PV fold of one tile from `o0`: one opaque step per 16 keys, the slice's bf16 probabilities
 printed into the step (the Python term carries them as the `p_slice` operands). -/
-def pvFold (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
+def pvFold (kv : String) (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
   let n := pbf.length / 16
   (List.range n).foldl (fun acc j =>
     let slice := (pbf.drop (16 * j)).take 16
-    .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) (vt0 + j) d) o0
+    .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) kv (vt0 + j) d) o0
 
 /-- `spec.tile_step` on a present tile `t`. -/
 def tileStep (P : Params) (st : State) (t : Nat) : State :=
   let scores : List (Option ATerm) :=
-    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.row (t * P.T + i) P.steps) else none)
+    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.kv P.row (t * P.T + i) P.steps) else none)
   let mT := (ptree ATerm.fmax P.tbits scores).getD (.const "-inf")
   let mNew := ATerm.fmax st.m mT
   let alpha := alphaTerm st.m mNew
@@ -150,7 +169,7 @@ def tileStep (P : Params) (st : State) (t : Nat) : State :=
   let rT := (ptree ATerm.add P.tbits probs).getD (.const "0.0")
   let lNew := ATerm.fma st.l alpha rT
   let pbf := probs.map (fun q => ATerm.cvt "bf16" (q.getD (.const "0.0")))
-  let oNew := pvFold (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
+  let oNew := pvFold P.kv (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
   ⟨mNew, lNew, oNew⟩
 
 /-- `spec.merge`: the running state `a` with the finished chunk `b`. -/
@@ -167,10 +186,14 @@ def chunkState (P : Params) (j : Nat) : State := (P.tilesOfChunk j).foldl (tileS
 /-- The fused (one-CTA) path: present chunks merged in index order from the init state. -/
 def fused (P : Params) : State := P.presentChunks.foldl (fun acc j => merge acc (chunkState P j)) initState
 
-/-- `spec.output_elem`. -/
-def epilogue (st : State) : ATerm := .cvt "bf16" (.add (.mul st.o (.div (.const "1.0") st.l)) (.const "0.0"))
+/-- `spec.output_elem`: the bf16 class's chain, or the fp8-KV classes' with one `mul` by the value scale before the
+`add +0` and the rounding. -/
+def epilogue (kv : String) (st : State) : ATerm :=
+  let o := ATerm.mul st.o (.div (.const "1.0") st.l)
+  let o := if kv == "" then o else ATerm.mul o (.sym "v_scale")
+  .cvt "bf16" (.add o (.const "0.0"))
 
-def output (P : Params) : ATerm := epilogue (fused P)
+def output (P : Params) : ATerm := epilogue P.kv (fused P)
 
 /-! ## The split kernel: one chunk per CTA, an index-addressed workspace, the fixup fold -/
 
@@ -181,7 +204,7 @@ def workspace (P : Params) (_σ : Nat → Nat) (j : Nat) : State := chunkState P
 fold by the last-arriving CTA is the same fold). -/
 def fixup (ws : Nat → State) (js : List Nat) : State := js.foldl (fun acc j => merge acc (ws j)) initState
 
-def splitKernel (P : Params) (σ : Nat → Nat) : ATerm := epilogue (fixup (workspace P σ) P.presentChunks)
+def splitKernel (P : Params) (σ : Nat → Nat) : ATerm := epilogue P.kv (fixup (workspace P σ) P.presentChunks)
 
 /-- **The split kernel computes the fused class**, for every assignment of chunks to CTAs (and hence
 for every unit kind, ring depth and grid the planner may choose). -/
@@ -206,8 +229,8 @@ structure Row where
   row : Nat
   deriving DecidableEq, Repr
 
-def rowOutput (steps tbits C : Nat) (win : Int) (d : Nat) (r : Row) : ATerm :=
-  output ⟨steps, tbits, C, r.p, win, r.row, d⟩
+def rowOutput (steps tbits C : Nat) (win : Int) (d : Nat) (kv : String) (r : Row) : ATerm :=
+  output ⟨steps, tbits, C, r.p, win, r.row, d, kv⟩
 
 /-- A prefill request: `q_len` tokens whose last one sits at position `kv_len - 1`; token `i` is at
 `kv_len - q_len + i` (bottom-right causal). -/
@@ -220,49 +243,58 @@ def decodeRow (kv_len h row : Nat) : Row := ⟨kv_len - 1, h, row⟩
 a prefill request (`kv_len = p + 1 + (q_len - 1 - i)`) or the decode step of a request with
 `p + 1` keys: both are `rowOutput` of `⟨p, h, row⟩`. The paged and the ragged KV layouts hand the
 kernel the same keys at the same positions, so they are the same rows of this model. -/
-theorem prefill_decode_agree (steps tbits C : Nat) (win : Int) (d : Nat) (kv_len q_len i h row : Nat)
+theorem prefill_decode_agree (steps tbits C : Nat) (win : Int) (d : Nat) (kv : String) (kv_len q_len i h row : Nat)
     (hi : i < q_len) (hq : q_len ≤ kv_len) :
-    rowOutput steps tbits C win d (prefillRow kv_len q_len i h row)
-      = rowOutput steps tbits C win d (decodeRow (kv_len - q_len + i + 1) h row) := by
+    rowOutput steps tbits C win d kv (prefillRow kv_len q_len i h row)
+      = rowOutput steps tbits C win d kv (decodeRow (kv_len - q_len + i + 1) h row) := by
   unfold prefillRow decodeRow
   simp only [Nat.add_sub_cancel]
 
 /-- The launch applies the per-row term to every row; there is no batch parameter inside. -/
-def launch (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) : ATerm :=
-  rowOutput steps tbits C win d (rows r)
+def launch (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (kv : String) (r : Fin M) : ATerm :=
+  rowOutput steps tbits C win d kv (rows r)
 
 /-- **Determinism (R1)**: the same inputs give the same term. -/
-theorem determinism (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) :
-    launch M rows steps tbits C win d r = launch M rows steps tbits C win d r := rfl
+theorem determinism (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (kv : String) (r : Fin M) :
+    launch M rows steps tbits C win d kv r = launch M rows steps tbits C win d kv r := rfl
 
 /-- **Batch invariance (R2)**: equal rows give equal outputs whatever the batch size, position or
 neighbours. -/
-theorem batch_invariance (steps tbits C : Nat) (win : Int) (d : Nat) {M₁ M₂ : Nat}
+theorem batch_invariance (steps tbits C : Nat) (win : Int) (d : Nat) (kv : String) {M₁ M₂ : Nat}
     (rows₁ : Fin M₁ → Row) (rows₂ : Fin M₂ → Row) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
-    launch M₁ rows₁ steps tbits C win d r₁ = launch M₂ rows₂ steps tbits C win d r₂ := by
+    launch M₁ rows₁ steps tbits C win d kv r₁ = launch M₂ rows₂ steps tbits C win d kv r₂ := by
   simp only [launch, h]
 
 /-- **Permutation invariance**: permuting the rows permutes the outputs row-wise. -/
-theorem permutation_invariance (steps tbits C : Nat) (win : Int) (d : Nat) {M : Nat} (rows : Fin M → Row) (σ : Fin M → Fin M) (r : Fin M) :
-    launch M (rows ∘ σ) steps tbits C win d r = launch M rows steps tbits C win d (σ r) := rfl
+theorem permutation_invariance (steps tbits C : Nat) (win : Int) (d : Nat) (kv : String) {M : Nat} (rows : Fin M → Row) (σ : Fin M → Fin M) (r : Fin M) :
+    launch M (rows ∘ σ) steps tbits C win d kv r = launch M rows steps tbits C win d kv (σ r) := rfl
 
 /-- **Sub-batch invariance**: any selection of rows reproduces exactly those rows' outputs. -/
-theorem subbatch_invariance (steps tbits C : Nat) (win : Int) (d : Nat) {M k : Nat} (rows : Fin M → Row) (sel : Fin k → Fin M) (i : Fin k) :
-    launch k (rows ∘ sel) steps tbits C win d i = launch M rows steps tbits C win d (sel i) := rfl
+theorem subbatch_invariance (steps tbits C : Nat) (win : Int) (d : Nat) (kv : String) {M k : Nat} (rows : Fin M → Row) (sel : Fin k → Fin M) (i : Fin k) :
+    launch k (rows ∘ sel) steps tbits C win d kv i = launch M rows steps tbits C win d kv (sel i) := rfl
 
 /-- **The chunk length must not depend on the batch or the request's total length**: the same
 position under `C` and `2C` is a different term (stated on a concrete toy row, decided). -/
 theorem output_depends_on_C :
-    output ⟨1, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨1, 2, 16, 9, -1, 0, 0⟩ := by native_decide
+    output ⟨1, 2, 8, 9, -1, 0, 0, ""⟩ ≠ output ⟨1, 2, 16, 9, -1, 0, 0, ""⟩ := by native_decide
 
 /-- **One class per head dim**: the same position under `D = 128` (8 MMA K-steps per score) and `D = 256` (16 steps) is a
 different term (the score fold differs; everything else -- `T`, `C`, the folds, the merge, the epilogue -- is shared). Stated
 on a concrete toy row, decided. The classes at D = 64 / 128 / 256 are therefore three fingerprints. -/
 theorem output_depends_on_D :
-    output ⟨8, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨16, 2, 8, 9, -1, 0, 0⟩ := by native_decide
+    output ⟨8, 2, 8, 9, -1, 0, 0, ""⟩ ≠ output ⟨16, 2, 8, 9, -1, 0, 0, ""⟩ := by native_decide
 
 theorem output_depends_on_D_64 :
-    output ⟨4, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0⟩ := by native_decide
+    output ⟨4, 2, 8, 9, -1, 0, 0, ""⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, ""⟩ := by native_decide
+
+/-- **One class per KV format**: the same position over a bf16 cache and over an e4m3 cache is a different term (the widened
+leaves and the scaled epilogue), and the two fp8 formats are different terms from each other (the leaves name the format: an
+e4m3 and an e5m2 byte of equal bits are different values). Stated on a concrete toy row, decided. -/
+theorem output_depends_on_kv :
+    output ⟨8, 2, 8, 9, -1, 0, 0, ""⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3"⟩ := by native_decide
+
+theorem output_depends_on_kv_fmt :
+    output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3"⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, "e5m2"⟩ := by native_decide
 
 /-- The visible keys, the tiles and the chunks of a row depend on `(p, win, T, C)` only: the page
 table, the batch and the configuration do not appear. -/
@@ -302,6 +334,12 @@ structure Config where
 so `kvSlots * D ≤ 512` (2..8 slots at D = 64, 2..4 at D = 128, exactly 2 at D = 256); the other knobs do not depend on `D`. -/
 def ConfigOKD (D : Nat) (c : Config) : Bool :=
   (2 ≤ c.kvSlots && c.kvSlots * D ≤ 512) && c.policy ≤ 2 && (c.softmaxWgs == 1 || c.softmaxWgs == 2) && c.merge ≤ 2 && c.small ≤ 1
+
+/-- The knob constraints of the fp8-KV classes' kernels (`AttnConfig.well_formed(D, lowbit=True)`): the row body with one
+softmax warpgroup (the conversion stage runs on the warps the second warpgroup would take) and the replicated-row placement
+for small units (the Swaps-AB body has no conversion stage); the ring and the planner knobs as for the bf16 class. -/
+def ConfigOKLowbit (D : Nat) (c : Config) : Bool :=
+  ConfigOKD D c && c.softmaxWgs == 1 && c.small == 0
 
 /-- A row's output under a configuration: the fused fold when the planner keeps all chunks in one unit (policy 2, or policy 0
 when its SM-count rule `fusedAuto` says so), the split kernel under the assignment `σ` otherwise. Ring depth, warpgroups

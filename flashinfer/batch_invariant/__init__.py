@@ -80,10 +80,32 @@ def _bmm_fp8_fingerprint(
     return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
 
 
-def _attention_fingerprint(head_dim: int) -> str:
+def _attention_kv_fmt(kv_dtype: Union[torch.dtype, str, None]) -> str:
+    """The attention class of a KV cache dtype: bf16 (the default class), ``torch.float8_e4m3fn`` / ``"e4m3"`` and
+    ``torch.float8_e5m2`` / ``"e5m2"`` (the fp8-KV classes)."""
+    names = {
+        None: "bf16",
+        torch.bfloat16: "bf16",
+        "bf16": "bf16",
+        torch.float8_e4m3fn: "e4m3",
+        torch.float8_e5m2: "e5m2",
+        "e4m3": "e4m3",
+        "e5m2": "e5m2",
+    }
+    if kv_dtype not in names:
+        raise ValueError(
+            "fingerprint(<attention wrapper>) takes kv_dtype torch.bfloat16 (the default), torch.float8_e4m3fn or "
+            f"torch.float8_e5m2 (or 'bf16' / 'e4m3' / 'e5m2'), not {kv_dtype!r}"
+        )
+    return names[kv_dtype]
+
+
+def _attention_fingerprint(
+    head_dim: int, kv_dtype: Union[torch.dtype, str, None] = None
+) -> str:
     from ..attention.batch_invariant.spec import spec_fingerprint
 
-    return spec_fingerprint(head_dim)
+    return spec_fingerprint(head_dim, kv_fmt=_attention_kv_fmt(kv_dtype))
 
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
@@ -164,15 +186,18 @@ CLASSES: Dict[str, ClassInfo] = {
         ("use_nvfp4", "arch"),
     ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class; the KV cache dtype is an optional
+    # dimension: bf16 (the default) names the bf16 class, torch.float8_e4m3fn / torch.float8_e5m2 the fp8-KV classes
+    # (attention.e4m3kv / attention.e5m2kv: exactly widened fp8 leaves, the key scale inside the log2 constant, one mul by the
+    # value scale before the conversion)
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("kv_dtype",)
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("kv_dtype",)
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("kv_dtype",)
     ),
 }
 
@@ -210,7 +235,11 @@ def fingerprint(op: str, **dims) -> str:
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
     ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too.
+    class's no-window sample row and covers windowed calls too. The optional ``kv_dtype`` names the KV cache format:
+    ``torch.bfloat16`` (the default) is the bf16 class, ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` the fp8-KV classes
+    (``attn-e4m3kv-d...`` / ``attn-e5m2kv-d...``: the fp8 keys and values widened to bf16 exactly at every leaf, the per-tensor
+    ``k_scale`` inside the one binary32 constant ``c = fp32(sm_scale * k_scale * log2 e)``, and one ``mul.rn`` by ``v_scale``
+    before the single rounding); the scales' values, like the cache, are inputs.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
@@ -222,6 +251,8 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
     'gemm-nvfp4-kfold-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=128, kv_dtype=torch.float8_e4m3fn)  # doctest: +SKIP
+    'attn-e4m3kv-d128-...'
     """
     info = CLASSES.get(op)
     if info is None:
