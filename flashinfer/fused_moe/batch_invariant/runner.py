@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """The batch-invariant MoE backend of the unified MoE layer (``BatchInvariantBf16Config`` -> ``BatchInvariantMoeRunner``).
 
-The runner serves the bf16 classes ``moe.bf16.swiglu`` (``SwiGLU`` with the default parameters) and ``moe.bf16.relu2``
-(``ReLU2``) on SM100 / SM103 / SM107. It takes every routing input mode: ``FromLogits`` runs the class's own routing kernel
+The runner serves the bf16 classes on SM100 / SM103 / SM107, one declared chain per typed activation of the layer:
+``SwiGLU`` with the default parameters is ``moe.bf16.swiglu``; a ``SwiGLU`` with other ``alpha`` / ``beta`` / ``limit``,
+``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU`` and ``PowLU`` are the gated chains with their scalars as class parameters;
+``ReLU2`` is ``moe.bf16.relu2`` and ``Identity``, ``GELU``, ``ReLU``, ``SiLU`` the other ungated chains (``spec.activation_of``).
+It takes every routing input mode: ``FromLogits`` runs the class's own routing kernel
 (the declared ``exp``, the strict selection order), ``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's
 expert ids and weights. The combine is the slot-order fp32 fold (never an atomic finalize: ``MoEFinalizeConfig.use_fused_finalize``
 is ignored), the tactics are the ranked grouped-GEMM records of the dispatcher (any tactic gives the same bits), and an
@@ -114,10 +117,10 @@ class BatchInvariantMoeRunner(MoERunner):
         # specialisation of another token count (every tactic computes the same bits; this is about the time).
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
+        self._scale: Optional[torch.Tensor] = None
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
-        self._scale: Optional[torch.Tensor] = None
         """The chain of the layer's activation (``spec.ActSpec``: gating, chain name, binary32 parameters)."""
         from .spec import activation_of
 
@@ -176,9 +179,6 @@ class BatchInvariantMoeRunner(MoERunner):
 
         self._part = part_of(self.device)
 
-    # ---- inputs ----------------------------------------------------------------------------------------------------
-    def _accepts_shape(self, act: MoEActivationPack) -> bool:
-        x = act.hidden_states_q
     def _scale_tensor(self) -> torch.Tensor:
         """The routed scaling factor as a one-element fp32 tensor on the runner's device, built once with a blocking copy
         (the route kernel reads it as given: no per-call fill, no process-wide cache keyed by the value)."""
@@ -189,6 +189,9 @@ class BatchInvariantMoeRunner(MoERunner):
             ).to(self.device)
         return self._scale
 
+    # ---- inputs ----------------------------------------------------------------------------------------------------
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        x = act.hidden_states_q
         return x.ndim == 2 and x.dtype == torch.bfloat16 and x.shape[1] % 8 == 0
 
     def pack_inputs(
@@ -230,8 +233,11 @@ class BatchInvariantMoeRunner(MoERunner):
         if (w.gated, w.act, w.params) != (a.gated, a.act, a.params):
             raise unsupported(
                 CLASS,
-                f"{type(cfg.activation).__name__} with {'gated' if w.gated else 'ungated'} weights",
-                "SwiGLU with fc1 [E, 2I, H], ReLU2 with fc1 [E, I, H]",
+                f"a weight view of the {'gated' if w.gated else 'ungated'} chain {w.act!r} with parameters "
+                f"{w.params!r} under {type(cfg.activation).__name__} (the {'gated' if a.gated else 'ungated'} chain "
+                f"{a.act!r} with parameters {a.params!r})",
+                "a weight view prepared with this layer's activation "
+                "(prepare_weights(..., activation=config.activation))",
             )
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
