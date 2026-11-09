@@ -99,8 +99,7 @@ def check_activation_matrix(doc_path: Path = DEFAULT_DOC_PATH) -> None:
     # encoding, which is cp1252 on native Windows (NVBug 7058649).
     text = doc_path.read_text(encoding="utf-8")
     if text != _replace_documented_matrix(text, render_activation_matrix()):
-        # relpath still names a document outside the repo. relative_to()
-        # raises ValueError for those paths before this assertion is built.
+        # relpath, not relative_to(): doc_path may lie outside the repo.
         shown = os.path.relpath(doc_path, REPO_ROOT)
         raise AssertionError(f"{shown} is stale; run: {REGENERATE_COMMAND}")
 
@@ -111,10 +110,9 @@ def write_activation_matrix(doc_path: Path = DEFAULT_DOC_PATH) -> bool:
     updated = _replace_documented_matrix(text, render_activation_matrix())
     if updated == text:
         return False
-    # newline="\n" keeps the checked-in doc LF-only. On Windows, write_text()
-    # would otherwise rewrite the file as CRLF and dirty the worktree when Git
-    # is not normalizing line endings. read_text() accepts CRLF, so the next
-    # check would still pass.
+    # Keep the checked-in doc LF-only: on Windows, write_text() would otherwise
+    # emit CRLF and dirty the worktree. read_text() accepts CRLF, so the check
+    # itself would still pass.
     doc_path.write_text(updated, encoding="utf-8", newline="\n")
     return True
 
