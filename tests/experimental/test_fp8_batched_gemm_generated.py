@@ -1,6 +1,6 @@
 """Projection routes: exact scale packing, changed inputs, stream replay, token coverage.
 
-The package is named once, through ``tests.test_helpers.cake_package``; the public
+The package is named once, through ``tests.cake.test_helpers.cake_package``; the public
 entry ``flashinfer.fp8_batched_gemm.prepare_fp8_batched_gemm`` is the second import,
 the route it exercises being the package's own.  The host plan of the registry
 records and the ``build.json`` contract are checked without a GPU.
@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from flashinfer.fp8_batched_gemm import prepare_fp8_batched_gemm
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("deepgemm_batched_gemm")
 _runtime = cake_package("deepgemm_batched_gemm", "batched_gemm")

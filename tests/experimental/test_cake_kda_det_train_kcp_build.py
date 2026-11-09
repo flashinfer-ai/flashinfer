@@ -15,25 +15,29 @@ limitations under the License.
 
 The KCP registry (``cake_kcp_jit``) and manifests of the Cake packed KDA training package: the records against the
 frozen kernel ABIs, the program names against the identity rule, ``build.json`` (the shipped programs, never a
-test-only one) and ``build.test.json`` (the test-only programs, loadable only after ``cake_kcp_plan.enable_test_knobs()``).
+test-only one) and ``build.test.json`` (the test-only programs, loadable only after ``cake_kcp_plan.enable_test_knobs()``),
+and the architecture the workspace byte query selects the local arena's records for.
 No device is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
+import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
-cake_build = cake_package("cake_kda_det_train_kcp", "cake_build")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
-kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
+cake_build = cake_package("cake.cake_kda_det_train_kcp", "cake_build")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
+kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
+kcp_plan = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -48,7 +52,7 @@ FWDH_PLAN = [
     ["buffer", "v_new"], *GRID,
 ]  # fmt: skip
 DHU_PLAN = [
-    ["buffer", "kg_tma"], ["buffer", "qg_tma"], ["buffer", "w_tma"], ["buffer", "do_tma"], ["buffer", "dv1"],
+    ["buffer", "kg_tma"], ["buffer", "qg_tma"], ["buffer", "w_tma"], ["buffer", "do_tma"], ["buffer", "aqk_tma"],
     ["buffer", "gk"], ["parameter", "num_heads"], ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"],
     ["parameter", "scale"], ["buffer", "walk_seg"], ["buffer", "dht"], ["buffer", "dht_index"], ["parameter", "dht_hg"],
     ["parameter", "dht_n"], ["buffer", "out"], ["buffer", "out_index"], ["parameter", "out_hg"], ["parameter", "out_n"],
@@ -179,19 +183,19 @@ IDENTITIES = {
     ),
     "kcp_dhu_offset": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "offset"},
+        {"program": "offset", "fuse_dv1": 1},
     ),
     "kcp_dhu_offset_overlap": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_det_dhu_v2_kcp",
-        {"program": "offset", "tile_prefetch": 0},
+        {"program": "offset", "tile_prefetch": 0, "fuse_dv1": 1},
     ),
     "kcp_dhu_offset_vh64": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "offset", "vh": 64},
+        {"program": "offset", "vh": 64, "fuse_dv1": 1},
     ),
     "kcp_dhu_tape": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape", "vh": 64, "tape_store": "tma"},
+        {"program": "tape", "vh": 64, "tape_store": "tma", "fuse_dv1": 1},
     ),
     "kcp_transfer_walk": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_det_transfer_walk_bf16x3_v2_kcp",
@@ -230,7 +234,7 @@ IDENTITIES = {
     ),
     "kcp_dhu_tape_full": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape"},
+        {"program": "tape", "fuse_dv1": 1},
     ),
 }
 
@@ -710,7 +714,7 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     assert (
         document["package"]
         == shipped["package"]
-        == "flashinfer.experimental.cake_kda_det_train_kcp"
+        == "flashinfer.experimental.cake.cake_kda_det_train_kcp"
     )
     # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
     # programs change: the two generator records share their form, not their stamp
@@ -747,3 +751,155 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     with pytest.raises(RuntimeError):
         kcp_jit.test_library_name("kcp_transfer_walk_three_mma", "sm_90a")
     kcp_jit._test_manifest.cache_clear()
+
+
+REPO = Path(__file__).resolve().parents[2]
+PACKAGE_NAME = "flashinfer.experimental.cake.cake_kda_det_train_kcp"
+SINGLE_RANK_NAME = "flashinfer.experimental.cake.cake_kda_det_train"
+
+
+def _manifest_checker():
+    """``scripts/check_cake_build_manifests.py`` of this checkout, loaded as a module (it never imports flashinfer)."""
+    path = REPO / "scripts" / "check_cake_build_manifests.py"
+    if not path.is_file():
+        pytest.skip(
+            "scripts/check_cake_build_manifests.py is not beside this test (installed package)"
+        )
+    spec = importlib.util.spec_from_file_location("check_cake_build_manifests", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules.setdefault("check_cake_build_manifests", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_manifest_checker_row_requires_the_single_rank_package() -> None:
+    """The checker's row of this package names its directory and requires the single-rank sibling, and its
+    manifest declares that sibling (``common.requires.packages``)."""
+    checker = _manifest_checker()
+    row = checker.package_named(PACKAGE_NAME)
+    assert row is not None
+    assert (row.path, row.loader) == (
+        "flashinfer/experimental/cake/cake_kda_det_train_kcp",
+        "cake_kcp_jit.py",
+    )
+    assert row.requires == (SINGLE_RANK_NAME,)
+    assert checker.check_requires(row) == []
+    assert checker.check_required_packages(row, cake_build.manifest()) == []
+
+
+def test_manifest_checker_required_packages_rule() -> None:
+    """``check_required_packages``: the manifest lists the directory names of ``Package.requires`` sorted and without
+    duplicates (as #8928 specifies), whatever the order of ``Package.requires``, and lists none when the package
+    requires none."""
+    checker = _manifest_checker()
+
+    def package(*requires: str):
+        return checker.Package(
+            "p.pkg", "p/pkg", "cake_jit.py", checker.refs_generic, requires=requires
+        )
+
+    def manifest(**requires):
+        return {"common": {"requires": {"cuda_toolkit": {"min": "12.8"}, **requires}}}
+
+    def messages(row, document):
+        return [f.message for f in checker.check_required_packages(row, document)]
+
+    two = package("p.sib", "p.other")
+    assert messages(two, manifest(packages=["other", "sib"])) == []
+    assert messages(package(), manifest()) == []
+    (missing,) = messages(two, manifest())
+    assert "common.requires.packages is missing; expected ['other', 'sib']" in missing
+    (unsorted,) = messages(two, manifest(packages=["sib", "other"]))
+    assert "!= ['other', 'sib']" in unsorted
+    (duplicate,) = messages(two, manifest(packages=["other", "other", "sib"]))
+    assert "!= ['other', 'sib']" in duplicate
+    (dotted,) = messages(two, manifest(packages=["p.other", "p.sib"]))
+    assert "!= ['other', 'sib']" in dotted
+    (extra,) = messages(package(), manifest(packages=["sib"]))
+    assert "Package.requires is empty" in extra
+
+
+# --------------------------------------------------------------------------- the byte query's architecture
+
+BYTE_QUERY_CALLS = ("plan", "workspace_bytes", "tables_bytes")
+
+
+def _context_on(device: str):
+    """Rank 0's context of a two-rank contiguous pack (148 SMs), seen as a context on ``device``: the byte query reads
+    the context's host fields and its ``device``; a CPU host builds the context on the CPU."""
+    part = kcp_plan.cake_kda_det_train_kcp_partition([0, 3000, 8192], 2)
+    ctx = kcp_plan.cake_kda_det_train_kcp_build_context(
+        part, None, 0, "cpu", 4, sm_count=148
+    )
+    assert ctx.T_r > 0
+
+    class OnDevice:
+        def __getattr__(self, name: str):
+            return getattr(ctx, name)
+
+    view = OnDevice()
+    view.device = torch.device(device)
+    return view
+
+
+def _spy_byte_query(monkeypatch) -> list[tuple[str, object]]:
+    """Record the ``arch`` each of :data:`BYTE_QUERY_CALLS` of the single-rank backend receives (the real function
+    then runs); every context's intra record is taken to write its scratch table set, so all three are called."""
+    single_rank = cake_package("cake.cake_kda_det_train_kcp", "_single_rank")
+    backend = single_rank.module("cake_backend")
+    seen: list[tuple[str, object]] = []
+    for name in BYTE_QUERY_CALLS:
+        real = getattr(backend, name)
+
+        def spy(*args, _real=real, _name=name, **kwargs):
+            seen.append((_name, kwargs.get("arch", "not passed")))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(backend, name, spy)
+    monkeypatch.setattr(kcp_plan, "intra_writes_tables", lambda *a, **k: True)
+    return seen
+
+
+def test_workspace_bytes_plan_for_the_contexts_device_architecture(
+    monkeypatch,
+) -> None:
+    """The byte query plans each context's local arena, its arena bytes and its scratch tables for the architecture
+    of the context's device, as the forward plans its local stages, never for that of the current CUDA device: here
+    the current device (``cuda:0``) is another model than the context's (``cuda:1``)."""
+    current, own = cake_jit.ARCHES[0], cake_jit.ARCHES[1]
+    by_index = {0: current, 1: own}
+    capability = {arch: cap for cap, arch in cake_jit.ARCH_BY_CAPABILITY.items()}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda index=None: capability[by_index[0 if index is None else int(index)]],
+    )
+    monkeypatch.setattr(kcp_plan, "_cuda_arch", lambda index: by_index[int(index)])
+    ctx = _context_on("cuda:1")
+    seen = _spy_byte_query(monkeypatch)
+    nbytes = kcp_plan.cake_kda_det_train_kcp_workspace_bytes(ctx, H=64)
+    assert nbytes > 0
+    assert seen == [(name, own) for name in BYTE_QUERY_CALLS]
+
+
+@pytest.mark.parametrize("device", ["cuda:1", "cpu"])
+def test_workspace_bytes_without_cuda_pass_no_architecture(
+    monkeypatch, device: str
+) -> None:
+    """On a host without CUDA the byte query passes ``arch=None`` (the existing backend's default) and makes no CUDA
+    call, whatever device the context names."""
+
+    def no_cuda_call(*args, **kwargs):
+        raise AssertionError("the byte query made a CUDA call on a host without CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    for name in ("current_device", "get_device_capability", "get_device_properties"):
+        monkeypatch.setattr(torch.cuda, name, no_cuda_call)
+    monkeypatch.setattr(kcp_plan, "_cuda_arch", no_cuda_call)
+    ctx = _context_on(device)
+    seen = _spy_byte_query(monkeypatch)
+    assert kcp_plan.cake_kda_det_train_kcp_workspace_bytes(ctx, H=64) > 0
+    assert seen == [(name, None) for name in BYTE_QUERY_CALLS]

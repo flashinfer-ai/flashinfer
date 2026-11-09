@@ -44,7 +44,7 @@ from flashinfer.experimental.cake import cake_causal_conv1d_nondet_train as pkg
 from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
     kcp as conv_kcp,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 from tests.test_cake_causal_conv1d_det_train_kcp import (
     DW_ATOL,
     DW_RTOL,
@@ -116,7 +116,9 @@ def test_forward_is_the_deterministic_forward(name, lens, cuts, C):
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
     y, hist = _fwd(p.x_local, p.w, p.ctx)
-    y_det, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
+    y_det, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
     assert torch.equal(_bits(y), _bits(y_det)) and torch.equal(
         _bits(hist), _bits(hist_det)
     )
@@ -134,8 +136,10 @@ def test_backward_repeats_dx_bitwise_dweight_within_budget(
     p = _problem(lens, cuts, C, device)
     _, hist = _fwd(p.x_local, p.w, p.ctx)
     _, dx_ref, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
-    _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_det, dw_det = det_kcp.cake_causal_conv1d_det_backward_kcp(
+    _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
+    dx_det, dw_det = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist_det
     )
     worst_ref = worst_det = 0.0
@@ -242,6 +246,11 @@ def test_fp32_dweight_must_be_16_byte_aligned():
 
 
 def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
+    """The KCP programs plan their launches with ``cake_jit.plan(..., legacy=True)``: the single backward program
+    (the ``bwd_route`` test knob ``"single"``; the overlapped pair plans with its own work plan) and the one-launch
+    forward (knobs ``fwd_main`` 0, ``fwd_overlap`` 0), while the shipped forward's single-rank main program
+    (``FWD_MAIN_ARCHS``) plans with the ``fwd`` route's rule for the device's architecture.  ``y`` is bitwise the
+    deterministic KCP forward's and ``dx`` its backward's either way."""
     calls = []
     original = conv_kcp.plan
 
@@ -249,18 +258,37 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
         calls.append(kwargs)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(conv_kcp, "plan", recording_plan)
     device = torch.device("cuda")
+    arch = conv_kcp._device_arch(device)
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 1280, device)
-    y, hist = _fwd(p.x_local, p.w, p.ctx)
-    dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
-    assert len(calls) == 2 and all(call.get("legacy") is True for call in calls), calls
-    monkeypatch.undo()
-    _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_det, _ = det_kcp.cake_causal_conv1d_det_backward_kcp(
+    y_det, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
+    dx_det, _ = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist_det
     )
-    assert torch.equal(dx, dx_det) and torch.isfinite(dw).all()
+    monkeypatch.setattr(conv_kcp, "plan", recording_plan)
+    for knobs in ({"fwd_main": 0, "fwd_overlap": 0}, {}):
+        calls.clear()
+        # the trimmed host path caches its plans per context: each form plans afresh
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+        conv_kcp._set_test_knobs(knobs)
+        try:
+            y, hist = _fwd(p.x_local, p.w, p.ctx)
+            conv_kcp._set_test_knobs({**knobs, "bwd_route": "single"})
+            dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
+        finally:
+            conv_kcp._set_test_knobs(None)
+        assert len(calls) == 2 and calls[1].get("legacy") is True, (knobs, calls)
+        if not knobs and arch in conv_kcp.FWD_MAIN_ARCHS:
+            assert calls[0].get("legacy") is not True, calls
+            assert (calls[0].get("route"), calls[0].get("arch")) == ("fwd", arch), calls
+        else:
+            assert calls[0].get("legacy") is True, (knobs, calls)
+        assert torch.equal(_bits(y), _bits(y_det)), knobs
+        assert torch.equal(_bits(hist), _bits(hist_det)), knobs
+        assert torch.equal(dx, dx_det) and torch.isfinite(dw).all(), knobs
+    conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
 
 
 def _one_sm_rows(device: torch.device) -> list[tuple[int, tuple[int, int, int]]]:
@@ -285,7 +313,8 @@ def _one_sm_rows(device: torch.device) -> list[tuple[int, tuple[int, int, int]]]
 def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
     monkeypatch,
 ) -> None:
-    """FlashInfer issue #8365: the main backward launches ``ctas_per_sm x SM count`` CTAs, less ``ctas_per_sm`` when
+    """FlashInfer issue #8365, the single backward program (the ``bwd_route`` test knob ``"single"``): it launches
+    ``ctas_per_sm x SM count`` CTAs, less ``ctas_per_sm`` when
     the last channel-tile rank of that grid holds at least ``ctas_per_sm`` CTAs (so a kernel on another stream that
     keeps one SM's shared memory leaves the launch one wave), else the whole grid, on both host paths; ``dx`` is
     bitwise the deterministic backward's, ``dweight`` within budget of the FP64 oracle and the workspace reads back
@@ -312,20 +341,21 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
 
     monkeypatch.setattr(conv_kcp, "_launch_plan", recording_plan)
     monkeypatch.setattr(conv_kcp, "run_module", recording_run)
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         for C, expected in rows:
             p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
             _, hist = _fwd(p.x_local, p.w, p.ctx)
-            _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(
+            _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
                 p.x_local, p.w, p.ctx
             )
-            dx_det, _ = det_kcp.cake_causal_conv1d_det_backward_kcp(
+            dx_det, _ = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
                 p.x_local, p.w, p.ctx, p.dy_local, hist_det
             )
             _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
             for host_trim in (1, 0):
-                conv_kcp._set_test_knobs({"host_trim": host_trim})
+                conv_kcp._set_test_knobs(
+                    {"host_trim": host_trim, "bwd_route": "single"}
+                )
                 conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
                 seen.clear()
                 dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
@@ -339,6 +369,112 @@ def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
     finally:
         conv_kcp._set_test_knobs(None)
         conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+
+
+def _forward_record(device: torch.device) -> tuple[str, dict, tuple[int, int, int]]:
+    """``(arch, the forward's record, its full co-resident grid)`` on ``device``."""
+
+    arch = conv_kcp._loader.device_arch(device.index)
+    (name,) = conv_kcp.route_modules(arch, conv_kcp.KCP_FWD)
+    record = conv_kcp._loader.MODULES[name]
+    return arch, record, conv_kcp.launch_grid(record, device_index=device.index)
+
+
+def _record_forward_grids(monkeypatch) -> list:
+    """The grid of every forward launch from here on (the trimmed path's argument plan or the untrimmed path's
+    ``run_module`` call), in order."""
+
+    seen = []
+    launch_plan, run_module = conv_kcp._launch_plan, conv_kcp.run_module
+
+    def recording_plan(name, grid, device_index):
+        if conv_kcp._loader.MODULES[name]["role"] == conv_kcp.KCP_FWD:
+            seen.append(tuple(grid))
+        return launch_plan(name, grid, device_index)
+
+    def recording_run(name, values, *, device_index, grid=None):
+        if conv_kcp._loader.MODULES[name]["role"] == conv_kcp.KCP_FWD:
+            seen.append(None if grid is None else tuple(grid))
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(conv_kcp, "_launch_plan", recording_plan)
+    monkeypatch.setattr(conv_kcp, "run_module", recording_run)
+    return seen
+
+
+def _check_forward_grid(seen: list, expected: tuple, Cs: tuple, arch: str) -> None:
+    """For each ``C`` of ``Cs`` and both host paths, the one-launch forward (knobs ``fwd_main`` 0, ``fwd_overlap`` 0:
+    the ``kcp_fwd`` program): one forward launch of grid ``expected``, ``y`` and ``hist`` bitwise the deterministic
+    KCP forward's."""
+
+    device = torch.device("cuda")
+    try:
+        for C in Cs:
+            p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
+            y_det, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+                p.x_local, p.w, p.ctx
+            )
+            for host_trim in (1, 0):
+                conv_kcp._set_test_knobs(
+                    {"host_trim": host_trim, "fwd_main": 0, "fwd_overlap": 0}
+                )
+                conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+                seen.clear()
+                y, hist = _fwd(p.x_local, p.w, p.ctx)
+                torch.cuda.synchronize()
+                label = f"{arch} C={C} host_trim={host_trim}"
+                assert seen == [expected], (label, seen)
+                assert torch.equal(_bits(y), _bits(y_det)), label
+                assert torch.equal(_bits(hist), _bits(hist_det)), label
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+
+
+def test_forward_grid_per_architecture(monkeypatch) -> None:
+    """The one-launch forward (knobs ``fwd_main`` 0, ``fwd_overlap`` 0: the ``kcp_fwd`` program) launches the
+    record's co-resident grid less ``FWD_RESERVE_SMS[arch]`` SMs of CTAs (sm_107a: one SM, the deterministic KCP
+    forward's grid; sm_100a / sm_103a: the full grid), on both host paths; ``y`` and ``hist`` are bitwise the
+    deterministic KCP forward's either way."""
+
+    arch, record, full = _forward_record(torch.device("cuda"))
+    assert conv_kcp.FWD_RESERVE_SMS == {"sm_107a": 1}
+    reserved = conv_kcp.FWD_RESERVE_SMS.get(arch, 0) * int(
+        record["grid_rule"]["ctas_per_sm"]
+    )
+    seen = _record_forward_grids(monkeypatch)
+    _check_forward_grid(
+        seen, (full[0] - reserved, full[1], full[2]), (1024, 10240), arch
+    )
+
+
+def test_forward_grid_reserve_falls_back_to_the_full_grid(monkeypatch) -> None:
+    """A reserve that leaves fewer CTAs than the call's channel tiles launches the full grid; one that leaves exactly
+    as many launches the shorter grid; more channel tiles than the full grid holds raise ``ValueError``.  The
+    fallback launch (C = 10240, one SM of CTAs left: fewer CTAs than its channel tiles) keeps ``y`` / ``hist``
+    bitwise the deterministic KCP forward's on both host paths."""
+
+    device = torch.device("cuda")
+    arch, record, full = _forward_record(device)
+    per_sm = int(record["grid_rule"]["ctas_per_sm"])
+    monkeypatch.setattr(conv_kcp, "FWD_RESERVE_SMS", {arch: full[0] // per_sm - 1})
+
+    def grid(n_ch_tiles):
+        return conv_kcp._forward_grid(
+            record, arch=arch, device_index=device.index, C=10240, n_ch_tiles=n_ch_tiles
+        )
+
+    assert grid(per_sm) == (per_sm, full[1], full[2])
+    assert grid(per_sm + 1) == full
+    assert grid(full[0]) == full
+    with pytest.raises(ValueError):
+        grid(full[0] + 1)
+    n_ch_tiles = conv_kcp.plan(
+        5000, 10240, 2, geometry=record["grid_rule"]["geometry"], legacy=True
+    )["n_ch_tiles"]
+    assert n_ch_tiles > per_sm, (n_ch_tiles, per_sm)
+    seen = _record_forward_grids(monkeypatch)
+    _check_forward_grid(seen, full, (10240,), arch)
 
 
 @pytest.mark.parametrize("form", ["knob", "keyword"])
@@ -355,7 +491,6 @@ def test_graph_replay_is_bitwise_for_y_and_dx(monkeypatch, form) -> None:
     dx0, dw0 = _bwd(x, w, ctx, dy, hist0)
     kw = {}
     if form == "knob":
-        monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
         conv_kcp._set_test_knobs({"graph": "replay"})
     else:
         kw = {"graph": "replay"}
@@ -447,8 +582,10 @@ def test_checkpoint_and_recompute_handle(
     monkeypatch.undo()
     assert conv_kcp.LAST_CALL["recompute_handle"] == {"fwd": "replay"}
     assert _same(plain, direct) and _same(got, plain)
-    _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(p.x_local, p.w, p.ctx)
-    dx_det, dw_det = det_kcp.cake_causal_conv1d_det_backward_kcp(
+    _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+        p.x_local, p.w, p.ctx
+    )
+    dx_det, dw_det = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist_det
     )
     assert torch.equal(_bits(got["dx"]), _bits(dx_det))

@@ -33,8 +33,9 @@ cannot address; the plan of a new binding, which can JIT-load the backward
 stages and, without a caller ``topk_length``, allocates and fills the
 binding's row-length vector; the validation of ``dkv_acc`` /
 ``dkv_dst_map``.  It never falls back to another package.  The
-deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` is a
-reserved name (planned); it does not exist yet.
+deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` has
+the same entry points (``det`` in place of ``nondet``); its outputs repeat bit
+for bit run to run.
 
 Entry points (each an autograd call: forward now, backward through autograd)::
 

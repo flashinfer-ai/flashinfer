@@ -2576,6 +2576,21 @@ _sp_logits = torch.randn(64, 32000, dtype=torch.float32, device=device)
 with contextlib.suppress(Exception):
     flashinfer.softmax(_sp_logits, temperature=1.0)
 with contextlib.suppress(Exception):
+    flashinfer.softmax(
+        _sp_logits.to(torch.bfloat16),
+        temperature=1.0,
+        batch_invariant=True,
+        out_dtype=torch.float32,
+    )
+with contextlib.suppress(Exception):
+    flashinfer.log_softmax(_sp_logits, temperature=1.0)
+with contextlib.suppress(Exception):
+    _lp_ids = torch.randint(0, 32000, (64,), dtype=torch.int64, device=device)
+    flashinfer.log_probs(_sp_logits, _lp_ids, temperature=1.0)
+with contextlib.suppress(Exception):
+    _lp_ids_k = torch.randint(0, 32000, (64, 4), dtype=torch.int64, device=device)
+    flashinfer.log_probs(_sp_logits, _lp_ids_k, temperature=1.0)
+with contextlib.suppress(Exception):
     flashinfer.sampling_from_probs(_sp_probs)
 with contextlib.suppress(Exception):
     flashinfer.sampling_from_logits(_sp_logits)

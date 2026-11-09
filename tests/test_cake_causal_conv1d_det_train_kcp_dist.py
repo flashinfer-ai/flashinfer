@@ -28,11 +28,28 @@ fragment that reads its history from three predecessor ranks).  Per row and rank
 - nested checkpoints: a handle created outside the outer region makes both recomputes communication-free; a handle
   created inside the outer region is empty in the outer recompute, which then exchanges once (still bitwise);
 - the handle retains exactly the history pool: ``nbytes() == n_hist_rows * C * 2``, the bytes still allocated after
-  the checkpointed forward are that pool (0 for the plain checkpoint).
+  the checkpointed forward are that pool (0 for the plain checkpoint);
+- every output repeats bit for bit over ``REPEATS`` explicit forward + backward calls per launch form (every rank
+  passing the same ``cooperative``): ``y``, ``hist``, ``dx``, ``dweight`` and the halo rows of both exchanges (the
+  rows the rank sends, among them the backward's ``dpre`` head rows, the halo adjoints, and the pools it receives);
+  ``y`` / ``hist`` / ``dx`` / halo rows are the same in the two forms, and the autograd entry's default is the
+  explicit call of ``COOPERATIVE_DEFAULT``;
+- the two-launch forward (knobs ``fwd_main`` x ``fwd_overlap``, the same on every rank): ``LAST_CALL["fwd"]`` names
+  the form the rank ran (the overlapped form on a rank with tokens, the history-row program when the rank receives
+  history rows) and ``y`` / ``hist`` are bitwise the one-launch forward's;
+- against the global FP64 oracle of the whole pack and the shipped zero-history backward of the whole pack (no CP),
+  at the single-GPU suite's tolerances: ``y`` / ``dx`` within one BF16 ulp of FP64, ``dx`` within the no-CP clause,
+  and the ranks' ``dweight`` partials summed in rank order within the ``dweight`` budget of the FP64 ``dweight``;
+- a steady explicit forward + backward of each form issues no host-to-device copy, no synchronizing operation and
+  no device allocation (``tests/experimental/test_helpers/cake_host_sync.py``), bitwise the first call;
+- per-document zigzag rows: the longest document is a chain of ``2 W`` fragments over every rank.
 
-Two launch forms (as ``tests/experimental/test_cake_kda_det_train_kcp_dist.py``): ``torch.multiprocessing`` (``pytest``:
-skipped when fewer than ``W`` CUDA devices are visible) and one process per Slurm task (``SLURM_NTASKS == W``; the
-rendezvous from ``MASTER_ADDR`` / ``MASTER_PORT``; rows of another ``W`` are skipped under a multi-task step).
+``ROWS`` are W = 2 / 4 / 8; ``ROWS_SCALE`` are per-document zigzag at W = 16 / 32 / 64 (FlashInfer issue #7815: at
+W = 64 a document of 128 fragments, and documents of one- and two-token fragments whose history comes from up to three
+predecessor ranks).  Two launch forms (as ``tests/experimental/test_cake_kda_det_train_kcp_dist.py``):
+``torch.multiprocessing`` (``pytest``: skipped when fewer than ``W`` CUDA devices are visible) and one process per Slurm
+task (``SLURM_NTASKS == W``; the rendezvous from ``MASTER_ADDR`` / ``MASTER_PORT``; rows of another ``W`` are skipped
+under a multi-task step).  The ``ROWS_SCALE`` rows run in a multi-node Slurm step of ``W`` tasks.
 """
 
 from __future__ import annotations
@@ -64,7 +81,17 @@ ROWS = [
     ((2048, 5, 3000, 1), 8, "zigzag_per_document", 384),
     ((6, 1, 2, 3, 4000), 8, "ragged:1,1,1,3,0,2,4000,4", 256),
 ]
+# Per-document zigzag at W = 16 / 32 / 64: every document is cut into 2 W fragments, so the longest is a chain over
+# every rank (128 fragments at W = 64); the short documents give one- and two-token fragments and empty ones.  Kept
+# out of ``ROWS`` (other suites import it).
+ROWS_SCALE = [
+    ((2048, 5, 3000, 1), 16, "zigzag_per_document", 384),
+    ((6000, 70, 2, 1000), 32, "zigzag_per_document", 256),
+    ((12800, 200, 100, 3), 64, "zigzag_per_document", 256),
+]
 TENSORS = ("y", "dx", "dw")
+# explicit forward + backward calls per launch form of the determinism check
+REPEATS = 5
 
 
 def _row_id(row) -> str:
@@ -72,12 +99,12 @@ def _row_id(row) -> str:
     return "s" + "_".join(map(str, lengths)) + f"-w{W}-{layout.split(':')[0]}-c{C}"
 
 
-def _partition(plan, lengths, W: int, layout: str):
+def _partition(partition, lengths, W: int, layout: str):
     cu = [0]
     for n in lengths:
         cu.append(cu[-1] + n)
     if not layout.startswith("ragged:"):
-        return plan.partition_det_kcp(cu, W, layout=layout), cu
+        return partition(cu, W, layout=layout), cu
     t_r = [int(x) for x in layout.split(":")[1].split(",")]
     assert len(t_r) == W and sum(t_r) == cu[-1]
     # contiguous ragged split of the global buffer, cut at document boundaries, in local order
@@ -96,7 +123,7 @@ def _partition(plan, lengths, W: int, layout: str):
             p = e
             d += 1
         pos = end
-    return plan.partition_det_kcp(cu, W, fragments=nested), cu
+    return partition(cu, W, fragments=nested), cu
 
 
 def _local(part, rank: int, cu: list[int], t: torch.Tensor) -> torch.Tensor:
@@ -205,8 +232,12 @@ def _run_rank(
 
     from flashinfer import cake_causal_conv1d_det_train as conv
     from flashinfer import cake_causal_conv1d_det_train_kcp as kcp_api
-    from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
-    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp_plan as plan
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
+    from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
+        cake_kcp_plan as plan,
+    )
 
     lengths, _w, layout, C = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
@@ -216,8 +247,10 @@ def _run_rank(
         os.environ.setdefault("MASTER_PORT", str(port))
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
     group = dist.group.WORLD
-    part, cu = _partition(plan, lengths, W, layout)
-    ctx = plan.build_context_det_kcp(part, group, rank, device, conv_kernel_size=WIDTH)
+    part, cu = _partition(plan.cake_kda_det_train_kcp_partition, lengths, W, layout)
+    ctx = plan.cake_kda_det_train_kcp_build_context(
+        part, group, rank, device, conv_kernel_size=WIDTH
+    )
     T = cu[-1]
     g = torch.Generator(device="cpu").manual_seed(7815)
     x_all = torch.randn(T, C, generator=g).to(torch.bfloat16)
@@ -260,7 +293,11 @@ def _run_rank(
                 def outer(x_, w_, h_):
                     # the product with ones saves a tensor of the outer region (so the outer recompute runs) and
                     # changes no bit of y or of its gradient
-                    hh = conv_kcp.RecomputeHandleDetKcp() if mode == "nested_in" else h_
+                    hh = (
+                        conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
+                        if mode == "nested_in"
+                        else h_
+                    )
                     yi = checkpoint(fn, x_, w_, hh, use_reentrant=False)
                     return yi * torch.ones_like(yi)
 
@@ -301,10 +338,10 @@ def _run_rank(
     info: dict[str, object] = {"n_hist_rows": n_hist, "T_r": int(x.shape[0])}
     direct, c_direct = run("direct")
     plain, c_plain = run("ckpt")
-    hd = conv_kcp.RecomputeHandleDetKcp()
+    hd = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     withh, c_h = run("ckpt", hd)
     plain_re, c_plain_re = run("ckpt", reentrant=True)
-    hd_re = conv_kcp.RecomputeHandleDetKcp()
+    hd_re = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     withh_re, c_h_re = run("ckpt", hd_re, reentrant=True)
     info["counts"] = {
         "direct": c_direct,
@@ -341,7 +378,7 @@ def _run_rank(
         and hd.entries["conv"]["hist"].shape == (n_hist, C)
     )
     # retain_graph: the entry is replayed again, no collective; exactly twice the gradients
-    hd2 = conv_kcp.RecomputeHandleDetKcp()
+    hd2 = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     twice, c_twice = run("ckpt", hd2, twice=True)
     info["counts"]["handle_twice"] = c_twice
     flags["twice_accumulates"] = (
@@ -350,8 +387,12 @@ def _run_rank(
         and c_twice["calls"] == {"orig": 1, "recompute": 0, "bwd": 2}
     )
     # nested checkpoints
-    nest_out, c_nest_out = run("nested_out", conv_kcp.RecomputeHandleDetKcp())
-    nest_in, c_nest_in = run("nested_in", conv_kcp.RecomputeHandleDetKcp())
+    nest_out, c_nest_out = run(
+        "nested_out", conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
+    )
+    nest_in, c_nest_in = run(
+        "nested_in", conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
+    )
     info["counts"]["nested_out"], info["counts"]["nested_in"] = c_nest_out, c_nest_in
     flags["nested_out_bitwise"] = eq(nest_out, direct)
     flags["nested_in_bitwise"] = eq(nest_in, direct)
@@ -370,7 +411,10 @@ def _run_rank(
     }
     # retained bytes after a checkpointed forward (after the warm-up above): the history pool with a handle, 0 without
     retained = {}
-    for name, h in (("plain", None), ("handle", conv_kcp.RecomputeHandleDetKcp())):
+    for name, h in (
+        ("plain", None),
+        ("handle", conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()),
+    ):
         xl, wl = leaves()
         torch.cuda.synchronize(device)
         gc.collect()
@@ -382,6 +426,180 @@ def _run_rank(
         del y, xl, wl
     info["retained_bytes"] = retained
     flags["retained"] = retained["plain"] == 0 and retained["handle"] == n_hist * C * 2
+
+    # Every output repeats bit for bit: REPEATS explicit forward + backward calls per launch form, the same form on
+    # every rank.  The halo rows of both exchanges are recorded: a copy of the rows this rank sends (history rows,
+    # then the dpre head rows -- the halo adjoints), taken before the exchange, and the pool it receives.
+    def explicit(coop: bool) -> dict:
+        rows: list[torch.Tensor] = []
+        exchange = conv_kcp._exchange
+
+        def recording(send, **kw):
+            sent = send.detach().clone()
+            recv, work = exchange(send, **kw)
+            rows.extend((sent, recv))
+            return recv, work
+
+        conv_kcp._exchange = recording
+        try:
+            y_e, hist_e = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+            dx_e, dw_e = conv_kcp.cake_causal_conv1d_det_train_kcp_backward(
+                x, w, ctx, dy, hist_e, cooperative=coop
+            )
+        finally:
+            conv_kcp._exchange = exchange
+        torch.cuda.synchronize(device)
+        return {"y": y_e, "hist": hist_e, "dx": dx_e, "dw": dw_e, "halo": rows}
+
+    def same_halo(a: dict, b: dict) -> bool:
+        # one exchange per direction: (sent, received) of the forward, then of the backward
+        return len(a["halo"]) == len(b["halo"]) == 4 and all(
+            same(s, t) for s, t in zip(a["halo"], b["halo"], strict=True)
+        )
+
+    forms = {}
+    for coop in (True, False):
+        ref = forms[coop] = explicit(coop)
+        ok = True
+        for _ in range(REPEATS - 1):
+            again = explicit(coop)
+            ok = (
+                ok
+                and same_halo(again, ref)
+                and all(same(again[k], ref[k]) for k in ("y", "hist", "dx", "dw"))
+            )
+        flags["repeats_bitwise_" + ("cooperative" if coop else "split")] = ok
+    flags["forms_agree_except_dweight"] = same_halo(forms[True], forms[False]) and all(
+        same(forms[True][k], forms[False][k]) for k in ("y", "hist", "dx")
+    )
+    flags["autograd_default_eq_explicit_default"] = eq(
+        direct, forms[conv_kcp.COOPERATIVE_DEFAULT]
+    )
+
+    # The two-launch forward: every (fwd_main, fwd_overlap) form, the same on every rank, records its form in
+    # LAST_CALL["fwd"] (the overlapped form with the exchange in flight on a rank with tokens; the history-row program
+    # when the rank receives history rows and the form has two launches) and gives y / hist bitwise the one-launch
+    # forward's.
+    fwd_bitwise, fwd_recorded = True, True
+    for fwd_main in (0, 1):
+        for fwd_overlap in (0, 1):
+            conv_kcp._set_test_knobs({"fwd_main": fwd_main, "fwd_overlap": fwd_overlap})
+            try:
+                for _ in range(2):
+                    y_f, hist_f = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
+                        x, w, ctx
+                    )
+                    torch.cuda.synchronize(device)
+                    want = (
+                        {
+                            "main": "sr" if fwd_main else "f",
+                            "form": "pair" if fwd_overlap else "wait",
+                            "repair": bool(fwd_main or fwd_overlap) and n_hist > 0,
+                        }
+                        if x.shape[0]
+                        else {"main": None, "form": "wait", "repair": False}
+                    )
+                    fwd_recorded = fwd_recorded and conv_kcp.LAST_CALL["fwd"] == want
+                    fwd_bitwise = (
+                        fwd_bitwise
+                        and same(y_f, forms[True]["y"])
+                        and same(hist_f, forms[True]["hist"])
+                    )
+            finally:
+                conv_kcp._set_test_knobs(None)
+                conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
+    flags["fwd_forms_bitwise"] = fwd_bitwise
+    flags["fwd_forms_recorded"] = fwd_recorded
+
+    # Against the global FP64 oracle of the whole pack (the KCP SiLU' policy; the rank's tokens gathered from it) and
+    # the shipped zero-history backward of the whole pack (no CP), at the single-GPU suite's tolerances.  The ranks'
+    # dweight partials are all-gathered and added in rank order (the same order on every rank).
+    from tests.test_cake_causal_conv1d_det_train_kcp import (
+        DW_ATOL,
+        DW_RTOL,
+        NOCP_ATOL,
+        NOCP_RTOL,
+        Y_ATOL,
+        Y_RTOL,
+        _reference,
+    )
+
+    def ratio(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float) -> float:
+        """The worst ``|a - b| / (atol + rtol |b|)`` (``<= 1``: no element outside the tolerance)."""
+        if a.numel() == 0:
+            return 0.0
+        a, b = a.double(), b.double()
+        if not torch.isfinite(a).all():
+            return float("inf")
+        return float(((a - b).abs() / (atol + rtol * b.abs())).max())
+
+    x_dev, dy_dev = x_all.to(device), dy_all.to(device)
+    y_ref, dx_ref, dw_ref = _reference(x_dev, w, cu_dev, dy_dev)
+    dx_nocp, _ = conv.cake_causal_conv1d_det_train_backward(x_dev, w, cu_dev, dy_dev)
+    partials = [torch.empty_like(direct["dw"]) for _ in range(W)]
+    dist.all_gather(partials, direct["dw"].contiguous())
+    dw_sum = partials[0].clone()
+    for partial in partials[1:]:
+        dw_sum += partial
+    info["ratio_to_tolerance"] = {
+        "y_vs_fp64": ratio(direct["y"], _local(part, rank, cu, y_ref), Y_ATOL, Y_RTOL),
+        "dx_vs_fp64": ratio(
+            direct["dx"], _local(part, rank, cu, dx_ref), Y_ATOL, Y_RTOL
+        ),
+        "dx_vs_nocp": ratio(
+            direct["dx"], _local(part, rank, cu, dx_nocp), NOCP_ATOL, NOCP_RTOL
+        ),
+        "dw_rank_sum_vs_fp64": ratio(dw_sum, dw_ref, DW_ATOL, DW_RTOL),
+    }
+    for key, value in info["ratio_to_tolerance"].items():
+        flags[f"{key}_within_tolerance"] = value <= 1.0
+
+    # Steady state: an explicit forward + backward of each form after the calls above issues no host-to-device copy,
+    # no synchronizing operation (the probe queued before it still runs when the host returns) and no device
+    # allocation or free; bitwise the first calls.
+    from tests.experimental.test_helpers.cake_host_sync import (
+        allocator_counts,
+        census,
+        nonblocking,
+        summary,
+    )
+
+    alloc_ok = allocator_counts(device)
+
+    def steady() -> list:
+        y_s, hist_s = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+        out = [y_s, hist_s]
+        for coop in (True, False):
+            out += conv_kcp.cake_causal_conv1d_det_train_kcp_backward(
+                x, w, ctx, dy, hist_s, cooperative=coop
+            )
+        return out
+
+    # after allocator_counts' empty_cache: fill the allocator's cache again
+    for _ in range(2):
+        steady()
+    c = census(steady, device)
+    info["steady_census"] = summary(c)
+    expected = [forms[True]["y"], forms[True]["hist"], forms[True]["dx"]]
+    expected += [forms[True]["dw"], forms[False]["dx"], forms[False]["dw"]]
+    flags["steady_nonblocking"] = nonblocking(c) and c["pinned"] == 0
+    flags["steady_no_device_alloc"] = not alloc_ok or (
+        (c["device_alloc"], c["device_free"], c["alloc_retries"]) == (0, 0, 0)
+        and c["prof_malloc"] in (None, 0)
+    )
+    flags["steady_bitwise"] = all(
+        same(a, b) for a, b in zip(c["out"], expected, strict=True)
+    )
+    info["allocator_counts"] = alloc_ok
+
+    # Per-document zigzag: the longest document is a chain of 2 W fragments over every rank (128 at W = 64).
+    if layout == "zigzag_per_document":
+        chain = max(
+            sum(1 for frs in part.fragments for f in frs if f.doc == d and f.length)
+            for d in range(len(lengths))
+        )
+        info["longest_chain"] = chain
+        flags["chain_of_2w_fragments"] = chain == 2 * W
     flag_list = [None] * W
     info_list = [None] * W
     dist.all_gather_object(flag_list, flags)
@@ -431,9 +649,18 @@ def _supported() -> bool:
     return is_cake_causal_conv1d_det_train_supported(torch.device("cuda"))
 
 
-@pytest.mark.parametrize("row", ROWS, ids=_row_id)
+def _skip_without_allocator_counts(report: dict) -> None:
+    # every other flag passed; the no-device-allocation flag is unmeasured on a rank whose allocator does not count
+    if not all(info["allocator_counts"] for info in report["info_by_rank"]):
+        pytest.skip(
+            "the caching allocator's statistics do not count device allocations here"
+        )
+
+
+@pytest.mark.parametrize("row", ROWS + ROWS_SCALE, ids=_row_id)
 def test_recompute_handle_rows(row) -> None:
-    """Bitwise and per-phase collective counts of the checkpoint with / without a recompute handle (module docstring)."""
+    """Bitwise and per-phase collective counts of the checkpoint with / without a recompute handle, repeats per launch
+    form, FP64 / no-CP tolerances and the steady-state census (module docstring)."""
     W = row[1]
     ntasks = int(os.environ.get("SLURM_NTASKS", "1"))
     if os.environ.get("SLURM_PROCID") is not None and ntasks > 1:
@@ -450,6 +677,7 @@ def test_recompute_handle_rows(row) -> None:
             int(os.environ.get("SLURM_LOCALID", "0")),
         )
         assert report["pass"], report
+        _skip_without_allocator_counts(report)
         return
     if not _supported():
         pytest.skip("cake_causal_conv1d_det_train needs a supported CUDA device")
@@ -467,3 +695,4 @@ def test_recompute_handle_rows(row) -> None:
         with open(os.path.join(result_dir, _row_id(row) + ".json")) as fh:
             report = json.load(fh)
     assert report["pass"], report
+    _skip_without_allocator_counts(report)

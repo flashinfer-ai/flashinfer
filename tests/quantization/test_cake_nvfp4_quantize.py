@@ -34,7 +34,7 @@ from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import (
     kernel_definitions,
     kernel_module_name,
 )
-from tests.test_helpers.cake_nvfp4_per_token import (
+from tests.quantization.test_helpers.cake_nvfp4_per_token import (
     VALIDATED_F16_INPUT_ROWS,
     VALIDATED_OFF_MATRIX_QUANTIZE_K,
     VALIDATED_QUANTIZE_K,
@@ -952,7 +952,7 @@ def _check_against_reference(x, gs_inv, out_scale, fp4, sf, scale):
     assert bool(((decoded - ref_codes).abs() <= quantum * 1.001).all())
 
 
-# The validated matrix (validated_problems in tests/test_helpers/
+# The validated matrix (validated_problems in tests/quantization/test_helpers/
 # cake_nvfp4_per_token.py): bf16 activations on
 # every K x M x fold; fp16 activations on the validated fp16 rows of K=7168, and the
 # K=7168 rows outside them that run the nearest registered program (1 and 8192 tokens).

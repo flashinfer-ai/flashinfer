@@ -22,8 +22,8 @@ per-size tables through ``_tab`` (the module-level tables at 4096,
 harness table of record at the two sizes -- one row per (hidden size, token
 count, board) over the 28 token counts of the contract and the four boards --
 and the registry must reproduce every row bitwise. The module also checks the
-records and routes of the two sizes (sm_100a and sm_103a; sm_107a ships 4096
-alone), their launch facts, that every call selects exactly one record per
+records and routes of the two sizes (sm_100a, sm_103a and sm_107a), their
+launch facts, that every call selects exactly one record per
 role -- the record of the program the host rule names -- and that the selected
 records launch the grids of the table, and that a Sinkhorn count other than
 the compiled 20 selects the size's run-time-count records.
@@ -33,9 +33,9 @@ from __future__ import annotations
 
 import pytest
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
-loader = cake_package("cake_mhc_det_train", "cake_jit")
+loader = cake_package("cake.cake_mhc_det_train", "cake_jit")
 
 NEW_HIDDEN_SIZES = (5120, 7168)
 BOARDS = (("sm_100a", 148), ("sm_103a", 152), ("sm_107a", 208), ("sm_107a", 216))
@@ -488,11 +488,102 @@ NEW_H_ROUTES = {
             "cake_mhc_det_train_fwd_coef__rt64__h7168",
         ],
     },
+    "sm_107a": {
+        "bwd_finish_h5120": [
+            "cake_mhc_det_train_fn_split__tv128_t128__h5120__t",
+            "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
+            "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h5120",
+            "cake_mhc_det_train_bwd_token__rt64__h5120",
+            "cake_mhc_det_train_bwd_slab__xrsg__h5120",
+            "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h5120",
+            "cake_mhc_det_train_bwd_reduce__wpu4__h5120",
+            "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h5120",
+        ],
+        "bwd_prepare_h5120": [
+            "cake_mhc_det_train_bwd_prepare__t160__h5120__a7",
+            "cake_mhc_det_train_bwd_prepare__h5120",
+        ],
+        "fwd_finish_h5120": [
+            "cake_mhc_det_train_fwd_finish__w1__h5120",
+        ],
+        "fwd_prepare_h5120": [
+            "cake_mhc_det_train_fn_split__h5120",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h5120",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree__h5120",
+            "cake_mhc_det_train_fwd_coef__pfl2_qmt__h5120",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+            "cake_mhc_det_train_fwd_coef__g2_el__h5120",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h5120",
+            "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd__h5120",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe__h5120",
+            "cake_mhc_det_train_fwd_coef__rt64__h5120",
+            "cake_mhc_det_train_fwd_collapse__h5120",
+        ],
+        "fwd_recompute_h5120": [
+            "cake_mhc_det_train_fn_split__h5120",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h5120",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree__h5120",
+            "cake_mhc_det_train_fwd_coef__pfl2_qmt__h5120",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+            "cake_mhc_det_train_fwd_coef__g2_el__h5120",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h5120",
+            "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd__h5120",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe__h5120",
+            "cake_mhc_det_train_fwd_coef__rt64__h5120",
+        ],
+        "bwd_finish_h7168": [
+            "cake_mhc_det_train_fn_split__tv128_t128__h7168__t",
+            "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
+            "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h7168",
+            "cake_mhc_det_train_bwd_token__rt64__h7168",
+            "cake_mhc_det_train_bwd_slab__xrsg__h7168",
+            "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h7168",
+            "cake_mhc_det_train_bwd_reduce__wpu4__h7168",
+            "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h7168",
+        ],
+        "bwd_prepare_h7168": [
+            "cake_mhc_det_train_bwd_prepare__t224__h7168__a7",
+            "cake_mhc_det_train_bwd_prepare__h7168",
+        ],
+        "fwd_finish_h7168": [
+            "cake_mhc_det_train_fwd_finish__w1__h7168",
+        ],
+        "fwd_prepare_h7168": [
+            "cake_mhc_det_train_fn_split__h7168",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h7168",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h7168",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168",
+            "cake_mhc_det_train_fwd_coef__pfl2_qmt__h7168",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+            "cake_mhc_det_train_fwd_coef__g2_el__h7168",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h7168",
+            "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd__h7168",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe__h7168",
+            "cake_mhc_det_train_fwd_coef__rt64__h7168",
+            "cake_mhc_det_train_fwd_collapse__h7168",
+        ],
+        "fwd_recompute_h7168": [
+            "cake_mhc_det_train_fn_split__h7168",
+            "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h7168",
+            "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h7168",
+            "cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168",
+            "cake_mhc_det_train_fwd_coef__pfl2_qmt__h7168",
+            "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+            "cake_mhc_det_train_fwd_coef__g2_el__h7168",
+            "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h7168",
+            "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd__h7168",
+            "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe__h7168",
+            "cake_mhc_det_train_fwd_coef__rt64__h7168",
+        ],
+    },
 }
 # (block, dynamic shared memory bytes, persistent CTAs per SM, use_pdl) of every record of the two sizes.
 NEW_H_LAUNCH_FACTS = {
     "cake_mhc_det_train_fn_split__h5120": ((256, 1, 1), 0, 1, False),
     "cake_mhc_det_train_fn_split__tv128__h5120__t": ((256, 1, 1), 0, 1, False),
+    "cake_mhc_det_train_fn_split__tv128_t128__h5120__t": ((128, 1, 1), 0, 1, False),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h5120": ((192, 1, 1), 144384, 1, False),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120": ((192, 1, 1), 115712, 2, False),
     "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h5120": ((128, 1, 1), 0, 1, True),
@@ -503,11 +594,19 @@ NEW_H_LAUNCH_FACTS = {
     "cake_mhc_det_train_fwd_coef__qe_mb10_pu4__h5120": ((128, 1, 1), 0, 1, True),
     "cake_mhc_det_train_fwd_coef__lp2_w8_adj__h5120": ((128, 1, 1), 0, 1, True),
     "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd__h5120": ((128, 1, 1), 6400, 1, True),
+    "cake_mhc_det_train_fwd_coef__pfl2_qmt__h5120": ((128, 1, 1), 0, 1, True),
+    "cake_mhc_det_train_fwd_coef__g2_el__h5120": ((128, 1, 1), 25600, 1, True),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd__h5120": ((128, 1, 1), 6400, 1, True),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe__h5120": ((128, 1, 1), 0, 1, True),
     "cake_mhc_det_train_fwd_collapse__h5120": ((256, 1, 1), 0, 1, 'runtime'),
     "cake_mhc_det_train_fwd_finish__w2__h5120": ((256, 1, 1), 0, 1, True),
+    "cake_mhc_det_train_fwd_finish__w1__h5120": ((256, 1, 1), 0, 1, True),
     "cake_mhc_det_train_bwd_prepare__t160__h5120": ((160, 1, 1), 896, 1, 'runtime'),
+    "cake_mhc_det_train_bwd_prepare__t160__h5120__a7": ((160, 1, 1), 896, 1, 'runtime'),
+    "cake_mhc_det_train_bwd_prepare__h5120": ((320, 1, 1), 1664, 1, 'runtime'),
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120": ((256, 1, 1), 111616, 2, True),
     "cake_mhc_det_train_bwd_token__dot_ao8__h5120": ((256, 1, 1), 111616, 2, True),
+    "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h5120": ((256, 1, 1), 111616, 2, True),
     "cake_mhc_det_train_fwd_coef__rt64__h5120": ((128, 1, 1), 0, 1, True),
     "cake_mhc_det_train_bwd_token__rt64__h5120": ((256, 1, 1), 71296, 2, True),
     "cake_mhc_det_train_bwd_slab__xrsg__h5120": ((384, 1, 1), 232448, 1, 'runtime'),
@@ -516,10 +615,13 @@ NEW_H_LAUNCH_FACTS = {
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h5120": ((256, 1, 1), 4224, 1, 'runtime'),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120": ((256, 1, 1), 4224, 1, 'runtime'),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h5120": ((256, 1, 1), 4224, 1, 'runtime'),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h5120": ((256, 1, 1), 4224, 1, 'runtime'),
+    "cake_mhc_det_train_bwd_reduce__wpu4__h5120": ((256, 1, 1), 4224, 1, 'runtime'),
     "cake_mhc_det_train_bwd_reduce__pt64__h5120": ((64, 1, 1), 2688, 1, 'runtime'),
     "cake_mhc_det_train_bwd_reduce__pt32__h5120": ((32, 1, 1), 2432, 1, 'runtime'),
     "cake_mhc_det_train_fn_split__h7168": ((256, 1, 1), 0, 1, False),
     "cake_mhc_det_train_fn_split__tv128__h7168__t": ((256, 1, 1), 0, 1, False),
+    "cake_mhc_det_train_fn_split__tv128_t128__h7168__t": ((128, 1, 1), 0, 1, False),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h7168": ((192, 1, 1), 144384, 1, False),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h7168": ((192, 1, 1), 115712, 2, False),
     "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h7168": ((128, 1, 1), 0, 1, True),
@@ -530,11 +632,19 @@ NEW_H_LAUNCH_FACTS = {
     "cake_mhc_det_train_fwd_coef__qe_mb10_pu4__h7168": ((128, 1, 1), 0, 1, True),
     "cake_mhc_det_train_fwd_coef__lp2_w8_adj__h7168": ((128, 1, 1), 0, 1, True),
     "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd__h7168": ((128, 1, 1), 6400, 1, True),
+    "cake_mhc_det_train_fwd_coef__pfl2_qmt__h7168": ((128, 1, 1), 0, 1, True),
+    "cake_mhc_det_train_fwd_coef__g2_el__h7168": ((128, 1, 1), 25600, 1, True),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd__h7168": ((128, 1, 1), 6400, 1, True),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe__h7168": ((128, 1, 1), 0, 1, True),
     "cake_mhc_det_train_fwd_collapse__h7168": ((256, 1, 1), 0, 1, 'runtime'),
     "cake_mhc_det_train_fwd_finish__w2__h7168": ((256, 1, 1), 0, 1, True),
+    "cake_mhc_det_train_fwd_finish__w1__h7168": ((256, 1, 1), 0, 1, True),
     "cake_mhc_det_train_bwd_prepare__t224__h7168": ((224, 1, 1), 1152, 1, 'runtime'),
+    "cake_mhc_det_train_bwd_prepare__t224__h7168__a7": ((224, 1, 1), 1152, 1, 'runtime'),
+    "cake_mhc_det_train_bwd_prepare__h7168": ((448, 1, 1), 2304, 1, 'runtime'),
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168": ((256, 1, 1), 152576, 1, True),
     "cake_mhc_det_train_bwd_token__dot_ao8__h7168": ((256, 1, 1), 152576, 1, True),
+    "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h7168": ((256, 1, 1), 152576, 1, True),
     "cake_mhc_det_train_fwd_coef__rt64__h7168": ((128, 1, 1), 0, 1, True),
     "cake_mhc_det_train_bwd_token__rt64__h7168": ((256, 1, 1), 71296, 1, True),
     "cake_mhc_det_train_bwd_slab__xrsg__h7168": ((384, 1, 1), 232448, 1, 'runtime'),
@@ -543,69 +653,95 @@ NEW_H_LAUNCH_FACTS = {
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h7168": ((256, 1, 1), 4224, 1, 'runtime'),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred__h7168": ((256, 1, 1), 4224, 1, 'runtime'),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h7168": ((256, 1, 1), 4224, 1, 'runtime'),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h7168": ((256, 1, 1), 4224, 1, 'runtime'),
+    "cake_mhc_det_train_bwd_reduce__wpu4__h7168": ((256, 1, 1), 4224, 1, 'runtime'),
     "cake_mhc_det_train_bwd_reduce__pt64__h7168": ((64, 1, 1), 2688, 1, 'runtime'),
 }  # fmt: skip
 # The architectures each record of the two sizes ships for (the routes that name it).
 NEW_H_RECORD_ARCHES = {
-    "cake_mhc_det_train_fn_split__h5120": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_fn_split__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_fn_split__tv128__h5120__t": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h5120": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h5120": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_coef__st16_w4_tree__h5120": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd__h5120": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_fn_split__tv128_t128__h5120__t": ('sm_107a',),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_fwd_coef__st16_w4_tree__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_fwd_coef__qe_mb10__h5120": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_fwd_coef__st8_lp2__h5120": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_fwd_coef__qe_mb10_pu4__h5120": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_fwd_coef__lp2_w8_adj__h5120": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd__h5120": ('sm_100a',),
-    "cake_mhc_det_train_fwd_collapse__h5120": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_fwd_coef__pfl2_qmt__h5120": ('sm_107a',),
+    "cake_mhc_det_train_fwd_coef__g2_el__h5120": ('sm_107a',),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd__h5120": ('sm_107a',),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe__h5120": ('sm_107a',),
+    "cake_mhc_det_train_fwd_collapse__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_fwd_finish__w2__h5120": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_fwd_finish__w1__h5120": ('sm_107a',),
     "cake_mhc_det_train_bwd_prepare__t160__h5120": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_bwd_prepare__t160__h5120__a7": ('sm_107a',),
+    "cake_mhc_det_train_bwd_prepare__h5120": ('sm_107a',),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_bwd_token__dot_ao8__h5120": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_coef__rt64__h5120": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_bwd_token__rt64__h5120": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_bwd_slab__xrsg__h5120": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h5120": ('sm_107a',),
+    "cake_mhc_det_train_fwd_coef__rt64__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_bwd_token__rt64__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_bwd_slab__xrsg__h5120": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_bwd_slab__dynr__h5120": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_bwd_slab__dynl__h5120": ('sm_100a',),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h5120": ('sm_100a',),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120": ('sm_100a',),
-    "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h5120": ('sm_100a',),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h5120": ('sm_100a', 'sm_107a'),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h5120": ('sm_107a',),
+    "cake_mhc_det_train_bwd_reduce__wpu4__h5120": ('sm_107a',),
     "cake_mhc_det_train_bwd_reduce__pt64__h5120": ('sm_103a',),
     "cake_mhc_det_train_bwd_reduce__pt32__h5120": ('sm_103a',),
-    "cake_mhc_det_train_fn_split__h7168": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_fn_split__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_fn_split__tv128__h7168__t": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h7168": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h7168": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h7168": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd__h7168": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_fn_split__tv128_t128__h7168__t": ('sm_107a',),
+    "cake_mhc_det_train_fwd_map__nsx_st5_mb1__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_fwd_coef__qe_mb10_tree__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_fwd_coef__qe_mb10__h7168": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_fwd_coef__st8_lp2__h7168": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_fwd_coef__qe_mb10_pu4__h7168": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_fwd_coef__lp2_w8_adj__h7168": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_fwd_coef__st8_lp2_as_el_qd__h7168": ('sm_100a',),
-    "cake_mhc_det_train_fwd_collapse__h7168": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_fwd_coef__pfl2_qmt__h7168": ('sm_107a',),
+    "cake_mhc_det_train_fwd_coef__g2_el__h7168": ('sm_107a',),
+    "cake_mhc_det_train_fwd_coef__st8_lp2_tree_asel_qd__h7168": ('sm_107a',),
+    "cake_mhc_det_train_fwd_coef__lp2_w8_adj_qe__h7168": ('sm_107a',),
+    "cake_mhc_det_train_fwd_collapse__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_fwd_finish__w2__h7168": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_fwd_finish__w1__h7168": ('sm_107a',),
     "cake_mhc_det_train_bwd_prepare__t224__h7168": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_bwd_prepare__t224__h7168__a7": ('sm_107a',),
+    "cake_mhc_det_train_bwd_prepare__h7168": ('sm_107a',),
+    "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_bwd_token__dot_ao8__h7168": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_fwd_coef__rt64__h7168": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_bwd_token__rt64__h7168": ('sm_100a', 'sm_103a'),
-    "cake_mhc_det_train_bwd_slab__xrsg__h7168": ('sm_100a', 'sm_103a'),
+    "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h7168": ('sm_107a',),
+    "cake_mhc_det_train_fwd_coef__rt64__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_bwd_token__rt64__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
+    "cake_mhc_det_train_bwd_slab__xrsg__h7168": ('sm_100a', 'sm_103a', 'sm_107a'),
     "cake_mhc_det_train_bwd_slab__dynr__h7168": ('sm_100a', 'sm_103a'),
     "cake_mhc_det_train_bwd_slab__dynl__h7168": ('sm_100a',),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h7168": ('sm_100a',),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred__h7168": ('sm_100a',),
-    "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h7168": ('sm_100a',),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h7168": ('sm_100a', 'sm_107a'),
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h7168": ('sm_107a',),
+    "cake_mhc_det_train_bwd_reduce__wpu4__h7168": ('sm_107a',),
     "cake_mhc_det_train_bwd_reduce__pt64__h7168": ('sm_103a',),
 }  # fmt: skip
 NEW_H_RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split__h5120": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__h5120__t": {"want_t": 1},
+    "cake_mhc_det_train_fn_split__tv128_t128__h5120__t": {"want_t": 1},
     "cake_mhc_det_train_fn_split__h7168": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__h7168__t": {"want_t": 1},
+    "cake_mhc_det_train_fn_split__tv128_t128__h7168__t": {"want_t": 1},
 }
 
 
@@ -639,6 +775,10 @@ COEF_TOKENS_PER_CTA = {
     "qe_mb10_pu4": 8,
     "lp2_w8_adj": 8,
     "st8_lp2_as_el_qd": 8,
+    "pfl2_qmt": 8,
+    "g2_el": 16,
+    "st8_lp2_tree_asel_qd": 8,
+    "lp2_w8_adj_qe": 8,
 }
 # the program rule of each program-selected role and the table column it fills
 PROGRAM_COLUMN = {
@@ -706,7 +846,11 @@ def test_records_and_routes_of_the_new_hidden_sizes() -> None:
         hidden = record["hidden"]
         suffix = f"__h{hidden}"
         assert record["library"].endswith(suffix), name
-        assert name in (record["library"], f"{record['library']}__t"), name
+        assert name in (
+            record["library"],
+            f"{record['library']}__t",
+            f"{record['library']}__a7",
+        ), name
         assert record["kernel"] == record["library"], name
         assert record["kernel_symbol"] == f"kernel_{record['library']}", name
         assert tuple(record["arches"]) == NEW_H_RECORD_ARCHES[name], name
@@ -718,16 +862,19 @@ def test_records_and_routes_of_the_new_hidden_sizes() -> None:
             launch["use_pdl"],
         ) == NEW_H_LAUNCH_FACTS[name], name
         rule = record["select_rule"]
-        # the host rule's program (or none); the run-time-count records' Sinkhorn count
-        want = "run_time_iters" if "__rt64__" in name else "program"
+        # the host rule's program (or none); the run-time-count records' Sinkhorn count; sm_107a's backward prepare
+        # by token count (K5_FORM_BANDS: the one-token form to 8192 tokens, the two-token form above)
+        want = (
+            "run_time_iters"
+            if "__rt64__" in name
+            else "rows_between"
+            if record["role"] == "bwd_prepare" and record["arches"] == ["sm_107a"]
+            else "program"
+        )
         assert (rule["kind"] if rule else "program") == want, name
-    # the routes of the two sizes on sm_100a / sm_103a; none on sm_107a
+    # the routes of the two sizes on every architecture
     for arch in loader.ARCHES:
         keys = [key for key in loader.ROUTES[arch] if not key.endswith("_h4096")]
-        if arch == "sm_107a":
-            assert keys == [], arch
-            assert loader.supported_hidden_sizes(arch) == (4096,)
-            continue
         assert {key: loader.ROUTES[arch][key] for key in keys} == NEW_H_ROUTES[arch]
         assert loader.supported_hidden_sizes(arch) == (4096, *NEW_HIDDEN_SIZES)
         for hidden in NEW_HIDDEN_SIZES:
@@ -749,7 +896,7 @@ def test_records_and_routes_of_the_new_hidden_sizes() -> None:
         if name in modules
     } == NEW_H_RECORD_SCALARS
     for hidden in NEW_HIDDEN_SIZES:
-        for arch, applies in (("sm_100a", True), ("sm_103a", True), ("sm_107a", False)):
+        for arch, applies in (("sm_100a", True), ("sm_103a", True), ("sm_107a", True)):
             capability = {"sm_100a": (10, 0), "sm_103a": (10, 3), "sm_107a": (10, 7)}[
                 arch
             ]
@@ -767,7 +914,7 @@ def test_records_and_routes_of_the_new_hidden_sizes() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("hidden", NEW_HIDDEN_SIZES)
-@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 def test_every_call_selects_one_record_per_role(arch: str, hidden: int) -> None:
     """Every call selects exactly one record of each role its route carries -- the
     record of the program the host rule names at the call's hidden size."""
@@ -782,8 +929,17 @@ def test_every_call_selects_one_record_per_role(arch: str, hidden: int) -> None:
                 got = [loader.MODULES[name]["role"] for name in selected]
                 assert sorted(got) == sorted(roles), (kind, sm, T, selected)
                 for name in selected:
-                    rule = loader.MODULES[name]["select_rule"]
-                    if rule is None:
+                    record = loader.MODULES[name]
+                    rule = record["select_rule"]
+                    if record["role"] == "bwd_prepare":
+                        # the backward prepare's form of record (k5_program): the one-token library or the
+                        # two-token production library of the size
+                        form = loader.k5_program(T, sm, arch, hidden)
+                        want = f"cake_mhc_det_train_bwd_prepare__{form}__h{hidden}"
+                        if form == "production":
+                            want = f"cake_mhc_det_train_bwd_prepare__h{hidden}"
+                        assert record["library"] == want, (kind, sm, T, name)
+                    if rule is None or rule["kind"] != "program":
                         continue
                     program = getattr(loader, rule["rule"])(T, sm, arch, hidden)
                     assert program == rule["program"], (kind, sm, T, name)
@@ -791,7 +947,7 @@ def test_every_call_selects_one_record_per_role(arch: str, hidden: int) -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("hidden", NEW_HIDDEN_SIZES)
-@pytest.mark.parametrize(("arch", "sm"), BOARDS[:2])
+@pytest.mark.parametrize(("arch", "sm"), BOARDS)
 def test_selected_records_launch_the_grids_of_the_table(
     monkeypatch: pytest.MonkeyPatch, arch: str, sm: int, hidden: int
 ) -> None:
@@ -810,7 +966,7 @@ def test_selected_records_launch_the_grids_of_the_table(
                 grid = loader.launch_grid(record, T, device_index=0)
                 role = record["role"]
                 rule = record["select_rule"]
-                if rule is not None:
+                if rule is not None and rule["kind"] == "program":
                     assert row[PROGRAM_COLUMN[rule["rule"]]] == rule["program"], (
                         T,
                         name,
@@ -829,7 +985,7 @@ def test_selected_records_launch_the_grids_of_the_table(
 def test_a_run_time_sinkhorn_count_selects_the_size_run_time_records(
     hidden: int,
 ) -> None:
-    """At 5120 and 7168 (sm_100a / sm_103a) a count other than 20 launches, for the coefficient and token-owner
+    """At 5120 and 7168 (sm_100a / sm_103a / sm_107a) a count other than 20 launches, for the coefficient and token-owner
     passes, exactly the size's run-time-count record and none of their compiled records; every other role keeps its
     records of the count of record, and at 20 no run-time-count record launches."""
     run_time = {
@@ -838,10 +994,14 @@ def test_a_run_time_sinkhorn_count_selects_the_size_run_time_records(
     }
     for name in run_time.values():
         record = loader.MODULES[name]
-        assert record["hidden"] == hidden and record["arches"] == ["sm_100a", "sm_103a"]
+        assert record["hidden"] == hidden and record["arches"] == [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ]
         assert record["select_rule"] == {"kind": "run_time_iters"}
     checked = 0
-    for arch, sm in BOARDS[:2]:
+    for arch, sm in BOARDS:
         for kind in loader.KINDS:
             for rows in (1, 1024, 4096, 16263):
                 default = loader.selected_modules(
