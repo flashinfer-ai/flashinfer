@@ -480,11 +480,11 @@ def mxfp8_quantize(
     The per-batch ``[B, round_up(M, R), round_up(K / vec, 4)]`` shape, with
     ``vec`` the block size (32 here, ``sf_vec_size`` for the NVFP4
     quantizers), is the block-scale layout convention shared with
-    :func:`nvfp4_batched_quantize`.  The MoE weight-refit layout contract
-    refers to this convention: a refit path that ships quantized expert
-    weights with their block scales describes the scales in this form,
-    one padded swizzled block per expert or batch, instead of defining a
-    padding rule of its own.
+    :func:`nvfp4_batched_quantize`.
+
+    With ``rank_preserving=True`` and ``M`` not a multiple of the swizzle row
+    block, a batched input costs one quantizer launch per batch plus a
+    ``torch.stack`` copy; aligned ``M`` takes a single launch.
     """
     sf_vec_size = 32
 
@@ -572,7 +572,10 @@ def _mxfp8_quantize_per_batch(
     alignment: int,
     enable_pdl: Optional[bool],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``[*, M, K]`` input to ``[*, M, K_pad]`` codes and ``[*, M_pad, cols]`` scales, padded per batch."""
+    """``[*, M, K]`` input to ``[*, M, K_pad]`` codes and ``[*, M_pad, cols]`` scales, padded per batch.
+
+    Unaligned ``M`` launches once per batch and stacks the results.
+    """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
     *batch_dims, m, k = input.shape

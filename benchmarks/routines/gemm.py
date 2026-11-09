@@ -1154,12 +1154,16 @@ def testBmmMxfp8(args):
 
     ## Prepare input tensors
     input = torch.randn([batch_size, m, k], device=device, dtype=torch.bfloat16)
-    input_mxfp8, input_scale = mxfp8_quantize(input, is_sf_swizzled_layout=True)
+    input_mxfp8, input_scale = mxfp8_quantize(
+        input, is_sf_swizzled_layout=True, rank_preserving=True
+    )
 
     # Quantize [b, n, k] weights, then pass their [b, k, n] transpose as B.
     # Keep the transpose as a view so the K dimension remains contiguous.
     mat2_weight = torch.randn([batch_size, n, k], device=device, dtype=torch.bfloat16)
-    mat2_mxfp8, mat2_scale = mxfp8_quantize(mat2_weight, is_sf_swizzled_layout=True)
+    mat2_mxfp8, mat2_scale = mxfp8_quantize(
+        mat2_weight, is_sf_swizzled_layout=True, rank_preserving=True
+    )
     # [b, k, n] views for the GEMM call and the reference.
     mat2_mxfp8 = mat2_mxfp8.transpose(-2, -1)
     mat2 = mat2_weight.transpose(-2, -1)

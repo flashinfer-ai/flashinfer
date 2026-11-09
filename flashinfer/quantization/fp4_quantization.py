@@ -2301,11 +2301,7 @@ def nvfp4_batched_quantize(
 
     The per-batch ``[B, round_up(M, 128), round_up(K / sf_vec_size, 4)]``
     shape is the block-scale layout convention shared with
-    :func:`mxfp8_quantize`.  The MoE weight-refit layout contract refers
-    to this convention: a refit path that ships quantized expert weights
-    with their block scales describes the scales in this form, one padded
-    swizzled block per expert or batch, instead of defining a padding rule
-    of its own.
+    :func:`mxfp8_quantize`.
     """
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     # e4m3 input reaches the recipe-less FP8 branch of invokeFP4Quantization;
