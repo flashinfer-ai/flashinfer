@@ -802,6 +802,48 @@ def test_three_routing_modes_agree_and_runs_are_deterministic():
 
 
 @needs_device
+def test_routing_constants_first_made_under_graph_capture_are_not_cached():
+    """A routing constant (the absent bias, the scale) first materialised while a CUDA graph is being captured is a
+    graph-pool allocation whose fill runs only at replay: it serves that capture alone and is never cached, so an eager
+    call after the capture gives the bits of an eager call before it, and the replay gives them too."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, E = 64, 8, 96
+    g = torch.Generator().manual_seed(11)
+    logits = (torch.randn(T, E, generator=g) * 2).cuda()
+    bias = (torch.randn(E, generator=g) * 0.1).cuda()
+    calls = (
+        # the absent bias: a cached zero vector per expert count
+        dict(method=S.METHOD_OF_FLASHINFER[RoutingMethodType.Renormalize]),
+        # the scale given as a number: a cached one-element tensor
+        dict(
+            method=S.METHOD_OF_FLASHINFER[RoutingMethodType.DeepSeekV3],
+            bias=bias,
+            scaling_factor=2.5,
+        ),
+    )
+    for kw in calls:
+        ex0, w0 = api.route(logits, k, **kw)  # eager: the compile, the constants cached
+        torch.cuda.synchronize()
+        api._CONST.clear()
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                ex_g, w_g = api.route(logits, k, **kw)
+        torch.cuda.synchronize()
+        assert not api._CONST  # nothing made under capture is served to later calls
+        ex1, w1 = api.route(logits, k, **kw)
+        assert torch.equal(ex1, ex0) and torch.equal(bits(w1), bits(w0))
+        ex_g.fill_(-1)
+        w_g.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(ex_g, ex0) and torch.equal(bits(w_g), bits(w0))
+
+
+@needs_device
 def test_batch_permutation_and_subbatch_invariance():
     """A token's bits do not depend on the batch size, its position, its neighbours or the expert loads the other tokens
     create: prefixes, permutations, sub-batches, one token alone, and a hot expert group around a probe token."""

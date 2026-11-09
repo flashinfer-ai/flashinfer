@@ -28,7 +28,11 @@ _CONST: Dict[Tuple[int, int, float], torch.Tensor] = {}
 
 def _const(dev: torch.device, n: int, value: float) -> torch.Tensor:
     """A cached fp32 constant tensor (``value`` repeated ``n`` times) per device: the route kernel reads an absent bias
-    or scale from it instead of a per-call fill (a fill is one more kernel in the caller's stream or graph)."""
+    or scale from it instead of a per-call fill (a fill is one more kernel in the caller's stream or graph). Under CUDA
+    graph capture the tensor is a graph-pool allocation whose fill runs only at replay: it serves that capture alone
+    and is never cached."""
+    if torch.cuda.is_current_stream_capturing():
+        return torch.full((n,), value, dtype=torch.float32, device=dev)
     key = (
         dev.index if dev.index is not None else torch.cuda.current_device(),
         n,
