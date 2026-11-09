@@ -81,7 +81,6 @@ def _get_cuda_graph_resources() -> _CudaGraphResources:
     return _cuda_graph_resources
 
 
-@functools.lru_cache(maxsize=None)
 def _sm90_moe_autotune_op_name(
     activation_type: int, situ_beta: Optional[float] = None
 ) -> str:
@@ -92,39 +91,12 @@ def _sm90_moe_autotune_op_name(
 
 
 @functools.lru_cache(maxsize=None)
-def _get_runner(
-    num_experts: int,
-    top_k: int,
-    num_local_experts: int,
-    local_expert_offset: int,
-    use_fused_finalize: bool,
-    enable_pdl: bool,
-    activation_type: int,
-    swiglu_alpha: float,
-    swiglu_beta: float,
-    swiglu_limit: float,
-    situ_beta: Optional[float],
-    situ_linear_beta: Optional[float],
-) -> CuteDslFusedMoESm90Runner:
+def _get_runner(**config: Any) -> CuteDslFusedMoESm90Runner:
     """The runner of one static MoE configuration (holds no tensors, so one
     instance serves every call with that configuration). Construction
     validates the activation parameters; a rejected configuration is not
     cached."""
-    return CuteDslFusedMoESm90Runner(
-        forward_impl=_moe_core_impl,
-        num_experts=num_experts,
-        top_k=top_k,
-        num_local_experts=num_local_experts,
-        local_expert_offset=local_expert_offset,
-        use_fused_finalize=use_fused_finalize,
-        enable_pdl=enable_pdl,
-        activation_type=activation_type,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
+    return CuteDslFusedMoESm90Runner(forward_impl=_moe_core_impl, **config)
 
 
 def _moe_core_impl(
@@ -419,18 +391,18 @@ def cute_dsl_fused_moe_bf16(
         num_local_experts = num_experts
     # Validates the activation configuration (once per configuration).
     runner = _get_runner(
-        num_experts,
-        top_k,
-        num_local_experts,
-        local_expert_offset,
-        use_fused_finalize,
-        enable_pdl,
-        activation_type,
-        float(swiglu_alpha),
-        float(swiglu_beta),
-        float(swiglu_limit),
-        situ_beta,
-        situ_linear_beta,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        use_fused_finalize=use_fused_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=float(swiglu_alpha),
+        swiglu_beta=float(swiglu_beta),
+        swiglu_limit=float(swiglu_limit),
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
     num_tokens, hidden = x.shape

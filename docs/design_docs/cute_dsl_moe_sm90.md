@@ -220,8 +220,7 @@ The public API carries an `@flashinfer_api` trace template
 Tests cover numerical correctness across dtypes, tiles, and expert shards;
 empty and partial batches; deterministic output; CUDA-graph replay; and
 autotuning with persisted results. Host-side tests cover tactic legality,
-pruning boundaries, dispatch behavior, operand validation, the runner
-cache, and the TVM-FFI compilation of the kernels.
+pruning boundaries, and dispatch behavior.
 
 ## 8. Performance
 
