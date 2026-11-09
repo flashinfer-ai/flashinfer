@@ -69,7 +69,9 @@ group of three is the round-once ``tail_g3_f32x`` (the group's FP32 ``dq`` /
 through token-row strides, so the head views of one packed row get one packed
 gradient row, :class:`CakeGDNDetPackedFunction`), and on those of
 ``DVL32_ARCHS`` its tcgen05 adjoint scan is ``dhu_tc2_dvl32`` (the FP32
-``dv_local`` values added to ``dv2`` before its one rounding);
+``dv_local`` values added to ``dv2`` before its one rounding: other ``dk`` /
+``dv`` / ``dg`` / ``dbeta`` / initial-state-gradient bits than the register
+scan's, within the budgets);
 :func:`fused_tail_stage`, :func:`dhu_tc2_stage`.  A host-built table lists
 the sequences longest first (:func:`lpt_sequence_order`; every chunk keeps its
 token offset, the state rows are gathered into that order and the final state
@@ -396,8 +398,10 @@ class ChainOptions:
     tail, :func:`fused_tail_stage`); ``warmup_log2`` overrides the pre-scans' warm-up threshold; ``dhu_scan``
     forces the adjoint scan of a serial plan (``"reg"``: ``dv_local`` + the register scan, ``"tc"``: ``dhu_tc2``;
     ``None``: the selection rule) and the pass 2 of a split ``SDT_CONFIG`` plan on a host-built table (``"reg"``:
-    ``dv_local`` + the register scan, ``"tc"``: ``dhu_tc2`` after the fused pre-scan; the same bits; a value-head
-    group of three runs the tcgen05 scan as :func:`dhu_tc2_stage`); ``prep``
+    ``dv_local`` + the register scan, ``"tc"``: ``dhu_tc2`` after the fused pre-scan).  ``"tc"`` runs the tcgen05
+    scan of :func:`dhu_tc2_stage`: on ``dhu_tc2`` it gives the bits of ``"reg"``; on ``dhu_tc2_dvl32`` (a value-head
+    group of three on ``DVL32_ARCHS``, dv2 rounded once) o and the final state keep the bits of ``"reg"`` and the
+    gradients take others within the budgets; ``prep``
     forces the prep (``"plain"``: grid (chunks, HV); ``"tma"``: ``prep_tma``,
     grid (chunks, H), where q and k are 16-byte aligned; ``None``: the dispatch rule) and with it the prep forward (a
     ``prep``, ``scan_config`` or ``segment_chunks`` pin keeps a call off the forwards on wy_a's A, :func:`fwd_a_route`,
@@ -1400,7 +1404,10 @@ def _dhu_tc_selected(
 # A split plan at ``SDT_CONFIG`` runs the pre-scan and the stitch, then pass 2 either as ``dv_local`` + the register
 # scan or on ``dhu_tc2`` (one CTA per (segment, value head), ``dv_local`` fused) from the stitched per-segment ``dht``;
 # on the ``dhu_tc2`` form the pre-scan is ``dhu_pre_dvl_r64k1``, which computes the ``dv_local`` tiles of the chunks it
-# scans, so no ``dv_local`` stage runs.  Both forms give the same bits at the same segment table.  The rule prices pass
+# scans, so no ``dv_local`` stage runs.  Both forms give the same bits at the same segment table on ``dhu_tc2``; on
+# ``dhu_tc2_dvl32`` (:func:`dhu_tc2_stage`: a value-head group of three on ``DVL32_ARCHS``) dv2 rounds once, so dk / dv
+# / dg / dbeta / dh0 take other bits than the register pass 2's (within the budgets), and this rule, the ``dhu_scan``
+# pin and the table route (a device-built table keeps the register pass 2) choose between them.  The rule prices pass
 # 2 the way :func:`dhu_tc_pricing` prices a serial scan: T_tc2 = steps x t(n), steps the makespan of the segment table
 # at one CTA per (segment, value head) and one CTA per SM, n = min(segments x HV, SMs) and t(n) the ``dhu_tc2``
 # interpolation above; T_reg2 = SCAN_STEP_FACTOR[SDT_CONFIG] x the planner makespan of the register pass 2 x t_unit +
@@ -3563,7 +3570,9 @@ def cake_gdn_det_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, init
 # requires dq and dk at one stride), so a call on the head views of one packed row writes one packed gradient row
 # (:class:`CakeGDNDetPackedFunction`).  On the architectures of DVL32_ARCHS the tcgen05 adjoint scan of a group of
 # three adds the FP32 dv_local values to dv2 before its one rounding (dhu_tc2_dvl32: dhu_tc2's arguments, tables and
-# selection constants), so dv2 rounds once; dk / dv / dg / dbeta / dh0 take other bits than on dhu_tc2.  B200 kernel
+# selection constants), so dv2 rounds once; dk / dv / dg / dbeta / dh0 take other bits than on dhu_tc2 and than on
+# dv_local + the register scan (dhu_tc2's bits), so the selection rules and the ``dhu_scan`` pin choose between two sets
+# of gradient bits (o and the final state keep theirs; each choice bitwise run to run).  B200 kernel
 # times (CUPTI, cold L2, four processes): tail_g3_f32x 1.024-1.051 x tail_g3, dhu_tc2_dvl32 0.990-0.995 x dhu_tc2;
 # GB300 1.039-1.045 x and 0.994-0.996 x.  Both switches are module constants whose off value is ``()``: with both off
 # a group of three runs tail_g3 on dhu_tc2 again (the non-deterministic package's tests that compare its tail_g3 with
@@ -3784,7 +3793,8 @@ def cake_gdn_det_train_backward(
         dht32, use_dht = dh0, 0
     scan_stage, vb, pre, pre_threads = _scan_stages("dhu", segs.scan_config, arch)
     if use_tc and groups is None and not wavefront:
-        # dv_local fused into the tcgen05 serial scan: the same dh / dv2 / dh0 (seg_state is not read)
+        # dv_local fused into the tcgen05 serial scan (seg_state is not read): on dhu_tc2 the register scan's dh / dv2 /
+        # dh0; dhu_tc2_dvl32 rounds dv2 once (other dh / dv2 / dh0 bits)
         _launch(tc_stage, segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
                 num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
@@ -3834,9 +3844,22 @@ def cake_gdn_det_train_backward(
         # three
         tail = fused_tail
         round_once = tail in F32X_TAILS
+        if groups is not None:
+            # R form: group A's tcgen05 adjoint scan (tc_stage, the caller's stream) first, so the host work below that
+            # makes the tail's outputs (the caller's gradient row among them) runs while it does
+            na, ca = groups.split, groups.split_chunk
+
+            def dhu_tc2(s0, s1):
+                _launch(tc_stage, s1 - s0, num_v_heads, 1, qn, kn, w, do, g_cs, dht32[s0:s1] if use_dht else dht32,
+                        dh, dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start[s0:s1 + 1],
+                        segs.seg_seq[s0:s1], meta.seq_chunk_start, num_heads, num_v_heads, use_dht,
+                        1 if has_initial_state else 0, scale)  # fmt: skip
+
+            dhu_tc2(0, na)
         stride = None
         if round_once and grad_qkv is not None:
-            # the caller's dq / dk / dv (the head views of one packed gradient row), made right before the tail
+            # the caller's dq / dk / dv (the head views of one packed gradient row), made right before the tail (after
+            # the adjoint scan's launches; on the R form after group A's)
             qkv = grad_qkv() if callable(grad_qkv) else grad_qkv
             dq, dk, dv = qkv[0], qkv[1], qkv[2]
             if len(qkv) > 3:
@@ -3890,16 +3913,9 @@ def cake_gdn_det_train_backward(
                     dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start, meta.chunk_len, num_heads,
                     num_v_heads, scale, normalize, *strides)  # fmt: skip
         else:
-            # R form: the caller's stream runs the tcgen05 adjoint scan (tc_stage) of group A (the full rounds), then the
-            # tail of A while the side stream runs that of group B (the partial round), then joins it and runs the
-            # tail of B
-            na, ca = groups.split, groups.split_chunk
-
-            def dhu_tc2(s0, s1):
-                _launch(tc_stage, s1 - s0, num_v_heads, 1, qn, kn, w, do, g_cs, dht32[s0:s1] if use_dht else dht32,
-                        dh, dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start[s0:s1 + 1],
-                        segs.seg_seq[s0:s1], meta.seq_chunk_start, num_heads, num_v_heads, use_dht,
-                        1 if has_initial_state else 0, scale)  # fmt: skip
+            # R form: the caller's stream has run the tcgen05 adjoint scan (tc_stage) of group A (the full rounds,
+            # launched above); it runs the tail of A while the side stream runs the scan of group B (the partial
+            # round), then joins it and runs the tail of B
 
             def tail_chunks(c0, c1):
                 _launch(tail, (c1 - c0) * num_v_heads, 1, 1, qn, kn, forward["rstd_q"], forward["rstd_k"], v_new, do,
@@ -3908,7 +3924,6 @@ def cake_gdn_det_train_backward(
 
             main = torch.cuda.current_stream(index)
             side = _side_stream(index, main)
-            dhu_tc2(0, na)
             fork = torch.cuda.Event()
             fork.record(main)
             try:
@@ -4346,8 +4361,9 @@ class CakeGDNDetPackedFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do, dht):
         # the gradient row and its q / k / v head views (one strided view each, at the row offsets of the forward's
-        # views), which the tail writes through their token-row strides; made when the chain reaches the tail, so the
-        # host work runs while the adjoint scan's kernels do instead of before the first of them
+        # views), which the tail writes through their token-row strides; made when the chain reaches the tail (on the
+        # two-stream R form after group A's adjoint scan is launched), so the host work runs while the adjoint scan's
+        # kernels do instead of before the first of them
         made = []
 
         def row_views():
