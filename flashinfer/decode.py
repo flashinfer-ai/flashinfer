@@ -2370,8 +2370,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._batch_invariant.refuse(
                 window_right=window_right, seq_lens=seq_lens, block_tables=block_tables
             )
-            # the mask mode is a class dimension: a single query token per request sees every key either way (the causal class);
-            # with several tokens, is_causal=False selects the non-causal class (every token sees the request's whole key range)
             bi_causal = (
                 True if q_len_per_req <= 1 or is_causal is None else bool(is_causal)
             )
