@@ -121,18 +121,19 @@ existing layout contract.
 Static PTX prefill on B300
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects four
-retained PTX programs from `NVlabs/kda (260927-kda-for-kda)
+``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects retained PTX
+programs originally imported from `NVlabs/kda (260927-kda-for-kda)
 <https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67/ptx>`_.
 The programs target SM103a (B300) and use persistent recurrence scheduling
 with exact FP32 state handoff between pieces. The default backend selection
 is unchanged.
 
-Install ``nvidia-cuda-nvcc>=13.2`` and ``apache-tvm-ffi>=0.1.12`` in addition
-to FlashInfer's regular dependencies. The retained PTX uses ISA 9.2. It is
-assembled once with ptxas >= 13.2 and embedded as a cubin, allowing execution
-with a CUDA 13 driver that cannot JIT PTX 9.2 directly. A C++17 host compiler
-and CUDA driver headers (provided by Triton) are needed for the FFI shims.
+Install ``apache-tvm-ffi>=0.1.12`` in addition to FlashInfer's regular
+dependencies. The retained PTX uses ISA 9.2. Drivers supporting CUDA 13.2 or
+newer JIT the PTX directly. Older CUDA 13 drivers use a cubin assembled with
+ptxas >= 13.2; install ``nvidia-cuda-nvcc>=13.2`` for this fallback. A C++17
+host compiler and CUDA driver headers (provided by Triton) are needed for
+the FFI shims.
 ``FLASHINFER_KDA_PTXAS`` selects the assembler;
 ``FLASHINFER_KDA_PTX_CACHE_DIR`` overrides the default FlashInfer JIT cubin
 cache directory. No build output is written into the installed package. This backend is

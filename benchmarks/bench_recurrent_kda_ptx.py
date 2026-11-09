@@ -1,3 +1,4 @@
+# Copyright 2026 Co-developed by KDA (Kernel Design Agents)
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -146,7 +147,7 @@ def main():
     os.environ["FLA_TILELANG"] = "0"
     from fla.ops.kda import chunk_kda
 
-    from flashinfer.kda_kernels.ptx.static_runtime import SHIMS, _ptxas
+    from flashinfer.kda_kernels.ptx.static_runtime import SHIMS, _image_kind, _ptxas
     import flashinfer.kda_prefill_ptx as public_adapter
 
     report = {
@@ -156,7 +157,8 @@ def main():
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "tvm_ffi": importlib.metadata.version("apache-tvm-ffi"),
-        "ptxas": _ptxas()[1],
+        "ptxas": _ptxas()[1] if _image_kind() == "assembled_cubin" else None,
+        "ptx_image_kind": _image_kind(),
         "ptx_manifest_sha256": hashlib.sha256(
             (SHIMS / "manifest.json").read_bytes()
         ).hexdigest(),

@@ -1,6 +1,6 @@
 # Static PTX Kimi Delta Attention
 
-These four SM103a PTX programs are imported from
+The original four SM103a PTX programs are imported from
 [`NVlabs/kda`, branch `260927-kda-for-kda`](https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67),
 `ptx/kda_ptx/shims/`. `manifest.json` records the exact source revision and
 the SHA-256 of each retained `.ptx` file; their bytes are unchanged. The
@@ -22,8 +22,9 @@ validation, and workspace contracts. Integration changes:
   exchange the complete FP32 recurrent state.
 - Clear handoff flags before every launch, including eager launches after
   CUDA Graph replay.
-- Assemble PTX ISA 9.2 with ptxas >= 13.2 and embed the cubin in TVM FFI.
-  Cache identity includes the PTX and assembler binary; temporary outputs
+- Prefer driver JIT for PTX ISA 9.2 when the CUDA driver supports 13.2 or
+  newer. Older drivers retain the ptxas >= 13.2 cubin fallback. Assembled
+  cache identity includes the PTX and assembler binary; temporary outputs
   are unique and published atomically outside the installed package.
 - Retain each prepared launch's TMA descriptor table and input tensors.
   Descriptor encoding/upload takes place during planning, outside capture.
@@ -36,3 +37,34 @@ The six INT21 workloads have 8192 total tokens, H96/H64, and sequence lengths
 Run `benchmarks/bench_recurrent_kda_ptx.py` for per-shape absolute latency,
 correctness against FLA, raw MoonshotAI/FlashKDA latency, and geometric mean
 speedup. See `docs/api/kda.rst` for installation and an example.
+
+## Optimized INT21 schedules
+
+The four optimized PTX payloads are recorded in `manifest.json` under
+`optimized_programs`, with SHA-256 checksums. Publication comments are
+normalized; the instruction stream is unchanged and has a separate checksum. They reuse the shared
+host shim and per-plan TMA descriptor ownership.
+
+On a 148-SM SM103 device, the six INT21 layouts use
+`flashinfer/kda_kernels/ptx/optimized/`. Other layouts retain the original
+scheduler. The public API and explicit `backend="ptx"` selection are unchanged.
+
+- A fixed sequence splits into an exact prefix and parallel zero-state and
+  identity-state tail recurrences. A Triton correction kernel composes the
+  tail output and final FP32 state with the prefix state; no recurrent history
+  is discarded.
+- Mixed and uniform layouts use revised piece packing, state handoffs, and
+  the updated uniform-family PTX pipeline. Partial pieces use identity-token
+  padding with masked output stores.
+- The PTX pipeline prefetches V into L2, overlaps state conversion with MMA,
+  and uses the retained deferred-decay variants.
+- Each prepared plan owns its mutable workspace. Preparation does not execute
+  the recurrence or modify the caller's state. The first eager call warms the
+  plan before capture. Native FP32 stores update the caller's state directly,
+  after the corresponding chain has consumed its initial state.
+
+Approximate splitting and expected-norm substitution are disabled by the
+adapter. Planning, compilation, and descriptor upload remain outside graph
+capture. The benchmark includes all captured GPU work, including tail
+correction. It reports GPU activity spans rather
+than CPU-inclusive end-to-end latency.

@@ -1,21 +1,21 @@
+# Copyright 2026 Co-developed by KDA (Kernel Design Agents)
 # Copyright (c) 2026 KDA Team
 # SPDX-License-Identifier: MIT
 # See LICENSE.kda-for-kda.txt for the full license.
 
-"""Load retained PTX kernels through one shared CUDA host shim.
+"""Load retained PTX kernels through the shared CUDA host shim.
 
-The retained PTX is ``.version 9.2`` / ``.target sm_103a``. Drivers older than
-CUDA 13.2 cannot JIT it, so each file is assembled once with ptxas >= 13.2 and
-the cubin is embedded instead. The cubins are cached in ``FLASHINFER_KDA_PTX_CACHE_DIR``
-(default: the FlashInfer JIT cache); ``FLASHINFER_KDA_PTXAS`` selects a specific ptxas.
+Drivers supporting CUDA 13.2 can JIT PTX ISA 9.2 directly. Prefer that compiler
+for the retained SM103a programs; older drivers use cubins assembled with
+ptxas >= 13.2. Assembled cubins are cached in ``FLASHINFER_KDA_PTX_CACHE_DIR``
+(default: the FlashInfer JIT cache); ``FLASHINFER_KDA_PTXAS`` selects ptxas.
 
-``csrc/kda/ptx/programs.json`` holds the one argument plan shared by the four
-programs and the per-program launch parameters; ``csrc/kda/ptx/shim.cc`` is
-compiled once per program with those parameters prepended as ``#define`` lines.
+``programs.json`` supplies the shared argument plan and launch parameters.
 """
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -116,6 +116,24 @@ def _cubin(name: str) -> bytes:
 
 
 @cache
+def _image_kind() -> str:
+    driver = ctypes.CDLL("libcuda.so.1")
+    version = ctypes.c_int()
+    get_version = driver.cuDriverGetVersion
+    get_version.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    get_version.restype = ctypes.c_int
+    if get_version(ctypes.byref(version)) != 0:
+        raise RuntimeError("cannot query the CUDA driver version")
+    return "driver_ptx" if version.value >= 13020 else "assembled_cubin"
+
+
+def _kernel_image(name: str) -> bytes:
+    if _image_kind() == "driver_ptx":
+        return (SHIMS / f"{name}.ptx").read_bytes() + b"\0"
+    return _cubin(name)
+
+
+@cache
 def _program_table() -> dict:
     return json.loads((SHIMS / "programs.json").read_text())
 
@@ -150,7 +168,7 @@ def _load(name: str):
     module = cpp.load_inline(
         f"flashinfer_ptx_{program['module_ident']}",
         cpp_sources=_shim_source(program),
-        embed_cubin={program["module_ident"]: _cubin(name)},
+        embed_cubin={program["module_ident"]: _kernel_image(name)},
         extra_include_paths=[_cuda_include()],
         extra_ldflags=["-lcuda"],
     )
