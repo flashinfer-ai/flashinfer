@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -99,8 +98,12 @@ def check_activation_matrix(doc_path: Path = DEFAULT_DOC_PATH) -> None:
     # encoding, which is cp1252 on native Windows (NVBug 7058649).
     text = doc_path.read_text(encoding="utf-8")
     if text != _replace_documented_matrix(text, render_activation_matrix()):
-        # relpath, not relative_to(): doc_path may lie outside the repo.
-        shown = os.path.relpath(doc_path, REPO_ROOT)
+        # doc_path may lie outside the repo, even on another Windows drive.
+        shown = (
+            doc_path.relative_to(REPO_ROOT)
+            if doc_path.is_relative_to(REPO_ROOT)
+            else doc_path
+        )
         raise AssertionError(f"{shown} is stale; run: {REGENERATE_COMMAND}")
 
 
