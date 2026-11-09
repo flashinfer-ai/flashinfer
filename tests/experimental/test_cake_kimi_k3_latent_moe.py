@@ -78,7 +78,7 @@ SMOKE_TOKENS = (
 # ---------------------------------------------------------------------------
 
 
-def test_decode_plan_rules():
+def test_decode_plan_rules(no_full_tile):
     # Front: TP1 streams 7 + 28 + 96 = 131 tiles (one CTA per tile), TP8 7 + 28 + 12 = 47 tiles as 94 cluster-pair CTAs.
     tp1 = decode_front_plan(1, i_local_for_tp(1))
     assert (tp1["tiles"], tp1["grid"], tp1["cluster"], tp1["n_pad"]) == (131, 131, 1, 8)
@@ -181,7 +181,7 @@ def test_decode_plan_rules():
         cb.n_pad_for(DECODE_MAX_T + 1)
 
 
-def test_decode_split_finalize_rules():
+def test_decode_split_finalize_rules(no_full_tile):
     """Split finalize (``_sf``): the cluster-pair decode instances -- the TP8 front from N_PAD 16 and the fused-norm
     tails of one routed partial from N_PAD 32, on both qualified SM counts -- with the early grid arrival on the TP1
     tail (``_ea``) and the up-unit L2 prefetch on the TP8 tail at N_PAD 32 / 64 (``_upf``); each CTA's landing zone
@@ -578,7 +578,7 @@ def test_prefill_tail_plan_and_trigger():
 # Every token count the public entry points accept, both tensor-parallel degrees and the partial
 # counts the decode tail plans on (P >= 2 selects the un-staged instances).
 COVERAGE_TOKENS = tuple(range(1, 1025)) + tuple(range(1025, 16385, 97)) + (16384,)
-COVERAGE_PARTIALS = (1, 2, 4, 8)
+COVERAGE_PARTIALS = (1, 2, 4, 6, 7, 8, 16)
 # The few-token multi-partial tail cells served by the global-y instances with the resident-B arithmetic.
 SB_NORM_ROUTES = {
     1: (32, {1: 5, 2: 5, 3: 5, 4: 5, 5: 3, 6: 3, 7: 3, 8: 3}),
@@ -625,9 +625,19 @@ SB_SPLIT_ROUTES = {
         },
     ),
 }
+# The TP1 tail cells served by the resident-B instance at N_PAD 8 with the routed partials prefetched and each row's
+# chunks split over the epilogue warps (ring rows): {(SM count, architecture): {tokens: (fewest partials, most
+# partials)}}, ``most`` None: from ``fewest`` up.  GB300 (152 SMs, sm_103a) only.
+RING_ROWS_ROUTES = {(152, "sm_103a"): {1: (7, 16), 2: (7, 16), 3: (6, 7)}}
+# The TP8 front token counts served by the split-finalize instance without its guarded finalize stores: {(SM count,
+# architecture): token counts}.  GB300 (152 SMs, sm_103a) only.
+FULL_TILE_ROUTES = {(152, "sm_103a"): (128,)}
 # The TP8 tail cells served by the staged-rows resident-B instance with the routed partials staged in shared memory:
 # {(SM count, architecture): {tokens: most partials (from 2)}}.
-STAGED_PARTIALS_ROUTES = {(152, "sm_103a"): {1: 2}}
+STAGED_PARTIALS_ROUTES = {
+    (152, "sm_100a"): {1: 2, 2: 3},
+    (152, "sm_103a"): {1: 2, 2: 3},
+}
 # The decode tail cells served by the global-y instances with the routed partials prefetched and each row split over
 # the epilogue warps, keeping the global-y arithmetic: {(SM count, architecture): {TP: {tokens: fewest partials}}}, at
 # the row's own N_PAD (TP8) or N_PAD 32 (TP1), and the registered program key of each (TP, N_PAD).
@@ -835,7 +845,8 @@ def test_cooperative_launch_follows_grid_wide_waits():
 def test_plans_follow_the_device_sm_count():
     """152-SM parts (GB200 / GB300) re-plan the resident-pair windows from their own count; the
     decode grids are tile-bound and identical on both qualified counts, and the decode tail plans
-    too but on the cells of ``TAIL_GY_SPLIT_ROUTES`` (152-SM parts only)."""
+    too but on the cells of ``TAIL_GY_SPLIT_ROUTES``, ``TAIL_STAGED_PARTIALS_ROUTES`` and of the lever tables keyed by
+    part that name the cell on one count only (``_part_lever_cell``; 152-SM parts only)."""
     for tp in SUPPORTED_TP:
         il = i_local_for_tp(tp)
         for tokens in (1, 8, 16, 64, 128):
@@ -844,10 +855,16 @@ def test_plans_follow_the_device_sm_count():
             )
             for num_partials in COVERAGE_PARTIALS:
                 gy = cb.tail_gy_split_n_pad(tokens, tp, num_partials, sm_count=152)
+                lever = _part_lever_cell(tokens, tp, num_partials, "sm_100a")
+                staged = cb.tail_staged_partials(tokens, tp, num_partials, sm_count=152)
                 same = decode_tail_plan(
                     tokens, il, tp, num_partials, 148
                 ) == decode_tail_plan(tokens, il, tp, num_partials, 152)
-                assert same is not bool(gy), (tp, tokens, num_partials)
+                assert same is not (bool(gy) or lever or staged), (
+                    tp,
+                    tokens,
+                    num_partials,
+                )
     assert decode_front_plan(1, i_local_for_tp(8), 152)["grid"] == 94
     assert decode_front_plan(1, i_local_for_tp(1), 152)["grid"] == 131
     assert decode_tail_plan(1, i_local_for_tp(8), 8, 1, 152)["grid"] == 112
@@ -2073,6 +2090,13 @@ _EPS_SCALE_ROWS = (
     (1, 0, 8, 5),
     (1, 0, 8, 8),
     (1, 0, 32, 8),
+    (1, 0, 1, 5),
+    (8, 1, 1, 9),
+    (8, 1, 3, 8),
+    (8, 1, 32, 1),
+    (8, 1, 128, 1),
+    (8, 1, 40, 2),
+    (1, 0, 1, 7),
 )
 
 
@@ -2100,6 +2124,15 @@ def test_eps_scale_rows_reach_every_decode_tail_program():
         for _, _, ranges in token_ranges:
             assert all(first < max(partials) for first, _, _ in ranges)
             assert all(last is None or last < max(partials) for _, last, _ in ranges)
+    for cells in cb.TAIL_RING_ROWS_ROUTES.values():
+        for first, last in cells.values():
+            assert first < max(partials) and (last is None or last <= max(partials))
+    # The lever tables keyed by part close their partial ranges at most at 16: past them a cell takes the route
+    # without the lever, whose program a smaller partial count already reaches.
+    for table in ():
+        for cells in table.values():
+            for first, last in cells.values():
+                assert first <= last <= max(partials)
     for sm_count in QUALIFIED_SM_COUNTS:
         for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
             routed = {
@@ -2192,6 +2225,53 @@ def no_gy_split(monkeypatch):
 
 
 @pytest.fixture
+def no_ring_rows(monkeypatch):
+    """The routes without the ring-rows cells of ``TAIL_RING_ROWS_ROUTES`` (which overlay the TP1 resident-B, prefetch,
+    resident-B arithmetic and split-rows cells of 1 to 4 tokens; their own rules and outputs are tested below), the
+    plan cache cleared around."""
+    monkeypatch.setattr(cb, "TAIL_RING_ROWS_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    yield
+    monkeypatch.undo()
+    decode_tail_plan.cache_clear()
+
+
+@pytest.fixture
+def no_full_tile(monkeypatch):
+    """The routes without the full-tile front cells of ``FRONT_FULL_TILE_ROUTES`` (which overlay the TP8 front of 128
+    tokens; their own rules and outputs are tested below), the plan cache cleared around."""
+    monkeypatch.setattr(cb, "FRONT_FULL_TILE_ROUTES", {})
+    decode_front_plan.cache_clear()
+    yield
+    monkeypatch.undo()
+    decode_front_plan.cache_clear()
+
+
+def _part_lever_cell(tokens, tp, num_partials, arch):
+    """Whether a lever table keyed by part names the decode tail cell on one qualified SM count and not the other."""
+    tables = ()
+    named = set()
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for table in tables:
+            cells = table.get((sm_count, arch), {}).get(tokens) if tp == 8 else None
+            if cells is not None and cells[0] <= num_partials <= cells[1]:
+                named.add(sm_count)
+    return len(named) == 1
+
+
+@pytest.fixture
+def no_staged_partials(monkeypatch):
+    """The routes without the staged-partials cells of ``TAIL_STAGED_PARTIALS_ROUTES`` (which overlay the split-rows
+    cells of 2 tokens and 3 partials on 152-SM parts; their own rules and outputs are tested below), the plan cache
+    cleared around."""
+    monkeypatch.setattr(cb, "TAIL_STAGED_PARTIALS_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    yield
+    monkeypatch.undo()
+    decode_tail_plan.cache_clear()
+
+
+@pytest.fixture
 def no_partial_prefetch(monkeypatch):
     """The routes without the prefetch cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` (which overlay
     ``TAIL_SB_NORM_ROUTES``; their own rules and outputs are tested below), the plan cache cleared around."""
@@ -2202,7 +2282,9 @@ def no_partial_prefetch(monkeypatch):
     decode_tail_plan.cache_clear()
 
 
-def test_tail_sb_norm_rules(monkeypatch, no_sb_split, no_partial_prefetch):
+def test_tail_sb_norm_rules(
+    monkeypatch, no_ring_rows, no_sb_split, no_partial_prefetch
+):
     """The few-token multi-partial tails of ``TAIL_SB_NORM_ROUTES`` take the global-y instance of the table's N_PAD with
     the resident-B arithmetic (``sb_norm``, ``_sbn``): its plan is that instance's but for the flag, on both qualified
     SM counts and from the table's partial count up; every other row keeps its plan, and the rows taken are rows of the
@@ -2250,7 +2332,13 @@ def test_tail_sb_norm_rules(monkeypatch, no_sb_split, no_partial_prefetch):
 
 @pytest.mark.parametrize(("tp", "tokens", "num_partials"), _sb_norm_rows())
 def test_tail_sb_norm_is_bitwise_the_resident_b_instance(
-    monkeypatch, no_sb_split, no_partial_prefetch, tp, tokens, num_partials
+    monkeypatch,
+    no_ring_rows,
+    no_sb_split,
+    no_partial_prefetch,
+    tp,
+    tokens,
+    num_partials,
 ):
     """The global-y instance with the resident-B arithmetic reproduces the resident-B instance's ``y`` and ``out`` bit for
     bit -- partial sums that flush to ``-0.0`` and subnormal partials of both signs included -- in the first launch,
@@ -2358,7 +2446,9 @@ def _without_partial_prefetch(tokens, tp, num_partials, sm_count, sb_norm):
     return base
 
 
-def test_tail_partial_prefetch_rules(monkeypatch, no_sb_split, no_gy_split):
+def test_tail_partial_prefetch_rules(
+    monkeypatch, no_ring_rows, no_sb_split, no_gy_split
+):
     """The cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` take the instance the table names (the global-y instance with the
     resident-B arithmetic, or the resident-B instance) with the routed partials prefetched into L2 (``_ppf``): its plan
     is that instance's but for the flag, on both qualified SM counts and up to 17 partials (a range open above
@@ -2401,7 +2491,7 @@ def test_tail_partial_prefetch_rules(monkeypatch, no_sb_split, no_gy_split):
     ("tp", "tokens", "num_partials", "sb_norm"), _partial_prefetch_rows()
 )
 def test_tail_partial_prefetch_is_bitwise_the_resident_b_instance(
-    monkeypatch, no_sb_split, tp, tokens, num_partials, sb_norm
+    monkeypatch, no_ring_rows, no_sb_split, tp, tokens, num_partials, sb_norm
 ):
     """The routed-partial prefetch changes no output: the ``_ppf`` instance reproduces the resident-B instance the
     planner takes without ``TAIL_SB_NORM_ROUTES`` and ``TAIL_PARTIAL_PREFETCH_ROUTES`` -- for a resident-B cell the same
@@ -2477,7 +2567,9 @@ def test_tail_partial_prefetch_is_bitwise_the_resident_b_instance(
         decode_tail_plan.cache_clear()
 
 
-def test_tail_sb_split_rules(monkeypatch, no_gy_split):
+def test_tail_sb_split_rules(
+    monkeypatch, no_ring_rows, no_gy_split, no_staged_partials
+):
     """The cells of ``TAIL_SB_SPLIT_ROUTES`` take the global-y instance of the table's N_PAD with the resident-B
     arithmetic, the routed partials prefetched and each row split over the epilogue warps (``_sbs``) on the table's
     parts (SM count, architecture): its plan is the ``_sbn_ppf`` instance's but for the flag, up to 17 partials; every
@@ -2551,7 +2643,7 @@ def test_tail_sb_split_rules(monkeypatch, no_gy_split):
     ((8, 1, 3), (8, 3, 4), (8, 4, 16), (1, 1, 8), (1, 5, 9), (1, 8, 16)),
 )
 def test_tail_sb_split_is_bitwise_the_resident_b_arithmetic(
-    monkeypatch, tp, tokens, num_partials
+    monkeypatch, no_ring_rows, tp, tokens, num_partials
 ):
     """The split rows change no output: the ``_sbs`` instance reproduces the instance the planner takes without
     ``TAIL_SB_SPLIT_ROUTES`` (the ``_sbn_ppf`` global-y instance or the resident-B instance, both with the resident-B
@@ -2627,6 +2719,407 @@ def test_tail_sb_split_is_bitwise_the_resident_b_arithmetic(
         decode_tail_plan.cache_clear()
 
 
+def test_tail_ring_rows_rules(monkeypatch):
+    """The TP1 cells of ``TAIL_RING_ROWS_ROUTES`` take the row's resident-B instance at N_PAD 8 with the routed partials
+    prefetched and each row's chunks split over the four epilogue warps (``ring_rows``, ``_ppf_rr``) on the table's
+    parts only: its plan is the row's resident-B plan but for the two flags, from the table's fewest to its most
+    partials (a range open above up to 17 partials); every other row keeps its plan, the other parts included; every
+    cell taken is a cell the planner without the table sends to the resident-B arithmetic (a global-y instance with it
+    or the resident-B instance)."""
+    assert cb.TAIL_RING_ROWS_ROUTES == RING_ROWS_ROUTES
+    taken = {}
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            for tp in SUPPORTED_TP:
+                for tokens in range(1, DECODE_MAX_T + 1):
+                    for num_partials in range(1, 18):
+                        plan = decode_tail_plan(
+                            tokens, i_local_for_tp(tp), tp, num_partials, sm_count, arch
+                        )
+                        cells = (
+                            RING_ROWS_ROUTES.get((sm_count, arch), {}).get(tokens)
+                            if tp == 1
+                            else None
+                        )
+                        routed = cells is not None and (
+                            cells[0] <= num_partials
+                            and (cells[1] is None or num_partials <= cells[1])
+                        )
+                        cell = (sm_count, arch, tp, tokens, num_partials)
+                        assert bool(plan.get("ring_rows")) is routed, cell
+                        assert (
+                            cb.tail_ring_rows(tokens, tp, num_partials, arch, sm_count)
+                            is routed
+                        ), cell
+                        key = decode_kernel_key(plan)
+                        assert key.endswith("_ppf_rr") is routed, cell
+                        if not routed:
+                            continue
+                        base = cb.decode_tail_instance_plan(
+                            tokens, i_local_for_tp(tp), tp, num_partials, sm_count
+                        )
+                        assert base["smem_b1"] and not base["rows_smem"], cell
+                        assert base["n_pad"] == 8 and base["stages"] == 10, cell
+                        assert plan == dict(base, partial_prefetch=True, ring_rows=True)
+                        assert key == decode_kernel_key(base) + "_ppf_rr"
+                        assert key in KERNELS and cake_jit.route_available(arch, (key,))
+                        taken[cell] = key
+    assert {
+        (sm_count, arch, tp, tokens) for sm_count, arch, tp, tokens, _ in taken
+    } == {
+        (sm_count, arch, 1, tokens)
+        for (sm_count, arch), cells in RING_ROWS_ROUTES.items()
+        for tokens in cells
+    }
+    assert len(set(taken.values())) == 1
+    monkeypatch.setattr(cb, "TAIL_RING_ROWS_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        for sm_count, arch, tp, tokens, num_partials in taken:
+            default = decode_tail_plan(
+                tokens, i_local_for_tp(tp), tp, num_partials, sm_count, arch
+            )
+            assert not default.get("ring_rows")
+            assert default["sb_norm"] or (
+                default["smem_b1"] and not default["rows_smem"]
+            ), (sm_count, arch, tp, tokens, num_partials)
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+def _ring_rows_rows():
+    """The (tp, tokens, num_partials) cells of ``TAIL_RING_ROWS_ROUTES``: the fewest and the most partial count of every
+    range, a range open above at 17 partials (past the measured 2 to 16)."""
+    return tuple(
+        sorted(
+            {
+                (1, tokens, num_partials)
+                for cells in RING_ROWS_ROUTES.values()
+                for tokens, (first, last) in cells.items()
+                for num_partials in {first, 17 if last is None else last}
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize(("tp", "tokens", "num_partials"), _ring_rows_rows())
+def test_tail_ring_rows_is_bitwise_the_resident_b_arithmetic(
+    monkeypatch, tp, tokens, num_partials
+):
+    """The ring rows change no output: the ``_ppf_rr`` instance reproduces the instance the planner takes without
+    ``TAIL_RING_ROWS_ROUTES`` (the resident-B instance, with or without the prefetch, or a global-y instance with the
+    resident-B arithmetic) bit for bit, partial sums that flush to ``-0.0`` and subnormal partials of both signs
+    included, in the first launch, re-launches over NaN-filled outputs and graph replays, with the control words back
+    at zero."""
+    rank = tp - 1
+    device = _require_program("tail", tp, tokens, num_partials)
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    if not cb.tail_ring_rows(tokens, tp, num_partials, _gpu_arch(), sm_count):
+        pytest.skip(
+            f"tp{tp} T={tokens} P={num_partials}: no TAIL_RING_ROWS_ROUTES cell on {_gpu_arch()} with {sm_count} SMs"
+        )
+    seed = 6700 + 97 * tp + 13 * tokens + num_partials
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, num_partials, seed
+    )
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1)
+    parts = routed.double().cpu()
+    pick = torch.rand(tokens, LATENT, generator=gen)
+    a = 2.0**-126 * (
+        1.0 + torch.randint(16, 128, (tokens, LATENT), generator=gen).double() / 128.0
+    )
+    m = torch.randint(1, 16, (tokens, LATENT), generator=gen).double()
+    cancel = pick < 0.25
+    parts[0] = torch.where(cancel, -a, parts[0])
+    parts[1] = torch.where(cancel, a - m * 2.0**-133, parts[1])
+    parts[2:] = torch.where(cancel, torch.full_like(parts[2:], -0.0), parts[2:])
+    parts = torch.where((pick >= 0.25) & (pick < 0.5), parts * 2.0**-130, parts)
+    routed.copy_(parts.to(torch.float32).to(torch.bfloat16).to(device))
+    args = (
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+    )
+    runner = prepare_kimi_k3_latent_moe_tail(
+        *args, out, tp=tp, rank=rank, y_workspace=y
+    )
+    assert runner.plan["ring_rows"] and runner.kernel_keys[0].endswith("_ppf_rr")
+    runner()
+    torch.cuda.synchronize()
+    first = _snapshot((y, out))
+    assert int((first[0] == -32768).sum()) > 0, "no -0.0 in y"
+    _assert_words_zero(runner, "first launch")
+    for rnd in range(3):
+        _nan_fill((y, out))
+        runner()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"re-launch {rnd}")
+    graph = _graph_replay(runner)
+    for rnd in range(3):
+        _nan_fill((y, out))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"replay {rnd}")
+        _assert_words_zero(runner, f"replay {rnd}")
+    monkeypatch.setattr(cb, "TAIL_RING_ROWS_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        out_b = torch.full_like(out, float("nan"))
+        y_b = torch.full_like(y, float("nan"))
+        base = prepare_kimi_k3_latent_moe_tail(
+            *args, out_b, tp=tp, rank=rank, y_workspace=y_b
+        )
+        assert not base.plan.get("ring_rows")
+        assert base.plan["sb_norm"] or base.plan["smem_b1"]
+        base()
+        torch.cuda.synchronize()
+        _assert_bitwise((y_b, out_b), first, "instance without the ring rows")
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+def _lever_cells(table, tp=8):
+    """(tp, tokens, num_partials) of a lever table keyed by part: the fewest and the most partial count of every token
+    count of every part, the first and the last token count of every run of token counts with the same range."""
+    rows = []
+    for cells in table.values():
+        runs = []
+        for tokens, rng in sorted(cells.items()):
+            if runs and runs[-1][1] == tokens - 1 and runs[-1][2] == rng:
+                runs[-1][1] = tokens
+            else:
+                runs.append([tokens, tokens, rng])
+        for first_tokens, last_tokens, (first, last) in runs:
+            for tokens in sorted({first_tokens, last_tokens}):
+                for num_partials in sorted({first, last}):
+                    rows.append((tp, tokens, num_partials))
+    return tuple(sorted(set(rows)))
+
+
+def _assert_tail_lever_is_bitwise(
+    monkeypatch, tp, tokens, num_partials, table, flag, suffix, seed, negative_zero
+):
+    """The tail lever of ``table`` (plan flag ``flag``, key suffix ``suffix``) changes no output: its instance repeats
+    its first launch bit for bit in re-launches over NaN-filled outputs and graph replays, with the control words back
+    at zero, and reproduces the instance the planner takes without ``table`` bit for bit -- partial pairs that cancel
+    to a negative FP32 subnormal (``-0.0`` in ``y`` under the resident-B arithmetic, ``negative_zero``) and subnormal
+    partials of both signs included."""
+    rank = tp - 1
+    device = _require_program("tail", tp, tokens, num_partials)
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    plan = decode_tail_plan(
+        tokens, i_local_for_tp(tp), tp, num_partials, sm_count, _gpu_arch()
+    )
+    if not plan.get(flag):
+        pytest.skip(
+            f"tp{tp} T={tokens} P={num_partials}: no {table} cell on {_gpu_arch()} with {sm_count} SMs"
+        )
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, num_partials, seed
+    )
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1)
+    parts = routed.double().cpu()
+    pick = torch.rand(tokens, LATENT, generator=gen)
+    if num_partials >= 2:
+        a = 2.0**-126 * (
+            1.0
+            + torch.randint(16, 128, (tokens, LATENT), generator=gen).double() / 128.0
+        )
+        m = torch.randint(1, 16, (tokens, LATENT), generator=gen).double()
+        cancel = pick < 0.25
+        parts[0] = torch.where(cancel, -a, parts[0])
+        parts[1] = torch.where(cancel, a - m * 2.0**-133, parts[1])
+        parts[2:] = torch.where(cancel, torch.full_like(parts[2:], -0.0), parts[2:])
+    parts = torch.where((pick >= 0.25) & (pick < 0.5), parts * 2.0**-130, parts)
+    routed.copy_(parts.to(torch.float32).to(torch.bfloat16).to(device))
+    args = (
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+    )
+    runner = prepare_kimi_k3_latent_moe_tail(
+        *args, out, tp=tp, rank=rank, y_workspace=y
+    )
+    assert runner.plan.get(flag) and runner.kernel_keys[0].endswith(suffix)
+    runner()
+    torch.cuda.synchronize()
+    first = _snapshot((y, out))
+    if negative_zero:
+        assert int((first[0] == -32768).sum()) > 0, "no -0.0 in y"
+    _assert_words_zero(runner, "first launch")
+    for rnd in range(3):
+        _nan_fill((y, out))
+        runner()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"re-launch {rnd}")
+    graph = _graph_replay(runner)
+    for rnd in range(3):
+        _nan_fill((y, out))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"replay {rnd}")
+        _assert_words_zero(runner, f"replay {rnd}")
+    monkeypatch.setattr(cb, table, {})
+    decode_tail_plan.cache_clear()
+    try:
+        out_b = torch.full_like(out, float("nan"))
+        y_b = torch.full_like(y, float("nan"))
+        base = prepare_kimi_k3_latent_moe_tail(
+            *args, out_b, tp=tp, rank=rank, y_workspace=y_b
+        )
+        assert not base.plan.get(flag)
+        assert base.kernel_keys != runner.kernel_keys
+        base()
+        torch.cuda.synchronize()
+        _assert_bitwise((y_b, out_b), first, f"instance without {table}")
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+def _lever_taken(table_name, is_lever, suffix):
+    """Every decode tail cell (both qualified SM counts, both architectures, TP1 / TP8, 1 to 128 tokens, 1 to 17
+    partials) whose plan is the lever's (``is_lever``): {cell: (plan, key)}; asserts the key suffix follows it."""
+    taken = {}
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            for tp in SUPPORTED_TP:
+                for tokens in range(1, DECODE_MAX_T + 1):
+                    for num_partials in range(1, 18):
+                        plan = decode_tail_plan(
+                            tokens, i_local_for_tp(tp), tp, num_partials, sm_count, arch
+                        )
+                        key = decode_kernel_key(plan)
+                        cell = (sm_count, arch, tp, tokens, num_partials)
+                        lever = bool(is_lever(plan))
+                        assert key.endswith(suffix) is lever, (
+                            table_name,
+                            cell,
+                            key,
+                        )
+                        if lever:
+                            assert key in KERNELS and cake_jit.route_available(
+                                arch, (key,)
+                            ), key
+                            taken[cell] = (plan, key)
+    return taken
+
+
+def _named(table, cell):
+    """Whether a lever table keyed by part names ``cell`` = (SM count, architecture, TP, tokens, partials)."""
+    sm_count, arch, tp, tokens, num_partials = cell
+    cells = table.get((sm_count, arch), {}).get(tokens) if tp == 8 else None
+    return cells is not None and cells[0] <= num_partials <= cells[1]
+
+
+def test_tail_lever_routes_take_one_lever_per_cell():
+    """No decode cell of any qualified part is named by two lever tables (the row ring, the wide split-rows ring, the
+    ring rows, the owned rows and the split rows of the split-finalize tail); the wide ring names split-rows cells only
+    and the row ring staged-row counts past 8 only."""
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            for tp in SUPPORTED_TP:
+                for tokens in range(1, DECODE_MAX_T + 1):
+                    for num_partials in range(1, 18):
+                        cell = (sm_count, arch, tp, tokens, num_partials)
+                        named = [
+                            name
+                            for name, hit in (
+                                (
+                                    "ring_rows",
+                                    cb.tail_ring_rows(
+                                        tokens, tp, num_partials, arch, sm_count
+                                    ),
+                                ),
+                            )
+                            if hit
+                        ]
+                        assert len(named) <= 1, (cell, named)
+
+
+def test_front_full_tile_rules(monkeypatch):
+    """The TP8 front token counts of ``FRONT_FULL_TILE_ROUTES`` (128 only) take the split-finalize instance at N_PAD 128
+    without its guarded finalize stores (``_la_ef_sf_ft``) on the table's parts only: its plan is that instance's
+    but for the flag; every other front row keeps its plan, the TP1 front and the other parts included; and a table
+    naming another token count is refused by the predicate (exactly 128 tokens)."""
+    assert cb.FRONT_FULL_TILE_ROUTES == FULL_TILE_ROUTES
+    taken = set()
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            for tp in SUPPORTED_TP:
+                for tokens in range(1, DECODE_MAX_T + 1):
+                    plan = decode_front_plan(tokens, i_local_for_tp(tp), sm_count, arch)
+                    key = decode_kernel_key(plan)
+                    routed = tp == 8 and tokens in FULL_TILE_ROUTES.get(
+                        (sm_count, arch), ()
+                    )
+                    cell = (sm_count, arch, tp, tokens)
+                    assert bool(plan.get("full_tile")) is routed, cell
+                    assert key.endswith("_ft") is routed, cell
+                    assert key in route_kernel_keys(
+                        "front", tp, tokens, sm_count, arch=arch
+                    ), cell
+                    if routed:
+                        assert key.endswith("_la_ef_sf_ft") and key in KERNELS
+                        taken.add(cell)
+    assert taken == {
+        (sm_count, arch, 8, tokens)
+        for (sm_count, arch), counts in FULL_TILE_ROUTES.items()
+        for tokens in counts
+    }
+    assert not cb.front_full_tile(127, i_local_for_tp(8), 152, "sm_103a")
+    assert not cb.front_full_tile(128, i_local_for_tp(1), 152, "sm_103a")
+    assert not cb.front_full_tile(128, i_local_for_tp(8), 152, "sm_100a")
+    assert not cb.front_full_tile(128, i_local_for_tp(8), 148, "sm_103a")
+    monkeypatch.setattr(cb, "FRONT_FULL_TILE_ROUTES", {})
+    decode_front_plan.cache_clear()
+    try:
+        for sm_count, arch, tp, tokens in taken:
+            default = decode_front_plan(tokens, i_local_for_tp(tp), sm_count, arch)
+            assert default["split_fin"] and default["n_pad"] == 128
+            assert decode_kernel_key(default).endswith("_la_ef_sf")
+    finally:
+        monkeypatch.undo()
+        decode_front_plan.cache_clear()
+
+
+def test_front_full_tile_is_bitwise_the_split_finalize_instance(monkeypatch):
+    """The full tile changes no output: the TP8 front of 128 tokens on the ``_ft`` instance reproduces the
+    split-finalize instance the planner takes without ``FRONT_FULL_TILE_ROUTES`` bit for bit, in the first launch and
+    re-launches over NaN-filled outputs."""
+    tp, tokens = 8, 128
+    device = _require_program("front", tp, tokens)
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    if not cb.front_full_tile(tokens, i_local_for_tp(tp), sm_count, _gpu_arch()):
+        pytest.skip(
+            f"T={tokens} TP{tp}: no full tile on {_gpu_arch()} with {sm_count} SMs"
+        )
+    w, x, shared_gate_up = _front_case(device, tp, tokens, 7200)
+    runner, outs = _front_run(w, x, shared_gate_up, tp)
+    assert runner.kernel_keys[0].endswith("_ft")
+    first = _snapshot(outs)
+    for rnd in range(3):
+        _nan_fill(outs)
+        runner()
+        torch.cuda.synchronize()
+        _assert_bitwise(outs, first, f"re-launch {rnd}")
+    monkeypatch.setattr(cb, "FRONT_FULL_TILE_ROUTES", {})
+    decode_front_plan.cache_clear()
+    try:
+        default, default_outs = _front_run(w, x, shared_gate_up, tp)
+        assert default.kernel_keys[0].endswith("_la_ef_sf")
+        _assert_bitwise(default_outs, first, "instance without the full tile")
+    finally:
+        monkeypatch.undo()
+        decode_front_plan.cache_clear()
+
+
 def test_tail_staged_partials_rules(monkeypatch):
     """The cells of ``TAIL_STAGED_PARTIALS_ROUTES`` take the TP8 staged-rows resident-B instance of the row with the
     partials staged in shared memory (``_mp``) on the table's parts: its plan is the row's one-partial plan (the
@@ -2679,7 +3172,15 @@ def test_tail_staged_partials_rules(monkeypatch):
                         assert key == decode_kernel_key(one) + "_mp"
                         assert key in KERNELS and cake_jit.route_available(arch, (key,))
                         taken[sm_count, arch, tp, tokens, num_partials] = key
-    assert set(taken) == {(152, "sm_103a", 8, 1, 2)}
+    assert set(taken) == {
+        (152, "sm_100a", 8, 1, 2),
+        (152, "sm_100a", 8, 2, 2),
+        (152, "sm_100a", 8, 2, 3),
+        (152, "sm_103a", 8, 1, 2),
+        (152, "sm_103a", 8, 2, 2),
+        (152, "sm_103a", 8, 2, 3),
+    }
+    assert len(set(taken.values())) == 1
     monkeypatch.setattr(cb, "TAIL_STAGED_PARTIALS_ROUTES", {})
     decode_tail_plan.cache_clear()
     try:
@@ -2694,7 +3195,9 @@ def test_tail_staged_partials_rules(monkeypatch):
         decode_tail_plan.cache_clear()
 
 
-@pytest.mark.parametrize(("tp", "tokens", "num_partials"), ((8, 1, 2),))
+@pytest.mark.parametrize(
+    ("tp", "tokens", "num_partials"), ((8, 1, 2), (8, 2, 2), (8, 2, 3))
+)
 def test_tail_staged_partials_is_bitwise_the_resident_b_arithmetic(
     monkeypatch, tp, tokens, num_partials
 ):
@@ -2723,6 +3226,7 @@ def test_tail_staged_partials_is_bitwise_the_resident_b_arithmetic(
     cancel = pick < 0.25
     parts[0] = torch.where(cancel, -a, parts[0])
     parts[1] = torch.where(cancel, a - m * 2.0**-133, parts[1])
+    parts[2:] = torch.where(cancel, 0.0, parts[2:])
     parts = torch.where((pick >= 0.25) & (pick < 0.5), parts * 2.0**-130, parts)
     routed.copy_(parts.to(torch.float32).to(torch.bfloat16).to(device))
     args = (
@@ -3892,9 +4396,7 @@ def test_functional_two_streams(monkeypatch, row):
 def test_functional_first_call_on_fresh_slab(monkeypatch, stage, tp, tokens):
     """A one-shot call that is the process's first control-word request (no slab yet) creates the slab, takes
     its lane and reproduces a prepared runner bitwise (no lock re-entry)."""
-    device = torch.device("cuda", 0) if torch.cuda.is_available() else None
-    if device is None:
-        pytest.skip("requires a GPU")
+    device = _require_program(stage, tp, tokens)
     if stage == "front":
         args, kwargs = _front_args(device, tp, tokens, 31), {}
         call, prepare = kimi_k3_latent_moe_front, prepare_kimi_k3_latent_moe_front

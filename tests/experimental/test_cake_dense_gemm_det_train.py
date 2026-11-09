@@ -269,7 +269,7 @@ EXPECTED_TEMPLATES = {
         (1001, 148): 'dense_proj_det_gemm_kn_n256_m256_ov_ht_pro7',
         (1001, 212): 'dense_proj_det_gemm_kn_n256_cg_pro7',
         (2049, 148): 'dense_proj_det_gemm_kn_n256_m256_ov_pro7',
-        (2049, 212): 'dense_proj_det_gemm_kn_n256_cg_pro7',
+        (2049, 212): 'dense_proj_det_gemm_kn_n256_cg_pro15',
     },
     ('q_b', 'dgrad', 'f32'): {
         (1001, 148): 'dense_proj_det_gemm_kn_n256_m256_f32_v8_ef_ov_ht_pro7',
@@ -352,9 +352,9 @@ EXPECTED_TEMPLATES = {
     },
     ('shared_down', 'dgrad', 'bf16'): {
         (1001, 148): 'dense_proj_det_gemm_kn_n256',
-        (1001, 212): 'dense_proj_det_gemm_kn_n256_pro7',
+        (1001, 212): 'dense_proj_det_gemm_kn_n256_ht_cg_pro15',
         (2049, 148): 'dense_proj_det_gemm_kn_n256',
-        (2049, 212): 'dense_proj_det_gemm_kn_n256_pro7',
+        (2049, 212): 'dense_proj_det_gemm_kn_n256_cg_pro15',
     },
     ('shared_down', 'dgrad', 'f32'): {
         (1001, 148): 'dense_proj_det_gemm_kn_n256_f32_v8_ef_pro7',
@@ -519,9 +519,9 @@ MLA_TEMPLATES = {
     ('qabs', 'fwd'): {
         (33, 148): 'dense_proj_det_gemm_nk_n128_t_pro7',
         (33, 212): 'dense_proj_det_gemm_nk_n128_t_pro7',
-        (1001, 148): 'dense_proj_det_gemm_kn_n256_tma1_pro7',
+        (1001, 148): 'dense_proj_det_gemm_kn_n256_tma1_bg64_pro7',
         (1001, 212): 'dense_proj_det_gemm_kn_n256_tma1_bg8_sol_pro7',
-        (2049, 148): 'dense_proj_det_gemm_kn_n256_tma1_pro7',
+        (2049, 148): 'dense_proj_det_gemm_kn_n256_tma1_bg64_pro7',
         (2049, 212): 'dense_proj_det_gemm_kn_n256_tma1_bg8_sol_pro7',
     },
     ('qabs', 'dgrad'): {
@@ -551,9 +551,9 @@ MLA_TEMPLATES = {
     ('vproj', 'dgrad'): {
         (33, 148): 'dense_proj_det_gemm_nk_n128_t_pro7',
         (33, 212): 'dense_proj_det_gemm_nk_n128_t_pro7',
-        (1001, 148): 'dense_proj_det_gemm_kn_n256_m256_tma1_bg4_pro7',
+        (1001, 148): 'dense_proj_det_gemm_kn_n256_tma1_bg8_sol_pro7',
         (1001, 212): 'dense_proj_det_gemm_kn_n256_tma1_bg8_pro7',
-        (2049, 148): 'dense_proj_det_gemm_kn_n256_m256_tma1_bg4_pro7',
+        (2049, 148): 'dense_proj_det_gemm_kn_n256_tma1_bg8_sol_pro7',
         (2049, 212): 'dense_proj_det_gemm_kn_n256_tma1_bg8_pro7',
     },
     ('vproj', 'wgrad'): {
@@ -708,9 +708,16 @@ def _eight_warp_program(cake_template, plan, arch):
     )
     if not form_rule.get("form"):
         return cake_template
+    # the batched rows' head-interleaved raster where it divides the batch count, with the rule's store hint
+    group = form_rule.get("batch_group") or 0
+    raster = (
+        dict(batch_group=group, store_hint=form_rule.get("store_hint", "none"))
+        if group > 1 and plan.L % group == 0
+        else {}
+    )
     return cake_backend.instance_symbol(
         cake_backend.instance_key(
-            a_mn=False, b_mn=True, epi="tma", slots=1, form=form_rule["form"]
+            a_mn=False, b_mn=True, epi="tma", slots=1, form=form_rule["form"], **raster
         )
     )
 
@@ -744,9 +751,14 @@ def _assert_mirrors_cake(plan, cake_template, where, arch, rule=None):
     the Cake host JIT-compiles) the FlashInfer planner must have fallen back onto a generated program.  A rule that
     pins ``htail`` names its ``_ht`` program on every device and T (``_rule_program``); a rule of record that carries
     the eight-warp CTA form names its eight-warp program (``_eight_warp_program``: the launcher's plans carry no
-    ``form``)."""
-    cake_template = _rule_program(cake_template, rule)
-    cake_template = _eight_warp_program(cake_template, plan, arch)
+    ``form``).  Where the launcher swapped such a row (the batched small-M swap on a tiny T: a transposed template),
+    the eight-warp program serves only the caller's orientation, so the planner drops the swap and keeps the rule
+    (``plan.swap_fallback``, the planner's first fallback)."""
+    launcher_template = _rule_program(cake_template, rule)
+    cake_template = _eight_warp_program(launcher_template, plan, arch)
+    swap_dropped = cake_template != launcher_template and _transposed_template(
+        _nopro(launcher_template)
+    )
     registered = _registered(arch)
     assert registered <= EXPORTED_TEMPLATES, (
         arch,
@@ -756,9 +768,8 @@ def _assert_mirrors_cake(plan, cake_template, where, arch, rule=None):
         arch, cake_template, plan
     ):
         assert plan.template == cake_template, (*where, plan.template)
-        assert not (plan.swap_fallback or plan.rule_fallback or plan.knob_fallback), (
-            where
-        )
+        assert plan.swap_fallback == swap_dropped, (*where, swap_dropped)
+        assert not (plan.rule_fallback or plan.knob_fallback), where
     else:
         assert plan.swap_fallback or plan.rule_fallback or plan.knob_fallback, (
             *where,
@@ -913,8 +924,10 @@ def test_registry_records_are_well_formed():
                 list(item) for item in cake_jit.ARG_PLANS[record["arg_plan"]]
             ]
         else:
-            # the fused split program is the only record with an inline plan
-            assert record["template"] == cake_backend.SPLIT_TEMPLATE, record["template"]
+            # the fused split program and the chain programs carry their plans inline
+            assert record["template"] == cake_backend.SPLIT_TEMPLATE or record[
+                "template"
+            ].startswith(cake_backend.CHAIN_TEMPLATE_PREFIX), record["template"]
             assert plan_items == [list(item) for item in record["arg_plan"]]
         if record["template"].startswith("dense_proj_det_gemm_"):
             # the raster group width is a launch parameter since round 11; the stream-K slabs and the
@@ -939,6 +952,29 @@ def test_registry_records_are_well_formed():
                     w8_modules.add(record["build"]["module"])
             elif "build" in record:
                 ten_warp_modules.add(record["build"]["module"])
+        elif record["template"].startswith(cake_backend.CHAIN_TEMPLATE_PREFIX):
+            # the one-split programs of several accumulation chains: the transposed-store extents, one split and
+            # the output pitches (the workspace and the counters are bound, unused at one split); sm_107a only
+            assert [n for _, n in plan_items] == [
+                "A",
+                "B",
+                "out",
+                "ws",
+                "counters",
+                "M",
+                "N",
+                "K",
+                "num_l",
+                "num_splits",
+                "ldo",
+                "out_l",
+                "enable_pdl",
+                "grid_x",
+                "grid_y",
+                "grid_z",
+            ], name
+            assert record["arches"] == ["sm_107a"], name
+            assert record["build"]["kwargs"]["chains"] > 1, name
         elif record["template"] == cake_backend.SPLIT_TEMPLATE:
             # the fp32 source, the [3, ...] BF16 stack and the element count
             assert ["buffer", "src"] in plan_items and ["buffer", "parts"] in plan_items
@@ -1480,7 +1516,7 @@ def test_round13_w3_knobs():
     # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
     key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
     assert (
-        len(key) == 37
+        len(key) == 38
         and key[18] == 64
         and key[19] is False
         and key[20] == 0
@@ -1542,7 +1578,7 @@ def test_round15_store_hint_knob():
     key = instance_key(
         a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
     )
-    assert len(key) == 37 and key[22] == "evict_last"
+    assert len(key) == 38 and key[22] == "evict_last"
     assert instance_symbol(key) == "dense_proj_det_gemm_kn_n256_tma1_sol"
     assert (
         instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
@@ -1554,7 +1590,7 @@ def test_round15_store_hint_knob():
             a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_sometimes"
         )
     # the round-15 sm_107a rule: the batched MLA qabs forward (N = 512, K = 192) plans the 8-head interleave with
-    # evict_last stores; sm_100a keeps the round-13 plan without the operand
+    # evict_last stores; sm_100a plans without the operand (its MLA absorbed-query rule names the eight-warp program)
     v = _views("mla", "qabs", "fwd", "bf16", 1001)
     r200, *_ = cake_dense_gemm_det_train_projection_plan(
         v["A"],
@@ -1577,6 +1613,58 @@ def test_round15_store_hint_knob():
         _fallback=False,
     )
     assert b200.store_hint == "none" and "_so" not in _nopro(b200.template)
+    # the sm_100a / sm_103a rules of the batched MLA rows (64 heads): the eight-warp programs with the head interleave,
+    # over all 64 heads for the absorbed-query forward and over 8 heads with the evict_last stores for the
+    # value-projection input gradient (raster group 4 on sm_100a, 2 on sm_103a), and the ten-warp quad-store program with
+    # the interleave over 8 heads for the value-projection forward at the training T; served by registered programs
+    for arch, sm_count in (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152)):
+        for row, op, template, group, group_m in (
+            ("qabs", "fwd", "dense_proj_det_gemm_kn_n256_tma1_bg64_w8rs", 64, 2),
+            (
+                "vproj",
+                "dgrad",
+                "dense_proj_det_gemm_kn_n256_tma1_bg8_sol_w8rs",
+                8,
+                4 if arch == "sm_100a" else 2,
+            ),
+        ):
+            v = _views("mla", row, op, "bf16", 1001)
+            gb, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"],
+                v["B"],
+                v["out"],
+                sm_count=sm_count,
+                l2_bytes=L2_BYTES,
+                arch=arch,
+                _fallback=False,
+            )
+            where = (arch, sm_count, row, op)
+            assert gb.template == template and gb.batch_group == group, where
+            assert gb.group_m == group_m and gb.form == "w8rs", where
+            assert template in cake_jit.KERNELS[arch], where
+        # the value-projection forward: the quad-store register program with the interleave over 8 heads at the training
+        # T alone (T-exact keys), the program without it at another T (the ragged rule)
+        for T, template, group in (
+            (16172, "dense_proj_det_gemm_kk_n256_q_bg8_pro7", 8),
+            (16231, "dense_proj_det_gemm_kk_n256_q_bg8_pro7", 8),
+            (16384, "dense_proj_det_gemm_kk_n256_q_bg8_pro7", 8),
+            (1001, "dense_proj_det_gemm_kk_n256_q_pro7", 0),
+            (4095, "dense_proj_det_gemm_kk_n256_q_pro7", 0),
+        ):
+            v = _views("mla", "vproj", "fwd", "bf16", T)
+            gb, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"],
+                v["B"],
+                v["out"],
+                sm_count=sm_count,
+                l2_bytes=L2_BYTES,
+                arch=arch,
+                _fallback=False,
+            )
+            where = (arch, sm_count, T)
+            assert gb.template == template and gb.batch_group == group, where
+            assert gb.epi == "reg" and gb.promo == "l2_256b" and not gb.form, where
+            assert template in cake_jit.KERNELS[arch], where
 
 
 def test_round15_pd_sh_knobs():
@@ -1584,7 +1672,7 @@ def test_round15_pd_sh_knobs():
     # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
     # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
     key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 37 and key[23] == 2 and key[24] == 0
+    assert len(key) == 38 and key[23] == 2 and key[24] == 0
     assert instance_symbol(key) == "dense_proj_det_gemm_kn_n256_tma2_pd2"
     assert (
         instance_key(a_mn=False, b_mn=True)[23:]
@@ -1603,8 +1691,9 @@ def test_round15_pd_sh_knobs():
             False,
             0,
             "",
+            0,
         )
-    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag, the round-33 pro knob (0 = off), the round-2 shapes tranche's sk_first / lw flags, the whole-tile tile resolve flag mg and the paced output-store step count sw and the CTA form token ("" = the default form)
+    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag, the round-33 pro knob (0 = off), the round-2 shapes tranche's sk_first / lw flags, the whole-tile tile resolve flag mg and the paced output-store step count sw, the CTA form token ("" = the default form) and the serpentine K walk kser (0 = off)
     assert (
         instance_symbol(
             instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
@@ -1708,7 +1797,7 @@ def test_round13_knob_normalisation():
     # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
     # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
     key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 37 and key[15] is False and key[16] is True and key[17] is True
+    assert len(key) == 38 and key[15] is False and key[16] is True and key[17] is True
     assert (
         instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
         is False
@@ -1851,7 +1940,7 @@ def test_round19_sk_slab_knob():
     # one key); 3 needs an fp32 output through the TMA-store or the transposed register epilogue; 2 needs the eight warp
     # slabs (EPI_WARPS x epi_cols x 128 B) to fit the mainloop stage ring
     key = instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2)
-    assert len(key) == 37 and key[25] is True and key[26] == 2 and key[27] is False
+    assert len(key) == 38 and key[25] is True and key[26] == 2 and key[27] is False
     assert instance_symbol(key) == "dense_proj_det_gemm_nn_n256_m256_sks_sb2"
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2)[26] == 0
     assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2) == instance_key(
@@ -1922,7 +2011,7 @@ def test_round19_cta1_knob():
     # single-CTA fit and ``_s<n>`` is relative to it; it excludes the tall / 64-row families, the pair-level tail
     # policies / probes and the batched raster knob
     key = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True)
-    assert len(key) == 37 and key[27] is True and key[26] == 0 and key[5] == 7
+    assert len(key) == 38 and key[27] is True and key[26] == 0 and key[5] == 7
     assert instance_symbol(key) == "dense_proj_det_gemm_kk_n128_c1"
     assert b_stage_bytes(False, 128, 128, 1) == 2 * b_stage_bytes(False, 128) == 16384
     assert b_stage_bytes(True, 256, 128, 1) == 2 * b_stage_bytes(True, 256) == 32768
@@ -2520,8 +2609,8 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
         and old_o.ovl
         and not old_o.ovr
     )
-    # the sm_100a dense_down / o_proj forwards carry no ovr rule and keep their round-21 programs (o_proj at T 16231:
-    # the round-8 T-exact key's row-half-release program, test_gb_t_exact_rules_plan_their_programs)
+    # the sm_100a dense_down / o_proj forwards carry no ovr rule and keep their round-21 programs (o_proj at T 16231 /
+    # 16172 / 16384: the round-8 / round-11 T-exact keys' row-half-release program, test_gb_t_exact_rules_plan_their_programs)
     pd100, *_ = cake_dense_gemm_det_train_projection_plan(
         d["A"], d["B"], d["out"], **kw
     )
@@ -2533,7 +2622,7 @@ def test_round24_rules_plan_like_the_cake_launcher(T):
     po100, *_ = cake_dense_gemm_det_train_projection_plan(
         o["A"], o["B"], o["out"], **kw
     )
-    if T == 16231:
+    if T in (16172, 16231, 16384):
         assert (
             _nopro(po100.template) == "dense_proj_det_gemm_kk_n256_m256_ht_cg_or"
             and po100.ovr
@@ -2795,7 +2884,7 @@ def test_round25_rules_plan_like_the_cake_launcher(T):
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
-def test_round26_rules_plan_like_the_cake_launcher(T):
+def test_round26_rules_plan_like_the_cake_launcher(T, monkeypatch):
     # the round-26 rule changes (Cake 2f44e6e19f6): six sm_107a rules, no sm_100a change - the dense_gate_up forward bf16 (new key) takes the
     # tall tile with the half-height tail wave, the row-half release and the column-grouped raster of 12 column tiles per group; the dense_down
     # weight gradient fp32-out (new key) takes the tall tile with the half-height tail and the fp32 v8 evict-first register epilogue; the
@@ -2933,9 +3022,12 @@ def test_round26_rules_plan_like_the_cake_launcher(T):
         and not old_dg.cgrp
     )  # the previous lock's program
     # ---- (e) q_b input gradient bf16 (G @ W, 2048 x 16384 x T; new key): the column-grouped raster with 8 column tiles per group on the standard
-    #      128-row family (the previous lock's program is dense_proj_det_gemm_kn_n256, no rule) ----
+    #      128-row family (the previous lock's program is dense_proj_det_gemm_kn_n256, no rule); the sm_107a 212-SM tranche re-values the key
+    #      to the half-tail program with the column-grouped raster in the default groups (test_sm107a_212_tranche_rules_plan_their_programs):
+    #      the round-26 rule is restated here ----
     qkey = ("sm_107a", False, True, False, False, False, 2048, 16384, None)
-    assert ROW_RULES[qkey] == {"cgrp": True, "group_m": 8}
+    assert ROW_RULES[qkey] == SM107A_212_TRANCHE_RULES[qkey]
+    monkeypatch.setitem(ROW_RULES, qkey, {"cgrp": True, "group_m": 8})
     q = _views("proj", "q_b", "dgrad", "bf16", T)
     pq, *_ = cake_dense_gemm_det_train_projection_plan(
         q["A"], q["B"], q["out"], **kw107
@@ -3148,7 +3240,7 @@ def test_round27_stt_knob(T):
         sk_sync=True,
         stt=True,
     )
-    assert len(on) == 37 and on[30] is True and on[25] is True and on[29] is False
+    assert len(on) == 38 and on[30] is True and on[25] is True and on[29] is False
     assert instance_symbol(on) == "dense_proj_det_gemm_nn_n192_bz64_hee_t_sks_stt"
     off = instance_key(
         a_mn=True,
@@ -3159,13 +3251,13 @@ def test_round27_stt_knob(T):
         hints=("evict_first", "evict_first"),
         sk_sync=True,
     )
-    assert len(off) == 37 and off[30] is False and off[:30] == on[:30]
+    assert len(off) == 38 and off[30] is False and off[:30] == on[:30]
     assert (
         instance_symbol(off) == "dense_proj_det_gemm_nn_n192_bz64_hee_t_sks"
     )  # the round-18 symbol, byte-identical
     plain = instance_key(a_mn=True, b_mn=True, out_t=True, stt=True)
     assert (
-        len(plain) == 37
+        len(plain) == 38
         and plain[30] is True
         and plain[5] == off[5] == on[5]
         or plain[30] is True
@@ -3173,7 +3265,7 @@ def test_round27_stt_knob(T):
     assert instance_symbol(plain) == "dense_proj_det_gemm_nn_n256_t_stt"
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 37
+        len(default) == 38
         and default[30] is False
         and instance_symbol(default) == "dense_proj_det_gemm_kk_n256"
     )
@@ -3250,7 +3342,7 @@ def test_round27_stt_knob(T):
 
 
 @pytest.mark.parametrize("T", [16172, 16231])
-def test_round33_rules_plan_like_the_cake_launcher(T):
+def test_round33_rules_plan_like_the_cake_launcher(T, monkeypatch):
     # the round-33 rule changes (Cake 8b34a0b1725): an architecture-wide default under every rule (ARCH_RULE_DEFAULTS: the pair prologue /
     # cleanup sync form ``pro`` 7 on sm_100a and sm_107a - instance-key field 32, symbol ``_pro{n}``), six keys inserted (pro 15 rows: the
     # indexer_q forward / input gradient bf16 on both architectures, the sm_107a indexer_k forward bf16 and q_b weight gradient bf16),
@@ -3275,21 +3367,57 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # and re-values two round-6 keys; their round 9 adds two sm_103a keys (the 12288 -> 4096 forward:
     # test_gb_t_exact_rules_plan_their_programs) and re-values the two sm_103a round-6 keys; their round 10
     # adds one sm_100a and two sm_103a keys (the 4096 -> 12288 input gradient:
-    # test_gb_t_exact_rules_plan_their_programs);
+    # test_gb_t_exact_rules_plan_their_programs); their round 11 adds six sm_100a and eight sm_103a keys (measured
+    # rules moved to neighbouring T: test_gb_t_exact_rules_plan_their_programs and, for the two sm_103a weight
+    # gradients, test_gb_t_exact_wgrad_rules_plan_their_programs); their round 12 adds one sm_100a key (the
+    # 4096 -> 12288 weight gradient in 2-row raster groups: test_gb_t_exact_raster_wgrad_rules_plan_their_programs);
     # the 4096 -> 1024 fp32 weight gradient adds one sm_107a T-exact key at T 16384 (the T 16231 key's rule:
-    # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule)
+    # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule); three ragged sm_107a weight-gradient keys add 3 sm_107a
+    # keys (test_sm107a_ragged_wgrad_rules_plan_their_programs); the MLA absorbed-query forward adds one sm_100a key
+    # (test_mla_rows_plan_as_batched_views); the sm_107a 212-SM tranche adds 9 sm_107a keys and re-values 2
+    # (test_sm107a_212_tranche_rules_plan_their_programs); the MLA value-projection input gradient's head-interleaved
+    # raster adds one sm_103a key (test_round15_store_hint_knob); the MLA value-projection forward's raster adds three
+    # sm_100a T-exact keys (test_round15_store_hint_knob); round 13 adds three sm_103a T-exact weight-gradient keys
+    # (the 17408 -> 5120 fp32 weight gradient at T 16231 / 16384 in 12-row raster groups:
+    # test_gb_t_exact_raster_f32_wgrad_rules_plan_their_programs; the indexer_q weight gradient at T 16384:
+    # test_gb_t_exact_sks_wgrad_rules_plan_their_programs)
     assert (
         len(ROW_RULES)
-        == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 4 + 2 + 4 + 2 + 2 + 2 + 3 + 1
+        == 109
+        + 79
+        + 86
+        + 1
+        + 6
+        + 26
+        + 34
+        + 16
+        + 10
+        + 4
+        + 4
+        + 2
+        + 4
+        + 2
+        + 2
+        + 2
+        + 3
+        + 14
+        + 1
+        + 3
+        + 1
+        + 9
+        + 1
+        + 3
+        + 1
+        + 3
     )
     assert (
         sum(k[0] == "sm_100a" for k in ROW_RULES)
-        == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1 + 1
+        == 51 + 79 + 8 + 4 + 2 + 2 + 2 + 2 + 2 + 1 + 1 + 1 + 6 + 3 + 1
     )
-    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1 + 3 + 9
     assert (
         sum(k[0] == "sm_103a" for k in ROW_RULES)
-        == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2 + 2
+        == 86 + 1 + 8 + 6 + 2 + 2 + 2 + 1 + 2 + 2 + 8 + 1 + 3
     )
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
@@ -3502,7 +3630,8 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     assert (
         p107.template == "dense_proj_det_gemm_kk_n256_pro15"
     )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kk_n256_pro15)
-    # the shared_down input gradient bf16: sm_100a pins pro 0 (the round-27 program, no suffix), sm_107a has no rule (the default pro 7)
+    # the shared_down input gradient bf16: sm_100a pins pro 0 (the round-27 program, no suffix); sm_107a had no rule (the
+    # default pro 7) until the 212-SM tranche, whose rule plans the column-grouped pro-15 program (restated below)
     s = _views("proj", "shared_down", "dgrad", "bf16", T)
     ps, *_ = cake_dense_gemm_det_train_projection_plan(s["A"], s["B"], s["out"], **kw)
     assert (
@@ -3511,7 +3640,14 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     ps107, *_ = cake_dense_gemm_det_train_projection_plan(
         s["A"], s["B"], s["out"], **kw107
     )
+    assert ps107.pro == 15 and ps107.cgrp and ps107.template.endswith("_cg_pro15")
+    sdk107 = ("sm_107a", False, True, False, False, False, 2048, 6144, None)
+    monkeypatch.delitem(ROW_RULES, sdk107)
+    ps107, *_ = cake_dense_gemm_det_train_projection_plan(
+        s["A"], s["B"], s["out"], **kw107
+    )
     assert ps107.pro == 7 and ps107.template.endswith("_pro7")
+    monkeypatch.undo()
     # the q_b weight gradient fp32-out on sm_107a: pro 15 on the register epilogue with the 256-bit stores (the round-27 knobs)
     w = _views("proj", "q_b", "wgrad", "f32", T)
     pw, *_ = cake_dense_gemm_det_train_projection_plan(
@@ -3596,10 +3732,10 @@ def test_round33_pro_knob(T):
     # pair programs only (the single-CTA form refuses it); every other field is unchanged: the OFF form's key is the round-27 key plus a
     # trailing 0 and its symbol is the round-27 symbol
     on = instance_key(a_mn=False, b_mn=True, pro=7)
-    assert len(on) == 37 and on[31] == 7 and on[30] is False and on[27] is False
+    assert len(on) == 38 and on[31] == 7 and on[30] is False and on[27] is False
     assert instance_symbol(on) == "dense_proj_det_gemm_kn_n256_pro7"
     off = instance_key(a_mn=False, b_mn=True)
-    assert len(off) == 37 and off[31] == 0 and off[:31] == on[:31]
+    assert len(off) == 38 and off[31] == 0 and off[:31] == on[:31]
     assert (
         instance_symbol(off) == "dense_proj_det_gemm_kn_n256"
     )  # the round-2 symbol, byte-identical
@@ -3647,7 +3783,7 @@ def test_round33_pro_knob(T):
     )
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 37
+        len(default) == 38
         and default[31] == 0
         and instance_symbol(default) == "dense_proj_det_gemm_kk_n256"
     )
@@ -3730,10 +3866,10 @@ def test_round21_cgrp_knob(T):
     key = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
     )
-    assert len(key) == 37 and key[28] is True and key[27] is False
+    assert len(key) == 38 and key[28] is True and key[27] is False
     assert instance_symbol(key) == "dense_proj_det_gemm_kk_n256_m256_ov_ht_cg"
     off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 37 and off[:28] == key[:28] and off[28] is False
+    assert len(off) == 38 and off[:28] == key[:28] and off[28] is False
     assert instance_symbol(off) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
     assert (
         instance_symbol(instance_key(a_mn=False, b_mn=False, cgrp=True))
@@ -3899,26 +4035,26 @@ def test_round24_ovr_knob(T, monkeypatch):
     key = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, htail=True, cgrp=True, ovr=True
     )
-    assert len(key) == 37 and key[29] is True and key[28] is True and key[16] is False
+    assert len(key) == 38 and key[29] is True and key[28] is True and key[16] is False
     assert instance_symbol(key) == "dense_proj_det_gemm_kk_n256_m256_ht_cg_or"
     solo = instance_key(a_mn=False, b_mn=False, cta_rows=256, htail=True, ovr=True)
-    assert len(solo) == 37 and solo[29] is True and solo[28] is False
+    assert len(solo) == 38 and solo[29] is True and solo[28] is False
     assert instance_symbol(solo) == "dense_proj_det_gemm_kk_n256_m256_ht_or"
     off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 37 and off[29] is False and off[16] is True
+    assert len(off) == 38 and off[29] is False and off[16] is True
     assert (
         instance_symbol(off) == "dense_proj_det_gemm_kk_n256_m256_ov_ht"
     )  # the round-21 symbol, byte-identical
     cg = instance_key(
         a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
     )
-    assert len(cg) == 37 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
+    assert len(cg) == 38 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
     assert (
         instance_symbol(cg) == "dense_proj_det_gemm_kk_n256_m256_ov_ht_cg"
     )  # test_round21_cgrp_knob's symbol, now on a 30-field key
     default = instance_key(a_mn=False, b_mn=False)
     assert (
-        len(default) == 37
+        len(default) == 38
         and default[29] is False
         and instance_symbol(default) == "dense_proj_det_gemm_kk_n256"
     )
@@ -3941,12 +4077,12 @@ def test_round24_ovr_knob(T, monkeypatch):
     # launcher's round-24 precedence rule, asserted below on the sm_107a o_proj / dense_down forwards)
     kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
     v = _views("proj", "o_proj", "fwd", "bf16", T)
-    # the round-8 T-exact key of this row at T 16231 plans the row-half-release program; (1) reads the ragged rule, so
-    # it plans without that key
+    # the round-8 T-exact key of this row at T 16231 (round 11: and at T 16172) plans the row-half-release program;
+    # (1) reads the ragged rule, so it plans without the key of its T
     with monkeypatch.context() as m:
         m.delitem(
             ROW_RULES,
-            ("sm_100a", False, False, False, False, False, 6144, 16384, 16231),
+            ("sm_100a", False, False, False, False, False, 6144, 16384, T),
             raising=False,
         )
         cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
@@ -4151,7 +4287,7 @@ def test_instance_key_rejects_bad_configurations():
     # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
     # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19), cgrp (29 fields
     # since round 21), ovr (30 fields since round 24)
-    assert len(key) == 37 and key[11:] == (
+    assert len(key) == 38 and key[11:] == (
         0,
         ("none", "none"),
         False,
@@ -4178,6 +4314,7 @@ def test_instance_key_rejects_bad_configurations():
         False,  # mg (35 fields: the whole-tile tile resolve)
         0,  # sw (36 fields: the paced output stores)
         "",  # form (37 fields: the eight-warp CTA form)
+        0,  # kser (38 fields: the serpentine K walk)
     )
     # the promotion is validated where it is resolved, by the planner
     v = _views("proj", "o_proj", "fwd", "bf16", 257)
@@ -4786,7 +4923,11 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     and sync_plan is None
                 )
                 # the fit of the half items selects the plan, never the program the rule names
-                htail_plan = htail and 0 < 2 * tail <= plan.sm_pairs
+                htail_plan = (
+                    htail
+                    and 0 < 2 * tail <= plan.sm_pairs
+                    and tail >= int(rule.get("ht_min_tail", 1))
+                )
                 parts = rule.get("sk_parts") if sync_plan is None else None
                 sk_rule = (
                     sk_parts_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, parts)
@@ -5688,9 +5829,13 @@ def test_router_split_rules_are_measured_windows_and_resolve_by_device():
     # the measured rows and their counts, pinned here rather than read from the table under test
     assert {key: windows[0][2] for key, windows in ROUTER_SPLIT_RULES.items()} == {
         ("sm_100a", 148, "nn_t", 5120): 9,
+        ("sm_100a", 148, "nn_t", 6144): 3,
         ("sm_100a", 152, "nn_t", 5120): 9,
+        ("sm_100a", 152, "nn_t", 6144): 3,
         ("sm_103a", 148, "nn_t", 5120): 9,
+        ("sm_103a", 148, "nn_t", 6144): 3,
         ("sm_103a", 152, "nn_t", 5120): 9,
+        ("sm_103a", 152, "nn_t", 6144): 3,
     }
     assert all(len(windows) == 1 for windows in ROUTER_SPLIT_RULES.values())
     for (arch, sm_count, layout, H), windows in ROUTER_SPLIT_RULES.items():
@@ -6580,9 +6725,16 @@ def test_template_knobs_invert_instance_symbol():
         for template in table:
             tokens = cake_backend._template_tokens(template)
             if tokens is None:
-                # the router programs, the fused split program and the swapped forward carry no knob tokens
+                # the router programs, the fused split program, the swapped forward and the chain programs carry no
+                # knob tokens
                 assert (
-                    template.startswith(("router_fp32_det_gemm_", "swap_ab_"))
+                    template.startswith(
+                        (
+                            "router_fp32_det_gemm_",
+                            "swap_ab_",
+                            cake_backend.CHAIN_TEMPLATE_PREFIX,
+                        )
+                    )
                     or template == cake_backend.SPLIT_TEMPLATE
                 ), (
                     arch,
@@ -6719,6 +6871,8 @@ def test_registry_fallback_serves_every_registered_class(arch):
                         continue  # a shape the class refuses
                     if mirror.template in registered:
                         continue
+                    if mirror.transposed_out != out_t:
+                        continue  # the unbatched weight-gradient swap: the transposed class plans the row
                     if cake_backend._measured_row_rule(
                         arch, mirror.a_mn, mirror.b_mn, out_f32, out_t, False, N, K, M
                     ):
@@ -6922,7 +7076,11 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
 # 12288 -> 4096 forward; round 6: the 17408 -> 5120 forward, the ragged rule's program; round 8: its form with the tall
 # epilogue released by row half on sm_100a; round 9: the same form on sm_103a, and the sm_103a 12288 -> 4096
 # forward at T 16231 / 16384; round 10: the 4096 -> 12288 input gradient at T 16384 on sm_100a and at
-# T 16231 / 16384 on sm_103a) name their T-exact key and its program.
+# T 16231 / 16384 on sm_103a; round 11: the sm_100a 4096 -> 12288 input gradient at T 16231; round 12: the sm_100a
+# 4096 -> 12288 weight gradient at T 16231, the ragged rule's program in 2-row raster groups) name their T-exact key and
+# its program; the sm_103a keys that also walk K serpentine (``kser`` 76: the 12288 -> 4096 forward at T 16384, the
+# 4096 -> 12288 input gradient at T 16231 / 16384) name the ``_ks76`` program, the plan of the 152-SM part they were
+# re-measured on.
 # ---------------------------------------------------------------------------
 # fmt: off
 MEASURED_SHAPE_ROWS = (
@@ -6984,7 +7142,7 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
     (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, True, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
     (('sm_100a', False, True, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
     (('sm_100a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
@@ -7034,7 +7192,7 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', True, True, False, False, False, 4096, None, 1024), 16384, 152, 'dense_proj_det_gemm_nn_n224_hne_cg_pro15'),
     (('sm_100a', True, True, False, False, False, 4096, None, 4096), 16231, 152, 'dense_proj_det_gemm_nn_n224_m256_pro7'),
     (('sm_100a', True, True, False, False, False, 4096, None, 4096), 16384, 152, 'dense_proj_det_gemm_nn_n224_m256_pro7'),
-    (('sm_100a', True, True, False, False, False, 4096, None, 12288), 16231, 152, 'dense_proj_det_gemm_nn_n256_m256_skx_skf_pro7'),
+    (('sm_100a', True, True, False, False, False, 4096, 16231, 12288), 16231, 152, 'dense_proj_det_gemm_nn_n256_m256_skx_skf_pro7'),
     (('sm_100a', True, True, False, False, False, 4096, None, 12288), 16384, 152, 'dense_proj_det_gemm_nn_n256_m256_skx_skf_pro7'),
     (('sm_100a', True, True, False, False, False, 5120, None, 512), 16231, 152, 'dense_proj_det_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
     (('sm_100a', True, True, False, False, False, 5120, None, 512), 16384, 152, 'dense_proj_det_gemm_nn_n192_bz64_hne_sks_sb2_pro15'),
@@ -7137,7 +7295,7 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
-    (('sm_103a', False, False, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
+    (('sm_103a', False, False, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_ks76_pro7'),
     (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 5120, 17408, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7'),
@@ -7164,8 +7322,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8rs'),
     (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
     (('sm_103a', False, True, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
-    (('sm_103a', False, True, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
-    (('sm_103a', False, True, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7'),
+    (('sm_103a', False, True, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7'),
     (('sm_103a', False, True, False, False, False, 5120, 32, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_103a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
@@ -7417,7 +7575,8 @@ def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
             dims = (N, 16231 if K is None else K, 16231 if M is None else M)
             # an own sm_103a rule of the row at these dims wins over the parent's: the GB T-exact keys of the 6144 x 2048
             # rows and of the 16384 -> 6144 forward at T 16231 over the sm_100a ragged rules, the ragged 4096 -> 48 rule
-            # over the sm_100a T-exact keys;
+            # over the sm_100a T-exact keys, the ragged-K 4096 -> 12288 weight-gradient rule over the sm_100a T-exact key
+            # at T 16231;
             # an own T-exact key wins over the row's own ragged rule (the 5120 -> 17408 and 4096 -> 12288 input
             # gradients, the 17408 -> 5120 forward and the 12288 -> 4096 forward at T 16231)
             src = (arch_of,) + key
@@ -7435,10 +7594,31 @@ def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
                 for own_key in (
                     ("sm_103a",) + key[:5] + (N, dims[1], dims[2]),
                     ("sm_103a",) + key[:5] + (N, dims[1], None),
+                    ("sm_103a",) + key[:5] + (N, None, dims[2]),
                 ):
                     if own_key in ROW_RULES:
                         src = own_key
                         break
+                else:
+                    # without an own rule the parent's T-exact key wins over the parent's ragged rule at its T (the MLA
+                    # value-projection forward at T 16231); the ragged rule still plans one token less
+                    parent_exact = ("sm_100a",) + key[:5] + dims
+                    if M is None and parent_exact in ROW_RULES:
+                        assert (
+                            cake_backend._measured_row_rule(
+                                "sm_103a",
+                                a_mn,
+                                b_mn,
+                                out_f32,
+                                out_t,
+                                batched,
+                                N,
+                                K,
+                                16230,
+                            )
+                            == ROW_RULES[src]
+                        ), key
+                        src = parent_exact
             assert (
                 cake_backend._measured_row_rule(
                     "sm_103a", a_mn, b_mn, out_f32, out_t, batched, *dims
@@ -7577,6 +7757,280 @@ def test_wgrad_swap_follows_the_measured_rule():
             assert mirror not in ROW_RULES, (key, mirror)
 
 
+# The unbatched weight-gradient view pairs of the generic entry (A = G.T, B = X, out [d_out, d_in]) on rows the rule table keys
+# in the swapped orientation alone: (arch, SM count, d_out, d_in) -> the program the weight-gradient entry plans for the row at
+# T 16384 (bf16 output), which the generic call now plans too.
+UNBATCHED_WGRAD_SWAP_ROWS = {
+    ("sm_100a", 152, 32, 4096): "dense_proj_det_gemm_nn_n128_m64_hen_t_pro15",
+    ("sm_100a", 152, 48, 5120): "dense_proj_det_gemm_nn_n128_hen_t_pro15",
+    ("sm_100a", 152, 128, 8192): "dense_proj_det_gemm_nn_n128_m64_hen_t_pro15",
+    ("sm_100a", 152, 576, 6144): "dense_proj_det_gemm_nn_n192_hee_t_tma1_pro7",
+    ("sm_103a", 152, 32, 5120): "dense_proj_det_gemm_nn_n128_hen_t_sks_pro7",
+    ("sm_103a", 152, 64, 4096): "dense_proj_det_gemm_nn_n128_m64_hen_t_pro15",
+    ("sm_103a", 152, 128, 6144): "dense_proj_det_gemm_nn_n128_m64_hen_t_pro7",
+    ("sm_103a", 152, 512, 4096): "dense_proj_det_gemm_nn_n256_m64_hen_t_pro15",
+    ("sm_107a", 212, 128, 4096): "dense_proj_det_gemm_nn_n128_m64_hen_t_skx_pro15",
+}
+
+
+@pytest.mark.parametrize("out_f32", [False, True])
+@pytest.mark.parametrize("T", [1024, 16384, 65537])
+def test_unbatched_wgrad_view_pair_plans_the_wgrad_entry(T, out_f32):
+    """An unbatched generic call with both operands MN-major and no transposed store (the weight gradient
+    ``G.T @ X``) on a row keyed in the swapped orientation alone plans exactly the weight-gradient entry's plan for
+    the same math: the swapped ``X.T @ G`` with the transposed store, the same operand views and output view."""
+    odt = torch.float32 if out_f32 else torch.bfloat16
+    for (arch, sm, d_out, d_in), template in UNBATCHED_WGRAD_SWAP_ROWS.items():
+        assert cake_backend._orientation_rules(arch, d_out, d_in, out_f32) == (
+            True,
+            False,
+        )
+        G = torch.empty(T, d_out, dtype=torch.bfloat16)
+        X = torch.empty(T, d_in, dtype=torch.bfloat16)
+        out = torch.empty(d_out, d_in, dtype=odt)
+        got = cake_dense_gemm_det_train_projection_plan(
+            G.t(), X, out, sm_count=sm, l2_bytes=L2_BYTES, arch=arch
+        )
+        A, B, transposed = wgrad_views(G, X, arch=arch, out_f32=out_f32)
+        assert transposed
+        want = cake_dense_gemm_det_train_projection_plan(
+            A, B, out, sm_count=sm, l2_bytes=L2_BYTES, transposed_out=True, arch=arch
+        )
+        where = (arch, sm, d_out, d_in, T, out_f32)
+        assert got[0] == want[0], where
+        assert got[0].transposed_out and not got[0].swap_fallback, where
+        for g, w in zip(got[1:], want[1:], strict=True):
+            # the same views; a batch of one never dereferences its batch stride (2-D views unsqueezed)
+            assert (g.data_ptr(), tuple(g.shape), g.stride()[1:]) == (
+                w.data_ptr(),
+                tuple(w.shape),
+                w.stride()[1:],
+            ), where
+        if T == 16384 and not out_f32:
+            assert got[0].template == template, (where, got[0].template)
+
+
+@pytest.mark.parametrize("out_f32", [False, True])
+@pytest.mark.parametrize("T", [1024, 16384])
+def test_unbatched_narrow_output_wgrad_plans_the_swapped_call(T, out_f32):
+    """On sm_100a / sm_103a an unbatched generic call with both operands MN-major, no transposed store, no rule in
+    either orientation, at most 64 output columns against 4096 to 8192 output rows and at least 256 tokens (the
+    ``[d_in, d_out]`` weight gradient ``X.T @ G`` of a narrow projection) plans exactly the swapped generic call
+    ``G.T @ X`` with the transposed store into the same output: the 64-row transposed program instead of one padded
+    224- / 256-column tile."""
+    odt = torch.float32 if out_f32 else torch.bfloat16
+    template = (
+        "dense_proj_det_gemm_nn_n128_m64_f32_t_pro7"
+        if out_f32
+        else "dense_proj_det_gemm_nn_n128_m64_t_pro7"
+    )
+    for arch in ("sm_100a", "sm_103a"):
+        for d_in, d_out in ((4096, 8), (4096, 32), (5120, 48), (8192, 64)):
+            assert cake_backend._orientation_rules(arch, d_in, d_out, out_f32) == (
+                False,
+                False,
+            )
+            G = torch.empty(T, d_out, dtype=torch.bfloat16)
+            X = torch.empty(T, d_in, dtype=torch.bfloat16)
+            out = torch.empty(d_in, d_out, dtype=odt)
+            got = cake_dense_gemm_det_train_projection_plan(
+                X.t(), G, out, sm_count=152, l2_bytes=L2_BYTES, arch=arch
+            )
+            want = cake_dense_gemm_det_train_projection_plan(
+                G.t(),
+                X,
+                out,
+                sm_count=152,
+                l2_bytes=L2_BYTES,
+                transposed_out=True,
+                arch=arch,
+            )
+            where = (arch, d_in, d_out, T, out_f32)
+            assert got[0] == want[0], where
+            assert got[0].transposed_out and not got[0].swap_fallback, where
+            for g, w in zip(got[1:], want[1:], strict=True):
+                assert (g.data_ptr(), tuple(g.shape), g.stride()[1:]) == (
+                    w.data_ptr(),
+                    tuple(w.shape),
+                    w.stride()[1:],
+                ), where
+            if T == 16384 and d_out == 32:
+                assert got[0].template == template, (where, got[0].template)
+
+
+def test_unbatched_wgrad_swap_keeps_every_other_call():
+    """The unbatched weight-gradient swap takes only the rows it names: a row keyed direct, a row
+    without a rule and more than 64 output columns (2048 -> 32 in the out_in orientation, which the weight-gradient
+    entry swaps by the padded-work heuristic; 4096 x 72), a narrow output against fewer than 4096 rows (2048 x 32) or
+    more than 8192 rows (12288 x 40), a narrow output with fewer than 256 tokens, the narrow output on sm_107a, the
+    sm_107a bf16 6144 -> 576 weight gradient below 6144 tokens, a call with the transposed store and the K-major
+    layouts keep the caller's orientation, as before."""
+    T = 16384
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
+        sm = 212 if arch == "sm_107a" else 152
+
+        def plan(A, B, out, arch=arch, sm=sm, **kw):
+            return cake_dense_gemm_det_train_projection_plan(
+                A, B, out, sm_count=sm, l2_bytes=L2_BYTES, arch=arch, **kw
+            )[0]
+
+        # (M, N, K); a row keyed direct: 5120 -> 512 on sm_100a / sm_103a, 4096 -> 1024 on sm_107a
+        rows = [(1024, 4096, T) if arch == "sm_107a" else (512, 5120, T)]
+        rows += [(32, 2048, T), (4096, 72, T), (2048, 32, T)]
+        if arch == "sm_107a":
+            rows += [(4096, 32, T), (576, 6144, 4096)]
+        else:
+            rows += [(12288, 40, T), (4096, 32, 255)]
+        for M, N, K in rows:
+            A = torch.empty(K, M, dtype=torch.bfloat16).t()
+            B = torch.empty(K, N, dtype=torch.bfloat16)
+            p = plan(A, B, torch.empty(M, N, dtype=torch.bfloat16))
+            assert not p.transposed_out and not p.swap_fallback, (arch, M, N, K)
+            assert p.M == M and p.N == N, (arch, M, N, K)
+        G = torch.empty(T, 32, dtype=torch.bfloat16)
+        X = torch.empty(T, 4096, dtype=torch.bfloat16)
+        p = plan(
+            G.t(), X, torch.empty(4096, 32, dtype=torch.bfloat16), transposed_out=True
+        )
+        assert p.M == 32 and p.N == 4096 and p.transposed_out
+        assert not plan(
+            torch.empty(32, T, dtype=torch.bfloat16),
+            torch.empty(4096, T, dtype=torch.bfloat16).t(),
+            torch.empty(32, 4096, dtype=torch.bfloat16),
+        ).transposed_out
+        assert not plan(
+            torch.empty(32, T, dtype=torch.bfloat16),
+            X,
+            torch.empty(32, 4096, dtype=torch.bfloat16),
+        ).transposed_out
+        swap = cake_backend._single_wgrad_swap
+        assert not swap(arch, 32, 4096, T, False, True, False)
+        assert not swap(arch, 32, 4096, T, True, False, False)
+        assert swap(arch, 32, 4096, T, True, True, False)
+        narrow = arch != "sm_107a"
+        assert swap(arch, 4096, 32, T, True, True, False) == narrow
+        assert swap(arch, 8192, 32, 256, True, True, False) == narrow
+        assert not swap(arch, 4096, 32, 255, True, True, False)
+        assert not swap(arch, 12288, 32, T, True, True, False)
+        # sm_107a: the bf16 6144 -> 576 key swaps from 6144 tokens on, the fp32 one at every T
+        if arch == "sm_107a":
+            assert not swap(arch, 576, 6144, 6143, True, True, False)
+            assert swap(arch, 576, 6144, 6144, True, True, False)
+            assert swap(arch, 576, 6144, 1024, True, True, True)
+
+
+def test_unbatched_wgrad_view_pair_binds_the_wgrad_entry_launch(monkeypatch):
+    """Through the convenience path (planned and bound) the generic entry's unbatched weight-gradient view pair
+    launches the weight-gradient entry's program with the same arguments (CPU stand-ins: nothing is launched)."""
+    calls, _ = _cpu_k1_entry_points(monkeypatch, arch="sm_100a")
+    T = 2048
+    G = torch.randn(T, 48).to(torch.bfloat16)
+    X = torch.randn(T, 5120).to(torch.bfloat16)
+    out = torch.empty(48, 5120, dtype=torch.bfloat16)
+    for index in (-1, 0):  # the convenience path, then the bound launch of the key
+        monkeypatch.setattr(cake_backend, "_entry_index", lambda sources, i=index: i)
+        for _ in range(2):
+            calls.clear()
+            assert (
+                cake_backend.cake_dense_gemm_det_train_projection(G.t(), X, out) is out
+            )
+            assert (
+                cake_backend.cake_dense_gemm_det_train_projection_wgrad(G, X, out)
+                is out
+            )
+            (name, args), (want_name, want_args) = calls
+            assert name == want_name, (name, want_name)
+            assert len(args) == len(want_args)
+            for i, (g, w) in enumerate(zip(args, want_args, strict=True)):
+                if not isinstance(w, torch.Tensor):
+                    assert type(g) is type(w) and g == w, (i, g, w)
+                    continue
+                # the same views; a batch of one never dereferences its batch stride (2-D views unsqueezed)
+                assert (tuple(g.shape), g.data_ptr(), g.dtype) == (
+                    tuple(w.shape),
+                    w.data_ptr(),
+                    w.dtype,
+                ), i
+                assert g.stride()[-2:] == w.stride()[-2:], i
+    # the module of the swapped plan (the weight-gradient entry's views X.T, G with the transposed store)
+    swapped, *_ = cake_dense_gemm_det_train_projection_plan(
+        X.t(),
+        G,
+        out,
+        sm_count=152,
+        l2_bytes=126 << 20,
+        transposed_out=True,
+        arch="sm_100a",
+    )
+    assert name == cake_backend.select_module("sm_100a", swapped.template), (
+        name,
+        swapped.template,
+    )
+
+
+@pytest.mark.parametrize("orient", ["out_in", "in_out"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_unbatched_wgrad_view_pair_matches_fp64_and_the_wgrad_entry_bits(
+    out_dtype, orient
+):
+    """On the device, a re-planned unbatched weight-gradient view pair of 5120 -> 48 at T 2048: ``out_in``
+    (``G.T @ X`` into ``[48, 5120]``, keyed in the swapped orientation alone) runs the weight-gradient entry's launch,
+    ``in_out`` (``X.T @ G`` into ``[5120, 48]``, a narrow output without a rule) the swapped generic call's launch
+    (``G.T @ X`` with the transposed store): bitwise equal outputs on the prepared and the convenience paths, bit-exact
+    reruns and the FP64 reference of the exact BF16 operands within the package tolerance."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    device = torch.device("cuda")
+    arch = arch_for(device)
+    out_f32 = out_dtype == torch.float32
+    T, d_out, d_in = 2048, 48, 5120
+    g = torch.Generator(device=device).manual_seed(SEED)
+    G = torch.randn(T, d_out, device=device, generator=g).to(torch.bfloat16)
+    X = (torch.randn(T, d_in, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
+    if orient == "out_in":
+        A, B, shape = G.t(), X, (d_out, d_in)
+    else:
+        A, B, shape = X.t(), G, (d_in, d_out)
+    M, N = shape
+    if not cake_backend._single_wgrad_swap(arch, M, N, T, True, True, out_f32):
+        pytest.skip(
+            f"the {orient} view pair of {d_in} -> {d_out} is not swapped on {arch}"
+        )
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    out = torch.full(shape, float("nan"), dtype=out_dtype, device=device)
+    prepared = cake_dense_gemm_det_train_projection_prepare(A, B, out)
+    ref_out = torch.full_like(out, float("nan"))
+    if orient == "out_in":
+        reference = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, ref_out)
+    else:
+        reference = cake_dense_gemm_det_train_projection_prepare(
+            B.t(), A.t(), ref_out, transposed_out=True
+        )
+    assert prepared.plan == reference.plan and prepared.plan.transposed_out
+    _require_program(prepared.template)
+    reference.launch()
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(A.double(), B.double()))
+    bits = torch.int32 if out_f32 else torch.int16
+    first = out.clone()
+    assert torch.equal(out.view(bits), ref_out.view(bits))
+    for _ in range(20):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(bits), first.view(bits))
+    conv = torch.full_like(out, float("nan"))
+    for _ in range(2):  # planned, then the bound launch of the key
+        cake_backend.cake_dense_gemm_det_train_projection(A, B, conv)
+        torch.cuda.synchronize()
+        assert torch.equal(conv.view(bits), first.view(bits))
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+
+
 def test_round2_knobs_name_their_programs():
     """The round-2 shapes tranche's build knobs: ``sk_first`` (``_skf`` directly after ``_skx``) and ``lw`` (``_lw``
     between ``_or`` and ``_pro``) in ``instance_key`` / ``instance_symbol``, their refusals, and the symbol decoder's
@@ -7589,7 +8043,7 @@ def test_round2_knobs_name_their_programs():
     key = cake_backend.instance_key(
         **nn, cta_rows=256, sk_exact=True, sk_first=True, pro=7
     )
-    assert len(key) == 37 and key[32] is True and key[33] is False and key[34] is False
+    assert len(key) == 38 and key[32] is True and key[33] is False and key[34] is False
     assert (
         cake_backend.instance_symbol(key)
         == "dense_proj_det_gemm_nn_n256_m256_skx_skf_pro7"
@@ -8068,7 +8522,7 @@ def test_mg_rules_plan_the_whole_tile_programs(T):
     # the key: field 35, the symbol token after ``_lw``; the forms the program excludes are refused with it
     kn = dict(a_mn=False, b_mn=True, epi="tma", slots=1, pd=2, pro=15)
     key = cake_backend.instance_key(**kn, mg=True)
-    assert len(key) == 37 and key[34] is True and key[33] is False
+    assert len(key) == 38 and key[34] is True and key[33] is False
     assert (
         cake_backend.instance_symbol(key)
         == "dense_proj_det_gemm_kn_n256_tma1_pd2_mg_pro15"
@@ -8193,7 +8647,7 @@ def test_sw_rules_plan_the_paced_store_programs(T):
     # the key: field 36, the symbol token after ``_mg``; the knob is a step count on the bf16 TMA-store pd-2 drain
     kn = dict(a_mn=False, b_mn=True, epi="tma", slots=1, pd=2, pro=15)
     key = cake_backend.instance_key(**kn, mg=True, sw=25)
-    assert len(key) == 37 and key[35] == 25 and key[34] is True
+    assert len(key) == 38 and key[35] == 25 and key[34] is True
     assert (
         cake_backend.instance_symbol(key)
         == "dense_proj_det_gemm_kn_n256_tma1_pd2_mg_sw25_pro15"
@@ -8226,10 +8680,15 @@ def test_sw_rules_plan_the_paced_store_programs(T):
     assert "sw" not in cake_backend._CTA1_CLEARED
 
 
-# the ragged ROW_RULES keys that carry the eight-warp CTA form (the six sm_103a and the seven sm_100a input-gradient
-# rows; the two sm_100a 4096 -> 48 T-exact keys that carry it are GB_T_EXACT_ROWS)
+# the unbatched ragged ROW_RULES keys that carry the eight-warp CTA form (the six sm_103a and the seven sm_100a
+# input-gradient rows; the two sm_100a 4096 -> 48 T-exact keys that carry it are GB_T_EXACT_ROWS, the batched MLA rows
+# of sm_100a and sm_103a are MLA_TEMPLATES rows and test_round15_store_hint_knob's)
 EIGHT_WARP_ROWS = sorted(
-    (key for key, rule in ROW_RULES.items() if rule.get("form") and key[8] is None),
+    (
+        key
+        for key, rule in ROW_RULES.items()
+        if rule.get("form") and key[8] is None and not key[5]
+    ),
     key=repr,
 )
 # the eight-warp rows per architecture: (N, K) -> (template, form, group_m, promo); the raster group is the row's
@@ -8438,7 +8897,7 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
     # the key: field 37, the symbol token after ``_pro<n>``; every field the form cannot carry is refused with it
     kn = dict(a_mn=False, b_mn=True, epi="tma", slots=1)
     key = cake_backend.instance_key(**kn, form="w8r")
-    assert len(key) == 37 and key[36] == "w8r" and key[35] == 0 and key[34] is False
+    assert len(key) == 38 and key[36] == "w8r" and key[35] == 0 and key[34] is False
     assert cake_backend.instance_symbol(key) == "dense_proj_det_gemm_kn_n256_tma1_w8r"
     assert (
         cake_backend.instance_symbol(cake_backend.instance_key(**kn, form="w8rs"))
@@ -8457,7 +8916,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
         dict(**kn, cta1=True, form="w8r"),
         dict(**kn, out_f32=True, form="w8r"),
         dict(a_mn=False, b_mn=True, block_n=128, epi="tma", slots=1, form="w8r"),
-        dict(**kn, batch_group=4, form="w8r"),
+        dict(**kn, batch_group=1, form="w8r"),
+        dict(**kn, batch_group=1, store_hint="evict_last", form="w8rs"),
+        dict(**kn, batch_group=8, store_hint="evict_first", form="w8rs"),
         dict(**kn, pd=2, form="w8rs"),
         dict(**kn, pro=15, form="w8rs"),
         dict(**kn, lw=True, pro=15, form="w8rs"),
@@ -8470,6 +8931,30 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
     ):
         with pytest.raises(ValueError, match=r"form"):
             cake_backend.instance_key(**bad)
+    # the head-interleaved batch raster (G > 1) and, with it, the evict_last store hint are the eight-warp kernel's
+    # own knobs (the batched MLA programs): ``_bg<G>`` / ``_sol`` before the form token, decoded back
+    for knobs_bg, symbol in (
+        (dict(batch_group=8, form="w8r"), "dense_proj_det_gemm_kn_n256_tma1_bg8_w8r"),
+        (
+            dict(batch_group=64, form="w8rs"),
+            "dense_proj_det_gemm_kn_n256_tma1_bg64_w8rs",
+        ),
+        (
+            dict(batch_group=8, store_hint="evict_last", form="w8rs"),
+            "dense_proj_det_gemm_kn_n256_tma1_bg8_sol_w8rs",
+        ),
+    ):
+        assert (
+            cake_backend.instance_symbol(cake_backend.instance_key(**kn, **knobs_bg))
+            == symbol
+        )
+        decoded = cake_backend._template_knobs(symbol)
+        assert decoded is not None, symbol
+        assert (decoded["form"], decoded["batch_group"], decoded["store_hint"]) == (
+            knobs_bg["form"],
+            knobs_bg["batch_group"],
+            knobs_bg.get("store_hint", "none"),
+        ), symbol
     # the symbol decoder reads the form back and names the program again; a token the form refuses (``_pro15`` with
     # it) decodes to a key ``instance_key`` refuses
     knobs = cake_backend._template_knobs("dense_proj_det_gemm_kn_n256_tma1_w8r")
@@ -8546,7 +9031,13 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
 # the sm_103a 12288 -> 4096 forward at T 16231 / 16384 (that form in 8-column-tile groups, in place of the ragged rule's
 # overlapped half-tail program in 16-column-tile groups); round 10 adds the 4096 -> 12288 input gradient at T 16384 on
 # sm_100a and at T 16231 / 16384 on sm_103a (that form in 16-column-tile groups, in place of the ragged rule's overlapped
-# half-tail program in the same groups).
+# half-tail program in the same groups); round 11 moves measured rules to neighbouring T on sm_100a: the 16384 -> 6144
+# forward at T 16172 / 16384, the 17408 -> 5120 forward and the 5120 -> 17408 input gradient at T 16172, the
+# 4096 -> 12288 input gradient at T 16231 (each its row's program) and the 12288 -> 4096 forward at T 16172
+# (GB_T_EXACT_T_PROGRAMS), and on sm_103a: the 16384 -> 6144 forward at T 16172 / 16384, the 12288 -> 4096 and
+# 17408 -> 5120 forwards and the 5120 -> 17408 and 4096 -> 12288 input gradients at T 16172 (each its row's program;
+# the 12288 -> 4096 forward and the 4096 -> 12288 input gradient at T 16172 with the serpentine K walk on the
+# 152-SM part: GB_T_EXACT_KSER_ROWS).
 GB_T_EXACT_ROWS = {
     ("sm_100a", True, 2048, 16384): (
         (16172, 16231),
@@ -8589,7 +9080,7 @@ GB_T_EXACT_ROWS = {
         "dense_proj_det_gemm_kn_n256_m256_ov_ht_cg_pro7",
     ),
     ("sm_100a", True, 5120, 17408): (
-        (16231, 16384),
+        (16172, 16231, 16384),
         "dense_proj_det_gemm_kn_n256_m256_ov_ht_tma1_cg_pro7",
     ),
     ("sm_100a", False, 4096, 12288): (
@@ -8597,47 +9088,70 @@ GB_T_EXACT_ROWS = {
         "dense_proj_det_gemm_kk_n256_m256_ov_ht_tma1_cg_pro7",
     ),
     ("sm_103a", True, 5120, 17408): (
-        (16231, 16384),
+        (16172, 16231, 16384),
         "dense_proj_det_gemm_kn_n256_m256_ov_ht_tma1_cg_pro7",
     ),
     ("sm_100a", False, 5120, 17408): (
-        (16231, 16384),
+        (16172, 16231, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_103a", False, 5120, 17408): (
-        (16231, 16384),
+        (16172, 16231, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_100a", False, 6144, 16384): (
-        (16231,),
+        (16172, 16231, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_103a", False, 6144, 16384): (
-        (16231,),
+        (16172, 16231, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_103a", False, 4096, 12288): (
-        (16231, 16384),
+        (16231,),
         "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
     ),
     ("sm_100a", True, 4096, 12288): (
-        (16384,),
-        "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
-    ),
-    ("sm_103a", True, 4096, 12288): (
         (16231, 16384),
         "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
     ),
+}
+# The GB T-exact keys whose program differs from the program of their row's other keys: (arch, B MN-major, N, K, T) ->
+# the program (round 11: the sm_100a 12288 -> 4096 forward at T 16172 plans the half-tail program with the tall
+# epilogue released by row half and the column-grouped raster, the sm_103a round-9 keys' program, where its round-5
+# keys at T 16231 / 16384 plan the overlapped half-tail program through the one-slot TMA store).
+GB_T_EXACT_T_PROGRAMS = {
+    (
+        "sm_100a",
+        False,
+        4096,
+        12288,
+        16172,
+    ): "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
 }
 # The GB T-exact rows whose keys keep the ragged rule's program and change only its raster group (round 6: the
 # 17408 -> 5120 forward in 12-column-tile groups, the ragged rule's 8; sm_103a only since round 8, none since
 # round 9): the row's plan without the key runs the same program at the ragged rule's raster group.
 GB_T_EXACT_RASTER_ROWS = frozenset()
 GB_T_EXACT_KEYS = sorted(
-    (arch, False, b_mn, False, False, False, N, K, T)
-    for (arch, b_mn, N, K), (Ts, _template) in GB_T_EXACT_ROWS.items()
-    for T in Ts
+    [
+        (arch, False, b_mn, False, False, False, N, K, T)
+        for (arch, b_mn, N, K), (Ts, _template) in GB_T_EXACT_ROWS.items()
+        for T in Ts
+    ]
+    + [
+        (arch, False, b_mn, False, False, False, N, K, T)
+        for (arch, b_mn, N, K, T) in GB_T_EXACT_T_PROGRAMS
+    ]
 )
+
+
+def _gb_t_exact_program(arch, b_mn, N, K, T):
+    """The program a GB T-exact forward / input-gradient key plans at its T."""
+    return (
+        GB_T_EXACT_T_PROGRAMS.get((arch, b_mn, N, K, T))
+        or GB_T_EXACT_ROWS[(arch, b_mn, N, K)][1]
+    )
 
 
 def _whole_k(plan) -> bool:
@@ -8664,7 +9178,12 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
     epilogue released by row half, and the 16384 -> 6144 forward at T 16231 with that form in 8-column-tile groups;
     round 9: the same form on the sm_103a 17408 -> 5120 forward, and the sm_103a 12288 -> 4096 forward at
     T 16231 / 16384 in 8-column-tile groups; round 10: the same form on the 4096 -> 12288 input gradient
-    at T 16384 on sm_100a and at T 16231 / 16384 on sm_103a in 16-column-tile groups)
+    at T 16384 on sm_100a and at T 16231 / 16384 on sm_103a in 16-column-tile groups, the sm_103a keys with ``kser``
+    in test_gb_t_exact_kser_rules_plan_their_programs; round 11: the sm_100a keys moved
+    to neighbouring T - the 16384 -> 6144 forward at T 16172 / 16384, the 12288 -> 4096 and 17408 -> 5120 forwards and
+    the 5120 -> 17408 input gradient at T 16172, the 4096 -> 12288 input gradient at T 16231; the sm_103a keys moved
+    to neighbouring T - the 16384 -> 6144 forward at T 16172 / 16384, the 12288 -> 4096 and 17408 -> 5120 forwards and
+    the 5120 -> 17408 and 4096 -> 12288 input gradients at T 16172)
     plan their program at their T on every SM count of the architecture's parts, with whole K per output tile like
     the row's plan without the key (another program, or for round 6 the same program at another raster group);
     one token more or less plans that plan.  The sm_103a 4096 -> 48 input gradient
@@ -8677,13 +9196,16 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
         and not key[1]
         and not key[3]
         and not key[4]
+        # the batched MLA T-exact keys are test_round15_store_hint_knob's
+        and not key[5]
         and key[8] is not None
+        and "kser" not in ROW_RULES[key]
     )
     assert exact == [key for key in GB_T_EXACT_KEYS if key[0] == arch]
     registered = _registered(arch)
     for key in exact:
         _arch, _a_mn, b_mn, _f32, _out_t, _batched, N, K, T = key
-        template = GB_T_EXACT_ROWS[(arch, b_mn, N, K)][1]
+        template = _gb_t_exact_program(arch, b_mn, N, K, T)
         assert template in registered, (key, template)
         for sm_count in (148, 152, 160) if arch == "sm_103a" else (148, 152):
             kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, _fallback=False)
@@ -8777,7 +9299,7 @@ def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypa
             .to(torch.bfloat16)
             .t()
         )
-    template = GB_T_EXACT_ROWS[(arch, b_mn, N, K)][1]
+    template = _gb_t_exact_program(arch, b_mn, N, K, T)
     _require_program(template)
     out = torch.full((T, N), float("nan"), dtype=torch.bfloat16, device=device)
     cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
@@ -8806,10 +9328,214 @@ def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypa
     )
 
 
+# The GB T-exact serpentine-K rules: (arch, B MN-major, N, K) -> (the T of the exact keys, the program on the 76-pair parts, the
+# program without ``kser``).  Each key names the T 16231 key's program of the row with ``kser`` 76 (at T 16172; at the T of
+# the row's round-9 / round-10 keys the key's own rule gains ``kser`` 76); the wave guard keeps it on
+# the 152-SM parts only (76 CTA pairs), every other part plans the program without it.
+GB_T_EXACT_KSER_ROWS = {
+    ("sm_103a", False, 4096, 12288): (
+        (16172, 16384),
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_ks76_pro7",
+        "dense_proj_det_gemm_kk_n256_m256_ht_cg_or_pro7",
+    ),
+    ("sm_103a", True, 4096, 12288): (
+        (16172, 16231, 16384),
+        "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7",
+        "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7",
+    ),
+}
+GB_T_EXACT_KSER_KEYS = sorted(
+    (arch, False, b_mn, False, False, False, N, K, T)
+    for (arch, b_mn, N, K), (Ts, _template, _plain) in GB_T_EXACT_KSER_ROWS.items()
+    for T in Ts
+)
+
+
+def test_kser_instance_key_symbol_and_refusals():
+    """``kser`` is instance-key field 38 (symbol ``_ks<P>`` between ``_sw<n>`` and ``_pro<n>``); 0 renders the key and symbol of
+    the program without it; the single-CTA form, the exact / tail-first / synchronised splits, the transposed staging, the
+    whole-tile tile resolve, a batch raster, the eight-warp form and a negative count are refused; the symbol decodes back."""
+    tall = dict(
+        a_mn=False, b_mn=True, cta_rows=256, ovr=True, htail=True, cgrp=True, pro=7
+    )
+    on, off = instance_key(**tall, kser=76), instance_key(**tall)
+    assert len(on) == 38 and on[37] == 76 and off[37] == 0 and on[:37] == off[:37]
+    assert instance_symbol(on) == "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_ks76_pro7"
+    assert instance_symbol(off) == "dense_proj_det_gemm_kn_n256_m256_ht_cg_or_pro7"
+    assert cake_backend._template_knobs(instance_symbol(on))["kser"] == 76
+    assert cake_backend._template_knobs(instance_symbol(off))["kser"] == 0
+    for bad in (
+        dict(a_mn=False, b_mn=True, kser=-1),
+        dict(a_mn=False, b_mn=True, cta1=True, kser=76),
+        dict(a_mn=False, b_mn=True, sk_exact=True, kser=76),
+        dict(a_mn=False, b_mn=True, sk_exact=True, sk_first=True, kser=76),
+        dict(a_mn=False, b_mn=True, sk_sync=True, kser=76),
+        dict(a_mn=True, b_mn=True, out_t=True, stt=True, kser=76),
+        dict(a_mn=False, b_mn=True, mg=True, pro=4, kser=76),
+        dict(a_mn=False, b_mn=True, batch_group=8, kser=76),
+    ):
+        with pytest.raises(ValueError, match="kser"):
+            instance_key(**bad)
+
+
+@pytest.mark.parametrize("arch", ["sm_103a"])
+def test_gb_t_exact_kser_rules_plan_their_programs(arch, monkeypatch):
+    """The GB T-exact serpentine-K rules (sm_103a: the 12288 -> 4096 forward at T 16172 / 16384 and
+    the 4096 -> 12288 input gradient at T 16172 / 16231 / 16384) plan their ``_ks76`` program on the 152-SM part
+    and the program without ``kser`` on the 148- and 160-SM parts
+    (the wave guard); on every part the plan is the plan of the key's rule without ``kser`` but for the program (whole K per
+    output tile, the same K partitions, raster group and grid), and T +- 1 plan the row's plan without the key."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    keys = sorted(
+        key for key in ROW_RULES if key[0] == arch and "kser" in ROW_RULES[key]
+    )
+    assert keys == [key for key in GB_T_EXACT_KSER_KEYS if key[0] == arch]
+    registered = _registered(arch)
+    for key in keys:
+        _arch, _a_mn, b_mn, _f32, _out_t, _batched, N, K, T = key
+        _Ts, template, plain_template = GB_T_EXACT_KSER_ROWS[(arch, b_mn, N, K)]
+        assert template in registered and plain_template in registered, key
+        rule = dict(ROW_RULES[key])
+        assert rule.pop("kser") == 76
+        for sm_count in (148, 152, 160):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, _fallback=False)
+            v = _class_views("kn" if b_mn else "kk", False, False, T, N, K)
+            plan, *_ = cake_dense_gemm_det_train_projection_plan(
+                v["A"], v["B"], v["out"], **kw
+            )
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), key
+            assert _whole_k(plan), (key, sm_count)
+            if sm_count == 152:
+                assert (plan.template, plan.kser) == (template, 76), (
+                    key,
+                    sm_count,
+                    plan.template,
+                )
+            else:
+                assert (plan.template, plan.kser) == (plain_template, 0), (
+                    key,
+                    sm_count,
+                    plan.template,
+                )
+            with monkeypatch.context() as m:
+                m.setitem(ROW_RULES, key, rule)
+                v = _class_views("kn" if b_mn else "kk", False, False, T, N, K)
+                without, *_ = cake_dense_gemm_det_train_projection_plan(
+                    v["A"], v["B"], v["out"], **kw
+                )
+            assert without.template == plain_template and without.kser == 0, (
+                key,
+                sm_count,
+            )
+            assert (
+                plan.group_m,
+                plan.grid,
+                plan.k_blocks,
+                plan.num_full,
+                plan.sk_units,
+                plan.htail_plan,
+            ) == (
+                without.group_m,
+                without.grid,
+                without.k_blocks,
+                without.num_full,
+                without.sk_units,
+                without.htail_plan,
+            ), (key, sm_count)
+            for t in (T - 1, T + 1):
+                v = _class_views("kn" if b_mn else "kk", False, False, t, N, K)
+                near, *_ = cake_dense_gemm_det_train_projection_plan(
+                    v["A"], v["B"], v["out"], **kw
+                )
+                with monkeypatch.context() as m:
+                    m.delitem(ROW_RULES, key)
+                    v = _class_views("kn" if b_mn else "kk", False, False, t, N, K)
+                    far, *_ = cake_dense_gemm_det_train_projection_plan(
+                        v["A"], v["B"], v["out"], **kw
+                    )
+                assert near.kser == 0 and _plan_signature(near) == _plan_signature(
+                    far
+                ), (key, t)
+
+
+@pytest.mark.parametrize(
+    "key",
+    GB_T_EXACT_KSER_KEYS,
+    ids=lambda key: f"{key[0]}-{'kn' if key[2] else 'kk'}-{key[6]}x{key[7]}-T{key[8]}",
+)
+def test_gb_t_exact_kser_rows_match_fp64_and_repeat_bitwise(key, monkeypatch):
+    """Each GB T-exact serpentine-K row of the device's architecture runs its program at its T against the FP64 reference of
+    the exact BF16 operands (the package tolerance), bitwise equal over repeated launches and a second prepare; on the 152-SM
+    part the program is the ``_ks76`` one and its bits differ from the program without ``kser`` (another FP32 summation
+    order), elsewhere the program is the one without ``kser``.  A key of another architecture is skipped."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    arch, _a_mn, b_mn, _f32, _out_t, _batched, N, K, T = key
+    device = torch.device("cuda")
+    if arch != arch_for(device):
+        pytest.skip(f"a {arch} key; the device is {arch_for(device)}")
+    g = torch.Generator(device=device).manual_seed(SEED)
+    A = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
+    if b_mn:
+        B = (torch.randn(K, N, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
+    else:
+        B = (
+            (torch.randn(N, K, device=device, generator=g) * K**-0.5)
+            .to(torch.bfloat16)
+            .t()
+        )
+    _Ts, template, plain_template = GB_T_EXACT_KSER_ROWS[(arch, b_mn, N, K)]
+    pairs = torch.cuda.get_device_properties(device).multi_processor_count // 2
+    want = template if pairs == 76 else plain_template
+    _require_program(want)
+    out = torch.full((T, N), float("nan"), dtype=torch.bfloat16, device=device)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_prepare(A, B, out)
+    assert prepared.template == want, prepared.template
+    assert _whole_k(prepared.plan)
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(A.double(), B.double()))
+    first = out.clone()
+    for _ in range(3):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), first.view(torch.int16)), key
+    again_out = torch.full_like(out, float("nan"))
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    again = cake_dense_gemm_det_train_projection_prepare(A, B, again_out)
+    again.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(again_out.view(torch.int16), first.view(torch.int16)), key
+    if pairs != 76:
+        return
+    rule = dict(ROW_RULES[key])
+    rule.pop("kser")
+    plain_out = torch.full_like(out, float("nan"))
+    with monkeypatch.context() as m:
+        m.setitem(ROW_RULES, key, rule)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_prepare(A, B, plain_out)
+    assert plain.template == plain_template, plain.template
+    plain.launch()
+    torch.cuda.synchronize()
+    _check(plain_out, torch.matmul(A.double(), B.double()))
+    assert not torch.equal(plain_out.view(torch.int16), first.view(torch.int16)), key
+
+
 # The GB T-exact weight-gradient rules (round 2; round 7: the sm_100a 5120 -> 17408 weight gradient with the sm_103a
-# keys' rule of the row): ROW_RULES key -> the program it plans at its T (K = T, in the direct
+# keys' rule of the row; round 11: the sm_103a 5120 -> 17408 and 17408 -> 5120 weight gradients at T 16172 with the
+# rule of their T 16231 / 16384 keys): ROW_RULES key -> the program it plans at its T (K = T, in the direct
 # orientation the row plans without it, G[T, M].T @ X[T, N]), with the per-tile K partitions of the row's plan without it
-# (whole K per output tile on both), so every output is bitwise equal to that plan's.
+# (whole K per output tile on both), so every output is bitwise equal to that plan's.  The two sm_103a keys at T 16172
+# carry ht_min_tail 16: on 148 SMs their 14-tile tail stays whole (sk_units 0, not 28 half items), on 152 / 160 SMs
+# they plan as before (test_gb_t_exact_wgrad_ht_min_tail_keeps_the_148_sm_tail_whole).
 GB_T_EXACT_WGRAD_ROWS = {
     (
         "sm_100a",
@@ -8899,6 +9625,47 @@ GB_T_EXACT_WGRAD_ROWS = {
         16384,
         5120,
     ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        5120,
+        16172,
+        17408,
+    ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        17408,
+        16172,
+        5120,
+    ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
+}
+
+# The GB T-exact weight-gradient rule of round 12 (the sm_100a 4096 -> 12288 weight gradient at T 16231): ROW_RULES
+# key -> the program it plans at its T (K = T, in the direct orientation), the ragged rule's exact 16-way stream-K
+# program with the tail-first order: the same program, tiles and stream-K units as the row's plan without it, in
+# 2-row raster groups in place of the default 16.  The raster changes which output tiles take the stream-K tail, so
+# the K partitions of those tiles (and their bits) differ from that plan's; each plan is deterministic run to run.
+GB_T_EXACT_RASTER_WGRAD_ROWS = {
+    (
+        "sm_100a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        4096,
+        16231,
+        12288,
+    ): "dense_proj_det_gemm_nn_n256_m256_skx_skf_pro7",
 }
 
 
@@ -8914,7 +9681,7 @@ def _gb_wgrad_views(N, T, M):
 def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
     """The GB T-exact weight-gradient rules (sm_100a: the 17408 -> 5120 weight gradient at T 16231 / 16384 and, round
     7, the 5120 -> 17408 weight gradient at T 16231 / 16384; sm_103a: the 5120 -> 17408 and 17408 -> 5120 weight
-    gradients at T 16231 / 16384; all with the half-tail program through the
+    gradients at T 16231 / 16384 and, round 11, at T 16172; all with the half-tail program through the
     one-slot TMA store and 12-row raster groups) plan their program at their T on every SM count of the architecture's
     parts, in the direct orientation and with whole K per output tile like the row's plan without the key (on sm_103a
     without the sm_100a key it restates as well); one token more or less plans that plan."""
@@ -8927,6 +9694,8 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
         and key[7] is not None
         and key[8] is not None
         and key not in GB_T_EXACT_SKS_WGRAD_ROWS
+        and key not in GB_T_EXACT_RASTER_WGRAD_ROWS
+        and key not in GB_T_EXACT_RASTER_F32_WGRAD_ROWS
     )
     assert exact == sorted(key for key in GB_T_EXACT_WGRAD_ROWS if key[0] == arch)
     registered = _registered(arch)
@@ -8968,6 +9737,63 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
                 ragged.N,
                 ragged.K,
             )
+
+
+def test_gb_t_exact_wgrad_ht_min_tail_keeps_the_148_sm_tail_whole(monkeypatch):
+    """The sm_103a 5120 -> 17408 / 17408 -> 5120 weight-gradient keys at T 16172 (680 pair tiles) carry
+    ``ht_min_tail`` 16: on 148 SMs (74 pairs) the 14-tile tail stays in whole tiles - the ``_ht`` program runs its
+    whole-tile plan, where the 28 half items measured slower than FI main - while 152 SMs (tail 72, no half-item fit)
+    and 160 SMs (tail 40, 80 half items) plan exactly as without the field; no other rule carries it."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    keys = sorted(key for key, rule in ROW_RULES.items() if "ht_min_tail" in rule)
+    assert keys == sorted(
+        [
+            ("sm_103a", True, True, False, False, False, 5120, 16172, 17408),
+            ("sm_103a", True, True, False, False, False, 17408, 16172, 5120),
+        ]
+    ), keys
+    for key in keys:
+        arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+        assert ROW_RULES[key]["ht_min_tail"] == 16 and ROW_RULES[key]["htail"], key
+        G, X, out = _gb_wgrad_views(N, T, M)
+        A, B, transposed = wgrad_views(G, X, arch=arch)
+        assert not transposed, key
+        for sm_count, half, units in (
+            (148, False, 0),
+            (152, False, 0),
+            (160, True, 80),
+        ):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, _fallback=False)
+            plan, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, **kw)
+            with monkeypatch.context() as m:
+                m.setitem(
+                    ROW_RULES,
+                    key,
+                    {k: v for k, v in ROW_RULES[key].items() if k != "ht_min_tail"},
+                )
+                plain, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, **kw)
+            assert plan.template == plain.template == GB_T_EXACT_WGRAD_ROWS[key], (
+                key,
+                sm_count,
+                plan.template,
+            )
+            assert plan.htail and plan.htail_plan == half and plan.sk_units == units, (
+                key,
+                sm_count,
+                plan.sk_units,
+            )
+            if sm_count == 148:
+                assert plain.htail_plan and plain.sk_units == 28, (key, plain.sk_units)
+                assert (plan.num_full, plan.tail_tiles) == (plan.pair_tiles, 0), key
+                sig, base = _plan_signature(plan), _plan_signature(plain)
+                assert {f for f in sig if sig[f] != base[f]} <= {
+                    "num_full",
+                    "tail_tiles",
+                    "sk_units",
+                    "htail_plan",
+                }, key
+            else:
+                assert _plan_signature(plan) == _plan_signature(plain), (key, sm_count)
 
 
 @pytest.mark.parametrize(
@@ -9020,10 +9846,11 @@ def test_gb_t_exact_wgrad_rows_match_fp64_and_their_plan_without_the_key(
     cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 
-# The GB T-exact weight-gradient rules of round 3: ROW_RULES key -> the program it plans at its T (K = T, in the direct
-# orientation the row plans without it), the ragged rule's synchronised two-partial stream-K plan with its bf16 tiles
-# through the one-slot TMA store: the same per-tile K partitions (the same stream-K units, slabs and two-addend fixup) as
-# the row's plan without it, so every output is bitwise equal to that plan's.
+# The GB T-exact weight-gradient rules of round 3 (round 13: the sm_103a key at T 16384): ROW_RULES key -> the program
+# it plans at its T (K = T, in the direct orientation the row plans without it), the ragged rule's synchronised
+# two-partial stream-K plan with its bf16 tiles through the one-slot TMA store: the same per-tile K partitions (the same
+# stream-K units, slabs and two-addend fixup) as the row's plan without it, so every output is bitwise equal to that
+# plan's.
 GB_T_EXACT_SKS_WGRAD_ROWS = {
     (
         "sm_100a",
@@ -9067,6 +9894,17 @@ GB_T_EXACT_SKS_WGRAD_ROWS = {
         False,
         2048,
         16231,
+        4096,
+    ): "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        2048,
+        16384,
         4096,
     ): "dense_proj_det_gemm_nn_n256_m256_tma1_sks_sb2_pro7",
 }
@@ -9184,6 +10022,293 @@ def test_gb_t_exact_sks_wgrad_rows_match_fp64_and_their_plan_without_the_key(
     cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
 
 
+def test_gb_t_exact_raster_wgrad_rules_plan_their_programs(monkeypatch):
+    """The GB T-exact weight-gradient rule of round 12 (sm_100a: the 4096 -> 12288 weight gradient at T 16231) plans
+    the ragged rule's exact stream-K program with the tail-first order at its T on every SM count of the GB200 parts,
+    in the direct orientation, with the plan of the row without the key in every field but the raster group width
+    (2): the same program, tiles, stream-K units and K steps per unit; one token more or less plans that plan.
+    sm_103a holds its own ragged rule for the row, so the sm_100a key never reaches it through ``RULE_PARENT``."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    keys = sorted(GB_T_EXACT_RASTER_WGRAD_ROWS)
+    assert keys and all(key[0] == "sm_100a" for key in keys), keys
+
+    def plan_at(arch, N, T, M, kw):
+        G, X, out = _gb_wgrad_views(N, T, M)
+        A, B, transposed = wgrad_views(G, X, arch=arch)
+        assert not transposed, (arch, N, T, M)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, arch=arch, **kw)
+        return plan
+
+    for key in keys:
+        arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+        template = GB_T_EXACT_RASTER_WGRAD_ROWS[key]
+        assert template in _registered(arch), (key, template)
+        # the ragged rule of the row in 2-row raster groups
+        ragged_rule = ROW_RULES[key[:7] + (None, M)]
+        assert "group_m" not in ragged_rule, ragged_rule
+        assert ROW_RULES[key] == {**ragged_rule, "group_m": 2}, key
+        for sm_count in (148, 152):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, _fallback=False)
+            plans = {t: plan_at(arch, N, t, M, kw) for t in (T - 1, T, T + 1)}
+            with monkeypatch.context() as m:
+                m.delitem(ROW_RULES, key)
+                without = {t: plan_at(arch, N, t, M, kw) for t in (T - 1, T, T + 1)}
+            for t in (T - 1, T + 1):
+                assert _plan_signature(plans[t]) == _plan_signature(without[t]), (
+                    key,
+                    t,
+                )
+            plan, ragged = plans[T], without[T]
+            assert plan.template == template == ragged.template, (
+                key,
+                sm_count,
+                plan.template,
+                ragged.template,
+            )
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), key
+            assert plan.group_m == 2 and ragged.group_m != 2, (
+                key,
+                sm_count,
+                ragged.group_m,
+            )
+            sig, plain = _plan_signature(plan), _plan_signature(ragged)
+            assert {f for f in sig if sig[f] != plain[f]} == {"group_m"}, (
+                key,
+                sm_count,
+            )
+        # sm_103a: its own ragged rule wins over the sm_100a key (the row plans the same with and without it)
+        own = ("sm_103a",) + key[1:7] + (None, M)
+        assert own in ROW_RULES, own
+        for sm_count in (148, 152, 160):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, _fallback=False)
+            mirror = plan_at("sm_103a", N, T, M, kw)
+            with monkeypatch.context() as m:
+                m.delitem(ROW_RULES, key)
+                plain = plan_at("sm_103a", N, T, M, kw)
+            assert _plan_signature(mirror) == _plan_signature(plain), (key, sm_count)
+
+
+@pytest.mark.parametrize(
+    "key",
+    sorted(GB_T_EXACT_RASTER_WGRAD_ROWS),
+    ids=lambda key: f"{key[0]}-nn-{key[6]}x{key[8]}-T{key[7]}",
+)
+def test_gb_t_exact_raster_wgrad_rows_match_fp64_and_repeat_bitwise(key, monkeypatch):
+    """Each round-12 GB T-exact weight-gradient row of the device's architecture runs its program at its T against
+    the FP64 reference of the exact BF16 operands (the package tolerance) and returns the same bits on a second
+    launch; the plan the row has without the key runs the same program in its own raster groups and meets the same
+    tolerance (the raster moves the stream-K tail tiles, so the two outputs may differ in those tiles' bits).  A key
+    of another architecture is skipped."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+    device = torch.device("cuda")
+    if arch != arch_for(device):
+        pytest.skip(f"a {arch} key; the device is {arch_for(device)}")
+    g = torch.Generator(device=device).manual_seed(SEED)
+    G = torch.randn(T, M, device=device, generator=g).to(torch.bfloat16)
+    X = (torch.randn(T, N, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
+    template = GB_T_EXACT_RASTER_WGRAD_ROWS[key]
+    _require_program(template)
+    ref = torch.matmul(G.double().t(), X.double())
+    out = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device=device)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out)
+    assert prepared.template == template, prepared.template
+    assert not prepared.plan.transposed_out
+    assert prepared.plan.group_m == ROW_RULES[key]["group_m"], prepared.plan.group_m
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, ref)
+    first = out.clone()
+    out.fill_(float("nan"))
+    prepared.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), first.view(torch.int16)), key
+    plain_out = torch.full_like(out, float("nan"))
+    with monkeypatch.context() as m:
+        m.delitem(ROW_RULES, key)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, plain_out)
+    assert plain.template == template, plain.template
+    assert plain.plan.group_m != prepared.plan.group_m, plain.plan.group_m
+    plain.launch()
+    torch.cuda.synchronize()
+    _check(plain_out, ref)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+
+
+# The GB T-exact fp32 weight-gradient rules of round 13 (the sm_103a 17408 -> 5120 fp32 weight gradient at T 16231 /
+# 16384): ROW_RULES key -> the program it plans at its T (K = T, in the direct orientation).  Without the key the row
+# plans its own 128-row fp32 program, which sm_103a does not generate, and the registry's knob fallback runs the 256-row
+# tiles through the one-slot TMA store; the key names that program and plans it in 12-row raster groups in place of
+# the default: the same program, tiles and K steps as the fallback plan.
+GB_T_EXACT_RASTER_F32_WGRAD_ROWS = {
+    (
+        "sm_103a",
+        True,
+        True,
+        True,
+        False,
+        False,
+        17408,
+        16231,
+        5120,
+    ): "dense_proj_det_gemm_nn_n256_m256_f32_tma1_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        True,
+        False,
+        False,
+        17408,
+        16384,
+        5120,
+    ): "dense_proj_det_gemm_nn_n256_m256_f32_tma1_pro7",
+}
+
+
+def _gb_f32_wgrad_views(N, T, M):
+    """Empty operands of a GB T-exact fp32 weight-gradient key (N, K = T, M): G[T, M] and X[T, N] in bf16 and the fp32
+    output dW[M, N] (the direct orientation)."""
+    G = torch.empty(T, M, dtype=torch.bfloat16)
+    X = torch.empty(T, N, dtype=torch.bfloat16)
+    return G, X, torch.empty(M, N, dtype=torch.float32)
+
+
+def test_gb_t_exact_raster_f32_wgrad_rules_plan_their_programs(monkeypatch):
+    """The GB T-exact fp32 weight-gradient rules of round 13 (sm_103a: the 17408 -> 5120 fp32 weight gradient at
+    T 16231 / 16384) plan, at their T on every SM count of the GB300 parts and in the direct orientation, the program
+    the row runs without the key (the registry's knob fallback: the row's own 128-row program is not generated), with
+    that plan in every field but the raster group width (12) and the fallback flag; one token more or less plans the
+    row's plan without the key."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    keys = sorted(GB_T_EXACT_RASTER_F32_WGRAD_ROWS)
+    assert keys and all(key[0] == "sm_103a" and key[3] for key in keys), keys
+    registered = _registered("sm_103a")
+
+    def plan_at(N, T, M, kw):
+        G, X, out = _gb_f32_wgrad_views(N, T, M)
+        A, B, transposed = wgrad_views(G, X, arch="sm_103a")
+        assert not transposed, (N, T, M)
+        plan, *_ = cake_dense_gemm_det_train_projection_plan(A, B, out, **kw)
+        return plan
+
+    for key in keys:
+        _arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+        template = GB_T_EXACT_RASTER_F32_WGRAD_ROWS[key]
+        assert template in registered, (key, template)
+        assert ROW_RULES[key] == {
+            "cta_rows": 256,
+            "epi": "tma",
+            "slots": 1,
+            "group_m": 12,
+        }, key
+        for sm_count in (148, 152, 160):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch="sm_103a")
+            mirror = dict(kw, _fallback=False)
+            plans = {t: plan_at(N, t, M, mirror) for t in (T - 1, T, T + 1)}
+            with monkeypatch.context() as m:
+                for k in _gb_t_exact_keys_of(key):
+                    m.delitem(ROW_RULES, k)
+                without = {t: plan_at(N, t, M, mirror) for t in (T - 1, T, T + 1)}
+                plain = plan_at(N, T, M, kw)
+            for t in (T - 1, T + 1):
+                assert _plan_signature(plans[t]) == _plan_signature(without[t]), (
+                    key,
+                    t,
+                )
+            plan, own = plans[T], without[T]
+            # without the key the row's own plan is the 128-row program, which sm_103a does not generate; the
+            # registry's knob fallback runs the rule's program in the default raster groups
+            assert own.template not in registered, (key, sm_count, own.template)
+            assert plain.knob_fallback, (key, sm_count, plain.template)
+            assert not (plain.rule_fallback or plain.swap_fallback), (key, sm_count)
+            assert plan.template == template == plain.template, (
+                key,
+                sm_count,
+                plan.template,
+                plain.template,
+            )
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), key
+            assert plan.group_m == 12 and plain.group_m != 12, (
+                key,
+                sm_count,
+                plain.group_m,
+            )
+            sig, base = _plan_signature(plan), _plan_signature(plain)
+            assert {f for f in sig if sig[f] != base[f]} == {
+                "group_m",
+                "knob_fallback",
+            }, (key, sm_count)
+
+
+@pytest.mark.parametrize(
+    "key",
+    sorted(GB_T_EXACT_RASTER_F32_WGRAD_ROWS),
+    ids=lambda key: f"{key[0]}-nn-f32-{key[6]}x{key[8]}-T{key[7]}",
+)
+def test_gb_t_exact_raster_f32_wgrad_rows_match_fp64_and_repeat_bitwise(
+    key, monkeypatch
+):
+    """Each round-13 GB T-exact fp32 weight-gradient row of the device's architecture runs its program at its T against
+    the FP64 reference of the exact BF16 operands (the package fp32 tolerance) and returns the same bits on a second
+    launch; the plan the row has without the key runs the same program in its own raster groups and meets the same
+    tolerance, and where both plans keep whole K per output tile the two outputs are bitwise equal.  A key of another
+    architecture is skipped."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
+    device = torch.device("cuda")
+    if arch != arch_for(device):
+        pytest.skip(f"a {arch} key; the device is {arch_for(device)}")
+    g = torch.Generator(device=device).manual_seed(SEED)
+    G = torch.randn(T, M, device=device, generator=g).to(torch.bfloat16)
+    X = (torch.randn(T, N, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
+    template = GB_T_EXACT_RASTER_F32_WGRAD_ROWS[key]
+    _require_program(template)
+    ref = torch.matmul(G.double().t(), X.double())
+    out = torch.full((M, N), float("nan"), dtype=torch.float32, device=device)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out)
+    assert prepared.template == template, prepared.template
+    assert not prepared.plan.transposed_out
+    assert prepared.plan.group_m == ROW_RULES[key]["group_m"], prepared.plan.group_m
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, ref)
+    first = out.clone()
+    out.fill_(float("nan"))
+    prepared.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int32), first.view(torch.int32)), key
+    plain_out = torch.full_like(out, float("nan"))
+    with monkeypatch.context() as m:
+        for k in _gb_t_exact_keys_of(key):
+            m.delitem(ROW_RULES, k)
+        cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+        plain = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, plain_out)
+    assert plain.template == template, plain.template
+    assert plain.plan.group_m != prepared.plan.group_m, plain.plan.group_m
+    plain.launch()
+    torch.cuda.synchronize()
+    _check(plain_out, ref)
+    if _whole_k(prepared.plan) and _whole_k(plain.plan):
+        assert torch.equal(out.view(torch.int32), plain_out.view(torch.int32)), key
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+
+
 def test_sync_tma_store_programs_serve_only_rows_that_name_the_epilogue():
     """The synchronised TMA-store gate (``cake_backend._serves``): on sm_103a at 160 SMs the 12288 -> 6144 weight
     gradient at T 1001 plans the ragged rule's synchronised stream-K program with the short-K TMA-store default (the
@@ -9231,13 +10356,16 @@ def test_sync_tma_store_programs_serve_only_rows_that_name_the_epilogue():
 
 def _n224_rule_rows():
     """Every (key, T) of a ragged ``ROW_RULES`` entry that selects the exact-wave tile (BLOCK_N 224); a T-exact key
-    (the sm_107a weight-gradient rules at T 16231 / 16384) names its own token count and was measured on its own device."""
+    (the sm_107a weight-gradient rules at T 16231 / 16384) names its own token count and was measured on its own device.
+    The sm_107a ragged 5120 -> 1024 bf16 rule plans on the 212- and 216-SM parts
+    (test_sm107a_ragged_wgrad_rules_plan_their_programs)."""
     return [
         (key, T)
         for key, rule in sorted(ROW_RULES.items(), key=repr)
         if rule.get("block_n") == cake_backend.EXACT_WAVE_BLOCK_N
         and not key[5]
         and None in key[7:]
+        and key[0] != "sm_107a"
         for T in (16231, 16384)
     ]
 
@@ -10578,6 +11706,8 @@ def test_sm107a_t16384_wgrad_key_plans_the_t16231_rule(monkeypatch):
     one token more or less plans that plan."""
     monkeypatch.setattr(cake_backend, "_DUMMIES", {})
     key = SM107A_T16384_WGRAD_KEY
+    # the row's ragged key carries the same rule at every other token count: compare with the row before either key
+    monkeypatch.delitem(ROW_RULES, key[:7] + (None,) + key[8:])
     _arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
     sibling = key[:7] + (16231,) + key[8:]
     assert ROW_RULES[key] == ROW_RULES[sibling]
@@ -10606,6 +11736,209 @@ def test_sm107a_t16384_wgrad_key_plans_the_t16231_rule(monkeypatch):
         assert _k_partitions(plan) == _k_partitions(plain), (sm_count, plain.template)
 
 
+SM107A_RAGGED_WGRAD_KEYS = (
+    ("sm_107a", True, True, True, False, False, 4096, None, 512),
+    ("sm_107a", True, True, True, False, False, 4096, None, 1024),
+    ("sm_107a", True, True, False, False, False, 5120, None, 1024),
+)
+
+
+def _sm107a_wgrad_plan_out(N, T, M, sm_count, out_f32):
+    G = torch.empty(T, M, dtype=torch.bfloat16)
+    X = torch.empty(T, N, dtype=torch.bfloat16)
+    out = torch.empty(M, N, dtype=torch.float32 if out_f32 else torch.bfloat16)
+    A, B, transposed = wgrad_views(G, X, arch="sm_107a", out_f32=out_f32)
+    assert not transposed, (N, T, M)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        A,
+        B,
+        out,
+        sm_count=sm_count,
+        l2_bytes=L2_BYTES,
+        arch="sm_107a",
+    )
+    return plan
+
+
+@pytest.mark.parametrize("key", SM107A_RAGGED_WGRAD_KEYS)
+def test_sm107a_ragged_wgrad_rules_plan_their_programs(monkeypatch, key):
+    """The ragged sm_107a weight-gradient keys plan their measured programs at token counts without an exact key on the
+    212- and 216-SM parts: the 4096 -> 512 / 4096 -> 1024 fp32 rows the program of the row's T 16231 key (the same rule),
+    the 5120 -> 1024 bf16 row the 224-column tile with the column-grouped raster; registered, no fallback flag, and not
+    the plan without the key."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    _arch, _a_mn, _b_mn, out_f32, _out_t, _batched, N, _K, M = key
+    registered = _registered("sm_107a")
+    if out_f32:
+        assert ROW_RULES[key] == ROW_RULES[key[:7] + (16231,) + key[8:]]
+    for sm_count in (212, 216):
+        want = (
+            _sm107a_wgrad_plan_out(N, 16231, M, sm_count, True).template
+            if out_f32
+            else None
+        )
+        for T in (1024, 4096, 16172, 32768):
+            plan = _sm107a_wgrad_plan_out(N, T, M, sm_count, out_f32)
+            with monkeypatch.context() as m:
+                m.delitem(ROW_RULES, key)
+                plain = _sm107a_wgrad_plan_out(N, T, M, sm_count, out_f32)
+            assert plan.template in registered, (sm_count, T, plan.template)
+            assert not (plan.rule_fallback or plan.knob_fallback or plan.swap_fallback)
+            assert plan.template != plain.template, (sm_count, T, plain.template)
+            if out_f32:
+                assert plan.template == want, (sm_count, T, plan.template)
+            else:
+                assert plan.template.endswith("_nn_n224_hne_cg_pro15"), plan.template
+
+
+# The sm_107a 212-SM tranche: ragged keys measured on R200 (212 SMs) at T 16172 - 16384 against the plan the row had
+# without them.  key -> (the rule, K = in features, N = out features, op, output dtype, the program it plans)
+# fmt: off
+_T212_HT_CG = {"cgrp": True, "htail": True, "pro": 15}
+_T212_CG12 = {"cgrp": True, "group_m": 12, "pro": 15}
+SM107A_212_TRANCHE = {
+    ("sm_107a", False, True, False, False, False, 12288, 4096, None): (_T212_HT_CG, 12288, 4096, "dgrad", "bf16", "dense_proj_det_gemm_kn_n256_ht_cg_pro15"),
+    ("sm_107a", False, True, False, False, False, 4096, 12288, None): (_T212_HT_CG, 4096, 12288, "dgrad", "bf16", "dense_proj_det_gemm_kn_n256_ht_cg_pro15"),
+    ("sm_107a", False, True, False, False, False, 4096, 4096, None): (_T212_HT_CG, 4096, 4096, "dgrad", "bf16", "dense_proj_det_gemm_kn_n256_ht_cg_pro15"),
+    ("sm_107a", False, True, False, False, False, 5120, 5120, None): (_T212_CG12, 5120, 5120, "dgrad", "bf16", "dense_proj_det_gemm_kn_n256_cg_pro15"),
+    ("sm_107a", False, True, False, False, False, 2048, 16384, None): (_T212_HT_CG, 2048, 16384, "dgrad", "bf16", "dense_proj_det_gemm_kn_n256_ht_cg_pro15"),
+    ("sm_107a", False, True, False, False, False, 2048, 6144, None): (_T212_HT_CG, 2048, 6144, "dgrad", "bf16", "dense_proj_det_gemm_kn_n256_ht_cg_pro15"),
+    ("sm_107a", False, False, False, False, False, 12288, 4096, None): (_T212_HT_CG, 4096, 12288, "fwd", "bf16", "dense_proj_det_gemm_kk_n256_ht_cg_pro15"),
+    ("sm_107a", True, True, False, False, False, 12288, None, 4096): ({"sk_parts": 3, "pro": 15}, 12288, 4096, "wgrad", "bf16", "dense_proj_det_gemm_nn_n256_pro15"),
+    ("sm_107a", True, True, False, False, False, 4096, None, 12288): ({"group_m": 16, "sk_parts": 3, "pro": 15}, 4096, 12288, "wgrad", "bf16", "dense_proj_det_gemm_nn_n256_pro15"),
+    ("sm_107a", True, True, False, False, False, 5120, None, 5120): ({"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2}, 5120, 5120, "wgrad", "bf16", "dense_proj_det_gemm_nn_n256_sks_sb2_pro7"),
+    ("sm_107a", True, True, True, False, False, 5120, None, 5120): ({"epi": "reg", "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_sync_m": 38, "sk_slab": 2}, 5120, 5120, "wgrad", "f32", "dense_proj_det_gemm_nn_n256_f32_v8_ef_sks_sb2_pro7"),
+}
+# fmt: on
+SM107A_212_TRANCHE_RULES = {key: value[0] for key, value in SM107A_212_TRANCHE.items()}
+
+
+def _sm107a_tranche_plan(K, N, op, out_dtype, T, sm_count):
+    """The production plan of one projection row on an sm_107a part (the views of the det entry points)."""
+    dt = {"bf16": torch.bfloat16, "f32": torch.float32}[out_dtype]
+    X = torch.empty(T, K, dtype=torch.bfloat16)
+    W = torch.empty(N, K, dtype=torch.bfloat16)
+    G = torch.empty(T, N, dtype=torch.bfloat16)
+    if op == "fwd":
+        A, B, out, transposed = X, W.t(), torch.empty(T, N, dtype=dt), False
+    elif op == "dgrad":
+        A, B, out, transposed = G, W, torch.empty(T, K, dtype=dt), False
+    else:
+        A, B, transposed = wgrad_views(G, X, arch="sm_107a", out_f32=out_dtype == "f32")
+        out = torch.empty(N, K, dtype=dt)
+    assert not transposed, (K, N, op, out_dtype)
+    plan, *_ = cake_dense_gemm_det_train_projection_plan(
+        A, B, out, sm_count=sm_count, l2_bytes=L2_BYTES, arch="sm_107a"
+    )
+    return plan
+
+
+@pytest.mark.parametrize("key", list(SM107A_212_TRANCHE))
+def test_sm107a_212_tranche_rules_plan_their_programs(monkeypatch, key):
+    """The ragged keys of the sm_107a 212-SM tranche plan their measured programs at the measured token counts on the
+    212- and 216-SM parts: registered, no fallback flag, the weight gradients in their direct orientation, and another
+    plan than the row's without the key.  The half-tail and column-grouped forward / input-gradient rows keep the per-tile
+    K partitions of the row's plan without the key (every output bitwise equal to that plan's); the weight-gradient rows
+    split the tail tiles' K (3 parts, or the synchronised stream-K tail)."""
+    rule, K, N, op, out_dtype, program = SM107A_212_TRANCHE[key]
+    assert ROW_RULES[key] == rule
+    registered = _registered("sm_107a")
+    for sm_count in (212, 216):
+        for T in (16172, 16231, 16384):
+            plan = _sm107a_tranche_plan(K, N, op, out_dtype, T, sm_count)
+            with monkeypatch.context() as m:
+                m.delitem(ROW_RULES, key)
+                plain = _sm107a_tranche_plan(K, N, op, out_dtype, T, sm_count)
+            where = (sm_count, T, plan.template, plain.template)
+            assert plan.template == program, where
+            assert program in registered
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), where
+            assert (plan.template, plan.group_m, plan.sk_units) != (
+                plain.template,
+                plain.group_m,
+                plain.sk_units,
+            ), where
+            if op == "wgrad":
+                assert plan.sk_units > 0, where
+                assert _k_partitions(plan) != _k_partitions(plain), where
+            else:
+                assert plan.cgrp, where
+                assert _k_partitions(plan) == _k_partitions(plain), where
+                assert _k_partitions(plan) == [(0, plan.k_blocks)], where
+
+
+# The token tiers of the sm_107a 212-SM tranche (cake_backend.ROW_RULE_MIN_T): key -> ((bound, rule), ...).  Under a
+# bound the key plans the row with the tier's rule (FlashInfer main's rule of the row, or no rule; the fp32 5120 -> 5120
+# weight gradient with no rule up to T 257); from the floor (the last bound) on, the tranche rule.  T = M of a forward /
+# input gradient, K of a weight gradient.
+# fmt: off
+_FI_MAIN_QB_DGRAD = {"cgrp": True, "group_m": 8}  # the round-26 rule (test_round26_rules_plan_like_the_cake_launcher)
+_FI_MAIN_5120_WGRAD_F32 = {"block_n": 256, "cta_rows": 128, "f32_v8": True, "pro": 15, "hints": ("none", "none"), "epi": "reg", "b_swz": 128, "pd": 0, "pf": 0}
+SM107A_212_TRANCHE_TIERS = {
+    ("sm_107a", False, True, False, False, False, 2048, 16384, None): ((2048, _FI_MAIN_QB_DGRAD),),
+    ("sm_107a", False, True, False, False, False, 5120, 5120, None): ((959, {}),),
+    ("sm_107a", True, True, True, False, False, 5120, None, 5120): ((258, {}), (16129, _FI_MAIN_5120_WGRAD_F32)),
+    ("sm_107a", True, True, False, False, False, 12288, None, 4096): ((16129, {}),),
+    ("sm_107a", True, True, False, False, False, 4096, None, 12288): ((16129, {}),),
+    ("sm_107a", False, True, False, False, False, 12288, 4096, None): ((33, {}),),
+    ("sm_107a", False, False, False, False, False, 12288, 4096, None): ((33, {}),),
+    ("sm_107a", True, True, False, False, False, 5120, None, 5120): ((16129, {}),),
+}
+# fmt: on
+
+
+def test_sm107a_212_tranche_floor_table():
+    assert cake_backend.ROW_RULE_MIN_T == SM107A_212_TRANCHE_TIERS
+    for key, tiers in cake_backend.ROW_RULE_MIN_T.items():
+        # ragged tranche keys only: one token dimension left out, the training T at or above the floor
+        assert key in SM107A_212_TRANCHE and (key[7] is None) != (key[8] is None), key
+        bounds = [bound for bound, _ in tiers]
+        assert (
+            bounds == sorted(set(bounds)) and bounds[0] > 1 and bounds[-1] <= 16172
+        ), key
+        assert all(
+            ROW_RULES[key] == SM107A_212_TRANCHE_RULES[key] != below
+            for _, below in tiers
+        ), key
+
+
+@pytest.mark.parametrize("key", list(SM107A_212_TRANCHE_TIERS))
+def test_sm107a_212_tranche_token_floors(monkeypatch, key):
+    """At T 1, each tier bound - 1, each bound and 16172 on the 212- and 216-SM parts: under a bound the plan equals the
+    row's plan with the tier's rule in place of the key's (no key for ``{}``); from the floor on it equals the tranche
+    rule's plan and differs from the plan with FlashInfer main's rule of the row (no key for ``{}``)."""
+    tiers = cake_backend.ROW_RULE_MIN_T[key]
+    main_rule = tiers[-1][1]
+    _rule, K, N, op, out_dtype, _program = SM107A_212_TRANCHE[key]
+
+    def plan_with(rule, T, sm_count):
+        with monkeypatch.context() as m:
+            m.delitem(cake_backend.ROW_RULE_MIN_T, key)
+            if rule is None:
+                pass  # the tranche rule
+            elif rule:
+                m.setitem(ROW_RULES, key, rule)
+            else:
+                m.delitem(ROW_RULES, key)
+            return _sm107a_tranche_plan(K, N, op, out_dtype, T, sm_count)
+
+    token_counts = (
+        {1, 16172} | {bound - 1 for bound, _ in tiers} | {bound for bound, _ in tiers}
+    )
+    for sm_count in (212, 216):
+        for T in sorted(token_counts):
+            plan = _sm107a_tranche_plan(K, N, op, out_dtype, T, sm_count)
+            below = next((rule for bound, rule in tiers if bound > T), None)
+            where = (sm_count, T, plan.template)
+            if below is not None:
+                assert plan == plan_with(below, T, sm_count), where
+            else:
+                assert plan == plan_with(None, T, sm_count), where
+                assert plan != plan_with(main_rule, T, sm_count), where
+
+
 def test_sm107a_t16384_wgrad_key_matches_fp64_and_the_plan_without_it(monkeypatch):
     """On sm_107a the 4096 -> 1024 fp32 weight gradient at T 16384 runs the key's program against the FP64 reference
     of the exact BF16 operands (the package tolerance), and its output is bitwise equal to the output of the plan the
@@ -10616,6 +11949,8 @@ def test_sm107a_t16384_wgrad_key_matches_fp64_and_the_plan_without_it(monkeypatc
             f"(compute capability {_registered_capabilities()})"
         )
     key = SM107A_T16384_WGRAD_KEY
+    # the row's ragged key carries the same rule at every other token count: compare with the row before either key
+    monkeypatch.delitem(ROW_RULES, key[:7] + (None,) + key[8:])
     arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
     device = torch.device("cuda")
     if arch != arch_for(device):
@@ -11098,3 +12433,224 @@ def test_the_entry_points_run_unchanged_under_torch_deterministic_mode(warn_only
     assert [w for w in caught if "determinis" in str(w.message)] == []
     for got, want in zip(outputs, reference, strict=True):
         assert torch.equal(got, want)
+
+
+# ---------------------------------------------------------------------------
+# K1 weight-gradient chain plans (``CHAIN_RANGES_BY_SM``)
+# ---------------------------------------------------------------------------
+
+
+def _chain_wgrad_plan(N, T, M, sm_count, out_dtype=torch.float32, **knobs):
+    """The planner's plan of the ``N -> M`` weight gradient at ``T`` tokens on an ``sm_107a`` part of ``sm_count`` SMs."""
+    G = torch.empty(T, M, dtype=torch.bfloat16)
+    X = torch.empty(T, N, dtype=torch.bfloat16)
+    out = torch.empty(M, N, dtype=out_dtype)
+    A, B, transposed = wgrad_views(
+        G, X, arch="sm_107a", out_f32=out_dtype == torch.float32
+    )
+    plan, a_desc, b_desc, _o3 = cake_dense_gemm_det_train_projection_plan(
+        A,
+        B,
+        out,
+        sm_count=sm_count,
+        l2_bytes=L2_BYTES,
+        transposed_out=transposed,
+        arch="sm_107a",
+        **knobs,
+    )
+    return plan, (A, B, a_desc, b_desc)
+
+
+def test_chain_ranges_plan_the_chain_program():
+    """Inside a ``CHAIN_RANGES_BY_SM`` range the FP32 weight gradient plans the registered chain program: the caller's
+    operands exchanged under the transposed store, three contiguous K-block chains, at most one CTA pair per two SMs
+    and no workspace.  Outside a range, on another SM count, for a BF16 output, under a caller knob or the pure mirror
+    the row keeps the planner's routing; an exact ``ROW_RULES`` key keeps precedence unless the range overrides it."""
+    table = cake_backend.CHAIN_RANGES_BY_SM
+    assert set(table) == {("sm_107a", 212), ("sm_107a", 216)}
+    kernels = cake_jit.KERNELS["sm_107a"]
+    checked = 0
+    for (arch, sm_count), rows in table.items():
+        for ident, ranges in rows.items():
+            assert ident[:6] == (arch, True, True, True, False, False), ident
+            N, M = ident[6], ident[7]
+            for lo, hi, (block_n, chains), over_exact in ranges:
+                template = cake_backend.chain_template(block_n, chains)
+                assert template.startswith(cake_backend.CHAIN_TEMPLATE_PREFIX)
+                assert template in kernels, template
+                inside = sorted(
+                    {lo, lo + 1, hi} | {t for t in (16231, 16384) if lo <= t <= hi}
+                )
+                for T in inside:
+                    exact = (arch, True, True, True, False, False, N, T, M) in ROW_RULES
+                    plan, (A, B, a_desc, b_desc) = _chain_wgrad_plan(N, T, M, sm_count)
+                    if exact and not over_exact:
+                        assert not isinstance(plan, cake_backend.ChainGemmPlan), (
+                            N,
+                            T,
+                            M,
+                        )
+                        continue
+                    assert isinstance(plan, cake_backend.ChainGemmPlan), (
+                        sm_count,
+                        N,
+                        T,
+                        M,
+                        plan.template,
+                    )
+                    assert plan.template == template and (
+                        plan.block_n,
+                        plan.chains,
+                    ) == (block_n, chains)
+                    assert plan.swapped and not plan.transposed_out
+                    assert (plan.launch_m, plan.launch_n, plan.K) == (N, M, T)
+                    kb = -(-T // cake_backend.CHAIN_BLOCK_K)
+                    assert plan.chain_bounds == tuple(
+                        j * kb // chains for j in range(chains + 1)
+                    )
+                    assert all(
+                        b > a
+                        for a, b in zip(
+                            plan.chain_bounds[:-1], plan.chain_bounds[1:], strict=True
+                        )
+                    )
+                    tiles = -(-N // cake_backend.CHAIN_PAIR_ROWS) * -(-M // block_n)
+                    assert plan.tiles == tiles and plan.grid == (
+                        2 * min(tiles, sm_count // 2),
+                        1,
+                        1,
+                    )
+                    assert plan.ws_f32_elems == 0 and not plan.sk_units
+                    assert cake_backend._k1_swapped(plan, A, B, transposed_out=False)
+                    checked += 1
+                for T in (lo - 1, hi + 1):
+                    plan, _ = _chain_wgrad_plan(N, T, M, sm_count)
+                    assert not isinstance(plan, cake_backend.ChainGemmPlan), (
+                        sm_count,
+                        N,
+                        T,
+                        M,
+                    )
+                T = min(max(16231, lo), hi)
+                for kw in (dict(sk=False), dict(cta_rows=128), dict(_fallback=False)):
+                    plan, _ = _chain_wgrad_plan(N, T, M, sm_count, **kw)
+                    assert not isinstance(plan, cake_backend.ChainGemmPlan), (
+                        N,
+                        T,
+                        M,
+                        kw,
+                    )
+                plan, _ = _chain_wgrad_plan(N, T, M, sm_count, out_dtype=torch.bfloat16)
+                assert not isinstance(plan, cake_backend.ChainGemmPlan), (N, T, M)
+                for other in (148, 152, 208):
+                    plan, _ = _chain_wgrad_plan(N, T, M, other)
+                    assert not isinstance(plan, cake_backend.ChainGemmPlan), (
+                        other,
+                        N,
+                        T,
+                        M,
+                    )
+    assert checked
+    # the exact keys of rows outside the table (4096 -> 512 / 4096 -> 1024) keep their programs at both SM counts
+    for sm_count in (212, 216):
+        for N, M in ((4096, 512), (4096, 1024)):
+            for T in (16231, 16384):
+                assert ("sm_107a", True, True, True, False, False, N, T, M) in ROW_RULES
+                plan, _ = _chain_wgrad_plan(N, T, M, sm_count)
+                assert not isinstance(plan, cake_backend.ChainGemmPlan), (
+                    sm_count,
+                    N,
+                    T,
+                    M,
+                )
+
+
+def test_chain_plan_of_exact_key_precedence(monkeypatch):
+    """``chain_plan_of``: an exact ``ROW_RULES`` key of the row wins over a range without ``over_exact``; a range with it
+    plans the chain program at the key's token count; chains that do not each get a K block are refused."""
+    ident = ("sm_107a", True, True, True, False, False, 5120, 512)
+    key = ("sm_107a", True, True, True, False, False, 5120, 16231, 512)
+    assert key in ROW_RULES
+    monkeypatch.setitem(
+        cake_backend.CHAIN_RANGES_BY_SM,
+        ("sm_107a", 216),
+        {ident: ((64, 40961, (128, 3), False),)},
+    )
+    assert (
+        cake_backend.chain_plan_of(
+            "sm_107a", 216, 5120, 16231, 512, transposed_out=False
+        )
+        is None
+    )
+    assert cake_backend.chain_plan_of(
+        "sm_107a", 216, 5120, 16232, 512, transposed_out=False
+    ) == (128, 3)
+    assert (
+        cake_backend.chain_plan_of("sm_107a", 216, 5120, 64, 512, transposed_out=False)
+        is None
+    )
+    assert cake_backend.chain_plan_of(
+        "sm_107a", 216, 5120, 129, 512, transposed_out=False
+    ) == (128, 3)
+    assert (
+        cake_backend.chain_plan_of(
+            "sm_107a", 216, 5120, 16232, 512, transposed_out=True
+        )
+        is None
+    )
+    assert (
+        cake_backend.chain_plan_of(
+            "sm_107a", 208, 5120, 16232, 512, transposed_out=False
+        )
+        is None
+    )
+    monkeypatch.setitem(
+        cake_backend.CHAIN_RANGES_BY_SM,
+        ("sm_107a", 216),
+        {ident: ((64, 40961, (128, 3), True),)},
+    )
+    assert cake_backend.chain_plan_of(
+        "sm_107a", 216, 5120, 16231, 512, transposed_out=False
+    ) == (128, 3)
+    assert not cake_backend.chains_fit(3, 128) and cake_backend.chains_fit(3, 129)
+
+
+@pytest.mark.parametrize("N, M", [(5120, 1024), (5120, 512)])
+@pytest.mark.parametrize("T", [961, 4096])
+def test_chain_wgrad_matches_fp64_and_repeats_bitwise(N, M, T, monkeypatch):
+    """On an ``sm_107a`` part of a ``CHAIN_RANGES_BY_SM`` SM count the chain plan of the FP32 weight gradient meets the
+    package tolerance against the FP64 reference of the exact BF16 operands (odd K-block counts included) and its
+    prepared launch, rerun over NaN-poisoned outputs, gives the first launch's bits; elsewhere it skips."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    device = torch.device("cuda")
+    if arch_for(device) != "sm_107a":
+        pytest.skip(f"an sm_107a plan; the device is {arch_for(device)}")
+    sm_count = _sm_count()
+    choice = cake_backend.chain_plan_of(
+        "sm_107a", sm_count, N, T, M, transposed_out=False
+    )
+    if choice is None:
+        pytest.skip(f"no chain range for {N} -> {M} at T {T} on {sm_count} SMs")
+    _require_program(cake_backend.chain_template(*choice))
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    g = torch.Generator(device=device).manual_seed(SEED + 11)
+    G = torch.randn(T, M, device=device, generator=g).to(torch.bfloat16)
+    X = (torch.randn(T, N, device=device, generator=g) * T**-0.5).to(torch.bfloat16)
+    out = torch.full((M, N), float("nan"), dtype=torch.float32, device=device)
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()
+    prepared = cake_dense_gemm_det_train_projection_wgrad_prepare(G, X, out)
+    assert isinstance(prepared.plan, cake_backend.ChainGemmPlan), prepared.template
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(G.double().t(), X.double()))
+    first = out.clone()
+    for _ in range(REPEATS):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int32), first.view(torch.int32))
+    cake_backend.cake_dense_gemm_det_train_convenience_cache_clear()

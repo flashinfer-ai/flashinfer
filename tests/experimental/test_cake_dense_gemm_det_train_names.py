@@ -135,6 +135,32 @@ def _run(code: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_the_shared_mode_name_checks():
+    """The shared #8928 checks (tests/test_helpers/cake_mode_names.py): mode word and stem, no ``deterministic``
+    keyword, one name per object across the module, the backend modules and the flashinfer top level, and the
+    former paths and names failing at import in a fresh interpreter."""
+    import flashinfer
+
+    from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+
+    module = importlib.import_module(MODULE)
+    assert_cake_mode_module(
+        module,
+        "det",
+        namespaces=[
+            flashinfer,
+            importlib.import_module(f"{BACKEND}.cake_backend"),
+            importlib.import_module(f"{BACKEND}.cake_jit"),
+        ],
+        old_modules=[FORMER_PACKAGE, *FORMER_MODULES],
+        old_names=[
+            (f"{BACKEND}.{submodule}", name)
+            for submodule, names in sorted(REMOVED.items())
+            for name in names
+        ],
+    )
+
+
 def test_all_lists_the_public_names():
     module = importlib.import_module(MODULE)
     assert set(module.__all__) == PUBLIC
@@ -274,8 +300,22 @@ def test_the_backend_never_reads_the_torch_deterministic_setting():
             assert token not in text, (path.name, token)
 
 
+# the build leaf of a several-chain weight-gradient program's registry record: the shared module's path
+_CHAIN_BUILD_LEAF = re.compile(
+    r'"build": \{"module": "[\w.]+", "kwargs": \{[^{}]*"chains": [2-9][^{}]*\}\}'
+)
+
+
 def _former_lines(text: str) -> list[str]:
-    return [line for line in text.split("\n") if any(t in line for t in FORMER_TOKENS)]
+    """The lines of ``text`` spelling a former token, the build leaf of a several-chain program's record
+    (``_CHAIN_BUILD_LEAF``) aside."""
+    out = []
+    for line in text.split("\n"):
+        if '"template": "chain_det_gemm_' in line:
+            line = _CHAIN_BUILD_LEAF.sub('"build": {}', line)
+        if any(t in line for t in FORMER_TOKENS):
+            out.append(line)
+    return out
 
 
 def test_the_registry_spells_only_canonical_names():
@@ -298,12 +338,18 @@ def test_the_registry_spells_only_canonical_names():
                 "router_fp32_det_gemm_",
                 "split_fp32_det_bf16x3",
                 "swap_ab_",
+                "chain_det_gemm_",
             )
         )
-        assert (
-            "build" not in record
-            or ".dense_projection_gemm" not in record["build"]["module"]
-        )
+        if record["template"].startswith("chain_det_gemm_"):
+            # the several-chain weight-gradient programs build the weight-gradient module both packages share: its
+            # path keeps the former spelling, its program names do not
+            assert record["build"]["kwargs"]["chains"] > 1
+        else:
+            assert (
+                "build" not in record
+                or ".dense_projection_gemm" not in record["build"]["module"]
+            )
     templates = {t for table in jit.KERNELS.values() for t in table}
     assert backend.SPLIT_TEMPLATE in templates
     assert {

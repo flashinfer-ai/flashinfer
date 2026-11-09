@@ -827,6 +827,95 @@ def test_public_cake_gdn_prefill_sm107a_gatestream_one_cta_per_tile_runs_the_twi
     )
 
 
+def test_public_cake_gdn_prefill_sm107a_f16io_gatestream_twins_equal_the_base_record(
+    monkeypatch,
+):
+    # The FP16-I/O full-DV key with several short tiles per CTA runs the gate-stream
+    # prefetch twin on the persistent grid and the gate-stream twin without the prefetch
+    # with one CTA per tile; with the twin rule off for the FP16-I/O body it runs the base
+    # record.  The twins only move data differently: all three outputs and final states
+    # are equal bit for bit and match the reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the FP16-I/O gate-stream twins are sm_107a only")
+    case = _make_case(
+        seq_lens=(128,) * 32,
+        io_dtype=torch.float16,
+        num_q_heads=4,
+        num_k_heads=4,
+        num_v_heads=16,
+    )
+    total_tiles = len(case["seq_lens"]) * case["num_v_heads"]
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    results = []
+
+    def run():
+        case["output"].fill_(float("nan"))
+        case["output_state"].fill_(float("nan"))
+        out, state = _launch(case)
+        torch.cuda.synchronize()
+        results.append((out.clone(), state.clone()))
+
+    run()
+    assert len(grids) == 1 and grids[0] < total_tiles, grids
+    (prefetch,) = loaded
+    assert "_initial_f16io_gatestream_full_pf_sm107a_i64meta_" in prefetch, prefetch
+    real_sm_count = prefill_mod._cake_gdn_sm_count
+    monkeypatch.setattr(
+        prefill_mod, "_cake_gdn_sm_count", lambda _device_index: total_tiles
+    )
+    run()
+    assert grids[1:] == [total_tiles], grids
+    assert loaded[1:] == [prefetch.replace("_gatestream_full_pf_", "_gatestream_full_")]
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_sm_count", real_sm_count)
+    monkeypatch.setattr(
+        cake_gdn,
+        "_GATE_STREAM_FULL_BASES",
+        cake_gdn._GATE_STREAM_FULL_BASES
+        - {"flashinfer_blackwell_gdn_prefill_initial_f16io"},
+    )
+    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    try:
+        run()
+    finally:
+        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    assert len(loaded) == 3
+    assert "_initial_f16io_sm107a_i64meta_" in loaded[2], loaded
+    record = cake_gdn._kernel_record(loaded[2])
+    for name in loaded[:2]:
+        assert (
+            cake_gdn._kernel_record(name)["specializations"]
+            == record["specializations"]
+        )
+    base_out, base_state = results[2]
+    for out, state in results[:2]:
+        assert torch.equal(out, base_out)
+        assert torch.equal(state, base_state)
+    torch.testing.assert_close(
+        base_out.float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        base_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_matches_independent_recurrence(
     monkeypatch,
 ):
@@ -887,6 +976,211 @@ def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_matches_independent
         assert torch.equal(runs[0][0], runs[1][0])
         assert torch.equal(runs[0][1], runs[1][1])
         assert grids == [expected_grid, expected_grid]
+
+
+@pytest.mark.parametrize(
+    ("io_dtype", "state_dtype", "initial", "heads", "seq_lens", "split"),
+    (
+        # BF16 I/O, BF16 state, with an initial state: Hq8/Hv16, 512 half tiles
+        (
+            torch.bfloat16,
+            torch.bfloat16,
+            True,
+            (8, 16),
+            (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1, 1),
+            "_dvsplit_initial_bf16state_sm107a_l7b_vec2lp_",
+        ),
+        # FP16 I/O, FP32 state, with an initial state: Hq4/Hv16, 512 half tiles
+        (
+            torch.float16,
+            torch.float32,
+            True,
+            (4, 16),
+            (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1, 1),
+            "_dvsplit_initial_f16io_sm107a_l7_vec2_",
+        ),
+        # BF16 / FP16 I/O, FP32 state, no initial state: Hq16/Hv32, 1024 half tiles
+        (
+            torch.bfloat16,
+            torch.float32,
+            False,
+            (16, 32),
+            (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1),
+            "_dvsplit_sm107a_l7_vec2_",
+        ),
+        (
+            torch.float16,
+            torch.float32,
+            False,
+            (16, 32),
+            (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1),
+            "_dvsplit_f16io_sm107a_l7_vec2_",
+        ),
+    ),
+    ids=("bf16_state", "f16_io", "no_initial_state", "f16_io_no_initial_state"),
+)
+def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_of_each_contract_matches_independent_recurrence(
+    monkeypatch, io_dtype, state_dtype, initial, heads, seq_lens, split
+):
+    # The BF16-state, FP16-I/O and no-initial-state contracts of the ragged DV-split route:
+    # a ragged batch over the DV-split tile budget whose critical path is its long first
+    # sequence runs its contract's DV-split body with one CTA per half tile when
+    # ``cu_seqlens_cpu`` is passed, else the full-DV body on the grid rule's grid.  Both
+    # match the reference recurrence and repeat bitwise.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the ragged DV-split route is sm_107a only")
+    num_q_heads, num_v_heads = heads
+    case = _make_case(
+        seq_lens=seq_lens,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    if not initial:
+        case["initial_state"] = None
+    initial_state = (
+        None if case["initial_state"] is None else case["initial_state"].clone()
+    )
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    unrouted = _public_route(case)
+    assert unrouted.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert unrouted.one_cta_per_tile is False
+    routed = cake_gdn.select_cake_gdn_prefill_variant(
+        **_public_route_kwargs(case), host_seq_lens=seq_lens
+    )
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.one_cta_per_tile is True
+    assert split in routed.variant_name, routed.variant_name
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    sm_count = torch.cuda.get_device_properties(case["q"].device).multi_processor_count
+    full_dv_tiles = len(seq_lens) * max(heads)
+    full_dv_grid = cake_gdn._cake_gdn_prefill_grid_x(
+        full_dv_tiles, sm_count, False, sum(seq_lens)
+    )
+    assert full_dv_grid <= sm_count < 2 * full_dv_tiles
+    for host_copy, expected_grid in (
+        ({"cu_seqlens_cpu": _host_cu_seqlens(seq_lens)}, 2 * full_dv_tiles),
+        ({}, full_dv_grid),
+    ):
+        runs = []
+        grids.clear()
+        for _ in range(2):
+            case["output"].fill_(float("nan"))
+            if initial_state is None:
+                case["output_state"].fill_(float("nan"))
+            else:
+                case["output_state"].copy_(initial_state)
+            out, state = _launch(case, **host_copy)
+            torch.cuda.synchronize()
+            runs.append((out.clone(), state.clone()))
+        for out, state in runs:
+            assert torch.isfinite(out.float()).all()
+            assert torch.isfinite(state.float()).all()
+        torch.testing.assert_close(
+            runs[0][0].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            runs[0][1].float(), expected_state.float(), atol=1e-2, rtol=1e-2
+        )
+        assert torch.equal(runs[0][0], runs[1][0])
+        assert torch.equal(runs[0][1], runs[1][1])
+        assert grids == [expected_grid, expected_grid]
+
+
+@pytest.mark.parametrize(
+    ("io_dtype", "state_dtype", "initial", "heads"),
+    (
+        (torch.bfloat16, torch.bfloat16, True, (8, 32)),
+        (torch.bfloat16, torch.float32, False, (16, 32)),
+        (torch.float16, torch.float32, False, (16, 64)),
+    ),
+    ids=("bf16_state", "no_initial_state", "f16_io_no_initial_state"),
+)
+@pytest.mark.parametrize("seq_len", (2048, 2049), ids=("max2048", "max2049"))
+def test_public_cake_gdn_prefill_sm107a_vec2full_twin_equals_the_shared_record(
+    monkeypatch, io_dtype, state_dtype, initial, heads, seq_len
+):
+    # A full-DV batch of the BF16-state contract (without gate streaming) or of the FP32-state
+    # contracts without an initial state runs the key's vec2-full twin record when its longest
+    # sequence is at most 2048 tokens and the shared record above that.  The twin only moves
+    # the state differently: with the rule's bound moved to the other side, the other record
+    # of the same key gives the same output and final state bit for bit, and both match the
+    # reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the vec2-full twin records are sm_107a only")
+    num_q_heads, num_v_heads = heads
+    seq_lens = (seq_len,) * 4
+    case = _make_case(
+        seq_lens=seq_lens,
+        io_dtype=io_dtype,
+        state_dtype=state_dtype,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    if not initial:
+        case["initial_state"] = None
+    initial_state = (
+        None if case["initial_state"] is None else case["initial_state"].clone()
+    )
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    loaded = []
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def loading(name, arch):
+        loaded.append(name)
+        return load(name, arch)
+
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    results = []
+
+    def run():
+        case["output"].fill_(float("nan"))
+        if initial_state is None:
+            case["output_state"].fill_(float("nan"))
+        else:
+            case["output_state"].copy_(initial_state)
+        out, state = _launch(case, cu_seqlens_cpu=_host_cu_seqlens(seq_lens))
+        torch.cuda.synchronize()
+        results.append((out.clone(), state.clone()))
+
+    run()
+    twin_first = seq_len <= 2048
+    limit = cake_gdn._VEC2FULL_MAX_TILE_CHUNKS
+    cake_gdn._VEC2FULL_MAX_TILE_CHUNKS = -1 if twin_first else 1 << 20
+    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    try:
+        run()
+    finally:
+        cake_gdn._VEC2FULL_MAX_TILE_CHUNKS = limit
+        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    assert len(loaded) == 2, loaded
+    twin, shared = loaded if twin_first else loaded[::-1]
+    assert "_sm107a_vec2full_i64meta_" in twin, loaded
+    assert shared == twin.replace("_sm107a_vec2full_i64meta_", "_sm107a_i64meta_")
+    twin_record = cake_gdn._kernel_record(twin)
+    shared_record = cake_gdn._kernel_record(shared)
+    assert twin_record["specializations"] == shared_record["specializations"]
+    assert twin_record["outputs"] != shared_record["outputs"]
+    (out, state), (other_out, other_state) = results
+    assert torch.isfinite(out.float()).all() and torch.isfinite(state.float()).all()
+    assert torch.equal(out, other_out)
+    assert torch.equal(state, other_state)
+    torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
 
 
 def _carry_segment(case, start, stop, initial_state):

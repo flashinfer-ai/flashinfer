@@ -115,7 +115,7 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
         unsigned long long row_base = (unsigned long long)row_c * (unsigned long long)K;
         int m_tile = row_c / sf_rows;
         int row_in_tile = row_c - m_tile * sf_rows;
-        unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4;
+        unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16ull + (unsigned long long)(row_in_tile >> 5) * 4ull;
         asm volatile("griddepcontrol.wait;" ::: "memory");
         float staged[32];
         #pragma unroll
@@ -230,7 +230,7 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
         unsigned long long row_base_1 = (unsigned long long)row_c_1 * (unsigned long long)K;
         int m_tile_1 = row_c_1 / sf_rows;
         int row_in_tile_1 = row_c_1 - m_tile_1 * sf_rows;
-        unsigned long long sf_row_base_1 = (unsigned long long)m_tile_1 * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile_1 & 31) * 16 + (unsigned long long)(row_in_tile_1 >> 5) * 4;
+        unsigned long long sf_row_base_1 = (unsigned long long)m_tile_1 * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile_1 & 31) * 16ull + (unsigned long long)(row_in_tile_1 >> 5) * 4ull;
         asm volatile("griddepcontrol.wait;" ::: "memory");
         float staged_1[32];
         #pragma unroll

@@ -281,7 +281,7 @@ static_assert(kTwoShotEarlyMaxTokensWorldSize8 >= kTwoShotMinTokensWorldSize8 &&
 // World size 2 runs the large-token program for top_k 4 above these token counts, without and
 // with the shared-expert operand; every other world-size-2 batch runs the persistent program.
 constexpr int64_t kLargeTokenMinTokens = 512;
-constexpr int64_t kLargeTokenMinTokensSharedExpert = 1280;
+constexpr int64_t kLargeTokenMinTokensSharedExpert = 895;
 
 // World size 2 runs the quad-gather program for batches above the small-token test up to this
 // token count (one wave: at most 142 resident clusters at 4 CTAs per SM).
