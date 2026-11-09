@@ -349,6 +349,10 @@ def _make_wrapper(
                 # kernel, so the original call stands.
                 bump_stat(fi_api, "fallback_batch_invariant")
                 return original(*args, **kwargs)
+            if namespace.get("fc2_input_out") is not None:
+                # A registered solution does not fill the caller's copy of the
+                # FC2 input (trtllm FP4 MoE), so the original call stands.
+                return original(*args, **kwargs)
             template = (
                 templates[0]
                 if template_dispatch is None

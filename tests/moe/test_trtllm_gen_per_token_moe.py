@@ -564,9 +564,10 @@ def test_fc2_input_out(num_tokens: int, expert_parallel: bool):
     )
 
     # It is the activation, quantized to NvFP4 ...
-    ref = parts["intermediate"][local].float()
-    rel = (fc2_input[local] - ref).norm() / ref.norm()
-    assert rel < 0.15, rel
+    if local.any():
+        ref = parts["intermediate"][local].float()
+        rel = (fc2_input[local] - ref).norm() / ref.norm()
+        assert rel < 0.15, rel
 
     # ... and GEMM2 + finalize over it reproduce the kernel output.
     recon = torch.zeros(num_tokens, hidden_size, device=device)
@@ -575,8 +576,11 @@ def test_fc2_input_out(num_tokens: int, expert_parallel: bool):
         weight = parts["expert_weights"][token, slot].float().unsqueeze(1)
         out_e = fc2_input[token, slot] @ parts["w2_dequant"][e].float().T
         recon.index_add_(0, token, weight * out_e)
-    rel = (plain.float() - recon).norm() / recon.norm()
-    assert rel < 1e-2, rel
+    if recon.norm() == 0:
+        assert (plain == 0).all()
+    else:
+        rel = (plain.float() - recon).norm() / recon.norm()
+        assert rel < 1e-2, rel
 
     # CUDA-graph replay writes the same bytes.
     eager = [t.view(torch.uint8).clone() for t in fc2_input_out]
@@ -616,3 +620,78 @@ def test_fc2_input_out_requires_per_token_scale():
     kwargs["per_token_scale"] = None
     with pytest.raises(Exception, match="per_token_scale"), autotune(False):
         trtllm_fp4_block_scale_routed_moe(**kwargs, fc2_input_out=fc2_input_out)
+
+
+def test_fc2_input_out_bypasses_trace_apply():
+    """A registered Trace Apply solution replaces the plain call (the control) but
+    would not fill ``fc2_input_out``, so a call that asks for the copy runs the
+    kernel."""
+    import flashinfer.fused_moe as fused_moe
+    import flashinfer.trace_apply as ta
+    from flashinfer.trace_apply.apply import (
+        _registry_by_fi_api,
+        bind_namespace,
+        build_extractor_maps,
+        extract_axes,
+    )
+
+    device = torch.device("cuda:0")
+    _skip_unless_sm10x(device)
+    num_tokens, hidden_size, intermediate_size, top_k = 8, 1024, 2048, 4
+    kwargs, _reference, _ = _per_token_routed_case(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=32,
+        top_k=top_k,
+        use_4over6=False,
+        weights_use_4over6=False,
+        activation_type=ActivationType.Swiglu,
+        zero_rows=False,
+        device=device,
+    )
+    reg = _registry_by_fi_api()
+    key = next(k for k in reg if k.endswith(".trtllm_fp4_block_scale_routed_moe"))
+    original, templates = reg[key]
+    namespace = bind_namespace(original, (), kwargs)
+    name = templates[0].definition_name(
+        extract_axes(build_extractor_maps(templates), namespace)
+    )
+    calls: list = []
+
+    def solution(*args, **kw):
+        calls.append(1)
+        return [
+            torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+        ]
+
+    codes = torch.full(
+        (num_tokens, top_k, intermediate_size // 2),
+        0xFF,
+        dtype=torch.uint8,
+        device=device,
+    )
+    fc2_input_out = (
+        codes,
+        torch.empty(
+            num_tokens, top_k, intermediate_size // 16, dtype=torch.uint8, device=device
+        ),
+        torch.empty(num_tokens, top_k, dtype=torch.float32, device=device),
+    )
+    ta.enable_apply({name: solution})
+    try:
+        with autotune(False):
+            # Looked up at call time: Trace Apply patches the flashinfer modules.
+            fused_moe.trtllm_fp4_block_scale_routed_moe(**kwargs)
+            assert calls, (
+                f"the control: the solution replaces the plain call {ta.stats()}"
+            )
+            seen = len(calls)
+            fused_moe.trtllm_fp4_block_scale_routed_moe(
+                **kwargs, fc2_input_out=fc2_input_out
+            )
+        torch.cuda.synchronize()
+        assert len(calls) == seen, "the solution ran for a call with fc2_input_out"
+        assert not (codes == 0xFF).all(), "fc2_input_out was not written"
+    finally:
+        ta.disable_apply()
