@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CPU tests of the non-deterministic conv KCP module's private test knobs, the bookkeeping of its CUDA-graph replay
-cache, its trimmed host path, its recompute handle and its public names: the knob is refused without
-``CAKE_KCP_TEST_KNOBS=1``, validated against ``GRAPH_MODES`` and off by default; the validity key tells operands
+cache, its trimmed host path, its recompute handle and its public names: the knob is a private hook with no
+environment gate (the backend reads no environment variable), validated against ``GRAPH_MODES`` and off by default;
+the validity key tells operands
 apart by data pointer, shape, stride and dtype, keeps one entry per key, and the first call of a key runs eagerly;
 no public entry takes a ``deterministic`` keyword (the ordinary ``TypeError``) and every public name carries
 ``nondet``; the non-deterministic KCP package ``flashinfer.cake_causal_conv1d_nondet_train_kcp`` imports no KCP host
@@ -36,16 +37,35 @@ from tests.test_helpers.cake_package import PACKAGES
 
 
 @pytest.mark.cpu_only
-def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
+def test_backend_reads_no_environment_variable() -> None:
+    """The KCP route has no environment gate: no ``TEST_KNOBS_ENV`` constant, and neither ``kcp.py`` nor ``kcp_jit.py``
+    reads the environment (``os.environ`` / ``os.getenv`` / ``getenv``)."""
+    import inspect
+
+    from flashinfer.experimental.cake.cake_causal_conv1d_nondet_train import (
+        kcp_jit,
+    )
+
+    assert not hasattr(conv_kcp, "TEST_KNOBS_ENV")
+    for module in (conv_kcp, kcp_jit):
+        source = inspect.getsource(module)
+        for token in ("os.environ", "getenv", "environ.get", "import os"):
+            assert token not in source, (module.__name__, token)
+
+
+@pytest.mark.cpu_only
+def test_graph_knob_is_validated() -> None:
     assert conv_kcp.GRAPH_MODES == ("off", "replay")
-    assert conv_kcp._set_test_knobs(None) == {"graph": "off", "host_trim": 1}
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"graph": "replay"})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"host_trim": 1})
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
+    assert conv_kcp._set_test_knobs(None) == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_route": "overlap",
+    }
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_route": "overlap",
+    }
     try:
         with pytest.raises(ValueError, match="unknown"):
             conv_kcp._set_test_knobs({"grap": "replay"})
@@ -56,41 +76,45 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
         assert conv_kcp._set_test_knobs({"graph": "off"}) == {
             "graph": "off",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
     finally:
         conv_kcp._set_test_knobs(None)
 
 
 @pytest.mark.cpu_only
-def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
-    """``host_trim`` (the trimmed host path): refused without ``CAKE_KCP_TEST_KNOBS=1``,
-    validated against ``HOST_TRIMS`` (1 shipped = the trimmed host path of the eager halo call,
+def test_host_trim_knob_is_validated() -> None:
+    """``host_trim`` (the trimmed host path): validated against ``HOST_TRIMS`` (1 shipped = the trimmed host path of the eager halo call,
     0 = the previous host path), independent of ``graph``; a dict naming one knob keeps the other at its shipped default."""
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
     assert conv_kcp.HOST_TRIMS == (0, 1) and conv_kcp.HOST_TRIM_DEFAULT == 1
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"host_trim": 0})
     assert conv_kcp._TEST_KNOBS["host_trim"] == 1
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         assert conv_kcp._set_test_knobs({"host_trim": 1}) == {
             "graph": "off",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
         assert conv_kcp._graph_mode(None) == "off"
         assert conv_kcp._set_test_knobs({"host_trim": 1, "graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_route": "overlap",
         }
-        assert conv_kcp._set_test_knobs({}) == {"graph": "off", "host_trim": 1}
+        assert conv_kcp._set_test_knobs({}) == {
+            "graph": "off",
+            "host_trim": 1,
+            "bwd_route": "overlap",
+        }
         for bad in (
             {"host_trim": 2},
             {"host_trim": "1"},
@@ -102,15 +126,63 @@ def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
         assert conv_kcp._set_test_knobs({"host_trim": 0}) == {
             "graph": "off",
             "host_trim": 0,
+            "bwd_route": "overlap",
         }
     finally:
         conv_kcp._set_test_knobs(None)
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_route": "overlap",
+    }
+
+
+@pytest.mark.cpu_only
+def test_bwd_route_knob_is_validated() -> None:
+    """``bwd_route``: validated against ``BWD_ROUTES`` (``"overlap"`` shipped = the overlapped pair of programs around
+    the exchange's wait, ``"single"`` = the one backward program after it), independent of the other knobs; a
+    backward graph key holds it when not the default, a forward key never does."""
+    assert conv_kcp.BWD_ROUTES == ("overlap", "single")
+    assert conv_kcp.BWD_ROUTE_DEFAULT == "overlap"
+    assert conv_kcp._TEST_KNOBS["bwd_route"] == "overlap"
+    ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
+    try:
+        assert conv_kcp._set_test_knobs({"bwd_route": "single"}) == {
+            "graph": "off",
+            "host_trim": 1,
+            "bwd_route": "single",
+        }
+        assert conv_kcp._overlapped(1024, 8, 0) is False
+        for bad in ({"bwd_route": "dyn"}, {"bwd_route": None}, {"bwd_rout": "single"}):
+            with pytest.raises(ValueError):
+                conv_kcp._set_test_knobs(bad)
+        conv_kcp._set_test_knobs({"bwd_route": "single", "graph": "replay"})
+        bwd = conv_kcp._graph_entry("bwd", ctx, ())
+        fwd = conv_kcp._graph_entry("fwd", ctx, ())
+        assert bwd.key[-1] == ("bwd_route", "single")
+        assert ("bwd_route", "single") not in fwd.key
+        conv_kcp._set_test_knobs({"graph": "replay"})
+        assert ("bwd_route", "overlap") not in conv_kcp._graph_entry("bwd", ctx, ()).key
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_graph_cache_clear()
+    assert conv_kcp._TEST_KNOBS["bwd_route"] == "overlap"
+
+
+@pytest.mark.cpu_only
+def test_overlapped_route_rule() -> None:
+    """The overlapped pair runs every backward call with tokens and at most ``DYN_MAX_CHANNELS`` channels and no SM
+    reserve; a reserve, a wider ``C`` or no tokens run the single program."""
+    limit = conv_kcp._loader.DYN_MAX_CHANNELS
+    assert limit == 65536
+    assert conv_kcp._overlapped(8, 1, 0) and conv_kcp._overlapped(limit, 1 << 20, 0)
+    assert not conv_kcp._overlapped(limit + 8, 4096, 0)
+    assert not conv_kcp._overlapped(1024, 0, 0)
+    assert not conv_kcp._overlapped(1024, 4096, 1)
 
 
 @pytest.mark.cpu_only
 def test_graph_cache_key_and_eager_first_call(monkeypatch) -> None:
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     x = torch.empty(8, 16, dtype=torch.bfloat16)
     w = torch.empty(16, 4, dtype=torch.float32)
     ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
@@ -176,7 +248,6 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
     """``graph=`` is a public keyword of the conv KCP calls (no environment gate): validated against
     ``GRAPH_MODES``, ``None`` = the module's shipped default (``GRAPH_DEFAULT == "off"``), keyed and recorded like the
     knob; a keyword contradicting an active knob is a ``ValueError``.  No kernel runs here."""
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
     conv_kcp._set_test_knobs(None)
     assert conv_kcp.GRAPH_DEFAULT == "off" and "GRAPH_DEFAULT" in conv_kcp.__all__
     assert conv_kcp._graph_mode(None) == "off"
@@ -219,7 +290,6 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
             "graph_key": e.digest,
             "graph_fallback": None,
         }
-        monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
         conv_kcp._set_test_knobs({"graph": "replay"})
         assert (
             conv_kcp._graph_mode(None) == "replay"
@@ -272,7 +342,6 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
     w = torch.zeros(16, 4, dtype=torch.float32)
     hist = torch.zeros(1, 16, dtype=torch.bfloat16)
     ctx = types.SimpleNamespace(cu_seqlens_local_cpu=(0, 4))
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         conv_kcp._set_test_knobs({"host_trim": 1})
         with pytest.raises(ValueError, match="CUDA"):
