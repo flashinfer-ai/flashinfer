@@ -721,7 +721,8 @@ def spec_fingerprint(
 ) -> str:
     """Identifier of the class: the routing weight of slot 0 and slot k-1, the GEMM1 chain term (the gated ``silu``
     chain by default; any other chain, its gating and its binary32 parameters name a distinct class), the two GEMM
-    classes (``gemm.bf16.kfold[K=H]``, ``[K=I]``) and the combine term."""
+    classes (``gemm.bf16.kfold[K=H]``, ``[K=I]``) and the combine term, the terms hashed as DAGs
+    (:func:`.mterm.fingerprint`: linear in the expert count and ``k``)."""
     s = MoESpec(H, I, k, E, method, out_fmt, act=act, params=params, gated=gated)
     default_chain = s.gated and act == "silu" and not s.params
     parts = (

@@ -3,8 +3,8 @@
 """The MoE classes' symbolic terms: the engine's hash-consed terms
 (:mod:`flashinfer.batch_invariant.fp_interface.term`) with the primitives the MoE chains use (the exact ``neg`` /
 ``fmin`` / ``fmax`` / ``exp2i`` / ``rowmax``, the rounded ``div``, the named input leaves), their canonical
-S-expression (what the Lean model prints and the fingerprints hash) and their bit-exact evaluation through
-:mod:`flashinfer.batch_invariant.fp_interface.exact`.
+S-expression (what the Lean model prints), their DAG hash (what the fingerprints use) and their bit-exact evaluation
+through :mod:`flashinfer.batch_invariant.fp_interface.exact`.
 
 The GEMM classes' algebra stays as it is: this module extends it for the MoE chains only, so the GEMM fingerprints
 cannot move. The quantization classes extend the same base separately (``quantization/qterm.py``); both extensions
@@ -12,12 +12,12 @@ share the engine's interning table and print the primitives they have in common 
 
 from __future__ import annotations
 
-import hashlib
 import struct
 from typing import Any, Dict, Optional
 
 from ...batch_invariant.fp_interface import exact as fp32
 from ...batch_invariant.fp_interface.term import Term, TermAlgebra as _Base, to_f32
+from ...batch_invariant.sampling.sterm import fingerprint_dag
 
 __all__ = [
     "Term",
@@ -183,9 +183,13 @@ def evaluate(
 
 
 def fingerprint(t: Term) -> str:
-    """Structural sha256 of the canonical S-expression (op names, leaf coordinates, binary32 constants, association;
-    commutative operands sorted): independent of interning ids and construction order."""
-    return hashlib.sha256(sexpr(t).encode()).hexdigest()[:16]
+    """Structural hash of a term, linear in its DAG (the sampling class's
+    :func:`flashinfer.batch_invariant.sampling.sterm.fingerprint_dag`): every node's digest is the sha256 of its op, its
+    constants and its children's digests, the commutative operands sorted by digest, so it is independent of interning
+    ids, construction order and operand order and never expands a shared sub-term. The printed S-expression
+    (:func:`sexpr`) is for the Lean cases: a routing weight's expansion embeds the softmax sum once per leaf, a size
+    unbounded in the expert count."""
+    return fingerprint_dag(t)
 
 
 def size(t: Term) -> int:

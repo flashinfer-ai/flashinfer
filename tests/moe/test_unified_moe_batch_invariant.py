@@ -408,6 +408,37 @@ def test_registry_fingerprint_takes_an_activation_config():
     )
 
 
+def test_fingerprint_is_bounded_in_the_expert_count():
+    """The class identifier hashes its terms as DAGs: at the widest class (1024 experts, top-k 16) the default chain and
+    the largest ones (a parameterised ``SwiGLU``, ``SiTU``, ``PowLU``) fingerprint within a bounded time and host memory
+    (a routing weight's printed S-expression embeds the softmax sum once per leaf, the combine's once more per slot: a size
+    unbounded in the expert count), deterministically and distinctly."""
+    import time
+    import tracemalloc
+
+    dims = dict(H=4096, I=1536, top_k=16, num_experts=1024)
+    fps = set()
+    for act in (
+        SwiGLU(),
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+        SiTU(),
+        PowLU(),
+        PowLU(m=1.5, limit=4.0),
+    ):
+        tracemalloc.start()
+        t0 = time.monotonic()
+        fp = bi.fingerprint("fused_moe", act=act, **dims)
+        elapsed = time.monotonic() - t0
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert elapsed < 60.0 and peak < 256 * 2**20, (act, elapsed, peak)
+        assert fp.startswith("moe-") and fp == bi.fingerprint(
+            "fused_moe", act=act, **dims
+        )
+        fps.add(fp)
+    assert len(fps) == 5
+
+
 def _adversarial_accumulators(
     limits: list[float], n_random: int, seed: int
 ) -> torch.Tensor:
