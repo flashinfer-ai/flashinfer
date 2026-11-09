@@ -125,3 +125,14 @@ repos:
         language: system
         pass_filenames: false
         files: ^scripts/infra/pr_checks/experimental_test_scope\.py$
+      # Does nothing outside NVIDIA. For NVIDIA contributors it scans staged
+      # changes for guardwords, and installs the guardword pre-push hook; see
+      # "Guardword Hooks" in CONTRIBUTING.md. Its output shows even when it
+      # passes, because some findings only warn.
+      - id: guardwords
+        name: guardword scan (NVIDIA contributors)
+        entry: python3 scripts/infra/guardword_hooks.py check-commit
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true

@@ -63,6 +63,12 @@ fi
 
 DOCKER_ENV="${DOCKER_ENV} -e PIP_RETRIES=10 -e PIP_DEFAULT_TIMEOUT=60"
 
+# Tools in the container tell CI from a developer's shell by CI; the guardword
+# checks install nothing when it is set.
+if [[ -n "${CI:-}" ]]; then
+    DOCKER_ENV="${DOCKER_ENV} -e CI"
+fi
+
 # Share pip's downloads with the other jobs that land on this reused runner. In
 # HOME because the workspace is wiped between jobs and /opt needs root.
 # CI_PIP_CACHE_DIR="" opts out.

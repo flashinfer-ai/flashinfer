@@ -83,6 +83,12 @@ RUN bash -c 'source /install/jit_cache_build_common.sh \
 RUN mkdir -p "/home/${USERNAME}/.cache/sccache" \
     && chown -R "${USER_UID}:${USER_GID}" "/home/${USERNAME}/.cache"
 
+# The devcontainers mount a volume for the guardword scanner checkout here. A
+# mount point Docker creates itself is owned by root, so the checkout could not
+# be cloned into it.
+RUN mkdir -p "/home/${USERNAME}/.flashinfer-guardwords-scan" \
+    && chown "${USER_UID}:${USER_GID}" "/home/${USERNAME}/.flashinfer-guardwords-scan"
+
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
 ENV PYTHONUSERBASE="/home/${USERNAME}/.local"
