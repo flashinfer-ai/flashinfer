@@ -116,7 +116,11 @@ from ..jit.gemm import gen_deepgemm_sm100_module
 from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 from ..tllm_enums import DtypeTrtllmGen, SfLayout
-from .routergemm import get_tinygemm2_module
+from .routergemm import (
+    _tinygemm2_cake,
+    _tinygemm_bf16_cake,
+    get_tinygemm2_module,
+)
 
 
 _MIN_B12X_CUDA_VERSION = Version("12.9")
@@ -2535,25 +2539,42 @@ def _resolve_pdl(pdl: Optional[bool], auto_pdl: bool) -> bool:
     return auto_pdl if pdl is None else bool(pdl)
 
 
+# Tactics: 0 is the reference tinygemm2 kernel, 1 is the Cake kernel (only where a window admits the shape).
+_TINYGEMM_REFERENCE_TACTIC = 0
+_TINYGEMM_CAKE_TACTIC = 1
+
+
 @functools.lru_cache(maxsize=64)
-def _tinygemm_bf16_gemm_runner(auto_pdl: bool = False):
+def _tinygemm_bf16_gemm_runner(auto_pdl: bool = False, cake_only: bool = False):
     module = get_tinygemm2_module()
 
     class TinyGemmBf16GemmRunner(TunableRunner):
-        def __init__(self, auto_pdl: bool) -> None:
+        def __init__(self, auto_pdl: bool, cake_only: bool) -> None:
             self.auto_pdl = auto_pdl
+            self.cake_only = cake_only
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
             _, _, bias, pdl, _, _ = inputs
-            return (bias is not None, _resolve_pdl(pdl, self.auto_pdl))
+            extras = (bias is not None, _resolve_pdl(pdl, self.auto_pdl))
+            # Appended only when set, so tuned entries of the default runner keep their key.
+            return extras + (True,) if self.cake_only else extras
 
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
-            return [0]
+            a, b, bias, pdl, out, _ = inputs
+            pdl = _resolve_pdl(pdl, self.auto_pdl)
+            if (
+                _tinygemm2_cake(a, b.transpose(-2, -1), out, bias is not None, pdl)
+                is None
+            ):
+                return [] if self.cake_only else [_TINYGEMM_REFERENCE_TACTIC]
+            if self.cake_only:
+                return [_TINYGEMM_CAKE_TACTIC]
+            return [_TINYGEMM_REFERENCE_TACTIC, _TINYGEMM_CAKE_TACTIC]
 
         def forward(
             self,
@@ -2565,13 +2586,20 @@ def _tinygemm_bf16_gemm_runner(auto_pdl: bool = False):
             a, b, bias, pdl, out, _ = inputs
             pdl = _resolve_pdl(pdl, self.auto_pdl)
             weight = b.transpose(-2, -1)
+            if tactic == _TINYGEMM_CAKE_TACTIC:
+                # The tuned bucket's M can differ from this call's M, whose window may
+                # not admit the Cake kernel: the reference kernel serves it then.
+                program = _tinygemm2_cake(a, weight, out, bias is not None, pdl)
+                if program is not None:
+                    _tinygemm_bf16_cake(program, a, weight, bias, out, backend="cake")
+                    return out
             if bias is None:
                 module.tinygemm2_nobias_op(a, weight, out, pdl)
             else:
                 module.tinygemm2_op(a, weight, bias, out, pdl)
             return out
 
-    return TinyGemmBf16GemmRunner(auto_pdl)
+    return TinyGemmBf16GemmRunner(auto_pdl, cake_only)
 
 
 # DEBUG-ONLY toggle (not a public knob): set True to force the legacy C++

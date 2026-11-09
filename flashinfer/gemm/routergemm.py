@@ -2830,6 +2830,18 @@ def _tinygemm_bf16_cake(
         get_tinygemm2_tcgen05_op()(program, input, weight, bias, out)
 
 
+def _tinygemm2_cake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    has_bias: bool,
+    use_pdl: bool,
+) -> Optional[str]:
+    return _tinygemm2_wgmma_program(
+        input, weight, has_bias, use_pdl
+    ) or _tinygemm2_tcgen05_program(input, weight, out, has_bias, use_pdl)
+
+
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
 @flashinfer_api(trace=tinygemm_bf16_trace)
 def tinygemm_bf16(
@@ -2896,9 +2908,7 @@ def tinygemm_bf16(
     bit-identical to the reference's (``flashinfer.jit.cake_tinygemm2_wgmma``).
     Set ``FLASHINFER_DISABLE_TINYGEMM2_WGMMA=1`` to keep the reference kernel.
     """
-    program = _tinygemm2_wgmma_program(
-        input, weight, bias is not None, use_pdl
-    ) or _tinygemm2_tcgen05_program(input, weight, out, bias is not None, use_pdl)
+    program = _tinygemm2_cake(input, weight, out, bias is not None, use_pdl)
     if program is not None:
         _tinygemm_bf16_cake(program, input, weight, bias, out, backend="cake")
     elif bias is None:
