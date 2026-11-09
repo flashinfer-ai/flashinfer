@@ -682,7 +682,8 @@ class ChunkMeta:
     :func:`fwd_split_route` runs instead of the pre-scan (``None``: the other plans); ``m_share``: both splits run on one
     piece table and the plan takes M-share there (:func:`_m_share_planned`): the taped split forward keeps its segment
     state for the backward's first wave.  ``ready``: the write of a cached chunk table (:func:`_use_table`; ``None``: a
-    table built for its call); the split tables carry their own."""
+    table built for its call); the split tables carry their own.  ``written_on``: the stream of a ``_META_FRONT`` entry
+    on which a hit needs nothing of :func:`_use_tables` (:func:`_written_on`; ``None``: every hit runs it)."""
 
     chunk_start: torch.Tensor
     chunk_len: torch.Tensor
@@ -705,6 +706,7 @@ class ChunkMeta:
     # M-share on this table (:data:`M_SHARE_ARCHS`)
     m_share: bool = False
     ready: TableReady | None = None
+    written_on: int | None = None
 
 
 @dataclass(frozen=True)
@@ -836,7 +838,9 @@ def build_chunk_meta(
 # That covers only work queued before the capture; a table another thread builds during the capture must have its
 # stream synchronized before the capture reads it.  The table is then kept for the process, since every replay reads it.
 # A hit on the layout's ChunkMeta (``_META_FRONT``) covers its split tables too: the backward reads the adjoint split's
-# tables, and a replayed backward plan reads them without a lookup of its own.
+# tables, and a replayed backward plan reads them without a lookup of its own.  A hit on the default stream (handle 0)
+# makes no CUDA call: PyTorch captures CUDA graphs only on other streams (:func:`_capturing`), and a hit on the stream
+# that wrote the tables has nothing to wait for; a ``_META_FRONT`` hit there is one comparison (``written_on``).
 # entries of each of the three host table caches, least recently used first out
 _HOST_TABLES_LIMIT = 256
 _HOST_META: dict = {}
@@ -861,10 +865,12 @@ def _use_table(
     wait for the write and record their use.  ``ready`` ``None``: tables built for their call, nothing to do."""
     if ready is None:
         return
-    if torch.cuda.is_current_stream_capturing():
+    current = _raw_stream(device_index)
+    # the default stream never captures (:func:`_capturing`): no CUDA call there
+    if current and torch.cuda.is_current_stream_capturing():
         for table in tables:
             _GRAPH_TABLES.setdefault(table.untyped_storage().data_ptr(), table)
-    elif _stream_key(device_index)[1] != ready.stream:
+    elif current != ready.stream:
         stream = torch.cuda.current_stream(device_index)
         stream.wait_event(ready.event)
         for table in tables:
@@ -886,6 +892,17 @@ def _use_tables(found, device_index: int) -> None:
         _use_table(found.ready, device_index, found.seg_chunk_start, found.first_index)
 
 
+def _written_on(meta: ChunkMeta) -> int | None:
+    """The ``written_on`` of a ``_META_FRONT`` entry: the stream that wrote every cached table ``meta`` reads (its chunk
+    table and split tables; 0 where it reads none), else ``None``.  A hit on that stream needs nothing of
+    :func:`_use_tables` where it is the default stream (the only one :func:`_chunk_meta` compares with)."""
+    splits = (meta, meta.bwd_split, meta.fwd_split)
+    streams = {s.ready.stream for s in splits if s is not None and s.ready is not None}
+    if not streams:
+        return 0
+    return streams.pop() if len(streams) == 1 else None
+
+
 def _cached_tables(cache: dict, key, device_index: int, build):
     """The tables ``build()`` makes on the device (a :class:`ChunkMeta`, :class:`AdjointSplit` or
     :class:`ForwardSplit`), cached in ``cache`` under ``key`` for the ``_HOST_TABLES_LIMIT`` most recently used keys
@@ -897,7 +914,7 @@ def _cached_tables(cache: dict, key, device_index: int, build):
         _use_tables(found, device_index)
         return found
     found = build()
-    if torch.cuda.is_current_stream_capturing():
+    if _capturing(device_index):
         return found
     found = replace(found, ready=_table_ready(device_index))
     if len(cache) >= _HOST_TABLES_LIMIT:
@@ -1472,6 +1489,22 @@ WORKSPACE_SHAPES_PER_ROLE = 4
 _RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
+def _current_stream_handle(device_index: int) -> int:
+    return torch.cuda.current_stream(device_index).cuda_stream
+
+
+# the handle of the current stream of a device (0: the default stream): the C getter itself where PyTorch has it
+_raw_stream = _RAW_STREAM if _RAW_STREAM is not None else _current_stream_handle
+
+
+def _capturing(device_index: int) -> bool:
+    """``torch.cuda.is_current_stream_capturing()`` for launches on the current stream of ``device_index``, without
+    that CUDA call on the default stream (handle 0): PyTorch captures a CUDA graph only on another stream
+    (``torch.cuda.graph`` refuses the default one).  The per-call paths (:func:`_workspaces`,
+    :func:`_function_backward`) test the same inline."""
+    return _raw_stream(device_index) != 0 and torch.cuda.is_current_stream_capturing()
+
+
 def _stream_key(device_index: int) -> tuple[int, int]:
     """(device, handle of its current stream): the key of the per-stream workspaces."""
     if _RAW_STREAM is not None:
@@ -1541,11 +1574,15 @@ _POOLED = Workspaces()
 _FRESH = FreshWorkspaces()
 
 
-def _workspaces(options: ChainOptions) -> Workspaces:
-    """The pooled per-stream workspaces under ``host_cache``, else fresh buffers.  A CUDA graph capture takes fresh
-    buffers (from the graph's memory pool): pooled ones would be shared with the other graphs captured on that stream
-    and with eager calls on it, and an eviction would free them while the graph still writes them."""
-    if options.host_cache and not torch.cuda.is_current_stream_capturing():
+def _workspaces(options: ChainOptions, device_index: int) -> Workspaces:
+    """The pooled per-stream workspaces under ``host_cache``, else fresh buffers, for launches on CUDA device
+    ``device_index``.  A CUDA graph capture takes fresh buffers (from the graph's memory pool): pooled ones would be
+    shared with the other graphs captured on that stream and with eager calls on it, and an eviction would free them
+    while the graph still writes them."""
+    # not _capturing(device_index), inline (a call per launch path)
+    if options.host_cache and not (
+        _raw_stream(device_index) and torch.cuda.is_current_stream_capturing()
+    ):
         return _POOLED
     return _FRESH
 
@@ -3070,7 +3107,7 @@ def _walk(device, segs: SegmentTable, options: ChainOptions) -> torch.Tensor:
         _use_table(hit[1], key[0], hit[0])
         return hit[0]
     walk = torch.arange(int(num_segments), dtype=torch.int32, device=device)
-    if options.host_cache and not torch.cuda.is_current_stream_capturing():
+    if options.host_cache and not _capturing(key[0]):
         _WALKS[key] = (walk, _table_ready(key[0]))
     return walk
 
@@ -3421,7 +3458,7 @@ def _forward_a(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, output
         for (shape, dtype), on in zip(state, on_tape, strict=True)
     )
     o = torch.empty(v.shape, dtype=v.dtype, device=device)
-    workspaces = _workspaces(options)
+    workspaces = _workspaces(options, index)
     table = workspaces.table(index)
     # fwd_ho_a binds every tape tensor it does not write to a one-row stand-in (its tensor map encodes, nothing stores)
     word = sum(FWD_A_TAPE[name] for name in kept if name in FWD_A_TAPE)
@@ -3817,7 +3854,7 @@ def _forward_split(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, ou
             named[name] = cake_plan.placeholder(shape, dtype, device)
     w, u, h, v_new = (named[name] for name in cake_plan.STATE_NAMES)
     o = torch.empty(v.shape, dtype=v.dtype, device=device)
-    workspaces = _workspaces(options)
+    workspaces = _workspaces(options, index)
     table = workspaces.table(index)
     word = sum(FWD_FUSED_TAPE[name] for name in kept if name in FWD_FUSED_TAPE)
     rows = workspaces.take(table, "fa_rows_off", (1, 1, HEAD_DIM), bf16, device)
@@ -4032,7 +4069,7 @@ def _forward_split_a(q, k, v, g32, beta32, *, meta, arch, scale, initial_state, 
         for (shape, dtype), on in zip(state, on_tape, strict=True)
     )
     o = torch.empty(v.shape, dtype=v.dtype, device=device)
-    workspaces = _workspaces(options)
+    workspaces = _workspaces(options, index)
     table = workspaces.table(index)
     word = sum(FWD_A_TAPE[name] for name in kept if name in FWD_A_TAPE)
     rows = workspaces.take(table, "fa_rows_off", (1, 1, HEAD_DIM), bf16, device)
@@ -4264,8 +4301,9 @@ def cake_gdn_nondet_train_forward(q, k, v, g, beta, *, meta, arch, scale=None, i
                           num_heads if prep == "prep_tma" else num_v_heads, 1, q, k, g32, beta, beta32, qn, kn,
                           rstd_q, rstd_k, g_cs, meta.chunk_start, meta.chunk_len, num_heads, num_v_heads,
                           1 if normalize_qk else 0)]  # fmt: skip
-    workspaces = _workspaces(options)
-    table = workspaces.table(_tensor_index(kn))
+    index = _tensor_index(kn)
+    workspaces = _workspaces(options, index)
+    table = workspaces.table(index)
     fwd_ho = {"store_final_state": output_final_state, "table": table, "workspaces": workspaces, "options": options,
               "scale": scale, "out": (h, v_new, o)}  # fmt: skip
     initial_rows = _table_rows(initial_state, meta)
@@ -4866,7 +4904,6 @@ def _backward_chain(
     arch = forward["arch"]
     meta = forward["meta"]
     options = forward.get("options") or ChainOptions()
-    workspaces = _workspaces(options)
     qn, kn, A, g_cs = forward["qn"], forward["kn"], forward["A"], forward["g_cs"]
     scale = float(forward["scale"])
     v, beta32 = forward["v"], forward["beta32"]
@@ -4883,6 +4920,7 @@ def _backward_chain(
     total_tokens = qn.numel() // (num_heads * qn.shape[-1])
     device = qn.device
     index = _tensor_index(qn)
+    workspaces = _workspaces(options, index)
     table = workspaces.table(index)
     do = _aligned_rows(do)
     if initial_state is None:
@@ -5491,7 +5529,8 @@ def _chunk_meta(
     if options.host_cache:
         meta = _META_FRONT.get(key)
         if meta is not None:
-            _use_tables(meta, int(index))
+            if meta.written_on != 0 or _raw_stream(int(index)):
+                _use_tables(meta, int(index))
             return meta
     if cu_seqlens is None:
         seq_lens = (int(seq_len),) * int(batch)
@@ -5555,7 +5594,8 @@ def _chunk_meta(
         if fwd_groups is not None or bwd_groups is not None:
             meta = replace(meta, fwd_groups=fwd_groups, bwd_groups=bwd_groups)
     # a table built inside a CUDA graph capture (see "cached device tables") is not kept
-    if options.host_cache and not torch.cuda.is_current_stream_capturing():
+    if options.host_cache and not _capturing(int(index)):
+        meta = replace(meta, written_on=_written_on(meta))
         if len(_META_FRONT) >= _META_FRONT_LIMIT:
             del _META_FRONT[next(iter(_META_FRONT))]
         _META_FRONT[key] = meta
@@ -5673,7 +5713,12 @@ def _function_backward(ctx, do, dht, grad_qkv=None):
         saved, table = saved[:-1], saved[-1]
         ctx.meta = _device_meta(table, layout)[0]
     plan, key = ctx.plan, ctx.plan_key
-    if key is not None and torch.cuda.is_current_stream_capturing():
+    # _capturing(device) inline, key[1]: the forward's _stream_key (device, stream)
+    if (
+        key is not None
+        and _raw_stream(key[1][0])
+        and torch.cuda.is_current_stream_capturing()
+    ):
         plan = key = None
     if plan is not None and dht is None:
         # the do the general path reads (contiguous at a 16-byte aligned base) and the plan recorded
