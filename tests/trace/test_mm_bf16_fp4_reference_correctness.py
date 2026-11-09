@@ -73,7 +73,7 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
     if backend == "cute-dsl" and _cute_dsl_uses_sm100_layout(
         *torch.cuda.get_device_capability()
     ):
-        from tests.test_helpers.w4a16_reference import (
+        from tests.moe_ep.test_helpers.w4a16_reference import (
             assert_w4a16_bits,
             dense_w4a16_reference,
         )

@@ -15,7 +15,7 @@ limitations under the License.
 
 GPU tests of the MiniMax-M3 index-context-parallel (ICP) indexer kernels
 (``flashinfer.msa_ops.msa_icp_*`` and ``prepare_msa_icp_indexer``) against the
-CPU oracle of ``tests/test_helpers/cake_msa_icp_inputs.py``.
+CPU oracle of ``tests/experimental/test_helpers/cake_msa_icp_inputs.py``.
 
 Single GPU: the ``W`` ranks of a TP2 / TP4 group run on one device.  Each rank
 keeps its own index-K shard, score rows, carrier and receive storage; the
@@ -72,7 +72,7 @@ import torch
 
 import flashinfer.msa_ops as msa_ops
 from flashinfer.experimental.cake_msa_icp_indexer import cake_backend, cake_jit
-from tests.test_helpers import cake_msa_icp_inputs as ref
+from tests.experimental.test_helpers import cake_msa_icp_inputs as ref
 
 FP8 = torch.float8_e4m3fn
 H = ref.NUM_HEADS

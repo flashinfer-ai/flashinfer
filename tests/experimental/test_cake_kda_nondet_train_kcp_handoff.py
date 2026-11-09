@@ -91,14 +91,14 @@ from tests.experimental.test_cake_kda_nondet_train_kcp_dist import (
     cake_kcp,
     cake_kcp_plan,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     kda_exact_raw_with_grads,
     kda_exact_with_grads,
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers.cake_kda_det_train_reference_l2n import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference_l2n import (
     kda_exact_l2n_with_grads,
     kda_exact_raw_l2n_with_grads,
 )

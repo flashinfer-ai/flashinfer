@@ -9,7 +9,7 @@ from flashinfer.trace.templates.attention import batch_attention_run_trace
 from flashinfer.utils import get_compute_capability
 import pytest
 
-from tests.test_helpers.paged_kv import make_paged_kv_cache_pair
+from tests.attention.test_helpers.paged_kv import make_paged_kv_cache_pair
 from tests.trace.reference_utils import (
     _check,
 )

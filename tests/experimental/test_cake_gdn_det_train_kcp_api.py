@@ -55,7 +55,7 @@ def _few_cpu_threads():
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry when it lists the package, else directly."""
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
@@ -911,7 +911,7 @@ def test_legacy_names_are_removed() -> None:
 def test_package_exports_the_det_names_only() -> None:
     """The package's ``__all__`` holds the names that carry ``det`` only, each bound; the constants and backend
     controls without ``det`` are neither exported nor bound by the package, and are read from their modules."""
-    from tests.test_helpers.cake_mode_names import assert_mode_names  # noqa: PLC0415
+    from tests.cake.test_helpers.cake_mode_names import assert_mode_names  # noqa: PLC0415
 
     pkg = _mod()
     assert pkg.__all__

@@ -17,7 +17,7 @@ limitations under the License.
 import einops
 import pytest
 import torch
-from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
 
 import flashinfer
 from flashinfer.utils import get_compute_capability

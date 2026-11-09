@@ -383,6 +383,36 @@ domain-scheduled twin; sm_107a, the A-collector twin) from the architecture's
   one-element placeholders.
   `stream_workspace("tail_sums" | "tail_tickets", device, stream=None)`
   returns the buffer kept for a stream.
+- Queue walk (`wgrad_queue_walk`, this package's own): on sm_100a and
+  sm_103a the 512-wide k tile routes also serve `main_halves_queue` (and
+  `main_halves_queue_acc` on the fp32 route), the half-release build whose
+  tiles before the split tail are claimed from one global counter in tile
+  order instead of strided over the clusters, so the tiles in flight are
+  consecutive and tiles that read the same G or X strip run at nearly the same
+  time. Each tile keeps its k-step order, so the build gives the bits of the
+  same build on the strided walk. The host binds it in place of the stage it
+  selects where a rule of `HOST_PLAN_CONSTANTS["queue_walk"]` names the
+  device's architecture and SM count, the selected stage (`main_halves` /
+  `main_wave_halves`), the output (`"bfloat16"` / `"float32"` overwrite,
+  `"accumulate"` for the fused fp32 accumulate) and a range holding the group
+  count (both ends included); `launch.stages` names the bound stage, and the
+  plan is the selected stage's. The rules: sm_100a with 148 SMs (B200): `main_wave_halves`, E4 to
+  E32, and `main_halves`, E8 to E32, for bf16 and the fused accumulate;
+  sm_100a with 152 SMs (GB200): `main_wave_halves`, E4 to E32, for the fused
+  accumulate, and `main_halves`, E16 to E32, for bf16; sm_103a with 152 SMs
+  (GB300): `main_wave_halves`, E4 to E32, for bf16 and the fused accumulate,
+  and `main_halves`, E8 to E16, for the fused accumulate. Every other call
+  (fp32 overwrite, other group counts, other SM counts, sm_107a) keeps its
+  stage. The queue build places its split tail as the host plans it, so on
+  skewed groups its split tail tiles can differ in bits from `main_halves`'s
+  slack placement (both ordered, both repeat bit for bit). It takes one more
+  workspace, `sched`, which the host binds to the stream workspace
+  `queue_sched`: two u32 words, zero before and after a launch (the last
+  cluster to retire sets them back to zero), kept per (device, CUDA stream)
+  like the other stream workspaces, so launches on one stream reuse them with
+  no fill per launch; a capture or a launch for another device takes words of
+  its own. `stream_workspace("queue_sched", device, stream=None)` returns the
+  words kept for a stream.
 - Slot memory: the kept slot buffer holds `tail_splits` slots per tail tile,
   so it is `tail_splits` times larger than one fp32 sum per tile. For each
   stream, the package keeps the largest buffer that a launch needed, for the
@@ -419,8 +449,9 @@ only); the 512-wide k tile's routes bind the ordered one-launch tail builds.
 | `wgrad` k512 ordered one-launch tail: `main`, `main_halves` | yes (planned walk, slack tail) | yes (planned walk, slack tail) | yes (planned walk, slack tail) |
 | `wgrad` k512 ordered one-launch tail: `main_wave`, `main_wave_halves` (wp8) | yes | yes | - |
 | `wgrad` k512 ordered one-launch tail: `main_halves_k256t` | - | - | yes (slack tail) |
+| `wgrad` k512 ordered one-launch tail: `main_halves_queue` (queue walk) | yes (planned tail) | yes (planned tail) | - |
 | `wgrad` output dtypes | bf16, fp32 | bf16, fp32 | bf16, fp32 |
-| `wgrad` accumulate, fused (`_acc` builds, fp32 `out` only) | `main_halves`, `main_wave_halves` | `main_halves`, `main_wave_halves` | `main_halves`, `main_halves_k256t` |
+| `wgrad` accumulate, fused (`_acc` builds, fp32 `out` only) | `main_halves`, `main_wave_halves`, `main_halves_queue` | `main_halves`, `main_wave_halves`, `main_halves_queue` | `main_halves`, `main_halves_k256t` |
 | `wgrad` accumulate, composed | bf16 `out`; k256 tile; `main` / `main_wave`; misaligned `out`; `_acc` library not loadable | bf16 `out`; k256 tile; `main` / `main_wave`; misaligned `out`; `_acc` library not loadable | bf16 `out`; k256 tile; `main`; misaligned `out`; `_acc` library not loadable |
 | CUDA toolkit floor (`min_cuda`) | 12.8 | 12.9 | 13.4 |
 | CUDA toolkit floor of the fp32 `_acc` builds | 13.4 | 13.4 | 13.4 |
@@ -532,7 +563,7 @@ python benchmarks/bench_cake_moe_grouped_gemm_nondet_train.py --help
 ```
 
 `test_cake_moe_grouped_gemm_nondet_train.py` (the backend suite, through
-`tests.test_helpers.cake_package("cake_moe_grouped_gemm_nondet_train")`) checks every
+`tests.cake.test_helpers.cake_package("cake_moe_grouped_gemm_nondet_train")`) checks every
 op, output dtype and stage form against a per-group fp64 reference (worst case
 over repeats), empty groups, the #6570 shape relaunched and on concurrent
 streams, CUDA graph replay with changed offsets, checkpointing, gradient

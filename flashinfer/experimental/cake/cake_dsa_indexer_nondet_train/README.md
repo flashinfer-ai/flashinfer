@@ -176,7 +176,7 @@ reduction (registry field `NUMERICS["zero_sign_policy"] =
 "positive_accumulator"`).  Ordering rule: `+0.0` and `-0.0` compare equal, and
 an equal-score tie goes to the larger key id.  The written score keeps the
 computed bits and is never canonicalized.  The reference in
-`tests/test_helpers/cake_dsa_indexer_reference.py` follows the same reduction
+`tests/experimental/test_helpers/cake_dsa_indexer_reference.py` follows the same reduction
 model, so the bit-exact test cases compare like with like after each row is
 canonicalized (see "Tests and benchmark").
 
@@ -452,7 +452,7 @@ There are four test files:
   naming rules.
 
 They share the independent FP64 / FP32 reference in
-`tests/test_helpers/cake_dsa_indexer_reference.py` with the deterministic
+`tests/experimental/test_helpers/cake_dsa_indexer_reference.py` with the deterministic
 package.  Results are compared after each row is canonicalized: valid slots
 sorted by id with their score bits, padding last.  The comparisons therefore
 check sets, not slot order.  Coverage:
