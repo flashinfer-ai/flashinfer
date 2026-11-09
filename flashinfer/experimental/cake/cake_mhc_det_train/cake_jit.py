@@ -6201,6 +6201,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -6246,114 +6247,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "bwd_prepare",
         "select_rule": None,
-        "workspace_rule": None,
-    },
-    "cake_mhc_det_train_bwd_prepare__t160__h5120__a7": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "b"],
-            ["buffer", "x"],
-            ["buffer", "stats"],
-            ["buffer", "db"],
-            ["buffer", "gstats"],
-            ["parameter", "T"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "col_split": 1,
-            "grid_limit": 0,
-            "grid_per_sm": 0,
-            "kind": "rows_per_cta",
-            "rows_per_cta": 1,
-        },
-        "hidden": 5120,
-        "kernel": "cake_mhc_det_train_bwd_prepare__t160__h5120",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__t160__h5120",
-        "launch": {
-            "block": (160, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 896,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_prepare__t160__h5120",
-        "logical": {
-            "T": "rows",
-            "b": "b",
-            "db": "db",
-            "dy": "dy",
-            "gstats": "gstats",
-            "stats": "stats",
-            "x": "x",
-        },
-        "role": "bwd_prepare",
-        "select_rule": {
-            "above": 0,
-            "at_most": 8192,
-            "kind": "rows_between",
-        },
-        "workspace_rule": None,
-    },
-    "cake_mhc_det_train_bwd_prepare__h5120": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "b"],
-            ["buffer", "x"],
-            ["buffer", "stats"],
-            ["buffer", "db"],
-            ["buffer", "gstats"],
-            ["parameter", "T"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "col_split": 1,
-            "grid_limit": 0,
-            "grid_per_sm": 0,
-            "kind": "rows_per_cta",
-            "rows_per_cta": 2,
-        },
-        "hidden": 5120,
-        "kernel": "cake_mhc_det_train_bwd_prepare__h5120",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__h5120",
-        "launch": {
-            "block": (320, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 1664,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_prepare__h5120",
-        "logical": {
-            "T": "rows",
-            "b": "b",
-            "db": "db",
-            "dy": "dy",
-            "gstats": "gstats",
-            "stats": "stats",
-            "x": "x",
-        },
-        "role": "bwd_prepare",
-        "select_rule": {
-            "above": 8192,
-            "at_most": None,
-            "kind": "rows_between",
-        },
         "workspace_rule": None,
     },
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120": {
@@ -8259,6 +8152,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -8304,114 +8198,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "bwd_prepare",
         "select_rule": None,
-        "workspace_rule": None,
-    },
-    "cake_mhc_det_train_bwd_prepare__t224__h7168__a7": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "b"],
-            ["buffer", "x"],
-            ["buffer", "stats"],
-            ["buffer", "db"],
-            ["buffer", "gstats"],
-            ["parameter", "T"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "col_split": 1,
-            "grid_limit": 0,
-            "grid_per_sm": 0,
-            "kind": "rows_per_cta",
-            "rows_per_cta": 1,
-        },
-        "hidden": 7168,
-        "kernel": "cake_mhc_det_train_bwd_prepare__t224__h7168",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__t224__h7168",
-        "launch": {
-            "block": (224, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 1152,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_prepare__t224__h7168",
-        "logical": {
-            "T": "rows",
-            "b": "b",
-            "db": "db",
-            "dy": "dy",
-            "gstats": "gstats",
-            "stats": "stats",
-            "x": "x",
-        },
-        "role": "bwd_prepare",
-        "select_rule": {
-            "above": 0,
-            "at_most": 8192,
-            "kind": "rows_between",
-        },
-        "workspace_rule": None,
-    },
-    "cake_mhc_det_train_bwd_prepare__h7168": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "b"],
-            ["buffer", "x"],
-            ["buffer", "stats"],
-            ["buffer", "db"],
-            ["buffer", "gstats"],
-            ["parameter", "T"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "col_split": 1,
-            "grid_limit": 0,
-            "grid_per_sm": 0,
-            "kind": "rows_per_cta",
-            "rows_per_cta": 2,
-        },
-        "hidden": 7168,
-        "kernel": "cake_mhc_det_train_bwd_prepare__h7168",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__h7168",
-        "launch": {
-            "block": (448, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 2304,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_prepare__h7168",
-        "logical": {
-            "T": "rows",
-            "b": "b",
-            "db": "db",
-            "dy": "dy",
-            "gstats": "gstats",
-            "stats": "stats",
-            "x": "x",
-        },
-        "role": "bwd_prepare",
-        "select_rule": {
-            "above": 8192,
-            "at_most": None,
-            "kind": "rows_between",
-        },
         "workspace_rule": None,
     },
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168": {
@@ -9815,8 +9601,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h5120",
         ],
         "bwd_prepare_h5120": [
-            "cake_mhc_det_train_bwd_prepare__t160__h5120__a7",
-            "cake_mhc_det_train_bwd_prepare__h5120",
+            "cake_mhc_det_train_bwd_prepare__t160__h5120",
         ],
         "fwd_finish_h5120": [
             "cake_mhc_det_train_fwd_finish__w1__h5120",
@@ -9859,8 +9644,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h7168",
         ],
         "bwd_prepare_h7168": [
-            "cake_mhc_det_train_bwd_prepare__t224__h7168__a7",
-            "cake_mhc_det_train_bwd_prepare__h7168",
+            "cake_mhc_det_train_bwd_prepare__t224__h7168",
         ],
         "fwd_finish_h7168": [
             "cake_mhc_det_train_fwd_finish__w1__h7168",
@@ -10709,8 +10493,10 @@ K6_CTAS_PER_SM = 2
 # launches dynr instead; "dynl" on sm_107a at every T (bitwise xrsg; beside a 128-thread side CTA on every SM it
 # completes where xrsg does not; unloaded backward path 0.998-1.014 / 0.974-0.995 of xrsg's at 5120 / 7168, R200, two
 # sessions). K8: the H 4096 maps except the sm_100a P refinements measured at the size (every form bitwise; P only
-# chooses the speed), pt64 at every T on sm_103a at 7168. K5: the one-token form of the size at every T on sm_100a /
-# sm_103a, on sm_107a the one-token form to 8192 tokens; no persistent band.
+# chooses the speed), pt64 at every T on sm_103a at 7168. K5: the one-token form of the size at every T (on sm_107a the
+# two-token record's 10 / 14 warps fill an SM sub-partition's 16384-register file, so with a 128-thread CTA on every SM
+# it waits for that load, where the one-token form runs; unloaded it reads 1.156-1.160 / 1.065-1.073 of the one-token
+# form at 5120 / 7168, T 14928-16263, R200, two sessions); no persistent band.
 H_TABLE_NAMES = (
     "PK_BANDS", "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT",
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "BWD_ROW_BANDS",
@@ -10820,7 +10606,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "K5_FORM_BANDS": {
             "sm_100a": ((0, None, "t160"),),
             "sm_103a": ((0, None, "t160"),),
-            "sm_107a": ((0, 8192, "t160"),),
+            "sm_107a": ((0, None, "t160"),),
         },
         "K5_FORM_ROWS": {"production": 2, "t160": 1},
         "FWD_FINISH_PROGRAM": {"sm_100a": "w2", "sm_103a": "w2", "sm_107a": "w1"},
@@ -10919,7 +10705,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "K5_FORM_BANDS": {
             "sm_100a": ((0, None, "t224"),),
             "sm_103a": ((0, None, "t224"),),
-            "sm_107a": ((0, 8192, "t224"),),
+            "sm_107a": ((0, None, "t224"),),
         },
         "K5_FORM_ROWS": {"production": 2, "t224": 1},
         "FWD_FINISH_PROGRAM": {"sm_100a": "w2", "sm_103a": "w2", "sm_107a": "w1"},
