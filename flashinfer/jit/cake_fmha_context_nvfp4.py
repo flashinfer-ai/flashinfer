@@ -94,12 +94,12 @@ Q511_SM100A = cake_program.CakeProgram(
 )
 
 Q511_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_c916619510183749b162",
+    name="cake_fmha_context_nvfp4_ea63d1372358797fdf6f",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_c916619510183749b162",
+    kernel="kernel_cake_fmha_context_nvfp4_ea63d1372358797fdf6f",
     sources=(
-        "cake_fmha_context_nvfp4_c916619510183749b162_kernel.cu",
-        "cake_fmha_context_nvfp4_c916619510183749b162_binding.cu",
+        "cake_fmha_context_nvfp4_ea63d1372358797fdf6f_kernel.cu",
+        "cake_fmha_context_nvfp4_ea63d1372358797fdf6f_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -150,7 +150,7 @@ Q511_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -220,12 +220,12 @@ Q511_SCALE_PTR_SM100A = cake_program.CakeProgram(
 )
 
 Q511_SCALE_PTR_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_1b4750660638d644a971",
+    name="cake_fmha_context_nvfp4_e673bfa791f7c71aeb61",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_1b4750660638d644a971",
+    kernel="kernel_cake_fmha_context_nvfp4_e673bfa791f7c71aeb61",
     sources=(
-        "cake_fmha_context_nvfp4_1b4750660638d644a971_kernel.cu",
-        "cake_fmha_context_nvfp4_1b4750660638d644a971_binding.cu",
+        "cake_fmha_context_nvfp4_e673bfa791f7c71aeb61_kernel.cu",
+        "cake_fmha_context_nvfp4_e673bfa791f7c71aeb61_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -276,7 +276,7 @@ Q511_SCALE_PTR_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -352,12 +352,12 @@ RUNTIME_PACK1_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_e5bc1ab476ab2d2281b3",
+    name="cake_fmha_context_nvfp4_6f93414ba399d23b5916",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_e5bc1ab476ab2d2281b3",
+    kernel="kernel_cake_fmha_context_nvfp4_6f93414ba399d23b5916",
     sources=(
-        "cake_fmha_context_nvfp4_e5bc1ab476ab2d2281b3_kernel.cu",
-        "cake_fmha_context_nvfp4_e5bc1ab476ab2d2281b3_binding.cu",
+        "cake_fmha_context_nvfp4_6f93414ba399d23b5916_kernel.cu",
+        "cake_fmha_context_nvfp4_6f93414ba399d23b5916_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -414,7 +414,7 @@ RUNTIME_PACK1_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -490,12 +490,12 @@ RUNTIME_PACK2_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_06d8cd436fe722542cfe",
+    name="cake_fmha_context_nvfp4_a07b0866dce3af2b4840",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_06d8cd436fe722542cfe",
+    kernel="kernel_cake_fmha_context_nvfp4_a07b0866dce3af2b4840",
     sources=(
-        "cake_fmha_context_nvfp4_06d8cd436fe722542cfe_kernel.cu",
-        "cake_fmha_context_nvfp4_06d8cd436fe722542cfe_binding.cu",
+        "cake_fmha_context_nvfp4_a07b0866dce3af2b4840_kernel.cu",
+        "cake_fmha_context_nvfp4_a07b0866dce3af2b4840_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -552,7 +552,7 @@ RUNTIME_PACK2_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -628,12 +628,12 @@ RUNTIME_PACK4_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_dfc2b69916b570e5656e",
+    name="cake_fmha_context_nvfp4_a2ccb67e2966ae3b7edc",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_dfc2b69916b570e5656e",
+    kernel="kernel_cake_fmha_context_nvfp4_a2ccb67e2966ae3b7edc",
     sources=(
-        "cake_fmha_context_nvfp4_dfc2b69916b570e5656e_kernel.cu",
-        "cake_fmha_context_nvfp4_dfc2b69916b570e5656e_binding.cu",
+        "cake_fmha_context_nvfp4_a2ccb67e2966ae3b7edc_kernel.cu",
+        "cake_fmha_context_nvfp4_a2ccb67e2966ae3b7edc_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -690,7 +690,7 @@ RUNTIME_PACK4_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -766,12 +766,12 @@ RUNTIME_PACK5_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK5_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808",
+    name="cake_fmha_context_nvfp4_a43177abb2d2639c34ba",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808",
+    kernel="kernel_cake_fmha_context_nvfp4_a43177abb2d2639c34ba",
     sources=(
-        "cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808_kernel.cu",
-        "cake_fmha_context_nvfp4_acb5f8ae4c49a94bb808_binding.cu",
+        "cake_fmha_context_nvfp4_a43177abb2d2639c34ba_kernel.cu",
+        "cake_fmha_context_nvfp4_a43177abb2d2639c34ba_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -828,7 +828,7 @@ RUNTIME_PACK5_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -904,12 +904,12 @@ RUNTIME_PACK6_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK6_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_183aa672fdfdebe90f8c",
+    name="cake_fmha_context_nvfp4_85634e40302d7c512ac5",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_183aa672fdfdebe90f8c",
+    kernel="kernel_cake_fmha_context_nvfp4_85634e40302d7c512ac5",
     sources=(
-        "cake_fmha_context_nvfp4_183aa672fdfdebe90f8c_kernel.cu",
-        "cake_fmha_context_nvfp4_183aa672fdfdebe90f8c_binding.cu",
+        "cake_fmha_context_nvfp4_85634e40302d7c512ac5_kernel.cu",
+        "cake_fmha_context_nvfp4_85634e40302d7c512ac5_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -966,7 +966,7 @@ RUNTIME_PACK6_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -1042,12 +1042,12 @@ RUNTIME_PACK7_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK7_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_8ead4ba98b727ad2bb88",
+    name="cake_fmha_context_nvfp4_e86e3160f4a150409eb7",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_8ead4ba98b727ad2bb88",
+    kernel="kernel_cake_fmha_context_nvfp4_e86e3160f4a150409eb7",
     sources=(
-        "cake_fmha_context_nvfp4_8ead4ba98b727ad2bb88_kernel.cu",
-        "cake_fmha_context_nvfp4_8ead4ba98b727ad2bb88_binding.cu",
+        "cake_fmha_context_nvfp4_e86e3160f4a150409eb7_kernel.cu",
+        "cake_fmha_context_nvfp4_e86e3160f4a150409eb7_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1104,7 +1104,7 @@ RUNTIME_PACK7_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -1180,12 +1180,12 @@ RUNTIME_PACK8_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_a7e740ed276553b8299f",
+    name="cake_fmha_context_nvfp4_2a9272cea2714be55f6d",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_a7e740ed276553b8299f",
+    kernel="kernel_cake_fmha_context_nvfp4_2a9272cea2714be55f6d",
     sources=(
-        "cake_fmha_context_nvfp4_a7e740ed276553b8299f_kernel.cu",
-        "cake_fmha_context_nvfp4_a7e740ed276553b8299f_binding.cu",
+        "cake_fmha_context_nvfp4_2a9272cea2714be55f6d_kernel.cu",
+        "cake_fmha_context_nvfp4_2a9272cea2714be55f6d_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1242,7 +1242,7 @@ RUNTIME_PACK8_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -1318,12 +1318,12 @@ RUNTIME_PACK12_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK12_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_8fab5c6a2f2e50fd6e51",
+    name="cake_fmha_context_nvfp4_5541b6e1896cbe81f9e5",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_8fab5c6a2f2e50fd6e51",
+    kernel="kernel_cake_fmha_context_nvfp4_5541b6e1896cbe81f9e5",
     sources=(
-        "cake_fmha_context_nvfp4_8fab5c6a2f2e50fd6e51_kernel.cu",
-        "cake_fmha_context_nvfp4_8fab5c6a2f2e50fd6e51_binding.cu",
+        "cake_fmha_context_nvfp4_5541b6e1896cbe81f9e5_kernel.cu",
+        "cake_fmha_context_nvfp4_5541b6e1896cbe81f9e5_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1380,7 +1380,7 @@ RUNTIME_PACK12_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,
@@ -1456,12 +1456,12 @@ RUNTIME_PACK16_SM100A = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK16_SM103A = cake_program.CakeProgram(
-    name="cake_fmha_context_nvfp4_ac3c9f437f13b1b822dd",
+    name="cake_fmha_context_nvfp4_a012c93ca3cba6e2a56e",
     operator_dir="cake_fmha_context_nvfp4",
-    kernel="kernel_cake_fmha_context_nvfp4_ac3c9f437f13b1b822dd",
+    kernel="kernel_cake_fmha_context_nvfp4_a012c93ca3cba6e2a56e",
     sources=(
-        "cake_fmha_context_nvfp4_ac3c9f437f13b1b822dd_kernel.cu",
-        "cake_fmha_context_nvfp4_ac3c9f437f13b1b822dd_binding.cu",
+        "cake_fmha_context_nvfp4_a012c93ca3cba6e2a56e_kernel.cu",
+        "cake_fmha_context_nvfp4_a012c93ca3cba6e2a56e_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1518,7 +1518,7 @@ RUNTIME_PACK16_SM103A = cake_program.CakeProgram(
     ),
     block=(512, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=104960,
+    dynamic_smem_bytes=160256,
     use_pdl=False,
     cooperative=False,
     needs_device_linking=False,

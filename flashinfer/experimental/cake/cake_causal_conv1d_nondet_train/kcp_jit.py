@@ -50,6 +50,25 @@ before its channel tile's last CTA (a ticket on ``work``, uint32
 counter.  So ``acc`` / ``work`` are zero before and after every launch; only
 the run-to-run bits of ``dweight`` are relaxed.
 
+Two more routes carry the overlapped backward the host runs for up to
+:data:`DYN_MAX_CHANNELS` channels (:data:`ROUTE_KINDS`; :data:`KINDS` stays the
+det package's three): ``kcp_bwd_dyn``, ONE ORDINARY launch of
+:func:`dyn_plan`'s ``n_ctas`` CTAs that runs while the halo exchange is in
+flight, every ``tail_row_off`` entry ``-1`` (``dx`` of every row, a fragment's
+last rows as at a document end, and the rank's FP32 ``dweight`` partial, whose
+CTAs take their units of tokens from lanes, from the back of other lanes and
+from the CTAs they cancel through Cluster Launch Control, and add their runs
+into ``DW_COPIES`` (the rule's ``slots``) FP32 copies of the accumulators
+``acc`` before each channel tile's last warp sums the copies, stores ``dw`` and
+zeroes them), and ``kcp_bwd_halo``, launched once the exchanged ``dpre_tail``
+rows arrived (grid :func:`head_grid`), which writes the last ``min(3, len)``
+rows of every fragment with a tail row again with the tail rows folded in, so
+``dx`` is the det program's bits on every row.  The main program's ``work``
+words are the tiles' warp words ``tile_tk`` (``DYN_TILE_WORDS`` per tile of
+:data:`DYN_TILE` channels), the claim words ``claims`` (``L``, one per lane)
+and the departure word ``departs`` (one), all zero before and after every
+launch (:func:`dyn_workspace_layout`).
+
 The host plan reuses :mod:`.cake_jit`'s functions over a record (:func:`plan`,
 :func:`launch_grid`, :func:`accumulator_layout`, :func:`channel_split`)
 unchanged; the functions bound to the tables (:func:`route_modules`,
@@ -82,7 +101,6 @@ from .cake_jit import (  # noqa: F401  (re-exported: the host plan over a record
     ARCHES,
     CHANNEL_MULTIPLE,
     INT32_MAX,
-    LOGICAL_SCALARS,
     SELECT_KINDS,
     WIDTH,
     accumulator_layout,
@@ -513,17 +531,174 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "kcp_bwd_head",
         "workspace_rule": None,
     },
+    # Route ``kcp_bwd_dyn``: the main program of the overlapped backward (no det program: its own kernel module key).
+    "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw"],
+            ["buffer", "dw_acc"],
+            ["buffer", "tile_tk"],
+            ["buffer", "hist"],
+            ["buffer", "hist_row_off"],
+            ["buffer", "dpre_tail"],
+            ["buffer", "tail_row_off"],
+            ["buffer", "claims"],
+            ["buffer", "departs"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "M"],
+            ["parameter", "NL"],
+            ["parameter", "P"],
+            ["parameter", "L"],
+            ["parameter", "n_ctas"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 1,
+            "geometry": {
+                "threads": 384,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 197760,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        "logical": {
+            "C": "C",
+            "L": "L",
+            "M": "M",
+            "NL": "NL",
+            "P": "P",
+            "S": "S",
+            "claims": "claims",
+            "cu": "cu",
+            "departs": "departs",
+            "dpre_tail": "dpre_tail",
+            "dw": "dw",
+            "dw_acc": "acc",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "hist": "hist",
+            "hist_row_off": "hist_row_off",
+            "n_ctas": "n_ctas",
+            "num_docs": "num_docs",
+            "tail_row_off": "tail_row_off",
+            "tile_tk": "tile_tk",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "role": "kcp_bwd_dyn",
+        "workspace_rule": {
+            "acc": "float32",
+            "kind": "accumulators",
+            "slots": 4,
+            "taps": 4,
+            "work": "uint32",
+        },
+    },
+    # Route ``kcp_bwd_halo``: the tail-row program of the overlapped backward (its own kernel module key).
+    "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "hist"],
+            ["buffer", "hist_row_off"],
+            ["buffer", "dpre_tail"],
+            ["buffer", "tail_row_off"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 5,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
+        "logical": {
+            "C": "C",
+            "cu": "cu",
+            "dpre_tail": "dpre_tail",
+            "dx": "dx",
+            "dy": "dy",
+            "hist": "hist",
+            "hist_row_off": "hist_row_off",
+            "num_docs": "num_docs",
+            "tail_row_off": "tail_row_off",
+            "w": "w",
+            "x": "x",
+        },
+        "role": "kcp_bwd_halo",
+        "workspace_rule": None,
+    },
 }
 
 # architecture -> KCP kind -> the records the route may launch, in launch
 # order.  The forward and the head route carry one program; the backward
 # route carries the architecture's fallback program first and the
-# big-channel ``_st8`` program second (:func:`selected_modules` launches one).
+# big-channel ``_st8`` program second (:func:`selected_modules` launches one);
+# the overlapped backward's two routes carry one program each.
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "kcp_bwd": [
             "cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp",
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
+        ],
+        "kcp_bwd_dyn": [
+            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        ],
+        "kcp_bwd_halo": [
+            "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
         ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
@@ -537,6 +712,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp",
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
+        "kcp_bwd_dyn": [
+            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        ],
+        "kcp_bwd_halo": [
+            "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
+        ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
         ],
@@ -549,6 +730,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp",
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
+        "kcp_bwd_dyn": [
+            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        ],
+        "kcp_bwd_halo": [
+            "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
+        ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp",
         ],
@@ -558,8 +745,14 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
 }
 
-# The KCP kinds (the zero-history kinds are ``cake_jit.KINDS``).
+# The KCP kinds (the zero-history kinds are ``cake_jit.KINDS``): the launch
+# roles of the det package's KCP registry.
 KINDS = ("kcp_fwd", "kcp_bwd", "kcp_bwd_head")
+# The overlapped backward's routes: its main program and its tail-row program.
+DYN_KIND = "kcp_bwd_dyn"
+HALO_KIND = "kcp_bwd_halo"
+# Every route of ``ROUTES[arch]``.
+ROUTE_KINDS = (*KINDS, DYN_KIND, HALO_KIND)
 # The history / halo rows every fragment carries (the convolution width minus one).
 HALO = WIDTH - 1
 # Logical argument names the KCP host flow binds: the zero-history vocabulary
@@ -570,8 +763,10 @@ HALO = WIDTH - 1
 # ``[n_frag, 3]``; ``dpre_head``: FP32 ``[n_head_rows, C]`` head derivatives
 # with ``head_row_off`` int32 ``[n_frag, 3, 3]``; ``acc`` / ``work``: the
 # backward's FP32 ``[C, 4]`` accumulators and uint32 ``[n_ch_tiles]`` ticket
-# counters (zero before and after every launch).  The scalars are the
-# zero-history scalars (``cake_jit.LOGICAL_SCALARS``).
+# counters (zero before and after every launch); ``tile_tk`` / ``claims`` /
+# ``departs``: the overlapped main program's uint32 tile words, claim words
+# and departure word (its ``acc`` holds ``slots`` copies of the accumulators;
+# :func:`dyn_workspace_layout`).
 LOGICAL_TENSORS = (
     "x",
     "w",
@@ -588,7 +783,29 @@ LOGICAL_TENSORS = (
     "tail_row_off",
     "dpre_head",
     "head_row_off",
+    "tile_tk",
+    "claims",
+    "departs",
 )
+# The scalars: the zero-history scalars (``cake_jit.LOGICAL_SCALARS``) and the
+# overlapped main program's work plan (:func:`dyn_plan`).
+LOGICAL_SCALARS = (*_zero_history.LOGICAL_SCALARS, "M", "NL", "P", "L", "n_ctas")
+# The overlapped main program's channel tile (eight compute warps of 256
+# channels), its words per tile (one per warp), its most lanes and channels,
+# the smallest unit of tokens its plan considers, a unit's fixed cost in
+# tenths of a lane token (start, claim and run switch: about 0.69 us per unit
+# against 0.215 us per token of a lane, measured on B200), and the tail's cost
+# in tenths of a token per token of a unit: a lane's last unit is the granule
+# at which the other CTAs finish a lane whose SM is busy (a held SM or another
+# stream's kernel); on B200, 112-token units of 3 x 8192 channels lose 2-6%
+# against 64-token units with 16 or 32 SMs held.
+DYN_TILE = 2048
+DYN_TILE_WORDS = 8
+DYN_MAX_LANES = 256
+DYN_MAX_CHANNELS = 32 * DYN_TILE
+DYN_UNIT = 64
+DYN_UNIT_COST_TENTHS = 32
+DYN_TAIL_COST_TENTHS = 3
 
 
 def route_applies(*, device_capability: Sequence[int], kind: str) -> bool:
@@ -608,8 +825,8 @@ def route_modules(arch: str, kind: str) -> tuple[str, ...]:
     count.
     """
 
-    if kind not in KINDS:
-        raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
+    if kind not in ROUTE_KINDS:
+        raise ValueError(f"kind must be one of {ROUTE_KINDS}, got {kind!r}")
     names = ROUTES.get(arch, {}).get(kind)
     if not names:
         raise ValueError(
@@ -745,8 +962,81 @@ def workspace_bytes(arch: str, C: int) -> int:
     return nbytes
 
 
+def dyn_applies(C: int, S: int) -> bool:
+    """Whether the overlapped backward runs a call of ``C`` channels and ``S`` tokens (at least one token and at most
+    :data:`DYN_MAX_CHANNELS` channels); the ``kcp_bwd`` route runs the others."""
+
+    return int(S) >= 1 and int(C) <= DYN_MAX_CHANNELS
+
+
+def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
+    """The overlapped main program's work plan on a device of ``sms`` SMs: ``P`` lanes per tile of
+    :data:`DYN_TILE` channels (as many as give every SM's CTA a lane, at most one per unit of tokens and
+    :data:`DYN_MAX_LANES` lanes in all), each of ``NL`` units of ``M`` tokens, ``L`` lanes, ``n_ctas = max(L, sms)``
+    CTAs (the grid) and ``n_tiles``.  Lane ``j`` of a tile starts at token ``j * NL * M``, and a CTA whose lane is
+    done takes units from the ends of the other lanes.  When the plan of :data:`DYN_UNIT` tokens leaves the last
+    lane of each tile without tokens (``ceil(S / (NL * M)) < P``), that plan is taken: the empty lanes' CTAs and the
+    spare CTAs take units from the start, and the small units balance the lanes better than larger units shorten
+    them.  Otherwise every lane is busy, the lane bound sets the time, and ``M`` is the multiple of 8 from
+    :data:`DYN_UNIT` to twice it whose plan fits the lanes' 16-bit claim counts at the least lane cost ``NL * M``
+    tokens plus ``NL`` units of :data:`DYN_UNIT_COST_TENTHS` plus the tail's ``M`` tokens of
+    :data:`DYN_TAIL_COST_TENTHS` (the smaller ``M`` on a tie); when none fits, ``M`` doubles from
+    ``4 * DYN_UNIT`` until a plan fits.  A pure function of ``(S, C, sms)``; ``dx`` does not depend on it."""
+
+    S, C, sms = int(S), int(C), int(sms)
+    if S < 1 or C < 1 or C > DYN_MAX_CHANNELS:
+        raise ValueError(
+            f"the overlapped backward plans 1 <= C <= {DYN_MAX_CHANNELS} and S >= 1, got C={C}, S={S}"
+        )
+    n_tiles = -(-C // DYN_TILE)
+
+    def plan_for(M: int) -> dict[str, int] | None:
+        P = max(1, min(sms // n_tiles, -(-S // M), DYN_MAX_LANES // n_tiles))
+        per_lane = -(-S // P)
+        NL = -(-per_lane // M)
+        L = n_tiles * P
+        n_ctas = max(L, sms)
+        if (L + 1) * NL + n_ctas > 65535 or NL > 32768:
+            return None
+        return {"M": M, "NL": NL, "P": P, "L": L, "n_ctas": n_ctas, "n_tiles": n_tiles}
+
+    base = plan_for(DYN_UNIT)
+    if base is not None and -(-S // (base["NL"] * DYN_UNIT)) < base["P"]:
+        # measured on GB300, GB200 and VR200: with idle lanes, 64-token units beat the larger units the cost picks
+        return base
+    fits = [
+        p for p in map(plan_for, range(DYN_UNIT, 2 * DYN_UNIT + 1, 8)) if p is not None
+    ]
+    if fits:
+        return min(
+            fits,
+            key=lambda p: (
+                p["NL"] * (10 * p["M"] + DYN_UNIT_COST_TENTHS)
+                + DYN_TAIL_COST_TENTHS * p["M"],
+                p["M"],
+            ),
+        )
+    M = 4 * DYN_UNIT
+    p = plan_for(M)
+    while p is None:
+        M *= 2
+        p = plan_for(M)
+    return p
+
+
+def dyn_workspace_layout(
+    record: dict[str, Any], C: int, n_tiles: int, L: int
+) -> dict[str, Any]:
+    """:func:`accumulator_layout` of the overlapped main program: ``slots`` copies of the ``[C, 4]`` FP32
+    accumulators, then ``DYN_TILE_WORDS x n_tiles`` tile words, ``L`` claim words and one departure word
+    (``tile_tk`` is ``work[:DYN_TILE_WORDS * n_tiles]``, then ``claims``, then ``departs``)."""
+
+    return accumulator_layout(record, C, DYN_TILE_WORDS * int(n_tiles) + int(L) + 1)
+
+
 def head_grid(record: dict[str, Any], *, n_frag: int, C: int) -> tuple[int, int, int]:
-    """The head program's grid: ``max(1, n_frag x ceil(C / (threads x vec)))`` work items over the record's geometry."""
+    """The grid of the head program and of the tail-row program: ``max(1, n_frag x ceil(C / (threads x vec)))`` work
+    items over the record's geometry."""
 
     geometry = record["grid_rule"]["geometry"]
     channels_per_cta = int(geometry["threads"]) * int(geometry["vec"])
@@ -841,19 +1131,32 @@ __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "CHANNEL_MULTIPLE",
+    "DYN_KIND",
+    "DYN_MAX_CHANNELS",
+    "DYN_MAX_LANES",
+    "DYN_TILE",
+    "DYN_TILE_WORDS",
+    "DYN_UNIT",
+    "DYN_TAIL_COST_TENTHS",
+    "DYN_UNIT_COST_TENTHS",
     "HALO",
+    "HALO_KIND",
     "INT32_MAX",
     "KINDS",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MODULES",
     "ROUTES",
+    "ROUTE_KINDS",
     "SELECT_KINDS",
     "WIDTH",
     "accumulator_layout",
     "arch_for_capability",
     "channel_split",
     "device_arch",
+    "dyn_applies",
+    "dyn_plan",
+    "dyn_workspace_layout",
     "head_grid",
     "launch_grid",
     "library_name",

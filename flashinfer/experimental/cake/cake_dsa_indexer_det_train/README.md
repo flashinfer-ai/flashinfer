@@ -9,8 +9,9 @@ flashinfer-ai/flashinfer#5676.
 The public entry points live in the module `flashinfer.cake_dsa_indexer_det_train`;
 this backend package under `flashinfer/experimental/cake/` is their implementation
 and carries no compatibility guarantee of its own.  The non-deterministic
-counterpart `flashinfer.cake_dsa_indexer_nondet_train` is a reserved name for a
-planned package (flashinfer-ai/flashinfer#8928).
+counterpart is `flashinfer.cake_dsa_indexer_nondet_train`
+(flashinfer-ai/flashinfer#8928), which leaves the slot order of each row
+unspecified.
 SM107 (Rubin) is the primary target of the request, SM100 (B200 / GB200) the
 comparison architecture, SM103 (B300 / GB300) the third target.  The feature
 does not participate in automatic backend selection, autotuning or
@@ -59,7 +60,7 @@ the package paths `flashinfer.experimental.cake_dsa_indexer_det` and
 | `k_scale` | optional `[Tkv]` FP32, contiguous | the FP8 form's per-key scales (see "FP8 form"); BF16 calls take none |
 | `ratio` | positive int | key compression ratio (normally 1) |
 | `max_seqlen_q` | optional int | host mirror of the longest query segment; accepted, not read by any launch decision |
-| `max_seqlen_k` | optional int | the caller's bound on every key segment (`max(cu_seqlens_k[1:] - cu_seqlens_k[:-1])`); sizes the rank finalize's bitmap pool and so selects its program variant (`rank_seg_window`) -- the results are bitwise identical with and without it; a value above `Tkv` or below `ceil(Tkv / S)` is rejected |
+| `max_seqlen_k` | optional int | the caller's bound on every key segment (`max(cu_seqlens_k[1:] - cu_seqlens_k[:-1])`); sizes the rank finalize's bitmap pool and so selects its program variant (`rank_seg_window`); on `sm_100a` and `sm_103a` it also shows the host whether every key segment of a packed call has the same length (`Tkv == S * max_seqlen_k`), and such a call runs its scan program without the longest-segment-first unit order (the `:lsf` copy) -- the results are bitwise identical with and without it; a value above `Tkv` or below `ceil(Tkv / S)` is rejected |
 | `workspace_buffer` | optional uint8 tensor | at least `cake_dsa_indexer_det_train_topk_workspace_size(T, Tkv, S, top_k=..., ratio=..., device=...)` bytes, 8-byte aligned |
 | `indices`, `scores` (outputs) | `[T, top_k]` int32 and FP32 | selected segment-local ids in ascending order and their aligned scores; tail padding `-1` / `-inf` |
 
@@ -67,6 +68,20 @@ the package paths `flashinfer.experimental.cake_dsa_indexer_det` and
 training calls have `T = 16231` and `16172`); nothing needs caller-side
 padding.  `T = 0` returns empty outputs; a call without keys returns all
 padding.
+
+## Outputs
+
+The "repeats bit for bit" column holds for identical inputs and configuration:
+the same device, the same SM count and the same arguments.  The bits may change
+between package versions.
+
+| output | contents | repeats bit for bit | not specified |
+|---|---|---|---|
+| `indices [T, top_k]` int32 | segment-local key ids: per row, the `min(top_k, visible)` selected ids in ascending order, then `-1` in every other slot | every slot: the selected ids, their order and the `-1` tail | nothing |
+| `scores [T, top_k]` FP32 | aligned slot by slot with `indices`: the computed FP32 score of the id in the same slot (a selected `-0.0` stays `-0.0`); `-inf` in every padding slot; `None` with `return_scores=False` | every slot's bits | nothing |
+
+Neither the program that the host dispatches nor the partition knobs of the
+backend change these bits (see "Selection, ties, output order, padding").
 
 ## Scoring and the reduction scheme
 
@@ -261,7 +276,7 @@ candidate gate, per-row selection; grid = `grid_ctas`, one CTA per SM), the
 (grid = `T`), and the **finalize** (ascending-id sort of every row in place,
 by the CUB block radix sort or -- where the policy's `finalize_rank_for`
 names a bitmap window for the call -- by the prefix-popcount rank scatter
-program of that window; grid = `T`).  The scan exists in several physical programs and the host picks
+program of that window; grid = `T`, or the persistent grid of the `:persist` program in the finalize row below).  The scan exists in several physical programs and the host picks
 one per call from host-known integers only -- `T`, `Tkv`, `S`, `ratio`,
 `top_k`, the optional `max_seqlen_k` bound and the SM count (the device's compute capability and SM count
 are read once per device index and reused); no tensor is read -- through the registry's
@@ -280,9 +295,9 @@ mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
 | segment order | the longest-first copy (`:lsf`) where the record sets `lsf_programs` and the call packs at least two key segments that are not all equal (`max_seqlen_k` decides; without it the copy runs); an FP8 call of the `wide` unit on one segment also runs it from `lsf_single_rule[0]` mean unit tiles on (the FP8 record of `sm_103a`: [64.0]; None elsewhere) |
 | tile-loop unroll | `tile_unroll_factor` when `tile_unroll_rule` names the program kind and `top_k` reaches its floor (yielding to the snake order where the rule says so) |
 | sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles`, the mean segment offset leaves fitting units and the program kind is one of `sample_fit_kinds` (the kinds whose sampled-fit program the architecture registers; the split programs, for example, run their plain form on every call) |
-| sampled rank shift | `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`; an explicit `sample_shift_permille=` knob overrides both.  A launch scalar only: it sets how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or an output bit; unsampled calls (`sample_tiles_max=0`) do not read it |
+| sampled rank shift | `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`; where the record sets `sample_long_rule` (sm_107a: `[["l6"], 500]`), a call of more than `sample_dispatch_mean_tiles_max` mean unit tiles on a kind it names takes `sample_long_rule[1]`; otherwise, where the record sets `sample_class_rule` (sm_100a, sm_103a: [8, 500]; sm_107a: [32, 500]), a wide-unit call of two or more segments takes `sample_class_rule[1]`, and a call of two or more segments of at most 4096 queries per segment on average and at most `sample_dispatch_tiny_tiles_max` mean unit tiles samples `sample_class_rule[0]` tiles at that shift (where `sample_class_rule[0]` exceeds `sample_tiles_tiny_units`, only a call of more than `sample_class_rule[0]` mean unit tiles: on shorter units the larger sample covers whole units); an explicit `sample_shift_permille=` / `sample_tiles_max=` knob overrides these.  A launch scalar only: it sets how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or an output bit; unsampled calls (`sample_tiles_max=0`) do not read it |
 | candidate capacity | `candidate_multiplier` x `top_k` (`cand_mult_rule[1]` for long units), raised to `cand_cap_floor` slots (`cand_cap_floor_rule[1]` slots from `top_k >= cand_cap_floor_rule[0]` on, where the record sets the rule: on `sm_100a` the 16384-slot floor applies from `top_k = 1024` on and smaller `top_k` keep 8192; `sm_103a` keeps its 16384-slot floor on every `top_k`) and lowered to `cand_cap_ceiling` slots where the record sets one (the multiplier becomes `ceiling // top_k`, so the buffer stops growing with `top_k` once it holds the ceiling), rounded up to whole tiles; with the sampled first threshold off (`sample_tiles_max=0`) the `candidate_multiplier_unsampled` / `cand_mult_rule_unsampled` / `cand_cap_floor_unsampled` / `cand_cap_ceiling_unsampled` values apply instead; the default check period follows the capacity (`check_period_cap_divisor`, per-kind overrides) |
-| finalize program | threads = the smallest power of two of sort slots holding `top_k` (`finalize_threads_fit` x `finalize_items`) for small `top_k`, else `finalize_threads_small` up to `finalize_top_k_small`, else `finalize_threads`.  Where the rank rules admit the call -- `rank_finalize` and `top_k >= rank_top_k_min` -- the row sort is a prefix-popcount rank finalize program sized for the call's **pool**: `Tkv`, or the caller's `max_seqlen_k` where `rank_seg_window` is set (lever RW; a bound above `Tkv` or below `ceil(Tkv / S)` is rejected whether or not the switch is set).  A pool above `rank_slab_window_max` takes the two-level (bucket + word) program of the smallest `rank_two_level_window_variants` entry holding it, with no segment bound, where `rank_two_level` is set and the window is within `rank_two_level_rule` (lever FR2; key `finalize_rank:t<threads>:w<window>:two`, staged where `rank_two_level_staged_rule` admits the window); a pool within the slab bound takes the smallest `rank_window_variants` entry holding it and one bitmap word (32 bits) per thread when `pool <= rank_rule[0]` and the segment -- mean `Tkv / S`, or `max_seqlen_k` itself under lever RW -- is at most `rank_rule[1]`, skipping the `rank_window_variants_seg_only` entries when the pool is `Tkv` (`finalize_rank:t<threads>:w<window>`, stage role `finalize_rank`; the kernel reads the segment boundaries on the device; where `rank_staged` is set and `rank_staged_rule` admits the window, its SMEM-staged, coalesced-I/O form `...:staged` -- lever FRS, same role and arguments); every other call sorts with the CUB block radix sort program (`finalize:t<threads>`, `(Tkv - 1).bit_length()` key bits).  Both produce the same ids and bits  Two forms of the staged program carry their own key tags: `:i16` (`rank_t16` / `rank_t16_slots`: the 4096-slot staged form runs 256 launched threads x 16 slots) and `:bulk` (`rank_bulk_io` / `rank_bulk_align_bytes`: `cp.async.bulk` row I/O when `top_k x 4` and the output addresses are multiples of the granule; unaligned caller-owned outputs run the registered plain twin, same results).  Where the record's `rank_persist_max_k` is above zero (SM107 only), the staged bulk program of rows with `top_k <= rank_persist_max_k` and 8-item threads carries `:persist` (the `:i16` form keeps the one-row program): one persistent grid of `min(rows, rank_persist_ctas_per_sm x SMs)` CTAs ranks the call's rows, each CTA landing its next row while it ranks the current one (`cake_policy.finalize_grid`); same results as the one-row program. |
+| finalize program | threads = the smallest power of two of sort slots holding `top_k` (`finalize_threads_fit` x `finalize_items`) for small `top_k`, else `finalize_threads_small` up to `finalize_top_k_small`, else `finalize_threads`.  Where the rank rules admit the call -- `rank_finalize` and `top_k >= rank_top_k_min` -- the row sort is a prefix-popcount rank finalize program sized for the call's **pool**: `Tkv`, or the caller's `max_seqlen_k` where `rank_seg_window` is set (lever RW; a bound above `Tkv` or below `ceil(Tkv / S)` is rejected whether or not the switch is set).  A pool above `rank_slab_window_max` takes the two-level (bucket + word) program of the smallest `rank_two_level_window_variants` entry holding it, with no segment bound, where `rank_two_level` is set and the window is within `rank_two_level_rule` (lever FR2; key `finalize_rank:t<threads>:w<window>:two`, staged where `rank_two_level_staged_rule` admits the window); a pool within the slab bound takes the smallest `rank_window_variants` entry holding it and one bitmap word (32 bits) per thread when `pool <= rank_rule[0]` and the segment -- mean `Tkv / S`, or `max_seqlen_k` itself under lever RW -- is at most `rank_rule[1]`, skipping the `rank_window_variants_seg_only` entries when the pool is `Tkv` (`finalize_rank:t<threads>:w<window>`, stage role `finalize_rank`; the kernel reads the segment boundaries on the device; where `rank_staged` is set and `rank_staged_rule` admits the window, its SMEM-staged, coalesced-I/O form `...:staged` -- lever FRS, same role and arguments); every other call sorts with the CUB block radix sort program (`finalize:t<threads>`, `(Tkv - 1).bit_length()` key bits).  Both produce the same ids and bits  Two forms of the staged program carry their own key tags: `:i16` (`rank_t16` / `rank_t16_slots`: the 4096-slot staged form runs 256 launched threads x 16 slots) and `:bulk` (`rank_bulk_io` / `rank_bulk_align_bytes`: `cp.async.bulk` row I/O when `top_k x 4` and the output addresses are multiples of the granule; unaligned caller-owned outputs run the registered plain twin, same results).  Where the record's `rank_persist_max_k` is above zero (SM107 only), the staged bulk program of rows with `top_k <= rank_persist_max_k` and 8-item threads carries `:persist` (the `:i16` form keeps the one-row program): one persistent grid of `min(rows, rank_persist_ctas_per_sm x (SMs - rank_persist_spare_sms))` CTAs (SM107: 8 x (SMs - 1)) ranks the call's rows, each CTA landing its next row while it ranks the current one (`cake_policy.finalize_grid`); an SM107 SM holds 4 of these 256-thread CTAs at a time, so the grid is two whole waves of the other SMs when another stream holds a block on one SM, not one wave plus a short second one (#7548); same results as the one-row program. |
 
 The dispatched program must be registered for the device's architecture
 (`cake_jit.PROGRAM_KEYS[arch]`); the backend raises `NotImplementedError`
@@ -336,8 +351,8 @@ that writes the registry verifies the record against them before it is frozen.
   where the shape alone bounds the work units by the grid,
   `cake_policy.ticket_static_path`, the scan never touches the ticket word;
   none for a program of the `static_scan_kinds` of its form's record, which
-  keeps the static unit enumeration on every call: on `sm_107a` the BF16 l6
-  and CTA-pair l6 programs and every FP8 program);
+  keeps the static unit enumeration on every call: on `sm_107a` every FP8
+  program);
   the prepared runner (`cake_backend.prepare_dsa_indexer_det_topk`) allocates nothing at launch
   and is CUDA-graph capturable.
 * **Launch structure**: scan, optional merge, finalize (see above).  No

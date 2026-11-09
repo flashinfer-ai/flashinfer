@@ -41,9 +41,12 @@ from .cake_jit import (
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
 )
-# Every kernel tensor is read and written with 256-bit vector accesses:
-# contiguous storage, 32-byte aligned base (a row of 4096, 5120 or 7168 BF16
-# values is a whole number of 32-byte vectors).
+# The kernels read and write each tensor in vectors of 64 bits (the sm_100a /
+# sm_103a libraries of one hidden size), 128 bits (the other forward) or 256
+# bits (the other backward).  Every operand must be contiguous with a 32-byte
+# aligned base on every architecture, the alignment of the widest access any
+# library makes; a row of 4096, 5120 or 7168 BF16 values is a whole number of
+# 32-byte vectors.
 TENSOR_ALIGNMENT_BYTES = 32
 _BF16 = torch.bfloat16
 
@@ -188,9 +191,10 @@ def _run(
     hidden: int,
     device: torch.device,
 ) -> None:
-    """Launch the module of ``role`` on the current torch stream of ``device``."""
+    """Launch the module :func:`route_module` names for the call on the current
+    torch stream of ``device``."""
 
-    name = _loader.ROLES[role]
+    name = _loader.route_module(arch, role, hidden, rows)
     record = _loader.MODULES[name]
     grid_x, grid_y, grid_z = _loader.launch_grid(record, rows, hidden)
     grid = {"grid_x": grid_x, "grid_y": grid_y, "grid_z": grid_z}

@@ -112,11 +112,11 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
     float qvl[2];
     int g0 = (int)bid;
     if (p_k <= 16) {
-        long long sa_rowp = (long long)g0 * 8;
+        long long sa_rowp = (long long)g0 * 8ll;
         int sa_ip0_1_0 = tid_2;
         int sa_planep0_1_0 = sa_ip0_1_0 / 48;
         int sa_withinp0_1_0 = sa_ip0_1_0 - sa_planep0_1_0 * 48;
-        long long sa_srcp0_1_0 = ((long long)sa_planep0_1_0 * tp64 + sa_rowp) * 24 + (long long)(sa_withinp0_1_0 * 4);
+        long long sa_srcp0_1_0 = ((long long)sa_planep0_1_0 * tp64 + sa_rowp) * 24ll + (long long)(sa_withinp0_1_0 * 4);
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
@@ -127,7 +127,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
         int sa_ip0_1_1 = tid_2 + 128;
         int sa_planep0_1_1 = sa_ip0_1_1 / 48;
         int sa_withinp0_1_1 = sa_ip0_1_1 - sa_planep0_1_1 * 48;
-        long long sa_srcp0_1_1 = ((long long)sa_planep0_1_1 * tp64 + sa_rowp) * 24 + (long long)(sa_withinp0_1_1 * 4);
+        long long sa_srcp0_1_1 = ((long long)sa_planep0_1_1 * tp64 + sa_rowp) * 24ll + (long long)(sa_withinp0_1_1 * 4);
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
@@ -138,7 +138,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
         int sa_ip0_1_2 = tid_2 + 256;
         int sa_planep0_1_2 = sa_ip0_1_2 / 48;
         int sa_withinp0_1_2 = sa_ip0_1_2 - sa_planep0_1_2 * 48;
-        long long sa_srcp0_1_2 = ((long long)sa_planep0_1_2 * tp64 + sa_rowp) * 24 + (long long)(sa_withinp0_1_2 * 4);
+        long long sa_srcp0_1_2 = ((long long)sa_planep0_1_2 * tp64 + sa_rowp) * 24ll + (long long)(sa_withinp0_1_2 * 4);
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
@@ -149,7 +149,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
         int sa_ip0_1_3 = tid_2 + 384;
         int sa_planep0_1_3 = sa_ip0_1_3 / 48;
         int sa_withinp0_1_3 = sa_ip0_1_3 - sa_planep0_1_3 * 48;
-        long long sa_srcp0_1_3 = ((long long)sa_planep0_1_3 * tp64 + sa_rowp) * 24 + (long long)(sa_withinp0_1_3 * 4);
+        long long sa_srcp0_1_3 = ((long long)sa_planep0_1_3 * tp64 + sa_rowp) * 24ll + (long long)(sa_withinp0_1_3 * 4);
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
@@ -160,7 +160,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
         int sa_ip0_1_4 = tid_2 + 512;
         int sa_planep0_1_4 = sa_ip0_1_4 / 48;
         int sa_withinp0_1_4 = sa_ip0_1_4 - sa_planep0_1_4 * 48;
-        long long sa_srcp0_1_4 = ((long long)sa_planep0_1_4 * tp64 + sa_rowp) * 24 + (long long)(sa_withinp0_1_4 * 4);
+        long long sa_srcp0_1_4 = ((long long)sa_planep0_1_4 * tp64 + sa_rowp) * 24ll + (long long)(sa_withinp0_1_4 * 4);
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
@@ -171,7 +171,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
         int sa_ip0_1_5 = tid_2 + 640;
         int sa_planep0_1_5 = sa_ip0_1_5 / 48;
         int sa_withinp0_1_5 = sa_ip0_1_5 - sa_planep0_1_5 * 48;
-        long long sa_srcp0_1_5 = ((long long)sa_planep0_1_5 * tp64 + sa_rowp) * 24 + (long long)(sa_withinp0_1_5 * 4);
+        long long sa_srcp0_1_5 = ((long long)sa_planep0_1_5 * tp64 + sa_rowp) * 24ll + (long long)(sa_withinp0_1_5 * 4);
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
@@ -211,11 +211,11 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
             if (gn < n_groups) {
                 int boffn = (it[0] + 1 & 1) * 3072;
                 int qoffn = (it[0] + 1 & 1) * 128;
-                long long sa_row = (long long)gn * 8;
+                long long sa_row = (long long)gn * 8ll;
                 int sa_i0_1 = tid_2;
                 int sa_plane0_1 = sa_i0_1 / 48;
                 int sa_within0_1 = sa_i0_1 - sa_plane0_1 * 48;
-                long long sa_src0_1 = ((long long)sa_plane0_1 * tp64 + sa_row) * 24 + (long long)(sa_within0_1 * 4);
+                long long sa_src0_1 = ((long long)sa_plane0_1 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1 * 4);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p;\n\t"
@@ -226,7 +226,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
                 int sa_i0_1_0 = tid_2 + 128;
                 int sa_plane0_1_0 = sa_i0_1_0 / 48;
                 int sa_within0_1_0 = sa_i0_1_0 - sa_plane0_1_0 * 48;
-                long long sa_src0_1_0 = ((long long)sa_plane0_1_0 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_0 * 4);
+                long long sa_src0_1_0 = ((long long)sa_plane0_1_0 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1_0 * 4);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p;\n\t"
@@ -237,7 +237,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
                 int sa_i0_1_1 = tid_2 + 256;
                 int sa_plane0_1_1 = sa_i0_1_1 / 48;
                 int sa_within0_1_1 = sa_i0_1_1 - sa_plane0_1_1 * 48;
-                long long sa_src0_1_1 = ((long long)sa_plane0_1_1 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_1 * 4);
+                long long sa_src0_1_1 = ((long long)sa_plane0_1_1 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1_1 * 4);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p;\n\t"
@@ -248,7 +248,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
                 int sa_i0_1_2 = tid_2 + 384;
                 int sa_plane0_1_2 = sa_i0_1_2 / 48;
                 int sa_within0_1_2 = sa_i0_1_2 - sa_plane0_1_2 * 48;
-                long long sa_src0_1_2 = ((long long)sa_plane0_1_2 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_2 * 4);
+                long long sa_src0_1_2 = ((long long)sa_plane0_1_2 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1_2 * 4);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p;\n\t"
@@ -259,7 +259,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
                 int sa_i0_1_3 = tid_2 + 512;
                 int sa_plane0_1_3 = sa_i0_1_3 / 48;
                 int sa_within0_1_3 = sa_i0_1_3 - sa_plane0_1_3 * 48;
-                long long sa_src0_1_3 = ((long long)sa_plane0_1_3 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_3 * 4);
+                long long sa_src0_1_3 = ((long long)sa_plane0_1_3 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1_3 * 4);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p;\n\t"
@@ -270,7 +270,7 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
                 int sa_i0_1_4 = tid_2 + 640;
                 int sa_plane0_1_4 = sa_i0_1_4 / 48;
                 int sa_within0_1_4 = sa_i0_1_4 - sa_plane0_1_4 * 48;
-                long long sa_src0_1_4 = ((long long)sa_plane0_1_4 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_4 * 4);
+                long long sa_src0_1_4 = ((long long)sa_plane0_1_4 * tp64 + sa_row) * 24ll + (long long)(sa_within0_1_4 * 4);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p;\n\t"
@@ -310,10 +310,10 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
                 long long k64 = (long long)k_1 * tp64;
                 long long plane = k64 + tcr[0];
                 float _add_1;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(s_acc[0]), "f"(spart[plane * 24 + n64]));
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(s_acc[0]), "f"(spart[plane * 24ll + n64]));
                 s_acc[0] = _add_1;
                 float _add_2;
-                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(s_acc[1]), "f"(spart[plane * 24 + (24 + n64)]));
+                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(s_acc[1]), "f"(spart[plane * 24ll + (24ll + n64)]));
                 s_acc[1] = _add_2;
             }
             #pragma unroll
@@ -753,16 +753,16 @@ kernel_cake_mhc_train_fwd_coef__g2_el(float* __restrict__ spart, float* __restri
             int tok = tokr[j_5];
             long long tc64 = tcr[j_5];
             if (tok < T) {
-                long long row = tc64 * 64;
+                long long row = tc64 * 64ll;
                 if (lane_0 == 0) {
                     *(reinterpret_cast<float*>(stats + row) + (0)) = rr[j_5];
                 }
                 if (lane_0 < 24) {
-                    *(reinterpret_cast<float*>(stats + (row + 1 + lane64)) + (0)) = zz[j_5];
-                    *(reinterpret_cast<float*>(stats + (row + 25 + lane64)) + (0)) = cc[j_5];
+                    *(reinterpret_cast<float*>(stats + (row + 1ll + lane64)) + (0)) = zz[j_5];
+                    *(reinterpret_cast<float*>(stats + (row + 25ll + lane64)) + (0)) = cc[j_5];
                 }
                 if (lane_0 < 15) {
-                    *(reinterpret_cast<float*>(stats + (row + 49 + lane64)) + (0)) = 0.0f;
+                    *(reinterpret_cast<float*>(stats + (row + 49ll + lane64)) + (0)) = 0.0f;
                 }
             }
         }

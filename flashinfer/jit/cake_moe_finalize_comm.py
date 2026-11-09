@@ -362,7 +362,7 @@ MODULES: dict[str, dict[str, Any]] = {
 # at world size 8 from 56 tokens, in its deferred form from 1536 and 768 tokens (except
 # at world size 8 for top_k 4 without a shared expert and without an NVFP4 epilogue).
 # Larger batches run the two-shot program at world size 8, the large-token program at
-# world size 2 for top_k 4 above 512 tokens (1280 with a shared expert), and the
+# world size 2 for top_k 4 above 512 tokens (895 with a shared expert), and the
 # persistent program otherwise.
 SMALL_TOKEN_MAX = 64
 

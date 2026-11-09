@@ -58,7 +58,10 @@ The programs are the nine launches of the KCP composition
   same two forms; the offset program's full-width form ships in two records,
   bitwise equal (``select_rule`` ``walk_heads``): the plain build and the
   overlap-schedule build ``_overlap``, picked per launch from the head count
-  (:data:`WALK_HEADS_RULE`, :func:`walk_heads_record`);
+  (:data:`WALK_HEADS_RULE`, :func:`walk_heads_record`).  Every record is its
+  form's ``fuse_dv1`` build: the step forms the first value gradient
+  ``dv1 = Aqk^T do`` in FP32 from the internal ``Aqk`` rows (``aqk_tma`` on
+  ``aqk_int``), adds ``kg bf16(dh)`` and rounds once (``dv2``);
 * ``kcp_transfer_walk`` -- the FP32-class transfer ``M_f`` (``^T``) of a
   segment (BF16x3 on the tensor cores: two CTAs per segment and head, each
   over one 64-column half of the state) or, with ``init_mode = 1``, its
@@ -79,7 +82,8 @@ The programs are the nine launches of the KCP composition
   not started (Cluster Launch Control), so a CTA another stream keeps from
   starting costs the call its share of the SMs, not a second pass;
 * ``kcp_dav`` -- the output backward at the rank's shape: ``dAqk`` and the
-  first value gradient ``dv1`` (read by the adjoint walk) from ``do_int``, the
+  first value gradient ``dv1`` (which no walk reads: the adjoint walks form
+  their own from ``aqk_int``) from ``do_int``, the
   ``v_new`` tape and the ``Aqk`` rows, one CTA per chunk pair and head
   (``grid_rule`` ``kcp_pairs``: ``(num_chunks_pad / 2, num_heads, 1)``);
 * ``kcp_fwdh_o`` -- the forward state walk of ``kcp_fwdh_tape`` with the
@@ -564,7 +568,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "qg_tma"],
             ["buffer", "w_tma"],
             ["buffer", "do_tma"],
-            ["buffer", "dv1"],
+            ["buffer", "aqk_tma"],
             ["buffer", "gk"],
             ["parameter", "num_heads"],
             ["buffer", "seq_chunk_start"],
@@ -588,7 +592,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_1c66573e87150245374b_kcp",
+        "kernel_symbol": "kernel_cake_kda_train_c18b6c39ed72603017e6_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -596,15 +600,15 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_1c66573e87150245374b_kcp",
+        "library": "cake_kda_train_c18b6c39ed72603017e6_kcp",
         "logical": {
+            "aqk_tma": "aqk_int",
             "dh_tape": "dh",
             "dht": "dht",
             "dht_hg": "dht_hg",
             "dht_index": "dht_index",
             "dht_n": "dht_n",
             "do_tma": "do_int",
-            "dv1": "dv1",
             "dv2": "dv2",
             "gk": "gk",
             "kg_tma": "kg",
@@ -632,7 +636,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "qg_tma"],
             ["buffer", "w_tma"],
             ["buffer", "do_tma"],
-            ["buffer", "dv1"],
+            ["buffer", "aqk_tma"],
             ["buffer", "gk"],
             ["parameter", "num_heads"],
             ["buffer", "seq_chunk_start"],
@@ -656,7 +660,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_4a02b970484a9ef1f3c1_kcp",
+        "kernel_symbol": "kernel_cake_kda_train_7886f9703ccdc5a28f12_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -664,15 +668,15 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_4a02b970484a9ef1f3c1_kcp",
+        "library": "cake_kda_train_7886f9703ccdc5a28f12_kcp",
         "logical": {
+            "aqk_tma": "aqk_int",
             "dh_tape": "dh",
             "dht": "dht",
             "dht_hg": "dht_hg",
             "dht_index": "dht_index",
             "dht_n": "dht_n",
             "do_tma": "do_int",
-            "dv1": "dv1",
             "dv2": "dv2",
             "gk": "gk",
             "kg_tma": "kg",
@@ -700,7 +704,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "qg_tma"],
             ["buffer", "w_tma"],
             ["buffer", "do_tma"],
-            ["buffer", "dv1"],
+            ["buffer", "aqk_tma"],
             ["buffer", "gk"],
             ["parameter", "num_heads"],
             ["buffer", "seq_chunk_start"],
@@ -724,23 +728,23 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_afe02fb600500ba3556f_kcp",
+        "kernel_symbol": "kernel_cake_kda_train_0897f215cbb985961807_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 82944,
+            "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_afe02fb600500ba3556f_kcp",
+        "library": "cake_kda_train_0897f215cbb985961807_kcp",
         "logical": {
+            "aqk_tma": "aqk_int",
             "dh_tape": "dh",
             "dht": "dht",
             "dht_hg": "dht_hg",
             "dht_index": "dht_index",
             "dht_n": "dht_n",
             "do_tma": "do_int",
-            "dv1": "dv1",
             "dv2": "dv2",
             "gk": "gk",
             "kg_tma": "kg",
@@ -768,7 +772,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "qg_tma"],
             ["buffer", "w_tma"],
             ["buffer", "do_tma"],
-            ["buffer", "dv1"],
+            ["buffer", "aqk_tma"],
             ["buffer", "gk"],
             ["parameter", "num_heads"],
             ["buffer", "seq_chunk_start"],
@@ -792,23 +796,23 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_32b1aa657b082f2f4cb7_kcp",
+        "kernel_symbol": "kernel_cake_kda_train_daf0600c550c5f707ac4_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 107520,
+            "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_32b1aa657b082f2f4cb7_kcp",
+        "library": "cake_kda_train_daf0600c550c5f707ac4_kcp",
         "logical": {
+            "aqk_tma": "aqk_int",
             "dh_tape": "dh",
             "dht": "dht",
             "dht_hg": "dht_hg",
             "dht_index": "dht_index",
             "dht_n": "dht_n",
             "do_tma": "do_int",
-            "dv1": "dv1",
             "dv2": "dv2",
             "gk": "gk",
             "kg_tma": "kg",
@@ -1624,7 +1628,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "qg_tma"],
             ["buffer", "w_tma"],
             ["buffer", "do_tma"],
-            ["buffer", "dv1"],
+            ["buffer", "aqk_tma"],
             ["buffer", "gk"],
             ["parameter", "num_heads"],
             ["buffer", "seq_chunk_start"],
@@ -1648,7 +1652,7 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_3808ea4d567b82ea21a4_kcp",
+        "kernel_symbol": "kernel_cake_kda_train_e1f82c1cff44a51988f7_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1656,15 +1660,15 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_3808ea4d567b82ea21a4_kcp",
+        "library": "cake_kda_train_e1f82c1cff44a51988f7_kcp",
         "logical": {
+            "aqk_tma": "aqk_int",
             "dh_tape": "dh",
             "dht": "dht",
             "dht_hg": "dht_hg",
             "dht_index": "dht_index",
             "dht_n": "dht_n",
             "do_tma": "do_int",
-            "dv1": "dv1",
             "dv2": "dv2",
             "gk": "gk",
             "kg_tma": "kg",
@@ -2250,8 +2254,8 @@ _WALK_POOLS: dict[str, tuple[str | None, str | None]] = {
 _WALK_OPERANDS: dict[str, tuple[str, ...]] = {
     "kcp_fwdh_offset": ("w", "kg", "u", "gk", "h", "v_new"),
     "kcp_fwdh_tape": ("w", "kg", "u", "gk", "h", "v_new"),
-    "kcp_dhu_offset": ("w", "kg", "qg", "do_int", "dv1", "gk", "dh", "dv2"),
-    "kcp_dhu_tape": ("w", "kg", "qg", "do_int", "dv1", "gk", "dh", "dv2"),
+    "kcp_dhu_offset": ("w", "kg", "qg", "do_int", "aqk_int", "gk", "dh", "dv2"),
+    "kcp_dhu_tape": ("w", "kg", "qg", "do_int", "aqk_int", "gk", "dh", "dv2"),
     "kcp_transfer_walk": ("w", "kg", "u", "gk"),
     "kcp_fwdh_o": ("w", "kg", "u", "gk", "qg", "aqk_int", "chunk_bos", "chunk_len"),
 }

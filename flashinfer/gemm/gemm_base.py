@@ -739,6 +739,13 @@ def _heuristic_func_mm_bf16(
     return heuristic_backends
 
 
+def _batch_invariant_requested(*args, **kwargs) -> bool:
+    # ``batch_invariant`` is keyword-only in every GEMM API that has it. The batch-invariant class replaces the backends
+    # (it never runs one) and validates every input itself with typed errors, so the backend checks and the auto
+    # heuristic are skipped for it.
+    return bool(kwargs.get("batch_invariant", False))
+
+
 @backend_requirement(
     {
         "cudnn": _cudnn_mm_bf16_requirement,
@@ -751,6 +758,7 @@ def _heuristic_func_mm_bf16(
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_bf16_trace)
 def mm_bf16(
@@ -7845,6 +7853,7 @@ def _heuristic_func_mm_mxfp8(
     },
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_mxfp8_trace)
 def mm_mxfp8(
@@ -10091,6 +10100,7 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     },
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_fp4_trace)
 def mm_fp4(
@@ -10524,6 +10534,7 @@ def _heuristic_func_bmm_fp8(
     },
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=bmm_fp8_trace)
 def bmm_fp8(
@@ -12429,8 +12440,8 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
 ) -> bool:
     """Admission of the generated Cake programs: exactly the band the Cake dispatcher owns.
 
-    SM100a / SM103a devices with an exported SM count, the eight inventory
-    ``(N, K)`` geometries, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
+    SM100a / SM103a / SM107a devices with an exported SM count, the ``(N, K)``
+    geometries the architecture's route chain owns, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
     operands with float32 ``(1, 128, 128)`` scales (or the native MN-major packed
     UE8M0 int32 scales of the serving routes), int32 ``masked_m`` and a bfloat16
     output.  Every other problem raises through ``backend_requirement``.
@@ -12561,13 +12572,14 @@ def batch_deepgemm_fp8_nt_groupwise(
         (SM100a / SM103a; ``(n, k)`` in ``{(128, 512), (512, 128),
         (4096, 7168), (7168, 2048), (6144, 7168), (7168, 3072), (4096, 4096),
         (4096, 2048)}``; SM107a: the masked BLOCK_N programs, ``(n, k)`` in
-        ``{(128, 512), (512, 128), (4096, 7168), (7168, 2048)}`` with float32
-        scales; bfloat16 output; FP32 accumulation with the same
+        ``{(128, 512), (512, 128), (4096, 7168), (7168, 2048)}``; bfloat16 output; FP32 accumulation with the same
         ordered block-scale application as DeepGEMM) and raises for every other
         problem.  With ``backend="cake"`` the scales may also be the native
         MN-major packed UE8M0 ``torch.int32`` tensors of the serving routes
         (``a_scale`` of shape ``(batch_size, m, k // 512)``, ``b_scale`` of
-        shape ``(batch_size, n, k // 512)``), consumed without conversion.
+        shape ``(batch_size, n, k // 512)``) for ``(n, k)`` in
+        ``{(4096, 7168), (7168, 2048)}`` and ``batch_size`` 32 or 64 on
+        SM100a, SM103a and SM107a, consumed without conversion.
         Every launch of the Cake backend, including the first, may be captured
         into a CUDA graph; see
         :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.prepare_batch_deepgemm_fp8_nt_groupwise`

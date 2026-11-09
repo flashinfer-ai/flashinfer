@@ -18,16 +18,16 @@ Benchmark of the Cake SiLU-gated RMSNorm training kernels
 non-deterministic weight gradient (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``:
 one backward kernel whose last CTA finishes the FP64 weight-gradient sum)
 against the deterministic package
-(``flashinfer.cake_rmsnorm_silu_gate_det_train``: its backward kernel and its
-fixed-order weight-gradient reduction), each called through its own entry
+(``flashinfer.cake_rmsnorm_silu_gate_det_train``: its one-kernel backward with
+the exact fixed-point weight-gradient sum), each called through its own entry
 points.
 
 Every row times, for both modes, on identical generated inputs:
 
 - ``fwd``: one forward call (preallocated output);
 - ``bwd``: one backward call into a BF16 weight gradient, the final weight
-  gradient included (the deterministic reduction kernel, or the last CTA of
-  the non-deterministic kernel), with a preallocated caller workspace;
+  gradient included (the last CTA of either backward), with a preallocated
+  caller workspace;
 - ``ckpt``: the activation-checkpointed step through autograd,
   ``torch.utils.checkpoint(cake_rmsnorm_silu_gate_nondet, ..., use_reentrant=False)``
   then the backward (which replays the forward): ``2 * fwd + bwd`` measured.
@@ -42,8 +42,8 @@ autograd forward plus backward beyond the inputs (``peak``, outputs included),
 the backward's temporary allocation with preallocated outputs and no caller
 workspace (``temp``) and the caller workspace of each mode (``workspace``).
 Output columns check the non-deterministic results against the deterministic
-ones: ``dx`` and ``dz`` bitwise, ``dw`` as the largest distance in BF16 units
-in the last place, and the number of distinct ``dw`` bit patterns over
+ones: ``y`` bitwise, ``dx``, ``dz`` and ``dw`` as the largest distance in BF16
+units in the last place, and the number of distinct ``dw`` bit patterns over
 ``--repeats`` backward calls.
 
 Example::
@@ -232,11 +232,10 @@ def bench_row(T: int, H: int, eps: float, seed: int, repeats: int) -> dict:
     # The non-deterministic outputs against the deterministic ones.
     reference, candidate = outputs["deterministic"], outputs["nondeterministic"]
     result["y_bitwise_equal"] = bool(torch.equal(reference[0], candidate[0]))
-    result["dx_bitwise_equal"] = bool(torch.equal(reference[1], candidate[1]))
-    result["dz_bitwise_equal"] = bool(torch.equal(reference[2], candidate[2]))
-    result["dw_max_ulps_apart"] = int(
-        (_ordered(reference[3]) - _ordered(candidate[3])).abs().max().item()
-    )
+    for i, grad in enumerate(("dx", "dz", "dw"), 1):
+        result[f"{grad}_max_ulps_apart"] = int(
+            (_ordered(reference[i]) - _ordered(candidate[i])).abs().max().item()
+        )
     # deterministic GPU time over non-deterministic GPU time
     for stage in STAGES:
         result[f"{stage}_speedup"] = (
@@ -271,9 +270,9 @@ def _format(result: dict) -> list[str]:
             f"dw patterns {m['dw_patterns']}/{m['repeats']}"
         )
     lines.append(
-        f"{head} out  | y/dx/dz bitwise equal: {result['y_bitwise_equal']}/"
-        f"{result['dx_bitwise_equal']}/{result['dz_bitwise_equal']}  "
-        f"dw at most {result['dw_max_ulps_apart']} BF16 ulp apart"
+        f"{head} out  | y bitwise equal: {result['y_bitwise_equal']}  "
+        f"dx/dz/dw at most {result['dx_max_ulps_apart']}/"
+        f"{result['dz_max_ulps_apart']}/{result['dw_max_ulps_apart']} BF16 ulp apart"
     )
     return lines
 

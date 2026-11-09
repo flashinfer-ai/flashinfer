@@ -49,15 +49,16 @@ This module checks:
   and paths (accumulation, ``compute_grad_weight=False``, a reset workspace
   with nonzero scratch reused across shapes, two streams, a side stream, CUDA
   Graph replays, autograd and non-reentrant checkpointing) its ``y``, ``dx``
-  and ``dz`` are the deterministic package's bits and its ``dw`` lies within
-  the weight-gradient budget of the deterministic ``dw``, on every repeat; so
-  are they for one-head inputs of several layouts past the start of each
-  module that warms packed rows in L2, which launch with the packed-rows test
+  and ``dz`` lie within one BF16 ulp of FP64 (``dx`` and ``dz`` the same bits
+  on every repeat and path) and its ``dw`` lies within the weight-gradient
+  budget of the deterministic ``dw``, on every repeat; so are they for
+  one-head inputs of several layouts past the start of each module that
+  warms packed rows in L2, which launch with the packed-rows test
   passing exactly when their rows follow one another; and for weight
   gradients in the subnormal range (identical rows whose FP32 terms
   underflow) on the short, the mid and the long backward: ``dx`` and ``dz``
-  the deterministic bits, a BF16 ``dw`` the deterministic ``dw``'s bits, and
-  every ``dw`` within the budget widened by the underflow allowance the
+  within one BF16 ulp of FP64 (``dx`` with an absolute floor of ``2^-134``),
+  and every ``dw`` within the budget widened by the underflow allowance the
   package documents.
 
 The numerical contract of the non-deterministic kernels against the FP64
@@ -145,6 +146,66 @@ def det_forward(x, z, w, eps, **kwargs):
         return deterministic_facade.cake_rmsnorm_silu_gate_det_train_forward(
             x, z, w, eps, **kwargs
         )
+
+
+def assert_y_within_fp64(y, x, z, w, eps, *, what):
+    """``y`` NaN where the FP64 forward is NaN, its infinity where it is
+    infinite and elsewhere within one BF16 ulp of it plus a floor of 1/64 ulp of
+    its row's largest finite ungated magnitude ``|x * rstd * w|``, times the
+    gate's magnitude where that exceeds one.  The deterministic package's
+    forward computes its gate and ``rstd`` with approximate instructions, so its
+    ``y`` need not be this package's bits; each package holds its own ``y`` to
+    FP64."""
+    xd, zd, wd = (t.double().reshape(-1, D) for t in (x, z, w))
+    rstd = 1.0 / torch.sqrt(xd.square().mean(dim=-1, keepdim=True) + eps)
+    ungated = xd * rstd * wd
+    scale = torch.where(ungated.isfinite(), ungated.abs(), 0.0).amax(
+        dim=-1, keepdim=True
+    )
+    silu = zd * torch.sigmoid(zd)
+    want = ungated * silu
+    got = y.detach().double().reshape(-1, D)
+    assert torch.equal(got.isnan(), want.isnan()), f"{what}: NaN elements"
+    inf = want.isinf()
+    assert torch.equal(got.isinf(), inf), f"{what}: infinite elements"
+    assert torch.equal(got[inf], want[inf]), f"{what}: infinite elements"
+    floor = scale * silu.abs().clamp_min(1.0) * suite.BF16_RTOL / 64
+    err = (got - want).abs()
+    bad = want.isfinite() & ~(err <= want.abs() * suite.BF16_RTOL + floor)
+    assert not bad.any(), (
+        f"{what}: {int(bad.sum())} of {bad.numel()} elements beyond one BF16 ulp "
+        f"of FP64; worst err {err[bad].max().item():.3e}"
+    )
+
+
+def assert_dx_dz_within_fp64(dx, dz, ref: list, *, what="", dx_floor=0.0):
+    """``dx`` and ``dz`` against ``ref``, first ``[dx64, dz64]`` of
+    ``suite.fp64_reference``: ``NaN`` where it is ``NaN``, its infinity where
+    it is infinite and elsewhere within one BF16 ulp of it plus a floor of 1/64
+    ulp of its largest finite magnitude (``suite.assert_bf16_close``, the
+    deterministic suite's rule; ``dx_floor`` for ``dx`` where larger).  ``ref``
+    then holds this ``dx`` and ``dz``, whose bits every later launch on the
+    same inputs returns.  The deterministic package's backward computes its
+    gate and ``rstd`` with approximate instructions, so its ``dx`` and ``dz``
+    need not be this package's bits; each package holds its own to FP64."""
+    if ref[0].dtype != torch.float64:
+        for got, want, name in ((dx, ref[0], "dx"), (dz, ref[1], "dz")):
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16)), (
+                f"{what} {name} vs the first launch"
+            )
+        return
+    for got, want, name in ((dx, ref[0], "dx"), (dz, ref[1], "dz")):
+        got, inf, finite = got.detach().double(), want.isinf(), want.isfinite()
+        assert torch.equal(got.isnan(), want.isnan()), f"{what} {name}: NaN elements"
+        assert torch.equal(got.isinf(), inf), f"{what} {name}: infinite elements"
+        assert torch.equal(got[inf], want[inf]), f"{what} {name}: infinite elements"
+        scale = want[finite].abs().max().item()
+        if name == "dx":
+            scale = max(scale, dx_floor * 64 / suite.BF16_RTOL)
+        suite.assert_bf16_close(
+            got[finite], want[finite], what=f"{what} {name} vs FP64", scale=scale
+        )
+    ref[:] = [dx.detach(), dz.detach()]
 
 
 def _supported() -> bool:
@@ -681,8 +742,8 @@ def test_nondet_entry_points_run_this_package(
     determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ``nondet`` entry points launch the backend's forward and its one
-    backward kernel (and no det module): ``y``, ``dx`` and ``dz`` are the det
-    package's bits, ``dw`` within one BF16 rounding plus the FP32 accumulation
+    backward kernel (and no det module): ``y``, ``dx`` and ``dz`` lie within one
+    BF16 ulp of FP64, ``dw`` within one BF16 rounding plus the FP32 accumulation
     budget of the det ``dw``.  The two workspace kinds do not substitute: each
     backward refuses the other package's buffer, naming both."""
     launched = _spy_launches(monkeypatch)
@@ -695,11 +756,11 @@ def test_nondet_entry_points_run_this_package(
     assert launched == [fwd, routes["bwd_bf16"]], launched
     for name in launched:
         assert name not in deterministic_loader.MODULES, name
-    assert torch.equal(y, det_forward(x, z, w, EPS))
-    dx_d, dz_d, dw_d = deterministic_facade.cake_rmsnorm_silu_gate_det_train_backward(
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
+    dw_d = deterministic_facade.cake_rmsnorm_silu_gate_det_train_backward(
         dy, x, z, w, EPS
-    )
-    assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
+    )[2]
+    assert_dx_dz_within_fp64(dx, dz, list(suite.fp64_reference(dy, x, z, w, EPS)[1:3]))
     terms = (dy.double() * torch.nn.functional.silu(z.double())) * (
         x.double() * torch.rsqrt(x.double().square().mean(-1, keepdim=True) + EPS)
     )
@@ -833,12 +894,13 @@ MATRIX = [
 def test_nondeterministic_matches_the_deterministic_package(
     shape, make_kwargs, eps, dw_dtype, determinism_setting
 ) -> None:
-    """``y`` and, on every one of ``suite.REPEATS`` backward launches, ``dx``
-    and ``dz`` are the deterministic package's bits; ``dw`` lies within the
-    weight-gradient budget of the deterministic ``dw``."""
+    """``y`` lies within one BF16 ulp of FP64; on every one of
+    ``suite.REPEATS`` backward launches, ``dx`` and ``dz`` are the same bits,
+    within one BF16 ulp of FP64, and ``dw`` lies within the weight-gradient
+    budget of the deterministic ``dw``."""
     x, z, w, dy = suite.make(*shape, **make_kwargs)
     y = nd_forward(x, z, w, eps)
-    assert torch.equal(y, det_forward(x, z, w, eps)), "y vs the deterministic package"
+    assert_y_within_fp64(y, x, z, w, eps, what="y")
     mag = suite.magnitudes(dy, x, z, eps)
 
     def out():
@@ -848,12 +910,12 @@ def test_nondeterministic_matches_the_deterministic_package(
             else torch.empty(D, dtype=dw_dtype, device=x.device)
         )
 
-    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, eps, grad_weight=out())
+    dw_d = det_backward(dy, x, z, w, eps, grad_weight=out())[2]
+    ref = list(suite.fp64_reference(dy, x, z, w, eps)[1:3])
     for _ in range(suite.REPEATS):
         dx, dz, dw = nd_backward(dy, x, z, w, eps, grad_weight=out())
         assert dw.dtype == dw_dtype
-        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
-        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        assert_dx_dz_within_fp64(dx, dz, ref)
         suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
 
 
@@ -883,9 +945,12 @@ def test_accumulation_matches_the_deterministic_package(determinism_setting) -> 
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
     nd_gated_rmsnorm(xa, za, wa, EPS).backward(dy)
     nd_gated_rmsnorm(xa, za, wa, EPS).backward(dy)
-    dx_d, dz_d, _ = det_backward(dy, x, z, w, EPS)
-    assert torch.equal(xa.grad, dx_d + dx_d)
-    assert torch.equal(za.grad, dz_d + dz_d)
+    twice = [2 * t for t in suite.fp64_reference(dy, x, z, w, EPS)[1:3]]
+    assert_dx_dz_within_fp64(xa.grad, za.grad, twice, what="accumulated .grad")
+    # and exactly twice the bits of one backward call
+    dx1, dz1, _ = nd_backward(dy, x, z, w, EPS)
+    assert torch.equal(xa.grad, dx1 + dx1), "accumulated dx vs twice one call"
+    assert torch.equal(za.grad, dz1 + dz1), "accumulated dz vs twice one call"
 
 
 @requires_device
@@ -893,18 +958,18 @@ def test_compute_grad_weight_false_matches_the_deterministic_package(
     determinism_setting,
 ) -> None:
     x, z, w, dy = suite.make(257, 48, seed=12)
-    dx_d, dz_d, _ = det_backward(dy, x, z, w, EPS, compute_grad_weight=False)
+    ref = list(suite.fp64_reference(dy, x, z, w, EPS)[1:3])
     ws = nd_workspace(257 * 48, x.device)
     for workspace in (ws, None):
         dx, dz, dw = nd_backward(
             dy, x, z, w, EPS, compute_grad_weight=False, workspace=workspace
         )
         assert dw is None
-        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
+        assert_dx_dz_within_fp64(dx, dz, ref, what=f"workspace {workspace is ws}")
     # autograd with a weight that needs no gradient
     xa, za = (t.clone().requires_grad_(True) for t in (x, z))
     nd_gated_rmsnorm(xa, za, w, EPS).backward(dy)
-    assert torch.equal(xa.grad, dx_d) and torch.equal(za.grad, dz_d)
+    assert_dx_dz_within_fp64(xa.grad, za.grad, ref, what="autograd")
 
 
 @requires_device
@@ -913,8 +978,8 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
     ticket and claim counter) zeroed by
     ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``,
     then reused without a reset over the backend suite's sequence of shapes,
-    weight-gradient dtypes and accumulation: ``dx`` and ``dz`` are the
-    deterministic package's bits, ``dw`` lies within the budget of the
+    weight-gradient dtypes and accumulation: ``dx`` and ``dz`` lie within one
+    BF16 ulp of FP64, ``dw`` lies within the budget of the
     deterministic ``dw`` and of the FP64 reference, and the workspace is zero
     after every call."""
     device = torch.device("cuda")
@@ -958,15 +1023,16 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
             accumulate_grad_weight=accumulate,
             workspace=ws,
         )
-        dx_d, dz_d, dw_d = det_backward(
+        dw_d = det_backward(
             dy, x, z, w, EPS, grad_weight=gw(), accumulate_grad_weight=accumulate
-        )
+        )[2]
         torch.cuda.synchronize()
         assert not bool(ws.any()), (T, H, dtype)
-        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), (T, H)
+        _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
+        assert_dx_dz_within_fp64(dx, dz, [dx64, dz64], what=f"T={T} H={H}")
         assert dw.dtype == dtype
         mag = suite.magnitudes(dy, x, z, EPS)
-        want = suite.fp64_reference(dy, x, z, w, EPS)[3] + start
+        want = dw64 + start
         suite.assert_dw_within(dw, want, mag, what=f"dw T={T} H={H} {dtype} vs FP64")
         suite.assert_dw_within(
             dw, dw_d, mag, what=f"dw T={T} H={H} {dtype} vs the deterministic package"
@@ -976,7 +1042,7 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
 @requires_device
 def test_two_streams_match_the_deterministic_package(determinism_setting) -> None:
     cases = [suite.make(4097, 48, seed=30), suite.make(1031, 16, seed=31)]
-    refs = [det_backward(dy, x, z, w, EPS) for x, z, w, dy in cases]
+    refs = [list(suite.fp64_reference(dy, x, z, w, EPS)[1:3]) for x, z, w, dy in cases]
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     workspaces = [nd_workspace(1, torch.device("cuda")) for _ in streams]
     outputs: list[list] = [[], []]
@@ -991,16 +1057,14 @@ def test_two_streams_match_the_deterministic_package(determinism_setting) -> Non
                 )
     torch.cuda.synchronize()
     for i in range(2):
-        dx_d, dz_d, _ = refs[i]
         for dx, dz, _ in outputs[i]:
-            assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), i
+            assert_dx_dz_within_fp64(dx, dz, refs[i], what=f"stream {i}")
 
 
 @requires_device
 def test_side_stream_matches_the_deterministic_package(determinism_setting) -> None:
     x, z, w, dy = suite.make(2049, 48, seed=9)
-    want_y = det_forward(x, z, w, EPS)
-    dx_d, dz_d, _ = det_backward(dy, x, z, w, EPS)
+    ref = list(suite.fp64_reference(dy, x, z, w, EPS)[1:3])
     ws = nd_workspace(x.shape[0] * x.shape[1], x.device)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -1010,9 +1074,9 @@ def test_side_stream_matches_the_deterministic_package(determinism_setting) -> N
         fresh = nd_backward(dy, x, z, w, EPS)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
-    assert torch.equal(y, want_y)
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
     for dx, dz, _ in (got, fresh):
-        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
+        assert_dx_dz_within_fp64(dx, dz, ref)
 
 
 @requires_device
@@ -1049,9 +1113,9 @@ def test_cuda_graph_replay_matches_the_deterministic_package(
         dys.copy_(dyn)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(y, det_forward(xn, zn, w, EPS)), k
-        dx_d, dz_d, _ = det_backward(dyn, xn, zn, w, EPS)
-        assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d), k
+        assert_y_within_fp64(y, xn, zn, w, EPS, what=f"y, replay {k}")
+        ref = list(suite.fp64_reference(dyn, xn, zn, w, EPS)[1:3])
+        assert_dx_dz_within_fp64(dx, dz, ref, what=f"replay {k}")
 
 
 @requires_device
@@ -1059,13 +1123,13 @@ def test_autograd_and_checkpoint_match_the_deterministic_package(
     determinism_setting,
 ) -> None:
     x, z, w, dy = suite.make(513, 48, seed=8)
-    y_ref = det_forward(x, z, w, EPS)
-    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS)
+    dw_d = det_backward(dy, x, z, w, EPS)[2]
+    ref = list(suite.fp64_reference(dy, x, z, w, EPS)[1:3])
     mag = suite.magnitudes(dy, x, z, EPS)
 
     def check(y, xg, zg, wg, what):
-        assert torch.equal(y, y_ref), what
-        assert torch.equal(xg, dx_d) and torch.equal(zg, dz_d), what
+        assert_y_within_fp64(y, x, z, w, EPS, what=f"{what} y")
+        assert_dx_dz_within_fp64(xg, zg, ref, what=what)
         assert wg.dtype == torch.bfloat16, what
         suite.assert_dw_within(
             wg, dw_d, mag, what=f"{what} dw vs the deterministic package"
@@ -1159,7 +1223,7 @@ LONG_FORWARD_CASES = [
 def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     tokens, heads, layout, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``y`` is the deterministic package's bits on both sides of the mid and
+    """``y`` lies within one BF16 ulp of FP64 on both sides of the mid and
     the long forward's thresholds and past them, and the forward launches
     ``module_for_rows``' module: where the architecture routes them, the short
     forward up to ``SHORT_FORWARD_ROWS_PER_SM * SMs`` rows, the long forward
@@ -1198,7 +1262,7 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     elif "fwd_mid" in routes and rows >= mid_start * sms:
         want = routes["fwd_mid"]
     assert name == want, (arch, rows, sms)
-    assert torch.equal(y, det_forward(x, z, w, EPS)), "y vs the deterministic package"
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
 
 
 # Gate inputs at and past the edges of the packed gate's range: below -41,
@@ -1259,8 +1323,8 @@ def test_forward_gate_edges_match_the_deterministic_package(
     """With gate inputs at and past the packed gate's range in two of every
     three rows (a quarter of their elements, so the range check fails for some
     threads of a row and holds for others) and ordinary ones in the rest,
-    ``y`` is the deterministic package's bits, NaN included, and the forward
-    launches ``module_for_rows``' module."""
+    ``y`` lies within one BF16 ulp of FP64, NaN and infinities included, and
+    the forward launches ``module_for_rows``' module."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     x, z, w, _ = suite.make(tokens, heads, seed=23)
@@ -1276,10 +1340,7 @@ def test_forward_gate_edges_match_the_deterministic_package(
     launched = _spy_launches(monkeypatch)
     y = nd_forward(x, z, w, EPS)
     assert launched == [loader.module_for_rows(arch, "fwd", tokens * heads, sms)]
-    want = det_forward(x, z, w, EPS)
-    assert torch.equal(y.view(torch.int16), want.view(torch.int16)), (
-        "y vs the deterministic package"
-    )
+    assert_y_within_fp64(y, x, z, w, EPS, what="y")
 
 
 # The rows per SM from which each architecture runs the long backward.
@@ -1314,8 +1375,8 @@ def test_backward_around_the_long_threshold_matches_the_deterministic_package(
     """Around and past the long backward's threshold
     (``LONG_BACKWARD_ROWS_PER_SM``): the module launched is
     ``module_for_rows``' (the long backward from the threshold, the backward
-    below it), ``dx`` and ``dz`` are the deterministic package's bits and
-    ``dw`` lies within the budget of the deterministic ``dw`` on every repeat,
+    below it), ``dx`` and ``dz`` are the same bits, within one BF16 ulp of
+    FP64, and ``dw`` lies within the budget of the deterministic ``dw`` on every repeat,
     and the workspace is zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
@@ -1335,14 +1396,14 @@ def test_backward_around_the_long_threshold_matches_the_deterministic_package(
     def out():
         return torch.empty(D, dtype=dw_dtype, device=x.device)
 
-    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())[2]
+    ref = list(suite.fp64_reference(dy, x, z, w, EPS)[1:3])
     ws = nd_workspace(rows, x.device)
     launched = _spy_launches(monkeypatch)
     for _ in range(suite.REPEATS):
         dx, dz, dw = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
         assert dw.dtype == dw_dtype
-        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
-        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        assert_dx_dz_within_fp64(dx, dz, ref)
         suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
         assert not bool(ws.any()), "the workspace is not zero"
     name = long if rows >= start * sms else loader.route_module(arch, role)
@@ -1389,8 +1450,8 @@ def test_backward_around_the_mid_threshold_matches_the_deterministic_package(
 ) -> None:
     """Around and in the mid backward's rows (``MID_BACKWARD_ROWS_PER_SM``,
     on the architectures that route it): the module launched is
-    ``module_for_rows``', ``dx`` and ``dz`` are the deterministic package's
-    bits, ``dw`` lies within the budget of the deterministic ``dw`` on every
+    ``module_for_rows``', ``dx`` and ``dz`` are the same bits, within one BF16
+    ulp of FP64, ``dw`` lies within the budget of the deterministic ``dw`` on every
     repeat, and the workspace is zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
@@ -1410,14 +1471,14 @@ def test_backward_around_the_mid_threshold_matches_the_deterministic_package(
     def out():
         return torch.empty(D, dtype=dw_dtype, device=x.device)
 
-    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())[2]
+    ref = list(suite.fp64_reference(dy, x, z, w, EPS)[1:3])
     ws = nd_workspace(rows, x.device)
     launched = _spy_launches(monkeypatch)
     for _ in range(suite.REPEATS):
         dx, dz, dw = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
         assert dw.dtype == dw_dtype
-        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
-        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        assert_dx_dz_within_fp64(dx, dz, ref)
         suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
         assert not bool(ws.any()), "the workspace is not zero"
     name = loader.module_for_rows(arch, role, rows, sms)
@@ -1439,9 +1500,10 @@ def test_mid_backward_with_infinite_grad_out_keeps_the_documented_classes(
     weight gradient of the columns holding them is not finite (``+-inf`` or
     ``NaN``, as the module documentation states for either package), every
     other column's lies within the budget of the deterministic ``dw``, and
-    ``dx`` and ``dz`` have the deterministic package's ``NaN`` positions and
-    its bits everywhere else, on every repeat, with the workspace zero after
-    every call."""
+    ``dx`` and ``dz`` are the same bits, with the FP64 reference's ``NaN``
+    positions and infinities and within one BF16 ulp of it everywhere else
+    (the floor from its finite elements), on every repeat, with the workspace
+    zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
     mid = loader.ROUTES[arch].get(f"{role}_mid")
@@ -1468,7 +1530,8 @@ def test_mid_backward_with_infinite_grad_out_keeps_the_documented_classes(
     def out():
         return torch.empty(D, dtype=dw_dtype, device=x.device)
 
-    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())[2]
+    ref = list(suite.fp64_reference(dy, x, z, w, EPS)[1:3])
     assert torch.equal(~torch.isfinite(dw_d), cols), "deterministic dw columns"
     ws = nd_workspace(rows, x.device)
     launched = _spy_launches(monkeypatch)
@@ -1479,10 +1542,7 @@ def test_mid_backward_with_infinite_grad_out_keeps_the_documented_classes(
         suite.assert_dw_within(
             dw[~cols], dw_d[~cols], mag[~cols], what="finite dw columns"
         )
-        for got, want, what in ((dx, dx_d, "dx"), (dz, dz_d, "dz")):
-            nan = torch.isnan(want)
-            assert torch.equal(torch.isnan(got), nan), what
-            assert torch.equal(got[~nan], want[~nan]), what
+        assert_dx_dz_within_fp64(dx, dz, ref)
         assert not bool(ws.any()), "the workspace is not zero"
     assert launched == [mid] * suite.REPEATS, launched
 
@@ -1517,8 +1577,8 @@ def test_backward_around_the_short_threshold_matches_the_deterministic_package(
     """Around the short backward's 256 rows: the module launched is
     ``module_for_rows``' (where the architecture routes it, the short backward
     up to ``SHORT_BACKWARD_ROWS`` rows, else the backward), ``dx`` and ``dz``
-    are the deterministic package's bits, ``dw`` lies within the budget of the
-    deterministic ``dw`` on every repeat (an accumulated one within the budget
+    are the same bits, within one BF16 ulp of FP64, ``dw`` lies within the budget of
+    the deterministic ``dw`` on every repeat (an accumulated one within the budget
     of the FP64 reference), and the workspace is zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
@@ -1535,15 +1595,15 @@ def test_backward_around_the_short_threshold_matches_the_deterministic_package(
             return torch.empty(D, dtype=dw_dtype, device=x.device)
         return torch.full((D,), value, dtype=dw_dtype, device=x.device)
 
-    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
-    dw64 = suite.fp64_reference(dy, x, z, w, EPS)[3]
+    dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())[2]
+    _, dx64, dz64, dw64 = suite.fp64_reference(dy, x, z, w, EPS)
+    ref = [dx64, dz64]
     ws = nd_workspace(rows, x.device)
     launched = _spy_launches(monkeypatch)
     for _ in range(suite.REPEATS):
         dx, dz, dw = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
         assert dw.dtype == dw_dtype
-        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
-        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        assert_dx_dz_within_fp64(dx, dz, ref)
         suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
         assert not bool(ws.any()), "the workspace is not zero"
     acc = nd_backward(
@@ -1692,8 +1752,8 @@ def test_one_head_inputs_match_the_flat_rows_and_the_deterministic_package(
     (``ONE_HEAD_LAYOUTS``)
     launches ``module_for_rows``' module with head stride 128, passes the
     packed-rows test exactly when its rows follow one another (or the host
-    copied it), and returns the deterministic package's ``y``, ``dx`` and
-    ``dz`` bits and a ``dw`` within the budget of the deterministic ``dw`` on
+    copied it), and returns the flat rows' ``y``, ``dx`` and ``dz`` bits (within
+    one BF16 ulp of FP64) and a ``dw`` within the budget of the deterministic ``dw`` on
     every repeat, with the workspace zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     name = loader.ROUTES[arch].get(tier)
@@ -1709,9 +1769,13 @@ def test_one_head_inputs_match_the_flat_rows_and_the_deterministic_package(
         return torch.empty(D, dtype=dw_dtype, device=x0.device)
 
     if role == "fwd":
-        y_d = det_forward(x0, z0, w, EPS)
+        y_d = nd_forward(x0, z0, w, EPS)
+        assert_y_within_fp64(y_d, x0, z0, w, EPS, what="flat y")
     else:
-        dx_d, dz_d, dw_d = det_backward(dy0, x0, z0, w, EPS, grad_weight=out())
+        dw_d = det_backward(dy0, x0, z0, w, EPS, grad_weight=out())[2]
+        ref = list(suite.fp64_reference(dy0, x0, z0, w, EPS)[1:3])
+        dx_f, dz_f, _ = nd_backward(dy0, x0, z0, w, EPS, grad_weight=out())
+        assert_dx_dz_within_fp64(dx_f, dz_f, ref, what="flat")
         mag = suite.magnitudes(dy0, x0, z0, EPS)
         ws = nd_workspace(rows, x0.device)
     launched = _spy_strides(monkeypatch)
@@ -1727,8 +1791,8 @@ def test_one_head_inputs_match_the_flat_rows_and_the_deterministic_package(
                 dx, dz, dw = nd_backward(
                     dy, x, z, w, EPS, grad_weight=out(), workspace=ws
                 )
-                assert torch.equal(dx.reshape(rows, D), dx_d), (layout, "dx")
-                assert torch.equal(dz.reshape(rows, D), dz_d), (layout, "dz")
+                dx, dz = dx.reshape(rows, D), dz.reshape(rows, D)
+                assert_dx_dz_within_fp64(dx, dz, ref, what=layout)
                 suite.assert_dw_within(
                     dw, dw_d, mag, what=f"{layout}: dw vs the deterministic package"
                 )
@@ -1778,16 +1842,17 @@ def test_subnormal_weight_gradient_matches_the_deterministic_package(
 ) -> None:
     """Weight gradients in the subnormal range, where the documented budget
     ``|dw64| * 2^-7 + sum|terms| * 2^-20`` (for FP32 normal gates, terms and
-    sums) does not hold for either package: ``dx`` and ``dz`` are the
-    deterministic package's bits, a BF16 ``dw`` the deterministic ``dw``'s
-    bits, and every ``dw`` lies within that budget widened by the documented
+    sums) does not hold for either package: ``dx`` and ``dz`` are the same
+    bits, within one BF16 ulp of FP64 (``dx``, below BF16's smallest subnormal
+    in FP64, with an absolute floor of ``2^-134``), and every ``dw`` lies
+    within that budget widened by the documented
     underflow allowance, ``(1 + |x * rstd|) * 2^-150`` per row plus half the
     dtype's smallest subnormal, on every repeat, with the workspace zero."""
     x, z, w, dy = _underflowing_rows(T, H)
     rows = T * H
-    dx_d, dz_d, dw_d = det_backward(
+    dw_d = det_backward(
         dy, x, z, w, EPS, grad_weight=torch.empty(D, dtype=dw_dtype, device=x.device)
-    )
+    )[2]
     xd, zd = x.double(), z.double()
     n = xd * torch.rsqrt(xd.square().mean(-1, keepdim=True) + EPS)
     terms = (dy.double() * zd * torch.sigmoid(zd) * n).reshape(rows, D)
@@ -1799,13 +1864,12 @@ def test_subnormal_weight_gradient_matches_the_deterministic_package(
         "the inputs no longer leave the normal-range budget"
     )
     ws = nd_workspace(rows, x.device)
+    ref = list(suite.fp64_reference(dy, x, z, w, EPS)[1:3])
     for _ in range(suite.REPEATS):
         dw = torch.empty(D, dtype=dw_dtype, device=x.device)
         dx, dz, _ = nd_backward(dy, x, z, w, EPS, grad_weight=dw, workspace=ws)
-        assert torch.equal(dx, dx_d), "dx"
-        assert torch.equal(dz, dz_d), "dz"
-        if dw_dtype == torch.bfloat16:
-            assert torch.equal(dw.view(torch.int16), dw_d.view(torch.int16)), "dw bits"
+        # |dx64| < 2^-148, under half BF16's smallest subnormal: dx is zero
+        assert_dx_dz_within_fp64(dx, dz, ref, dx_floor=2.0**-134)
         excess = (dw.double() - dw64).abs() - budget - allowance
         assert not bool((excess > 0).any()), (
             f"dw beyond the floored budget by {excess.max().item():.3e}"

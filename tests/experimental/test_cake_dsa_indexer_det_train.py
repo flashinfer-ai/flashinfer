@@ -139,6 +139,7 @@ _COMMON = dict(
     sample_shift_permille=250,
     sample_shift_rule=None,
     sample_class_rule=None,
+    sample_long_rule=None,
     lsf_programs=False,
     lsf_single_rule=None,
     static_scan_kinds=[],
@@ -169,6 +170,7 @@ _COMMON = dict(
     rank_t16_slots=[4096],
     rank_persist_max_k=0,
     rank_persist_ctas_per_sm=4,
+    rank_persist_spare_sms=0,
     merge_rank=False,
 )
 NARROW_PAIR_POLICY = DispatchPolicy.from_record(
@@ -740,6 +742,8 @@ def test_policy_record_round_trip_and_validation():
         dict(rank_persist_max_k=-1),  # round 39: lever FRP-K fields
         dict(rank_persist_max_k=2048.5),
         dict(rank_persist_ctas_per_sm=0),
+        dict(rank_persist_spare_sms=-1),  # the spare SMs of the persistent grid (#7548)
+        dict(rank_persist_spare_sms=0.5),
         dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
         dict(far_sample=-1),
         dict(far_sample=True),
@@ -3317,8 +3321,9 @@ def test_shipped_unit_rules_by_architecture():
 def test_shipped_sample_shift_rule_by_architecture():
     """sm_103a (``sample_shift_rule [4096, 375]``): a ``top_k = 4096`` call shifts its sampled rank by 375 permille, a
     ``top_k = 2048`` call keeps the 250 default, in both sample modes, and an explicit ``sample_shift_permille`` knob wins
-    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``.  The backend's plan carries the
-    same scalar (host-only: ``arch`` and the SM count given)."""
+    on both; sm_100a and sm_107a carry no rule (``None``) and keep 250 at every ``top_k``, except where their class rules
+    shift a sampled two-segment call (sm_107a also by its long-unit rule).  The backend's plan carries the same scalar
+    (host-only: ``arch`` and the SM count given)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     p103, p100, p107 = (
@@ -3335,7 +3340,8 @@ def test_shipped_sample_shift_rule_by_architecture():
         for knobs in ({}, {"sample_tiles_max": 0}):
             for T, Tkv, S in rows:
                 # sample_class_rule [8, 500] (sm_103a / sm_100a): a sampled call of two or more segments on a wide-unit
-                # program shifts 500 permille, ahead of sample_shift_rule; sm_107a carries no class rule
+                # program shifts 500 permille, ahead of sample_shift_rule; on sm_107a the two-segment call shifts 500
+                # permille too (sample_long_rule on a long-unit l6 program, sample_class_rule [32, 500] on a wide one)
                 cls = 500 if S >= 2 and not knobs else None
                 for K, shift in ((2048, 250), (4096, 375)):
                     where = (grid, knobs, T, Tkv, S, K)
@@ -3343,9 +3349,7 @@ def test_shipped_sample_shift_rule_by_architecture():
                     assert c.sample_shift_permille == (cls or shift), where
                     for p in (p100, p107):
                         c = _select(p, T, Tkv, S=S, K=K, grid=grid, **knobs)
-                        assert c.sample_shift_permille == (
-                            cls if cls and p is p100 else 250
-                        ), where
+                        assert c.sample_shift_permille == (cls or 250), where
                     forced = dict(knobs, sample_shift_permille=-500)
                     c = _select(p103, T, Tkv, S=S, K=K, grid=grid, **forced)
                     assert c.sample_shift_permille == -500, where
@@ -4121,6 +4125,60 @@ def test_repeatability_bitwise():
     assert ref.same_bits(a, b) and ref.same_bits(a, c)
 
 
+def test_sm107a_sampling_rules_cover_the_7549_rank_geometries():
+    """#7549 on sm_107a: the packed calls of short query segments and few mean unit tiles (the 22-segment packed rank
+    inputs) sample ``sample_class_rule[0]`` tiles at its shift -- not a call whose units average no more tiles than that
+    (the ratio-4 pooled packed rows keep the tiny defaults) -- and the long-unit l6 calls (the two-segment 262144-key
+    document ranks) take ``sample_long_rule``'s shift at the long-unit tile count, for every ``top_k``.  A long-unit call
+    of another kind keeps the long-unit defaults, explicit knobs stay, and sampling off stays off.  The other
+    architectures set no long-unit rule, and the sm_107a FP8 record sets neither rule."""
+    assert policy_for("sm_100a").sample_long_rule is None
+    assert policy_for("sm_103a").sample_long_rule is None
+    assert policy_for("sm_107a", "fp8").sample_class_rule is None
+    assert policy_for("sm_107a", "fp8").sample_long_rule is None
+    arch, grid = "sm_107a", _FROZEN_GRIDS["sm_107a"][0]
+    policy = policy_for(arch)
+    class_rule, long_rule = policy.sample_class_rule, policy.sample_long_rule
+    assert class_rule is not None and long_rule is not None
+
+    def plan(T, Tkv, S, top_k=2048, **knobs):
+        return plan_dsa_indexer_det_topk(
+            T, Tkv, S, top_k=top_k, arch=arch, num_sms=grid, **knobs
+        )
+
+    def sampling(choice):
+        return choice.sample_tiles_max, choice.sample_shift_permille
+
+    assert sampling(plan(17536, 289344, 22)) == tuple(class_rule)
+    # the ratio-4 pooled packed call (top-512 pools, about 21 mean unit tiles) keeps the tiny defaults: the class
+    # rule's larger sample would cover its whole units; sm_100a / sm_103a sample the tiny default count under theirs
+    pooled = plan(10624, 43824, 16, top_k=512, ratio=4)
+    assert policy.mean_unit_tiles(10624, 43824, 16, 4) <= class_rule[0]
+    assert sampling(pooled) == (
+        policy.sample_tiles_tiny_units,
+        policy.sample_shift_for(512),
+    )
+    for other in ("sm_100a", "sm_103a"):
+        assert (
+            policy_for(other).sample_class_rule[0]
+            == policy_for(other).sample_tiles_tiny_units
+        )
+    for top_k in (256, 2048, 4096):
+        doc = plan(16384, 270336, 2, top_k=top_k)
+        assert doc.physical_kind in long_rule[0], top_k
+        assert sampling(doc) == (policy.sample_tiles_max, long_rule[1]), top_k
+    wide = plan(4096, 131072, 1)
+    assert wide.physical_kind not in long_rule[0]
+    assert sampling(wide) == (policy.sample_tiles_max, policy.sample_shift_for(2048))
+    assert sampling(plan(16384, 270336, 2, sample_tiles_max=16)) == (16, long_rule[1])
+    assert sampling(plan(16384, 270336, 2, sample_shift_permille=100)) == (
+        policy.sample_tiles_max,
+        100,
+    )
+    assert plan(16384, 270336, 2, sample_tiles_max=0).sample_tiles_max == 0
+    assert plan(17536, 289344, 22, sample_tiles_max=0).sample_tiles_max == 0
+
+
 def test_far_sample_knob_is_validated_on_the_host():
     """``far_sample`` is ``0`` or ``1`` and defaults to the architecture's record; the check reads no device."""
     if not cake_jit.PROGRAM_KEYS:
@@ -4439,7 +4497,9 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
     )
     runner = _prepare(inputs)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
     # the scan binding zeroes nothing: the device's one empty region, no per-call view
@@ -4493,7 +4553,9 @@ def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
     """A runner on the caller-owned ``workspace`` (skips where its program has no ticket tail)."""
     runner = _prepare(inputs, workspace_buffer=workspace)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runner._tail_shared
     # the scan binding zeroes the tail right before every scan launch; nothing on a static call
     zero_region = _scan_zero_region(runner)
@@ -4636,7 +4698,9 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         assert not host_memsets and runner._ticket_restore is None
         return
     if runners[-1].ticket_tail is None:
-        pytest.skip("no ticket tail for this program (static_scan_kinds)")
+        pytest.skip(
+            "no ticket tail for this program (a static_scan_kinds program, or one drawing from its TicketWord block)"
+        )
     assert runners[-1]._tail_shared and not host_memsets  # the scan binding zeroes it
     assert not runners[-1]._tail_static  # the call draws tickets
     runner = runners[-1]
@@ -4693,10 +4757,11 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
 
 
 def test_static_scan_kind_runner_has_no_ticket_tail_and_stays_exact_on_a_poisoned_workspace():
-    """A program of the record's ``static_scan_kinds`` (sm_107a: the l6 and CTA-pair l6 programs) keeps the static
-    enumeration on every call, also where the call's units exceed the grid: its runner gets no ticket tail (no memset
-    at prepare or run) and its rows stay bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on
-    the same architecture keeps its tail."""
+    """A program of the record's ``static_scan_kinds`` keeps the static enumeration on every call, also where the
+    call's units exceed the grid: its runner gets no ticket tail (no memset at prepare or run) and its rows stay
+    bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on the same architecture keeps its tail.
+    No BF16 record names a static kind now, so this skips; the FP8 form's static programs (sm_107a) are covered by
+    ``test_fp8_ticket_decision_is_per_form_and_exact_on_a_poisoned_workspace``."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     arch = arch_for(device)
@@ -5220,7 +5285,8 @@ def test_empty_rows_and_no_keys_are_all_padding():
 
 def test_persistent_rank_finalize_follows_the_architecture_cap():
     """Lever FRP-K (round 39): the persistent two-row pipelined rank finalize serves the staged bulk slab calls up to the
-    architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x SMs)`` CTAs; every
+    architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x (SMs -
+    rank_persist_spare_sms))`` CTAs; every
     other architecture and every larger top_k keeps the one-row program (one CTA per row)."""
     for arch in cake_jit.ARCHES:
         policy = policy_for(arch)
@@ -5248,13 +5314,18 @@ def test_persistent_rank_finalize_follows_the_architecture_cap():
             )
             if expected:
                 assert choice.rank_persist_ctas == policy.rank_persist_ctas_per_sm
+                assert choice.rank_persist_spare == policy.rank_persist_spare_sms
                 assert finalize_grid(choice, 148) == min(
-                    8192, policy.rank_persist_ctas_per_sm * 148
+                    8192,
+                    policy.rank_persist_ctas_per_sm
+                    * (148 - policy.rank_persist_spare_sms),
                 )
                 assert finalize_grid(choice, 10_000) == 8192
             else:
                 assert (
-                    choice.rank_persist_ctas == 0 and finalize_grid(choice, 148) == 8192
+                    choice.rank_persist_ctas == 0
+                    and choice.rank_persist_spare == 0
+                    and finalize_grid(choice, 148) == 8192
                 )
             assert choice.finalize_key in cake_jit.PROGRAM_KEYS[arch], (
                 arch,
@@ -5310,6 +5381,45 @@ _MERGE_RANK_CALLS = (
     (64, 16384, 1),
     (128, 32768, 2),
 )
+
+
+def test_persistent_rank_grid_spares_sms_for_another_stream():
+    """#7548: where the record spares SMs (sm_107a: one), the persistent rank grid of a call with enough rows is
+    ``rank_persist_ctas_per_sm x (SMs - spare)``, a multiple of the SMs that remain.  The :persist programs run 256 threads
+    per CTA, so a 1024-thread SM107 SM holds 4 of them at a time; with ``rank_persist_ctas_per_sm`` a multiple of 4, a block
+    of another stream on the spare SM leaves the static row walk whole waves of the other SMs instead of a short extra
+    wave."""
+    assert policy_for("sm_107a").rank_persist_spare_sms == 1
+    for arch in cake_jit.ARCHES:
+        policy = policy_for(arch)
+        if policy.rank_persist_max_k <= 0:
+            assert policy.rank_persist_spare_sms == 0, arch
+            continue
+        for sms in (148, 212):
+            choice = select_program(
+                policy,
+                num_queries=8192,
+                num_keys=8192,
+                num_segments=1,
+                ratio=1,
+                top_k=2048,
+                grid=sms,
+            )
+            assert choice.rank_persistent, (arch, sms)
+            spare = policy.rank_persist_spare_sms
+            grid = finalize_grid(choice, sms)
+            assert grid == policy.rank_persist_ctas_per_sm * (sms - spare), (arch, sms)
+            assert grid < policy.rank_persist_ctas_per_sm * sms, (arch, sms)
+            # CTAs one 1024-thread SM107 SM holds at a time divide the CTAs per SM: whole waves
+            assert choice.rank_threads == 256, (arch, choice.finalize_key)
+            assert (
+                policy.rank_persist_ctas_per_sm % (1024 // choice.rank_threads) == 0
+            ), arch
+        # a device of no more SMs than the spare count keeps one SM's grid
+        assert (
+            finalize_grid(choice, policy.rank_persist_spare_sms)
+            == policy.rank_persist_ctas_per_sm
+        )
 
 
 def test_merge_rank_fuses_the_slab_rank_finalize_into_split_merges():
@@ -5579,13 +5689,13 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
 
 def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
     """Every architecture is a ticket architecture; a record's ``static_scan_kinds`` names the physical scan kinds whose
-    programs keep the static enumeration there (sm_107a: the l6 and CTA-pair l6 programs), each a kind the
+    programs keep the static enumeration there (no BF16 record names one; sm_107a's FP8 record does), each a kind the
     architecture registers, and a kind with an ``:lsf`` copy is never static (the copy reorders ticket draws)."""
     assert tuple(cake_jit.POLICY) == cake_jit.TICKET_TAIL_ARCHES
     assert {arch: policy_for(arch).static_scan_kinds for arch in cake_jit.POLICY} == {
         "sm_100a": [],
         "sm_103a": [],
-        "sm_107a": ["l6", "pair_l6"],
+        "sm_107a": [],
     }
     # prepare decides a call's tail from this per-architecture set (made once per process)
     for arch in cake_jit.POLICY:

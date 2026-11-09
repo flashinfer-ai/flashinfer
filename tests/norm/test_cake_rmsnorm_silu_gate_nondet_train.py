@@ -53,8 +53,8 @@ package's FP32 workspace is refused naming both modes' workspaces.
 This suite exercises the package alone, named once through
 ``tests.test_helpers.cake_package`` (so a vendored copy runs it unchanged), and
 imports nothing else from flashinfer.  The comparisons against the
-deterministic package (``y``, ``dx`` and ``dz`` bitwise, ``dw`` within the
-budget of the deterministic ``dw``), the facade, the ``flashinfer`` top level
+deterministic package (``dw`` within the budget of the deterministic ``dw``;
+``y``, ``dx`` and ``dz`` there held to FP64), the facade, the ``flashinfer`` top level
 and the facade's interplay with ``torch.use_deterministic_algorithms`` are
 ``test_cake_rmsnorm_silu_gate_nondet_train_api.py``'s.
 """
@@ -876,8 +876,8 @@ def test_captured_calls_without_capture_ids_take_one_workspace_each(
 
 def test_capture_with_no_ready_workspace_fills_in_the_graph(monkeypatch):
     """With no ready reserve workspace a captured backward without a caller
-    workspace zero-fills one from the graph's pool inside the graph (a fill
-    kernel before the backward kernel) and stays correct."""
+    workspace zero-fills one from the graph's pool inside the graph (a memset
+    or fill kernel before the backward kernel) and stays correct."""
     monkeypatch.setattr(pkg, "_RESERVES", {})
     monkeypatch.setattr(pkg, "_CAPTURE_WORKSPACES", {})
     monkeypatch.setattr(pkg, "_RESERVE_SIZE", 0)
@@ -890,7 +890,7 @@ def test_capture_with_no_ready_workspace_fills_in_the_graph(monkeypatch):
     with torch.cuda.graph(graph):
         dx, dz, dw = backward(dy, x, z, w, EPS)
     types = _graph_node_types(graph)
-    assert types == ["KERNEL", "KERNEL"], types
+    assert types in (["MEMSET", "KERNEL"], ["KERNEL", "KERNEL"]), types
     for k in range(3):
         graph.replay()
         torch.cuda.synchronize()

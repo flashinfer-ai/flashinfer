@@ -125,6 +125,22 @@ def _zero_weight_split_at_every_size():
         cake_backend.set_zero_weight_min_rows(previous)
 
 
+# A zero-weight floor above every call's row count: the split never applies
+NO_SPLIT = 1 << 62
+
+
+@contextlib.contextmanager
+def _det_unsplit():
+    """Run the deterministic package without its own zero-weight split (its floor raised past every call,
+    ``det_backend.set_zero_weight_min_rows``), then restore its previous floor: its plain path, every valid row in the
+    chunk loop."""
+    previous = det_backend.set_zero_weight_min_rows(NO_SPLIT)
+    try:
+        yield
+    finally:
+        det_backend.set_zero_weight_min_rows(previous)
+
+
 @contextlib.contextmanager
 def _slice_policy(policy: str):
     """Run under the dX slice rule's ``policy`` (:func:`cake_backend.set_dx_slice_policy`), then restore the previous."""
@@ -2884,14 +2900,15 @@ def _loss_call(
     return_logp=True,
     train_x=True,
     train_w=True,
+    module=None,
     **kw,
 ):
-    """One autograd loss call (forward + backward) of ``package``; returns loss / logp (``None`` without
-    ``return_logp``) / dX / dW."""
+    """One autograd loss call (forward + backward) of ``package`` (``module``: this package's opt-in module for its
+    keywords); returns loss / logp (``None`` without ``return_logp``) / dX / dW."""
     X = inp.X.detach().requires_grad_(train_x)
     W = inp.W.detach().requires_grad_(train_w)
     if package == "nd":
-        fn = cake_backend.cake_lm_head_nondet_train_loss
+        fn = (cake_backend if module is None else module).cake_lm_head_nondet_train_loss
     else:
         fn = det_backend.cake_lm_head_det_train_loss
     out = fn(
@@ -3222,8 +3239,8 @@ def test_device_zero_weight_rows_checkpoint_accumulation_retained_graph(glm_weig
 
 def test_device_zero_weight_rows_do_not_propagate_non_finite_values(glm_weight):
     """An ``inf`` ``X`` row and a NaN ``infer_logp`` in zero-weight rows leave ``loss`` / ``dX`` / ``dW`` finite and
-    equal to the clean call's (the deterministic package gives a non-finite ``dW``); a NaN weight keeps its row in
-    the gradient path (NaN loss)."""
+    equal to the clean call's (the deterministic package's plain path, without its own zero-weight split, gives a
+    non-finite ``dW``); a NaN weight keeps its row in the gradient path (NaN loss)."""
     _require_program(entry="loss")
     base = _device_inputs(4097, "policy", W=glm_weight)
     zero = _zero_weight_set(base, ("random", 0.2))
@@ -3239,7 +3256,8 @@ def test_device_zero_weight_rows_do_not_propagate_non_finite_values(glm_weight):
     for key in ("loss", "dW"):
         assert _same_bits(a[key], b[key]), key
     assert bool(torch.isfinite(b["dX"].float()).all()) and not bool(b["dX"][zero].any())
-    det = _loss_call(poisoned, 4096, package="det")
+    with _det_unsplit():
+        det = _loss_call(poisoned, 4096, package="det")
     assert not bool(torch.isfinite(det["dW"].float()).all())
     w = clean.loss_weights.clone()
     w[int((~zero & (clean.labels >= 0)).nonzero()[0])] = float("nan")
@@ -3822,6 +3840,323 @@ def test_zero_weight_split_is_not_applied_to_the_excluded_forms():
     split = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw)
     assert split.row_index.numel() == int((inp.labels >= 0).sum()) - int(zero.sum())
     torch.testing.assert_close(split.logp, flat.logp, atol=1e-5, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Calls without a gradient GEMM (``T == 0``, every row ignored, every valid row of zero weight): no FP32 ``[V, H]``
+# weight-gradient accumulator from the forward to the backward, the call's backend kept, ``dW = cast(0 * g)``
+# ---------------------------------------------------------------------------
+
+
+def _all_plus_zero(t: torch.Tensor) -> bool:
+    """Every element is ``+0`` (bit pattern zero)."""
+    return not bool(_bits(t).any())
+
+
+@contextlib.contextmanager
+def _zero_weight_floor(rows):
+    """Run under the split's floor ``rows`` (:data:`NO_SPLIT`: never), then restore the previous setting."""
+    previous = cake_backend.set_zero_weight_min_rows(rows)
+    try:
+        yield
+    finally:
+        cake_backend.set_zero_weight_min_rows(previous)
+
+
+@pytest.mark.parametrize("module_name", ["main", "opt_in"])
+def test_all_zero_weight_split_result(module_name):
+    """A split whose valid rows all have zero weight (no gradient GEMM): the result keeps the call's backend (the
+    reference backend's backward runs on any device), its ``dw_acc`` holds no FP32 ``[V, H]`` storage and the memory
+    report counts that accumulator's one FP32 element, and :meth:`ForwardResult.backward` forms ``dW`` in the output
+    dtype with the bits :func:`scale_cast` gives for a zero FP32 accumulator (``+0``; ``-0`` for a negative upstream
+    scalar, also beyond the BF16 range; NaN for a non-finite one); the autograd entry's ``dX`` / ``dW`` are ``+0``."""
+    module = cake_backend if module_name == "main" else opt_in
+    base = _host_inputs(1200, "policy")
+    inp = _with_zero_weights(base, base.labels >= 0)
+    with _zero_weight_floor(0):
+        fr = module.forward_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            objective="policy",
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=256,
+            backend="reference",
+        )
+        out = _loss_call(inp, 256, backend="reference", module=module)
+    assert "zero_weight_rows" in fr.memory and int(fr.row_index.numel()) == 0
+    assert fr.backend == "reference"
+    assert tuple(fr.dw_acc.shape) == (V_HOST, H_HOST)
+    assert fr.dw_acc.untyped_storage().nbytes() <= 4
+    assert fr.memory["accumulators"]["dW_acc"] == 4
+    assert fr.memory["accumulator_bytes"] == sum(fr.memory["accumulators"].values())
+    zero_acc = torch.zeros((V_HOST, H_HOST), dtype=torch.float32, device=DEV)
+    f32_max = torch.finfo(torch.float32).max  # finite, beyond the BF16 range
+    for g in (None, 2.0, -2.0, f32_max, -f32_max, math.inf, math.nan):
+        grad = None if g is None else torch.tensor(g, dtype=torch.float32, device=DEV)
+        dx, dw = fr.backward(grad)
+        assert dw.dtype == torch.bfloat16 and tuple(dw.shape) == (V_HOST, H_HOST)
+        ref = cake_backend.scale_cast(
+            zero_acc, grad, torch.bfloat16, backend="reference"
+        )
+        if g is None or math.isfinite(g):
+            negative = g is not None and g < 0
+            assert _same_bits(dw, ref), g
+            assert bool((dw == 0).all()), g
+            assert bool((torch.signbit(dw) == negative).all()), g
+            assert _all_plus_zero(dx)
+        else:
+            assert bool(torch.isnan(dw).all() and torch.isnan(ref).all()), g
+    _, dw32 = fr.backward(grad_weight_dtype=torch.float32)
+    assert dw32.dtype == torch.float32 and _all_plus_zero(dw32)
+    assert _all_plus_zero(out["loss"])
+    assert out["dW"].dtype == torch.bfloat16 and _all_plus_zero(out["dW"])
+    assert _all_plus_zero(out["dX"])
+
+
+@pytest.mark.parametrize("module_name", ["main", "opt_in"])
+@pytest.mark.parametrize("backend", ["reference", "cake"])
+def test_zero_row_result(module_name, backend):
+    """A call without rows (no binding, no launch): the result keeps the call's backend, its memory report counts the
+    zero ``dw_acc``'s one FP32 element (not an FP32 ``[V, H]`` buffer), and the backward's ``dW`` is the FP32 product
+    ``0 * g`` cast once (``+0``; ``-0`` for a negative ``g``, also beyond the BF16 range)."""
+    module = cake_backend if module_name == "main" else opt_in
+    W = torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16, device=DEV)
+    X0 = torch.zeros(0, H_HOST, dtype=torch.bfloat16, device=DEV)
+    labels0 = torch.zeros(0, dtype=torch.int64, device=DEV)
+    fr = module.forward_loss(
+        X0, W, labels0, objective="ce", loss_div=1.0, backend=backend
+    )
+    assert fr.backend == backend
+    assert fr.dw_acc.untyped_storage().nbytes() <= 4
+    assert fr.memory["accumulators"] == {"dX_acc": 0, "dW_acc": 4}
+    assert fr.memory["accumulator_bytes"] == 4
+    f32_max = torch.finfo(torch.float32).max
+    for g in (None, 2.0, f32_max, -f32_max):
+        grad = None if g is None else torch.tensor(g, dtype=torch.float32, device=DEV)
+        dx, dw = fr.backward(grad)
+        assert tuple(dx.shape) == (0, H_HOST) and dx.dtype == torch.bfloat16
+        assert dw.dtype == torch.bfloat16 and tuple(dw.shape) == (V_HOST, H_HOST)
+        if g is None or g > 0:
+            assert _all_plus_zero(dw), g
+        else:
+            assert bool((dw == 0).all() and torch.signbit(dw).all()), g
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("shape", [(V_HOST, H_HOST), (2, 8), (2, 6), (7, 13)])
+def test_zero_gradient_bits(shape, out_dtype):
+    """:func:`cake_backend._zero_gradient` writes the FP32 product ``0 * g`` cast once into every element -- through
+    the 16-byte view when the element count is a multiple of the copies one 16-byte element holds (8 BF16, 4 FP32),
+    element by element otherwise -- with the bits of a broadcast copy of that cast value, for finite, huge,
+    signed-zero and non-finite ``g``."""
+    acc = cake_backend._zero_accumulator(shape, DEV)
+    f32_max = torch.finfo(torch.float32).max
+    finite = (None, 1.0, -2.0, f32_max, -f32_max, 0.0, -0.0)
+    for g in finite + (math.inf, -math.inf, math.nan):
+        grad = None if g is None else torch.tensor(g, dtype=torch.float32, device=DEV)
+        dw = cake_backend._zero_gradient(acc, grad, out_dtype)
+        zero = torch.zeros((), dtype=torch.float32, device=DEV)
+        if grad is not None:
+            zero = zero * grad
+        ref = torch.empty(shape, dtype=out_dtype, device=DEV).copy_(zero.to(out_dtype))
+        assert dw.dtype == out_dtype and tuple(dw.shape) == shape and dw.is_contiguous()
+        assert _same_bits(dw, ref), (shape, out_dtype, g)
+
+
+@pytest.mark.parametrize("module_name", ["main", "opt_in"])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_empty_autograd_scales_the_zero_weight_gradient(module_name, checkpointed):
+    """A loss call without gradient rows (``T == 0``; every row ignored), plain or under a non-reentrant checkpoint:
+    the autograd backward's ``dW`` has the bits :meth:`ForwardResult.backward` gives for the same upstream scalar (the
+    FP32 product ``0 * g`` cast once: ``+0``; ``-0`` for a negative ``g``, also beyond the BF16 range; NaN for a
+    non-finite one), and ``dX`` is ``+0``.  The opt-in arm passes ``num_valid_rows=0`` so its own autograd Function
+    runs (without an opt-in keyword the call is ``cake_backend``'s)."""
+    from torch.utils.checkpoint import checkpoint
+
+    module = cake_backend if module_name == "main" else opt_in
+    extra = {} if module_name == "main" else dict(num_valid_rows=0)
+    W0 = torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16, device=DEV)
+    f32_max = torch.finfo(torch.float32).max
+    for T in (0, 37):
+        X0 = torch.zeros(T, H_HOST, dtype=torch.bfloat16, device=DEV)
+        labels = torch.full((T,), -100, dtype=torch.int64, device=DEV)
+        kw = dict(objective="ce", loss_div=1.0, backend="reference", **extra)
+        fr = module.forward_loss(X0, W0, labels, **kw)
+
+        def call(X, W):
+            return module.cake_lm_head_nondet_train_loss(X, W, labels, **kw)
+
+        for g in (2.0, -2.0, f32_max, -f32_max, math.inf, math.nan):
+            grad = torch.tensor(g, dtype=torch.float32, device=DEV)
+            X = X0.clone().requires_grad_()
+            W = W0.clone().requires_grad_()
+            loss = (
+                checkpoint(call, X, W, use_reentrant=False)
+                if checkpointed
+                else call(X, W)
+            )
+            assert loss.grad_fn._forward_cls is module.CakeLMHeadNondetLossFunction
+            loss.backward(grad)
+            _, ref = fr.backward(grad)
+            assert W.grad.dtype == ref.dtype == torch.bfloat16, (T, g)
+            if math.isfinite(g):
+                assert _same_bits(W.grad, ref), (T, g)
+                assert bool((torch.signbit(W.grad) == (g < 0)).all()), (T, g)
+            else:
+                both_nan = torch.isnan(W.grad).all() and torch.isnan(ref).all()
+                assert bool(both_nan), (T, g)
+            assert tuple(X.grad.shape) == (T, H_HOST), (T, g)
+            assert _all_plus_zero(X.grad), (T, g)
+
+
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_all_zero_weight_split_autograd_scales_the_zero_weight_gradient(checkpointed):
+    """Every valid row of zero weight under the split (a policy call, plain or under a non-reentrant checkpoint, whose
+    backward then reads the recomputation's state): the autograd backward's ``dW`` is the FP32 product ``0 * g`` cast
+    once, as :meth:`ForwardResult.backward` forms it (``-0`` for a negative ``g``, NaN for a non-finite one), and
+    ``dX`` is ``+0``."""
+    from torch.utils.checkpoint import checkpoint
+
+    base = _host_inputs(1200, "policy")
+    inp = _with_zero_weights(base, base.labels >= 0)
+    kw = dict(
+        objective="policy",
+        infer_logp=inp.infer_logp,
+        loss_weights=inp.loss_weights,
+        chunk_size=256,
+        backend="reference",
+    )
+    with _zero_weight_floor(0):
+        fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw)
+        assert "zero_weight_rows" in fr.memory and int(fr.row_index.numel()) == 0
+
+        def call(X, W):
+            return cake_backend.cake_lm_head_nondet_train_loss(X, W, inp.labels, **kw)
+
+        f32_max = torch.finfo(torch.float32).max
+        for g in (-2.0, -f32_max, math.inf):
+            grad = torch.tensor(g, dtype=torch.float32, device=DEV)
+            X = inp.X.detach().clone().requires_grad_()
+            W = inp.W.detach().clone().requires_grad_()
+            loss = (
+                checkpoint(call, X, W, use_reentrant=False)
+                if checkpointed
+                else call(X, W)
+            )
+            loss.backward(grad)
+            _, ref = fr.backward(grad)
+            if math.isfinite(g):
+                assert _same_bits(W.grad, ref), g
+                assert bool((W.grad == 0).all() and torch.signbit(W.grad).all()), g
+            else:
+                assert bool(torch.isnan(W.grad).all() and torch.isnan(ref).all()), g
+            assert _all_plus_zero(X.grad), g
+
+
+def _peaks(call):
+    """``(allocated, reserved)`` peak bytes of ``call()`` above its start, after one warm-up call (the binding is
+    remembered) with the caching allocator emptied before each measured call."""
+    call()
+    out = []
+    for _ in range(2):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        start_alloc = torch.cuda.memory_allocated()
+        start_res = torch.cuda.memory_reserved()
+        call()
+        torch.cuda.synchronize()
+        out.append(
+            (
+                torch.cuda.max_memory_allocated() - start_alloc,
+                torch.cuda.max_memory_reserved() - start_res,
+            )
+        )
+    return max(a for a, _ in out), max(r for _, r in out)
+
+
+def _cold_peaks(call, modules):
+    """``(allocated, reserved)`` peak bytes of ``call()`` above its start with every binding cache of ``modules``
+    cleared before each measured call (each call prepares its bindings), after one warm-up call."""
+    call()
+    out = []
+    for _ in range(2):
+        for mod in modules:
+            mod.BINDING_CACHE.clear()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        start_alloc = torch.cuda.memory_allocated()
+        start_res = torch.cuda.memory_reserved()
+        call()
+        torch.cuda.synchronize()
+        out.append(
+            (
+                torch.cuda.max_memory_allocated() - start_alloc,
+                torch.cuda.max_memory_reserved() - start_res,
+            )
+        )
+    return max(a for a, _ in out), max(r for _, r in out)
+
+
+def _step_call(inp, module, **kw):
+    """One forward + backward of the loss entry (``X`` and ``W`` trainable, ``return_logp``), outputs dropped."""
+
+    def call():
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        loss, logp = module.cake_lm_head_nondet_train_loss(
+            X,
+            W,
+            inp.labels,
+            objective="policy",
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=4096,
+            return_logp=True,
+            **kw,
+        )
+        loss.backward()
+        del loss, logp, X, W
+
+    return call
+
+
+@pytest.mark.parametrize(
+    "module_name, mode", [("main", None), ("opt_in", "fast"), ("opt_in", "budget")]
+)
+@pytest.mark.parametrize("cold", [False, True])
+@pytest.mark.parametrize("T", [4096, 16231])
+def test_device_all_zero_weight_peak_within_the_plain_path(
+    glm_weight, T, cold, module_name, mode
+):
+    """Every valid row of zero weight (one chunk at ``T`` 4096, several at 16231): the split launches no gradient
+    GEMM and holds no FP32 weight-gradient accumulator into the backward, so its measured step peak stays within the
+    same call's without the split -- allocated with the binding caches warm or cleared before each call, reserved
+    with them cleared (a warm call's reserved peak depends on which allocator segments the remembered bindings of
+    earlier calls leave partly used, so it is compared from the same cleared state); ``dX`` and ``dW`` are ``+0``."""
+    _require_program(entry="loss")
+    module = cake_backend if module_name == "main" else opt_in
+    base = _device_inputs(T, "policy", W=glm_weight)
+    inp = _with_zero_weights(base, base.labels >= 0)
+    kw = {} if mode is None else dict(memory_mode=mode)
+    call = _step_call(inp, module, **kw)
+    peaks = (lambda c: _cold_peaks(c, (cake_backend, opt_in))) if cold else _peaks
+    with _zero_weight_floor(0):
+        split_alloc, split_res = peaks(call)
+        out = _loss_call(inp, 4096, module=module, **kw)
+    with _zero_weight_floor(NO_SPLIT):
+        plain_alloc, plain_res = peaks(call)
+    print(
+        f"\nall-zero-weight peak {module_name}/{mode} T={T} cold={cold}: allocated split {split_alloc} "
+        f"plain {plain_alloc}; reserved split {split_res} plain {plain_res}"
+    )
+    assert _all_plus_zero(out["dX"]) and _all_plus_zero(out["dW"])
+    assert split_alloc <= plain_alloc
+    if cold:
+        assert split_res <= plain_res
 
 
 # ---------------------------------------------------------------------------
@@ -5271,8 +5606,8 @@ def test_device_red_min_rows_keeps_small_chunks_on_the_plain_store(glm_weight):
 
 def test_device_zero_weight_floor_keeps_small_calls_unsplit(glm_weight):
     """``set_zero_weight_min_rows``: a policy call below the floor keeps its zero-weight rows on the gradient path (no
-    split): ``loss`` / ``logp`` / ``dW`` are the deterministic package's bits and the zero-weight rows' ``dX`` rows are
-    zeros."""
+    split): ``loss`` / ``logp`` / ``dW`` are the bits of the deterministic package's plain path (its own zero-weight
+    split off) and the zero-weight rows' ``dX`` rows are zeros."""
     _require_program(entry="loss")
     base = _device_inputs(4097, "policy", W=glm_weight)
     zero = _zero_weight_set(base, ("random", 0.3))
@@ -5292,7 +5627,8 @@ def test_device_zero_weight_floor_keeps_small_calls_unsplit(glm_weight):
     finally:
         cake_backend.set_zero_weight_min_rows(previous)
     assert "zero_weight_rows" not in (fwd.memory or {})
-    det = _loss_call(inp, 4096, package="det")
+    with _det_unsplit():
+        det = _loss_call(inp, 4096, package="det")
     for key in ("loss", "logp", "dW"):
         assert _same_bits(nd[key], det[key]), key
     assert not bool(nd["dX"][zero].any())

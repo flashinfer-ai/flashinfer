@@ -103,6 +103,9 @@ from .cake_backend import (
     _hidden_count_pair_cell,
     _with_zero_weight_rows,
     _zero_weight_logp,
+    _is_zero_accumulator,
+    _zero_accumulator,
+    _zero_gradient,
     gradient_index,
     gradient_rows,
     zero_weight_split,
@@ -3952,11 +3955,15 @@ def _empty_forward(
     row_valid: Optional[torch.Tensor] = None,
     fuse_dw_cast: Optional[bool] = None,
     dx_finalize: Optional[bool] = None,
+    backend: str = "cake",
 ) -> ForwardResult:
     """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty).
 
     ``fuse_dw_cast`` / ``dx_finalize`` are the call's switches (``None`` = the documented default), so the memory
-    report records the form the caller asked for, as a launched call's would."""
+    report records the form the caller asked for, as a launched call's would.  ``backend``: the call's, kept on the
+    result for :meth:`ForwardResult.backward`.  The loss entry's ``dw_acc`` is a zero accumulator without ``[V, H]``
+    storage (:func:`_zero_accumulator`): the backward forms the zero weight gradient in the output dtype, and the
+    memory report counts the accumulator's one FP32 element."""
     device = X.device
     T = int(problem.num_rows)
     memory = memory_report(
@@ -3973,6 +3980,9 @@ def _empty_forward(
         fuse_dw_cast=fuse_dw_cast,
         dx_finalize=dx_finalize,
     )
+    if problem.entry == "loss" and "dW_acc" in memory["accumulators"]:
+        memory["accumulators"]["dW_acc"] = 4  # the zero accumulator's one element
+        memory["accumulator_bytes"] = sum(memory["accumulators"].values())
     zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
         return ForwardResult(
@@ -3981,12 +3991,11 @@ def _empty_forward(
             dx_acc=torch.zeros((0, problem.hidden), dtype=torch.float32, device=device)
             if need_dx
             else None,
-            dw_acc=torch.zeros(
-                (problem.vocab, problem.hidden), dtype=torch.float32, device=device
-            )
+            dw_acc=_zero_accumulator((problem.vocab, problem.hidden), device)
             if need_dw
             else None,
             memory=memory,
+            backend=backend,
             row_index=row_index,
             row_valid=row_valid,
             num_rows=T,
@@ -4191,6 +4200,7 @@ def forward_loss(
             need_dw=need_dw,
             fuse_dw_cast=fuse_dw_cast,
             dx_finalize=dx_finalize,
+            backend=backend,
         )
     fused_dx = bool(
         need_dx and _resolve_dx_finalize(dx_finalize)
@@ -4277,6 +4287,7 @@ def forward_loss(
                 row_valid=row_valid,
                 fuse_dw_cast=fuse_dw_cast,
                 dx_finalize=fused_dx,
+                backend=backend,
             ),
             zero_index,
             zero_logp,
@@ -5529,6 +5540,9 @@ def backward_loss(
             backend=backend,
             gemm_tuning=gemm_tuning,
         )
+    elif dw_acc is not None and _is_zero_accumulator(dw_acc):
+        # a call without a gradient GEMM (:func:`_empty_forward`): no FP32 accumulator to read
+        dw = _zero_gradient(dw_acc, grad, grad_weight_dtype)
     else:
         dw = (
             None
@@ -6600,12 +6614,8 @@ class CakeLMHeadNondetLossFunction(torch.autograd.Function):
             dw = (
                 None
                 if ctx.dw_acc is None
-                else torch.zeros(
-                    ctx.dw_acc.shape,
-                    dtype=ctx.grad_weight_dtype,
-                    device=ctx.dw_acc.device,
-                )
-            )
+                else _zero_gradient(ctx.dw_acc, grad_loss, ctx.grad_weight_dtype)
+            )  # cast(g * 0), as ForwardResult.backward forms it
             if not keep:
                 CakeLMHeadNondetLossFunction._release(ctx)
             return (dx, dw) + none[2:]

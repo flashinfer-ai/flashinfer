@@ -35,8 +35,25 @@ the backward stages and, without a caller `topk_length`, allocates and fills
 the binding's row-length vector) and the validation of `dkv_acc` /
 `dkv_dst_map`.  It never falls back to another package.  A
 backward without query rows launches nothing and does not alert.  The
-deterministic package `flashinfer.cake_dsa_sparse_attention_det_train` is a
-reserved name (planned) and does not exist yet.
+deterministic package `flashinfer.cake_dsa_sparse_attention_det_train` has
+the same entry points (`det` in place of `nondet`); its outputs repeat bit for
+bit run to run.
+
+Run to run, with identical inputs on the same GPU, and the error of each output
+against an FP64 reference: relative L2 / worst element over max |reference|,
+median of 5 runs at T 1024, S 8192, top-k 2048 (B200; rope form, then NoPE
+form), next to the same error of the package at FlashInfer `2e989556`:
+
+| Output | Run to run | Error vs FP64 | Error at `2e989556` |
+|---|---|---|---|
+| `out` | repeats bit for bit | 1.98e-3 / 4.28e-3; 2.01e-3 / 2.89e-3 | 1.98e-3 / 4.28e-3; 2.01e-3 / 2.89e-3 |
+| `lse` | repeats bit for bit | 8.30e-8 / 2.29e-7; 9.11e-8 / 2.10e-7 | 8.30e-8 / 2.29e-7; 9.11e-8 / 2.10e-7 |
+| the `o_lo` residual (forward) | repeats bit for bit | (internal) | (internal) |
+| `dq_latent`; the NoPE `dq` | repeats bit for bit | 1.97e-3 / 4.33e-3; 2.13e-3 / 3.24e-3 | 1.97e-3 / 4.33e-3; 2.13e-3 / 3.24e-3 |
+| `dq_rope` | repeats bit for bit | 2.35e-3 / 4.35e-3 | 2.35e-3 / 4.35e-3 |
+| `dkv_latent`; the NoPE `dkv` (fresh, or the `kv` gradient) | may vary (unordered FP32 atomic adds) | 1.65e-3 / 1.40e-3; 1.66e-3 / 1.86e-3 | 1.65e-3 / 1.40e-3; 1.66e-3 / 1.86e-3 |
+| `dk_rope` | may vary (unordered FP32 atomic adds) | 1.66e-3 / 1.93e-3 | 1.66e-3 / 1.93e-3 |
+| the rows accumulated into `dkv_acc` | may vary (unordered FP32 atomic adds) | as `dkv_latent` / `dk_rope` | as `dkv_latent` / `dk_rope` |
 
 | Before | Now |
 |---|---|
@@ -268,8 +285,18 @@ full-length `topk_length` vector it materializes when the caller passes none)
 and, per call, allocate the outputs
 and the backward scratch from the caching allocator and launch the stages
 through the generated positional launchers of `cake_launch.py`.  During
-CUDA-graph capture the eager entry points plan privately and leave the cache
-untouched.  The bindings encode the tensor maps by value, so a step is its
+CUDA-graph capture the eager entry points never store a plan in the cache;
+they reuse a cached plan only when it owns no `topk_length` vector (the call
+passes its own lengths, as the autograd entries do), since such a plan holds
+no storage, and otherwise plan privately.  A cache hit of that kind also skips
+the capture query.  The rope varlen entry decides its index route on every
+call; on the stage route its cached binding is keyed by the geometry of the
+activations, the per-document rows, both prefix sums and a caller cut, plus
+`causal` and the scale, and holds the forward plan with the stage's resolved
+entry and the launch values that follow from that geometry -- no tensor.  The
+entry launches the stage and hands the binding to the autograd function, whose
+forward launches over it without a second lookup.  The bindings encode the
+tensor maps by value, so a step is its
 kernels -- one launch for the forward; three for the single-pass backward
 (`bwd_delta`, `bwd_main`, `bwd_cast`); `2 + 2 x chunks x passes` for the
 key-range-pass backward (`bwd_delta`, then `bwd_compact` + `bwd_main_pass` per
@@ -532,6 +559,14 @@ out = cake_dsa_sparse_attention_nondet_nope_varlen(
   of the FP32 buffers the call owns and the delta / main stages then follow
   back to back, with no allocation, validation or synchronization between the
   launches.  The kernel-level `backward_nope` keeps the same launch order.
+  Forward host order: the NoPE autograd wrappers allocate and bind the
+  forward, then settle what their backward needs (its binding key without
+  `dout`, with the accumulator's geometry when the accumulator is a tensor or
+  absent; the accumulator check; the saved tensors, which PyTorch packs once
+  the forward returns), then launch, so the host work after the forward's
+  launch is the return, and an invalid `dkv_acc` tensor (with its
+  `dkv_dst_map`) is rejected before any launch; a callable's result is
+  checked in the backward.
   Every call checks the structure of the prefix sums (`validate_cu_seqlens`:
   contiguous int32 `[num_docs + 1]` of one length) and never synchronizes with
   the device; `check_cu_seqlens=True` also checks their values -- start at 0,
@@ -553,10 +588,11 @@ it replaced),
 `nope_bwd_main_natural` (own kernels, 640 threads: no rope operands, one
 accumulator `dkv_f32` with `dkv_stride >= 512`, a multiple of 4, and the
 destination map; a persistent token loop, so the host launches them through
-`nope_bwd_launch_grid(num_queries, num_kv, sm_count)`: one CTA per SM --
+`nope_bwd_launch_grid(num_queries, num_kv, sm_count, arch)`: one CTA per SM --
 `min(num_queries, SMs)`, CTA `b` taking tokens `b, b + grid, ...` of the
 launch's `num_queries` tokens (the whole row or the chunk) -- while the launch's
-FP32 `dkv` window `num_kv x 2048 B` is within 64 MiB, else one CTA per token;
+FP32 `dkv` window `num_kv x 2048 B` is within 128 MiB on SM100 / SM103 and
+64 MiB on SM107, else one CTA per token;
 the SM count is read once per device), `nope_bwd_compact` (the rope compaction kernel),
 `nope_bwd_main_pass` / `nope_bwd_main_pass_natural` (the key-range-pass forms)
 and `nope_bwd_cast` (the rope cast kernel with `rope_groups = 0`, grid
