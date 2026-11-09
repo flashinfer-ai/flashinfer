@@ -973,11 +973,15 @@ def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
     """The overlapped main program's work plan on a device of ``sms`` SMs: ``P`` lanes per tile of
     :data:`DYN_TILE` channels (as many as give every SM's CTA a lane, at most one per unit of tokens and
     :data:`DYN_MAX_LANES` lanes in all), each of ``NL`` units of ``M`` tokens, ``L`` lanes, ``n_ctas = max(L, sms)``
-    CTAs (the grid) and ``n_tiles``.  ``M`` is the multiple of 8 from :data:`DYN_UNIT` to twice it whose plan fits
-    the lanes' 16-bit claim counts at the least lane cost ``NL * M`` tokens plus ``NL`` units of
-    :data:`DYN_UNIT_COST_TENTHS` plus the tail's ``M`` tokens of :data:`DYN_TAIL_COST_TENTHS` (the smaller ``M``
-    on a tie); when none fits, ``M`` doubles from ``4 * DYN_UNIT``
-    until a plan fits.  A pure function of ``(S, C, sms)``; ``dx`` does not depend on it."""
+    CTAs (the grid) and ``n_tiles``.  Lane ``j`` of a tile starts at token ``j * NL * M``, and a CTA whose lane is
+    done takes units from the ends of the other lanes.  When the plan of :data:`DYN_UNIT` tokens leaves the last
+    lane of each tile without tokens (``ceil(S / (NL * M)) < P``), that plan is taken: the empty lanes' CTAs and the
+    spare CTAs take units from the start, and the small units balance the lanes better than larger units shorten
+    them.  Otherwise every lane is busy, the lane bound sets the time, and ``M`` is the multiple of 8 from
+    :data:`DYN_UNIT` to twice it whose plan fits the lanes' 16-bit claim counts at the least lane cost ``NL * M``
+    tokens plus ``NL`` units of :data:`DYN_UNIT_COST_TENTHS` plus the tail's ``M`` tokens of
+    :data:`DYN_TAIL_COST_TENTHS` (the smaller ``M`` on a tie); when none fits, ``M`` doubles from
+    ``4 * DYN_UNIT`` until a plan fits.  A pure function of ``(S, C, sms)``; ``dx`` does not depend on it."""
 
     S, C, sms = int(S), int(C), int(sms)
     if S < 1 or C < 1 or C > DYN_MAX_CHANNELS:
@@ -996,6 +1000,10 @@ def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
             return None
         return {"M": M, "NL": NL, "P": P, "L": L, "n_ctas": n_ctas, "n_tiles": n_tiles}
 
+    base = plan_for(DYN_UNIT)
+    if base is not None and -(-S // (base["NL"] * DYN_UNIT)) < base["P"]:
+        # measured on GB300, GB200 and VR200: with idle lanes, 64-token units beat the larger units the cost picks
+        return base
     fits = [
         p for p in map(plan_for, range(DYN_UNIT, 2 * DYN_UNIT + 1, 8)) if p is not None
     ]

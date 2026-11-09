@@ -132,13 +132,17 @@ reads no head row. The caller's stream joins the side stream before the wait.
 The buffers that the side stream fills are allocated on the caller's stream
 before the fork. The programs and their inputs are the same, so no bit changes.
 
-The main program splits each lane into units of `M` tokens. `M` is the
-multiple of 8 from 64 to 128 with the least lane cost: the lane bound
-`NL x M` tokens (`NL` units per lane) plus 3.2 tokens per unit, plus
-0.3 x `M` tokens for the last unit, which the other CTAs finish when an SM is
-busy (`kcp_jit.dyn_plan`). On a 148-SM B200 this gives 104 for one
-10240-channel tensor of 32768 tokens and 64 for 8192 channels of 16384
-tokens.
+The main program splits each lane into units of `M` tokens
+(`kcp_jit.dyn_plan`). Lane `j` starts at token `j x NL x M` (`NL` units per
+lane), and a CTA whose lane is done takes units from the ends of the other
+lanes. When 64-token units leave the last lane of each channel tile empty,
+`M` is 64: the idle CTAs take units from the start, and small units balance
+the lanes best. Otherwise every lane is busy and `M` is the multiple of 8 from
+64 to 128 with the least lane cost: the lane bound `NL x M` tokens plus 3.2
+tokens per unit, plus 0.3 x `M` tokens for the last unit, which the other CTAs
+finish when an SM is busy. One 10240-channel tensor of 32768 tokens per rank
+gets 104 on a 148-SM B200 and 64 on GB300, GB200 and VR200; 8192 channels of
+16384 tokens get 64 on all four.
 
 Under any of these conditions, the one-program backward (`kcp_bwd`) runs after the wait instead:
 
