@@ -602,11 +602,14 @@ def cake_gqa_det_train_forward(
     device_index = q.device.index
     ws = workspace if workspace is not None else default_workspace(device_index)
     scale = _scale(softmax_scale)
+    # The kernel stores ``out`` in 32-byte pieces: a caller's ``out`` off a 32-byte boundary gets an aligned buffer,
+    # copied in after the launch.
+    dst = out if out.data_ptr() % 32 == 0 else torch.empty_like(out)
     values = {
         "Q": q,
         "K": k,
         "V": v,
-        "O": out,
+        "O": dst,
         "LSE": lse,
         "cu_seqlens_q": cu_seqlens_q,
         "cu_seqlens_k": cu_seqlens_k,
@@ -619,6 +622,8 @@ def cake_gqa_det_train_forward(
     }
     with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
         _launch("fwd", values, dims, device_index)
+    if dst is not out:
+        out.copy_(dst)
     return out, lse
 
 

@@ -19,15 +19,20 @@ SM100 / SM103, and SM107 at hidden 4096): the column-slab pass folds ``dfn``,
 ``dscale`` and ``dbase`` itself, so no final reduction kernel runs.
 
 This registry is a self-contained copy of the deterministic package's registry
-(``flashinfer.experimental.cake.cake_mhc_det_train.cake_jit``): every record, route, host
-rule and table below is that registry's under the ``cake_mhc_train_`` prefix,
-except what the backward's ``bwd_finish`` route changes.  The deterministic
-column-slab records (``bwd_slab``) and final-reduction records (``bwd_reduce``)
-are absent with their selection tables and their PDL edge (``K7->K8``), and
-four programs of this package take their place:
+(``flashinfer.experimental.cake.cake_mhc_det_train.cake_jit``) at this package's
+(architecture, hidden size) pairs, 4096 on every architecture and 5120 and 7168
+on sm_100a and sm_103a: every record, route, host rule and table below is that
+registry's under the ``cake_mhc_train_`` prefix, except what the backward's
+``bwd_finish`` route changes.  The deterministic package also serves 5120 and
+7168 on sm_107a, which this package does not: a copied record keeps only the
+architectures that serve its hidden size here, a deterministic record of those
+sizes on sm_107a alone has no copy, and sm_107a has no route of them.
+The deterministic column-slab records (``bwd_slab``) and final-reduction records
+(``bwd_reduce``) are absent with their selection tables and their PDL edge
+(``K7->K8``), and four programs of this package take their place:
 
 * ``cake_mhc_train_fn_split_atomic__tv128_dep`` (sm_100a, sm_103a) and
-  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` (sm_107a): the
+  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep1`` (sm_107a): the
   deterministic transposed-layout fn split of the architecture (16-byte
   ``fnTp`` stores on 256- / 128-thread CTAs), bit for bit, which with
   ``accumulate == 0`` also zeroes the FP32 ``dfn`` output, launched after the
@@ -35,7 +40,11 @@ four programs of this package take their place:
   own dependent first and waits for the token-owner pass as its last
   instruction, so it runs beside that pass (it reads only ``fn`` and writes
   only ``fnTp`` and ``dfn``, which the token-owner pass never touches) and
-  completes only after it;
+  completes only after it.  On sm_107a (``_dep1``) only its last CTA waits:
+  the other CTAs exit after their stores, so the column-slab pass's CTAs, which
+  need a whole SM, can become resident while the token-owner pass still runs.
+  The grid completes only after its last CTA's wait, so the column-slab pass,
+  which waits for this grid, still follows the token-owner pass;
 * ``cake_mhc_train_bwd_slab_fold__dynr`` (every architecture): the
   deterministic dynamic-schedule column-slab form ``dynr`` (``dX`` bit for
   bit), which stores the compensated ``dfn`` sums of every (column slab, token
@@ -193,10 +202,10 @@ record's ``grid_per_sm``.
 
 Every record names its hidden size (``hidden``, one of :data:`HIDDEN_SIZES`).
 The hidden sizes 5120 and 7168 are the deterministic package's (libraries
-``__h<H>`` on the routes ``<kind>_h5120`` / ``<kind>_h7168``, on sm_100a and
-sm_103a; sm_107a serves 4096 only), copied under the same rule as hidden 4096:
-the deterministic ``__h<H>`` records but the backward fn split, the column slab
-and the reduction, and a ``bwd_finish`` of the deterministic token-owner
+``__h<H>`` on the routes ``<kind>_h5120`` / ``<kind>_h7168``), copied on sm_100a
+and sm_103a (this package serves sm_107a at 4096 only) under the same rule as
+hidden 4096: the deterministic ``__h<H>`` records but the backward fn split, the
+column slab and the reduction, and a ``bwd_finish`` of the deterministic token-owner
 records, the atomic fn split ``__h<H>`` and the column slab ``dynr__h<H>`` and
 ``dynr_os__h<H>``.
 Every rule takes the hidden size as its last argument and reads its tables
@@ -347,7 +356,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_train_fn_split_atomic__tv128_t128_dep": {
+    "cake_mhc_train_fn_split_atomic__tv128_t128_dep1": {
         "arches": [
             "sm_107a",
         ],
@@ -366,8 +375,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "fixed",
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_train_fn_split_atomic__tv128_t128_dep",
-        "kernel_symbol": "kernel_cake_mhc_train_fn_split_atomic__tv128_t128_dep",
+        "kernel": "cake_mhc_train_fn_split_atomic__tv128_t128_dep1",
+        "kernel_symbol": "kernel_cake_mhc_train_fn_split_atomic__tv128_t128_dep1",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -376,7 +385,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "persistent_ctas_per_sm": 1,
             "use_pdl": True,
         },
-        "library": "cake_mhc_train_fn_split_atomic__tv128_t128_dep",
+        "library": "cake_mhc_train_fn_split_atomic__tv128_t128_dep1",
         "logical": {
             "accumulate": "accumulate",
             "dfn": "dfn",
@@ -6688,10 +6697,13 @@ MODULES: dict[str, dict[str, Any]] = {
 # one column-slab record per backward call: the per-T dispatch of rounds 2-7,
 # keyed by the architecture through the routes and by the token count and the
 # device's SM count through the rules).  The routes are the deterministic
-# package's, except ``bwd_finish``: the deterministic token-owner records
+# package's at this package's (architecture, hidden size) pairs (sm_107a: the
+# 4096 routes alone; the deterministic package's 5120 and 7168 routes there have
+# no copy), except ``bwd_finish``: the deterministic token-owner records
 # (their group-row forms ``_trows_dyn`` included, on sm_100a and sm_103a at
 # hidden 4096), the atomic fn split of the architecture (launched after the
-# token-owner pass, as its programmatic dependent) and the column slab's fold
+# token-owner pass, as its programmatic dependent; on sm_107a the ``_dep1``
+# form, whose last CTA alone waits) and the column slab's fold
 # forms (``dynr`` and its slab-fastest copy ``dynr_os``: one per call by
 # ``bwd_slab_atomic_program``; no reduction record): both at hidden 4096 on
 # every architecture and at hidden 5120 and 7168 (``__h<H>``) on sm_100a and
@@ -7010,7 +7022,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_token__dot_ao8_l2l",
             "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7",
             "cake_mhc_train_bwd_token__rt64",
-            "cake_mhc_train_fn_split_atomic__tv128_t128_dep",
+            "cake_mhc_train_fn_split_atomic__tv128_t128_dep1",
             "cake_mhc_train_bwd_slab_fold__dynr",
             "cake_mhc_train_bwd_slab_fold__dynr_os",
         ],

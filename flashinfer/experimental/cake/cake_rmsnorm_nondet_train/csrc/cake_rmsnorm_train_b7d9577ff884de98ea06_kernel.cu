@@ -369,7 +369,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
                 float kx = rq * rq * rq * cq;
                 float nkx = -kx;
                 if (row4a < row_end) {
-                    unsigned long long dx_base = (unsigned long long)row4a * 256;
+                    unsigned long long dx_base = (unsigned long long)row4a * 256ull;
                     #pragma unroll
                     for (int v_6 = 0; v_6 < 1; v_6++) {
                         float out[8];
@@ -471,7 +471,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
                 float kx_0 = rq_0 * rq_0 * rq_0 * cq_0;
                 float nkx_0 = -kx_0;
                 if (row4a + 4 < row_end) {
-                    unsigned long long dx_base_1 = (unsigned long long)(row4a + 4) * 256;
+                    unsigned long long dx_base_1 = (unsigned long long)(row4a + 4) * 256ull;
                     #pragma unroll
                     for (int v_9 = 0; v_9 < 1; v_9++) {
                         float out_1[8];
@@ -573,7 +573,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
                 float kx_1 = rq_1 * rq_1 * rq_1 * cq_1;
                 float nkx_1 = -kx_1;
                 if (row4a + 8 < row_end) {
-                    unsigned long long dx_base_2 = (unsigned long long)(row4a + 8) * 256;
+                    unsigned long long dx_base_2 = (unsigned long long)(row4a + 8) * 256ull;
                     #pragma unroll
                     for (int v_12 = 0; v_12 < 1; v_12++) {
                         float out_2[8];
@@ -675,7 +675,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
                 float kx_2 = rq_3 * rq_3 * rq_3 * cq_2;
                 float nkx_2 = -kx_2;
                 if (row4a + 12 < row_end) {
-                    unsigned long long dx_base_3 = (unsigned long long)(row4a + 12) * 256;
+                    unsigned long long dx_base_3 = (unsigned long long)(row4a + 12) * 256ull;
                     #pragma unroll
                     for (int v_15 = 0; v_15 < 1; v_15++) {
                         float out_3[8];
@@ -783,7 +783,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
                 float kx_3 = rq_2 * rq_2 * rq_2 * cq_3;
                 float nkx_3 = -kx_3;
                 if (row5a < row_end) {
-                    unsigned long long dx_base_4 = (unsigned long long)row5a * 256;
+                    unsigned long long dx_base_4 = (unsigned long long)row5a * 256ull;
                     #pragma unroll
                     for (int v_18 = 0; v_18 < 1; v_18++) {
                         float out_4[8];
@@ -888,7 +888,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
                     float kx_3_1 = rq_4 * rq_4 * rq_4 * cq_3_1;
                     float nkx_3_1 = -kx_3_1;
                     if (row5a + 4 < row_end) {
-                        unsigned long long dx_base_5 = (unsigned long long)(row5a + 4) * 256;
+                        unsigned long long dx_base_5 = (unsigned long long)(row5a + 4) * 256ull;
                         #pragma unroll
                         for (int v_21 = 0; v_21 < 1; v_21++) {
                             float out_5[8];
@@ -994,7 +994,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
                     float kx_4 = rq_5 * rq_5 * rq_5 * cq_5;
                     float nkx_4 = -kx_4;
                     if (row5a + 8 < row_end) {
-                        unsigned long long dx_base_6 = (unsigned long long)(row5a + 8) * 256;
+                        unsigned long long dx_base_6 = (unsigned long long)(row5a + 8) * 256ull;
                         #pragma unroll
                         for (int v_24 = 0; v_24 < 1; v_24++) {
                             float out_6[8];
@@ -1072,7 +1072,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
                     float kx_6 = rq_6 * rq_6 * rq_6 * cq_6;
                     float nkx_5 = -kx_6;
                     if (row5a + 12 < row_end) {
-                        unsigned long long dx_base_7 = (unsigned long long)(row5a + 12) * 256;
+                        unsigned long long dx_base_7 = (unsigned long long)(row5a + 12) * 256ull;
                         #pragma unroll
                         for (int v_26 = 0; v_26 < 1; v_26++) {
                             float out_7[8];
@@ -1128,7 +1128,7 @@ kernel_cake_rmsnorm_train_b7d9577ff884de98ea06(__nv_bfloat16* __restrict__ g, __
         for (int j2 = 0; j2 < 8; j2++) {
             acc[j2] = acc[j2] - comp[j2];
         }
-        unsigned long long pbase = (unsigned long long)c * 256;
+        unsigned long long pbase = (unsigned long long)c * 256ull;
         #pragma unroll
         for (int v_27 = 0; v_27 < 1; v_27++) {
             int fcol = (v_27 * 32 + tir) * 8;

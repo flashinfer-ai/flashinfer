@@ -62,7 +62,7 @@ without.  The backend package exposes the same entry points (`cake_gqa_nondet`,
 
 | stage | kernel |
 |---|---|
-| `fwd` | O and the natural-log LSE `[H_q, T_q]`: a CTA pair per 256 query rows of one (segment, query head), persistent tile tickets from a self-resetting counter |
+| `fwd` | O and the natural-log LSE `[H_q, T_q]`: a CTA pair per 128 query rows of two query heads of one key head, persistent tile tickets from a self-resetting counter |
 | `bwd_pre` | `dPsum = sum(O * dO)`, `LSE * log2(e)` and the zeroed FP32 dQ accumulator, two query heads per scratch head |
 | `bwd_plan` | one CTA: the workspace tile numbering and the dQ work order from `cu_seqlens_q` / `cu_seqlens_k` (PyTorch ops instead past 16384 pairs of 128 query rows) |
 | `bwd_main_fp32` / `bwd_main_bf16` | per workspace chunk: a CTA pair per 128 keys of one (segment, key head), looping the key head's query heads two at a time: S^T, dP^T, dK and dV (summed in FP32 in tensor memory, stored once as FP32 window gradients or as BF16), dS^T stored to the workspace |

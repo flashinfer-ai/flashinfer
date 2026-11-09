@@ -17,6 +17,7 @@ from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
     supported_nk,
 )
 from flashinfer.jit.gemm.cake_batch_deepgemm_fp8 import (
+    _SM100A_SM103A_MMSETUP_TWINS,
     _SM107A_CELLS,
     _SM107A_MMSETUP_TWINS,
     _TABLE,
@@ -770,6 +771,58 @@ def test_sm107a_mmsetup_twins_match_reference(expected_m, route):
         a, b, a_scale, b_scale, masked_m, expected_m
     )
     assert prepared.route == route, prepared.route
+    out = prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(
+        out, _reference(a, b, a_scale, b_scale, masked_m), masked_m
+    )
+    del a, b, out
+    torch.cuda.empty_cache()
+
+
+_BN192 = "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9"
+_N512_BN192 = "seed_n512_k128__b9_mbn192"
+_N512_BN128 = "seed_n512_k128__b9_bn128"
+_N512_PROGRAM = "cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7"
+
+
+def test_sm100a_sm103a_mmsetup_twin_takes_n512_k128_keys_of_at_least_64_groups():
+    """On SM100a and SM103a an N=512 K=128 key with at least 64 groups whose
+    route picks the BLOCK_N 192 program runs its masked_m setup twin under the
+    route's name with ``_mmsetup`` appended; fewer groups and the keys of other
+    programs keep their route."""
+    assert list(_SM100A_SM103A_MMSETUP_TWINS) == [_BN192]
+    twin, b_min, b_max = _SM100A_SM103A_MMSETUP_TWINS[_BN192]
+    assert (b_min, b_max) == (64, None) and twin != _BN192
+    assert PROGRAMS[twin]["arches"] == ["sm_100a", "sm_103a"]
+    for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+        for groups, m, expected_m, route, program, twinned in (
+            (64, 2048, 1000, _N512_BN192, _BN192, True),
+            (256, 4096, 3067, _N512_BN192, _BN192, True),
+            (48, 2048, 1000, _N512_BN192, _BN192, False),
+            (64, 1024, 1000, _N512_BN128, _N512_PROGRAM, False),
+        ):
+            plan = select_route(arch, sm_count, groups, m, 512, 128, expected_m)
+            want = (f"{route}_mmsetup", twin) if twinned else (route, program)
+            assert (plan.route, plan.stages[0].program) == want, (arch, groups, m)
+            assert len(plan.stages) == 1 and arch in PROGRAMS[want[1]]["arches"]
+
+
+def test_sm100a_sm103a_mmsetup_twin_matches_reference():
+    """The SM100a / SM103a masked_m setup twin, with an empty group and a full one,
+    matches the reference."""
+    if _arch() not in ("sm_100a", "sm_103a"):
+        pytest.skip("the masked_m setup twin runs on SM100a and SM103a")
+    device = torch.device("cuda")
+    groups, m, n, k, expected_m = 64, 2048, 512, 128, 1000
+    masked = [expected_m] * (groups - 2) + [0, m]
+    a, b, a_scale, b_scale, masked_m, _ = _make_inputs(
+        groups, m, n, k, seed=1356, device=device, masked=masked
+    )
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, b, a_scale, b_scale, masked_m, expected_m
+    )
+    assert prepared.route == f"{_N512_BN192}_mmsetup", prepared.route
     out = prepared.launch()
     torch.cuda.synchronize()
     _assert_valid_rows_close(

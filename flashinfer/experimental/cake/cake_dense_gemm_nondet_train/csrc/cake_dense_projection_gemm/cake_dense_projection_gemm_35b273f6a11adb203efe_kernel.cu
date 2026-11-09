@@ -364,8 +364,13 @@ kernel_cake_dense_projection_gemm_35b273f6a11adb203efe(const __grid_constant__ C
                             mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((k_block_m == k_begin_1) ? 1 : 0);
+#if __CUDA_ARCH__ == 1070
+                            int a_lo = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_stage) * 2048;
+                            int b_lo = ((((smem_b_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_stage) * 2048;
+#else
                             int a_lo = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_stage) * 2048;
                             int b_lo = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_stage) * 2048;
+#endif
                             uint32_t _elected_0 = elect_sync();
                             asm volatile(
                     "{\n\t"

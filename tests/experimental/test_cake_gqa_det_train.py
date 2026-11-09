@@ -1040,6 +1040,36 @@ def test_matches_the_fp64_reference(layout, form, device) -> None:
     _assert_matches_reference(f"{name} {form}", x, form, got, ref, dst_init, row_map)
 
 
+@pytest.mark.parametrize(
+    "h_q, h_kv", ((24, 4), (4, 2), (8, 1)), ids=("group_6", "group_2", "group_8")
+)
+def test_the_forward_of_every_group_matches_the_reference(h_q, h_kv, device) -> None:
+    """Forward tiles of two query heads of one key head match the FP64 reference for several groups and repeat bit
+    for bit, also into a caller's ``out`` 16 bytes past a 32-byte boundary."""
+    q_lens, k_lens = (77, 300, 1, 129, 0, 40), (77, 700, 1000, 129, 50, 0)
+    x = _inputs(q_lens, k_lens, h_q, h_kv, device)
+    ref = _reference(x)
+    args = (x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"])
+    out, lse = cake_backend.cake_gqa_det_train_forward(*args)
+    again, lse_again = cake_backend.cake_gqa_det_train_forward(*args)
+    buf = torch.empty(out.numel() + 8, dtype=torch.bfloat16, device=device)
+    off = buf[8:].view(out.shape)
+    assert off.data_ptr() % 32 == 16
+    off_lse = torch.empty_like(lse)
+    cake_backend.cake_gqa_det_train_forward(*args, out=off, lse=off_lse)
+    torch.cuda.synchronize()
+    for t, got in (("out", out), ("lse", lse)):
+        e = _rel_l2(got, ref[t])
+        assert e <= BUDGET * FA4_REL_L2[t], f"{t} rel-L2 {e:.3e}"
+    no_key = _no_key_rows(x)
+    assert torch.equal(out[no_key], torch.zeros_like(out[no_key]))
+    assert bool((lse[:, no_key] == -math.inf).all())
+    _assert_same_bits(again, out, "out")
+    _assert_same_bits(lse_again, lse, "lse")
+    _assert_same_bits(off, out, "out off a 32-byte boundary")
+    _assert_same_bits(off_lse, lse, "lse beside it")
+
+
 @pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
 def test_every_output_repeats_bit_for_bit(layout, device) -> None:
     """``REPEATS`` runs of every form, through the per-stream default workspace, a reused workspace and fresh ones,

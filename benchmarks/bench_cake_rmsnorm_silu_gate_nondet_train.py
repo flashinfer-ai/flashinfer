@@ -14,13 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake SiLU-gated RMSNorm training kernels
-(``RMSNorm(x) * w * SiLU(z)`` over ``[T, H, 128]``) with the opt-in
-non-deterministic weight gradient (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``:
-one backward kernel whose last CTA finishes the FP64 weight-gradient sum)
-against the deterministic package
+(``RMSNorm(x) * w * SiLU(z)`` over ``[T, H, 128]``) of the non-deterministic
+package (``flashinfer.cake_rmsnorm_silu_gate_nondet_train``: a forward with
+approximate FP32 intrinsics, and one backward kernel whose CTAs add the
+weight-gradient partials exactly as 64-bit integer windows, the last CTA
+rounding the sum once, or, for a BF16 weight gradient in its fused band, run
+the deterministic package's fused backward's schedule and row arithmetic and
+add FP32 runs of rows to FP64 accumulators with atomics, and past that band
+run its copy of the deterministic package's backward) against the
+deterministic package
 (``flashinfer.cake_rmsnorm_silu_gate_det_train``: its one-kernel backward with
-the exact fixed-point weight-gradient sum), each called through its own entry
-points.
+the exact fixed-point weight-gradient sum), each called through its own public
+entry points.
 
 Every row times, for both modes, on identical generated inputs:
 
@@ -32,6 +37,27 @@ Every row times, for both modes, on identical generated inputs:
   ``torch.utils.checkpoint(cake_rmsnorm_silu_gate_nondet, ..., use_reentrant=False)``
   then the backward (which replays the forward): ``2 * fwd + bwd`` measured.
 
+Each package picks its kernels from the rows and the SM count.  The
+non-deterministic forward of packed rows (the benchmark's inputs) runs its tiny
+forward up to 38 rows per SM on SM100, 36 on SM103 and 65 on SM107 and past
+that its mid, long, extra-long or pipelined forward (its copy of the
+deterministic forward) by bands of rows per SM (``cake_jit.FORWARD_BANDS``).
+Its backward runs one cluster of 16 CTAs for few rows, else one kernel by bands
+of rows per SM (``cake_jit.BACKWARD_BANDS``).  A BF16 weight gradient (the one
+timed here) runs the short backward (one cluster, a fixed-order sum) up to 256
+rows and, on SM100 and SM107, the exact tiny backward (one cluster, the bits of
+the deterministic pair at FlashInfer 2e989556) up to 512 rows.  Past that, on
+SM100 and SM103, it runs the fused backward (256-thread CTAs of 16-row blocks,
+at most 4 per SM) up to 1000 rows per SM and the repeatable backward (its copy
+of the deterministic package's backward, the same grid; its ``dw`` repeats its
+bits) past it; on SM107 the repeatable backward up to 64 rows per SM, the
+fused backward up to 256 and the repeatable backward past it.
+An FP32 weight gradient runs the exact tiny backward up to 512 rows, the
+static backward up to 256 rows per SM on SM100 and SM103 (64 on SM107) and the
+claimed backward past that.  At ``--heads 48`` the default token counts reach
+every forward kernel of packed rows and every BF16 backward kernel that a band
+of a 148-SM B200 runs (2048 tokens: the extra-long forward).
+
 Timing uses CUPTI kernel activity with a cold L2
 (``flashinfer.testing.bench_gpu_time(enable_cupti=True)``); each stage reports
 the median and, as its variation, the samples' minimum, maximum and coefficient
@@ -40,11 +66,18 @@ non-deterministic one.  Memory columns report the bytes autograd keeps for the b
 (``saved``, retained between forward and backward), the peak allocation of one
 autograd forward plus backward beyond the inputs (``peak``, outputs included),
 the backward's temporary allocation with preallocated outputs and no caller
-workspace (``temp``) and the caller workspace of each mode (``workspace``).
-Output columns check the non-deterministic results against the deterministic
-ones: ``y`` bitwise, ``dx``, ``dz`` and ``dw`` as the largest distance in BF16
-units in the last place, and the number of distinct ``dw`` bit patterns over
-``--repeats`` backward calls.
+workspace (``temp``; the zero-filled ``torch.uint8`` workspaces that
+non-deterministic calls without a caller workspace keep, one per device,
+stream and kernel that takes one and a reserve per device, come from the calls before it) and
+the caller workspace of each mode (``workspace``: the non-deterministic one
+29192 bytes on SM100 and SM103 and 36360 on SM107, whatever the rows).  Output columns check the non-deterministic
+results against the deterministic ones: ``y`` bitwise (the non-deterministic
+forward's approximate intrinsics need not give the deterministic ``y`` bits),
+``dx``, ``dz`` and ``dw`` as the largest distance in BF16 units in the last
+place, and the number of distinct ``dw`` bit patterns over ``--repeats``
+backward calls (1 for the deterministic package; 1 for the non-deterministic
+package too, except in its fused band, where the BF16 ``dw``'s last bits may
+vary from run to run, so the count may exceed 1).
 
 Example::
 
@@ -88,7 +121,16 @@ API = {
 MODES = tuple(API)
 STAGES = ("fwd", "bwd", "ckpt")
 # The issue's token counts and a spread around them, then small and irregular ones.
-TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 7, 129, 1031, 4097)
+# The BF16 backward each reaches at 48 heads (``cake_jit.BACKWARD_BANDS``):
+# - 148-SM B200 (sm_100a): 1 and 5 tokens the short backward; 7 the exact tiny
+#   backward; 16 to 2048 the fused backward; 4097 and more the repeatable
+#   backward.
+# - 152-SM GB300 (sm_103a): 1 and 5 tokens the short backward; 7 to 2048 the
+#   fused backward; 4097 and more the repeatable backward.
+# - 212-SM R200 (sm_107a): 1 and 5 tokens the short backward; 7 the exact tiny
+#   backward; 16 and 129 the repeatable backward; 1031 the fused backward;
+#   2048 and more the repeatable backward.
+TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 2048, 4097)
 
 
 def _stats(fn: Callable[[], object]) -> dict:
@@ -301,7 +343,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             "cake_rmsnorm_silu_gate_nondet_train or "
             "cake_rmsnorm_silu_gate_det_train has no exported route on this device"
         )
-    torch.use_deterministic_algorithms(False)
     props = torch.cuda.get_device_properties(device)
     print(
         f"# {props.name}, sm_{props.major}{props.minor}, {props.multi_processor_count} SMs, "

@@ -212,6 +212,14 @@ def _run_rank(
     yd = det_kcp.cake_causal_conv1d_det_kcp(xd, wd, ctx)
     yd.backward(dy)
     det = {"y": yd.detach(), "dx": xd.grad, "dw": wd.grad}
+    # The first nondet call of the context runs the rank-agreement check of #8946 (one all_gather_into_tensor per
+    # phase, before that phase's exchange); every later call issues only the halo exchanges.
+    _, c_first = run("direct")
+    flags["agreement_check_once_per_phase"] = c_first["calls"] == {
+        "orig": 2,
+        "recompute": 0,
+        "bwd": 2,
+    }
     direct, c_direct = run("direct")
     plain, c_plain = run("ckpt")
     hd = conv_kcp.CakeCausalConv1dNondetKcpRecomputeHandle()
@@ -367,6 +375,25 @@ def _run_rank(
     # These rows are tiny: one more wave of CTAs beside the SM that the side kernel
     # holds can exceed 2x alone (about 0.1 ms) without a stall.
     flags["side_kernel_no_stall"] = busy <= max(2.0 * alone, 0.5 * sleep)
+    # Rank agreement (#8946): on a fresh context of the same partition, rank 0 calls with C channels and every other
+    # rank with C + 8.  The first forward's check raises the same ValueError on every rank, before any exchange; a
+    # matching call on that context then runs (the failed check recorded nothing).
+    ctx2 = plan.cake_kda_det_train_kcp_build_context(
+        part, group, rank, device, conv_kernel_size=WIDTH
+    )
+    C2 = C if rank == 0 else C + 8
+    x2 = torch.zeros(x.shape[0], C2, dtype=torch.bfloat16, device=device)
+    w2 = torch.zeros(C2, WIDTH, dtype=torch.float32, device=device)
+    try:
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(x2, w2, ctx2)
+        flags["agreement_mismatch_raises"] = False
+    except ValueError as exc:
+        flags["agreement_mismatch_raises"] = "rank agreement" in str(exc)
+        info["agreement_error"] = str(exc)[:300]
+    y2, _ = conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(
+        x2[:, :C].contiguous(), w2[:C].contiguous(), ctx2
+    )
+    flags["agreement_matching_call_runs"] = bool(torch.all(y2 == 0))
     flag_list = [None] * W
     info_list = [None] * W
     dist.all_gather_object(flag_list, flags)
