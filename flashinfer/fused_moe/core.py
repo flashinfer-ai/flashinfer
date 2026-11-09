@@ -2121,7 +2121,25 @@ def _enabled_trtllm_da_config() -> Optional["TrtllmDaConfig"]:
 
 def get_trtllm_moe_sm100_module():
     device = torch.device("cuda", torch.cuda.current_device())
-    enable_rubin = get_compute_capability(device) == (10, 7)
+    major, minor = get_compute_capability(device)
+    if major < 10:
+        # Every trtllm-gen MoE entry point comes through here, and
+        # is_trtllm_moe_supported has returned False for arch[0] < 10 since it
+        # was added without anything acting on it. Without this check the
+        # module is still requested, its JIT flags are built from
+        # supported_major_versions=[10, 12] (jit/fused_moe.py), the filter
+        # leaves nothing for this device, and the user gets
+        # "No supported CUDA architectures found for major versions [10, 12]"
+        # from CompilationContext -- a message that names neither this module
+        # nor trtllm-gen. SM120/SM121 compile here but have no trtllm-gen MoE
+        # cubins yet, which is a different gap (see _TRTLLM_ROUTED_ARCHS above)
+        # and this check says nothing about it.
+        raise ValueError(
+            f"trtllm-gen MoE requires an SM100-family GPU (SM100/SM103, plus "
+            f"SM107 on the Rubin cubin build); this device is SM{major}{minor}. "
+            "Use cutlass_fused_moe for a MoE path built for this architecture."
+        )
+    enable_rubin = (major, minor) == (10, 7)
     return _get_trtllm_moe_sm100_module_impl(enable_rubin)
 
 
