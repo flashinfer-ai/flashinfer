@@ -697,6 +697,7 @@ def test_prefill_workspace_reset_clears_preparation_history(monkeypatch, paged):
         else BatchPrefillWithRaggedKVCacheWrapper
     )
     wrapper = cls.__new__(cls)
+    wrapper._batch_invariant = None  # __init__ default without batch_invariant=True
     wrapper._cudnn_prepared = object()
     wrapper._cudnn_prepared_cache = [object(), object()]
     empty = torch.empty
