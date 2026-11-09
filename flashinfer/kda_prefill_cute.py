@@ -361,7 +361,6 @@ def _run_cute_dsl_kda_prefill(
     checkpoint_every_n_tokens: int,
     state_indices: Optional[torch.Tensor] = None,
     checkpoint_state_indices: Optional[torch.Tensor] = None,
-    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -459,10 +458,6 @@ def _run_cute_dsl_kda_prefill(
                 "during CUDA graph capture"
             )
         cu_seqlens = cu_seqlens.to(torch.int64)
-    if cu_seqlens is not None and cu_seqlens_cpu is not None:
-        from .kda_kernels.kda_chunked_bt16 import _record_cu_seqlens_contents
-
-        _record_cu_seqlens_contents(cu_seqlens, cu_seqlens_cpu)
 
     compiled = _get_compiled_cute_dsl_kda(
         lower_bound=float(lower_bound),
