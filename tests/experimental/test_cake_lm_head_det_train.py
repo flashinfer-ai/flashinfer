@@ -13686,8 +13686,8 @@ def test_temperature_selective_checkpoint_runs_outside_the_dispatch_modes(
     """The temperature entry under selective activation checkpointing runs its forward with every torch dispatch
     mode popped in both passes (the checkpointed forward and the recomputation), as the other det entries, and gives
     the uncheckpointed step's ``logp`` / ``dX`` / ``dW`` bits (a per-token temperature).  ``opt_in``: the opt-in
-    module's autograd function (the entry with a count).  Under the gradient placement ``"auto"`` the main module's
-    recomputation takes the checkpointed call's row results (no forward); ``"forward"`` runs it in both passes."""
+    module's autograd function (the entry with a count).  Under the gradient placement ``"auto"`` the recomputation
+    takes the checkpointed call's row results (no forward), in both modules; ``"forward"`` runs it in both passes."""
     inp = _host_inputs(65, ignore_frac=0.1, temperature="hetero")
     mod = cake_backend if module == "backend" else opt_in
     kw = (
@@ -13729,8 +13729,7 @@ def test_temperature_selective_checkpoint_runs_outside_the_dispatch_modes(
         logps.clear()
         with _placement(placement):
             run = step(kind)
-        taken = module == "backend" and placement == "auto"
-        assert stacks == ([0] if taken else [0, 0]), (placement, stacks)
+        assert stacks == ([0] if placement == "auto" else [0, 0]), (placement, stacks)
         for name, a, b in zip(("logp", "dX", "dW"), run, plain, strict=True):
             assert torch.equal(a, b), (placement, name)
     gc.collect()
