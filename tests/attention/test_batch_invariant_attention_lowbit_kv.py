@@ -44,10 +44,12 @@ class LowbitProblem:
 
     def __init__(self, pr: Problem, dtype, scale_jitter: float = 1.0):
         self.pr, self.dtype = pr, dtype
-        self.k_scale = (
+        # binary32 scale values (as a serving engine's fp32 scale tensors hold them): a Python float that is a binary32 value and a
+        # 1-element fp32 tensor are then the same input of the class
+        self.k_scale = spec.to_f32(
             pr.k_nhd.float().abs().amax().item() / FP8_MAX[dtype] * scale_jitter
         )
-        self.v_scale = (
+        self.v_scale = spec.to_f32(
             pr.v_nhd.float().abs().amax().item() / FP8_MAX[dtype] / scale_jitter
         )
         self.k_nhd = (pr.k_nhd.float() / self.k_scale).to(dtype)
@@ -212,7 +214,7 @@ def test_fingerprints_per_head_dim_and_kv_format(op):
     with pytest.raises(ValueError):
         bi.fingerprint(op, head_dim=128, kv_dtype=torch.float16)
     with pytest.raises(ValueError):
-        bi.fingerprint(op, head_dim=128, kv_dtype=torch.uint8)
+        bi.fingerprint(op, head_dim=128, kv_dtype=torch.int8)
     assert bi.class_name(op) == "attention.bf16"
     assert (
         spec.class_name("e4m3") == "attention.e4m3kv"
@@ -658,14 +660,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bi.BatchInvariantUnsupportedError, match="use_token_head_sf"
     ):  # per-(token, head) scales
         w.plan(*plan_args, causal=True, use_token_head_sf=True, **plan_kw(lp))
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="NVFP4"
-    ):  # an NVFP4 cache
+    with pytest.raises(bi.BatchInvariantUnsupportedError):  # an fp16 cache
         w.plan(
             *plan_args,
             causal=True,
             q_data_type=torch.bfloat16,
-            kv_data_type=torch.uint8,
+            kv_data_type=torch.float16,
         )
     with pytest.raises(
         bi.BatchInvariantUnsupportedError
@@ -819,7 +819,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     rag = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         ws, "NHD", batch_invariant=True
     )
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="NVFP4"):
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="use_token_head_sf"):
         rag.plan(
             pr.qo_indptr,
             pr.kv_indptr_rag,
@@ -827,7 +827,475 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             8,
             128,
             causal=True,
+            use_token_head_sf=True,
+            q_data_type=torch.bfloat16,
+            kv_data_type=E4,
+        )
+
+
+# ------------------------------------------------------------------------------------------------------ NVFP4
+E2M1_VALUES = torch.tensor(
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
+)
+
+
+def nvfp4_dequant(x: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """The class's ``dq4`` leaves in fp32: the e2m1 nibbles (the low nibble is the even element) times the e4m3 block scale of
+    their 16-element block; every product is exact (and a bf16 value)."""
+    lut = E2M1_VALUES.to(x.device)
+    lo, hi = lut[(x & 0xF).long()], lut[(x >> 4).long()]
+    vals = torch.stack([lo, hi], dim=-1).reshape(*x.shape[:-1], x.shape[-1] * 2)
+    scales = sf.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=-1)
+    return vals * scales
+
+
+class Fp4Problem:
+    """``Problem``'s geometry with random NVFP4 pools (``tests.test_helpers.utils_fp4.create_nvfp4_kv``: packed nibbles and e4m3
+    block scales of the cache's geometry, as FlashInfer's NVFP4 append kernel lays them out) and per-tensor scales; the ragged
+    copies are gathered through the page table (the same bytes)."""
+
+    def __init__(self, pr: Problem, k_scale=0.75, v_scale=1.5, seed=0):
+        from tests.test_helpers.utils_fp4 import create_nvfp4_kv
+
+        self.pr, self.k_scale, self.v_scale = pr, k_scale, v_scale
+        torch.manual_seed(seed)
+        D, dev = pr.D, pr.device
+        self.k_nhd, self.k_sf, _ = create_nvfp4_kv(pr.k_nhd.shape[:-1] + (D // 2,), dev)
+        self.v_nhd, self.v_sf, _ = create_nvfp4_kv(pr.v_nhd.shape[:-1] + (D // 2,), dev)
+        self.k_rag, self.v_rag = self._gather(self.k_nhd), self._gather(self.v_nhd)
+        self.k_sf_rag, self.v_sf_rag = self._gather(self.k_sf), self._gather(self.v_sf)
+
+    def _gather(self, pool):
+        pr = self.pr
+        outs = []
+        for r in range(len(pr.kv_lens)):
+            pages = pr.kv_indices[int(pr.kv_indptr[r]) : int(pr.kv_indptr[r + 1])]
+            outs.append(
+                pool[pages].reshape(-1, pr.Hkv, pool.shape[-1])[: pr.kv_lens[r]]
+            )
+        return torch.cat(outs).contiguous()
+
+    def cache(self, layout):
+        if layout == "NHD":
+            return self.k_nhd, self.v_nhd
+        return self.k_nhd.transpose(1, 2).contiguous(), self.v_nhd.transpose(
+            1, 2
+        ).contiguous()
+
+    def sf(self, layout):
+        if layout == "NHD":
+            return self.k_sf, self.v_sf
+        return self.k_sf.transpose(1, 2).contiguous(), self.v_sf.transpose(
+            1, 2
+        ).contiguous()
+
+    def ragged(self, layout):
+        if layout == "NHD":
+            return self.k_rag, self.v_rag
+        return self.k_rag.transpose(0, 1).contiguous(), self.v_rag.transpose(
+            0, 1
+        ).contiguous()
+
+    def sf_ragged(self, layout):
+        if layout == "NHD":
+            return self.k_sf_rag, self.v_sf_rag
+        return self.k_sf_rag.transpose(0, 1).contiguous(), self.v_sf_rag.transpose(
+            0, 1
+        ).contiguous()
+
+    def dq_rag(self):
+        return nvfp4_dequant(self.k_rag, self.k_sf_rag), nvfp4_dequant(
+            self.v_rag, self.v_sf_rag
+        )
+
+
+def fp4_problem(q_lens, kv_lens, Hq, Hkv, D, page, seed):
+    return Fp4Problem(Problem(q_lens, kv_lens, Hq, Hkv, D, page, seed=seed), seed=seed)
+
+
+def fp4_run_paged_prefill(fp, layout="NHD", window_left=-1):
+    pr = fp.pr
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        causal=True,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+    )
+    return w.run(
+        pr.q,
+        fp.cache(layout),
+        kv_cache_sf=fp.sf(layout),
+        k_scale=fp.k_scale,
+        v_scale=fp.v_scale,
+    )
+
+
+def fp4_run_ragged_prefill(fp, layout="NHD", window_left=-1):
+    pr = fp.pr
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr_rag,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        causal=True,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+    )
+    k, v = fp.ragged(layout)
+    return w.run(
+        pr.q,
+        k,
+        v,
+        kv_cache_sf=fp.sf_ragged(layout),
+        k_scale=fp.k_scale,
+        v_scale=fp.v_scale,
+    )
+
+
+def fp4_run_decode(fp, layout="NHD", window_left=-1):
+    pr = fp.pr
+    last = torch.tensor(
+        [int(pr.qo_indptr[i + 1]) - 1 for i in range(len(pr.q_lens))], device=pr.device
+    )
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        window_left=window_left,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+    )
+    return w.run(
+        pr.q[last].contiguous(),
+        fp.cache(layout),
+        kv_cache_sf=fp.sf(layout),
+        k_scale=fp.k_scale,
+        v_scale=fp.v_scale,
+    ), last
+
+
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_nvfp4_fingerprint(op):
+    for D in (64, 128, 256):
+        f4 = bi.fingerprint(op, head_dim=D, kv_dtype=torch.uint8)
+        assert f4.startswith(f"attn-nvfp4kv-d{D}-") and f4 == bi.fingerprint(
+            op, head_dim=D, kv_dtype="nvfp4"
+        )
+        assert f4 != bi.fingerprint(
+            op, head_dim=D, kv_dtype=E4
+        ) and f4 != bi.fingerprint(op, head_dim=D)
+    assert spec.class_name("nvfp4") == "attention.nvfp4kv"
+    from flashinfer.batch_invariant.fp_interface.term import sexpr
+
+    sx = sexpr(
+        spec.AttentionSpec(64, T=16, C=32, kv_fmt="nvfp4").output(
+            spec.RowSpec(p=40, row=0), 17
+        )
+    )
+    assert (
+        "(dq4 (b " in sx
+        and "(sfb " in sx
+        and "(dq4 (op:v_slice " in sx
+        and "(sfv " in sx
+        and "widen" not in sx
+    )
+    assert all(
+        c.well_formed(D, lowbit=True)
+        for D in (64, 128, 256)
+        for c in engine.all_valid_configs(D, lowbit=True)
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_nvfp4_matches_reference_and_the_bf16_class_oracle(D):
+    """The NVFP4-KV class against the fp32 reference over the dequantized cache, and -- the dq4 leaves being exact bf16 values --
+    bit for bit against the bf16 class over those values with ``k_scale`` folded and ``v_scale = 1``."""
+    fp = fp4_problem([300, 1, 1000, 64], [700, 2500, 1000, 3000], 32, 8, D, 16, 1)
+    pr = fp.pr
+    out = fp4_run_paged_prefill(fp)
+    k_dq, v_dq = fp.dq_rag()
+    assert torch.equal(k_dq.to(torch.bfloat16).float(), k_dq) and torch.equal(
+        v_dq.to(torch.bfloat16).float(), v_dq
+    )
+    lp = LowbitProblem.__new__(LowbitProblem)
+    lp.pr, lp.k_scale, lp.v_scale = pr, fp.k_scale, fp.v_scale
+    lp.k_rag, lp.v_rag = (
+        k_dq,
+        v_dq,
+    )  # fp32 values: reference() multiplies by the per-tensor scales
+    ref = reference(lp)
+    err = (out.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr_rag,
+        pr.Hq,
+        pr.Hkv,
+        D,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+    )
+    got = w.run(
+        pr.q,
+        fp.k_rag,
+        fp.v_rag,
+        kv_cache_sf=(fp.k_sf_rag, fp.v_sf_rag),
+        k_scale=fp.k_scale,
+        v_scale=1.0,
+    )
+    wb = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    wb.plan(
+        pr.qo_indptr,
+        pr.kv_indptr_rag,
+        pr.Hq,
+        pr.Hkv,
+        D,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        sm_scale=(1.0 / math.sqrt(D)) * fp.k_scale,
+    )
+    want = wb.run(
+        pr.q, k_dq.to(torch.bfloat16).contiguous(), v_dq.to(torch.bfloat16).contiguous()
+    )
+    assert torch.equal(bits(got), bits(want))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_nvfp4_prefill_decode_paged_ragged_agree(D, layout):
+    """R4 for the NVFP4-KV class: prefill rows == decode rows, paged == ragged, in both cache layouts; the 5-D kv_cache_sf form
+    is the tuple form."""
+    fp = fp4_problem([256, 1, 1024, 33], [1500, 2500, 1024, 4096], 32, 8, D, 16, 2)
+    pre = fp4_run_paged_prefill(fp, layout)
+    dec, last = fp4_run_decode(fp, layout)
+    assert torch.equal(bits(pre[last]), bits(dec))
+    assert torch.equal(bits(pre), bits(fp4_run_ragged_prefill(fp, layout)))
+    pr = fp.pr
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        D,
+        16,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+    )
+    k_sf, v_sf = fp.sf(layout)
+    five = torch.stack([k_sf, v_sf], dim=1)
+    assert torch.equal(
+        bits(
+            w.run(
+                pr.q,
+                fp.cache(layout),
+                kv_cache_sf=five,
+                k_scale=fp.k_scale,
+                v_scale=fp.v_scale,
+            )
+        ),
+        bits(pre),
+    )
+    # e4m3-typed scale tensors are the same bytes
+    e4 = (k_sf.view(torch.float8_e4m3fn), v_sf.view(torch.float8_e4m3fn))
+    assert torch.equal(
+        bits(
+            w.run(
+                pr.q,
+                fp.cache(layout),
+                kv_cache_sf=e4,
+                k_scale=fp.k_scale,
+                v_scale=fp.v_scale,
+            )
+        ),
+        bits(pre),
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_nvfp4_config_agreement_and_batch_invariance(D):
+    fp = fp4_problem([256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, D, 16, 8)
+    pr = fp.pr
+    ref = bits(fp4_run_paged_prefill(fp))
+    for cfg in engine.all_valid_configs(D, lowbit=True):
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            kv_fmt="nvfp4",
+        )
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            fp.k_nhd,
+            fp.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+            k_scale=fp.k_scale,
+            v_scale=fp.v_scale,
+            kv_cache_sf=(fp.k_sf, fp.v_sf),
+        )
+        assert torch.equal(bits(out), ref), cfg
+    # a request alone (ragged) gives its rows of the batch
+    rows = [slice(int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])) for i in range(4)]
+    kv_rows = [
+        slice(int(pr.kv_indptr_rag[i]), int(pr.kv_indptr_rag[i + 1])) for i in range(4)
+    ]
+    full = bits(fp4_run_ragged_prefill(fp))
+    assert torch.equal(full, ref)
+    for i in (0, 3):
+        one = Fp4Problem.__new__(Fp4Problem)
+        one.pr = Problem([pr.q_lens[i]], [pr.kv_lens[i]], 32, 8, D, 16, seed=30 + i)
+        one.pr.q = pr.q[rows[i]].clone()
+        one.k_scale, one.v_scale = fp.k_scale, fp.v_scale
+        one.k_rag, one.v_rag = (
+            fp.k_rag[kv_rows[i]].clone(),
+            fp.v_rag[kv_rows[i]].clone(),
+        )
+        one.k_sf_rag, one.v_sf_rag = (
+            fp.k_sf_rag[kv_rows[i]].clone(),
+            fp.v_sf_rag[kv_rows[i]].clone(),
+        )
+        assert torch.equal(bits(fp4_run_ragged_prefill(one)), full[rows[i]]), i
+
+
+@needs_device
+def test_nvfp4_refusals():
+    fp = fp4_problem([64], [700], 32, 8, 128, 16, 10)
+    pr = fp.pr
+    ws = workspace(pr.device)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
+    plan_args = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="use_token_head_sf"):
+        w.plan(
+            *plan_args,
+            causal=True,
+            use_token_head_sf=True,
             q_data_type=torch.bfloat16,
             kv_data_type=torch.uint8,
         )
-    assert w.resolved_backend == "batch_invariant"
+    w.plan(
+        *plan_args, causal=True, q_data_type=torch.bfloat16, kv_data_type=torch.uint8
+    )
+    k, v = fp.cache("NHD")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="kv_cache_sf"
+    ):  # no block scales
+        w.run(pr.q, (k, v), k_scale=fp.k_scale)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):  # scales of the wrong width
+        w.run(pr.q, (k, v), kv_cache_sf=(fp.k_sf[..., :4], fp.v_sf[..., :4]))
+    with pytest.raises(bi.BatchInvariantUnsupportedError):  # scales of the wrong dtype
+        w.run(pr.q, (k, v), kv_cache_sf=(fp.k_sf.float(), fp.v_sf.float()))
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # one scale tensor of the tuple missing
+        w.run(pr.q, (k, v), kv_cache_sf=(fp.k_sf,))
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # an fp8 cache over the NVFP4 plan
+        w.run(pr.q, (k.view(E4), v.view(E4)), kv_cache_sf=(fp.k_sf, fp.v_sf))
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a bf16 cache of the full width
+        w.run(pr.q, pr.cache("NHD"), kv_cache_sf=(fp.k_sf, fp.v_sf))
+    ref = bits(
+        w.run(
+            pr.q,
+            (k, v),
+            kv_cache_sf=(fp.k_sf, fp.v_sf),
+            k_scale=fp.k_scale,
+            v_scale=fp.v_scale,
+        )
+    )
+    assert torch.equal(
+        bits(
+            w.run(
+                pr.q,
+                (k, v),
+                kv_cache_sf=(fp.k_sf, fp.v_sf),
+                k_scale=fp.k_scale,
+                v_scale=fp.v_scale,
+            )
+        ),
+        ref,
+    )
+    # the fp8 and bf16 classes refuse block scales
+    w8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
+    w8.plan(*plan_args, causal=True, q_data_type=torch.bfloat16, kv_data_type=E4)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="kv_cache_sf"):
+        w8.run(pr.q, (pr.k_nhd.to(E4), pr.v_nhd.to(E4)), kv_cache_sf=(fp.k_sf, fp.v_sf))
+    with pytest.raises(ValueError):  # the functional API: an NVFP4 cache without scales
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            None,
+            None,
+            pr.device,
+            kv_fmt="nvfp4",
+        )
+        engine.run_attention(
+            planned,
+            pr.q,
+            fp.k_nhd,
+            fp.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+        )
