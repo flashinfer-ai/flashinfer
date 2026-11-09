@@ -125,6 +125,18 @@ deterministic route's head program. Then:
    (`kcp_bwd_halo`) rewrites `dx` of the last three rows of each such
    fragment from the received rows.
 
+With more than one rank, the head program, the concatenation of a multi
+call's send rows and the exchange issue run on a high-priority side stream of
+the device. The main program starts on the caller's stream at once, because it
+reads no head row. The caller's stream joins the side stream before the wait.
+The programs and their inputs are the same, so no bit changes.
+
+The main program splits each lane into units of `M` tokens. `M` is the
+multiple of 8 from 64 to 128 with the least lane cost: the lane's tokens plus
+3.2 tokens per unit (`kcp_jit.dyn_plan`). On a 148-SM B200 this gives 104 for
+one 10240-channel tensor of 32768 tokens and 112 for 8192 channels of 16384
+tokens.
+
 Under any of these conditions, the one-program backward (`kcp_bwd`) runs after the wait instead:
 
 - `bwd_reserve_sms >= 1`

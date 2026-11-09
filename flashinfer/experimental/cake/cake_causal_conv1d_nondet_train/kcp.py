@@ -48,6 +48,13 @@ after the head program, which overlaps the halo exchange (:func:`_bwd_overlap`):
    (kind ``kcp_bwd_halo``) writes ``dx`` of the last three rows of each
    fragment that has them again, from the received rows.
 
+With more than one rank the head program(s), the multi call's concatenation of
+the send rows and the exchange issue run on the device's high-priority side
+stream (:func:`_side_stream`), forked from the caller's stream; the main
+program(s) launch on the caller's stream at once (they read no head row), and
+the caller's stream joins the side stream after them, before the wait.  The
+same programs read the same inputs, so no bit changes.
+
 The plan of the main program is :func:`kcp_jit.dyn_plan` (units of ``M``
 tokens, ``P`` lanes per 2048-channel tile, one CTA per SM).  A call that
 reserves SMs (``bwd_reserve_sms >= 1``), has more than
@@ -674,6 +681,10 @@ LAST_CALL: dict[str, dict[str, Any]] = {}
 HOST_CACHE_MAX = 64
 _HOST_CACHE: dict[int, tuple[Any, dict[tuple, dict[str, Any]]]] = {}
 _FFI_DEVICES: dict[int, Any] = {}
+# The overlapped backward's side stream per device (:func:`_side_stream`); ``_BWD_SIDE_STREAM = False`` keeps the
+# head programs and the exchange issue on the caller's stream (the previous order, for the A/B record).
+_BWD_SIDE_STREAM = True
+_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
 
 
 def _host_cache_entry(ctx: Any, key: tuple) -> dict[str, Any]:
@@ -694,6 +705,32 @@ def cake_causal_conv1d_nondet_train_kcp_host_cache_clear() -> int:
     n = len(_HOST_CACHE)
     _HOST_CACHE.clear()
     return n
+
+
+def _side_stream(
+    ctx: Any, device: torch.device, overlapped: bool
+) -> Optional[torch.cuda.Stream]:
+    """The stream of an overlapped backward's head programs and exchange issue, forked from the current stream:
+    the device's high-priority side stream when the call exchanges (``world_size > 1``) and runs the overlapped pair,
+    else ``None`` (the current stream)."""
+    if not (_BWD_SIDE_STREAM and overlapped and int(ctx.world_size) > 1):
+        return None
+    index = _device_index(device)
+    side = _SIDE_STREAMS.get(index)
+    if side is None:
+        side = _SIDE_STREAMS[index] = torch.cuda.Stream(device=device, priority=-1)
+    side.wait_stream(torch.cuda.current_stream(device))
+    return side
+
+
+def _join_side(side: Optional[torch.cuda.Stream], recv: torch.Tensor) -> None:
+    """After the main program(s): the current stream waits for the side stream (inside a capture this joins it), and
+    the received pool, allocated on the side stream, is recorded on the current stream that reads it."""
+    if side is None:
+        return
+    current = torch.cuda.current_stream(recv.device)
+    current.wait_stream(side)
+    recv.record_stream(current)
 
 
 def _ffi_device(device_index: int) -> Any:
@@ -1974,11 +2011,14 @@ def _bwd_overlap(
     S: int,
     C: int,
     device: torch.device,
+    side: Optional[torch.cuda.Stream] = None,
 ) -> None:
     """The overlapped backward of a call with ``S > 0``: the main program while ``work`` (the exchange) is in flight,
-    the wait, then the tail-row program."""
+    the side stream's join (``side``: the stream of the head program and the exchange issue, or ``None``), the wait,
+    then the tail-row program."""
     args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx_out, S=S, C=C)
     _launch_dyn(e["dyn"], dw_out=dw_out, spare=dpre_head, S=S, device=device, **args)
+    _join_side(side, dpre_tail)
     if work is not None:
         work.wait()
     _launch_halo(e["dyn"], tail_row_off=e["tail_row_off"], dpre_tail=dpre_tail, **args)
@@ -2010,15 +2050,17 @@ def _kcp_backward_trim(
         device=device,
         reserve=reserve,
     )
-    dpre_head = _bwd_head(e, x_flat, w, dy_flat, hist_t, S=S, C=C, device=device)
-    dpre_tail, work = _exchange(
-        dpre_head[: e["n_head"]],
-        recv_rows=e["tail_rows"],
-        send_splits=e["send_splits"],
-        recv_splits=e["recv_splits"],
-        ctx=ctx,
-        agree=("bwd", (C,), False),
-    )
+    side = _side_stream(ctx, device, S > 0 and e["dyn"] is not None)
+    with torch.cuda.stream(side):
+        dpre_head = _bwd_head(e, x_flat, w, dy_flat, hist_t, S=S, C=C, device=device)
+        dpre_tail, work = _exchange(
+            dpre_head[: e["n_head"]],
+            recv_rows=e["tail_rows"],
+            send_splits=e["send_splits"],
+            recv_splits=e["recv_splits"],
+            ctx=ctx,
+            agree=("bwd", (C,), False),
+        )
     if S == 0:
         if work is not None:
             work.wait()
@@ -2039,6 +2081,7 @@ def _kcp_backward_trim(
             S=S,
             C=C,
             device=device,
+            side=side,
         )
         return dx_out, dw_out
     _bwd_main(
@@ -2547,30 +2590,34 @@ def _kcp_backward_multi(
             xs, weights, dys, hists, dxs, dweights, strict=True
         )
     ]
-    heads = [
-        _bwd_head(c[8], c[2], c[3], c[4], c[5], S=c[0], C=c[1], device=device)
-        for c in calls
-    ]
+    side = _side_stream(
+        ctx, device, calls[0][0] > 0 and all(c[8]["dyn"] is not None for c in calls)
+    )
     e0 = calls[0][8]
     n_head = e0["n_head"]
     work = None
     recv = None
-    if int(ctx.world_size) == 1:
-        tails = [h[:n_head] for h in heads]
-    else:
-        send = (
-            torch.cat([h[:n_head] for h in heads], dim=1)
-            if len(heads) > 1
-            else heads[0][:n_head]
-        )
-        recv, work = _exchange(
-            send,
-            recv_rows=e0["tail_rows"],
-            send_splits=e0["send_splits"],
-            recv_splits=e0["recv_splits"],
-            ctx=ctx,
-            agree=("bwd", tuple(c[1] for c in calls), True),
-        )
+    with torch.cuda.stream(side):
+        heads = [
+            _bwd_head(c[8], c[2], c[3], c[4], c[5], S=c[0], C=c[1], device=device)
+            for c in calls
+        ]
+        if int(ctx.world_size) == 1:
+            tails = [h[:n_head] for h in heads]
+        else:
+            send = (
+                torch.cat([h[:n_head] for h in heads], dim=1)
+                if len(heads) > 1
+                else heads[0][:n_head]
+            )
+            recv, work = _exchange(
+                send,
+                recv_rows=e0["tail_rows"],
+                send_splits=e0["send_splits"],
+                recv_splits=e0["recv_splits"],
+                ctx=ctx,
+                agree=("bwd", tuple(c[1] for c in calls), True),
+            )
     dx_out = tuple(c[6] for c in calls)
     dw_out = tuple(c[7] for c in calls)
     if calls[0][0] == 0:
@@ -2586,6 +2633,8 @@ def _kcp_backward_multi(
         if e["dyn"] is not None:
             args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx, S=S, C=C)
             _launch_dyn(e["dyn"], dw_out=dw, spare=head, S=S, device=device, **args)
+    if recv is not None:
+        _join_side(side, recv)
     if work is not None:
         work.wait()
     if recv is not None:

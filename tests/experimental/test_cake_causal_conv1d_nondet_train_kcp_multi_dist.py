@@ -28,7 +28,9 @@ per-document one).  Per row and rank, for every tensor:
 - the collective counts per phase of the deterministic suite: multi 1/0/1 direct, 1/1/1 plain checkpoint, 1/0/1
   with a handle; single calls n/0/n;
 - ``graph="replay"`` of the multi forward / backward: ``y`` / ``hist`` / ``dx`` bitwise the eager single calls on
-  every call, ``dweight`` within budget, the deterministic suite's event sequence.
+  every call, ``dweight`` within budget, the deterministic suite's event sequence; and of the single backward of the
+  first tensor (its head program and exchange issue on the side stream inside the capture): ``dx`` bitwise the eager
+  call, ``dweight`` within budget, events eager, capture, replay, replay.
 
 Launch forms as the deterministic suite.  Skipped until the exporter renders the non-deterministic package.
 """
@@ -324,6 +326,7 @@ def _run_rank_graph(
         )
         ref.append((y, hist, dx, dw))
     events, ok, worst = [], True, 0.0
+    single_events, single_ok = [], True
     try:
         for _ in range(4):
             ys, hists = conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_forward(
@@ -343,9 +346,22 @@ def _run_rank_graph(
                     and _same(dxs[i], dx)
                 )
                 worst = max(worst, _ratio(dws[i], dw))
+        _, hist0, dx0, dw0 = ref[0]
+        for _ in range(4):
+            dx, dw = conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+                xs[0], ws[0], ctx, dys[0], hist0, graph="replay"
+            )
+            single_events.append(conv_kcp.LAST_CALL["bwd"]["graph_event"])
+            torch.cuda.synchronize(device)
+            single_ok = single_ok and _same(dx, dx0)
+            worst = max(worst, _ratio(dw, dw0))
     finally:
         torch.cuda.synchronize(device)
         conv_kcp.cake_causal_conv1d_nondet_train_kcp_graph_cache_clear()
+    if int(xs[0].shape[0]) == 0:
+        single_expected = ["eager"] * 4
+    else:
+        single_expected = ["eager", "capture", "replay", "replay"]
     if int(xs[0].shape[0]) == 0:
         expected = ["eager"] * 8
     elif int(ctx.halo.n_hist_rows) == 0:
@@ -365,8 +381,15 @@ def _run_rank_graph(
         "graph_y_hist_dx_bitwise": ok,
         "graph_dw_within_budget": worst <= 1.0,
         "graph_events": events == expected,
+        "graph_single_dx_bitwise": single_ok,
+        "graph_single_events": single_events == single_expected,
     }
-    info = {"events": events, "worst_dw_ratio": worst, "T_r": int(xs[0].shape[0])}
+    info = {
+        "events": events,
+        "single_events": single_events,
+        "worst_dw_ratio": worst,
+        "T_r": int(xs[0].shape[0]),
+    }
     return _report(W, row, flags, info, result_dir, rank, "nondet-graph")
 
 
