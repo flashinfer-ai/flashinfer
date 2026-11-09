@@ -973,7 +973,14 @@ def gen_all_modules(
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
-            jit_specs.append(gen_cutlass_fused_moe_sm90_module())
+            # Ship both existing variants, independent of the builder's GPU.
+            # H20 runtime dispatch uses a distinct name from the generic module.
+            for use_prebuilt_d_descriptor in (False, True):
+                jit_specs.append(
+                    gen_cutlass_fused_moe_sm90_module(
+                        use_prebuilt_d_descriptor=use_prebuilt_d_descriptor
+                    )
+                )
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
             # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to
             # the fixed E=256/N=512/K=2048 shape (BS8).

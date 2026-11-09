@@ -161,7 +161,15 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
 
-def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
+def gen_cutlass_fused_moe_sm90_module(
+    use_fast_build: bool = False,
+    *,
+    use_prebuilt_d_descriptor: Optional[bool] = None,
+) -> JitSpec:
+    # AOT builders must select both variants without inspecting their own GPU.
+    # Runtime callers leave this unset to retain the H20-only selection policy.
+    if use_prebuilt_d_descriptor is None:
+        use_prebuilt_d_descriptor = _should_enable_sm90_moe_prebuilt_d_descriptor()
     nvcc_flags = sm90a_nvcc_flags + [
         "-DCOMPILE_HOPPER_TMA_GEMMS",
         "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
@@ -174,7 +182,7 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
     ]
     module_name = None
-    if _should_enable_sm90_moe_prebuilt_d_descriptor():
+    if use_prebuilt_d_descriptor:
         nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
         module_name = "fused_moe_90_h20_prebuilt_d"
     return gen_cutlass_fused_moe_module(
