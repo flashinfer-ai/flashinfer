@@ -9723,7 +9723,9 @@ def test_device_split_forms_cast_dw_in_place(
     the step's peak, of the call that binds and of one from the remembered binding, stays within the planned budget
     (``0.98 B``) and below the fast step's.  A non-reentrant checkpointed step gives the same bits; a retained graph
     casts out of place (the accumulators read, never written) and the following backward in place, both to the fast
-    bits; a :class:`ForwardResult` casts out of place, repeatably."""
+    bits; a :class:`ForwardResult` casts out of place, repeatably.  The explicit pair: ``backward_loss`` with the split
+    accumulator's upper rows (``dw_acc_hi``) and the deferred operands finishes ``"fused_ip"`` to the same bits, and
+    refuses ``"partial_ip"`` (rows recomputed from the forward's inputs) and the lower part alone (``ValueError``)."""
     _require_program(entry="loss")
     V = DEFAULT_V
     inp = make_inputs(
@@ -9819,6 +9821,34 @@ def test_device_split_forms_cast_dw_in_place(
         dX, dW = res.backward()
         _assert_same_bits(fast, dict(dX=dX, dW=dW), keys=("dX", "dW"))
     assert casts == [False, False], casts
+    # the explicit pair: the split accumulator's upper rows through backward_loss
+    pair = dict(
+        backend="cake",
+        row_index=res.row_index,
+        num_rows=res.num_rows,
+        dz_last=res.dz_last,
+        x_last=res.x_last,
+        x_src=res.x_src,
+        x_idx=res.x_idx,
+        row_valid=res.row_valid,
+        gemm_tuning=res.gemm_tuning,
+    )
+    assert res.dw_split is not None and res.dz_last is not None
+    if form == "fused_ip":
+        assert res.dw_acc_hi is not None
+        assert res.dw_acc.shape[0] + res.dw_acc_hi.shape[0] == V
+        for _ in range(2):
+            dX, dW = opt_in.backward_loss(
+                res.dx_acc, res.dw_acc, dw_acc_hi=res.dw_acc_hi, **pair
+            )
+            _assert_same_bits(fast, dict(dX=dX, dW=dW), keys=("dX", "dW"))
+        with pytest.raises(ValueError, match="dw_acc_hi"):
+            opt_in.backward_loss(res.dx_acc, res.dw_acc, **pair)
+    else:
+        with pytest.raises(ValueError, match="ForwardResult.backward"):
+            opt_in.backward_loss(
+                res.dx_acc, res.dw_acc, dw_acc_hi=res.dw_acc_hi, **pair
+            )
 
 
 def test_device_logprob_budget_forms_are_bitwise(glm_weight, monkeypatch):

@@ -452,11 +452,17 @@ keyword.
   the weight-gradient block, so each chunk runs the accumulate GEMM on rows
   `[0, a)` and `[a, V)`; a backward that frees the graph casts `dW` in place:
   the deferred last chunk's fused scale + cast GEMM writes the BF16 rows of
-  `[0, a)` into the first part's own storage, in pieces that each start at
-  most twice as far in as the previous one ends (the first one, `a / 16`
-  rows rounded up to the block, through a temporary), then the rows `[a,
-  V)`, so no `[V, H]` BF16 output is held beside the accumulator; a backward
-  that keeps the graph, and `ForwardResult.backward`, cast out of place; the
+  `[0, a)` into the first part's own storage, in pieces: the first one, `a /
+  16` rows rounded up to the block, through a temporary, and after it each
+  piece `[m0, m1)` ends at most twice as far in as it starts (`m1 <= 2 *
+  m0`), so its BF16 rows overwrite only FP32 rows that earlier pieces have
+  read; then the rows `[a, V)`, so no `[V, H]` BF16 output is held beside
+  the accumulator; a backward that keeps the graph, and
+  `ForwardResult.backward`, cast out of place; the explicit pair carries the
+  split as `ForwardResult.dw_split` = `(a, V)`, `ForwardResult.dw_acc` = the
+  FP32 `[a, H]` rows `[0, a)` and `ForwardResult.dw_acc_hi` = the FP32 `[V -
+  a, H]` rows `[a, V)`, which `backward_loss(..., dw_acc_hi=...)` with the
+  deferred operands casts out of place, bitwise `ForwardResult.backward`; the
   log-probability backward runs the same split accumulator in its own chunk
   loop and always casts in place),
   `"unfused"` (every chunk accumulated, one flat cast after `dX` is written),

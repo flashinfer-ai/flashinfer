@@ -7109,6 +7109,7 @@ def backward_loss(
     x_idx: Optional[torch.Tensor] = None,
     row_valid: Optional[torch.Tensor] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    dw_acc_hi: Optional[torch.Tensor] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the loss entry from the saved accumulators: ``(dX, dW)`` = ``bf16(g * dX_acc)``,
     ``cast(g * dW_acc)``; the accumulators are read, never written (repeatable).  A compacted forward
@@ -7116,7 +7117,14 @@ def backward_loss(
     zero BF16 ``[T, H]``.  A deferred weight gradient (``fuse_dw_cast``; ``ForwardResult.dz_last`` with
     ``x_last`` or ``x_src`` / ``x_idx``): ``dW = cast(g * (dW_acc + dz_last^T @ X_last))`` through the fused
     GEMM (:func:`dw_cast`), ``dW_acc`` being the chunks before the last one or ``None``;
-    :meth:`ForwardResult.backward` passes everything.  ``row_valid`` (``ForwardResult.row_valid``, the
+    :meth:`ForwardResult.backward` passes everything.  The split accumulator of the budget form ``"fused_ip"``
+    (``ForwardResult.dw_split`` set): ``dw_acc`` is the FP32 ``[a, H]`` sum of the vocabulary rows ``[0, a)`` and
+    ``dw_acc_hi`` (``ForwardResult.dw_acc_hi``) the FP32 ``[V - a, H]`` sum of the rows ``[a, V)`` of the chunks before
+    the last one; pass both with the deferred operands and ``dW`` is :func:`_dw_cast_split`'s out-of-place cast, bitwise
+    :meth:`ForwardResult.backward`'s (``cake`` backend, BF16 ``dW``).  The form ``"partial_ip"`` and the other
+    recompute forms (``ForwardResult.memory_plan.recompute``) recompute rows of ``dW`` from the forward's inputs:
+    only :meth:`ForwardResult.backward` finishes them, and a split accumulator short of ``V`` rows is a
+    ``ValueError`` here.  ``row_valid`` (``ForwardResult.row_valid``, the
     valid-row mask of a compacted forward that ran with the fused dX finalize) selects the one-pass
     scale-cast-scatter of the compact rows (:func:`finalize_dx`); without it the compact rows are cast,
     then scattered into a zero BF16 ``[T, H]``.  Both give the same bits.  ``gemm_tuning`` (default
@@ -7131,6 +7139,23 @@ def backward_loss(
                 "backward_loss needs num_rows (the caller's T) with row_index"
             )
         dx = finalize_dx(dx_acc, grad, row_index, row_valid, num_rows, backend=backend)
+    if dw_acc_hi is not None:
+        # the split accumulator (``"fused_ip"``): checked before any launch
+        if dz_last is None or dw_acc is None:
+            raise ValueError(
+                "dw_acc_hi (the split accumulator's upper rows) needs dw_acc (its lower rows) and the deferred "
+                "operands dz_last with x_last or x_src / x_idx"
+            )
+        if backend != "cake" or grad_weight_dtype != torch.bfloat16:
+            raise ValueError(
+                f"the split accumulator (dw_acc_hi) of the budget forms {_SPLIT_FORMS} is cast by the cake kernels "
+                "into a BF16 dW (backend='cake', grad_weight_dtype=torch.bfloat16)"
+            )
+        if int(dw_acc.shape[0]) + int(dw_acc_hi.shape[0]) != int(dz_last.shape[-1]):
+            raise ValueError(
+                "the split accumulator covers fewer than V rows (the budget form 'partial_ip' recomputes the "
+                "others): finish it with ForwardResult.backward"
+            )
     if dz_last is not None:
         if x_last is None:
             if x_src is None or x_idx is None:
@@ -7140,6 +7165,21 @@ def backward_loss(
             x_last = torch.index_select(
                 x_src, 0, x_idx
             )  # the compacted chunk's rows, gathered again
+        if dw_acc_hi is not None:
+            return dx, _dw_cast_split(
+                dz_last,
+                x_last,
+                [dw_acc, dw_acc_hi],
+                grad,
+                in_place=False,
+                gemm_tuning=gemm_tuning,
+            )
+        if dw_acc is not None and int(dw_acc.shape[0]) != int(dz_last.shape[-1]):
+            raise ValueError(
+                "dw_acc holds fewer than V rows: a budget form's accumulator -- the split accumulator of "
+                "'fused_ip' also needs its upper rows dw_acc_hi (ForwardResult.dw_acc_hi); the recompute forms "
+                "finish through ForwardResult.backward"
+            )
         dw = dw_cast(
             dz_last,
             x_last,
