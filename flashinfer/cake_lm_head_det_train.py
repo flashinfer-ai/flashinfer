@@ -528,7 +528,8 @@ def cake_lm_head_det_train_logprob(
     ``dW`` bits can then differ from the fastest form's where valid rows have
     a zero upstream gradient (within the accuracy budget, the same bits on
     every run).  ``memory_mode="keep_logits"`` (this
-    entry only, without ``num_valid_rows``; opt-in): where a backward can
+    entry only; opt-in; with ``num_valid_rows`` its forward runs on the index
+    formed from the caller's count, without a readback): where a backward can
     follow (grad mode on, ``X`` or ``W`` trainable) the forward keeps the BF16
     logits of the valid rows, ``2 * T_v * V`` bytes from the forward to the
     backward (the chunk bound of the memory rule does not hold for them), and

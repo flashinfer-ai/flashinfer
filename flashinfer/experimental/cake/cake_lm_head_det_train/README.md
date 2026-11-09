@@ -394,7 +394,9 @@ keyword.
   `cake_lm_head_det_train_logprob`, default `None`, the automatic form below;
   `"fast"` always runs the fast form; `"budget"` is opt-in, `cake` backend and
   BF16 `dW` only; `"keep_logits"`, the log-probability entry's kept logits
-  above, takes no `num_valid_rows` and is a `ValueError` on the loss entry).
+  above, also takes `num_valid_rows` (its forward then runs on the index
+  formed from the caller's count, no readback, bitwise the same outputs) and
+  is a `ValueError` on the loss entry).
   The fast form keeps the FP32 `[V, H]`
   weight-gradient accumulator next to the chunk buffers, so its step peak
   (forward through backward, outputs included) is above that of a head that

@@ -4984,7 +4984,8 @@ def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
     with pytest.raises(ValueError, match="memory_mode must be"):
         _run(inp, 16, entry="logprob", memory_mode="keep")
     n = int(inp.valid.sum())
-    with pytest.raises(ValueError, match="num_valid_rows"):
+    # the kept form takes the caller's count (on the cake backend: test_device_logprob_keep_takes_num_valid_rows)
+    with pytest.raises(ValueError, match="cake backend"):
         _run(inp, 16, entry="logprob", memory_mode="keep_logits", num_valid_rows=n)
     with pytest.raises(ValueError, match="cake backend"):
         _run(inp, 16, entry="logprob", memory_mode="keep_logits")
@@ -8966,6 +8967,97 @@ def test_device_logprob_keep_is_bitwise(glm_weight):
                     assert torch.equal(out["dW"], base["dW"]), case
                     assert out["dX"] is None, case
             del base, keep
+
+
+def test_device_logprob_keep_takes_num_valid_rows(glm_weight, monkeypatch):
+    """``memory_mode="keep_logits"`` with the caller's count ``num_valid_rows``: bitwise the kept call without the count
+    (``logp`` / ``dX`` / ``dW``) over one-, two- and many-chunk calls, every row valid, every row ignored and an
+    uncompacted call, through the kept autograd function with the index formed on the device; once its bindings are
+    remembered the forward and the backward run without a host synchronization (no count is read back); a wrong
+    count with ``check_num_valid_rows=True`` is a ``ValueError``; where no backward can follow, the call is the default
+    entry with the count (the same ``logp``)."""
+    _require_program(entry="logprob")
+    readback = opt_in._given_count_readback(CUDA)
+    for T, C, ignore, switches in (
+        (1500, 4096, 0.05, {}),
+        (1500, 4096, 0.0, {}),
+        (1500, 4096, 1.0, {}),
+        (6000, 4096, 0.05, {}),
+        (8700, 4096, 0.05, {}),
+        (2500, 2048, 0.05, dict(compact_rows=False)),
+    ):
+        inp = make_inputs(
+            T, seed=SEED + 290 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
+        )
+        n = int(inp.valid.sum())
+        case = (T, C, ignore, switches, n)
+        kw = dict(entry="logprob", backend="cake", memory_mode="keep_logits")
+        base = _run(inp, C, **kw, **switches)
+        applied = []
+        apply = cake_backend.CakeLMHeadDetLogprobKeepFunction.apply
+
+        def spy(*args):
+            applied.append(args[-1])
+            return apply(*args)
+
+        monkeypatch.setattr(cake_backend.CakeLMHeadDetLogprobKeepFunction, "apply", spy)
+        given = [_run(inp, C, **kw, num_valid_rows=n, **switches) for _ in range(2)]
+        monkeypatch.undo()
+        assert len(applied) == 2, case
+        for index in applied:
+            if switches.get("compact_rows") is False or n == T:
+                assert index is None, case
+            else:
+                assert torch.equal(index, inp.valid.nonzero().reshape(-1)), case
+        for i, out in enumerate(given):
+            for key in ("logp", "dX", "dW"):
+                assert torch.equal(out[key], base[key]), (case, key, i)
+        if not readback or switches.get("compact_rows") is False:
+            X = inp.X.detach().requires_grad_(True)
+            W = inp.W.detach().requires_grad_(True)
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                logp = opt_in.cake_lm_head_det_train_logprob(
+                    X,
+                    W,
+                    inp.labels,
+                    chunk_size=C,
+                    backend="cake",
+                    memory_mode="keep_logits",
+                    num_valid_rows=n,
+                    **switches,
+                )
+                logp.backward(inp.dlogp)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.synchronize()
+            assert torch.equal(logp.detach(), base["logp"]), case
+            assert torch.equal(X.grad, base["dX"]), case
+            assert torch.equal(W.grad, base["dW"]), case
+        if n < T:
+            with pytest.raises(ValueError, match="num_valid_rows"):
+                _run(
+                    inp,
+                    C,
+                    **kw,
+                    num_valid_rows=n + 1,
+                    check_num_valid_rows=True,
+                    **switches,
+                )
+        with torch.no_grad():
+            lp = opt_in.cake_lm_head_det_train_logprob(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=C,
+                backend="cake",
+                memory_mode="keep_logits",
+                num_valid_rows=n,
+                **switches,
+            )
+        assert torch.equal(lp, base["logp"]), case
+        del base, given
 
 
 def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):

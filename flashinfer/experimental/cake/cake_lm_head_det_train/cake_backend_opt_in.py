@@ -21,11 +21,12 @@ Opt-in forms of the Cake chunked LM-head + loss backend (:mod:`.cake_backend`):
 * ``num_valid_rows=<host integer>``: the forward plans on the caller's
   valid-row count instead of reading the count back from the device
   (:func:`given_valid_rows`);
-* ``memory_mode="keep_logits"`` (log-probability entry, without
-  ``num_valid_rows``): :mod:`.cake_backend`'s
+* ``memory_mode="keep_logits"`` (log-probability entry): :mod:`.cake_backend`'s
   ``cake_lm_head_det_train_logprob_keep`` -- where a backward can follow, the
   forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes) and
-  the backward forms ``dz`` from them instead of recomputing them.
+  the backward forms ``dz`` from them instead of recomputing them; with
+  ``num_valid_rows`` its forward runs on the index formed from the caller's
+  count (no readback).
 
 The default ``memory_mode`` (``None``, :data:`MEMORY_AUTO`) picks per call: a
 call whose backward forms a BF16 weight gradient on the ``cake`` backend on
@@ -9593,6 +9594,73 @@ def cake_lm_head_det_train_loss(
     return (loss, logp.detach()) if return_logp else loss
 
 
+def _logprob_keep_given(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    chunk_size: int,
+    compact_rows: Optional[bool],
+    fuse_dw_cast: Optional[bool],
+    dx_finalize: Optional[bool],
+    dw_stream: Optional[Union[bool, str]],
+    hidden_count: Optional[bool],
+    gemm_tuning: Optional[dict[str, dict[str, Any]]],
+    logprob_dz: Optional[bool],
+    logprob_lbl: Optional[bool],
+    num_valid_rows,
+    check_num_valid_rows: bool,
+) -> torch.Tensor:
+    """``memory_mode="keep_logits"`` with the caller's valid-row count ``num_valid_rows`` (``cake`` backend): where a
+    backward can follow, :mod:`.cake_backend`'s kept-logits function over the valid-row index formed on the device
+    from the count (:func:`given_valid_rows`: no readback; ``check_num_valid_rows`` reads it back once), so the
+    forward counts nothing; elsewhere the default entry with the same count (as the kept entry's own fallback).
+    Bitwise the same ``logp`` / ``dX`` / ``dW`` as the kept entry without the count."""
+    if not (torch.is_grad_enabled() and (X.requires_grad or W.requires_grad)):
+        return CakeLMHeadDetLogprobFunction.apply(
+            X,
+            W,
+            labels,
+            int(chunk_size),
+            "cake",
+            compact_rows,
+            fuse_dw_cast,
+            dx_finalize,
+            dw_stream,
+            hidden_count,
+            gemm_tuning,
+            logprob_dz,
+            logprob_lbl,
+            _resolve_memory_mode(None),
+            num_valid_rows,
+            check_num_valid_rows,
+        )
+    problem = validate_lm_head_det_inputs(
+        X, W, labels, chunk_size=chunk_size, entry="logprob"
+    )
+    T = int(problem.num_rows)
+    given = _given_count(num_valid_rows, T)
+    row_index = None
+    if T and _resolve_compact(compact_rows):
+        row_index = given_valid_rows(labels, given, check=check_num_valid_rows)[0]
+    elif T and check_num_valid_rows:
+        _check_count_on_host(labels, given)
+    return _main.CakeLMHeadDetLogprobKeepFunction.apply(
+        X,
+        W,
+        labels,
+        int(chunk_size),
+        compact_rows,
+        fuse_dw_cast,
+        dx_finalize,
+        dw_stream,
+        hidden_count,
+        gemm_tuning,
+        logprob_dz,
+        row_index,
+    )
+
+
 def cake_lm_head_det_train_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -9627,12 +9695,14 @@ def cake_lm_head_det_train_logprob(
     without ``num_valid_rows``, with ``"fast"`` or a default call whose step forms no BF16 weight gradient on the
     ``cake`` backend, the call is :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob``, and so is a default call
     under gradient mode off whose ``W`` requires a gradient, with its hidden valid-row count checked against the
-    step's budget (:func:`_auto_hidden_count`).  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`,
-    without ``num_valid_rows``; ``cake`` backend): :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob_keep`` --
-    where a backward can follow, the forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes until the
-    backward) and the backward forms ``dz`` from them instead of recomputing them (bitwise the same ``logp`` /
-    ``dX`` / ``dW``); where none can, the default entry.  Like ``"budget"`` it is a ``ValueError`` on the reference
-    backend (the backend-level ``cake_lm_head_det_train_logprob_keep`` runs the default entry there)."""
+    step's budget (:func:`_auto_hidden_count`).  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`; ``cake``
+    backend): :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob_keep`` -- where a backward can follow, the
+    forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes until the backward) and the backward forms
+    ``dz`` from them instead of recomputing them (bitwise the same ``logp`` / ``dX`` / ``dW``); where none can, the
+    default entry.  With ``num_valid_rows`` (:func:`_logprob_keep_given`) the kept forward runs on the valid-row
+    index formed on the device from the caller's count, without a readback (bitwise the same outputs).  Like
+    ``"budget"`` it is a ``ValueError`` on the reference backend (the backend-level
+    ``cake_lm_head_det_train_logprob_keep`` runs the default entry there)."""
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
     mode: Optional[str] = None
@@ -9661,13 +9731,25 @@ def cake_lm_head_det_train_logprob(
             logprob_lbl=logprob_lbl,
         )
     if memory_mode == KEEP_LOGITS:  # past the fast form: the opt-in kept logits
-        if num_valid_rows is not None:
-            raise ValueError(
-                f"memory_mode={KEEP_LOGITS!r} runs the default entry's forward, which counts the valid rows itself: "
-                "pass no num_valid_rows with it"
-            )
         if backend != "cake":
             raise ValueError(f"memory_mode={KEEP_LOGITS!r} runs on the cake backend")
+        if num_valid_rows is not None:
+            return _logprob_keep_given(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
+                dx_finalize=dx_finalize,
+                dw_stream=dw_stream,
+                hidden_count=hidden_count,
+                gemm_tuning=gemm_tuning,
+                logprob_dz=logprob_dz,
+                logprob_lbl=logprob_lbl,
+                num_valid_rows=num_valid_rows,
+                check_num_valid_rows=check_num_valid_rows,
+            )
         return _main.cake_lm_head_det_train_logprob_keep(
             X,
             W,

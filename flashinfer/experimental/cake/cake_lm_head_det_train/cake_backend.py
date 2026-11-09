@@ -10641,12 +10641,16 @@ def forward_logprob_keep(
     compact_rows: Optional[bool] = None,
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    row_index: Any = _RECOUNT,
 ) -> KeptForwardResult:
     """:func:`forward_logprob` that keeps every chunk's BF16 logits for the backward (``cake`` backend): the logits
     GEMM is the plain ``gemm_logits`` (the whole ``z_c``, not the label-column arm), chunk 0's logits stay in the
     chunk buffer and the later chunks' go to one ``[T_v - rows_0, V]`` buffer, ``2 * T_v * V`` bytes in all
     (:attr:`KeptForwardResult.logits`).  Pass them to :func:`backward_logprob_keep`, which forms ``dz`` from them
-    instead of recomputing the logits.  Bitwise the same ``logp`` / ``lse`` as :func:`forward_logprob`."""
+    instead of recomputing the logits.  Bitwise the same ``logp`` / ``lse`` as :func:`forward_logprob`.
+    ``row_index``: the caller's valid-row index of a compacted call (the ascending int64 rows whose label is ``>= 0``,
+    ``None`` when every row is valid; the opt-in module forms it on the device from ``num_valid_rows``) -- the call
+    then counts nothing (no host synchronization, no hidden count); the default counts the valid rows itself."""
     if backend != "cake":
         raise ValueError("the kept logits (logprob_keep) run on the cake backend")
     problem = validate_lm_head_det_inputs(
@@ -10663,20 +10667,24 @@ def forward_logprob_keep(
             _empty_forward(problem, X, need_dx=False, need_dw=False), None
         )
     compact = _resolve_compact(compact_rows)
-    hc = _hidden_count(
-        problem,
-        X,
-        W,
-        labels,
-        backend=backend,
-        compact=compact,
-        stats=True,
-        hidden_count=_resolve_hidden_count(hidden_count),
-    )
-    if hc is not None:
-        row_index = hc.row_index()
-    else:
-        row_index = valid_row_index(labels) if compact else None
+    hc = None
+    if row_index is _RECOUNT:
+        hc = _hidden_count(
+            problem,
+            X,
+            W,
+            labels,
+            backend=backend,
+            compact=compact,
+            stats=True,
+            hidden_count=_resolve_hidden_count(hidden_count),
+        )
+        if hc is not None:
+            row_index = hc.row_index()
+        else:
+            row_index = valid_row_index(labels) if compact else None
+    elif row_index is not None and not compact:
+        raise ValueError("a valid-row index belongs to a compacted forward")
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _kept_result(
             _empty_forward(
@@ -11853,7 +11861,10 @@ def _logprob_temperature_backward(ctx, dlogp, saved) -> tuple:
 
 class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
     """Entry (b) with the kept logits (:func:`cake_lm_head_det_train_logprob_keep`): the forward saves the row statistic
-    and the kept logits; the first backward forms ``dz`` from them, a later one (a retained graph) recomputes."""
+    and the kept logits; the first backward forms ``dz`` from them, a later one (a retained graph) recomputes.
+    ``row_index`` (optional, last): the caller's valid-row index (:func:`forward_logprob_keep`; the opt-in module's
+    ``num_valid_rows``); omitted, the forward counts the valid rows itself.  The backward returns one gradient slot per
+    input either way (PyTorch drops trailing ``None`` slots past the inputs given)."""
 
     @staticmethod
     def forward(
@@ -11869,6 +11880,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
         hidden_count,
         gemm_tuning,
         logprob_dz,
+        row_index=_RECOUNT,
     ):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
@@ -11885,6 +11897,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
                     hidden_count,
                     gemm_tuning,
                     logprob_dz,
+                    row_index,
                 )
         compact = _resolve_compact(compact_rows)
         hidden = _resolve_hidden_count(hidden_count)
@@ -11897,6 +11910,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
             compact_rows=compact,
             hidden_count=hidden,
             gemm_tuning=tuning,
+            row_index=row_index,
         )
         ctx.set_materialize_grads(False)
         # the kept logits are saved tensors too, so a non-reentrant checkpoint drops them with the rest; ``row_grad``
@@ -11921,7 +11935,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 11
+            return (None,) * 12
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         X, W, labels, lse, row_index, *kept = ctx.saved_tensors
         common = dict(
@@ -11951,7 +11965,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
                 logprob_dz=ctx.logprob_dz,
                 **common,
             )
-        return (dx, dw) + (None,) * 9
+        return (dx, dw) + (None,) * 10
 
 
 def cake_lm_head_det_train_loss(
