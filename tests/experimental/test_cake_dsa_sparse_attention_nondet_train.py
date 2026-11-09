@@ -4660,7 +4660,7 @@ def test_nope_autograd_entries_validate_before_their_first_launch_and_settle_aft
     """On every route the NoPE autograd entries allocate and bind the forward, validate the accumulator arguments
     (:class:`_NopeBackwardPrep`'s constructor) and launch; the backward's settlement (:meth:`_NopeBackwardPrep.settle`:
     the key, the saved list, the prediction) follows the last launch, so it overlaps the forward kernel.  An invalid
-    accumulator argument is rejected before any launch."""
+    accumulator argument, or a ``key_passes`` the backward key cannot convert, is rejected before any launch."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     events = []
@@ -4735,6 +4735,7 @@ def test_nope_autograd_entries_validate_before_their_first_launch_and_settle_aft
             (dict(dkv_dst_map=mine), "only meaningful together with dkv_acc"),
             (dict(dkv_acc=torch.zeros(S, 16, device="cuda")), ""),
             (dict(dkv_acc=3), "callable"),
+            (dict(key_passes="auto"), "invalid literal"),
         ):
             del events[:]
             with pytest.raises((ValueError, TypeError), match=match):
@@ -4968,8 +4969,8 @@ def test_nope_autograd_backward_runs_the_prediction_of_its_dout_layout(monkeypat
     ``dout`` has that geometry runs it with no lookup; another ``dout`` layout takes the lookup (a plan on a miss)
     and replaces the prediction.  Every backward runs the binding of its own ``dout`` layout -- the delta stage
     receives that layout's strides -- however the layouts alternate.  No prediction is looked up when neither
-    ``q`` nor ``kv`` requires a gradient; ``clear()`` drops the predictions with the bindings, and one capacity
-    bounds both."""
+    ``q`` nor ``kv`` requires a gradient; ``clear()`` drops the predictions with the bindings -- including one a
+    forward has already read for its backward -- and one capacity bounds both."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     cache = cake_backend.BINDING_CACHE
@@ -5014,10 +5015,12 @@ def test_nope_autograd_backward_runs_the_prediction_of_its_dout_layout(monkeypat
     }
     varlen = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen
 
-    def step(name):
+    def step(name, between=None):
         dout = layouts[name]
         counts.clear()
         out = varlen(q, kv, local, cu_q, cu_k, causal=True)
+        if between is not None:
+            between()
         del calls[:]
         torch.autograd.grad(out, (q,), dout)
         stage, delta = calls[0]
@@ -5051,6 +5054,10 @@ def test_nope_autograd_backward_runs_the_prediction_of_its_dout_layout(monkeypat
     cache.clear()
     assert step("dense") == (1, 1, 1, 1)
     assert len([k for k in cache._entries if k[0] == NOPE_BWD_PREDICTION]) == 1
+    # a clear() between a forward and its backward retires the prediction that forward read: the backward plans
+    assert step("dense") == (1, 0, 0, 0)
+    assert step("dense", between=cache.clear) == (1, 1, 1, 1)
+    assert step("dense") == (1, 0, 0, 0)
     # one capacity bounds bindings and predictions alike
     monkeypatch.setattr(cache, "capacity", cache.capacity)  # restored after the test
     cache.configure(capacity=1)
@@ -8369,6 +8376,53 @@ def test_rope_varlen_hit_skips_the_registry_queries_of_the_route_decision(
     assert counted_call(causal=True) == {}
     assert counted_call(causal=False) == miss  # another key of the same rows
     assert counted_call(causal=False) == {}
+
+
+def test_rope_varlen_record_swap_keeping_the_stage_serves_the_cached_binding_until_clear(
+    monkeypatch,
+):
+    """A swap of the NoPE record for one that keeps the index-preparation stage ends the lookup-first path, not the
+    cached binding: the cache is keyed by geometry, not by record, so every call decides its route again and the
+    stage route still launches the binding resolved from the old record.  ``BINDING_CACHE.clear()`` lets the next
+    call plan against the registered record, and the calls after it are served lookup-first again."""
+    calls = []
+    record = _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    decisions = []
+    real_available = cake_backend.nope_index_prep_available
+
+    def available(*args, **kwargs):
+        decisions.append(True)
+        return real_available(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "nope_index_prep_available", available)
+    cache = cake_backend.BINDING_CACHE
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    acts = _rope_device_inputs(T, int(cu_k[-1]), K)[:4]
+
+    def call():
+        """``(route decisions, the cached binding)`` of one stage call."""
+        del decisions[:], calls[:]
+        cake_backend.cake_dsa_sparse_attention_nondet_varlen(
+            *acts, local, cu_q, cu_k, causal=True
+        )
+        assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "fwd"]
+        (binding,) = cache._entries.values()
+        return len(decisions), binding
+
+    cache.clear()
+    decided, first = call()
+    assert decided == 1 and first.record is record
+    assert call() == (0, first)
+    swapped = dict(record)  # keeps the stage and its entry
+    monkeypatch.setitem(cake_jit.MODULES, NOPE_PROGRAM, swapped)
+    assert call() == (1, first)
+    assert call() == (1, first)
+    cache.clear()
+    decided, planned = call()
+    assert decided == 1 and planned is not first and planned.record is swapped
+    assert call() == (0, planned)
 
 
 def test_rope_varlen_stage_route_launches_before_the_autograd_function(monkeypatch):

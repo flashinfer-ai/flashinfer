@@ -306,7 +306,9 @@ the last backward ran and that `dout`'s geometry.  The NoPE autograd forward
 looks it up after its launch, and a backward whose `dout` has that geometry
 runs the binding with no key completion and no cache lookup; another `dout`
 layout takes the lookup and replaces the prediction.  A binding planned during
-capture is never remembered.  The rope varlen entry decides its index route on
+capture is never remembered.  `BINDING_CACHE.clear()` drops the predictions
+with the bindings, and a backward whose forward read a prediction before the
+clear takes the lookup.  The rope varlen entry decides its index route on
 every call; on the stage route its cached binding is keyed by the geometry of the
 activations, the per-document rows and a caller cut, plus `causal` and the
 scale -- not by the prefix sums, whose length (the document count) is a launch

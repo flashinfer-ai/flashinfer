@@ -2377,10 +2377,11 @@ def _binding_cache_capacity(capacity: Optional[int]) -> int:
 
 
 def _segment_class(num_segments: int) -> int:
-    """``num_segments`` as the backward binding keys hold it: the count itself up to 1 (a count below 1 is refused
-    when the binding is planned, so it is never stored) and 2 for every multi-segment row.  The key-pass policy
-    reads only whether the row has more than one segment (:meth:`KeyPassPolicy.passes`), so a training step with a
-    new document count reuses the binding of the last one instead of planning anew."""
+    """``num_segments`` as the backward binding keys hold it: the count itself up to 1 (a count below 1 keeps a key of
+    its own, apart from every valid count, whether or not the plan refuses it -- the key-pass policy does when
+    :func:`plan_key_passes` consults it, not under a ``key_passes`` override) and 2 for every multi-segment row.  The
+    key-pass policy reads only whether the row has more than one segment (:meth:`KeyPassPolicy.passes`), so a
+    training step with a new document count reuses the binding of the last one instead of planning anew."""
     n = int(num_segments)
     return n if n <= 1 else 2
 
@@ -2581,7 +2582,9 @@ class _Binding:
 class _BindingCache:
     """Bounded, lock-protected LRU of :class:`_Binding` by call key.  It also holds the NoPE autograd backward's
     predicted bindings (:meth:`predict`, :meth:`remember`) under their own tagged keys, so one capacity and one
-    eviction order bound both, and :meth:`clear` / :meth:`configure` act on both.
+    eviction order bound both, and :meth:`clear` / :meth:`configure` act on both.  :meth:`clear` also reaches a
+    prediction a NoPE autograd forward has already read for its backward: ``generation`` counts the clears, and
+    that backward runs the prediction only while the count is the one it was read under.
 
     ``capacity`` (``None`` = :data:`BINDING_CACHE_DEFAULT_CAPACITY`, 64) bounds the entries; :meth:`configure`
     changes it on a live cache.
@@ -2592,6 +2595,7 @@ class _BindingCache:
         self._lock = threading.Lock()
         # a binding by its call key; a ``(dout geometry, binding)`` prediction by its tagged key
         self._entries: "OrderedDict[tuple, Any]" = OrderedDict()
+        self.generation = 0
 
     def configure(self, *, capacity: Optional[int] = None) -> None:
         """Set the capacity (``None`` = :data:`BINDING_CACHE_DEFAULT_CAPACITY`); entries beyond it are evicted,
@@ -2646,6 +2650,7 @@ class _BindingCache:
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+            self.generation += 1
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -3220,8 +3225,11 @@ class _RopeVarlenBinding(_Binding):
     stage's fresh rows and counts -- it owns no ``topk_length`` vector (the stage writes the lengths), so it holds
     no storage and :func:`_binding` serves captured calls from it too -- and the stage call less its tensors
     (:class:`_IndexPrepStage`: the resolved entry and the launch values that follow from the key).  ``record`` is the
-    NoPE record the stage was resolved from: a hit serves a call only while that record is the registered one
-    (:func:`_rope_varlen_hit`; a registry swap is seen, an in-place edit of the record is not).  ``rows_in_place``:
+    NoPE record the stage was resolved from: the lookup-first path serves a call only while that record is the
+    registered one (:func:`_rope_varlen_hit`; an in-place edit of the record is not seen).  After a swap the entry
+    decides the route on every call, and on the stage route :func:`_binding` still returns this binding -- the cache
+    is keyed by geometry, not by record, as for every binding -- until :meth:`_BindingCache.clear` lets the next
+    call plan against the registered record.  ``rows_in_place``:
     whether the rows have the strides ``(K_slots, 1)`` exactly (one row with another row stride has not) and start at
     a vector-aligned element, so the stage reads them as they are instead of through the flat alias; a function of
     the key.  The operands and the launch values of both launches are bound per call."""
@@ -3305,8 +3313,8 @@ def _rope_varlen_hit(
     (:func:`_rope_varlen_index_mode`), else ``None``.  On a hit the key fixes the rows' dtype, shape and device and
     the query count, and the device fixes the architecture, so only what the key does not hold can change the
     route: the prefix sums, checked here as :func:`_check_gather_kv_indices` and the route's device comparison check
-    them, and a swap of the NoPE record the binding was resolved from.  No capture query: the binding owns no
-    storage (:func:`_binding`)."""
+    them, and a swap of the NoPE record the binding was resolved from (which sends the call to the full route
+    decision; see :class:`_RopeVarlenBinding`).  No capture query: the binding owns no storage (:func:`_binding`)."""
     binding = BINDING_CACHE.get(key)
     num_prefix = cu_seqlens_q.numel()
     device_index = gather_kv_indices.get_device()
@@ -4706,21 +4714,24 @@ class _NopeBackwardPrep:
     nothing: a tensor ``dkv_acc`` (:func:`_check_dkv_acc`; ``check_dst_map`` synchronizes here) is kept with its
     pointer operand and ``dkv_dst_map`` in ``operands`` -- caller-owned, outside the saved list -- and a
     zero-argument callable is kept as the source a deferred accumulator comes from, resolved and validated in the
-    backward (:data:`DkvAccSource`).  :meth:`settle` runs after the launch, while the forward kernel runs, and cannot
-    raise: it stores the backward's binding key without ``dout`` (``key_head``, then ``key_tail``: the rest of the
-    key, the accumulator's geometry included, whenever the accumulator is known at forward time -- none, or a
-    tensor; ``None`` for a callable, whose result is keyed in the backward), the presence flag of the lengths and
-    whether the call has query rows, saves the tensors, and looks up the backward's predicted binding.
+    backward (:data:`DkvAccSource`).  It also makes the key's conversions of the options (``int(key_passes)``
+    included), so a value they refuse launches nothing either.  :meth:`settle` runs after the launch, while the
+    forward kernel runs, and cannot raise: it stores the backward's binding key without ``dout`` (``key_head``, then
+    ``key_tail``: the rest of the key, the accumulator's geometry included, whenever the accumulator is known at
+    forward time -- none, or a tensor; ``None`` for a callable, whose result is keyed in the backward), the presence
+    flag of the lengths and whether the call has query rows, saves the tensors, and looks up the backward's predicted
+    binding.
 
     The prediction (:meth:`_BindingCache.predict`) is the binding the last backward with the same key without
     ``dout`` ran, with that ``dout``'s geometry, the one part of the key the forward cannot know.  A backward whose
     ``dout`` has that geometry runs it with no key completion and no cache lookup: its full key is the one the
     binding is cached under, so it is the binding :func:`_binding` would return.  Any other backward completes the
     key, looks it up and remembers its binding for the next forward (:meth:`_BindingCache.remember`) and for a
-    later backward through the same node.  Only calls with lengths and query rows and without a callable
-    accumulator predict -- their bindings own no ``topk_length`` vector and their key without ``dout`` is complete
-    at forward time -- and only when ``q_latent`` or ``kv_latent`` requires a gradient
-    (``ctx.needs_input_grad``).
+    later backward through the same node.  A :meth:`_BindingCache.clear` after the prediction was read
+    (``generation``) sends the backward to the lookup too, as if no prediction had been read.  Only calls with lengths
+    and query rows and without a callable accumulator predict -- their bindings own no ``topk_length`` vector and
+    their key without ``dout`` is complete at forward time -- and only when ``q_latent`` or ``kv_latent`` requires a
+    gradient (``ctx.needs_input_grad``).
 
     The plan bakes the index rows' stride and start offset, so the backward keys by the saved tensors instead, and
     neither runs nor remembers a prediction, when the saved rows' geometry differs from the forward's (a saved-tensor
@@ -4747,6 +4758,7 @@ class _NopeBackwardPrep:
         "key_tail",
         "prediction_key",
         "predicted",
+        "generation",
     )
 
     def __init__(
@@ -4764,6 +4776,10 @@ class _NopeBackwardPrep:
             raise ValueError("dkv_dst_map is only meaningful together with dkv_acc")
         self.softmax_scale = float(softmax_scale)
         self.key_passes, self.num_segments = key_passes, int(num_segments)
+        if key_passes is not None:
+            # the backward key's conversion (:func:`backward_binding_key_nope`), made here so that a value it
+            # refuses raises before the launch; ``key_passes`` itself is kept as given for the plan to check
+            int(key_passes)
         self.dkv_direct, self.check_dst_map = dkv_direct, bool(check_dst_map)
         acc_tensor = dkv_acc if isinstance(dkv_acc, torch.Tensor) else None
         self.operands = {}
@@ -4825,6 +4841,9 @@ class _NopeBackwardPrep:
         if self.key_tail is not None and self.has_topk_length and self.has_rows:
             self.prediction_key = (_NOPE_BWD_PREDICTION, self.key_head, self.key_tail)
             if any(ctx.needs_input_grad[:2]):
+                # the cache's generation (:attr:`_BindingCache.generation`) before the read: a clear since then,
+                # however it interleaves with the read, retires ``predicted``
+                self.generation = BINDING_CACHE.generation
                 self.predicted = BINDING_CACHE.predict(self.prediction_key)
 
     def backward(self, saved, dout) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -4884,9 +4903,14 @@ class _NopeBackwardPrep:
             )
         dout_geometry = _geometry(dout)
         predicted = self.predicted if prediction_key is not None else None
-        if predicted is not None and predicted[0] == dout_geometry:
+        if (
+            predicted is not None
+            and predicted[0] == dout_geometry
+            and self.generation == BINDING_CACHE.generation
+        ):
             binding = predicted[1]
         else:
+            generation = BINDING_CACHE.generation
             key = key_head + (dout_geometry,) + key_tail
             binding = _binding(
                 key,
@@ -4909,7 +4933,7 @@ class _NopeBackwardPrep:
             )
             if prediction_key is not None:
                 BINDING_CACHE.remember(prediction_key, dout_geometry, key, binding)
-                self.predicted = (dout_geometry, binding)
+                self.predicted, self.generation = (dout_geometry, binding), generation
         inert_f32, inert_bf16 = _inert_placeholders(q_latent.device)
         operands = dict(
             q_latent=q_latent,
