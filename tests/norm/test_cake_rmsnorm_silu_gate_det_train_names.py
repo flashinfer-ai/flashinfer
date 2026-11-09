@@ -376,17 +376,14 @@ def test_the_two_modes_are_separate_modules() -> None:
         | set(loader.MID_ROLES)
         | set(loader.SHORT_ROLES)
     )
-    # the deterministic package routes its call roles and, on some
-    # architectures, a forward of packed rows
+    # the deterministic package routes its call roles, the long modules of its
+    # backward roles and, on some architectures, a forward of packed rows
     det_loader = det_backend.cake_jit
     roles = {record["role"] for record in det_loader.MODULES.values()}
-    assert (
-        set(det_loader.ROLES)
-        <= roles
-        <= set(det_loader.ROLES) | set(det_loader.PACKED_ROLES)
-    )
+    routed = {*det_loader.ROLES, *det_loader.LONG_ROLES}
+    assert routed <= roles <= routed | set(det_loader.PACKED_ROLES)
     for routes in det_loader.ROUTES.values():
-        assert set(det_loader.ROLES) <= set(routes) <= roles
+        assert routed <= set(routes) <= roles
 
 
 def test_facade_objects() -> None:

@@ -55,14 +55,20 @@ Host design (every control is a keyword; no environment variable):
   every block; otherwise every CTA claims chunks of blocks (interleaved within
   each halving round) from a counter in the workspace, following a table of
   halving rounds that every CTA computes from the block count and ``G``, so a
-  CTA that starts late takes fewer blocks.  ``dx`` and ``dz`` are FP32
-  formulas rounded once each, with ``rstd`` from the approximate FP32
-  reciprocal square root and the sigmoid factor ``s`` from the approximate
-  FP32 base-2 exponential of the exact FP32 product of ``-z`` and the 15-bit
-  head of ``log2(e)`` (the remaining bits applied to first order) and the
-  approximate reciprocal, on every element alike: each lies within one BF16
-  unit in the last place of the same formula in correctly rounded FP32 plus
-  1/64 of a unit of its row's scale (for ``dz`` the row's largest
+  CTA that starts late takes fewer blocks.  From 2560 rows per SM on SM100 and
+  SM103 and 1536 on SM107, a call whose ``grad_out``, ``x`` and ``z`` the
+  kernel reads as packed rows (head stride 128, token stride ``H * 128``;
+  ``cake_jit.backward_module``) runs the same backward in a loop that loads a
+  block's rows while the previous block's row math runs: the same grid, FP32
+  operations in the same order and workspace, so the same bits; other calls run
+  the default module of their weight-gradient dtype (``cake_jit.ROUTES``).
+  ``dx`` and ``dz`` are FP32 formulas rounded once each, with ``rstd`` from the
+  approximate FP32 reciprocal square root and the sigmoid factor ``s`` from the
+  approximate FP32 base-2 exponential of the exact FP32 product of ``-z`` and
+  the 15-bit head of ``log2(e)`` (the remaining bits applied to first order)
+  and the approximate reciprocal, on every element alike: each lies within one
+  BF16 unit in the last place of the same formula in correctly rounded FP32
+  plus 1/64 of a unit of its row's scale (for ``dz`` the row's largest
   ``|dy * x * rstd * w|``, for ``dx`` the sum of the largest magnitudes of its
   two terms; rows whose sums reach ``2^127`` aside).  Like the FP32 sigmoid,
   ``s`` is subnormal for ``z`` from about ``-87.34`` to ``-88.72`` and 0 below
@@ -136,11 +142,12 @@ from .cake_jit import (
     ARCHES,
     HEAD_DIM,
     INT32_MAX,
+    LONG_ROLES,
     ROLES,
     ROUTES,
     arch_for_capability,
+    backward_module,
     device_sm_count,
-    module_for_rows,
     workspace_elements,
 )
 
@@ -392,11 +399,14 @@ def cake_rmsnorm_silu_gate_det_train_forward(
 
 def _workspace_elements(arch: str) -> int:
     """FP32 elements of a workspace that serves every backward module of
-    ``arch`` (both weight-gradient dtypes, any row count)."""
+    ``arch`` (both weight-gradient dtypes and their long modules, any row
+    count)."""
 
     routes = ROUTES[arch]
     return max(
-        workspace_elements(routes[role]) for role in ROLES if role.startswith("bwd")
+        workspace_elements(routes[role])
+        for role in ROLES + LONG_ROLES
+        if role.startswith("bwd") and role in routes
     )
 
 
@@ -468,10 +478,11 @@ def cake_rmsnorm_silu_gate_det_train_reset_workspace(
 # zero-filled once and kept for the process (18952 bytes for every stream that
 # ran a backward).  Every backward leaves its workspace zero and the calls of
 # one stream run in order, so they share it (no allocation and no fill per
-# call); both weight-gradient dtypes' modules read the same layout.  A call
-# during CUDA Graph capture uses a workspace of its capture instead
-# (``_capture_workspace``), so a graph replayed on another stream never shares
-# a buffer with eager calls or other graphs.
+# call); every backward module (both weight-gradient dtypes and their long
+# modules) reads the same layout.  A call during CUDA Graph capture uses a
+# workspace of its capture instead (``_capture_workspace``), so a graph
+# replayed on another stream never shares a buffer with eager calls or other
+# graphs.
 _STREAM_WORKSPACES: dict[
     tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ] = {}
@@ -773,7 +784,19 @@ def cake_rmsnorm_silu_gate_det_train_backward(
     zv, z_tok, z_head = _kernel_view(z, "z", shape=shape, device=device)
     index = _device_index(device)
     role = "bwd_f32" if dw is not None and dw.dtype == torch.float32 else "bwd_bf16"
-    name = module_for_rows(arch, role, rows, device_sm_count(index))
+    name = backward_module(
+        arch,
+        role,
+        rows,
+        heads,
+        device_sm_count(index),
+        dy_tok,
+        dy_head,
+        x_tok,
+        x_head,
+        z_tok,
+        z_head,
+    )
     if workspace is None:
         acc, flags, done = _stream_workspace_views(name, arch, device)
     else:
