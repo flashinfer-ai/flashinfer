@@ -1601,11 +1601,6 @@ _FP8_CAUSAL_FORMS = ("LSE", "SINK")
 _FORM_ONE_STAGE_PACKS = {"sm100a": (1, 2, 4, 8), "sm103a": (1, 2, 4, 8)}
 
 
-# The own packs whose form calls of more than one stage of query tokens per
-# tile take pack 1's one-stage program where its tiles fit one wave.
-_FORM_ONE_STAGE_OWN_PACKS = (5,)
-
-
 def _form_choice(target, pack, form, max_kv, max_q, batch, num_q_heads):
     """``(pack, program)`` of an FP8 call of ``form`` whose form program runs
     at ``pack`` (``batch`` requests, ``num_q_heads`` query heads, at most
@@ -1614,9 +1609,8 @@ def _form_choice(target, pack, form, max_kv, max_q, batch, num_q_heads):
     at most one stage of query tokens; else, at packs 1, 2, 4 and 8, the
     swapped one-stage build where every tile holds at most one stage of query
     tokens (``max_q <= 128 / pack``) or where the one-stage tiles fit one wave
-    (``_SM_COUNT``), at an own pack of ``_FORM_ONE_STAGE_OWN_PACKS`` of more
-    than one stage of query tokens pack 1's one-stage build where its tiles fit
-    one wave, and otherwise the swapped two-stage build (both targets)."""
+    (``_SM_COUNT``), and otherwise the swapped two-stage build (both
+    targets)."""
 
     program = f"RUNTIME_PACK{pack}_{form}"
     one = pack in _FORM_ONE_STAGE_PACKS.get(target, ())
@@ -1629,12 +1623,6 @@ def _form_choice(target, pack, form, max_kv, max_q, batch, num_q_heads):
         or batch * (num_q_heads // pack) * -(-max_q // tokens) <= sm_count
     ):
         return pack, program + "_PX_Q1"
-    if (
-        pack in _FORM_ONE_STAGE_OWN_PACKS
-        and max_q > tokens
-        and batch * num_q_heads * -(-max_q // 128) <= sm_count
-    ):
-        return 1, f"RUNTIME_PACK1_{form}_PX_Q1"
     return pack, program + "_PX"
 
 
@@ -6761,22 +6749,22 @@ def test_cake_fmha_context_fp8_form_one_stage_routes_of_one_wave(
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 @pytest.mark.parametrize("form", sorted(_FP8_FORMS))
-def test_cake_fmha_context_fp8_pack5_form_calls_of_one_wave_take_pack1(
+def test_cake_fmha_context_fp8_pack5_form_calls_keep_pack5(
     monkeypatch, target, form
 ) -> None:
-    """A pack-5 call of another form (GQA group 5) whose tiles hold more than
-    one stage of query tokens over more than 128 keys takes pack 1's swapped
-    one-stage build where pack 1's one-stage tiles fit one wave, causal forms
-    included; with more tiles, at most one stage of query tokens or at most
-    128 keys it keeps pack 5's form program."""
+    """A pack-5 call of another form (GQA group 5) keeps pack 5's form
+    program, causal forms included, whatever its tiles: the swapped two-stage
+    build over more than 128 keys, the build with P in its own S columns over
+    at most 128 keys.  (Pack 1's one-stage tiles would put other rows in each
+    warp of the correction, whose rescale vote decides the output's bits.)"""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     monkeypatch.setattr(
         cake_api, "_context_split_sm_count", lambda device: _SM_COUNT[target]
     )
     for batch, max_q, max_kv, expected in (
-        (2, 200, 700, (1, f"RUNTIME_PACK1_{form}_PX_Q1", 2)),
-        (4, 200, 700, (1, f"RUNTIME_PACK1_{form}_PX_Q1", 2)),
+        (2, 200, 700, (5, f"RUNTIME_PACK5_{form}_PX", 4)),
+        (4, 200, 700, (5, f"RUNTIME_PACK5_{form}_PX", 4)),
         (8, 200, 700, (5, f"RUNTIME_PACK5_{form}_PX", 4)),
         (2, 25, 700, (5, f"RUNTIME_PACK5_{form}_PX", 1)),
         (2, 200, 128, (5, f"RUNTIME_PACK5_{form}", 4)),
@@ -6835,14 +6823,14 @@ def _check_form_program_bitwise(
 @pytest.mark.parametrize("form", sorted(_FP8_FORMS))
 @pytest.mark.parametrize(
     ("hq", "hkv", "batch", "max_q", "max_kv"),
-    ((10, 2, 2, 200, 700), (8, 8, 4, 512, 1024), (16, 8, 4, 128, 1024)),
+    ((8, 8, 4, 512, 1024), (16, 8, 4, 128, 1024)),
 )
 def test_cake_context_fp8_form_one_wave_programs_match_the_jit_route_bitwise(
     monkeypatch, served_programs, form, hq, hkv, batch, max_q, max_kv
 ) -> None:
-    """A form call that takes a one-stage build of one wave (several m-blocks,
-    or pack 1 for a pack-5 call) writes the JIT module's output and LSE bit
-    for bit and ignores NaN codes past each request's length."""
+    """A form call that takes a one-stage build of one wave (several m-blocks)
+    writes the JIT module's output and LSE bit for bit and ignores NaN codes
+    past each request's length."""
 
     _check_form_program_bitwise(
         monkeypatch, served_programs, form, hq, hkv, batch, max_q, max_kv, "_PX_Q1"
@@ -6858,15 +6846,17 @@ def test_cake_context_fp8_form_one_wave_programs_match_the_jit_route_bitwise(
         (32, 4, 16, 64, 1024),
         (32, 8, 16, 128, 4096),
         (10, 2, 8, 200, 700),
+        (10, 2, 2, 200, 700),
     ),
 )
 def test_cake_context_fp8_form_two_stage_programs_match_the_jit_route_bitwise(
     monkeypatch, served_programs, form, hq, hkv, batch, max_q, max_kv
 ) -> None:
-    """A form call of more one-stage tiles than the SMs takes the two-stage
-    program with the 4-stage K/V ring and the P tile in the other stage's S
-    columns (packs 8, 4 and 5 here): it writes the JIT module's output and
-    LSE bit for bit and ignores NaN codes past each request's length."""
+    """A form call of more one-stage tiles than the SMs, or of pack 5 (no
+    one-stage build), takes the two-stage program with the 4-stage K/V ring
+    and the P tile in the other stage's S columns (packs 8, 4 and 5 here): it
+    writes the JIT module's output and LSE bit for bit and ignores NaN codes
+    past each request's length."""
 
     _check_form_program_bitwise(
         monkeypatch, served_programs, form, hq, hkv, batch, max_q, max_kv, "_PX"

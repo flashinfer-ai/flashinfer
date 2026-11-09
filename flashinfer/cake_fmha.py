@@ -2313,10 +2313,6 @@ _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES: dict[
     }
     for target in ("sm100a", "sm103a")
 }
-# The packs of :data:`_CONTEXT_FP8_RUNTIME_OWN_PACKS` whose form calls of more
-# than one stage of query tokens per tile take the one-stage program of pack 1
-# where its tiles fit one wave (:func:`_context_fp8_form_one_stage_pack`).
-_CONTEXT_FP8_FORM_ONE_STAGE_OWN_PACKS = frozenset({5})
 # Targets whose form calls of at most one stage of query tokens per tile take
 # the one-stage program also over at most the keys of the form program's
 # short-KV entry (timed B200: 64 and 128 keys).
@@ -7541,10 +7537,9 @@ def _context_fp8_runtime_form_pack(
     (:func:`_context_fp8_runtime_route_pack`): each of its rows reads every
     key block of its request.  A causal form takes the JIT pack itself: the
     tokens of a tile decide which key blocks its P.V reads, and a row whose
-    keys end before a block multiplies that block's V by 0, which adds 0 to
-    its sums.  (The programs zero the V rows past a request's last key, so NaN
-    bytes there reach no output whatever the tiles; the one-stage choice,
-    :func:`_context_fp8_form_one_stage_pack`, may run a causal call at pack 1.)"""
+    keys end before a block still multiplies that block's V by 0; where the
+    slots past a request's last key hold NaN, only the JIT's tiles give the
+    JIT's bytes."""
 
     if form in ("NC", "NC_LSE", "NC_SINK"):
         return _context_fp8_runtime_route_pack(
@@ -7568,13 +7563,9 @@ def _context_fp8_form_one_stage_pack(
     or ``None`` (its form program): ``pack`` itself where its tiles hold at
     most one stage of query tokens or where its one-stage tiles (``batch_size
     x num_q_heads / pack x ceil(max_q_len / (128 / pack))``) fit one wave of
-    ``sm_count``; for a pack of :data:`_CONTEXT_FP8_RUNTIME_OWN_PACKS` (no
-    one-stage build) of :data:`_CONTEXT_FP8_FORM_ONE_STAGE_OWN_PACKS` whose
-    two-stage tiles hold more than one stage of query tokens, pack 1 where its
-    one-stage tiles fit one wave (timed B200 and
-    GB300, ten seeded layouts: 2 requests of 200 query tokens over 700 keys,
-    heads 10/2, pack 5's 16 tiles against pack 1's 40 one-stage tiles, ran 20
-    .. 29 % faster; 8 requests, more tiles than the SMs, ran slower)."""
+    ``sm_count``.  A pack without a one-stage build keeps its form program:
+    another pack's tiles would put other rows in each warp of the correction,
+    whose rescale vote (any row's scale below 1) the JIT's tiles decide."""
 
     one_stage = _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.get(target) or {}
     if (form, pack, None) in one_stage:
@@ -7583,14 +7574,6 @@ def _context_fp8_form_one_stage_pack(
             return pack
         tiles = batch_size * (num_q_heads // pack) * -(-max_q_len // tokens)
         return pack if sm_count and tiles <= sm_count else None
-    if (
-        pack in _CONTEXT_FP8_FORM_ONE_STAGE_OWN_PACKS
-        and (form, 1, None) in one_stage
-        and max_q_len > 128 // pack
-        and sm_count
-        and batch_size * num_q_heads * -(-max_q_len // 128) <= sm_count
-    ):
-        return 1
     return None
 
 
