@@ -1074,7 +1074,10 @@ def test_main_grid_literal_table() -> None:
 # sm_107a) takes the row-group program's rows on its channel bands from its
 # token floor: sm_100a 264 <= C < 280 and 344 <= C < 440 from S = 65536,
 # sm_103a 264 <= C < 472 and 480 <= C < 512 from S = 24576, sm_107a
-# 264 <= C < 296 and 344 <= C < 416 from S = 32768.  The rows are
+# 264 <= C < 296 and 344 <= C < 416 from S = 32768; and on every arch from
+# C = 520 while it folds five sub-tiles (384 threads: 520 <= C < 616) or
+# three (sm_107a's 256 threads: 520 <= C < 688), from the same floor, in
+# place of the program the rows below take below the floor.  The rows are
 # the kernel module's rules-test rows on both sides of the token and channel
 # boundaries; C = 512 is the first channel-selected program of every arch.
 # From C = 512: sm_100a runs the eight-token-stage program, sm_103a the
@@ -1097,9 +1100,9 @@ BWD_SM_CTA = {
 }
 # arch -> (channel bands [lo, hi), token floor) of the SM-wide row-group program.
 BWD_SM_CTA_RULE = {
-    "sm_100a": (((264, 280), (344, 440)), 65536),
-    "sm_103a": (((264, 472), (480, 512)), 24576),
-    "sm_107a": (((264, 296), (344, 416)), 32768),
+    "sm_100a": (((264, 280), (344, 440), (520, 616)), 65536),
+    "sm_103a": (((264, 472), (480, 512), (520, 616)), 24576),
+    "sm_107a": (((264, 296), (344, 416), (520, 688)), 32768),
 }
 BWD_AT_512 = {
     "sm_100a": "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
@@ -1127,7 +1130,8 @@ BWD_SELECTION_TOKENS = (
 BWD_SELECTION_CHANNELS = (
     *(128, 248, 255, 256, 264, 272, 280, 288, 296, 336, 344, 384, 408, 416),
     *(432, 440, 464, 472, 480, 504, 511, 512),
-    *(516, 519, 520, 640, 760, 767, 768, 1016, 1023, 1024),
+    *(516, 519, 520, 576, 608, 615, 616, 640, 680, 687, 688, 760, 767, 768),
+    *(1016, 1023, 1024),
 )
 
 
@@ -1137,16 +1141,16 @@ def _sm_cta_band(arch: str, C: int) -> bool:
 
 
 def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
+    if _sm_cta_band(arch, C):
+        _, floor = BWD_SM_CTA_RULE[arch]
+        if floor <= S:
+            return BWD_SM_CTA[arch]
     if BWD_STAGE8_FROM[arch] <= C:
         return BWD_STAGE8
     if arch == "sm_107a" and C >= 520:
         return BWD_C520_R200
     if C >= 512:
         return BWD_AT_512[arch]
-    if _sm_cta_band(arch, C):
-        _, floor = BWD_SM_CTA_RULE[arch]
-        if floor <= S:
-            return BWD_SM_CTA[arch]
     if arch in ("sm_100a", "sm_103a") and C >= 264:
         return BWD_ROW_GROUP
     if arch == "sm_107a" and C >= 264:
@@ -1192,7 +1196,7 @@ def test_backward_selection_literal_table() -> None:
         loader.MODULES[n] for n in (BWD_C520_R200, BWD_FALLBACK["sm_107a"])
     )
     assert loader.select_rule(band) == {
-        "channels": {"sm_107a": 520},
+        "channels": {"sm_107a": [520, 688]},
         "kind": "channels_at_least",
     }
     assert band["arches"] == fallback["arches"] == ["sm_107a"]
@@ -1440,8 +1444,15 @@ def test_document_isolation() -> None:
     _check(S, C, docs, x=x2, w=w, cu=cu, dy=dy2, label="perturbed documents")
 
 
+# S 65536 x C 576: every arch's SM-wide row-group program (from its token floor).
 @pytest.mark.parametrize(
-    "case", ((1000, 512, "perf"), (4097, 2048, (1000, 0, 3, 3094))), ids=_case_id
+    "case",
+    (
+        (1000, 512, "perf"),
+        (4097, 2048, (1000, 0, 3, 3094)),
+        (65536, 576, "perf"),
+    ),
+    ids=_case_id,
 )
 def test_dweight_is_bitwise_identical_over_three_launches(case) -> None:
     S, C, docs = case
