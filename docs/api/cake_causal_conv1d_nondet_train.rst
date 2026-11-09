@@ -19,3 +19,5 @@ experimental and is imported on first use.
     cake_causal_conv1d_nondet_train_forward_workspace_bytes
     cake_causal_conv1d_nondet_train_forward_workspace
     cake_causal_conv1d_nondet_train_forward
+    cake_causal_conv1d_nondet_train_backward
+    cake_causal_conv1d_nondet

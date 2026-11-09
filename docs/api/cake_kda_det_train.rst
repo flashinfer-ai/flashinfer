@@ -15,3 +15,8 @@ experimental and is imported on first use.
     cake_kda_det_train_forward
     cake_kda_det_train_backward
     cake_kda_det
+    cake_kda_det_train_arena
+    cake_kda_det_train_workspace
+    cake_kda_det_train_workspace_bytes
+    cake_kda_det_train_saved_bytes
+    is_cake_kda_det_train_supported
