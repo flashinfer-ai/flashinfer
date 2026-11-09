@@ -33,7 +33,8 @@ deterministic registry's records, routes and record scalars of this package's
   equal field for field (the token owner's group-row forms ``_trows_dyn``
   included), plus the programs of this package: at hidden 4096
   ``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a / sm_103a,
-  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on sm_107a,
+  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep1`` on sm_107a (its last CTA
+  alone waits for the token-owner pass: ``SPLIT_CHAIN``),
   ``cake_mhc_train_bwd_slab_fold__dynr`` and its slab-fastest copy
   ``cake_mhc_train_bwd_slab_fold__dynr_os`` on all three; at 5120
   and 7168 ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>``,
@@ -166,7 +167,7 @@ ND_PREFIX, DET_PREFIX = "cake_mhc_train_", "cake_mhc_det_train_"
 # The programs of this package and their architectures (the library suffix ``__h<H>`` names a size other than 4096).
 OWN = {
     "cake_mhc_train_fn_split_atomic__tv128_dep": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fn_split_atomic__tv128_t128_dep": ("sm_107a",),
+    "cake_mhc_train_fn_split_atomic__tv128_t128_dep1": ("sm_107a",),
     "cake_mhc_train_bwd_slab_fold__dynr": ("sm_100a", "sm_103a", "sm_107a"),
     **{
         f"cake_mhc_train_{program}__h{hidden}": NEW_HIDDEN_ARCHES
@@ -181,6 +182,9 @@ OWN = {
     "cake_mhc_train_bwd_slab_fold__dynr_os__h5120": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_slab_fold__dynr_os__h7168": ("sm_100a", "sm_103a"),
 }
+# The (architecture, hidden size) pairs whose atomic fn split is the "dep1" form (only the last CTA waits for the
+# token-owner pass); the "dep" form elsewhere.
+SPLIT_CHAIN = {("sm_107a", HIDDEN): "dep1"}
 SLAB = "cake_mhc_train_bwd_slab_fold__dynr"
 LPT = "cake_mhc_train_bwd_slab_fold__lpt"
 # The slab-fastest copies of the column slab's two forms (the units drawn slab-fastest; program key ``<form>_os``); the
@@ -523,9 +527,11 @@ def _suffix(hidden: int) -> str:
 
 def _atomic_split(arch: str, hidden: int = HIDDEN) -> str:
     """The atomic fn split of ``arch`` at ``hidden``: the form of the deterministic backward split
-    (``fn_split_program(arch, 1, hidden)``), launched as the token-owner pass's programmatic dependent (``_dep``)."""
+    (``fn_split_program(arch, 1, hidden)``), launched as the token-owner pass's programmatic dependent (``_dep``; on
+    the (architecture, hidden size) pairs of ``SPLIT_CHAIN`` its ``_dep1`` form, whose last CTA alone waits)."""
     return (
-        f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1, hidden)}_dep"
+        f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1, hidden)}_"
+        + SPLIT_CHAIN.get((arch, hidden), "dep")
         + _suffix(hidden)
     )
 
