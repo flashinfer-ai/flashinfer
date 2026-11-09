@@ -47,8 +47,8 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define NUM_M_BLOCKS 1
 #define NUM_Q_HEADS 8
 #define HEADS_PER_GROUP 1
-#define PACK_G 8
-#define TOK_PER_STAGE 16
+#define PACK_G 4
+#define TOK_PER_STAGE 32
 #define L2_SWIZZLE 8
 #define STATIC_ONE_TILE 1
 #define CHUNK_MAJOR_DEQUANT 0
@@ -371,7 +371,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Kp, const __grid_constant__ CUtensorMap Vp, const __grid_constant__ CUtensorMap Ksf, const __grid_constant__ CUtensorMap Vsf, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int scale_source, CakeFastDivmod m_blocks, unsigned int full_sections, CakeFastDivmod bh_units, int q_heads, CakeFastDivmod heads_group)
+kernel_cake_fmha_context_nvfp4_a2ccb67e2966ae3b7edc(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Kp, const __grid_constant__ CUtensorMap Vp, const __grid_constant__ CUtensorMap Ksf, const __grid_constant__ CUtensorMap Vsf, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int scale_source, CakeFastDivmod m_blocks, unsigned int full_sections, CakeFastDivmod bh_units, int q_heads, CakeFastDivmod heads_group)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -2426,7 +2426,6 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                 mbarrier_arrive(p_full_addr + 8);
                 if (next_kv0_done == 0) {
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                     int pk_base = smem_pk_addr + dq_pk_stage * 9216;
                     int sf_base = pk_base + 8192;
@@ -2483,7 +2482,6 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                     dq_kv_stage += 1;
                     if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                     int pk_base_0 = smem_pk_addr + dq_pk_stage * 9216;
                     int sf_base_0 = pk_base_0 + 8192;
@@ -2548,7 +2546,6 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                 }
                 if (num_n_blocks_1 > 1) {
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                     int pk_base_1 = smem_pk_addr + dq_pk_stage * 9216;
                     int sf_base_1 = pk_base_1 + 8192;
@@ -2605,7 +2602,6 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                     dq_kv_stage += 1;
                     if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                     int pk_base_1_1 = smem_pk_addr + dq_pk_stage * 9216;
                     int sf_base_1_1 = pk_base_1_1 + 8192;
@@ -2746,7 +2742,6 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                     mbarrier_arrive(p_full_addr);
                     if (n_iter_2 < num_n_blocks_1 - 1) {
                         mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                         int pk_base_2 = smem_pk_addr + dq_pk_stage * 9216;
                         int sf_base_2 = pk_base_2 + 8192;
@@ -2873,7 +2868,6 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                     mbarrier_arrive(p_full_addr + 8);
                     if (n_iter_2 < num_n_blocks_1 - 1) {
                         mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                         int pk_base_3 = smem_pk_addr + dq_pk_stage * 9216;
                         int sf_base_3 = pk_base_3 + 8192;
@@ -2956,7 +2950,6 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                         }
                         if (total_tiles_1 > (tile_iter_1 + 1) * ctas_2 + col_2) {
                             mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                             int pk_base_4 = smem_pk_addr + dq_pk_stage * 9216;
                             int sf_base_4 = pk_base_4 + 8192;
@@ -3013,7 +3006,6 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                             dq_kv_stage += 1;
                             if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                             mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                             int pk_base_2_1 = smem_pk_addr + dq_pk_stage * 9216;
                             int sf_base_2_1 = pk_base_2_1 + 8192;
@@ -3668,8 +3660,8 @@ kernel_cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3(const __grid_constant__ CUte
                 num_n_blocks_4 = _max_0_4;
                 uint32_t ld_b = (bh_units.divisor != 1) ? (__umulhi((uint32_t)(bh_4), bh_units.multiplier) >> bh_units.shift_right) : (uint32_t)(bh_4);
                 uint32_t ld_unit = (uint32_t)(bh_4) - ld_b * (uint32_t)(bh_units.divisor);
-                uint32_t ld_head = (heads_group.divisor != 1) ? (__umulhi((uint32_t)(ld_unit * 8), heads_group.multiplier) >> heads_group.shift_right) : (uint32_t)(ld_unit * 8);
-                uint32_t ld_rank = (uint32_t)(ld_unit * 8) - ld_head * (uint32_t)(heads_group.divisor);
+                uint32_t ld_head = (heads_group.divisor != 1) ? (__umulhi((uint32_t)(ld_unit * 4), heads_group.multiplier) >> heads_group.shift_right) : (uint32_t)(ld_unit * 4);
+                uint32_t ld_rank = (uint32_t)(ld_unit * 4) - ld_head * (uint32_t)(heads_group.divisor);
                 int unit_1 = ld_unit;
                 int kv_head = ld_head;
                 int tok_q0 = (unsigned int)cu_seq_lens_q[ld_b] + m_block_4 * 2 * (unsigned int)TOK_PER_STAGE;
