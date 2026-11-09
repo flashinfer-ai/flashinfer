@@ -197,7 +197,7 @@ def _moe_fp8_fingerprint(
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
 ) -> str:
-    """The fp8 per-tensor MoE classes behind ``MoELayer`` with ``BatchInvariantMoeFp8Config``: the dimensions of
+    """The fp8 per-tensor MoE classes behind ``MoELayer`` with ``BatchInvariantFp8PerTensorConfig``: the dimensions of
     :func:`_moe_bf16_fingerprint` (the routing method, the activation with its scalars and gating); the scales' values are
     inputs, not dimensions."""
     from flashinfer.fused_moe.batch_invariant import spec
@@ -267,7 +267,7 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
-    # the unified MoE layer with `BatchInvariantMoeFp8Config`: the same dimensions as `fused_moe`; the static per-tensor
+    # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
     "fused_moe_fp8": ClassInfo(
         "moe.e4m3",
@@ -320,7 +320,7 @@ def fingerprint(op: str, **dims) -> str:
     'moe-...'
 
     ``fused_moe_fp8`` takes the dimensions of ``fused_moe`` for the fp8 per-tensor classes ``moe.e4m3.<act>`` behind
-    ``BatchInvariantMoeFp8Config``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
+    ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
     activation on the alpha-scaled accumulators and GEMM2's scaled chain are the specification; the static per-tensor
     scales, like the operands, are inputs.
     """

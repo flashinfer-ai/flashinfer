@@ -3347,7 +3347,7 @@ class BatchInvariantBf16Config:
 
 
 @dataclass(frozen=True)
-class BatchInvariantMoeFp8Config:
+class BatchInvariantFp8PerTensorConfig:
     """The batch-invariant fp8 per-tensor MoE backend: the W8A8 classes ``moe.e4m3.<act>`` of the mode documented in
     ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set, as the bf16 backend), on
     SM100 / SM103 / SM107.
@@ -3416,7 +3416,7 @@ class BatchInvariantMoeFp8Config:
         return quantize_e4m3_static(x, m), None
 
     def __repr__(self) -> str:
-        return "BatchInvariantMoeFp8Config()"
+        return "BatchInvariantFp8PerTensorConfig()"
 
 
 # Union type for backend config
@@ -3464,7 +3464,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
-    BatchInvariantMoeFp8Config,
+    BatchInvariantFp8PerTensorConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3511,7 +3511,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
-    BatchInvariantMoeFp8Config,
+    BatchInvariantFp8PerTensorConfig,
 )
 
 

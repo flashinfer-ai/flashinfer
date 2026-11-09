@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The fp8 per-tensor batch-invariant MoE backend of the unified MoE layer (``BatchInvariantMoeFp8Config`` ->
-``BatchInvariantMoeFp8Runner``): the W8A8 classes ``moe.e4m3.<act>`` on SM100 / SM103 / SM107.
+"""The fp8 per-tensor batch-invariant MoE backend of the unified MoE layer (``BatchInvariantFp8PerTensorConfig`` ->
+``BatchInvariantFp8PerTensorRunner``): the W8A8 classes ``moe.e4m3.<act>`` on SM100 / SM103 / SM107.
 
 The surface is TRTLLM-Gen's fp8 per-tensor one: e4m3 activations (quantized by the caller with the static multiplier
 ``hidden_states_scale_global``, no activation scale tensor in the pack), the weights prepared from the bf16 experts with the
@@ -35,10 +35,10 @@ MOE_FP8_ARCHS: Tuple[Tuple[int, int], ...] = MOE_BF16_ARCHS
 _X, _IDS, _W, _W1, _W2, _SW1, _SW2, _SX, _SINTER, _MINTER, _OUT = range(11)
 
 
-class BatchInvariantMoeFp8Runner(BatchInvariantMoeRunner):
+class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
     """The unified layer's runner for the batch-invariant fp8 per-tensor MoE classes."""
 
-    backend_key = "batch_invariant_fp8"
+    backend_key = "batch_invariant_fp8_per_tensor"
     supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
 
     # ---- support ---------------------------------------------------------------------------------------------------

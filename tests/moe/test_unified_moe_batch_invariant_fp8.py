@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The fp8 per-tensor batch-invariant MoE backend of the unified MoE layer (``BatchInvariantMoeFp8Config``): the W8A8
+"""The fp8 per-tensor batch-invariant MoE backend of the unified MoE layer (``BatchInvariantFp8PerTensorConfig``): the W8A8
 classes ``moe.e4m3.<act>``, one per typed activation of the layer and its scalars, on the surface of the TRTLLM-Gen fp8
 per-tensor backend (e4m3 activations quantized with the static ``hidden_states_scale_global``, the weights prepared with
 the two calibrated multipliers, every routing input mode).
@@ -26,7 +26,7 @@ from flashinfer import batch_invariant as bi
 from flashinfer.fused_moe import (
     GELU,
     BackendOptions,
-    BatchInvariantMoeFp8Config,
+    BatchInvariantFp8PerTensorConfig,
     ExecutionConfig,
     ExpertConfig,
     GeGLU,
@@ -53,7 +53,7 @@ from flashinfer.fused_moe.api import ALL_BACKEND_CONFIGS, _DEFAULT_BACKEND
 from flashinfer.fused_moe.batch_invariant.runner import BatchInvariantMoeRunner
 from flashinfer.fused_moe.batch_invariant.runner_fp8 import (
     MOE_FP8_ARCHS,
-    BatchInvariantMoeFp8Runner,
+    BatchInvariantFp8PerTensorRunner,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.tllm_enums import RoutingMethodType
@@ -160,7 +160,7 @@ def _config(
         ),
         experts=ExpertConfig(intermediate_size=I),
         activation=act,
-        backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+        backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tune_max),
         finalize=MoEFinalizeConfig(do_finalize=True),
     )
@@ -178,7 +178,7 @@ def _weights(
     m_inter: float = M_INTER,
 ) -> MoEWeightPack:
     pack = MoEWeightPack({})
-    view = BatchInvariantMoeFp8Config.prepare_weights(
+    view = BatchInvariantFp8PerTensorConfig.prepare_weights(
         w1,
         w2,
         hidden_states_scale_global=m_x,
@@ -188,12 +188,12 @@ def _weights(
         intermediate_size=w2.shape[2],
         activation=act,
     )
-    pack.prepare_for(BatchInvariantMoeFp8Runner.backend_key, view)
+    pack.prepare_for(BatchInvariantFp8PerTensorRunner.backend_key, view)
     return pack
 
 
 def _xq(x: torch.Tensor, m_x: torch.Tensor) -> torch.Tensor:
-    xq, scale = BatchInvariantMoeFp8Config.prepare_activations(
+    xq, scale = BatchInvariantFp8PerTensorConfig.prepare_activations(
         x, hidden_states_scale_global=m_x
     )
     assert scale is None and xq.dtype == torch.float8_e4m3fn
@@ -238,32 +238,36 @@ def _routed_pack(
 def test_backend_is_registered_and_never_a_default_candidate():
     """The config is a known backend of the layer, mapped to its runner, absent from the default candidates, and declares the
     fp8 per-tensor quantization pair, the three routing modes and every activation class of the layer (the bf16 runner's)."""
-    assert BatchInvariantMoeFp8Config in ALL_BACKEND_CONFIGS
-    assert _BACKEND_RUNNERS[BatchInvariantMoeFp8Config] is BatchInvariantMoeFp8Runner
+    assert BatchInvariantFp8PerTensorConfig in ALL_BACKEND_CONFIGS
+    assert (
+        _BACKEND_RUNNERS[BatchInvariantFp8PerTensorConfig]
+        is BatchInvariantFp8PerTensorRunner
+    )
     assert not any(
-        isinstance(c, BatchInvariantMoeFp8Config) for c in _DEFAULT_BACKEND.candidates
+        isinstance(c, BatchInvariantFp8PerTensorConfig)
+        for c in _DEFAULT_BACKEND.candidates
     )
     assert [
         a
         for a in (89, 90, 100, 103, 107, 110, 120, 121)
-        if BatchInvariantMoeFp8Config.supported(a)
+        if BatchInvariantFp8PerTensorConfig.supported(a)
     ] == [100, 103, 107]
-    assert issubclass(BatchInvariantMoeFp8Runner, BatchInvariantMoeRunner)
+    assert issubclass(BatchInvariantFp8PerTensorRunner, BatchInvariantMoeRunner)
     assert (
-        BatchInvariantMoeFp8Runner.backend_key
-        == "batch_invariant_fp8"
+        BatchInvariantFp8PerTensorRunner.backend_key
+        == "batch_invariant_fp8_per_tensor"
         != BatchInvariantMoeRunner.backend_key
     )
-    assert BatchInvariantMoeFp8Runner.supported_quant_variants == (
+    assert BatchInvariantFp8PerTensorRunner.supported_quant_variants == (
         (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
     )
-    assert set(BatchInvariantMoeFp8Runner.supported_routing_modes) == {
+    assert set(BatchInvariantFp8PerTensorRunner.supported_routing_modes) == {
         RoutingInputMode.FromLogits,
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     }
     assert (
-        set(BatchInvariantMoeFp8Runner.supported_activation_classes)
+        set(BatchInvariantFp8PerTensorRunner.supported_activation_classes)
         == set(BatchInvariantMoeRunner.supported_activation_classes)
         == {
             SwiGLU,
@@ -279,7 +283,9 @@ def test_backend_is_registered_and_never_a_default_candidate():
             SiLU,
         }
     )
-    assert repr(BatchInvariantMoeFp8Config()) == "BatchInvariantMoeFp8Config()"
+    assert (
+        repr(BatchInvariantFp8PerTensorConfig()) == "BatchInvariantFp8PerTensorConfig()"
+    )
     assert (
         "fused_moe_fp8" in bi.CLASSES and bi.class_name("fused_moe_fp8") == "moe.e4m3"
     )
@@ -461,7 +467,7 @@ def test_input_quantization_and_dequantization_scales_are_the_declared_chains():
     x = _adversarial_accumulators([448.0, 1.0], 2000, seed=5).to(torch.bfloat16)
     x = x[: x.numel() // 16 * 16].view(-1, 16)
     for m in (0.007, 1.0, 3.0, 2.0**20):
-        q, scale = BatchInvariantMoeFp8Config.prepare_activations(
+        q, scale = BatchInvariantFp8PerTensorConfig.prepare_activations(
             x, hidden_states_scale_global=m
         )
         assert scale is None and q.dtype == torch.float8_e4m3fn and q.shape == x.shape
@@ -583,7 +589,7 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
 
 def test_unsupported_device_raises_before_any_kernel():
     """The runner on a CPU device fails its support check with the mode's error naming the class."""
-    runner = BatchInvariantMoeFp8Runner(_config(8, 64, 256), torch.device("cpu"))
+    runner = BatchInvariantFp8PerTensorRunner(_config(8, 64, 256), torch.device("cpu"))
     with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
         runner._check_support()
     assert "moe.e4m3" in str(excinfo.value) and "cpu" in str(excinfo.value)
@@ -692,7 +698,7 @@ def test_layer_matches_the_class_composition(act):
     layer = _layer(k, E, I, act)
     out = layer(_logits_pack(xq, logits), W)
     ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
-    view = W.get_view(BatchInvariantMoeFp8Runner.backend_key)
+    view = W.get_view(BatchInvariantFp8PerTensorRunner.backend_key)
     ref, pieces = _reference_ffn(xq, ids.cuda(), weights.cuda(), view, chain)
     assert torch.equal(bits(out.cpu()), bits(ref))
     _, im = fused_moe_fp8(
@@ -727,7 +733,7 @@ def test_the_largest_expert_count_routes_and_runs():
         xq,
         ids,
         wts,
-        W.get_view(BatchInvariantMoeFp8Runner.backend_key),
+        W.get_view(BatchInvariantFp8PerTensorRunner.backend_key),
         activation_of(_SWIGLU),
     )
     assert torch.equal(bits(out.cpu()), bits(ref))
@@ -849,7 +855,7 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
     layer = _layer(k, E, I)
     W = _weights(w1, w2, m_x)
     runner = layer.runners[0]
-    assert isinstance(runner, BatchInvariantMoeFp8Runner)
+    assert isinstance(runner, BatchInvariantFp8PerTensorRunner)
     pack = _logits_pack(xq, logits)
     ref = bits(layer(pack, W))
     inputs = runner.pack_inputs(pack, W)
@@ -903,7 +909,7 @@ def test_routing_methods_from_logits_match_the_cpu_model():
                 ),
                 experts=ExpertConfig(intermediate_size=I),
                 activation=SwiGLU(),
-                backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+                backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)),
                 execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
             ),
             device=torch.device("cuda"),
@@ -977,7 +983,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                     routing=kw.get("routing", routing),
                     quant=quant,
                     experts=kw.get("experts", experts),
-                    backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+                    backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)),
                     finalize=kw.get("finalize", MoEFinalizeConfig(do_finalize=True)),
                 ),
                 device=torch.device("cuda"),
@@ -990,7 +996,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                 routing=routing,
                 quant=QuantConfig(),
                 experts=experts,
-                backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+                backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)),
             ),
             device=torch.device("cuda"),
         )
@@ -1027,7 +1033,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             quant=quant,
             experts=experts,
-            backend=BackendOptions((BatchInvariantMoeFp8Config(),)),
+            backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)),
         ),
         device=torch.device("cuda"),
     )
