@@ -94,7 +94,9 @@ def _replace_documented_matrix(text: str, rendered: str) -> str:
 
 def check_activation_matrix(doc_path: Path = DEFAULT_DOC_PATH) -> None:
     """Raise when the documented matrix differs from runner declarations."""
-    text = doc_path.read_text()
+    # The design doc is UTF-8. Path.read_text() otherwise uses the locale
+    # encoding, which is cp1252 on native Windows (NVBug 7058649).
+    text = doc_path.read_text(encoding="utf-8")
     if text != _replace_documented_matrix(text, render_activation_matrix()):
         raise AssertionError(
             f"{doc_path.relative_to(REPO_ROOT)} is stale; run: {REGENERATE_COMMAND}"
@@ -103,11 +105,13 @@ def check_activation_matrix(doc_path: Path = DEFAULT_DOC_PATH) -> None:
 
 def write_activation_matrix(doc_path: Path = DEFAULT_DOC_PATH) -> bool:
     """Update the documented matrix and return whether the file changed."""
-    text = doc_path.read_text()
+    text = doc_path.read_text(encoding="utf-8")
     updated = _replace_documented_matrix(text, render_activation_matrix())
     if updated == text:
         return False
-    doc_path.write_text(updated)
+    # newline="\n" keeps the checked-in doc LF-only; Windows would otherwise
+    # rewrite every line ending and make the next check fail.
+    doc_path.write_text(updated, encoding="utf-8", newline="\n")
     return True
 
 
