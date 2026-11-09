@@ -125,6 +125,27 @@ deterministic route's head program. Then:
    (`kcp_bwd_halo`) rewrites `dx` of the last three rows of each such
    fragment from the received rows.
 
+With more than one rank, the head program, the concatenation of a multi
+call's send rows and the exchange issue run on a high-priority side stream of
+the device. The main program starts on the caller's stream at once, because it
+reads no head row. The caller's stream joins the side stream before the wait.
+The buffers that the side stream fills are allocated on the caller's stream
+before the fork. The programs and their inputs are the same, so no bit changes.
+
+The main program splits each lane into units of `M` tokens
+(`kcp_jit.dyn_plan`). Lane `j` starts at token `j x NL x M` (`NL` units per
+lane), and a CTA whose lane is done takes units from the ends of the other
+lanes. When 64-token units leave the last lane of each channel tile empty,
+`M` is 64: the idle CTAs take units from the start, and small units balance
+the lanes best. Otherwise every lane is busy and `M` is the multiple of 8 from
+64 to 128 with the least lane cost: the lane bound `NL x M` tokens plus 3.2
+tokens per unit, plus 0.3 x `M` tokens for the last unit, which the other CTAs
+finish when an SM is busy. Only the plans whose lanes' claim counts fit the
+kernel's 16-bit fields count; when none of them fits (very long sequences),
+`M` doubles from 256 until a plan fits. One 10240-channel tensor of 32768
+tokens per rank gets 104 on a 148-SM B200 and 64 on GB300, GB200 and VR200;
+8192 channels of 16384 tokens get 64 on all four.
+
 Under any of these conditions, the one-program backward (`kcp_bwd`) runs after the wait instead:
 
 - `bwd_reserve_sms >= 1`
@@ -209,8 +230,8 @@ A one-thread side kernel on GB200 (sm_100a, 152 SMs) barely changes the time:
 
 | Side kernel on another stream | shape A next-to / alone | shape B next-to / alone |
 | --- | --- | --- |
-| one thread, 2 ms | 1.000 | 1.002 |
-| one thread, 4 ms | 0.999 | 1.006 |
+| one thread, 2 ms | 0.999 | 0.999 |
+| one thread, 4 ms | 0.998 | 1.000 |
 
 The next table shows a resident kernel on another stream that holds `k` SMs. `N` is the SM count. The
 ratio columns give the time next to the resident kernel divided by the time alone. The `k = 0` rows give the
@@ -218,15 +239,15 @@ unloaded backward time. The previous non-deterministic backward ran as one progr
 
 | GPU | `k` | ideal `N / (N - k)` | shape A | shape B | previous backward, A / B |
 | --- | --- | --- | --- | --- | --- |
-| GB200 (sm_100a, 152 SMs) | 0 | 1 | 365.0 us | 493.1 us | 395.0 us / 560.5 us |
-| GB200 | 16 | 1.118 | 1.087 (396.7 us) | 1.175 (579.5 us) | 667.5 us / 921.1 us |
-| GB200 | 32 | 1.267 | 1.208 (440.8 us) | 1.286 (634.2 us) | 687.8 us / 914.1 us |
-| B200 (sm_100a, 148 SMs) | 0 | 1 | 384.3 us | 519.2 us | 423.9 us / 583.7 us |
-| B200 | 16 | 1.121 | 1.114 (428.0 us) | 1.190 (618.0 us) | 738.0 us / 973.8 us |
-| B200 | 32 | 1.276 | 1.258 (483.3 us) | 1.295 (672.6 us) | 743.4 us / 975.9 us |
+| GB200 (sm_100a, 152 SMs) | 0 | 1 | 360.1 us | 466.0 us | 395.0 us / 560.5 us |
+| GB200 | 16 | 1.118 | 1.091 (392.9 us) | 1.183 (551.1 us) | 667.5 us / 921.1 us |
+| GB200 | 32 | 1.267 | 1.210 (435.6 us) | 1.284 (598.2 us) | 687.8 us / 914.1 us |
+| B200 (sm_100a, 148 SMs) | 0 | 1 | 370.1 us | 486.4 us | 423.9 us / 583.7 us |
+| B200 | 16 | 1.121 | 1.159 (428.9 us) | 1.190 (578.6 us) | 738.0 us / 973.8 us |
+| B200 | 32 | 1.276 | 1.289 (477.1 us) | 1.320 (642.2 us) | 743.4 us / 975.9 us |
 
-For shape A, the slowdown closely follows the share of SMs the resident kernel holds and stays at or below the ideal ratio. For
-shape B it is above the ideal ratio.
+The slowdown follows the share of SMs the resident kernel holds. For shape A on GB200 it stays below the ideal
+ratio. For shape A on B200 and for shape B on both GPUs it is at most 0.07 above the ideal ratio.
 
 `bwd_reserve_sms=K` is an opt-in alternative (SM100 / SM103 only). It runs the one-program backward
 after the exchange with a grid `K x ctas_per_sm` CTAs short. A kernel holding up
@@ -259,6 +280,6 @@ tensors that share the context, such as a layer's q, k and v. It uses one halo e
 direction instead of `n`.
 
 - Inputs: each `xs[i]` is BF16 `[T_r, C_i]` and each `weights[i]` is FP32 `[C_i, 4]`. Each `C_i` is a multiple of 8, and they may differ.
-- Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, the rows are copied into each tensor's own pool.
+- Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, when the call uses the side stream (more than one rank, every tensor on the overlapped pair) and every tensor has the same width, each tensor's tail-row program reads its rows in place in the received pool, and the programs run concurrently on separate streams. Otherwise the rows are copied into each tensor's own pool.
 - Programs: each tensor then runs the single call's programs. Outputs and `dx` are bitwise one single call per tensor. Each `dweight` is that tensor's own unordered partial.
 - Keywords: one `bwd_reserve_sms` value applies to every tensor. One recompute handle covers the whole call; its `"conv"` entry holds the `n` history pools.

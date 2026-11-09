@@ -274,7 +274,7 @@ def test_dyn_plan_meets_the_kernel_requirements(sms) -> None:
             assert p["M"] % 8 == 0 and p["M"] >= 24, label
             assert 1 <= p["NL"] <= 32768 and p["P"] * p["NL"] * p["M"] >= S, label
             assert (p["L"] + 1) * p["NL"] + p["n_ctas"] <= 65535, label
-            if sms * kcp_jit.DYN_UNIT <= S and n_tiles <= sms:
+            if sms * p["M"] <= S and n_tiles <= sms:
                 assert p["L"] >= sms - n_tiles + 1, label
     for S, C in ((0, 1024), (16, 0), (16, kcp_jit.DYN_MAX_CHANNELS + 8)):
         with pytest.raises(ValueError):
@@ -282,6 +282,74 @@ def test_dyn_plan_meets_the_kernel_requirements(sms) -> None:
     assert kcp_jit.dyn_applies(kcp_jit.DYN_MAX_CHANNELS, 1)
     assert not kcp_jit.dyn_applies(kcp_jit.DYN_MAX_CHANNELS + 8, 1)
     assert not kcp_jit.dyn_applies(1024, 0)
+
+
+@pytest.mark.cpu_only
+def test_dyn_plan_unit_size() -> None:
+    """:func:`kcp_jit.dyn_plan` takes the 64-token plan when it leaves the last lane of each tile without tokens;
+    otherwise the unit size ``M`` (a multiple of 8 from 64 to 128) whose fitting plan has the least lane cost
+    ``NL * M`` tokens plus ``NL`` fixed unit costs plus a tail cost per token of a unit, the smaller ``M`` on a tie;
+    above that range it doubles ``M`` from 256 until the claim counts fit."""
+
+    def lane_cost(p):
+        unit = 10 * p["M"] + kcp_jit.DYN_UNIT_COST_TENTHS
+        return p["NL"] * unit + kcp_jit.DYN_TAIL_COST_TENTHS * p["M"]
+
+    # the customer per-rank shapes.  148-SM B200 (every lane busy; costs in tenths of a token): one tensor of 10240
+    # channels, 32768 tokens (P 29: 11 units of 104 tokens, 11 * 1072 + 3 * 104 = 12104, against 13 x 88: 12120
+    # and 18 x 64: 12288) and 8192 channels, 16384 tokens (P 37: 7 x 64, 7 * 672 + 192 = 4896, against 4 x 112:
+    # 4944).  152 SMs (GB300, GB200) and 212 SMs (VR200): the 64-token lanes of 1152, 448, 832 and 320 tokens fill
+    # 29 of 30, 37 of 38, 40 of 42 and 52 of 53 lanes, so M is 64.
+    for (S, C, sms), want in (
+        ((32768, 10240, 148), {"M": 104, "NL": 11, "P": 29, "L": 145, "n_ctas": 148}),
+        ((16384, 8192, 148), {"M": 64, "NL": 7, "P": 37, "L": 148, "n_ctas": 148}),
+        ((32768, 10240, 152), {"M": 64, "NL": 18, "P": 30, "L": 150, "n_ctas": 152}),
+        ((16384, 8192, 152), {"M": 64, "NL": 7, "P": 38, "L": 152, "n_ctas": 152}),
+        ((32768, 10240, 212), {"M": 64, "NL": 13, "P": 42, "L": 210, "n_ctas": 212}),
+        ((16384, 8192, 212), {"M": 64, "NL": 5, "P": 53, "L": 212, "n_ctas": 212}),
+    ):
+        p = kcp_jit.dyn_plan(S, C, sms)
+        assert {k: p[k] for k in want} == want, (S, C, sms, p)
+    branches = {"idle": 0, "cost": 0, "doubling": 0}
+    for sms in (132, 148, 152, 188, 212):
+        for C in (8, 2048, 8192, 10240, 65536):
+            n_tiles = -(-C // kcp_jit.DYN_TILE)
+            for S in (1, 7, 1003, 4096, 16384, 32768, 100000, 1 << 20, 1 << 23):
+
+                def plan_for(M):
+                    lanes = min(sms // n_tiles, -(-S // M), 256 // n_tiles)
+                    P = max(1, lanes)
+                    per_lane = -(-S // P)
+                    NL = -(-per_lane // M)
+                    L = n_tiles * P
+                    if (L + 1) * NL + max(L, sms) > 65535 or NL > 32768:
+                        return None
+                    n_ctas = max(L, sms)
+                    return {"M": M, "NL": NL, "P": P, "L": L, "n_ctas": n_ctas}
+
+                p = kcp_jit.dyn_plan(S, C, sms)
+                p = {k: p[k] for k in ("M", "NL", "P", "L", "n_ctas")}
+                fits = [q for q in map(plan_for, range(64, 129, 8)) if q is not None]
+                label = (sms, C, S, p)
+                base = plan_for(64)
+                if base is not None and -(-S // (base["NL"] * 64)) < base["P"]:
+                    branches["idle"] += 1
+                    assert p == base, label
+                elif fits:
+                    branches["cost"] += 1
+                    best = min(lane_cost(q) for q in fits)
+                    assert lane_cost(p) == best, label
+                    tied = [q["M"] for q in fits if lane_cost(q) == best]
+                    assert p["M"] == min(tied), label
+                else:
+                    # the first power of two from 256 whose plan fits (the previous doubling rule)
+                    branches["doubling"] += 1
+                    assert p["M"] >= 256 and p["M"] & (p["M"] - 1) == 0, label
+                    assert p == plan_for(p["M"]), label
+                    assert p["M"] == 256 or plan_for(p["M"] // 2) is None, label
+    assert all(n > 0 for n in branches.values()), branches
+    # a rank too long for any unit up to 128 tokens: the doubling from 256 (32 tiles, 4 lanes each, 256 units)
+    assert kcp_jit.dyn_plan(1 << 23, 65536, 148)["M"] == 8192
 
 
 @pytest.mark.cpu_only

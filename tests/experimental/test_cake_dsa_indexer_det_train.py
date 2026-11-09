@@ -170,6 +170,7 @@ _COMMON = dict(
     rank_t16_slots=[4096],
     rank_persist_max_k=0,
     rank_persist_ctas_per_sm=4,
+    rank_persist_spare_sms=0,
     merge_rank=False,
 )
 NARROW_PAIR_POLICY = DispatchPolicy.from_record(
@@ -741,6 +742,8 @@ def test_policy_record_round_trip_and_validation():
         dict(rank_persist_max_k=-1),  # round 39: lever FRP-K fields
         dict(rank_persist_max_k=2048.5),
         dict(rank_persist_ctas_per_sm=0),
+        dict(rank_persist_spare_sms=-1),  # the spare SMs of the persistent grid (#7548)
+        dict(rank_persist_spare_sms=0.5),
         dict(far_sample=2),  # the far-sample first threshold switch: 0 or 1
         dict(far_sample=-1),
         dict(far_sample=True),
@@ -5282,7 +5285,8 @@ def test_empty_rows_and_no_keys_are_all_padding():
 
 def test_persistent_rank_finalize_follows_the_architecture_cap():
     """Lever FRP-K (round 39): the persistent two-row pipelined rank finalize serves the staged bulk slab calls up to the
-    architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x SMs)`` CTAs; every
+    architecture's ``rank_persist_max_k`` (sm_107a: 2048) and launches ``min(rows, rank_persist_ctas_per_sm x (SMs -
+    rank_persist_spare_sms))`` CTAs; every
     other architecture and every larger top_k keeps the one-row program (one CTA per row)."""
     for arch in cake_jit.ARCHES:
         policy = policy_for(arch)
@@ -5310,13 +5314,18 @@ def test_persistent_rank_finalize_follows_the_architecture_cap():
             )
             if expected:
                 assert choice.rank_persist_ctas == policy.rank_persist_ctas_per_sm
+                assert choice.rank_persist_spare == policy.rank_persist_spare_sms
                 assert finalize_grid(choice, 148) == min(
-                    8192, policy.rank_persist_ctas_per_sm * 148
+                    8192,
+                    policy.rank_persist_ctas_per_sm
+                    * (148 - policy.rank_persist_spare_sms),
                 )
                 assert finalize_grid(choice, 10_000) == 8192
             else:
                 assert (
-                    choice.rank_persist_ctas == 0 and finalize_grid(choice, 148) == 8192
+                    choice.rank_persist_ctas == 0
+                    and choice.rank_persist_spare == 0
+                    and finalize_grid(choice, 148) == 8192
                 )
             assert choice.finalize_key in cake_jit.PROGRAM_KEYS[arch], (
                 arch,
@@ -5372,6 +5381,45 @@ _MERGE_RANK_CALLS = (
     (64, 16384, 1),
     (128, 32768, 2),
 )
+
+
+def test_persistent_rank_grid_spares_sms_for_another_stream():
+    """#7548: where the record spares SMs (sm_107a: one), the persistent rank grid of a call with enough rows is
+    ``rank_persist_ctas_per_sm x (SMs - spare)``, a multiple of the SMs that remain.  The :persist programs run 256 threads
+    per CTA, so a 1024-thread SM107 SM holds 4 of them at a time; with ``rank_persist_ctas_per_sm`` a multiple of 4, a block
+    of another stream on the spare SM leaves the static row walk whole waves of the other SMs instead of a short extra
+    wave."""
+    assert policy_for("sm_107a").rank_persist_spare_sms == 1
+    for arch in cake_jit.ARCHES:
+        policy = policy_for(arch)
+        if policy.rank_persist_max_k <= 0:
+            assert policy.rank_persist_spare_sms == 0, arch
+            continue
+        for sms in (148, 212):
+            choice = select_program(
+                policy,
+                num_queries=8192,
+                num_keys=8192,
+                num_segments=1,
+                ratio=1,
+                top_k=2048,
+                grid=sms,
+            )
+            assert choice.rank_persistent, (arch, sms)
+            spare = policy.rank_persist_spare_sms
+            grid = finalize_grid(choice, sms)
+            assert grid == policy.rank_persist_ctas_per_sm * (sms - spare), (arch, sms)
+            assert grid < policy.rank_persist_ctas_per_sm * sms, (arch, sms)
+            # CTAs one 1024-thread SM107 SM holds at a time divide the CTAs per SM: whole waves
+            assert choice.rank_threads == 256, (arch, choice.finalize_key)
+            assert (
+                policy.rank_persist_ctas_per_sm % (1024 // choice.rank_threads) == 0
+            ), arch
+        # a device of no more SMs than the spare count keeps one SM's grid
+        assert (
+            finalize_grid(choice, policy.rank_persist_spare_sms)
+            == policy.rank_persist_ctas_per_sm
+        )
 
 
 def test_merge_rank_fuses_the_slab_rank_finalize_into_split_merges():

@@ -27,7 +27,11 @@ block below ``persistent_from_rows_per_sm`` rows per SM, whole waves from
 there) and of the backward's grid on the device, on every layout (on an
 architecture that routes a forward of packed rows, on both forward routes), on
 two streams at once, in CUDA Graph replays and under
-``torch.use_deterministic_algorithms``.  Far past
+``torch.use_deterministic_algorithms``.  A backward of packed rows runs its
+role's long module from the long module's ``min_rows_per_sm`` rows per SM, and
+strided rows, a single token and fewer rows run the role's module; the two
+give the same ``dx``, ``dz`` and weight-gradient bits on the same inputs and
+grid.  Far past
 one wave of the backward's grid (CTAs claiming row blocks) and with the grids
 of other SM counts the weight gradient lies within its FP64 budget.  The
 backward's workspace is zero after every call (``compute_grad_weight=False``
@@ -842,6 +846,170 @@ def test_forward_module_runs_packed_rows_only():
             assert got == want, (arch, rows, heads, strides)
 
 
+# The rows per SM from which each architecture's backward runs the long module
+# of its role on packed rows (the long records' ``min_rows_per_sm``).
+LONG_MIN_ROWS_PER_SM = {"sm_100a": 2560, "sm_103a": 2560, "sm_107a": 1536}
+# The roles of ``_long_calls``' backward calls, in order.
+LONG_CALL_ROLES = ("bwd_bf16", "bwd_bf16", "bwd_bf16", "bwd_f32", "bwd_f32")
+
+
+def _long_calls(dy, x, z, w, ws):
+    """The backward calls of the long-module tests, of the roles
+    ``LONG_CALL_ROLES``: a BF16 weight gradient, one accumulated onto 0.5 (on
+    ``ws``), ``compute_grad_weight=False``, an FP32 one (on ``ws``) and one
+    accumulated onto 0.25.  Their ``dx``, ``dz`` and weight gradients."""
+    device = x.device
+    bf16 = torch.full((D,), 0.5, dtype=torch.bfloat16, device=device)
+    f32 = torch.empty(D, dtype=torch.float32, device=device)
+    acc = torch.full((D,), 0.25, dtype=torch.float32, device=device)
+    got = []
+    for kwargs in (
+        {},
+        {"grad_weight": bf16, "accumulate_grad_weight": True, "workspace": ws},
+        {"compute_grad_weight": False},
+        {"grad_weight": f32, "workspace": ws},
+        {"grad_weight": acc, "accumulate_grad_weight": True},
+    ):
+        dx, dz, dw = backward(dy, x, z, w, EPS, **kwargs)
+        got += [dx, dz] if dw is None else [dx, dz, dw]
+    return got
+
+
+def _route_to(suffix):
+    """A ``backward_module`` that names the module of the call's role
+    (``suffix`` ``""``) or of its long role (``LONG``) whatever the call."""
+
+    def module(arch, role, *_strides):
+        return loader.ROUTES[arch][role + suffix]
+
+    return module
+
+
+# Layouts around this device's first row count of the long modules: flat
+# ``[rows, 128]`` rows a row below, at and a row above it; ``[T, 48, 128]``
+# rows at the fewest tokens that reach it (contiguous a token fewer too,
+# misaligned ones copied by the host, a gate and ``grad_out`` sliced from
+# projections, head-major ``x`` and ``z``, ``grad_out`` alone sliced from a
+# projection, a token-stride-0 broadcast of ``x`` and ``z``); a single token
+# of that many heads.
+LONG_ROUTE_LAYOUTS = (
+    "flat-1",
+    "flat",
+    "flat+1",
+    "contiguous-1",
+    "contiguous",
+    "misaligned",
+    "projection",
+    "head_major",
+    "dy_projection",
+    "broadcast",
+    "single_token",
+)
+# The layouts the kernel reads as packed rows at or above that row count.
+LONG_ROUTED = ("flat", "flat+1", "contiguous", "misaligned")
+
+
+@pytest.mark.parametrize("layout", LONG_ROUTE_LAYOUTS)
+def test_backward_route_follows_the_layout_and_rows(layout, launches):
+    """On this device a backward runs its role's long module when the kernel
+    reads ``grad_out``, ``x`` and ``z`` as packed rows (``LONG_ROUTED``) from
+    ``min_rows_per_sm * SMs`` rows, and its role's module a row or a token
+    fewer, on strided, head-major and broadcast inputs and for a single
+    token, for a BF16 and an FP32 weight gradient, accumulated or not, and
+    for ``compute_grad_weight=False``; the workspace is zero after the calls,
+    and the long module gives the bits of the role's module on the same
+    calls."""
+    arch, sms = _device()
+    start = LONG_MIN_ROWS_PER_SM[arch] * sms
+    H = 48
+    tokens = -(-start // H)
+    if layout.startswith("flat"):
+        rows = start + {"flat-1": -1, "flat": 0, "flat+1": 1}[layout]
+        x, z, w, dy = make(rows, 1, layout="flat", seed=44)
+    elif layout == "single_token":
+        x, z, w, dy = make(1, start, seed=44)
+    elif layout == "broadcast":
+        x, z, w, _ = make(1, H, seed=44)
+        x, z = x.expand(tokens, H, D), z.expand(tokens, H, D)
+        dy = make(tokens, H, seed=45)[3]
+    elif layout == "dy_projection":
+        x, z, w, _ = make(tokens, H, seed=44)
+        dy = make(tokens, H, layout="projection", seed=45)[3]
+    else:
+        T = tokens - 1 if layout == "contiguous-1" else tokens
+        x, z, w, dy = make(T, H, layout=layout.removesuffix("-1"), seed=44)
+    long = layout in LONG_ROUTED
+    rows = x.numel() // D
+    assert (rows >= start) == (long or layout not in ("flat-1", "contiguous-1"))
+    routes = loader.ROUTES[arch]
+    ws = workspace_for(rows, x.device)
+    launches.clear()
+    got = _long_calls(dy, x, z, w, ws)
+    suffix = loader.LONG if long else ""
+    want = [routes[role + suffix] for role in LONG_CALL_ROLES]
+    assert launches == want, (layout, launches)
+    assert_zero(ws)
+    if not long:
+        return
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(pkg, "backward_module", _route_to(""))
+        launches.clear()
+        want = _long_calls(dy, x, z, w, ws)
+        assert launches == [routes[role] for role in LONG_CALL_ROLES], launches
+    assert_zero(ws)
+    for i, (a, b) in enumerate(zip(got, want, strict=True)):
+        assert_same_bits(a, b, f"{layout} ({rows} rows): output {i}")
+
+
+# Packed shapes on which each long module is compared with its role's module:
+# small and odd ones, the issue's (blocks far past the prefetch share of the
+# CTAs), and flat rows around this device's first row count of the long
+# modules.  Up to ``LONG_BIT_GRID_ROWS`` rows also on the grids of
+# ``LONG_BIT_SM_COUNTS`` SMs, whose CTAs claim many blocks each.
+LONG_BIT_SHAPES = ("1x1", "33x1", "17x7", "2049x33", "4097x33", "32737x48")
+LONG_BIT_SHAPES += ("long-1", "long", "long+1")
+LONG_BIT_SM_COUNTS = (1, 16, 66)
+LONG_BIT_GRID_ROWS = 4097 * 33
+
+
+@pytest.mark.parametrize("shape", LONG_BIT_SHAPES)
+def test_long_modules_give_the_bits_of_their_roles(shape, launches):
+    """Each backward role's long module (forced through ``backward_module``)
+    gives the bits of the role's module on the same packed inputs and grid:
+    ``dx``, ``dz``, the BF16 and FP32 weight gradients, accumulated or not,
+    and ``compute_grad_weight=False``, on this device's grid and, up to
+    ``LONG_BIT_GRID_ROWS`` rows, on the grids of ``LONG_BIT_SM_COUNTS`` SMs
+    (``device_sm_count`` patched); the workspace is zero after the calls."""
+    arch, sms = _device()
+    if shape.startswith("long"):
+        start = LONG_MIN_ROWS_PER_SM[arch] * sms
+        rows = start + {"long-1": -1, "long": 0, "long+1": 1}[shape]
+        x, z, w, dy = make(rows, 1, layout="flat", seed=46)
+    else:
+        T, H = (int(v) for v in shape.split("x"))
+        rows = T * H
+        x, z, w, dy = make(T, H, seed=46)
+    ws = workspace_for(rows, x.device)
+    routes = loader.ROUTES[arch]
+    counts = [sms, *LONG_BIT_SM_COUNTS] if rows <= LONG_BIT_GRID_ROWS else [sms]
+    for sm_count in counts:
+        runs = []
+        for suffix in ("", loader.LONG):
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(pkg, "backward_module", _route_to(suffix))
+                patch.setattr(
+                    loader, "device_sm_count", lambda index, count=sm_count: count
+                )
+                launches.clear()
+                runs.append(_long_calls(dy, x, z, w, ws))
+                want = [routes[role + suffix] for role in LONG_CALL_ROLES]
+                assert launches == want, (suffix, launches)
+            assert_zero(ws)
+        what = f"{shape} on the grids of {sm_count} SMs"
+        for i, (a, b) in enumerate(zip(runs[1], runs[0], strict=True)):
+            assert_same_bits(a, b, f"{what}: output {i}")
+
+
 def test_claimed_backward_matches_fp64():
     """65536 x 48 rows, many times one wave of the backward's row blocks on
     any device, so its CTAs claim chunks of blocks over several rounds:
@@ -1029,12 +1197,15 @@ def test_steps_neither_raise_nor_warn_under_deterministic_algorithms(warn_only):
 
 @pytest.mark.parametrize("T,H", [(1, 1), (17, 7), (1031, 48), (32737, 48)])
 def test_each_call_launches_one_module_of_its_role(T, H, launches):
-    """One module a role whatever the rows: the forward of contiguous inputs
-    runs ``forward_module`` of their strides (``ROUTES[arch]["fwd_packed"]``
-    where routed, except for a single token; else ``ROUTES[arch]["fwd"]``); a
-    backward runs one kernel, ``bwd_bf16`` for a BF16 weight
-    gradient and for ``compute_grad_weight=False``, ``bwd_f32`` for an FP32
-    one, accumulating or not; the reset launches no module."""
+    """One module a call: the forward of contiguous inputs runs
+    ``forward_module`` of their strides (``ROUTES[arch]["fwd_packed"]`` where
+    routed, except for a single token; else ``ROUTES[arch]["fwd"]``); a
+    backward runs one kernel, ``backward_module`` of its role and strides:
+    ``bwd_bf16`` for a BF16 weight gradient and for
+    ``compute_grad_weight=False``, ``bwd_f32`` for an FP32 one, accumulating
+    or not, each its long module (``LONG_ROLES``) where these packed rows
+    reach the long module's ``min_rows_per_sm`` rows per SM (32737 x 48 on
+    every product); the reset launches no module."""
     arch, sms = _device()
     routes = loader.ROUTES[arch]
     for role in loader.ROLES:
@@ -1043,6 +1214,12 @@ def test_each_call_launches_one_module_of_its_role(T, H, launches):
     forward_name = loader.forward_module(arch, T * H, H, sms, tok, D, tok, D)
     packed = routes.get("fwd_packed", routes["fwd"])
     assert forward_name == (packed if T > 1 else routes["fwd"])
+    long = T > 1 and LONG_MIN_ROWS_PER_SM[arch] * sms <= T * H
+    names = {"fwd": forward_name}
+    for role in ("bwd_bf16", "bwd_f32"):
+        names[role] = routes[role + loader.LONG] if long else routes[role]
+        got = loader.backward_module(arch, role, T * H, H, sms, tok, D, tok, D, tok, D)
+        assert got == names[role], (role, got)
     x, z, w, dy = make(T, H, seed=39)
     ws = workspace_for(T * H, x.device)
     bf16 = torch.zeros(D, dtype=torch.bfloat16, device=x.device)
@@ -1081,9 +1258,7 @@ def test_each_call_launches_one_module_of_its_role(T, H, launches):
     for role, call in calls:
         launches.clear()
         call()
-        want = [] if role is None else [routes[role]]
-        if role == "fwd":
-            want = [forward_name]
+        want = [] if role is None else [names[role]]
         assert launches == want, (role, launches)
     assert_zero(ws)
 
@@ -1130,14 +1305,19 @@ def test_compute_grad_weight_false_touches_no_weight_state(launches):
 
 def test_workspace_size_and_layout():
     """The backward's workspace: ``workspace_elements`` FP32 elements (4738,
-    18952 bytes) for both weight-gradient modules and every row count,
-    zero-filled, 16-byte aligned; negative rows are a ``ValueError``.  Its
-    views are the ``uint64`` digit counters (``slots * limbs * 128``), one
+    18952 bytes) for every backward module (both weight-gradient dtypes and
+    their long modules, so one stream workspace serves them all) and every row
+    count, zero-filled, 16-byte aligned; negative rows are a ``ValueError``.
+    Its views are the ``uint64`` digit counters (``slots * limbs * 128``), one
     ``uint32`` flag word a column and the two ``uint32`` words of the arrival
     ticket and the claim counter, in that order."""
     device = torch.device("cuda")
     arch, _ = _device()
-    names = [loader.route_module(arch, role) for role in ("bwd_bf16", "bwd_f32")]
+    names = [
+        loader.route_module(arch, role)
+        for role in ("bwd_bf16", "bwd_f32", *loader.LONG_ROLES)
+    ]
+    assert len(set(names)) == 4
     elements = loader.workspace_elements(names[0])
     for name in names:
         shape = loader.MODULES[name]["workspace"]
@@ -1662,6 +1842,94 @@ def test_capture_without_workspace_takes_a_reserve_workspace(reserve):
         assert_zero(ws, f"the reserve workspace after replay {k}")
 
 
+def test_capture_runs_long_and_default_modules_on_shared_workspaces(reserve, launches):
+    """Backwards of this device's first row count of the long modules
+    (``LONG_MIN_ROWS_PER_SM * SMs`` flat packed rows) captured in one graph on
+    one stream: a BF16 weight gradient on a caller workspace and an FP32 one
+    accumulated without a workspace run their roles' long modules, and a BF16
+    one whose ``grad_out`` is strided (read in place, so not packed) runs the
+    ``bwd_bf16`` module on the reserve workspace the FP32 call took.  The
+    graph holds the three backward kernels only (no fill kernel, memset or
+    event wait).  Every replay on new inputs gives the bits of eager calls
+    forced to the roles' default modules (the accumulated weight gradient
+    those of the same accumulation run eagerly) and leaves the caller
+    workspace and the reserve workspace zero."""
+    pytest.importorskip("cuda.bindings.runtime")
+    arch, sms = _device()
+    routes = loader.ROUTES[arch]
+    rows = LONG_MIN_ROWS_PER_SM[arch] * sms
+    xs, zs, w, dys = make(rows, 1, layout="flat", seed=76)
+    # ``grad_out`` read in place with token stride 2 * 128 + 16, so not packed
+    wide = torch.zeros(rows, 2 * D + 16, dtype=torch.bfloat16, device=xs.device)
+    dy_strided = wide[:, :D]
+    dy_strided.copy_(dys)
+    main = torch.zeros(D, dtype=torch.float32, device=xs.device)
+    ws = workspace_for(rows, xs.device)
+
+    def step():
+        return (
+            backward(dys, xs, zs, w, EPS, workspace=ws),
+            backward(
+                dys, xs, zs, w, EPS, grad_weight=main, accumulate_grad_weight=True
+            ),
+            backward(dy_strided, xs, zs, w, EPS),
+        )
+
+    want = [
+        routes["bwd_bf16" + loader.LONG],
+        routes["bwd_f32" + loader.LONG],
+        routes["bwd_bf16"],
+    ]
+    launches.clear()
+    step()  # loads the long modules before the capture
+    torch.cuda.synchronize()
+    assert launches == want, launches
+    assert_zero(ws)
+    main.zero_()
+    ready = list(reserve["ready"])
+    launches.clear()
+    graph = _kept_graph()
+    with torch.cuda.graph(graph):
+        outs = step()
+    assert launches == want, launches
+    types = _graph_node_types(graph)
+    assert types == ["KERNEL"] * 3, types
+    taken = [t for t in ready if all(t is not r for r in reserve["ready"])]
+    assert len(taken) == 1 and len(reserve["ready"]) == len(ready) - 1
+    eager_main = torch.zeros_like(main)
+    defaults = [routes["bwd_bf16"], routes["bwd_f32"], routes["bwd_bf16"]]
+    for k in range(3):
+        xn, zn, _, dyn = make(rows, 1, layout="flat", seed=77 + k)
+        xs.copy_(xn)
+        zs.copy_(zn)
+        dys.copy_(dyn)
+        dy_strided.copy_(dyn)
+        graph.replay()
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(pkg, "backward_module", _route_to(""))
+            launches.clear()
+            refs = (
+                backward(dyn, xn, zn, w, EPS),
+                backward(
+                    dyn,
+                    xn,
+                    zn,
+                    w,
+                    EPS,
+                    grad_weight=eager_main,
+                    accumulate_grad_weight=True,
+                ),
+                backward(dy_strided, xn, zn, w, EPS),
+            )
+            assert launches == defaults, launches
+        torch.cuda.synchronize()
+        for i, (out, ref) in enumerate(zip(outs, refs, strict=True)):
+            for a, b, name in zip(out, ref, ("dx", "dz", "dw"), strict=True):
+                assert_same_bits(a, b, f"replay {k} call {i} ({want[i]}) {name}")
+        assert_zero(ws, f"the caller workspace after replay {k}")
+        assert_zero(taken[0], f"the reserve workspace after replay {k}")
+
+
 def test_graphs_without_workspace_replay_together_on_two_streams(reserve):
     """Two graphs, each capturing a backward without a caller workspace, own
     two reserve workspaces and replay at the same time on two streams, the
@@ -1812,12 +2080,16 @@ def test_empty_and_errors():
 
 def test_registry_records_reference_the_build_manifest():
     """Every call role (``ROLES``: the forward and the backward of each
-    weight-gradient dtype) ships one module per architecture, an architecture
-    may also route a forward of packed rows (``PACKED_ROLES``), and no other
-    role is routed; every module record names its ``build.json`` library
-    (schema ``cake-build/1``), whose entries carry the package's kernel and
-    binding sources and the precise-arithmetic flags."""
+    weight-gradient dtype) ships one module per architecture, every
+    architecture routes the long module of each backward role
+    (``LONG_ROLES``), an architecture may also route a forward of packed rows
+    (``PACKED_ROLES``), and no other role is routed; every module record
+    names its ``build.json`` library (schema ``cake-build/1``), whose entries
+    carry the package's kernel and binding sources and the precise-arithmetic
+    flags."""
     assert loader.ROLES == ("fwd", "bwd_bf16", "bwd_f32")
+    assert loader.LONG == "_long"
+    assert loader.LONG_ROLES == ("bwd_bf16_long", "bwd_f32_long")
     assert loader.GRID_KINDS == ("persistent_row_blocks", "claimed_row_blocks")
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
@@ -1829,7 +2101,8 @@ def test_registry_records_reference_the_build_manifest():
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:
         roles = set(loader.ROUTES[arch])
-        assert set(loader.ROLES) <= roles <= {*loader.ROLES, *loader.PACKED_ROLES}
+        assert {*loader.ROLES, *loader.LONG_ROLES} <= roles
+        assert roles <= {*loader.ROLES, *loader.LONG_ROLES, *loader.PACKED_ROLES}
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
             assert record["role"] == role and arch in record["arches"], (arch, role)
@@ -1901,7 +2174,9 @@ def test_records_launch_alone_and_take_the_hosts_arguments():
     the same arguments.
     Each backward: 256 threads and the ``claimed_row_blocks`` rule of 4 CTAs
     per SM over 16-row blocks, and a workspace of 2 slots of 9 limbs, the same
-    for both weight-gradient dtypes."""
+    for both weight-gradient dtypes; a long module's rule adds its
+    ``min_rows_per_sm`` (``LONG_MIN_ROWS_PER_SM``) and ``packed_rows``, and it
+    launches and takes its arguments as its role's module does."""
     for name, record in loader.MODULES.items():
         launch = record["launch"]
         assert tuple(launch["cluster"]) == (1, 1, 1), name
@@ -1931,11 +2206,15 @@ def test_records_launch_alone_and_take_the_hosts_arguments():
             assert "workspace" not in record, name
             assert set(logical.values()) == FORWARD_ARGUMENTS, name
         else:
-            assert rule == {
+            want = {
                 "ctas_per_sm": 4,
                 "kind": "claimed_row_blocks",
                 "rows_per_block": 16,
-            }, name
+            }
+            if record["role"] in loader.LONG_ROLES:
+                want["min_rows_per_sm"] = LONG_MIN_ROWS_PER_SM
+                want["packed_rows"] = True
+            assert rule == want, name
             assert tuple(launch["block"]) == (256, 1, 1), name
             assert record["workspace"] == {"limbs": 9, "slots": 2}, name
             assert set(logical.values()) == BACKWARD_ARGUMENTS, name
@@ -1946,6 +2225,16 @@ def test_records_launch_alone_and_take_the_hosts_arguments():
         )
         for key in ("grid_rule", "workspace", "logical"):
             assert bf16[key] == f32[key], (arch, key)
+        for role in ("bwd_bf16", "bwd_f32"):
+            short = loader.MODULES[loader.route_module(arch, role)]
+            long = loader.MODULES[loader.route_module(arch, role + loader.LONG)]
+            for key in ("workspace", "logical", "arg_plan", "ffi_entry", "arches"):
+                assert short[key] == long[key], (arch, role, key)
+            for key in ("block", "cluster", "cooperative", "use_pdl"):
+                assert short["launch"][key] == long["launch"][key], (arch, role, key)
+            rule = dict(long["grid_rule"])
+            del rule["min_rows_per_sm"], rule["packed_rows"]
+            assert rule == short["grid_rule"], (arch, role)
         if "fwd_packed" in loader.ROUTES[arch]:
             fwd, packed = (
                 loader.MODULES[loader.route_module(arch, role)]
@@ -2054,19 +2343,78 @@ def test_forward_grid_is_one_cta_a_block_then_whole_waves(sm_count):
 
 @pytest.mark.parametrize("sm_count", GRID_SM_COUNTS)
 def test_backward_grid_is_at_most_one_wave(sm_count):
-    """Each backward's grid is ``min(row blocks, ctas_per_sm * SMs)`` CTAs:
-    one CTA a block up to one wave, one wave past it (where CTAs claim
-    blocks).  ``module_for_rows`` names the one module of each dtype whatever
-    the rows."""
+    """Each backward's grid (both weight-gradient dtypes and their long
+    modules) is ``min(row blocks, ctas_per_sm * SMs)`` CTAs: one CTA a block
+    up to one wave, one wave past it (where CTAs claim blocks).
+    ``module_for_rows`` names the role's module for rows that are not packed,
+    at any row count, and for packed rows the role's long module from its
+    ``min_rows_per_sm * SMs`` rows."""
     for arch in loader.ARCHES:
         for role in ("bwd_bf16", "bwd_f32"):
             name = loader.route_module(arch, role)
-            record = loader.MODULES[name]
-            rule = record["grid_rule"]
-            wave = rule["ctas_per_sm"] * sm_count
-            for rows in _grid_rows(rule, sm_count):
-                assert loader.module_for_rows(arch, role, rows, sm_count) == name
-                grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
-                blocks = -(-rows // rule["rows_per_block"])
-                want = blocks if blocks <= wave else wave
-                assert grid == (want, 1, 1), (arch, role, rows, grid)
+            long = loader.route_module(arch, role + loader.LONG)
+            start = loader.min_rows_per_sm(long, arch) * sm_count
+            for module in (name, long):
+                record = loader.MODULES[module]
+                rule = record["grid_rule"]
+                wave = rule["ctas_per_sm"] * sm_count
+                edges = {*_grid_rows(rule, sm_count), start - 1, start, start + 1}
+                for rows in sorted(edges):
+                    got = loader.module_for_rows(arch, role, rows, sm_count)
+                    assert got == name, (arch, role, rows, got)
+                    got = loader.module_for_rows(arch, role, rows, sm_count, True)
+                    assert got == (long if rows >= start else name), (arch, rows)
+                    grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
+                    blocks = -(-rows // rule["rows_per_block"])
+                    want = blocks if blocks <= wave else wave
+                    assert grid == (want, 1, 1), (arch, module, rows, grid)
+
+
+@pytest.mark.parametrize("sm_count", GRID_SM_COUNTS)
+def test_backward_module_runs_long_modules_on_packed_rows_only(sm_count):
+    """``backward_module`` (host only): a backward role's long module from
+    ``min_rows_per_sm * SMs`` rows (``LONG_MIN_ROWS_PER_SM``) when ``dy``,
+    ``x`` and ``z`` all have head stride 128 and token stride ``H * 128``
+    (also with one head, and at the kernels' row limit); the role's module a
+    row fewer, for a single token (token stride 0), a token-stride-0
+    broadcast of any one tensor, a gate or a ``dy`` sliced from a
+    projection, head-major rows and a head stride other than 128.
+    ``module_for_rows`` takes the packed flag; the forward has no long
+    module."""
+    H = 48
+    row = H * D
+    packed = (row, D, row, D, row, D)
+    one_head = (D, D, D, D, D, D)
+    for arch in loader.ARCHES:
+        fwd = loader.ROUTES[arch]["fwd"]
+        assert loader.module_for_rows(arch, "fwd", 2**31 - 1, sm_count, True) == fwd
+        for role in ("bwd_bf16", "bwd_f32"):
+            short = loader.ROUTES[arch][role]
+            long = loader.ROUTES[arch][role + loader.LONG]
+            assert loader.min_rows_per_sm(long, arch) == LONG_MIN_ROWS_PER_SM[arch]
+            start = LONG_MIN_ROWS_PER_SM[arch] * sm_count
+            for rows, heads, strides, want in (
+                (start - 1, H, packed, short),
+                (start, H, packed, long),
+                (start + 1, H, packed, long),
+                (2**31 - 1, H, packed, long),
+                (1, 1, one_head, short),
+                (start - 1, 1, one_head, short),
+                (start, 1, one_head, long),
+                (start, start, (0, D, 0, D, 0, D), short),
+                (start, H, (0, D, row, D, row, D), short),
+                (start, H, (row, D, 0, D, row, D), short),
+                (start, H, (row, D, row, D, 0, D), short),
+                (start, H, (row, D, row, D, 2 * row + 16, D), short),
+                (start, H, (2 * row + 16, D, row, D, row, D), short),
+                (start, H, (row, D, D, 65 * D, D, 65 * D), short),
+                (start, H, (row, D, row, D, row, 2 * D), short),
+            ):
+                got = loader.backward_module(
+                    arch, role, rows, heads, sm_count, *strides
+                )
+                assert got == want, (arch, role, rows, heads, strides)
+            assert loader.module_for_rows(arch, role, start, sm_count) == short
+            assert loader.module_for_rows(arch, role, start, sm_count, True) == long
+            got = loader.module_for_rows(arch, role, start - 1, sm_count, True)
+            assert got == short, (arch, role)

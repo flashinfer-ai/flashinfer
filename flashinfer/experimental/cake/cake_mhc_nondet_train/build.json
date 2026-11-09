@@ -55,9 +55,9 @@
     }
   },
   "generator": {
-    "cake_revision": "d9fbf4bc275766f8a12062722308cb474993393d",
+    "cake_revision": "4dafabe47ef36bd4e62fa3cb8b2a4d22c67f0e2a",
     "cuda": "13.4.92",
-    "rendered_at": "2026-11-08T01:07:48Z"
+    "rendered_at": "2026-11-09T03:21:27Z"
   },
   "libraries": [
     {
@@ -1571,25 +1571,25 @@
     },
     {
       "arch": "sm_107a",
-      "closure_sha256": "5fd5cc6b54438a1960d98b3a1d4a095c127310079d13e99a4a4aa7463c380424",
+      "closure_sha256": "5b6cf7d48eaeaf181512262de60fed3cd97847a4ebbdc2f386a3b961433f78b4",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
       "min_cuda": "13.4",
-      "name": "cake_mhc_train_fn_split_atomic__tv128_t128_dep_sm_107a",
+      "name": "cake_mhc_train_fn_split_atomic__tv128_t128_dep1_sm_107a",
       "nvcc_flags": [
         "--prec-div=true",
         "--prec-sqrt=true",
         "--ftz=false"
       ],
       "nvcc_flags_if": [],
-      "path": "aot/cake_mhc_train_fn_split_atomic__tv128_t128_dep_sm_107a.so",
+      "path": "aot/cake_mhc_train_fn_split_atomic__tv128_t128_dep1_sm_107a.so",
       "sha256": {
-        "csrc/cake_mhc_train_fn_split_atomic__tv128_t128_dep_binding.cu": "0d0dcc5e1e7ccb6140ec0cf56b9235bd0858ff1edbb0ec0d449a2719f56016ca",
-        "csrc/cake_mhc_train_fn_split_atomic__tv128_t128_dep_kernel.cu": "31106eb5f7dcb0df8bcb1e161fe939fe793a70a150efcdce9a86e91800f35b82"
+        "csrc/cake_mhc_train_fn_split_atomic__tv128_t128_dep1_binding.cu": "24b3ea28333f50a843179d02f3c49f4fe4435be21a33a31ab9cb6973e51c92bb",
+        "csrc/cake_mhc_train_fn_split_atomic__tv128_t128_dep1_kernel.cu": "11cc5f0bf0bce165c935cd6c2dfb45f35745eacd9cd2e70f2ebfcd9fd788d63c"
       },
       "sources": [
-        "csrc/cake_mhc_train_fn_split_atomic__tv128_t128_dep_kernel.cu",
-        "csrc/cake_mhc_train_fn_split_atomic__tv128_t128_dep_binding.cu"
+        "csrc/cake_mhc_train_fn_split_atomic__tv128_t128_dep1_kernel.cu",
+        "csrc/cake_mhc_train_fn_split_atomic__tv128_t128_dep1_binding.cu"
       ]
     },
     {
