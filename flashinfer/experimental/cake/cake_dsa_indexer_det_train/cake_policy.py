@@ -159,7 +159,8 @@ POLICY_FIELDS = (
     "rank_t16",  # the staged rank finalize runs its 16-item thread form on the sort-slot counts of rank_t16_slots (lever FRT)
     "rank_t16_slots",  # sort-slot counts (threads x finalize_items) whose staged form runs as 16-item threads (half the threads), ascending
     "rank_persist_max_k",  # the persistent two-row pipelined rank finalize serves the staged bulk calls with top_k <= this on the architecture (lever FRP-K; 0 = the one-row program everywhere; program key tag :persist)
-    "rank_persist_ctas_per_sm",  # persistent CTAs per SM: the :persist programs launch min(num_queries, this x SM count) CTAs, each walking rows bid, bid + grid, ...
+    "rank_persist_ctas_per_sm",  # persistent CTAs per SM: the :persist programs launch min(num_queries, this x (SM count - rank_persist_spare_sms)) CTAs, each walking rows bid, bid + grid, ...
+    "rank_persist_spare_sms",  # SMs the persistent rank grid is sized without: the grid is a multiple of the other SMs, so a block of another stream on up to this many SMs adds no partial wave to its walk (#7548)
     "merge_rank",  # a split call whose finalize is the slab rank form (window <= rank_slab_window_max, top_k <= MERGE_RANK_MAX_TOP_K) runs the merge with the rank finalize fused in (key merge:rank:w<window>) and launches no finalize program
 )
 
@@ -316,7 +317,8 @@ _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_
         "sample_tiles_max", "sample_tiles_short_units", "sample_tiles_tiny_units", "sample_shift_permille", "far_sample",
         "check_period_max", "check_period_knob_max", "check_period_cap_divisor", "finalize_items",
         "finalize_threads_small", "finalize_top_k_small", "finalize_threads", "rank_top_k_min",
-        "rank_slab_window_max", "rank_bulk_align_bytes", "rank_persist_max_k", "rank_persist_ctas_per_sm")  # fmt: skip
+        "rank_slab_window_max", "rank_bulk_align_bytes", "rank_persist_max_k", "rank_persist_ctas_per_sm",
+        "rank_persist_spare_sms")  # fmt: skip
 _BOOL = (
     "wide_pair_snake_only",
     "snake_default",
@@ -474,6 +476,7 @@ class DispatchPolicy:
     rank_t16_slots: list
     rank_persist_max_k: int
     rank_persist_ctas_per_sm: int
+    rank_persist_spare_sms: int
     merge_rank: bool
 
     @classmethod
@@ -819,6 +822,8 @@ class DispatchPolicy:
             )
         if raw["rank_persist_ctas_per_sm"] <= 0:
             raise ValueError("policy['rank_persist_ctas_per_sm'] must be positive")
+        if raw["rank_persist_spare_sms"] < 0:
+            raise ValueError("policy['rank_persist_spare_sms'] must be >= 0")
         for name in ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes",
                      "candidate_multiplier", "candidate_multiplier_unsampled", "candidate_slack", "split_max",
                      "split_min_range_tiles",
@@ -1623,11 +1628,16 @@ def merge_key(rank_window: Optional[int] = None) -> str:
 
 
 def finalize_grid(choice: "ProgramChoice", num_sms: int) -> int:
-    """CTAs of a call's finalize launch: ``min(num_queries, rank_persist_ctas x SM count)`` for the persistent rank program (lever
-    FRP-K; every CTA walks the rows ``bid, bid + grid, ...``), one CTA per row otherwise (at least one CTA)."""
+    """CTAs of a call's finalize launch: ``min(num_queries, rank_persist_ctas x (SM count - rank_persist_spare))`` for the
+    persistent rank program (lever FRP-K; every CTA walks the rows ``bid, bid + grid, ...``; at least one SM), one CTA per row
+    otherwise (at least one CTA).  The grid is a multiple of the SMs that remain after the spare ones: where the CTAs one
+    SM holds at a time divide ``rank_persist_ctas`` (sm_107a: 4 of the 256-thread program on a 1024-thread SM, 8 per
+    SM), a block of another stream on up to ``rank_persist_spare`` SMs leaves the static row walk whole waves of the
+    other SMs instead of a short extra wave (#7548)."""
     rows = max(1, int(choice.num_queries))
     if choice.rank_persistent:
-        return max(1, min(rows, int(choice.rank_persist_ctas) * int(num_sms)))
+        sms = max(1, int(num_sms) - int(choice.rank_persist_spare))
+        return max(1, min(rows, int(choice.rank_persist_ctas) * sms))
     return rows
 
 
@@ -1833,6 +1843,9 @@ class ProgramChoice:
     )
     rank_persistent: bool  # the persistent two-row pipelined form of the staged bulk rank finalize (lever FRP-K; key tag :persist)
     rank_persist_ctas: int  # persistent CTAs per SM of that form (0 when the call runs a one-row program)
+    rank_persist_spare: (
+        int  # SMs that form's grid leaves out (0 when the call runs a one-row program)
+    )
     scan_key: str
     merge_key: Optional[str]
     merge_rank: bool  # the merge program finalizes the split rows itself (key merge:rank:w*): no finalize launch
@@ -2121,6 +2134,7 @@ def select_program(
         rank_persist_ctas=int(policy.rank_persist_ctas_per_sm)
         if rank_persistent
         else 0,
+        rank_persist_spare=int(policy.rank_persist_spare_sms) if rank_persistent else 0,
         scan_key=key,
         merge_key=(merge_key(rank_window) if merge_rank else MERGE_KEY)
         if split

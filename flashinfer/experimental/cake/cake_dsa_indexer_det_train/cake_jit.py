@@ -1051,6 +1051,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "rank_t16_slots": [4096],
         "rank_persist_max_k": 0,
         "rank_persist_ctas_per_sm": 4,
+        "rank_persist_spare_sms": 0,
         "merge_rank": True,
     },
     "sm_103a": {
@@ -1139,6 +1140,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "rank_t16_slots": [4096],
         "rank_persist_max_k": 0,
         "rank_persist_ctas_per_sm": 4,
+        "rank_persist_spare_sms": 0,
         "merge_rank": True,
     },
     "sm_107a": {
@@ -1242,7 +1244,8 @@ POLICY: dict[str, dict[str, Any]] = {
         "rank_t16": True,
         "rank_t16_slots": [4096],
         "rank_persist_max_k": 2048,
-        "rank_persist_ctas_per_sm": 4,
+        "rank_persist_ctas_per_sm": 8,
+        "rank_persist_spare_sms": 1,
         "merge_rank": True,
     },
 }
