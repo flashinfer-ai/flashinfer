@@ -1252,8 +1252,9 @@ def k1_ordered_plan(
 #: and 257 K blocks (16300 and 16385 tokens); eight chains meet it at every measured token count (at most 1.00 times,
 #: 0.63 and 0.65 times there) at 1.002 to 1.007 times the time of four.
 #: ``4096 -> 512`` runs the deterministic program at its even counts from 12001 tokens and at every count from 32768 to
-#: 40961 tokens, faster there and within the check; ``5120 -> 512`` runs it from 40962 to 65536 tokens on 212 SMs, where
-#: two splits missed the check at the odd counts, and ``4096 -> 1024`` four chains at the odd counts there.  The check is
+#: 40961 tokens, faster there and within the check; ``5120 -> 512`` runs it from 40962 to 65536 tokens on 208 SMs, where
+#: two splits missed the check at the odd counts (212 SMs keep two splits there, :data:`_K1_PARITY_SM107A_212`), and
+#: ``4096 -> 1024`` four chains at the odd counts there.  The check is
 #: the one of :data:`K1_DSM_RANGES_BY_SM` (at most 1.1 times the reference's median error on each of six input kinds,
 #: five runs each), measured on a 212-SM R200 part at the ends of every range, one token on each side of them and the
 #: token counts between (22 to 27 per row), the 216-SM ranges as the same plans forced on that part (the accuracy and
@@ -1282,8 +1283,9 @@ _K1_PARITY_SM107A: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ...]] 
     (4096, 1024): ((961, 40961, _C2_N192, _C4_N192),),
     (5120, 1024): ((961, 40961, _C2_N256, _C8_N256),),
 }
-#: The ranges past 40961 tokens: on 212 SMs (the two-split ranges of :data:`K1_TWO_SPLIT_RANGES_BY_SM` end at 65536) and
-#: 208 SMs both rows, on 216 and more SMs ``4096 -> 1024``.
+#: The ranges past 40961 tokens (to 65536, where the 212-SM two-split ranges of :data:`K1_TWO_SPLIT_RANGES_BY_SM` end):
+#: on 208 SMs both rows, on 216 and more SMs ``4096 -> 1024``; 212 SMs take the ``4096 -> 1024`` one in
+#: :data:`_K1_PARITY_SM107A_212`.
 _K1_PARITY_SM107A_TAIL: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ...]] = {
     (5120, 512): ((40962, 65536, (), ()),),
     (4096, 1024): ((40962, 65536, None, _C4_N192),),
@@ -1305,8 +1307,10 @@ _K1_PARITY_SM107A_208: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ..
 #: The 212-SM ranges: the ranges above and the ones past 40961 tokens, rechecked where they ran slower than the routing
 #: they replaced (this package's A/B against FI main on a 212-SM R200 part) per range and K-block parity against every
 #: token count measured on that part under the same accuracy check (FI main's program where it met the check at every
-#: measured count of the range, else the fastest program that did).  ``4096 -> 512`` runs FI main's deterministic
-#: program at the odd counts from 24577 tokens: it met the check at 24577, 28673, 30721 and 32641 tokens and missed it
+#: measured count of the range, else the fastest program that did; two ranges keep FI main's program although it
+#: missed the check at some counts: ``4096 -> 512`` at the odd counts from 24577 to 32767 tokens and ``5120 -> 512`` at
+#: the odd counts from 40962 tokens).  ``4096 -> 512`` runs the deterministic program at the odd counts from 24577
+#: tokens, FI main's program up to 32767 tokens: it met the check at 24577, 28673, 30721 and 32641 tokens and missed it
 #: at 25601 (1.12 times); below 24577 four chains stay (it missed the check at 16385 and 20001 tokens, up to 1.15
 #: times).  ``4096 -> 1024`` runs the deterministic program at the even counts from 24576 tokens (FI main's program
 #: up to 32767 tokens, where it met the check at every measured even count; FI main's three chains from 32768 tokens

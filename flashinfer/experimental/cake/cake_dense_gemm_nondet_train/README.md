@@ -149,7 +149,11 @@ They apply to every program this package adds or keeps, on every supported archi
   commit `2e989556`; flashinfer-ai/flashinfer#8946) at that shape.  This holds for random normal inputs and for
   adversarial inputs: long sums, cancellation, values concentrated in a few elements, and values near the largest
   magnitude of the dtype.  Partial sums stay in FP32 or wider, and each output element is rounded once.  The
-  absolute budgets of the table above apply as well.
+  absolute budgets of the table above apply as well.  Outside the benchmarked shapes, two 212-SM `sm_107a` FP32
+  weight-gradient ranges keep the program they ran before this change although it missed this rule at some token
+  counts: `5120 -> 512` at odd K-block counts from 40962 tokens (up to 1.83 times, at 57345 tokens) and `4096 -> 512`
+  at odd counts from 24577 to 32767 tokens (1.12 times at 25601 tokens); see the accuracy and repeatability changes
+  under [Planners and rule tables](#planners-and-rule-tables).
 - **Speed.** An output may vary from run to run only where that makes the module at least 3 % faster at the shape:
   the package's own time for the shape (its forward, input gradient and weight gradient through the public entry
   points) must drop by at least 3 % against the program whose result repeats bit for bit.  Everywhere else the
@@ -280,7 +284,10 @@ token-range table also at its ranges.*
 
 **Accuracy and repeatability changes.**  Every shipped row repeats bit for bit.  Every shipped row meets the accuracy
 rule above (the six input kinds against the reference implementation, FlashInfer commit `2e989556`; measured at every
-benchmark row on a B200, a GB200, a GB300 and an R200 part, the error column of the run-to-run table).  The changes:
+benchmark row on a B200, a GB200, a GB300 and an R200 part, the error column of the run-to-run table), except two
+212-SM `sm_107a` FP32 weight-gradient ranges, which keep their former program although it missed the rule at some
+token counts: `5120 -> 512` at odd K-block counts from 40962 tokens and `4096 -> 512` at odd counts from 24577 to 32767
+tokens (the first item below).  The changes:
 
 - K1 weight gradient, `sm_107a` FP32 `4096 -> 512`, `5120 -> 512`, `4096 -> 1024` and `5120 -> 1024` from 961
   tokens (`K1_PARITY_RANGES_BY_SM`): one split of three accumulation chains (equal thirds of the K blocks) missed
@@ -291,12 +298,13 @@ benchmark row on a B200, a GB200, a GB300 and an R200 part, the error column of 
   `4096 -> 512` at its even counts from 12001 tokens and at every count from 32768 to 40961 tokens (faster there), and
   `5120 -> 512` from 40962 to 65536 tokens on 208 SMs (two splits missed the check there at the odd counts).
   On 212 SMs the ranges were rechecked per range and parity where this route ran slower than the former one (the former
-  program where it met the check at every measured token count, else the fastest program that did): `4096 -> 1024`
-  runs the deterministic program at the even counts from 24576 tokens and `5120 -> 1024` four chains from 16170 to
-  16172 tokens; `5120 -> 512` keeps the former two splits from 40962 tokens (the deterministic bits at the even counts;
-  at the odd counts they missed the check at 40962 and 57345 tokens, up to 1.83 times); `4096 -> 512` runs the former
-  deterministic program at its odd counts from 24577 tokens (it missed the check at 25601 tokens, 1.12 times, and met it
-  at 24577, 28673, 30721 and 32641).
+  program where it met the check at every measured token count, else the fastest program that did; two ranges keep the
+  former program although it missed the check at some counts): `4096 -> 1024` runs the deterministic program at the
+  even counts from 24576 tokens and `5120 -> 1024` four chains from 16170 to 16172 tokens; `5120 -> 512` keeps the
+  former two splits from 40962 tokens (the deterministic bits at the even counts; at the odd counts they missed the
+  check at 40962 and 57345 tokens, up to 1.83 times); `4096 -> 512` runs the deterministic program at its odd counts
+  from 24577 tokens, the former program up to 32767 tokens (it missed the check at 25601 tokens, 1.12 times, and met
+  it at 24577, 28673, 30721 and 32641).
   208-SM parts take the 212-SM ranges, but keep the deterministic program of the two `4096 ->` rows at 16231 and 16384
   tokens and run two chains at the even counts of `4096 -> 512` from 16172 to 16384 tokens; the deterministic plan of
   208 SMs missed the check next to that window (up to 1.38 times at 16171 and 16385 tokens).  Parts of 216 and more SMs
@@ -308,7 +316,8 @@ benchmark row on a B200, a GB200, a GB300 and an R200 part, the error column of 
   chains stay within 1.00 times at every measured token count (0.63 and 0.65 times there) at 1.002 to 1.007 times the
   time of four on a 212-SM part.  Measured on a 212-SM R200 part at the ends of every range, one token on each side and
   the token counts between, the 208-SM, 216-SM and larger plans forced there (the accuracy and the bits are the plan's;
-  no time is claimed for those parts): every kind within the check.
+  no time is claimed for those parts): every kind within the check, except in the two 212-SM ranges above that keep
+  the former program.
 - K1 weight gradient: the `sm_107a` CTA-pair rows of three or four splits (their partials added in the order they
   finish; on 212-SM parts they missed mirrored cancellation, 5.8 to 8.7 times the reference's error) run two splits
   where the two-split program was not slower than the deterministic plan on 212-SM parts (`4096 -> 32`, `5120 -> 32`,
