@@ -129,10 +129,18 @@ OPS = ("fwd", "dgrad", "wgrad")
 INT_VIEW = {torch.bfloat16: torch.int16, torch.float32: torch.int32}
 
 # The host plan constants of this package alone: the keys of the one-launch split
-# tail.  Every other constant is the deterministic package's.
+# tail and of the queue walk.  Every other constant is the deterministic package's.
 OWN_CONSTANTS = frozenset(
-    {"unordered_tail_archs", "ordered_tail_archs", "atomic_tail_plan"}
+    {
+        "unordered_tail_archs",
+        "ordered_tail_archs",
+        "atomic_tail_plan",
+        "queue_walk",
+        "queue_sched_words",
+    }
 )
+# The queue walk's stages (``cake_backend.wgrad_queue_walk``): this package's alone.
+QUEUE_STAGES = frozenset({cb.QUEUE_STAGE, cb.QUEUE_STAGE + cb.ACC_SUFFIX})
 # Data-gradient cases of the evict-first rule (at least every architecture's
 # ``dgrad_evict_first_min_rows`` rows per group on average,
 # ``K >= dgrad_evict_first_min_k``): (label, sizes, N, K),
@@ -202,6 +210,48 @@ def bench_cases():
     return cases
 
 
+def _skewed_sizes(e, sum_m=EXPERT_COUNT_SUM_M, align=32):
+    """The skewed family of ``E4_GROUPS`` over ``e`` groups: weights ``e, e - 1, ..., 1``,
+    each group ``sum_m * w / sum(w)`` rows floored to ``align``, the ``align``-row chunks
+    left to the largest remainders (ties: the lower group).  ``e`` = 4 at 112,576 /
+    136,064 rows gives ``E4_GROUPS``' skewed sizes."""
+    weights = list(range(e, 0, -1))
+    total = sum(weights)
+    sizes = [(sum_m * w // total) // align * align for w in weights]
+    rest = [sum_m * w / total - s for w, s in zip(weights, sizes, strict=True)]
+    for i in sorted(range(e), key=lambda i: (-rest[i], i))[
+        : (sum_m - sum(sizes)) // align
+    ]:
+        sizes[i] += align
+    assert sum(sizes) == sum_m, sizes
+    return sizes
+
+
+# The queue walk's uneven rows (``cake_backend.wgrad_queue_walk``): E8 / E16 / E32
+# over ``EXPERT_COUNT_SUM_M`` rows, skewed and one-empty (the skewed sizes with the
+# last group's rows moved to the first).
+QUEUE_SIZES = {}
+for _e in EXPERT_COUNTS:
+    _sizes = _skewed_sizes(_e)
+    QUEUE_SIZES[f"e{_e}_m{EXPERT_COUNT_SUM_M}_skewed"] = _sizes
+    QUEUE_SIZES[f"e{_e}_m{EXPERT_COUNT_SUM_M}_one_empty"] = (
+        [_sizes[0] + _sizes[-1]] + _sizes[1:-1] + [0]
+    )
+assert _skewed_sizes(4, 112576) == E4_GROUPS[112576]["skewed"]
+assert _skewed_sizes(4, 136064) == E4_GROUPS[136064]["skewed"]
+
+
+def queue_cases():
+    cases = []
+    for proj, nk in BENCH_PROJ.items():
+        for label, sizes in QUEUE_SIZES.items():
+            for out_dtype in (torch.bfloat16, torch.float32):
+                cases.append(
+                    _case(f"{proj}_{label}", "wgrad", nk, sizes, out_dtype=out_dtype)
+                )
+    return cases
+
+
 def _edge_variants(label, nk, sizes, repeats=REPEATS):
     cases = [_case(label, "fwd", nk, sizes), _case(label, "dgrad", nk, sizes)]
     if len(sizes) * nk[0] * nk[1] <= int(HOST_PLAN_CONSTANTS["int32_elems"]):
@@ -230,7 +280,7 @@ def edge_cases():
     return cases
 
 
-CASES = bench_cases() + edge_cases()
+CASES = bench_cases() + edge_cases() + queue_cases()
 CASE_BY_LABEL = {case.label: case for case in CASES}
 assert len(CASE_BY_LABEL) == len(CASES)
 K512_LABELS = [
@@ -406,7 +456,8 @@ def test_routes_mirror_the_deterministic_package():
     architecture whose host plan never selects it (not in ``wave_sync_archs`` for the
     route's k tile).  The accumulate stages (``<stage>_acc``) are left out of the
     mirror on both sides; their twins are mirrored, and ``test_cake_moe_grouped_gemm_nondet_train_acc.py`` checks them against
-    their twins.  The L2 evict-first twins of the wide tile (``main_wide_ef``) are
+    their twins.  The queue walk's stages (``QUEUE_STAGES``) are this package's alone
+    and left out (``test_queue_stages_take_the_half_release_arguments``).  The L2 evict-first twins of the wide tile (``main_wide_ef``) are
     copies like every other fwd / dgrad stage.  (A CPU check; it lives here because
     the backend suite imports no package but its own.)"""
     det_routes, det_programs = det_jit.ROUTES, det_jit.PROGRAMS
@@ -438,6 +489,7 @@ def test_routes_mirror_the_deterministic_package():
                 for s in route["stages"]
                 if arch in programs[s["program"]]["arches"]
                 and not s["name"].endswith(cb.ACC_SUFFIX)
+                and s["name"] not in QUEUE_STAGES
             }
             expected_stages = det_stages - {"tail_reduce"} if one_launch else det_stages
             unselected = set()
@@ -477,6 +529,60 @@ def test_routes_mirror_the_deterministic_package():
                 )
                 assert program["library"].startswith("cake_moe_grouped_gemm_")
                 assert binding["program"].startswith("cake_moe_grouped_gemm_")
+
+
+def test_queue_stages_take_the_half_release_arguments():
+    """The queue walk's stages: served by both 512-wide k tile routes (the accumulate
+    stage by the fp32 route alone) on the architectures of the ``queue_walk`` rules and
+    nowhere else, each program with the launch shape and FFI entry of the route's
+    ``main_halves`` program on that architecture and its argument plan plus the
+    ``sched`` buffer, which the weight-gradient binding binds to the ``queue_sched``
+    stream workspace.  Every rule names a stage the queue walk may stand in for, an
+    output kind and a group range that the routes serve.  (A CPU check.)"""
+    assert cb.BINDING_WORKSPACE_KINDS["wgrad"]["sched"] == cb.QUEUE_SCHED
+    assert cb.QUEUE_SCHED in cb.WORKSPACE_KINDS
+    assert cb.QUEUE_SCHED not in cb.SIZED_STREAM_WORKSPACES
+    rules = HOST_PLAN_CONSTANTS["queue_walk"]
+    rule_arches = {rule["arch"] for rule in rules}
+    for rule in rules:
+        assert rule["stage"] in cb.QUEUE_SELECTED_STAGES, rule
+        assert set(rule["outputs"]) <= {"bfloat16", "float32", "accumulate"}, rule
+        low, high = rule["groups"]
+        assert 1 <= low <= high, rule
+        assert rule["sm_counts"] and all(int(v) > 0 for v in rule["sm_counts"]), rule
+    for out_dtype in ("bfloat16", "float32"):
+        name = cake_jit.record_name("wgrad", out_dtype=out_dtype, tile_k=512)
+        for arch in cake_jit.ROUTES[name]["arches"]:
+            served = cake_jit.stage_served(name, cb.QUEUE_STAGE, arch)
+            assert served == (arch in rule_arches), (name, arch)
+            acc_served = cake_jit.stage_served(
+                name, cb.QUEUE_STAGE + cb.ACC_SUFFIX, arch
+            )
+            assert acc_served == (served and out_dtype == "float32"), (name, arch)
+            if not served:
+                continue
+            for stage, twin in (
+                (cb.QUEUE_STAGE, "main_halves"),
+                (cb.QUEUE_STAGE + cb.ACC_SUFFIX, "main_halves" + cb.ACC_SUFFIX),
+            ):
+                if not cake_jit.stage_served(name, stage, arch):
+                    continue
+                binding = cake_jit.stage_binding(name, stage, arch)
+                twin_binding = cake_jit.stage_binding(name, twin, arch)
+                assert binding["specializations"] == twin_binding["specializations"]
+                program = cake_jit.PROGRAMS[binding["program"]]
+                halves = cake_jit.PROGRAMS[twin_binding["program"]]
+                assert program["launch"] == halves["launch"], (name, stage, arch)
+                assert program["ffi_entry"] == halves["ffi_entry"], (name, stage, arch)
+                plan = [tuple(i) for i in program["arg_plan"]]
+                assert plan.count(("buffer", "sched")) == 1, (name, stage, arch)
+                assert [i for i in plan if i != ("buffer", "sched")] == [
+                    tuple(i) for i in halves["arg_plan"]
+                ], (name, stage, arch)
+            if out_dtype == "float32":
+                for rule in rules:
+                    if rule["arch"] == arch and "accumulate" in rule["outputs"]:
+                        assert acc_served, (name, arch, rule)
 
 
 def test_host_plan_constants_mirror_the_deterministic_package():
@@ -698,12 +804,38 @@ def test_dgrad_evict_first_gives_the_deterministic_bits(
     assert torch.equal(_bits(narrow_out), _bits(out)), "main"
 
 
+def _queue_as_selected(launch, det, case, device):
+    """``launch.stages`` with a bound queue-walk stage replaced by the main stage it stands
+    in for (the deterministic launch's first stage, which both packages select alike),
+    after checking that a ``queue_walk`` rule names that stage, the output and the group
+    count on this device."""
+    stages = tuple(launch.stages)
+    if not stages or stages[0] not in QUEUE_STAGES:
+        return stages
+    selected = det.stages[0].removesuffix(cb.ACC_SUFFIX)
+    fused = stages[0].endswith(cb.ACC_SUFFIX)
+    output = (
+        "accumulate"
+        if fused
+        else {torch.bfloat16: "bfloat16", torch.float32: "float32"}[case.out_dtype]
+    )
+    assert cb.wgrad_queue_walk(
+        selected,
+        output,
+        cb.arch_for(device),
+        cb.sm_count(device),
+        len(case.sizes),
+    ), (stages, det.stages)
+    return (selected + (cb.ACC_SUFFIX if fused else ""),) + stages[1:]
+
+
 @pytest.mark.parametrize("label", K512_LABELS)
 def test_unsplit_k512_builds_give_the_deterministic_bits(label, monkeypatch):
     """With the tail split switched off in both packages (``max_splits`` 1), a weight
     gradient on the 512-wide k tile runs every tile whole in both, and the ordered
     one-launch tail build gives the deterministic build's bits for every form the case
-    selects."""
+    selects, the queue walk included where a ``queue_walk`` rule binds it (it keeps
+    every tile's k-step order)."""
     case = CASE_BY_LABEL[label]
     device = _device()
     _require_programs(case, device)
@@ -715,7 +847,7 @@ def test_unsplit_k512_builds_give_the_deterministic_bits(label, monkeypatch):
     launch = _prepare(cb, case, a, b, offs, out)
     if launch.plan["tile_k"] != 512:
         pytest.skip("the case takes the 256-wide k tile on this device")
-    assert launch.stages == det.stages
+    assert _queue_as_selected(launch, det, case, device) == det.stages
     assert launch.plan["tail_splits"] == det.plan["tail_splits"] == 1
     for fill in (0, FILL_BYTE):
         out.view(torch.uint8).fill_(fill)
@@ -832,6 +964,145 @@ def test_e1_fp32_wgrad_error_within_det(proj, sum_m, record_property):
     assert det_rel_l2 > 0.0 and det_worst > 0.0, record
     assert rel_l2 <= DET_ERROR_RATIO * det_rel_l2, record
     assert worst <= DET_ERROR_RATIO * det_worst, record
+
+
+# The accuracy bar of the queue walk's uneven rows against the deterministic package
+# at the same inputs (``test_queue_rows_error_within_det``): rel-L2 and worst / max |ref|
+# against the fp64 reference at most these multiples of the deterministic package's.
+QUEUE_REL_L2_RATIO = 1.1
+QUEUE_WORST_RATIO = 1.5
+# The tiny-scale variant: g and x drawn same-sign and scaled by 2^-TINY_LOG2, so the
+# products and the fp32 partial sums of the split tail fall near and below the
+# smallest normal fp32 value.
+TINY_LOG2 = 62
+QUEUE_OUTPUTS = ("bfloat16", "float32", "accumulate")
+
+
+@pytest.mark.parametrize("scale", ["normal", "tiny"])
+@pytest.mark.parametrize("output", QUEUE_OUTPUTS)
+@pytest.mark.parametrize("label", list(QUEUE_SIZES))
+def test_queue_rows_error_within_det(label, output, scale, record_property):
+    """The down projection's weight gradient over the queue walk's uneven rows (skewed
+    and one-empty, E8 / E16 / E32), as a bf16 or fp32 overwrite or a fused fp32
+    accumulate into a random fp32 ``main_grad``, with normal or tiny-scale inputs:
+    against the fp64 reference, its rel-L2 and worst / max |ref| are at most
+    ``QUEUE_REL_L2_RATIO`` / ``QUEUE_WORST_RATIO`` times the deterministic package's at
+    the same inputs, and a repeat gives the first launch's bits.  On a device whose
+    ``queue_walk`` rules name the row, the launch binds the queue walk; elsewhere the
+    row checks the stage it selects."""
+    device = _device()
+    sizes = QUEUE_SIZES[label]
+    n, k = BENCH_PROJ["down"]
+    out_dtype = torch.bfloat16 if output == "bfloat16" else torch.float32
+    accumulate = output == "accumulate"
+    case = _case(f"down_{label}_{scale}", "wgrad", (n, k), sizes, out_dtype=out_dtype)
+    for backend in (cb, det_cb):
+        assert backend.generated_program_available(
+            device, op="wgrad", out_dtype=out_dtype
+        ), (
+            f"no {output} wgrad program for {backend.arch_for(device)} in {backend.__name__}"
+        )
+    a, b, offs = _inputs(case, device)
+    if scale == "tiny":
+        a = (a.float().abs() * 2.0**-TINY_LOG2).to(torch.bfloat16)
+        b = (b.float().abs() * 2.0**-TINY_LOG2).to(torch.bfloat16)
+    ref = torch.zeros(len(sizes), n, k, dtype=torch.float64, device=device)
+    start = 0
+    for e, rows in enumerate(sizes):
+        if rows:
+            ref[e] = (
+                a[start : start + rows].double().T @ b[start : start + rows].double()
+            )
+        start += rows
+    base = None
+    if accumulate:
+        gen = torch.Generator(device=device).manual_seed(zlib.crc32(label.encode()))
+        scale_mg = float(ref.abs().max()) or 1.0
+        base = torch.randn(
+            len(sizes), n, k, generator=gen, device=device, dtype=torch.float32
+        ).mul_(scale_mg)
+        ref += base.double()
+
+    def run(backend):
+        out = (
+            base.clone()
+            if accumulate
+            else torch.full(
+                (len(sizes), n, k), float("nan"), dtype=out_dtype, device=device
+            )
+        )
+        if backend is det_cb:
+            launch = det_cb.cake_moe_grouped_gemm_det_train_prepare_wgrad(
+                a, b, offs, out=out, out_dtype=out_dtype, accumulate=accumulate
+            )
+        else:
+            launch = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+                a, b, offs, out=out, out_dtype=out_dtype, accumulate=accumulate
+            )
+        launch.launch()
+        return launch, out
+
+    det, det_out = run(det_cb)
+    launch, out = run(cb)
+    first = out.clone()
+    # A repeat: the output refilled (main_grad restored), the split-tail slots poisoned.
+    _poison_tail_sums(device)
+    if accumulate:
+        out.copy_(base)
+    else:
+        out.view(torch.uint8).fill_(FILL_BYTE)
+    launch.launch()
+    torch.cuda.synchronize(device)
+    assert torch.equal(_bits(out), _bits(first)), "repeat"
+    ref_max = float(ref.abs().max())
+    ref_norm = float(ref.norm())
+
+    def errors(t):
+        diff = t.double() - ref
+        return float(diff.norm()) / ref_norm, float(diff.abs().max()) / ref_max
+
+    rel_l2, worst = errors(first)
+    det_rel_l2, det_worst = errors(det_out)
+    arch, sms = cb.arch_for(device), cb.sm_count(device)
+    queue = any(stage.startswith(cb.QUEUE_STAGE) for stage in launch.stages)
+    record = dict(
+        case=case.label,
+        output=output,
+        arch=arch,
+        sm_count=sms,
+        stages=list(launch.stages),
+        det_stages=list(det.stages),
+        queue_walk=queue,
+        plan=_plan_record(launch),
+        rel_l2=rel_l2,
+        det_rel_l2=det_rel_l2,
+        worst=worst,
+        det_worst=det_worst,
+        equal_to_det=bool(torch.equal(_bits(first), _bits(det_out))),
+    )
+    print("QUEUEVSDET " + json.dumps(record, sort_keys=True))
+    record_property("queue_vs_det", json.dumps(record, sort_keys=True))
+    tile_k = int(launch.plan["tile_k"])
+    if tile_k == 512:
+        selected, _wave = cb.select_wgrad_stage(
+            launch.record_name,
+            k,
+            tile_k,
+            arch,
+            sum_m=sum(sizes),
+            num_groups=len(sizes),
+        )
+        fused = launch.plan["accumulate"] == "fused"
+        kind = "accumulate" if fused else ("float32" if accumulate else output)
+        stage = cb.QUEUE_STAGE + (cb.ACC_SUFFIX if fused else "")
+        want = cb.wgrad_queue_walk(
+            selected, kind, arch, sms, len(sizes)
+        ) and cake_jit.stage_served(launch.record_name, stage, arch)
+        assert queue == want, record
+    assert math.isfinite(det_rel_l2) and math.isfinite(det_worst), record
+    assert det_rel_l2 > 0.0 and det_worst > 0.0, record
+    assert rel_l2 <= QUEUE_REL_L2_RATIO * det_rel_l2, record
+    assert worst <= QUEUE_WORST_RATIO * det_worst, record
 
 
 def test_cases_exercise_the_ordered_tail(record_property):
