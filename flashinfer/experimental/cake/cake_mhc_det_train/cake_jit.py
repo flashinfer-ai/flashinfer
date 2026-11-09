@@ -11103,7 +11103,7 @@ H_TABLE_NAMES = (
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "BWD_ROW_BANDS",
     "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_SLAB_FIT", "BWD_REDUCE_PROGRAM", "BWD_REDUCE_REGIMES", "BWD_REDUCE_PARTS",
     "BWD_REDUCE_GRID", "K5_GRID_BANDS", "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS",
-    "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM", "FWD_MAP_XNRM", "BWD_DPL_BANDS",
+    "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM", "FWD_MAP_XNRM", "BWD_DPL_BANDS", "PDL_OFF_BANDS",
 )  # fmt: skip
 H_TABLES: dict[int, dict[str, Any]] = {
     5120: {
@@ -11147,6 +11147,46 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "sm_100a": ((14927, None),),
             "sm_103a": ((14927, None),),
             "sm_107a": (),
+        },
+        # the H 4096 PDL_OFF_BANDS, plus K7->K8 off in the sm_103a group-row band (above 14927 tokens): there the
+        # column-slab pass releases the reduction as soon as it passes its own wait (the persistent token-owner pass
+        # ends at once), and the reduction's CTAs, resident through the slab pass, lengthen the tail after it
+        "PDL_OFF_BANDS": {
+            "sm_100a": {
+                "K1->K3": {
+                    "forward": ((4096, 8192),),
+                },
+                "K1->K5": {
+                    "checkpoint": ((4096, 8192),),
+                },
+                "K6->K7": {
+                    "checkpoint": ((1024, 8192),),
+                },
+                "K7->K8": {
+                    "backward": ((1024, 32768),),
+                    "checkpoint": ((1024, 4096),),
+                },
+            },
+            "sm_103a": {
+                "K1->K3": {
+                    "forward": ((4096, 16263),),
+                },
+                "K1->K5": {
+                    "checkpoint": ((4096, 16263),),
+                },
+                "K6->K7": {
+                    "checkpoint": ((4096, 8192),),
+                },
+                "K7->K8": {
+                    "backward": ((0, 4096), (14927, None)),
+                    "checkpoint": ((0, 4096), (14927, None)),
+                },
+            },
+            "sm_107a": {
+                "K6->K7": {
+                    "checkpoint": ((3583, 4096),),
+                },
+            },
         },
         "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "dynl"},
         "BWD_SLAB_BANDS": {
@@ -11267,6 +11307,44 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "sm_100a": ((14927, None),),
             "sm_103a": ((14927, None),),
             "sm_107a": (),
+        },
+        # the H 4096 PDL_OFF_BANDS (at 7168 the group-row reduction's parameter CTAs fold during the slab pass)
+        "PDL_OFF_BANDS": {
+            "sm_100a": {
+                "K1->K3": {
+                    "forward": ((4096, 8192),),
+                },
+                "K1->K5": {
+                    "checkpoint": ((4096, 8192),),
+                },
+                "K6->K7": {
+                    "checkpoint": ((1024, 8192),),
+                },
+                "K7->K8": {
+                    "backward": ((1024, 32768),),
+                    "checkpoint": ((1024, 4096),),
+                },
+            },
+            "sm_103a": {
+                "K1->K3": {
+                    "forward": ((4096, 16263),),
+                },
+                "K1->K5": {
+                    "checkpoint": ((4096, 16263),),
+                },
+                "K6->K7": {
+                    "checkpoint": ((4096, 8192),),
+                },
+                "K7->K8": {
+                    "backward": ((0, 4096),),
+                    "checkpoint": ((0, 4096),),
+                },
+            },
+            "sm_107a": {
+                "K6->K7": {
+                    "checkpoint": ((3583, 4096),),
+                },
+            },
         },
         "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "dynl"},
         "BWD_SLAB_BANDS": {
@@ -12310,7 +12388,12 @@ def enable_pdl(name: str, rows: int, arch: str, path: str) -> int:
             f"record {name!r} takes the per-call attribute but its library sits on no edge of PDL_EDGES"
         )
     rows = int(rows)
-    for above, at_most in PDL_OFF_BANDS.get(arch, {}).get(edge, {}).get(path, ()):
+    for above, at_most in (
+        _tab("PDL_OFF_BANDS", record["hidden"])
+        .get(arch, {})
+        .get(edge, {})
+        .get(path, ())
+    ):
         if int(above) < rows and (at_most is None or rows <= int(at_most)):
             return 0
     return 1
