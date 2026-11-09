@@ -2258,16 +2258,17 @@ _CONTEXT_FP8_FORMS: dict[tuple[bool, bool, bool], str] = {
 }
 # Per target, ``(form, pack_g, page_size)`` -> the runtime-size program of an
 # FP8 call of that form (``None``: every page size): the program of its pack
-# (:func:`_context_fp8_runtime_form_pack`), the 3-stage K/V ring with each
-# stage's P tile in its own S columns on sm100a, and on sm103a the 4-stage
-# ring with each stage's P tile in the other stage's S columns, as for the
-# causal call without LSE or sink (the same arithmetic; its launches of at
-# most 128 keys take the program with P in its own S columns,
-# ``_CONTEXT_FP8_SHORT_KV_ROUTES``).  It writes the LSE (log2 units, one
-# float per query row and head) or reads the sinks of the call.
+# (:func:`_context_fp8_runtime_form_pack`) with the 4-stage K/V ring and each
+# stage's P tile in the other stage's S columns, on both targets (the same
+# arithmetic; its launches of at most 128 keys take the program with the
+# 3-stage ring and P in its own S columns, ``_CONTEXT_FP8_SHORT_KV_ROUTES``).
+# Timed B200 (ten seeded layouts): packs 1, 2, 4, 5 and 8, 1 .. 256 requests
+# of 32 .. 2048 query tokens over 700 .. 8192 keys, ran 1 .. 6 % faster than
+# the 3-stage build with P in its own S columns.  It writes the LSE (log2
+# units, one float per query row and head) or reads the sinks of the call.
 _CONTEXT_FP8_RUNTIME_FORM_ROUTES: dict[str, dict[tuple[str, int, int | None], str]] = {
     target: {
-        (form, pack, None): f"RUNTIME_PACK{pack}_{form}{suffix}"
+        (form, pack, None): f"RUNTIME_PACK{pack}_{form}_PX"
         for form in _CONTEXT_FP8_FORMS.values()
         for pack in (
             1,
@@ -2275,24 +2276,33 @@ _CONTEXT_FP8_RUNTIME_FORM_ROUTES: dict[str, dict[tuple[str, int, int | None], st
             *_CONTEXT_FP8_RUNTIME_OWN_PACKS,
         )
     }
-    for target, suffix in (("sm100a", ""), ("sm103a", "_PX"))
+    for target in ("sm100a", "sm103a")
 }
-_CONTEXT_FP8_SHORT_KV_ROUTES["sm103a"] |= {
-    program: (program.removesuffix("_PX"), 128)
-    for program in _CONTEXT_FP8_RUNTIME_FORM_ROUTES["sm103a"].values()
+_CONTEXT_FP8_SHORT_KV_ROUTES = {
+    target: {
+        **_CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}),
+        **{program: (program.removesuffix("_PX"), 128) for program in routes.values()},
+    }
+    for target, routes in _CONTEXT_FP8_RUNTIME_FORM_ROUTES.items()
 }
 # Per target, ``(form, pack_g, page_size)`` -> the one-stage program of an FP8
 # call of that form (one 128-row query stage per tile, an m-block of ``128 /
 # pack_g`` query tokens): the call takes it in place of its form program
-# where every tile holds at most one stage of query tokens (``max_q_len <=
-# 128 / pack_g``: the two-stage tile's second stage holds no row, so the
-# tile's rows, key blocks and arithmetic are the same) and it has more keys
-# than the form program's short-KV entry (sm103a: 128; sm100a has none).
-# Both targets run the build with the 4-stage K/V ring and each stage's P
-# tile in the other stage's S columns (timed B200: 4 .. 32 requests of 1 ..
-# 64 query tokens over 64 .. 2048 keys, heads 32/4, 32/8, 16/8 and 32/32, ran
-# 5 .. 35 % faster than the two-stage form program with P in its own S
-# columns).
+# (:func:`_context_fp8_form_one_stage_pack`) where every tile holds at most one
+# stage of query tokens (``max_q_len <= 128 / pack_g``: the two-stage tile's
+# second stage holds no row, so the tile's rows, key blocks and arithmetic are
+# the same; on sm100a also over at most 128 keys) or where its one-stage tiles
+# fit one wave (at most the SMs: the same rows and key blocks per row in half
+# as many rows per tile, all tiles at once), over more keys than the form
+# program's short-KV entry (128).  Both targets run the build with the 4-stage
+# K/V ring and each stage's P tile in the other stage's S columns (timed B200:
+# 4 .. 32 requests of 1 .. 64 query tokens over 64 .. 2048 keys, heads 32/4,
+# 32/8, 16/8 and 32/32, ran 5 .. 35 % faster than the two-stage form program
+# with P in its own S columns; timed B200 and GB300, ten seeded layouts: 1 ..
+# 8 requests of 64 .. 2048 query tokens in 2 .. 16 m-blocks over 1024 .. 4096
+# keys, at most the SMs one-stage tiles of packs 1, 2, 4 and 8, ran 20 .. 33 %
+# faster than the two-stage form program, and more tiles than the SMs 9 ..
+# 39 % slower).
 _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES: dict[
     str, dict[tuple[str, int, int | None], str]
 ] = {
@@ -2303,6 +2313,10 @@ _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES: dict[
     }
     for target in ("sm100a", "sm103a")
 }
+# Targets whose form calls of at most one stage of query tokens per tile take
+# the one-stage program also over at most the keys of the form program's
+# short-KV entry (timed B200: 64 and 128 keys).
+_CONTEXT_FP8_FORM_ONE_STAGE_SHORT_KV = frozenset({"sm100a"})
 # Per target, the most tiles of a short-KV call (one 128-key block per tile,
 # served by a short-KV one-stage program) at which it takes the smallest pack
 # whose tiles number at most that many, in place of the one-stage choice: such
@@ -7535,6 +7549,34 @@ def _context_fp8_runtime_form_pack(
     return pack_g if (form, pack_g, None) in forms else None
 
 
+def _context_fp8_form_one_stage_pack(
+    target: str,
+    form: str,
+    batch_size: int,
+    max_q_len: int,
+    num_q_heads: int,
+    pack: int,
+    sm_count: int | None,
+) -> int | None:
+    """The pack of the one-stage program (``_CONTEXT_FP8_FORM_ONE_STAGE_ROUTES``)
+    an FP8 call of ``form`` whose form program runs at ``pack`` takes instead,
+    or ``None`` (its form program): ``pack`` itself where its tiles hold at
+    most one stage of query tokens or where its one-stage tiles (``batch_size
+    x num_q_heads / pack x ceil(max_q_len / (128 / pack))``) fit one wave of
+    ``sm_count``.  A pack without a one-stage build keeps its form program:
+    another pack's tiles would put other rows in each warp of the correction,
+    whose rescale vote (any row's scale below 1) the JIT's tiles decide."""
+
+    one_stage = _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.get(target) or {}
+    if (form, pack, None) in one_stage:
+        tokens = 128 // pack
+        if max_q_len <= tokens:
+            return pack
+        tiles = batch_size * (num_q_heads // pack) * -(-max_q_len // tokens)
+        return pack if sm_count and tiles <= sm_count else None
+    return None
+
+
 # Per target, the query-head tiles (``batch_size x num_q_heads`` at pack 1) from
 # which a pack-1 call whose query tokens fit one stage runs the one-stage
 # program of pack 1 where the runtime-size program would serve it: the
@@ -8952,20 +8994,38 @@ def select_cake_fmha_context_route(
                 (form, pack, None)
             )
             # A call of at most the keys of the program's short-KV entry: the
-            # entry's program (the same schedule, pack, m-blocks and arguments).
+            # entry's program (the same schedule, pack, m-blocks and
+            # arguments), but an sm100a call whose tiles hold at most one
+            # stage of query tokens, which takes its one-stage program.
             short = _CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(program)
+            form_one_stage = _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.get(target, {})
             stages = 2
-            if short and max_kv_len <= short[1]:
-                program = short[0]
-            elif program is not None and max_q_len <= 128 // pack:
-                # A call whose tiles hold at most one stage of query tokens:
-                # the one-stage program of its form and pack, where the
-                # target names one.
-                form_one_stage = _CONTEXT_FP8_FORM_ONE_STAGE_ROUTES.get(target, {}).get(
-                    (form, pack, None)
+            if (
+                short
+                and max_kv_len <= short[1]
+                and not (
+                    target in _CONTEXT_FP8_FORM_ONE_STAGE_SHORT_KV
+                    and max_q_len <= 128 // pack
+                    and (form, pack, None) in form_one_stage
                 )
-                if form_one_stage is not None:
-                    program, stages = form_one_stage, 1
+            ):
+                program = short[0]
+            elif program is not None:
+                # A call whose tiles hold at most one stage of query tokens, or
+                # whose one-stage tiles fit one wave: the one-stage program of
+                # its form at the pack of the one-stage choice.
+                one_pack = _context_fp8_form_one_stage_pack(
+                    target,
+                    form,
+                    batch_size,
+                    max_q_len,
+                    num_q_heads,
+                    pack,
+                    _context_split_sm_count(device),
+                )
+                if one_pack is not None:
+                    pack = one_pack
+                    program, stages = form_one_stage[(form, pack, None)], 1
             if program is not None:
                 pack_g = pack
                 tok_per_stage = 128 // pack
