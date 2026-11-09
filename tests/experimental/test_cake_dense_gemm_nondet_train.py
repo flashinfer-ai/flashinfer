@@ -6246,25 +6246,14 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
 
 #: The rows of the program tables, ``(arch, sm_count) -> {key: template}`` (keys as in the tables): the lean
 #: one-wave forward of eight epilogue warps with the X prefetch and the token-half last stage, at 512 features on
-#: every part of the table and at the measured 1024-feature rows of the 152-SM parts.
+#: every part of the table and at 1024 features on the 152-SM parts.
 _WAVE_PF2_ST = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st"
 _F512_ROWS = {(K, 512, T) for K in (4096, 5120) for T in (16172, 16231, 16384)}
+_F1024_ROWS = {(K, 1024, T) for K in (4096, 5120) for T in (16172, 16231, 16384)}
 K1_FORWARD_PROGRAM_ROWS = {
     ("sm_100a", 148): dict.fromkeys(_F512_ROWS, _WAVE_PF2_ST),
-    ("sm_100a", 152): dict.fromkeys(
-        _F512_ROWS | {(K, 1024, T) for K in (4096, 5120) for T in (16172, 16384)},
-        _WAVE_PF2_ST,
-    ),
-    ("sm_103a", 152): dict.fromkeys(
-        _F512_ROWS
-        | {
-            (4096, 1024, 16172),
-            (4096, 1024, 16384),
-            (5120, 1024, 16172),
-            (5120, 1024, 16231),
-        },
-        _WAVE_PF2_ST,
-    ),
+    ("sm_100a", 152): dict.fromkeys(_F512_ROWS | _F1024_ROWS, _WAVE_PF2_ST),
+    ("sm_103a", 152): dict.fromkeys(_F512_ROWS | _F1024_ROWS, _WAVE_PF2_ST),
 }
 #: The rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` (BF16 out, all on the lean nvjet program): ``4096 -> 32`` and
 #: ``4096 -> 64`` at the token counts of the thin scan, ``4096 -> 16, 48, 96, 128``, ``5120 -> 32, 48, 64, 128``,

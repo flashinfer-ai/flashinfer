@@ -1873,8 +1873,12 @@ _DGRAD_WINDOW_TOKENS = range(16172, 16385)
 #: same program without the prefetch and the token halves took 1.007 to 1.040 times its time on a B200 part, 1.018 to
 #: 1.055 times on a GB200 part and 1.012 to 1.026 times on a GB300 part, slower in 0 of 5 groups on every row; at 1024
 #: features the deterministic plan's program took 1.032 to 1.057 times its time on a GB200 part and 1.010 to 1.033
-#: times on a GB300 part, slower in at most 1 of 5 groups.  The other 1024-feature rows and parts keep the
-#: deterministic plan.
+#: times on a GB300 part, slower in at most 1 of 5 groups.  The other 1024-feature rows of the 152-SM parts
+#: (``4096 -> 1024`` and ``5120 -> 1024`` at 16231 tokens on ``sm_100a``, ``4096 -> 1024`` at 16231 and
+#: ``5120 -> 1024`` at 16384 tokens on ``sm_103a``), 17 paired groups in eager launches and in CUDA graph replays each:
+#: the deterministic plan's program took 1.017 to 1.036 times its time in two processes on a GB200 part and 1.011 to
+#: 1.033 times on a GB300 part, slower in at most 2 of 17 groups, the same bits on 20 repeats.  The 1024-feature rows of
+#: the 148-SM parts keep the deterministic plan.
 # fmt: off
 K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int], str]] = {
     ("sm_100a", 148): {
@@ -1886,15 +1890,17 @@ K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int],
         (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
         (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
         (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
-        (4096, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
-        (5120, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 1024, 16231): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 1024, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16172): _WAVE_LEAN_N224_PF2_ST,
+        (5120, 1024, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
     },
     ("sm_103a", 152): {
         (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
         (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
         (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
-        (4096, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
-        (5120, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16231): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 1024, 16231): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 1024, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16172): _WAVE_LEAN_N224_PF2_ST,
+        (5120, 1024, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
     },
 }
 # fmt: on
