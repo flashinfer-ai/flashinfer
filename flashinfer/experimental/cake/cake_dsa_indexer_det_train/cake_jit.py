@@ -258,16 +258,16 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "library": "cake_dsa_indexer_det_topk_4088d4e22e0d6d733fef",
         "arches": ["sm_100a"],
     },
+    "cake_dsa_indexer_det_topk_44163f96c12681e411cc": {
+        "role": "finalize_rank",
+        "library": "cake_dsa_indexer_det_topk_44163f96c12681e411cc",
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+    },
     "cake_dsa_indexer_det_topk_47acefcdee217bade960": {
         "role": "scan",
         "library": "cake_dsa_indexer_det_topk_47acefcdee217bade960",
         "arches": ["sm_107a"],
         "ticket_arg_arches": ["sm_107a"],
-    },
-    "cake_dsa_indexer_det_topk_44163f96c12681e411cc": {
-        "role": "finalize_rank",
-        "library": "cake_dsa_indexer_det_topk_44163f96c12681e411cc",
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_dsa_indexer_det_topk_48e51726170f87b759f8": {
         "role": "scan",
