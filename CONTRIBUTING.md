@@ -116,6 +116,83 @@ graduation checklist), see
 For how we review, see [docs/code_review_guidance_human.md](docs/code_review_guidance_human.md)
 (agent reviewers follow [docs/code_review_guidance.md](docs/code_review_guidance.md)).
 
+# Guardword Hooks (NVIDIA Contributors)
+
+NVIDIA contributors also work with names and details that must not be published. For them,
+two checks scan with NVIDIA's internal guardword scanner:
+
+* **The push check**, a git pre-push hook, scans what a push to GitHub publishes: new commits
+  and their messages, branch and tag names, and tag messages. Pushes to other remotes are not
+  scanned. This check is the gate. `pip install -e .`, `pytest`, and the commit check install it
+  when they detect an NVIDIA contributor. It runs on every branch, including branches that
+  predate it, and then runs whatever pre-push hook it replaced, kept as
+  `.git/hooks/pre-push.chained`.
+* **The commit check**, the `guardwords` hook in `.pre-commit-config.yaml`, scans staged changes
+  next to the formatters, while a problem is easiest to fix. It runs wherever the pre-commit
+  framework's git hook is installed (`pre-commit install`). The push check installs that hook
+  once per clone, along with itself; `pre-commit uninstall` turns off both the formatters and
+  the commit check, and stays in effect.
+
+"Pre-commit" names two things here: the pre-commit framework (the `pre-commit` tool, configured
+by `.pre-commit-config.yaml`), and git's `pre-commit` hook, the script git runs before each
+commit, which the framework installs itself as. The commit check is a framework hook. The push
+check deliberately is not, although the framework supports pre-push hooks: those see only one
+branch of a push, so other branches and tags in it would go unscanned, and they don't run on
+branches whose `.pre-commit-config.yaml` predates the check.
+
+What to scan, and how, is decided by a hook runner that ships with the scanner and updates together
+with its rules; `scripts/guardword_hooks.py` recognizes NVIDIA contributors, installs the push
+check, and applies the settings below.
+
+Everyone else is unaffected. Detection checks the `flashinfer.internal` git setting, then for an
+`@nvidia.com` commit email, a guardword scanner checkout on the machine, or
+`FLASHINFER_SCAN_REPO_URL` in the environment, then, at most once a day, whether the account
+logged in to the GitHub CLI (`gh`) belongs to the NVIDIA GitHub org. A positive answer from `gh` is
+recorded as
+`flashinfer.internal true` in your global git config. When `CI` is set, nothing is installed
+automatically and commits are not scanned; an explicit `setup` still installs the push check,
+and an installed one still scans.
+
+The scanner lives in an internal repository and updates itself on every push; if it can't be
+updated for a week, pushes and `status` say so. Its location is never stored in this
+repository. NVIDIA contributors follow the internal setup instructions once, then run:
+
+```bash
+python3 scripts/guardword_hooks.py setup
+```
+
+It checks for pre-commit and `gh`, installs both checks, asks for the scanner's location, and
+clones the scanner. Until the scanner is set up, pushes to GitHub are blocked; commits go
+through unscanned. The location is kept only in the scanner checkout,
+`~/.flashinfer-guardwords-scan`, which every clone on the machine shares. The devcontainers keep
+that directory in a volume, so after a rebuild `setup` reinstalls the checks without asking for
+it again.
+
+Each push to GitHub updates the scanner first. If both use SSH with a key that has a passphrase
+and no ssh-agent holds it, a push asks for the passphrase twice: once for GitHub, then once for
+the update. To be asked only once, load the key into a running agent with `ssh-add`, or add
+`AddKeysToAgent yes` to `~/.ssh/config` so the first use loads it; on macOS, `UseKeychain yes`
+also keeps it across restarts.
+
+Fresh environments, such as containers, cloud machines, and coding agents' sandboxes, often
+can't recognize you automatically. Coding agents are instructed (in `AGENTS.md`) to check and,
+if needed, set up the checks before their first commit, and to stop rather than push if setup
+fails. For agents and other automation, give the environment the scanner's location in
+`FLASHINFER_SCAN_REPO_URL`, for example as a secret: the checks then install themselves, and
+`setup --non-interactive` runs without prompts.
+
+| Task | Command |
+|------|---------|
+| Check whether a checkout is protected (exits non-zero if not) | `python3 scripts/guardword_hooks.py status` |
+| Set up without prompts, for agents and automation | `python3 scripts/guardword_hooks.py setup --non-interactive` |
+| Skip the checks once | `SKIP=guardwords git commit`, `git commit --no-verify`, or `git push --no-verify` |
+| Stop scanning commits (pushes stay scanned) | `git config flashinfer.guardwords.scanCommits false` |
+| Detected by mistake (installed hooks then do nothing) | `git config --global flashinfer.internal false` |
+| Opt back in after opting out | `git config --global --unset flashinfer.internal` |
+
+If `core.hooksPath` is set, the push check is not installed; the warning gives the line to add
+to your own pre-push hook, and `status` checks for it.
+
 # Continuous Integration (CI)
 
 FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVIDIA internal CI running on GitLab.

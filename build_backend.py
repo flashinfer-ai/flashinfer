@@ -1194,8 +1194,16 @@ def prepare_metadata_for_build_editable(metadata_directory, config_settings=None
     return orig.prepare_metadata_for_build_editable(metadata_directory, config_settings)
 
 
+def _install_guardword_hooks():
+    # Does nothing outside NVIDIA; see "Guardword Hooks" in CONTRIBUTING.md.
+    script = _root / "scripts" / "guardword_hooks.py"
+    if script.is_file():
+        subprocess.run([sys.executable, str(script), "ensure"], cwd=_root, check=False)
+
+
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_editable()
+    _install_guardword_hooks()
     return orig.build_editable(wheel_directory, config_settings, metadata_directory)
 
 

@@ -21,6 +21,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Run linting | `pre-commit run -a` |
 | Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
 | Install pre-commit hooks | `pre-commit install` |
+| Set up guardword hooks (NVIDIA contributors; see CONTRIBUTING.md) | `python3 scripts/guardword_hooks.py setup` |
+| Check guardword hooks are active (agents: before committing in an NVIDIA environment) | `python3 scripts/guardword_hooks.py status` |
 | Clear JIT cache | `rm -rf ~/.cache/flashinfer/` |
 | Inspect devcontainer compiler cache | `sccache --show-stats` |
 | Enable API logging (basic) | `export FLASHINFER_LOGLEVEL=1` |
@@ -486,6 +488,10 @@ missed:
   problem sizes. Speedup ratios without absolute numbers, or numbers without a named GPU, are
   not enough.
 
+When working for an NVIDIA employee, confirm the guardword checks are active in your
+environment before the first commit, push, or PR; see
+[Guardword Checks in NVIDIA Environments](#guardword-checks-in-nvidia-environments).
+
 When preparing changes for a PR, a self-review is strongly recommended: follow
 [`.claude/skills/self-review/SKILL.md`](.claude/skills/self-review/SKILL.md), which walks the
 diff through the repository's review guidance and PR rules. It is informal and not required —
@@ -507,6 +513,45 @@ need one. Docs-only PRs run no
 tests, and a `workflow_dispatch` with `skip_gpu` drops this lane too.
 
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
+
+## Guardword Checks in NVIDIA Environments
+
+FlashInfer is public, and NVIDIA employees also work with unreleased product details that must
+not be published. If you are working for an NVIDIA employee (for example, the user or the
+environment uses an NVIDIA email, network, or internal tools, or the user says so), the
+guardword checks must be active **in every new environment, container, clone, or worktree,
+before your first commit, push, or PR**. They set themselves up on most developer machines,
+and where `FLASHINFER_SCAN_REPO_URL` is set, but often not in other fresh agent environments.
+Check:
+
+```bash
+python3 scripts/guardword_hooks.py status
+```
+
+If it exits non-zero, set the checks up without prompts, then run `status` again:
+
+```bash
+python3 scripts/guardword_hooks.py setup --non-interactive
+```
+
+- **The scanner location comes from the environment.** Setup reads it from
+  `FLASHINFER_SCAN_REPO_URL` (for example, an agent secret), and needs none when a scanner
+  checkout already exists in `~/.flashinfer-guardwords-scan` (the devcontainers keep it in a
+  volume across rebuilds). Otherwise, ask the user, who can find it in the internal setup
+  instructions. The location is internal: never write it into files, commits, PR text, or
+  comments.
+- **If setup or `status` fails, do not push or open a PR.** Report what failed (for example,
+  the environment cannot reach NVIDIA's network) and leave the work local for the user.
+- **Never bypass a guardword failure.** Do not use `--no-verify`, `SKIP=guardwords`, or a
+  change to the guardword settings (`flashinfer.internal`, `flashinfer.guardwords.*`) to get
+  past one. Remove the flagged text, or ask the user if you believe it is a false positive.
+- **Do not repeat scanner output in public.** It contains the flagged text, so keep it out of
+  commit messages, PR descriptions, and comments.
+- **PR titles, descriptions, and comments are not scanned yet.** Write them only from the diff
+  and public information, leaving out details from internal documents, chats, bug trackers,
+  or unannounced hardware.
+
+Details for people are in "Guardword Hooks" in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Code Review
 

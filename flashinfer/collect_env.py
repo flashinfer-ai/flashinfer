@@ -581,8 +581,17 @@ def _get_relevant_packages():
 
 def _get_env_vars():
     # Reports are pasted into public issues; redact anything credential-like
-    # (the broad prefixes can match e.g. NVIDIA_API_KEY).
-    secret_markers = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+    # (the broad prefixes can match e.g. NVIDIA_API_KEY), and the settings of
+    # NVIDIA's internal guardword scanner (scripts/guardword_hooks.py), whose
+    # location must not be published.
+    secret_markers = (
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "CREDENTIAL",
+        "FLASHINFER_SCAN_",
+    )
     info = {}
     for k in sorted(os.environ):
         if k.startswith(_ENV_PREFIXES) or k in _ENV_EXACT:

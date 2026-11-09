@@ -63,6 +63,8 @@ From [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) (Pull Request Guidelines):
   `benchmark-kernel` skill to produce them.
 - Documentation referenced by the change (`AGENTS.md`, `.claude/skills/`, `docs/`) is
   updated in the same PR.
+- When working for an NVIDIA employee, `python3 scripts/guardword_hooks.py status` passes
+  before anything is pushed (see "Guardword Checks in NVIDIA Environments" in `AGENTS.md`).
 - **Backwards compatibility.** If the change removes or renames a public API, or changes a
   signature, default, or semantics, say so explicitly in the PR description.
 - **Defendability.** For each non-obvious choice, the author can explain the rationale when
