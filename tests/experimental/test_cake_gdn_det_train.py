@@ -27,7 +27,9 @@ packed layouts (host and device table routes, FP32 and BF16 ``beta``, every regi
 and segment-parallel scans, both adjoint scans, both preps, the fused tails of a value-head group of two and of three
 and the unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
 initial / final state with its gradients (also through empty sequences), the pre-scan capacity, the bitwise
-contracts: two runs, PyTorch's deterministic mode against the default, the two table routes on one plan, a split plan's pass 2 on ``dhu_tc2`` after the fused pre-scan
+contracts: two runs, PyTorch's deterministic mode against the default, the two table routes on one plan (a split
+plan's tcgen05 pass 2 with ``DVL32_ARCHS`` off; on ``dhu_tc2_dvl32`` ``o`` bitwise and the gradients within the
+budgets), a split plan's pass 2 on ``dhu_tc2`` after the fused pre-scan
 against ``dv_local`` and the register one, the fused tail of a value-head group of three against the unfused one with
 either finalize, the longest-first dispatch order against the caller's (and its
 tables without a device), two streams against one (the adjoint scan of serial plans beside the fused tail of a
@@ -2315,12 +2317,50 @@ def test_segments_beyond_the_prescan_capacity_raise(device) -> None:
     ],
     ids=["serial-32x2", "serial-dhu-tc", "split-32x2", "split-64x1", "split-64x1-tc"],
 )
-def test_table_routes_agree_bitwise(pins, device) -> None:
+def test_table_routes_agree_bitwise(pins, device, monkeypatch) -> None:
+    # the host- and device-built tables of one plan: the same bits on every output.  A split (64, 1) plan runs its
+    # tcgen05 pass 2 on a host-built table only (_sdt_selected); the device-built one keeps dv_local + the register pass
+    # 2, whose bits dhu_tc2 gives.  dhu_tc2_dvl32 (this value-head group of three on DVL32_ARCHS) rounds dv2 once, so
+    # the split tc pin runs here with DVL32_ARCHS off (on: test_table_routes_split_tc_on_dhu_tc2_dvl32_within_the_budgets)
+    if pins["dhu_scan"] == "tc" and pins["segment_chunks"] > 0:
+        _round_once_off(monkeypatch, ("DVL32_ARCHS",))
     seq_lens = (1500, 77, 640)
     inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=11)
     host = _run(inputs, seq_lens, route="host", **pins)
     dev = _run(inputs, seq_lens, route="device", **pins)
     _assert_bitwise(host, dev, OUTPUT_NAMES)
+
+
+def test_table_routes_split_tc_on_dhu_tc2_dvl32_within_the_budgets(
+    device, monkeypatch
+) -> None:
+    # the split-64x1-tc pins with DVL32_ARCHS on: the host-built table runs pass 2 on dhu_tc2_dvl32 (after the fused
+    # pre-scan, no dv_local stage), the device-built one dv_local + the register pass 2.  o keeps one set of bits; the
+    # gradients agree within the budgets of each other and of the FP64 recurrence; each route repeats bitwise
+    arch = _current_arch()
+    if arch not in cake_chain.DVL32_ARCHS:
+        pytest.skip(f"{arch} runs the adjoint without the FP32 dv_local values")
+    heads = (2, 6)
+    assert _tc2(heads) == "dhu_tc2_dvl32"
+    pins = {"scan_config": (64, 1), "segment_chunks": 6, "dhu_scan": "tc"}
+    seq_lens = (1500, 77, 640)
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=11)
+    stages = _record_launches(monkeypatch)
+    runs = {}
+    for route, want, other in (
+        ("host", ("dhu_pre_dvl_r64k1", "dhu_tc2_dvl32"), ("dv_local", "dhu_pre_r64k1", "dhu_r64k1", "dhu_tc2")),
+        ("device", ("dv_local", "dhu_pre_r64k1", "dhu_r64k1"), ("dhu_pre_dvl_r64k1", "dhu_tc2_dvl32", "dhu_tc2")),
+    ):  # fmt: skip
+        start = len(stages)
+        runs[route] = _run(inputs, seq_lens, route=route, **pins)
+        got = stages[start:]
+        assert "stitch" in got and all(x in got for x in want) and not any(x in got for x in other), (route, got)  # fmt: skip
+        _assert_bitwise(_run(inputs, seq_lens, route=route, **pins), runs[route], OUTPUT_NAMES)  # fmt: skip
+    _assert_bitwise(runs["host"], runs["device"], ("o",))
+    _assert_close_to_reference(runs["host"], runs["device"], OUTPUT_NAMES)
+    ref = _reference(inputs, seq_lens)
+    for route in runs:
+        _assert_close_to_reference(runs[route], ref, OUTPUT_NAMES)
 
 
 @pytest.mark.parametrize("route", ["host", "device"])
