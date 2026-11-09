@@ -873,11 +873,11 @@ def test_device_public_logprob_keeps_one_chunk_with_a_frozen_weight(monkeypatch)
     _clear(monkeypatch)
     inp = make_inputs(1500, seed=SEED + 1500, device=CUDA, ignore_frac=0.05)
     applied: list = []
-    apply = cake_backend.CakeLMHeadDetLogprobKeepFunction.apply
+    bound = cake_backend._forward_keep_bound
 
-    def spy(*args):
+    def spy(*args, **kw):
         applied.append(len(args))
-        return apply(*args)
+        return bound(*args, **kw)
 
     def step(train_w, **kw):
         X = inp.X.detach().requires_grad_(True)
@@ -894,7 +894,7 @@ def test_device_public_logprob_keeps_one_chunk_with_a_frozen_weight(monkeypatch)
     for train_w in (True, False):
         fast = step(train_w, memory_mode="fast")
         with monkeypatch.context() as m:
-            m.setattr(cake_backend.CakeLMHeadDetLogprobKeepFunction, "apply", spy)
+            m.setattr(cake_backend, "_forward_keep_bound", spy)
             applied.clear()
             out = step(train_w)
             assert applied, train_w

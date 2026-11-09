@@ -99,7 +99,7 @@ def _kept_logits_reach(X, labels, chunk_size) -> bool:
     # A default log-probability call without a temperature whose ``X`` requires
     # a gradient under grad mode and whose rows fit two chunks also takes the
     # opt-in forms when its ``W`` is frozen: their one-chunk kept logits
-    # (``cake_backend_opt_in._one_chunk_keep_rows``, the rule) can apply to it.
+    # (``cake_backend_opt_in._one_chunk_keep_rule``, the rule) can apply to it.
     # A pre-filter only: a call the rule does not keep runs the default entry's
     # form there.
     return (

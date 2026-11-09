@@ -9149,8 +9149,9 @@ def _with_zero_dlogp(inp):
 
 def test_device_logprob_one_chunk_keep_rule(glm_weight, monkeypatch):
     """The default log-probability call's one-chunk kept logits (``set_logprob_one_chunk_keep``, on by default; the
-    rule ``_one_chunk_keep_rows``), with a quarter of the valid rows' ``dlogp`` zero: a default call runs the
-    kept-logits function exactly when its valid rows (every row of an uncompacted call) fit one chunk and the fast
+    rule ``_one_chunk_keep_rule``), with a quarter of the valid rows' ``dlogp`` zero: a default call runs the kept
+    form (the kept binding, ``_forward_keep_bound``) exactly when its valid rows (every row of an uncompacted call) fit
+    one chunk and the fast
     backward runs no zero-gradient row skip on it -- the skip's floor set here (``None``: off; ``0``: every eligible
     call) or the device's own (a call below every architecture's floor keeps the logits; at ``T_v`` 3973, at or
     above the sm_100a and sm_103a floors, a device whose skip can run keeps the default form) -- counts its valid rows
@@ -9165,14 +9166,14 @@ def test_device_logprob_one_chunk_keep_rule(glm_weight, monkeypatch):
     arch = cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
     C = 4096
     applied: list = []
-    apply = cake_backend.CakeLMHeadDetLogprobKeepFunction.apply
+    bound = cake_backend._forward_keep_bound
 
-    def spy(*args):
-        applied.append(args[-1])
-        return apply(*args)
+    def spy(*args, **kw):
+        applied.append(args[4])  # the valid-row index the kept form runs on
+        return bound(*args, **kw)
 
     def default_call(inp, **kw):
-        monkeypatch.setattr(cake_backend.CakeLMHeadDetLogprobKeepFunction, "apply", spy)
+        monkeypatch.setattr(cake_backend, "_forward_keep_bound", spy)
         counts = _record_host_counts(monkeypatch)
         applied.clear()
         try:
@@ -9239,7 +9240,7 @@ def test_device_logprob_one_chunk_keep_rule(glm_weight, monkeypatch):
     out, routed, _ = default_call(inp, train_w=False)
     assert routed
     _assert_same_bits(fast_x, out, keys=("logp", "dX"))
-    monkeypatch.setattr(cake_backend.CakeLMHeadDetLogprobKeepFunction, "apply", spy)
+    monkeypatch.setattr(cake_backend, "_forward_keep_bound", spy)
     applied.clear()
     try:
         with torch.no_grad():

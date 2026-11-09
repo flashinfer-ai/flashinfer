@@ -336,7 +336,7 @@ keyword.
   `cake_lm_head_det_train_logprob_keep` runs the default entry there).
 * One-chunk kept logits (the default log-probability call;
   `cake_backend_opt_in.set_logprob_one_chunk_keep`, on by default; the one
-  rule is `cake_backend_opt_in._one_chunk_keep_rows`): a default call of
+  rule is `cake_backend_opt_in._one_chunk_keep_rule`): a default call of
   `cake_lm_head_det_train_logprob` (`memory_mode=None`, no
   `num_valid_rows`, no temperature) runs the kept form above when all of
   these hold: the `cake` backend with `X` on CUDA; a backward can follow
@@ -352,18 +352,21 @@ keyword.
   has no skip: with valid rows of a zero `dlogp` its `dW` would add the rows
   in another order than the skip, so a call the skip can take keeps the
   default form, and every output stays the bits of `memory_mode="fast"`, in
-  a checkpointed step too (which keeps the default form on every pass).  The
-  rule reads the valid-row count once, on the host count's path that the
-  forward of a call of fewer than three chunks of rows takes anyway (a
-  longer call keeps its route without counting), and either form then runs
-  on that count's index.  A kept call runs three GEMMs instead of four: its
+  a checkpointed step too (which keeps the default form on every pass).
+  The call's forward counts its valid rows once, on the host, as the
+  default forward of a call of fewer than three chunks of rows does, and
+  applies the rule right after the count
+  (`cake_backend_opt_in.CakeLMHeadDetLogprobOneChunkFunction`): either form
+  runs on that count, with no other work between the count and its first
+  launch (a longer call keeps its route).  A kept call runs three GEMMs
+  instead of four: its
   forward writes the whole `z_c` (the label-column arm is off) and its
   backward forms `dz` with `row_grad` over the kept logits.  Memory: the
   forward keeps `2 * T_v * V` bytes until the backward, at most one chunk
   (`chunk_size` rows) of BF16 logits, which the backward overwrites with
   `dz` in place; no logits or `dlogits` allocation spans more than one
-  chunk, so the memory rule below (#5680) holds.  Each pending forward holds its own
-  chunk: a caller that runs several forwards before their backwards (heads
+  chunk, so the memory rule below (#5680) holds.  Each pending forward
+  holds its own chunk: a caller that runs several forwards before their backwards (heads
   of several positions, for example) holds one chunk per forward until each
   backward runs, and a forward whose backward never runs holds it until its
   graph is freed.  `memory_mode="fast"` (per call) or
