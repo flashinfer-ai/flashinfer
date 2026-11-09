@@ -29,9 +29,13 @@ from typing import List, Tuple
 
 from ...batch_invariant import canon
 from .spec import (
+    ALPHA_GIVEN,
+    BLOCK_SCALED,
     ELEM_BITS_OF,
     MMA_K_OF,
     MMA_OP_OF,
+    SF_FMT,
+    SF_VEC,
     EpilogueChain,
     GemmSpec,
     is_scaled,
@@ -73,8 +77,46 @@ SWIZZLES = (1, 2, 4, 8)
 #: ascending), and the epilogue warps fold the completed chunk partial into a TMEM running sum in chunk order from +0 with
 #: ``add.rn``, then apply the chain once after the last chunk -- the workspace fixup's fold, with the partials in TMEM instead
 #: of an fp32 round trip through HBM and no second launch. The running sum takes one accumulator's worth of TMEM columns,
-#: so the record exists where ``(stages + 1) x tile N`` fit the TMEM: tile N <= CTA_CHUNKS_MAX_TN.
-CTA_CHUNKS_MAX_TN = 256
+#: so the record exists where ``(stages + 1) x tile N`` (plus the scale-factor columns of a block-scaled class) fit the
+#: TMEM: tile N <= CTA_CHUNKS_MAX_TN[format] (192 under the 512-column budget of the sm_100 block-scaled class, 256 otherwise).
+CTA_CHUNKS_MAX_TN = {
+    "bf16": 256,
+    "e4m3": 256,
+    "e5m2": 256,
+    "mxfp8": 192,
+    "mxfp8_k64": 256,
+    "nvfp4": 192,
+    "nvfp4_k128": 256,
+    "mxfp4": 192,
+    "mxfp4_k128": 256,
+}
+#: The block-scaled instruction fixes MMA M at 128 (1-CTA) / 256 (2-CTA): its scale-factor atom spans 128 rows, so no
+#: 64-row CTA tile exists; tile N below 64 would need sub-tile scale-factor addressing; a scale-factor tile multicasts to
+#: at most 4 CTAs.
+TILES_N_BLOCKSCALED = (64, 128, 192, 256)
+TILES_M_BLOCKSCALED = {False: (128,), True: (256,)}
+MAX_CLUSTER_DIM_BLOCKSCALED = 4
+#: In-cluster split-K (block-scaled body): the ``cluster_k`` CTAs of a (cluster_k, 1, 1) cluster each fold one K chunk and
+#: the partials are folded in chunk order through distributed shared memory in the epilogue; the record computes the class
+#: ``kchunk[cluster_k]`` exactly as the workspace split does. 1-CTA MMA, no M / N cluster, tile N bounded by the mailbox.
+CLUSTER_K = (1, 2, 4)
+MAX_TILE_N_CLUSTER_K = {2: 128, 4: 64}
+#: The decode specialisation (block-scaled body): operands swapped (the kernel computes C^T with the weights as the MMA's
+#: A operand on the 128-row axis and the tokens as B) with one token tile holding every token: the narrow tiles 8 / 16 / 32
+#: on the 1-CTA instruction, or the 64-wide tile on either CTA group. The block-scaled step is symmetric in its operands
+#: (checked bit for bit), so the records compute the same class. No N cluster (the narrow scale-factor tile is not
+#: multicast), no in-cluster split.
+TILES_N_NARROW = (8, 16, 32)
+SWAP_WIDE_TILE_N = 64
+#: The 64-wide swapped token tile exists for the UE8M0 classes (their scale-factor atom covers the tile's K extent of one stage);
+#: the NVFP4 classes keep the narrow token tiles only.
+SWAP_WIDE_FMTS = ("mxfp8", "mxfp8_k64", "mxfp4", "mxfp4_k128")
+#: B-reuse (the sm_107 instructions only): a 512-row tiler on the 2-CTA 256-row instruction; each CTA pair issues two
+#: instructions per K step on the two halves of the tile, the B fragment loaded into the collector buffer by the first and
+#: consumed by the second: half the B smem traffic per MMA. One accumulator per half, the same K steps in order from +0:
+#: a placement of the class. Dense records only (no swap, no in-cluster split, no in-CTA chunk fold).
+TILE_M_BREUSE = 512
+BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128")
 
 
 @dataclass(frozen=True)
@@ -90,6 +132,8 @@ class Knobs:
     swizzle_size: int = 1
     grid_clusters: int = 0  # persistent grid size in clusters; 0 = the launch device's co-resident cluster count
     cta_chunks: bool = False  # the in-CTA chunk fold (split class): one CTA folds every chunk of its tile
+    cluster_k: int = 1  # in-cluster split-K factor (block-scaled body): the record computes the class kchunk[cluster_k]
+    swap_ab: bool = False  # the decode specialisation (block-scaled body): operands swapped, one token tile for all tokens
 
     # named views
     @property
@@ -112,33 +156,93 @@ class Knobs:
     def cta_tile_mn(self) -> Tuple[int, int]:
         return (self.tile_m // (2 if self.use_2cta_instrs else 1), self.tile_n)
 
+    @property
+    def b_reuse(self) -> bool:
+        """The B-reuse record: tile M = 2 x the instruction's M (512 on the 2-CTA instruction; the sm_107 block-scaled
+        classes only)."""
+        return self.tile_m == TILE_M_BREUSE
+
+    @property
+    def inst_m(self) -> int:
+        """The MMA instruction's M: the tile M, or half of it for the B-reuse record (two instructions per K step)."""
+        return self.tile_m // 2 if self.b_reuse else self.tile_m
+
     def well_formed(self, in_fmt: str = "bf16") -> bool:
-        """The body's static knob constraints (mirror of ``BIK.GEMM.ConfigOK`` / ``ConfigOKFp8``): the 8-wide decode tile
-        exists on the 1-CTA ``kind::f16`` instruction only (``kind::f8f6f4`` admits N >= 16)."""
-        tm_ok = self.tile_m in TILES_M[self.use_2cta_instrs]
-        # the decode tiles: N 16 on both CTA groups; N 8 on the 1-CTA kind::f16 instruction only
-        tn_ok = (32 <= self.tile_n <= 256 and self.tile_n % 32 == 0) or (
-            self.tile_n in TILES_N_DENSE_NARROW
-            and (self.tile_n >= 16 or (not self.use_2cta_instrs and in_fmt == "bf16"))
-        )
+        """The body's static knob constraints (mirror of ``BIK.GEMM.ConfigOK`` / ``ConfigOKFp8`` / ``ConfigOKBlockScaled*``):
+        for the dense classes the 8-wide decode tile exists on the 1-CTA ``kind::f16`` instruction only (``kind::f8f6f4``
+        admits N >= 16) and the block-scaled knobs are off; for the block-scaled classes the instruction's own
+        restrictions (MMA M 128 / 256, tile N 64 .. 256 or a swapped token tile, cluster dims at most 4, the in-cluster
+        split and B-reuse records' shapes)."""
+        two = self.use_2cta_instrs
         cm, cn = self.cluster_shape_mn
         cl_ok = (
             cm in (1, 2, 4, 8, 16)
             and cn in (1, 2, 4, 8, 16)
             and cm * cn <= 16
-            and (not self.use_2cta_instrs or cm % 2 == 0)
+            and (not two or cm % 2 == 0)
         )
         ok = (
-            tm_ok
-            and tn_ok
-            and cl_ok
+            cl_ok
             and self.raster_along in RASTERS
             and self.swizzle_size in SWIZZLES
             and self.use_tma_store
         )
+        if in_fmt in BLOCK_SCALED:
+            tm_ok = self.tile_m in TILES_M_BLOCKSCALED[two] or (
+                self.b_reuse
+                and in_fmt in BREUSE_FMTS
+                and two
+                and not self.swap_ab
+                and self.cluster_k == 1
+            )
+            ok = (
+                ok
+                and tm_ok
+                and cm <= MAX_CLUSTER_DIM_BLOCKSCALED
+                and cn <= MAX_CLUSTER_DIM_BLOCKSCALED
+                and self.cluster_k in CLUSTER_K
+            )
+            if self.swap_ab:
+                ok = (
+                    ok
+                    and cn == 1
+                    and self.cluster_k == 1
+                    and (
+                        (self.tile_n in TILES_N_NARROW and not two)
+                        or (
+                            self.tile_n == SWAP_WIDE_TILE_N and in_fmt in SWAP_WIDE_FMTS
+                        )
+                    )
+                )
+            else:
+                ok = ok and self.tile_n in TILES_N_BLOCKSCALED
+            if self.cluster_k > 1:
+                ok = (
+                    ok
+                    and cm == 1
+                    and cn == 1
+                    and not two
+                    and self.tile_n <= MAX_TILE_N_CLUSTER_K[self.cluster_k]
+                )
+            if self.cta_chunks:
+                ok = (
+                    ok
+                    and self.cluster_k == 1
+                    and not self.swap_ab
+                    and not self.b_reuse
+                    and self.tile_n <= CTA_CHUNKS_MAX_TN[in_fmt]
+                )
+            return ok
+        tm_ok = self.tile_m in TILES_M[two]
+        # the decode tiles: N 16 on both CTA groups; N 8 on the 1-CTA kind::f16 instruction only
+        tn_ok = (32 <= self.tile_n <= 256 and self.tile_n % 32 == 0) or (
+            self.tile_n in TILES_N_DENSE_NARROW
+            and (self.tile_n >= 16 or (not two and in_fmt == "bf16"))
+        )
+        ok = ok and tm_ok and tn_ok and self.cluster_k == 1 and not self.swap_ab
         if self.cta_chunks:
             ok = (
-                ok and self.tile_n <= CTA_CHUNKS_MAX_TN
+                ok and self.tile_n <= CTA_CHUNKS_MAX_TN[in_fmt]
             )  # the running sum fits next to the accumulator stages
         return ok
 
@@ -147,23 +251,44 @@ class Knobs:
             f"mma{self.tile_m}x{self.tile_n}_cl{self.cluster_m}x{self.cluster_n}"
             f"_{'2cta' if self.use_2cta_instrs else '1cta'}_{'tma' if self.use_tma_store else 'st'}_r{self.raster_along}_sw{self.swizzle_size}"
             + (f"_g{self.grid_clusters}" if self.grid_clusters else "")
+            + (f"_ck{self.cluster_k}" if self.cluster_k > 1 else "")
+            + ("_swap" if self.swap_ab else "")
             + ("_cc" if self.cta_chunks else "")
         )
 
     def instruction(self, in_fmt: str = "bf16") -> str:
         """The MMA instruction variant these knobs select for the format: the A2 assumption surface."""
-        kind = "kind::f16" if in_fmt == "bf16" else "kind::f8f6f4"
+        if in_fmt in BLOCK_SCALED:
+            kind = {
+                "mxfp8": "kind::mxf8f6f4.block_scale",
+                "mxfp8_k64": "kind::mxf8f6f4.block_scale",
+                "nvfp4": "kind::mxf4nvf4.block_scale",
+                "nvfp4_k128": "kind::mxf4nvf4.block_scale",
+                "mxfp4": "kind::mxf4.block_scale",
+                "mxfp4_k128": "kind::mxf4nvf4.block_scale",
+            }[in_fmt]
+            sf = f" sf={SF_FMT[in_fmt]}/{SF_VEC[in_fmt]}"
+            arch = " (sm_107a)" if in_fmt.endswith(("_k64", "_k128")) else ""
+            breuse = (
+                " x2 b-reuse (FILL/LASTUSE)"
+                if self.b_reuse and in_fmt in BREUSE_FMTS
+                else ""
+            )
+        else:
+            kind = "kind::f16" if in_fmt == "bf16" else "kind::f8f6f4"
+            sf = arch = breuse = ""
         return (
             f"tcgen05.mma.cta_group::{2 if self.use_2cta_instrs else 1}.{kind} "
-            f"{self.tile_m}x{self.tile_n}x{MMA_K_OF[in_fmt]}"
+            f"{self.inst_m}x{self.tile_n}x{MMA_K_OF[in_fmt]}{sf}{arch}{breuse}"
         )
 
     def lean(self) -> str:
-        """The record ``BIK.GEMM.Config`` (tm, tn, clusterM, clusterN, twoCta, rasterM, swizzle, ctaChunks)."""
+        """The record ``BIK.GEMM.Config`` (tm, tn, clusterM, clusterN, twoCta, rasterM, swizzle, ctaChunks, clusterK,
+        swapAb)."""
         return (
             f"⟨{self.tile_m}, {self.tile_n}, {self.cluster_m}, {self.cluster_n}, "
             f"{'true' if self.use_2cta_instrs else 'false'}, {'true' if self.raster_along == 'm' else 'false'}, {self.swizzle_size}, "
-            f"{'true' if self.cta_chunks else 'false'}⟩"
+            f"{'true' if self.cta_chunks else 'false'}, {self.cluster_k}, {'true' if self.swap_ab else 'false'}⟩"
         )
 
 
@@ -181,21 +306,46 @@ def knob_product(
     ``cta_chunks=True`` adds the in-CTA chunk-fold twin of every record under the TMEM budget, which only the split
     classes accept."""
     out = []
+    bs = in_fmt in BLOCK_SCALED
     for two in (False, True):
-        for tm in TILES_M[two]:
-            for tn in TILES_N + TILES_N_DENSE_NARROW:
+        tms = (
+            TILES_M_BLOCKSCALED[two]
+            + ((TILE_M_BREUSE,) if two and in_fmt in BREUSE_FMTS else ())
+            if bs
+            else TILES_M[two]
+        )
+        tns = (
+            TILES_N_BLOCKSCALED + TILES_N_NARROW
+            if bs
+            else TILES_N + TILES_N_DENSE_NARROW
+        )
+        for tm in tms:
+            for tn in tns:
                 for cl in clusters:
                     if two and cl[0] % 2:
                         continue
                     for raster in RASTERS:
                         for sw in swizzles:
-                            for cc in (False, True) if cta_chunks else (False,):
-                                k = Knobs((tm, tn), cl, two, True, raster, sw, 0, cc)
-                                if (
-                                    k.well_formed(in_fmt)
-                                    and (k.mma_tiler_mn, two) not in PRUNED_DENSE
-                                ):
-                                    out.append(k)
+                            for ck in CLUSTER_K if bs else (1,):
+                                for swap in (False, True) if bs else (False,):
+                                    for cc in (False, True) if cta_chunks else (False,):
+                                        k = Knobs(
+                                            (tm, tn),
+                                            cl,
+                                            two,
+                                            True,
+                                            raster,
+                                            sw,
+                                            0,
+                                            cc,
+                                            ck,
+                                            swap,
+                                        )
+                                        if k.well_formed(in_fmt) and (
+                                            bs
+                                            or (k.mma_tiler_mn, two) not in PRUNED_DENSE
+                                        ):
+                                            out.append(k)
     return out
 
 
@@ -364,5 +514,13 @@ class GemmKernelPlan:
             f"{self.knobs.describe()} | {self.block.op} x{self.block.steps(self.K)}"
             + (f" in {self.chunks} chunks" if self.chunks > 1 else "")
             + f" | {self.epilogue.describe()}"
-            + (" | alpha = mul.rn(a_scale, b_scale)" if is_scaled(self.in_fmt) else "")
+            + (
+                (
+                    " | alpha = the given scalar"
+                    if self.in_fmt in ALPHA_GIVEN
+                    else " | alpha = mul.rn(a_scale, b_scale)"
+                )
+                if is_scaled(self.in_fmt)
+                else ""
+            )
         )

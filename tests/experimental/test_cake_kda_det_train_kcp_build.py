@@ -15,24 +15,29 @@ limitations under the License.
 
 The KCP registry (``cake_kcp_jit``) and manifests of the Cake packed KDA training package: the records against the
 frozen kernel ABIs, the program names against the identity rule, ``build.json`` (the shipped programs, never a
-test-only one) and ``build.test.json`` (the test-only programs, loadable only after ``cake_kcp_plan.enable_test_knobs()``).
+test-only one) and ``build.test.json`` (the test-only programs, loadable only after ``cake_kcp_plan.enable_test_knobs()``),
+and the architecture the workspace byte query selects the local arena's records for.
 No device is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import re
+import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-cake_build = cake_package("cake_kda_det_train_kcp", "cake_build")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
-kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-kcp_plan = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
+cake_build = cake_package("cake.cake_kda_det_train_kcp", "cake_build")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
+kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
+kcp_plan = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -47,7 +52,7 @@ FWDH_PLAN = [
     ["buffer", "v_new"], *GRID,
 ]  # fmt: skip
 DHU_PLAN = [
-    ["buffer", "kg_tma"], ["buffer", "qg_tma"], ["buffer", "w_tma"], ["buffer", "do_tma"], ["buffer", "dv1"],
+    ["buffer", "kg_tma"], ["buffer", "qg_tma"], ["buffer", "w_tma"], ["buffer", "do_tma"], ["buffer", "aqk_tma"],
     ["buffer", "gk"], ["parameter", "num_heads"], ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"],
     ["parameter", "scale"], ["buffer", "walk_seg"], ["buffer", "dht"], ["buffer", "dht_index"], ["parameter", "dht_hg"],
     ["parameter", "dht_n"], ["buffer", "out"], ["buffer", "out_index"], ["parameter", "out_hg"], ["parameter", "out_n"],
@@ -70,6 +75,13 @@ FWD_O_PLAN = [
     ["buffer", "chunk_bos"], ["buffer", "chunk_len"], ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"],
     ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
 ]  # fmt: skip
+FWDH_O_PLAN = [
+    ["buffer", "w_tma"], ["buffer", "kg_tma"], ["buffer", "u"], ["buffer", "gk"], ["parameter", "num_heads"],
+    ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"], ["buffer", "walk_seg"], ["buffer", "h0"],
+    ["buffer", "h0_index"], ["parameter", "h0_hg"], ["parameter", "h0_n"], ["parameter", "tile_stride"],
+    ["buffer", "qg_tma"], ["buffer", "aqk_tma"], ["buffer", "o_out"], ["buffer", "chunk_bos"], ["buffer", "chunk_len"],
+    ["parameter", "scale"], *GRID,
+]  # fmt: skip
 DAV_PLAN = [
     ["buffer", "do_tma"], ["buffer", "vnew_tma"], ["buffer", "aqk_tma"], ["buffer", "dAqk"], ["buffer", "dv1"],
     ["parameter", "num_heads"], ["parameter", "scale"], *GRID,
@@ -90,13 +102,13 @@ MERGE_RECORDS = {
         ARCHES,
     ),
     "kcp_affine_merge_c32": (
-        {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "4x8"},
+        {"chunk_k": 32, "cols_per_cta": 32, "pairs": True, "ring": 4, "tile": "8x4"},
         128,
         ARCHES,
     ),
     "kcp_affine_merge_c64": (
-        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x8"},
-        128,
+        {"chunk_k": 32, "cols_per_cta": 64, "pairs": True, "ring": 4, "tile": "8x4"},
+        256,
         ("sm_100a", "sm_103a"),
     ),
 }
@@ -105,11 +117,15 @@ MERGE_RECORDS = {
 MERGE_SELECT = {
     ("sm_103a", 128, 64): "kcp_affine_merge_c64",
     ("sm_100a", 128, 57): "kcp_affine_merge_c64",
-    ("sm_107a", 128, 64): "kcp_affine_merge_c32",
+    ("sm_107a", 128, 64): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 49): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 48): "kcp_affine_merge_c32",
     ("sm_103a", 128, 56): "kcp_affine_merge_c16",
     ("sm_103a", 256, 21): "kcp_affine_merge_c16",
     ("sm_103a", 128, 40): "kcp_affine_merge_c32",
-    ("sm_107a", 128, 21): "kcp_affine_merge_c32",
+    ("sm_107a", 256, 13): "kcp_affine_merge_c32",
+    ("sm_107a", 128, 24): "kcp_affine_merge_c16",
+    ("sm_107a", 128, 21): "kcp_affine_merge_c16",
     ("sm_103a", 256, 10): "kcp_affine_merge_c16",
     ("sm_103a", 128, 13): "kcp_affine_merge_c16",
     ("sm_103a", 128, 12): "kcp_affine_merge_c8",
@@ -128,6 +144,8 @@ PLANS = {
     **dict.fromkeys(MERGE_RECORDS, MERGE_PLAN),
     "kcp_fwd_o": FWD_O_PLAN,
     "kcp_dav": DAV_PLAN,
+    "kcp_fwdh_o": FWDH_O_PLAN,
+    "kcp_fwdh_o_vh64": FWDH_O_PLAN,
     "kcp_transfer_walk_three_mma": TRANSFER_PLAN,
     "kcp_transfer_walk_plain_tf32": TRANSFER_PLAN,
     "kcp_transfer_walk_bf16x3": TRANSFER_PLAN,
@@ -137,8 +155,14 @@ PLANS = {
 }
 # Launch block of the records that are not 192 threads wide (the merge records: MERGE_RECORDS); the full-width fwdh
 # offset walk runs the split-role schedule (four state, four decay, one TMA and one MMA warp), the shipped transfer
-# walk two compute warpgroups (eight compute, one load and one MMA warp).
-BLOCKS = {"kcp_fwdh_offset": 320, "kcp_transfer_walk": 320}
+# walk two compute warpgroups (eight compute, one load and one MMA warp), the fused forward walk ten warps in both
+# forms.
+BLOCKS = {
+    "kcp_fwdh_offset": 320,
+    "kcp_transfer_walk": 320,
+    "kcp_fwdh_o": 320,
+    "kcp_fwdh_o_vh64": 320,
+}
 # The identity rule: ``cake_kda_det_train_<20 hex of sha256("<source module>\\n<sorted JSON of the build keywords>")>``,
 # then ``_kcp`` for a program only the context-parallel route runs (every one but the single-rank ``dav`` stage).
 # The digest hashes the source module path the program shipped under, so the digests are those of the previous names
@@ -159,19 +183,19 @@ IDENTITIES = {
     ),
     "kcp_dhu_offset": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "offset"},
+        {"program": "offset", "fuse_dv1": 1},
     ),
     "kcp_dhu_offset_overlap": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_det_dhu_v2_kcp",
-        {"program": "offset", "tile_prefetch": 0},
+        {"program": "offset", "tile_prefetch": 0, "fuse_dv1": 1},
     ),
     "kcp_dhu_offset_vh64": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "offset", "vh": 64},
+        {"program": "offset", "vh": 64, "fuse_dv1": 1},
     ),
     "kcp_dhu_tape": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape", "vh": 64, "tape_store": "tma"},
+        {"program": "tape", "vh": 64, "tape_store": "tma", "fuse_dv1": 1},
     ),
     "kcp_transfer_walk": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_det_transfer_walk_bf16x3_v2_kcp",
@@ -180,6 +204,14 @@ IDENTITIES = {
     **{name: (MERGE_V2_MODULE, row[0]) for name, row in MERGE_RECORDS.items()},
     "kcp_fwd_o": (f"tart.kda_chunk_kcp_fwd_o.{_W}.kda_chunk_det_fwd_o_v1_kcp", {}),
     "kcp_dav": (f"tart.kda_chunk_bwd_dav.{_W}.kda_chunk_train_bwd_dav_v1", {}),
+    "kcp_fwdh_o": (
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_det_fwdh_o_v1_kcp",
+        {"vh": 128},
+    ),
+    "kcp_fwdh_o_vh64": (
+        f"tart.kda_chunk_kcp_fwd_h.{_W}.kda_chunk_det_fwdh_o_v1_kcp",
+        {"vh": 64},
+    ),
     "kcp_transfer_walk_three_mma": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
         {"precision_mode": 1},
@@ -202,7 +234,7 @@ IDENTITIES = {
     ),
     "kcp_dhu_tape_full": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape"},
+        {"program": "tape", "fuse_dv1": 1},
     ),
 }
 
@@ -236,7 +268,9 @@ def test_the_tables_are_disjoint_and_complete() -> None:
         "kcp_affine_merge",
         "kcp_fwd_o",
         "kcp_dav",
+        "kcp_fwdh_o",
     )
+    assert (*kcp_jit.PROGRAMS[:5], "kcp_fwdh_o") == kcp_jit.WALK_PROGRAMS
     assert kcp_jit.PRECISION_MODES == (0, 1, 2)
     assert kcp_jit.TRANSFER_WALKS == ("bf16x3_hw64", "tf32_hilo", "bf16x3")
 
@@ -319,7 +353,8 @@ def test_merge_selection_covers_every_launch_once() -> None:
                 assert arch in kcp_jit.MODULES[record]["arches"], (arch, record)
                 named.setdefault(record, set()).add(arch)
     assert named == {name: set(MERGE_RECORDS[name][2]) for name in MERGE_RECORDS}
-    # without an architecture: the record every architecture names, refused where they differ (T > 56)
+    # without an architecture: the record every architecture names, refused where they differ (T 21-24, 41-48 and
+    # above 56)
     assert kcp_jit.merge_record(128, 8) == "kcp_affine_merge_c8"
     with pytest.raises(ValueError):
         kcp_jit.merge_record(128, 64)
@@ -340,6 +375,12 @@ def test_selection_and_grids() -> None:
     with pytest.raises(ValueError):
         kcp_jit.select_record("kcp_fwdh_offset")  # two records: the form must be given
     assert kcp_jit.select_record("kcp_fwdh_tape", form="split") == "kcp_fwdh_tape"
+    assert kcp_jit.select_record("kcp_fwdh_o", form="full") == "kcp_fwdh_o"
+    assert kcp_jit.select_record("kcp_fwdh_o", form="split") == "kcp_fwdh_o_vh64"
+    with pytest.raises(ValueError):
+        kcp_jit.select_record("kcp_fwdh_o")
+    assert kcp_jit.launch_grid("kcp_fwdh_o", n_walk=3, num_heads=4) == (12, 1, 1)
+    assert kcp_jit.launch_grid("kcp_fwdh_o_vh64", n_walk=3, num_heads=4) == (24, 1, 1)
     assert kcp_jit.launch_grid("kcp_fwdh_offset", n_walk=3, num_heads=4) == (12, 1, 1)
     assert kcp_jit.launch_grid("kcp_fwdh_offset_vh64", n_walk=3, num_heads=4) == (
         24,
@@ -414,14 +455,21 @@ def test_test_record_selection_by_knobs() -> None:
 
 
 def test_walk_form_rules_and_records() -> None:
-    # the offset programs: the fit rule (two shipped records); the tape programs: split on every launch, the
-    # full-width record test-only under walk_form "full"
+    # the offset programs: the fit rule (two shipped records); the tape programs: split on every launch, the full-width
+    # record test-only under walk_form "full"; the fused forward walk: a rule per architecture (two shipped records)
     assert kcp_jit.WALK_FORM_RULES == {
         "kcp_fwdh_offset": "fit",
         "kcp_fwdh_tape": "split",
         "kcp_dhu_offset": "fit",
         "kcp_dhu_tape": "split",
+        "kcp_fwdh_o": kcp_jit.FWDH_O_FORM_RULE,
     }
+    assert kcp_jit.FWDH_O_FORM_RULE == {
+        "sm_100a": ((32, "split"), (None, "full")),
+        "sm_103a": ((32, "split"), (None, "full")),
+        "sm_107a": ((48, "fit"), (None, "full")),
+    }
+    assert set(kcp_jit.FWDH_O_FORM_RULE) == set(ARCHES)
     sms = 152
     assert kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms) == "split"
     assert kcp_jit.walk_form("kcp_fwdh_offset", [111, 59, 52], 64, sms) == "split"
@@ -435,6 +483,58 @@ def test_walk_form_rules_and_records() -> None:
     assert kcp_jit.walk_form("kcp_fwdh_offset", [64] * 7, 1, sms) == "split"
     assert kcp_jit.walk_form("kcp_fwdh_offset", [], 64, sms) == "full"
     assert kcp_jit.walk_form("kcp_fwdh_tape", [124, 124, 124], 64, sms) == "split"
+    # the fused forward walk: the architecture's rule on every launch (one wave or several; on sm_100a / sm_103a the
+    # two-CTA record up to 32 heads, the full-width one above; on sm_107a the fit rule up to 48 heads, the full-width
+    # record above: the W4 list at 32 to 48 heads, 512 to 768 two-CTA CTAs on 304 slots, outlasts its longest chain),
+    # the knob's form where given
+    w4 = [48, 48, 32, 32, 28, 28, 20, 20]
+    by_heads = {
+        1: "split",
+        4: "split",
+        16: "split",
+        32: "split",
+        33: "full",
+        64: "full",
+    }
+    fit_by_heads = {
+        1: "split",
+        4: "split",
+        16: "split",
+        32: "split",
+        33: "split",
+        48: "split",
+        49: "full",
+        64: "full",
+    }
+    for arch in ARCHES:
+        for chains in (w4, [222, 222], [48]):
+            for heads, form in (
+                fit_by_heads if arch == "sm_107a" else by_heads
+            ).items():
+                if arch == "sm_107a" and chains is w4 and heads in (32, 33, 48):
+                    form = "full"
+                assert (
+                    kcp_jit.walk_form("kcp_fwdh_o", chains, heads, sms, arch=arch)
+                    == form
+                ), (arch, chains, heads)
+        assert (
+            kcp_jit.walk_form("kcp_fwdh_o", [48], 4, sms, knob="full", arch=arch)
+            == "full"
+        )
+        assert (
+            kcp_jit.walk_form("kcp_fwdh_o", [48], 4, sms, knob="split", arch=arch)
+            == "split"
+        )
+    with pytest.raises(ValueError, match="per architecture"):
+        kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms)
+    with pytest.raises(ValueError, match="per architecture"):
+        kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms, arch="sm_90a")
+    assert kcp_jit.walk_form("kcp_fwdh_o", w4, 64, sms, knob="split") == "split"
+    # the other programs' rules take no architecture
+    assert (
+        kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms, arch="sm_107a")
+        == "split"
+    )
     assert kcp_jit.walk_form("kcp_dhu_tape", [39] * 14, 64, sms) == "split"
     assert (
         kcp_jit.walk_form("kcp_fwdh_offset", [222, 222], 64, sms, knob="full") == "full"
@@ -453,11 +553,14 @@ def test_walk_form_rules_and_records() -> None:
         assert record["test_knobs"] == {"walk_form": "full"}
         assert record["select_rule"] == {"kind": "always"}
         assert record["grid_rule"] == {"kind": "kcp_segments_heads"}
+    with pytest.raises(ValueError):
+        kcp_jit.test_walk_record("kcp_fwdh_o", "full")
     for name in (
         "kcp_fwdh_offset_vh64",
         "kcp_dhu_offset_vh64",
         "kcp_fwdh_tape",
         "kcp_dhu_tape",
+        "kcp_fwdh_o_vh64",
     ):
         assert kcp_jit.MODULES[name]["grid_rule"] == {
             "ctas_per_head": 2,
@@ -468,6 +571,15 @@ def test_walk_form_rules_and_records() -> None:
         "kind": "walk_form",
     }
     assert kcp_jit.MODULES["kcp_fwdh_tape"]["select_rule"] == {"kind": "always"}
+    assert kcp_jit.MODULES["kcp_fwdh_o"]["select_rule"] == {
+        "form": "full",
+        "kind": "walk_form",
+    }
+    assert kcp_jit.MODULES["kcp_fwdh_o_vh64"]["select_rule"] == {
+        "form": "split",
+        "kind": "walk_form",
+    }
+    assert kcp_jit.MODULES["kcp_fwdh_o"]["grid_rule"] == {"kind": "kcp_segments_heads"}
 
 
 def test_walk_heads_selection() -> None:
@@ -556,6 +668,32 @@ def test_shipped_manifest_lists_the_kcp_programs_and_no_test_only_one() -> None:
     assert not names & test_only
 
 
+# The PTX ISA 8.8 instructions (CUDA 12.9; CUDA 12.8's ptxas refuses them): a 256-bit ld / st, a three-input
+# min / max.
+_PTX_ISA_8_8 = re.compile(
+    rb"\b(?:min|max)(?:\.\w+)*\s+%[^;,\"]+(?:,[^;,\"]+){3};"
+    rb"|\b(?:ld|st)(?:\.[\w:]+)*\.v8\.[bfsu]32\b"
+)
+
+
+@pytest.mark.parametrize("manifest", ["build.json", "build.test.json"])
+def test_an_entry_whose_units_use_ptx_isa_8_8_needs_cuda_12_9(manifest: str) -> None:
+    """An entry whose units use a PTX ISA 8.8 instruction (the 256-bit stores of the fused forward walk, the output
+    stages and the full-width tape walks) states ``min_cuda`` 12.9 or newer: CUDA 12.8 cannot build it."""
+    path = PACKAGE_DIR / manifest
+    if not path.is_file():
+        pytest.skip(f"{manifest} is not shipped here")
+    wide = []
+    for entry in json.loads(path.read_text())["libraries"]:
+        if any(
+            _PTX_ISA_8_8.search((PACKAGE_DIR / source).read_bytes())
+            for source in entry["sources"]
+        ):
+            wide.append(entry["name"])
+            assert tuple(map(int, entry["min_cuda"].split("."))) >= (12, 9), entry
+    assert any(name.endswith("_sm_100a") for name in wide), wide
+
+
 def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -576,7 +714,7 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     assert (
         document["package"]
         == shipped["package"]
-        == "flashinfer.experimental.cake_kda_det_train_kcp"
+        == "flashinfer.experimental.cake.cake_kda_det_train_kcp"
     )
     # the shipped manifest is re-rendered by every kernel update of the package, the test-only manifest only when its
     # programs change: the two generator records share their form, not their stamp
@@ -613,3 +751,155 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     with pytest.raises(RuntimeError):
         kcp_jit.test_library_name("kcp_transfer_walk_three_mma", "sm_90a")
     kcp_jit._test_manifest.cache_clear()
+
+
+REPO = Path(__file__).resolve().parents[2]
+PACKAGE_NAME = "flashinfer.experimental.cake.cake_kda_det_train_kcp"
+SINGLE_RANK_NAME = "flashinfer.experimental.cake.cake_kda_det_train"
+
+
+def _manifest_checker():
+    """``scripts/check_cake_build_manifests.py`` of this checkout, loaded as a module (it never imports flashinfer)."""
+    path = REPO / "scripts" / "check_cake_build_manifests.py"
+    if not path.is_file():
+        pytest.skip(
+            "scripts/check_cake_build_manifests.py is not beside this test (installed package)"
+        )
+    spec = importlib.util.spec_from_file_location("check_cake_build_manifests", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules.setdefault("check_cake_build_manifests", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_manifest_checker_row_requires_the_single_rank_package() -> None:
+    """The checker's row of this package names its directory and requires the single-rank sibling, and its
+    manifest declares that sibling (``common.requires.packages``)."""
+    checker = _manifest_checker()
+    row = checker.package_named(PACKAGE_NAME)
+    assert row is not None
+    assert (row.path, row.loader) == (
+        "flashinfer/experimental/cake/cake_kda_det_train_kcp",
+        "cake_kcp_jit.py",
+    )
+    assert row.requires == (SINGLE_RANK_NAME,)
+    assert checker.check_requires(row) == []
+    assert checker.check_required_packages(row, cake_build.manifest()) == []
+
+
+def test_manifest_checker_required_packages_rule() -> None:
+    """``check_required_packages``: the manifest lists the directory names of ``Package.requires`` sorted and without
+    duplicates (as #8928 specifies), whatever the order of ``Package.requires``, and lists none when the package
+    requires none."""
+    checker = _manifest_checker()
+
+    def package(*requires: str):
+        return checker.Package(
+            "p.pkg", "p/pkg", "cake_jit.py", checker.refs_generic, requires=requires
+        )
+
+    def manifest(**requires):
+        return {"common": {"requires": {"cuda_toolkit": {"min": "12.8"}, **requires}}}
+
+    def messages(row, document):
+        return [f.message for f in checker.check_required_packages(row, document)]
+
+    two = package("p.sib", "p.other")
+    assert messages(two, manifest(packages=["other", "sib"])) == []
+    assert messages(package(), manifest()) == []
+    (missing,) = messages(two, manifest())
+    assert "common.requires.packages is missing; expected ['other', 'sib']" in missing
+    (unsorted,) = messages(two, manifest(packages=["sib", "other"]))
+    assert "!= ['other', 'sib']" in unsorted
+    (duplicate,) = messages(two, manifest(packages=["other", "other", "sib"]))
+    assert "!= ['other', 'sib']" in duplicate
+    (dotted,) = messages(two, manifest(packages=["p.other", "p.sib"]))
+    assert "!= ['other', 'sib']" in dotted
+    (extra,) = messages(package(), manifest(packages=["sib"]))
+    assert "Package.requires is empty" in extra
+
+
+# --------------------------------------------------------------------------- the byte query's architecture
+
+BYTE_QUERY_CALLS = ("plan", "workspace_bytes", "tables_bytes")
+
+
+def _context_on(device: str):
+    """Rank 0's context of a two-rank contiguous pack (148 SMs), seen as a context on ``device``: the byte query reads
+    the context's host fields and its ``device``; a CPU host builds the context on the CPU."""
+    part = kcp_plan.cake_kda_det_train_kcp_partition([0, 3000, 8192], 2)
+    ctx = kcp_plan.cake_kda_det_train_kcp_build_context(
+        part, None, 0, "cpu", 4, sm_count=148
+    )
+    assert ctx.T_r > 0
+
+    class OnDevice:
+        def __getattr__(self, name: str):
+            return getattr(ctx, name)
+
+    view = OnDevice()
+    view.device = torch.device(device)
+    return view
+
+
+def _spy_byte_query(monkeypatch) -> list[tuple[str, object]]:
+    """Record the ``arch`` each of :data:`BYTE_QUERY_CALLS` of the single-rank backend receives (the real function
+    then runs); every context's intra record is taken to write its scratch table set, so all three are called."""
+    single_rank = cake_package("cake.cake_kda_det_train_kcp", "_single_rank")
+    backend = single_rank.module("cake_backend")
+    seen: list[tuple[str, object]] = []
+    for name in BYTE_QUERY_CALLS:
+        real = getattr(backend, name)
+
+        def spy(*args, _real=real, _name=name, **kwargs):
+            seen.append((_name, kwargs.get("arch", "not passed")))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(backend, name, spy)
+    monkeypatch.setattr(kcp_plan, "intra_writes_tables", lambda *a, **k: True)
+    return seen
+
+
+def test_workspace_bytes_plan_for_the_contexts_device_architecture(
+    monkeypatch,
+) -> None:
+    """The byte query plans each context's local arena, its arena bytes and its scratch tables for the architecture
+    of the context's device, as the forward plans its local stages, never for that of the current CUDA device: here
+    the current device (``cuda:0``) is another model than the context's (``cuda:1``)."""
+    current, own = cake_jit.ARCHES[0], cake_jit.ARCHES[1]
+    by_index = {0: current, 1: own}
+    capability = {arch: cap for cap, arch in cake_jit.ARCH_BY_CAPABILITY.items()}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda index=None: capability[by_index[0 if index is None else int(index)]],
+    )
+    monkeypatch.setattr(kcp_plan, "_cuda_arch", lambda index: by_index[int(index)])
+    ctx = _context_on("cuda:1")
+    seen = _spy_byte_query(monkeypatch)
+    nbytes = kcp_plan.cake_kda_det_train_kcp_workspace_bytes(ctx, H=64)
+    assert nbytes > 0
+    assert seen == [(name, own) for name in BYTE_QUERY_CALLS]
+
+
+@pytest.mark.parametrize("device", ["cuda:1", "cpu"])
+def test_workspace_bytes_without_cuda_pass_no_architecture(
+    monkeypatch, device: str
+) -> None:
+    """On a host without CUDA the byte query passes ``arch=None`` (the existing backend's default) and makes no CUDA
+    call, whatever device the context names."""
+
+    def no_cuda_call(*args, **kwargs):
+        raise AssertionError("the byte query made a CUDA call on a host without CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    for name in ("current_device", "get_device_capability", "get_device_properties"):
+        monkeypatch.setattr(torch.cuda, name, no_cuda_call)
+    monkeypatch.setattr(kcp_plan, "_cuda_arch", no_cuda_call)
+    ctx = _context_on(device)
+    seen = _spy_byte_query(monkeypatch)
+    assert kcp_plan.cake_kda_det_train_kcp_workspace_bytes(ctx, H=64) > 0
+    assert seen == [(name, None) for name in BYTE_QUERY_CALLS]

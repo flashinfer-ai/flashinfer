@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .generator import CLUSTERS, SWIZZLES, Knobs, enumerate_space  # noqa: F401  (re-exported)
-from .spec import MMA_K_OF
+from .spec import chunk_unit
 
 GemmConfig = Knobs
 
@@ -50,7 +50,9 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
     a bounded fraction of the operand traffic). An empty weight (N = 0) has no split, as the Lean mirror's natural-number
     division gives. Mirrored by ``BIK.GEMM.chunksFor`` / ``chunksForFp8`` in Lean (checked by the generated conformance
     cases)."""
-    step = MMA_K_OF[in_fmt]
+    step = chunk_unit(
+        in_fmt
+    )  # the format's MMA step; for the block-scaled classes also a whole scale-factor atom column
     if N <= 0 or -(-N // 32) >= SPLIT_MIN_CTAS:
         return 1
     budget = K // (16 * N)
@@ -62,6 +64,28 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
     ):
         C *= 2
     return C
+
+
+#: The sm_107 instructions' classes of the MX formats (the sm_100 / sm_103 instructions' classes elsewhere).
+MX_SM107_CLASS = {"mxfp8": "mxfp8_k64", "mxfp4": "mxfp4_k128"}
+
+
+def mx_class_for(base: str, family: Optional[str]) -> str:
+    """The MX class a part runs for an MX format: the sm_107 instruction's class (64 elements per step for mxfp8,
+    ``mxfp8_k64``; 128 for mxfp4, ``mxfp4_k128``) on the sm_107 parts, the sm_100 instruction's class (``mxfp8`` /
+    ``mxfp4``) elsewhere. A function of the architecture family only (the fingerprint is scoped to the architecture),
+    never of the shape."""
+    return MX_SM107_CLASS.get(base, base) if family == "sm_107" else base
+
+
+def fp4_class_for(N: int, K: int, family: Optional[str]) -> str:
+    """The NVFP4 class a part runs for a weight shape: on the sm_107 parts the sm_107 instruction's class (128 elements per
+    step, ``nvfp4_k128``) for every weight shape whose chunk rule at that step is unsplit, the sm_100 instruction's class
+    (``nvfp4``) for the split shapes; ``nvfp4`` elsewhere. A function of (N, K) and the architecture family only, never of M
+    (a token's bits may not depend on the batch), so a weight that takes the wider step at prefill takes it at decode too."""
+    if family == "sm_107" and chunks_for(N, K, "nvfp4_k128") == 1:
+        return "nvfp4_k128"
+    return "nvfp4"
 
 
 def rank_topk(

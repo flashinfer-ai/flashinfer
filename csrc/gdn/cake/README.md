@@ -230,8 +230,8 @@ shim checks that grid.
 
 The K-major (nontranspose) fp32-state T=1 row (`gated_delta_rule_decode`,
 H=16 / HV=32) follows the batch size on SM107a
-(`cake_gdn_nontranspose_fp32_t1_route`): `mid4_rc_kq128` below 21 rows and,
-from 21 rows on (the upper small band 21-31, which formerly ran
+(`cake_gdn_nontranspose_fp32_t1_route`): `mid4_rc_kq128` below 10 rows and,
+from 10 rows on (the upper small band 10-31, which formerly ran
 `mid4_rc_kq128`, and the whole large band, which formerly ran `tilev32_x2` for
 32-36 and `hqsplit` from 37), `gdn_decode_nontranspose_fp32_t1_hqsplit_tma3`:
 the `hqsplit` statements and
@@ -243,17 +243,24 @@ takes the state as a `const __grid_constant__ CUtensorMap`, so its records
 spell `"tma_abi": "grid_constant"` and launch through
 `host/templates/decode_fp32_t1_tma_state.cc.in`, which checks the state as
 the pointer template does (FP32, contiguous `[B, HV, 128, 128]`) plus a
-16-byte aligned base address, and encodes the 4D map (V, K, HV, B; box
-32 x 128 x 1 x 1) on every call. The map is a by-value kernel parameter: a
-CUDA graph captures it with the launch, so a replay addresses the state
-tensor the capture saw, exactly as the pointer ABI's captured pointer does; a
-different state tensor needs its own capture (or the eager path, which
-encodes per call). Nothing is cached by pointer. The TMA-state records cover
+16-byte aligned base address, and passes the 4D map (V, K, HV, B; box
+32 x 128 x 1 x 1). The map is a function of the state's base address, batch
+and head count alone, so each host thread keeps the maps it encoded in a
+64-slot table keyed by (device, address, B, HV) and encodes only on a miss; a
+hit passes the bytes a fresh encode returns. The map is a by-value kernel
+parameter: a CUDA graph captures it with the launch, so a replay addresses the
+state tensor the capture saw, exactly as the pointer ABI's captured pointer
+does; a different state tensor needs its own capture (or the eager path, which
+looks the map up per call). The TMA-state records cover
 H=16 / HV=32 only; the H=4 / HV=8 trace row keeps `mid4_rc_kq128` in the
 upper small band. The H=16 / HV=32 B=28 row at scale 1.0 also keeps
 `mid4_rc_kq128` (`hqsplit_tma3` ran it at 0.996x on a 216-SM R200; the same
 row at scale K^-0.5 takes `hqsplit_tma3`). SM100a/SM103a keep the shipped
-bodies.
+bodies. On every architecture the public nontranspose decode keeps the kernel
+entry and grid it resolved per (device, B, H, HK, HV, scale, l2norm)
+(`gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES`) after the per-call checks, so an
+eager call resolves its route and loads its module only on the first call of
+a row.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)

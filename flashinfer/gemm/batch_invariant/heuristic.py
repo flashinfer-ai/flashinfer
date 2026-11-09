@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from .generator import Knobs, enumerate_space
-from .spec import ELEM_BITS_OF, MMA_K_OF
+from .spec import ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +73,17 @@ FAMILY_OF_CC = {(10, 0): "sm_100", (10, 3): "sm_103", (10, 7): "sm_107"}
 
 
 def family_of(cc: Tuple[int, int]) -> str:
-    """The architecture family of a compute capability; the API passes the operand device's."""
-    return FAMILY_OF_CC.get((int(cc[0]), int(cc[1])), "sm_107")
+    """The architecture family of a compute capability; the API passes the operand device's. The family selects the
+    block-scaled classes' instruction (`schedule.mx_class_for`), hence the bits, so an unlisted capability raises instead
+    of borrowing a family."""
+    from ...batch_invariant.support import BatchInvariantUnsupportedError
+
+    key = (int(cc[0]), int(cc[1]))
+    if key not in FAMILY_OF_CC:
+        raise BatchInvariantUnsupportedError(
+            f"batch_invariant: compute capability {key} is not a part of the mode; the parts are {sorted(FAMILY_OF_CC)}"
+        )
+    return FAMILY_OF_CC[key]
 
 
 # the co-resident cluster counts a device reported at run time, keyed (family, SM count); device-free callers use the table
@@ -157,11 +166,20 @@ CONSTANTS: Dict[str, float] = dict(
 DECODE_M = 64  # up to this many rows the candidates are the `decode_sane` subset
 
 
-def decode_sane(k: Knobs, M: int) -> bool:
-    """The candidate guard at M <= DECODE_M (structural): 1-CTA tiles of N >= 32 in an N-cluster at swizzle 1. Records
+def decode_sane(k: Knobs, M: int, swapped: bool = False) -> bool:
+    """The candidate guard at M <= DECODE_M (structural): 1-CTA tiles of N >= 32 in an N-cluster at swizzle 1; where the
+    space has swapped decode records (``swapped``: the block-scaled classes), those records at swizzle 1 -- the narrow
+    token tiles on the 1-CTA instruction, the 64-wide one on the 2-CTA pair once the tokens fill at least half of it --
+    and no dense record (one token tile holds every token, the weights stream through the 128-row operand). Records
     outside the guard stay members of the space (the autotuner may still reach them)."""
     if M > DECODE_M:
         return True
+    if swapped:
+        return (
+            k.swap_ab
+            and k.swizzle_size == 1
+            and (not k.use_2cta_instrs or (k.tile_n == 64 and M > 32))
+        )
     return (
         (not k.use_2cta_instrs)
         and k.tile_n >= 32
@@ -256,16 +274,18 @@ def estimate_cycles(
     rows = tm // group
     eb = ELEM_BITS_OF[in_fmt] / 8.0
     kk = MMA_K_OF[in_fmt]
-    rate = part.mma_flop_per_clk * (
-        kk / 16.0
-    )  # the 8-bit kind (K step 32): twice the dense bf16 rate
-    m_tiles = -(-M // tm)
-    n_tiles = -(-N // tn)
+    rate = (
+        part.mma_flop_per_clk * MMA_RATE_OF[in_fmt]
+    )  # the 8-bit kinds: twice the dense bf16 rate
+    # the swapped decode record computes C^T: the kernel's rows are the weights' N, its columns the tokens' M
+    pm, pn = (N, M) if k.swap_ab else (M, N)
+    m_tiles = -(-pm // tm)
+    n_tiles = -(-pn // tn)
     if m_tiles == 0 or n_tiles == 0:
         return float("inf")
     ws = (
-        chunks > 1 and not k.cta_chunks
-    )  # workspace split: `chunks` work items per tile and a fixup kernel
+        chunks > 1 and not k.cta_chunks and k.cluster_k == 1
+    )  # workspace split: `chunks` work items per tile and a fixup kernel (the in-CTA and in-cluster folds store directly)
     items = chunks if ws else 1
     ctas_m = m_tiles * group
     pad_m = -(-ctas_m // cm) * cm
@@ -274,13 +294,14 @@ def estimate_cycles(
     size = cm * cn
     capacity = cap.get(size) or max(1, sms // size)
     waves = -(-clusters // capacity)
-    ksteps = max(1.0, (K / (chunks if ws else 1)) / kk)
+    ksteps = max(1.0, (K / (chunks if (ws or k.cluster_k > 1) else 1)) / kk)
     flops = 2.0 * rows * tn * kk
     mma_eff = 1.0 if rows >= 128 else p["rows64_eff"]
     mma_cycles = flops / (rate * mma_eff)
-    # a narrow N tile (the CTA's share tn / group, in bytes): its B box wastes transactions for a row-major weight and each
-    # MMA's A-operand read is amortised over fewer MACs in either layout; the cost is measured alike in both layouts
-    wb = tn / group * eb
+    # a narrow N tile (the CTA's share tn / group, in bytes of a one-byte element): its B box wastes transactions for a
+    # row-major weight and each MMA's A-operand read is amortised over fewer MACs in either layout; the cost is measured
+    # alike in both layouts, per MMA column: a 4-bit element is a column like an 8-bit one
+    wb = tn / group * max(eb, 1.0)
     b_eff = (
         p["eff16b"]
         if wb <= 16
@@ -290,6 +311,8 @@ def estimate_cycles(
         if wb <= 64
         else 1.0
     )
+    if k.swap_ab:
+        b_eff = 1.0  # the swapped record's narrow tile is the token tile, one per CTA for the whole K: no such cost is measured for it
     a_bytes = rows * kk * eb / (cn ** p["mcast_pow"])
     b_bytes = tn * kk * eb / (cm ** p["mcast_pow"]) / b_eff
     step = (
@@ -312,8 +335,8 @@ def estimate_cycles(
         else 0.0
     )
     hbm_bytes = hbm_traffic(
-        M,
-        N,
+        pm,
+        pn,
         K,
         eb,
         out_bytes,
@@ -327,7 +350,7 @@ def estimate_cycles(
         k.raster_along,
         p["l2_resident"] * l2_for(family, sms, nominal),
     )
-    unique = (M * K + K * N) * eb + M * N * out_bytes
+    unique = (pm * K + K * pn) * eb + pm * pn * out_bytes
     bw = part.hbm_bytes_per_clk * sms
     # the operands' own bytes bound the launch from below (overlapped with the body). The bytes the tile order fetches
     # again are hidden while the HBM is lightly loaded: a fraction `absorb` of the body's time streams them at no cost
@@ -387,7 +410,8 @@ def rank(
     Cached per argument tuple."""
     fam = family or "sm_107"
     space = enumerate_space(M, N, K, chunks=chunks, b_major=b_major, in_fmt=in_fmt)
-    guarded = [k for k in space if decode_sane(k, M)]
+    swapped = any(k.swap_ab for k in space)
+    guarded = [k for k in space if decode_sane(k, M, swapped)]
     space = guarded or space
     if not space:
         return ()
