@@ -66,11 +66,11 @@ each where the architecture's bands name it); the backward by
 ``BACKWARD_BANDS``, bands of rows or of rows per SM: its small-row roles (``BAND_ROLES``: the
 short backward ``bwd_bf16_short`` and the exact tiny backward ``_t512``, each
 up to a count of rows), its fused role (``_fused``: a BF16 weight gradient,
-up to a count of rows per SM) and its repeatable role (``_rep``: a BF16
-weight gradient, past the fused band), its call role (the static backward,
-where an architecture routes one for the role), for a BF16 weight gradient
-its row-claims roles (``_rc``, ``_rc_mid``) and its mid role (the claimed
-backward).
+in a band of rows per SM) and its repeatable role (``_rep``: a BF16
+weight gradient, past the fused band, and on sm_107a also before it), its
+call role (the static backward, where an architecture routes one for the
+role), for a BF16 weight gradient its row-claims roles (``_rc``,
+``_rc_mid``) and its mid role (the claimed backward).
 The forward's programs: the tiny forward (16 threads to a row, one 8-row
 block per 128-thread CTA, the gate before the sum of squares, packed rows
 only; the short forward's arithmetic and bits), the short forward (16
@@ -2016,15 +2016,25 @@ STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
 # about one CTA's chunks late, within the bound of the SMs held plus one row
 # block a CTA (FlashInfer issue #7548, item 1) only up to about 4 blocks a
 # CTA; past it a claimed backward runs.  A BF16 weight gradient runs, past
-# its small-row bands on every architecture, the fused backward (``_fused``,
-# whose CTAs claim their blocks) up to a count of rows per SM and the
-# repeatable backward (``_rep``, the same schedule with the deterministic
-# package's exact weight-gradient sum) past it: the fused backward's weight
-# gradient may vary in its last bits from run to run (and so may the
+# its small-row bands, the fused backward (``_fused``, whose CTAs claim their
+# blocks) and the repeatable backward (``_rep``, the same schedule with the
+# deterministic package's exact weight-gradient sum): the fused backward's
+# weight gradient may vary in its last bits from run to run (and so may the
 # row-claims backwards', ``_rc``, ``_rc_mid``, which no band runs), so it
 # runs only where it makes the checkpointed training step at least 3 %
-# faster than the repeatable backward does; every other band repeats its bits.
+# faster than the repeatable backward does; every other band repeats its
+# bits.  On sm_100a and sm_103a the fused backward runs up to 1000 rows per
+# SM and the repeatable backward past it.  On sm_107a the fused backward
+# saves at least 3 % of the step only past 64 and up to 256 rows per SM (both
+# cuts on the repeatable backward's waves of 64 rows per SM), so the
+# repeatable backward runs up to ``SM107A_BF16_REP_LAST`` rows per SM, the
+# fused backward up to ``SM107A_BF16_FUSED_LAST`` and the repeatable backward
+# again past it.
 ROWS = "rows"
+# The sm_107a BF16 cuts in rows per SM: the end of the first repeatable band
+# and the end of the fused band.
+SM107A_BF16_REP_LAST = 64
+SM107A_BF16_FUSED_LAST = 256
 BACKWARD_BANDS: dict[
     str, dict[str, tuple[tuple[tuple[str, int] | float | None, str], ...]]
 ] = {
@@ -2057,7 +2067,8 @@ BACKWARD_BANDS: dict[
         "bwd_bf16": (
             ((ROWS, 256), "bwd_bf16_short"),
             ((ROWS, 512), "bwd_bf16_t512"),
-            (1000, "bwd_bf16_fused"),
+            (SM107A_BF16_REP_LAST, "bwd_bf16_rep"),
+            (SM107A_BF16_FUSED_LAST, "bwd_bf16_fused"),
             (None, "bwd_bf16_rep"),
         ),
         "bwd_f32": (
