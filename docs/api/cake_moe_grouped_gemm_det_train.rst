@@ -26,6 +26,7 @@ produce exactly zero weight gradients.
 
 The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
 For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+Standalone ``wgrad`` calls with ``m_indptr`` must also pass ``num_groups=E``.
 
 ============ ==================================================================== ============================
 operation    computation                                                           output

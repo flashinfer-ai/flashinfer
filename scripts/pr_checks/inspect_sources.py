@@ -304,6 +304,8 @@ def collect_module_alias_exports(
         visitor = ModuleScopeImportFromVisitor()
         visitor.visit(tree)
         for node in visitor.imports:
+            if any((alias.asname or alias.name) == "__all__" for alias in node.names):
+                public_modules.add(importer_mod)
             level = node.level or 0
             target_mod: str
             if level > 0:
