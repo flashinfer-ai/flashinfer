@@ -382,7 +382,7 @@ def test_dyn_plan_unit_size() -> None:
     # and 18 x 64: 12288) and 8192 channels, 16384 tokens (P 37: 7 x 64, 7 * 672 + 192 = 4896, against 4 x 112:
     # 4944).  152 SMs (GB300, GB200) and 212 SMs (VR200): the 64-token lanes of 1152, 448, 832 and 320 tokens fill
     # 29 of 30, 37 of 38, 40 of 42 and 52 of 53 lanes, so M is 64 unless 56-token lanes leave more CTAs idle: they
-    # leave 7, 4 (a tie), 2 and 16 idle against 7, 4, 12 and 4, so only the last (VR200, 8192 channels) takes
+    # leave 2, 4 (a tie), 2 and 16 idle against 7, 4, 12 and 4, so only the last (VR200, 8192 channels) takes
     # 6 units of 56 tokens (49 of 53 lanes busy).
     for (S, C, sms), want in (
         ((32768, 10240, 148), {"M": 104, "NL": 11, "P": 29, "L": 145, "n_ctas": 148}),

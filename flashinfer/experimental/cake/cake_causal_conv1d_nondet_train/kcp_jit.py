@@ -900,7 +900,7 @@ LOGICAL_SCALARS = (*_zero_history.LOGICAL_SCALARS, "M", "NL", "P", "L", "n_ctas"
 # units from the other lanes absorb the SMs another stream holds): on VR200
 # (212 SMs), 3 x 8192 channels of 16384 tokens leave 16 such CTAs with 56-token
 # units against 4 with 64-token units, and the backward with 16 / 32 SMs held
-# ran 1.130x / 1.055x faster (other phases within 0.5%).
+# ran 1.130x / 1.055x faster (other phases within 0.6%).
 DYN_TILE = 2048
 DYN_TILE_WORDS = 8
 DYN_MAX_LANES = 256
