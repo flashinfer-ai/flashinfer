@@ -267,8 +267,9 @@ def _check_case(
     check_rings=True,
     hpc=None,
     u_dtype=None,
+    fn=None,
 ):
-    fn = _umma()
+    fn = fn or _umma()
     if hpc is not None:
         import functools
 
@@ -1691,8 +1692,7 @@ def _public_call(case, flush_min=None, **extra):
         cache_base=cb,
         scale=SCALE,
         flush_min=flush_min,
-        restart_hist_on_flush=False,
-        **extra,
+        **{"restart_hist_on_flush": False, **extra},
     )
 
 
@@ -1811,3 +1811,106 @@ def test_auto_backend_never_picks_umma_ring64():
     case = _make_case(2, 4, [0, 1], 5, [0, 0])
     with pytest.raises(AssertionError, match="k_cache must be"):
         _public_call(case, backend="auto")
+
+
+def _public_restart_fn(**extra):
+    """The facade with the default restart_hist_on_flush=True, shaped like the direct kernel call."""
+
+    def fn(A_log, a, dt_bias, *, flush_min=None, restart_hist_on_flush, **kw):
+        assert not restart_hist_on_flush
+        return _flashinfer_fp16_state().gated_delta_rule_mtp_ucache_flush(
+            A_log, a, dt_bias, flush_min=flush_min, backend="umma_ring64", **kw, **extra
+        )
+
+    return fn
+
+
+@pytest.mark.parametrize("T", [4, 8])
+@pytest.mark.parametrize("bases", ["base0", "wrap", "high"])
+def test_public_restart_cursor_check_takes_ring64_histories(T, bases):
+    """restart_hist_on_flush=True (the default): histories deeper than 16 and bases in [0, 64) are legal on
+    ring64 (the 16-row / 32-slot limits of the merged kernel used to reject them) and match the fp32 oracle."""
+    _skip_if_not_sm100()
+    fm = _default_fm(T)
+    hist = [0, 1, 5, 16, 17, fm - 1, fm, fm - 1 + T]
+    base = {"base0": [0] * 8, "wrap": _B8W, "high": [40] * 8}[bases]
+    _check_case(
+        T, hist, base, fm, 61, fn=_public_restart_fn(restart_hist_on_flush=True)
+    )
+
+
+def test_public_restart_cursor_check_commits_like_the_direct_call():
+    """The public eager call is bit-identical to the direct kernel call, cursors included."""
+    _skip_if_not_sm100()
+    T = 4
+    hist, bases = [17, 28, 29, 32], [40, 40, 63, 41]
+    case_a = _make_case(len(hist), T, hist, 91, bases)
+    case_b = tuple(x.clone() for x in case_a)
+    y_a = _public_call(case_a, backend="umma_ring64", restart_hist_on_flush=True)
+    y_b = _run(_umma(), case_b, None, restart=True)
+    torch.cuda.synchronize()
+    for x, y_ in zip((y_a, *case_a[7:13]), (y_b, *case_b[7:13]), strict=True):
+        assert torch.equal(_bits(x), _bits(y_))
+
+
+@pytest.mark.parametrize(
+    "T,flush_min,hist,bases,match",
+    [
+        (4, None, 33, 0, "hist_len out of legal range"),
+        (4, 13, 17, 0, "hist_len out of legal range"),
+        (8, 9, 17, 0, "hist_len out of legal range"),
+        (4, None, 4, 64, "cache_base out of legal"),
+        (4, None, 4, -1, "cache_base out of legal"),
+    ],
+)
+def test_public_restart_cursor_check_bounds_ring64(T, flush_min, hist, bases, match):
+    """Ring64 limits: hist_len up to the built window min(nu, flush_min - 1 + T) (silently truncated
+    beyond it), cache_base below 64."""
+    _skip_if_not_sm100()
+    case = _make_case(1, T, [4], 7, [0])
+    case[11].copy_(torch.tensor([hist], dtype=torch.int32))
+    case[12].copy_(torch.tensor([bases], dtype=torch.int32))
+    with pytest.raises(AssertionError, match=match):
+        _public_call(case, flush_min, backend="umma_ring64", restart_hist_on_flush=True)
+
+
+@pytest.mark.parametrize("backend", ["auto", "umma", "hmma"])
+def test_public_restart_cursor_check_hints_umma_ring64_for_64_slot_rings(backend):
+    """A valid 64-slot cursor under another backend gets the umma_ring64 hint, not a 32-slot range error."""
+    _skip_if_not_sm100()
+    case = _make_case(1, 4, [4], 7, [40])
+    with pytest.raises(ValueError, match="umma_ring64"):
+        _public_call(case, backend=backend, restart_hist_on_flush=True)
+
+
+@pytest.mark.parametrize(
+    "hist,bases,match",
+    [
+        ([17], [0], "hist_len out of legal range"),
+        ([4], [32], "cache_base out of legal"),
+    ],
+)
+def test_public_restart_cursor_check_still_rejects_for_merged_umma(hist, bases, match):
+    """The merged kernel's 16-row window / 32-slot ring limits are unchanged."""
+    _skip_if_not_sm100()
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
+        1, 4, hist, 7, [0]
+    )
+    case = (
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool,
+        kc[:, :, :32].contiguous(),
+        uc[:, :, :32].contiguous(),
+        gc[:, :, :32].contiguous(),
+        hl,
+        torch.tensor(bases, dtype=torch.int32, device=DEV),
+        idx,
+    )
+    with pytest.raises(AssertionError, match=match):
+        _public_call(case, backend="umma", restart_hist_on_flush=True)

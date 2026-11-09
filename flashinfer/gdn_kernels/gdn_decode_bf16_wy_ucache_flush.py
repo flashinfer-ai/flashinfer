@@ -159,6 +159,7 @@ except ImportError:
 
 # Opt-in ring-64 UMMA variant (backend="umma_ring64": 64-slot rings, 32-row window), imported on first use.
 _UMMA_RING64_SLOTS = 64
+_UMMA_RING64_WINDOW = 32  # rows of the ring-64 window (its W_RING)
 
 
 def _load_umma_ring64():
@@ -3381,7 +3382,7 @@ def gated_delta_rule_mtp_ucache_flush(
     (k [pool, H, 64, K], u [pool, HV, 64, V], g [pool, HV, 64]; +0.63 MiB per
     request and layer) and gets a 32-row window; ``flush_min`` defaults to
     nu - T + 1 (T = 4: 29, T = 8: 25; 16 at T = 1), legal ``hist_len`` is
-    [0, flush_min - 1 + T], ``cache_base`` [0, 64). It takes a bf16 k ring and a bf16 or fp16 u ring (vLLM's u-cache dtype), and 4 value heads per key head.
+    [0, min(nu, flush_min - 1 + T)] ([0, nu] at T = 1), ``cache_base`` [0, 64). It takes a bf16 k ring and a bf16 or fp16 u ring (vLLM's u-cache dtype), and 4 value heads per key head.
     The 32-slot ring contents are not interchangeable with it.
     ``stochastic_rounding`` (``"philox"`` / ``"lcg"``, with
     ``rand_seed`` and ``philox_rounds``; off unless set) rounds the fp16
@@ -3497,15 +3498,37 @@ def gated_delta_rule_mtp_ucache_flush(
         # appends back into the live window — the write-after-read race the
         # ring exists to remove. The graph-captured serving path passes
         # restart_hist_on_flush=False and owns these invariants.
+        # backend="umma_ring64" has its own limits: 64 slots and a window of
+        # min(nu, flush_min - 1 + T) rows (nu = min(32, 64 - T); the full nu
+        # rows at T = 1, whose rings may come from larger-T steps).
         if not torch.cuda.is_current_stream_capturing():
+            if (
+                backend != "umma_ring64"
+                and k_cache is not None
+                and k_cache.shape[-2] == _UMMA_RING64_SLOTS
+            ):
+                raise ValueError(
+                    "gated_delta_rule_mtp_ucache_flush: 64-slot rings are served "
+                    f"by backend='umma_ring64' only, got backend={backend!r}."
+                )
+            if backend == "umma_ring64":
+                _slots = _UMMA_RING64_SLOTS
+                _nu = min(_UMMA_RING64_WINDOW, _slots - T)
+                if T == 1:
+                    _hl_cap = _nu
+                else:
+                    _fm = _nu - T + 1 if flush_min is None else flush_min
+                    _hl_cap = min(_nu, _fm - 1 + T)
+            else:
+                _slots, _hl_cap = RING_SLOTS, W_RING
             _hl_min, _hl_max = (int(x.item()) for x in hist_len.aminmax())
-            assert _hl_min >= 0 and _hl_max <= W_RING, (
-                f"hist_len out of legal range [0, {W_RING}]: "
+            assert _hl_min >= 0 and _hl_max <= _hl_cap, (
+                f"hist_len out of legal range [0, {_hl_cap}]: "
                 f"min={_hl_min} max={_hl_max}"
             )
             _cb_min, _cb_max = (int(x.item()) for x in cache_base.aminmax())
-            assert _cb_min >= 0 and _cb_max < RING_SLOTS, (
-                f"cache_base out of legal range [0, {RING_SLOTS}): "
+            assert _cb_min >= 0 and _cb_max < _slots, (
+                f"cache_base out of legal range [0, {_slots}): "
                 f"min={_cb_min} max={_cb_max}"
             )
     if initial_state_source.dim() == 5:
