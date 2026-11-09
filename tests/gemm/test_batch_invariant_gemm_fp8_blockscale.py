@@ -89,6 +89,16 @@ FULL_SPACE_SHAPES = [
     (37, 2048, 1024),
     (16, 8192, 8192),
 ]
+#: A few rows in the K layout (the K-native staging) with a short last ring stage: K of one, two and three blocks (the short
+#: stage alone; a stage holds four blocks) and of six and seven (a whole stage, then the short one); the exact-model shapes at
+#: these row counts are whole stages.
+NATIVE_TAIL_SHAPES = [
+    (64, 4096, 128),
+    (37, 2048, 256),
+    (16, 576, 384),
+    (16, 2048, 768),
+    (16, 576, 896),
+]
 #: Hand-picked records: every tile N, both CTA groups, clusters to 4, both rasters, swizzles to 8.
 RECORDS = [
     Knobs((128, 16), (1, 1), False, True, "m", 1),
@@ -283,6 +293,32 @@ def test_space_is_the_block_scale_tiles_on_a_k_major_weight():
     for N, K in DS_PAIRS:
         assert chunks_for(N, K, FMT) == 1  # no split variant
     assert chunks_for(64, 65536, FMT) == 1
+
+
+def test_blocked_fold_traces_the_indexed_block_digit():
+    """The promotion issues the spec's ``block`` digit -- an indexed fold: the step takes the block's index for its scale -- one
+    block per k-tile; the engine's loop-nest trace of it over the block partials is the digit's direct fold and the spec's
+    canonical term, at one block per stage and at several."""
+    from flashinfer.batch_invariant.canon import BlockedFold, Reduction
+    from flashinfer.batch_invariant.fp_interface.term import TermAlgebra
+    from flashinfer.gemm.batch_invariant.spec import reduction_blockscale
+
+    alg = TermAlgebra()
+    red = reduction_blockscale(4 * BLOCK_K, 0, 0, FMT)
+    kstep, block = red.digits
+    assert block.indexed and not kstep.indexed
+    partials = [
+        kstep.reduce(
+            alg, [red.leaf(alg, {"block": kb, "kstep": t}) for t in range(kstep.radix)]
+        )
+        for kb in range(block.radix)
+    ]
+    direct = block.reduce(alg, partials)
+    assert direct is red.canonical(alg)
+    promotion = Reduction("promotion", (block,), lambda fp, idx: partials[idx["block"]])
+    for inner in (1, 2):
+        low = BlockedFold("block", inner)
+        assert low.trace(promotion, alg, block.radix // inner) is direct, inner
 
 
 @pytest.mark.parametrize("family,sm_count", PARTS)
@@ -499,6 +535,37 @@ def test_k_native_scale_staging_is_a_placement():
         compile_fp8bs.get_compiled_fp8bs = real
 
 
+@needs_device
+@pytest.mark.parametrize("M,N,K", NATIVE_TAIL_SHAPES)
+def test_k_native_staging_short_last_stage_equals_the_exact_model(M, N, K):
+    """At a few rows the ``K`` layout's scales are staged natively, four blocks per ring stage and the short last group block by
+    block: a K of one, two or three blocks is that short group alone, six or seven a whole stage and then it. The kernel's
+    output is bit for bit the exact model's in every output format, the staging forced and the API's own choice."""
+    from flashinfer.gemm.batch_invariant.blocks.blockscale_fp8 import (
+        SCALE_GROUP_NATIVE_K,
+    )
+
+    assert native_k_staging(M) and (K // BLOCK_K) % SCALE_GROUP_NATIVE_K
+    a, w, sa, sb = operands(M, N, K, seed=13)
+    P = block_partials(a, w)
+    for od in (torch.float32, torch.bfloat16, torch.float16):
+        ref = bits(reference(a, w, sa, sb, od, P=P))
+        got_forced = ours(a, w, sa, sb, native_k=True, out_dtype=od)
+        got_default = ours(a, w, sa, sb, out_dtype=od)
+        assert torch.equal(bits(got_forced).cpu(), ref), (M, N, K, od, "native")
+        assert torch.equal(bits(got_default).cpu(), ref), (M, N, K, od, "default")
+
+
+@needs_device
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
+def test_entry_follows_the_operands_device():
+    """The compile and the launch run on A's device whatever the current one."""
+    a, w, sa, sb = operands(37, 2048, 1024, seed=15)
+    ref = bits(ours(a, w, sa, sb))
+    with torch.cuda.device(1):
+        assert torch.equal(bits(ours(a, w, sa, sb)), ref)
+
+
 # ----------------------------------------------------------------------------------------------- R1 / R2 / R3
 
 
@@ -612,6 +679,7 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, mode):
 
     ref = [run(M) for M in (1, 16, 300)]
     tuner = AutoTuner.get()
+    tuner.clear_cache()  # no earlier call answers the profiles from the cache: the candidates are profiled in this test
 
     def failed():
         return {
@@ -621,9 +689,14 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, mode):
         }
 
     before = failed()
+    profiled = tuner.stats.tuned_op_successful_configs.get(tuning.CUSTOM_OP_FP8BS, 0)
     with autotune(True):
         tuned = [run(M) for M in (1, 16, 300)]
     assert failed() == before, f"tactics failed while profiling: {failed()}"
+    assert (
+        tuner.stats.tuned_op_successful_configs.get(tuning.CUSTOM_OP_FP8BS, 0)
+        > profiled
+    )  # profiled here, not a cache hit
     post = [run(M) for M in (1, 16, 300)]
     for r, t, p in zip(ref, tuned, post, strict=True):
         assert torch.equal(r, t) and torch.equal(r, p)
@@ -645,32 +718,31 @@ def test_flashinfer_backends_within_tolerance(M, N, K):
         * float(sa.max())
         * float(sb.max())
     )
+    op = flashinfer.gemm.gemm_fp8_nt_groupwise
+    major, minor = torch.cuda.get_device_capability(a.device)
+    # the combinations a backend takes, settled before the call: CUTLASS in the K layout at any M and in the MN layout at M a
+    # multiple of 4 (the operator's documented row requirement, which its K-layout kernel does not enforce); the cute-dsl kernel
+    # on SM107, the MN layout, M a multiple of 4. Every error of a call is the test's failure
+    aligned = M % 4 == 0
+    combos = [("cutlass", "K")] + ([("cutlass", "MN")] if aligned else [])
+    if op.is_backend_supported("cute-dsl", major * 10 + minor) and aligned:
+        combos.append(("cute-dsl", "MN"))
     ran = 0
-    for be, mode in (("cutlass", "K"), ("cutlass", "MN"), ("cute-dsl", "MN")):
-        try:
-            if mode == "K":
-                c = flashinfer.gemm.gemm_fp8_nt_groupwise(
-                    a,
-                    w,
-                    sa,
-                    sb,
-                    scale_major_mode="K",
-                    out_dtype=torch.bfloat16,
-                    backend=be,
-                )
-            else:
-                c = flashinfer.gemm.gemm_fp8_nt_groupwise(
-                    a,
-                    w,
-                    sa.t().contiguous(),
-                    sb.t().contiguous(),
-                    scale_major_mode="MN",
-                    out_dtype=torch.bfloat16,
-                    backend=be,
-                )
-        except Exception as e:  # noqa: BLE001  (a backend that does not run this shape, layout or part)
-            print(f"{be}/{mode}: {type(e).__name__}: {str(e)[:100]}")
-            continue
+    for be, mode in combos:
+        if mode == "K":
+            c = op(
+                a, w, sa, sb, scale_major_mode="K", out_dtype=torch.bfloat16, backend=be
+            )
+        else:
+            c = op(
+                a,
+                w,
+                sa.t().contiguous(),
+                sb.t().contiguous(),
+                scale_major_mode="MN",
+                out_dtype=torch.bfloat16,
+                backend=be,
+            )
         err = ((c.float().cpu() - ref).abs() / (scale + 1e-30)).max().item()
         assert err <= 2.0**-7, (
             be,
@@ -678,7 +750,7 @@ def test_flashinfer_backends_within_tolerance(M, N, K):
             err,
         )  # a bf16 output's own rounding bounds the norm-relative difference
         ran += 1
-    assert ran >= 1
+    assert ran == len(combos) >= 1
 
 
 @needs_device
@@ -784,6 +856,19 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             backend="auto",
             batch_invariant=True,
         )
+    for bad_a, bad_w in ((a[None], w), (a, adv_fp8(N, 2 * K, seed=5, cancel=False))):
+        with pytest.raises(
+            ValueError
+        ):  # likewise its shape check: a non-2-D operand, a K mismatch
+            flashinfer.gemm.gemm_fp8_nt_groupwise(
+                bad_a,
+                bad_w,
+                sa,
+                sb,
+                scale_major_mode="K",
+                backend="auto",
+                batch_invariant=True,
+            )
     out = ours(a[:0], w, sa[:0], sb)
     assert out.shape == (0, N) and out.dtype == torch.bfloat16
     out = torch.empty(M, N, dtype=torch.float16, device="cuda")
