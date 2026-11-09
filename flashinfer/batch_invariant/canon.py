@@ -592,7 +592,10 @@ class BlockedFold:
         acc = None
         for blk in range(n_blocks):
             for j in self.inner_steps():
-                x = red.leaf(fp, {**fixed, self.digit: self.step_index(blk, j)})
+                i = self.step_index(blk, j)
+                x = red.leaf(fp, {**fixed, self.digit: i})
                 assert x is not None, "blocked folds have no absent leaves"
-                acc = d.step(fp, acc if self.accumulate(blk, j) else d.init(fp), x)
+                prev = acc if self.accumulate(blk, j) else d.init(fp)
+                # an indexed digit's step takes the digit value as well (`Digit.reduce`)
+                acc = d.step(fp, prev, x, i) if d.indexed else d.step(fp, prev, x)
         return acc
