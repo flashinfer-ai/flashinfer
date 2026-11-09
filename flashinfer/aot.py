@@ -224,6 +224,7 @@ from .jit.sampling import gen_sampling_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
+from .jit.tinygemm2 import gen_tinygemm2_module, gen_tinygemm2_sm100_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
@@ -1021,6 +1022,21 @@ def gen_all_modules(
             jit_specs.append(gen_alphamoe_fused_router_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_mm_bf16_cublaslt_module())
+        if (
+            has_sm90
+            or has_sm100
+            or has_sm103
+            or has_sm107
+            or has_sm110
+            or has_sm120
+            or has_sm121
+        ):
+            # mm_bf16(backend="tinygemm") and the router GEMM load this module on
+            # SM90+; without it they run nvcc on first use.
+            jit_specs.append(gen_tinygemm2_module())
+        if has_sm100 or has_sm103 or has_sm107:
+            # Generated SM100/SM103/SM107 variant, selected by the router GEMM bias path.
+            jit_specs.append(gen_tinygemm2_sm100_module())
         jit_specs.extend(_gen_blackwell_bf16_bmm_aot_specs(sm_capabilities))
         jit_specs.extend(_gen_cake_grouped_fp8_gemm_aot_specs(sm_capabilities))
         jit_specs.extend(

@@ -200,3 +200,36 @@ def test_trtllm_gen_gemm_runners_target_the_built_sm10x_arch(
     flags = getattr(gemm_core, generator)().extra_cuda_cflags
 
     assert [flag for flag in flags if flag.startswith("-gencode=")] == [expected]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "arch", ["sm90", "sm100", "sm103", "sm107", "sm110", "sm120", "sm121"]
+)
+def test_tinygemm2_is_prebuilt_for_every_arch_that_loads_it(monkeypatch, arch):
+    # mm_bf16(backend="tinygemm") loads tinygemm2 on SM90+; when the jit-cache
+    # lacks it, the first call runs nvcc.
+    registered = _registered_generators(monkeypatch, {arch: True})
+
+    assert "gen_tinygemm2_module" in registered
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        ("sm90", False),
+        ("sm100", True),
+        ("sm103", True),
+        ("sm107", True),
+        ("sm110", False),
+        ("sm120", False),
+        ("sm121", False),
+    ],
+)
+def test_tinygemm2_sm100_variant_is_prebuilt_only_for_sm10x(
+    monkeypatch, arch, expected
+):
+    registered = _registered_generators(monkeypatch, {arch: True})
+
+    assert ("gen_tinygemm2_sm100_module" in registered) == expected
