@@ -90,7 +90,7 @@ kernel module key.
 from __future__ import annotations
 
 import functools
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 import tvm_ffi
 
@@ -792,12 +792,15 @@ LOGICAL_TENSORS = (
 LOGICAL_SCALARS = (*_zero_history.LOGICAL_SCALARS, "M", "NL", "P", "L", "n_ctas")
 # The overlapped main program's channel tile (eight compute warps of 256
 # channels), its words per tile (one per warp), its most lanes and channels,
-# and its default unit of tokens.
+# the smallest unit of tokens its plan considers, and a unit's fixed cost in
+# tenths of a lane token (start, claim and run switch: about 0.69 us per unit
+# against 0.215 us per token of a lane, measured on B200).
 DYN_TILE = 2048
 DYN_TILE_WORDS = 8
 DYN_MAX_LANES = 256
 DYN_MAX_CHANNELS = 32 * DYN_TILE
 DYN_UNIT = 64
+DYN_UNIT_COST_TENTHS = 32
 
 
 def route_applies(*, device_capability: Sequence[int], kind: str) -> bool:
@@ -964,9 +967,11 @@ def dyn_applies(C: int, S: int) -> bool:
 def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
     """The overlapped main program's work plan on a device of ``sms`` SMs: ``P`` lanes per tile of
     :data:`DYN_TILE` channels (as many as give every SM's CTA a lane, at most one per unit of tokens and
-    :data:`DYN_MAX_LANES` lanes in all), each of ``NL`` units of ``M`` tokens (:data:`DYN_UNIT`, doubled until the
-    lanes' claim counts fit the kernel's 16-bit fields), ``L`` lanes, ``n_ctas = max(L, sms)`` CTAs (the grid) and
-    ``n_tiles``.  A pure function of ``(S, C, sms)``; ``dx`` does not depend on it."""
+    :data:`DYN_MAX_LANES` lanes in all), each of ``NL`` units of ``M`` tokens, ``L`` lanes, ``n_ctas = max(L, sms)``
+    CTAs (the grid) and ``n_tiles``.  ``M`` is the multiple of 8 from :data:`DYN_UNIT` to twice it whose plan fits
+    the lanes' 16-bit claim counts at the least lane cost ``NL * M`` tokens plus ``NL`` units of
+    :data:`DYN_UNIT_COST_TENTHS` (the smaller ``M`` on a tie); when none fits, ``M`` doubles from ``4 * DYN_UNIT``
+    until a plan fits.  A pure function of ``(S, C, sms)``; ``dx`` does not depend on it."""
 
     S, C, sms = int(S), int(C), int(sms)
     if S < 1 or C < 1 or C > DYN_MAX_CHANNELS:
@@ -974,23 +979,29 @@ def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
             f"the overlapped backward plans 1 <= C <= {DYN_MAX_CHANNELS} and S >= 1, got C={C}, S={S}"
         )
     n_tiles = -(-C // DYN_TILE)
-    M = DYN_UNIT
-    while True:
+
+    def plan(M: int) -> Optional[dict[str, int]]:
         P = max(1, min(sms // n_tiles, -(-S // M), DYN_MAX_LANES // n_tiles))
         per_lane = -(-S // P)
         NL = -(-per_lane // M)
         L = n_tiles * P
         n_ctas = max(L, sms)
-        if (L + 1) * NL + n_ctas <= 65535 and NL <= 32768:
-            return {
-                "M": M,
-                "NL": NL,
-                "P": P,
-                "L": L,
-                "n_ctas": n_ctas,
-                "n_tiles": n_tiles,
-            }
+        if (L + 1) * NL + n_ctas > 65535 or NL > 32768:
+            return None
+        return {"M": M, "NL": NL, "P": P, "L": L, "n_ctas": n_ctas, "n_tiles": n_tiles}
+
+    fits = [p for p in map(plan, range(DYN_UNIT, 2 * DYN_UNIT + 1, 8)) if p is not None]
+    if fits:
+        return min(
+            fits,
+            key=lambda p: (p["NL"] * (10 * p["M"] + DYN_UNIT_COST_TENTHS), p["M"]),
+        )
+    M = 4 * DYN_UNIT
+    p = plan(M)
+    while p is None:
         M *= 2
+        p = plan(M)
+    return p
 
 
 def dyn_workspace_layout(
@@ -1106,6 +1117,7 @@ __all__ = [
     "DYN_TILE",
     "DYN_TILE_WORDS",
     "DYN_UNIT",
+    "DYN_UNIT_COST_TENTHS",
     "HALO",
     "HALO_KIND",
     "INT32_MAX",
