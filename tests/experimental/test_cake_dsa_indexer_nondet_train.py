@@ -2906,7 +2906,7 @@ def test_ticket_word_runner_owns_its_block_and_ignores_a_poisoned_caller_workspa
 # the packed calls of the sm_107a longest-first copies (``_SM107_LSF_COPIES``): unequal key segments on each copy, and
 # near-equal ones (the longest at most 5/4 of the shortest), on which the copy keeps the argument order
 _SM107_LSF_GEOMETRIES = (
-    ([600, 400], [600, 12000], 1024, "scan:l6:u1:s0:f1:lsf"),
+    ([1500, 1000], [1500, 12000], 1024, "scan:l6:u1:s0:f1:lsf"),
     ([1024, 1024], [8192, 24576], 1024, "scan:l6:u1:s0:f0:lsf"),
     ([1024, 1024], [16384, 18432], 1024, None),
 )
