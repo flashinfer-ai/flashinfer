@@ -339,6 +339,64 @@ small ``B * HV * T``. Requires SM90+ for the WY path and ``K = V = 128``;
     packed_kda_decode
     recurrent_kda
 
+.. _kda-indexed-single-token-decode:
+
+Indexed single-token decode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For ``recurrent_kda`` with ``backend="cute-dsl"``, ``T=1`` and
+``ssm_state_indices``, the batched ``[B, 1, ...]`` form without ``cu_seqlens``
+gathers the selected state-pool rows into a temporary and scatters them back
+following decode. In-place updates therefore do not imply that the call avoids
+state copies. Each gather and scatter moves the full selected state: at
+``HV=64`` and ``K=V=128``, that is 2 MiB of BF16 state per sequence.
+This also applies when ``auto`` falls back to this CuTe DSL path; Cake paths
+that directly index the pool do not have this gather/scatter cost.
+
+For a serving pool, use the packed ``[1, B, ...]`` form with one token per
+sequence and ``cu_seqlens = [0, 1, ..., B]`` to let the decode kernel access the
+selected slots directly. For example, given contiguous BF16 CUDA tensors
+``q, k, v, g`` of shape ``[B, 1, H, 128]``, ``beta`` of shape ``[B, 1, H]``,
+a contiguous BF16 ``state_pool`` of shape ``[num_slots, H, 128, 128]``, and
+contiguous CUDA int32 ``slots`` of shape ``[B]`` containing unique, in-range,
+nonnegative pool indices:
+
+.. code-block:: python
+
+    from flashinfer import recurrent_kda
+    import torch
+
+    # Prepare and reuse this metadata for a fixed batch size, outside timing
+    # and CUDA graph capture. Each sequence contributes exactly one token.
+    B = q.shape[0]
+    cu_seqlens = torch.arange(B + 1, dtype=torch.int32, device=q.device)
+
+    # g contains precomputed log gates; beta contains sigmoid probabilities.
+    # Swapping the batch and singleton token axes creates views, not copies.
+    output, _ = recurrent_kda(
+        q.transpose(0, 1),
+        k.transpose(0, 1),
+        v.transpose(0, 1),
+        g.transpose(0, 1),
+        beta.transpose(0, 1),
+        initial_state=state_pool,
+        ssm_state_indices=slots,
+        cu_seqlens=cu_seqlens,
+        backend="cute-dsl",
+    )
+    output = output.transpose(0, 1)  # [B, 1, H, 128]
+
+The selected slots of ``state_pool`` are updated in place. With
+``output_final_state=True``, the packed call returns the pool itself, whereas
+the batched indexed CuTe DSL path returns the gathered per-sequence state;
+use the caller-owned pool when converting a serving call between these forms.
+If each batch row already owns a contiguous state row, the batched form can
+instead pass that contiguous state tensor without ``ssm_state_indices``.
+
+Profile the complete public call, including state movement, rather than only
+the decode kernel. This layout change avoids the indexed state copies; it does
+not guarantee an allocation-free call or a fixed speedup.
+
 .. _apikda_prefill:
 
 flashinfer.kda_prefill
