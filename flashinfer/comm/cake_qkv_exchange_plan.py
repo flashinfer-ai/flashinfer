@@ -1484,8 +1484,9 @@ def hopper_bn128_max_m(arch: str, world_size: int, hidden: int) -> int:
 # Rows that keep the baseline producer build under the default build: per ``(arch, world_size)``, ``(min_hidden,
 # min_M)`` -- a row with ``hidden >= min_hidden`` and ``M >= min_M`` launches the baseline build's programs instead of
 # the session's default build (the loader's ``PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``).  SM90 with 8 ranks at
-# ``hidden >= 6144``, ``M >= 8192``: there the decoupled-storer build measured slower than the baseline build on
-# 8 x H100.  A build named by the environment variable runs on every row.
+# ``hidden >= 6144``, ``M >= 8192``: there the decoupled-storer build (``sw3``) measured 0.3-1.6 % slower than the
+# baseline build, or even with it, on 8 x H100, so these rows keep the baseline build and its previous speed instead
+# of a small loss.  A build named by the environment variable runs on every row.
 PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD: dict[tuple[str, int], tuple[int, int]] = {
     ("sm_90a", 8): (6144, 8192),
 }

@@ -898,7 +898,11 @@ of 8 and 4 ranks run ``ow256_fma`` and groups of 2 ranks ``fma``; on SM107 a
 group of 4 ranks runs the build with bulk row stores (``bulk``); the other
 groups of 2 ranks run the baseline build; SM90 runs the build whose epilogue
 stages each head in shared memory for three storer warps (``sw3``) on every
-group size.  The ``fma`` builds contract
+group size, except that under this default a group of 8 ranks on SM90 runs the
+baseline build on rows with a hidden size of at least 6144 and at least 8192
+rows per rank (``cake_qkv_exchange_plan.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``);
+a build named by ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` runs on every
+row.  The ``fma`` builds contract
 the norm and RoPE multiply-adds into single-rounding fused multiply-adds, so
 their stored bits can differ from those of the builds without it; both agree
 within the kernel's accuracy tolerance, and the builds without the fused
