@@ -7811,6 +7811,48 @@ def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry
     assert len([k for k in cache._entries if k[0] == "rope_varlen_fwd"]) == 5
 
 
+def test_rope_varlen_stage_route_rejects_a_bad_length_cut_before_any_launch(
+    monkeypatch,
+):
+    """On the stage route the rope varlen entry checks a caller ``topk_length`` as the NoPE entries do -- a
+    contiguous int32 ``[T]`` tensor, here also on the rows' device -- when it plans the call's binding: the stage's
+    binding checks no shape and would read a short cut past its end.  A short cut, a ``[T, 1]`` cut, int64 lengths,
+    a strided cut and a host cut each raise ``ValueError``, launch nothing and store no binding, before and after a
+    valid cut of the same call has cached its own."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    cache = cake_backend.BINDING_CACHE
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    acts = _rope_device_inputs(T, int(cu_k[-1]), K)[:4]
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_varlen
+    assert cake_backend._rope_varlen_index_mode(local, cu_q, cu_k, T) == "index_prep"
+    cut = torch.full((T,), 2, dtype=torch.int32, device="cuda")
+    bad = {
+        "[T - 1]": cut[:-1].clone(),
+        "[T, 1]": cut[:, None].clone(),
+        "int64": cut.long(),
+        "strided": torch.stack([cut, cut], 1)[:, 0],
+        "host": cut.cpu(),
+    }
+    for warm in (False, True):
+        if warm:
+            varlen(*acts, local, cu_q, cu_k, causal=True, topk_length=cut)
+            assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "fwd"]
+            assert calls[0][1]["length_in"] is cut
+            del calls[:]
+        keys = list(cache._entries)
+        assert len(keys) == int(warm)
+        for name, length in bad.items():
+            with pytest.raises(
+                ValueError, match=r"topk_length must be a contiguous int32 \[T\] tensor"
+            ):
+                varlen(*acts, local, cu_q, cu_k, causal=True, topk_length=length)
+            assert calls == [], name
+            assert list(cache._entries) == keys, name
+
+
 def test_rope_varlen_binding_serves_captured_calls_and_a_capture_miss_stays_private(
     monkeypatch,
 ):
@@ -8328,3 +8370,124 @@ def test_save_on_cpu_outputs_and_gradients_match_the_eager_pair(name):
     grads = torch.autograd.grad(out, leaves, inp.dout, allow_unused=True)
     torch.cuda.synchronize()
     _assert_same_results((out.detach(), grads), want[:2])
+
+
+# --- saved-tensor hooks over strided index rows: the NoPE autograd backward keys and plans by the rows it receives
+# (GPU) ---
+
+NOPE_ROW_VIEWS = ("column_slice", "offset_view")
+
+
+def _nope_row_view(idx, view):
+    """``idx`` as a strided view the flat NoPE entry reads in place: a column slice of a wider buffer (row stride
+    ``K + 8``, start offset 3) or a view one element into a flat buffer (start offset 1)."""
+    T, K = (int(d) for d in idx.shape)
+    if view == "column_slice":
+        wide = torch.zeros(T, K + 8, dtype=torch.int32, device=idx.device)
+        wide[:, 3 : 3 + K] = idx
+        return wide[:, 3 : 3 + K]
+    flat = torch.zeros(T * K + 1, dtype=torch.int32, device=idx.device)
+    rows = flat[1:].view(T, K)
+    rows.copy_(idx)
+    return rows
+
+
+def _nope_offload_case(view, lengths):
+    """``(q, kv, rows, dout, topk_length)`` of a flat NoPE step below the slot limit over strided rows: without
+    lengths the mask route (the forward derives the lengths, the backward reads the caller's rows), with them the
+    rows and lengths as given; either way the caller's rows are a saved tensor."""
+    _require_nope_program(backward=True)
+    T, S, K = 256, 512, 96
+    q, kv, idx, dout = _nope_device_inputs(T, S, K, seed=SEED + 130)
+    assert cake_backend.nope_flat_index_mode(T, K) == "mask"
+    cut = None
+    if lengths:
+        gen = torch.Generator(device="cuda").manual_seed(SEED + 131)
+        cut = torch.randint(
+            1, K + 1, (T,), device="cuda", generator=gen, dtype=torch.int32
+        )
+    return q, kv, _nope_row_view(idx, view), dout, cut
+
+
+def _nope_flat_step(q, kv, rows, dout, cut, *, offload=None):
+    """One step of the flat NoPE autograd entry over fresh leaves: ``(out, (dq, dkv), saved rows)``.  ``offload``:
+    ``None`` (eager) or the ``pin_memory`` flag of a ``save_on_cpu`` region around the forward."""
+    leaves = [t.detach().clone().requires_grad_() for t in (q, kv)]
+    fn = cake_backend.cake_dsa_sparse_attention_nondet_nope
+    if offload is None:
+        out = fn(*leaves, rows, topk_length=cut)
+    else:
+        with torch.autograd.graph.save_on_cpu(pin_memory=offload):
+            out = fn(*leaves, rows, topk_length=cut)
+    saved_rows = out.grad_fn.saved_tensors[5]
+    grads = torch.autograd.grad(out, leaves, dout)
+    torch.cuda.synchronize()
+    return out.detach(), grads, saved_rows
+
+
+@pytest.mark.parametrize("pin_memory", [False, True])
+@pytest.mark.parametrize("order", ["eager_first", "offload_first"])
+@pytest.mark.parametrize("lengths", [False, True], ids=["mask", "topk_length"])
+@pytest.mark.parametrize("view", NOPE_ROW_VIEWS)
+def test_nope_backward_keys_offloaded_strided_rows_by_their_saved_layout(
+    monkeypatch, view, lengths, order, pin_memory
+):
+    """The flat NoPE entry over strided caller rows -- a column slice of a wider buffer, a view at an offset into a
+    flat buffer -- saves the rows as given, on the mask route and with caller lengths; ``save_on_cpu`` hands them
+    back contiguous at offset 0, and the backward's plan bakes the rows' stride and start offset.  An eager and an
+    offloaded step in either order, from an empty binding cache, each give the cache-cleared eager step's ``out``
+    and ``dq`` bitwise and its ``dkv`` within the atomics spread: the backward keys by the rows it reads, so each
+    layout keeps its own backward binding and neither step runs over the other's."""
+    q, kv, rows, dout, cut = _nope_offload_case(view, lengths)
+    _private_binding_cache(monkeypatch)
+    cache = cake_backend.BINDING_CACHE
+    want = _nope_flat_step(q, kv, rows, dout, cut)[:2]
+    cache.clear()
+    modes = [None, pin_memory] if order == "eager_first" else [pin_memory, None]
+    layouts = set()
+    for offload in modes:
+        out, grads, saved = _nope_flat_step(q, kv, rows, dout, cut, offload=offload)
+        if offload is None:
+            assert saved.data_ptr() == rows.data_ptr()
+            assert saved.stride() == rows.stride()
+        else:
+            assert saved.is_contiguous() and saved.storage_offset() == 0
+            assert torch.equal(saved, rows)
+        layouts.add(cake_backend._geometry(saved))
+        _assert_same_results((out, grads), want)
+    assert len(layouts) == 2
+    keys = [k for k in cache._entries if k[0] == "nope_bwd"]
+    assert len(keys) == 2 and {k[3] for k in keys} == layouts
+
+
+@pytest.mark.parametrize(
+    "offloaded", [0, 1], ids=["first_offloaded", "second_offloaded"]
+)
+@pytest.mark.parametrize("lengths", [False, True], ids=["mask", "topk_length"])
+@pytest.mark.parametrize("view", NOPE_ROW_VIEWS)
+def test_nope_selective_offload_of_one_of_two_same_geometry_layers(
+    monkeypatch, view, lengths, offloaded
+):
+    """Selective activation offload: two layers of one step call the flat NoPE entry with one geometry (the same
+    strided rows), one of them inside ``save_on_cpu``; one backward over both gives each layer the cache-cleared
+    eager step's ``out`` and ``dq`` bitwise and its ``dkv`` within the atomics spread, whichever layer's backward
+    plans first."""
+    q, kv, rows, dout, cut = _nope_offload_case(view, lengths)
+    _private_binding_cache(monkeypatch)
+    want = _nope_flat_step(q, kv, rows, dout, cut)[:2]
+    cake_backend.BINDING_CACHE.clear()
+    fn = cake_backend.cake_dsa_sparse_attention_nondet_nope
+    layers = [[t.detach().clone().requires_grad_() for t in (q, kv)] for _ in range(2)]
+    outs = []
+    for layer, leaves in enumerate(layers):
+        if layer == offloaded:
+            with torch.autograd.graph.save_on_cpu(pin_memory=True):
+                outs.append(fn(*leaves, rows, topk_length=cut))
+        else:
+            outs.append(fn(*leaves, rows, topk_length=cut))
+    grads = torch.autograd.grad(
+        outs, [t for leaves in layers for t in leaves], [dout, dout]
+    )
+    torch.cuda.synchronize()
+    for layer, out in enumerate(outs):
+        _assert_same_results((out.detach(), grads[2 * layer : 2 * layer + 2]), want)

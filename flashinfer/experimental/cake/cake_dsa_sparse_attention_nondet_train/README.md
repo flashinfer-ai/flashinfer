@@ -121,7 +121,9 @@ out = cake_dsa_sparse_attention_nondet_varlen(
   sum -- with bitwise the same result).  Rows whose valid slots already come
   first are unchanged bytes with the same length on every route.  A caller
   `topk_length` is a position cut applied before compaction (slots at positions
-  `>= topk_length[t]` are invalid regardless of content).  `cu_seqlens_q`
+  `>= topk_length[t]` are invalid regardless of content); on the rope varlen
+  entry's stage route a cut that is not a contiguous int32 `[T]` tensor on the
+  rows' device raises `ValueError` before any launch.  `cu_seqlens_q`
   and `cu_seqlens_k` are independent: a query segment may be shorter than its
   key segment, in which case it is the tail of that key prefix -- query
   `local_q` of document `d` sits at key position
@@ -227,7 +229,10 @@ context-parallel window):
   placeholder for an absent `topk_length`, so non-reentrant
   `torch.utils.checkpoint` can match the recomputed tensors by position) and
   keep nothing else of size on `ctx`: after a checkpointed forward the entries
-  retain ~0 MiB (flashinfer-ai/flashinfer#7039).  A tensor `dkv_acc` (and
+  retain ~0 MiB (flashinfer-ai/flashinfer#7039).  Saved-tensor hooks such as
+  `torch.autograd.graph.save_on_cpu` may hand the index rows back in another
+  layout (a column slice or an offset view comes back contiguous); the NoPE
+  backward then plans over the rows it receives.  A tensor `dkv_acc` (and
   `dkv_dst_map`) is caller-owned and stays on the autograd node as before,
   outside the saved list: zeroing or otherwise touching it in place between
   the forward and the backward is fine.
