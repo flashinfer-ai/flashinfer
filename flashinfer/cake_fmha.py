@@ -797,7 +797,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "Q511_SM103A"): (
-        "cake_fmha_context_nvfp4_7360fe70a945a41c5d0d",
+        "cake_fmha_context_nvfp4_e45bc90b69f0fc31215c",
         16,
         False,
     ),
@@ -807,7 +807,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "Q511_SCALE_PTR_SM103A"): (
-        "cake_fmha_context_nvfp4_62a335e01c8f3530d827",
+        "cake_fmha_context_nvfp4_81f166c4d715b824c4ed",
         16,
         False,
     ),
@@ -817,7 +817,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK1_SM103A"): (
-        "cake_fmha_context_nvfp4_a5fcd58886fc76e8f7e0",
+        "cake_fmha_context_nvfp4_33d3b7c3d901d4a2979d",
         None,
         False,
     ),
@@ -827,7 +827,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK2_SM103A"): (
-        "cake_fmha_context_nvfp4_eba9334f768b4eebd97a",
+        "cake_fmha_context_nvfp4_7e30df993f080875ccac",
         None,
         False,
     ),
@@ -837,7 +837,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK4_SM103A"): (
-        "cake_fmha_context_nvfp4_be1af2e307496c73f39f",
+        "cake_fmha_context_nvfp4_8014de3355e94a76a28e",
         None,
         False,
     ),
@@ -847,7 +847,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK5_SM103A"): (
-        "cake_fmha_context_nvfp4_be52830625b75b09c119",
+        "cake_fmha_context_nvfp4_0d3744017807e7c34100",
         None,
         False,
     ),
@@ -857,7 +857,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK6_SM103A"): (
-        "cake_fmha_context_nvfp4_d45ee790f5cd718e5b26",
+        "cake_fmha_context_nvfp4_611ee6aa818250537852",
         None,
         False,
     ),
@@ -867,7 +867,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK7_SM103A"): (
-        "cake_fmha_context_nvfp4_a7b0eecf0e7dfe7fed5c",
+        "cake_fmha_context_nvfp4_f0e620cd381756f2a2c2",
         None,
         False,
     ),
@@ -877,7 +877,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK8_SM103A"): (
-        "cake_fmha_context_nvfp4_df7740bb8ce4be3bb0b3",
+        "cake_fmha_context_nvfp4_a5c97d11fcc3c83f65b5",
         None,
         False,
     ),
@@ -887,7 +887,7 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK12_SM103A"): (
-        "cake_fmha_context_nvfp4_099089a6787f767da51e",
+        "cake_fmha_context_nvfp4_fa5a7007388a7a382e58",
         None,
         False,
     ),
@@ -897,7 +897,64 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         False,
     ),
     ("context_nvfp4", "RUNTIME_PACK16_SM103A"): (
-        "cake_fmha_context_nvfp4_6c4c5131194d8657d641",
+        "cake_fmha_context_nvfp4_de2ab2021b2f5e79afe4",
+        None,
+        False,
+    ),
+    # sm103a, launches of at most the keys of _CONTEXT_NVFP4_SHORT_KV_ROUTES:
+    # the V dequant on the correction warps.
+    ("context_nvfp4", "Q511_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_ea63d1372358797fdf6f",
+        16,
+        False,
+    ),
+    ("context_nvfp4", "Q511_SCALE_PTR_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_e673bfa791f7c71aeb61",
+        16,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK16_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_a012c93ca3cba6e2a56e",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK12_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_5541b6e1896cbe81f9e5",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK8_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_2a9272cea2714be55f6d",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK7_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_e86e3160f4a150409eb7",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK6_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_85634e40302d7c512ac5",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK5_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_a43177abb2d2639c34ba",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK4_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_a2ccb67e2966ae3b7edc",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK2_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_a07b0866dce3af2b4840",
+        None,
+        False,
+    ),
+    ("context_nvfp4", "RUNTIME_PACK1_SHORT_KV_SM103A"): (
+        "cake_fmha_context_nvfp4_6f93414ba399d23b5916",
         None,
         False,
     ),
@@ -2096,6 +2153,27 @@ _CONTEXT_NVFP4_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (4, None): "RUNTIME_PACK4_SM103A",
         (2, None): "RUNTIME_PACK2_SM103A",
         (1, None): "RUNTIME_PACK1_SM103A",
+    },
+}
+# The sm103a short-KV NVFP4 programs: per target, routed program -> (the
+# program a call of at most ``max_kv_len`` keys takes instead, those keys).
+# The routed sm103a programs dequantize V on the page-offset and scheduler
+# warps; over few KV blocks per tile that hand-off ran slower than the
+# correction warps' own V dequant, which the short-KV programs keep (same
+# tile work, pack and arguments, so the same output bits).
+_CONTEXT_NVFP4_SHORT_KV_ROUTES: dict[str, dict[str, tuple[str, int]]] = {
+    "sm103a": {
+        "Q511_SM103A": ("Q511_SHORT_KV_SM103A", 1023),
+        "Q511_SCALE_PTR_SM103A": ("Q511_SCALE_PTR_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK16_SM103A": ("RUNTIME_PACK16_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK12_SM103A": ("RUNTIME_PACK12_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK8_SM103A": ("RUNTIME_PACK8_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK7_SM103A": ("RUNTIME_PACK7_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK6_SM103A": ("RUNTIME_PACK6_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK5_SM103A": ("RUNTIME_PACK5_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK4_SM103A": ("RUNTIME_PACK4_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK2_SM103A": ("RUNTIME_PACK2_SHORT_KV_SM103A", 1023),
+        "RUNTIME_PACK1_SM103A": ("RUNTIME_PACK1_SHORT_KV_SM103A", 1023),
     },
 }
 # Per target and mask (causal or not), per JIT pack: the calls the runtime-size
@@ -8701,6 +8779,16 @@ def select_cake_fmha_context_route(
             program = runtime_nvfp4.get((pack_g, page_size)) or runtime_nvfp4.get(
                 (pack_g, None)
             )
+        # An NVFP4 call of at most the keys of its program's short-KV entry,
+        # where the target names one: the entry's program (the same pack,
+        # m-blocks and arguments).
+        short_nvfp4 = _CONTEXT_NVFP4_SHORT_KV_ROUTES.get(target, {}).get(program)
+        if (
+            component == "context_nvfp4"
+            and short_nvfp4
+            and max_kv_len <= short_nvfp4[1]
+        ):
+            program = short_nvfp4[0]
         # An FP8 call of at most the keys of its route's short-KV entry, where
         # the target names one: the entry's program (the same schedule, pack,
         # m-blocks and arguments).

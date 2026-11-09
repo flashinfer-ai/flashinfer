@@ -349,10 +349,26 @@ __device__ __forceinline__ uint32_t qmul4_higher4(uint32_t src, uint32_t scale) 
   return y;
 }
 
+
+__device__ __forceinline__ unsigned int __as_u32(float v) {
+    unsigned int u;
+    asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
+    return u;
+}
+__device__ __forceinline__ unsigned int __as_u32(__nv_bfloat162 v) {
+    return *reinterpret_cast<const unsigned int*>(&v);
+}
+__device__ __forceinline__ unsigned int __as_u32(unsigned int v) { return v; }
+__device__ __forceinline__ unsigned int __as_u32(int v) {
+    unsigned int u;
+    asm("mov.b32 %0, %1;" : "=r"(u) : "r"(v));
+    return u;
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Kp, const __grid_constant__ CUtensorMap Vp, const __grid_constant__ CUtensorMap Ksf, const __grid_constant__ CUtensorMap Vsf, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2)
+kernel_cake_fmha_context_nvfp4_e673bfa791f7c71aeb61(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Kp, const __grid_constant__ CUtensorMap Vp, const __grid_constant__ CUtensorMap Ksf, const __grid_constant__ CUtensorMap Vsf, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -487,6 +503,20 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
         asm volatile("setmaxnreg.inc.sync.aligned.u32 168;");
         { // softmax_main
             float smx_scale = softmax_scale_log2;
+            smx_scale = bmm1_scale_ptr[0];
+            unsigned int raw_bits = __as_u32(smx_scale);
+            if (bmm1_is_log2 == 0) {
+                smx_scale = (float)((double)smx_scale * 1.4426950216293335);
+            }
+            smx_scale = (float)((double)smx_scale / 1.4426950408889634 * 1.4426950408889634);
+            if (bmm1_is_log2 == 0 && (raw_bits & 2147483647) - 1 < 8388607) {
+                double wide = (double)(int)(raw_bits & 8388607) * 1.401298464324817e-45;
+                if (raw_bits >= 2147483648u) {
+                    wide = -wide;
+                }
+                smx_scale = (float)(wide * 1.4426950216293335);
+                smx_scale = (float)((double)smx_scale / 1.4426950408889634 * 1.4426950408889634);
+            }
             unsigned int stage = make_warp_uniform(warp / 4);
             int tmem_s_off = make_warp_uniform(stage * 128);
             int tmem_p_off = make_warp_uniform(stage * 128 + 64);
@@ -2293,6 +2323,21 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
         { // correction_main
             float smx_scale_c = softmax_scale_log2;
             float out_scale_c = output_scale;
+            smx_scale_c = bmm1_scale_ptr[0];
+            unsigned int raw_bits_c = __as_u32(smx_scale_c);
+            if (bmm1_is_log2 == 0) {
+                smx_scale_c = (float)((double)smx_scale_c * 1.4426950216293335);
+            }
+            smx_scale_c = (float)((double)smx_scale_c / 1.4426950408889634 * 1.4426950408889634);
+            if (bmm1_is_log2 == 0 && (raw_bits_c & 2147483647) - 1 < 8388607) {
+                double wide_c = (double)(int)(raw_bits_c & 8388607) * 1.401298464324817e-45;
+                if (raw_bits_c >= 2147483648u) {
+                    wide_c = -wide_c;
+                }
+                smx_scale_c = (float)(wide_c * 1.4426950216293335);
+                smx_scale_c = (float)((double)smx_scale_c / 1.4426950408889634 * 1.4426950408889634);
+            }
+            out_scale_c = bmm2_scale_ptr[0];
             unsigned int total_tiles_1 = NUM_M_BLOCKS * total_bh;
             unsigned int max_rounds_1 = total_tiles_1 + 1;
             {
@@ -2368,7 +2413,6 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
                 mbarrier_arrive(p_full_addr + 8);
                 if (next_kv0_done == 0) {
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                     int pk_base = smem_pk_addr + dq_pk_stage * 9216;
                     int sf_base = pk_base + 8192;
@@ -2425,7 +2469,6 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
                     dq_kv_stage += 1;
                     if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                     int pk_base_0 = smem_pk_addr + dq_pk_stage * 9216;
                     int sf_base_0 = pk_base_0 + 8192;
@@ -2490,7 +2533,6 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
                 }
                 if (num_n_blocks_1 > 1) {
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                     int pk_base_1 = smem_pk_addr + dq_pk_stage * 9216;
                     int sf_base_1 = pk_base_1 + 8192;
@@ -2547,7 +2589,6 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
                     dq_kv_stage += 1;
                     if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                     mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                     int pk_base_1_1 = smem_pk_addr + dq_pk_stage * 9216;
                     int sf_base_1_1 = pk_base_1_1 + 8192;
@@ -2688,7 +2729,6 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
                     mbarrier_arrive(p_full_addr);
                     if (n_iter_2 < num_n_blocks_1 - 1) {
                         mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                         int pk_base_2 = smem_pk_addr + dq_pk_stage * 9216;
                         int sf_base_2 = pk_base_2 + 8192;
@@ -2815,7 +2855,6 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
                     mbarrier_arrive(p_full_addr + 8);
                     if (n_iter_2 < num_n_blocks_1 - 1) {
                         mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                         int pk_base_3 = smem_pk_addr + dq_pk_stage * 9216;
                         int sf_base_3 = pk_base_3 + 8192;
@@ -2898,7 +2937,6 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
                         }
                         if (total_tiles_1 > (tile_iter_1 + 1) * ctas_2 + col_2) {
                             mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                             int pk_base_4 = smem_pk_addr + dq_pk_stage * 9216;
                             int sf_base_4 = pk_base_4 + 8192;
@@ -2955,7 +2993,6 @@ kernel_cake_fmha_context_nvfp4_7360fe70a945a41c5d0d(const __grid_constant__ CUte
                             dq_kv_stage += 1;
                             if (dq_kv_stage == 3) { dq_kv_stage = 0; _phase_kv_empty ^= 1; }
                             mbarrier_wait(pk_full_addr + (dq_pk_stage) * 8, _phase_pk_full);
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             mbarrier_wait(kv_empty_addr + (dq_kv_stage) * 8, _phase_kv_empty);
                             int pk_base_2_1 = smem_pk_addr + dq_pk_stage * 9216;
                             int sf_base_2_1 = pk_base_2_1 + 8192;
