@@ -6698,8 +6698,32 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    # sm_100a H256 f32 weight: (524288, inf] the twosum form with an L2 warm-up: exact per-thread dw sums, so the dw error does not grow with T (from 92160 to 524288 rows the deterministic package's det pair runs, one cut with the BF16-weight route: its worst dw element stays within 0.69 of the per-element budget at the sampled row counts from 80896 to 524288 rows on B200, worst of 60 inputs of each of three families)
-    "cake_rmsnorm_train_7c2aa4b429538da06a2a": {
+    # sm_100a H256 f32 weight: (92160, 864240] the dw reduce of the det pair c4c89f0d of that window (the BF16-weight route keeps b4b63d5b__92160_524288)
+    "cake_rmsnorm_train_b4b63d5b5028c7a60333__92160_864240": {
+        "arches": [
+            "sm_100a",
+        ],
+        "grid_rule": {
+            "ctas": 64,
+            "kind": "fixed",
+        },
+        "hidden": 256,
+        "kernel": "cake_rmsnorm_train_b4b63d5b5028c7a60333",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_b4b63d5b5028c7a60333",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 92160,
+            "at_most": 864240,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
+    # sm_100a H256 f32 weight: (864240, inf] the twosum form with an L2 warm-up: exact per-thread dw sums, so the dw error does not grow with T (from 92160 to 864240 rows the deterministic package's det pair runs: its worst dw element stays within 0.69 of the per-element budget at the sampled row counts from 80896 to 524288 rows on B200, worst of 60 inputs of each of three families, and within 0.52 at 589824, 786432 and 864240 rows, worst of 100 inputs of each of two families; against the FP64 reference at the FP64 rstd it reaches 1.11 of the budget at 864264 rows)
+    "cake_rmsnorm_train_7c2aa4b429538da06a2a__864240_inf": {
         "arches": [
             "sm_100a",
         ],
@@ -6721,7 +6745,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_7c2aa4b429538da06a2a",
         "role": "bwd_main_w32",
         "select_rule": {
-            "above": 524288,
+            "above": 864240,
             "at_most": None,
             "kind": "rows_between",
         },
@@ -6764,7 +6788,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 4096,
         },
     },
-    "cake_rmsnorm_train_c4c89f0d04b7b3a38d0b__92160_524288": {
+    # sm_100a H256 f32 weight: (92160, 864240] the deterministic package's det pair of these rows (main kernel c4c89f0d and fixed-order dw reduce b4b63d5b with that package's host plan, det record (80896, 1572864]), renamed into this package and cut to this window (the BF16-weight route cuts its pair at 524288 rows); from 524288 rows for speed: on B200 its backward took 0.887x to 0.899x the time of the twosum single 7c2aa4b4 at 524304 to 864240 rows (FI bench, L2 flushed before every call, two runs), and it is the program the deterministic package at FlashInfer 2e989556 runs there
+    "cake_rmsnorm_train_c4c89f0d04b7b3a38d0b__92160_864240": {
         "arches": [
             "sm_100a",
         ],
@@ -6787,7 +6812,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main_w32",
         "select_rule": {
             "above": 92160,
-            "at_most": 524288,
+            "at_most": 864240,
             "kind": "rows_between",
         },
         "workspace_rule": {
@@ -7303,8 +7328,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 0,
         },
     },
-    # sm_103a H4096 bf16 weight: (32768, 65536] the pair-row single kernel with its chunk table cut for 8 slots per SM (table_slots 8: more, shorter chunks than CTAs, the grid unchanged; 128-thread CTAs of 32 items, two per SM, 128 helper CTAs) for speed: on GB300 (CUDA graph replay, cold L2, 7 rounds) it took 125.89 us and 237.73 us at T 32768 and 65536, 0.953x and 0.938x the time of the programs FlashInfer main runs there (the det pair 35a0b0ca, the twosum single 8250eb92), with a dw error (relative L2 or worst element, the larger over six input families) of 0.975x and 0.860x that of the deterministic package's program at FlashInfer 2e989556
-    "cake_rmsnorm_train_06e5f7e09e42d1108365__32768_65536": {
+    # sm_103a H4096 bf16 weight: (10239, 65536] the pair-row single kernel with its chunk table cut for 8 slots per SM (table_slots 8: more, shorter chunks than CTAs, the grid unchanged; 128-thread CTAs of 32 items, two per SM, 128 helper CTAs) for speed: on GB300 (CUDA graph replay, cold L2, 7 rounds) it took 125.89 us and 237.73 us at T 32768 and 65536, 0.953x and 0.938x the time of the programs FlashInfer main runs there (the det pair 35a0b0ca, the twosum single 8250eb92), with a dw error (relative L2 or worst element, the larger over six input families) of 0.975x and 0.860x that of the deterministic package's program at FlashInfer 2e989556; from T 10240 to 32768, where the det pair 35a0b0ca ran before, its backward took 0.940x to 0.959x the det pair's time on GB300 (FI bench, L2 flushed before every call, two runs at T 10240, 12288, 14928, 15288, 15566, 16114, 16164, 16384, 16385, 18432, 20480, 24576, 28672 and 32768), with a dw error of at most 0.979x the median of the deterministic package's program at FlashInfer 2e989556 (six input families, three seeds, five repeats) at the gated T; the dw gate has not sampled T 10240 yet: it passes at T 8192 and 12288 next to it, and the worst dw element stays within 0.0006 of the per-element budget at T 8192 and 16384 (0.125 and 0.173 against the FP64-rstd reference); below T 10240 the det pair stays: there a forward and backward call or a training step was slower with this kernel in both runs at T 4097, 4608 and 8192
+    "cake_rmsnorm_train_06e5f7e09e42d1108365__10239_65536": {
         "arches": [
             "sm_103a",
         ],
@@ -7327,7 +7352,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_06e5f7e09e42d1108365",
         "role": "bwd_main",
         "select_rule": {
-            "above": 32768,
+            "above": 10239,
             "at_most": 65536,
             "kind": "rows_between",
         },
@@ -7800,8 +7825,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 65536,
         },
     },
-    # sm_103a H6144 bf16 weight: (32768, 65536] the pair-row single kernel with 96 helper CTAs and its chunk table cut for 6 slots per SM (table_slots 6: more, shorter chunks than CTAs, the grid unchanged) for speed: on GB300 (CUDA graph replay, cold L2, 7 rounds) it took 183.78 us and 351.71 us at T 32768 and 65536, 0.969x and 0.962x the time of the programs FlashInfer main runs there (the det pair 322574af, the kblock single 87e0b860), with a dw error (relative L2 or worst element, the larger over six input families) of at most 0.961x that of the deterministic package's program at FlashInfer 2e989556
-    "cake_rmsnorm_train_f5806bd223b2ad27230a__32768_65536": {
+    # sm_103a H6144 bf16 weight: (24575, 65536] the pair-row single kernel with 96 helper CTAs and its chunk table cut for 6 slots per SM (table_slots 6: more, shorter chunks than CTAs, the grid unchanged) for speed: on GB300 (CUDA graph replay, cold L2, 7 rounds) it took 183.78 us and 351.71 us at T 32768 and 65536, 0.969x and 0.962x the time of the programs FlashInfer main runs there (the det pair 322574af, the kblock single 87e0b860), with a dw error (relative L2 or worst element, the larger over six input families) of at most 0.961x that of the deterministic package's program at FlashInfer 2e989556; from T 24576 to 32768, where the det pair 322574af ran before, its backward took 0.972x to 0.980x the det pair's time on GB300 (FI bench, L2 flushed before every call, two runs at T 24576, 28672 and 32768), with a dw error of at most 0.907x the median of the deterministic package's program at FlashInfer 2e989556 (six input families, three seeds, five repeats); below T 24576 the det pair stays: there a forward and backward call or a training step was slower with this kernel in both runs at some sampled T
+    "cake_rmsnorm_train_f5806bd223b2ad27230a__24575_65536": {
         "arches": [
             "sm_103a",
         ],
@@ -7824,7 +7849,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_f5806bd223b2ad27230a",
         "role": "bwd_main",
         "select_rule": {
-            "above": 32768,
+            "above": 24575,
             "at_most": 65536,
             "kind": "rows_between",
         },
@@ -8021,8 +8046,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 98304,
         },
     },
-    # sm_107a H2048 bf16 weight: (50176, inf] above T 50176 for dw accuracy (the det pair's worst dw element reaches 0.900 of the per-element budget at T 51200 on R200 with 212 SMs); twosum: exact per-thread dw sums
-    "cake_rmsnorm_train_1a3df5ac020055477581": {
+    # sm_107a H2048 bf16 weight: (50176, 50688] above T 50176 for dw accuracy (the det pair 845cdcd8's worst dw element reaches 0.900 of the per-element budget at T 51200 on R200 with 212 SMs; the deterministic package's compensated det pair 694decfb runs from T 50688 to 65536); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_1a3df5ac020055477581__50176_50688": {
         "arches": [
             "sm_107a",
         ],
@@ -8045,6 +8070,94 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main",
         "select_rule": {
             "above": 50176,
+            "at_most": 50688,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 65536,
+        },
+    },
+    # sm_107a H2048 bf16 weight: (50688, 65536] the deterministic package's det pair of these rows (its compensated program over 8-row blocks: main kernel 694decfb and fixed-order dw reduce c4d8be67 with that package's host plan, det record (50688, inf]), renamed into this package and cut to this window, for speed: on R200 with 212 SMs its backward took 0.831x to 0.854x the time of the twosum single 1a3df5ac at the sampled T from 50689 to 65536 (FI bench, L2 flushed before every call, two runs), its worst dw element stays within 0.58 of the per-element budget at T 50689, 57344 and 65536 (212 SMs, 45 inputs), and it is the program the deterministic package at FlashInfer 2e989556 runs there
+    "cake_rmsnorm_train_694decfb79ba96468f62__50688_65536": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 4,
+            "tail_div": 12,
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_694decfb79ba96468f62",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_694decfb79ba96468f62",
+        "role": "bwd_large",
+        "select_rule": {
+            "above": 50688,
+            "at_most": 65536,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 64,
+            "kind": "chunk_partials",
+        },
+    },
+    "cake_rmsnorm_train_c4d8be677fa70b841877__50688_65536": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas": 64,
+            "kind": "fixed",
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_c4d8be677fa70b841877",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_c4d8be677fa70b841877",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 50688,
+            "at_most": 65536,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
+    # sm_107a H2048 bf16 weight: (65536, inf] above T 65536, the largest token count the dw gate against the deterministic package at FlashInfer 2e989556 samples on this route (the compensated det pair 694decfb runs below, from T 50688); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_1a3df5ac020055477581__65536_inf": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_1a3df5ac020055477581",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_1a3df5ac020055477581",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 65536,
             "at_most": None,
             "kind": "rows_between",
         },
@@ -13974,7 +14087,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_35a0b0ca6b2060313255__4096_32768": {
+    "cake_rmsnorm_train_35a0b0ca6b2060313255__4096_10239": {
         "arches": [
             "sm_103a",
         ],
@@ -13997,7 +14110,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main",
         "select_rule": {
             "above": 4096,
-            "at_most": 32768,
+            "at_most": 10239,
             "kind": "rows_between",
         },
         "workspace_rule": {
@@ -14074,7 +14187,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_fcbfa14d591a9babfd26__4096_32768": {
+    "cake_rmsnorm_train_fcbfa14d591a9babfd26__4096_10239": {
         "arches": [
             "sm_103a",
         ],
@@ -14092,7 +14205,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_reduce",
         "select_rule": {
             "above": 4096,
-            "at_most": 32768,
+            "at_most": 10239,
             "kind": "rows_between",
         },
         "workspace_rule": None,
@@ -15012,7 +15125,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_322574af704b51aef0bb__4096_32768": {
+    "cake_rmsnorm_train_322574af704b51aef0bb__4096_24575": {
         "arches": [
             "sm_103a",
         ],
@@ -15035,7 +15148,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_mid",
         "select_rule": {
             "above": 4096,
-            "at_most": 32768,
+            "at_most": 24575,
             "kind": "rows_between",
         },
         "workspace_rule": {
@@ -15089,7 +15202,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__4096_32768": {
+    "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__4096_24575": {
         "arches": [
             "sm_103a",
         ],
@@ -15107,7 +15220,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_reduce",
         "select_rule": {
             "above": 4096,
-            "at_most": 32768,
+            "at_most": 24575,
             "kind": "rows_between",
         },
         "workspace_rule": None,
@@ -18891,9 +19004,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_6a0114cb0b27a780a4c3",
             "cake_rmsnorm_train_8de0131445eed6eeabb7",
             "cake_rmsnorm_train_7c2aa4b429538da06a2a__20480_92160",
-            "cake_rmsnorm_train_c4c89f0d04b7b3a38d0b__92160_524288",
-            "cake_rmsnorm_train_7c2aa4b429538da06a2a",
-            "cake_rmsnorm_train_b4b63d5b5028c7a60333__92160_524288",
+            "cake_rmsnorm_train_c4c89f0d04b7b3a38d0b__92160_864240",
+            "cake_rmsnorm_train_7c2aa4b429538da06a2a__864240_inf",
+            "cake_rmsnorm_train_b4b63d5b5028c7a60333__92160_864240",
         ],
         "bwd_h512": [
             "cake_rmsnorm_train_64a299691c17079fe510",
@@ -19335,14 +19448,14 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_50044ee3bd1ca54bd821__152_256",
             "cake_rmsnorm_train_ad2bb26ea5916baef963",
             "cake_rmsnorm_train_24643edc7e1143da24e0",
-            "cake_rmsnorm_train_35a0b0ca6b2060313255__4096_32768",
-            "cake_rmsnorm_train_06e5f7e09e42d1108365__32768_65536",
+            "cake_rmsnorm_train_35a0b0ca6b2060313255__4096_10239",
+            "cake_rmsnorm_train_06e5f7e09e42d1108365__10239_65536",
             "cake_rmsnorm_train_3e6231b66942e510fdae__65536_262144",
             "cake_rmsnorm_train_8c8bebecc5b08454b6a0__262144_inf",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__152_256",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__256_1024",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__1024_4096",
-            "cake_rmsnorm_train_fcbfa14d591a9babfd26__4096_32768",
+            "cake_rmsnorm_train_fcbfa14d591a9babfd26__4096_10239",
         ],
         "bwd_w32_h4096": [
             "cake_rmsnorm_train_f6bd1634a115bd281055",
@@ -19396,13 +19509,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_38b1c6bc8fa558bccc49__16_896",
             "cake_rmsnorm_train_5c804aed7ad14b99e1d0__896_1024",
             "cake_rmsnorm_train_5c804aed7ad14b99e1d0__1024_4096",
-            "cake_rmsnorm_train_322574af704b51aef0bb__4096_32768",
-            "cake_rmsnorm_train_f5806bd223b2ad27230a__32768_65536",
+            "cake_rmsnorm_train_322574af704b51aef0bb__4096_24575",
+            "cake_rmsnorm_train_f5806bd223b2ad27230a__24575_65536",
             "cake_rmsnorm_train_7236b7379272c82c7614__65536_131072",
             "cake_rmsnorm_train_582b2a20f9be648af8ec__131072_inf",
             "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__896_1024",
             "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__1024_4096",
-            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__4096_32768",
+            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__4096_24575",
         ],
         "bwd_residual_h6144": [
             "cake_rmsnorm_train_deeb187630473818923d__0_4",
@@ -19619,10 +19732,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_845cdcd8145ada631461__256_1024",
             "cake_rmsnorm_train_81c3d8ab0a482e3af043",
             "cake_rmsnorm_train_845cdcd8145ada631461__16384_50176",
-            "cake_rmsnorm_train_1a3df5ac020055477581",
+            "cake_rmsnorm_train_1a3df5ac020055477581__50176_50688",
+            "cake_rmsnorm_train_694decfb79ba96468f62__50688_65536",
+            "cake_rmsnorm_train_1a3df5ac020055477581__65536_inf",
             "cake_rmsnorm_train_271082c56c222bf10d77",
             "cake_rmsnorm_train_c4d8be677fa70b841877",
             "cake_rmsnorm_train_c4d8be677fa70b841877__16384_50176",
+            "cake_rmsnorm_train_c4d8be677fa70b841877__50688_65536",
         ],
         "bwd_w32_h2048": [
             "cake_rmsnorm_train_0017ab41f68d8689ebc2",

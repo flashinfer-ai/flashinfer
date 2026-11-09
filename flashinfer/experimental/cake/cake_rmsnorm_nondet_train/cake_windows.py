@@ -141,8 +141,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (24, 64, "cake_rmsnorm_train_6a0114cb0b27a780a4c3"),
             (64, 20480, "cake_rmsnorm_train_8de0131445eed6eeabb7"),
             (20480, 92160, "cake_rmsnorm_train_7c2aa4b429538da06a2a"),
-            (92160, 524288, "cake_rmsnorm_train_c4c89f0d04b7b3a38d0b"),
-            (524288, None, "cake_rmsnorm_train_7c2aa4b429538da06a2a"),
+            (92160, 864240, "cake_rmsnorm_train_c4c89f0d04b7b3a38d0b"),
+            (864240, None, "cake_rmsnorm_train_7c2aa4b429538da06a2a"),
         ),
         "bwd_h512": (
             (0, 4, "cake_rmsnorm_train_64a299691c17079fe510"),
@@ -504,8 +504,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (152, 256, "cake_rmsnorm_train_50044ee3bd1ca54bd821"),
             (256, 1024, "cake_rmsnorm_train_ad2bb26ea5916baef963"),
             (1024, 4096, "cake_rmsnorm_train_24643edc7e1143da24e0"),
-            (4096, 32768, "cake_rmsnorm_train_35a0b0ca6b2060313255"),
-            (32768, 65536, "cake_rmsnorm_train_06e5f7e09e42d1108365"),
+            (4096, 10239, "cake_rmsnorm_train_35a0b0ca6b2060313255"),
+            (10239, 65536, "cake_rmsnorm_train_06e5f7e09e42d1108365"),
             (65536, 262144, "cake_rmsnorm_train_3e6231b66942e510fdae"),
             (262144, None, "cake_rmsnorm_train_8c8bebecc5b08454b6a0"),
         ),
@@ -550,8 +550,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (16, 896, "cake_rmsnorm_train_38b1c6bc8fa558bccc49"),
             (896, 1024, "cake_rmsnorm_train_5c804aed7ad14b99e1d0"),
             (1024, 4096, "cake_rmsnorm_train_5c804aed7ad14b99e1d0"),
-            (4096, 32768, "cake_rmsnorm_train_322574af704b51aef0bb"),
-            (32768, 65536, "cake_rmsnorm_train_f5806bd223b2ad27230a"),
+            (4096, 24575, "cake_rmsnorm_train_322574af704b51aef0bb"),
+            (24575, 65536, "cake_rmsnorm_train_f5806bd223b2ad27230a"),
             (65536, 131072, "cake_rmsnorm_train_7236b7379272c82c7614"),
             (131072, None, "cake_rmsnorm_train_582b2a20f9be648af8ec"),
         ),
@@ -751,7 +751,9 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (256, 1024, "cake_rmsnorm_train_845cdcd8145ada631461"),
             (1024, 16384, "cake_rmsnorm_train_81c3d8ab0a482e3af043"),
             (16384, 50176, "cake_rmsnorm_train_845cdcd8145ada631461"),
-            (50176, None, "cake_rmsnorm_train_1a3df5ac020055477581"),
+            (50176, 50688, "cake_rmsnorm_train_1a3df5ac020055477581"),
+            (50688, 65536, "cake_rmsnorm_train_694decfb79ba96468f62"),
+            (65536, None, "cake_rmsnorm_train_1a3df5ac020055477581"),
         ),
         "bwd_w32_h2048": (
             (0, 4, "cake_rmsnorm_train_0017ab41f68d8689ebc2"),
@@ -903,7 +905,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (64, "unmeasured"),
             (20480, "same"),
             (92160, "same"),
-            (524288, "same"),
+            (864240, "unmeasured"),
         ),
         "bwd_h512": (
             (4, "unmeasured"),
@@ -1178,7 +1180,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (256, "same"),
             (1024, "same"),
             (4096, "same"),
-            (32768, "unmeasured"),
+            (10239, "unmeasured"),
             (65536, "unmeasured"),
             (262144, "unmeasured"),
         ),
@@ -1220,7 +1222,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (896, "unmeasured"),
             (1024, "unmeasured"),
             (4096, "same"),
-            (32768, "unmeasured"),
+            (24575, "unmeasured"),
             (65536, "unmeasured"),
             (131072, "unmeasured"),
         ),
@@ -1358,6 +1360,8 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (1024, "same"),
             (16384, "same"),
             (50176, "same"),
+            (50688, "unmeasured"),
+            (65536, "unmeasured"),
         ),
         "bwd_w32_h2048": (
             (4, "unmeasured"),
@@ -1587,8 +1591,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (24, 64, 100),
             (64, 20480, None),
             (20480, 92160, None),
-            (92160, 524288, None),
-            (524288, None, None),
+            (92160, 864240, None),
+            (864240, None, None),
         ),
         "bwd_w32_h4096": (
             (0, 4, 100),
@@ -1689,8 +1693,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (152, 256, None),
             (256, 1024, None),
             (1024, 4096, 132),
-            (4096, 32768, 132),
-            (32768, 65536, 100),
+            (4096, 10239, 132),
+            (10239, 65536, 100),
             (65536, 262144, 100),
             (262144, None, None),
         ),
@@ -1720,8 +1724,8 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (16, 896, 100),
             (896, 1024, 132),
             (1024, 4096, 132),
-            (4096, 32768, 132),
-            (32768, 65536, 100),
+            (4096, 24575, 132),
+            (24575, 65536, 100),
             (65536, 131072, 100),
             (131072, None, 100),
         ),
@@ -1854,7 +1858,9 @@ SMEM_WAITS: dict[str, dict[str, tuple[tuple[int, int | None, int | None], ...]]]
             (256, 1024, 100),
             (1024, 16384, 100),
             (16384, 50176, 100),
-            (50176, None, None),
+            (50176, 50688, None),
+            (50688, 65536, 100),
+            (65536, None, None),
         ),
         "bwd_h256": (
             (0, 4, 100),
@@ -2012,7 +2018,7 @@ WHOLE_SM: dict[str, dict[str, tuple[tuple[int, int | None], ...]]] = {
         "fwd_w32_h6144": ((4096, None),),
         "bwd_h1536": ((1024, 65536),),
         "bwd_w32_h1536": ((16384, 65536),),
-        "bwd_h2048": ((256, 50176),),
+        "bwd_h2048": ((256, 50176), (50688, 65536)),
         "bwd_w32_h2048": ((256, 1024), (16384, 50176)),
         "bwd_h4096": ((1024, 24576),),
         "bwd_w32_h4096": ((1024, 65536),),
@@ -2092,7 +2098,7 @@ its windows there end at T 262144 on ``bwd_w32_h4096``, T 196608 on ``bwd_w32_h5
 and T 393216 on ``bwd_h5120``, the largest sampled ``T`` at or
 below which it stays within the budget); its ``dw`` is not bitwise reproducible either.
 On sm_103a ``bwd_residual_h6144`` from T 1920 to 131072, ``bwd_w32_residual_h6144`` from
-T 1824 to 131072, ``bwd_h6144`` from T 32768 to 131072 and ``bwd_h4096`` from T 32768 to
+T 1824 to 131072, ``bwd_h6144`` from T 24575 to 131072 and ``bwd_h4096`` from T 10239 to
 262144, and on sm_107a ``bwd_h6144`` from T 30720 to 131072, ``bwd_residual_h6144`` and
 ``bwd_w32_residual_h6144`` from T 7168 to 131072, ``bwd_h4096`` from T 24576 to 65536
 and ``bwd_w32_h5120`` from T 32767 to 131072 run a pair-row single kernel: each thread
@@ -2102,15 +2108,21 @@ pairs as one row of a scratch area of the workspace, and once every row is in, i
 helper CTAs (128; 96 on sm_103a ``bwd_h6144`` up to T 65536, 256 on sm_107a
 ``bwd_h4096``) fold the rows by pair addition and round ``dw`` once, with no FP64
 instruction; its ``dw`` is not bitwise reproducible either (the row order follows
-scheduling).  On sm_103a from T 32768 to 65536 on ``bwd_h4096`` and ``bwd_h6144`` and in
-every sm_107a window its build cuts the chunk table for more slots per SM than the grid
-has CTAs (8 and 6 per SM on sm_103a; 4 per SM on sm_107a, 8 on ``bwd_h4096``): more,
-shorter chunks, the grid unchanged.  On GB300 it took 0.84x to 0.99x the time of the
-programs FlashInfer e14ddfd9 runs there, at the sampled ``T`` of those windows (0.938x
-to 0.969x in the windows from T 32768 to 65536), with a ``dw`` error (relative L2 or
-worst element, the larger over six input families) of at most 1.0x that of the
-deterministic package's program at FlashInfer 2e989556, except 1.2x at T 98304 on the
-residual routes, equal to the twosum single kernel's there.  On R200 with 212 SMs it
+scheduling).  On sm_103a from T 10239 to 65536 on ``bwd_h4096``, from T 24575 to 65536
+on ``bwd_h6144`` and in every sm_107a window its build cuts the chunk table for more
+slots per SM than the grid has CTAs (8 and 6 per SM on sm_103a; 4 per SM on sm_107a, 8
+on ``bwd_h4096``): more, shorter chunks, the grid unchanged.  On GB300 it took 0.84x to
+0.99x the time of the programs FlashInfer e14ddfd9 runs there, at the sampled ``T`` of
+those windows (0.938x to 0.969x at T 32768 and 65536 on ``bwd_h4096`` and
+``bwd_h6144``), with a ``dw`` error (relative L2 or worst element, the larger over six
+input families) of at most 1.0x that of the deterministic package's program at
+FlashInfer 2e989556, except 1.2x at T 98304 on the residual routes, equal to the twosum
+single kernel's there.  From T 10239 to 32768 on ``bwd_h4096`` and from T 24575 to
+32768 on ``bwd_h6144`` it replaces the det pairs that ran there before: on GB300 its
+backward took 0.940x to 0.959x and 0.972x to 0.980x their time at the sampled ``T``,
+with a ``dw`` error of at most 0.979x and 0.907x that of the deterministic package's
+program at FlashInfer 2e989556 (on ``bwd_h4096`` the ``dw`` gate has not sampled T
+10240 yet; it passes at T 8192 and 12288).  On R200 with 212 SMs it
 took 0.87x to 0.90x (``bwd_h6144``) and 0.78x to 0.82x (the residual routes) the time of
 the twosum single kernel FlashInfer e14ddfd9 runs there, 0.96x to 0.98x that of the
 deterministic package's det pair on ``bwd_h4096`` and 0.93x to 0.95x that of the det
@@ -2133,8 +2145,12 @@ above 97280 rows); their fixed-order dw reduce is that package's, except from 51
 12288 and from 720896 to 1572864 rows, where it is the dw reduce that package ran
 there earlier.  On ``bwd_h256`` (both weight dtypes) the det pair the deterministic
 package runs above 80896 rows on sm_100a also runs from 92160 to 524288 rows on
-sm_100a; the twosum single kernel runs above, where that pair's worst ``dw`` element
-exceeds 0.85 of the budget at some sampled row counts.  On sm_103a
+sm_100a, and with FP32 weight up to 864240 rows, for speed: there its backward took
+0.887x to 0.899x the time of the twosum single kernel on B200, and its worst ``dw``
+element stays within 0.52 of the budget at 589824 to 864240 rows.  The twosum single
+kernel runs above, where that pair's worst ``dw`` element exceeds 0.85 of the budget
+at some sampled row counts (with FP32 weight, against the FP64 reference at the FP64
+``rstd``).  On sm_103a
 ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic package runs
 from T 4096, for ``dw`` accuracy.  On sm_100a ``bwd_h512`` above T 4096, ``bwd_h2048``
 from T 13608 to 58880, ``bwd_w32_h2048`` from T 58880 to 65536 (the FP32-weight det
@@ -2187,7 +2203,11 @@ twosum single kernel that ran there in this package (harness pooled medians), an
 ``bwd_w32_h1536`` the single kernel it replaces computes the ``dw`` of one whose FP32
 ``dw`` sums over windows of 16 steps put its worst ``dw`` error at 1.18x the
 deterministic package's median FP64 error over 5 repeats at T 65536 on R200 with 212
-SMs.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
+SMs.  On sm_107a ``bwd_h2048`` from T 50688 to 65536 runs the det pair the
+deterministic package runs there (its compensated program), for speed: on R200 with 212
+SMs its backward took 0.831x to 0.854x the time of the twosum single kernel that runs
+below and above that window (two runs), and its worst ``dw`` element stays within 0.58
+of the budget there.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
 from T 1024 to 4096 runs the single kernel of its window from T 32768 to 75776,
 ``bwd_w32_h2048`` from T 1024 to 4096 and ``bwd_w32_h4096`` from T 1792 to 3584 the
 single kernel whose twosum form runs their top window, ``bwd_w32_h2048`` from T 336 to
@@ -2339,7 +2359,7 @@ its windows there end at T 262144 on ``bwd_w32_h4096``, T 196608 on ``bwd_w32_h5
 and T 393216 on ``bwd_h5120``, the largest sampled ``T`` at or
 below which it stays within the budget); its ``dw`` is not bitwise reproducible either.
 On sm_103a ``bwd_residual_h6144`` from T 1920 to 131072, ``bwd_w32_residual_h6144`` from
-T 1824 to 131072, ``bwd_h6144`` from T 32768 to 131072 and ``bwd_h4096`` from T 32768 to
+T 1824 to 131072, ``bwd_h6144`` from T 24575 to 131072 and ``bwd_h4096`` from T 10239 to
 262144, and on sm_107a ``bwd_h6144`` from T 30720 to 131072, ``bwd_residual_h6144`` and
 ``bwd_w32_residual_h6144`` from T 7168 to 131072, ``bwd_h4096`` from T 24576 to 65536
 and ``bwd_w32_h5120`` from T 32767 to 131072 run a pair-row single kernel: each thread
@@ -2349,15 +2369,21 @@ pairs as one row of a scratch area of the workspace, and once every row is in, i
 helper CTAs (128; 96 on sm_103a ``bwd_h6144`` up to T 65536, 256 on sm_107a
 ``bwd_h4096``) fold the rows by pair addition and round ``dw`` once, with no FP64
 instruction; its ``dw`` is not bitwise reproducible either (the row order follows
-scheduling).  On sm_103a from T 32768 to 65536 on ``bwd_h4096`` and ``bwd_h6144`` and in
-every sm_107a window its build cuts the chunk table for more slots per SM than the grid
-has CTAs (8 and 6 per SM on sm_103a; 4 per SM on sm_107a, 8 on ``bwd_h4096``): more,
-shorter chunks, the grid unchanged.  On GB300 it took 0.84x to 0.99x the time of the
-programs FlashInfer e14ddfd9 runs there, at the sampled ``T`` of those windows (0.938x
-to 0.969x in the windows from T 32768 to 65536), with a ``dw`` error (relative L2 or
-worst element, the larger over six input families) of at most 1.0x that of the
-deterministic package's program at FlashInfer 2e989556, except 1.2x at T 98304 on the
-residual routes, equal to the twosum single kernel's there.  On R200 with 212 SMs it
+scheduling).  On sm_103a from T 10239 to 65536 on ``bwd_h4096``, from T 24575 to 65536
+on ``bwd_h6144`` and in every sm_107a window its build cuts the chunk table for more
+slots per SM than the grid has CTAs (8 and 6 per SM on sm_103a; 4 per SM on sm_107a, 8
+on ``bwd_h4096``): more, shorter chunks, the grid unchanged.  On GB300 it took 0.84x to
+0.99x the time of the programs FlashInfer e14ddfd9 runs there, at the sampled ``T`` of
+those windows (0.938x to 0.969x at T 32768 and 65536 on ``bwd_h4096`` and
+``bwd_h6144``), with a ``dw`` error (relative L2 or worst element, the larger over six
+input families) of at most 1.0x that of the deterministic package's program at
+FlashInfer 2e989556, except 1.2x at T 98304 on the residual routes, equal to the twosum
+single kernel's there.  From T 10239 to 32768 on ``bwd_h4096`` and from T 24575 to
+32768 on ``bwd_h6144`` it replaces the det pairs that ran there before: on GB300 its
+backward took 0.940x to 0.959x and 0.972x to 0.980x their time at the sampled ``T``,
+with a ``dw`` error of at most 0.979x and 0.907x that of the deterministic package's
+program at FlashInfer 2e989556 (on ``bwd_h4096`` the ``dw`` gate has not sampled T
+10240 yet; it passes at T 8192 and 12288).  On R200 with 212 SMs it
 took 0.87x to 0.90x (``bwd_h6144``) and 0.78x to 0.82x (the residual routes) the time of
 the twosum single kernel FlashInfer e14ddfd9 runs there, 0.96x to 0.98x that of the
 deterministic package's det pair on ``bwd_h4096`` and 0.93x to 0.95x that of the det
@@ -2380,8 +2406,12 @@ above 97280 rows); their fixed-order dw reduce is that package's, except from 51
 12288 and from 720896 to 1572864 rows, where it is the dw reduce that package ran
 there earlier.  On ``bwd_h256`` (both weight dtypes) the det pair the deterministic
 package runs above 80896 rows on sm_100a also runs from 92160 to 524288 rows on
-sm_100a; the twosum single kernel runs above, where that pair's worst ``dw`` element
-exceeds 0.85 of the budget at some sampled row counts.  On sm_103a
+sm_100a, and with FP32 weight up to 864240 rows, for speed: there its backward took
+0.887x to 0.899x the time of the twosum single kernel on B200, and its worst ``dw``
+element stays within 0.52 of the budget at 589824 to 864240 rows.  The twosum single
+kernel runs above, where that pair's worst ``dw`` element exceeds 0.85 of the budget
+at some sampled row counts (with FP32 weight, against the FP64 reference at the FP64
+``rstd``).  On sm_103a
 ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic package runs
 from T 4096, for ``dw`` accuracy.  On sm_100a ``bwd_h512`` above T 4096, ``bwd_h2048``
 from T 13608 to 58880, ``bwd_w32_h2048`` from T 58880 to 65536 (the FP32-weight det
@@ -2434,7 +2464,11 @@ twosum single kernel that ran there in this package (harness pooled medians), an
 ``bwd_w32_h1536`` the single kernel it replaces computes the ``dw`` of one whose FP32
 ``dw`` sums over windows of 16 steps put its worst ``dw`` error at 1.18x the
 deterministic package's median FP64 error over 5 repeats at T 65536 on R200 with 212
-SMs.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
+SMs.  On sm_107a ``bwd_h2048`` from T 50688 to 65536 runs the det pair the
+deterministic package runs there (its compensated program), for speed: on R200 with 212
+SMs its backward took 0.831x to 0.854x the time of the twosum single kernel that runs
+below and above that window (two runs), and its worst ``dw`` element stays within 0.58
+of the budget there.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
 from T 1024 to 4096 runs the single kernel of its window from T 32768 to 75776,
 ``bwd_w32_h2048`` from T 1024 to 4096 and ``bwd_w32_h4096`` from T 1792 to 3584 the
 single kernel whose twosum form runs their top window, ``bwd_w32_h2048`` from T 336 to
@@ -2672,7 +2706,7 @@ its windows there end at T 262144 on ``bwd_w32_h4096``, T 196608 on ``bwd_w32_h5
 and T 393216 on ``bwd_h5120``, the largest sampled ``T`` at or
 below which it stays within the budget); its ``dw`` is not bitwise reproducible either.
 On sm_103a ``bwd_residual_h6144`` from T 1920 to 131072, ``bwd_w32_residual_h6144`` from
-T 1824 to 131072, ``bwd_h6144`` from T 32768 to 131072 and ``bwd_h4096`` from T 32768 to
+T 1824 to 131072, ``bwd_h6144`` from T 24575 to 131072 and ``bwd_h4096`` from T 10239 to
 262144, and on sm_107a ``bwd_h6144`` from T 30720 to 131072, ``bwd_residual_h6144`` and
 ``bwd_w32_residual_h6144`` from T 7168 to 131072, ``bwd_h4096`` from T 24576 to 65536
 and ``bwd_w32_h5120`` from T 32767 to 131072 run a pair-row single kernel: each thread
@@ -2682,15 +2716,21 @@ pairs as one row of a scratch area of the workspace, and once every row is in, i
 helper CTAs (128; 96 on sm_103a ``bwd_h6144`` up to T 65536, 256 on sm_107a
 ``bwd_h4096``) fold the rows by pair addition and round ``dw`` once, with no FP64
 instruction; its ``dw`` is not bitwise reproducible either (the row order follows
-scheduling).  On sm_103a from T 32768 to 65536 on ``bwd_h4096`` and ``bwd_h6144`` and in
-every sm_107a window its build cuts the chunk table for more slots per SM than the grid
-has CTAs (8 and 6 per SM on sm_103a; 4 per SM on sm_107a, 8 on ``bwd_h4096``): more,
-shorter chunks, the grid unchanged.  On GB300 it took 0.84x to 0.99x the time of the
-programs FlashInfer e14ddfd9 runs there, at the sampled ``T`` of those windows (0.938x
-to 0.969x in the windows from T 32768 to 65536), with a ``dw`` error (relative L2 or
-worst element, the larger over six input families) of at most 1.0x that of the
-deterministic package's program at FlashInfer 2e989556, except 1.2x at T 98304 on the
-residual routes, equal to the twosum single kernel's there.  On R200 with 212 SMs it
+scheduling).  On sm_103a from T 10239 to 65536 on ``bwd_h4096``, from T 24575 to 65536
+on ``bwd_h6144`` and in every sm_107a window its build cuts the chunk table for more
+slots per SM than the grid has CTAs (8 and 6 per SM on sm_103a; 4 per SM on sm_107a, 8
+on ``bwd_h4096``): more, shorter chunks, the grid unchanged.  On GB300 it took 0.84x to
+0.99x the time of the programs FlashInfer e14ddfd9 runs there, at the sampled ``T`` of
+those windows (0.938x to 0.969x at T 32768 and 65536 on ``bwd_h4096`` and
+``bwd_h6144``), with a ``dw`` error (relative L2 or worst element, the larger over six
+input families) of at most 1.0x that of the deterministic package's program at
+FlashInfer 2e989556, except 1.2x at T 98304 on the residual routes, equal to the twosum
+single kernel's there.  From T 10239 to 32768 on ``bwd_h4096`` and from T 24575 to
+32768 on ``bwd_h6144`` it replaces the det pairs that ran there before: on GB300 its
+backward took 0.940x to 0.959x and 0.972x to 0.980x their time at the sampled ``T``,
+with a ``dw`` error of at most 0.979x and 0.907x that of the deterministic package's
+program at FlashInfer 2e989556 (on ``bwd_h4096`` the ``dw`` gate has not sampled T
+10240 yet; it passes at T 8192 and 12288).  On R200 with 212 SMs it
 took 0.87x to 0.90x (``bwd_h6144``) and 0.78x to 0.82x (the residual routes) the time of
 the twosum single kernel FlashInfer e14ddfd9 runs there, 0.96x to 0.98x that of the
 deterministic package's det pair on ``bwd_h4096`` and 0.93x to 0.95x that of the det
@@ -2713,8 +2753,12 @@ above 97280 rows); their fixed-order dw reduce is that package's, except from 51
 12288 and from 720896 to 1572864 rows, where it is the dw reduce that package ran
 there earlier.  On ``bwd_h256`` (both weight dtypes) the det pair the deterministic
 package runs above 80896 rows on sm_100a also runs from 92160 to 524288 rows on
-sm_100a; the twosum single kernel runs above, where that pair's worst ``dw`` element
-exceeds 0.85 of the budget at some sampled row counts.  On sm_103a
+sm_100a, and with FP32 weight up to 864240 rows, for speed: there its backward took
+0.887x to 0.899x the time of the twosum single kernel on B200, and its worst ``dw``
+element stays within 0.52 of the budget at 589824 to 864240 rows.  The twosum single
+kernel runs above, where that pair's worst ``dw`` element exceeds 0.85 of the budget
+at some sampled row counts (with FP32 weight, against the FP64 reference at the FP64
+``rstd``).  On sm_103a
 ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic package runs
 from T 4096, for ``dw`` accuracy.  On sm_100a ``bwd_h512`` above T 4096, ``bwd_h2048``
 from T 13608 to 58880, ``bwd_w32_h2048`` from T 58880 to 65536 (the FP32-weight det
@@ -2767,7 +2811,11 @@ twosum single kernel that ran there in this package (harness pooled medians), an
 ``bwd_w32_h1536`` the single kernel it replaces computes the ``dw`` of one whose FP32
 ``dw`` sums over windows of 16 steps put its worst ``dw`` error at 1.18x the
 deterministic package's median FP64 error over 5 repeats at T 65536 on R200 with 212
-SMs.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
+SMs.  On sm_107a ``bwd_h2048`` from T 50688 to 65536 runs the det pair the
+deterministic package runs there (its compensated program), for speed: on R200 with 212
+SMs its backward took 0.831x to 0.854x the time of the twosum single kernel that runs
+below and above that window (two runs), and its worst ``dw`` element stays within 0.58
+of the budget there.  For ``dw`` accuracy, on sm_100a ``bwd_w32_h1536``
 from T 1024 to 4096 runs the single kernel of its window from T 32768 to 75776,
 ``bwd_w32_h2048`` from T 1024 to 4096 and ``bwd_w32_h4096`` from T 1792 to 3584 the
 single kernel whose twosum form runs their top window, ``bwd_w32_h2048`` from T 336 to
@@ -2878,7 +2926,7 @@ route not listed is unmeasured.
 * ``sm_100a`` ``bwd_residual_h6144``: (0, 2] >= 100, (2, 64] -, (64, 1408] >= 100, (1408, 65536] >= 100, (65536, 131072] >= 100, (131072, inf) >= 100
 * ``sm_100a`` ``bwd_w32_h1536``: (0, 2] >= 100, (2, 64] -, (64, 384] -, (384, 1024] >= 132, (1024, 4096] -, (4096, 32768] >= 100, (32768, 75776] -, (75776, 131072] -, (131072, inf) -
 * ``sm_100a`` ``bwd_w32_h2048``: (0, 4] >= 100, (4, 14] >= 100, (14, 64] -, (64, 336] -, (336, 1024] -, (1024, 4096] >= 132, (4096, 15403] >= 100, (15403, 45056] >= 132, (45056, 58880] >= 132, (58880, 65536] >= 100, (65536, 131072] -, (131072, inf) >= 132
-* ``sm_100a`` ``bwd_w32_h256``: (0, 4] >= 100, (4, 24] >= 100, (24, 64] >= 100, (64, 20480] -, (20480, 92160] -, (92160, 524288] -, (524288, inf) -
+* ``sm_100a`` ``bwd_w32_h256``: (0, 4] >= 100, (4, 24] >= 100, (24, 64] >= 100, (64, 20480] -, (20480, 92160] -, (92160, 864240] -, (864240, inf) -
 * ``sm_100a`` ``bwd_w32_h4096``: (0, 4] >= 100, (4, 14] >= 100, (14, 64] -, (64, 1792] -, (1792, 3584] -, (3584, 36864] -, (36864, 44032] >= 132, (44032, 65536] >= 100, (65536, 131072] -, (131072, inf) -
 * ``sm_100a`` ``bwd_w32_h512``: (0, 4] >= 100, (4, 16] >= 100, (16, 227] -, (227, 292] -, (292, 960] -, (960, inf) -
 * ``sm_100a`` ``bwd_w32_h5120``: (0, 4] >= 100, (4, 64] >= 100, (64, 1792] -, (1792, 6144] >= 132, (6144, 56256] -, (56256, 131072] >= 132, (131072, inf) >= 132
@@ -2887,10 +2935,10 @@ route not listed is unmeasured.
 * ``sm_103a`` ``bwd_h1536``: (0, 4] >= 100, (4, 5] >= 100, (5, 64] -, (64, 214] -, (214, 1024] >= 132, (1024, 4096] >= 100, (4096, 14928] >= 132, (14928, 15566] >= 100, (15566, 46592] >= 100, (46592, 53184] -, (53184, 76352] >= 100, (76352, 131072] -, (131072, inf) -
 * ``sm_103a`` ``bwd_h2048``: (0, 4] >= 100, (4, 16] >= 100, (16, 63] -, (63, 171] -, (171, 3072] >= 100, (3072, 4096] >= 100, (4096, 16384] >= 100, (16384, 32768] >= 100, (32768, 58496] >= 100, (58496, 61952] >= 100, (61952, 68160] >= 100, (68160, 131072] -, (131072, inf) >= 132
 * ``sm_103a`` ``bwd_h256``: (0, 4] >= 100, (4, 24] >= 100, (24, 64] >= 100, (64, 1080] -, (1080, 5120] -, (5120, 12288] -, (12288, 40960] -, (40960, 97280] -, (97280, 720896] -, (720896, 1572864] -, (1572864, inf) -
-* ``sm_103a`` ``bwd_h4096``: (0, 4] >= 100, (4, 16] >= 100, (16, 32] -, (32, 152] -, (152, 256] -, (256, 1024] -, (1024, 4096] >= 132, (4096, 32768] >= 132, (32768, 65536] >= 100, (65536, 262144] >= 100, (262144, inf) -
+* ``sm_103a`` ``bwd_h4096``: (0, 4] >= 100, (4, 16] >= 100, (16, 32] -, (32, 152] -, (152, 256] -, (256, 1024] -, (1024, 4096] >= 132, (4096, 10239] >= 132, (10239, 65536] >= 100, (65536, 262144] >= 100, (262144, inf) -
 * ``sm_103a`` ``bwd_h512``: (0, 4] >= 100, (4, 16] >= 100, (16, 64] -, (64, 1024] -, (1024, 4096] -, (4096, 32768] -, (32768, inf) -
 * ``sm_103a`` ``bwd_h5120``: (0, 4] >= 100, (4, 16] >= 100, (16, 64] >= 100, (64, 1024] >= 132, (1024, 5120] >= 132, (5120, 61952] >= 132, (61952, 393216] >= 132, (393216, inf) >= 132
-* ``sm_103a`` ``bwd_h6144``: (0, 4] >= 100, (4, 6] >= 100, (6, 16] -, (16, 896] >= 100, (896, 1024] >= 132, (1024, 4096] >= 132, (4096, 32768] >= 132, (32768, 65536] >= 100, (65536, 131072] >= 100, (131072, inf) >= 100
+* ``sm_103a`` ``bwd_h6144``: (0, 4] >= 100, (4, 6] >= 100, (6, 16] -, (16, 896] >= 100, (896, 1024] >= 132, (1024, 4096] >= 132, (4096, 24575] >= 132, (24575, 65536] >= 100, (65536, 131072] >= 100, (131072, inf) >= 100
 * ``sm_103a`` ``bwd_residual_h6144``: (0, 4] >= 100, (4, 6] >= 100, (6, 31] -, (31, 32] >= 100, (32, 48] -, (48, 56] >= 100, (56, 304] >= 100, (304, 1920] >= 100, (1920, 131072] >= 100, (131072, inf) >= 100
 * ``sm_103a`` ``bwd_w32_h1536``: (0, 4] >= 100, (4, 6] >= 100, (6, 64] -, (64, 214] -, (214, 1024] >= 132, (1024, 4096] >= 100, (4096, 14928] >= 132, (14928, 15566] >= 100, (15566, 37888] >= 100, (37888, 40448] -, (40448, 76352] >= 100, (76352, 131072] -, (131072, inf) -
 * ``sm_103a`` ``bwd_w32_h2048``: (0, 4] >= 100, (4, 16] >= 100, (16, 64] -, (64, 171] -, (171, 3072] >= 100, (3072, 4096] >= 100, (4096, 16384] >= 100, (16384, 32768] >= 100, (32768, 58496] >= 100, (58496, 61952] >= 100, (61952, 68160] >= 100, (68160, 131072] -, (131072, inf) >= 132
@@ -2901,7 +2949,7 @@ route not listed is unmeasured.
 * ``sm_103a`` ``bwd_w32_h6144``: (0, 4] >= 100, (4, 12] >= 100, (12, 16] -, (16, 1024] >= 100, (1024, 4096] >= 132, (4096, 49152] >= 132, (49152, 83392] >= 132, (83392, 131072] >= 100, (131072, inf) >= 100
 * ``sm_103a`` ``bwd_w32_residual_h6144``: (0, 4] >= 100, (4, 10] >= 100, (10, 31] -, (31, 32] >= 100, (32, 48] -, (48, 320] >= 100, (320, 1824] >= 100, (1824, 131072] >= 100, (131072, inf) >= 100
 * ``sm_107a`` ``bwd_h1536``: (0, 4] >= 100, (4, 16] >= 100, (16, 320] -, (320, 1024] -, (1024, 16384] >= 100, (16384, 45056] >= 100, (45056, 65536] >= 100, (65536, inf) -
-* ``sm_107a`` ``bwd_h2048``: (0, 4] >= 100, (4, 16] >= 100, (16, 31] -, (31, 256] -, (256, 1024] >= 100, (1024, 16384] >= 100, (16384, 50176] >= 100, (50176, inf) -
+* ``sm_107a`` ``bwd_h2048``: (0, 4] >= 100, (4, 16] >= 100, (16, 31] -, (31, 256] -, (256, 1024] >= 100, (1024, 16384] >= 100, (16384, 50176] >= 100, (50176, 50688] -, (50688, 65536] >= 100, (65536, inf) -
 * ``sm_107a`` ``bwd_h256``: (0, 4] >= 100, (4, 24] >= 100, (24, 64] >= 100, (64, 786432] -, (786432, inf) -
 * ``sm_107a`` ``bwd_h4096``: (0, 4] >= 100, (4, 16] >= 100, (16, 256] -, (256, 1024] >= 100, (1024, 4096] >= 100, (4096, 24064] >= 100, (24064, 24576] >= 100, (24576, 65536] >= 100, (65536, inf) >= 132
 * ``sm_107a`` ``bwd_h512``: (0, 4] >= 100, (4, 16] >= 100, (16, 576] -, (576, 1024] -, (1024, 4096] >= 100, (4096, 16384] >= 100, (16384, 49152] >= 100, (49152, inf) -
@@ -2924,7 +2972,7 @@ Beside those, leave some SMs free of the resident kernel.
 
 * ``sm_107a`` ``bwd_h1536``: (1024, 65536]
 * ``sm_107a`` ``bwd_w32_h1536``: (16384, 65536]
-* ``sm_107a`` ``bwd_h2048``: (256, 50176]
+* ``sm_107a`` ``bwd_h2048``: (256, 50176], (50688, 65536]
 * ``sm_107a`` ``bwd_w32_h2048``: (256, 1024], (16384, 50176]
 * ``sm_107a`` ``bwd_h4096``: (1024, 24576]
 * ``sm_107a`` ``bwd_w32_h4096``: (1024, 65536]
@@ -2935,6 +2983,10 @@ Beside those, leave some SMs free of the resident kernel.
   (4, 24] f2ccf719 (one cluster) ? (24, 64] 9fb6b410 (one cluster) ?
   (64, 20480] 195c4317 = (20480, 92160] 172a47a1 = (92160, 524288] 083ea823 (det pair) =
   (524288, inf) 172a47a1
+* ``sm_100a`` ``bwd_w32_h256``: (0, 4] 67cb5641 (one cluster) ?
+  (4, 24] aa745395 (one cluster) ? (24, 64] 6a0114cb (one cluster) ?
+  (64, 20480] 8de01314 = (20480, 92160] 7c2aa4b4 = (92160, 864240] c4c89f0d (det pair) ?
+  (864240, inf) 7c2aa4b4
 * ``sm_100a`` ``bwd_h512``: (0, 4] 64a29969 (one cluster) ?
   (4, 16] c167e0d2 (one cluster) ? (16, 227] 5f3e3fcc = (227, 1024] 09601d42 (det pair)
   = (1024, 1280] 123db0b2 (det pair) = (1280, 4096] d0bde38a ?
@@ -3031,8 +3083,8 @@ Beside those, leave some SMs free of the resident kernel.
 * ``sm_103a`` ``bwd_h4096``: (0, 4] 945a0afd (one cluster) ?
   (4, 16] 41f44b4b (one cluster) ? (16, 32] 3dbab232 = (32, 152] ff0156d5 =
   (152, 256] 50044ee3 (det pair) = (256, 1024] ad2bb26e (det pair) =
-  (1024, 4096] 24643edc (det pair) = (4096, 32768] 35a0b0ca (det pair) ?
-  (32768, 65536] 06e5f7e0 ? (65536, 262144] 3e6231b6 ? (262144, inf) 8c8bebec
+  (1024, 4096] 24643edc (det pair) = (4096, 10239] 35a0b0ca (det pair) ?
+  (10239, 65536] 06e5f7e0 ? (65536, 262144] 3e6231b6 ? (262144, inf) 8c8bebec
 * ``sm_103a`` ``bwd_w32_h4096``: (0, 4] f6bd1634 (one cluster) ?
   (4, 16] b378ba00 (one cluster) ? (16, 32] c1b9ee6b = (32, 152] 11820fe4 =
   (152, 256] 3fd77c8c (det pair) = (256, 1024] 16545056 (det pair) =
@@ -3049,7 +3101,7 @@ Beside those, leave some SMs free of the resident kernel.
 * ``sm_103a`` ``bwd_h6144``: (0, 4] e37752b0 (one cluster) ?
   (4, 6] fdfb7335 (one cluster) ? (6, 16] d70f2562 ? (16, 896] 38b1c6bc ?
   (896, 1024] 5c804aed (det pair) ? (1024, 4096] 5c804aed (det pair) =
-  (4096, 32768] 322574af (det pair) ? (32768, 65536] f5806bd2 ? (65536, 131072] 7236b737
+  (4096, 24575] 322574af (det pair) ? (24575, 65536] f5806bd2 ? (65536, 131072] 7236b737
   ? (131072, inf) 582b2a20
 * ``sm_103a`` ``bwd_residual_h6144``: (0, 4] deeb1876 (one cluster) ?
   (4, 6] 94c547ec (one cluster) ? (6, 31] 7b0f5a6a = (31, 32] 07135550 =
@@ -3085,7 +3137,8 @@ Beside those, leave some SMs free of the resident kernel.
 * ``sm_107a`` ``bwd_h2048``: (0, 4] c5f62407 (one cluster) ?
   (4, 16] a951623c (one cluster) ? (16, 31] ef052c09 = (31, 256] 32eb12e2 =
   (256, 1024] 845cdcd8 (det pair) = (1024, 16384] 81c3d8ab (det pair) =
-  (16384, 50176] 845cdcd8 (det pair) = (50176, inf) 1a3df5ac
+  (16384, 50176] 845cdcd8 (det pair) = (50176, 50688] 1a3df5ac ?
+  (50688, 65536] 694decfb (det pair) ? (65536, inf) 1a3df5ac
 * ``sm_107a`` ``bwd_w32_h2048``: (0, 4] 0017ab41 (one cluster) ?
   (4, 16] 65e5f202 (one cluster) ? (16, 256] 22944704 = (256, 1024] 838a9a40 (det pair)
   = (1024, 16384] 810989bd = (16384, 50176] 838a9a40 (det pair) = (50176, inf) 810989bd
