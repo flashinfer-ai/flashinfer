@@ -6,7 +6,7 @@ import os
 
 from cutlass.cutlass_dsl import CuTeDSL
 
-from ..jit.core import logger
+from ..jit.core import MissingJITCacheError, logger
 from ..jit.cute_dsl_core import (
     build_and_load_cute_dsl_kernel,
     cute_dsl_cache_disabled,
@@ -49,6 +49,11 @@ def build_and_load_gdn_kernel(
         or env.compiler_opt
         or (env.enable_tvm_ffi and not enable_tvm_ffi)
     ):
+        if os.environ.get("FLASHINFER_DISABLE_JIT"):
+            raise MissingJITCacheError(
+                "JIT compilation is disabled via FLASHINFER_DISABLE_JIT, but "
+                "the CuTe-DSL compiler settings require compiling this GDN kernel."
+            )
         return compile_fn()
 
     name = _kernel_name(kind, specialization, args, env.cache_key_str())

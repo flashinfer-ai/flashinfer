@@ -34,6 +34,7 @@ pattern for their own name functions.
 
 import errno
 import inspect
+import json
 import re
 from functools import partial
 from unittest.mock import Mock
@@ -77,6 +78,41 @@ def test_explicit_target_keys_cute_dsl_artifact(monkeypatch, tmp_path):
     assert explicit.object_path.parent.name == "gdn_sm120a_cute_dsl"
     assert default.expected_meta["arch"] == "sm90a"
     assert default.object_path != explicit.object_path
+
+
+@pytest.mark.parametrize("precompile", [False, True])
+def test_cute_dsl_failed_export_keeps_compiled_kernel(
+    monkeypatch, tmp_path, precompile
+):
+    from flashinfer.jit import cute_dsl_core, env as jit_env
+
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    compiled = object()
+    compile_fn = Mock(return_value=compiled)
+    spec = cute_dsl_core.JitSpecCuteDsl(
+        "gdn", "kernel", compile_fn, "sources", target_arch="sm_120a"
+    )
+    spec.module_dir.mkdir()
+    spec.meta_path.write_text(json.dumps(spec.expected_meta), encoding="utf-8")
+    spec.object_path.write_bytes(b"corrupt object")
+    monkeypatch.setattr(
+        spec, "_load_from_disk", Mock(side_effect=RuntimeError("invalid object"))
+    )
+    monkeypatch.setattr(
+        spec,
+        "_export_object",
+        Mock(side_effect=PermissionError(errno.EACCES, "read-only cache")),
+    )
+
+    if precompile:
+        assert spec.try_load() is None
+        spec.compile_and_persist()
+        assert spec.load() is compiled
+    else:
+        assert spec.build_and_load() is compiled
+    compile_fn.assert_called_once_with()
+    assert spec.object_path.read_bytes() == b"corrupt object"
 
 
 def test_gdn_disk_name_tracks_layout_and_specialization():
@@ -142,6 +178,19 @@ def test_gdn_compile_override_uses_process_cache(
     compiled = object()
     assert gdn_compile(lambda: compiled) is compiled
     disk_cache.assert_not_called()
+
+
+def test_gdn_compile_override_honors_disabled_jit(monkeypatch, gdn_compile):
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    from flashinfer.jit import MissingJITCacheError
+
+    monkeypatch.setattr(CuTeDSL._get_dsl().envar, "no_cache", True)
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    compile_fn = Mock()
+    with pytest.raises(MissingJITCacheError, match="FLASHINFER_DISABLE_JIT"):
+        gdn_compile(compile_fn)
+    compile_fn.assert_not_called()
 
 
 def test_gdn_disk_name_tracks_compiler_settings(monkeypatch, gdn_compile):

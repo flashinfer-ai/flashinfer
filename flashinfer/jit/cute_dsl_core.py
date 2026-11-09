@@ -151,9 +151,9 @@ class JitSpecCuteDsl(JitSpec):
         if not enable_tvm_ffi:
             # The two export formats must never share a module directory.
             self.expected_meta["tvm_ffi"] = False
-        # Set by build(): the freshly compiled in-process kernel, returned by
-        # load() so a build is never followed by a redundant JITLink reload.
+        # Retain the freshly compiled kernel for load() if export fails.
         self._compiled_kernel: Optional[Any] = None
+        self._export_failed = False
 
     @property
     def lock_path(self) -> Path:
@@ -209,13 +209,7 @@ class JitSpecCuteDsl(JitSpec):
 
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")
         self._compiled_kernel = self.compile_fn()
-        try:
-            self._export()
-        except Exception as e:
-            logger.warning(
-                f"Failed to persist CuTe-DSL kernel {self.name} to "
-                f"{self.object_path}: {e}. The kernel will be recompiled next run."
-            )
+        self._export_best_effort()
 
     def compile_and_persist(self) -> None:
         """Compile outside the module lock; commit the artifact under it.
@@ -240,17 +234,21 @@ class JitSpecCuteDsl(JitSpec):
                     f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
                 )
                 shutil.rmtree(self.module_dir, ignore_errors=True)
-            try:
-                self._export()
-            except Exception as e:  # noqa: BLE001 -- persistence is best-effort
-                logger.warning(
-                    f"Failed to persist CuTe-DSL kernel {self.name} to "
-                    f"{self.object_path}: {e}. The kernel will be recompiled "
-                    f"next run."
-                )
+            self._export_best_effort()
+
+    def _export_best_effort(self) -> None:
+        self._export_failed = False
+        try:
+            self._export()
+        except Exception as e:  # noqa: BLE001 -- persistence is best-effort
+            self._export_failed = True
+            logger.warning(
+                f"Failed to persist CuTe-DSL kernel {self.name} to "
+                f"{self.object_path}: {e}. The kernel will be recompiled next run."
+            )
 
     def load(self) -> Any:
-        """The kernel to hand back: the exported artifact whenever one exists.
+        """Load the exported artifact or return the in-process kernel.
 
         The artifact is preferred even immediately after ``build()``.
         ``cute.compile`` does not reject a ``--gpu-arch`` the current device
@@ -265,11 +263,10 @@ class JitSpecCuteDsl(JitSpec):
         reloaded artifact, so every second run was exercising that form
         anyway.  Miss and hit now hand back the same thing.
 
-        Falls back to the in-process object when no artifact exists -- export
-        is best-effort (``build()`` logs and continues on failure) and the
-        on-disk cache can be disabled outright.
+        An export failure can leave an older object at the final path. Return
+        the freshly compiled kernel if export failed or the artifact is absent.
         """
-        if self.object_path.exists():
+        if not self._export_failed and self.object_path.exists():
             return self._load_from_disk()
         if self._compiled_kernel is not None:
             return self._compiled_kernel

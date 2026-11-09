@@ -65,6 +65,7 @@ from flashinfer.gdn_kernels.blackwell.gdn_prefill import (  # noqa: E402
     _get_compiled_cache,
     _prefill_kernel_name,
 )
+from flashinfer.utils import get_compute_capability  # noqa: E402
 
 _SYMBOL_SAFE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
@@ -679,7 +680,8 @@ def _make_prefill_call(use_cp, cu_seqlens_dtype=torch.int64):
 
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_delta_rule_prefill_disk_cache_round_trip(monkeypatch, tmp_path, use_cp):
-    major, _ = torch.cuda.get_device_capability()
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, _ = get_compute_capability(device)
     if major not in (8, 9, 12) and not (major == 10 and use_cp):
         pytest.skip("requires a delta-rule DSL prefill path")
     if major == 10 and int((torch.version.cuda or "0").split(".")[0]) < 13:
@@ -771,7 +773,9 @@ def _make_wy_call(variant):
 
 @pytest.mark.parametrize("variant", ["output_only", "ucache", "ucache_flush"])
 def test_wy_disk_cache_round_trip(monkeypatch, tmp_path, variant):
-    if torch.cuda.get_device_capability()[0] < 9:
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, _ = get_compute_capability(device)
+    if major < 9:
         pytest.skip("requires an SM90+ WY kernel")
 
     import cutlass.cute as cute
