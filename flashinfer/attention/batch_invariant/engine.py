@@ -24,7 +24,25 @@ from typing import Dict, List, Optional
 import torch
 
 from .plan import DESC_FIELDS, GROUP_FIELDS, build_plan, ws_row
-from .spec import HEAD_DIMS, scale_log2
+from .spec import FLT_MAX, HEAD_DIMS, KV_FMTS, scale_log2
+from ...batch_invariant.fp_interface.term import to_f32
+
+#: The KV cache dtypes of the attention classes: bf16 (the bf16 class) and the two fp8 formats (the fp8-KV classes).
+KV_FORMAT_OF_DTYPE = {
+    torch.bfloat16: "bf16",
+    torch.float8_e4m3fn: "e4m3",
+    torch.float8_e5m2: "e5m2",
+}
+
+
+def kv_format(dtype: torch.dtype) -> str:
+    """The class's KV format of a cache dtype; ``ValueError`` for any other dtype."""
+    fmt = KV_FORMAT_OF_DTYPE.get(dtype)
+    if fmt is None:
+        raise ValueError(
+            f"a KV cache of dtype {dtype}: the classes take bf16, float8_e4m3fn or float8_e5m2 caches"
+        )
+    return fmt
 
 
 PAGE_SIZES = (
@@ -53,25 +71,40 @@ def check_supported(D: int, Hq: int, Hkv: int, page: int) -> None:
         raise ValueError(f"page_size {page}: supported page sizes are {PAGE_SIZES}")
 
 
-def check_sm_scale(sm_scale: float) -> float:
-    """``scale_log2(sm_scale)`` for a positive, finite ``sm_scale`` whose log2 scale is a binary32 number; ``ValueError`` otherwise
-    (the kernel forms every exp2 argument with this constant)."""
+def check_sm_scale(sm_scale: float, k_scale: float = 1.0) -> float:
+    """``scale_log2(sm_scale, k_scale)`` for a positive, finite ``sm_scale`` (and ``k_scale``: the fp8-KV classes' per-tensor key
+    scale, 1.0 for the bf16 class) whose log2 scale is a nonzero binary32 number; ``ValueError`` otherwise (the kernel forms every
+    exp2 argument with this constant)."""
     s = float(sm_scale)
     if not (math.isfinite(s) and s > 0.0):
         raise ValueError(
             f"sm_scale {sm_scale}: the class takes a positive finite scale"
         )
+    ks = float(k_scale)
+    if not (math.isfinite(ks) and ks > 0.0):
+        raise ValueError(
+            f"k_scale {k_scale}: the class takes a positive finite key scale"
+        )
     try:
-        c = scale_log2(s)
+        c = scale_log2(s, ks)
     except OverflowError:
         raise ValueError(
-            f"sm_scale {sm_scale}: sm_scale * log2(e) is outside the binary32 range"
+            f"sm_scale {sm_scale}, k_scale {k_scale}: sm_scale * k_scale * log2(e) is outside the binary32 range"
         ) from None
     if c == 0.0:
         raise ValueError(
-            f"sm_scale {sm_scale}: sm_scale * log2(e) rounds to zero in binary32"
+            f"sm_scale {sm_scale}, k_scale {k_scale}: sm_scale * k_scale * log2(e) rounds to zero in binary32"
         )
     return c
+
+
+def check_v_scale(v_scale: float) -> float:
+    """The fp8-KV classes' per-tensor value scale as the binary32 value the epilogue multiplies by (rounded once from the caller's
+    double); ``ValueError`` unless finite."""
+    v = float(v_scale)
+    if not (math.isfinite(v) and abs(v) <= FLT_MAX):
+        raise ValueError(f"v_scale {v_scale}: the class takes a finite value scale")
+    return to_f32(v)
 
 
 def valid_kv_slots(D: int = 128) -> tuple:
@@ -111,10 +144,12 @@ class AttnConfig:
             + ("_q2" if self.q2 else "")
         )
 
-    def well_formed(self, D: int = 128) -> bool:
+    def well_formed(self, D: int = 128, lowbit: bool = False) -> bool:
         """The body's static knob constraints at head dim ``D`` (mirror of ``BIK.Attn.ConfigOKD``: ``2 <= kv_slots``,
-        ``kv_slots * D <= 512``, ``small <= 1``)."""
-        return (
+        ``kv_slots * D <= 512``, ``small <= 1``). ``lowbit`` (the fp8-KV classes, ``BIK.Attn.ConfigOKLowbit``): one softmax
+        warpgroup (the conversion stage takes the second one's registers), no pairing, and the row body's replicated-row placement
+        for small units (the Swaps-AB body has no conversion stage)."""
+        ok = (
             self.kv_slots in valid_kv_slots(D)
             and self.split_policy in ("auto", "split", "fused")
             and self.softmax_wgs in (1, 2)
@@ -123,6 +158,9 @@ class AttnConfig:
             and self.small in ("rep", "swap")
             and (not self.q2 or (self.softmax_wgs == 2 and D == 64))
         )
+        if lowbit:
+            ok = ok and self.softmax_wgs == 1 and not self.q2 and self.small == "rep"
+        return ok
 
     def lean(self) -> str:
         """The record ``BIK.Attn.Config`` (kvSlots, policy, softmaxWgs, merge, small) of ``lean/BIKernels/Attention.lean``."""
@@ -132,15 +170,16 @@ class AttnConfig:
         )
 
 
-def all_valid_configs(D: int = 128) -> list:
+def all_valid_configs(D: int = 128, lowbit: bool = False) -> list:
     """The enumerated space at head dim ``D`` (R3 is claimed over it): ring ``valid_kv_slots(D)`` x unit kind x softmax warpgroups x
-    merge placement x small-unit placement = 252 / 108 / 36 points at D = 64 / 128 / 256."""
+    merge placement x small-unit placement = 252 / 108 / 36 points at D = 64 / 128 / 256. The fp8-KV classes' space (``lowbit``):
+    one softmax warpgroup and the replicated-row placement, 63 / 27 / 9 points."""
     assert D in HEAD_DIMS, D
     return [
         AttnConfig(s, p, 0, w, merge=m, small=sm)
-        for sm in ("rep", "swap")
+        for sm in (("rep",) if lowbit else ("rep", "swap"))
         for m in ("auto", "fixup", "inkernel")
-        for w in (1, 2)
+        for w in ((1,) if lowbit else (1, 2))
         for s in valid_kv_slots(D)
         for p in ("auto", "split", "fused")
     ]
@@ -220,10 +259,15 @@ DEFAULT_RING = {
 # the noise), D = 256 has only 2
 
 
-def default_config(D: int = 128):
+def default_config(D: int = 128, kv_fmt: str = "bf16"):
     """The default placement of the class at head dim ``D``: the ring depth of ``DEFAULT_RING`` (4 / 4 / 2 at D = 64 / 128 / 256), one
-    softmax warpgroup, the planner's unit kind and fold placement (``plan.build_plan``: per head dim).."""
-    return AttnConfig(DEFAULT_RING[D], "auto", 0, 1)
+    softmax warpgroup, the planner's unit kind and fold placement (``plan.build_plan``: per head dim). The fp8-KV classes
+    (``kv_fmt`` ``"e4m3"`` / ``"e5m2"``) take the row body for small units too (``small="rep"``: the Swaps-AB body has no
+    conversion stage)."""
+    assert kv_fmt in KV_FMTS, kv_fmt
+    return AttnConfig(
+        DEFAULT_RING[D], "auto", 0, 1, small="rep" if kv_fmt != "bf16" else "swap"
+    )
 
 
 def _kv_view(
@@ -283,6 +327,9 @@ class _Planned:
         self.window_left: Optional[int] = None
         self.config: Optional[AttnConfig] = None
         self.page: Optional[int] = None
+        self.kv_fmt: str = (
+            "bf16"  # the KV cache format the plan's configuration was checked for
+        )
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
@@ -304,16 +351,19 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    kv_fmt: str = "bf16",
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
-    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
+    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer. ``kv_fmt``: the
+    KV cache format the run will bring (``spec.KV_FMTS``): the plan is the same, the configuration must be well formed for it."""
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
     check_supported(D, Hq, Hkv, page)
-    config = config or default_config(D=D)
-    assert config.well_formed(D), (config, D)
+    assert kv_fmt in KV_FMTS, kv_fmt
+    config = config or default_config(D=D, kv_fmt=kv_fmt)
+    assert config.well_formed(D, lowbit=kv_fmt != "bf16"), (config, D, kv_fmt)
     device = device or qo_indptr.device
     sm = (
         sm_count
@@ -393,6 +443,7 @@ def plan_attention(
         torch.zeros(max(1, len(plan.groups)), dtype=torch.int32, device=device),
     )
     planned.ragged = ragged
+    planned.kv_fmt = kv_fmt
     planned.heads = (int(Hq), int(Hkv))
     planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
     planned.window_left = int(window_left)
@@ -486,10 +537,27 @@ def run_attention(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     ragged: bool = False,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    """``k_scale`` / ``v_scale``: the fp8-KV classes' per-tensor scales (Python floats; 1.0 when None), refused for a bf16 cache
+    (the bf16 class has no scale in its chain)."""
     total_q, Hq, D = q.shape
+    kv_fmt = kv_format(k_cache.dtype)
+    if v_cache.dtype != k_cache.dtype:
+        raise ValueError(
+            f"K and V caches of different dtypes ({k_cache.dtype}, {v_cache.dtype}): one class per cache format"
+        )
+    if kv_fmt == "bf16" and (k_scale is not None or v_scale is not None):
+        raise ValueError(
+            "k_scale / v_scale with a bf16 KV cache: the bf16 class has no scale in its chain (the fp8-KV classes take them)"
+        )
+    if planned.kv_fmt != kv_fmt:
+        raise ValueError(
+            f"a {kv_fmt} KV cache at run_attention over a plan built for a {planned.kv_fmt} cache (plan with kv_fmt=)"
+        )
     if config is None:
-        config = planned.config or default_config(D=D)
+        config = planned.config or default_config(D=D, kv_fmt=kv_fmt)
     elif planned.config is not None and config != planned.config:
         raise ValueError(
             f"run_attention with {config.describe()} over a plan built for {planned.config.describe()}: the descriptor table is "
@@ -531,11 +599,7 @@ def run_attention(
             f"{Hq} query heads over {Hkv} KV heads at run_attention over a plan built for {planned.heads[0]} over "
             f"{planned.heads[1]} (one unit per KV head: the table does not cover other head counts)"
         )
-    assert (
-        q.dtype == torch.bfloat16
-        and k_cache.dtype == torch.bfloat16
-        and v_cache.dtype == torch.bfloat16
-    )
+    assert q.dtype == torch.bfloat16
     assert q.is_contiguous(), "Q must be a packed (total_q, Hq, D) tensor"
     if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1:
         raise ValueError(
@@ -546,10 +610,12 @@ def run_attention(
             raise ValueError(
                 f"{name} must be 16-byte aligned (the TMA descriptors' requirement); its base address is not"
             )
+    elems16 = 16 // k_cache.element_size()  # elements per 16 bytes (8 bf16, 16 fp8)
     for name, t in (("k_cache", k_cache), ("v_cache", v_cache)):
-        if any(st % 8 for st in t.stride()[:-1]):
+        if any(st % elems16 for st in t.stride()[:-1]):
             raise ValueError(
-                f"{name} outer strides must be multiples of 8 elements (16 bytes: the TMA descriptors' requirement); got {tuple(t.stride())}"
+                f"{name} outer strides must be multiples of {elems16} elements (16 bytes: the TMA descriptors' and the 16-byte "
+                f"loads' requirement); got {tuple(t.stride())}"
             )
     supplied_out = out is not None
     if out is None:
@@ -563,7 +629,8 @@ def run_attention(
         raise ValueError(
             "out must not alias the K / V cache: CTAs store output rows while others still read pages"
         )
-    c = check_sm_scale(sm_scale)
+    c = check_sm_scale(sm_scale, 1.0 if k_scale is None else k_scale)
+    vs = check_v_scale(1.0 if v_scale is None else v_scale)
     return _run_attention_validated(
         planned,
         q,
@@ -577,6 +644,8 @@ def run_attention(
         out,
         config,
         ragged,
+        kv_fmt,
+        vs,
     )
 
 
@@ -593,13 +662,21 @@ def _run_attention_validated(
     out: torch.Tensor,
     config: AttnConfig,
     ragged: bool,
+    kv_fmt: str = "bf16",
+    vs: float = 1.0,
 ) -> torch.Tensor:
-    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale."""
+    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale (the key scale inside it for
+    the fp8-KV classes), ``vs`` the binary32 value scale (1.0 for the bf16 class, whose kernels ignore it), ``kv_fmt`` the cache
+    format (``spec.KV_FMTS``): the fp8 caches reach the kernels as byte tensors of the cache's geometry."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
 
     total_q, Hq, D = q.shape
+    lowbit = kv_fmt != "bf16"
+    if lowbit:
+        k_cache = k_cache.view(torch.uint8)
+        v_cache = v_cache.view(torch.uint8)
     if ragged:
         page = TILE_KEYS
         Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
@@ -624,7 +701,11 @@ def _run_attention_validated(
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"
     )
-    n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
+    n_pad = (
+        swaps_n_pad(plan)
+        if (config.small == "swap" and D in SWAPS_DIMS and not lowbit)
+        else 0
+    )
     if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
         from .swaps.compile import get_compiled_swaps
 
@@ -655,11 +736,18 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body (same bits)
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, 1, False, ragged
+                D, g, page, config.kv_slots, 1, False, ragged, kv_fmt
             )
         else:
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, config.softmax_wgs, config.q2, ragged
+                D,
+                g,
+                page,
+                config.kv_slots,
+                config.softmax_wgs,
+                config.q2,
+                ragged,
+                kv_fmt,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -688,6 +776,7 @@ def _run_attention_validated(
             kv_indices,
             float(c),
             float(-c),
+            float(vs),
             int(window_left),
             int(n_launch if n_launch is not None else plan.num_units),
             int(grid),
@@ -695,12 +784,13 @@ def _run_attention_validated(
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g)(
+        get_fixup(D, g, lowbit)(
             planned.ws,
             o_view,
             planned.fixup_groups,
             float(c),
             float(-c),
+            float(vs),
             int(window_left),
             int(Hq),
             int(len(fx)),
@@ -724,8 +814,11 @@ def attention_paged(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     workspace: Optional[torch.Tensor] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
 ) -> torch.Tensor:
-    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned)."""
+    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned); an fp8 cache runs the fp8-KV class
+    of its dtype with the per-tensor ``k_scale`` / ``v_scale``."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -742,6 +835,7 @@ def attention_paged(
         config,
         workspace,
         q.device,
+        kv_fmt=kv_format(k_cache.dtype),
     )
     return run_attention(
         planned,
@@ -755,4 +849,6 @@ def attention_paged(
         kv_layout,
         out,
         config,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
