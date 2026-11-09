@@ -117,6 +117,7 @@ class BatchInvariantMoeRunner(MoERunner):
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
+        self._scale: Optional[torch.Tensor] = None
         """The chain of the layer's activation (``spec.ActSpec``: gating, chain name, binary32 parameters)."""
         from .spec import activation_of
 
@@ -178,6 +179,16 @@ class BatchInvariantMoeRunner(MoERunner):
     # ---- inputs ----------------------------------------------------------------------------------------------------
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         x = act.hidden_states_q
+    def _scale_tensor(self) -> torch.Tensor:
+        """The routed scaling factor as a one-element fp32 tensor on the runner's device, built once with a blocking copy
+        (the route kernel reads it as given: no per-call fill, no process-wide cache keyed by the value)."""
+        if self._scale is None:
+            v = self.config.routing.routed_scaling_factor
+            self._scale = torch.tensor(
+                [1.0 if v is None else float(v)], dtype=torch.float32
+            ).to(self.device)
+        return self._scale
+
         return x.ndim == 2 and x.dtype == torch.bfloat16 and x.shape[1] % 8 == 0
 
     def pack_inputs(
@@ -254,9 +265,7 @@ class BatchInvariantMoeRunner(MoERunner):
                     "a routing bias" if bias is not None else "no routing bias",
                     "a bias exactly for the methods that select on sigmoid(l) + bias",
                 )
-            scale = cfg.routing.routed_scaling_factor if self._method.scaled else None
-            if self._method.scaled and scale is None:
-                scale = 1.0
+            scale = self._scale_tensor() if self._method.scaled else None
             from .blocks.scheduler import MAX_E
             from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
 
