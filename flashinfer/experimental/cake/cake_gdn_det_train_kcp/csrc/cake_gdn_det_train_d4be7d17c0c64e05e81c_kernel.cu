@@ -294,7 +294,7 @@ kernel_cake_gdn_det_train_d4be7d17c0c64e05e81c(const __grid_constant__ CUtensorM
                     float _exp_0 = expf(g_c);
                     float eg_own = _exp_0 * scale;
                     unsigned int src_l = do_s_addr + do_stage * 24576 + do_row_l;
-                    long long dog_l = ((long long)(row0_c + wq * 16 + rsel) * nh64 + h64) * 128 + (long long)col_l;
+                    long long dog_l = ((long long)(row0_c + wq * 16 + rsel) * nh64 + h64) * 128ll + (long long)col_l;
                     #pragma unroll
                     for (int c = 0; c < 8; c++) {
                         float eg_c = __shfl_sync(0xFFFFFFFF, eg_own, 2 * c + rsel);
@@ -357,7 +357,7 @@ kernel_cake_gdn_det_train_d4be7d17c0c64e05e81c(const __grid_constant__ CUtensorM
                                 pk[_lp + 3] = *(uint32_t*)&_bf2;
                             }
                         }
-                        reinterpret_cast<int4*>(do_g + (dog_l + (long long)c * (nh64 * 256)))[0] = reinterpret_cast<int4*>(pk)[0];
+                        reinterpret_cast<int4*>(do_g + (dog_l + (long long)c * (nh64 * 256ll)))[0] = reinterpret_cast<int4*>(pk)[0];
                     }
                     mbarrier_arrive(tiles_empty_addr + (do_stage) * 8);
                     do_stage += 1;
@@ -365,7 +365,7 @@ kernel_cake_gdn_det_train_d4be7d17c0c64e05e81c(const __grid_constant__ CUtensorM
                     mbarrier_wait(acc_full_addr + (epi_buf) * 8, _phase_acc_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int buf_col = (int)epi_buf * 128;
-                    long long dvi_base = ((long long)(row0_c + s_row) * nh64 + h64) * 128 + (long long)col_half;
+                    long long dvi_base = ((long long)(row0_c + s_row) * nh64 + h64) * 128ll + (long long)col_half;
                     #pragma unroll
                     for (int blk = 0; blk < 4; blk++) {
                         float _tmem_load_0[16];

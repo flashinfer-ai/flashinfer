@@ -297,7 +297,7 @@ kernel_cake_gdn_det_train_a44997811b71d9d83fb4_kcp(const __grid_constant__ CUten
             int dht_slot = dht_index[seg];
             if (dht_slot >= 0) {
                 int dht_tile = (head / dht_hg * dht_n + dht_slot) * dht_hg + head % dht_hg;
-                long long dht_base = (long long)dht_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128 + vbase);
+                long long dht_base = (long long)dht_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128 + vbase);
                 #pragma unroll
                 for (int blk = 0; blk < 4; blk++) {
                     #pragma unroll
@@ -339,7 +339,7 @@ kernel_cake_gdn_det_train_a44997811b71d9d83fb4_kcp(const __grid_constant__ CUten
             unsigned int dvi_c[16];
             if (nc > 0) {
                 int trow_s = row0 + (nc - 1) * 64 + t_row;
-                long long t_base_s = ((long long)trow_s * (long long)num_heads + (long long)head) * 128 + (long long)vbase;
+                long long t_base_s = ((long long)trow_s * (long long)num_heads + (long long)head) * 128ll + (long long)vbase;
                 #pragma unroll
                 for (int blk_2 = 0; blk_2 < 2; blk_2++) {
                     {
@@ -355,10 +355,10 @@ kernel_cake_gdn_det_train_a44997811b71d9d83fb4_kcp(const __grid_constant__ CUten
             for (int rc = 0; rc < nc; rc++) {
                 int c = nc - 1 - rc;
                 int gc = c0 + c;
-                long long dh_base = ((long long)gc * (long long)num_heads + (long long)head) * 16384 + (long long)(k_row * 128 + vbase);
+                long long dh_base = ((long long)gc * (long long)num_heads + (long long)head) * 16384ll + (long long)(k_row * 128 + vbase);
                 float decay = gamma[(long long)gc * (long long)num_heads + (long long)head];
                 int trow = row0 + c * 64 + t_row;
-                long long t_base = ((long long)trow * (long long)num_heads + (long long)head) * 128 + (long long)vbase;
+                long long t_base = ((long long)trow * (long long)num_heads + (long long)head) * 128ll + (long long)vbase;
                 unsigned int dh4_bf16[32];
                 #pragma unroll
                 for (int g = 0; g < 1; g++) {
@@ -467,7 +467,7 @@ kernel_cake_gdn_det_train_a44997811b71d9d83fb4_kcp(const __grid_constant__ CUten
                 }
                 int c_n = ((c > 0) ? c - 1 : 0);
                 int trow_n = row0 + c_n * 64 + t_row;
-                long long t_base_n = ((long long)trow_n * (long long)num_heads + (long long)head) * 128 + (long long)vbase;
+                long long t_base_n = ((long long)trow_n * (long long)num_heads + (long long)head) * 128ll + (long long)vbase;
                 #pragma unroll
                 for (int blk_5 = 0; blk_5 < 2; blk_5++) {
                     {
