@@ -269,13 +269,16 @@ ONE_TILE_ROWS = {
 }
 # Rows whose plan, launch and gradients the narrow-tile tests check per route:
 # C 576 / 640 below every token floor of ``FWD_NARROW_FLOORS`` (S = 4097) and
-# above every floor (S = 40961, the forward on ``FWD_WIDE_SPLIT_TABLE``).
+# above every floor (S = 40961, the forward on ``FWD_WIDE_SPLIT_TABLE``), and
+# C 576 at S = 65536, from every token floor of the default backward's SM-wide
+# band (``BWD_SM_CTA_RULE``).
 NARROW_CASES = (
     (1000, 224, "perf"),
     (4097, 576, (1000, 0, 3, 3094)),
     (4097, 640, (1000, 0, 3, 3094)),
     (40961, 576, (1000, 0, 3, 39958)),
     (40961, 640, (1000, 0, 3, 39958)),
+    (65536, 576, "perf"),
     (4097, 1016, (1000, 0, 3, 3094)),
 )
 # The call settings that resolve to each backward route (the forward route
@@ -1496,7 +1499,8 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
     rows = [
         (S, docs, C) for S, docs in ((5, (2, 0, 3)), (1000, "perf")) for C in channels
     ]
-    # A token-floored program runs from its floor only: both sides of the floor at its channel threshold.
+    # A token-floored program runs from its floor only: both sides of the floor at its channel threshold, and
+    # at the floor the top channel count of its band (below the route's next threshold).
     for floored, floor in _token_floors(arch, kind).values():
         rows += [
             (S, "perf", C)
@@ -1504,6 +1508,10 @@ def test_backward_programs_switch_on_channel_count(kind) -> None:
             for S in (floor - 8, floor)
             for C in (T - 8, T, T + 8)
         ]
+        for T in floored:
+            end = min((t for t in thresholds if t > T), default=None)
+            if end is not None and end - 8 > T + 8:
+                rows.append((floor, "perf", end - 8))
     launched = set()
     for S, docs, C in rows:
         selected = loader.selected_modules(arch, kind, C=C, S=S)
@@ -2134,10 +2142,12 @@ def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
     """On the narrow single-tile rows each route launches its route's plan
     (``NARROW_SPLIT_TABLE`` on the ``NARROW_TILE_ROUTES``, one tile elsewhere;
     the forward's C 576 / 640 on ``FWD_WIDE_SPLIT_TABLE`` from the device
-    architecture's ``FWD_NARROW_FLOORS`` floor) for the backward and for the
-    forward its inputs select; ``y`` and ``dx`` are bitwise the one-tile
-    plan's, ``dweight`` / ``dbias`` are bitwise reproducible and within the
-    route's tolerance of the reference."""
+    architecture's ``FWD_NARROW_FLOORS`` floor; the default backward's SM-wide
+    band rows from its ``BWD_SM_CTA_RULE`` floor on that program's plan, one
+    whole channel tile of ``threads // (C / 8)`` sub-tiles) for the backward
+    and for the forward its inputs select; ``y`` and ``dx`` are bitwise the
+    one-tile plan's, ``dweight`` / ``dbias`` are bitwise reproducible and
+    within the route's tolerance of the reference."""
 
     _require_route(kind)
     fwd_kind = FORWARD_OF[kind]
@@ -2329,7 +2339,8 @@ def test_workspace_bytes_and_layout() -> None:
     device = _device()
     arch = _arch()
     # The capacity owner: the backward program of the largest grid_mult x ctas_per_sm x taps over every
-    # backward route sizes the public buffer (every owner of the routes' fallback geometry shares it, so
+    # backward route of the routes' fallback geometry (the SM-wide program, below, can need more in its
+    # bands) sizes the public buffer (every owner of the routes' fallback geometry shares it, so
     # their rows differ by grid_mult x ctas_per_sm alone -- grid_mult over-decomposes the token streams and
     # the partial rows grow with it -- and their bytes by that times taps).
     record = loader.workspace_record(arch)
