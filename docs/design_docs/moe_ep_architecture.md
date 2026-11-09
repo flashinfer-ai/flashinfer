@@ -571,6 +571,123 @@ handoff, with a different rounding contract.
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
 BF16-activation backends ignore `quantize_input` and copy BF16 inputs.
 
+## Training and rollout forward contract
+
+The training interface chooses **recompute for backward** (option C in
+[#7936](https://github.com/flashinfer-ai/flashinfer/issues/7936)). Both callers use
+the same `MoEEpMegaLayer.forward(MoEEpTensors(...))`. FlashInfer supplies the
+forward value; the trainer owns autograd, saved training inputs, recomputation,
+the backward recipe, and optimizer updates. This does not claim that a BF16
+surrogate backward is the derivative of a quantized forward. Value inputs that
+require gradients are detached at the FFI boundary without changing the
+caller's tensors or their storage.
+
+### Communication and tensor layout
+
+`MoEEpMegaLayer` owns dispatch, expert computation, and combine for the complete
+EP group. Every rank participates, including ranks with no live tokens. A
+trainer that already dispatched rows must instead use a local routed expert
+interface, such as `flashinfer.fused_moe.MoELayer` with its documented routing
+mode. Feeding those rows into a full EP layer would dispatch them again.
+
+Let `T` be this rank's live tokens, `H` the hidden size, `I` the post-activation
+intermediate size, `K` top-k, and `E_local` the number of experts on the rank.
+For the BF16 and MXFP8 CuTe-DSL paths covered by this contract:
+
+| Value | Logical layout and meaning |
+| --- | --- |
+| `hidden_states` | Contiguous `[T, H]` BF16 before input quantization; rows are in source-token order. Prequantized MXFP8 uses the selected backend's FP8 dtype and `scales`, with `quantize_input=False`. |
+| `topk_ids` | Contiguous `[T, K]` int64 global expert IDs, with `-1` for a masked route. Slot order is significant. |
+| `topk_weights` | Contiguous `[T, K]` FP32 routing probabilities. Supply the final routing weights; the layer does not reproduce the router's softmax or normalize these weights. |
+| Canonical `w13` | `[E_local, 2 * I, H]`, **gate followed by up** along the second axis. |
+| Canonical `w2` | `[E_local, H, I]`, the down projection. Experts occupy the rank's contiguous global expert range. |
+| MXFP8 weight scales | Before packing: `[E_local, 2 * I, ceil(H / 32)]` and `[E_local, H, ceil(I / 32)]`, UE8M0 (or its uint8 bit representation). Each scale describes 32 consecutive reduction-axis elements. |
+| Final output | BF16 `[T, H]` in source-token order. `MoEEpTensors.output` may supply storage. |
+
+Use the public `preprocess_bf16_cutedsl_mega_weights` or
+`preprocess_mxfp8_cutedsl_mega_weights` helper for the selected variant. The
+helpers convert canonical gate/up ordering into the backend's interleaved FC1
+layout, transpose projections and, for MXFP8, pack scale factors. Prequantized
+payloads and scales are only rearranged, never requantized. Do not interchange
+these buffers with `fused_moe` weights: that API has its own gate/up and scale
+layout contract. Backend validators remain authoritative for alignment,
+padding, and supported geometry.
+
+### Quantization, routing, and reduction
+
+BF16 weights are prepared once into a detached snapshot; BF16 activations are
+staged without FP8 quantization. FC1 computes gate/up, applies the configured
+activation and clamps, and rounds its handoff to BF16 before FC2. MXFP8 instead
+quantizes weights at preparation, inputs at staging, and the FC1 activation
+before FC2, using per-32 reduction-axis blocks and UE8M0 scales. Already
+quantized inputs bypass staging quantization. The weight/input/activation
+quantizer, activation kind, clamp parameters, scale rounding, `kind`, and
+kernel variant are all part of the recipe; changing any of them selects a
+different numerical contract. MXFP8 is not ordinary per-tensor or 128-blockwise
+FP8.
+
+With `apply_routing_weights_before_fc2=True`, routing weights multiply the
+activated FC1 value before the BF16/MXFP8 handoff to FC2. With it disabled,
+routing is deferred to the completed FC2 output/finalizer according to the
+selected backend. Moving that multiplication across quantization or BF16
+rounding changes results. The backend's finalizer also fixes the order of
+top-k accumulation, FP32 multiplication/FMA, and any per-rank rounding. An
+external `sum` or differently ordered scatter-add is not a replacement with
+a bitwise guarantee.
+
+The reproducible profile uses `FinalizeMode.DEFAULT`, fixed resolved knobs,
+`fast_math=False`, and `enable_in_kernel_fc2_reduce=False` (including the
+corresponding resolved knob). For MXFP8 GenPhase, pin tile, cluster, and
+schedule policy as well. Both callers must use the same source revision,
+device architecture, compiler/runtime, capacity profile, EP partition, live
+inputs, ordered routing, prepared weight bits, and complete resolved backend
+configuration. Independent online tuning is outside this guarantee. Equality
+is between trainer and rollout calls to that same implementation, not between
+BF16 and MXFP8, different variants, arbitrary GEMM libraries, or releases.
+
+### Ownership, refresh, and capture
+
+`forward` returns an owned output by default. An explicitly supplied output or
+`return_workspace_view=True` follows caller/workspace lifetime instead. A
+captured graph writes its captured output on every replay, so copy a value
+that must survive another replay. Workspaces are not reentrant; order their
+uses across streams.
+
+`forward_unfinalized` requires `FinalizeMode.NONE` and returns borrowed BF16
+`[T * K, H]` rows, FP32 `[T, K]` remaining weights, and an int32 `[T, K]`
+route-to-row map. The weights are ones if early routing already applied them.
+Consume or clone **all three** before another use of the pooled workspace.
+This interface does not save backward intermediates. Use the ordinary owned
+forward for the recompute training contract.
+
+After an optimizer step, checkpoint load, or parameter swap, call
+`layer.refresh_weights(weights)` explicitly. It prepares a new snapshot then
+copies into the existing buffers without changing their addresses. The public
+preprocessing helpers also accept `out=previous_result`. Both FC1 and FC2 are
+independent of the source parameters; updating a parameter alone leaves the
+previous forward snapshot intact. Refresh preserves prequantized payload bits
+and checks all destination metadata and overlap before copying.
+
+Refresh is asynchronous on the current stream and may allocate scratch. Run it
+outside capture, after previous readers and parameter writes, and before the
+next forward or replay on every reader stream. Do not refresh between
+`stage_inputs` and `compute_staged`. Every EP rank must complete a successful
+refresh before the next collective forward. Warm up and allocate workspaces on
+all ranks before capture; destroy the layer collectively after graphs and GPU
+work referencing it have retired.
+
+### Executable acceptance
+
+`tests/moe_ep/test_mega_training_forward.py` compares a PyTorch checkpoint-based
+trainer value-forward against an independently loaded rollout snapshot with
+exact byte equality. It covers BF16, MXFP8 legacy/next/GenPhase, optimizer
+updates, stale-snapshot isolation, explicit refresh, and CUDA graph replay with
+stable weight/output addresses. Backward is recomputed by the trainer and
+checked for finite, nonzero gradients. `test_mega_weight_refresh.py` covers
+refresh validation and ownership; prequantized cases preserve E4M3/E5M2
+payload bits. These are single-GPU tests, not evidence of an end-to-end
+Megatron/NeMo training run or an ordinary FP8 contract from #7935.
+
 ## Runtime
 
 Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True` (default), layers acquire a ref-counted process runtime and release it in `destroy()`.

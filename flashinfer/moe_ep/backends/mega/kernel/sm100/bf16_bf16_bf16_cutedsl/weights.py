@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
+from ......core.kernel.weight_snapshot import (
+    check_weight_refresh,
+    finish_weight_snapshot,
+)
 from ......weights import MoEWeightPack
 
 if TYPE_CHECKING:
@@ -28,7 +32,7 @@ def _interleave_gate_up_32(
     if intermediate_size % 32:
         raise ValueError("intermediate_size must be divisible by 32.")
     gate, up = w13[:, :intermediate_size], w13[:, intermediate_size:]
-    out = torch.empty_like(w13)
+    out = torch.empty_like(w13, memory_format=torch.contiguous_format)
     out.view(w13.shape[0], intermediate_size // 32, 2, 32, w13.shape[2])[:, :, 0].copy_(
         gate.view(w13.shape[0], intermediate_size // 32, 32, w13.shape[2])
     )
@@ -43,10 +47,22 @@ def preprocess_mega_weights(
     *,
     intermediate_size: int,
     hidden_size: int,
+    out: TransformedMegaWeights | None = None,
 ) -> TransformedMegaWeights:
-    """Convert canonical BF16 weights to the kernel's K-major layouts."""
+    """Prepare an owned BF16 snapshot from canonical gate||up and down weights.
+
+    Both projections are detached from the source parameters. Updating those
+    parameters does not update this snapshot. After an optimizer step or refit,
+    pass ``out=previous_result`` to refresh it without changing tensor addresses,
+    or use ``MoEEpMegaLayer.refresh_weights``. Source and destination must not
+    overlap; all destination shapes, strides, dtypes and devices must match,
+    and destination tensors must be 16-byte aligned.
+    Refresh outside CUDA graph capture, ordered after earlier readers and before
+    the next forward/replay. Preparation may allocate temporary storage.
+    """
     import torch
 
+    check_weight_refresh(out)
     expected_w13 = (weights.w13.shape[0], 2 * intermediate_size, hidden_size)
     expected_w2 = (weights.w2.shape[0], hidden_size, intermediate_size)
     if (
@@ -59,9 +75,16 @@ def preprocess_mega_weights(
         )
     if weights.w13.dtype != torch.bfloat16 or weights.w2.dtype != torch.bfloat16:
         raise ValueError("BF16 MegaMoE requires bfloat16 canonical weights.")
-    fc1 = _interleave_gate_up_32(weights.w13, intermediate_size).transpose(1, 2)
-    fc2 = weights.w2.transpose(1, 2)
-    return (fc1, None), (fc2, None)
+    if weights.w13.device != weights.w2.device:
+        raise ValueError("BF16 MegaMoE weights must be on the same device.")
+    if weights.w13_scale is not None or weights.w2_scale is not None:
+        raise ValueError("BF16 MegaMoE weights must not supply quantization scales.")
+    with torch.no_grad():
+        fc1 = _interleave_gate_up_32(weights.w13, intermediate_size).transpose(1, 2)
+        # Canonical input may be a slice of a larger parameter allocation.
+        # Materialize before transposing so the native K-major stride is stable.
+        fc2 = weights.w2.clone(memory_format=torch.contiguous_format).transpose(1, 2)
+        return finish_weight_snapshot(((fc1, None), (fc2, None)), weights, out=out)
 
 
 def validate_transformed_mega_weights(
