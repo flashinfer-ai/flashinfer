@@ -180,15 +180,18 @@ The main program splits each lane into units of `M` tokens
 (`kcp_jit.dyn_plan`). Lane `j` starts at token `j x NL x M` (`NL` units per
 lane), and a CTA whose lane is done takes units from the ends of the other
 lanes. When 64-token units leave the last lane of each channel tile empty,
-`M` is 64: the idle CTAs take units from the start, and small units balance
-the lanes best. Otherwise every lane is busy and `M` is the multiple of 8 from
+`M` is 64, or 56 (`kcp_jit.DYN_IDLE_UNIT`) when 56-token units leave more
+idle CTAs (the grid's CTAs less the lanes that have tokens; 64 on a tie):
+the idle CTAs take units from the start, and small units balance the lanes
+best. Otherwise every lane is busy and `M` is the multiple of 8 from
 64 to 128 with the least lane cost: the lane bound `NL x M` tokens plus 3.2
 tokens per unit, plus 0.3 x `M` tokens for the last unit, which the other CTAs
 finish when an SM is busy. Only the plans whose lanes' claim counts fit the
 kernel's 16-bit fields count; when none of them fits (very long sequences),
 `M` doubles from 256 until a plan fits. One 10240-channel tensor of 32768
 tokens per rank gets 104 on a 148-SM B200 and 64 on GB300, GB200 and VR200;
-8192 channels of 16384 tokens get 64 on all four.
+8192 channels of 16384 tokens get 64 on B200, GB300 and GB200, and 56 on the
+212-SM VR200 (16 idle CTAs instead of 4).
 
 Under any of these conditions, the one-program backward (`kcp_bwd`) runs after the wait instead:
 

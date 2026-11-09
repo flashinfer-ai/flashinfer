@@ -894,12 +894,19 @@ LOGICAL_SCALARS = (*_zero_history.LOGICAL_SCALARS, "M", "NL", "P", "L", "n_ctas"
 # in tenths of a token per token of a unit: a lane's last unit is the granule
 # at which the other CTAs finish a lane whose SM is busy (a held SM or another
 # stream's kernel); on B200, 112-token units of 3 x 8192 channels lose 2-6%
-# against 64-token units with 16 or 32 SMs held.
+# against 64-token units with 16 or 32 SMs held.  ``DYN_IDLE_UNIT``: the
+# smaller unit of a plan whose 64-token lanes leave lanes idle, taken when it
+# leaves more CTAs without a lane of their own (the CTAs that start by taking
+# units from the other lanes absorb the SMs another stream holds): on VR200
+# (212 SMs), 3 x 8192 channels of 16384 tokens leave 16 such CTAs with 56-token
+# units against 4 with 64-token units, and the backward with 16 / 32 SMs held
+# ran 1.130x / 1.055x faster (other phases within 0.5%).
 DYN_TILE = 2048
 DYN_TILE_WORDS = 8
 DYN_MAX_LANES = 256
 DYN_MAX_CHANNELS = 32 * DYN_TILE
 DYN_UNIT = 64
+DYN_IDLE_UNIT = 56
 DYN_UNIT_COST_TENTHS = 32
 DYN_TAIL_COST_TENTHS = 3
 
@@ -1071,9 +1078,11 @@ def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
     :data:`DYN_MAX_LANES` lanes in all), each of ``NL`` units of ``M`` tokens, ``L`` lanes, ``n_ctas = max(L, sms)``
     CTAs (the grid) and ``n_tiles``.  Lane ``j`` of a tile starts at token ``j * NL * M``, and a CTA whose lane is
     done takes units from the ends of the other lanes.  When the plan of :data:`DYN_UNIT` tokens leaves the last
-    lane of each tile without tokens (``ceil(S / (NL * M)) < P``), that plan is taken: the empty lanes' CTAs and the
-    spare CTAs take units from the start, and the small units balance the lanes better than larger units shorten
-    them.  Otherwise every lane is busy, the lane bound sets the time, and ``M`` is the multiple of 8 from
+    lane of each tile without tokens (``ceil(S / (NL * M)) < P``), that plan is taken, or the plan of
+    :data:`DYN_IDLE_UNIT` tokens when it leaves more idle CTAs (``n_ctas`` less the lanes with tokens; the
+    :data:`DYN_UNIT` plan on a tie): the empty lanes' CTAs and the spare CTAs take units from the start, and the
+    small units balance the lanes better than larger units shorten them.  Otherwise every lane is busy, the lane
+    bound sets the time, and ``M`` is the multiple of 8 from
     :data:`DYN_UNIT` to twice it whose plan fits the lanes' 16-bit claim counts at the least lane cost ``NL * M``
     tokens plus ``NL`` units of :data:`DYN_UNIT_COST_TENTHS` plus the tail's ``M`` tokens of
     :data:`DYN_TAIL_COST_TENTHS` (the smaller ``M`` on a tie); when none fits, ``M`` doubles from
@@ -1096,9 +1105,17 @@ def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
             return None
         return {"M": M, "NL": NL, "P": P, "L": L, "n_ctas": n_ctas, "n_tiles": n_tiles}
 
+    def idle_ctas(p: dict[str, int]) -> int:
+        """The plan's CTAs without a lane of their own that has tokens."""
+        return p["n_ctas"] - p["n_tiles"] * min(p["P"], -(-S // (p["NL"] * p["M"])))
+
     base = plan_for(DYN_UNIT)
     if base is not None and -(-S // (base["NL"] * DYN_UNIT)) < base["P"]:
-        # measured on GB300, GB200 and VR200: with idle lanes, 64-token units beat the larger units the cost picks
+        # measured on GB300, GB200 and VR200: with idle lanes, 64-token units beat the larger units the cost picks;
+        # 56-token units that leave more CTAs idle absorb held SMs better (VR200, DYN_IDLE_UNIT)
+        small = plan_for(DYN_IDLE_UNIT)
+        if small is not None and idle_ctas(small) > idle_ctas(base):
+            return small
         return base
     fits = [
         p for p in map(plan_for, range(DYN_UNIT, 2 * DYN_UNIT + 1, 8)) if p is not None
@@ -1232,9 +1249,11 @@ __all__ = [
     "DYN_MAX_LANES",
     "DYN_TILE",
     "DYN_TILE_WORDS",
+    "DYN_IDLE_UNIT",
     "DYN_UNIT",
     "DYN_TAIL_COST_TENTHS",
     "DYN_UNIT_COST_TENTHS",
+    "FWD_HALO_KIND",
     "HALO",
     "HALO_KIND",
     "INT32_MAX",
@@ -1253,7 +1272,6 @@ __all__ = [
     "dyn_applies",
     "dyn_plan",
     "dyn_workspace_layout",
-    "FWD_HALO_KIND",
     "head_grid",
     "launch_grid",
     "library_name",

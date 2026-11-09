@@ -367,8 +367,9 @@ def test_dyn_plan_meets_the_kernel_requirements(sms) -> None:
 
 @pytest.mark.cpu_only
 def test_dyn_plan_unit_size() -> None:
-    """:func:`kcp_jit.dyn_plan` takes the 64-token plan when it leaves the last lane of each tile without tokens;
-    otherwise the unit size ``M`` (a multiple of 8 from 64 to 128) whose fitting plan has the least lane cost
+    """:func:`kcp_jit.dyn_plan` takes the 64-token plan when it leaves the last lane of each tile without tokens,
+    or the 56-token plan (``DYN_IDLE_UNIT``) when that one leaves more idle CTAs (``n_ctas`` less the lanes with
+    tokens; the 64-token plan on a tie); otherwise the unit size ``M`` (a multiple of 8 from 64 to 128) whose fitting plan has the least lane cost
     ``NL * M`` tokens plus ``NL`` fixed unit costs plus a tail cost per token of a unit, the smaller ``M`` on a tie;
     above that range it doubles ``M`` from 256 until the claim counts fit."""
 
@@ -380,18 +381,20 @@ def test_dyn_plan_unit_size() -> None:
     # channels, 32768 tokens (P 29: 11 units of 104 tokens, 11 * 1072 + 3 * 104 = 12104, against 13 x 88: 12120
     # and 18 x 64: 12288) and 8192 channels, 16384 tokens (P 37: 7 x 64, 7 * 672 + 192 = 4896, against 4 x 112:
     # 4944).  152 SMs (GB300, GB200) and 212 SMs (VR200): the 64-token lanes of 1152, 448, 832 and 320 tokens fill
-    # 29 of 30, 37 of 38, 40 of 42 and 52 of 53 lanes, so M is 64.
+    # 29 of 30, 37 of 38, 40 of 42 and 52 of 53 lanes, so M is 64 unless 56-token lanes leave more CTAs idle: they
+    # leave 7, 4 (a tie), 2 and 16 idle against 7, 4, 12 and 4, so only the last (VR200, 8192 channels) takes
+    # 6 units of 56 tokens (49 of 53 lanes busy).
     for (S, C, sms), want in (
         ((32768, 10240, 148), {"M": 104, "NL": 11, "P": 29, "L": 145, "n_ctas": 148}),
         ((16384, 8192, 148), {"M": 64, "NL": 7, "P": 37, "L": 148, "n_ctas": 148}),
         ((32768, 10240, 152), {"M": 64, "NL": 18, "P": 30, "L": 150, "n_ctas": 152}),
         ((16384, 8192, 152), {"M": 64, "NL": 7, "P": 38, "L": 152, "n_ctas": 152}),
         ((32768, 10240, 212), {"M": 64, "NL": 13, "P": 42, "L": 210, "n_ctas": 212}),
-        ((16384, 8192, 212), {"M": 64, "NL": 5, "P": 53, "L": 212, "n_ctas": 212}),
+        ((16384, 8192, 212), {"M": 56, "NL": 6, "P": 53, "L": 212, "n_ctas": 212}),
     ):
         p = kcp_jit.dyn_plan(S, C, sms)
         assert {k: p[k] for k in want} == want, (S, C, sms, p)
-    branches = {"idle": 0, "cost": 0, "doubling": 0}
+    branches = {"idle": 0, "idle_unit": 0, "cost": 0, "doubling": 0}
     for sms in (132, 148, 152, 188, 212):
         for C in (8, 2048, 8192, 10240, 65536):
             n_tiles = -(-C // kcp_jit.DYN_TILE)
@@ -412,10 +415,20 @@ def test_dyn_plan_unit_size() -> None:
                 p = {k: p[k] for k in ("M", "NL", "P", "L", "n_ctas")}
                 fits = [q for q in map(plan_for, range(64, 129, 8)) if q is not None]
                 label = (sms, C, S, p)
+
+                def idle(q):
+                    busy = min(q["P"], -(-S // (q["NL"] * q["M"])))
+                    return q["n_ctas"] - n_tiles * busy
+
                 base = plan_for(64)
                 if base is not None and -(-S // (base["NL"] * 64)) < base["P"]:
-                    branches["idle"] += 1
-                    assert p == base, label
+                    small = plan_for(56)
+                    if small is not None and idle(small) > idle(base):
+                        branches["idle_unit"] += 1
+                        assert p == small, label
+                    else:
+                        branches["idle"] += 1
+                        assert p == base, label
                 elif fits:
                     branches["cost"] += 1
                     best = min(lane_cost(q) for q in fits)
