@@ -140,9 +140,11 @@ lanes. When 64-token units leave the last lane of each channel tile empty,
 the lanes best. Otherwise every lane is busy and `M` is the multiple of 8 from
 64 to 128 with the least lane cost: the lane bound `NL x M` tokens plus 3.2
 tokens per unit, plus 0.3 x `M` tokens for the last unit, which the other CTAs
-finish when an SM is busy. One 10240-channel tensor of 32768 tokens per rank
-gets 104 on a 148-SM B200 and 64 on GB300, GB200 and VR200; 8192 channels of
-16384 tokens get 64 on all four.
+finish when an SM is busy. Only the plans whose lanes' claim counts fit the
+kernel's 16-bit fields count; when none of them fits (very long sequences),
+`M` doubles from 256 until a plan fits. One 10240-channel tensor of 32768
+tokens per rank gets 104 on a 148-SM B200 and 64 on GB300, GB200 and VR200;
+8192 channels of 16384 tokens get 64 on all four.
 
 Under any of these conditions, the one-program backward (`kcp_bwd`) runs after the wait instead:
 

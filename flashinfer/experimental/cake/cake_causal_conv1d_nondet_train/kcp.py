@@ -150,8 +150,9 @@ level (no check is made; a mismatch hangs or corrupts data).
 Several convolutions of one layer (FlashInfer issue #7815): ``cake_causal_conv1d_nondet_kcp_multi(xs, weights, ctx)``
 runs the convolutions of ``n`` tensors that share the context (a layer's q, k and v) with one halo exchange per
 direction instead of ``n``: the tensors' send rows travel side by side in one ``all_to_all_single``; after the wait,
-the tail-row programs of tensors of one width read them in place in the received pool, and other widths copy them out
-into each tensor's own contiguous pool; each tensor then runs the single call's kernels with the single call's
+when the backward runs the overlapped pair with more than one rank and all the tensors share one width, the tail-row
+programs read their rows in place in the received pool, and otherwise each tensor's rows are copied out into its own
+contiguous pool; each tensor then runs the single call's kernels with the single call's
 arguments (the tail-row program with its rows' offsets in the pool), so outputs and ``dx`` are bitwise one single
 call per tensor (``dweight`` is each tensor's own unordered partial).
 One recompute handle serves the whole call (its ``"conv"`` entry holds the ``n`` pools).  The multi path always
@@ -2057,8 +2058,12 @@ def _bwd_overlap(
     the side stream's join (``side``: the stream of the head program and the exchange issue, or ``None``), the wait,
     then the tail-row program."""
     args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx_out, S=S, C=C)
-    _launch_dyn(e["dyn"], dw_out=dw_out, spare=dpre_head, S=S, device=device, **args)
-    _join_side(side, device)
+    try:
+        _launch_dyn(
+            e["dyn"], dw_out=dw_out, spare=dpre_head, S=S, device=device, **args
+        )
+    finally:
+        _join_side(side, device)
     if work is not None:
         work.wait()
     _launch_halo(e["dyn"], tail_row_off=e["tail_row_off"], dpre_tail=dpre_tail, **args)
@@ -2412,30 +2417,25 @@ def _halos_in_place(
     Row ``r`` of tensor ``i`` sits at element ``(r * n + i) * C`` of the packed receive pool, so tensor ``i`` reads
     the pool from element ``i * C`` with its tail-row table scaled by ``n`` (no copy; the program addresses
     ``dpre_tail + row * C`` and needs a contiguous pool).  The scaled tables are made on the current stream once per
-    host-cache entry, with an event that a later call from another stream waits for (inside a CUDA-graph capture
-    they are made for the call only: a captured table holds its values only after a replay; a capture starts after
-    a device synchronization).  Then the first program runs on the current stream and the others on the device's
-    streams 1 .. n - 1, forked from it and joined back (the pool, allocated on the current stream, outlives the
-    join)."""
+    host-cache entry and calling stream, so a table is read only on the stream that allocated it and on streams
+    forked from it and joined back before its next launch: when the entry is dropped, the allocator reuses the
+    table only after those reads (inside a CUDA-graph capture they are made for the call only: a captured table
+    holds its values only after a replay).  Then the first program runs on the current stream and the others on
+    the device's streams 1 .. n - 1, forked from it and joined back (the pool, allocated on the current stream,
+    outlives the join)."""
     n = len(calls)
     capturing = torch.cuda.is_current_stream_capturing()
     current = torch.cuda.current_stream(device)
     tables = []
     for call in calls:
         e = call[8]
-        key = f"tail_row_off_x{n}"
-        hit = e.get(key)
-        if hit is None:
+        key = f"tail_row_off_x{n}@{current.cuda_stream:x}"
+        table = e.get(key)
+        if table is None:
             t = e["tail_row_off"]
             table = torch.where(t >= 0, t * n, t)
             if not capturing:
-                made = torch.cuda.Event()
-                made.record(current)
-                e[key] = (table, made, current.cuda_stream)
-        else:
-            table, made, stream_ptr = hit
-            if not capturing and stream_ptr != current.cuda_stream:
-                current.wait_event(made)
+                e[key] = table
         tables.append(table)
     streams = [current] + [_device_stream(device, i) for i in range(1, n)]
     for stream in streams[1:]:
@@ -2760,13 +2760,17 @@ def _kcp_backward_multi(
             dw.zero_()
         return dx_out, dw_out
     # The overlapped tensors' main programs run while the exchange is in flight; every other launch follows the wait.
-    for (S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), head in zip(
-        calls, heads, strict=True
-    ):
-        if e["dyn"] is not None:
-            args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx, S=S, C=C)
-            _launch_dyn(e["dyn"], dw_out=dw, spare=head, S=S, device=device, **args)
-    _join_side(side, device)
+    try:
+        for (S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), head in zip(
+            calls, heads, strict=True
+        ):
+            if e["dyn"] is not None:
+                args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx, S=S, C=C)
+                _launch_dyn(
+                    e["dyn"], dw_out=dw, spare=head, S=S, device=device, **args
+                )
+    finally:
+        _join_side(side, device)
     if work is not None:
         work.wait()
     if side is not None and len(calls) > 1 and len({c[1] for c in calls}) == 1:

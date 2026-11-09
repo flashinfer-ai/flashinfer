@@ -30,7 +30,9 @@ per-document one).  Per row and rank, for every tensor:
 - ``graph="replay"`` of the multi forward / backward: ``y`` / ``hist`` / ``dx`` bitwise the eager single calls on
   every call, ``dweight`` within budget, the deterministic suite's event sequence; and of the single backward of the
   first tensor (its head program and exchange issue on the side stream inside the capture): ``dx`` bitwise the eager
-  call, ``dweight`` within budget, events eager, capture, replay, replay.
+  call, ``dweight`` within budget, events eager, capture, replay, replay;
+- a main-program launch that raises after the fork (single and multi backward) still joins the side stream: the
+  error is the injected one and the current stream waits for work queued on the side stream before the call.
 
 Launch forms as the deterministic suite.  Skipped until the exporter renders the non-deterministic package.
 """
@@ -310,6 +312,40 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     return _report(W, row, flags, info, result_dir, rank, "nondet-multi")
 
 
+def _join_after_failed_launch(conv_kcp, ctx, device, call) -> bool:
+    """``call`` with the main-program launch raising, while the side stream sleeps from before the call: True when
+    the call raised the injected error and an event recorded on the current stream right after it is still pending
+    (the current stream waits for the side stream), or when the call launched no main program (no error)."""
+    if conv_kcp._side_stream(ctx, device, True) is None:
+        return True
+    side = conv_kcp._device_stream(device, 0)
+    torch.cuda.synchronize(device)
+    hits = []
+
+    def boom(*args, **kwargs):
+        hits.append(1)
+        raise RuntimeError("injected main-launch failure")
+
+    real = conv_kcp._launch_dyn
+    conv_kcp._launch_dyn = boom
+    err = None
+    try:
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(1 << 30)
+        call()
+    except RuntimeError as exc:
+        err = exc
+    finally:
+        conv_kcp._launch_dyn = real
+    done = torch.cuda.Event()
+    done.record(torch.cuda.current_stream(device))
+    pending = not done.query()
+    torch.cuda.synchronize(device)
+    if not hits:
+        return err is None
+    return err is not None and "injected main-launch failure" in str(err) and pending
+
+
 def _run_rank_graph(
     rank: int, W: int, row, port: int, result_dir, local_id: int
 ) -> dict:
@@ -355,6 +391,22 @@ def _run_rank_graph(
             torch.cuda.synchronize(device)
             single_ok = single_ok and _same(dx, dx0)
             worst = max(worst, _ratio(dw, dw0))
+        join_single = _join_after_failed_launch(
+            conv_kcp,
+            ctx,
+            device,
+            lambda: conv_kcp.cake_causal_conv1d_nondet_train_kcp_backward(
+                xs[0], ws[0], ctx, dys[0], hist0
+            ),
+        )
+        join_multi = _join_after_failed_launch(
+            conv_kcp,
+            ctx,
+            device,
+            lambda: conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_backward(
+                xs, ws, ctx, dys, hists
+            ),
+        )
     finally:
         torch.cuda.synchronize(device)
         conv_kcp.cake_causal_conv1d_nondet_train_kcp_graph_cache_clear()
@@ -383,6 +435,8 @@ def _run_rank_graph(
         "graph_events": events == expected,
         "graph_single_dx_bitwise": single_ok,
         "graph_single_events": single_events == single_expected,
+        "launch_error_joins_side_single": join_single,
+        "launch_error_joins_side_multi": join_multi,
     }
     info = {
         "events": events,
