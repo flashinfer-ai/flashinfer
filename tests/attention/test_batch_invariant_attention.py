@@ -1646,6 +1646,44 @@ def test_noncausal_paged_equals_ragged(D, page):
 
 @needs_device
 @pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_query_chunks_equal_full(D):
+    """Chunked prefill under the non-causal class: a request's query rows run in chunks, each chunk planned over the request's
+    FULL key set, give the bits of the one-shot run row for row (a row's visible set is ``[0, kv_len)`` whatever the cut), paged and
+    ragged. Two requests cut at different points (inside a 512-key chunk and at a tile boundary); incremental KV growth is not
+    this test -- a chunk run over a shorter key set is that chunk's view of those keys, not a prefix of the full run."""
+    kv = [1700, 1000]
+    cut = [700, 512]
+    full = Problem(kv, kv, 32, 8, D, 16, seed=15)
+    out_full = bits(run_paged_prefill(full, causal=False))
+    assert torch.equal(out_full, bits(run_ragged_prefill(full, causal=False)))
+    rows = [slice(int(full.qo_indptr[i]), int(full.qo_indptr[i + 1])) for i in range(2)]
+    for part, q_lens in enumerate(([cut[0], cut[1]], [kv[0] - cut[0], kv[1] - cut[1]])):
+        prob = Problem(q_lens, kv, 32, 8, D, 16, seed=16 + part)
+        prob.q = torch.cat(
+            [
+                full.q[rows[i]][: cut[i]] if part == 0 else full.q[rows[i]][cut[i] :]
+                for i in range(2)
+            ]
+        ).contiguous()
+        prob.k_rag, prob.v_rag = full.k_rag.clone(), full.v_rag.clone()
+        prob = _repack(prob)
+        out_p = bits(run_paged_prefill(prob, causal=False))
+        out_r = bits(run_ragged_prefill(prob, causal=False))
+        off = 0
+        for i in range(2):
+            ref = (
+                out_full[rows[i]][: cut[i]]
+                if part == 0
+                else out_full[rows[i]][cut[i] :]
+            )
+            n = ref.shape[0]
+            assert torch.equal(out_p[off : off + n], ref), (D, part, i, "paged")
+            assert torch.equal(out_r[off : off + n], ref), (D, part, i, "ragged")
+            off += n
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 def test_noncausal_prefill_equals_multi_token_decode(D, layout):
     """R4: the decode wrapper with ``q_len_per_req = 4`` and ``is_causal=False`` gives, for the last four tokens of every request,

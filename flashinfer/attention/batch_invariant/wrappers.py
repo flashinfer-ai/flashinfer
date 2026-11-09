@@ -7,6 +7,9 @@ engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. 
 class a token's output bits depend on its KV position, its head and the window alone; under the non-causal class (``causal=False`` on
 the prefill wrappers, ``is_causal=False`` with ``q_len_per_req > 1`` on the decode wrapper) on its request's key count and its head
 alone. The three wrappers compute the same bits for the same token of the same class.
+Chunked prefill: under the causal class a request cut into chunks (each later chunk over the keys cached so far) reproduces the
+one-shot bits; under the non-causal class only query chunks planned over the request's full key set do -- a chunk run while the
+KV is still growing is that chunk's view of the keys present at the time, and a different ``kv_len`` is a different term.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
