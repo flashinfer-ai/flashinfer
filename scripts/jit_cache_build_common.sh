@@ -17,8 +17,8 @@ SCCACHE_RAPIDS_SHA256_x86_64="6b479c4d4903c8f738f031d4a18f2937a1090827ed553b6bfd
 SCCACHE_RAPIDS_SHA256_aarch64="2994d493d18566af0d55dc4ebc678be6b6f91b6856d1c6837325c121da755b6d"
 # Installed in a directory of its own under the name "sccache": invoked under any
 # other name (e.g. sccache-rapids), sccache treats that name as a compiler to
-# wrap, and even `--version` hangs.
-SCCACHE_RAPIDS_BIN="${SCCACHE_RAPIDS_BIN:-/usr/local/libexec/sccache-rapids/sccache}"
+# wrap, and even `--version` hangs. Not overridable from the environment.
+SCCACHE_RAPIDS_BIN=/usr/local/libexec/sccache-rapids/sccache
 
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
@@ -312,19 +312,29 @@ cleanup_jit_cache_python_build() {
   unset JIT_CACHE_RESTORE_PIP_BUILD_CONSTRAINT
 }
 
-# Download and install a released sccache binary to /usr/local/bin/sccache,
-# verifying the upstream sha256 checksum.
+# Download, verify and install a released sccache binary.
+#
+# Args:
+#   $1 - Release version (without the leading "v").
+#   $2 - Architecture (x86_64 or aarch64).
+#   $3 - GitHub repository (default mozilla/sccache).
+#   $4 - Install path (default /usr/local/bin/sccache).
+#   $5 - Expected sha256 (default: the release's published .sha256 file).
+# Exits on a checksum mismatch, before the archive is extracted, even when the
+# caller runs with errexit off.
 install_released_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
+  local sccache_repo=${3:-mozilla/sccache}
+  local sccache_dest=${4:-/usr/local/bin/sccache}
+  local sccache_sha256=${5:-}
   local sccache_package="sccache-v${sccache_version}-${sccache_arch}-unknown-linux-musl"
   local sccache_archive="${sccache_package}.tar.gz"
-  local sccache_url="https://github.com/mozilla/sccache/releases/download/v${sccache_version}/${sccache_archive}"
+  local sccache_url="https://github.com/${sccache_repo}/releases/download/v${sccache_version}/${sccache_archive}"
   local sccache_tmpdir
-  local sccache_sha256
   local sccache_install_started_at=${SECONDS}
 
-  echo "::group::Install sccache v${sccache_version} (${sccache_arch})"
+  echo "::group::Install ${sccache_repo} v${sccache_version} (${sccache_arch})"
 
   if ! command -v sha256sum >/dev/null 2>&1; then
     echo "ERROR: sha256sum is required to verify sccache downloads"
@@ -333,18 +343,25 @@ install_released_sccache() {
 
   sccache_tmpdir=$(mktemp -d)
   curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
-  sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
+  if [ -z "${sccache_sha256}" ]; then
+    curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
+    sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
+  fi
   if [ -z "${sccache_sha256}" ]; then
     echo "ERROR: Missing checksum for ${sccache_archive}"
     exit 1
   fi
 
-  printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
+  if ! printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -; then
+    echo "ERROR: Checksum mismatch for ${sccache_archive}"
+    rm -rf "${sccache_tmpdir}"
+    exit 1
+  fi
   tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
-  mv "${sccache_tmpdir}/${sccache_package}/sccache" /usr/local/bin/
+  mkdir -p "$(dirname "${sccache_dest}")"
+  mv "${sccache_tmpdir}/${sccache_package}/sccache" "${sccache_dest}"
   rm -rf "${sccache_tmpdir}"
-  chmod +x /usr/local/bin/sccache
+  chmod +x "${sccache_dest}"
   echo "::endgroup::"
   echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
 }
@@ -374,33 +391,21 @@ install_sccache() {
 # replacing) an upstream /usr/local/bin/sccache.
 install_rapids_sccache() {
   local sccache_arch=$1
-  local version="${SCCACHE_RAPIDS_VERSION}"
-  local sha_var="SCCACHE_RAPIDS_SHA256_${sccache_arch}"
-  local sccache_sha256="${!sha_var:-}"
-  local sccache_package="sccache-v${version}-${sccache_arch}-unknown-linux-musl"
-  local sccache_archive="${sccache_package}.tar.gz"
-  local sccache_url="https://github.com/rapidsai/sccache/releases/download/v${version}/${sccache_archive}"
-  local sccache_tmpdir
+  local sccache_sha256
 
-  if [ -z "${sccache_sha256}" ]; then
-    echo "ERROR: No pinned rapids sccache checksum for ${sccache_arch}"
-    exit 1
-  fi
-  if ! command -v sha256sum >/dev/null 2>&1; then
-    echo "ERROR: sha256sum is required to verify sccache downloads"
-    exit 1
-  fi
+  case "${sccache_arch}" in
+    x86_64) sccache_sha256="${SCCACHE_RAPIDS_SHA256_x86_64}" ;;
+    aarch64) sccache_sha256="${SCCACHE_RAPIDS_SHA256_aarch64}" ;;
+    *)
+      echo "ERROR: Unsupported sccache build architecture: ${sccache_arch}"
+      exit 1
+      ;;
+  esac
 
-  echo "::group::Install rapids sccache v${version} (${sccache_arch})"
-  sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
-  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
-  mkdir -p "$(dirname "${SCCACHE_RAPIDS_BIN}")"
-  mv "${sccache_tmpdir}/${sccache_package}/sccache" "${SCCACHE_RAPIDS_BIN}"
-  rm -rf "${sccache_tmpdir}"
-  chmod +x "${SCCACHE_RAPIDS_BIN}"
-  echo "::endgroup::"
+  install_released_sccache "${SCCACHE_RAPIDS_VERSION}" "${sccache_arch}" \
+    rapidsai/sccache "${SCCACHE_RAPIDS_BIN}" "${sccache_sha256}"
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release-rapidsai"
+  export FLASHINFER_SCCACHE_REVISION="v${SCCACHE_RAPIDS_VERSION}"
 }
 
 # Install sccache (if missing), configure environment, and start the server.
@@ -443,11 +448,9 @@ setup_sccache() {
   if [ "${nvcc_impl}" = "rapids" ]; then
     export FLASHINFER_SCCACHE_BIN="${SCCACHE_RAPIDS_BIN}"
     key_prefix="${key_prefix}-rapids"
-    if [ "$("${SCCACHE_RAPIDS_BIN}" --version 2>/dev/null)" != "sccache ${SCCACHE_RAPIDS_VERSION}" ]; then
-      install_rapids_sccache "${sccache_arch}"
-    fi
-    export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release-rapidsai"
-    export FLASHINFER_SCCACHE_REVISION="v${SCCACHE_RAPIDS_VERSION}"
+    # Always installed: nothing preinstalls the fork, unlike the upstream
+    # probe below.
+    install_rapids_sccache "${sccache_arch}"
   elif [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
     # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
     export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
