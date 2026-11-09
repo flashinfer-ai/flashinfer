@@ -38,8 +38,16 @@ def test_graph_knob_is_validated() -> None:
         "graph": "off",
         "host_trim": 1,
         "bwd_overlap": 1,
+        "fwd_main": None,
+        "fwd_overlap": None,
     }
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1, "bwd_overlap": 1}
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_overlap": 1,
+        "fwd_main": None,
+        "fwd_overlap": None,
+    }
     try:
         with pytest.raises(ValueError, match="unknown"):
             conv_kcp._set_test_knobs({"grap": "replay"})
@@ -51,11 +59,15 @@ def test_graph_knob_is_validated() -> None:
             "graph": "replay",
             "host_trim": 1,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._set_test_knobs({"graph": "off"}) == {
             "graph": "off",
             "host_trim": 1,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
     finally:
         conv_kcp._set_test_knobs(None)
@@ -73,22 +85,30 @@ def test_host_trim_knob_is_validated() -> None:
             "graph": "off",
             "host_trim": 1,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._graph_mode(None) == "off"
         assert conv_kcp._set_test_knobs({"host_trim": 1, "graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._set_test_knobs({}) == {
             "graph": "off",
             "host_trim": 1,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         for bad in (
             {"host_trim": 2},
@@ -102,10 +122,18 @@ def test_host_trim_knob_is_validated() -> None:
             "graph": "off",
             "host_trim": 0,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
     finally:
         conv_kcp._set_test_knobs(None)
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1, "bwd_overlap": 1}
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_overlap": 1,
+        "fwd_main": None,
+        "fwd_overlap": None,
+    }
 
 
 @pytest.mark.cpu_only
@@ -126,6 +154,8 @@ def test_bwd_overlap_knob_is_validated() -> None:
             "graph": "off",
             "host_trim": 1,
             "bwd_overlap": 0,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._overlapped(False, work) is False
         assert conv_kcp._bwd_variant(False) == (False, ("bwd_overlap", 0))
@@ -135,6 +165,143 @@ def test_bwd_overlap_knob_is_validated() -> None:
     finally:
         conv_kcp._set_test_knobs(None)
     assert conv_kcp._TEST_KNOBS["bwd_overlap"] == 1
+
+
+ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+FORMS = ((False, False), (True, False), (False, True), (True, True))
+
+
+@pytest.mark.cpu_only
+def test_fwd_form_knobs_are_validated(monkeypatch) -> None:
+    """``fwd_main`` / ``fwd_overlap`` (the two-launch forward): private setters validated against ``FWD_MAINS`` /
+    ``FWD_OVERLAPS`` (``None`` shipped = the architecture sets, ``0`` = off, ``1`` = on), independent of each other
+    and of the other knobs.  The shipped sets are empty, so ``_fwd_form`` is the one-launch forward ``(False, False)``
+    on every architecture and entry; a ``0`` / ``1`` knob forces its form on every architecture and entry; with the
+    knob ``None`` an architecture added to a set takes that form in that set's entry only."""
+    assert conv_kcp.FWD_MAINS == (None, 0, 1) and conv_kcp.FWD_MAIN_DEFAULT is None
+    assert conv_kcp.FWD_OVERLAPS == (None, 0, 1)
+    assert conv_kcp.FWD_OVERLAP_DEFAULT is None
+    sets = (
+        "FWD_MAIN_ARCHS",
+        "FWD_OVERLAP_ARCHS",
+        "MULTI_FWD_MAIN_ARCHS",
+        "MULTI_FWD_OVERLAP_ARCHS",
+    )
+    for name in sets:
+        assert getattr(conv_kcp, name) == frozenset(), name
+    try:
+        for arch in ARCHES:
+            for multi in (False, True):
+                assert conv_kcp._fwd_form(arch, multi=multi) == (False, False)
+        for main in (0, 1):
+            for overlap in (0, 1):
+                knobs = {"fwd_main": main, "fwd_overlap": overlap}
+                assert conv_kcp._set_test_knobs(knobs) == {
+                    "graph": "off",
+                    "host_trim": 1,
+                    "bwd_overlap": 1,
+                    **knobs,
+                }
+                for arch in ARCHES:
+                    for multi in (False, True):
+                        assert conv_kcp._fwd_form(arch, multi=multi) == (
+                            bool(main),
+                            bool(overlap),
+                        )
+        assert conv_kcp._set_test_knobs({"fwd_overlap": 1})["fwd_main"] is None
+        assert conv_kcp._fwd_form("sm_100a") == (False, True)
+        for bad in (
+            {"fwd_main": 2},
+            {"fwd_main": True},
+            {"fwd_main": "1"},
+            {"fwd_overlap": -1},
+            {"fwd_overlap": False},
+            {"fwd_overlap": "0"},
+            {"fwd_mian": 1},
+        ):
+            with pytest.raises(ValueError):
+                conv_kcp._set_test_knobs(bad)
+        conv_kcp._set_test_knobs(None)
+        # an architecture added to one set: that form in that entry only, and a knob of 0 / 1 still forces its form
+        for name, form, multi in (
+            ("FWD_MAIN_ARCHS", (True, False), False),
+            ("FWD_OVERLAP_ARCHS", (False, True), False),
+            ("MULTI_FWD_MAIN_ARCHS", (True, False), True),
+            ("MULTI_FWD_OVERLAP_ARCHS", (False, True), True),
+        ):
+            monkeypatch.setattr(conv_kcp, name, frozenset({"sm_103a"}))
+            assert conv_kcp._fwd_form("sm_103a", multi=multi) == form, name
+            assert conv_kcp._fwd_form("sm_103a", multi=not multi) == (False, False)
+            assert conv_kcp._fwd_form("sm_100a", multi=multi) == (False, False)
+            conv_kcp._set_test_knobs({"fwd_main": 0, "fwd_overlap": 0})
+            assert conv_kcp._fwd_form("sm_103a", multi=multi) == (False, False)
+            conv_kcp._set_test_knobs(None)
+            monkeypatch.undo()
+    finally:
+        monkeypatch.undo()
+        conv_kcp._set_test_knobs(None)
+    assert conv_kcp._TEST_KNOBS["fwd_main"] is None
+    assert conv_kcp._TEST_KNOBS["fwd_overlap"] is None
+
+
+@pytest.mark.cpu_only
+def test_graph_key_and_record_of_the_forward_form() -> None:
+    """The forward's graph-key variant is its effective form (``_fwd_variant`` = ``_fwd_form`` of the device: the four
+    forms are four keys, the same form one key), and ``LAST_CALL[kind]`` holds the launch form the body records
+    (``_fwd_record``) beside the graph event: afresh on an eager call, the captured call's on a replay.  No kernel runs
+    here (a stand-in graph replays)."""
+    ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
+    x = torch.zeros(8, 16, dtype=torch.bfloat16)
+    try:
+        keys = {
+            form: conv_kcp._graph_entry("fwd", ctx, (x, None), "replay", variant=form)
+            for form in FORMS
+        }
+        assert len({id(e) for e in keys.values()}) == len(FORMS)
+        for form in FORMS:
+            again = conv_kcp._graph_entry("fwd", ctx, (x, None), "replay", variant=form)
+            assert again is keys[form], form
+        e = keys[(True, True)]
+
+        def body():
+            conv_kcp._fwd_record("fwd", True, True, True)
+            return ("y", "hist")
+
+        conv_kcp.LAST_CALL["fwd"] = {"stale": 1}
+        assert conv_kcp._graph_run("fwd", e, body, "replay") == ("y", "hist")
+        assert conv_kcp.LAST_CALL["fwd"] == {
+            "main": "sr",
+            "form": "pair",
+            "repair": True,
+            "graph": "replay",
+            "graph_event": "eager",
+            "graph_key": e.digest,
+            "graph_fallback": None,
+        }
+        e.graph = types.SimpleNamespace(replay=lambda: None)
+        e.result = ("y", "hist")
+        e.record = {"main": "f", "form": "pair", "repair": False}
+        conv_kcp.LAST_CALL["fwd"] = {"stale": 1}
+        assert conv_kcp._graph_run("fwd", e, body, "replay") == ("y", "hist")
+        assert conv_kcp.LAST_CALL["fwd"] == {
+            "main": "f",
+            "form": "pair",
+            "repair": False,
+            "graph": "replay",
+            "graph_event": "replay",
+            "graph_key": e.digest,
+            "graph_fallback": None,
+        }
+        # a rank without tokens launches nothing
+        conv_kcp._fwd_record("fwd_multi", None, False, False)
+        assert conv_kcp.LAST_CALL["fwd_multi"] == {
+            "main": None,
+            "form": "wait",
+            "repair": False,
+        }
+    finally:
+        conv_kcp._GRAPHS.clear()
+        conv_kcp.LAST_CALL.clear()
 
 
 @pytest.mark.cpu_only

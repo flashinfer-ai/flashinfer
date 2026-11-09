@@ -1264,15 +1264,25 @@ def test_kcp_backend_reads_no_environment_variable() -> None:
             "graph": "off",
             "host_trim": 0,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
             "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
     finally:
         conv_kcp._set_test_knobs(None)
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1, "bwd_overlap": 1}
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_overlap": 1,
+        "fwd_main": None,
+        "fwd_overlap": None,
+    }
 
 
 _VENDORED = """
@@ -1312,7 +1322,9 @@ for name in kcp.__all__:
 assert isinstance(kcp_jit.MODULES, dict) and kcp_jit.MODULES
 assert kcp.COOPERATIVE_DEFAULT is False and kcp._cooperative(None) is False
 assert kcp._set_test_knobs({"host_trim": 0})["host_trim"] == 0
-assert kcp._set_test_knobs(None) == {"graph": "off", "host_trim": 1, "bwd_overlap": 1}
+assert kcp._set_test_knobs(None) == {
+    "graph": "off", "host_trim": 1, "bwd_overlap": 1, "fwd_main": None, "fwd_overlap": None
+}
 
 x = torch.zeros(8, 128, dtype=torch.bfloat16)
 w = torch.zeros(128, 4, dtype=torch.float32)

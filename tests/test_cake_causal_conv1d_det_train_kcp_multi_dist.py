@@ -26,6 +26,8 @@ row and rank:
   recompute / backward): multi 1/0/1 direct, 1/1/1 plain checkpoint, 1/0/1 with a handle, against 3/0/3, 3/3/3 and
   3/0/3 for three single calls;
 - the multi handle retains exactly the n history pools (``nbytes`` and the allocator's bytes after the forward);
+- the two-launch forward (knobs ``fwd_main`` x ``fwd_overlap``, the same on every rank): ``LAST_CALL["fwd_multi"]``
+  names the form the rank ran and every tensor's ``y`` / ``hist`` are bitwise the one-launch single call's;
 - ``graph="replay"`` of the multi forward / backward is bitwise the eager single calls on every call.
 
 ``ROWS`` are W = 2 / 4 / 8; ``ROWS_SCALE`` adds a W = 16 per-document zigzag row.  Launch forms as
@@ -379,6 +381,46 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         and cg_multi["calls"] == table(1, 0, 1)
         and cg_handle["calls"] == table(1, 0, 1)
     )
+    # The two-launch forward: every (fwd_main, fwd_overlap) form, the same on every rank, records its form in
+    # LAST_CALL["fwd_multi"] (the first tensor's main program before the exchange's wait on a rank with tokens; the
+    # history-row program when the rank receives history rows and the form has two launches) and gives every
+    # tensor's y / hist bitwise the one-launch single call's.
+    refs = [
+        conv_kcp.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+        for x, w in zip(xs, ws, strict=True)
+    ]
+    torch.cuda.synchronize(device)
+    fwd_bitwise, fwd_recorded = True, True
+    for fwd_main in (0, 1):
+        for fwd_overlap in (0, 1):
+            conv_kcp._set_test_knobs({"fwd_main": fwd_main, "fwd_overlap": fwd_overlap})
+            try:
+                for _ in range(2):
+                    ys, hists = conv_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(
+                        xs, ws, ctx
+                    )
+                    torch.cuda.synchronize(device)
+                    want = (
+                        {
+                            "main": "sr" if fwd_main else "f",
+                            "form": "pair" if fwd_overlap else "wait",
+                            "repair": bool(fwd_main or fwd_overlap) and n_hist > 0,
+                        }
+                        if xs[0].shape[0]
+                        else {"main": None, "form": "wait", "repair": False}
+                    )
+                    fwd_recorded = (
+                        fwd_recorded and conv_kcp.LAST_CALL["fwd_multi"] == want
+                    )
+                    fwd_bitwise = fwd_bitwise and all(
+                        _same(ys[i], y) and _same(hists[i], hist)
+                        for i, (y, hist) in enumerate(refs)
+                    )
+            finally:
+                conv_kcp._set_test_knobs(None)
+                conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
+    flags["fwd_forms_bitwise"] = fwd_bitwise
+    flags["fwd_forms_recorded"] = fwd_recorded
     return _report(W, row, flags, info, result_dir, rank, "multi")
 
 
