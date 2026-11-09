@@ -501,9 +501,13 @@ keyword.
   (`"fused_ip"`, 57.0 against 56.9 ms, within the noise; a checkpointed step
   about 2 % slower); at `T = 8117` (two chunks, `H = 6144`, `"partial_ip"`)
   from 6.811 to 3.996 GiB, 31.8 against 29.7 ms (about 7 % slower).  The
-  log-probability entry's backward runs `"partial"` there: 56.4 against
-  54.0 ms (about 4 % slower) at `T = 16384` with a third of the labels
-  ignored, 43.6 against 39.1 ms (about 11 % slower) at `T = 8117`.  A short
+  log-probability entry's backward gets the same forms: `"partial_ip"` at
+  `T = 16384` with a third of the labels ignored (7.081 to 5.015 GiB, 54.5
+  against 53.0 ms, about 3 % slower) and at `T = 8117` (7.005 to 3.996 GiB,
+  40.6 against 38.2 ms, about 6 % slower), `"fused_ip"` at `H = 4096` (4.989
+  to 3.838 GiB, 36.5 against 35.7 ms, about 2 % slower) and with 5 % of the
+  labels ignored (7.185 to 5.430 GiB, 76.6 against 75.8 ms, within the
+  noise).  A short
   call that recomputes most of the vocabulary costs more.  The margin above was measured for the `"budget"`
   form; the fast form's own-lifetime model is checked against measured peaks
   of the issue's shapes.  The hidden valid-row count allocates a whole
