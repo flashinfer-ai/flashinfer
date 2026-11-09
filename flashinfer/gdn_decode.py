@@ -26,6 +26,7 @@ APIs:
 - gated_delta_rule_decode: K-major state layout [B, HV, K, V], T=1
 - gated_delta_rule_mtp: Multi-token processing (T > 1) for speculative decoding
 - gated_delta_rule_replayssm_commit: Commit the accepted ReplaySSM prefix
+- gated_delta_rule_replayssm_prefer_u: Pick the ReplaySSM window kind
 """
 
 import functools
@@ -1404,6 +1405,7 @@ def gated_delta_rule_mtp(
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
     verify_parents: Optional[torch.Tensor] = None,
+    replayssm_u: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule MTP kernel (Multiple Token Processing).
 
@@ -1495,19 +1497,22 @@ def gated_delta_rule_mtp(
         Persist only the fold-every-commit ReplaySSM raw input window instead
         of full intermediate hidden-state snapshots. Requires frozen-state
         verify mode (``disable_state_update=True``), no
-        ``intermediate_states_buffer`` or ``ssm_state_indices``, and all four
-        ``replayssm_*`` buffers. Live ``initial_state_indices`` must be unique
-        and in range. Negative indices leave output and cache rows untouched.
+        ``intermediate_states_buffer`` or ``ssm_state_indices``, and
+        ``replayssm_rawk``/``replayssm_g`` plus either ``replayssm_u`` or
+        ``replayssm_rawv``/``replayssm_beta``. Live ``initial_state_indices``
+        must be unique and in range. Negative indices leave output and cache
+        rows untouched.
         Windows are indexed by pool slot, overwritten on every verify, and
         consumed once by :func:`gated_delta_rule_replayssm_commit` before the
         next verify. FP16 inputs are converted to BF16 before caching, as in
         the existing MTP kernel. All tensor base addresses must be 16-byte
         aligned for vectorized loads and TMA. Default: ``False``.
 
-        The SM100 tcgen05 TF32 specialization requires T=4..8, B=1..256, a
-        contiguous checkpoint, BF16 output, int32 indices, Q/K normalization,
-        and even HV/H. The SM120 warp-MMA TF32 specialization has the same
-        requirements except the HV/H parity, and is selected when
+        The SM100 tcgen05 TF32 specialization requires T=4..16, B=1..256, a
+        contiguous checkpoint, BF16 output, int32 indices and Q/K normalization;
+        a CTA shares Q/K between two value heads of one key head (with odd HV/H,
+        each key head's last value head runs alone). The SM120 warp-MMA TF32
+        specialization has the same requirements and is selected when
         ``B * HV <= 128`` or T>=7. Other supported cases use the FP32 MTP
         fallback. TF32 changes reduction precision; outputs need not be
         bitwise equal to the fallback.
@@ -1526,6 +1531,16 @@ def gated_delta_rule_mtp(
         root entry may be -1 or 0. Checked on device only when
         ``FLASHINFER_VALIDATE_VERIFY_PARENTS=1``. Only the tcgen05 ReplaySSM
         verify honors it; any other path raises ``ValueError``.
+    replayssm_u : torch.Tensor, optional
+        FP32 window of shape ``[pool_size, HV, T, V]`` for the delta-rule
+        corrections ``u_t = beta_t (v_t - (g_t h_{t-1})^T k_t)`` computed from
+        the frozen checkpoint. When given, ``replayssm_rawv`` and
+        ``replayssm_beta`` must be omitted; pass the window to
+        :func:`gated_delta_rule_replayssm_commit` as ``u_cache``. ``u``
+        depends on the checkpoint content read here, so that checkpoint must
+        not change before the commit. SM100/SM103 only, with T<=32, the
+        longest window the u commit folds; every SM100 verify path (tcgen05
+        and the FP32 fallback) produces it.
 
     Returns
     -------
@@ -1721,6 +1736,7 @@ def gated_delta_rule_mtp(
         replayssm_g,
         replayssm_beta,
     )
+    u_mode = replayssm_u is not None
     if cache_replayssm:
         from .gdn_kernels.device_target import gdn_device_target
 
@@ -1770,18 +1786,34 @@ def gated_delta_rule_mtp(
             raise ValueError("initial_state_indices must be [B]")
         if T < 3:
             raise ValueError(f"ReplaySSM caching requires T >= 3, got T={T}")
+        if u_mode and (replayssm_rawv is not None or replayssm_beta is not None):
+            raise ValueError("replayssm_u replaces replayssm_rawv and replayssm_beta")
+        if u_mode:
+            from .gdn_kernels.gdn_replayssm_u_commit import MAX_WINDOW
+
+            # Produce u only where the u commit can consume it.
+            if target.major != 10:
+                raise ValueError("replayssm_u requires SM100/SM103")
+            if T > MAX_WINDOW:
+                raise ValueError(f"replayssm_u supports T <= {MAX_WINDOW}, got T={T}")
         expected_replayssm = (
             ((pool_size, HV, T, V), torch.bfloat16, "replayssm_rawv"),
             ((pool_size, H, T, K), torch.bfloat16, "replayssm_rawk"),
             ((pool_size, HV, T), torch.float32, "replayssm_g"),
             ((pool_size, HV, T), torch.float32, "replayssm_beta"),
+            ((pool_size, HV, T, V), torch.float32, "replayssm_u"),
         )
         for tensor, (shape, dtype, name) in zip(
-            replayssm_buffers, expected_replayssm, strict=True
+            (*replayssm_buffers, replayssm_u), expected_replayssm, strict=True
         ):
             if tensor is None:
+                if u_mode and name in ("replayssm_rawv", "replayssm_beta"):
+                    continue
+                if not u_mode and name == "replayssm_u":
+                    continue
                 raise ValueError(
-                    "cache_replayssm=True requires replayssm_rawv/rawk/g/beta"
+                    "cache_replayssm=True requires replayssm_rawk/g and either "
+                    "replayssm_u or replayssm_rawv/beta"
                 )
             if tensor.shape != shape:
                 raise ValueError(
@@ -1814,10 +1846,11 @@ def gated_delta_rule_mtp(
             ("replayssm_rawk", replayssm_rawk),
             ("replayssm_g", replayssm_g),
             ("replayssm_beta", replayssm_beta),
+            ("replayssm_u", replayssm_u),
         ):
             if tensor is not None and tensor.data_ptr() % 16:
                 raise ValueError(f"{name} must have a 16-byte aligned base address")
-    elif any(t is not None for t in replayssm_buffers):
+    elif any(t is not None for t in (*replayssm_buffers, replayssm_u)):
         raise ValueError("replayssm_* buffers require cache_replayssm=True")
 
     # Execute kernel
@@ -1856,6 +1889,7 @@ def gated_delta_rule_mtp(
         replayssm_rawk=replayssm_rawk,
         replayssm_g=replayssm_g,
         replayssm_beta=replayssm_beta,
+        replayssm_u=replayssm_u,
     )
 
     # No post-kernel scatter step: `intermediate_states` aliases the caller's
@@ -1869,13 +1903,37 @@ def gated_delta_rule_mtp(
     return output, initial_state
 
 
+def gated_delta_rule_replayssm_prefer_u(
+    max_cache_len: int, device: torch.device
+) -> bool:
+    """Whether ReplaySSM should cache ``u`` rather than raw V and beta windows.
+
+    The choice has to be made before verify, which writes either window kind,
+    so it depends only on the window length ``max_cache_len`` and the device.
+    Pass ``replayssm_u`` to :func:`gated_delta_rule_mtp` and ``u_cache`` to
+    :func:`gated_delta_rule_replayssm_commit` when this returns True. A ``u``
+    window takes twice the bytes of a raw V window.
+
+    u mode trades a recurrent commit for an FP32 ``u`` write in verify and a
+    rank-``a`` commit that streams each checkpoint once. It is available on
+    SM100/SM103 only, where the raw commit is compute bound and u mode is
+    faster for every batch size and head count measured with windows of 3 to
+    32 tokens.
+    """
+    from .gdn_kernels.gdn_replayssm_u_commit import MAX_WINDOW
+
+    if not 3 <= max_cache_len <= MAX_WINDOW:
+        return False
+    return get_compute_capability(device)[0] == 10
+
+
 @flashinfer_api(trace=gdn_replayssm_commit_trace)
 def gated_delta_rule_replayssm_commit(
     checkpoint_state: torch.Tensor,
-    rawv_cache: torch.Tensor,
+    rawv_cache: Optional[torch.Tensor],
     rawk_cache: torch.Tensor,
     g_cache: torch.Tensor,
-    beta_cache: torch.Tensor,
+    beta_cache: Optional[torch.Tensor],
     state_indices: torch.Tensor,
     accept_lens: torch.Tensor,
     accept_paths: Optional[torch.Tensor] = None,
@@ -1885,6 +1943,7 @@ def gated_delta_rule_replayssm_commit(
     use_qk_l2norm: bool = True,
     null_block_id: int = -1,
     backend: Literal["auto", "simt", "tcgen05"] = "auto",
+    u_cache: Optional[torch.Tensor] = None,
 ) -> None:
     """Commit an accepted ReplaySSM prefix into all layers' checkpoints.
 
@@ -1899,14 +1958,16 @@ def gated_delta_rule_replayssm_commit(
         Contiguous FP32 ``[layers, slots, HV, 128, 128]`` state, K-last.
         Updated in place. All tensors must be on the same SM100/SM103 or
         SM120 device.
-    rawv_cache : torch.Tensor
+    rawv_cache : torch.Tensor or None
         Contiguous BF16 ``[layers, slots, HV, T, 128]`` raw V windows.
+        Must be None with ``u_cache``.
     rawk_cache : torch.Tensor
         Contiguous BF16 ``[layers, slots, H, T, 128]`` pre-normalization K.
     g_cache : torch.Tensor
         Contiguous FP32 ``[layers, slots, HV, T]`` log-decay windows.
-    beta_cache : torch.Tensor
+    beta_cache : torch.Tensor or None
         Contiguous FP32 ``[layers, slots, HV, T]`` sigmoid-beta windows.
+        Must be None with ``u_cache``.
     state_indices : torch.Tensor
         Contiguous int32 ``[B]`` pool slots. Live slots must be unique and
         in range. Slots <= ``null_block_id`` are ignored.
@@ -1936,16 +1997,25 @@ def gated_delta_rule_replayssm_commit(
         Largest reserved/invalid slot; must be >= -1. Default -1.
 
     backend : {"auto", "simt", "tcgen05"}
-        With normalized K and no tracking, auto selects TF32 tcgen05 for T=8,
-        or T=6/7 when B>1 and ``layers * B * HV >= 256``. Otherwise, and
-        whenever ``track_state_indices`` is given, it uses FP32 SIMT. Shorter
-        accepted prefixes may favor explicit ``simt``; auto does not read
-        accepted lengths back to the host. Explicit ``tcgen05`` supports
-        normalized T=4..8 on SM100/SM103; SM120 always uses ``simt``. With
+        With normalized K and no tracking, auto selects TF32 tcgen05 for
+        T=8..16, or T=6/7 when B>1 and ``layers * B * HV >= 256``. Otherwise,
+        and whenever ``track_state_indices`` is given, it uses FP32 SIMT.
+        Shorter accepted prefixes may favor explicit ``simt``; auto does not
+        read accepted lengths back to the host. Explicit ``tcgen05`` supports
+        normalized T=4..16 on SM100/SM103; SM120 always uses ``simt``. With
         tracking it first runs a short FP32 SIMT pass that writes the tracked
         snapshots from the untouched checkpoint, so the snapshot is FP32 while
         the live slot is TF32 and the two can differ by about 1e-5. Use ``simt``
-        to retain FP32 contractions.
+        to retain FP32 contractions. Must be ``auto`` with ``u_cache``.
+    u_cache : torch.Tensor, optional
+        Contiguous FP32 ``[layers, slots, HV, T, 128]`` windows written by
+        :func:`gated_delta_rule_mtp` through ``replayssm_u`` (SM100/SM103,
+        T<=32). The accepted prefix ``a`` is then committed without
+        a recurrence, as ``h_a = gamma_a h0 + sum_{j<=a} (gamma_a / gamma_j)
+        k_j u_j^T`` with FP32 FMAs, streaming each checkpoint once. ``u``
+        depends on the checkpoint content verify read: ``state_indices`` must
+        name the same checkpoints as that verify's ``initial_state_indices``,
+        and they must not be modified in between.
 
     Notes
     -----
@@ -1978,4 +2048,5 @@ def gated_delta_rule_replayssm_commit(
         null_block_id=null_block_id,
         accept_paths=accept_paths,
         backend=backend,
+        u_cache=u_cache,
     )

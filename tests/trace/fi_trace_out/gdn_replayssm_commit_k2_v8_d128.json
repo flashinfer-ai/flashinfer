@@ -56,7 +56,8 @@
         "seq_len",
         "head_size"
       ],
-      "dtype": "bfloat16"
+      "dtype": "bfloat16",
+      "optional": true
     },
     "rawk_cache": {
       "shape": [
@@ -84,7 +85,8 @@
         "num_v_heads",
         "seq_len"
       ],
-      "dtype": "float32"
+      "dtype": "float32",
+      "optional": true
     },
     "state_indices": {
       "shape": [
@@ -133,6 +135,17 @@
     "backend": {
       "shape": null,
       "dtype": "str",
+      "optional": true
+    },
+    "u_cache": {
+      "shape": [
+        "num_layers",
+        "pool_size",
+        "num_v_heads",
+        "seq_len",
+        "head_size"
+      ],
+      "dtype": "float32",
       "optional": true
     }
   },

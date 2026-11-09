@@ -254,6 +254,32 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
 
 
 @cute.jit
+def _store_replayssm_u(
+    replayssm_u: cute.Tensor,
+    cache_idx,
+    i_hv,
+    i_t,
+    v_first,
+    values,
+    lane,
+):
+    """Store one step's delta-rule corrections for consecutive V rows.
+
+    Every lane holds all ``values`` after the h·k reduction; lane ``r`` picks
+    row ``v_first + r`` and the first ``len(values)`` lanes store together, so
+    the step issues one store instruction instead of one per row.  ``u_t`` is
+    the undecayed correction from the frozen checkpoint, the input of the
+    u-mode ReplaySSM commit.
+    """
+    value = values[0]
+    for row in cutlass.range_constexpr(1, len(values)):
+        if lane == row:
+            value = values[row]
+    if lane < len(values):
+        replayssm_u[(cache_idx, i_hv, i_t, v_first + lane)] = value
+
+
+@cute.jit
 def _mtp_precompute_replayssm_step(
     q: cute.Tensor,
     k: cute.Tensor,
@@ -290,8 +316,13 @@ def _mtp_precompute_replayssm_step(
     vec_size: cutlass.Constexpr[int],
     use_qk_l2norm: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
+    write_u: cutlass.Constexpr[bool],
 ):
-    """Precompute one timestep and write its ReplaySSM inputs on one warp."""
+    """Precompute one timestep and write its ReplaySSM inputs on one warp.
+
+    With ``write_u`` the raw V and beta are not cached: the kernel stores the
+    delta-rule corrections instead.
+    """
     r_q = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
@@ -321,7 +352,8 @@ def _mtp_precompute_replayssm_step(
         v_idx = i_v * tile_v + v_local
         if v_local < tile_v and v_idx < V:
             raw_v = v[(i_n, i_t, i_hv, v_idx)]
-            replayssm_rawv[(cache_idx, i_hv, i_t, v_idx)] = raw_v
+            if cutlass.const_expr(not write_u):
+                replayssm_rawv[(cache_idx, i_hv, i_t, v_idx)] = raw_v
             if cutlass.const_expr(use_smem_v):
                 sVdata[(i_t, v_local)] = cutlass.Float32(raw_v)
 
@@ -368,7 +400,8 @@ def _mtp_precompute_replayssm_step(
         sBeta[i_t] = r_beta
         if i_v == 0:
             replayssm_g[(cache_idx, i_hv, i_t)] = r_g_value
-            replayssm_beta[(cache_idx, i_hv, i_t)] = r_beta
+            if cutlass.const_expr(not write_u):
+                replayssm_beta[(cache_idx, i_hv, i_t)] = r_beta
 
 
 # Optimized MTP kernel with ILP rows and SMEM v caching - used for BS >= 8
@@ -395,6 +428,7 @@ def gdn_verify_kernel_mtp(
     replayssm_rawk: cute.Tensor,  # [pool_size, H, T, K] bf16
     replayssm_g: cute.Tensor,  # [pool_size, HV, T] fp32 log-decay
     replayssm_beta: cute.Tensor,  # [pool_size, HV, T] fp32 sigmoid beta
+    replayssm_u: cute.Tensor,  # [pool_size, HV, T, V] fp32 delta-rule corrections
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -422,6 +456,7 @@ def gdn_verify_kernel_mtp(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    write_replayssm_u: cutlass.Constexpr[bool],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -584,6 +619,7 @@ def gdn_verify_kernel_mtp(
                         vec_size,
                         use_qk_l2norm,
                         use_smem_v,
+                        write_replayssm_u,
                     )
         elif warp_idx == 0:
             # Warp 0: Phase 1 — compute and broadcast q, k, g, beta via SMEM
@@ -875,6 +911,16 @@ def gdn_verify_kernel_mtp(
                         vn5 = (rv5 - s5) * r_beta
                         vn6 = (rv6 - s6) * r_beta
                         vn7 = (rv7 - s7) * r_beta
+                        if cutlass.const_expr(write_replayssm_u):
+                            _store_replayssm_u(
+                                replayssm_u,
+                                cache_idx,
+                                i_hv,
+                                i_t,
+                                v0,
+                                (vn0, vn1, vn2, vn3, vn4, vn5, vn6, vn7),
+                                lane_in_group,
+                            )
 
                         # Step 4: Rank-1 update all 8 h vectors
                         for i in cutlass.range_constexpr(vec_size):
@@ -1326,6 +1372,16 @@ def gdn_verify_kernel_mtp(
                         v_new_b = (r_v_b - sum_hk_b) * r_beta
                         v_new_c = (r_v_c - sum_hk_c) * r_beta
                         v_new_d = (r_v_d - sum_hk_d) * r_beta
+                        if cutlass.const_expr(write_replayssm_u):
+                            _store_replayssm_u(
+                                replayssm_u,
+                                cache_idx,
+                                i_hv,
+                                i_t,
+                                v_idx_a,
+                                (v_new_a, v_new_b, v_new_c, v_new_d),
+                                lane_in_group,
+                            )
 
                         # Steps 4+5 FUSED: h-update + h@q using fma_packed_f32x2
                         sum_hq_a = cutlass.Float32(0.0)
@@ -1690,6 +1746,16 @@ def gdn_verify_kernel_mtp(
                             r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
                         v_new_a = (r_v_a - sum_hk_a) * r_beta
                         v_new_b = (r_v_b - sum_hk_b) * r_beta
+                        if cutlass.const_expr(write_replayssm_u):
+                            _store_replayssm_u(
+                                replayssm_u,
+                                cache_idx,
+                                i_hv,
+                                i_t,
+                                v_idx_a,
+                                (v_new_a, v_new_b),
+                                lane_in_group,
+                            )
 
                         # Step 4: Update BOTH h vectors (ILP)
                         for i in cutlass.range_constexpr(vec_size):
@@ -1835,6 +1901,7 @@ def run_gdn_verify_kernel_mtp(
     replayssm_rawk: cute.Tensor,
     replayssm_g: cute.Tensor,
     replayssm_beta: cute.Tensor,
+    replayssm_u: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -1858,6 +1925,7 @@ def run_gdn_verify_kernel_mtp(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    write_replayssm_u: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     # h0_source has two possible layouts:
@@ -1908,6 +1976,7 @@ def run_gdn_verify_kernel_mtp(
         replayssm_rawk,
         replayssm_g,
         replayssm_beta,
+        replayssm_u,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -1928,6 +1997,7 @@ def run_gdn_verify_kernel_mtp(
         use_packed_fma,
         per_token_pool_scatter,
         cache_replayssm,
+        write_replayssm_u,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -1961,6 +2031,7 @@ def gdn_verify_kernel_mtp_inline(
     replayssm_rawk: cute.Tensor,  # [pool_size, H, T, K] bf16
     replayssm_g: cute.Tensor,  # [pool_size, HV, T] fp32 log-decay
     replayssm_beta: cute.Tensor,  # [pool_size, HV, T] fp32 sigmoid beta
+    replayssm_u: cute.Tensor,  # [pool_size, HV, T, V] fp32 delta-rule corrections
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -1987,6 +2058,7 @@ def gdn_verify_kernel_mtp_inline(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    write_replayssm_u: cutlass.Constexpr[bool],
 ):
     """
     Parallel MTP kernel - each block handles one [TILE_V, TILE_K] tile.
@@ -2066,9 +2138,10 @@ def gdn_verify_kernel_mtp_inline(
                 v_cache_idx = i_v * tile_v + tidx
                 if tidx < tile_v and v_cache_idx < V:
                     raw_v_cache = v[(i_n, i_t_cache, i_hv, v_cache_idx)]
-                    replayssm_rawv[(cache_idx, i_hv, i_t_cache, v_cache_idx)] = (
-                        raw_v_cache
-                    )
+                    if cutlass.const_expr(not write_replayssm_u):
+                        replayssm_rawv[(cache_idx, i_hv, i_t_cache, v_cache_idx)] = (
+                            raw_v_cache
+                        )
                     if cutlass.const_expr(use_smem_v):
                         sVdata[(i_t_cache, tidx)] = cutlass.Float32(raw_v_cache)
                 if i_v == 0 and i_hv % (HV // H) == 0 and tidx < K:
@@ -2140,7 +2213,8 @@ def gdn_verify_kernel_mtp_inline(
             if cutlass.const_expr(cache_replayssm):
                 if i_v == 0 and tidx == 0:
                     replayssm_g[(cache_idx, i_hv, i_t)] = r_g_value
-                    replayssm_beta[(cache_idx, i_hv, i_t)] = r_beta_value
+                    if cutlass.const_expr(not write_replayssm_u):
+                        replayssm_beta[(cache_idx, i_hv, i_t)] = r_beta_value
 
         if cutlass.const_expr(ilp_rows == 4):
             # === 4-ROW ILP PATH (v10: inline pre-compute + deferred L2 norm) ===
@@ -2277,6 +2351,16 @@ def gdn_verify_kernel_mtp_inline(
                         v_new_b = (r_v_b - sum_hk_b) * r_beta
                         v_new_c = (r_v_c - sum_hk_c) * r_beta
                         v_new_d = (r_v_d - sum_hk_d) * r_beta
+                        if cutlass.const_expr(write_replayssm_u):
+                            _store_replayssm_u(
+                                replayssm_u,
+                                cache_idx,
+                                i_hv,
+                                i_t,
+                                v_idx_a,
+                                (v_new_a, v_new_b, v_new_c, v_new_d),
+                                lane_in_group,
+                            )
 
                         # Step 4: Rank-1 update
                         if cutlass.const_expr(use_qk_l2norm):
@@ -2628,6 +2712,16 @@ def gdn_verify_kernel_mtp_inline(
                             r_v_b = r_vb_all[i_t]
                         v_new_a = (r_v_a - sum_hk_a) * r_beta
                         v_new_b = (r_v_b - sum_hk_b) * r_beta
+                        if cutlass.const_expr(write_replayssm_u):
+                            _store_replayssm_u(
+                                replayssm_u,
+                                cache_idx,
+                                i_hv,
+                                i_t,
+                                v_idx_a,
+                                (v_new_a, v_new_b),
+                                lane_in_group,
+                            )
 
                         # Fused update + h@q
                         if cutlass.const_expr(use_qk_l2norm):
@@ -2785,6 +2879,7 @@ def run_gdn_verify_kernel_mtp_inline(
     replayssm_rawk: cute.Tensor,
     replayssm_g: cute.Tensor,
     replayssm_beta: cute.Tensor,
+    replayssm_u: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -2807,6 +2902,7 @@ def run_gdn_verify_kernel_mtp_inline(
     use_packed_fma: cutlass.Constexpr[bool],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     cache_replayssm: cutlass.Constexpr[bool],
+    write_replayssm_u: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     # h0_source has two possible layouts:
@@ -2851,6 +2947,7 @@ def run_gdn_verify_kernel_mtp_inline(
         replayssm_rawk,
         replayssm_g,
         replayssm_beta,
+        replayssm_u,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -2871,6 +2968,7 @@ def run_gdn_verify_kernel_mtp_inline(
         use_packed_fma,
         per_token_pool_scatter,
         cache_replayssm,
+        write_replayssm_u,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -2904,6 +3002,7 @@ def _mtp_kernel_name(
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
     cache_replayssm: bool = False,
+    write_replayssm_u: bool = False,
 ) -> str:
     """Specialization name within the gdn_decode_mtp module, encoding the
     kernel variant ("inline" or "warp") and every parameter that affects
@@ -2930,6 +3029,7 @@ def _mtp_kernel_name(
         use_packed_fma,
         per_token_pool_scatter,
         cache_replayssm,
+        write_replayssm_u,
     )
 
 
@@ -2955,6 +3055,7 @@ def _get_compiled_mtp_kernel(
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
     cache_replayssm: bool = False,
+    write_replayssm_u: bool = False,
 ):
     """Cache compiled optimized MTP kernel for given configuration."""
     return {}
@@ -2982,6 +3083,7 @@ def _get_compiled_mtp_kernel_inline(
     use_packed_fma: bool = True,
     per_token_pool_scatter: bool = False,
     cache_replayssm: bool = False,
+    write_replayssm_u: bool = False,
 ):
     """Cache compiled inline MTP kernel (BS <= 2) for given configuration."""
     return {}
@@ -3022,12 +3124,17 @@ def run_mtp_decode(
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
     verify_parents: Optional[torch.Tensor] = None,
+    replayssm_u: Optional[torch.Tensor] = None,
 ):
-    """Execute the appropriate MTP kernel based on batch size.
+    """Execute the appropriate MTP kernel for the device and problem shape.
 
     Kernel selection:
-    - BS <= 2: Inline kernel (register-resident q/k/g/beta, no SMEM precompute)
-    - BS >= 3: Warp-specialized kernel (SMEM precompute + h-state prefetch)
+    - ReplaySSM verify within the tensor-core specialization's limits: the
+      TF32 warp-MMA kernel on SM120 or the tcgen05 kernel on SM100/SM103
+      (conditions at the dispatch below).
+    - B * HV <= 128: Inline kernel (register-resident q/k/g/beta, no SMEM
+      precompute)
+    - Otherwise: Warp-specialized kernel (SMEM precompute + h-state prefetch)
 
     Args:
         h0_source: Reshaped initial state [pool_size * HV, V, K].
@@ -3060,6 +3167,9 @@ def run_mtp_decode(
             may be -1 or 0. Checked on device only when
             ``FLASHINFER_VALIDATE_VERIFY_PARENTS=1``. Only the tcgen05
             ReplaySSM verify honors it; any other path raises.
+        replayssm_u: Optional FP32 ``[pool, HV, T, V]`` window for the
+            delta-rule corrections; replaces the raw V and beta windows.
+            Every SM100 verify path produces it; the SM120 verify does not.
     """
     if B == 0:
         return
@@ -3079,6 +3189,7 @@ def run_mtp_decode(
     use_packed_fma = target.use_packed_fma
 
     per_token_pool_scatter = ssm_state_indices is not None
+    write_replayssm_u = replayssm_u is not None
 
     # SM120 frozen-state ReplaySSM fast path.  SM120 has no tcgen05, so the
     # state/K, state/Q and Gram products use TF32 warp MMA (mma.sync).  It is
@@ -3096,7 +3207,7 @@ def run_mtp_decode(
         and output_writeback is None
         and h0_source.dtype == torch.float32
         and initial_state_indices.dtype == torch.int32
-        and 4 <= T <= 8
+        and 4 <= T <= 16
         and K == 128
         and V == 128
         and 1 <= B <= 256
@@ -3152,19 +3263,18 @@ def run_mtp_decode(
         and output_writeback is None
         and h0_source.dtype == torch.float32
         and initial_state_indices.dtype == torch.int32
-        and 4 <= T <= 8
+        and 4 <= T <= 16
         and K == 128
         and V == 128
-        and HV % 2 == 0
-        and (HV // H) % 2 == 0
         and 1 <= B <= 256
         and use_qk_l2norm
     )
     if use_replayssm_tcgen:
-        assert replayssm_rawv is not None
         assert replayssm_rawk is not None
         assert replayssm_g is not None
-        assert replayssm_beta is not None
+        assert replayssm_u is not None or (
+            replayssm_rawv is not None and replayssm_beta is not None
+        )
         from .gdn_decode_mtp_replayssm_tcgen import (
             run_gdn_verify_kernel_mtp_replayssm_tcgen,
         )
@@ -3189,13 +3299,14 @@ def run_mtp_decode(
             HV,
             scale,
             verify_parents,
+            replayssm_u=replayssm_u,
         )
         return
     if verify_parents is not None:
         raise ValueError(
             "verify_parents is only supported by the tcgen05 ReplaySSM verify "
             "(SM100/SM103, cache_replayssm with a contiguous fp32 pool, int32 "
-            "indices and BF16 output, 4 <= T <= 8, B <= 256, K = V = 128, even HV "
+            "indices and BF16 output, 4 <= T <= 16, B <= 256, K = V = 128, even HV "
             "and HV // H, use_qk_l2norm); this call does not qualify"
         )
 
@@ -3256,6 +3367,7 @@ def run_mtp_decode(
             use_packed_fma,
             per_token_pool_scatter,
             cache_replayssm,
+            write_replayssm_u,
         )
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
@@ -3280,6 +3392,7 @@ def run_mtp_decode(
             use_packed_fma,
             per_token_pool_scatter,
             cache_replayssm,
+            write_replayssm_u,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
 
@@ -3315,10 +3428,17 @@ def run_mtp_decode(
     )
 
     if cache_replayssm:
-        assert replayssm_rawv is not None
         assert replayssm_rawk is not None
         assert replayssm_g is not None
-        assert replayssm_beta is not None
+        # The window this mode does not write is compile-time dead; bind an
+        # existing tensor of the same rank and dtype so nothing is allocated.
+        if write_replayssm_u:
+            replayssm_rawv = replayssm_rawk
+            replayssm_beta = replayssm_g
+        else:
+            assert replayssm_rawv is not None
+            assert replayssm_beta is not None
+            replayssm_u = replayssm_g.unsqueeze(-1)
     else:
         # The ReplaySSM arguments are compile-time dead in the normal
         # specialization. Reuse existing allocations to preserve the
@@ -3327,6 +3447,7 @@ def run_mtp_decode(
         replayssm_rawk = k
         replayssm_g = A_log
         replayssm_beta = A_log
+        replayssm_u = v
 
     # Resolve write indices: default to read indices when output_state_indices is None.
     # `.to(initial_state_indices)` (passing the tensor, not just the dtype) realigns
@@ -3389,11 +3510,13 @@ def run_mtp_decode(
             replayssm_rawk_tensor = _mark_slot_dynamic(replayssm_rawk)
             replayssm_g_tensor = _mark_slot_dynamic(replayssm_g)
             replayssm_beta_tensor = _mark_slot_dynamic(replayssm_beta)
+            replayssm_u_tensor = _mark_slot_dynamic(replayssm_u)
         else:
             replayssm_rawv_tensor = v_tensor
             replayssm_rawk_tensor = k_tensor
             replayssm_g_tensor = A_log_tensor
             replayssm_beta_tensor = A_log_tensor
+            replayssm_u_tensor = v_tensor
 
         compile_options = gdn_compile_options(
             q.device, cute.EnableTVMFFI(True), cute.GenerateLineInfo(True)
@@ -3422,6 +3545,7 @@ def run_mtp_decode(
                     replayssm_rawk_tensor,
                     replayssm_g_tensor,
                     replayssm_beta_tensor,
+                    replayssm_u_tensor,
                     softplus_beta=1.0,
                     softplus_threshold=20.0,
                     scale=scale,
@@ -3446,6 +3570,7 @@ def run_mtp_decode(
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
                     cache_replayssm=cache_replayssm,
+                    write_replayssm_u=write_replayssm_u,
                     stream=stream,
                 ),
                 extra_key_files=(__file__, _softplus.__file__),
@@ -3474,6 +3599,7 @@ def run_mtp_decode(
                     replayssm_rawk_tensor,
                     replayssm_g_tensor,
                     replayssm_beta_tensor,
+                    replayssm_u_tensor,
                     softplus_beta=1.0,
                     softplus_threshold=20.0,
                     scale=scale,
@@ -3498,6 +3624,7 @@ def run_mtp_decode(
                     use_packed_fma=use_packed_fma,
                     per_token_pool_scatter=per_token_pool_scatter,
                     cache_replayssm=cache_replayssm,
+                    write_replayssm_u=write_replayssm_u,
                     stream=stream,
                 ),
                 extra_key_files=(__file__, _softplus.__file__),
@@ -3526,6 +3653,7 @@ def run_mtp_decode(
         replayssm_rawk,
         replayssm_g,
         replayssm_beta,
+        replayssm_u,
         cache_intermediate_states,
         stream,
     )

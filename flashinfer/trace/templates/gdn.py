@@ -750,6 +750,7 @@ def _gdn_mtp_reference(
     replayssm_rawk=None,
     replayssm_g=None,
     replayssm_beta=None,
+    replayssm_u=None,
 ):
     """Direct GDN recurrence, including frozen-state raw-window verification."""
     B, T, H, K = q.shape
@@ -772,10 +773,11 @@ def _gdn_mtp_reference(
         if slot < 0:
             continue
         if cache_replayssm:
-            replayssm_rawv[slot] = raw_v[row].transpose(0, 1).to(torch.bfloat16)
             replayssm_rawk[slot] = raw_k[row].transpose(0, 1).to(torch.bfloat16)
             replayssm_g[slot] = log_g[row].transpose(0, 1).float()
-            replayssm_beta[slot] = beta[row].transpose(0, 1).float()
+            if replayssm_u is None:
+                replayssm_rawv[slot] = raw_v[row].transpose(0, 1).to(torch.bfloat16)
+                replayssm_beta[slot] = beta[row].transpose(0, 1).float()
         state = initial_state[slot].double()
         for step in range(T):
             kt = key[row, step]
@@ -783,6 +785,8 @@ def _gdn_mtp_reference(
             prediction = (state * kt[:, None, :]).sum(-1)
             delta = (raw_v[row, step] - prediction) * beta[row, step, :, None]
             state += delta[..., None] * kt[:, None, :]
+            if cache_replayssm and replayssm_u is not None:
+                replayssm_u[slot, :, step] = delta.float()
             output[row, step] = (
                 (state * query[row, step, :, None, :]).sum(-1).to(output.dtype)
             )
@@ -954,6 +958,11 @@ gdn_mtp_trace = TraceTemplate(
         "verify_parents": Tensor(
             ["batch_size", "seq_len"], dtype="int32", optional=True
         ),
+        "replayssm_u": Tensor(
+            ["pool_size", "num_v_heads", "seq_len", "head_size"],
+            dtype="float32",
+            optional=True,
+        ),
     },
     outputs={
         "output": Tensor(
@@ -988,6 +997,12 @@ gdn_mtp_trace = TraceTemplate(
             ["pool_size", "num_v_heads", "seq_len"],
             dtype="float32",
             param="replayssm_beta",
+            optional=True,
+        ),
+        "replayssm_u": Tensor(
+            ["pool_size", "num_v_heads", "seq_len", "head_size"],
+            dtype="float32",
+            param="replayssm_u",
             optional=True,
         ),
     },
@@ -1337,10 +1352,14 @@ def _gdn_replayssm_commit_reference(
     use_qk_l2norm=True,
     null_block_id=-1,
     backend="auto",
+    u_cache=None,
 ):
-    """Direct recurrence over accepted tokens; mutates the checkpoint pool."""
-    hv, h = rawv_cache.shape[2], rawk_cache.shape[2]
-    steps = rawv_cache.shape[3]
+    """Direct recurrence over accepted tokens; mutates the checkpoint pool.
+
+    With ``u_cache`` the cached corrections replace the raw V/beta prediction.
+    """
+    hv, h = g_cache.shape[2], rawk_cache.shape[2]
+    steps = g_cache.shape[3]
     for row, slot in enumerate(state_indices.tolist()):
         count = int(accept_lens[row])
         if slot <= null_block_id or count <= 0:
@@ -1356,10 +1375,13 @@ def _gdn_replayssm_commit_reference(
             if use_qk_l2norm:
                 key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
             state *= g_cache[:, slot, :, step, None, None].double().exp()
-            delta = (
-                rawv_cache[:, slot, :, step].double()
-                - (state * key[..., None, :]).sum(-1)
-            ) * beta_cache[:, slot, :, step, None].double()
+            if u_cache is not None:
+                delta = u_cache[:, slot, :, step].double()
+            else:
+                delta = (
+                    rawv_cache[:, slot, :, step].double()
+                    - (state * key[..., None, :]).sum(-1)
+                ) * beta_cache[:, slot, :, step, None].double()
             state += delta[..., None] * key[..., None, :]
             if track_state_indices is not None and track_steps is not None:
                 track = int(track_state_indices[row])
@@ -1439,6 +1461,7 @@ gdn_replayssm_commit_trace = TraceTemplate(
         "rawv_cache": Tensor(
             ["num_layers", "pool_size", "num_v_heads", "seq_len", "head_size"],
             dtype="bfloat16",
+            optional=True,
         ),
         "rawk_cache": Tensor(
             ["num_layers", "pool_size", "num_k_heads", "seq_len", "head_size"],
@@ -1448,7 +1471,9 @@ gdn_replayssm_commit_trace = TraceTemplate(
             ["num_layers", "pool_size", "num_v_heads", "seq_len"], dtype="float32"
         ),
         "beta_cache": Tensor(
-            ["num_layers", "pool_size", "num_v_heads", "seq_len"], dtype="float32"
+            ["num_layers", "pool_size", "num_v_heads", "seq_len"],
+            dtype="float32",
+            optional=True,
         ),
         "state_indices": Tensor(["batch_size"], dtype="int32"),
         "accept_lens": Tensor(["batch_size"], dtype="int32"),
@@ -1458,6 +1483,11 @@ gdn_replayssm_commit_trace = TraceTemplate(
         "use_qk_l2norm": Scalar("bool", optional=True),
         "null_block_id": Scalar("int32", optional=True),
         "backend": Scalar("str", optional=True),
+        "u_cache": Tensor(
+            ["num_layers", "pool_size", "num_v_heads", "seq_len", "head_size"],
+            dtype="float32",
+            optional=True,
+        ),
     },
     outputs={
         "checkpoint_state": Tensor(

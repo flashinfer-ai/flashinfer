@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import inspect
+
 import pytest
 import torch
 
 from flashinfer.gdn_decode import (
     gated_delta_rule_mtp,
     gated_delta_rule_replayssm_commit,
+    gated_delta_rule_replayssm_prefer_u,
 )
 
 
@@ -76,12 +79,13 @@ def _inputs(batch=4, steps=8, heads=2, value_heads=8, dtype=torch.bfloat16):
     return args, cache
 
 
-def _reference(args, rows=None):
+def _reference(args, rows=None, deltas=None):
     """FP64 recurrence independent of the CuTe layouts and TF32 contractions.
 
     ``rows`` is an optional ``[B, T]`` index of the draft rows each request
     replays, in order; ``None`` replays ``0..T-1``. Element ``j`` of the
     returned states is the state after replaying ``rows[:, j]``.
+    ``deltas``, if given, receives each step's delta-rule correction u_t.
     """
     q, k, v = (args[n].to(torch.bfloat16).double() for n in ("q", "k", "v"))
     batch, steps, heads, _ = q.shape
@@ -109,6 +113,8 @@ def _reference(args, rows=None):
         prediction = (state * k[request, t, :, None, :]).sum(-1)
         delta = (v[request, t] - prediction) * beta[request, t, :, None]
         state = state + delta[..., None] * k[request, t, :, None, :]
+        if deltas is not None:
+            deltas.append(delta)
         outputs.append((state * q[request, t, :, None, :]).sum(-1))
         states.append(state.clone())
     return torch.stack(outputs, 1), torch.stack(states, 1), log_g, beta
@@ -145,6 +151,18 @@ def _offset_copy(tensor, offset):
         (17, 6, 2, 8, "inner_strided"),
         (17, 7, 2, 8, "strided_bias"),
         (2, 16, 2, 8, "default"),
+        (1, 9, 2, 8, "default"),
+        (17, 9, 2, 8, "default"),
+        (17, 10, 2, 8, "default"),
+        (1, 11, 2, 8, "default"),
+        (8, 12, 8, 32, "default"),
+        (256, 12, 1, 2, "default"),
+        (17, 13, 2, 8, "default"),
+        (17, 16, 2, 8, "default"),
+        (17, 11, 2, 8, "all_padding"),
+        (2, 12, 2, 8, "zero_qk"),
+        (2, 12, 2, 8, "extreme_gates"),
+        (17, 10, 2, 8, "inner_strided"),
         (1, 6, 8, 24, "default"),
         (8, 7, 8, 24, "default"),
         (8, 8, 8, 32, "default"),
@@ -264,7 +282,7 @@ def test_replayssm_verify(batch, steps, heads, hv, variant):
         )
 
 
-@pytest.mark.parametrize("steps", [3, 4, 5, 6, 7, 8], ids=lambda t: f"T{t}")
+@pytest.mark.parametrize("steps", [3, 4, 5, 6, 7, 8, 9, 12, 16], ids=lambda t: f"T{t}")
 @pytest.mark.parametrize(
     "normalize,track", [(True, False), (True, True), (False, True)]
 )
@@ -273,7 +291,7 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
     if tcgen and not _IS_SM100:
         pytest.skip("tcgen05 commit requires SM100")
     if tcgen and (steps < 4 or not normalize):
-        pytest.skip("tcgen commit requires normalized T=4..8")
+        pytest.skip("tcgen commit requires normalized T=4..16")
     # The extra full-accept row preserves final-step tracking coverage at T=3,
     # where the first full-accept row exercises an intermediate tracked step.
     counts = list(range(steps + 1)) + [steps, 0, steps]
@@ -676,7 +694,7 @@ def test_replayssm_commit_pool_beyond_int32_elements(backend):
     "steps,accept",
     [
         pytest.param(t, a, id=f"T{t}-accept{a}")
-        for t in (3, 4, 5, 6, 7, 8)
+        for t in (3, 4, 5, 6, 7, 8, 9, 16)
         for a in (1, t - 1, t)
     ],
 )
@@ -685,7 +703,7 @@ def test_replayssm_single_request_commit(steps, accept, backend):
     if backend == "tcgen05" and not _IS_SM100:
         pytest.skip("tcgen05 commit requires SM100")
     if steps < 4 and backend == "tcgen05":
-        pytest.skip("tcgen commit requires T=4..8")
+        pytest.skip("tcgen commit requires T=4..16")
     args, cache = _inputs(batch=1, steps=steps)
     # Nonzero storage offsets are valid when the resulting pointers are aligned.
     args["initial_state"] = _offset_copy(args["initial_state"], 4)
@@ -902,6 +920,26 @@ def test_replayssm_commit_noop(batch, backend):
     torch.testing.assert_close(args["checkpoint_state"], before, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "capability,steps,expected",
+    [
+        ((10, 0), 3, True),
+        ((10, 3), 32, True),
+        ((10, 0), 33, False),
+        ((10, 0), 2, False),
+        ((12, 0), 8, False),
+        ((12, 1), 8, False),
+        ((9, 0), 8, False),
+    ],
+)
+def test_replayssm_prefer_u(capability, steps, expected, monkeypatch):
+    import flashinfer.gdn_decode as gdn_decode
+
+    monkeypatch.setattr(gdn_decode, "get_compute_capability", lambda device: capability)
+    device = torch.device("cuda")
+    assert gated_delta_rule_replayssm_prefer_u(steps, device) is expected
+
+
 def test_replayssm_rejects_other_architectures(monkeypatch):
     from flashinfer.gdn_kernels import device_target
 
@@ -932,11 +970,14 @@ def test_replayssm_rejects_other_architectures(monkeypatch):
         (7, 4, 1, 64, "auto", False, ["simt"]),
         (7, 4, 8, 32, "simt", False, ["simt"]),
         (8, 1, 1, 8, "auto", False, ["tcgen05"]),
-        (9, 4, 8, 32, "auto", False, ["simt"]),
+        (9, 1, 1, 8, "auto", False, ["tcgen05"]),
+        (16, 4, 8, 32, "auto", False, ["tcgen05"]),
+        (17, 4, 8, 32, "auto", False, ["simt"]),
         (6, 4, 8, 32, "auto", True, ["simt"]),
         (8, 1, 8, 32, "auto", True, ["simt"]),
         (8, 4, 64, 32, "auto", True, ["simt"]),
         (8, 1, 8, 32, "tcgen05", True, ["simt", "tcgen05"]),
+        (16, 1, 8, 32, "tcgen05", True, ["simt", "tcgen05"]),
     ],
 )
 @requires_sm100
@@ -1015,6 +1056,9 @@ def test_replayssm_commit_rejects_tcgen05_on_sm120():
         (8, 4, 32, "default", None),
         (8, 8, 32, "default", 2),
         (256, 8, 2, "default", 2),
+        (1, 9, 8, "default", 4),
+        (17, 12, 8, "default", 2),
+        (8, 16, 32, "default", 2),
         (1, 3, 8, "default", None),
         (1, 8, 8, "unnormalized", None),
         (1, 8, 8, "int64", None),
@@ -1042,3 +1086,311 @@ def test_replayssm_verify_dispatch_sm120(
     )
     gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
     assert selected == ([] if expected is None else [expected])
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "steps,heads,hv,expected",
+    [
+        (3, 2, 8, False),
+        (4, 2, 8, True),
+        (8, 2, 8, True),
+        (9, 2, 8, True),
+        (16, 2, 8, True),
+        (8, 8, 24, True),
+        (8, 3, 3, True),
+    ],
+)
+def test_replayssm_verify_dispatch_sm100(steps, heads, hv, expected, monkeypatch):
+    """The SM100 tcgen05 verify covers T=4..16 and any HV/H."""
+    from flashinfer.gdn_kernels import gdn_decode_mtp_replayssm_tcgen as tcgen
+
+    args, cache = _inputs(17, steps, heads, hv)
+    selected = []
+    signature = inspect.signature(tcgen.run_gdn_verify_kernel_mtp_replayssm_tcgen)
+
+    def record(*call_args, **call_kwargs):
+        selected.append(signature.bind(*call_args, **call_kwargs).arguments["T"])
+
+    monkeypatch.setattr(tcgen, "run_gdn_verify_kernel_mtp_replayssm_tcgen", record)
+    gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+    assert selected == ([steps] if expected else [])
+
+
+def _u_cache(cache):
+    """Windows for u mode: raw V and beta are replaced by FP32 u."""
+    slots, value_heads, steps, _ = cache["replayssm_rawv"].shape
+    return dict(
+        replayssm_rawk=cache["replayssm_rawk"],
+        replayssm_g=cache["replayssm_g"],
+        replayssm_u=torch.full(
+            (slots, value_heads, steps, 128), 7.0, device="cuda", dtype=torch.float32
+        ),
+    )
+
+
+_U_CYCLE_CASES = (
+    [
+        pytest.param(steps, 2, 8, "default", track, single, id=f"T{steps}-{tag}")
+        for steps in (4, 5, 8, 9, 12, 16)
+        for track, single, tag in (
+            (False, False, "batch"),
+            (True, False, "batch-track"),
+            (False, True, "single"),
+            (True, True, "single-track"),
+        )
+    ]
+    + [
+        # HV/H=3: the SM100 verify pairs value heads within a key head.
+        pytest.param(steps, 8, 24, "default", True, single, id=f"T{steps}-hv24-{tag}")
+        for steps in (4, 8, 12, 16)
+        for single, tag in ((False, "batch"), (True, "single"))
+    ]
+    + [
+        # Shapes served by the FP32 fallback verify (inline and warp kernels).
+        pytest.param(steps, 2, 8, variant, True, single, id=f"T{steps}-{variant}-{tag}")
+        for steps, variant in (
+            (3, "default"),
+            (20, "default"),
+            (32, "default"),
+            (8, "unnormalized"),
+            (16, "unnormalized"),
+            (8, "large_batch"),
+        )
+        for single, tag in ((False, "batch"), (True, "single"))
+        if not (single and variant == "large_batch")
+    ]
+)
+
+
+@requires_sm100
+@pytest.mark.parametrize("steps,heads,hv,variant,track,single", _U_CYCLE_CASES)
+def test_replayssm_u_verify_commit_cycles(steps, heads, hv, variant, track, single):
+    """Verify emits u; committing u matches the FP64 recurrence for every prefix."""
+    if single:
+        counts = [steps]
+    elif variant == "large_batch":
+        counts = [row % (steps + 1) for row in range(300)]
+    else:
+        counts = list(range(steps + 1)) + [steps, 0, steps]
+    batch = len(counts)
+    args, cache = _inputs(batch, steps, heads, hv)
+    normalize = variant != "unnormalized"
+    args["use_qk_l2norm"] = normalize
+    windows_layer = _u_cache(cache)
+    accepts = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    layers = 2
+    slots, hv, v, k = args["initial_state"].shape
+    checkpoint = torch.randn(layers, slots * 2, hv, v, k, device="cuda") * 0.1
+    windows = {
+        name: torch.empty(
+            (layers, slots * 2, *value.shape[1:]), device="cuda", dtype=value.dtype
+        )
+        for name, value in windows_layer.items()
+    }
+    track_ids = torch.arange(slots, slots + batch, device="cuda", dtype=torch.int32)
+    track_steps = (accepts - 1).clamp_min(0)
+    if not single:
+        track_ids[1] = -1
+        track_steps[2] = accepts[2]
+        track_steps[3] = 1
+    for _ in range(2):
+        before = checkpoint.clone()
+        expected_state = checkpoint.clone()
+        for layer in range(layers):
+            args["initial_state"] = checkpoint[layer]
+            args["v"] = torch.randn_like(args["v"]) * 0.1
+            deltas = []
+            ref_out, ref_states, _, _ = _reference(args, deltas=deltas)
+            output, _ = gated_delta_rule_mtp(
+                **args,
+                cache_replayssm=True,
+                **{name: value[layer] for name, value in windows.items()},
+            )
+            live = slice(None) if single else slice(None, -1)
+            torch.testing.assert_close(
+                output[live].double(), ref_out[live], atol=1e-4, rtol=1e-2
+            )
+            ref_u = torch.stack(deltas, 2)  # [B, HV, T, V]
+            slot_ids = args["initial_state_indices"].long()[live]
+            torch.testing.assert_close(
+                windows["replayssm_u"][layer, slot_ids].double(),
+                ref_u[live],
+                atol=1e-4,
+                rtol=1e-2,
+            )
+            for row, (slot, count) in enumerate(
+                zip(
+                    args["initial_state_indices"].tolist(),
+                    accepts.tolist(),
+                    strict=True,
+                )
+            ):
+                if slot < 0 or count == 0:
+                    continue
+                expected_state[layer, slot] = ref_states[row, count - 1].float()
+                if track and track_ids[row] >= 0 and track_steps[row] < count:
+                    expected_state[layer, track_ids[row]] = ref_states[
+                        row, track_steps[row]
+                    ].float()
+        torch.testing.assert_close(checkpoint, before, atol=0, rtol=0)
+        # A rejected suffix must not influence the accepted checkpoint.
+        for slot, count in zip(
+            args["initial_state_indices"].tolist(), accepts.tolist(), strict=True
+        ):
+            if slot >= 0:
+                for window in windows.values():
+                    window[:, slot, :, count:] = float("nan")
+        gated_delta_rule_replayssm_commit(
+            checkpoint,
+            None,
+            windows["replayssm_rawk"],
+            windows["replayssm_g"],
+            None,
+            args["initial_state_indices"],
+            accepts,
+            use_qk_l2norm=normalize,
+            track_state_indices=track_ids if track else None,
+            track_steps=track_steps if track else None,
+            u_cache=windows["replayssm_u"],
+        )
+        torch.testing.assert_close(checkpoint, expected_state, atol=1e-4, rtol=1e-3)
+
+
+@requires_sm100
+def test_replayssm_u_commit_matches_raw_simt():
+    """Given verify's u, the u commit is FP32-accurate against the raw replay."""
+    steps = 16
+    counts = list(range(steps + 1)) + [steps, 0, steps]
+    args, cache = _inputs(len(counts), steps)
+    u_cache = _u_cache(cache)
+    raw_cache = {k: v.clone() for k, v in cache.items()}
+    gated_delta_rule_mtp(**args, cache_replayssm=True, **raw_cache)
+    gated_delta_rule_mtp(**args, cache_replayssm=True, **u_cache)
+    accepts = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    deltas = []
+    _, ref_states, _, _ = _reference(args, deltas=deltas)
+    # Feed the commit the exact FP64 u so only the commit arithmetic differs.
+    slots = args["initial_state_indices"].long()[:-1]
+    u_cache["replayssm_u"][slots] = torch.stack(deltas, 2)[:-1].float()
+    raw_state = args["initial_state"].clone()
+    u_state = args["initial_state"].clone()
+    gated_delta_rule_replayssm_commit(
+        raw_state.unsqueeze(0),
+        raw_cache["replayssm_rawv"].unsqueeze(0),
+        raw_cache["replayssm_rawk"].unsqueeze(0),
+        raw_cache["replayssm_g"].unsqueeze(0),
+        raw_cache["replayssm_beta"].unsqueeze(0),
+        args["initial_state_indices"],
+        accepts,
+        backend="simt",
+    )
+    gated_delta_rule_replayssm_commit(
+        u_state.unsqueeze(0),
+        None,
+        u_cache["replayssm_rawk"].unsqueeze(0),
+        u_cache["replayssm_g"].unsqueeze(0),
+        None,
+        args["initial_state_indices"],
+        accepts,
+        u_cache=u_cache["replayssm_u"].unsqueeze(0),
+    )
+    expected = args["initial_state"].clone()
+    for row, (slot, count) in enumerate(zip(slots.tolist(), counts, strict=False)):
+        if count:
+            expected[slot] = ref_states[row, count - 1].float()
+    torch.testing.assert_close(raw_state, expected, atol=2e-6, rtol=1e-5)
+    torch.testing.assert_close(u_state, expected, atol=2e-6, rtol=1e-5)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "invalid", ["with_rawv", "with_beta", "dtype", "shape", "long"]
+)
+def test_replayssm_u_verify_validation(invalid):
+    # u is produced only for windows the u commit can fold (T <= 32).
+    steps = 33 if invalid == "long" else 8
+    args, cache = _inputs(steps=steps)
+    windows = _u_cache(cache)
+    if invalid == "with_rawv":
+        windows["replayssm_rawv"] = cache["replayssm_rawv"]
+    if invalid == "with_beta":
+        windows["replayssm_beta"] = cache["replayssm_beta"]
+    if invalid == "dtype":
+        windows["replayssm_u"] = windows["replayssm_u"].bfloat16()
+    if invalid == "shape":
+        windows["replayssm_u"] = windows["replayssm_u"][..., :-1].contiguous()
+    with pytest.raises(ValueError):
+        gated_delta_rule_mtp(**args, cache_replayssm=True, **windows)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "invalid", ["with_rawv", "with_beta", "backend", "shape", "long_window"]
+)
+def test_replayssm_u_commit_validation(invalid):
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init(
+        seq_len=33 if invalid == "long_window" else 8
+    )
+    rawv, beta = args.pop("rawv_cache"), args.pop("beta_cache")
+    args["rawv_cache"], args["beta_cache"] = None, None
+    args["u_cache"] = torch.zeros(rawv.shape, device=rawv.device)
+    if invalid == "with_rawv":
+        args["rawv_cache"] = rawv
+    if invalid == "with_beta":
+        args["beta_cache"] = beta
+    if invalid == "backend":
+        args["backend"] = "simt"
+    if invalid == "shape":
+        args["u_cache"] = args["u_cache"][..., :-1].contiguous()
+    with pytest.raises(ValueError):
+        gated_delta_rule_replayssm_commit(**args)
+
+
+def test_replayssm_commit_requires_raw_windows_without_u():
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init()
+    args["beta_cache"] = None
+    with pytest.raises(ValueError):
+        gated_delta_rule_replayssm_commit(**args)
+
+
+@requires_sm100
+def test_replayssm_u_cuda_graph():
+    args, cache = _inputs()
+    windows = _u_cache(cache)
+    output = torch.empty_like(args["v"])
+    before = args["initial_state"].clone()
+    accepts = torch.tensor([0, 1, 4, 8], device="cuda", dtype=torch.int32)
+
+    def cycle():
+        gated_delta_rule_mtp(**args, output=output, cache_replayssm=True, **windows)
+        gated_delta_rule_replayssm_commit(
+            args["initial_state"].unsqueeze(0),
+            None,
+            windows["replayssm_rawk"].unsqueeze(0),
+            windows["replayssm_g"].unsqueeze(0),
+            None,
+            args["initial_state_indices"],
+            accepts,
+            u_cache=windows["replayssm_u"].unsqueeze(0),
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cycle()
+    torch.cuda.current_stream().wait_stream(stream)
+    expected_output, expected_state = output.clone(), args["initial_state"].clone()
+    args["initial_state"].copy_(before)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cycle()
+    output.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output[:-1], expected_output[:-1], atol=0, rtol=0)
+    torch.testing.assert_close(args["initial_state"], expected_state, atol=0, rtol=0)
