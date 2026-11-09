@@ -25,6 +25,7 @@ accumulation; the reductions are bitwise deterministic (no atomics) and empty gr
 produce exactly zero weight gradients.
 
 The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
 
 ============ ==================================================================== ============================
 operation    computation                                                           output

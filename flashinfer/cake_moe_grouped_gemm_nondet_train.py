@@ -140,6 +140,7 @@ def cake_moe_grouped_gemm_nondet_train_forward(
     """``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T`` for every group ``e``.
 
     The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
 
     Parameters
     ----------
@@ -184,6 +185,7 @@ def cake_moe_grouped_gemm_nondet_train_dgrad(
     """``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]`` for every group ``e``.
 
     The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
 
     ``g`` is ``[sum_m, N]`` bfloat16, ``w`` is ``[E, N, K]`` bfloat16 and is
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
@@ -213,6 +215,7 @@ def cake_moe_grouped_gemm_nondet_train_wgrad(
     """``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` for every group ``e``.
 
     The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
 
     ``g`` is ``[sum_m, N]`` bfloat16, ``x`` is ``[sum_m, K]`` bfloat16,
     ``offs`` is ``[E]`` int32 device end offsets (``E = offs.numel()``; pass
@@ -370,6 +373,7 @@ def cake_moe_grouped_gemm_nondet(
     """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
     The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
 
     Parameters
     ----------

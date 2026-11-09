@@ -19,6 +19,7 @@ an int32 **device** tensor `offs[E]` of cumulative end offsets, or
 `m_indptr[E + 1]`, read by the kernels only.
 
 The slice lower bound is `0` for `e == 0` and `offs[e-1]` for `e > 0`.
+For `m_indptr` input, `offs` in these formulas means `m_indptr[1:]`.
 
 | helper | computation | output |
 | --- | --- | --- |

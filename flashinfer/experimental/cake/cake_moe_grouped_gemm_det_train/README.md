@@ -20,6 +20,7 @@ two forms apart). The kernels read the offsets on the device; the host never
 synchronises on them.
 
 The slice lower bound is `0` for `e == 0` and `offs[e-1]` for `e > 0`.
+For `m_indptr` input, `offs` in these formulas means `m_indptr[1:]`.
 
 | helper | computation | inputs | output |
 | --- | --- | --- | --- |
