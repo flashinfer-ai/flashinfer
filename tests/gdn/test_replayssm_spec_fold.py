@@ -401,6 +401,8 @@ def _sample_paths(batch, steps, counts, seed):
 
 @pytest.mark.parametrize("backend", ["simt", "tcgen05"])
 def test_replayssm_commit_non_prefix_path(backend):
+    if backend == "tcgen05" and not _IS_SM100:
+        pytest.skip("tcgen05 commit requires SM100")
     """A tree accept of {0, 2} must not read the rejected sibling at row 1."""
     args, cache = _inputs(batch=1, steps=4)
     paths = torch.tensor([[0, 2, 0, 0]], device="cuda", dtype=torch.int32)
@@ -426,6 +428,8 @@ def test_replayssm_commit_non_prefix_path(backend):
 @pytest.mark.parametrize("backend", ["simt", "tcgen05"])
 @pytest.mark.parametrize("track", [False, True])
 def test_replayssm_commit_path_cycles(steps, backend, track):
+    if backend == "tcgen05" and not _IS_SM100:
+        pytest.skip("tcgen05 commit requires SM100")
     """Every accepted length over a non-prefix path, with null and zero rows."""
     if backend == "tcgen05" and steps < 4:
         pytest.skip("tcgen commit requires T=4..8")
@@ -500,6 +504,8 @@ def test_replayssm_commit_path_cycles(steps, backend, track):
 @pytest.mark.parametrize("backend", ["simt", "tcgen05"])
 @pytest.mark.parametrize("batch", [1, 5])
 def test_replayssm_commit_identity_path_is_bitwise_identical(batch, steps, backend):
+    if backend == "tcgen05" and not _IS_SM100:
+        pytest.skip("tcgen05 commit requires SM100")
     """The no-gather fast path and an explicit identity path must agree exactly."""
     if backend == "tcgen05" and steps < 4:
         pytest.skip("tcgen commit requires T=4..8")
@@ -526,6 +532,8 @@ def test_replayssm_commit_identity_path_is_bitwise_identical(batch, steps, backe
     "backend,tracked", [("auto", False), ("simt", False), ("tcgen05", True)]
 )
 def test_replayssm_commit_path_cuda_graph(backend, tracked):
+    if backend == "tcgen05" and not _IS_SM100:
+        pytest.skip("tcgen05 commit requires SM100")
     args, cache = _inputs()
     output = torch.empty_like(args["v"])
     before = args["initial_state"].clone()
@@ -594,6 +602,8 @@ def test_replayssm_commit_path_validation(invalid, backend):
 @pytest.mark.parametrize("bad_row,clamped_row", [(99, 3), (-5, 0)])
 @pytest.mark.parametrize("backend", ["simt", "tcgen05"])
 def test_replayssm_commit_path_clamps_out_of_range_rows(backend, bad_row, clamped_row):
+    if backend == "tcgen05" and not _IS_SM100:
+        pytest.skip("tcgen05 commit requires SM100")
     """Row values are a caller contract; a bad row must stay in bounds."""
     args, cache = _inputs(batch=1, steps=4)
     accepts = torch.tensor([2], device="cuda", dtype=torch.int32)
