@@ -1731,9 +1731,17 @@ def test_instance_rules_mirror_the_launchers():
         7168,
         2049,
     )
-    assert cake_backend.RASTER_WIDE_GROUPS == {"sm_100a": (16, 32), "sm_103a": (16, 32)}
+    assert cake_backend.RASTER_WIDE_GROUPS == {
+        "sm_100a": (16, 32),
+        "sm_103a": (16, 32),
+        "sm_107a": (32, 32),
+    }
     assert cake_backend.DW_LONG_CHUNK_GROUP_M == 16
-    assert cake_backend.DW_LONG_CHUNK_GROUPS == {"sm_100a": 16, "sm_103a": 16}
+    assert cake_backend.DW_LONG_CHUNK_GROUPS == {
+        "sm_100a": 16,
+        "sm_103a": 16,
+        "sm_107a": 16,
+    }
     assert cake_backend.DW_LONG_CHUNK_MIN_ROWS == 4097
     assert cake_backend.LOGITS_LONG_RASTER_GROUPS == {"sm_100a": 16, "sm_103a": 16}
     assert cake_backend.LOGITS_LONG_RASTER_MIN_ROWS == 3841  # 30 row tiles of 128 + 1
@@ -1743,7 +1751,11 @@ def test_instance_rules_mirror_the_launchers():
     assert (cake_backend.DX_TILE_WIDE, cake_backend.DX_TILE_NARROW) == (512, 256)
     assert cake_backend.DX_LONG_CHUNK_STAGES == {"sm_100a": 3, "sm_103a": 3}
     assert cake_backend.DX_WIDE_TILE_STAGES == 4
-    assert cake_backend.DW_BLOCK_GROUPS == {"sm_100a": 12, "sm_103a": 12}
+    assert cake_backend.DW_BLOCK_GROUPS == {
+        "sm_100a": 12,
+        "sm_103a": 12,
+        "sm_107a": 12,
+    }
     assert (cake_backend.DW_BLOCK_MIN_ROWS, cake_backend.DW_BLOCK_MAX_ROWS) == (
         2049,
         4096,
@@ -1752,9 +1764,9 @@ def test_instance_rules_mirror_the_launchers():
     # the dX tile rule's wave-efficiency floor: SM100 only, one-slice launches below H 7168 (T 65031 / 32463 tails at
     # chunk 4096: 15 row pairs x 12 = 180 wide items on 74 SM pairs = 2.43 waves, 81 % < 83 % -> the 256-wide form)
     assert cake_backend.DX_WIDE_MIN_EFF == {"sm_100a": 0.83}
-    assert cake_backend.DX_SPLIT_ARCHES == ("sm_100a", "sm_103a")
-    assert cake_backend.DX_SPLIT_LONG_RING_ARCHES == ("sm_103a",)
-    assert cake_backend.DX_SPLIT_WHOLE_ARCHES == ("sm_103a",)
+    assert cake_backend.DX_SPLIT_ARCHES == ("sm_100a", "sm_103a", "sm_107a")
+    assert cake_backend.DX_SPLIT_LONG_RING_ARCHES == ("sm_103a", "sm_107a")
+    assert cake_backend.DX_SPLIT_WHOLE_ARCHES == ("sm_103a", "sm_107a")
     assert cake_backend.DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES == ("sm_100a",)
     g_glm = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     g_wide = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
@@ -1787,8 +1799,8 @@ def test_instance_rules_mirror_the_launchers():
         assert cake_backend.dx_stages_variant(8192, 6144, 256, arch) is None
         assert cake_backend.dx_stages_variant(8192, 7168, None, arch) is None
     assert cake_backend.dx_stages_variant(8192, 6144, None, None) is None
-    # the dW block rule: both architectures, the C 4096 chunk and its tails of the default geometry
-    for arch in ("sm_100a", "sm_103a"):
+    # the dW block rule: every architecture, the C 4096 chunk and its tails of the default geometry
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
         assert cake_backend.dw_block_variant(4096, 6144, arch) == 12
         assert cake_backend.dw_block_variant(3943, 6144, arch) == 12
         assert cake_backend.dw_block_variant(2049, 6144, arch) == 12
@@ -1842,6 +1854,18 @@ def test_instance_rules_mirror_the_launchers():
         assert cake_backend.raster_variant(6912, 3840, arch) is None
     assert cake_backend.raster_variant(8192, 4096, None) is None
     assert cake_backend.raster_variant(8192, 4096, "sm_90a") is None
+    # sm_107a: the wide rule keeps the record's logits height (32) and takes the tall weight-gradient raster; below H
+    # 7168 no logits rule (the record's 32 stays) and the long-chunk weight-gradient raster above 4096 rows; the dX
+    # long chunks keep the table ring depth
+    assert cake_backend.raster_variant(7168, 2049, "sm_107a") == (32, 32)
+    assert cake_backend.raster_variant(8192, 8192, "sm_107a") == (32, 32)
+    assert cake_backend.raster_variant(7168, 2048, "sm_107a") is None
+    for rows in (1, 2048, 3841, 4096):
+        assert cake_backend.raster_variant(6144, rows, "sm_107a") is None
+    for rows in (4097, 8192, 16231):
+        assert cake_backend.raster_variant(6144, rows, "sm_107a") == (None, 16)
+    assert cake_backend.dx_stages_variant(4097, 6144, None, "sm_107a") is None
+    assert cake_backend.dx_stages_variant(8192, 6144, 512, "sm_107a") is None
     assert cake_backend.raster_variant(6144, 8192, "sm_90a") is None
     g = Geometry.from_record(None)
     rule = cake_backend.dx_tile_rule
@@ -2259,17 +2283,19 @@ def test_dx_split_eligible_whole_chunks_by_architecture_and_call_length():
     # a chunk that is not a whole number of 512-token tiles may always take the split rule
     assert cake_backend.dx_split_eligible(3943, 6144, "sm_100a", 512, 4)
     assert cake_backend.dx_split_eligible(3943, 6144, "sm_103a", 512, 4)
-    # a whole 4096-token chunk below H 7168: every call on sm_103a; on sm_100a only a call of fewer than
+    assert cake_backend.dx_split_eligible(3943, 6144, "sm_107a", 512, 4)
+    # a whole 4096-token chunk below H 7168: every call on sm_103a / sm_107a; on sm_100a only a call of fewer than
     # DW_STREAM_MIN_CHUNKS chunks, whose dW accumulate shares the dX stream (an unknown chunk count: no)
     assert cake_backend.DW_STREAM_MIN_CHUNKS == 3
     for n in (1, 2, 3, 16, None):
         assert cake_backend.dx_split_eligible(4096, 6144, "sm_103a", 512, n)
+        assert cake_backend.dx_split_eligible(4096, 6144, "sm_107a", 512, n)
     assert cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 1)
     assert cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 2)
     assert not cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 3)
     assert not cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, None)
-    # from H 7168 on a whole chunk keeps its full items on both architectures
-    for arch in ("sm_100a", "sm_103a"):
+    # from H 7168 on a whole chunk keeps its full items on every architecture
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
         assert not cake_backend.dx_split_eligible(4096, 7168, arch, 512, 1)
         assert not cake_backend.dx_split_eligible(8192, 8192, arch, 512, 2)
     # the 256-wide tile is never a whole-tile chunk; the reference path (no architecture) never splits a whole chunk
@@ -2691,7 +2717,7 @@ def test_make_plan_explicit_dx_split_runs_1_to_w_wide_items():
 
 
 def _plan_kw(arch, H=6144, V=154880):
-    sms = {"sm_100a": 148, "sm_103a": 152}[arch]
+    sms = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}[arch]
     return dict(
         need_dx=True,
         need_dw=True,
@@ -2708,8 +2734,12 @@ _ENTRIES = (("ce", "loss"), ("policy", "loss"), ("ce", "logprob"))
 
 
 def test_dw_cast_tma_rule():
-    assert cake_backend.DW_CAST_TMA_MAX_ROWS == {"sm_100a": 1792, "sm_103a": 1792}
-    for arch in ("sm_100a", "sm_103a"):
+    assert cake_backend.DW_CAST_TMA_MAX_ROWS == {
+        "sm_100a": 1792,
+        "sm_103a": 1792,
+        "sm_107a": 1792,
+    }
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
         for rows in (1, 59, 63, 64, 65, 339, 1083, 1536, 1792):
             assert cake_backend.dw_cast_tma_rule(2, rows, arch)
             assert cake_backend.dw_cast_tma_rule(16, rows, arch)
@@ -2721,10 +2751,10 @@ def test_dw_cast_tma_rule():
     assert not cake_backend.dw_cast_tma_rule(2, 1792, "sm_90a")
 
 
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_make_plan_dw_cast_tma_runs_the_last_chunk_of_tails_up_to_1792(arch):
     """The bf16 fused cast of the deferred last chunk takes the TMA store when the call has >= 2 chunks and the last
-    chunk has 1 .. 1792 rows, on both architectures and every entry / objective; a one-chunk call, a 1793-row tail,
+    chunk has 1 .. 1792 rows, on every architecture and every entry / objective; a one-chunk call, a 1793-row tail,
     the fp32 cast, the unfused cast and the reference path keep their shipped forms; only the last chunk's variant
     changes."""
     kw = _plan_kw(arch)
@@ -2805,12 +2835,15 @@ def test_make_plan_sm100_changes_only_the_last_cast():
 
 
 def test_dx_swab_rule():
-    assert cake_backend.DX_SWAB_ARCHES == ("sm_103a",)
+    assert cake_backend.DX_SWAB_ARCHES == ("sm_103a", "sm_107a")
     rule = cake_backend.dx_swab_rule
-    for rows in (512, 1024, 2048, 4096, 8192):
-        for n in (3, 4, 16):
-            assert rule(rows, 6144, "sm_103a", None, True, n)
-            assert rule(rows, 6144, "sm_103a", 512, True, n)
+    for arch in ("sm_103a", "sm_107a"):
+        for rows in (512, 1024, 2048, 4096, 8192):
+            for n in (3, 4, 16):
+                assert rule(rows, 6144, arch, None, True, n)
+                assert rule(rows, 6144, arch, 512, True, n)
+        assert not rule(4096, 6144, arch, None, True, 2)
+        assert not rule(4096, 6144, arch, None, False, 4)
     assert rule(4096, 7168, "sm_103a", None, True, 3) and rule(
         4096, 8192, "sm_103a", None, True, 3
     )
@@ -2996,7 +3029,9 @@ def test_reachable_variants_r6_forms():
     bases = cake_jit.BASE_STAGES
     r103 = cake_backend.reachable_variants(bases, "sm_103a", 4)
     r100 = cake_backend.reachable_variants(bases, "sm_100a", 4)
+    r107 = cake_backend.reachable_variants(bases, "sm_107a", 4)
     assert {"gemm_dx_swab", "gemm_dx_s_swab", "gemm_dw_cast_bf16_tma"} <= r103
+    assert {"gemm_dx_swab", "gemm_dx_s_swab", "gemm_dw_cast_bf16_tma"} <= r107
     assert "gemm_dw_cast_bf16_tma" in r100
     assert not {s for s in r100 if "_swab" in s}
 
@@ -3155,6 +3190,10 @@ def test_reachable_variants_complete_the_rule_closure():
         "gemm_dx_swab",
         "gemm_dx_s_swab",
     }
+    # SM107 takes the SM103 rules except the long-chunk ring (DX_LONG_CHUNK_STAGES): no ``_st3`` form
+    st3 = {"gemm_dx_st3", "gemm_dx_s_st3", "gemm_dx_st3_split", "gemm_dx_s_st3_split"}
+    assert rv(bases, "sm_107a", 4) == rv(bases, "sm_103a", 4) - st3
+    assert rv(bases, "sm_107a", 1) == rv(bases, "sm_103a", 1) - st3
     assert rv(bases, "sm_100a", 2) == rv(bases, "sm_100a", 4)
     assert rv(bases, "sm_103a", 1) == rv(bases, "sm_100a", 1) | {"gemm_dx_swab"}
     # a record without the K-sliced form serves one slice: the plain dX forms only

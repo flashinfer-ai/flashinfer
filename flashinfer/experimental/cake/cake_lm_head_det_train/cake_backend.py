@@ -473,7 +473,7 @@ DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
 # chunk has 1 .. DW_CAST_TMA_MAX_ROWS[arch] rows (:func:`dw_cast_tma_rule`); the per-element (old + acc) * g
 # and its round-to-nearest order are the shipped form's, so dW is bitwise the same.  A one-chunk call has no old
 # sum to read and keeps the shipped form.
-DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792}
+DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792, "sm_107a": 1792}
 # Its form under the zero-gradient row skip (:data:`DCNT_BASES`): the same TMA cast with the K steps bounded by the
 # last chunk's device count of live rows, so a counted plan keeps the rule's cast (a record without it: the shipped
 # cast's counted form).
@@ -590,17 +590,21 @@ RASTER_RULE_MIN_ROWS = 2049
 RASTER_WIDE_GROUPS = {
     "sm_100a": (16, 32),
     "sm_103a": (16, 32),
-}  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture
+    "sm_107a": (32, 32),
+}  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture (sm_107a: the logits slot keeps
+#    the record's group_m 32)
 DW_LONG_CHUNK_GROUP_M = 16  # weight-gradient group_m of the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
 DW_LONG_CHUNK_GROUPS = {
     "sm_100a": DW_LONG_CHUNK_GROUP_M,
     "sm_103a": DW_LONG_CHUNK_GROUP_M,
+    "sm_107a": DW_LONG_CHUNK_GROUP_M,
 }  # the same height on every supported architecture (the kernel source keeps a per-architecture table; the export mirrors it)
 DW_LONG_CHUNK_MIN_ROWS = 4097
 LOGITS_LONG_RASTER_GROUPS = {
     "sm_100a": 16,
     "sm_103a": 16,
 }  # logits group_m of the GLM-class chunks of >= LOGITS_LONG_RASTER_MIN_ROWS rows below RASTER_RULE_MIN_HIDDEN, per architecture
+#    (sm_107a is not listed: its chunks keep the record's logits group_m 32)
 LOGITS_LONG_RASTER_MIN_ROWS = (
     3841  # 30 row tiles of 128 + 1: the first chunk size with 31 row tiles
 )
@@ -608,10 +612,12 @@ DX_LONG_CHUNK_STAGES = {
     "sm_100a": 3,
     "sm_103a": 3,
 }  # operand-ring depth of the 512-wide dX tile at the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
+#    (sm_107a is not listed: its long chunks keep the table ring depth DX_WIDE_TILE_STAGES)
 DX_WIDE_TILE_STAGES = 4  # the 512-wide dX tile's table ring depth (an explicit ``stages`` of 4 pins the default form)
 DW_BLOCK_GROUPS = {
     "sm_100a": 12,
     "sm_103a": 12,
+    "sm_107a": 12,
 }  # column tiles per raster block of the weight-gradient accumulate / fp32 fused cast at the C 4096 chunk, per architecture
 DW_BLOCK_MIN_ROWS = RASTER_RULE_MIN_ROWS  # 2049
 DW_BLOCK_MAX_ROWS = (
@@ -640,12 +646,16 @@ DX_K_SLICES_MAX = 4
 DX_SPLIT_ARCHES = (
     "sm_100a",
     "sm_103a",
+    "sm_107a",
 )
 DX_SPLIT_LONG_RING_ARCHES = (
     "sm_103a",
-)  # architectures whose long-chunk ring (``_st3``) also takes the split (on sm_100a it ran slower at the power limit)
+    "sm_107a",
+)  # architectures whose long-chunk ring (``_st3``) also takes the split (on sm_100a it ran slower at the power limit; on
+#    sm_107a only an explicit ``stages`` pin selects the ring)
 DX_SPLIT_WHOLE_ARCHES: tuple[str, ...] = (
     "sm_103a",
+    "sm_107a",
 )  # whole-tile chunks below RASTER_RULE_MIN_HIDDEN split in every call
 DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES: tuple[str, ...] = (
     "sm_100a",
@@ -656,7 +666,7 @@ DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
 # of whole 512-token tiles of a cross-entropy loss call of >= DW_STREAM_MIN_CHUNKS chunks (:func:`dx_swab_rule`), ahead
 # of the split-tail rule and of the H >= RASTER_RULE_MIN_HIDDEN base form.  Bitwise: the same bf16 products summed
 # over the same K slices in the same K order.
-DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a",)
+DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a", "sm_107a")
 _TUNING_KNOBS = {
     "logits": ("group_m",),
     "dx": ("k_slices", "tile_n", "stages", "split", "swap_ab"),

@@ -11,7 +11,8 @@ The public module `flashinfer.cake_lm_head_det_train` is a stable API
 experimental, with no compatibility guarantee for its internal modules.
 SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
-built for `sm_107a`, under the base dispatch rules).  The feature does not participate in
+built for `sm_107a`, under SM103's dispatch rules except the logits rasters and
+the long-chunk `dX` ring).  The feature does not participate in
 automatic backend selection, autotuning or trace-apply.  Its libraries are
 loaded prebuilt from `aot/` when the package ships them and JIT-built by
 FlashInfer from `build.json` otherwise (see "Layout of this package").
@@ -1136,7 +1137,8 @@ a record serves every admissible geometry and the host never selects by shape:
   (`cake_backend.dx_tile_rule`, evaluated after the slice count; `dX` is
   bitwise the same on both tiles);
 * `_st3`: the 3-deep operand ring of the 512-wide `dX` tile below `H` 7168 for
-  chunks of more than 4096 rows on both architectures
+  chunks of more than 4096 rows on sm_100a and sm_103a (sm_107a keeps the
+  table depth)
   (`cake_backend.dx_stages_variant`, `DX_LONG_CHUNK_STAGES`); the 256-wide
   fallback keeps its depth.  Bitwise: the ring depth only changes when a stage
   is refilled;
@@ -1145,9 +1147,9 @@ a record serves every admissible geometry and the host never selects by shape:
   `k_slices`) leave `r = W mod P` items in the last wave of the `P` SM pairs
   with `0 < r <= P / 2`, the last `r` wide items run as `2 r` 256-wide half
   items in the same launch (the grid carries `W + r` clusters; the split count
-  is the launch scalar `dx_split`).  Taken on both architectures for chunks
+  is the launch scalar `dx_split`).  Taken on every architecture for chunks
   that are not a whole number of 512-token tiles; for chunks of whole
-  512-token tiles below `H` 7168 on sm_103a in every call
+  512-token tiles below `H` 7168 on sm_103a and sm_107a in every call
   (`DX_SPLIT_WHOLE_ARCHES`) and on sm_100a in calls of fewer than three
   chunks, whose dW accumulate shares the dX stream
   (`DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES`, `DW_STREAM_MIN_CHUNKS`); on the
@@ -1157,7 +1159,8 @@ a record serves every admissible geometry and the host never selects by shape:
   slices and per-element K order on both widths;
 * `_swab`: the swapped 512-wide `dX` tile (`dX^T = W^T dz^T`: a CTA's 128
   hidden columns of `W` on the MMA's M, the chunk's 512-token tile on its N,
-  the output stored per thread), at the table ring depth, on sm_103a only
+  the output stored per thread), at the table ring depth, on sm_103a and
+  sm_107a
   (`DX_SWAB_ARCHES`): a chunk of whole 512-token tiles of a cross-entropy
   loss call (the loss entry point with objective `"ce"`) of at least three
   chunks (`DW_STREAM_MIN_CHUNKS`) takes it ahead of the split-tail rule
@@ -1171,14 +1174,14 @@ On sm_100a the record's 512-wide `dX` stages (`gemm_dx`, `gemm_dx_s`, their
 its `_st3` form); sm_103a keeps the table depths.  Bitwise: only the pipeline
 depths differ.
 * `_gn`: the 2-D blocked raster of the weight-gradient accumulate and the fp32
-  fused cast below `H` 7168 for chunks of 2049 .. 4096 rows on both
-  architectures, with `group_n` = 12 column tiles per block
+  fused cast below `H` 7168 for chunks of 2049 .. 4096 rows on every
+  architecture, with `group_n` = 12 column tiles per block
   (`cake_backend.dw_block_variant`, `DW_BLOCK_GROUPS`); the bf16 cast keeps the
   1-D raster.  Bitwise: a permutation of the same tiles.
 * `_tma`: the TMA-epilogue form of the bf16 fused weight-gradient cast
   (`gemm_dw_cast_bf16_tma`): the deferred cast of the last chunk of a call of
   at least two chunks whose last chunk has at most 1792 rows
-  (`DW_CAST_TMA_MAX_ROWS`, both architectures; `cake_backend.dw_cast_tma_rule`)
+  (`DW_CAST_TMA_MAX_ROWS`, every architecture; `cake_backend.dw_cast_tma_rule`)
   reads the old FP32 sum and stores the bf16 tile as TMA sub-tiles.  A
   one-chunk call (no old sum) and a longer last chunk keep the shipped cast;
   an explicit `"epi_store"` knob of `gemm_tuning`'s `"dw"` wins over the rule.
@@ -1193,13 +1196,13 @@ depths differ.
   arithmetic on the rows before the count.
 
 The raster height is a scalar of the base forms: `group_m` 16 for the logits
-GEMMs and 32 for the weight-gradient GEMMs (accumulate and fused cast) at
-`H >= 7168` for chunks of more than 2048 rows (`cake_backend.raster_variant`,
-`RASTER_WIDE_GROUPS` per architecture); below that `H`, 16 for the logits
-GEMMs of chunks of at least 3841 rows (31 row tiles of 128:
-`LOGITS_LONG_RASTER_GROUPS` / `LOGITS_LONG_RASTER_MIN_ROWS`) and 16 for the
-weight-gradient GEMMs of chunks of more than 4096 rows, both on both
-architectures (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`); every
+GEMMs (32 on sm_107a, its record's height) and 32 for the weight-gradient GEMMs
+(accumulate and fused cast) at `H >= 7168` for chunks of more than 2048 rows
+(`cake_backend.raster_variant`, `RASTER_WIDE_GROUPS` per architecture); below
+that `H`, 16 for the logits GEMMs of chunks of at least 3841 rows (31 row tiles
+of 128: `LOGITS_LONG_RASTER_GROUPS` / `LOGITS_LONG_RASTER_MIN_ROWS`, sm_100a
+and sm_103a) and 16 for the weight-gradient GEMMs of chunks of more than 4096
+rows on every architecture (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`); every
 other chunk -- the default geometry's chunks of up to 30 row tiles, short tail
 chunks -- takes the GEMM's default height from the record geometry
 (`logits_group_m` / `dx_group_m` / `dw_group_m`).  Bitwise: only the tile
@@ -1303,9 +1306,11 @@ per index width, the two row stages, the gather and scatter of the dense form,
 the support logits gather GEMM and the segment gather-accumulate dX / dW /
 combine kernels in their BF16 and FP32-accumulate modes), exported from the
 kernel snapshot named in the pull request.  The `sm_107a` record registers
-every stage of the `sm_103a` record; no structural-form rule table lists
-`sm_107a`, so its rules reach five of the sixteen forms (the device-count
-logits forms and the K-sliced and 256-wide dX tiles).
+every stage of the `sm_103a` record; its rule tables take the `sm_103a`
+entries except the logits rasters (`LOGITS_LONG_RASTER_GROUPS`; the logits slot
+of `RASTER_WIDE_GROUPS` keeps the record's 32) and the long-chunk `dX` ring
+(`DX_LONG_CHUNK_STAGES`), so its rules reach twelve of the sixteen forms (all
+but the four `_st3` forms).
 `tests/experimental/test_cake_lm_head_det_train_support.py` tests the candidate-support
 entries (host rules and the reference backend on any device, the cake backend
 on a registered device).
