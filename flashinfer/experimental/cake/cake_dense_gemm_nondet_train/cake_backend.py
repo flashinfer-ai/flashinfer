@@ -1829,15 +1829,8 @@ def _k1_dgrad_knobs_of(G: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> t
 #: (:data:`K1_DGRAD_PROGRAM_RULES_BY_SM`): row stores, or TMA stores of the tile from shared memory (``tma_store``),
 #: both loading the output gradient with the L2 evict-first hint; ``lean_free``: TMA stores without that hint, the
 #: start path of cuBLAS's nvjet kernels (each role waiting on the cluster barrier only before its first operation that
-#: needs it) and the epilogue freeing the tensor memory (``tma_store`` implied); ``resident``: that form with the
-#: evict-first hint and the tile row's whole output gradient held in shared memory as ``resident`` slices of 64
-#: features for the CTA pair's run of tiles (``lean_free`` and ``tma_store`` implied), a program for a reduction of
-#: exactly ``64 * resident`` output features only.
-def dgrad_program_template(
-    tma_store: bool, lean_free: bool = False, resident: int = 0
-) -> str:
-    if resident:
-        return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_ef_tma_lean_free_r{int(resident)}"
+#: needs it) and the epilogue freeing the tensor memory (``tma_store`` implied).
+def dgrad_program_template(tma_store: bool, lean_free: bool = False) -> str:
     if lean_free:
         return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_tma_lean_free"
     return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_ef" + (
@@ -1849,7 +1842,6 @@ _WAVE_LEAN_N224_PF2_ST = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st"
 _DGRAD_N = "dense_proj_gemm_dgrad_kn_n256_f32_ef"
 _DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
 _DGRAD_N_TMA_LEAN_FREE = "dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free"
-_DGRAD_N_EF_TMA_LEAN_FREE_R9 = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma_lean_free_r9"
 #: The token counts of the 148-SM ``sm_100a`` and 152-SM ``sm_103a`` input-gradient windows of
 #: :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`.
 _DGRAD_WINDOW_TOKENS = range(16172, 16385)
@@ -1916,15 +1908,16 @@ K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int],
 #: deterministic plan.  Measured at exactly these rows and token counts on one part of each SM count against this
 #: package's program of the row in the same process: faster in eager launches and in CUDA graph replays in 5 of 5 paired
 #: groups, the output equal to the deterministic plan's bit for bit, and the same bits on 20 repeats.  On 148-SM
-#: ``sm_100a`` parts ``4096 -> 512`` and ``5120 -> 512`` run the program without the evict-first hint
-#: (``dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free``), and ``6144 -> 576`` its evict-first form with the tile row's
-#: output gradient resident in shared memory (``dense_proj_gemm_dgrad_kn_n256_f32_ef_tma_lean_free_r9``, nine slices
-#: of 64 features: a reduction of exactly 576 features only), at every token count from 16172 to 16384
+#: ``sm_100a`` parts ``4096 -> 512``, ``5120 -> 512`` and ``6144 -> 576`` run the program without the evict-first hint
+#: (``dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free``) at every token count from 16172 to 16384
 #: (:data:`_DGRAD_WINDOW_TOKENS`).  On one B200 part, two GPUs, 17 paired groups in eager launches and in CUDA graph
 #: replays each, the same bits as the deterministic plan and on 20 repeats: at 16172 and 16384 tokens the 512-feature
-#: rows took 0.95 to 0.97 times the time of the evict-first TMA form they ran before and ``6144 -> 576`` 0.94 to 0.96
-#: times that of the deterministic plan; at 16231 tokens the form without the hint took 0.93 to 0.95 times the time of
-#: the evict-first TMA form in 5 of 5 paired groups.  On 152-SM ``sm_103a`` parts ``4096 -> 512``, ``5120 -> 512`` and
+#: rows took 0.95 to 0.97 times the time of the evict-first TMA form they ran before; at 16231 tokens the form without
+#: the hint took 0.93 to 0.95 times the time of that form in 5 of 5 paired groups.  ``6144 -> 576`` on one B200 part,
+#: with its weight placed at 24 random addresses at each of 16172, 16231, 16300 and 16384 tokens: 0.944 to 0.949 times
+#: the deterministic plan's time (medians over the placements), slower than it at none.  A form holding the tile row's
+#: output gradient in shared memory with the evict-first hint took 0.95 times that plan's time at most placements but
+#: 1.07 to 1.08 times at some (the time depended on the memory pages holding the weight); this form's did not.  On 152-SM ``sm_103a`` parts ``4096 -> 512``, ``5120 -> 512`` and
 #: ``6144 -> 576`` run the program without the evict-first hint at every token count of the same window.  On one GB300
 #: part, two GPUs, 17 paired groups in eager launches and in CUDA graph replays each, at 16172, 16231 and 16384 tokens,
 #: the same bits as the deterministic plan and on 20 repeats: the 512-feature rows took 0.95 to 0.96 times the time of
@@ -1934,8 +1927,8 @@ K1_DGRAD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, st
     ("sm_100a", 148): {
         (4096, 1024, 16172, "f32"): _DGRAD_N, (4096, 1024, 16231, "f32"): _DGRAD_N, (4096, 1024, 16384, "f32"): _DGRAD_N,
         (5120, 1024, 16172, "f32"): _DGRAD_N, (5120, 1024, 16231, "f32"): _DGRAD_N, (5120, 1024, 16384, "f32"): _DGRAD_N,
-        **{(K, 512, T, "f32"): _DGRAD_N_TMA_LEAN_FREE for K in (4096, 5120) for T in _DGRAD_WINDOW_TOKENS},
-        **{(6144, 576, T, "f32"): _DGRAD_N_EF_TMA_LEAN_FREE_R9 for T in _DGRAD_WINDOW_TOKENS},
+        **{(K, N, T, "f32"): _DGRAD_N_TMA_LEAN_FREE for K, N in ((4096, 512), (5120, 512), (6144, 576))
+           for T in _DGRAD_WINDOW_TOKENS},
     },
     ("sm_100a", 152): {
         (4096, 1024, 16172, "f32"): _DGRAD_N_TMA, (4096, 1024, 16231, "f32"): _DGRAD_N_TMA,
@@ -2223,17 +2216,9 @@ def _launch_dgrad_program(
     ``N = K`` columns and ``K = N`` reduction, ``W`` as ``[1, N, K]``; ``out`` stored through its own pointer and row
     stride (a padded ``out`` as the contiguous 1-D alias of its span, ``flat_alias``: the binding checks the
     pointer's contiguity), and through ``[1, T, K]`` TMA maps (the map of the other dtype a per-device dummy the
-    program never touches).  A program with a resident output gradient of ``r`` slices (``resident``) takes a
-    reduction of exactly ``64 * r`` features; another ``N`` raises ``ValueError``.  With the entry point's ``head``
-    flags bound and cached (:func:`_launch_k1_program`)."""
+    program never touches).  With the entry point's ``head`` flags bound and cached (:func:`_launch_k1_program`)."""
     det = deterministic_backend()
     T, N, K = int(G.shape[0]), int(W.shape[0]), int(W.shape[1])
-    resident = int(MODULES[module]["build"]["kwargs"].get("resident", 0))
-    if resident and 64 * resident != N:
-        raise ValueError(
-            f"cake_dense_gemm_nondet_train: {module} holds {resident} slices of 64 features of the output gradient, "
-            f"a reduction of {64 * resident} features, not {N}"
-        )
     f32 = out.dtype == torch.float32
     other = torch.bfloat16 if f32 else torch.float32
     spare, flat = det._dummy_map(out.device, other), det._dummy(out.device, other)

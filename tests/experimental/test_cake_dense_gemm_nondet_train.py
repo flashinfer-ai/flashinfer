@@ -6279,11 +6279,10 @@ K1_DGRAD_NVJET_ROWS = {
     ("sm_100a", 152): {(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM100_KEPT},
     ("sm_103a", 152): {(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM103_KEPT},
 }
-_KD, _KD_TMA, _KD_TMA_LEAN_FREE, _KD_R9 = (
+_KD, _KD_TMA, _KD_TMA_LEAN_FREE = (
     "dense_proj_gemm_dgrad_kn_n256_f32_ef",
     "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma",
     "dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free",
-    "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma_lean_free_r9",
 )
 #: The token window of the 148-SM ``sm_100a`` and 152-SM ``sm_103a`` input-gradient program rows: 16172 to 16384
 #: tokens; the GPU tests run its rows at its ends, the token counts measured inside it and one more.
@@ -6297,11 +6296,10 @@ K1_DGRAD_PROGRAM_ROWS = {
             for T in (16172, 16231, 16384)
         },
         **{
-            (K, 512, T, "f32"): _KD_TMA_LEAN_FREE
-            for K in (4096, 5120)
+            (K, N, T, "f32"): _KD_TMA_LEAN_FREE
+            for K, N in ((4096, 512), (5120, 512), (6144, 576))
             for T in _KD_WINDOW
         },
-        **{(6144, 576, T, "f32"): _KD_R9 for T in _KD_WINDOW},
     },
     ("sm_100a", 152): {
         (K, N, T, "f32"): _KD_TMA
@@ -6396,7 +6394,6 @@ def test_k1_program_tables():
     assert (
         cake_backend.dgrad_program_template(True, lean_free=True) == _KD_TMA_LEAN_FREE
     )
-    assert cake_backend.dgrad_program_template(True, True, resident=9) == _KD_R9
     assert (
         cake_backend.wgrad_sk_template(256, True) == "dense_proj_gemm_sk_nn_n256_f32_t"
     )
@@ -6975,7 +6972,7 @@ _KD_WINDOW_PROGRAMS = {
     ("sm_100a", 148): {
         (4096, 512): _KD_TMA_LEAN_FREE,
         (5120, 512): _KD_TMA_LEAN_FREE,
-        (6144, 576): _KD_R9,
+        (6144, 576): _KD_TMA_LEAN_FREE,
     },
     ("sm_103a", 152): {
         (4096, 512): _KD_TMA_LEAN_FREE,
@@ -6989,12 +6986,9 @@ _KD_WINDOW_PROGRAMS = {
 def test_k1_dgrad_window_rows_bind_their_program(monkeypatch, arch, sms):
     """On a 148-SM ``sm_100a`` and a 152-SM ``sm_103a`` part the input-gradient entry point runs, at the first, an
     inner and the last token count of the window of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` (16172 to 16384 tokens), the
-    window's program -- ``dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free`` for ``4096 -> 512`` and ``5120 -> 512``,
-    and for ``6144 -> 576`` ``dense_proj_gemm_dgrad_kn_n256_f32_ef_tma_lean_free_r9`` on ``sm_100a`` and
-    ``dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free`` on ``sm_103a`` -- with the program's argument order (no cached
-    deterministic plan); one token outside the window keeps the deterministic routing.  The program with the resident
-    output gradient takes a reduction of exactly 576 features: another raises ``ValueError`` before anything is
-    launched."""
+    window's program -- ``dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free`` for ``4096 -> 512``, ``5120 -> 512`` and
+    ``6144 -> 576`` -- with the program's argument order (no cached deterministic plan); one token outside the window
+    keeps the deterministic routing."""
     entry_fn = _cpu_k1_launches(monkeypatch, arch)
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
     facts = dataclasses.replace(det_backend.device_facts(), sm_count=sms)
@@ -7033,14 +7027,6 @@ def test_k1_dgrad_window_rows_bind_their_program(monkeypatch, arch, sms):
         for T in (16171, 16385):
             G, W, out = views(T, N, K)
             assert cake_backend._k1_dgrad_program_of(G, W, out) is None, (K, N, T)
-    if arch != "sm_100a":
-        return
-    r9 = cake_jit.KERNELS["sm_100a"][_KD_R9]
-    assert cake_jit.MODULES[r9]["build"]["kwargs"]["resident"] == 9
-    n = len(entry_fn.calls)
-    with pytest.raises(ValueError, match="a reduction of 576 features, not 512"):
-        cake_backend._launch_dgrad_program(r9, *views(16231, 512, 6144), None)
-    assert len(entry_fn.calls) == n
 
 
 @pytest.mark.parametrize("arch, sms", sorted(K1_WGRAD_SK_ROWS))
