@@ -16,10 +16,10 @@ from flashinfer.utils import get_compute_capability
 
 
 # Curated smoke set. Randomized breadth over {b,m,n,k} x backend (swizzled scales,
-# tight elementwise oracle, determinism, autotune-winner validation, and the tracked
-# #3604 b>1/M%128 ledger) lives in tests/gemm/test_unified_gemm_fuzz.py's bmm_mxfp8
-# adapter; keep autotune on/off per backend. Linear scale metadata cannot currently
-# be represented by the public 3D BMM API, so every executable row uses swizzled scales.
+# tight elementwise oracle, determinism, autotune-winner validation) lives in
+# tests/gemm/test_unified_gemm_fuzz.py's bmm_mxfp8 adapter; keep autotune on/off per
+# backend. Linear scale metadata cannot currently be represented by the public 3D BMM
+# API, so every executable row uses swizzled scales.
 _SMOKE_CASES = [
     # b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning
     (16, 128, 256, 1024, True, "cudnn", True),
@@ -118,6 +118,74 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
     )
 
 
+def _mxfp8_quantize_per_batch(x):
+    return mxfp8_quantize(x, True, rank_preserving=True)
+
+
+def _per_batch_cos_sim(res, reference):
+    return F.cosine_similarity(
+        reference.float().flatten(1), res.float().flatten(1), dim=1
+    )
+
+
+# #3604 regression anchor: b>1 with m or n not a multiple of 128 needs a per-batch scale.
+@pytest.mark.parametrize("b,m,n,k", [(4, 130, 256, 256), (2, 200, 160, 512), (2, 130, 130, 160), (3, 64, 200, 288)])
+@pytest.mark.parametrize("scale_ndim", [3, 1])
+@pytest.mark.parametrize("backend", ["cudnn", "cutlass"])
+def test_bmm_mxfp8_per_batch_scale(b, m, n, k, scale_ndim, backend):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if backend == "cudnn" and compute_capability[0] != 10:
+        pytest.skip("bmm_mxfp8 cudnn backend requires SM10x.")
+    if backend == "cutlass" and compute_capability[0] != 12:
+        pytest.skip("bmm_mxfp8 cutlass backend requires SM12x.")
+    torch.manual_seed(42)
+    input_mat = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, input_scale = _mxfp8_quantize_per_batch(input_mat)
+    weight_mxfp8, weight_scale = _mxfp8_quantize_per_batch(weight)
+    assert input_scale.shape == (b, (m + 127) // 128 * 128, (k // 32 + 3) // 4 * 4)
+    if scale_ndim == 1:
+        input_scale = input_scale.flatten()
+        weight_scale = weight_scale.flatten()
+
+    with autotune(False):
+        res = bmm_mxfp8(
+            input_mxfp8,
+            weight_mxfp8.transpose(-2, -1),
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            backend=backend,
+        )
+
+    reference = torch.bmm(input_mat, weight.transpose(-2, -1))
+    assert torch.isfinite(res).all()
+    cos_sim = _per_batch_cos_sim(res, reference)
+    assert (cos_sim > 0.99).all(), f"per-batch cosine similarity {cos_sim.tolist()}"
+
+
+def test_bmm_mxfp8_rejects_folded_scale_for_unaligned_batches():
+    b, m, n, k = 4, 130, 256, 256
+    a = torch.empty((b, m, k), dtype=torch.float8_e4m3fn)
+    bt = torch.empty((b, k, n), dtype=torch.float8_e4m3fn)
+    folded_a_scale = torch.empty(
+        ((b * m + 127) // 128 * 128 * (k // 32),), dtype=torch.uint8
+    )
+    b_scale = torch.empty((b * n * (k // 32),), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="A_scale to contain 8192 elements"):
+        gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
+            a, bt, folded_a_scale, b_scale
+        )
+    wrong_3d_scale = torch.empty((b, m, k // 32), dtype=torch.uint8)
+    with pytest.raises(ValueError, match=r"3D A_scale of shape \(4, 256, 8\)"):
+        gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
+            a, bt, wrong_3d_scale, b_scale
+        )
+    gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
+        a, bt, torch.empty((b, 256, k // 32), dtype=torch.uint8), b_scale
+    )
+
+
 def test_bmm_mxfp8_raises_for_row_major_weight():
     a = torch.empty((1, 2, 32), dtype=torch.float8_e4m3fn)
     b = torch.empty((1, 32, 2), dtype=torch.float8_e4m3fn)
@@ -129,14 +197,14 @@ def test_bmm_mxfp8_raises_for_row_major_weight():
         )
 
 
-def test_bmm_mxfp8_cudnn_raises_for_scale_length_mismatch():
+def test_bmm_mxfp8_raises_for_scale_length_mismatch():
     a = torch.empty((1, 200, 256), dtype=torch.float8_e4m3fn)
     b = torch.empty((1, 256, 200), dtype=torch.float8_e4m3fn)
     linear_a_scale = torch.empty((1600,), dtype=torch.uint8)
     linear_b_scale = torch.empty((1600,), dtype=torch.uint8)
 
     with pytest.raises(ValueError, match="A_scale to contain 2048 elements"):
-        gemm_base._check_cudnn_bmm_mxfp8_scale_len(  # pyright: ignore[reportPrivateUsage]
+        gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
             a,
             b,
             linear_a_scale,
@@ -144,14 +212,14 @@ def test_bmm_mxfp8_cudnn_raises_for_scale_length_mismatch():
         )
 
 
-def test_bmm_mxfp8_cudnn_scale_length_check_has_aligned_size_blind_spot():
+def test_bmm_mxfp8_scale_length_check_has_aligned_size_blind_spot():
     a = torch.empty((1, 128, 256), dtype=torch.float8_e4m3fn)
     b = torch.empty((1, 256, 128), dtype=torch.float8_e4m3fn)
     indistinguishable_scale = torch.empty((1024,), dtype=torch.uint8)
 
     # Scale has the right element count for the expected swizzled layout,
     # so the check passes even if the data is not actually swizzled.
-    gemm_base._check_cudnn_bmm_mxfp8_scale_len(  # pyright: ignore[reportPrivateUsage]
+    gemm_base._check_bmm_mxfp8_scale_shape(  # pyright: ignore[reportPrivateUsage]
         a,
         b,
         indistinguishable_scale,

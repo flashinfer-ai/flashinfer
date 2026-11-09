@@ -4970,25 +4970,46 @@ def _check_mxfp8_gemm_strides(a: torch.Tensor, b: torch.Tensor, backend: str) ->
         )
 
 
-def _check_cudnn_bmm_mxfp8_scale_len(
+def _check_bmm_mxfp8_scale_shape(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
 ) -> None:
-    scale_specs = (
-        ("A_scale", a_scale, a.numel() // a.shape[-1], a.shape[-1]),
-        ("B_scale", b_scale, b.shape[0] * b.shape[-1], b.shape[-2]),
-    )
-    for name, scale, rows, k in scale_specs:
-        expected_len = _mxfp8_swizzled_scale_len(rows, k, SfLayout.layout_128x4)
-        if scale.numel() != expected_len:
+    batch, k = a.shape[0], a.shape[-1]
+    k_blocks_padded = _pad_up(k, 128) // 32
+    for name, scale, rows in (
+        ("A_scale", a_scale, a.shape[1]),
+        ("B_scale", b_scale, b.shape[-1]),
+    ):
+        rows_padded = _pad_up(rows, 128)
+        expected_shape = (batch, rows_padded, k_blocks_padded)
+        expected_len = batch * rows_padded * k_blocks_padded
+        if scale.ndim == 3:
+            if tuple(scale.shape) != expected_shape:
+                raise ValueError(
+                    f"bmm_mxfp8 expects a 3D {name} of shape {expected_shape} "
+                    "(one F8_128x4 swizzled block per batch), but got "
+                    f"{tuple(scale.shape)}."
+                )
+        elif scale.ndim == 1:
+            if scale.numel() != expected_len:
+                raise ValueError(
+                    f"bmm_mxfp8 expects {name} to contain {expected_len} "
+                    f"elements ({batch} x {rows_padded} x {k_blocks_padded}, one "
+                    "F8_128x4 swizzled block per batch), but got "
+                    f"{scale.numel()}. mxfp8_quantize on a 3D tensor pads the "
+                    "folded batch*rows, which is only per-batch separable when "
+                    "rows is a multiple of 128; pass rank_preserving=True to "
+                    f"mxfp8_quantize to get the per-batch {expected_shape} scale."
+                )
+        else:
             raise ValueError(
-                f"cuDNN bmm_mxfp8 expects {name} to contain {expected_len} "
-                "elements in the F8_128x4 swizzled layout for the operand "
-                f"shape, but got {scale.numel()}. Quantize with "
-                "mxfp8_quantize(..., is_sf_swizzled_layout=True)."
+                f"bmm_mxfp8 expects a 1D or 3D F8_128x4 swizzled {name}, "
+                f"got {name}.ndim={scale.ndim}."
             )
+        if not scale.is_contiguous():
+            raise ValueError(f"bmm_mxfp8 expects a contiguous {name}.")
 
 
 def execute_cudnn_gemm_mxfp8_graph(
@@ -13303,12 +13324,7 @@ def _check_bmm_mxfp8_problem_size(
             f"got b={A.shape[0]}, m={A.shape[1]}, n={B.shape[2]}, k={A.shape[2]}."
         )
 
-    if A_scale.ndim != 1 or B_scale.ndim != 1:
-        raise ValueError(
-            "bmm_mxfp8 requires 1D swizzled scale tensors "
-            "(produced by mxfp8_quantize(..., is_sf_swizzled_layout=True)); "
-            f"got A_scale.ndim={A_scale.ndim}, B_scale.ndim={B_scale.ndim}."
-        )
+    _check_bmm_mxfp8_scale_shape(A, B, A_scale, B_scale)
     _validate_mxfp8_output_dtype(dtype)
     return True
 
@@ -13323,9 +13339,6 @@ def _cutlass_bmm_mxfp8_requirement(
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cutlass", "auto"] = "auto",
 ):
-    # SM120/121 CUTLASS MXFP8 only supports 1D swizzled scales.
-    if A_scale.ndim != 1 or B_scale.ndim != 1:
-        return False
     return True
 
 
@@ -13382,11 +13395,17 @@ def bmm_mxfp8(
 
     A_scale: torch.Tensor
         Scale tensor for A, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
-        layout produced by ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
+        layout with one ``[round_up(m, 128), round_up(k, 128) // 32]`` block
+        per batch: either a 3D ``[b, round_up(m, 128), round_up(k, 128) // 32]``
+        tensor or that buffer flattened to 1D, as returned by
+        ``mxfp8_quantize(A, rank_preserving=True)``. The default
+        ``mxfp8_quantize(A)`` pads the folded ``b * m`` rows instead, which
+        matches this layout only when ``m % 128 == 0``.
 
     B_scale: torch.Tensor
-        Scale tensor for B, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
-        layout, as returned by quantizing the [b, n, k] weight (see ``B``).
+        Scale tensor for B, uint8 (fp8 e8m0 format), in the same per-batch
+        F8_128x4 swizzled layout with ``n`` in place of ``m``, as returned by
+        quantizing the [b, n, k] weight (see ``B``).
 
     dtype: torch.dtype
         out dtype, bf16 or fp16.
@@ -13396,14 +13415,13 @@ def bmm_mxfp8(
 
     backend: Literal["cudnn", "cutlass", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
-        On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
-        be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
-        shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
-        Both the cuDNN and CUTLASS backends read the scale tensors in the
-        F8_128x4 swizzled layout; linear-layout scales are not supported.
-        Both layouts are flat 1D buffers, so a linear scale whose length happens
-        to match the padded swizzled length cannot be detected at runtime. Ensure
-        the scale was produced with the swizzled layout rather than relying on a
+        On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend. Pass ``B``
+        in the standard shape ``[b, k, n]`` (column-major); the CUTLASS path
+        transposes internally. Both the cuDNN and CUTLASS backends read the
+        scale tensors in the per-batch F8_128x4 swizzled layout; linear-layout
+        scales are not supported. A linear scale whose length happens to match
+        the padded swizzled length cannot be detected at runtime. Ensure the
+        scale was produced with the swizzled layout rather than relying on a
         warning.
 
     Returns
@@ -13445,7 +13463,6 @@ def bmm_mxfp8(
     if resolved_backend == "cudnn":
         if not CUDNN_AVAILABLE:
             raise ValueError("cudnn is not available")
-        _check_cudnn_bmm_mxfp8_scale_len(A, B, A_scale, B_scale)
         mxfp8_gemm_sm100(
             A,
             B,
