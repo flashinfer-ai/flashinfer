@@ -68,8 +68,23 @@ def test_tensor_core_decode_refuses_head_dim(kv_dtype, head_dim):
         )
 
 
-@pytest.mark.parametrize("kv_dtype, head_dim", _UNSUPPORTED)
-def test_fa2_paged_prefill_refuses_head_dim(kv_dtype, head_dim):
+# (kv_dtype, head_dim_qk, head_dim_vo, the dimension the error names)
+_UNSUPPORTED_QK_VO = [
+    (dtype, d, d, f"head_dim_qk={d}") for dtype, d in _UNSUPPORTED
+] + [
+    # FP8 K rows of 192 are loaded only up to column 128: wrong output, no error.
+    (torch.float8_e4m3fn, 192, 128, "head_dim_qk=192"),
+    # head_dim_vo == 64 selects the 64B swizzle, which only fits 64-element K rows.
+    (torch.float8_e4m3fn, 192, 64, "head_dim_qk=192"),
+    # A valid head_dim_qk must not hide an invalid head_dim_vo.
+    (torch.bfloat16, 128, 96, "head_dim_vo=96"),
+]
+
+
+@pytest.mark.parametrize(
+    "kv_dtype, head_dim_qk, head_dim_vo, named", _UNSUPPORTED_QK_VO
+)
+def test_fa2_paged_prefill_refuses_head_dim(kv_dtype, head_dim_qk, head_dim_vo, named):
     device = "cuda:0"
     qo_indptr, kv_indptr, kv_indices, kv_last_page_len, page_size = _paged_kv_metadata(
         device
@@ -78,7 +93,7 @@ def test_fa2_paged_prefill_refuses_head_dim(kv_dtype, head_dim):
     wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
         workspace, "NHD", backend="fa2"
     )
-    with pytest.raises(ValueError, match=f"head_dim_qk={head_dim}"):
+    with pytest.raises(ValueError, match=named):
         wrapper.plan(
             qo_indptr,
             kv_indptr,
@@ -86,8 +101,9 @@ def test_fa2_paged_prefill_refuses_head_dim(kv_dtype, head_dim):
             kv_last_page_len,
             8,
             2,
-            head_dim,
+            head_dim_qk,
             page_size,
+            head_dim_vo=head_dim_vo,
             causal=True,
             q_data_type=torch.bfloat16,
             kv_data_type=kv_dtype,
