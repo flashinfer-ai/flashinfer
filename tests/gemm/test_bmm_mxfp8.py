@@ -198,19 +198,23 @@ def test_bmm_mxfp8_cudnn_dynamic_m(m: int):
     assert cos_sim > 0.99
 
 
-if __name__ == "__main__":
-    pytest.main([__file__])
-
-
 @pytest.mark.parametrize("layout", ["contiguous", "interleaved"])
 @pytest.mark.parametrize("auto_tuning", [False, True])
-def test_bmm_mxfp8_cute_dsl_mxfp8_output(layout, auto_tuning):
+@pytest.mark.parametrize(
+    "b,m,n,k",
+    [
+        (8, 512, 1024, 1024),
+        # 3 M-tiles and 3 N-tiles: clusters of 2 or 4 would round the grid up past m and n
+        (2, 384, 384, 512),
+    ],
+)
+def test_bmm_mxfp8_cute_dsl_mxfp8_output(layout, auto_tuning, b, m, n, k):
     """float8_e4m3fn output + out_scale equals the bf16 result passed through mxfp8_quantize,
-    bit for bit; ``interleaved`` reads A from and writes out to [m, b, *] storage, with
-    out_scale covering the [m, b * n] row (a grouped projection feeding one GEMM)."""
+    bit for bit, and stores nothing past out_scale; ``interleaved`` reads A from and writes
+    out to [m, b, *] storage, with out_scale covering the [m, b * n] row (a grouped projection
+    feeding one GEMM)."""
     if tuple(get_compute_capability(torch.device("cuda"))) != (10, 7):
         pytest.skip("bmm_mxfp8 cute-dsl backend requires SM107.")
-    b, m, n, k = 8, 512, 1024, 1024
     torch.manual_seed(0)
     x = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
     x = x * torch.exp(torch.randn([b, m, 1], device="cuda")).bfloat16()
@@ -240,7 +244,11 @@ def test_bmm_mxfp8_cute_dsl_mxfp8_output(layout, auto_tuning):
     expected = torch.bmm(x.float(), weight.float().transpose(-2, -1))
     cos_sim = F.cosine_similarity(expected.reshape(-1), ref.float().reshape(-1), dim=0)
     assert cos_sim > 0.99, f"cosine similarity {cos_sim:.4f}"
-    out_scale = torch.zeros_like(ref_s)
+    guard = 4096
+    scale_buf = torch.full(
+        [ref_s.numel() + guard], 0xAB, device="cuda", dtype=torch.uint8
+    )
+    out_scale = scale_buf[: ref_s.numel()]
     if auto_tuning:
         gemm_base.AutoTuner.get().clear_cache()  # tune afresh, not from an earlier test's entry
     with warnings.catch_warnings(record=True) as caught, autotune(auto_tuning):
@@ -261,7 +269,8 @@ def test_bmm_mxfp8_cute_dsl_mxfp8_output(layout, auto_tuning):
     assert torch.equal(
         storage.view(torch.uint8).reshape(-1), ref_q.view(torch.uint8).reshape(-1)
     )
-    assert torch.equal(out_scale, ref_s.view(torch.uint8))
+    assert torch.equal(out_scale, ref_s.view(torch.uint8).reshape(-1))
+    assert (scale_buf[ref_s.numel() :] == 0xAB).all()
 
 
 def test_bmm_mxfp8_fp8_output_needs_out_scale():
@@ -297,3 +306,19 @@ def test_bmm_mxfp8_sm107_out_scale_geometry():
     # unaligned batch start / row pitch
     assert geometry((2, 128, 128), (128 * 128 + 64, 128, 1)) is None
     assert geometry((1, 128, 96), (96 * 128, 96, 1)) is None
+
+
+def test_bmm_mxfp8_sm107_mxfp8_out_tactic_fits():
+    fits = gemm_base._sm107_bmm_mxfp8_mxfp8_out_fits  # pyright: ignore[reportPrivateUsage]
+    # clusters that round the CTA grid past m or n
+    assert not fits(384, 1024, ((128, 256), (2, 1), False, 128))
+    assert not fits(768, 1024, ((256, 128), (4, 1), False, 256))
+    assert not fits(128, 384, ((128, 128), (1, 2), False, 128))
+    # a 192-wide tile straddles 128-column scale groups
+    assert not fits(512, 768, ((128, 192), (1, 1), False, 128))
+    assert fits(768, 1024, ((256, 128), (2, 1), False, 256))
+    assert fits(16384, 1024, ((256, 256), (2, 4), False, 256))
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

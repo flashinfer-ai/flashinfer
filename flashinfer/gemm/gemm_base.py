@@ -7527,21 +7527,47 @@ def _bmm_mxfp8_sm107_out_scale_geometry(
     return pitch, offset, ((rows + 127) // 128) * 128 * pitch // 32
 
 
+def _sm107_bmm_mxfp8_mxfp8_out_fits(m, n, tactic):
+    """MXFP8 output stores its scale bytes without bounds checks, so every CTA the tile
+    scheduler launches, including those that round the grid up to whole clusters, must
+    cover in-range rows and 128-column scale groups of its own batch."""
+    (tile_m, tile_n), (cluster_m, cluster_n), _, inst_m = tactic
+    cta_tile_m = tile_m // (2 if inst_m == 256 else 1)
+    return (
+        tile_n % 128 == 0
+        and m % (cta_tile_m * cluster_m) == 0
+        and n % (tile_n * cluster_n) == 0
+    )
+
+
+@functools.lru_cache(maxsize=1024)
 def _sm107_bmm_mxfp8_tactics(m, n, real_k, out_dtype):
-    """Non-swapped SM107 tactics for bmm_mxfp8(backend="cute-dsl"). MXFP8 output stores
-    its scale bytes without bounds checks, so its tiles must divide m and n exactly."""
+    """Non-swapped SM107 tactics for bmm_mxfp8(backend="cute-dsl")."""
     from ..cute_dsl.utils import torch_to_cutlass_dtype
 
     mxfp8_out = out_dtype == torch.float8_e4m3fn
-    return [
+    return tuple(
         t
         for t in _get_sm107_mxfp8_tactics(
             m, n, real_k, torch_to_cutlass_dtype(out_dtype)
         )
-        if not t[2] and (not mxfp8_out or (m % t[0][0] == 0 and n % t[0][1] == 0))
-    ]
+        if not t[2] and (not mxfp8_out or _sm107_bmm_mxfp8_mxfp8_out_fits(m, n, t))
+    )
 
 
+def _as_sm107_bmm_mxfp8_tactic(tactic):
+    """A tactic as the hashable tuple _sm107_bmm_mxfp8_tactics lists (a tuning cache
+    loaded from JSON holds lists)."""
+    (tile_m, tile_n), (cluster_m, cluster_n), swap_ab, inst_m = tactic
+    return (
+        (int(tile_m), int(tile_n)),
+        (int(cluster_m), int(cluster_n)),
+        bool(swap_ab),
+        int(inst_m),
+    )
+
+
+@functools.lru_cache(maxsize=1024)
 def _select_sm107_bmm_mxfp8_tactic(m, n, real_k, batch, sm_count, out_dtype):
     """Untuned bmm_mxfp8(backend="cute-dsl") tactic: the best-scored tactic of
     _sm107_bmm_mxfp8_tactics whose instruction M equals its tile M."""
@@ -7554,7 +7580,7 @@ def _select_sm107_bmm_mxfp8_tactic(m, n, real_k, batch, sm_count, out_dtype):
         if inst_m != tile[0]:
             continue
         score = _score_block_scaled_tactic(
-            m * batch, n, real_k, sm_count, tile, cluster, False
+            m, n, real_k, sm_count, tile, cluster, False, batch=batch
         )
         if score > best_score:
             best, best_score = (tile, cluster, swap_ab, inst_m), score
@@ -7592,14 +7618,27 @@ def _cute_dsl_bmm_mxfp8_sm107_runner(out_dtype: torch.dtype):
 
     class CuteDSLBmmMxfp8Sm107Runner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-            A, _, _, _, out, _ = inputs
-            return (str(out.dtype), A.stride(), out.stride())
+            return (str(inputs[4].dtype),)
 
         def get_valid_tactics(
             self, inputs: List[torch.Tensor], profile: OptimizationProfile
         ) -> list:
             A, B, _, _, _, _ = inputs
-            return _sm107_bmm_mxfp8_tactics(
+            return list(
+                _sm107_bmm_mxfp8_tactics(A.shape[1], B.shape[2], A.shape[2], out_dtype)
+            )
+
+        def is_tactic_compatible(
+            self, inputs: List[torch.Tensor], tactic: object
+        ) -> bool:
+            if tactic == -1:
+                return True
+            A, B, *_ = inputs
+            try:
+                tactic = _as_sm107_bmm_mxfp8_tactic(tactic)
+            except (TypeError, ValueError):
+                return False
+            return tactic in _sm107_bmm_mxfp8_tactics(
                 A.shape[1], B.shape[2], A.shape[2], out_dtype
             )
 
@@ -7622,10 +7661,13 @@ def _cute_dsl_bmm_mxfp8_sm107_runner(out_dtype: torch.dtype):
                         f"The SM107 CuTe-DSL kernel cannot run bmm_mxfp8 with "
                         f"b={batch}, m={m}, n={n}, k={real_k}."
                     )
+            tactic = _as_sm107_bmm_mxfp8_tactic(tactic)
             mma_tiler_mn, cluster_shape_mn, _, mma_inst_shape_m = tactic
-            if mxfp8_out and (m % mma_tiler_mn[0] != 0 or n % mma_tiler_mn[1] != 0):
+            if mxfp8_out and not _sm107_bmm_mxfp8_mxfp8_out_fits(m, n, tactic):
                 raise ValueError(
-                    f"MXFP8 output needs tiles that divide m={m} and n={n}; got tile {mma_tiler_mn}."
+                    f"MXFP8 output cannot use tile {mma_tiler_mn} with cluster "
+                    f"{cluster_shape_mn} at m={m}, n={n}: its CTAs would store scales "
+                    "out of range."
                 )
 
             key = (
@@ -10271,6 +10313,41 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     _MM_MXFP8_TUNING_CONFIG,
     use_cuda_graph=True,
     # Rank the runners from a cold L2.
+    use_cold_l2_graph_replay=True,
+    use_cold_l2_cache=True,
+)
+
+# bmm_mxfp8(backend="cute-dsl") inputs: A [b, m, k], B, A_scale, B_scale, out [b, m, n],
+# out_scale. Profiling tensors for an M bucket are contiguous.
+_BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),
+            (1,),
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            2,
+            0,
+            lambda shapes: _mxfp8_swizzled_scale_len(
+                shapes[0][0] * shapes[0][1], shapes[0][2], SfLayout.layout_128x4
+            ),
+        ),
+        ConstraintSpec(4, 1, lambda shapes: shapes[0][1]),
+        ConstraintSpec(
+            5,
+            0,
+            lambda shapes: (
+                _pad_up(shapes[0][0] * shapes[0][1], 128) * shapes[4][2] // 32
+                if shapes[5][0]
+                else 0
+            ),
+        ),
+    ),
+    use_cuda_graph=True,
     use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
 )
@@ -13434,6 +13511,8 @@ def _cute_dsl_bmm_mxfp8_requirement(
     backend: Literal["cute-dsl", "auto"] = "cute-dsl",
     out_scale: Optional[torch.Tensor] = None,
 ):
+    if tuple(get_compute_capability(A.device)) != (10, 7):
+        return False
     if _sm107_mxfp8_cute_dsl_kernel() is None:
         return False
     batch, m, k = A.shape
@@ -13455,9 +13534,11 @@ def _cute_dsl_bmm_mxfp8_requirement(
     # The kernel reads the scales from their data pointers as 128x4-swizzled bytes
     if not (A_scale.is_contiguous() and B_scale.is_contiguous()):
         return False
+    # 128x4-swizzled scales pad each row's k/32 columns to a multiple of 4
+    sf_k = (k + 127) // 128 * 4
     if (
-        A_scale.numel() * A_scale.element_size() < batch * m * k // 32
-        or B_scale.numel() * B_scale.element_size() < batch * n * k // 32
+        A_scale.numel() * A_scale.element_size() < batch * m * sf_k
+        or B_scale.numel() * B_scale.element_size() < batch * n * sf_k
     ):
         return False
     if out is not None:
@@ -13475,6 +13556,7 @@ def _cute_dsl_bmm_mxfp8_requirement(
             out_scale is None
             or out_scale.dtype != torch.uint8
             or not out_scale.is_contiguous()
+            or out_scale.data_ptr() % 4 != 0
         ):
             return False
         geometry = _bmm_mxfp8_sm107_out_scale_geometry(
@@ -13607,10 +13689,11 @@ def bmm_mxfp8(
     Parameters
     ----------
     A: torch.Tensor
-        Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2.
+        Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2 (``"cute-dsl"``: e4m3 only).
 
     B: torch.Tensor
-        Mat2 tensor, shape (b, k, n), must be column major, fp8 e4m3 or fp8 e5m2.
+        Mat2 tensor, shape (b, k, n), must be column major, fp8 e4m3 or fp8 e5m2
+        (``"cute-dsl"``: e4m3 only).
         Quantize the contiguous [b, n, k] weight (so the 32-element scale blocks
         run along k, the reduction dim) and pass the transpose of the quantized
         tensor, e.g. ``B = mxfp8_quantize(weight)[0].transpose(-2, -1)``
@@ -13625,13 +13708,16 @@ def bmm_mxfp8(
         layout, as returned by quantizing the [b, n, k] weight (see ``B``).
 
     dtype: torch.dtype
-        out dtype, bf16 or fp16.
+        out dtype, bf16 or fp16; ``"cute-dsl"`` also takes float8_e4m3fn (MXFP8 output,
+        with ``out_scale``).
 
     out: Optional[torch.Tensor]
-        Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
+        Out tensor, shape (b, m, n), of ``dtype``, defaults to ``None``.
 
-    backend: Literal["cudnn", "cutlass", "auto"]
+    backend: Literal["cudnn", "cutlass", "cute-dsl", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
+        ``"cute-dsl"`` runs on SM107 only (see below); ``"auto"`` picks it only when
+        no other backend can run the call, e.g. float8_e4m3fn output.
         On SM120/121 GPUs, ``"auto"`` selects the CUTLASS backend; scales must
         be 1D swizzled (``SfLayout.layout_128x4``). Pass ``B`` in the standard
         shape ``[b, k, n]`` (column-major); the CUTLASS path transposes internally.
@@ -13683,8 +13769,15 @@ def bmm_mxfp8(
         inputs = [A, B, A_scale, B_scale, out, scale_out]
         runner = _cute_dsl_bmm_mxfp8_sm107_runner(dtype)
         _, tactic = AutoTuner.get().choose_one(
-            "bmm_mxfp8_cute_dsl_sm107", [runner], TuningConfig(), inputs
+            "bmm_mxfp8_cute_dsl_sm107",
+            [runner],
+            _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG,
+            inputs,
         )
+        # The cache is keyed by M bucket; an MXFP8-output tactic tuned at the bucket's
+        # M may not tile this M.
+        if not runner.is_tactic_compatible(inputs, tactic):
+            tactic = -1
         runner(inputs=inputs, tactic=tactic)
         return out
 
