@@ -2629,3 +2629,76 @@ def test_topk_select_floor_and_nan_with_valid_pages_and_forced_blocks():
         force_end_blocks=1,
     )
     assert torch.equal(out.cpu(), expect)
+
+
+_TINY = torch.finfo(torch.float32).tiny  # smallest normal; below it are denormals
+# zero / denormal scores, largest first: every one is a distinct finite candidate
+_ZERO_CLASS = (_TINY / 2, _TINY / 2**10, 0.0, -0.0, -_TINY / 2**10, -_TINY / 2)
+
+
+@sm90_only
+@pytest.mark.parametrize("hq,tiles,total_q", [(1, 48, 37), (4, 300, 64), (1, 2048, 32)])
+def test_topk_select_keeps_zero_and_denormal_scores(hq, tiles, total_q):
+    """+0.0, -0.0 and denormal scores are ordinary finite candidates. With at most
+    16 finite blocks the selection is exactly those blocks, -1 padded; with more,
+    the cut falls strictly between two distinct values, so the kept set is unique:
+    the denormals above the cut stay and the zeros and denormals below it go."""
+    g = torch.Generator().manual_seed(hq * 104729 + tiles)
+    scores = torch.full((hq, tiles, total_q), float("-inf"), dtype=torch.float32)
+    expect = torch.full((total_q, hq, TOPK), -1, dtype=torch.int32)
+    for t in range(total_q):
+        for h in range(hq):
+            if t % 2 == 0:  # at most 16 candidates, at least one zero / denormal
+                n = 1 + (t * 3 + h) % TOPK
+                pos = _place(g, tiles, n)
+                zeros = min(n, 1 + (t + h) % len(_ZERO_CLASS))
+                for j, p in enumerate(pos):
+                    if j < zeros:
+                        scores[h, p, t] = _ZERO_CLASS[(t + h + j) % len(_ZERO_CLASS)]
+                    else:
+                        scores[h, p, t] = float(torch.randn(1, generator=g))
+                expect[t, h, :n] = torch.tensor(pos, dtype=torch.int32)
+            else:  # 14 ordinary positives + the 6 zero / denormal scores
+                pos = _place(g, tiles, 20)
+                perm = torch.randperm(20, generator=g).tolist()
+                highs = [pos[i] for i in perm[:14]]
+                lows = [pos[i] for i in perm[14:]]
+                for p in highs:
+                    scores[h, p, t] = 1.0 + float(torch.rand(1, generator=g))
+                for p, v in zip(lows, _ZERO_CLASS, strict=True):
+                    scores[h, p, t] = v
+                # the 16 kept: the 14 positives and the 2 positive denormals
+                keep = sorted(highs + lows[:2])
+                expect[t, h] = torch.tensor(keep, dtype=torch.int32)
+    out = msa_topk_select(scores.cuda(), TOPK)
+    assert torch.equal(out.cpu(), expect)
+
+
+@sm90_only
+def test_topk_select_zero_and_denormal_scores_with_valid_pages_and_forced_blocks():
+    """The same inside a per-token extent with forced sink / window blocks: every
+    zero / denormal block inside the extent is kept, decoys past it are not."""
+    g = torch.Generator().manual_seed(9243)
+    hq, tiles, total_q = 2, 64, 53
+    scores = torch.full((hq, tiles, total_q), float("-inf"), dtype=torch.float32)
+    nvp = torch.randint(20, tiles + 1, (total_q,), generator=g, dtype=torch.int32)
+    expect = torch.full((total_q, hq, TOPK), -1, dtype=torch.int32)
+    for t in range(total_q):
+        v = int(nvp[t])
+        scores[:, v:, t] = 1.0e3  # decoys outside the extent
+        forced = [0, v - 1]
+        for h in range(hq):
+            n = 1 + (t + 5 * h) % (TOPK - 2)
+            pos = _place(g, v, n, exclude=forced)
+            for j, p in enumerate(pos):
+                scores[h, p, t] = _ZERO_CLASS[(t + h + j) % len(_ZERO_CLASS)]
+            chosen = sorted(set(pos) | set(forced))
+            expect[t, h, : len(chosen)] = torch.tensor(chosen, dtype=torch.int32)
+    out = msa_topk_select(
+        scores.cuda(),
+        TOPK,
+        num_valid_pages=nvp.cuda(),
+        force_begin_blocks=1,
+        force_end_blocks=1,
+    )
+    assert torch.equal(out.cpu(), expect)
