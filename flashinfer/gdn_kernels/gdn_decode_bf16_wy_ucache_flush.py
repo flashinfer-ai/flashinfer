@@ -3671,6 +3671,17 @@ def gated_delta_rule_mtp_ucache_flush(
                 f"needs 32- or {_UMMA_RING64_SLOTS}-slot rings (k_cache [pool, H, "
                 f"{{32, {_UMMA_RING64_SLOTS}}}, K]); got k_cache {tuple(k_cache.shape)}"
             )
+        if _why is None and not (
+            k_cache.dim() == 4
+            and u_cache.dim() == 4
+            and g_cache.dim() == 3
+            and k_cache.shape[2] == u_cache.shape[2] == g_cache.shape[2]
+        ):
+            _why = (
+                "needs k, u and g rings of one depth, got k_cache "
+                f"{tuple(k_cache.shape)}, u_cache {tuple(u_cache.shape)}, "
+                f"g_cache {tuple(g_cache.shape)}"
+            )
         if _why is not None:
             raise ValueError(
                 f"gated_delta_rule_mtp_ucache_flush: backend='umma_ring64' unavailable: {_why}."
