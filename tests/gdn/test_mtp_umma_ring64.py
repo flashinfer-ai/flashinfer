@@ -17,6 +17,7 @@ Run:  pytest tests/gdn/test_mtp_umma_ring64.py -q
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import math
 import os
@@ -40,23 +41,24 @@ _B8 = [0, 28 * RS, 5 * RS, 30 * RS, 17 * RS, 31 * RS, 20 * RS, 25 * RS]
 _B8W = [28 * RS, 5 * RS, 30 * RS, 17 * RS, 31 * RS, 20 * RS, 25 * RS, 9 * RS]
 
 
-def _fm_max(T):
+def _fm_max(T, ring=RING):
     """Largest ring-safe flush_min of this W/RING build (the wrapper's default): nu - T + 1 = min(W - T + 1, RING - 2 T + 1).
     A row with P == fm_max flushes; a verify row at fm_max - 1 advances to at most nu, so the next call's window still
     fits the nu-row window; the T appends land at physical slots P..P+T-1 with P + T <= nu + T <= RING, no overlap
     against the P live rows just read."""
-    return _p_max(T) - T + 1
+    return _p_max(T, ring) - T + 1
 
 
-def _default_fm(T):
+def _default_fm(T, ring=RING):
     """The wrapper's default flush_min: the ring-safe maximum, except at T = 1 (one ring row per step), where a window
     longer than one 16-row chunk costs more in window-row reads than it saves in flush writes: F = 16."""
-    return min(_fm_max(T), 16) if T == 1 else _fm_max(T)
+    return min(_fm_max(T, ring), 16) if T == 1 else _fm_max(T, ring)
 
 
-def _p_max(T):
-    """Deepest live window a call may see: nu = min(W, RING - T) (= W at W < RING)."""
-    return min(W, RING - T)
+def _p_max(T, ring=RING):
+    """Deepest live window a call may see: nu = min(W, RING - T); 32-slot rings run the merged kernel's 16-row
+    window (COMPAT_WINDOW)."""
+    return min(16 if ring == 32 else W, ring - T)
 
 
 SCALE = 1.0 / math.sqrt(K)
@@ -156,7 +158,7 @@ def _ref_fp32(q, k, v, a, b, A_log, dt_bias, S0, kc, uc, gc, P):
     return y, S_after_history, us, khat, gam
 
 
-def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
+def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None, ring=RING):
     io = torch.bfloat16
     g = torch.Generator(device=DEV).manual_seed(seed)
 
@@ -172,9 +174,9 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
     dt_bias = rn(HV, sc=0.5)
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(torch.float16)
     fill = float("nan") if poison else 0.0
-    kc = torch.full((B, H, RING, K), fill, dtype=io, device=DEV)
-    uc = torch.full((B, HV, RING, V), fill, dtype=u_dtype or io, device=DEV)
-    gc = torch.full((B, HV, RING), fill, dtype=torch.float32, device=DEV)
+    kc = torch.full((B, H, ring, K), fill, dtype=io, device=DEV)
+    uc = torch.full((B, HV, ring, V), fill, dtype=u_dtype or io, device=DEV)
+    gc = torch.full((B, HV, ring), fill, dtype=torch.float32, device=DEV)
     hl = torch.tensor(hist_lens, dtype=torch.int32, device=DEV)
     bases = bases or [0] * B
     cb = torch.tensor(bases, dtype=torch.int32, device=DEV)
@@ -183,7 +185,7 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
         if P == 0:
             continue
         rows = torch.tensor(
-            [(bases[r] + j) % RING for j in range(P)], dtype=torch.long, device=DEV
+            [(bases[r] + j) % ring for j in range(P)], dtype=torch.long, device=DEV
         )
         kh = torch.randn(H, P, K, generator=g, device=DEV)
         kc[r, :, rows] = F.normalize(kh, dim=-1).to(io)
@@ -196,9 +198,9 @@ def _make_case(B, T, hist_lens, seed, bases=None, poison=True, u_dtype=None):
     return q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx
 
 
-def _logical(kc_r, uc_r, gc_r, base):
+def _logical(kc_r, uc_r, gc_r, base, ring=RING):
     rows = torch.tensor(
-        [(base + j) % RING for j in range(W)], dtype=torch.long, device=DEV
+        [(base + j) % ring for j in range(W)], dtype=torch.long, device=DEV
     )
     return (
         kc_r.index_select(1, rows),
@@ -235,7 +237,7 @@ def _run(fn, case, flush_min, row_order=None, restart=False, window_rows=None):
     ):
         # histories deeper than the commit rule allows (P <= flush_min - 1 + T: flush_min = 1 sweeps, predictive
         # flush_min with deep rows) need the window passed explicitly; in-contract cases use the derived default
-        window_rows = min(int(hl.max()), _p_max(T))
+        window_rows = min(int(hl.max()), _p_max(T, kc.shape[2]))
     if window_rows is not None:
         kw["window_rows"] = window_rows
     return fn(A_log, a, dt_bias, **kw)
@@ -252,14 +254,13 @@ def _check_case(
     hpc=None,
     u_dtype=None,
     fn=None,
+    ring=RING,
 ):
     fn = fn or _umma()
     if hpc is not None:
-        import functools
-
         fn = functools.partial(fn, heads_per_cta=hpc)
     B = len(hist)
-    case = _make_case(B, T, hist, seed, bases, u_dtype=u_dtype)
+    case = _make_case(B, T, hist, seed, bases, u_dtype=u_dtype, ring=ring)
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
     pool0, kc0, uc0, gc0 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
     ro = None
@@ -276,7 +277,7 @@ def _check_case(
     errs = {"y": 0.0, "S": 0.0, "u": 0.0, "k": 0.0, "g": 0.0}
     for r in range(B):
         P = hist[r]
-        kc_l, uc_l, gc_l = _logical(kc0[r], uc0[r], gc0[r], bases[r])
+        kc_l, uc_l, gc_l = _logical(kc0[r], uc0[r], gc0[r], bases[r], ring)
         y_ref, S_ref, u_ref, khat, gam = _ref_fp32(
             q[r], k[r], v[r], a[r], b[r], A_log, dt_bias, pool0[r], kc_l, uc_l, gc_l, P
         )
@@ -292,12 +293,12 @@ def _check_case(
             )
         if check_rings:
             app = torch.tensor(
-                [(bases[r] + P + s) % RING for s in range(T)],
+                [(bases[r] + P + s) % ring for s in range(T)],
                 dtype=torch.long,
                 device=DEV,
             )
             win = torch.tensor(
-                [(bases[r] + j) % RING for j in range(P)], dtype=torch.long, device=DEV
+                [(bases[r] + j) % ring for j in range(P)], dtype=torch.long, device=DEV
             )
             assert torch.isfinite(uc[r][:, app].float()).all(), f"row {r}: non-finite u"
             assert torch.isfinite(kc[r][:, app].float()).all(), f"row {r}: non-finite k"
@@ -313,7 +314,7 @@ def _check_case(
             gp = (
                 0.0
                 if (flushed or P == 0)
-                else gc0[r][:, (bases[r] + P - 1) % RING][:, None]
+                else gc0[r][:, (bases[r] + P - 1) % ring][:, None]
             )
             errs["g"] = max(
                 errs["g"],
@@ -392,7 +393,6 @@ def test_launch_policy_is_bit_identical(T):
     """heads_per_cta (grid split) only changes how the kernel is launched: outputs, committed
     state and every ring must stay bit-identical to the default launch."""
     _skip_if_not_sm100()
-    import functools
 
     fm = _fm_max(T)
     hist = [fm, 0, fm - 1, _p_max(T), 3, fm - 1, 1, fm]
@@ -1397,30 +1397,15 @@ def test_public_backend_umma_ring64_matches_the_direct_call(T):
         assert torch.equal(_bits(x), _bits(y_))
 
 
-def test_public_backend_umma_ring64_needs_64_slot_rings():
-    """32-slot rings (the HMMA / W=16 UMMA contract) are refused with a message naming the ring depth."""
+@pytest.mark.parametrize("ring", [16, 48, 128])
+def test_public_backend_umma_ring64_rejects_unsupported_ring_depths(ring):
+    """Only 32- and 64-slot rings are served; any other depth is refused with a message naming it."""
     _skip_if_not_sm100()
-    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
-        2, 4, [0, 1], 5, [0, 0]
-    )
-    case = (
-        q,
-        k,
-        v,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        pool,
-        kc[:, :, :32].contiguous(),
-        uc[:, :, :32].contiguous(),
-        gc[:, :, :32].contiguous(),
-        hl,
-        cb,
-        idx,
-    )
-    with pytest.raises(ValueError, match="64-slot rings"):
+    case = _make_case(2, 4, [0, 1], 5, [0, 0], ring=ring)
+    with pytest.raises(ValueError, match="32- or 64-slot"):
         _public_call(case, backend="umma_ring64")
+    with pytest.raises(ValueError, match="32- or 64-slot"):
+        _public_call(case, backend="umma_ring64", restart_hist_on_flush=True)
 
 
 @pytest.mark.parametrize("T", [1, 4, 8])
@@ -1625,3 +1610,297 @@ def test_public_restart_cursor_check_still_rejects_for_merged_umma(hist, bases, 
     )
     with pytest.raises(AssertionError, match=match):
         _public_call(case, backend="umma", restart_hist_on_flush=True)
+
+
+# ---------------------------------------------------------------------------
+# 32-slot rings: the merged kernel's contract (flush_min <= 17 - T, 16-row window, hist_len <= 16,
+# cache_base < 32) served by the ring-64 kernel built for ring_slots = 32.
+
+R32 = 32
+_B8_32 = [31, 28, 17, 30, 25, 20, 9, 5]
+
+
+def _merged():
+    from flashinfer.gdn_kernels.gdn_replay_mtp_umma import (
+        gated_delta_rule_mtp_ucache_flush_umma,
+    )
+
+    return gated_delta_rule_mtp_ucache_flush_umma
+
+
+def _hist32(T, B):
+    """Verify rows up to flush_min - 1, flush rows from flush_min, the deepest legal window, empty rows."""
+    fm = _fm_max(T, R32)
+    pat = [0, fm - 1, fm, _p_max(T, R32), 1, fm, min(_p_max(T, R32), fm - 1 + T), 3]
+    return [pat[i % len(pat)] for i in range(B)]
+
+
+def _bases32(B, wrapped):
+    return [_B8_32[i % 8] if wrapped else 0 for i in range(B)]
+
+
+@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("bases", ["base0", "wrap"])
+@pytest.mark.parametrize("u_dtype", [None, torch.float16], ids=["bf16u", "fp16u"])
+def test_ring32_matches_fp32_reference(T, bases, u_dtype):
+    """32-slot rings, default flush_min (17 - T): outputs, appended rings and the folded state against the oracle,
+    mixed verify / flush rows, windows wrapping the ring (bases up to 31), bf16 and fp16 u rings."""
+    _skip_if_not_sm100()
+    fm = _fm_max(T, R32)
+    b = _bases32(8, bases == "wrap")
+    _check_case(
+        T,
+        _hist32(T, 8),
+        b,
+        fm,
+        seed=500 + T,
+        u_dtype=u_dtype,
+        ring=R32,
+    )
+
+
+@pytest.mark.parametrize("T", [1, 4, 8])
+@pytest.mark.parametrize("order", [None, "flush_first", "reverse"])
+@pytest.mark.parametrize("hpc", [1, 2, 4])
+def test_ring32_row_order_and_heads_per_cta(T, order, hpc):
+    """Row order (flush-first, reverse) and every heads-per-CTA split on 32-slot rings; predictive explicit flush_min
+    below the default (rows past it flush, the window stays 16 rows)."""
+    _skip_if_not_sm100()
+    fm = max(1, _fm_max(T, R32) - 3)
+    hist = [fm, 0, min(16, fm + 2), fm - 1, 2, _p_max(T, R32), fm, 1]
+    _check_case(
+        T,
+        hist,
+        _bases32(8, True),
+        fm,
+        seed=520 + T + hpc,
+        row_order=order,
+        hpc=hpc,
+        ring=R32,
+    )
+
+
+@pytest.mark.parametrize("T", [1, 4, 8])
+def test_ring32_padded_rows_untouched(T):
+    """Padded rows (index -1) on 32-slot rings leave the pool and the rings bit-untouched; live rows stay finite."""
+    _skip_if_not_sm100()
+    B = 4
+    fm = _fm_max(T, R32)
+    case = list(_make_case(B, T, [fm, fm - 1, 5, 2], 11, [0, 31, 3, 9], ring=R32))
+    idx = torch.tensor([0, -1, 2, -1], dtype=torch.int32, device=DEV)
+    case[13] = idx
+    snap = [x.clone() for x in case[7:11]]
+    out = torch.full((B, T, HV, V), 7.0, dtype=torch.bfloat16, device=DEV)
+    q, k, v, a, b, A_log, dt_bias = case[:7]
+    _umma()(
+        A_log,
+        a,
+        dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=case[7],
+        initial_state_indices=idx,
+        k_cache=case[8],
+        u_cache=case[9],
+        g_cache=case[10],
+        hist_len=case[11],
+        cache_base=case[12],
+        scale=SCALE,
+        flush_min=fm,
+        output=out,
+        restart_hist_on_flush=False,
+    )
+    torch.cuda.synchronize()
+    for r in (1, 3):
+        assert torch.equal(out[r].float(), torch.full_like(out[r].float(), 7.0))
+        for before, after in zip(snap, case[7:11], strict=True):
+            assert torch.equal(_bits(before[r]), _bits(after[r]))
+    assert torch.isfinite(out[[0, 2]].float()).all()
+
+
+@pytest.mark.parametrize("T", [1, 4, 8])
+def test_ring32_default_flush_min_is_the_merged_default(T):
+    """flush_min=None resolves to 17 - T at 32 slots (16 at T = 1): bit-identical to the explicit value."""
+    _skip_if_not_sm100()
+    fm = _fm_max(T, R32)
+    hist = list(range(0, min(16, fm - 1 + T) + 1))
+    B = len(hist)
+    case_a = _make_case(B, T, hist, 21 + T, [5] * B, ring=R32)
+    case_b = tuple(x.clone() for x in case_a)
+    y_a = _run(_umma(), case_a, None)
+    y_b = _run(_umma(), case_b, fm)
+    torch.cuda.synchronize()
+    for x, y_ in zip((y_a, *case_a[7:11]), (y_b, *case_b[7:11]), strict=True):
+        assert torch.equal(_bits(x), _bits(y_))
+    ref = _make_case(B, T, hist, 21 + T, [5] * B, ring=R32)[7]
+    assert not torch.equal(case_a[7][B - 1], ref[B - 1])
+
+
+@pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("u_dtype", [None, torch.float16], ids=["bf16u", "fp16u"])
+def test_ring32_is_bit_identical_to_the_merged_kernel(T, u_dtype):
+    """Under the compat contract the 32-slot build of the ring-64 kernel and the merged UMMA kernel agree bit for
+    bit (outputs, state pool and the k / u / g rings, NaN poison included): B in {1, 7, 8, 64}, base 0 and wrapped
+    windows, natural and flush-first row order."""
+    _skip_if_not_sm100()
+    from flashinfer.gdn_kernels.gdn_replay_mtp_umma import (
+        flush_first_row_order as merged_flush_first,
+    )
+
+    fm = _fm_max(T, R32)
+    for B in (1, 7, 8, 64):
+        for wrapped in (False, True):
+            for ordered in (False, True):
+                hist, bases = _hist32(T, B), _bases32(B, wrapped)
+                got = []
+                for fn in (_umma(), _merged()):
+                    case = _make_case(
+                        B, T, hist, 700 + T, bases, u_dtype=u_dtype, ring=R32
+                    )
+                    ro = merged_flush_first(case[11], fm) if ordered else None
+                    y = _run(fn, case, fm, ro)
+                    torch.cuda.synchronize()
+                    got.append((y, *case[7:11], case[11], case[12]))
+                for name, x, y_ in zip(
+                    ("y", "state", "k", "u", "g", "hist", "base"), *got, strict=True
+                ):
+                    assert torch.equal(_bits(x), _bits(y_)), (
+                        T,
+                        B,
+                        wrapped,
+                        ordered,
+                        name,
+                    )
+
+
+@pytest.mark.parametrize("T", [1, 4, 8])
+def test_ring32_stochastic_rounding_is_bit_identical_to_the_merged_kernel(T):
+    """Philox stochastic rounding of the flushed fp16 state: same bits as the merged kernel."""
+    _skip_if_not_sm100()
+    fm = _fm_max(T, R32)
+    hist, bases = _hist32(T, 8), _bases32(8, True)
+    got = []
+    for fn in (_umma(), _merged()):
+        case = _make_case(8, T, hist, 730 + T, bases, ring=R32)
+        _run_sr = functools.partial(
+            fn,
+            stochastic_rounding="philox",
+            rand_seed=torch.tensor([1234], dtype=torch.int64, device=DEV),
+        )
+        _run(_run_sr, case, fm)
+        torch.cuda.synchronize()
+        got.append(case[7:11])
+    for x, y_ in zip(*got, strict=True):
+        assert torch.equal(_bits(x), _bits(y_))
+
+
+@pytest.mark.parametrize("T", [1, 2, 4, 5, 8])
+def test_ring32_refuses_deep_flush_min_and_window(T):
+    """32-slot rings run the merged contract only: flush_min above 17 - T and a window deeper than 16 rows are refused
+    (a ValueError naming 64-slot rings), with restart_hist_on_flush either way; the 64-slot ring accepts the same
+    flush_min."""
+    _skip_if_not_sm100()
+    fm = _fm_max(T, R32)
+    for restart in (False, True):
+        for kw in ({"flush_min": fm + 1}, {"flush_min": fm, "window_rows": 17}):
+            case = _make_case(2, T, [0, 1], 3, [0, 0], ring=R32)
+            window_rows = kw.get("window_rows")
+            with pytest.raises(ValueError, match="64-slot rings"):
+                _run(
+                    _umma(),
+                    case,
+                    kw["flush_min"],
+                    restart=restart,
+                    window_rows=window_rows,
+                )
+    case = _make_case(2, T, [0, 1], 3, [0, 0], ring=64)
+    _run(_umma(), case, fm + 1)
+
+
+@pytest.mark.parametrize("ring", [16, 48, 128])
+def test_ring_depths_other_than_32_and_64_are_refused(ring):
+    """The kernel entry names the supported depths for any other ring depth."""
+    _skip_if_not_sm100()
+    case = _make_case(2, 4, [0, 1], 5, [0, 0], ring=ring)
+    with pytest.raises(ValueError, match="ring depth .* unsupported"):
+        _run(_umma(), case, None)
+
+
+@pytest.mark.parametrize("bad", ["k", "u", "g"])
+def test_mismatched_ring_depths_are_refused(bad):
+    """k, u and g rings of different depths are refused (direct call: assertion, public call: ValueError)."""
+    _skip_if_not_sm100()
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
+        2, 4, [0, 1], 5, [0, 0], ring=64
+    )
+    rings = {"k": kc, "u": uc, "g": gc}
+    rings[bad] = rings[bad][:, :, :32].contiguous()
+    case = (q, k, v, a, b, A_log, dt_bias, pool, *rings.values(), hl, cb, idx)
+    with pytest.raises(AssertionError):
+        _run(_umma(), case, None)
+    with pytest.raises(ValueError, match="one depth"):
+        _public_call(case, backend="umma_ring64")
+
+
+@pytest.mark.parametrize("T", [4, 8])
+@pytest.mark.parametrize("bases", ["base0", "wrap", "high"])
+def test_public_restart_cursor_check_takes_ring32_histories(T, bases):
+    """restart_hist_on_flush=True on 32-slot rings: every history 0..16 and bases up to 31 are legal and match the
+    fp32 oracle."""
+    _skip_if_not_sm100()
+    fm = _fm_max(T, R32)
+    hist = [0, 1, 5, 11, 12, 13, 15, 16]
+    base = {"base0": [0] * 8, "wrap": _B8_32, "high": [31] * 8}[bases]
+    _check_case(
+        T,
+        hist,
+        base,
+        fm,
+        62,
+        fn=_public_restart_fn(restart_hist_on_flush=True),
+        ring=R32,
+    )
+
+
+def test_public_ring32_commits_like_the_merged_backend():
+    """The public eager umma_ring64 call on 32-slot rings commits the cursors exactly like backend='umma'."""
+    _skip_if_not_sm100()
+    T = 4
+    hist, bases = [3, 12, 13, 16], [31, 30, 20, 9]
+    case_a = _make_case(len(hist), T, hist, 92, bases, ring=R32)
+    case_b = tuple(x.clone() for x in case_a)
+    y_a = _public_call(case_a, backend="umma_ring64", restart_hist_on_flush=True)
+    y_b = _public_call(case_b, backend="umma", restart_hist_on_flush=True)
+    torch.cuda.synchronize()
+    for x, y_ in zip((y_a, *case_a[7:13]), (y_b, *case_b[7:13]), strict=True):
+        assert torch.equal(_bits(x), _bits(y_))
+
+
+@pytest.mark.parametrize(
+    "T,flush_min,hist,bases,match",
+    [
+        (4, None, 17, 0, r"hist_len out of legal range \[0, 16\]"),
+        (8, 9, 17, 0, r"hist_len out of legal range \[0, 16\]"),
+        (4, 5, 9, 0, r"hist_len out of legal range \[0, 8\]"),
+        (4, None, 4, 32, "cache_base out of legal"),
+        (4, None, 4, -1, "cache_base out of legal"),
+    ],
+)
+def test_public_restart_cursor_check_bounds_ring32(T, flush_min, hist, bases, match):
+    """32-slot limits of the eager cursor check: hist_len up to min(16, flush_min - 1 + T), cache_base below 32."""
+    _skip_if_not_sm100()
+    case = _make_case(1, T, [4], 7, [0], ring=R32)
+    case[11].copy_(torch.tensor([hist], dtype=torch.int32))
+    case[12].copy_(torch.tensor([bases], dtype=torch.int32))
+    with pytest.raises(AssertionError, match=match):
+        _public_call(case, flush_min, backend="umma_ring64", restart_hist_on_flush=True)
+
+
+def test_public_ring32_refuses_deep_flush_min():
+    """The public call refuses a deep flush_min on 32-slot rings and points to 64-slot rings."""
+    _skip_if_not_sm100()
+    case = _make_case(1, 4, [4], 7, [0], ring=R32)
+    with pytest.raises(ValueError, match="64-slot rings"):
+        _public_call(case, 14, backend="umma_ring64", restart_hist_on_flush=True)
