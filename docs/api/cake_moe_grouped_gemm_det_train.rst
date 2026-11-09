@@ -24,6 +24,10 @@ any size that is not a tile multiple.  All operands are bfloat16 with fp32 tenso
 accumulation; the reductions are bitwise deterministic (no atomics) and empty groups
 produce exactly zero weight gradients.
 
+The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+Standalone ``wgrad`` calls with ``m_indptr`` must also pass ``num_groups=E``.
+
 ============ ==================================================================== ============================
 operation    computation                                                           output
 ============ ==================================================================== ============================

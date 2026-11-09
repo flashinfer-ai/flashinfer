@@ -20,6 +20,9 @@ The three operations of the deterministic module
 described by an int32 **device** tensor ``offs[E]`` of cumulative end offsets
 (never read on the host):
 
+The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
 * ``fwd``:   ``Y[offs[e-1]:offs[e]]  = X[offs[e-1]:offs[e]] @ W[e].T``
 * ``dgrad``: ``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]``
 * ``wgrad``: ``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` (bf16 or fp32 output)
