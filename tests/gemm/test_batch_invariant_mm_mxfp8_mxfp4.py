@@ -1,8 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant mixed MX GEMM: ``flashinfer.gemm.batch_invariant.api.mm_mxfp4w8a_mxfp8a_batch_invariant`` (e2m1
-weights against e4m3 activations, UE8M0 block scales per 32 elements on both; FlashInfer has no dense operator for the pair,
-so the entry is the mode's own hook).
+"""The batch-invariant mixed MX GEMM: ``flashinfer.mm_mxfp8_mxfp4(a, b, a_descale, b_descale, alpha, out_dtype, out,
+batch_invariant=...)`` (e2m1 weights against e4m3 activations, UE8M0 block scales per 32 elements on both). The class is the
+pair's only dense kernel in FlashInfer, so both values of the flag run it; the suite drives the class through its direct entry
+``flashinfer.gemm.batch_invariant.api.mm_mxfp8_mxfp4_batch_invariant`` (it forces configurations, chunk counts and the class,
+and exposes the fp32 chain input) and checks the public entry against it.
 
 The classes ``gemm.mxfp4w8a.kfold`` / ``kchunk[C]`` (the SM100 / SM103 ``kind::mxf8f6f4`` instruction with mixed operand
 formats: 32 elements per step, one UE8M0 scale per row; the e2m1 weight reaches the instruction through the TMA's unpacking
@@ -22,6 +24,7 @@ the GPU tests need SM100 / SM103 / SM107 (the SM100 class runs on SM107 too, the
 """
 
 import dataclasses
+import inspect
 import os
 
 import pytest
@@ -31,7 +34,7 @@ import flashinfer
 from flashinfer import batch_invariant as bi
 from flashinfer.gemm.batch_invariant.api import (
     MM_MXW48_ARCHS,
-    mm_mxfp4w8a_mxfp8a_batch_invariant,
+    mm_mxfp8_mxfp4_batch_invariant,
     mm_mxfp8_batch_invariant,
     mxfp4w8a_format_for,
     part_of,
@@ -193,7 +196,7 @@ def norm_rel_err(c, a, sfa, bt, sfb, alpha: float = 1.0) -> float:
 
 
 def mm(a, b, sfa, sfb, alpha=None, out_dtype=torch.bfloat16, **kw):
-    return mm_mxfp4w8a_mxfp8a_batch_invariant(
+    return mm_mxfp8_mxfp4_batch_invariant(
         a, b, sfa, sfb, alpha, out_dtype=out_dtype, **kw
     )
 
@@ -315,40 +318,40 @@ def fi_sm107_mixed(
 
 def test_fingerprint_is_a_function_of_the_weight_shape_the_output_format_and_the_architecture():
     f107 = bi.fingerprint(
-        "mm_mxfp4w8a_mxfp8a", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_107"
+        "mm_mxfp8_mxfp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_107"
     )
     f100 = bi.fingerprint(
-        "mm_mxfp4w8a_mxfp8a", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100"
+        "mm_mxfp8_mxfp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100"
     )
     assert f107.startswith("gemm-mxfp4w8a-k64-kfold-scaled-") and f100.startswith(
         "gemm-mxfp4w8a-kfold-scaled-"
     )
     assert f107 != f100  # two instructions, two classes
     assert f100 == bi.fingerprint(
-        "mm_mxfp4w8a_mxfp8a", N=4096, K=4096, out_dtype="bf16", arch="sm_103"
+        "mm_mxfp8_mxfp4", N=4096, K=4096, out_dtype="bf16", arch="sm_103"
     )
     assert f107 == bi.fingerprint(
-        "mm_mxfp4w8a_mxfp8a", N=4096, K=4096, out_dtype="bf16", arch=(10, 7)
+        "mm_mxfp8_mxfp4", N=4096, K=4096, out_dtype="bf16", arch=(10, 7)
     )
     assert bi.fingerprint(
-        "mm_mxfp4w8a_mxfp8a", N=128, K=8192, out_dtype=torch.float16, arch="sm_100"
+        "mm_mxfp8_mxfp4", N=128, K=8192, out_dtype=torch.float16, arch="sm_100"
     ).startswith("gemm-mxfp4w8a-kchunk4-scaled-")
     # a weight in the mixed classes' lower-bound region carries the split class (8 chunks) on both parts; the MX rule would give 2
     assert bi.fingerprint(
-        "mm_mxfp4w8a_mxfp8a", N=512, K=16384, out_dtype=torch.bfloat16, arch="sm_100"
+        "mm_mxfp8_mxfp4", N=512, K=16384, out_dtype=torch.bfloat16, arch="sm_100"
     ).startswith("gemm-mxfp4w8a-kchunk8-scaled-")
     assert bi.fingerprint(
-        "mm_mxfp4w8a_mxfp8a", N=512, K=16384, out_dtype=torch.bfloat16, arch="sm_107"
+        "mm_mxfp8_mxfp4", N=512, K=16384, out_dtype=torch.bfloat16, arch="sm_107"
     ).startswith("gemm-mxfp4w8a-k64-kchunk8-scaled-")
     assert bi.fingerprint(
         "mm_mxfp8", N=512, K=16384, out_dtype=torch.bfloat16, arch="sm_100"
     ).startswith("gemm-mxfp8-kchunk2-")
     assert bi.fingerprint(
-        "mm_mxfp4w8a_mxfp8a", N=1024, K=16384, out_dtype=torch.bfloat16, arch="sm_100"
+        "mm_mxfp8_mxfp4", N=1024, K=16384, out_dtype=torch.bfloat16, arch="sm_100"
     ).startswith("gemm-mxfp4w8a-kfold-scaled-")
     # the output dtype and the raw K are dimensions of the specification; M and the layout of the scale buffers are not
     distinct = {
-        bi.fingerprint("mm_mxfp4w8a_mxfp8a", N=4096, K=K, out_dtype=od, arch=arch)
+        bi.fingerprint("mm_mxfp8_mxfp4", N=4096, K=K, out_dtype=od, arch=arch)
         for K in (4096, 4096 + 128)
         for od in (torch.bfloat16, torch.float16)
         for arch in ("sm_100", "sm_107")
@@ -357,7 +360,7 @@ def test_fingerprint_is_a_function_of_the_weight_shape_the_output_format_and_the
     # a different class from the one-format MX classes of the same shape and part: the step's operand formats differ
     for arch in ("sm_100", "sm_107"):
         mixed = bi.fingerprint(
-            "mm_mxfp4w8a_mxfp8a", N=4096, K=4096, out_dtype=torch.bfloat16, arch=arch
+            "mm_mxfp8_mxfp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch=arch
         )
         assert mixed != bi.fingerprint(
             "mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16, arch=arch
@@ -372,12 +375,12 @@ def test_fingerprint_is_a_function_of_the_weight_shape_the_output_format_and_the
         )
     assert spec_fingerprint(4096, "bf16", 1, "mxfp4w8a") == f100
     assert spec_fingerprint(4096, "bf16", 1, "mxfp4w8a_k64") == f107
-    assert bi.class_name("mm_mxfp4w8a_mxfp8a") == "gemm.mxfp4w8a"
+    assert bi.class_name("mm_mxfp8_mxfp4") == "gemm.mxfp4w8a"
     with pytest.raises(TypeError):
-        bi.fingerprint("mm_mxfp4w8a_mxfp8a", N=4096, K=4096)
+        bi.fingerprint("mm_mxfp8_mxfp4", N=4096, K=4096)
     with pytest.raises(ValueError):
         bi.fingerprint(
-            "mm_mxfp4w8a_mxfp8a",
+            "mm_mxfp8_mxfp4",
             N=4096,
             K=4096,
             out_dtype=torch.float32,
@@ -385,7 +388,7 @@ def test_fingerprint_is_a_function_of_the_weight_shape_the_output_format_and_the
         )
     with pytest.raises(ValueError):
         bi.fingerprint(
-            "mm_mxfp4w8a_mxfp8a", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_90"
+            "mm_mxfp8_mxfp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_90"
         )
 
 
@@ -555,7 +558,50 @@ def test_unsupported_device_raises_before_any_kernel():
     w = torch.zeros(128, 64, dtype=torch.uint8).t()
     sf = torch.zeros(512, dtype=torch.uint8)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="gemm.mxfp4w8a"):
-        mm_mxfp4w8a_mxfp8a_batch_invariant(a, w, sf, sf)
+        mm_mxfp8_mxfp4_batch_invariant(a, w, sf, sf)
+
+
+def test_public_entry_exists_under_the_library_naming_and_routes_to_the_class():
+    """``flashinfer.gemm.mm_mxfp8_mxfp4`` (FlashInfer's ``mm_<activation>_<weight>`` naming) is exported from ``flashinfer`` too,
+    with ``mm_mxfp8``'s argument names and order plus the keyword-only ``batch_invariant`` / ``enable_pdl``; the former
+    internal name is gone from the API module and the class table, whose key is the public API's; both flag values reach the
+    class (a CPU operand raises the class's own error before any kernel, under either value)."""
+    fn = flashinfer.gemm.mm_mxfp8_mxfp4
+    assert flashinfer.mm_mxfp8_mxfp4 is fn
+    assert "mm_mxfp8_mxfp4" in flashinfer.gemm.__all__
+    params = inspect.signature(fn).parameters
+    assert list(params) == [
+        "a",
+        "b",
+        "a_descale",
+        "b_descale",
+        "alpha",
+        "out_dtype",
+        "out",
+        "batch_invariant",
+        "enable_pdl",
+    ]
+    assert params["alpha"].default is None
+    assert params["out_dtype"].default is torch.bfloat16
+    assert params["out"].default is None
+    assert params["batch_invariant"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["batch_invariant"].default is False
+    assert params["enable_pdl"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["enable_pdl"].default is None
+    from flashinfer.gemm.batch_invariant import api
+
+    assert not hasattr(api, "mm_mxfp4w8a_mxfp8a_batch_invariant")
+    assert "mm_mxfp4w8a_mxfp8a" not in bi.CLASSES
+    assert bi.class_name("mm_mxfp8_mxfp4") == "gemm.mxfp4w8a"
+    a = torch.zeros(4, 128).to(E4)
+    w = torch.zeros(128, 64, dtype=torch.uint8).t()
+    sf = torch.zeros(512, dtype=torch.uint8)
+    for flag in (False, True):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="gemm.mxfp4w8a"):
+            fn(a, w, sf, sf, batch_invariant=flag)
+    # the public contract is bf16 / fp16 output (the fingerprint's output formats); fp32 is the direct entry's test exposure
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16"):
+        fn(a, w, sf, sf, out_dtype=torch.float32)
 
 
 # ----------------------------------------------------------------------------------------------- on the device
@@ -586,6 +632,50 @@ def test_determinism_and_graph_replay(M, N, K):
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out), ref)
+
+
+@needs_device
+@pytest.mark.parametrize("M,N,K", [(8, 4096, 4096), (300, 2048, 4096)])
+def test_public_entry_computes_the_class_under_both_flag_values(M, N, K):
+    """``flashinfer.mm_mxfp8_mxfp4`` with ``batch_invariant=False`` and with ``True`` gives the bits of the direct entry at a decode
+    shape (the swapped records) and a prefill shape, for the bf16 and the fp16 output, with and without a caller's output
+    buffer and under the forced dependent-launch placement; the class is the pair's only dense kernel."""
+    a, sfa = adv_mx8(M, K, 41)
+    b, sfb = weight(N, K, 42)
+    alpha = alpha_t(0.37)
+    for od in (torch.bfloat16, torch.float16):
+        ref = bits(mm(a, b, sfa, sfb, alpha, out_dtype=od)).clone()
+        for flag in (False, True):
+            out = flashinfer.mm_mxfp8_mxfp4(
+                a, b, sfa, sfb, alpha, out_dtype=od, batch_invariant=flag
+            )
+            assert out.dtype == od and out.shape == (M, N)
+            assert torch.equal(bits(out), ref)
+            buf = torch.empty(M, N, dtype=od, device="cuda")
+            got = flashinfer.mm_mxfp8_mxfp4(
+                a, b, sfa, sfb, alpha, od, buf, batch_invariant=flag
+            )
+            assert got is buf and torch.equal(bits(buf), ref)
+            assert torch.equal(
+                bits(
+                    flashinfer.mm_mxfp8_mxfp4(
+                        a,
+                        b,
+                        sfa,
+                        sfb,
+                        alpha,
+                        out_dtype=od,
+                        batch_invariant=flag,
+                        enable_pdl=True,
+                    )
+                ),
+                ref,
+            )
+    # alpha None is 1.0 on the public entry as on the direct one
+    assert torch.equal(
+        bits(flashinfer.mm_mxfp8_mxfp4(a, b, sfa, sfb)),
+        bits(mm(a, b, sfa, sfb, alpha_t(1.0))),
+    )
 
 
 @needs_device

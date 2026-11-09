@@ -26,11 +26,11 @@ alpha applied once after the whole fold, for packed-fp4 A (M, K / 2) row-major a
 (N, K / 2) weight, bf16 or fp16 output; the class is the device architecture's and, for NVFP4 on SM107, the weight shape's
 (`schedule.fp4_class_for`: the 128-wide step for the weight shapes its chunk rule leaves unsplit, the 64-wide step's class
 otherwise).
-``mm_mxfp4w8a_mxfp8a_batch_invariant`` is the mixed MX GEMM, C = cvt(mul.rn(A @ B, alpha)) for e4m3 A (M, K) with UE8M0 scales
-per 32 (``mxfp8_quantize``'s output) against the packed-e2m1 weight B (K / 2, N) with UE8M0 scales per 32 (``mxfp4_quantize``'s),
-the scales applied inside the mixed-operand block-scaled instruction and the caller's alpha once after the fold; FlashInfer
-has no dense operator for this operand pair (its low-latency ``tgv_gemm_sm100`` path takes it for a few rows only), so this
-entry is the mode's own hook, not a ``batch_invariant=True`` path of an existing API; the class is the device architecture's
+``mm_mxfp8_mxfp4_batch_invariant`` is what :func:`flashinfer.mm_mxfp8_mxfp4` runs under either value of ``batch_invariant``
+(the pair has no other dense kernel in FlashInfer; its low-latency ``tgv_gemm_sm100`` path takes it for a few rows only): the
+mixed MX GEMM, C = cvt(mul.rn(A @ B, alpha)) for e4m3 A (M, K) with UE8M0 scales per 32 (``mxfp8_quantize``'s output) against
+the packed-e2m1 weight B (K / 2, N) with UE8M0 scales per 32 (``mxfp4_quantize``'s), the scales applied inside the mixed-operand
+block-scaled instruction and the caller's alpha once after the fold; the class is the device architecture's
 (`schedule.mx_class_for`: ``gemm.mxfp4w8a.kfold64`` on SM107, ``gemm.mxfp4w8a.kfold`` on SM100 / SM103, whose instruction reads
 the e2m1 operand through the TMA's unpacking format and therefore takes K in multiples of 128).
 Every unsupported input raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back."""
@@ -69,8 +69,8 @@ CLASS_MXFP8 = "gemm.mxfp8"
 #: The class family of :func:`flashinfer.mm_fp4`: the NVFP4 classes ``gemm.nvfp4.*`` (and ``gemm.nvfp4.*128`` on SM107 for
 #: the unsplit weight shapes, `schedule.fp4_class_for`) and the MXFP4 classes ``gemm.mxfp4.*`` / ``gemm.mxfp4.*128``.
 CLASS_FP4 = "gemm.fp4"
-#: The class family of the mixed MX GEMM (no FlashInfer operator: the mode's own entry ``mm_mxfp4w8a_mxfp8a_batch_invariant``):
-#: ``gemm.mxfp4w8a.*`` on SM100 / SM103 and ``gemm.mxfp4w8a.*64`` on SM107 (`schedule.mx_class_for`).
+#: The class family of :func:`flashinfer.mm_mxfp8_mxfp4` (the pair's only dense kernel, so both values of ``batch_invariant``
+#: run it): ``gemm.mxfp4w8a.*`` on SM100 / SM103 and ``gemm.mxfp4w8a.*64`` on SM107 (`schedule.mx_class_for`).
 CLASS_MXW48 = "gemm.mxfp4w8a"
 #: The compute capabilities the classes are stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 MM_BF16_ARCHS = ((10, 0), (10, 3), (10, 7))
@@ -92,6 +92,8 @@ MM_MXFP8_API_OUT_DTYPES = (torch.bfloat16, torch.float16)
 MM_MXFP8_OUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 MM_FP4_API_OUT_DTYPES = MM_MXFP8_API_OUT_DTYPES
 MM_FP4_OUT_DTYPES = MM_MXFP8_OUT_DTYPES
+#: The mixed MX class's output dtypes: ``mm_mxfp8_mxfp4``'s bf16 / fp16; fp32 on the direct entry exposes the chain's input for tests.
+MM_MXW48_API_OUT_DTYPES = MM_MXFP8_API_OUT_DTYPES
 MM_MXW48_OUT_DTYPES = MM_MXFP8_OUT_DTYPES
 _ONES: Dict[
     int, torch.Tensor
@@ -1514,7 +1516,7 @@ def mxfp4w8a_format_for(device: torch.device, in_fmt: Optional[str] = None) -> s
     return in_fmt
 
 
-def mm_mxfp4w8a_mxfp8a_batch_invariant(
+def mm_mxfp8_mxfp4_batch_invariant(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -1533,8 +1535,8 @@ def mm_mxfp4w8a_mxfp8a_batch_invariant(
     elements applied inside the mixed-operand block-scaled instruction, by the mixed class of the device's architecture
     (``gemm.mxfp4w8a.kfold64`` / ``kchunk64[C]`` on SM107, ``gemm.mxfp4w8a.kfold`` / ``kchunk[C]`` on SM100 / SM103; the
     fingerprint carries the architecture): ``C = chunks_for(N, K, fmt)`` is a function of the weight shape and the format only.
-    FlashInfer has no dense operator for this operand pair, so this entry is the mode's own hook (not a ``batch_invariant=True``
-    path of an existing API): ``a`` is ``mxfp8_quantize``'s e4m3 ``(M, K)``, ``b`` the ``(K / 2, N)`` transpose of
+    What :func:`flashinfer.mm_mxfp8_mxfp4` runs under either value of ``batch_invariant`` (the pair has no other dense kernel in
+    FlashInfer): ``a`` is ``mxfp8_quantize``'s e4m3 ``(M, K)``, ``b`` the ``(K / 2, N)`` transpose of
     ``mxfp4_quantize``'s row-major packed ``(N, K / 2)`` weight, the scales the quantizers' 1-D swizzled uint8 buffers, ``alpha``
     the caller's 1-element fp32 tensor (one ``mul.rn``, once, after the whole fold; None: 1.0), ``out_dtype`` bf16 / fp16 (fp32
     exposes the fp32 chain input for tests). On SM100 / SM103 the instruction reads the e2m1 weight through the TMA's unpacking

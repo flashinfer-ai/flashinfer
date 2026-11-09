@@ -352,6 +352,7 @@ from .gemm import mm_fp4 as mm_fp4
 from .gemm import mm_fp8 as mm_fp8
 from .gemm import mm_fp8_lora as mm_fp8_lora
 from .gemm import mm_mxfp8 as mm_mxfp8
+from .gemm import mm_mxfp8_mxfp4 as mm_mxfp8_mxfp4
 from .gemm import mm_nvfp4_lora as mm_nvfp4_lora
 from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
 from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
