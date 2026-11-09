@@ -24,12 +24,14 @@ any size that is not a tile multiple.  All operands are bfloat16 with fp32 tenso
 accumulation; the reductions are bitwise deterministic (no atomics) and empty groups
 produce exactly zero weight gradients.
 
+For group ``e``, ``start = 0 if e == 0 else offs[e - 1]`` and ``end = offs[e]``.
+
 ============ ==================================================================== ============================
-operation    computation                                                           output
+operation    computation                                                          output
 ============ ==================================================================== ============================
-``fwd``      ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``              ``[sum_m, N]`` bfloat16
-``dgrad``    ``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]`` (W in place)  ``[sum_m, K]`` bfloat16
-``wgrad``    ``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]``             ``[E, N, K]`` bfloat16 or float32
+``fwd``      ``Y[start:end] = X[start:end] @ W[e].T``                             ``[sum_m, N]`` bfloat16
+``dgrad``    ``dX[start:end] = G[start:end] @ W[e]`` (W in place)                 ``[sum_m, K]`` bfloat16
+``wgrad``    ``dW[e] = G[start:end].T @ X[start:end]``                            ``[E, N, K]`` bfloat16 or float32
 ============ ==================================================================== ============================
 
 Mode rules
