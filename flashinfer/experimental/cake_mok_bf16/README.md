@@ -67,6 +67,14 @@ context = backend.recompute_forward_context(
     config, workspace, schedule, x, shared[0], shared[1], *fwd_routed[:2])
 grads = backend.backward(config, workspace, schedule, context, dy, x, scores,
                          *shared, *bwd_routed)
+
+# BF16 activation checkpointing without storing the context at all.
+backend.prepare(save_context=False)  # compile before CUDA Graph capture
+y, _ = backend.forward(config, workspace, schedule, x, scores, *weights,
+                       save_context=False)
+context = backend.recompute_forward_context(
+    config, workspace, schedule, x, *weights[:2], *weights[3:5])
+grads = backend.backward(config, workspace, schedule, context, dy, x, scores, *weights)
 ```
 
 `weights` contains shared gate/up/down followed by routed gate/up/down; gate
@@ -125,6 +133,21 @@ recomputes the gate/up GEMMs and SwiGLU of exactly that context. Pass the same
 schedule, inputs, weights and limit as the checkpointed forward; the returned
 context is bitwise identical to the forward's and interchangeable with it.
 
+### Context-free forward
+
+With BF16 routed experts, `forward(..., save_context=False)` runs the
+context-free forward of an activation-checkpointed step and returns
+`(y, None)`. Its fused tiles store hidden, which the down projection reads,
+and skip the shared and routed gate/up stores that only backward reads; it
+also allocates no gate/up tensors. `y` is bitwise identical to the context
+forward's `y`. Before `backward`, rebuild the context with
+`recompute_forward_context` (same schedule, inputs, weights and limit);
+backward then returns the same bits as after a context forward. Compile it
+with `prepare(swiglu_limit, save_context=False)` before CUDA Graph capture.
+The MXFP8 forward always saves its context and rejects `save_context=False`.
+The kernels are the `forward_noctx` and `forward_clamped_noctx` roles; they
+take the forward's arguments and launcher.
+
 Local work follows the real source rows: shared-expert GEMMs, their weight
 gradients and both epilogues read only the active prefix rounded up to 256
 rows; peers read only routed rows. Reserved source or schedule capacity adds
@@ -147,7 +170,8 @@ which select the UMMA shared-memory descriptor address mask from
 `__CUDA_ARCH__`: 15 bits on SM107a, 14 bits otherwise) and the scheduler,
 communication and epilogue sources are shared by SM100a, SM103a and SM107a.
 Launchers of the same shape share one TU: the plain fused launcher also
-serves the `_clamped` kernel of its role, and `csrc/cake_mok_count_binding.cu`,
+serves the `_clamped` kernel of its role (and the forward launcher the
+`_noctx` kernels), and `csrc/cake_mok_count_binding.cu`,
 `cake_mok_rows_binding.cu`, `cake_mok_pad_binding.cu`,
 `cake_mok_epilogue_2_binding.cu` and `cake_mok_epilogue_8_binding.cu` serve
 their kernel families; the entry's `nvcc_flags` name the kernel with
@@ -196,7 +220,7 @@ Within the scope below, every output repeats bit for bit:
 
 | Output | Repeats bit for bit |
 | --- | --- |
-| `forward`: `y` | yes |
+| `forward`: `y` | yes; identical with `save_context=False` |
 | `forward`: context | yes |
 | `recompute_forward_context`: context | yes, identical to the forward's |
 | `backward`: `dx` | yes |
@@ -377,7 +401,9 @@ Single-GPU tests:
   an independent BF16-rounding reference (empty experts, multiple ring lengths,
   variable widths, CUDA Graph replay, changed and zero scores), clamped SwiGLU,
   FP32 accumulation, GLM-5.3-Flash local expert counts, recompute versus
-  saved context, every scheduler layout (with the owner-rank load counts
+  saved context, the context-free forward (`y`, combine rows, hidden and
+  routed x against the context forward, and backward after recompute against
+  backward from the saved context, all bitwise), every scheduler layout (with the owner-rank load counts
   against the host reference and the expert layout against a torch reference,
   explicit and launcher-derived), the counter slab, the launch-geometry memo
   and the epilogues.
@@ -393,7 +419,8 @@ Distributed tests (`torchrun --standalone --nproc-per-node=4 -m pytest ...`):
 `test_mok_bf16_distributed.py` (toy), `test_mok_bf16_unequal.py` (unequal and
 empty ranks, graph reuse), `test_mok_bf16_capacity.py` (adapter guards) and
 `test_mok_training_distributed.py` (clamped SwiGLU, recompute versus saved
-context, FP32 accumulation with BF16 and MXFP8 routed experts, and MXFP8
+context, the context-free BF16 forward with recompute versus saved context,
+FP32 accumulation with BF16 and MXFP8 routed experts, and MXFP8
 over unequal ranks; 288 experts at EP8 or EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter.
 `test_mok_bf16.py`, `test_mok_mxfp8.py` and `test_mok_bf16_capacity.py` import the
 package only through `tests/test_helpers/cake_package.py`; the torchrun suites and

@@ -208,26 +208,29 @@ def test_backward_releases_launcher_scratch_before_epilogue(mok_distributed_grou
     key = (False, False)  # (MXFP8, clamped SwiGLU) of the BF16 plain variant
     launcher = f._backward_kernels[key]
     scratch, dx_shared_ref, weight_grads = [], [], []
+    # The BF16 backward runs the launcher's prebuilt plan: record its launch
+    # and the planned output epilogue (instance attributes shadow the static
+    # methods the backend calls through the launcher and ``f.epilogues``).
+    launch = launcher.launch_planned
 
-    class Recording:
-        def __call__(self, *args, **kwargs):
-            values = launcher(*args, **kwargs)
-            dx_shared_ref.append(weakref.ref(values[0]))
-            scratch.extend(weakref.ref(value) for value in values[1:9])
-            weight_grads.extend(values[9:])
-            return values
+    def recording(*args, **kwargs):
+        values = launch(*args, **kwargs)
+        dx_shared_ref.append(weakref.ref(values[0]))
+        scratch.extend(weakref.ref(value) for value in values[1:9])
+        weight_grads.extend(values[9:])
+        return values
 
-    epilogue = f.epilogues.backward
+    epilogue = f.epilogues.launch_planned
 
-    def checking(shared_grad, routed_grad):
+    def checking(plan, shared_grad, *rest):
         # Entry of the epilogue: every scratch output of the launch is dead,
         # dx_shared is the tensor the launcher returned.
         assert len(scratch) == 8 and all(ref() is None for ref in scratch)
         assert dx_shared_ref[0]() is shared_grad
-        return epilogue(shared_grad, routed_grad)
+        return epilogue(plan, shared_grad, *rest)
 
-    f._backward_kernels[key] = Recording()
-    f.epilogues.backward = checking
+    launcher.launch_planned = recording
+    f.epilogues.launch_planned = checking
     gradients = f.backward(
         config, workspace, schedule, context, dy, x, scores, *shared, *routed
     )
