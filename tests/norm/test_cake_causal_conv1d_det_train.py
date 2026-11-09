@@ -2173,6 +2173,15 @@ def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
             floor = FWD_NARROW_FLOORS.get(arch, {}).get(C // 8)
             if role == "fwd" and narrow and floor is not None and floor <= S:
                 want = FWD_WIDE_SPLIT_TABLE[C]
+            if role == "bwd" and route == "bwd" and _bwd_selection_of_record(
+                arch, S, C
+            ) == BWD_SM_CTA.get(arch):
+                # The SM-wide row-group program's band: one channel tile of the
+                # whole width, as many row groups as its threads fold.
+                threads = loader.MODULES[BWD_SM_CTA[arch]]["grid_rule"]["geometry"][
+                    "threads"
+                ]
+                want = (C // 8, threads // (C // 8), 1)
             got = (values["ct_vec"], values["n_sub"], values["n_ch_tiles"])
             assert got == want, (kind, route, C, got, want)
         y = cake_causal_conv1d_det_train_forward(x, w, cu, bias=b)
@@ -2414,18 +2423,25 @@ def test_workspace_bytes_and_layout() -> None:
                     selected["library"],
                 )
     # The SM-wide row-group program counts at the channels of its bands and nowhere else (at C = 1280 its
-    # one channel tile per CTA would outgrow the other programs' rows), and there they still bound it: the
-    # public buffer is the largest over the owners of the shared geometry at every C.
+    # one channel tile per CTA would outgrow the other programs' rows): the public buffer is the largest over
+    # the owners counted at C, the owners of the shared geometry everywhere and the SM-wide program in its
+    # bands, where its one channel tile per CTA can outgrow them (sm_107a from C 520).
     sm_cta = loader.MODULES.get(BWD_SM_CTA.get(arch, ""))
     for C in range(8, 1281, 8):
         capacity = cake_causal_conv1d_det_train_backward_workspace_bytes(1, C, device)
+        counted_owners = loader.workspace_owners(arch, C)
         assert capacity == max(
+            loader.workspace_layout(owner, C, device_index=device.index)["total_bytes"]
+            for owner in counted_owners
+        ), C
+        assert capacity >= max(
             loader.workspace_layout(owner, C, device_index=device.index)["total_bytes"]
             for owner in shared
         ), C
         if sm_cta is not None:
-            counted = sm_cta in loader.workspace_owners(arch, C)
+            counted = sm_cta in counted_owners
             assert counted == _sm_cta_band(arch, C), C
+            assert [owner for owner in counted_owners if owner is not sm_cta] == shared, C
             if counted:
                 layout = loader.workspace_layout(sm_cta, C, device_index=device.index)
                 assert layout["total_bytes"] <= capacity, C
