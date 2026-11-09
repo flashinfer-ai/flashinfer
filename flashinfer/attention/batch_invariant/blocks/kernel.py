@@ -11,9 +11,10 @@ arriver runs the group's chunk-order fold (``fixup.fold_row``) and writes the ou
 Every floating-point op outside the two MMAs and ``ex2`` goes through ``CuteF32``; the reduction
 trees come from ``canon`` plans; the arithmetic functions are ``spec.py``'s.
 
-The fp8-KV kernels (``kv_fmt`` ``"e4m3"`` / ``"e5m2"``) differ in one role: the load warp and the two empty warps form the
-conversion stage (``convert.py``) that fills the bf16 ring from the fp8 cache instead of the TMA, through a thread-to-UMMA ring
-pipeline; the epilogue takes the value scale ``vs`` (``fixup.finish``). Every other role is the bf16 kernel's code.
+The low-bit-KV kernels (``kv_fmt`` ``"e4m3"`` / ``"e5m2"`` / ``"nvfp4"``) differ in one role: the load warp and the two empty
+warps form the conversion stage (``convert.py``) that fills the bf16 ring from the fp8 or NVFP4 cache instead of the TMA, through
+a thread-to-UMMA ring pipeline; the epilogue takes the value scale ``vs`` (``fixup.finish``). Every other role is the bf16
+kernel's code.
 """
 
 from __future__ import annotations
