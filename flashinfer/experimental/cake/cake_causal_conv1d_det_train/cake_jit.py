@@ -110,7 +110,7 @@ program of another build geometry at the channel counts it runs
 (:func:`workspace_owners`); each program writes the leading rows of its own
 grid and its reduce program sums exactly those.  The forward workspace is
 sized by the forward program of the most counter words over every forward
-route (:func:`forward_workspace_words`).
+route and token count (:func:`forward_workspace_words`).
 
 The program name ``cake_causal_conv1d_det_train_<20 hex>`` is the first twenty hex
 digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted>,
@@ -3841,25 +3841,50 @@ def _ceil_div(numerator: int, denominator: int) -> int:
 # (a reduce program runs on its backward record's plan): each has its own rule.
 SPLIT_ROLES = ("fwd", "bwd")
 # The routes whose single-tile rows run 32-vector tiles (``ct_vec`` 32, four
-# token sub-tiles, the last tile partial), or the whole tiles of
-# :data:`NARROW_TILE_WIDTHS`, instead of one tile of ``cv = C / vec`` vectors,
-# per role, at 128 threads (:func:`_narrow_tile`): the backward at 64 < cv <
-# 128 (C = 520 to 1016, three or four tiles) and cv = 28 (C = 224), the
-# forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv
-# vectors leaves 128 - cv lanes of every CTA idle over the whole token axis;
-# the programs are unchanged.  Every route of both roles takes the rule.
+# token sub-tiles, the last tile partial), or, from the token floors of
+# :data:`NARROW_WIDTH_FLOORS`, the whole tiles of :data:`NARROW_TILE_WIDTHS`,
+# instead of one tile of ``cv = C / vec`` vectors, per role, at 128 threads
+# (:func:`_narrow_tile`): the backward at 64 < cv < 128 (C = 520 to 1016,
+# three or four tiles) and cv = 28 (C = 224), the forward at 72 <= cv <= 96
+# (C = 576 to 768).  One tile of cv vectors leaves 128 - cv lanes of every
+# CTA idle over the whole token axis; the programs are unchanged.  Every
+# route of both roles takes the rule.
 NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
     "fwd": ("fwd", "fwd_dt", "fwd_bias"),
     "bwd": ("bwd", "bwd_dt", "bwd_bias", "bwd_fp32g", "bwd_bias_fp32g"),
 }
 NARROW_TILE_THREADS = 128
 # The narrow rows that run whole tiles of another width instead of 32
-# vectors, per role: ``cv -> ct_vec`` (a divisor of ``cv``).  The forward
-# runs C = 576 as (18, 7, 4) and C = 640 as (40, 3, 2): on B200 and GB300,
-# paired probes against the 32-vector tiles on the fwd / fwd_dt / fwd_bias
-# routes read 1.01-1.20x at C = 576 and 1.02-1.12x at C = 640 for the
-# forward; ``y`` keeps its bits.
+# vectors from a token floor (:data:`NARROW_WIDTH_FLOORS`), per role: ``cv ->
+# ct_vec`` (a divisor of ``cv``).  From its floor the forward runs C = 576 as
+# (18, 7, 4) and C = 640 as (40, 3, 2); ``y`` keeps its bits in every plan.
 NARROW_TILE_WIDTHS: dict[str, dict[int, int]] = {"fwd": {72: 18, 80: 40}, "bwd": {}}
+# The token count ``S`` from which a row of :data:`NARROW_TILE_WIDTHS` runs
+# its width, per role and architecture: ``cv -> S``.  Below it, in a plan
+# made without ``S`` or without the architecture, and on an architecture or
+# row the table does not list, the row runs the 32-vector tiles.  The whole
+# tiles split a launch into fewer token chunks, so at a small ``S`` they
+# underfill the grid, the more so the more SMs the device has.  Paired
+# probes against the 32-vector tiles on the fwd / fwd_dt / fwd_bias routes
+# (same GPU, 9 rotated rounds, ``y`` bit for bit): on GB300 (152 SMs) C =
+# 640 reads 0.95-0.99x up to S = 20480 and 1.02-1.12x from 24576, C = 576
+# 0.91-0.98x on some routes at S = 8192-16384, down to 0.96x at 20480-28672,
+# 1.016-1.033x at 31292 and 1.02-1.17x from 36864; on R200 (212 SMs) C =
+# 640 reads 0.96-0.99x at S = 12288-16384 and 24576-28672 (1.07-1.10x at
+# 20480) and 1.02-1.08x from 36864, C = 576 0.91-0.98x up to 16384, down to
+# 0.96x on fwd_bias at 24576-36864 and 1.006-1.14x from 40960.  At S =
+# 250340 C = 576 reads 1.20x on B200, 1.15-1.17x on GB300 and 1.11-1.13x on
+# R200, C = 640 1.12x, 1.10-1.12x and 1.02-1.08x.  B200 (148 SMs; 1.05-1.08x
+# and 1.02-1.03x at S = 31292) takes GB300's floors until it is probed at a
+# smaller ``S``.
+NARROW_WIDTH_FLOORS: dict[str, dict[str, dict[int, int]]] = {
+    "fwd": {
+        "sm_100a": {72: 32768, 80: 24576},
+        "sm_103a": {72: 32768, 80: 24576},
+        "sm_107a": {72: 40960, 80: 36864},
+    },
+    "bwd": {},
+}
 
 
 def channel_split(
@@ -3869,8 +3894,11 @@ def channel_split(
     role: str | None = None,
     legacy: bool = False,
     route: str | None = None,
+    S: int | None = None,
+    arch: str | None = None,
 ) -> tuple[int, int, int]:
-    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry, role and route.
+    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry, role, route, token count
+    and architecture.
 
     ``ct_vec`` channel vectors per channel tile (one thread each), ``n_sub =
     threads // ct_vec`` token sub-tiles per CTA and ``n_ch_tiles = ceil(C / vec
@@ -3904,24 +3932,57 @@ def channel_split(
     ``route`` is the launch's route (one of :data:`KINDS` of the role; the
     host passes its record's).  On a route of :data:`NARROW_TILE_ROUTES` the
     single-tile rows of the role's narrow set run 32-vector tiles, ``(32,
-    threads // 32, ceil(cv / 32))``, or the whole tiles of
-    :data:`NARROW_TILE_WIDTHS`: the backward's C = 224 and 520 to 1016 (three
-    or four tiles) on every backward route, the forward's C = 576 to 768 on
-    every forward route, so the forward runs C = 576 as (18, 7, 4), C = 640 as
-    (40, 3, 2) instead of (80, 1, 1) and C = 768 as (32, 4, 3).  ``y`` and
-    ``dx`` keep their bits; ``dweight`` and ``dbias`` sum in
-    the narrow plan's fixed order (bitwise reproducible).  Without a route,
-    the single tile stays.
+    threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 1016
+    (three or four tiles) on every backward route, the forward's C = 576 to
+    768 on every forward route, so the forward runs C = 576, 640 and 768 as
+    (32, 4, 3) instead of one tile of 72, 80 and 96 vectors.  A row of
+    :data:`NARROW_TILE_WIDTHS` runs whole tiles of its width instead when the
+    call names its token count ``S`` and its architecture ``arch`` (one of
+    :data:`ARCHES`, a ``ValueError`` otherwise) and ``S`` is at least the
+    row's floor on ``arch`` in :data:`NARROW_WIDTH_FLOORS`: the forward runs
+    C = 576 as (18, 7, 4) and C = 640 as (40, 3, 2) from its floor.  Without
+    ``S`` or ``arch``, below the floor and on an architecture or row the
+    table does not list, the 32-vector tiles stay.  ``y`` and ``dx`` keep
+    their bits in every plan; ``dweight`` and ``dbias`` sum in the narrow
+    plan's fixed order (bitwise reproducible).  Without a route, the single
+    tile stays.
     """
 
+    if arch is not None and arch not in ARCHES:
+        raise ValueError(f"arch must be one of {ARCHES}, got {arch!r}")
+    vec = int(geometry["vec"])
     return _channel_split(
         int(C),
-        int(geometry["vec"]),
+        vec,
         int(geometry["threads"]),
         role,
         bool(legacy),
         route,
+        _narrow_width(int(C) // vec, role, bool(legacy), route, S, arch),
     )
+
+
+def _narrow_width(
+    channel_vectors: int,
+    role: str | None,
+    legacy: bool,
+    route: str | None,
+    S: int | None,
+    arch: str | None,
+) -> bool:
+    """Whether a row of :data:`NARROW_TILE_WIDTHS` runs its width: a call on a
+    narrow route of the role that names ``S`` and ``arch``, ``S`` at least the
+    row's floor on ``arch`` in :data:`NARROW_WIDTH_FLOORS`.  The memoized plan
+    takes this flag, not ``S``, so its keys stay one or two per row."""
+
+    if legacy or S is None or arch is None:
+        return False
+    if route not in NARROW_TILE_ROUTES.get(role, ()):
+        return False
+    if channel_vectors not in NARROW_TILE_WIDTHS.get(role, {}):
+        return False
+    floor = NARROW_WIDTH_FLOORS.get(role, {}).get(arch, {}).get(channel_vectors)
+    return floor is not None and int(S) >= floor
 
 
 @functools.lru_cache(maxsize=4096)
@@ -3932,10 +3993,13 @@ def _channel_split(
     role: str | None,
     legacy: bool,
     route: str | None = None,
+    wide: bool = False,
 ) -> tuple[int, int, int]:
     """:func:`channel_split` of plain arguments, memoized: a model's channel
     counts are few, so every call after a channel count's first reuses its
-    plan (a backward call plans its row up to twice)."""
+    plan (a backward call plans its row up to twice).  ``wide`` is
+    :func:`_narrow_width`: whether a row of :data:`NARROW_TILE_WIDTHS` runs
+    its width (else its 32-vector tiles)."""
 
     if (role is None and not legacy) or (role is not None and role not in SPLIT_ROLES):
         raise ValueError(
@@ -3955,7 +4019,7 @@ def _channel_split(
             and route in NARROW_TILE_ROUTES[role]
             and _narrow_tile(channel_vectors, threads, role)
         ):
-            ct_vec = NARROW_TILE_WIDTHS[role].get(channel_vectors, 32)
+            ct_vec = NARROW_TILE_WIDTHS[role][channel_vectors] if wide else 32
     else:
         candidates = [
             width
@@ -4024,19 +4088,23 @@ def plan(
     role: str | None = None,
     legacy: bool = False,
     route: str | None = None,
+    arch: str | None = None,
 ) -> dict[str, int]:
-    """The kernel's launch scalars for one problem under a record's build geometry, role and route.
+    """The kernel's launch scalars for one problem under a record's build geometry, role, route and architecture.
 
     ``geometry`` is ``record["grid_rule"]["geometry"]``: ``threads`` per CTA
     and ``vec`` BF16 channels per thread; ``role`` is ``record["role"]``
     (``"fwd"`` or ``"bwd"``).  The scalars are ``S``, ``C``, ``num_docs``,
     :func:`channel_split`'s ``ct_vec`` / ``n_sub`` / ``n_ch_tiles`` (``role``,
-    ``legacy`` and ``route`` are passed on) and ``search_steps``, the number
-    of halvings of the device-side binary search over ``cu_seqlens``
-    (``max(1, ceil(log2 num_docs))``).  Every value is a pure function of
-    ``(S, C, num_docs)``, the geometry, the role and the route: the host
-    never reads ``cu_seqlens``, and the kernel derives its token ranges from
-    ``S`` and the grid.  The ``flags`` scalar of
+    ``legacy``, ``route``, ``S`` and ``arch`` are passed on: a row of
+    :data:`NARROW_TILE_WIDTHS` runs its width from its token floor on
+    ``arch``, and the 32-vector tiles below it or without ``arch``) and
+    ``search_steps``, the number of halvings of the device-side binary
+    search over ``cu_seqlens`` (``max(1, ceil(log2 num_docs))``).  Every
+    value is a pure function of ``(S, C, num_docs)``, the geometry, the role,
+    the route and the architecture: the host never reads ``cu_seqlens``, and
+    the kernel derives its token ranges from ``S`` and the grid.  The
+    ``flags`` scalar of
     the ``dtype_flags`` programs is not a plan value: the host derives it from
     the tensors of the call.
     """
@@ -4045,7 +4113,7 @@ def plan(
     if S < 0 or num_docs < 0:
         raise ValueError(f"S and num_docs must be non-negative, got {(S, num_docs)}")
     ct_vec, n_sub, n_ch_tiles = channel_split(
-        C, geometry=geometry, role=role, legacy=legacy, route=route
+        C, geometry=geometry, role=role, legacy=legacy, route=route, S=S, arch=arch
     )
     return {
         "S": S,
@@ -4287,7 +4355,12 @@ def launch_grid(
             if row_may_trim(record, arch, co_resident, factor, int(C), int(S)):
                 route = record_route(record, arch)
                 ct_vec, _, n_ch_tiles = channel_split(
-                    C, geometry=rule["geometry"], role=record["role"], route=route
+                    C,
+                    geometry=rule["geometry"],
+                    role=record["role"],
+                    route=route,
+                    S=int(S),
+                    arch=arch,
                 )
                 grid_x = main_grid(
                     co_resident,
@@ -4404,7 +4477,11 @@ def forward_workspace_words(arch: str, C: int) -> int:
 
     The largest :func:`counter_words` over every forward program of every
     forward route of the architecture (each planned with its own geometry and
-    role), so one buffer serves every forward route; it depends on ``C`` only
+    role on its route), so one buffer serves every forward route.  A row of
+    :data:`NARROW_TILE_WIDTHS` takes one plan below its token floor and
+    another from it (C = 576: 3 tiles, then 4), so each program is planned
+    without ``S`` and at every floor of :data:`NARROW_WIDTH_FLOORS` on the
+    architecture, and the buffer serves every ``S``: it depends on ``C`` only
     (never on ``S`` or the device's SM count).  0 when no forward program of
     the architecture takes ``work``.
     """
@@ -4415,13 +4492,17 @@ def forward_workspace_words(arch: str, C: int) -> int:
             record = MODULES[name]
             if record["workspace_rule"] is None:
                 continue
-            _, _, n_ch_tiles = channel_split(
-                C,
-                geometry=record["grid_rule"]["geometry"],
-                role=record["role"],
-                route=kind,
-            )
-            words = max(words, counter_words(record, n_ch_tiles))
+            floors = NARROW_WIDTH_FLOORS.get(record["role"], {}).get(arch, {})
+            for S in (None, *sorted(set(floors.values()))):
+                _, _, n_ch_tiles = channel_split(
+                    C,
+                    geometry=record["grid_rule"]["geometry"],
+                    role=record["role"],
+                    route=kind,
+                    S=S,
+                    arch=arch,
+                )
+                words = max(words, counter_words(record, n_ch_tiles))
     return words
 
 
