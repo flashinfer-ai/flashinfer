@@ -8441,7 +8441,7 @@ def _trtllm_fused_moe_workspace_size_impl(
         )  # fmt: skip
     # Every entry point ends with (workspace_buffer, query_workspace_size); the FP4
     # entry additionally takes the 4over6 recipe code and fc2_input_out.
-    tail = (
+    tail: Tuple[Any, ...] = (
         (NVFP4_4OVER6_CODE_FROM_ENV, [])
         if fn is moe_op.trtllm_fp4_block_scale_moe
         else ()
