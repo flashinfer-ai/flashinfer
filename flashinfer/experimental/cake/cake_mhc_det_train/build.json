@@ -55,57 +55,11 @@
     }
   },
   "generator": {
-    "cake_revision": "fdf0a5a5790965581db2890d27a8a0934e7051b1",
+    "cake_revision": "ac1eca29cf3611c247205fb48510e46b0dcc6395",
     "cuda": "13.4.92",
-    "rendered_at": "2026-11-09T02:54:47Z"
+    "rendered_at": "2026-11-09T08:15:53Z"
   },
   "libraries": [
-    {
-      "arch": "sm_107a",
-      "closure_sha256": "00f24dc6335e26f302e909fe24b956ca2caed8f12dec6f4e4bf1a9b23f75c5fb",
-      "entry": "run",
-      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.4",
-      "name": "cake_mhc_det_train_bwd_prepare__h5120_sm_107a",
-      "nvcc_flags": [
-        "--prec-div=true",
-        "--prec-sqrt=true",
-        "--ftz=false"
-      ],
-      "nvcc_flags_if": [],
-      "path": "aot/cake_mhc_det_train_bwd_prepare__h5120_sm_107a.so",
-      "sha256": {
-        "csrc/cake_mhc_det_train_bwd_prepare__h5120_binding.cu": "0022fe47b59562357337397f80c4a3e1e03e2982ed6eb25fa6f79ff21d002836",
-        "csrc/cake_mhc_det_train_bwd_prepare__h5120_kernel.cu": "85560b957aa03cc59ee997cb4098074bdc23022f56bd8a0d935244f65155db3c"
-      },
-      "sources": [
-        "csrc/cake_mhc_det_train_bwd_prepare__h5120_kernel.cu",
-        "csrc/cake_mhc_det_train_bwd_prepare__h5120_binding.cu"
-      ]
-    },
-    {
-      "arch": "sm_107a",
-      "closure_sha256": "5725267b8723f05890cd04011f850e07386d9d768099bec2ddc8119730427891",
-      "entry": "run",
-      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.4",
-      "name": "cake_mhc_det_train_bwd_prepare__h7168_sm_107a",
-      "nvcc_flags": [
-        "--prec-div=true",
-        "--prec-sqrt=true",
-        "--ftz=false"
-      ],
-      "nvcc_flags_if": [],
-      "path": "aot/cake_mhc_det_train_bwd_prepare__h7168_sm_107a.so",
-      "sha256": {
-        "csrc/cake_mhc_det_train_bwd_prepare__h7168_binding.cu": "e782e040c6d78afb1769ba44d0fd92b648eba4c9d6ef5dda2160bcb86041dc83",
-        "csrc/cake_mhc_det_train_bwd_prepare__h7168_kernel.cu": "bdb18ce16e7e6c6bbafc0533a79a36031adae3d001765a18079245dad64900c9"
-      },
-      "sources": [
-        "csrc/cake_mhc_det_train_bwd_prepare__h7168_kernel.cu",
-        "csrc/cake_mhc_det_train_bwd_prepare__h7168_binding.cu"
-      ]
-    },
     {
       "arch": "sm_100a",
       "closure_sha256": "cc33b091a2ae36e66f4c0e042d8525d4e422f69bd4e3fd508d65054146bf1c94",
