@@ -41,8 +41,10 @@ def _measure(
     output_mode="caller",
 ):
     layer.warmup(tensors, workspace=workspace)
-    output = torch.empty_like(tensors.hidden_states)
-    caller = replace(tensors, output=output if output_mode == "caller" else None)
+    output = (
+        torch.empty_like(tensors.hidden_states) if output_mode == "caller" else None
+    )
+    caller = replace(tensors, output=output)
     for _ in range(warmups):
         layer(caller, workspace=workspace)
     graph = None
