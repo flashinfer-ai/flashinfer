@@ -668,15 +668,16 @@ FWD_OVERLAP_DEFAULT = None
 # program before the exchange's wait (``FWD_OVERLAP_ARCHS``), and the multi entry's (``MULTI_*``).  Each entry takes,
 # per architecture, the form faster than the one-launch forward on every forward, forward + backward and checkpointed
 # step row, the simpler form of a tie (launch-to-launch time with the split backward; CP4, and CP8 on B200; contiguous,
-# zigzag and per-document zigzag layouts; one tensor of C = 10240, three of C = 8192):
-# - the single call waits and runs the single-rank main program on every architecture: forward 1.13-1.15x / 1.08x /
-#   1.08-1.09x, forward + backward 1.05-1.06x / 1.03x / 1.03-1.04x, checkpointed step 1.07-1.09x / 1.04x / 1.04-1.05x
-#   (B200 / GB300 / R200).  Overlapped, its forward gains more, but beside the overlapped backward the contiguous row
-#   loses (forward + backward 0.88-0.89x on B200 and GB300, checkpointed step 0.94-0.96x on all three);
-# - the multi entry waits and runs the single-rank main program on sm_100a and sm_103a (forward 1.08-1.10x /
-#   1.03-1.05x, forward + backward 1.03-1.04x / 1.02x, checkpointed step 1.05-1.06x / 1.02-1.03x; overlapped is up to
-#   1.2% faster again, also on every row, and the tie goes to the waiting form) and overlaps on sm_107a (forward 1.03x,
-#   forward + backward 1.01-1.02x, checkpointed step 1.02x; waiting reads 0.99-1.00x there).
+# zigzag and per-document zigzag layouts; one tensor of C = 10240, three of C = 8192; % = speedup - 1):
+# - the single call waits and runs the single-rank main program on every architecture: forward 11.6-15.3% /
+#   6.6-8.1% / 8.0-9.4%, forward + backward 4.6-6.4% / 2.5-2.8% / 3.3-3.7%, checkpointed step 6.7-8.5% / 3.5-3.8% /
+#   3.7-4.7% (B200 / GB300 / R200).  Overlapped, its forward gains more, but beside the overlapped backward the
+#   contiguous row loses (forward + backward 0.881x / 0.887x on B200 / GB300, checkpointed step 0.943x-0.957x on all
+#   three);
+# - the multi entry waits on sm_100a and sm_103a (forward 7.5-10.0% / 3.5-4.5%, forward + backward 3.0-4.3% /
+#   1.6-2.0%, checkpointed step 4.1-5.7% / 2.3-2.8%; overlapped, within -0.2% to +1.2% of that on every row, a tie that
+#   goes to the waiting form) and overlaps on sm_107a (forward 2.8-3.0%, forward + backward 1.1-1.6%, checkpointed
+#   step 1.6-1.8%; waiting reads -0.9% to +0.5% there).
 FWD_MAIN_ARCHS = frozenset(("sm_100a", "sm_103a", "sm_107a"))
 FWD_OVERLAP_ARCHS: frozenset[str] = frozenset()
 MULTI_FWD_MAIN_ARCHS = frozenset(("sm_100a", "sm_103a", "sm_107a"))
