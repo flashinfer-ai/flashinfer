@@ -168,9 +168,10 @@ SHAPE_ROWS = {
         "context_nvfp4", 4, 2048, 2048, 40, 8, 16, True,
         {"sm100a": "RUNTIME_PACK5_SM100A", "sm103a": "RUNTIME_PACK5_SM103A"},
     ),
+    # At most the short-KV keys: sm103a takes the short-KV program.
     "nvfp4_b16_q512_k512_g1": (
         "context_nvfp4", 16, 512, 512, 8, 8, 16, True,
-        {"sm100a": "RUNTIME_PACK1_SM100A", "sm103a": "RUNTIME_PACK1_SM103A"},
+        {"sm100a": "RUNTIME_PACK1_SM100A", "sm103a": "RUNTIME_PACK1_SHORT_KV_SM103A"},
     ),
 }  # fmt: skip
 # The device-scale program of a host-scale one; a runtime-size program serves
@@ -236,6 +237,14 @@ _NVFP4_RUNTIME_PACK = {
     identifier: pack
     for routes in cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES.values()
     for (pack, _), identifier in routes.items()
+}
+# the short-KV programs: the pack of the runtime-size program they stand in
+# for
+_NVFP4_RUNTIME_PACK |= {
+    identifier: _NVFP4_RUNTIME_PACK[routed]
+    for short in cake_api._CONTEXT_NVFP4_SHORT_KV_ROUTES.values()
+    for routed, (identifier, _) in short.items()
+    if routed in _NVFP4_RUNTIME_PACK
 }
 
 
@@ -335,6 +344,11 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
                 )
     for target, routes in cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES.items():
         for identifier in routes.values():
+            served.setdefault(("context_nvfp4", identifier), set()).add(
+                _TARGET_ARCH[target]
+            )
+    for target, short in cake_api._CONTEXT_NVFP4_SHORT_KV_ROUTES.items():
+        for identifier, _ in short.values():
             served.setdefault(("context_nvfp4", identifier), set()).add(
                 _TARGET_ARCH[target]
             )
@@ -815,6 +829,10 @@ def test_cake_fmha_context_nvfp4_calls_outside_the_exact_programs_take_the_runti
     row = ("context_nvfp4", batch, q_len, kv_len, hq, hkv, 16, True, None)
     pack = cake_api._context_pack_g(q_len, kv_len, hq, hkv)
     expected = cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES[target].get((pack, None))
+    # of at most the keys of its program's short-KV entry: the entry's program
+    short = cake_api._CONTEXT_NVFP4_SHORT_KV_ROUTES.get(target, {}).get(expected)
+    if short and kv_len <= short[1]:
+        expected = short[0]
     for device_scales in (False, True):
         kwargs = _context_kwargs(row, device_scales=device_scales, device="meta")
         route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
@@ -831,6 +849,57 @@ def test_cake_fmha_context_nvfp4_calls_outside_the_exact_programs_take_the_runti
     route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
     assert route is not None and route.program is None
     assert route.pack_g == pack
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_nvfp4_short_kv_routes(monkeypatch, target) -> None:
+    """A causal NVFP4 call of at most the keys of its program's short-KV entry
+    runs the entry's program, with the same pack, m-block count and scale
+    form; one key more runs the routed program.  sm103a names an entry for
+    each of its NVFP4 programs, sm100a none."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(cake_api, "context_nvfp4_programs_unavailable", lambda: None)
+    short = cake_api._CONTEXT_NVFP4_SHORT_KV_ROUTES.get(target, {})
+    runtime = cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES[target]
+    if target == "sm100a":
+        assert short == {}
+    else:
+        assert set(short) == {
+            "Q511_SM103A",
+            "Q511_SCALE_PTR_SM103A",
+            *runtime.values(),
+        }
+    # (routed program, device scales, batch, query length, query heads, KV
+    # heads): the exact Q511 class with both scale forms, and per runtime-size
+    # program a call of its JIT pack (16 queries, 4 KV heads)
+    calls = [
+        ("Q511_" + target.upper(), False, 4, 511, 32, 4),
+        ("Q511_SCALE_PTR_" + target.upper(), True, 4, 511, 32, 4),
+    ]
+    calls += [
+        (identifier, device_scales, 2, 16, 4 * pack, 4)
+        for (pack, _), identifier in runtime.items()
+        for device_scales in (False, True)
+    ]
+    keys = max((bound for _, bound in short.values()), default=512)
+    for routed, device_scales, batch, q_len, hq, hkv in calls:
+        sibling = short.get(routed)
+        for kv_len in (keys, keys + 1):
+            row = ("context_nvfp4", batch, q_len, kv_len, hq, hkv, 16, True, None)
+            kwargs = _context_kwargs(row, device_scales=device_scales, device="meta")
+            route = cake_api.select_cake_fmha_context_route(
+                torch.device("meta"), **kwargs
+            )
+            assert route is not None and route.component == "context_nvfp4"
+            assert route.device_scales is device_scales
+            takes = sibling is not None and kv_len <= sibling[1]
+            assert route.program == (sibling[0] if takes else routed), (row, route)
+            if routed in _NVFP4_RUNTIME_PACK:
+                pack = _NVFP4_RUNTIME_PACK[routed]
+                assert pack == cake_api._context_pack_g(q_len, kv_len, hq, hkv)
+                assert route.pack_g == pack
+                assert route.num_m_blocks == -(-q_len // (2 * (128 // pack)))
 
 
 def _bf16_flag_form_box(target, causal, pack, batch, heads, q_len, kv_len):
@@ -5185,6 +5254,11 @@ def test_cake_context_nvfp4_runtime_programs_run_tiles_without_keys(
     program = cake_api._CONTEXT_NVFP4_RUNTIME_ROUTES[target].get((pack, None))
     if program is None:
         pytest.skip(f"no runtime-size NVFP4 program of pack {pack} on {target}")
+    # a launch of at most the keys of the program's short-KV entry takes the
+    # entry's program
+    short = cake_api._CONTEXT_NVFP4_SHORT_KV_ROUTES.get(target, {}).get(program)
+    if short and max(kv_lens) <= short[1]:
+        program = short[0]
     case = _jit_route_batch("context_nvfp4", heads, q_lens, kv_lens, 16)
     route = _jit_route_of(monkeypatch, case)
     assert route.program == program and route.pack_g == pack
