@@ -2168,7 +2168,7 @@ def _launch_dgrad_program(
     det = deterministic_backend()
     T, N, K = int(G.shape[0]), int(W.shape[0]), int(W.shape[1])
     resident = int(MODULES[module]["build"]["kwargs"].get("resident", 0))
-    if resident and N != 64 * resident:
+    if resident and 64 * resident != N:
         raise ValueError(
             f"cake_dense_gemm_nondet_train: {module} holds {resident} slices of 64 features of the output gradient, "
             f"a reduction of {64 * resident} features, not {N}"
