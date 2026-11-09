@@ -279,9 +279,9 @@ def cake_moe_grouped_gemm_nondet(
     *,
     fuse_wgrad_accumulation: bool = False,
 ) -> torch.Tensor:
-    """Differentiable ragged grouped GEMM ``Y[start:end] = X[start:end] @ W[e].T``.
+    """Differentiable ragged grouped GEMM ``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T``.
 
-    Here ``start = 0 if e == 0 else offs[e - 1]`` and ``end = offs[e]``.
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
 
     Parameters
     ----------

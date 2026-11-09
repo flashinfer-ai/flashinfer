@@ -80,9 +80,9 @@ def cake_moe_grouped_gemm_det_train_forward(
     offs: torch.Tensor,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``Y[start:end] = X[start:end] @ W[e].T`` for every group ``e``.
+    """``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T`` for every group ``e``.
 
-    Here ``start = 0 if e == 0 else offs[e - 1]`` and ``end = offs[e]``.
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
 
     Parameters
     ----------
@@ -119,9 +119,9 @@ def cake_moe_grouped_gemm_det_train_dgrad(
     offs: torch.Tensor,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """``dX[start:end] = G[start:end] @ W[e]`` for every group ``e``.
+    """``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]`` for every group ``e``.
 
-    Here ``start = 0 if e == 0 else offs[e - 1]`` and ``end = offs[e]``.
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
 
     ``g`` is ``[sum_m, N]`` bfloat16, ``w`` is ``[E, N, K]`` bfloat16 and is
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
@@ -143,9 +143,9 @@ def cake_moe_grouped_gemm_det_train_wgrad(
     *,
     accumulate: bool = False,
 ) -> torch.Tensor:
-    """``dW[e] = G[start:end].T @ X[start:end]`` for every group ``e``.
+    """``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` for every group ``e``.
 
-    Here ``start = 0 if e == 0 else offs[e - 1]`` and ``end = offs[e]``.
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
 
     ``g`` is ``[sum_m, N]`` bfloat16, ``x`` is ``[sum_m, K]`` bfloat16,
     ``offs`` is ``[E]`` int32 device end offsets (``E = offs.numel()``; pass

@@ -18,11 +18,11 @@ Cake backend: ragged BF16 MoE grouped GEMM (SM100 / SM103 / SM107).
 Three operations over ``E`` groups of rows described by an int32 **device**
 tensor ``offs[E]`` of cumulative end offsets (never read on the host):
 
-For group ``e``, ``start = 0 if e == 0 else offs[e - 1]`` and ``end = offs[e]``.
+The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
 
-* ``fwd``:   ``Y[start:end]  = X[start:end] @ W[e].T``
-* ``dgrad``: ``dX[start:end] = G[start:end] @ W[e]``
-* ``wgrad``: ``dW[e] = G[start:end].T @ X[start:end]`` (bf16 or fp32 output)
+* ``fwd``:   ``Y[offs[e-1]:offs[e]]  = X[offs[e-1]:offs[e]] @ W[e].T``
+* ``dgrad``: ``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]``
+* ``wgrad``: ``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` (bf16 or fp32 output)
 
 Every launch is one persistent cluster kernel (one CTA pair per SM pair); the
 weight gradient adds one ordered fp32 tail-reduce kernel when the tiles of its

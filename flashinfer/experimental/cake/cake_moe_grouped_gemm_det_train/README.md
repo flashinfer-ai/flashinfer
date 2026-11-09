@@ -19,13 +19,13 @@ equivalently, an `m_indptr[E + 1]` with a leading 0 (`torch._grouped_mm` /
 two forms apart). The kernels read the offsets on the device; the host never
 synchronises on them.
 
-For group `e`, `start = 0 if e == 0 else offs[e - 1]` and `end = offs[e]`.
+The slice lower bound is `0` for `e == 0` and `offs[e-1]` for `e > 0`.
 
 | helper | computation | inputs | output |
 | --- | --- | --- | --- |
-| `cake_moe_grouped_gemm_det_train_forward(x, w, offs, out=None)` | `Y[start:end] = X[start:end] @ W[e].T` | `x [sum_m, K]`, `w [E, N, K]` bf16 | `Y [sum_m, N]` bf16 |
-| `cake_moe_grouped_gemm_det_train_dgrad(g, w, offs, out=None)` | `dX[start:end] = G[start:end] @ W[e]` (W read in place) | `g [sum_m, N]`, `w [E, N, K]` bf16 | `dX [sum_m, K]` bf16 |
-| `cake_moe_grouped_gemm_det_train_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, accumulate=False)` | `dW[e] = G[start:end].T @ X[start:end]` (with `accumulate=True`: `out[e] += dW[e]`) | `g [sum_m, N]`, `x [sum_m, K]` bf16 | `dW [E, N, K]` bf16 or fp32 |
+| `cake_moe_grouped_gemm_det_train_forward(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `x [sum_m, K]`, `w [E, N, K]` bf16 | `Y [sum_m, N]` bf16 |
+| `cake_moe_grouped_gemm_det_train_dgrad(g, w, offs, out=None)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `g [sum_m, N]`, `w [E, N, K]` bf16 | `dX [sum_m, K]` bf16 |
+| `cake_moe_grouped_gemm_det_train_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, accumulate=False)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]` (with `accumulate=True`: `out[e] += dW[e]`) | `g [sum_m, N]`, `x [sum_m, K]` bf16 | `dW [E, N, K]` bf16 or fp32 |
 
 Alignment: `fwd` needs `N % 256 == 0` and `K % 64 == 0`; `dgrad` needs
 `K % 256 == 0` and `N % 64 == 0`; `wgrad` needs `N % 256 == 0` and `K` a
