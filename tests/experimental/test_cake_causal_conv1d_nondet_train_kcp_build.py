@@ -213,7 +213,8 @@ def test_overlapped_backward_records() -> None:
     """The overlapped backward's two routes: one record each on every architecture.  The main program is an
     ordinary ``co_resident`` launch of one CTA per SM (the host passes the grid) that owns an ``accumulators``
     workspace of ``slots`` FP32 copies of four taps, its logical map names ``acc``, ``tile_tk``, ``claims``,
-    ``departs`` and the two TMA tensors; the tail-row program has the head program's geometry and no workspace."""
+    ``departs``, the two TMA tensors and its two tail tables (``tail_row_off`` and ``skip_row_off``, the rows it
+    leaves to the tail-row program); the tail-row program has the head program's geometry and no workspace."""
 
     vocabulary = set(kcp_jit.LOGICAL_TENSORS) | set(kcp_jit.LOGICAL_SCALARS)
     for arch in ARCHES:
@@ -235,6 +236,8 @@ def test_overlapped_backward_records() -> None:
         assert logical["dw_acc"] == "acc" and logical["tile_tk"] == "tile_tk"
         assert logical["claims"] == "claims" and logical["departs"] == "departs"
         assert logical["x_map"] == "x" and logical["dy_map"] == "dy"
+        assert logical["tail_row_off"] == "tail_row_off"
+        assert logical["skip_row_off"] == "skip_row_off"
         assert {logical[k] for k in ("M", "NL", "P", "L", "n_ctas")} == {
             "M",
             "NL",

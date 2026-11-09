@@ -60,10 +60,14 @@ CTAs take their units of tokens from lanes, from the back of other lanes and
 from the CTAs they cancel through Cluster Launch Control, and add their runs
 into ``DW_COPIES`` (the rule's ``slots``) FP32 copies of the accumulators
 ``acc`` before each channel tile's last warp sums the copies, stores ``dw`` and
-zeroes them), and ``kcp_bwd_halo``, launched once the exchanged ``dpre_tail``
-rows arrived (grid :func:`head_grid`), which writes the last ``min(3, len)``
-rows of every fragment with a tail row again with the tail rows folded in, so
-``dx`` is the det program's bits on every row.  The main program's ``work``
+zeroes them; its ``skip_row_off`` table names the fragments whose last
+``min(3, len)`` rows it leaves unwritten: none with an all ``-1`` table, the
+fragments with a tail row with ``tail_row_off``), and ``kcp_bwd_halo``,
+launched once the exchanged ``dpre_tail`` rows arrived (grid
+:func:`head_grid`), which writes the last ``min(3, len)`` rows of every
+fragment with a tail row with the tail rows folded in, after the main program
+on its stream or beside it on another when the main program leaves those
+rows, so ``dx`` is the det program's bits on every row.  The main program's ``work``
 words are the tiles' warp words ``tile_tk`` (``DYN_TILE_WORDS`` per tile of
 :data:`DYN_TILE` channels), the claim words ``claims`` (``L``, one per lane)
 and the departure word ``departs`` (one), all zero before and after every
@@ -76,7 +80,7 @@ unchanged; the functions bound to the tables (:func:`route_modules`,
 :func:`load`, :func:`run_module`) are spelled here over ``MODULES`` and
 ``ROUTES``.  The logical tensor names are :mod:`.cake_jit`'s plus the KCP
 tables ``hist``, ``hist_row_off``, ``dpre_tail``, ``tail_row_off``,
-``dpre_head`` and ``head_row_off``; the two ``CUtensorMap`` parameters
+``skip_row_off``, ``dpre_head`` and ``head_row_off``; the two ``CUtensorMap`` parameters
 ``x_map`` / ``dy_map`` of the TMA backward programs map onto ``x`` / ``dy``
 (the binding encodes the descriptors from the tensors at every launch); the
 scalars are :mod:`.cake_jit`'s.
@@ -532,7 +536,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": None,
     },
     # Route ``kcp_bwd_dyn``: the main program of the overlapped backward (no det program: its own kernel module key).
-    "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp": {
+    "cake_causal_conv1d_train_4fb1b7f750457bfedfdb_kcp": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -551,6 +555,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["buffer", "hist_row_off"],
             ["buffer", "dpre_tail"],
             ["buffer", "tail_row_off"],
+            ["buffer", "skip_row_off"],
             ["buffer", "claims"],
             ["buffer", "departs"],
             ["parameter", "S"],
@@ -577,8 +582,8 @@ MODULES: dict[str, dict[str, Any]] = {
             },
             "kind": "co_resident",
         },
-        "kernel": "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
-        "kernel_symbol": "kernel_cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        "kernel": "cake_causal_conv1d_train_4fb1b7f750457bfedfdb_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_4fb1b7f750457bfedfdb_kcp",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -586,7 +591,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 197760,
             "use_pdl": False,
         },
-        "library": "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+        "library": "cake_causal_conv1d_train_4fb1b7f750457bfedfdb_kcp",
         "logical": {
             "C": "C",
             "L": "L",
@@ -594,6 +599,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "NL": "NL",
             "P": "P",
             "S": "S",
+            "skip_row_off": "skip_row_off",
             "claims": "claims",
             "cu": "cu",
             "departs": "departs",
@@ -695,7 +701,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_dyn": [
-            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+            "cake_causal_conv1d_train_4fb1b7f750457bfedfdb_kcp",
         ],
         "kcp_bwd_halo": [
             "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
@@ -713,7 +719,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_dyn": [
-            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+            "cake_causal_conv1d_train_4fb1b7f750457bfedfdb_kcp",
         ],
         "kcp_bwd_halo": [
             "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
@@ -731,7 +737,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_584216799fed8caece3a_kcp",
         ],
         "kcp_bwd_dyn": [
-            "cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp",
+            "cake_causal_conv1d_train_4fb1b7f750457bfedfdb_kcp",
         ],
         "kcp_bwd_halo": [
             "cake_causal_conv1d_train_ae0c093e1e0ac46aec3f_kcp",
@@ -760,7 +766,9 @@ HALO = WIDTH - 1
 # plus the KCP tables.  ``hist``: BF16 history rows ``[n_hist_rows, C]``;
 # ``hist_row_off``: int32 ``[n_frag, 3]`` (``-1`` = none); ``dpre_tail``: FP32
 # ``[n_tail_rows, C]`` tail derivatives with ``tail_row_off`` int32
-# ``[n_frag, 3]``; ``dpre_head``: FP32 ``[n_head_rows, C]`` head derivatives
+# ``[n_frag, 3]``; ``skip_row_off``: int32 ``[n_frag, 3]``, the fragments
+# whose last rows the overlapped main program leaves to the tail-row program
+# (an entry ``>= 0``); ``dpre_head``: FP32 ``[n_head_rows, C]`` head derivatives
 # with ``head_row_off`` int32 ``[n_frag, 3, 3]``; ``acc`` / ``work``: the
 # backward's FP32 ``[C, 4]`` accumulators and uint32 ``[n_ch_tiles]`` ticket
 # counters (zero before and after every launch); ``tile_tk`` / ``claims`` /
@@ -781,6 +789,7 @@ LOGICAL_TENSORS = (
     "hist_row_off",
     "dpre_tail",
     "tail_row_off",
+    "skip_row_off",
     "dpre_head",
     "head_row_off",
     "tile_tk",

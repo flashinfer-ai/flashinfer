@@ -46,18 +46,26 @@ after the head program, which overlaps the halo exchange (:func:`_bwd_overlap`):
    runs end, summed once per channel tile;
 3. after the wait, when the rank receives tail rows, the tail-row program
    (kind ``kcp_bwd_halo``) writes ``dx`` of the last three rows of each
-   fragment that has them again, from the received rows.
+   fragment that has them, from the received rows.
 
-With more than one rank the head program(s), the multi call's concatenation of
-the send rows and the exchange issue run on the device's high-priority side
-stream (:func:`_side_stream`), forked from the caller's stream; the main
-program(s) launch on the caller's stream at once (they read no head row), and
-the caller's stream joins the side stream after them, before the wait.  The
-buffers the side stream fills are allocated on the caller's stream before the
-fork, so the join orders their reuse (no ``record_stream``).  After
-the wait, the tail-row programs of a multi call whose tensors share one width
-read their rows in place in the received pool and run concurrently
-(:func:`_halos_in_place`).  The same programs read the same inputs, so no bit
+With one rank every launch is on the caller's stream: the main program writes
+every row (its ``skip_row_off`` table all ``-1``) and the tail-row program
+writes the tail rows again after it.  With more than one rank the head
+program(s), the multi call's concatenation of the send rows, the exchange
+issue, the wait and the tail-row program(s) run on the device's high-priority
+side stream (:func:`_side_stream`), forked from the caller's stream, and the
+main program(s) launch on the caller's stream at once (they read no head row)
+with the context's ``tail_row_off`` as their ``skip_row_off``: they leave the
+last rows of every fragment with a tail row to the tail-row programs, so the
+two write disjoint rows and the tail-row programs run as soon as the exchange
+arrives, beside the main programs, instead of after them.  The caller's stream
+joins the side stream after the main programs (also when a launch raises).
+The buffers the side stream fills are allocated on the caller's stream before
+the fork, so the join orders their reuse (no ``record_stream``).  After the
+wait, the tail-row programs of a multi call whose tensors share one width read
+their rows in place in the received pool and run concurrently
+(:func:`_halos_in_place`).  The same programs read the same inputs and every
+``dx`` row is written by the program that writes it with one rank, so no bit
 changes.
 
 The plan of the main program is :func:`kcp_jit.dyn_plan` (units of ``M``
@@ -761,10 +769,11 @@ def _rejoin(side: Optional[torch.cuda.Stream], device: torch.device) -> None:
 
 
 def _join_side(side: Optional[torch.cuda.Stream], device: torch.device) -> None:
-    """After the main program(s): the current stream waits for the side stream (inside a capture this joins it).
-    The head pools, the send rows and the received pool were allocated on the current stream before the fork and
-    live until after this join and the exchange's wait, so the allocator reuses them only after the side stream's
-    and the collective's work (no ``record_stream``, whose blocks the allocator frees only at a later allocation)."""
+    """After the main program(s), and the exchange's wait and the tail-row program(s) queued on the side stream: the
+    current stream waits for the side stream (inside a capture this joins it).  The head pools, the send rows and the
+    received pool were allocated on the current stream before the fork and live until after this join, so the
+    allocator reuses them only after the side stream's and the collective's work (no ``record_stream``, whose blocks
+    the allocator frees only at a later allocation)."""
     if side is not None:
         torch.cuda.current_stream(device).wait_stream(side)
 
@@ -885,9 +894,10 @@ def _dyn_host(
     device_index: int,
 ) -> dict[str, Any]:
     """The overlapped backward's host state of a call: the main program's launch plan over :func:`dyn_plan`'s
-    ``n_ctas`` CTAs, its work-plan scalars, accumulator layout and tile-word count, the all ``-1`` tail table it runs
-    with, and the tail-row program's launch plan over :func:`head_grid` (``None`` when the rank receives no tail row:
-    the main program then writes every row as the single program does)."""
+    ``n_ctas`` CTAs, its work-plan scalars, accumulator layout and tile-word count, the all ``-1`` table it runs with as
+    ``tail_row_off`` (and as ``skip_row_off`` when it writes every row), and the tail-row program's launch plan over
+    :func:`head_grid` (``None`` when the rank receives no tail row: the main program then writes every row as the
+    single program does)."""
     (main,) = route_modules(arch, KCP_BWD_DYN)
     p = dyn_plan(S, C, _loader.sm_count(device_index))
     halo = None
@@ -917,6 +927,7 @@ def _launch_dyn(
     dx2: torch.Tensor,
     dw_out: torch.Tensor,
     spare: torch.Tensor,
+    skip: torch.Tensor,
     S: int,
     C: int,
     n_frag: int,
@@ -924,9 +935,11 @@ def _launch_dyn(
     device_index: int,
 ) -> None:
     """The overlapped backward's main program (:func:`_dyn_host` state ``d``), launched while the halo exchange is in
-    flight: ``dx`` of every row (a fragment's last rows without the successors' tail rows, as at a document end) and
-    the rank's FP32 ``dweight`` partial, summed in the zeroed accumulator copies and words of the device's cached
-    backward workspace.  ``spare``: an FP32 ``[*, C]`` tensor passed as ``dpre_tail``, which no ``-1`` entry reads."""
+    flight: ``dx`` of every row but the last ``min(3, len)`` rows of each fragment with an entry ``>= 0`` in ``skip``
+    (``skip_row_off``: ``d["no_tail"]`` writes every row; the context's ``tail_row_off`` leaves the rows the tail-row
+    program writes), a fragment's last rows without the successors' tail rows, as at a document end, and the rank's
+    FP32 ``dweight`` partial, summed in the zeroed accumulator copies and words of the device's cached backward
+    workspace.  ``spare``: an FP32 ``[*, C]`` tensor passed as ``dpre_tail``, which no ``-1`` entry reads."""
     acc, words = _backward_accumulators(
         None,
         d["layout"],
@@ -953,6 +966,7 @@ def _launch_dyn(
             "hist_row_off": hist_row_off,
             "dpre_tail": spare,
             "tail_row_off": d["no_tail"],
+            "skip_row_off": skip,
             "S": S,
             "C": C,
             "num_docs": n_frag,
@@ -1732,7 +1746,15 @@ def _kcp_backward(
             "n_frag": n_frag,
             "device_index": device_index,
         }
-        _launch_dyn(d, dw_out=dw_out, spare=dpre_head, S=S, device=device, **common)
+        _launch_dyn(
+            d,
+            dw_out=dw_out,
+            spare=dpre_head,
+            skip=d["no_tail"],
+            S=S,
+            device=device,
+            **common,
+        )
         if work is not None:
             work.wait()
         _launch_halo(d, tail_row_off=tail_row_off, dpre_tail=dpre_tail, **common)
@@ -2037,6 +2059,15 @@ def _bwd_args(
     }
 
 
+def _dyn_skip(e: dict[str, Any], side: Optional[torch.cuda.Stream]) -> torch.Tensor:
+    """The main program's ``skip_row_off`` for a trimmed host-cache entry ``e``: the context's ``tail_row_off`` when
+    the tail-row program runs on the side stream (``side``) beside it, so it leaves the rows that program writes;
+    else the all ``-1`` table (every row written, the tail-row program after it on the same stream)."""
+    if side is not None and e["dyn"]["halo"] is not None:
+        return e["tail_row_off"]
+    return e["dyn"]["no_tail"]
+
+
 def _bwd_overlap(
     e: dict[str, Any],
     x_flat: torch.Tensor,
@@ -2054,16 +2085,36 @@ def _bwd_overlap(
     device: torch.device,
     side: Optional[torch.cuda.Stream] = None,
 ) -> None:
-    """The overlapped backward of a call with ``S > 0``: the main program while ``work`` (the exchange) is in flight,
-    the side stream's join (``side``: the stream of the head program and the exchange issue, or ``None``), the wait,
-    then the tail-row program."""
+    """The overlapped backward of a call with ``S > 0``: the main program while ``work`` (the exchange) is in flight.
+    With ``side`` (the stream of the head program and the exchange issue) the main program leaves the tail-row
+    program's rows (:func:`_dyn_skip`), and the side stream waits for the exchange and runs the tail-row program
+    beside it; the current stream then joins the side stream, also when a launch raises.  Without (``None``) the main
+    program writes every row, the current stream waits, then the tail-row program writes the tail rows again."""
     args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx_out, S=S, C=C)
     try:
         _launch_dyn(
-            e["dyn"], dw_out=dw_out, spare=dpre_head, S=S, device=device, **args
+            e["dyn"],
+            dw_out=dw_out,
+            spare=dpre_head,
+            skip=_dyn_skip(e, side),
+            S=S,
+            device=device,
+            **args,
         )
+        if side is not None:
+            with torch.cuda.stream(side):
+                if work is not None:
+                    work.wait()
+                _launch_halo(
+                    e["dyn"],
+                    tail_row_off=e["tail_row_off"],
+                    dpre_tail=dpre_tail,
+                    **args,
+                )
     finally:
         _join_side(side, device)
+    if side is not None:
+        return
     if work is not None:
         work.wait()
     _launch_halo(e["dyn"], tail_row_off=e["tail_row_off"], dpre_tail=dpre_tail, **args)
@@ -2421,8 +2472,8 @@ def _halos_in_place(
     forked from it and joined back before its next launch: when the entry is dropped, the allocator reuses the
     table only after those reads (inside a CUDA-graph capture they are made for the call only: a captured table
     holds its values only after a replay).  Then the first program runs on the current stream and the others on
-    the device's streams 1 .. n - 1, forked from it and joined back (the pool, allocated on the current stream,
-    outlives the join)."""
+    the device's streams 1 .. n - 1, forked from it and joined back (the pool, allocated on the caller's stream
+    before the side stream's fork, lives until the caller's stream joins the side stream)."""
     n = len(calls)
     capturing = torch.cuda.is_current_stream_capturing()
     current = torch.cuda.current_stream(device)
@@ -2700,6 +2751,7 @@ def _kcp_backward_multi(
     n_head = e0["n_head"]
     work = None
     recv = None
+    tails: Optional[list[torch.Tensor]] = None
     pools: list[Optional[torch.Tensor]] = [None] * len(calls)
     send = None
     if side is not None:
@@ -2759,21 +2811,54 @@ def _kcp_backward_multi(
         for dw in dw_out:
             dw.zero_()
         return dx_out, dw_out
-    # The overlapped tensors' main programs run while the exchange is in flight; every other launch follows the wait.
+    # The overlapped tensors' main programs run while the exchange is in flight; every other launch follows the wait,
+    # on the side stream when the call has one (the main programs then leave the tail-row programs' rows).
     try:
         for (S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), head in zip(
             calls, heads, strict=True
         ):
             if e["dyn"] is not None:
                 args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx, S=S, C=C)
-                _launch_dyn(e["dyn"], dw_out=dw, spare=head, S=S, device=device, **args)
+                _launch_dyn(
+                    e["dyn"],
+                    dw_out=dw,
+                    spare=head,
+                    skip=_dyn_skip(e, side),
+                    S=S,
+                    device=device,
+                    **args,
+                )
+        if side is not None:
+            in_place = len(calls) > 1 and len({c[1] for c in calls}) == 1
+            with torch.cuda.stream(side):
+                if work is not None:
+                    work.wait()
+                _multi_after_wait(calls, recv, tails, device, in_place=in_place)
     finally:
         _join_side(side, device)
+    if side is not None:
+        return dx_out, dw_out
     if work is not None:
         work.wait()
-    if side is not None and len(calls) > 1 and len({c[1] for c in calls}) == 1:
+    _multi_after_wait(calls, recv, tails, device, in_place=False)
+    return dx_out, dw_out
+
+
+def _multi_after_wait(
+    calls: list[tuple],
+    recv: Optional[torch.Tensor],
+    tails: Optional[list[torch.Tensor]],
+    device: torch.device,
+    *,
+    in_place: bool,
+) -> None:
+    """The launches of a multi backward after the exchange's wait, on the current stream: with ``in_place`` (more than
+    one tensor of one width, on the side stream) the tail-row programs read the received pool in place
+    (:func:`_halos_in_place`); otherwise each tensor's tail rows (the received pool ``recv`` cut per tensor, or
+    ``tails`` with one rank) go to its tail-row program, or to its one-program backward when it is not overlapped."""
+    if in_place:
         _halos_in_place(calls, recv, device)
-        return dx_out, dw_out
+        return
     if recv is not None:
         tails = _unpack(recv, [c[1] for c in calls]) if len(calls) > 1 else [recv]
     for (S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), tail in zip(
@@ -2799,7 +2884,6 @@ def _kcp_backward_multi(
                 C=C,
                 device=device,
             )
-    return dx_out, dw_out
 
 
 def _handle_hists(

@@ -122,15 +122,24 @@ deterministic route's head program. Then:
    accumulator copies in the order the runs end. The copies are summed once per
    channel tile.
 3. After the wait, on a rank that receives tail rows, the tail-row program
-   (`kcp_bwd_halo`) rewrites `dx` of the last three rows of each such
+   (`kcp_bwd_halo`) writes `dx` of the last three rows of each such
    fragment from the received rows.
 
+With one rank, every launch is on the caller's stream: the main program writes
+every row, and the tail-row program writes the tail rows again after it.
+
 With more than one rank, the head program, the concatenation of a multi
-call's send rows and the exchange issue run on a high-priority side stream of
-the device. The main program starts on the caller's stream at once, because it
-reads no head row. The caller's stream joins the side stream before the wait.
-The buffers that the side stream fills are allocated on the caller's stream
-before the fork. The programs and their inputs are the same, so no bit changes.
+call's send rows, the exchange issue, the wait and the tail-row program run on
+a high-priority side stream of the device. The main program starts on the
+caller's stream at once, because it reads no head row. It leaves the last rows
+of each fragment that receives tail rows to the tail-row program (its
+`skip_row_off` table is the context's `tail_row_off`). The two programs
+therefore write disjoint rows, and the tail-row program runs as soon as the
+exchange arrives, beside the main program instead of after it. The caller's
+stream joins the side stream after the main program. The buffers that the side
+stream fills are allocated on the caller's stream before the fork. The programs
+and their inputs are the same, and each `dx` row comes from the program that
+writes it with one rank, so no bit changes.
 
 The main program splits each lane into units of `M` tokens
 (`kcp_jit.dyn_plan`). Lane `j` starts at token `j x NL x M` (`NL` units per
@@ -280,6 +289,6 @@ tensors that share the context, such as a layer's q, k and v. It uses one halo e
 direction instead of `n`.
 
 - Inputs: each `xs[i]` is BF16 `[T_r, C_i]` and each `weights[i]` is FP32 `[C_i, 4]`. Each `C_i` is a multiple of 8, and they may differ.
-- Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, when the call uses the side stream (more than one rank, every tensor on the overlapped pair) and every tensor has the same width, each tensor's tail-row program reads its rows in place in the received pool, and the programs run concurrently on separate streams. Otherwise the rows are copied into each tensor's own pool.
+- Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, when the call uses the side stream (more than one rank, every tensor on the overlapped pair) and every tensor has the same width, each tensor's tail-row program reads its rows in place in the received pool, and the programs run concurrently on the side stream and streams forked from it. Otherwise the rows are copied into each tensor's own pool.
 - Programs: each tensor then runs the single call's programs. Outputs and `dx` are bitwise one single call per tensor. Each `dweight` is that tensor's own unordered partial.
 - Keywords: one `bwd_reserve_sms` value applies to every tensor. One recompute handle covers the whole call; its `"conv"` entry holds the `n` history pools.
