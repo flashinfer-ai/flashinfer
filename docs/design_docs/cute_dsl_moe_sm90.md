@@ -58,12 +58,14 @@ Properties:
   masked by `mn_limit` exactly where they would escape (GEMM2's scatter).
 
 Host-side stream choreography (fused mode): the finalize accumulates into
-`out`, so the host zeroes it on an aux stream overlapped with GEMM1
-(`moe_output_memset_inplace`, a `cudaMemsetAsync` binding — cheaper to
-launch than `Tensor.zero_`), with event fork-join only (`main_event` ->
-aux memset -> `memset_event` -> main waits before GEMM2). No
-`Tensor.record_stream` — it is illegal under CUDA-graph capture and
-redundant given the event join.
+`out`, so the host zeroes it first (`moe_output_memset_inplace`, a
+`cudaMemsetAsync` binding — cheaper to launch than `Tensor.zero_`). Under
+CUDA-graph capture the memset runs on an aux stream overlapped with GEMM1,
+with event fork-join only (`main_event` -> aux memset -> `memset_event` ->
+main waits before GEMM2); no `Tensor.record_stream` — it is illegal under
+capture and redundant given the event join. Eagerly the memset runs on the
+main stream ahead of GEMM1: the fork-join costs more host time than the
+few microseconds of GPU time the overlap saves.
 
 **PDL** (`enable_pdl`, default on) allows dependent kernel setup to overlap
 its predecessor's tail. GEMM1 signals dependents after its epilogue and
@@ -193,10 +195,13 @@ shapes and the global expert count; the local shard enters only through
 the padded row bound, so expert-parallel ranks that tune together profile
 identical sequences.
 
-Compiled kernels are reused within a process. Loading saved tuning results
-still requires compiling the selected kernels, so applications must warm
-relevant shapes and tactics before CUDA-graph capture or latency-sensitive
-serving.
+Each GEMM specialization (dtype, tactic, `top_k`, PDL, activation
+constants, resident cluster count) is compiled once per process as a
+TVM-FFI function, so a launch passes raw device addresses, dimensions and
+the stream handle without per-call pointer objects or argument
+marshalling. Loading saved tuning results still requires compiling the
+selected kernels, so applications must warm relevant shapes and tactics
+before CUDA-graph capture or latency-sensitive serving.
 
 ## 6. Weight layout and Python API
 
@@ -217,7 +222,8 @@ The public API carries an `@flashinfer_api` trace template
 Tests cover numerical correctness across dtypes, tiles, and expert shards;
 empty and partial batches; deterministic output; CUDA-graph replay; and
 autotuning with persisted results. Host-side tests cover tactic legality,
-pruning boundaries, and dispatch behavior.
+pruning boundaries, dispatch behavior, operand validation, the runner
+cache, and the TVM-FFI compilation of the kernels.
 
 ## 8. Performance
 

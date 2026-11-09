@@ -23,6 +23,7 @@ Three kernels per MoE layer:
 Design doc: docs/design_docs/cute_dsl_moe_sm90.md.
 """
 
+import functools
 from typing import Any, NamedTuple, Optional, Tuple
 
 import torch
@@ -80,6 +81,7 @@ def _get_cuda_graph_resources() -> _CudaGraphResources:
     return _cuda_graph_resources
 
 
+@functools.lru_cache(maxsize=None)
 def _sm90_moe_autotune_op_name(
     activation_type: int, situ_beta: Optional[float] = None
 ) -> str:
@@ -87,6 +89,42 @@ def _sm90_moe_autotune_op_name(
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
     activation_name = "Situ" if situ_beta is not None else activation.name
     return f"CuteDslFusedMoE::run_moe_sm90::{activation_name}"
+
+
+@functools.lru_cache(maxsize=None)
+def _get_runner(
+    num_experts: int,
+    top_k: int,
+    num_local_experts: int,
+    local_expert_offset: int,
+    use_fused_finalize: bool,
+    enable_pdl: bool,
+    activation_type: int,
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+) -> CuteDslFusedMoESm90Runner:
+    """The runner of one static MoE configuration (holds no tensors, so one
+    instance serves every call with that configuration). Construction
+    validates the activation parameters; a rejected configuration is not
+    cached."""
+    return CuteDslFusedMoESm90Runner(
+        forward_impl=_moe_core_impl,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        use_fused_finalize=use_fused_finalize,
+        enable_pdl=enable_pdl,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
 
 
 def _moe_core_impl(
@@ -173,26 +211,33 @@ def _moe_core_impl(
             permuted_m, inter, dtype=x.dtype, device=x.device
         )
 
-    # Zero the finalize destination on an aux stream, overlapped with GEMM1
-    # (the fused scatter-reduce accumulates into it). Events order the zeroing
-    # after prior main-stream work and before GEMM2. Deterministic mode
-    # skips the zeroing: GEMM2 writes each valid (token, slot) route to its
-    # own expanded row and moe_unpermute fully overwrites moe_output.
+    # Zero the finalize destination (the fused scatter-reduce accumulates into
+    # it). Under CUDA-graph capture the cudaMemsetAsync runs on an aux stream
+    # overlapped with GEMM1, ordered by events after prior main-stream work and
+    # before GEMM2 (Tensor.record_stream is illegal during capture and
+    # redundant here: the join orders later main-stream reuse of moe_output
+    # after the auxiliary-stream write). Eagerly it runs on the main stream
+    # ahead of GEMM1: the fork/join costs more host time than the memset
+    # (a few microseconds of GPU time) saves. Deterministic mode skips the
+    # zeroing: GEMM2 writes each valid (token, slot) route to its own expanded
+    # row and moe_unpermute fully overwrites moe_output.
     if moe_output is None:
         moe_output = torch.empty(num_tokens, hidden, dtype=x.dtype, device=x.device)
     main_stream = torch.cuda.current_stream()
+    memset_event = None
     if use_fused_finalize:
-        aux_stream, main_event, memset_event = _get_cuda_graph_resources()
-        # Fork/join via events only. Tensor.record_stream is illegal during
-        # CUDA-graph capture and redundant here: the join orders later
-        # main-stream reuse of moe_output after the auxiliary-stream write.
-        main_event.record(main_stream)
-        with torch.cuda.stream(aux_stream):
-            aux_stream.wait_event(main_event)
-            # cudaMemsetAsync via the C++ binding avoids a tensor-operation
-            # launch for the destination initialization.
+        if torch.cuda.is_current_stream_capturing():
+            aux_stream, main_event, memset_event = _get_cuda_graph_resources()
+            main_event.record(main_stream)
+            with torch.cuda.stream(aux_stream):
+                aux_stream.wait_event(main_event)
+                moe_output_memset_inplace(moe_output)
+                memset_event.record(aux_stream)
+        else:
+            if _cuda_graph_resources is None:
+                # Create the capture-path stream and events outside capture.
+                _get_cuda_graph_resources()
             moe_output_memset_inplace(moe_output)
-            memset_event.record(aux_stream)
 
     intermediate = sm90_contiguous_gather_grouped_gemm_act_fusion(
         x,
@@ -217,8 +262,9 @@ def _moe_core_impl(
     )
 
     if use_fused_finalize:
-        # The zeroing must complete before the finalize scatter-reduce.
-        main_stream.wait_event(memset_event)
+        if memset_event is not None:
+            # The zeroing must complete before the finalize scatter-reduce.
+            main_stream.wait_event(memset_event)
         gemm2_output = moe_output
     else:
         # Deterministic path: unscaled expert rows in expanded
@@ -376,13 +422,21 @@ def cute_dsl_fused_moe_bf16(
     """
     if num_local_experts is None:
         num_local_experts = num_experts
-    activation, _ = normalize_cute_dsl_moe_activation_type(
+    # Validates the activation configuration (once per configuration).
+    runner = _get_runner(
+        num_experts,
+        top_k,
+        num_local_experts,
+        local_expert_offset,
+        use_fused_finalize,
+        enable_pdl,
         activation_type,
-        SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
-        backend="the SM90 CuTe-DSL MoE",
+        float(swiglu_alpha),
+        float(swiglu_beta),
+        float(swiglu_limit),
+        situ_beta,
+        situ_linear_beta,
     )
-    validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
-    validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     num_tokens, hidden = x.shape
     if num_tokens == 0:
@@ -393,21 +447,6 @@ def cute_dsl_fused_moe_bf16(
     if moe_output is None:
         moe_output = torch.empty(num_tokens, hidden, dtype=x.dtype, device=x.device)
 
-    runner = CuteDslFusedMoESm90Runner(
-        forward_impl=_moe_core_impl,
-        num_experts=num_experts,
-        top_k=top_k,
-        num_local_experts=num_local_experts,
-        local_expert_offset=local_expert_offset,
-        use_fused_finalize=use_fused_finalize,
-        enable_pdl=enable_pdl,
-        activation_type=int(activation),
-        swiglu_alpha=float(swiglu_alpha),
-        swiglu_beta=float(swiglu_beta),
-        swiglu_limit=float(swiglu_limit),
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
     inputs = [
         x,
         token_selected_experts,
@@ -419,7 +458,7 @@ def cute_dsl_fused_moe_bf16(
     if tactic is not None:
         return runner(inputs, tactic=tactic, intermediate_buffer=intermediate_buffer)
     _, best_tactic = AutoTuner.get().choose_one(
-        _sm90_moe_autotune_op_name(activation, situ_beta),
+        _sm90_moe_autotune_op_name(runner.activation_type, situ_beta),
         [runner],
         runner.tuning_config,
         inputs,

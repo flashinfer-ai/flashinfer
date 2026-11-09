@@ -1519,3 +1519,239 @@ def test_sm90_moe_non_gated_tactic_legality():
     assert is_valid_tactic(wide, intermediate_size=128, **common)
     assert is_valid_tactic(wide, intermediate_size=128, gated=False, **common)
     assert is_valid_tactic(wide, intermediate_size=256, gated=False, **common)
+
+
+@cute_dsl_available
+def test_sm90_moe_runner_is_cached_per_configuration():
+    """One runner serves every call with the same static configuration."""
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import _get_runner
+    from flashinfer.tllm_enums import ActivationType
+
+    def runner(**overrides):
+        config = dict(
+            num_experts=128,
+            top_k=8,
+            num_local_experts=128,
+            local_expert_offset=0,
+            use_fused_finalize=True,
+            enable_pdl=True,
+            activation_type=int(ActivationType.Swiglu),
+            swiglu_alpha=1.0,
+            swiglu_beta=0.0,
+            swiglu_limit=7.0,
+            situ_beta=None,
+            situ_linear_beta=None,
+        )
+        config.update(overrides)
+        return _get_runner(**config)
+
+    base = runner()
+    assert runner() is base
+    assert runner(swiglu_limit=8.0) is not base
+    assert runner(use_fused_finalize=False) is not base
+    # A rejected configuration raises every time instead of being cached.
+    for _ in range(2):
+        with pytest.raises(ValueError, match="swiglu_limit must be positive"):
+            runner(swiglu_limit=0.0)
+
+
+@cute_dsl_available
+def test_sm90_gemm_kernels_compile_as_tvm_ffi_functions(monkeypatch):
+    """Both GEMM specializations are compiled with TVM-FFI enabled (so launches
+    take raw device addresses) from pointer examples of the declared types, and
+    are reused from the process cache afterwards."""
+    import importlib
+
+    import cutlass
+
+    from flashinfer.tllm_enums import ActivationType
+
+    gemm1 = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion"
+    )
+    gemm2 = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.sm90_contiguous_grouped_gemm_finalize_fusion"
+    )
+    calls = []
+
+    def fake_compile(fn, *args, **kwargs):
+        calls.append((fn, args, kwargs))
+        return object()
+
+    monkeypatch.setattr(gemm1.cute, "compile", fake_compile)
+    monkeypatch.setattr(gemm2.cute, "compile", fake_compile)
+    saved_gemm1 = dict(gemm1._gather_kernel_cache)
+    saved_gemm2 = dict(gemm2._finalize_kernel_cache)
+    gemm1._gather_kernel_cache.clear()
+    gemm2._finalize_kernel_cache.clear()
+    address = 0x1000
+    try:
+        gather_args = dict(
+            orig_m=8,
+            permuted_m=128,
+            n=128,
+            k=256,
+            num_experts=4,
+            a_ptr=address,
+            b_ptr=address,
+            c_ptr=address,
+            tile_idx_ptr=address,
+            mn_limit_ptr=address,
+            token_id_ptr=address,
+            num_tiles_ptr=address,
+            max_active_clusters=132,
+            stream=0,
+            ab_dtype=cutlass.BFloat16,
+            c_dtype=cutlass.BFloat16,
+            tile_shape_mn=(128, 64),
+            cluster_shape_mn=(1, 1),
+            topk=2,
+            swizzle_size=1,
+            raster_along_m=False,
+            enable_pdl=True,
+            activation_type=int(ActivationType.Swiglu),
+            swiglu_alpha=1.0,
+            swiglu_beta=0.0,
+            swiglu_limit=7.0,
+            situ_beta=None,
+            situ_linear_beta=None,
+        )
+        finalize_args = dict(
+            permuted_m=128,
+            n=256,
+            k=64,
+            num_experts=4,
+            num_tokens=8,
+            out_rows=8,
+            a_ptr=address,
+            b_ptr=address,
+            out_ptr=address,
+            tile_idx_ptr=address,
+            mn_limit_ptr=address,
+            token_id_ptr=address,
+            num_tiles_ptr=address,
+            token_scales_ptr=address,
+            max_active_clusters=132,
+            stream=0,
+            ab_dtype=cutlass.BFloat16,
+            c_dtype=cutlass.BFloat16,
+            tile_shape_mn=(128, 64),
+            cluster_shape_mn=(1, 1),
+            topk=2,
+            use_fused_finalize=True,
+            raster_along_m=False,
+            enable_pdl=True,
+        )
+        k1 = gemm1._get_compiled_gather_kernel(**gather_args)
+        k2 = gemm2._get_compiled_finalize_kernel(**finalize_args)
+        assert gemm1._get_compiled_gather_kernel(**gather_args) is k1
+        assert gemm2._get_compiled_finalize_kernel(**finalize_args) is k2
+        assert len(calls) == 2
+        for (_, args, kwargs), num_pointers in zip(calls, (7, 8), strict=True):
+            assert kwargs["options"] == "--enable-tvm-ffi"
+            assert kwargs["max_active_clusters"] == 132
+            pointers = args[:num_pointers]
+            assert [p.dtype for p in pointers[:3]] == [cutlass.BFloat16] * 3
+            assert all(p.dtype is cutlass.Int32 for p in pointers[3:7])
+            assert all(p._assumed_align == 16 for p in pointers[:3])
+            assert all(p._assumed_align == 4 for p in pointers[3:])
+        assert calls[1][1][7].dtype is cutlass.Float32
+    finally:
+        gemm1._gather_kernel_cache.clear()
+        gemm1._gather_kernel_cache.update(saved_gemm1)
+        gemm2._finalize_kernel_cache.clear()
+        gemm2._finalize_kernel_cache.update(saved_gemm2)
+
+
+@cute_dsl_available
+@sm90_required
+def test_cute_dsl_bf16_moe_eager_zeroes_preallocated_output():
+    """The eager fused-finalize path overwrites a dirty caller-provided
+    moe_output (the destination is zeroed before the scatter-reduce)."""
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+    from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
+        interleave_up_gate_sm90,
+    )
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import DEFAULT_SM90_MOE_TACTIC
+
+    torch.manual_seed(19)
+    dtype = torch.bfloat16
+    num_experts, top_k, hidden, inter, num_tokens = 4, 2, 128, 64, 70
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype) / (hidden**0.25)
+    w_gate_up = torch.randn(
+        num_experts, 2 * inter, hidden, device="cuda", dtype=dtype
+    ) / (hidden**0.25)
+    w1 = interleave_up_gate_sm90(w_gate_up)
+    w2 = torch.randn(num_experts, hidden, inter, device="cuda", dtype=dtype) / (
+        inter**0.25
+    )
+    ids, scales = make_random_topk(num_experts, num_tokens, top_k)
+    dirty = torch.full((num_tokens, hidden), float("nan"), device="cuda", dtype=dtype)
+    out = cute_dsl_fused_moe_bf16(
+        x,
+        ids,
+        scales,
+        w1,
+        w2,
+        num_experts=num_experts,
+        top_k=top_k,
+        moe_output=dirty,
+        tactic=DEFAULT_SM90_MOE_TACTIC,
+    )
+    assert out is dirty
+    ref = ref_moe(x, ids, scales, w_gate_up, w2)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+def test_cute_dsl_bf16_moe_rejects_bad_operands():
+    """The fused pipeline rejects malformed operands and tactics with
+    ``ValueError`` before the GEMM launches."""
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+    from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
+        interleave_up_gate_sm90,
+    )
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import DEFAULT_SM90_MOE_TACTIC
+
+    torch.manual_seed(11)
+    dtype = torch.bfloat16
+    num_experts, top_k, hidden, inter, num_tokens = 4, 2, 128, 64, 8
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype)
+    w1 = interleave_up_gate_sm90(
+        torch.randn(num_experts, 2 * inter, hidden, device="cuda", dtype=dtype)
+    )
+    w2 = torch.randn(num_experts, hidden, inter, device="cuda", dtype=dtype)
+    ids, scales = make_random_topk(num_experts, num_tokens, top_k)
+
+    def run(**overrides):
+        args = dict(
+            x=x,
+            token_selected_experts=ids,
+            token_final_scales=scales,
+            w1_weight=w1,
+            w2_weight=w2,
+            num_experts=num_experts,
+            top_k=top_k,
+            tactic=DEFAULT_SM90_MOE_TACTIC,
+        )
+        args.update(overrides)
+        return cute_dsl_fused_moe_bf16(**args)
+
+    run()  # the baseline configuration is valid
+    with pytest.raises(ValueError, match="mismatched dtypes"):
+        run(w1_weight=w1.half())
+    with pytest.raises(ValueError, match="x must be a contiguous"):
+        run(x=x.t().contiguous().t())
+    with pytest.raises(ValueError, match="w2_weight .* does not match"):
+        run(w2_weight=w2[:, :, : inter // 2].contiguous())
+    with pytest.raises(ValueError, match="token_final_scales"):
+        run(token_final_scales=scales.to(dtype))
+    with pytest.raises(ValueError, match="out shape"):
+        run(moe_output=torch.empty(num_tokens + 1, hidden, device="cuda", dtype=dtype))
+    with pytest.raises(ValueError, match="out shape"):
+        run(intermediate_buffer=torch.empty(1, inter, device="cuda", dtype=dtype))
+    with pytest.raises(ValueError, match="cannot implement"):
+        run(tactic=(128, ((128, 64), 0), ((128, 64), (1, 1), False)))
+    with pytest.raises(ValueError, match="cannot implement"):
+        run(tactic=(128, ((128, 64), 1), ((128, 64), (2, 2), False)))
