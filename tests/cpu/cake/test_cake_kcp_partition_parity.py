@@ -171,10 +171,13 @@ def _kcp_package(op: str, mode: str) -> str:
 
 def _entry(plan: ModuleType, op: str, mode: str, what: str) -> Callable[..., Any]:
     """``cake_<op>_<mode>_train_kcp_<what>`` of ``plan``: a public function of the
-    module itself, and the module's only public function that names ``what`` with
-    ``kcp`` (no pre-#8928 name such as ``partition_det_kcp``, no alias)."""
+    module itself, and the module's only public function whose name is ``what``
+    plus package-name words only (no pre-#8928 name such as ``partition_det_kcp``,
+    no alias).  A helper that names ``what`` alongside other words, such as
+    ``kcp_partition_digest``, is a different function and is allowed."""
     name = f"cake_{op}_{mode}_train_kcp_{what}"
     words = tuple(what.split("_"))
+    package_words = {"cake", "kda", "gdn", "det", "nondet", "train", "kcp"}
     value = vars(plan).get(name)
     if not inspect.isfunction(value) or value.__module__ != plan.__name__:
         pytest.fail(
@@ -190,7 +193,9 @@ def _entry(plan: ModuleType, op: str, mode: str, what: str) -> Callable[..., Any
             and inspect.isfunction(obj)
             and "kcp" in parts
             and any(
-                tuple(parts[i : i + len(words)]) == words for i in range(len(parts))
+                tuple(parts[i : i + len(words)]) == words
+                and set(parts[:i] + parts[i + len(words) :]) <= package_words
+                for i in range(len(parts))
             )
         ):
             others.append(other)
