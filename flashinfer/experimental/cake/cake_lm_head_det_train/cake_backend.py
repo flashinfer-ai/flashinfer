@@ -473,7 +473,11 @@ DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
 # chunk has 1 .. DW_CAST_TMA_MAX_ROWS[arch] rows (:func:`dw_cast_tma_rule`); the per-element (old + acc) * g
 # and its round-to-nearest order are the shipped form's, so dW is bitwise the same.  A one-chunk call has no old
 # sum to read and keeps the shipped form.
-DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792, "sm_107a": 1792}
+DW_CAST_TMA_MAX_ROWS: dict[str, int] = {
+    "sm_100a": 1792,
+    "sm_103a": 1792,
+    "sm_107a": 1792,
+}
 # Its form under the zero-gradient row skip (:data:`DCNT_BASES`): the same TMA cast with the K steps bounded by the
 # last chunk's device count of live rows, so a counted plan keeps the rule's cast (a record without it: the shipped
 # cast's counted form).
