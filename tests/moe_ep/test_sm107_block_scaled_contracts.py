@@ -47,6 +47,75 @@ def _config(**kw):
     )
 
 
+@pytest.mark.parametrize(
+    "kind", ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+)
+def test_inference_grid_covers_uniform_phase_launches(kind):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        is_valid_sm107,
+        sm107_candidates,
+    )
+
+    candidates = sm107_candidates(kind)
+    assert (
+        len(candidates)
+        == len({json.dumps(c, sort_keys=True) for c in candidates})
+        == 32
+    )
+    depth = 256 if kind in ("nvfp4", "mxfp4") else 128
+    expected_prefix = [
+        (tile, cluster, epi, bulk)
+        for tile in ((256, 128, depth), (256, 256, depth))
+        for cluster, epi in (
+            ((2, 1), (1, 4)),
+            ((2, 1), (2, 4)),
+            ((4, 1), (1, 4)),
+            ((4, 1), (2, 4)),
+        )
+        for bulk in (False, True)
+    ]
+    assert [
+        (
+            c["mma_tiler_mnk"],
+            c["cluster_shape_mn"],
+            c["epi_flag_batches"],
+            c["fc2_use_bulk"],
+        )
+        for c in candidates[:16]
+    ] == expected_prefix
+    added = candidates[16:]
+    assert {c["mma_tiler_mnk"] for c in added} == {
+        (256, 64, depth),
+        (256, 64, 2 * depth),
+        (256, 128, depth),
+        (256, 256, depth),
+    }
+    for c in added:
+        assert c["fallback_cluster_shape_mn"] is None
+        assert c["schedule_policy"] == ("phase_interleave", None)
+        assert c["work_id_mode"] == "atomic_counter"
+        assert c["epi_flag_batches"] == (2, 4)
+        assert c["fc2_tma_stages"] == (
+            (1 if c["mma_tiler_mnk"][1] == 64 else 2) if c["fc2_use_bulk"] else None
+        )
+    for tile in {c["mma_tiler_mnk"] for c in added}:
+        assert {
+            (c["cluster_shape_mn"], c["fc2_use_bulk"])
+            for c in added
+            if c["mma_tiler_mnk"] == tile
+        } == {((2, 1), False), ((2, 1), True), ((4, 1), False), ((4, 1), True)}
+    with_ikr = sm107_candidates(kind, allow_in_kernel_fc2_reduce=True)
+    assert len(with_ikr) == 64
+    assert [c for c in with_ikr if not c["reduce_topk_in_kernel"]] == candidates
+    assert [
+        dict(c, reduce_topk_in_kernel=False)
+        for c in with_ikr
+        if c["reduce_topk_in_kernel"]
+    ] == candidates
+    base = _config(quant_kind=kind, hidden=512, intermediate=256, world_size=4)
+    assert all(is_valid_sm107(c, base) for c in with_ikr)
+
+
 @pytest.mark.parametrize("rubin", [False, True])
 def test_route_staging_fallback_preserves_architecture_score_policy(rubin):
     from flashinfer.moe_ep.backends.mega.kernel import routing_staging as shared
@@ -154,6 +223,10 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     from flashinfer.moe_ep.core.kernel import registry
     from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
 
+    def gather(results, value, **kwargs):
+        results[:] = [value] * len(results)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     args = tune._parse_args(
         [
             "--dtype",
@@ -183,6 +256,13 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     create = mock.Mock(return_value=backend)
     resolve = mock.Mock(return_value=({}, "default"))
     execution = mock.Mock()
+
+    def gather(results, result, *, group):
+        assert group is backend.ep_comm_group
+        results[:] = [result] * len(results)
+
+    exchange = mock.Mock(side_effect=gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
     monkeypatch.setattr(registry, "create_mega_kernel", create)
     monkeypatch.setattr(tuning, "_dummy_transformed_weights", lambda *a: (None, None))
     monkeypatch.setattr(
@@ -196,6 +276,8 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     monkeypatch.setattr(tuning, "finish_sweep", finish)
 
     assert tuning.tune_one(args, 0, 2, 128, "mxfp4") == {"fc2_use_bulk": True}
+    exchange.assert_called_once()
+    assert finish.call_args.args[8] == [{}]
     config = create.call_args.args[0]
     assert isinstance(config, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig)
     assert config.kernel_variant == variant
@@ -204,7 +286,7 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     assert resolve.call_args.kwargs["kernel_variant"] == variant
     assert resolve.call_args.kwargs["apply_routing_weights_before_fc2"] is early
     assert execution.call_args.kwargs["quantize_input"] is True
-    backend._allocate_workspace.return_value.destroy.assert_called_once()
+    backend.destroy.assert_called_once_with(backend._allocate_workspace.return_value)
 
 
 def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():

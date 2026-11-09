@@ -641,7 +641,11 @@ def test_quantized_selection_cache(dtype, monkeypatch, frost_metadata_only):
     moe.runtime.clear_artifact_cache()
     try:
         first, second = moe._selected_kernels(**args)
-        assert sum(not k.quantizes_output for k in first) == len(second) == 4
+        grouped = [k for k in first if not k.quantizes_output and not k.gathers_input]
+        gathered = [k for k in first if not k.quantizes_output and k.gathers_input]
+        assert len(grouped) == 2
+        assert len(gathered) == heuristics.STAGE_BUDGET
+        assert len(second) == heuristics.STAGE_BUDGET
         for _ in range(25):
             assert moe._selected_kernels(**args) == (first, second)
         assert selection.call_count == 1
@@ -754,6 +758,45 @@ def test_factorized_tuning_and_graph_replay(dtype, monkeypatch):
         ref = reference()
         check(out, ref)
         check(layer(act, weights), ref)
+        forced_graphs = []
+        if dtype == "nvfp4" and torch.cuda.get_device_capability(x.device) == (10, 7):
+            runner = layer.runners[0]
+            packed = runner.pack_inputs(act, weights)
+            state = packed.launch_state
+            gathered = tuple(
+                a for a in state.first if a.gathers_input and not a.quantizes_output
+            )
+            assert gathered
+            for combined in (False, True):
+                layouts = {
+                    tuple(state.plans[key]["gather_layout"](tokens))
+                    for key in state.plans
+                    if len(key) == 3
+                    and key[1] in {a.tactic for a in gathered}
+                    and key[2]
+                    in {b.tactic for b in state.second if b.combines_output == combined}
+                }
+                assert len(layouts) == 1
+            orientations = set()
+            for b in state.second:
+                if not b.combines_output:
+                    continue
+                tactic = next(
+                    key
+                    for key in state.plans
+                    if len(key) == 3
+                    and key[1] == gathered[0].tactic
+                    and key[2] == b.tactic
+                )
+                check(runner.forward(packed, tactic).clone(), ref)
+                forced_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(forced_graph):
+                    forced_out = runner.forward(packed, tactic)
+                forced_graph.replay()
+                check(forced_out, ref)
+                forced_graphs.append((forced_graph, forced_out))
+                orientations.add(b.swap_ab)
+            assert orientations == {False, True}
         assert selection.call_count == 1  # Packing reuses this bucket's frozen pool.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -772,6 +815,10 @@ def test_factorized_tuning_and_graph_replay(dtype, monkeypatch):
         graph.replay()
         torch.cuda.synchronize()
         check(graph_out, changed_ref)
+        for forced_graph, forced_out in forced_graphs:
+            forced_out.fill_(float("nan"))
+            forced_graph.replay()
+            check(forced_out, changed_ref)
         assert selection.call_count == 1
     finally:
         tuner.clear_cache()

@@ -30,6 +30,8 @@ Kernels for LLM sampling.
     sampling_from_probs
     sampling_from_logits
     softmax
+    log_softmax
+    log_probs
     top_p_sampling_from_probs
     top_k_sampling_from_probs
     min_p_sampling_from_probs

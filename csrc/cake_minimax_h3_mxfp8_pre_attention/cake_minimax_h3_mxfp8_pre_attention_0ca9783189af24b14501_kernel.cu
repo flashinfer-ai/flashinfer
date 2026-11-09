@@ -47,19 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_SMEM_RSTD_OFF 0
-#define SMEM_SMEM_RSTD_STAGE_BYTES 4
-#define SMEM_SMEM_RSTD_STRIDE 4
-#define SMEM_SMEM_INDEX_OFF 4
-#define SMEM_SMEM_INDEX_STAGE_BYTES 4
-#define SMEM_SMEM_INDEX_STRIDE 4
-#define SMEM_SMEM_PARTIAL_OFF 8
-#define SMEM_SMEM_PARTIAL_STAGE_BYTES 84
-#define SMEM_SMEM_PARTIAL_STRIDE 84
-#define SMEM_TOTAL 128
-#define THREADS 672
 #define HIDDEN 5376
 #define SCALE_COLS 168
 
@@ -139,7 +126,7 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_0ca9783189af24b14501(__nv_bfloat16* _
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* smem_rstd = reinterpret_cast<float*>(smem_raw + 0);
     const int smem_rstd_addr = smem + 0;
     int* smem_index = reinterpret_cast<int*>(smem_raw + 4);
@@ -234,19 +221,19 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_0ca9783189af24b14501(__nv_bfloat16* _
                     _vdst_12[_blk] = _vptr_12[_blk];
                 }
             }
-            unsigned int words_0[4];
+            unsigned int words_2[4];
             {
                 const uint4* _vptr_13 = reinterpret_cast<const uint4*>(adaln_scale + table_base + (unsigned long long)col);
-                uint4* _vdst_13 = reinterpret_cast<uint4*>(&words_0[0]);
+                uint4* _vdst_13 = reinterpret_cast<uint4*>(&words_2[0]);
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
                     _vdst_13[_blk] = _vptr_13[_blk];
                 }
             }
-            unsigned int words_1[4];
+            unsigned int words_3[4];
             {
                 const uint4* _vptr_14 = reinterpret_cast<const uint4*>(adaln_shift + table_base + (unsigned long long)col);
-                uint4* _vdst_14 = reinterpret_cast<uint4*>(&words_1[0]);
+                uint4* _vdst_14 = reinterpret_cast<uint4*>(&words_3[0]);
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
                     _vdst_14[_blk] = _vptr_14[_blk];
@@ -264,9 +251,9 @@ kernel_cake_minimax_h3_mxfp8_pre_attention_0ca9783189af24b14501(__nv_bfloat16* _
                 float2 weighted;
                 asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&weighted) : "l"(*(const unsigned long long*)&scaled), "l"(*(const unsigned long long*)&_f32x2_mul_b_16));
                 unsigned int normalized_word = __as_u32(__float22bfloat162_rn(make_float2(weighted.x, weighted.y)));
-                float2 scale_plus_one = add_f32x2(make_float2(__uint_as_float(words_0[j_3] << 16), __uint_as_float(words_0[j_3] & 4294901760u)), _f2_1);
+                float2 scale_plus_one = add_f32x2(make_float2(__uint_as_float(words_2[j_3] << 16), __uint_as_float(words_2[j_3] & 4294901760u)), _f2_1);
                 unsigned int scale_word = __as_u32(__float22bfloat162_rn(make_float2(scale_plus_one.x, scale_plus_one.y)));
-                float2 adaln = fma_f32x2_rn_ftz(make_float2(__uint_as_float(normalized_word << 16), __uint_as_float(normalized_word & 4294901760u)), make_float2(__uint_as_float(scale_word << 16), __uint_as_float(scale_word & 4294901760u)), make_float2(__uint_as_float(words_1[j_3] << 16), __uint_as_float(words_1[j_3] & 4294901760u)));
+                float2 adaln = fma_f32x2_rn_ftz(make_float2(__uint_as_float(normalized_word << 16), __uint_as_float(normalized_word & 4294901760u)), make_float2(__uint_as_float(scale_word << 16), __uint_as_float(scale_word & 4294901760u)), make_float2(__uint_as_float(words_3[j_3] << 16), __uint_as_float(words_3[j_3] & 4294901760u)));
                 values[2 * j_3] = (float)(__nv_bfloat16)adaln.x;
                 values[2 * j_3 + 1] = (float)(__nv_bfloat16)adaln.y;
             }

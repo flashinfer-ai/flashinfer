@@ -688,6 +688,13 @@ def test_rope_quant_plan_options():
         pytest.param(0, 2, 8, 2049, True, False, True, id="small-head-long-kv-reuse"),
         pytest.param(1, 0, 64, 513, True, False, True, id="multiwave-prefill"),
         pytest.param(0, 4, 128, 2049, True, False, True, id="multiwave-decode"),
+        pytest.param(0, 1, 128, 1025, True, False, True, id="two-cta-wave"),
+        # Mid-grid H64 rows on one padded 2CTA cluster per row.
+        pytest.param(32, 1, 64, 513, True, False, True, id="h64-two-cta-mid"),
+        pytest.param(16, 4, 64, 1025, True, False, False, id="h64-two-cta-mid-holes"),
+        # Long-Q wave grids stage the BF16 output through SMEM/TMA stores.
+        pytest.param(1, 0, 128, 1025, True, False, True, id="two-cta-wave-prefill"),
+        pytest.param(1, 0, 128, 513, True, False, False, id="two-cta-wave-holes"),
         # Short lists (capacity 256 and 384) with enough rows for the H128 2CTA tile.
         pytest.param(0, 1, 128, 64, True, False, True, id="short-two-cta-decode"),
         pytest.param(1, 0, 128, 64, True, False, True, id="short-two-cta-prefill"),
@@ -851,7 +858,7 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     torch.cuda.synchronize()
     check()
     invalid_scales = dict(scales, softmax_scale=torch.ones((), device=q.device))
-    with pytest.raises(TypeError, match="Python int or float"):
+    with pytest.raises(TypeError, match="same scalar/tensor type"):
         w.run(
             q,
             primary,
@@ -1307,7 +1314,10 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
         (48, "nvfp4", 4, 2048),
         (96, "nvfp4", 4, 2048),
         (96, "fp8", 160, 2048),
-    ],
+    ]
+    # Long-list H12/H16 decode grids from a quarter wave up: split, just past
+    # one wave and persistent eight-issuer Swap-AB on 148-212 SM devices.
+    + [(12, "fp8", 64, 2048), (12, "fp8", 160, 2048), (16, "fp8", 320, 2048)],
 )
 def test_d576_sparse_graph(heads, precision, rows, topk, prefix=False):
     """Native352 cache mapping, tails, holes and live graph inputs on both families."""
@@ -1436,6 +1446,13 @@ def make_tensor_fp8_cache(pages, page_size):
         (64, 2, 129, 129),
         (128, 8, 513, 129),
         (64, 16, 2049, 129),
+        # Swap-AB keeps two tiles per split at a power-of-two tile count.
+        (16, 1, 512, 0),
+        # Persistent D512 grids select the two-slot raw record ring.
+        (64, 96, 1024, 0),
+        (64, 80, 1024, 129),
+        (16, 128, 1024, 129),
+        (32, 96, 2048, 0),
     ],
 )
 def test_d512_nvfp4_sources_graph(
@@ -1747,8 +1764,8 @@ def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads, capacity):
             owners.append((graph, out, lse, qo_indptr))
         assert compile_calls.call_count == 1
         for name in ("softmax_scale", "output_scale", "kv_cache_scale"):
-            invalid = dict(kwargs, **{name: torch.tensor(1.0, device="cuda")})
-            with pytest.raises(TypeError, match="Python int or float"):
+            invalid = dict(kwargs, **{name: torch.tensor([1.0], device="cuda")})
+            with pytest.raises(TypeError, match="same scalar/tensor type"):
                 wrapper.run(query[:capacity], primary, indices, lengths, **invalid)
         with pytest.raises(ValueError, match="packed query total rows"):
             wrapper.run(query, primary, indices, lengths)
@@ -2075,3 +2092,111 @@ def test_sparse_d576_capture_without_eager_run():
 def test_sparse_d576_rejects_d512_plan_options(option, match):
     with pytest.raises(ValueError, match=match):
         _d576_plan(2, 64, 64, **option)
+
+
+def test_sparse_mla_global_scales_graph_replay(monkeypatch):
+    """Global tensor scales preserve independent FP8 and NVFP4 source scaling."""
+    kinds = (True, False, True)
+    monkeypatch.setattr(
+        mla_decode_module,
+        "select_sparse_mla_profile",
+        lambda **_: sparse_policy.SparseMlaProfile(
+            family="2cta",
+            tile_size_q=128,
+            split_kv=2,
+            gather_issue_warps=1,
+            balanced_registers=True,
+        ),
+    )
+    torch.manual_seed(127)
+    rows, heads, topk = 2, 128, 129
+    query = (torch.randn(rows, heads, 512, device="cuda") * 0.2).to(torch.float8_e4m3fn)
+    primary, primary_ref = make_tensor_fp8_cache(2, 64)
+    extra, extra_ref = make_nvfp4_cache(2, 32)
+    indices = torch.randint(64, (rows, topk), device="cuda", dtype=torch.int32)
+    extra_indices = torch.randint(32, (rows, topk), device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([97, topk], device="cuda", dtype=torch.int32)
+    extra_lengths = torch.tensor([topk, 71], device="cuda", dtype=torch.int32)
+    indices[:, 3] = -1
+    extra_indices[:, 7] = -1
+    offsets = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
+    sinks = torch.linspace(-2, 1, heads, device="cuda")
+    values = (0.17, 0.75, 0.5)
+    scales = tuple(
+        torch.tensor(value, device="cuda") if kind else value
+        for value, kind in zip(values, kinds, strict=True)
+    )
+    plan = dict(
+        device=query.device,
+        batch_size=1,
+        num_qo_heads=heads,
+        max_topk=topk,
+        max_extra_topk=topk,
+        packed_query=True,
+        max_q_len=rows,
+        q_dtype=query.dtype,
+        kv_cache_format="fp8",
+        extra_kv_cache_format="nvfp4",
+        return_lse=True,
+        use_attention_sinks=True,
+        tuning=MLAAttentionTuning(0.0),
+    )
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        **plan,
+        softmax_scale=scales[0],
+        output_scale=scales[1],
+        kv_cache_scale=scales[2],
+    )
+    out = torch.empty(rows, heads, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(rows, heads, device="cuda", dtype=torch.float32)
+    inputs = dict(
+        extra_kv_cache=extra,
+        extra_indices=extra_indices,
+        extra_lengths=extra_lengths,
+        qo_indptr=offsets,
+        attention_sinks=sinks,
+    )
+
+    def run():
+        wrapper.run(
+            query, primary, indices, lengths, out=out, lse=lse, validate=False, **inputs
+        )
+
+    def check(current):
+        ref, ref_lse, bound = _reference(
+            query,
+            primary_ref * current[2],
+            extra_ref,
+            indices,
+            extra_indices,
+            lengths=lengths,
+            extra_lengths=extra_lengths,
+            attention_sinks=sinks,
+            softmax_scale=current[0],
+            output_scale=current[1],
+        )
+        assert ((out.double() - ref).abs() <= bound).all()
+        torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+    run()
+    check(values)
+    graph = torch.cuda.CUDAGraph()
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    # Graph setup may synchronize; guard only the attention call.
+    with torch.cuda.graph(graph):
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            run()
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_sync_mode)
+    changed = tuple(
+        value * (1.5 if kind else 1.0)
+        for value, kind in zip(values, kinds, strict=True)
+    )
+    for scale, kind, value in zip(scales, kinds, changed, strict=True):
+        if kind:
+            scale.fill_(value)
+    graph.replay()
+    check(changed)
+    torch.cuda.synchronize()

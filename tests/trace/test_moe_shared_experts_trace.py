@@ -360,6 +360,8 @@ def test_fp4_committed_shared_expert_init_runs_standalone():
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FP4 quantization requires SM100 or newer")
     source = json.loads(FP4_SHARED_JSON.read_text())["init"]
     namespace = _exec_in_fresh_namespace(source)
     init = namespace["_moe_fp4_block_scale_ds_shared_experts_init"]

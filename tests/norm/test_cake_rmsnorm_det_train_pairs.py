@@ -40,18 +40,24 @@ windows = cake_package("cake_rmsnorm_det_train", "cake_windows")
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN_SIZES = (6144, 5120, 4096, 2048, 1536, 512, 256)
 REDUCE_ROLE = "bwd_reduce"
+# The workspace kinds: a main program with its dw reduce companion keeps FP32 partial rows; a column-task program
+# (role ``bwd_col``) runs alone, its first ``H / col`` tickets summing whole columns of dw, and keeps no sums.
+PAIR_WORKSPACE = "chunk_partials"
+COL_WORKSPACE = "claim_sum_f64"
 # The column widths of the dw reduce slabs, one CTA each: 4 for the column-split H = 256 reduce (one column of a
 # four-column slab per lane).
 SHIPPED_SLABS = (4, 16, 32, 64)
 # Row counts of the contract: the small counts, both sides of every backward window edge of every route
 # (``test_rows_cover_every_backward_window_edge``) and the training shapes.
 ROWS = (
-    1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 2048, 2049, 3072, 3073, 4096, 4097,
+    1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 25, 26, 31, 32, 33, 63, 64, 65, 87, 88, 109, 110, 121, 122, 127, 128, 129, 152, 153,
+    171, 172, 203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 368, 369, 576, 577, 767, 768, 769, 960, 961, 1023,
+    1024, 1025, 1152, 1153, 1216, 1217, 1280, 1281, 1664, 1665, 1680, 1681, 2047, 2048, 2049, 3072, 3073, 4096, 4097,
     5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968,
-    19969, 20480, 20481, 24064, 24065, 32768, 32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 44032,
-    44033, 45056, 45057, 48640, 48641, 50688, 50689, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656,
-    70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688, 114689, 139264, 139265, 720896, 720897, 1179648, 1179649,
-    1572864, 1572865,
+    19969, 20480, 20481, 22528, 22529, 24064, 24065, 24576, 24577, 32768, 32769, 36352, 36353, 40448, 40449, 40960,
+    40961, 42496, 42497, 44032, 44033, 45056, 45057, 48640, 48641, 50176, 50177, 50688, 50689, 51200, 51201, 52736,
+    52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688,
+    114689, 139264, 139265, 720896, 720897, 1179648, 1179649, 1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -74,7 +80,15 @@ def _owners() -> dict[str, dict]:
     return {
         name: r
         for name, r in loader.MODULES.items()
-        if r.get("workspace_rule") is not None
+        if (r.get("workspace_rule") or {}).get("kind") == PAIR_WORKSPACE
+    }
+
+
+def _singles() -> dict[str, dict]:
+    return {
+        name: r
+        for name, r in loader.MODULES.items()
+        if (r.get("workspace_rule") or {}).get("kind") == COL_WORKSPACE
     }
 
 
@@ -132,6 +146,35 @@ def test_owner_records_claim_chunks_and_own_the_workspace() -> None:
     assert "rows_per_chunk" not in loader.LOGICAL_SCALARS
 
 
+def test_column_task_records_claim_their_columns_and_run_alone() -> None:
+    """A column-task record claims chunks like an owner, plus ``col_tasks`` column tickets that divide its hidden
+    size; it keeps one counter word and no sums, launches without PDL and has no companion."""
+    singles = _singles()
+    assert singles
+    assert set(_owners()) | set(singles) == {
+        name
+        for name, r in loader.MODULES.items()
+        if r.get("workspace_rule") is not None
+    }
+    for name, record in singles.items():
+        assert record["role"].startswith("bwd_col"), name
+        rule = record["grid_rule"]
+        assert rule["kind"] == "claimed_chunks", name
+        assert rule["ctas_per_sm"] == min(
+            rule["grid_factor"], rule["launch_bound_ctas_per_sm"]
+        ), name
+        tasks, hidden = int(rule["col_tasks"]), int(record["hidden"])
+        assert tasks >= 1 and hidden % tasks == 0, name
+        assert record["workspace_rule"] == {
+            "counters": 1,
+            "kind": COL_WORKSPACE,
+            "sum_bytes": 0,
+        }, name
+        assert record["launch"]["use_pdl"] is False, name
+        assert record["logical"]["n_chunks"] == "n_chunks", name
+        assert record["logical"]["rows_per_chunk"] == "slots", name
+
+
 def test_reduce_records_launch_one_cta_per_slab_under_pdl() -> None:
     companions = _companions()
     assert companions
@@ -154,7 +197,7 @@ def test_reduce_records_launch_one_cta_per_slab_under_pdl() -> None:
 
 @pytest.mark.parametrize("arch", sorted(loader.ROUTES))
 def test_every_backward_route_selects_an_owner_then_its_companion(arch: str) -> None:
-    owners, companions = _owners(), _companions()
+    owners, companions, singles = _owners(), _companions(), _singles()
     routes = loader.ROUTES[arch]
     checked = 0
     for hidden in HIDDEN_SIZES:
@@ -167,6 +210,10 @@ def test_every_backward_route_selects_an_owner_then_its_companion(arch: str) -> 
                 selected = loader.selected_modules(
                     arch, hidden, "bwd", residual, rows=rows
                 )
+                if len(selected) == 1 and selected[0] in singles:
+                    assert loader.MODULES[selected[0]]["hidden"] == hidden
+                    launched.update(selected)
+                    continue
                 assert len(selected) == 2, (arch, hidden, residual, rows, selected)
                 owner, companion = selected
                 assert owner in owners and companion in companions, (
@@ -225,7 +272,10 @@ def test_program_windows_tile_every_route_and_name_the_selected_program(
                 selected = loader.selected_modules(
                     arch, hidden, kind, residual, rows=rows, w_dtype=w_dtype
                 )
-                assert len(selected) == (2 if kind == "bwd" else 1), (
+                single = (loader.MODULES[selected[0]].get("workspace_rule") or {}).get(
+                    "kind"
+                ) == COL_WORKSPACE
+                assert len(selected) == (2 if kind == "bwd" and not single else 1), (
                     arch,
                     route,
                     rows,
@@ -236,7 +286,7 @@ def test_program_windows_tile_every_route_and_name_the_selected_program(
                     route,
                     rows,
                 )
-                if kind == "bwd":
+                if kind == "bwd" and not single:
                     assert loader.MODULES[selected[1]]["role"] == REDUCE_ROLE
                     assert (
                         loader.MODULES[selected[1]]["select_rule"]
@@ -320,11 +370,12 @@ def test_rows_cover_every_backward_window_edge() -> None:
 
 # The H = 256 backward route: per sm_100a / sm_103a window the faster of the four-CTA pipeline (``pd4``) and the
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
-# architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
-# ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 99840 on sm_103a, 70656 on sm_107a) the ring
-# with compensated dw sums runs instead: its lean form ``dcln`` (two rows per iteration with the same arithmetic in the
-# same order), on sm_103a to 720896 rows and the ring itself (``dc``) above; above 1572864 rows its form with hi / lo
-# partial rows (``dchl``).
+# architecture (BF16 and FP32 weight alike).  Above the ring's dw accuracy edge (80896 rows on sm_100a, 99840 on
+# sm_103a) the ring with compensated dw sums runs instead: its lean form ``dcln`` (two rows per iteration with the same
+# arithmetic in the same order), on sm_103a to 720896 rows and the ring itself (``dc``) above; above 1572864 rows its
+# form with hi / lo partial rows (``dchl``).  On sm_100a and sm_103a the lean compensated ring also runs the smallest
+# row counts (to 87 and 1680 rows), where the plain windows' dw drifts with the SM count; sm_107a runs it at every row
+# count to 1572864.
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
@@ -333,19 +384,22 @@ H256_BWD_PROGRAMS = {
     "dchl": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfhl_k_s32_split_pts_cl_td4_cs",
 }
 H256_BWD_RING = (
-    (0, 2048, "a3"),
     (2048, 5120, "pd4"),
     (5120, 12288, "a3"),
     (12288, 40960, "pd4"),
 )
 H256_BWD_SPLIT = {
     "sm_100a": (
+        (0, 87, "dcln"),
+        (87, 2048, "a3"),
         *H256_BWD_RING,
         (40960, 80896, "a3"),
         (80896, 1572864, "dcln"),
         (1572864, None, "dchl"),
     ),
     "sm_103a": (
+        (0, 1680, "dcln"),
+        (1680, 2048, "a3"),
         *H256_BWD_RING,
         (40960, 99840, "a3"),
         (99840, 720896, "dcln"),
@@ -353,9 +407,7 @@ H256_BWD_SPLIT = {
         (1572864, None, "dchl"),
     ),
     "sm_107a": (
-        (0, 65536, "pd4"),
-        (65536, 70656, "a3"),
-        (70656, 1572864, "dcln"),
+        (0, 1572864, "dcln"),
         (1572864, None, "dchl"),
     ),
 }
@@ -420,6 +472,11 @@ RECUT_FP32_ROUTES: dict[
         (49152, None),
     ),
     ("sm_107a", 5120, "fwd", False): ((49152, None),),
+    # the backward windows where the BF16 route runs a pipelined program that has no FP32-weight build: the
+    # FP32-weight route keeps the programs of its earlier windows there, each with the dw reduce of its window
+    ("sm_100a", 2048, "bwd", False): ((288, 1024), (1024, 16384), (16384, 58880)),
+    ("sm_100a", 6144, "bwd", False): ((256, 4096),),
+    ("sm_103a", 6144, "bwd", False): ((20, 4096),),
 }
 
 
@@ -459,8 +516,8 @@ def _recut_windows(
 def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
     """Every FP32-weight route (``_w32``) is the twin of the BF16 route of its width, kind and residual form: the
     same windows, companions and host plans, the owners' roles carrying ``_w32`` before ``_residual`` -- except the
-    windows ``RECUT_FP32_ROUTES`` names, where the route runs another FP32-weight kernel under its own record; and
-    the BF16 routes alone decide ``supported_hidden_sizes``."""
+    windows ``RECUT_FP32_ROUTES`` names, where the route runs another FP32-weight kernel under its own record (a
+    backward route with the dw reduce of that window); and the BF16 routes alone decide ``supported_hidden_sizes``."""
     routes = loader.ROUTES[arch]
     twins = [route for route in routes if _route_parts(route)[3] == "f32"]
     if not twins:
@@ -486,12 +543,27 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
         base_owners = [
             n for n in routes[base] if loader.MODULES[n]["role"] != REDUCE_ROLE
         ]
-        assert [
-            n for n in routes[route] if loader.MODULES[n]["role"] == REDUCE_ROLE
-        ] == [n for n in routes[base] if loader.MODULES[n]["role"] == REDUCE_ROLE], (
-            arch,
-            route,
-        )
+        reduces = [n for n in routes[route] if loader.MODULES[n]["role"] == REDUCE_ROLE]
+        base_reduces = [
+            n for n in routes[base] if loader.MODULES[n]["role"] == REDUCE_ROLE
+        ]
+        if kind == "bwd" and recut:
+            # every pair window of a re-cut backward route has the dw reduce of that window, the base route's
+            # outside the re-cut windows
+            pairs = [
+                n
+                for n in owners
+                if (loader.MODULES[n].get("workspace_rule") or {}).get("kind")
+                == PAIR_WORKSPACE
+            ]
+            assert [_window(loader.MODULES[n]) for n in reduces] == [
+                _window(loader.MODULES[n]) for n in pairs
+            ], (arch, route)
+            for name in reduces:
+                if _window(loader.MODULES[name]) not in recut:
+                    assert name in base_reduces, (arch, route, name)
+        else:
+            assert reduces == base_reduces, (arch, route)
         base_windows = [_window(loader.MODULES[n]) for n in base_owners]
         assert [_window(loader.MODULES[n]) for n in owners] == _recut_windows(
             base_windows, recut
@@ -537,7 +609,8 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
                 assert twin["role"] == expected_role, (arch, route, mine_name)
                 continue
             # a window of a re-cut route: the twin route's own record, for this architecture alone, with the
-            # BF16 owner's hidden size and workspace and a rows_per_cta grid rule of its own
+            # BF16 owner's hidden size and workspace and a grid rule of its own (rows_per_cta for a forward,
+            # claimed chunks for a backward)
             assert window in recut, (arch, route, mine_name)
             owner = loader.MODULES[
                 next(
@@ -555,7 +628,9 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
                 owner["hidden"],
                 owner["workspace_rule"],
             ), (arch, route, mine_name)
-            assert twin["grid_rule"]["kind"] == "rows_per_cta", (arch, route, mine_name)
+            assert twin["grid_rule"]["kind"] == (
+                "rows_per_cta" if kind == "fwd" else "claimed_chunks"
+            ), (arch, route, mine_name)
             assert twin["role"].startswith(kind) and "_w32" in twin["role"], (
                 arch,
                 route,
@@ -572,8 +647,9 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
 # The SM counts of devices per architecture at or above the guard's: the measured boards (B200 148, GB300 152,
 # R200 212 and 216) and a device of the same architecture with more SMs (GB200 152, a 160-SM GB300).
 BOARD_SMS = {"sm_100a": (148, 152), "sm_103a": (152, 160), "sm_107a": (212, 216)}
-# The accuracy edges: the plain programs of H = 1536 / 2048 / 4096 / 5120 / 6144 -> their block-compensated forms,
-# the H = 256 ring -> the compensated-dot ring.
+# The accuracy edges: the plain programs of H = 1536 / 2048 / 4096 / 5120 / 6144 and of the residual H = 6144 ->
+# their block-compensated forms, the H = 256 ring -> the compensated-dot ring (0 on sm_107a: its H = 256 route runs
+# compensated programs only).
 ACCURACY_EDGES = {
     "sm_100a": {
         "h1536": 36352,
@@ -582,6 +658,7 @@ ACCURACY_EDGES = {
         "h4096": 44032,
         "h5120": 6144,
         "h6144": 42496,
+        "residual_h6144": 42496,
     },
     "sm_103a": {
         "h1536": 40448,
@@ -590,14 +667,16 @@ ACCURACY_EDGES = {
         "h4096": 48640,
         "h5120": 5120,
         "h6144": 48640,
+        "residual_h6144": 48640,
     },
     "sm_107a": {
         "h1536": 45056,
         "h2048": 50688,
-        "h256": 70656,
+        "h256": 0,
         "h4096": 24064,
         "h5120": 19968,
         "h6144": 19456,
+        "residual_h6144": 19456,
     },
 }
 
@@ -620,8 +699,8 @@ def _launched_library(arch: str, route: str, rows: int) -> str:
 
 def test_accuracy_guard_names_the_measured_sm_counts_and_edges() -> None:
     """The guard's tables: the smallest measured SM count per architecture and, for the BF16 and FP32-weight
-    backward routes with a compensated program (every one but H = 512 and the residual H = 6144), the edge where the
-    route's compensated programs start."""
+    backward routes with a compensated program (every one but H = 512), the edge where the route's compensated
+    programs start."""
     assert windows.ACCURACY_MIN_SMS == {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}
     assert set(windows.ACCURACY_EDGES) == set(loader.ROUTES)
     for arch, edges in ACCURACY_EDGES.items():
@@ -631,7 +710,10 @@ def test_accuracy_guard_names_the_measured_sm_counts_and_edges() -> None:
             for w32 in ("", "_w32")
         }, arch
         for route, edge in windows.ACCURACY_EDGES[arch].items():
-            assert edge in _edges(windows.PROGRAM_WINDOWS[arch][route]), (arch, route)
+            assert edge == 0 or edge in _edges(windows.PROGRAM_WINDOWS[arch][route]), (
+                arch,
+                route,
+            )
 
 
 @pytest.mark.parametrize("arch", sorted(BOARD_SMS))
@@ -929,16 +1011,21 @@ def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) 
         for rows in (1, 129, 4096, 16384, 65536)
     ]
     assert sizes == sorted(sizes) and all(size % 256 == 0 for size in sizes)
-    assert sizes[0] > loader.COUNTERS_BYTES
     arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
-    sms = loader.sm_count(0)
+    # one token runs the route's column-task program where it has one (the counters alone), else a pair
+    (first, *_) = loader.selected_modules(arch, hidden, "bwd", False, rows=1)
+    if loader.MODULES[first]["workspace_rule"]["kind"] == COL_WORKSPACE:
+        assert sizes[0] == loader.COUNTERS_BYTES
+    else:
+        assert sizes[0] > loader.COUNTERS_BYTES
+    assert sizes[-1] > loader.COUNTERS_BYTES
     for name in loader.route_modules(arch, hidden, "bwd", False):
         record = loader.MODULES[name]
         if record.get("workspace_rule") is None:
             continue
         for rows in (1, 129, 16384, 65536):
             layout = loader.workspace_layout(record, rows, device_index=0)
-            slots = int(record["grid_rule"]["ctas_per_sm"]) * sms
+            slots = loader.slot_count(record["grid_rule"], device_index=0)
             assert (
                 layout["counters_offset"] == 0
                 and layout["partial_offset"] == loader.COUNTERS_BYTES
@@ -950,6 +1037,22 @@ def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) 
                 int(record["grid_rule"]["rows_per_issue"]),
                 *loader.chunk_taper(record["grid_rule"]),
             )
+            if record["workspace_rule"]["kind"] == COL_WORKSPACE:
+                # a column-task program keeps no sums: the counters alone, and its column tickets widen the grid
+                assert (
+                    layout["capacity_chunks"],
+                    layout["partial_bytes"],
+                    layout["total_bytes"],
+                ) == (0, 0, loader.COUNTERS_BYTES)
+                assert loader.launch_grid(record, rows, device_index=0) == (
+                    min(
+                        slots,
+                        layout["n_chunks"] + int(record["grid_rule"]["col_tasks"]),
+                    ),
+                    1,
+                    1,
+                )
+                continue
             assert (
                 layout["n_chunks"]
                 <= layout["capacity_chunks"]
