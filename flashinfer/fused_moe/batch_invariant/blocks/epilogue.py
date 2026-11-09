@@ -51,6 +51,9 @@ STAGED_STORE = True  # the shared-memory staged, row-coalesced store of the 16-b
 BAR_EPI_STAGE = (
     4  # named barrier ids BAR_EPI_STAGE + warpgroup (the dense blocks use 1 and 2)
 )
+BAR_EPI_JOIN = (
+    3  # every epilogue warpgroup once, after its last TMEM load, before the TMEM free
+)
 STAGED_OUT_FMTS = ("bf16", "f16")
 # elements of row padding in the staging buffer: a 16-byte skew per row, so the TMEM lanes' (thread = row) 16-byte stores
 # spread over the banks
