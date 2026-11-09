@@ -183,6 +183,11 @@ _DEFECTS = {
         "if ((polled >> j) & 1u) store_volatile(address(j), splat(kDataSentinel));",
         "(void)polled;",
     ),
+    10: (  # no D6 reset: received weights vectors stay in their rows
+        _HEADER,
+        "      store_volatile(address(kWeights), splat(kDataSentinel));\n",
+        "",
+    ),
 }
 
 

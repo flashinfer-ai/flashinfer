@@ -68,8 +68,9 @@ class NVLinkOneSidedConfig:
 
     The sentinel protocol needs compute capability 10.0, 10.3 or 10.7, at most
     64 EP ranks, a BF16 combine and a BF16, ``MXFP8``, ``DeepSeekFp8`` or
-    ``NVFP4`` dispatch format. Where a rank does not support it, every rank
-    uses the fence protocol (logged as a warning under ``"sentinel"``). It
+    ``NVFP4`` dispatch format, with ``hidden_size`` a multiple of 8, 256, 512
+    or 256 respectively. Where a rank does not support it, every rank uses
+    the fence protocol (logged as a warning under ``"sentinel"``). It
     cannot carry steps with ``eplb_local_stats`` or with payloads outside the
     instance's format; those take the fence protocol. Payload words equal to
     its sentinel arrive rewritten to the same value (NaN stays NaN), so callers
