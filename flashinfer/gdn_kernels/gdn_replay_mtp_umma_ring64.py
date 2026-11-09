@@ -7,6 +7,10 @@ with a 32-row window (RING_SLOTS = 64, W_RING = 32) instead of the 32-slot ring 
 allocates 64-slot rings (+0.63 MiB per request and layer); the default ``flush_min`` is nu - T + 1 (T = 4: 29,
 T = 8: 25) and 16 at T = 1. The ring contents are not interchangeable with the 32-slot kernel's.
 
+The ring depth is a compile-time parameter taken from ``k_cache.shape[2]``: 64 (above) or 32. A 32-slot ring runs
+the merged kernel's contract only (16-row window, ``flush_min`` = 17 - T at most, ``hist_len`` <= 16, ``cache_base``
+< 32) on this kernel, bit-identical to ``gdn_replay_mtp_umma``.
+
 * live window ``[cache_base, cache_base + hist_len) mod 64``, P = hist_len <= nu = min(W_RING, RING_SLOTS - T) = 32,
   g ring = window-relative cumulative log-decay, ``w_j = e^{G_P - g_j}``;
 * every row appends (k̂_s, u_s, g) at ``(base + P + s) & 63``; g restarts at 0 on flush rows;
@@ -72,8 +76,15 @@ except (
     from flashinfer.gdn_kernels import _umma_helpers as U
     from flashinfer.gdn_kernels.device_target import gdn_compile_options
 
-RING_SLOTS = 64  # physical ring per request (a power of two: indices use & RING_MASK)
+RING_SLOTS = 64  # default (deepest) physical ring per request
 RING_MASK = RING_SLOTS - 1
+RING_SLOTS_SUPPORTED = (
+    32,
+    64,
+)  # ring depths of a build (powers of two: indices mask with ring_slots - 1)
+# window rows a 32-slot ring serves: the merged kernel's window, whose contract (flush_min <= 17 - T,
+# hist_len <= 16) is the only one a 32-slot ring is validated for
+COMPAT_WINDOW = 16
 # window capacity in rows (<= RING_SLOTS): sizes the window tiles (W_CHUNKS tiles of W_CHUNK rows), the D columns in TMEM and
 # the coefficient block. The u window in shared memory holds nu <= W_RING rows, a compile-time depth that window_rows may reduce.
 W_RING = 32
@@ -81,8 +92,8 @@ W_CHUNK = 16  # history/fold/Gram window tiles: W_CHUNKS independent W_CHUNK-row
 W_CHUNKS = W_RING // W_CHUNK
 assert (
     W_RING % W_CHUNK == 0
-    and W_CHUNK <= W_RING <= RING_SLOTS
-    and RING_SLOTS & RING_MASK == 0
+    and W_CHUNK <= COMPAT_WINDOW <= W_RING <= RING_SLOTS
+    and all(r & (r - 1) == 0 for r in RING_SLOTS_SUPPORTED)
 )
 K_DIM = 128
 V_DIM = 128
@@ -167,8 +178,12 @@ class GdnReplayMtpUmma:
         sr: str = "",
         sr_rounds: int = 0,
         pmax: int = 0,
+        ring_slots: int = RING_SLOTS,
     ):
         assert 1 <= T <= 8
+        assert ring_slots in RING_SLOTS_SUPPORTED, ring_slots
+        self.ring_slots = ring_slots
+        self.ring_mask = ring_slots - 1
         assert hv % h == 0 and hv // h == HPK
         # hpc = value heads per CTA (4: one CTA per key head; 2 / 1 split a key head over 2 / 4
         # CTAs, which repeat the per-key-head prologue but shorten the serial head chain)
@@ -184,7 +199,7 @@ class GdnReplayMtpUmma:
         # (the T appends of the call land at slots P..P+T-1 of the ring), so rows >= nu are never read and are not even
         # copied. pmax (compile-time, the wrapper's flush_min - 1 + T) is the deepest window the caller will present:
         # the shared-memory window holds nu = pmax rows (at least one W_CHUNK tile), 0 = the whole window
-        nu_max = min(W_RING, RING_SLOTS - T)
+        nu_max = min(W_RING, ring_slots - T)
         assert pmax <= nu_max, (pmax, nu_max)
         self.nu = max(pmax, W_CHUNK) if pmax else nu_max
         assert (
@@ -573,9 +588,9 @@ class GdnReplayMtpUmma:
             wh = ((ct_e - 32) >> 4) & 3
             whc = wh & (HPC - 1)
             wj = (ct_e - 32) & 15
-            gp_g = Float32(g_cache[sidx, hv0 + ghc, (base + P - 1) & RING_MASK])
-            gp_w = Float32(g_cache[sidx, hv0 + whc, (base + P - 1) & RING_MASK])
-            gj_w = Float32(g_cache[sidx, hv0 + whc, (base + wj) & RING_MASK])
+            gp_g = Float32(g_cache[sidx, hv0 + ghc, (base + P - 1) & self.ring_mask])
+            gp_w = Float32(g_cache[sidx, hv0 + whc, (base + P - 1) & self.ring_mask])
+            gj_w = Float32(g_cache[sidx, hv0 + whc, (base + wj) & self.ring_mask])
             # window rows [P, nu) are never copied: zero them once (this CTA's SMEM holds another CTA's
             # data) so the D build needs no per-row masks (its weights are 0 there)
             for r in cutlass.range_constexpr((self.nu * 16 + 127) // 128):
@@ -757,7 +772,7 @@ class GdnReplayMtpUmma:
                             kc_g
                             + Int64(
                                 cute.crd2idx(
-                                    (sidx, kh, (base + P + xr_b) & RING_MASK, 0),
+                                    (sidx, kh, (base + P + xr_b) & self.ring_mask, 0),
                                     k_cache.layout,
                                 )
                             )
@@ -831,7 +846,7 @@ class GdnReplayMtpUmma:
                             kc_g
                             + Int64(
                                 cute.crd2idx(
-                                    (sidx, kh, (base + j) & RING_MASK, c8 * 8),
+                                    (sidx, kh, (base + j) & self.ring_mask, c8 * 8),
                                     k_cache.layout,
                                 )
                             )
@@ -874,7 +889,9 @@ class GdnReplayMtpUmma:
                             if not is_flush:
                                 if P > 0:
                                     gnew = gnew + gp_g
-                            g_cache[sidx, hv0 + gh, (base + P + gt) & RING_MASK] = gnew
+                            g_cache[
+                                sidx, hv0 + gh, (base + P + gt) & self.ring_mask
+                            ] = gnew
             if ct >= 32:
                 if ct < 96:
                     # window weights w_j = e^{G_P - g_j}, j < P. 64 threads (4 heads x 16
@@ -898,7 +915,9 @@ class GdnReplayMtpUmma:
                                 if wjg < P:
                                     gjw = Float32(
                                         g_cache[
-                                            sidx, hv0 + whc, (base + wjg) & RING_MASK
+                                            sidx,
+                                            hv0 + whc,
+                                            (base + wjg) & self.ring_mask,
                                         ]
                                     )
                                     w = cute.math.exp(gpw - gjw, fastmath=True)
@@ -1373,14 +1392,18 @@ class GdnReplayMtpUmma:
         ra0 = (
             kc_g
             + Int64(
-                cute.crd2idx((sidx, kh, (base + r0) & RING_MASK, 0), k_cache.layout)
+                cute.crd2idx(
+                    (sidx, kh, (base + r0) & self.ring_mask, 0), k_cache.layout
+                )
             )
             * 2
         )
         ra1 = (
             kc_g
             + Int64(
-                cute.crd2idx((sidx, kh, (base + r1) & RING_MASK, 0), k_cache.layout)
+                cute.crd2idx(
+                    (sidx, kh, (base + r1) & self.ring_mask, 0), k_cache.layout
+                )
             )
             * 2
         )
@@ -1423,7 +1446,9 @@ class GdnReplayMtpUmma:
         nl = _sel(P < self.nu, P, Int32(self.nu), Int32)
         ra = (
             kc_g
-            + Int64(cute.crd2idx((sidx, kh, (base + j) & RING_MASK, 0), k_cache.layout))
+            + Int64(
+                cute.crd2idx((sidx, kh, (base + j) & self.ring_mask, 0), k_cache.layout)
+            )
             * 2
             + Int64(half * 128)
         )
@@ -1450,7 +1475,7 @@ class GdnReplayMtpUmma:
         return Int32(t < self.T), va
 
     def _u_window_copy(self, u_cache, u_g, uw_addr, mbar, sidx, hv, base, P):
-        """Bulk-copy the live logical window slots j = 0..min(P, nu)-1 (physical (base + j) & RING_MASK)
+        """Bulk-copy the live logical window slots j = 0..min(P, nu)-1 (physical (base + j) mod ring_slots)
         of one value head's u ring into the single window buffer as [j][V]. Rows j >= P are not copied (they are
         zero-filled once per CTA, and their weights are +0). Call under elect_one."""
         # at most two contiguous copies (the window wraps the ring at most once) instead of one per row
@@ -1474,14 +1499,14 @@ class GdnReplayMtpUmma:
             )
 
     def _window_copy_pair(self, ctx_P, base, src_head, dst, rowb, mbar):
-        """Live window rows j < min(P, nu) (physical (base + j) & RING_MASK) as at most two contiguous bulk copies (the window
+        """Live window rows j < min(P, nu) (physical (base + j) mod ring_slots) as at most two contiguous bulk copies (the window
         wraps the ring at most once); without a wrap the second copy re-copies the last row (same bytes), so
         the transaction count is (n1 + n2) rows either way and no copy has size 0. P == 0: no rows, the arrival alone
         completes the barrier and the zero-filled window stays zero. Call under elect_one / from one lane."""
         nn0 = _sel(ctx_P < self.nu, ctx_P, Int32(self.nu), Int32)
         nn = _sel(nn0 > 0, nn0, Int32(1), Int32)
-        wrap = (base + nn) > RING_SLOTS
-        n1 = _sel(wrap, Int32(RING_SLOTS) - base, nn, Int32)
+        wrap = (base + nn) > self.ring_slots
+        n1 = _sel(wrap, Int32(self.ring_slots) - base, nn, Int32)
         n2 = _sel(wrap, nn - n1, Int32(1), Int32)
         d2 = _sel(wrap, n1, nn - 1, Int32)
         s2 = _sel(wrap, Int32(0), base + nn - 1, Int32)
@@ -1507,7 +1532,7 @@ class GdnReplayMtpUmma:
     @cute.jit
     def _window_warp(self, c):
         """Warp 6 (otherwise idle): once every consumer has released the window buffer (u_free completion hh), copy head
-        hh + 1's LIVE window rows j < min(P, nu) (slot (base + j) & RING_MASK -> row j) into it, with no consumer on the
+        hh + 1's LIVE window rows j < min(P, nu) (slot (base + j) mod ring_slots -> row j) into it, with no consumer on the
         path: two contiguous copies from one lane."""
         rowb = V_DIM * 2
         P, base = c["P"], c["base"]
@@ -1637,7 +1662,7 @@ class GdnReplayMtpUmma:
             for s_ in range(t + 1):
                 y = y + s_coef[cb + _bq_off(t, s_)] * uu[s_]
             out[brow, t, hv, row] = BFloat16(y)
-            u_cache[sidx, hv, (base + P + t) & RING_MASK, row] = ring_t(uu[t])
+            u_cache[sidx, hv, (base + P + t) & self.ring_mask, row] = ring_t(uu[t])
 
     def _load_seed(self, ctx, rand_seed):
         """SR variants, flush rows only: the Philox key / LCG mixing key (verify rows never
@@ -1791,6 +1816,7 @@ class GdnReplayMtpUmma:
         sr: str = "",
         sr_rounds: int = 0,
         pmax: int = 0,
+        ring_slots: int = RING_SLOTS,
     ):
         batch = cute.sym_int()
         pool = cute.sym_int()
@@ -1806,9 +1832,9 @@ class GdnReplayMtpUmma:
             ft(Float32, (hv,), 1),  # dt_bias (fp32)
             ft(Float16, (pool, hv, V_DIM, K_DIM), 8),  # state
             ft(Int32, (batch,), 1),  # state indices
-            ft(BFloat16, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring (bf16)
-            ft(uring, (pool, hv, RING_SLOTS, V_DIM), 8),  # u ring (bf16 / fp16)
-            ft(Float32, (pool, hv, RING_SLOTS), 1),  # g ring
+            ft(BFloat16, (pool, h, ring_slots, K_DIM), 8),  # k ring (bf16)
+            ft(uring, (pool, hv, ring_slots, V_DIM), 8),  # u ring (bf16 / fp16)
+            ft(Float32, (pool, hv, ring_slots), 1),  # g ring
             ft(Int32, (batch,), 1),  # hist_len
             ft(Int32, (batch,), 1),  # cache_base
             ft(Int32, (batch,), 1),  # row order
@@ -1827,6 +1853,7 @@ class GdnReplayMtpUmma:
                 sr,
                 sr_rounds,
                 pmax,
+                ring_slots,
             ),
             *args,
             Float32(1.0),
@@ -1936,8 +1963,13 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
     ``heads_per_cta`` (1, 2 or 4; None = by batch size, see ``auto_heads_per_cta``) sets how many
     of a key head's 4 value heads one CTA runs.
 
+    The ring depth (``k_cache.shape[2]``, 32 or 64; anything else raises ``ValueError``) is compile-time and part
+    of the compile-cache key. 64-slot rings: 32-row window. 32-slot rings: only the merged kernel's contract
+    (16-row window, ``flush_min`` <= 17 - T, ``hist_len`` <= min(16, flush_min - 1 + T), ``cache_base`` < 32); a
+    larger ``flush_min`` or ``window_rows`` raises ``ValueError`` (use 64-slot rings for deeper windows).
+
     ``window_rows`` (compile-time, part of the compile-cache key; default the full window
-    nu = min(W_RING, RING_SLOTS - T)): rows of the shared-memory u window, i.e. the deepest live
+    nu = min(W_RING, ring_slots - T), 16 at 32 slots): rows of the shared-memory u window, i.e. the deepest live
     window P a call may present. The default holds any history the ring can carry, including rings
     advanced at a larger T than this call's. A smaller explicit value saves shared memory but silently
     truncates deeper histories.
@@ -1961,9 +1993,8 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
     repeated flushes of a slot reuse the same random bits.
 
     ``flush_min`` (default: the largest value that is safe for any acceptance pattern,
-    ``nu - T + 1`` with ``nu = min(W_RING, RING_SLOTS - T)``, i.e. ``min(W_RING - T + 1, RING_SLOTS - 2 T + 1)``:
-    13 / 9 at W_RING = 16 for T = 4 / 8, 25 / 17 at W_RING = RING_SLOTS = 32, 29 / 25 at W_RING = 32 on the 64-slot
-    ring): a row with ``hist_len >= flush_min`` flushes. Values up to ``W_RING - T + 1`` are still accepted
+    ``nu - T + 1``: 29 / 25 for T = 4 / 8 on 64-slot rings, 13 / 9 (= 17 - T, also the maximum) on 32-slot rings):
+    a row with ``hist_len >= flush_min`` flushes. Values up to ``W_RING - T + 1`` are still accepted
     (single calls whose rows all have hist_len <= nu) but warn above the safe default: a verify row can then
     advance past nu, whose appends overwrite the live window (never the case at W_RING = 32 on the 64-slot ring,
     where the two bounds coincide). Contract: every call's hist_len <= nu (a deeper window is silently
@@ -1996,48 +2027,66 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         "bf16 or fp16 u ring required"
     )
     pool = h0.shape[0]
-    assert tuple(k_cache.shape) == (pool, H, RING_SLOTS, K_DIM)
-    assert tuple(u_cache.shape) == (pool, HV, RING_SLOTS, V_DIM)
+    ring_slots = k_cache.shape[2] if k_cache.dim() == 4 else None
+    if ring_slots not in RING_SLOTS_SUPPORTED:
+        raise ValueError(
+            f"ring depth {ring_slots} unsupported: k_cache [pool, H, ring_slots, K] needs "
+            f"ring_slots in {RING_SLOTS_SUPPORTED}, got k_cache {tuple(k_cache.shape)}"
+        )
+    assert tuple(k_cache.shape) == (pool, H, ring_slots, K_DIM)
+    assert tuple(u_cache.shape) == (pool, HV, ring_slots, V_DIM)
     assert (
-        tuple(g_cache.shape) == (pool, HV, RING_SLOTS)
+        tuple(g_cache.shape) == (pool, HV, ring_slots)
         and g_cache.dtype == torch.float32
     )
     if scale is None:
         scale = 1.0 / math.sqrt(K_)
     # A verify row at P = flush_min - 1 appends up to T more rows (the caller advances P by 1..T per call), and
-    # P must never exceed nu = min(W_RING, RING_SLOTS - T): the window tiles hold W_RING rows, the T appends of a
-    # call land at slots P..P+T-1 of the RING_SLOTS-slot ring (beyond it they wrap onto the live window) and the
-    # kernel only reads the first nu window rows. The flush_min that is safe for any acceptance pattern is
-    # therefore nu - T + 1 = min(W_RING - T + 1, RING_SLOTS - 2 T + 1). At W_RING == 16 and at W_RING = 32 on the
-    # 64-slot ring it is W_RING - T + 1 (the ring has headroom). At W_RING == RING_SLOTS == 32 the default
-    # follows the ring (29 at T = 4 would be unsafe).
-    nu = min(W_RING, RING_SLOTS - T)
-    fm_safe = nu - T + 1  # = min(W_RING - T + 1, RING_SLOTS - 2 T + 1)
-    fm_max = (
-        W_RING - T + 1
-    )  # unchanged upper bound: single calls may use up to it (e.g. all rows verify)
+    # P must never exceed nu: the window tiles hold `window` rows, the T appends of a call land at slots P..P+T-1
+    # of the ring (beyond it they wrap onto the live window) and the kernel only reads the first nu window rows.
+    # The flush_min that is safe for any acceptance pattern is therefore nu - T + 1. On 64-slot rings window =
+    # W_RING = 32 and the ring has headroom (nu = 32); a 32-slot ring serves only the merged kernel's contract:
+    # a COMPAT_WINDOW = 16 row window, built as 16 rows (not nu = 32 - T) so it does the merged kernel's work.
+    # Deeper windows at 32 slots (flush_min > 17 - T) are not validated (a T = 1 call after a deep T = 4 step
+    # would present hist_len > nu, silently truncated) and are refused.
+    window = W_RING if ring_slots == RING_SLOTS else COMPAT_WINDOW
+    nu_full = min(W_RING, ring_slots - T)
+    nu = min(window, ring_slots - T)
+    fm_safe = nu - T + 1
+    fm_max = window - T + 1  # unchanged upper bound: single calls may use up to it
     if flush_min is None:
         # T = 1 appends one ring row per step, so a row flushes about every F + 1 steps: past one 16-row chunk the extra
         # window-row reads cost more than the flush writes they save (measured: F = 16 is 3 % faster than F = 32).
         flush_min = min(fm_safe, W_CHUNK) if T == 1 else fm_safe
+    if ring_slots != RING_SLOTS and flush_min > fm_max:
+        raise ValueError(
+            f"flush_min={flush_min} > {fm_max} (= {COMPAT_WINDOW + 1} - T) is not supported on "
+            f"{ring_slots}-slot rings: they run the merged kernel's contract only (16-row window); "
+            f"use 64-slot rings for flush_min up to {min(W_RING, RING_SLOTS - T) - T + 1}."
+        )
     assert 1 <= flush_min <= fm_max, (
-        f"flush_min={flush_min} outside [1, {fm_max}] (W_RING={W_RING}, RING_SLOTS={RING_SLOTS}, T={T}). "
+        f"flush_min={flush_min} outside [1, {fm_max}] (window={window}, ring_slots={ring_slots}, T={T}). "
         f"Omit flush_min for the safe default {fm_safe}."
     )
     if flush_min > fm_safe:
         warnings.warn(
-            f"flush_min={flush_min} > {fm_safe} (= nu - T + 1, nu = min(W_RING, RING_SLOTS - T)) is only safe if "
+            f"flush_min={flush_min} > {fm_safe} (= nu - T + 1, nu = min(W_RING, ring_slots - T)) is only safe if "
             f"every call advances the history by exactly T tokens; with partial acceptance a verify row can reach "
             f"P > nu = {nu}, whose appends overwrite the live window.",
             stacklevel=2,
         )
     if window_rows is None:
         window_rows = nu
+    if ring_slots != RING_SLOTS and not 1 <= window_rows <= nu:
+        raise ValueError(
+            f"window_rows={window_rows} outside [1, {nu}]: {ring_slots}-slot rings run the "
+            f"{COMPAT_WINDOW}-row window only; use 64-slot rings for deeper windows."
+        )
     assert 1 <= window_rows <= nu, (
-        f"window_rows={window_rows} outside [1, {nu}] (W_RING={W_RING}, RING_SLOTS={RING_SLOTS}, T={T})"
+        f"window_rows={window_rows} outside [1, {nu}] (window={window}, ring_slots={ring_slots}, T={T})"
     )
     pmax = (
-        0 if window_rows == nu else window_rows
+        0 if window_rows == nu_full else window_rows
     )  # 0: the whole window (the compile key of a full build)
     if initial_state_indices is None:
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=q.device)
@@ -2112,6 +2161,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         sr,
         sr_rounds,
         pmax,
+        ring_slots,
     )
     fn(
         q,
@@ -2136,6 +2186,6 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
     )
     if restart_hist_on_flush:
         flushed = hist_len >= flush_min
-        cache_base.copy_((cache_base + hist_len * flushed) & RING_MASK)
+        cache_base.copy_((cache_base + hist_len * flushed) & (ring_slots - 1))
         hist_len.masked_fill_(flushed, 0)
     return output

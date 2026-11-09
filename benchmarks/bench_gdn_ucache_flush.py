@@ -667,6 +667,14 @@ def main():
         "umma_ph10 / umma_lcg (UMMA with stochastic rounding)",
     )
     ap.add_argument(
+        "--ring",
+        type=int,
+        default=None,
+        choices=(32, 64),
+        help="umma_ring64 arms: ring depth (default 64; 32 runs the merged kernel's 16-row window, "
+        "flush_min 17 - T)",
+    )
+    ap.add_argument(
         "--flush-min",
         type=int,
         default=None,
@@ -765,7 +773,8 @@ def main():
         # the ring-64 kernel's own window / ring size and its default flush_min (nu - T + 1; 16 at T = 1)
         from flashinfer.gdn_kernels import gdn_replay_mtp_umma_ring64 as _r64
 
-        W, RING = _r64.W_RING, _r64.RING_SLOTS
+        RING = args.ring or _r64.RING_SLOTS
+        W = _r64.W_RING if RING == _r64.RING_SLOTS else _r64.COMPAT_WINDOW
         FLUSH_MIN = min(W, RING - T) - T + 1
         if T == 1:
             FLUSH_MIN = min(FLUSH_MIN, 16)
