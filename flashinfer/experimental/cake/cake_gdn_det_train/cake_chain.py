@@ -1240,7 +1240,7 @@ class Workspaces:
         if buffer is None:
             buffer = buffers[key] = torch.empty(shape, dtype=dtype, device=device)
             if len(buffers) > WORKSPACE_SHAPES_PER_ROLE:
-                del buffers[next(iter(buffers))]
+                buffers.pop(next(iter(buffers)), None)
         return buffer
 
 
@@ -1360,7 +1360,7 @@ def _dhu_tc_selected(
                                   segment_chunks=options.segment_chunks).get("select", False))  # fmt: skip
         if options.host_cache:
             if len(_DHU_AUTO) >= _DHU_AUTO_LIMIT:
-                del _DHU_AUTO[next(iter(_DHU_AUTO))]
+                _DHU_AUTO.pop(next(iter(_DHU_AUTO)), None)
             _DHU_AUTO[key] = hit
     return hit
 
@@ -1459,7 +1459,7 @@ def _sdt_selected(meta: ChunkMeta, segs: SegmentTable, num_v_heads: int, device_
         )
         if options.host_cache:
             if len(_SDT_AUTO) >= _SDT_AUTO_LIMIT:
-                del _SDT_AUTO[next(iter(_SDT_AUTO))]
+                _SDT_AUTO.pop(next(iter(_SDT_AUTO)), None)
             _SDT_AUTO[key] = hit
     return hit
 
@@ -4007,7 +4007,7 @@ def _chunk_meta(
     capturing = meta.chunk_start.is_cuda and torch.cuda.is_current_stream_capturing()
     if options.host_cache and not capturing:
         if len(_META_FRONT) >= _META_FRONT_LIMIT:
-            del _META_FRONT[next(iter(_META_FRONT))]
+            _META_FRONT.pop(next(iter(_META_FRONT)), None)
         _META_FRONT[key] = meta
     return meta
 

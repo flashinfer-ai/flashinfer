@@ -225,7 +225,7 @@ def placeholder(
     dims = tuple(int(s) for s in shape)
     view = base.expand(dims) if dims else base.view(())
     if len(_PLACEHOLDERS) >= _PLACEHOLDERS_LIMIT:
-        del _PLACEHOLDERS[next(iter(_PLACEHOLDERS))]
+        _PLACEHOLDERS.pop(next(iter(_PLACEHOLDERS)), None)
     _PLACEHOLDERS[key] = view
     return view
 
