@@ -184,7 +184,9 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
       int32_t intermidiateExpert[NumInterTopKPerThread];
       for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE) {
         int ii = i / WARP_SIZE;
-        if (i < NumInterTopK) {
+        // Each expert warp wrote only the first `topk` of its MaxNumTopExperts slots above;
+        // the remaining slots hold stale shared memory and must not enter the reduction.
+        if (i < NumInterTopK && (i % MaxNumTopExperts) < topk) {
           intermidiateScore[ii] = smemInterTopScores[i];
           intermidiateExpert[ii] = smemInterTopExperts[i];
         } else {

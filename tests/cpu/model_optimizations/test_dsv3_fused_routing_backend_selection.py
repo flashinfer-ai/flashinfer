@@ -6,6 +6,7 @@ import torch
 import flashinfer.fused_moe.fused_routing_dsv3 as fused_routing
 from flashinfer.fused_moe.fused_routing_dsv3 import (
     _check_cake_dsv3_fused_routing_backend_supported,
+    _check_dsv3_fused_routing_supported,
     _device_capability,
     _is_cake_dsv3_fused_routing_supported,
 )
@@ -79,6 +80,64 @@ def test_cake_backend_rejects_single_group_above_boundary():
 @pytest.mark.cpu_only
 def test_cake_backend_preserves_source_single_group_topk_constraint():
     assert not _supported(num_experts=256, n_group=1, topk_group=1, topk=8)
+
+
+def _check_default_contract(num_experts, n_group, topk_group, topk):
+    return _check_dsv3_fused_routing_supported(
+        torch.empty((1, num_experts), dtype=torch.float32),
+        torch.empty((num_experts,), dtype=torch.float32),
+        n_group,
+        topk_group,
+        topk,
+        1.0,
+        torch.empty((1, topk), dtype=torch.float32),
+        torch.empty((1, topk), dtype=torch.int32),
+        True,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_experts", [64, 128, 256, 384])
+@pytest.mark.parametrize("topk", [1, 4, 8])
+def test_default_contract_accepts_single_group_topk(num_experts, topk):
+    assert _check_default_contract(num_experts, 1, 1, topk)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk",
+    [
+        (256, 8, 4, 8),
+        (128, 4, 1, 8),
+        (96, 3, 2, 5),
+    ],
+)
+def test_default_contract_accepts_grouped_capacity(
+    num_experts, n_group, topk_group, topk
+):
+    assert _check_default_contract(num_experts, n_group, topk_group, topk)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk",
+    [
+        (8, 8, 4, 8),
+        (32, 8, 1, 8),
+        (4, 1, 1, 8),
+    ],
+)
+def test_default_contract_rejects_insufficient_capacity(
+    num_experts, n_group, topk_group, topk
+):
+    with pytest.raises(ValueError, match="must be >= topk"):
+        _check_default_contract(num_experts, n_group, topk_group, topk)
+
+
+@pytest.mark.cpu_only
+def test_default_contract_rejects_topk_group_above_n_group():
+    with pytest.raises(ValueError, match="must be <= n_group"):
+        _check_default_contract(256, 4, 8, 8)
 
 
 def _selected_backend(monkeypatch, backend=None):
