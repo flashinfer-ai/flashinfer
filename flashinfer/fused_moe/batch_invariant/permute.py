@@ -22,8 +22,8 @@
   whole histogram (``E x T k`` shared-memory atomics); the two-launch form reads every slot three times in all;
 * ``gather``: ``x_perm[p, :] = x[src[p] // k, :]`` in 16-byte vectors (the bf16 class, dense packing).
 
-An expert id outside ``[0, E)`` (a caller's dropped slot) is dropped: no plan counts it, its ``dest`` is ``-1``,
-``src`` holds ``-1`` past the valid rows and the gather skips those rows.
+An expert id outside ``[0, E)`` (a caller's dropped slot) is dropped: no plan counts it, its ``dest`` (and ``dest_pad``) is
+``-1``, ``src`` (and ``pos_pad``) holds ``-1`` past the valid rows and the gather skips those rows.
 
 Every kernel here launches with programmatic dependent launch (``use_pdl``): it waits for its predecessor's grid
 (``griddepcontrol.wait``) before touching dependent data and lets its successor start its prologue once its own work
@@ -288,6 +288,8 @@ class PlanKernel:
             # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
             for p in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
                 mSrc[p] = Int32(-1)
+                if cutlass.const_expr(self.dual):
+                    mPosPad[p] = Int32(-1)
         base = s_off[e]
         base_pad = Int32(0)
         if cutlass.const_expr(self.dual):
@@ -508,6 +510,8 @@ class PlanFinishKernel:
             # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
             for p in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], PLAN_THREADS):
                 mSrc[p] = Int32(-1)
+                if cutlass.const_expr(self.dual):
+                    mPosPad[p] = Int32(-1)
         for c in cutlass.range_constexpr(PLAN_IDS_PER_THREAD):
             i = b * PLAN_BLOCK + c * PLAN_THREADS + tidx
             if i < n:
