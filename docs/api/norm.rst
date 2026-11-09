@@ -352,11 +352,13 @@ rules above). Its entry points run only the standalone non-deterministic
 kernels (``flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train``).
 ``y``, ``dx``, ``dz`` and an FP32 weight gradient repeat bit for bit from run
 to run everywhere.  A BF16 weight gradient repeats bit for bit too, except in
-the fused band (below: past 512 rows on SM100 and SM107, past 256 rows on
-SM103, up to 1000 rows per SM), where its last bits may vary from run to run.
-A band runs a backward whose weight gradient may vary only where that makes
-the checkpointed training step (2 x forward + backward) at least 3 % faster
-than the repeatable backward, which runs past the fused band.  ``y`` is the
+the fused band (below: past 512 rows on SM100, past 256 rows on SM103, up to
+1000 rows per SM; on SM107 past 64 up to 256 rows per SM), where its last
+bits may vary from run to run.  A band runs a backward whose weight gradient
+may vary only where that makes the checkpointed training step (2 x forward +
+backward) at least 3 % faster than the repeatable backward, which runs past
+the fused band (on SM107 also before it, past 512 rows up to 64 rows per
+SM).  ``y`` is the
 deterministic package's bits where a pipelined forward runs (below) and not
 elsewhere; ``dx`` and ``dz`` are the same bits in every band but the fused and
 the repeatable ones (below: a BF16 weight gradient), within one BF16 unit in
@@ -452,9 +454,10 @@ FlashInfer 2e989556, and against the deterministic package in this release
   ``x`` and ``z`` hold packed rows, on SM107 the block two ahead.
 * Past the one-cluster backwards a BF16 weight gradient (or
   ``compute_grad_weight=False``) runs the fused backward on every
-  architecture: past 512 rows on SM100 and SM107, past 256 rows on SM103, up
-  to 1000 rows per SM, where its varying weight gradient is to make the
-  checkpointed step at least 3 % faster than the repeatable backward.  An
+  architecture: past 512 rows on SM100, past 256 rows on SM103, up to 1000
+  rows per SM, and on SM107 past 64 up to 256 rows per SM, where its varying
+  weight gradient is to make the checkpointed step at least 3 % faster than
+  the repeatable backward.  An
   FP32 weight gradient runs no fused backward.  It runs the deterministic
   package's fused backward's schedule and row arithmetic: 256-thread CTAs (16
   lanes a row, 16-row blocks, ``min(ceil(rows / 16), 4 * SMs)`` of them),
@@ -486,8 +489,9 @@ FlashInfer 2e989556, and against the deterministic package in this release
   weight gradient there raises PyTorch's alert (rule 3); no other call
   alerts.
 * Past 1000 rows per SM a BF16 weight gradient (or
-  ``compute_grad_weight=False``) runs the repeatable backward on every
-  architecture, this package's copy of the deterministic package's BF16
+  ``compute_grad_weight=False``) runs the repeatable backward on SM100 and
+  SM103 (on SM107 past 512 rows up to 64 rows per SM and past 256 rows per
+  SM), this package's copy of the deterministic package's BF16
   backward: the fused backward's grid and row arithmetic, its CTAs claiming
   the blocks in chunks whose rows are fixed by the row count and the grid,
   each chunk's weight-gradient terms added exactly into fixed-point digits in

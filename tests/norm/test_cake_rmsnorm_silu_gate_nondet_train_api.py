@@ -26,9 +26,10 @@ runs only the non-deterministic kernels; no entry point takes a
 the deterministic package ``flashinfer.cake_rmsnorm_silu_gate_det_train``.
 
 Every output of the package repeats bit for bit, except a BF16 weight
-gradient of the fused backward (``bwd_bf16_fused``, the band past the
-small-row bands of ``BACKWARD_BANDS`` up to the repeatable backward's band on
-every architecture; an FP32 weight gradient runs no fused backward) and of
+gradient of the fused backward (``bwd_bf16_fused``, a band of
+``BACKWARD_BANDS`` past the small-row bands on every architecture, on sm_107a
+between two repeatable bands; an FP32 weight gradient runs no fused
+backward) and of
 the row-claims backwards
 (``bwd_bf16_rc``, ``bwd_bf16_rc_mid``, where a band runs them), whose CTAs
 claim 16-row blocks at run time and add FP64 atomics (grid kind
@@ -40,7 +41,8 @@ so its ``dx`` and ``dz`` are the deterministic package's bits at every grid
 while that package routes that program on the device
 (:func:`assert_det_bits_where_fused`); its ``dw`` need not be.  The
 repeatable backward (``bwd_bf16_rep``, :func:`_rep`, the last BF16 band on
-every architecture) is that program itself, so its ``dx``, ``dz`` and ``dw``
+every architecture and on sm_107a also the band before the fused one) is that
+program itself, so its ``dx``, ``dz`` and ``dw``
 (accumulated too) are the deterministic package's bits.  In every other
 band the backward writes ``dx`` and ``dz`` with this package's one row
 arithmetic; in every band they are held to FP64 (within one BF16 ulp plus
@@ -961,7 +963,7 @@ def test_no_call_alerts_under_deterministic_algorithms(
     calls = []
     varying = set()
     for role, dtype in (("bwd_bf16", torch.bfloat16), ("bwd_f32", torch.float32)):
-        for band, (name, first, _) in _band_modules(arch, role, sms).items():
+        for band, name, first, _ in _band_modules(arch, role, sms):
             if suite._varies(name):
                 varying.add(name)
                 continue
@@ -1557,9 +1559,9 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
     }
     for dtype in (torch.bfloat16, torch.float32):
         role = _role_of(dtype)
-        for band in _band_modules(arch, role, sms):
-            if (role, band) not in ran:
-                T, H = suite._band_shape(band)
+        for band, _, first, last in _band_modules(arch, role, sms):
+            if (role, (band, first)) not in ran:
+                T, H = suite._range_shape(first, last)
                 cases.append((T, H, dtype, False))
     for i, (T, H, dtype, accumulate) in enumerate(cases):
         x, z, w, dy = suite.make(T, H, seed=20 + i)
@@ -1859,26 +1861,42 @@ def _band_role_dtype(band: str) -> torch.dtype:
 
 def _band_modules(
     arch: str, role: str, sms: int
-) -> dict[str, tuple[str, int, int | None]]:
-    """``band role -> (module, first rows, last rows or None)`` of each
+) -> list[tuple[str, str, int, int | None]]:
+    """``(band role, module, first rows, last rows or None)`` of each
     ``loader.BACKWARD_BANDS`` band of the backward ``role`` (``bwd_bf16`` or
     ``bwd_f32``) on ``arch`` with ``sms`` SMs that runs at least one row
     count, in order (``suite._backward_bands``): the band's routed module
     over the rows past the ends of the bands before it up to its own end
-    (``suite._band_end``); the last band has no last row."""
-    return {
-        band: (loader.route_module(arch, band), first, last)
+    (``suite._band_end``); the last band has no last row.  A band role may
+    hold more than one band (on sm_107a the BF16 repeatable role runs on both
+    sides of the fused band)."""
+    return [
+        (band, loader.route_module(arch, band), first, last)
         for band, first, last in suite._backward_bands(arch, role, sms)
-    }
+    ]
 
 
-def _band_of(arch: str, role: str, rows: int, sms: int) -> str:
-    """The ``loader.BACKWARD_BANDS`` band role (:func:`_band_modules`) of the
-    backward ``role`` that holds ``rows`` rows on ``arch`` with ``sms``
-    SMs."""
-    for band, (_, first, last) in _band_modules(arch, role, sms).items():
+def _band_occurrence(
+    arch: str, role: str, sms: int, band: str, nth: int = 1
+) -> tuple[str, int, int | None] | None:
+    """``(module, first rows, last rows or None)`` of the ``nth`` band of the
+    band role ``band`` among :func:`_band_modules`, or ``None`` where the
+    role has fewer such bands on ``arch`` with ``sms`` SMs."""
+    found = [
+        (module, first, last)
+        for name, module, first, last in _band_modules(arch, role, sms)
+        if name == band
+    ]
+    return found[nth - 1] if len(found) >= nth else None
+
+
+def _band_of(arch: str, role: str, rows: int, sms: int) -> tuple[str, int]:
+    """``(band role, first rows)`` of the ``loader.BACKWARD_BANDS`` band
+    (:func:`_band_modules`) of the backward ``role`` that holds ``rows`` rows
+    on ``arch`` with ``sms`` SMs."""
+    for band, _, first, last in _band_modules(arch, role, sms):
         if first <= rows and (last is None or rows <= last):
-            return band
+            return band, first
     raise AssertionError(f"no {role} band of {arch} holds {rows} rows")
 
 
@@ -1892,7 +1910,7 @@ def _start_rows(arch: str, name: str, sms: int, packed: bool = True) -> int:
     role = loader.MODULES[name]["role"]
     if role.startswith("bwd"):
         call_role = "bwd_f32" if role.startswith("bwd_f32") else "bwd_bf16"
-        for module, first, _ in _band_modules(arch, call_role, sms).values():
+        for _, module, first, _ in _band_modules(arch, call_role, sms):
             if module == name:
                 return first
         raise AssertionError(f"{arch} has no backward band of {role}")
@@ -2384,35 +2402,64 @@ _BAND_KINDS = {
     }
     for band in BACKWARD_BAND_ROLES
 }
-# The band roles with an end (``last``) on some architecture (every band but
-# the last one of a role).
-_BANDS_WITH_AN_END = {
-    band
-    for roles in loader.BACKWARD_BANDS.values()
-    for bands in roles.values()
-    for last, band in bands
-    if last is not None
-}
+
+
+def _band_nths() -> dict[tuple[str, int], bool]:
+    """``(band role, n) -> whether it has an end`` of the ``n``-th band of each
+    band role in a role's table on some architecture (a band role may hold
+    more than one band: on sm_107a the BF16 repeatable role runs on both sides
+    of the fused band); a band has an end (``last``) where some architecture
+    gives it one."""
+    nths: dict[tuple[str, int], bool] = {}
+    for roles in loader.BACKWARD_BANDS.values():
+        for bands in roles.values():
+            seen: dict[str, int] = {}
+            for last, band in bands:
+                seen[band] = seen.get(band, 0) + 1
+                key = (band, seen[band])
+                nths[key] = nths.get(key, False) or last is not None
+    return nths
+
+
+_BAND_NTHS = _band_nths()
+# The ``(band role, n)`` bands in table order, and those with an end (``last``)
+# on some architecture (every band but the last one of a role).
+BACKWARD_BAND_NTHS = [
+    (band, nth) for band in BACKWARD_BAND_ROLES for b, nth in _BAND_NTHS if b == band
+]
+_BANDS_WITH_AN_END = {key for key, has_end in _BAND_NTHS.items() if has_end}
+
+
+def _band_id(band: str, nth: int) -> str:
+    """The test id of the ``nth`` band of the band role ``band``: the role
+    for the first one, the role and ``nth`` for a later one."""
+    return band if nth == 1 else f"{band}{nth}"
+
+
 # The edges of the backward's bands on this device (:func:`_band_modules`):
-# (band role, edge).  ``first`` and ``last`` are a band's first and last rows
+# (band role, nth, edge).  ``first`` and ``last`` are a band's first and last rows
 # (``last`` where the band has an end); for a band of a chunked backward
 # (grid kind ``chunks``) ``chunks`` is the program's last rows of chunks of
 # ``k`` blocks, ``rows_per_block * chunk_limit * k`` for the fewest ``k`` in
 # its band, and ``chunks+1`` its first rows of ``k + 1`` blocks, where its
 # band holds them.
 BACKWARD_BAND_EDGES = [
-    pytest.param(band, edge, id=f"{band}-{edge}")
-    for band in BACKWARD_BAND_ROLES
+    pytest.param(band, nth, edge, id=f"{_band_id(band, nth)}-{edge}")
+    for band, nth in BACKWARD_BAND_NTHS
     for edge in ("first", "last", "chunks", "chunks+1")
-    if (edge != "last" or band in _BANDS_WITH_AN_END)
+    if (edge != "last" or (band, nth) in _BANDS_WITH_AN_END)
     and (not edge.startswith("chunks") or "chunks" in _BAND_KINDS[band])
+]
+# Each band of each band role (``BACKWARD_BAND_NTHS``) as ``(band, nth)``.
+BACKWARD_BAND_CASES = [
+    pytest.param(band, nth, id=_band_id(band, nth)) for band, nth in BACKWARD_BAND_NTHS
 ]
 
 
 @requires_device
-@pytest.mark.parametrize("band,edge", BACKWARD_BAND_EDGES)
+@pytest.mark.parametrize("band,nth,edge", BACKWARD_BAND_EDGES)
 def test_backward_band_edges_within_the_deterministic_error(
-    band, edge, determinism_setting, monkeypatch: pytest.MonkeyPatch
+    band, nth, edge, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """At the first and the last rows of each ``BACKWARD_BANDS`` band on this
     device's SM count (:func:`_band_modules`: the small-row backwards, the
@@ -2427,10 +2474,10 @@ def test_backward_band_edges_within_the_deterministic_error(
     sms = _sm_count()
     dw_dtype = _band_role_dtype(band)
     role = _role_of(dw_dtype)
-    bands = _band_modules(arch, role, sms)
-    if band not in bands:
-        pytest.skip(f"{arch} routes no {band} band on {sms} SMs")
-    name, first, last = bands[band]
+    found = _band_occurrence(arch, role, sms, band, nth)
+    if found is None:
+        pytest.skip(f"{arch} routes no {_band_id(band, nth)} band on {sms} SMs")
+    name, first, last = found
     if edge == "first":
         rows = first
     elif edge == "last":
@@ -2500,7 +2547,7 @@ def test_backward_shapes_within_the_deterministic_error(
     x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=24)
     rows = x.numel() // D
     name = loader.module_for_rows(arch, role, rows, sms)
-    programs = {module for module, _, _ in _band_modules(arch, role, sms).values()}
+    programs = {module for _, module, _, _ in _band_modules(arch, role, sms)}
     assert name in programs, (name, programs)
     _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch)
 
@@ -2572,9 +2619,9 @@ def test_layouts_in_the_row_claims_and_claimed_backward_bands_within_the_determi
 
 
 @requires_device
-@pytest.mark.parametrize("band", BACKWARD_BAND_ROLES)
+@pytest.mark.parametrize("band,nth", BACKWARD_BAND_CASES)
 def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
-    band, determinism_setting, monkeypatch: pytest.MonkeyPatch
+    band, nth, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Infinite ``grad_out`` in rows that are not the last, in each
     ``BACKWARD_BANDS`` band of this device (:func:`_band_modules`: a band's
@@ -2595,10 +2642,10 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
     sms = _sm_count()
     dw_dtype = _band_role_dtype(band)
     role = _role_of(dw_dtype)
-    bands = _band_modules(arch, role, sms)
-    if band not in bands:
-        pytest.skip(f"{arch} routes no {band} band on {sms} SMs")
-    name, first, last = bands[band]
+    found = _band_occurrence(arch, role, sms, band, nth)
+    if found is None:
+        pytest.skip(f"{arch} routes no {_band_id(band, nth)} band on {sms} SMs")
+    name, first, last = found
     rows = first + 4097 if last is None else last
     assert loader.module_for_rows(arch, role, rows, sms) == name
     x, z, w, dy = suite.make(rows, 1, layout="flat", seed=27)
@@ -2698,9 +2745,9 @@ def _last_block_rows(block: int, first: int, last: int | None) -> dict[str, int]
 
 @requires_device
 @pytest.mark.parametrize("count", ["rem1", "half", "remmax"])
-@pytest.mark.parametrize("band", BACKWARD_BAND_ROLES)
+@pytest.mark.parametrize("band,nth", BACKWARD_BAND_CASES)
 def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
-    count, band, determinism_setting, monkeypatch: pytest.MonkeyPatch
+    count, band, nth, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Infinite ``grad_out`` in the last row, at row counts that are not a
     multiple of the program's row block (``_last_block_rows``: one row, half
@@ -2723,10 +2770,10 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
     sms = _sm_count()
     dw_dtype = _band_role_dtype(band)
     role = _role_of(dw_dtype)
-    bands = _band_modules(arch, role, sms)
-    if band not in bands:
-        pytest.skip(f"{arch} routes no {band} band on {sms} SMs")
-    name, first, last = bands[band]
+    found = _band_occurrence(arch, role, sms, band, nth)
+    if found is None:
+        pytest.skip(f"{arch} routes no {_band_id(band, nth)} band on {sms} SMs")
+    name, first, last = found
     block = _block_rows(name)
     rows = _last_block_rows(block, first, last)[count]
     if not first <= rows <= (last if last is not None else rows):
@@ -2959,7 +3006,7 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
         pytest.skip(f"{arch} routes no {band} module")
     sms = _sm_count()
     if role != "fwd" and name not in {
-        module for module, _, _ in _band_modules(arch, role, sms).values()
+        module for _, module, _, _ in _band_modules(arch, role, sms)
     }:
         pytest.skip(f"no band of {arch} on {sms} SMs runs {band}")
     strided = role == "fwd"

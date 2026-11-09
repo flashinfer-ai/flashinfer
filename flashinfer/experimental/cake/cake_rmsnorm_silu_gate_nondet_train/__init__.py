@@ -69,9 +69,10 @@ the 128-thread CTA of the deterministic backward at ``2e989556`` a CTA) adds
 that backward's chunk partials in its reduction order in FP64; the short backward
 of a BF16 weight gradient (256-thread CTAs) has each
 CTA finish 8 columns from every CTA's FP32 partials in rank order in FP64.
-Past its small-row bands, up to a count of rows per SM, a call with a BF16
+Past its small-row bands, in a band of rows per SM, a call with a BF16
 weight gradient runs the fused backward (``bwd_bf16_fused``, on every
-architecture; an FP32 weight gradient runs no fused backward): the
+architecture: up to 1000 rows per SM on sm_100a and sm_103a, past 64 up to
+256 rows per SM on sm_107a; an FP32 weight gradient runs no fused backward): the
 deterministic package's fused backward's schedule and row arithmetic,
 256-thread CTAs of 16-row blocks, 16 lanes a row, at most 4 CTAs per SM,
 which claim the blocks from the workspace's claim counter in chunks, with
@@ -82,9 +83,10 @@ pairs, to FP64 accumulators with atomics, and the CTA that arrives last
 rounds the sum once, so the sum's order, and the BF16 rounding of its last
 bits, depend on scheduling; its error stays within the family's budget
 (``dw`` within ``|dw64| * 2^-7 + sum|terms| * 2^-20`` of the FP64 sum
-``dw64`` of its terms).  Past the fused band a call with a BF16
-weight gradient runs the repeatable backward (``bwd_bf16_rep``, on every
-architecture), this package's copy of the deterministic package's BF16
+``dw64`` of its terms).  Past the fused band (on sm_107a also before it,
+up to 64 rows per SM) a call with a BF16 weight gradient runs the
+repeatable backward (``bwd_bf16_rep``, on every architecture), this
+package's copy of the deterministic package's BF16
 backward: the fused backward's schedule and row arithmetic, the CTAs
 claiming the blocks in chunks whose rows are fixed by the row count and the
 grid, each chunk's weight-gradient terms added exactly into fixed-point
@@ -242,7 +244,9 @@ Host design (the input layout rules are the deterministic package's):
   holds (small-row bands by a count of rows, the others by rows per SM): the
   small-row backwards, then for a BF16 weight gradient the fused backward
   past them up to a count of rows per SM and the repeatable backward past
-  it, on every architecture; for an FP32 weight gradient a static
+  it (on sm_107a the repeatable backward up to 64 rows per SM, the fused
+  backward up to 256 and the repeatable backward past it); for an FP32
+  weight gradient a static
   backward up to at most 4 row blocks a
   CTA (256 rows per SM; on sm_107a over 4 window copies plus occupancy words,
   one wave at most) and the claimed backward (``_mid``) past it;
@@ -1041,7 +1045,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     last rounds the exact sum once into ``dw`` (adding ``grad_weight``'s value
     first when accumulating; FP32, then BF16 for a BF16 ``dw``) and zeroes the
     workspace.  The BF16 bands past the small-row ones run the fused backward
-    (``bwd_bf16_fused``) up to a count of rows per SM: ``dx`` and ``dz`` the
+    (``bwd_bf16_fused``) in a band of rows per SM (on sm_107a past 64 up to
+    256; the repeatable backward runs below it there): ``dx`` and ``dz`` the
     deterministic package's bits at any grid, its weight gradient FP32 runs
     of rows added to FP64 accumulators with atomics, ``dw`` within the
     family's budget but its last bits may vary from run to run, and so do the

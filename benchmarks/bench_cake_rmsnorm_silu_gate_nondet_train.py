@@ -44,14 +44,14 @@ that its mid, long, extra-long or pipelined forward (its copy of the
 deterministic forward) by bands of rows per SM (``cake_jit.FORWARD_BANDS``).
 Its backward runs one cluster of 16 CTAs for few rows, else one kernel by bands
 of rows per SM (``cake_jit.BACKWARD_BANDS``).  A BF16 weight gradient (the one
-timed here) runs, on SM100 and SM107, the short backward (one cluster, a
-fixed-order sum) up to 256 rows, the exact tiny backward (one cluster, the bits
-of the deterministic pair at FlashInfer 2e989556) up to 512 rows and past that
-the fused backward (256-thread CTAs of 16-row blocks, at most 4 per SM) up to
-1000 rows per SM; on SM103 the short backward up to 256 rows and the fused
-backward past that up to 1000 rows per SM; past 1000 rows per SM, on every
-architecture, the repeatable backward (its copy of the deterministic
-package's backward, the same grid; its ``dw`` repeats its bits).
+timed here) runs the short backward (one cluster, a fixed-order sum) up to 256
+rows and, on SM100 and SM107, the exact tiny backward (one cluster, the bits of
+the deterministic pair at FlashInfer 2e989556) up to 512 rows.  Past that, on
+SM100 and SM103, it runs the fused backward (256-thread CTAs of 16-row blocks,
+at most 4 per SM) up to 1000 rows per SM and the repeatable backward (its copy
+of the deterministic package's backward, the same grid; its ``dw`` repeats its
+bits) past it; on SM107 the repeatable backward up to 64 rows per SM, the
+fused backward up to 256 and the repeatable backward past it.
 An FP32 weight gradient runs the exact tiny backward up to 512 rows, the
 static backward up to 256 rows per SM on SM100 and SM103 (64 on SM107) and the
 claimed backward past that.  At ``--heads 48`` the default token counts reach
@@ -128,8 +128,8 @@ STAGES = ("fwd", "bwd", "ckpt")
 # - 152-SM GB300 (sm_103a): 1 and 5 tokens the short backward; 7 to 2048 the
 #   fused backward; 4097 and more the repeatable backward.
 # - 212-SM R200 (sm_107a): 1 and 5 tokens the short backward; 7 the exact tiny
-#   backward; 16 to 4097 the fused backward; 30000 and more the repeatable
-#   backward.
+#   backward; 16 and 129 the repeatable backward; 1031 the fused backward;
+#   2048 and more the repeatable backward.
 TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 2048, 4097)
 
 

@@ -36,8 +36,8 @@ and the repeatable backwards at 1, 3 and 7 CTAs; the repeatable backward's
 weight gradient the bits of its grid, whose chunks follow it), a workspace
 reused across shapes; so must a BF16 weight gradient of every backward but
 the fused backward (``bwd_bf16_fused``, which runs a BF16 weight gradient's
-rows past the small-row bands of ``BACKWARD_BANDS`` up to the repeatable
-backward's band on every architecture) and the row-claims backwards (``_rc``
+rows in a band of ``BACKWARD_BANDS`` past the small-row bands on every
+architecture, on sm_107a between two repeatable bands) and the row-claims backwards (``_rc``
 and ``_rc_mid``, :func:`_varies`), whose CTAs claim 16-row blocks at run time
 and add FP32 runs of rows with FP64 atomics,
 so that their BF16 weight gradient may vary in its last bits from run to run:
@@ -386,12 +386,34 @@ def _band_shape(band: str) -> tuple[int, int] | None:
     """``(T, H)`` of the fewest rows in the ``BACKWARD_BANDS`` band of the
     backward role ``band`` on this device as tokens of 48 heads, else (a
     band narrower than that) the band's first rows as tokens of one head;
-    ``None`` where this device routes no such band."""
+    ``None`` where this device routes no such band.  The first band of the
+    role where it has more than one (on sm_107a the BF16 repeatable role
+    runs on both sides of the fused band; :func:`_range_shape` takes any)."""
     tokens = _band_tokens(band)
     if tokens is not None:
         return tokens, 48
     tokens = _band_tokens(band, heads=1)
     return None if tokens is None else (tokens, 1)
+
+
+def _range_shape(first: int, last: int | None) -> tuple[int, int]:
+    """``(T, H)`` of the fewest rows from ``first`` to ``last`` (``None``: no
+    end) as tokens of 48 heads, else (a range narrower than that) ``first``
+    as tokens of one head."""
+    tokens = -(-first // 48)
+    if last is None or tokens * 48 <= last:
+        return tokens, 48
+    return first, 1
+
+
+def _device_band_first(rows: int, dw_dtype: torch.dtype) -> tuple[str, int]:
+    """``(role, first rows)`` of the band of :func:`_device_bands` that holds
+    ``rows`` rows of a ``dw_dtype`` weight gradient on this device."""
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    for _band, first, last in _device_bands(role):
+        if first <= rows and (last is None or rows <= last):
+            return role, first
+    raise AssertionError(f"no {role} band of this device holds {rows} rows")
 
 
 def _varies(name: str) -> bool:
@@ -1032,14 +1054,12 @@ def test_workspace_reused_across_shapes_without_reset():
     bands = {
         band for role in ("bwd_bf16", "bwd_f32") for band, _, _ in _device_bands(role)
     }
-    listed = {
-        loader.MODULES[_backward_module(T * H, dtype)]["role"]
-        for T, H, dtype, _ in cases
-    }
-    for band in sorted(bands - listed):
-        T, H = _band_shape(band)
-        dtype = torch.float32 if band.startswith("bwd_f32") else torch.bfloat16
-        cases.append((T, H, dtype, False))
+    listed = {_device_band_first(T * H, dtype) for T, H, dtype, _ in cases}
+    for role, dtype in (("bwd_bf16", torch.bfloat16), ("bwd_f32", torch.float32)):
+        for _band, first, last in _device_bands(role):
+            if (role, first) not in listed:
+                T, H = _range_shape(first, last)
+                cases.append((T, H, dtype, False))
     ran = set()
     for i, (T, H, dtype, accumulate) in enumerate(cases):
         name = _backward_module(T * H, dtype)
@@ -1129,9 +1149,8 @@ def test_workspace_errors_in_every_band(role, launches):
     nbytes = workspace_for(1, torch.device("cuda")).numel()
     bands = _device_bands(role)
     assert bands, role
-    for band, _first, _last in bands:
-        shape = _band_shape(band)
-        assert shape is not None, (role, band)
+    for band, first, last in bands:
+        shape = _range_shape(first, last)
         x, z, w, dy = make(*shape, seed=17)
         assert _backward_module(shape[0] * shape[1], dw_dtype) == _routes()[band]
         for bad in _unfit_workspaces(nbytes):
@@ -3295,10 +3314,13 @@ def test_no_entry_point_alerts_under_deterministic_algorithms(warn_only, launche
     module of this device is among the launches."""
     forward_rows = _forward_rows()
     assert len(forward_rows) >= 3, forward_rows
-    bands = [
-        band for role in ("bwd_bf16", "bwd_f32") for band, _, _ in _device_bands(role)
+    ranges = [
+        (band, first, last)
+        for role in ("bwd_bf16", "bwd_f32")
+        for band, first, last in _device_bands(role)
     ]
-    shapes = list(dict.fromkeys(_band_shape(band) for band in bands))
+    bands = [band for band, _, _ in ranges]
+    shapes = list(dict.fromkeys(_range_shape(first, last) for _, first, last in ranges))
     cases = [make(T, H, seed=69 + i) for i, (T, H) in enumerate(shapes)]
     repeats = [not _dw_varies(T * H) for T, H in shapes]
     assert any(repeats), shapes

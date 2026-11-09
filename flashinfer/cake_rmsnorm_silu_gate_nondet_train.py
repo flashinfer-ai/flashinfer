@@ -38,10 +38,12 @@ values.
 same inputs on the same device give the same bits on every call, whatever the
 order in which CTAs run and the work beside the call on other streams, and
 whatever the grid.  A BF16 weight gradient repeats bit for bit too, whatever
-the grid but in the repeatable band (below: past 1000 rows per SM; there the
-rows and the SM count fix the grid and the bits), except in the fused band
-(below: past 512 rows on SM100 and SM107, past 256 rows on SM103, up to 1000
-rows per SM), where its last bits may vary from run to run.  A band runs a
+the grid but in the repeatable bands (below: past 1000 rows per SM on SM100
+and SM103; on SM107 past 512 rows up to 64 rows per SM and past 256; there
+the rows and the SM count fix the grid and the bits), except in the fused
+band (below: past 512 rows on SM100, past 256 rows on SM103, up to 1000 rows
+per SM; on SM107 past 64 up to 256 rows per SM), where its last bits may vary
+from run to run.  A band runs a
 backward whose weight gradient may vary only where that makes the
 checkpointed training step (2 x forward + backward) at least 3 % faster than
 the repeatable backward.  The kernels are those of the standalone package
@@ -103,8 +105,10 @@ the repeatable backward.  The kernels are those of the standalone package
   per-thread prefetches), on SM107 it warms the block two ahead.
 - Past the one-cluster backwards, a BF16 weight gradient (or
   ``compute_grad_weight=False``) runs the fused backward on every
-  architecture: past 512 rows on SM100 and SM107, past 256 rows on SM103, up
-  to 1000 rows per SM.  An FP32 weight gradient runs no fused backward.  It
+  architecture: past 512 rows on SM100, past 256 rows on SM103, up to 1000
+  rows per SM; on SM107 past 64 up to 256 rows per SM, where it makes the
+  step faster than the repeatable backward.  An FP32 weight gradient runs no
+  fused backward.  It
   runs the deterministic package's fused backward's schedule and row
   arithmetic: 256-thread CTAs (16 lanes a row, 16-row blocks,
   ``min(ceil(rows / 16), 4 * SMs)`` of them), which claim the blocks in chunks
@@ -116,8 +120,9 @@ the repeatable backward.  The kernels are those of the standalone package
   The order of that sum depends on scheduling, so the BF16 weight gradient's
   last bits may vary from run to run, within the family's error budget.
 - Past 1000 rows per SM a BF16 weight gradient (or
-  ``compute_grad_weight=False``) runs the repeatable backward on every
-  architecture, this package's copy of the deterministic package's BF16
+  ``compute_grad_weight=False``) runs the repeatable backward on SM100 and
+  SM103 (on SM107 past 512 rows up to 64 rows per SM and past 256), this
+  package's copy of the deterministic package's BF16
   backward: the fused backward's grid and row arithmetic, its CTAs claiming
   the blocks in chunks whose rows are fixed by the row count and the grid,
   each chunk's weight-gradient terms added exactly into fixed-point digits in
@@ -469,14 +474,16 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     deterministic backward's), else up to 512 rows (the exact tiny backward,
     the bits of the deterministic backward at FlashInfer 2e989556; SM103 runs
     it for an FP32 ``dw`` only).  The fused band (a BF16 ``dw`` or
-    ``compute_grad_weight=False`` past 512 rows on SM100 and SM107 and past
-    256 rows on SM103, up to 1000 rows per SM; an FP32 ``dw`` has none) runs
+    ``compute_grad_weight=False`` past 512 rows on SM100 and past 256 rows on
+    SM103 up to 1000 rows per SM, on SM107 past 64 up to 256 rows per SM; an
+    FP32 ``dw`` has none) runs
     the fused backward, the deterministic package's fused backward's schedule
     and row arithmetic (``dx`` and ``dz`` its bits at any grid) with FP32 runs
     of rows added to FP64 accumulators with atomics: that ``dw`` stays within
     the family's error budget, but its last bits may vary from run to run.
-    Past 1000 rows per SM the repeatable backward, this package's copy of the
-    deterministic package's backward, adds each chunk's weight-gradient terms
+    Past 1000 rows per SM (on SM107 past 512 rows up to 64 rows per SM and past
+    256) the repeatable backward, this package's copy of the deterministic
+    package's backward, adds each chunk's weight-gradient terms
     exactly into fixed-point digits in the workspace: ``dx``, ``dz`` and
     ``dw`` the deterministic package's bits, the same for the rows and the SM
     count.  Every other output repeats bit for bit, whatever the order in
