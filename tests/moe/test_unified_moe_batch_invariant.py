@@ -472,6 +472,19 @@ def test_fingerprint_is_bounded_in_the_expert_count():
     assert len(fps) == 5
 
 
+def test_ulp_error_counts_subnormal_spacing_at_zero_and_subnormal_references():
+    """The accuracy yardstick measures a zero or subnormal reference in the binary32 subnormal spacing: the smallest
+    subnormal against zero is one ulp, as is one spacing step between two subnormals and the step above the smallest
+    normal; a normal reference keeps its own ulp."""
+    from flashinfer.fused_moe.batch_invariant.reference import ulp_error
+
+    tiny, normal = 2.0**-149, 2.0**-126
+    assert ulp_error(torch.tensor([tiny]), torch.tensor([0.0])) == 1.0
+    assert ulp_error(torch.tensor([3 * tiny]), torch.tensor([2 * tiny])) == 1.0
+    assert ulp_error(torch.tensor([normal + tiny]), torch.tensor([normal])) == 1.0
+    assert ulp_error(torch.tensor([1.0 + 2.0**-23]), torch.tensor([1.0])) == 1.0
+
+
 def _adversarial_accumulators(
     limits: list[float], n_random: int, seed: int
 ) -> torch.Tensor:
