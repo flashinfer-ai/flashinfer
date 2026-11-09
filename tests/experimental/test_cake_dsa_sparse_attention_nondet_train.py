@@ -5396,6 +5396,21 @@ def test_nope_packed_entry_route_when_the_forward_program_converts(monkeypatch):
     assert (v["has_topk_length"], v["derive_length"]) == (1, 1)
 
 
+def test_token_order_follows_the_plan_and_architecture_table():
+    """Descending token order exactly for a single key pass of the (plan, arch) pairs of DESCENDING_TOKEN_PLANS (both
+    plans on sm_103a and sm_107a); ascending on sm_100a and for every multi-pass backward."""
+    plans = {(p, a) for p in ("rope", "nope") for a in ("sm_103a", "sm_107a")}
+    assert plans == cake_backend.DESCENDING_TOKEN_PLANS
+    for plan in ("rope", "nope"):
+        for arch in ("sm_100a", "sm_103a", "sm_107a"):
+            down = (plan, arch) in cake_backend.DESCENDING_TOKEN_PLANS
+            want = (99, -1) if down else (0, 1)
+            got = cake_backend.token_order(100, arch, True, plan)
+            assert (got["token_base"], got["token_step"]) == want, (plan, arch)
+            multi = cake_backend.token_order(100, arch, False, plan)
+            assert (multi["token_base"], multi["token_step"]) == (0, 1)
+
+
 def test_nope_plan_backward_fresh_and_accumulate_by_the_direct_rule(monkeypatch):
     """S = 8 T: the record's rule (one key per query) selects the natural-layout main stage adding into the FP32
     buffer -- the fresh ``dkv`` (zero-filled, stride 512) or the caller's rows (their stride, the map) -- with no
@@ -5427,7 +5442,13 @@ def test_nope_plan_backward_fresh_and_accumulate_by_the_direct_rule(monkeypatch)
     assert main["dkv_has_map"] == 0 and main["dkv_dst_map"].dtype == torch.int32
     assert main["dq_latent"] is dq and main["dout"] is dout
     assert (main["pass_lo"], main["pass_hi"], main["dq_mode"]) == (0, S, 0)
-    assert (main["token_base"], main["token_step"], main["num_queries"]) == (0, 1, T)
+    # one key pass: descending token order where DESCENDING_TOKEN_PLANS names (nope, arch)
+    order = cake_backend.token_order(T, cake_backend.arch_for(), True, "nope")
+    assert (main["token_base"], main["token_step"], main["num_queries"]) == (
+        order["token_base"],
+        order["token_step"],
+        T,
+    )
     assert main["sm_scale"] == pytest.approx(NOPE_SOFTMAX_SCALE)
     assert main["dq_partial"] is main["delta"] and main["delta"].dtype == torch.float32
     assert main["key_scratch"] is main["pass_counts"] is main["topk_length"]
