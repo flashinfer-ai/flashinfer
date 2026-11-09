@@ -1359,6 +1359,11 @@ def _pdl_schedule_kwargs(name):
     if name == "nvfp4_swap_fused_ldgsts":
         # One fused loader for the weights and the weight SFs.
         return _fused_operand_sf_kwargs(tile_scheduler=int(TileScheduler.STATIC))
+    if name == "nvfp4_swap_token_sf":
+        # The epilogue also loads a per-token scale of the activations.
+        return _fused_operand_sf_kwargs(
+            tile_scheduler=int(TileScheduler.STATIC), use_per_token_sf_b=1
+        )
     if name == "mxfp4_bf16_cast_a":
         # Swap-AB with the weight SFs on their own loader.
         return dict(
@@ -1389,7 +1394,8 @@ def _pdl_schedule_kwargs(name):
 
 
 _TASK_LEVEL_PDL_MODES = {
-    # MoE FC2: the weight loaders keep reading routing metadata before the wait.
+    # MoE FC2: the weight loaders and the epilogue keep reading routing metadata
+    # before the wait.
     "skip_early_exit_pdl": dict(use_pdl=1, use_early_exit=1, skip_early_exit_pdl=1),
     "no_early_exit": dict(use_pdl=1, use_early_exit=0),
 }
@@ -1406,9 +1412,10 @@ _TASK_LEVEL_PDL_MODES = {
         "nvfp4_swap_fused_ldgsts",
         "mxfp4_bf16_cast_a",
         "deepseek_fp8",
+        "nvfp4_swap_token_sf",
     ),
 )
-def test_task_level_pdl_waits_cover_epilogue_and_weight_loaders(config_name, mode):
+def test_task_level_pdl_wait_placement(config_name, mode):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         _pdl_task_waits,
@@ -1426,6 +1433,7 @@ def test_task_level_pdl_waits_cover_epilogue_and_weight_loaders(config_name, mod
         num_experts=2, num_tokens=256, top_k=1, verbose=False, **kwargs
     )
     weight_loads_wait = mode != "skip_early_exit_pdl"
+    epilogue_waits = weight_loads_wait or config_name == "nvfp4_swap_token_sf"
 
     def waits(task):
         return any(isinstance(r, PdlWaitBarrier) for r in task.src_resources)
@@ -1436,11 +1444,12 @@ def test_task_level_pdl_waits_cover_epilogue_and_weight_loaders(config_name, mod
     assert _pdl_task_waits(cfg)
     assert not task_manager._assume_pdl_wait_completed
 
-    # The epilogue runs in every CTA and waits before its first global read.
+    # The epilogue runs in every CTA. Under skip_early_exit_pdl it waits only
+    # when it loads a per-token activation scale.
     (epilogue,) = [t for t in task_manager.tasks if t.name.startswith("EpilogueTask0")]
     assert not isinstance(epilogue, CgaTask)
     assert epilogue.run_only_on_cta_id is None
-    assert waits(epilogue)
+    assert waits(epilogue) == epilogue_waits
 
     weight_names = {"GmemA", "GmemSfA"} if cfg.is_swap_ab else {"GmemB", "GmemSfB"}
     weight_loaders = [
@@ -1460,7 +1469,7 @@ def test_task_level_pdl_waits_cover_epilogue_and_weight_loaders(config_name, mod
         downstream.name: {upstream.name for upstream in upstreams}
         for downstream, upstreams in task_manager.resource_dependency_graph.items()
     }
-    assert "PdlWait" in graph["GmemC"]
+    assert ("PdlWait" in graph["GmemC"]) == epilogue_waits
     weight_resources = {
         r.name for t in weight_loaders for r in t.src_resources
     } & weight_names
@@ -1558,9 +1567,9 @@ def _compile_sm100_ptx(tmp_path, monkeypatch, **cfg_overrides):
         (dict(use_pdl=0), 0, 0),
         # The kernel-entry wait covers every CTA path.
         (dict(use_pdl=1), 1, 1),
-        # MoE FC2 on the static scheduler: the activation loader, the epilogue
-        # and the inactive early-exit CTAs each wait.
-        (dict(use_pdl=1, skip_early_exit_pdl=1), 3, 1),
+        # MoE FC2 on the static scheduler: the activation loader and the
+        # inactive early-exit CTAs each wait.
+        (dict(use_pdl=1, skip_early_exit_pdl=1), 2, 1),
     ),
     ids=("pdl_off", "entry_wait", "skip_early_exit_pdl"),
 )
