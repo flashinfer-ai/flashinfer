@@ -28,19 +28,19 @@ binding; ``library`` is the program identity (``cake_gqa_train_<20 hex>``),
 so a kernel swap renames it.  ``MODULES`` is a literal table (the exporter
 and the manifest checker read it with ``ast.literal_eval``).
 
-The stages, in launch order: ``fwd`` (O and the natural-log LSE),
-``bwd_pre`` (``dPsum``, ``LSE * log2(e)`` and the zeroed FP32 dQ accumulator
-in the pack-2 scratch layout), ``bwd_plan`` (one CTA: the workspace tile
-numbering and the dQ work order from the segment boundaries; PyTorch ops
-instead past ``PLAN_MAX_PAIRS``), then per workspace chunk ``bwd_main_fp32`` /
-``bwd_main_bf16`` (S^T, dP^T, dK and dV of a key block, dS^T stored to the
-workspace; dK / dV stored as FP32 window gradients or as BF16) and
-``bwd_dq`` (dQ = dS K over the workspace into the accumulator), then
-``bwd_fold`` (row-map destinations only: the FP32 window rows added into
-their destination rows in ascending window order) and ``bwd_post`` (dQ from
-the accumulator).  Every sum has one fixed order, so every output is bitwise
-reproducible run to run for one shape, one ``max_seqlen_k``, one workspace
-budget and the same host boundaries.  Every launch is a plain stream-ordered launch: nothing
+The stages, in launch order: ``fwd`` (O and the natural-log LSE), ``bwd_pre``
+(``dPsum`` and ``LSE * log2(e)`` in the pack-2 scratch layout), ``bwd_plan``
+(one CTA: the workspace tile numbering and the dQ work order from the segment
+boundaries; PyTorch ops instead past ``PLAN_MAX_PAIRS``), then per workspace
+chunk ``bwd_main_fp32`` / ``bwd_main_bf16`` (S^T, dP^T, dK and dV of a key
+block, dS^T stored to the workspace; dK / dV stored as FP32 window gradients or
+as BF16) and ``bwd_dq`` (dQ = dS K over the workspace into the FP32
+accumulator; the range that finishes a Q tile writes ``dQ = bf16(acc *
+softmax_scale)`` instead), then ``bwd_fold`` (row-map destinations only: the
+FP32 window rows added into their destination rows in ascending window order).
+Every sum has one fixed order, so every output is bitwise reproducible run to
+run for one shape, one ``max_seqlen_k``, one workspace budget and the same host
+boundaries.  Every launch is a plain stream-ordered launch: nothing
 cooperative, no PDL.
 """
 
@@ -67,7 +67,6 @@ STAGES = (
     "bwd_main_bf16",
     "bwd_dq",
     "bwd_fold",
-    "bwd_post",
 )
 
 MODULES: dict[str, dict[str, Any]] = {
@@ -305,33 +304,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_gqa_train_c6971742807c93720f2f",
         "stage": "bwd_fold",
     },
-    "bwd_post": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "arg_plan": [
-            ["buffer", "dQ_accum"],
-            ["buffer", "cu_seqlens_q"],
-            ["buffer", "dQ"],
-            ["parameter", "T_q"],
-            ["parameter", "H_q"],
-            ["parameter", "num_segments"],
-            ["parameter", "rows_pad"],
-            ["parameter", "softmax_scale"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gqa_train_76decc9a5d22dc91ddd1",
-        "launch": {
-            "block": (256, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_gqa_train_76decc9a5d22dc91ddd1",
-        "stage": "bwd_post",
-    },
 }
 
 # ---------------------------------------------------------------------------
@@ -365,13 +337,12 @@ FOLD_ITEMS_PER_CTA = 8
 PLAN_MAX_PAIRS = 16384
 # Pack-2 scratch: scratch head ``s`` holds query heads ``2 s`` and ``2 s + 1``;
 # every segment starts on a 128-row tile.  The preprocess runs one CTA per 32
-# packed rows of one scratch head, the postprocess one per 64 (each program's
-# ``rows_per_cta``; a grid past ``rows_pad`` would read past the scratch).
+# packed rows of one scratch head (its program's ``rows_per_cta``; a grid past
+# ``rows_pad`` would write past the scratch).
 SCRATCH_TILE_ROWS = 128
 PRE_ROWS_PER_CTA = 32
-POST_ROWS_PER_CTA = 64
-# Byte alignment of every scratch buffer (TMA / bulk copies need 16 B, the
-# 256-bit loads and stores of the pre/postprocess 32 B).
+# Byte alignment of every scratch buffer (TMA / bulk copies need 16 B,
+# 256-bit loads and stores 32 B).
 SCRATCH_ALIGN = 256
 # Default bound of the dS^T workspace of one backward call.  A smaller budget
 # splits the call into more chunks (KV heads first, then key-block ranges);
@@ -595,10 +566,8 @@ def grid(
         return (FWD_CLUSTER * pairs, 1, 1)
     if stage == "bwd_plan":
         return (1, 1, 1)
-    if stage in ("bwd_pre", "bwd_post"):
-        rows = rows_pad(total_q, num_segments)
-        per_cta = PRE_ROWS_PER_CTA if stage == "bwd_pre" else POST_ROWS_PER_CTA
-        return (rows // per_cta, num_heads_q // 2, 1)
+    if stage == "bwd_pre":
+        return (rows_pad(total_q, num_segments) // PRE_ROWS_PER_CTA, num_heads_q // 2, 1)
     if stage in ("bwd_main_fp32", "bwd_main_bf16"):
         return (BWD_CLUSTER * chunk_blocks, chunk_heads, num_segments)
     if stage == "bwd_dq":
@@ -639,7 +608,6 @@ __all__ = [
     "MODULES",
     "PACKAGE",
     "PLAN_MAX_PAIRS",
-    "POST_ROWS_PER_CTA",
     "PRE_ROWS_PER_CTA",
     "SCRATCH_ALIGN",
     "SCRATCH_TILE_ROWS",
