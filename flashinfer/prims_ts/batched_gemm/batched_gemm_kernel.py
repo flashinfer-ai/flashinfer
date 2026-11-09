@@ -157,8 +157,10 @@ def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
 def _pdl_task_waits(cfg: BatchedGemmConfig) -> bool:
     """Whether tasks, rather than the kernel entry, issue ``griddepcontrol.wait``.
 
-    The activation loaders and the epilogue then wait through a
-    ``PdlWaitBarrier``, and inactive early-exit CTAs wait before they exit.
+    The activation loaders then wait through a ``PdlWaitBarrier`` (the weight
+    loaders and the epilogue as well, see :func:`_pdl_weight_loads_wait` and
+    :func:`_pdl_epilogue_waits`), and inactive early-exit CTAs wait before they
+    exit.
     """
     return bool(cfg.use_pdl and not _pdl_wait_completed_before_tasks(cfg))
 
@@ -172,6 +174,33 @@ def _pdl_weight_loads_wait(cfg: BatchedGemmConfig) -> bool:
     task-level-wait config orders it after the wait.
     """
     return bool(_pdl_task_waits(cfg) and not cfg.skip_early_exit_pdl)
+
+
+def _epilogue_reads_token_scale(cfg: BatchedGemmConfig) -> bool:
+    """Whether the epilogue loads a per-token scale of the activation operand.
+
+    Per-token SF A runs along M and SF B along N, so the token side is SF B with
+    swap-AB and SF A without it; the other side holds per-channel weight scales.
+    """
+    if cfg.is_swap_ab:
+        return cfg.has_per_token_sf_b
+    return cfg.has_per_token_sf_a
+
+
+def _pdl_epilogue_waits(cfg: BatchedGemmConfig) -> bool:
+    """Whether the epilogue waits before its first global read.
+
+    Before its first TMEM-full wait the epilogue loads routing metadata
+    (``tile_idx``, ``mn_limit``, ``route_map``, the padded token count), the
+    expert's scales and bias, and any per-token scales. Under
+    ``skip_early_exit_pdl`` only a per-token activation scale can come from the
+    predecessor: the routing outputs fall under the option's precondition and
+    the rest are static per-expert operands. Every other task-level-wait config
+    waits.
+    """
+    if not _pdl_task_waits(cfg):
+        return False
+    return bool(not cfg.skip_early_exit_pdl or _epilogue_reads_token_scale(cfg))
 
 
 def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
@@ -928,6 +957,8 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     weight_pdl_wait_resource = (
         pdl_wait_resource if _pdl_weight_loads_wait(cfg) else None
     )
+    # The epilogue too, unless it reads only what _pdl_epilogue_waits allows.
+    epilogue_pdl_wait_resource = pdl_wait_resource if _pdl_epilogue_waits(cfg) else None
     pdl_launch_resource = PdlLaunchBarrier(name="PdlLaunch") if cfg.use_pdl else None
 
     # Tasks: LoadA/LoadB (or Gather replacing one of them), MMA, Epilogue
@@ -1351,7 +1382,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             gmem_c,
             work_queue,
             num_k_tiles,
-            pdl_wait_resource=pdl_wait_resource,
+            pdl_wait_resource=epilogue_pdl_wait_resource,
         )
         task_list += [mma, load_sfab, epi]
     else:
@@ -1361,7 +1392,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             gmem_c,
             work_queue,
             num_k_tiles,
-            pdl_wait_resource=pdl_wait_resource,
+            pdl_wait_resource=epilogue_pdl_wait_resource,
         )
         task_list += [mma, epi]
 
@@ -1456,9 +1487,10 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             resource_dependency_graph[gmem_a] = [pdl_wait_resource]
             if cfg.has_cast_a or cfg.has_input_block_scaling:
                 resource_dependency_graph[gmem_sfa] = [pdl_wait_resource]
-        resource_dependency_graph[gmem_c] = resource_dependency_graph[gmem_c] + [
-            pdl_wait_resource
-        ]
+        if epilogue_pdl_wait_resource is not None:
+            resource_dependency_graph[gmem_c] = resource_dependency_graph[gmem_c] + [
+                pdl_wait_resource
+            ]
 
     # SMEM allocator
     smem_allocator = SmemAllocator()
@@ -2287,6 +2319,11 @@ def _batched_gemm_kernel_bf16_body(
     weight_pdl_wait_resource = (
         pdl_wait_resource if cutlass.const_expr(_pdl_weight_loads_wait(cfg)) else None
     )
+    # The epilogue waits too, except under skip_early_exit_pdl when it reads no
+    # per-token activation scale; see _pdl_epilogue_waits.
+    epilogue_pdl_wait_resource = (
+        pdl_wait_resource if cutlass.const_expr(_pdl_epilogue_waits(cfg)) else None
+    )
     pdl_launch_resource = (
         PdlLaunchBarrier(name="PdlLaunch") if cutlass.const_expr(cfg.use_pdl) else None
     )
@@ -2563,7 +2600,7 @@ def _batched_gemm_kernel_bf16_body(
             gmem_c,
             work_queue,
             k_tile_cnt,
-            pdl_wait_resource=pdl_wait_resource,
+            pdl_wait_resource=epilogue_pdl_wait_resource,
         )
         task_list += [mma, load_sfab, epi]
     else:
@@ -2573,7 +2610,7 @@ def _batched_gemm_kernel_bf16_body(
             gmem_c,
             work_queue,
             k_tile_cnt,
-            pdl_wait_resource=pdl_wait_resource,
+            pdl_wait_resource=epilogue_pdl_wait_resource,
         )
         task_list += [mma, epi]
 
@@ -2682,8 +2719,8 @@ def _batched_gemm_kernel_bf16_body(
         # Declare every GMEM resource whose work reads predecessor-written
         # memory so TaskManager verification checks the wait placement: the
         # activation operand and its SFs always, the weight operand and its SFs
-        # unless skip_early_exit_pdl keeps them ahead of the wait, and GmemC,
-        # whose epilogue reads routing metadata, per-token SFs and scalars.
+        # unless skip_early_exit_pdl keeps them ahead of the wait, and GmemC
+        # whenever the epilogue waits (see _pdl_epilogue_waits).
         if cutlass.const_expr(cfg.is_swap_ab or weight_pdl_wait_resource is not None):
             resource_dependency_graph[gmem_b] = [pdl_wait_resource]
             if cutlass.const_expr(cfg.has_input_block_scaling):
@@ -2694,9 +2731,10 @@ def _batched_gemm_kernel_bf16_body(
             resource_dependency_graph[gmem_a] = [pdl_wait_resource]
             if cutlass.const_expr(cfg.has_cast_a or cfg.has_input_block_scaling):
                 resource_dependency_graph[gmem_sfa] = [pdl_wait_resource]
-        resource_dependency_graph[gmem_c] = resource_dependency_graph[gmem_c] + [
-            pdl_wait_resource
-        ]
+        if cutlass.const_expr(epilogue_pdl_wait_resource is not None):
+            resource_dependency_graph[gmem_c] = resource_dependency_graph[gmem_c] + [
+                pdl_wait_resource
+            ]
     _verify_rank_gated_register_donation(task_list)
     task_manager_cls = (
         TaskManager if _task_manager_verify_enabled() else _ProductionTaskManager

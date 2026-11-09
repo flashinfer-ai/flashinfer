@@ -73,18 +73,18 @@ manager is told the wait has completed (`assume_pdl_wait_completed`). No
 GEMM therefore cannot start until the predecessor has completed.
 
 `skip_early_exit_pdl=1` drops that entry wait. The wait then comes from the
-`PdlWaitBarrier` resource instead: the activation loaders and the epilogue wait
-before their first global access, which the task manager verifies through the
-`PdlWaitBarrier` edges on their GMEM resources. The epilogue runs in every CTA of
-a cluster, and an inactive early-exit CTA executes `griddepcontrol.wait` before
-it exits, so every CTA waits and a grid with no active CTA still completes after
-its predecessor. The kernel's CTAs can become resident while the predecessor is
-still running. Validation requires `use_pdl=1` and `use_early_exit=1`. The
-default is `0`.
+`PdlWaitBarrier` resource instead: the activation loaders wait before their
+first global access, which the task manager verifies through the
+`PdlWaitBarrier` edges on their GMEM resources. An inactive early-exit CTA
+executes `griddepcontrol.wait` before it exits, so a grid with no active CTA
+still completes after its predecessor. The kernel's CTAs can become resident
+while the predecessor is still running. Validation requires `use_pdl=1` and
+`use_early_exit=1`. The default is `0`.
 
-The count, and the `tile_idx`/`mn_limit` entries the weight loaders use to
-prefetch the expert's weights and weight scale factors, are read without waiting
-for the predecessor, so the option is correct only if they were complete before
+The count, the `tile_idx`/`mn_limit` entries the weight loaders use to prefetch
+the expert's weights and weight scale factors, and the routing metadata the
+epilogue loads before its first accumulator wait are read without waiting for
+the predecessor, so the option is correct only if they were complete before
 this grid could launch. In the MoE pipeline this is the intended FC2
 arrangement: routing writes them, FC1 waits on routing at kernel entry and
 triggers only afterwards, and every kernel enqueued after FC1 can launch only
@@ -95,6 +95,13 @@ routing itself and needs the entry wait), or on a kernel that no earlier
 wait-before-trigger kernel separates from the producer of the count.
 `launch_dependents` is emitted at the end of the activation load task, so the
 overlap is with the predecessor's MMA and epilogue, not its loads.
+
+The epilogue's other loads before its first accumulator wait are the expert's
+scales and bias, so under `skip_early_exit_pdl` it waits only when it also loads
+a per-token scale of the activation operand (`use_per_token_sf_a` without
+swap-AB, `use_per_token_sf_b` with it), which the predecessor may write. Waiting
+in every epilogue would move its loads behind the predecessor; on B200 that adds
+about 1.4 us to a one-token DeepSeek FP8 MoE call.
 
 With `use_pdl=1` and `use_early_exit=0` there is no entry wait either. The
 activation loaders, the weight loaders and the epilogue each wait before their
