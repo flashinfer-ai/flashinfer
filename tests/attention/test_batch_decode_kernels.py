@@ -1782,3 +1782,12 @@ def test_cuda_core_decode_refuses_rope_lanes_straddling_the_half():
         flashinfer.decode.single_decode_with_kv_cache(
             q, k, k, pos_encoding_mode="ROPE_LLAMA", use_tensor_cores=False
         )
+
+
+def test_cuda_core_decode_refuses_head_dim_not_a_multiple_of_vec_size():
+    """With an fp8 KV cache each lane loads vec_size = 16 elements, which does not
+    divide head_dim 72."""
+    q = torch.randn(8, 72, dtype=torch.bfloat16, device="cuda:0")
+    k = torch.randn(64, 2, 72, device="cuda:0").to(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="head_dim 72"):
+        flashinfer.decode.single_decode_with_kv_cache(q, k, k, use_tensor_cores=False)
