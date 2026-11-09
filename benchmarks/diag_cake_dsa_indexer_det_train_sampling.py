@@ -100,7 +100,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bench_cake_dsa_indexer_det_train as bcdi  # noqa: E402  (benchmarks/ is the script directory)
 from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
 from flashinfer.experimental.cake.cake_dsa_indexer_det_train import cake_backend  # noqa: E402
-from tests.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref  # noqa: E402
 
 TILE = 128
 NUM_HEADS = ref.NUM_HEADS

@@ -33,7 +33,7 @@ import sys
 
 import pytest
 
-from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
 
 pytestmark = pytest.mark.cpu_only
 

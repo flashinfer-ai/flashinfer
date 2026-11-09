@@ -322,7 +322,7 @@ def test_package_wiring() -> None:
     """The test-helper key, the build manifest's package and libraries, the package data, the ignored ``aot/``
     directory, the pre-commit exclude of the generated sources and the manifest checker's row name the package
     at its path."""
-    from tests.test_helpers.cake_package import PACKAGES
+    from tests.cake.test_helpers.cake_package import PACKAGES
 
     directory = _backend_dir()
     assert PACKAGES[KEY] == BACKEND

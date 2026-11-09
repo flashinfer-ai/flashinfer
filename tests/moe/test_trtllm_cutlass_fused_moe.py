@@ -41,7 +41,7 @@ from flashinfer import (
     mxfp8_quantize,
     mxfp4_dequantize_host,
 )
-from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
+from tests.quantization.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 
 from . import utils as moe_utils
 
