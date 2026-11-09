@@ -2125,12 +2125,17 @@ def _launch_k1_program(
     out: torch.Tensor,
     enable_pdl: Optional[bool],
     units: Optional[int] = None,
+    sources: Optional[tuple] = None,
+    head: Optional[tuple] = None,
 ) -> None:
     """Launch this package's program ``module`` (a forward / input-gradient program of the tables above, one CTA pair
     per SM pair up to ``items`` work items) with ``values`` in its argument order, the PDL flag of ``enable_pdl`` for
     ``out``'s device, on the current stream of that device.  ``units``: the stream-K program's unit count, one unit
     per CTA pair; a grid of another number of CTA pairs raises ``ValueError`` (a pair running two units could wait on
-    a higher pair that is not resident)."""
+    a higher pair that is not resident).  With an entry point's ``head`` flags and its tensors ``sources`` (the last
+    is ``out``) the launch is bound and cached in :data:`_K1_PROGRAM_CACHE` under the entry point's key
+    (:func:`_k1_cached_launch` launches it on a repeat call) and launched through that binding; a view the call's
+    tensors do not rebuild launches unbound, as without them."""
     det = deterministic_backend()
     index = _k1_index(out, out, out)
     facts = det.device_facts(out.device)
@@ -2141,10 +2146,46 @@ def _launch_k1_program(
             f"stream-K launch of {units} units on {grid[0] // 2} CTA pairs: the grid runs one unit per CTA pair"
         )
     fn, plan = _atomic_entry(module, grid, facts.arch)
-    values = dict(values, enable_pdl=int(det.pdl_enabled(enable_pdl, index)))
+    pdl = int(det.pdl_enabled(enable_pdl, index))
+    values = dict(values, enable_pdl=pdl)
+    if head is not None and sources is not None:
+        bound = _k1_program_binding(module, plan, values, grid, sources)
+        if bound is not None:
+            key = _k1_key(index, stream, (*head, pdl, *_K1_NOT_STATIC), *sources)
+            with _ATOMIC_PLAN_LOCK:
+                _cache_insert(
+                    _K1_PROGRAM_CACHE,
+                    key,
+                    _CachedProgramK1(module_name=module, entry=fn, k1=bound),
+                )
+            _launch_k1_binding(det, fn, bound, None, sources, index, stream)
+            return
     arguments = _order_atomic_arguments(module, plan, values, grid)
     with _k1_stream_context(det, index, stream):
         fn(*arguments)
+
+
+def _k1_program_binding(
+    module: str,
+    arg_plan: list,
+    values: dict[str, Any],
+    grid: tuple[int, int, int],
+    sources: tuple,
+) -> Optional["_K1Binding"]:
+    """The :class:`_K1Binding` of this package's program ``module`` for a call of the tensors ``sources``: ``values``
+    in the program's order, every tensor argument that starts at the data pointer of one of ``sources`` rebuilt per
+    call (a ``buffer`` argument as a pointer), the other tensors (the deterministic package's per-device dummies)
+    converted once; ``None`` when a view is not rebuilt from ``sources`` (:func:`_k1_view_recipe`)."""
+    pointers = {t.data_ptr() for t in sources}
+    marked, views = dict(values), {}
+    for kind, name in arg_plan:
+        value = values.get(name)
+        if kind in ("tma_buffer", "buffer") and isinstance(value, torch.Tensor):
+            if value.data_ptr() in pointers:
+                marked[name] = _Arg(name)
+                views[name] = (value, kind == "buffer")
+    template = _order_atomic_arguments(module, arg_plan, marked, grid)
+    return _k1_binding(template, views, sources)
 
 
 def _launch_wave_forward(
@@ -2153,17 +2194,20 @@ def _launch_wave_forward(
     W: torch.Tensor,
     out: torch.Tensor,
     enable_pdl: Optional[bool],
+    head: Optional[tuple] = None,
 ) -> torch.Tensor:
     """``out[T, N] = X[T, K] @ W[N, K].T`` on the one-wave forward program ``module``: ``W`` / ``X`` / ``out`` as
     batches of one (``[1, N, K]``, ``[1, T, K]``, ``[1, T, N]``), ``M = N`` features and ``N = T`` tokens of the
-    program."""
+    program; with the entry point's ``head`` flags bound and cached (:func:`_launch_k1_program`)."""
     tile_n = int(MODULES[module]["build"]["kwargs"]["tile_n"])
     F, K, T = int(W.shape[0]), int(W.shape[1]), int(X.shape[0])
     items = _ceil_div(F, _WAVE_ITEM_ROWS) * _ceil_div(T, tile_n)
     values = dict(
         A=W.unsqueeze(0), B=X.unsqueeze(0), C=out.unsqueeze(0), M=F, N=T, K=K, L=1
     )
-    _launch_k1_program(module, values, items, out, enable_pdl)
+    _launch_k1_program(
+        module, values, items, out, enable_pdl, sources=(X, W, out), head=head
+    )
     return out
 
 
@@ -2173,13 +2217,15 @@ def _launch_dgrad_program(
     W: torch.Tensor,
     out: torch.Tensor,
     enable_pdl: Optional[bool],
+    head: Optional[tuple] = None,
 ) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]`` on the input-gradient program ``module``: the program's ``M = T`` rows,
     ``N = K`` columns and ``K = N`` reduction, ``W`` as ``[1, N, K]``; ``out`` stored through its own pointer and row
     stride (a padded ``out`` as the contiguous 1-D alias of its span, ``flat_alias``: the binding checks the
     pointer's contiguity), and through ``[1, T, K]`` TMA maps (the map of the other dtype a per-device dummy the
     program never touches).  A program with a resident output gradient of ``r`` slices (``resident``) takes a
-    reduction of exactly ``64 * r`` features; another ``N`` raises ``ValueError``."""
+    reduction of exactly ``64 * r`` features; another ``N`` raises ``ValueError``.  With the entry point's ``head``
+    flags bound and cached (:func:`_launch_k1_program`)."""
     det = deterministic_backend()
     T, N, K = int(G.shape[0]), int(W.shape[0]), int(W.shape[1])
     resident = int(MODULES[module]["build"]["kwargs"].get("resident", 0))
@@ -2205,7 +2251,9 @@ def _launch_dgrad_program(
         K=N,
         ldo=int(out.stride(0)),
     )
-    _launch_k1_program(module, values, items, out, enable_pdl)
+    _launch_k1_program(
+        module, values, items, out, enable_pdl, sources=(G, W, out), head=head
+    )
     return out
 
 
@@ -4899,7 +4947,10 @@ def _atomic_k2(
 # so a call rebuilds only its views (each the caller's tensor, its ``unsqueeze(0)`` or one strided view, checked
 # against the planner's views when bound; passed as torch tensors, each converted in the FFI call) and enters its
 # thread's stream context of the (device, stream), made once; the projection entry points go from their key straight
-# to the bound launch when it is cached (:func:`_k1_cached_launch`).  A K2 call of this package that runs the
+# to the bound launch when it is cached (:func:`_k1_cached_launch`).  A forward or input-gradient row of
+# ``K1_FORWARD_PROGRAM_RULES_BY_SM`` / ``K1_DGRAD_PROGRAM_RULES_BY_SM`` binds this package's program the same way
+# (cache ``_K1_PROGRAM_CACHE``, under the entry point's key; :func:`_k1_program_binding`): a repeat call skips the
+# table lookup, the argument values and their order.  A K2 call of this package that runs the
 # deterministic program -- a row the planner keeps on it, a call without a split count whose row has no verdict
 # (:func:`_k2_row_without_verdict`, kept per device and view geometry until a router table changes,
 # :func:`_router_memo`; not planned here), a forward without a split count while no router table gives the forward a
@@ -5286,10 +5337,15 @@ class _CachedAtomic:
     det_splits: Optional[int] = None
 
 
-#: An entry of the convenience caches (:data:`_K1_ATOMIC_CACHE`, :data:`_K1_DET_CACHE`, :data:`_K2_ATOMIC_CACHE`,
-#: :data:`_K2_SPLITK_CACHE`, :data:`_K2_ENTRY_CACHE`).
+#: An entry of the convenience caches (:data:`_K1_ATOMIC_CACHE`, :data:`_K1_DET_CACHE`, :data:`_K1_PROGRAM_CACHE`,
+#: :data:`_K2_ATOMIC_CACHE`, :data:`_K2_SPLITK_CACHE`, :data:`_K2_ENTRY_CACHE`).
 _CacheEntry = TypeVar(
-    "_CacheEntry", "_CachedAtomic", "_CachedDetK1", "_CachedSplitK2", "_CachedK2Entry"
+    "_CacheEntry",
+    "_CachedAtomic",
+    "_CachedDetK1",
+    "_CachedProgramK1",
+    "_CachedSplitK2",
+    "_CachedK2Entry",
 )
 
 
@@ -5441,9 +5497,11 @@ def _k1_cached_launch(
     tail: tuple,
     sources: tuple,
     enable_pdl: Optional[bool],
+    programs: Optional["OrderedDict[tuple, Any]"] = None,
 ) -> bool:
     """A projection entry point's call when its key is cached and bound: the key the entry
-    point's own path builds for the tensors ``sources`` (``(A, B, out)`` of that path) in ``cache`` --
+    point's own path builds for the tensors ``sources`` (``(A, B, out)`` of that path) in ``cache``, then (a miss
+    there) in ``programs`` (:data:`_K1_PROGRAM_CACHE`, the same key: a row of a program table) --
     :data:`_K1_DET_CACHE` (:func:`_det_k1`, flags ``(*head, pdl, *tail)`` = ``(flags, pdl, weights_static)``) or
     :data:`_K1_ATOMIC_CACHE` (:func:`_launch_cached_atomic_k1`) -- and its bound launch, without the path's call
     layers.  ``False`` (nothing launched) when the tensors are not on one CUDA device or the key is not cached and
@@ -5454,7 +5512,10 @@ def _k1_cached_launch(
     det = deterministic_backend()
     stream = det._current_raw_stream(index)
     pdl = int(det.pdl_enabled(enable_pdl, index))
-    entry = det._cache_get(cache, _k1_key(index, stream, (*head, pdl, *tail), *sources))
+    key = _k1_key(index, stream, (*head, pdl, *tail), *sources)
+    entry = det._cache_get(cache, key)
+    if entry is None and programs is not None:
+        entry = det._cache_get(programs, key)
     if entry is None or entry.k1 is None or entry.entry is None:
         return False
     if entry.order_varying:
@@ -5516,11 +5577,28 @@ def _bind_atomic_k1(
 #: The cached bindings of the deterministic K1 program on this package's convenience path (keys of :func:`_k1_key`
 #: over the entry point's tensors).
 _K1_DET_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+#: The cached bindings of this package's programs of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` and
+#: :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` on the convenience path, under the keys of :data:`_K1_DET_CACHE` (the entry
+#: point's flags, the PDL flag and the geometry of its tensors): a repeat call goes from its key to the bound launch,
+#: without the table lookup, the argument values and their order (:func:`_k1_cached_launch`).
+_K1_PROGRAM_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
 #: The leading and trailing key flags of :func:`_det_k1` for the projection forward and input gradient (the PDL flag
 #: goes between them), as :func:`_k1_cached_launch` reads them.
 _K1_FWD_HEAD = (("fwd",),)
 _K1_DGRAD_HEAD = (("dgrad",),)
 _K1_NOT_STATIC = (False,)
+
+
+@dataclass
+class _CachedProgramK1:
+    """A bound launch of this package's forward / input-gradient program ``module_name`` (:data:`_K1_PROGRAM_CACHE`):
+    its entry and bound arguments; no workspace, so no arena; a fixed-order program, so no alert."""
+
+    module_name: str
+    entry: Optional[Callable[..., Any]] = field(default=None, repr=False)
+    k1: Optional[_K1Binding] = field(default=None, repr=False)
+    arena: None = None
+    order_varying: bool = False
 
 
 @dataclass
@@ -6510,6 +6588,7 @@ def _drop_convenience_entries() -> None:
     with _ATOMIC_PLAN_LOCK:
         _K1_ATOMIC_CACHE.clear()
         _K1_DET_CACHE.clear()
+        _K1_PROGRAM_CACHE.clear()
         _K2_ATOMIC_CACHE.clear()
         _K2_SPLITK_CACHE.clear()
         _K2_ENTRY_CACHE.clear()
@@ -6991,12 +7070,17 @@ def cake_dense_gemm_nondet_train_projection_forward(
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.bfloat16)
     o = out
     if _k1_cached_launch(
-        _K1_DET_CACHE, _K1_FWD_HEAD, _K1_NOT_STATIC, (X, W, o), enable_pdl
+        _K1_DET_CACHE,
+        _K1_FWD_HEAD,
+        _K1_NOT_STATIC,
+        (X, W, o),
+        enable_pdl,
+        _K1_PROGRAM_CACHE,
     ):
         return o
     module = _k1_forward_program_of(X, W, o)
     if module is not None:
-        return _launch_wave_forward(module, X, W, o, enable_pdl)
+        return _launch_wave_forward(module, X, W, o, enable_pdl, _K1_FWD_HEAD)
     return _det_k1(
         (X, W, o),
         ("fwd",),
@@ -7033,12 +7117,17 @@ def cake_dense_gemm_nondet_train_projection_dgrad(
         )
     o = out
     if _k1_cached_launch(
-        _K1_DET_CACHE, _K1_DGRAD_HEAD, _K1_NOT_STATIC, (G, W, o), enable_pdl
+        _K1_DET_CACHE,
+        _K1_DGRAD_HEAD,
+        _K1_NOT_STATIC,
+        (G, W, o),
+        enable_pdl,
+        _K1_PROGRAM_CACHE,
     ):
         return o
     module = _k1_dgrad_program_of(G, W, o)
     if module is not None:
-        return _launch_dgrad_program(module, G, W, o, enable_pdl)
+        return _launch_dgrad_program(module, G, W, o, enable_pdl, _K1_DGRAD_HEAD)
     nvjet = _k1_dgrad_nvjet_of(G, W, o)
     return _det_k1(
         (G, W, o),

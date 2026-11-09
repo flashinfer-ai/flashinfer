@@ -5850,7 +5850,7 @@ def _cpu_k1_launches(monkeypatch, arch="sm_103a"):
     )
     monkeypatch.setattr(cake_backend, "_ATOMIC_ARENAS", {})
     monkeypatch.setattr(cake_backend, "_K1_STREAM_CONTEXTS", {})
-    for cache in ("_K1_ATOMIC_CACHE", "_K1_DET_CACHE"):
+    for cache in ("_K1_ATOMIC_CACHE", "_K1_DET_CACHE", "_K1_PROGRAM_CACHE"):
         monkeypatch.setattr(cake_backend, cache, type(getattr(cake_backend, cache))())
     return module.entry
 
@@ -6847,6 +6847,128 @@ def test_k1_program_rows_bind_their_program(monkeypatch, arch):
         torch.empty(T, N, dtype=bf16),
     )
     assert cake_backend._k1_forward_program_of(X, W, out) is None
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_k1_program_rows_cache_their_binding(monkeypatch, arch):
+    """A forward / input-gradient row of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` / :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`
+    binds its program once per key in :data:`_K1_PROGRAM_CACHE` (the key of :data:`_K1_DET_CACHE`: the entry point's
+    flags, the PDL flag, the device, the stream and the geometry of its tensors); a repeat call -- on the same
+    tensors or on other tensors of that geometry -- launches the bound program without the table lookup, with the
+    call's own views in the program's order; a call of another PDL flag, device index, stream or output stride binds
+    a new entry, an FP32 forward output is no program row and no key of a BF16 one, and ``_drop_convenience_entries``
+    drops the entries."""
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    index = {"value": 0}
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: index["value"])
+    bf16, f32 = torch.bfloat16, torch.float32
+    cache = cake_backend._K1_PROGRAM_CACHE
+    (K, N, T), template = min(K1_FORWARD_PROGRAM_ROWS[(arch, 152)].items())
+    module = cake_jit.KERNELS[arch][template]
+    plan = cake_jit.arg_plan_of(cake_jit.MODULES[module])
+    lookup = cake_backend._k1_forward_program_of
+
+    def forward(X, W, out, **kw):
+        n = len(entry_fn.calls)
+        assert (
+            cake_backend.cake_dense_gemm_nondet_train_projection_forward(
+                X, W, out, **kw
+            )
+            is out
+        )
+        assert len(entry_fn.calls) == n + 1
+        return list(entry_fn.calls[-1][0])
+
+    def fresh():
+        return (
+            torch.empty(T, K, dtype=bf16),
+            torch.empty(N, K, dtype=bf16),
+            torch.empty(T, N, dtype=bf16),
+        )
+
+    X, W, out = fresh()
+    first = forward(X, W, out)
+    ((key, entry),) = cache.items()
+    assert key[2] == (("fwd",), 1, False) and not cake_backend._K1_DET_CACHE
+    assert (
+        entry.module_name == module and entry.k1 is not None and entry.entry is not None
+    )
+
+    def no_lookup(*args, **kwargs):
+        raise AssertionError("a cached program row looked its table up")
+
+    monkeypatch.setattr(cake_backend, "_k1_forward_program_of", no_lookup)
+    _same_k1_arguments(forward(X, W, out), first, plan)
+
+    def layout(args):
+        return [
+            (tuple(a.shape), a.stride(), a.dtype) if isinstance(a, torch.Tensor) else a
+            for a in args
+        ]
+
+    X2, W2, out2 = fresh()
+    got = forward(X2, W2, out2)
+    assert layout(got) == layout(first)
+    pointers = {t.data_ptr() for t in got if isinstance(t, torch.Tensor)}
+    assert {X2.data_ptr(), W2.data_ptr(), out2.data_ptr()} <= pointers
+    assert not pointers & {X.data_ptr(), W.data_ptr(), out.data_ptr()}
+    assert len(cache) == 1
+    monkeypatch.setattr(cake_backend, "_k1_forward_program_of", lookup)
+    # another PDL flag, device index, stream, output stride: a new entry each
+    pdl = forward(X, W, out, enable_pdl=False)
+    assert pdl[[name for _, name in plan].index("enable_pdl")] == 0
+    assert len(cache) == 2
+    index["value"] = 1
+    forward(X, W, out)
+    assert len(cache) == 3
+    index["value"] = 0
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 7)
+    forward(X, W, out)
+    assert len(cache) == 4 and {k[1] for k in cache} == {0, 7}
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 0)
+    padded = torch.empty(T, N + 64, dtype=bf16)[:, :N]
+    assert lookup(X, W, padded) == module
+    got = forward(X, W, padded)
+    assert len(cache) == 5
+    c = [name for _, name in plan].index("C")
+    assert (got[c].data_ptr(), tuple(got[c].stride())) == (
+        padded.data_ptr(),
+        (T * (N + 64), N + 64, 1),
+    )
+    # an FP32 output is no program row (the deterministic routing) and no key of a BF16 one
+    out32 = torch.empty(T, N, dtype=f32)
+    assert lookup(X, W, out32) is None
+    assert cake_backend._k1_key(0, 0, key[2], X, W, out32) != key
+    rows = sorted(K1_DGRAD_PROGRAM_ROWS[(arch, 152)].items())
+    if rows:
+        (K, N, T, _), template = rows[0]
+        G, W, out = (
+            torch.empty(T, N, dtype=bf16),
+            torch.empty(N, K, dtype=bf16),
+            torch.empty(T, K, dtype=f32),
+        )
+        module = cake_jit.KERNELS[arch][template]
+        plan = cake_jit.arg_plan_of(cake_jit.MODULES[module])
+        n = len(entry_fn.calls)
+        assert (
+            cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out) is out
+        )
+        first = list(entry_fn.calls[-1][0])
+        assert len(cache) == 6 and next(reversed(cache))[2] == (("dgrad",), 1, False)
+        assert next(reversed(cache.values())).module_name == module
+        monkeypatch.setattr(cake_backend, "_k1_dgrad_program_of", no_lookup)
+        G2 = torch.empty(T, N, dtype=bf16)
+        assert (
+            cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G2, W, out)
+            is out
+        )
+        assert len(entry_fn.calls) == n + 2 and len(cache) == 6
+        got = list(entry_fn.calls[-1][0])
+        assert layout(got) == layout(first)
+        a = [name for _, name in plan].index("A")
+        assert got[a].data_ptr() == G2.data_ptr()
+    cake_backend._drop_convenience_entries()
+    assert not cache
 
 
 _KD_WINDOW_PROGRAMS = {
@@ -9246,8 +9368,8 @@ def test_k1_forward_and_input_gradient_alert_only_when_order_varying(
                 (lambda: cake_backend.cake_dense_gemm_nondet_train_projection(G, W, out_d32), (G, W, out_d32)),
             )  # fmt: skip
             # a row of K1_FORWARD_PROGRAM_RULES_BY_SM / K1_DGRAD_PROGRAM_RULES_BY_SM on this part runs this package's
-            # program from the entry point, uncached: the same bits on every run, so never an alert; the generic entry
-            # point runs it too (_k1_table_call)
+            # program, bound once per key in _K1_PROGRAM_CACHE (the generic entry point reaches the entry point
+            # through _k1_table_call); the same bits on every run, so never an alert
             forward = cake_backend._k1_forward_program_of(X, W, out_f)
             dgrad32 = cake_backend._k1_dgrad_program_of(G, W, out_d32)
             programs = (
@@ -9265,8 +9387,12 @@ def test_k1_forward_and_input_gradient_alert_only_when_order_varying(
                     alert = _call_under_the_mode(call)
                     if program is not None:
                         assert alert is None, (K, N, T, program)
-                        caches = _k1_convenience_caches()
+                        own = cake_backend._K1_PROGRAM_CACHE
+                        caches = [c for c in _k1_convenience_caches() if c is not own]
                         assert not any(list(c.values()) for c in caches), (K, N, T)
+                        names = [e.module_name for e in own.values()]
+                        assert names == [program], (K, N, T)
+                        assert not any(e.order_varying for e in own.values())
                         assert len(entry_fn.calls) == before + 1
                         continue
                     entry = _single_k1_entry()
@@ -15143,9 +15269,10 @@ def test_gpu_k1_forward_named_rows_keep_the_det_bits():
 def test_gpu_k1_program_rows_keep_the_det_bits():
     """On a part of a table of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` / :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`: the
     forward / input gradient of every row (in the input-gradient token window, the token counts of
-    :data:`_KD_WINDOW_SAMPLE`) runs this package's program (no cached deterministic plan), gives the deterministic
-    package's result bit for bit, meets the deterministic package's budget against FP64 and repeats bit for bit over
-    ``RERUNS`` calls into NaN-poisoned outputs.  A part without rows skips."""
+    :data:`_KD_WINDOW_SAMPLE`) runs this package's program (no cached deterministic plan; the program bound in
+    :data:`_K1_PROGRAM_CACHE`, which the repeats launch), gives the deterministic package's result bit for bit, meets
+    the deterministic package's budget against FP64 and repeats bit for bit over ``RERUNS`` calls into NaN-poisoned
+    outputs.  A part without rows skips."""
     device, arch, sms = _part_or_skip()
     fwd = cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
     dgrad_rows = cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
@@ -15169,6 +15296,8 @@ def test_gpu_k1_program_rows_keep_the_det_bits():
         run(out)
         torch.cuda.synchronize()
         assert not cake_backend._K1_DET_CACHE, what
+        ((_, entry),) = cake_backend._K1_PROGRAM_CACHE.items()
+        assert entry.module_name == cake_jit.KERNELS[arch][template], what
         assert (
             cake_backend._k1_forward_program_of(X, W, out)
             == cake_jit.KERNELS[arch][template]
@@ -15192,6 +15321,8 @@ def test_gpu_k1_program_rows_keep_the_det_bits():
         run(out)
         torch.cuda.synchronize()
         assert not cake_backend._K1_DET_CACHE, what
+        ((_, entry),) = cake_backend._K1_PROGRAM_CACHE.items()
+        assert entry.module_name == cake_jit.KERNELS[arch][template], what
         assert (
             cake_backend._k1_dgrad_program_of(G, W, out)
             == cake_jit.KERNELS[arch][template]
