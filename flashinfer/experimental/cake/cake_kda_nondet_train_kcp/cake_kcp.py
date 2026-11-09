@@ -6413,16 +6413,29 @@ def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
 # rows: 768 B per internal token-head, about 0.8 GiB per rank at 16384 tokens and H = 64), which the default pool's
 # other allocations cannot use and torch.cuda.empty_cache() does not release while the pool lives (after
 # default_workspace_cache_clear() it does).  The row count of a set changes from pack to pack (each document's rows are padded to
-# whole chunks), and a block cut for one pack's rows does not fit a slightly larger set; so each kept tensor is
-# allocated with its leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`, at most 1/16
-# more) and resized in place to its rows (the storage keeps the rounded size), so packs of nearby sizes take the same
-# blocks.  A caller-held workspace's arena stays allocated between calls, so nothing is freed and reallocated around
-# its kept set: its calls keep the default pool, whose blocks the set then shares with the step's other allocations.
-# A saving forward outside a checkpoint (saved_rows="intra" / "wy" on a plain autograd call) keeps its rows in the
-# default pool: they live until each layer's backward, and their blocks then serve the next step's other allocations.
+# whole chunks), and a block cut for one pack's rows does not fit a slightly larger set; so each kept tensor's block is
+# cut for its leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`, at most 1/16 more), so packs
+# of nearby sizes take the same blocks (_kept_tensors).  A caller-held workspace's arena stays allocated between calls,
+# so nothing is freed and reallocated around its kept set: its calls keep the default pool, whose blocks the set then
+# shares with the step's other allocations.  A saving forward outside a checkpoint (saved_rows="intra" / "wy" on a
+# plain autograd call) keeps its rows in the default pool: they live until each layer's backward, and their blocks then
+# serve the next step's other allocations.
+# Host time: the kept sets are allocated where the GPU waits for the host (a recompute's first launches follow the
+# call's host work with nothing queued), so _tape_alloc makes the begin / end / release calls of use_mem_pool itself
+# (no generator, no second capture check) and rounds a tensor only when its rows exceed the largest extent rounded so
+# far for its name and trailing shape (_KEPT_EXTENTS) or the previous tensor of that key is still alive (_KEPT_LAST):
+# otherwise the freed block of that extent serves the exact shape.  Measured on GB300 (alloc, 5-tensor tape set /
+# 2-tensor rows set): default pool 7.3 / 3.0 us, use_mem_pool + rounding + resize_ 19.9 / 11.2 us, this 9.0 / 4.4 us.
 _MEM_POOL = getattr(torch.cuda, "MemPool", None)
 _USE_MEM_POOL = getattr(torch.cuda, "use_mem_pool", None)
+_POOL_BEGIN = getattr(torch._C, "_cuda_beginAllocateCurrentThreadToPool", None)
+_POOL_END = getattr(torch._C, "_cuda_endAllocateToPool", None)
+_POOL_RELEASE = getattr(torch._C, "_cuda_releasePool", None)
 _KEPT_POOLS: dict[int, Any] = {}
+# per (device index, buffer name, trailing shape): the largest leading extent rounded so far in the device's pool
+_KEPT_EXTENTS: dict[tuple, int] = {}
+# per the same key: a weak reference to the last tensor allocated (a live one keeps its block)
+_KEPT_LAST: dict[tuple, Any] = {}
 
 
 def _kept_extent(n: int) -> int:
@@ -6458,6 +6471,35 @@ def _kept_pool(call: CakeKDANondetKcpCall) -> Any:
     return pool
 
 
+def _kept_tensors(
+    index: int,
+    names: tuple[str, ...],
+    shapes: dict[str, tuple[int, ...]],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """The kept tensors ``names`` of ``shapes``, allocated while the pool of device ``index`` is active: the exact
+    shape when its rows fit the largest extent rounded so far for the key (:data:`_KEPT_EXTENTS`) and the key's
+    previous tensor is freed (:data:`_KEPT_LAST`), so the freed block of that extent serves it; else the leading
+    extent rounded up (:func:`_kept_extent`) and resized in place to the rows (the storage keeps the rounded size; a
+    contiguous base tensor, not a ``[:n]`` view of a temporary base, which costs about 4 us of host time)."""
+    tape = {}
+    for n in names:
+        shape = shapes[n]
+        rows, *rest = shape
+        key = (index, n, *rest)
+        last = _KEPT_LAST.get(key)
+        if rows <= _KEPT_EXTENTS.get(key, -1) and (last is None or last() is None):
+            t = _alloc(shape, torch.bfloat16, device)
+        else:
+            extent = _kept_extent(rows)
+            if extent > _KEPT_EXTENTS.get(key, -1):
+                _KEPT_EXTENTS[key] = extent
+            t = _alloc((extent, *rest), torch.bfloat16, device).resize_(shape)
+        _KEPT_LAST[key] = weakref.ref(t)
+        tape[n] = t
+    return tape
+
+
 def _tape_alloc(
     call: CakeKDANondetKcpCall,
     names: tuple[str, ...] = cake_kcp_plan.KCP_HANDOFF_BUFFERS,
@@ -6471,15 +6513,20 @@ def _tape_alloc(
     call.scratch["kept_pool"] = pool is not None
     if pool is None:
         tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
-    else:  # the leading extent rounded up (_kept_extent), then resized in place to the call's rows: resize_ keeps
-        # the rounded storage and leaves a contiguous base tensor, not a [:n] view of a temporary base (that view
-        # costs about 4 us of host time per tensor, measured on GB200, before the intra launch of a rows set)
-        tape = {}
-        with _USE_MEM_POOL(pool, call.device):
-            for n in names:
-                rows, *rest = shapes[n]
-                full = _alloc((_kept_extent(rows), *rest), torch.bfloat16, call.device)
-                tape[n] = full.resize_(shapes[n])
+    else:
+        index = call.device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        if _POOL_BEGIN is None or _POOL_END is None or _POOL_RELEASE is None:
+            with _USE_MEM_POOL(pool, call.device):
+                tape = _kept_tensors(index, names, shapes, call.device)
+        else:  # the calls use_mem_pool makes; _kept_pool returns no pool under a capture
+            _POOL_BEGIN(index, pool.id)
+            try:
+                tape = _kept_tensors(index, names, shapes, call.device)
+            finally:
+                _POOL_END(index, pool.id)
+                _POOL_RELEASE(index, pool.id)
     if _HANDOFF_POISON:
         for t in tape.values():
             t.fill_(float("nan"))
@@ -7783,6 +7830,8 @@ def default_workspace_cache_clear() -> int:
             break
     _L2N_DEFAULT_OK.clear()
     _KEPT_POOLS.clear()
+    _KEPT_EXTENTS.clear()
+    _KEPT_LAST.clear()
     return n
 
 

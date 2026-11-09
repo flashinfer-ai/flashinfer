@@ -2782,6 +2782,58 @@ def test_default_workspace_cache_clear_drops_the_kept_pools() -> None:
     assert dropped - torch.cuda.memory_reserved(device) >= nbytes
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or cake_kcp._MEM_POOL is None,
+    reason="CUDA device and torch.cuda.MemPool required",
+)
+def test_kept_tensors_round_once_then_take_the_exact_shape() -> None:
+    """:func:`cake_kcp._kept_tensors` rounds a key's first tensor (:func:`cake_kcp._kept_extent`, resized in place
+    to its rows), serves a later tensor of no more rows with its exact shape from the freed block (no new reserved
+    memory), rounds again while the key's previous tensor is alive and above the largest rounded extent, and keys
+    on the trailing shape; :func:`cake_kcp.default_workspace_cache_clear` forgets the extents."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    cake_kcp.default_workspace_cache_clear()
+    pool = cake_kcp._MEM_POOL()
+    row = 64 * 128 * 2  # bytes per row: blocks above 10 MiB, one segment each
+
+    def kept(rows: int, heads: int = 64) -> torch.Tensor:
+        with cake_kcp._USE_MEM_POOL(pool, device):
+            t = cake_kcp._kept_tensors(
+                device.index, ("w",), {"w": (rows, heads, 128)}, device
+            )["w"]
+        assert t.shape == (rows, heads, 128) and t.is_contiguous() and t._base is None
+        return t
+
+    first = kept(1000)
+    assert first.untyped_storage().nbytes() == cake_kcp._kept_extent(1000) * row
+    ptr = first.data_ptr()
+    del first
+    torch.cuda.synchronize(device)
+    reserved = torch.cuda.memory_reserved(device)
+    exact = kept(990)
+    assert exact.untyped_storage().nbytes() == 990 * row and exact.data_ptr() == ptr
+    assert torch.cuda.memory_reserved(device) == reserved
+    # the previous tensor is alive: rounded, in another block
+    other = kept(1010)
+    assert other.untyped_storage().nbytes() == cake_kcp._kept_extent(1010) * row
+    assert other.data_ptr() != ptr
+    del exact, other
+    # above the largest rounded extent: rounded again
+    above = kept(1100)
+    assert above.untyped_storage().nbytes() == cake_kcp._kept_extent(1100) * row
+    del above
+    # another trailing shape is another key: its first tensor is rounded
+    heads = kept(990, heads=32)
+    assert heads.untyped_storage().nbytes() == cake_kcp._kept_extent(990) * row // 2
+    del heads
+    assert len(cake_kcp._KEPT_EXTENTS) == 2
+    cake_kcp.default_workspace_cache_clear()
+    assert not cake_kcp._KEPT_EXTENTS and not cake_kcp._KEPT_LAST
+    pool = None  # dropped: empty_cache releases its blocks
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 def test_handoff_is_blocked_inside_a_cuda_graph_capture() -> None:
     """A CUDA-graph capture blocks the request (a replay would hand a dropped set to a later backward)."""
