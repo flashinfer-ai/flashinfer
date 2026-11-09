@@ -340,7 +340,7 @@ kernel_cake_causal_conv1d_train_fdd0d538db009e587335(__nv_bfloat16* __restrict__
                 for (int j_1 = 0; j_1 < 8; j_1++) {
                     {
                         uint2 _vld_2;
-                        _vld_2 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64 + (long long)j_1) * 4);
+                        _vld_2 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64 + (long long)j_1) * 4ll);
                         uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -353,7 +353,7 @@ kernel_cake_causal_conv1d_train_fdd0d538db009e587335(__nv_bfloat16* __restrict__
                 #pragma unroll
                 for (int j_2 = 0; j_2 < 8; j_2++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64 + (long long)j_2) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64 + (long long)j_2) * 4ll);
                         wr[j_2 * 4 + 0] = _v4.x;
                         wr[j_2 * 4 + 1] = _v4.y;
                         wr[j_2 * 4 + 2] = _v4.z;
@@ -385,7 +385,7 @@ kernel_cake_causal_conv1d_train_fdd0d538db009e587335(__nv_bfloat16* __restrict__
                     br[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(b) + c64 + 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(b) + c64 + 4ll);
                     br[4 + 0] = _v4.x;
                     br[4 + 1] = _v4.y;
                     br[4 + 2] = _v4.z;
@@ -968,7 +968,7 @@ kernel_cake_causal_conv1d_train_fdd0d538db009e587335(__nv_bfloat16* __restrict__
                 for (int j_4 = 0; j_4 < 8; j_4++) {
                     {
                         uint2 _vld_50;
-                        _vld_50 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64_1 + (long long)j_4) * 4);
+                        _vld_50 = *reinterpret_cast<const uint2*>(reinterpret_cast<__nv_bfloat16*>(w) + (c64_1 + (long long)j_4) * 4ll);
                         uint32_t* _vpairs_50 = reinterpret_cast<uint32_t*>(&_vld_50);
                         #pragma unroll
                         for (int _pair = 0; _pair < 2; _pair++) {
@@ -981,7 +981,7 @@ kernel_cake_causal_conv1d_train_fdd0d538db009e587335(__nv_bfloat16* __restrict__
                 #pragma unroll
                 for (int j_5 = 0; j_5 < 8; j_5++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64_1 + (long long)j_5) * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(w) + (c64_1 + (long long)j_5) * 4ll);
                         wr_1[j_5 * 4 + 0] = _v4.x;
                         wr_1[j_5 * 4 + 1] = _v4.y;
                         wr_1[j_5 * 4 + 2] = _v4.z;
@@ -1013,7 +1013,7 @@ kernel_cake_causal_conv1d_train_fdd0d538db009e587335(__nv_bfloat16* __restrict__
                     br_1[0 + 3] = _v4.w;
                 }
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(b) + c64_1 + 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(b) + c64_1 + 4ll);
                     br_1[4 + 0] = _v4.x;
                     br_1[4 + 1] = _v4.y;
                     br_1[4 + 2] = _v4.z;
@@ -1578,14 +1578,14 @@ kernel_cake_causal_conv1d_train_fdd0d538db009e587335(__nv_bfloat16* __restrict__
                 if (cl < lim) {
                     long long cl64 = (long long)cl;
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + cl64 * 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + cl64 * 4ll);
                         a[4 * j_8 + 0] = _v4.x;
                         a[4 * j_8 + 1] = _v4.y;
                         a[4 * j_8 + 2] = _v4.z;
                         a[4 * j_8 + 3] = _v4.w;
                     }
                     {
-                        tb_3[j_8] = *reinterpret_cast<const float*>(dw_acc + ((long long)C * 4 + cl64));
+                        tb_3[j_8] = *reinterpret_cast<const float*>(dw_acc + ((long long)C * 4ll + cl64));
                     }
                 }
             }
@@ -1594,21 +1594,21 @@ kernel_cake_causal_conv1d_train_fdd0d538db009e587335(__nv_bfloat16* __restrict__
                 int c = c0_0 + 128 * j_9;
                 if (c < lim) {
                     long long c64_2 = (long long)c;
-                    long long bi = (long long)C * 4 + c64_2;
+                    long long bi = (long long)C * 4ll + c64_2;
                     {
                         float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
-                        *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
+                        *reinterpret_cast<float4*>(dw_acc + c64_2 * 4ll) = _v4;
                     }
                     *(reinterpret_cast<float*>(dw_acc) + (bi)) = z4[0];
                     if ((flags & 2) != 0) {
                         #pragma unroll
                         for (int e_1 = 0; e_1 < 4; e_1++) {
-                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a[4 * j_9 + e_1];
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4ll + (long long)e_1)) = (__nv_bfloat16)a[4 * j_9 + e_1];
                         }
                     } else {
                         {
                             float4 _v4 = make_float4(a[4 * j_9 + 0], a[4 * j_9 + 1], a[4 * j_9 + 2], a[4 * j_9 + 3]);
-                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4ll) = _v4;
                         }
                     }
                     if ((flags & 8) != 0) {

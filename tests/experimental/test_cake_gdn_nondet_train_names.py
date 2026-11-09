@@ -29,7 +29,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 FACADE = "flashinfer.cake_gdn_nondet_train"
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train"
-SUBMODULES = ("cake_backend", "cake_build", "cake_chain", "cake_jit")
+SUBMODULES = ("cake_backend", "cake_build", "cake_chain", "cake_jit", "cake_plan")
 # the facade functions that call the package function of their name
 FORWARDS = ("cake_gdn_nondet",)
 OLD_MODULES = ("flashinfer.experimental.cake.cake_gdn_train",)

@@ -36,18 +36,28 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   other ``num_splits - 1`` partials with IEEE round-to-nearest adds, rounds once and stores (:func:`k1_plan` reads the
   tile width and the split count from the measured verdicts of :data:`K1_SPLIT_RULES`; every other row runs the
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
-  bit; three or more add in the order the splits finish;
-* the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 152-SM ``sm_100a`` parts,
-  in that table's token ranges), before every other K1 table: a cluster program (:func:`k1_dsm_plan`) whose ``S``
-  CTAs each take one of a tile's ``S`` K ranges and meet in the cluster's distributed shared memory -- each CTA sends
-  the column quads another rank owns to that rank, adds the ``S`` partials of its own quads in cluster-rank order and
-  stores them once (no workspace, no ticket; the same bits on every run);
-* the K2 weight gradient (and a forward given an explicit split count): a stream-K partition of the (tile, K block)
-  steps into ``units`` spans, alike or a head/tail partition of long head spans and short tail spans
-  (:func:`router_partition` reads the measured verdicts and token windows of :data:`ROUTER_RULES`; every other row and
-  token count runs the deterministic program); a segment that covers its tile's whole K range stores the
-  deterministic program's one-split bits, any other adds its partial into ``out`` with a TMA reduce-add (``out`` is
-  zeroed on the launch's stream first).  A forward partition gives every element at most two partials,
+  bit; three or more add in the order the splits finish (no row of the shipped tables: only a caller's explicit
+  ``splits``).  The rows of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a parts, and one 148-SM sm_100a BF16 row)
+  add four splits in the fixed mirror order or run two or four chains of one split, the one-split rows store whole
+  tiles, and the rows of
+  :data:`K1_WGRAD_DET_RULES_BY_SM` run another fixed-order program of the deterministic package;
+* the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
+  ``sm_100a``, 152-SM ``sm_103a`` and 212-SM ``sm_107a`` parts, in that table's token ranges; the odd numbers of K
+  blocks of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` take that table's 64-wide four-CTA tile), before every other K1
+  table: a cluster program (:func:`k1_dsm_plan`) whose ``S`` CTAs each take one of a tile's ``S`` K ranges and meet in the cluster's
+  distributed shared memory -- each CTA sends the column quads another rank owns to that rank, adds the ``S``
+  partials of its own quads in cluster-rank order and stores them once (no workspace, no ticket; the same bits on
+  every run);
+* the K2 weight gradient: the deterministic program at the split count of its row's ``"det_s<n>"`` token window in
+  the router tables (:func:`router_det_splits`; the partials added in a fixed order), else at the deterministic
+  package's split count of the row.  A stream-K partition of the (tile, K block) steps into ``units`` spans
+  (:func:`router_partition`) runs only for a caller's explicit split count (also of the forward), in the ``"waves"``
+  windows on a part without a router table of its SM count where it gives every element at most two partials, and
+  in the ``"ksum_S<n>"`` windows of the router tables, whose K-order program adds a tile's partials in K order
+  through a workspace (:func:`router_ksum_template`; the same bits on every run); in the other partitions a segment that covers its tile's whole K
+  range stores the deterministic program's one-split bits, any other adds its partial into ``out`` with a TMA
+  reduce-add (``out`` is zeroed on the launch's stream first).  The head/tail partitions (long head spans, short tail
+  spans) stay registered for an explicit table entry; no row of the shipped tables runs them.  A forward partition gives every element at most two partials,
   ``0 + a + b == 0 + b + a``, so a forward recomputed under activation checkpointing gives the same logits and the same
   top-k;
 * the K2 weight and input gradients in the SIMT token windows of their rows in the router tables
@@ -63,22 +73,29 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
 Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs: a
 recomputed forward must reproduce its result, and where the deterministic plan of a K1 forward or input gradient
 splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  The K1 forward rows of
-:data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 152-SM ``sm_100a`` / ``sm_103a`` parts) run another plan of those
-programs: the single-CTA program, every tile's whole K in one CTA.
+:data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 148-SM ``sm_100a`` and 152-SM ``sm_100a`` / ``sm_103a`` parts)
+run another plan of those programs (the single-CTA program, every tile's whole K in one CTA, or another named
+program), and the input-gradient rows of :data:`K1_DGRAD_RULES_BY_SM` another named program of that package (the
+deterministic plan's bits).  The K1 forward rows of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` run this package's one-wave
+forward program and the input-gradient rows of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` this package's input-gradient
+program: both add each output element's whole K in one ascending FP32 chain, with the deterministic plan's bits.  The
+input-gradient rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` launch this package's nvjet program on the deterministic
+package's plan of one of its programs (the same kernel parameters and bits).
 
 Under ``torch.use_deterministic_algorithms(True)`` a launch whose result can vary run to run -- the K1 split-K program
-of CTA pairs at three or more splits, a K2 stream-K partition that gives an element more than two partials -- raises
+of CTA pairs at three or more splits in the arrival order, a K2 stream-K partition that gives an element more than two
+partials; no default plan of the shipped tables, only a caller's explicit split count -- raises
 PyTorch's alert right before it launches (:func:`_alert_order_varying`): ``RuntimeError`` (the program is not launched
 and ``out`` is untouched), or with ``warn_only=True`` a ``UserWarning``, after which the launch runs.  The fixed-order
-launches (the one- and two-split K1 rows, the K1 cluster program, the K2 SIMT programs, a K2 partition of at most two
-partials per element, every deterministic program) do not alert.  The alert is checked on every launch, never at plan or
+launches (the one- and two-split K1 rows, the mirror order, the K1 cluster program, the K2 SIMT and K-order programs,
+a K2 partition of at most two partials per element, every deterministic program) do not alert.  The alert is checked on every launch, never at plan or
 prepare time; a launch captured into a CUDA graph is checked at capture, not at replay.  The PyTorch setting never
 changes which program a call runs, and no call goes to the deterministic package because of it.
 
 The two packages
 ----------------
 This package registers only the programs of its own schedule (``cake_jit``: programs
-``cake_dense_projection_gemm_<hex>``, templates ``dense_proj_gemm_atomic_*`` / ``router_fp32_gemm_*``); every
+``cake_dense_projection_gemm_<hex>``, templates ``dense_proj_gemm_*`` / ``router_fp32_gemm_*``); every
 deterministic program, and every planner rule of the deterministic package, is that package's.  A call of this
 package reuses them on the rows that run the deterministic programs (above): it launches the
 deterministic plan and program through a binding of this package (the same bits, fewer host operations per call),
@@ -259,12 +276,16 @@ def _k2_launch_text(plan: Any) -> str:
 ROUTES: dict[str, str] = {
     "k1_kk": "det",  # forward: feeds the recompute of checkpointing; whole tiles or a fixed-order two-way K split (the
     # rows of K1_FORWARD_RULES_BY_SM: another plan of the deterministic programs, whole K per tile)
-    "k1_kn": "det",  # input gradient: whole tiles or a fixed-order two-way K split
+    "k1_kn": "det",  # input gradient: whole tiles or a fixed-order two-way K split (the rows of
+    # K1_DGRAD_RULES_BY_SM: another program of the deterministic package, the same bits)
     "k1_nk": "det",
-    "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count
+    "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count; the rows of the tables repeat bit for
+    # bit (two splits, the cluster program, one split, a fixed split order) but the four-split arrival-order rows of
+    # K1_ORDERED_RANGES_BY_SM and K1_DSM_ODD_BLOCK_RANGES_BY_SM, the others run the deterministic program
     "k2_kk": "atomic",  # router forward: the cluster SIMT program in its token windows; an explicit split count <= 2
     "k2_kn": "atomic",  # router input gradient: the SIMT program in its token windows, else one split
-    "k2_nn_t": "atomic",  # router weight gradient: stream-K over the token count
+    "k2_nn_t": "atomic",  # router weight gradient: the SIMT program in its token windows, else the deterministic
+    # program at the split count of the router tables (fixed order); stream-K only for an explicit split count
     "split": "det",  # the exact BF16x3 split of the router's second operand
 }
 
@@ -321,7 +342,8 @@ K1_ROW_MAJOR_BLOCK_N: tuple[int, ...] = (192,)
 #: Accumulation chains of a one-split K1 program: with ``c`` chains each tile's K blocks are cut into ``c`` contiguous
 #: ranges, each summed in a TMEM accumulator of its own from an ``init`` MMA, and the epilogue adds them once, in order
 #: (no workspace, the same bits on every run).  This package ships the one-chain programs and, for the FP32 rows of
-#: :data:`K1_CHAIN_RANGES_BY_SM`, three-chain programs (templates ``..._c3``).
+#: :data:`K1_CHAIN_RANGES_BY_SM`, three-chain programs (templates ``..._c3``); the two- and four-chain programs of
+#: :data:`K1_ORDERED_RANGES_BY_SM` (templates ``..._c2``, ``..._c4``) are the planner's only, not a ``chains`` choice.
 K1_CHAINS_CHOICES: tuple[int, ...] = (1, 3)
 
 # ---------------------------------------------------------------------------
@@ -373,24 +395,26 @@ K1_SPLIT_RULES:dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] =
     ("sm_103a", 1, 5120, 128, "bf16"): (128, 2), ("sm_103a", 1, 5120, 128, "f32"): (128, 2),
     ("sm_103a", 1, 6144, 32, "bf16"): (64, 2), ("sm_103a", 1, 6144, 32, "f32"): (64, 2),
     ("sm_103a", 1, 6144, 128, "bf16"): (128, 2), ("sm_103a", 1, 6144, 128, "f32"): (128, 2),
-    # sm_107a (216 SMs): two to four splits; the one-split rows store whole tiles (deterministic) and win where the
+    # sm_107a (216 SMs): one or two splits (the rows of three or four splits, whose partials were added in the order
+    # they finish, run two splits where the two-split program was not slower than the deterministic plan on 212-SM
+    # parts, else the deterministic program); the one-split rows store whole tiles (deterministic) and win where the
     # deterministic package's sm_107a program of the row is slower (the FP32 one-split rows up to 40960 tokens on
     # 216 SMs, 5120 -> 1024 to 32768, and up to 960 on more SMs: K1_SPLIT_RULE_EXCLUDED_TOKENS).  d_out 64 BF16 at
     # d_in 4096 is not faster than the deterministic plan in every run; d_in 4096 to d_out 512 BF16 (192 CTAs) and to
     # d_out 4096 FP32 (216 CTAs) need more SMs than a kernel holding 32 SMs leaves free and lose next to it
-    ("sm_107a", 1, 4096, 32, "bf16"): (64, 4), ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
-    ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
-    ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
+    ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 2),
+    ("sm_107a", 1, 4096, 48, "f32"): None,
+    ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): None,
     ("sm_107a", 1, 4096, 128, "bf16"): None, ("sm_107a", 1, 4096, 128, "f32"): None,
     ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
     ("sm_107a", 1, 4096, 1024, "f32"): (256, 1),
     ("sm_107a", 1, 4096, 4096, "f32"): None,
-    ("sm_107a", 1, 5120, 32, "bf16"): (64, 3), ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
-    ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
-    ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
+    ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 2),
+    ("sm_107a", 1, 5120, 48, "f32"): (64, 2),
+    ("sm_107a", 1, 5120, 64, "f32"): None,
     ("sm_107a", 1, 5120, 512, "f32"): (128, 1),
     ("sm_107a", 1, 5120, 1024, "bf16"): (256, 1), ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
-    ("sm_107a", 1, 6144, 32, "bf16"): (64, 3), ("sm_107a", 1, 6144, 32, "f32"): (64, 3),
+    ("sm_107a", 1, 6144, 32, "bf16"): None, ("sm_107a", 1, 6144, 32, "f32"): None,
     ("sm_107a", 1, 8192, 128, "bf16"): (128, 2), ("sm_107a", 1, 8192, 128, "f32"): (128, 2),
 }
 # fmt: on
@@ -489,7 +513,8 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: there).  The 217-SM entries keep the four rows on the deterministic program from 961 tokens up on parts of more than
 #: 216 SMs, the route they took before that measurement: the one-split program's time at 961 to 40960 tokens was
 #: measured on 216-SM parts only (where the ranges of :data:`K1_CHAIN_RANGES_BY_SM` come first), and no part of more
-#: SMs was measured.
+#: SMs was measured.  The sm_107a rows that now run the deterministic program at every token count (their three- or
+#: four-split verdicts are gone, :data:`K1_SPLIT_RULES`) have no entries.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -522,40 +547,25 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_103a", 1, 6144, 32, "f32"): ((152, 512, 512),),
     ("sm_103a", 1, 6144, 128, "bf16"): ((152, 512, 8192),),
     ("sm_103a", 1, 6144, 128, "f32"): ((152, 512, 8192),),
-    ("sm_107a", 1, 4096, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 4096, 32, "f32"): ((216, 16231, 16231),),
-    ("sm_107a", 1, 4096, 48, "f32"): (
-        (208, 16231, 16231), (208, 16384, 16384), (216, 512, 512), (216, 16231, 16231),
-        (216, 16384, 16384),
-    ),
-    ("sm_107a", 1, 4096, 64, "f32"): (
-        (208, 16231, 16231), (208, 16384, 16384), (216, 512, 512), (216, 16231, 16231),
-        (216, 16384, 16384),
-    ),
     ("sm_107a", 1, 4096, 512, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
         (216, 16231, 16231), (216, 16384, 16384), (216, 40961, None), (217, 961, None),
     ),
     ("sm_107a", 1, 4096, 1024, "f32"): (
-        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 16231, 16231),
-        (216, 16384, 16384), (216, 40961, None), (217, 961, None),
+        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
+        (216, 16231, 16231), (216, 16384, 16384), (216, 40961, None), (217, 961, None),
     ),
-    ("sm_107a", 1, 5120, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 5120, 32, "f32"): ((216, 512, 512),),
     ("sm_107a", 1, 5120, 48, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 512, 512),
         (216, 16231, 16231), (216, 16384, 16384),
-    ),
-    ("sm_107a", 1, 5120, 64, "f32"): (
-        (208, 16231, 16231), (212, 16231, 16231), (216, 512, 512), (216, 16231, 16231),
-        (216, 16384, 16384),
     ),
     ("sm_107a", 1, 5120, 512, "f32"): (
         (212, 16231, 16231), (212, 16384, 16384), (216, 40961, None), (217, 961, None),
     ),
     ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231),),
     ("sm_107a", 1, 5120, 1024, "f32"): ((216, 32769, None), (217, 961, None)),
-    ("sm_107a", 1, 6144, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 8192, 128, "bf16"): ((216, 512, 512), (216, 65536, 65536)),
     ("sm_107a", 1, 8192, 128, "f32"): ((216, 512, 512), (216, 65536, 65536)),
 }
@@ -587,7 +597,11 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
 #: output missed the BF16 budget for one of 10 seeds at 40961 and at 40962 tokens (``5120 -> 64``: 47105) where the
 #: deterministic program's met it on every seed (``5120 -> 48`` met it at 41985 to 47105 tokens inside its range), and
 #: from 49152 tokens (``5120 -> 64``: 49153) both programs missed it for some seed, so the split program stays there.
-#: Unmeasured token counts keep the verdict.
+#: Unmeasured token counts keep the verdict.  The 152-SM ``sm_103a`` entries keep the FP32 rows ``5120 -> 32 / 48 / 64 /
+#: 128`` on the deterministic program at the token ranges where :data:`K1_DSM_RANGES_BY_SM` ran a cluster of three CTAs
+#: and at 16384 tokens of ``5120 -> 32`` (the accuracy check against the reference implementation described there),
+#: and ``5120 -> 48`` BF16 at 16231 tokens, where its two-split output missed that check on the mirrored-cancellation
+#: inputs with the permuted split (1.104 times the reference's worst error).
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     tuple[str, int],
@@ -602,6 +616,13 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
         ("sm_100a", 1, 5120, 48, "f32"): ((512, 512),),
         ("sm_100a", 1, 5120, 64, "bf16"): ((512, 2048), (8192, 8192)),
         ("sm_100a", 1, 5120, 64, "f32"): ((512, 1024), (8192, 8192)),
+    },
+    ("sm_103a", 152): {
+        ("sm_103a", 1, 5120, 32, "f32"): ((8192, 12287), (16384, 16384)),
+        ("sm_103a", 1, 5120, 48, "bf16"): ((16231, 16231),),
+        ("sm_103a", 1, 5120, 48, "f32"): ((4096, 8192),),
+        ("sm_103a", 1, 5120, 64, "f32"): ((4096, 6143), (12288, 24576)),
+        ("sm_103a", 1, 5120, 128, "f32"): ((4097, 32768),),
     },
     ("sm_103a", 148): {
         ("sm_103a", 1, 4096, 32, "bf16"): ((65536, None),),
@@ -683,30 +704,30 @@ K1_SPLIT_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
 ] = {
     ("sm_107a", 208): {
-        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
-        ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
-        ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
+        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 4096, 48, "f32"): None,
+        ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): None,
         ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
         ("sm_107a", 1, 4096, 1024, "f32"): (256, 1),
         ("sm_107a", 1, 4096, 4096, "f32"): None,
-        ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
-        ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
-        ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
+        ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 48, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 64, "f32"): None,
         ("sm_107a", 1, 5120, 512, "f32"): (128, 1),
         ("sm_107a", 1, 5120, 1024, "bf16"): None, ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
         ("sm_107a", 1, 6144, 32, "bf16"): None, ("sm_107a", 1, 6144, 32, "f32"): None,
         ("sm_107a", 1, 8192, 128, "bf16"): None, ("sm_107a", 1, 8192, 128, "f32"): None,
     },
     ("sm_107a", 212): {
-        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
-        ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
-        ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
+        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 4096, 48, "f32"): None,
+        ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): None,
         ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
         ("sm_107a", 1, 4096, 1024, "f32"): (192, 1),
         ("sm_107a", 1, 4096, 4096, "f32"): None,
-        ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
-        ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
-        ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
+        ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 48, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 64, "f32"): None,
         ("sm_107a", 1, 5120, 512, "f32"): (128, 1),
         ("sm_107a", 1, 5120, 1024, "bf16"): None, ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
         ("sm_107a", 1, 6144, 32, "bf16"): None, ("sm_107a", 1, 6144, 32, "f32"): None,
@@ -733,25 +754,21 @@ K1_SPLIT_RULES_BY_SM_TOKENS: tuple[int, int] = (16172, 16384)
 #: the window's first token count, or from the window's last one to such a measured token count, and holds no measured
 #: token count that failed; the token counts between two consecutive measured ones inside it take the verdict too (not
 #: measured).  The token counts below a range's first measured token count, above its last, and those between a
-#: measured token count that passed and one that failed run the deterministic program.  On 212 SMs: the FP32 rows
-#: ``4096 -> 32, 48, 64`` and ``5120 -> 32, 48, 64`` from 1024 to 65536 tokens (at 512 not faster in every run),
+#: measured token count that passed and one that failed run the deterministic program.  On 212 SMs:
 #: ``8192 -> 128`` from 1024 to 32768 tokens (at 512 slower, at 65536 not faster in every run), and
 #: the FP32 rows ``4096 / 5120 -> 512 / 1024`` at 512 tokens only (from 1024 tokens up their one-split program was not
 #: taken for its FP64 error, about twice the deterministic program's, which is reported data and not a rule; there
-#: these rows run the programs of :data:`K1_CHAIN_RANGES_BY_SM` and :data:`K1_TWO_SPLIT_RANGES_BY_SM`).
+#: these rows run the programs of :data:`K1_CHAIN_RANGES_BY_SM` and :data:`K1_TWO_SPLIT_RANGES_BY_SM`).  The FP32 rows
+#: ``4096 -> 32, 48, 64`` and ``5120 -> 32, 48, 64`` held three splits from 1024 to 65536 tokens; three partials added
+#: in the order they finish vary from run to run and missed the accuracy check of :data:`K1_DSM_RANGES_BY_SM`, so these
+#: rows now take their two-split or deterministic verdict in the window only (two splits were timed there alone).
 # fmt: off
 K1_SPLIT_RULES_BY_SM_TOKEN_RANGES: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int], ...]]
 ] = {
     ("sm_107a", 212): {
-        ("sm_107a", 1, 4096, 32, "f32"): ((1024, 16172), (16384, 65536)),
-        ("sm_107a", 1, 4096, 48, "f32"): ((1024, 16172), (16384, 65536)),
-        ("sm_107a", 1, 4096, 64, "f32"): ((1024, 16172), (16384, 65536)),
         ("sm_107a", 1, 4096, 512, "f32"): ((512, 512),),
         ("sm_107a", 1, 4096, 1024, "f32"): ((512, 512),),
-        ("sm_107a", 1, 5120, 32, "f32"): ((1024, 16172), (16384, 65536)),
-        ("sm_107a", 1, 5120, 48, "f32"): ((1024, 16172), (16384, 65536)),
-        ("sm_107a", 1, 5120, 64, "f32"): ((1024, 16172), (16384, 65536)),
         ("sm_107a", 1, 5120, 512, "f32"): ((512, 512),),
         ("sm_107a", 1, 5120, 1024, "f32"): ((512, 512),),
         ("sm_107a", 1, 8192, 128, "bf16"): ((1024, 16172), (16384, 32768)),
@@ -927,7 +944,8 @@ K1_CHAIN_RANGES_BY_SM: dict[
 #: 3.54e-6); from 1024 tokens up, where the deterministic program adds the halves of an output's token reduction in two
 #: partials, that error was 2.10 to 2.38 times the deterministic program's (reported, not a rule), and at 256 to 800
 #: tokens the same.  The protocol, the measured token counts and the times are in the 152-SM one-split table of the
-#: README.
+#: README.  The 148-SM ``sm_100a`` row ``4096 -> 1024`` BF16 runs one split of two chains of 256-wide tiles there
+#: instead (:data:`K1_ORDERED_RANGES_BY_SM`): one chain missed the accuracy check on mirrored cancelling inputs.
 # fmt: off
 K1_ONE_SPLIT_RANGES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int, int], ...]]
@@ -967,29 +985,237 @@ K1_ONE_SPLIT_RANGES_BY_SM: dict[
 #: than that routing (median of the runs at most 1.013 times, no run slower than the slowest run of the routing
 #: against itself).  A row's ranges run from a passing measured token count to a passing measured token count and
 #: hold no measured token count that failed; every other token count, part and row keeps the routing of the other
-#: tables (``4096 -> 32`` from 2049 to 6143 tokens, ``4096 -> 48`` from 2049 to 4095 and from 8193 to 16383 tokens,
+#: tables (``4096 -> 32`` from 2049 to 6143 tokens, ``4096 -> 48`` from 2049 to 4095 and from 8193 to 16171 tokens,
 #: ``4096 -> 128`` below 4096 and above 8192 tokens, ``5120 -> 64`` from 2049 to 4095 and above 24576 tokens,
 #: ``5120 -> 48`` above 24576 tokens, ``5120 -> 128`` above 6144 tokens, every row below 1024 and above 32768 tokens).
-#: The output met the deterministic package's FP32 budget against FP64 (relative Frobenius error at most 5e-5, max
-#: error at most 1e-3 times the largest reference element) in every one of 20 runs of 10 seeds at every measured
-#: token count.  The protocol, the measured token counts and the times are in the 152-SM cluster table of the README.
+#: On 152-SM ``sm_103a`` parts (two GB300 parts) and 148-SM ``sm_100a`` parts (two B200 parts) the same rows run it in
+#: the ranges of their tables.  There a measured token count's program is the fastest of the six programs on a first
+#: screen of both parts at 1024, 2048, 4096, 6144, 8192, 12288, 16384, 24576 and 32768 tokens, and the ranges were
+#: measured with the table at those token counts with the protocol above, except that the time next to a kernel holding
+#: SMs was recorded, not required.  Where two consecutive measured token counts of a range take different programs, the
+#: lower one's runs up to the token count before the upper one.  Not in a range (the routing of the other tables
+#: holds): on ``sm_103a`` ``4096 -> 48`` from 6145 to 12287 tokens, ``4096 -> 128`` above 12288 tokens, ``5120 -> 32``
+#: from 2049 to 6143 tokens, ``5120 -> 48`` above 8192 tokens and ``5120 -> 64`` above 24576 tokens; on 148-SM
+#: ``sm_100a`` ``4096 -> 48`` from 16385 to 32767 tokens, ``4096 -> 64`` from 6145 to 12287 tokens and ``4096 -> 128``
+#: above 12288 tokens; every row below 1024 and above 32768 tokens.  On every part the output met the deterministic
+#: package's FP32 budget against FP64 (relative Frobenius error at most 5e-5, max error at most 1e-3 times the largest
+#: reference element) in every one of 20 runs of 10 seeds at every measured token count.  The protocol, the measured
+#: token counts and the times are in the cluster tables of the README.
+#:
+#: Accuracy against the reference implementation (FlashInfer commit ``2e989556``): a cluster of three CTAs sums a
+#: tile's token reduction in three partials in rank order, so it repeats bit for bit, but on the rows whose reference
+#: adds the two halves of that reduction (``4096 -> 32 / 48 / 64 / 128`` and ``5120 -> 32 / 48``) it does not cancel a
+#: mirrored input exactly: its relative error on such an input was 5.8 to 8.7 times the reference's median at 16231
+#: and 16384 tokens on GB200, GB300 and B200 parts.  A cluster of two CTAs (the halves) stayed within 1.1 times the
+#: reference's median error on all six input kinds of that check (random normal, long sums, mirrored and permuted
+#: cancellation, concentrated values, values near the largest magnitude) there, 0.89 to 1.00 times the deterministic
+#: plan's time.  So those rows run two CTAs in every range where they ran three.  On 152-SM ``sm_103a`` parts the
+#: reference cuts the ``5120 -> x`` reduction at 135 / 136 of 256 K blocks, not at the half, and a two-CTA split
+#: failed the check at 16384 tokens (``5120 -> 64``: largest error 1.14 times on random normal inputs; ``5120 -> 32``:
+#: 1.15 times on values near the largest magnitude): their ranges of three CTAs and that token count run the
+#: deterministic program (:data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`).  The 148-SM ``sm_100a`` ranges of three CTAs of
+#: ``5120 -> 64`` and ``5120 -> 128`` stay: there the reference sums the reduction in one chain, and ``5120 -> 128`` on
+#: three CTAs met the check on all six kinds at 16231 and 16384 tokens (0.36 to 0.40 times the reference's error).
+#:
+#: On 148-SM and 152-SM ``sm_100a`` parts and 152-SM ``sm_103a`` parts ``4096 -> 48`` and ``4096 -> 64`` run two CTAs of
+#: 32-wide tiles from 16172 to 16384 tokens.  At an even number of 64-token K blocks (16231 and 16384 tokens) they sum
+#: the same two halves as the reference (its error exactly, on all six kinds) and were the fastest program that met the
+#: check: 0.98 to 0.99 times the time of two CTAs of 64-wide tiles on a B200 part and 0.94 times on a GB200 and a GB300
+#: part.  At an odd block count every two-way split missed the check; those token counts run the program of
+#: :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`.
+#:
+#: On 212-SM ``sm_107a`` parts ``4096 -> 48`` and ``4096 -> 64`` run four CTAs of 64-wide tiles from 16172 to 16384
+#: tokens, at an even and at an odd block count: on a R200 part it met the check on all six kinds at 16172, 16231,
+#: 16300 and 16384 tokens (its worst relative error 0.55 to 0.58 times the reference's median), the same bits on every
+#: run, at 0.84 to 0.87 times the time of four splits of the 64-wide CTA-pair program (the program these rows ran
+#: before, :data:`K1_ORDERED_RANGES_BY_SM`), 0.91 times that of two CTAs of 32-wide tiles at an even block count and
+#: 0.68 to 0.69 times the deterministic program's at an odd one.
 # fmt: off
 K1_DSM_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int]], ...]],
 ] = {
+    ("sm_100a", 148): {
+        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 32768, (32, 2)),),
+        ("sm_100a", 1, 4096, 48, "f32"): (
+            (1024, 4095, (32, 2)), (4096, 16171, (64, 2)), (16172, 16384, (32, 2)), (32768, 32768, (64, 2)),
+        ),
+        ("sm_100a", 1, 4096, 64, "f32"): (
+            (1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 16171, (64, 2)), (16172, 16384, (32, 2)),
+            (16385, 32768, (64, 2)),
+        ),
+        ("sm_100a", 1, 4096, 128, "f32"): ((1024, 12288, (64, 2)),),
+        ("sm_100a", 1, 5120, 32, "f32"): ((1024, 32768, (32, 2)),),
+        ("sm_100a", 1, 5120, 48, "f32"): ((1024, 32768, (64, 2)),),
+        ("sm_100a", 1, 5120, 64, "f32"): ((1024, 2047, (64, 3)), (2048, 32768, (64, 2))),
+        ("sm_100a", 1, 5120, 128, "f32"): ((1024, 4095, (128, 2)), (4096, 32768, (128, 3))),
+    },
     ("sm_100a", 152): {
-        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 2048, (32, 3)), (6144, 32768, (32, 2))),
-        ("sm_100a", 1, 4096, 48, "f32"): ((1024, 2048, (64, 3)), (4096, 8192, (64, 3)), (16384, 32768, (64, 3))),
-        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 32768, (64, 3)),),
-        ("sm_100a", 1, 4096, 128, "f32"): ((4096, 6144, (64, 2)), (6145, 8192, (128, 3))),
+        ("sm_100a", 1, 4096, 32, "f32"): ((1024, 2048, (32, 2)), (6144, 32768, (32, 2))),
+        ("sm_100a", 1, 4096, 48, "f32"): (
+            (1024, 2048, (64, 2)), (4096, 8192, (64, 2)), (16172, 16384, (32, 2)), (16385, 32768, (64, 2)),
+        ),
+        ("sm_100a", 1, 4096, 64, "f32"): ((1024, 16171, (64, 2)), (16172, 16384, (32, 2)), (16385, 32768, (64, 2))),
+        ("sm_100a", 1, 4096, 128, "f32"): ((4096, 6144, (64, 2)), (6145, 8192, (128, 2))),
         ("sm_100a", 1, 5120, 32, "f32"): ((1024, 32768, (32, 2)),),
         ("sm_100a", 1, 5120, 48, "f32"): ((1024, 24576, (64, 2)),),
         ("sm_100a", 1, 5120, 64, "f32"): ((1024, 2048, (64, 2)), (4096, 24576, (64, 2))),
         ("sm_100a", 1, 5120, 128, "f32"): ((1024, 6144, (128, 2)),),
     },
+    ("sm_103a", 152): {
+        ("sm_103a", 1, 4096, 32, "f32"): ((1024, 32768, (32, 2)),),
+        ("sm_103a", 1, 4096, 48, "f32"): (
+            (1024, 4095, (32, 2)), (4096, 6144, (64, 2)), (12288, 16171, (64, 2)), (16172, 16384, (32, 2)),
+            (16385, 32768, (64, 2)),
+        ),
+        ("sm_103a", 1, 4096, 64, "f32"): (
+            (1024, 2047, (32, 2)), (2048, 8191, (64, 2)), (8192, 12287, (32, 2)), (12288, 16171, (64, 2)),
+            (16172, 16384, (32, 2)), (16385, 32768, (64, 2)),
+        ),
+        ("sm_103a", 1, 4096, 128, "f32"): ((1024, 12288, (64, 2)),),
+        ("sm_103a", 1, 5120, 32, "f32"): ((1024, 2048, (32, 2)), (6144, 8191, (32, 2)), (12288, 16383, (32, 2)), (16385, 32768, (32, 2))),
+        ("sm_103a", 1, 5120, 48, "f32"): ((2048, 4095, (64, 2)),),
+        ("sm_103a", 1, 5120, 64, "f32"): ((1024, 4095, (64, 2)), (6144, 12287, (64, 2))),
+        ("sm_103a", 1, 5120, 128, "f32"): ((1024, 4095, (128, 2)),),
+    },
+    ("sm_107a", 212): {
+        ("sm_107a", 1, 4096, 48, "f32"): ((16172, 16384, (64, 4)),),
+        ("sm_107a", 1, 4096, 64, "f32"): ((16172, 16384, (64, 4)),),
+    },
 }
 # fmt: on
+#: The programs that rows of :data:`K1_DSM_RANGES_BY_SM` run in place of their cluster program at a token count that
+#: spans an odd number of 64-element K blocks (``ceil(K / 64)`` odd) inside a range of this table, on the parts of
+#: exactly one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, program), ...)}`` (keys as in
+#: :data:`K1_SPLIT_RULES`; ``program`` ``None`` for the deterministic program, ``(block_n, splits)`` for the cluster
+#: program of that tile as in :data:`K1_DSM_RANGES_BY_SM`, or ``(block_n, splits, chains, order)`` of this package's
+#: CTA-pair program as in :data:`K1_ORDERED_RANGES_BY_SM`).  An even block count, a token count outside the ranges and
+#: a token count outside the row's cluster ranges keep the routing of the other tables.  The deterministic program of
+#: these rows cuts the token reduction of the tiles, taken in order, into units of ``ceil(blocks / 2)`` K blocks.  At an
+#: even block count a tile's two units are the halves that two CTAs of the cluster program sum; at an odd one a unit
+#: runs on into the next tile, so 31 of the 32 tiles sum three shorter partials.  There every two-way split (two CTAs
+#: of 32-wide or 64-wide tiles, two splits of the CTA-pair program) missed the check of :data:`K1_DSM_RANGES_BY_SM`:
+#: its worst relative error was 1.16 times the reference's median at 16130, 16172, 16300 and 16320 tokens on a B200
+#: part (at 16172 tokens also on a GB200 and a GB300 part), and three CTAs of 64-wide tiles missed it on mirrored
+#: cancelling inputs.  A cluster of four CTAs of 64-wide tiles (its four partials added in cluster-rank order in shared
+#: memory, so the same bits on every run) met the check on all six kinds at 16172 and 16300 tokens on a B200, a GB200
+#: and a GB300 part (its worst relative error 0.60 to 0.64 times the reference's median) and was the fastest program
+#: that met it: 0.89 to 0.93 times the time of four splits of the 64-wide CTA-pair program and 0.83 to 0.93 times the
+#: deterministic program's there.  Both rows run it from 16172 to 16384 tokens.
+# fmt: off
+K1_DSM_ODD_BLOCK_RANGES_BY_SM: dict[
+    tuple[str, int],
+    dict[
+        tuple[str, int, int, int, str],
+        tuple[tuple[int, int, Optional[Union[tuple[int, int], tuple[int, int, int, str]]]], ...],
+    ],
+] = {
+    ("sm_100a", 148): {
+        ("sm_100a", 1, 4096, 48, "f32"): ((16172, 16384, (64, 4)),),
+        ("sm_100a", 1, 4096, 64, "f32"): ((16172, 16384, (64, 4)),),
+    },
+    ("sm_100a", 152): {
+        ("sm_100a", 1, 4096, 48, "f32"): ((16172, 16384, (64, 4)),),
+        ("sm_100a", 1, 4096, 64, "f32"): ((16172, 16384, (64, 4)),),
+    },
+    ("sm_103a", 152): {
+        ("sm_103a", 1, 4096, 48, "f32"): ((16172, 16384, (64, 4)),),
+        ("sm_103a", 1, 4096, 64, "f32"): ((16172, 16384, (64, 4)),),
+    },
+}
+# fmt: on
+
+
+#: The orders in which the last split of a CTA-pair K1 program adds the ``num_splits`` partial rows of a tile:
+#: ``"arrival"`` its own first, then the others from the split after its own (the order the splits finish, so with three
+#: or more splits the bits change from run to run), ``"mirror"`` each split ``j`` of the first half with its mirror
+#: ``j + num_splits // 2`` first and then the pair sums in split order (``((p_0 + p_h) + (p_1 + p_{h+1})) + ...``,
+#: the last split of an odd count at the end): the same bits on every run.
+K1_SPLIT_ORDERS: tuple[str, ...] = ("arrival", "mirror")
+#: Token ranges at which a row runs a given program of this package's CTA pairs, split order included, on the parts of
+#: exactly one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, splits, chains, order)),
+#: ...)}`` (keys as in :data:`K1_SPLIT_RULES`; ``order`` one of :data:`K1_SPLIT_ORDERS`; more than one chain at one
+#: split only): a token count from ``min_tokens`` to ``max_tokens`` runs that program (:func:`k1_ordered_plan`) in place
+#: of the routing of every other K1 table except :data:`K1_DSM_RANGES_BY_SM`; every other token count, part and row
+#: keeps that routing.  These rows' programs of the other tables were either slower, or missed the accuracy check of
+#: :data:`K1_DSM_RANGES_BY_SM` (within 1.1 times the reference's median error on six input kinds) on mirrored cancelling
+#: inputs, and these programs met it on all six kinds (on a 212-SM R200 part; the 148-SM row below on a B200 part).  On
+#: 212-SM sm_107a parts the thin FP32 weight gradient ``4096 -> 32`` (16172 to 16384 tokens) runs four splits of 64-wide
+#: tiles in the mirror order (the same bits on every repeat; three splits in the arrival order and three CTAs of the
+#: cluster program missed the check there): its worst kind at most 0.70 times the reference's error, about 2 % slower
+#: than four splits in the arrival order (whose bits vary run to run) and 0.97 to 0.98 times the deterministic program's
+#: time.  ``4096 -> 48`` and ``4096 -> 64`` take the cluster program of :data:`K1_DSM_RANGES_BY_SM` there.  The FP32
+#: weight gradients ``4096 -> 1024`` (the 192-wide row-major program) and ``5120 -> 1024`` (the 256-wide
+#: transposed-store program) run one split with the chain count of the parity of their 64-token K blocks from 16172 to
+#: 16384 tokens: four chains at an odd count (253 and 255 blocks), two at an even count (254 and 256 blocks; two chains
+#: are bit for bit two splits of one chain); ``5120 -> 512`` (the 128-wide transposed-store program) runs two chains at
+#: the even counts there.  At an odd count most of the reference's tiles add three K segments: two partials lost about
+#: 15 % on the long sums and three equal partials (the three-chain program of :data:`K1_CHAIN_RANGES_BY_SM`) missed the
+#: mirrored cancelling inputs, and four chains met the check.  Measured on a 212-SM R200 part at 16172, 16231 and 16384
+#: tokens: every kind within the check (the worst kind of four chains 0.79 times the reference's error at
+#: ``4096 -> 1024`` and 0.60 times at ``5120 -> 1024``), the same bits on 200 repeats; four chains took 1.005 to 1.010
+#: times the three-chain program's time, two chains 0.999 to 1.000 times the time of the former route of their row
+#: (three chains, or the deterministic program at ``5120 -> 512``).  On 148-SM sm_100a parts the BF16 weight gradient
+#: ``4096 -> 1024`` runs one split of two chains of 256-wide tiles from 16172 to 16384 tokens: 64 tiles, one wave of 128
+#: CTAs, and the bits of two splits of one chain (the same two K ranges, one addition), the same on every run.  Its
+#: former route, one split of one chain, missed the check on mirrored cancelling inputs at every token count of that
+#: window (1.87 to 1.95 times the reference's error, and 1.38 to 1.39 times on the permuted ones); two splits met all
+#: six kinds there (at most 1.08 times the reference's error; the reference's own error at the even block counts) but
+#: took 1.108 to 1.116 times one split's time, in a second wave of CTAs.  Measured on a B200 part at 16172, 16231,
+#: 16256, 16300 and 16384 tokens in one process: two chains had the bits of two splits on all six kinds and repeated
+#: bit for bit; they took 86.5 to 88.9 us, 1.003 to 1.005 times one chain's time, 0.897 to 0.906 times two splits'
+#: (96.0 to 98.4 us) and 0.74 to 0.84 times the deterministic program's (103.9 to 120.0 us), in eager launches and in
+#: CUDA graph replays.
+# fmt: off
+K1_ORDERED_RANGES_BY_SM: dict[
+    tuple[str, int],
+    dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int, int, str]], ...]],
+] = {
+    ("sm_100a", 148): {
+        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 1, 2, "arrival")),),
+    },
+    ("sm_107a", 212): {
+        ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
+        ("sm_107a", 1, 4096, 1024, "f32"): (
+            (16172, 16192, (192, 1, 4, "arrival")), (16193, 16256, (192, 1, 2, "arrival")),
+            (16257, 16320, (192, 1, 4, "arrival")), (16321, 16384, (192, 1, 2, "arrival")),
+        ),
+        ("sm_107a", 1, 5120, 512, "f32"): (
+            (16193, 16256, (128, 1, 2, "arrival")), (16321, 16384, (128, 1, 2, "arrival")),
+        ),
+        ("sm_107a", 1, 5120, 1024, "f32"): (
+            (16172, 16192, (256, 1, 4, "arrival")), (16193, 16256, (256, 1, 2, "arrival")),
+            (16257, 16320, (256, 1, 4, "arrival")), (16321, 16384, (256, 1, 2, "arrival")),
+        ),
+    },
+}
+# fmt: on
+
+
+def k1_ordered_plan(
+    *,
+    arch: str,
+    L: int,
+    M: int,
+    N: int,
+    K: int,
+    out_f32: bool,
+    sm_count: int,
+) -> Optional[tuple[int, int, int, str]]:
+    """``(block_n, splits, chains, order)`` of the program the row runs at ``K`` on a device of exactly
+    ``sm_count`` SMs (its range in :data:`K1_ORDERED_RANGES_BY_SM`), or ``None``: the row keeps the routing of
+    :func:`k1_plan` -- outside those ranges, or at a ``K`` too short for the splits or chains (:func:`k1_splits_fit`,
+    :func:`k1_chains_fit`).  ``M``, ``N`` and ``K`` as in :func:`k1_plan`."""
+    key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    for lo, hi, (block_n, splits, chains, order) in K1_ORDERED_RANGES_BY_SM.get(
+        (arch, int(sm_count)), {}
+    ).get(key, ()):
+        if lo <= int(K) <= hi:
+            fits = k1_splits_fit(splits, K) and k1_chains_fit(chains, K)
+            return (
+                (int(block_n), int(splits), int(chains), str(order)) if fits else None
+            )
+    return None
 
 
 def k1_splits_fit(splits: int, K: int) -> bool:
@@ -1024,6 +1250,43 @@ def k1_dsm_plan(
     for lo, hi, (block_n, splits) in K1_DSM_RANGES_BY_SM.get(part, {}).get(key, ()):
         if lo <= int(K) <= hi:
             return (int(block_n), int(splits)) if k1_splits_fit(splits, K) else None
+    return None
+
+
+def k1_dsm_odd_block_plan(
+    *,
+    arch: str,
+    L: int,
+    M: int,
+    N: int,
+    K: int,
+    out_f32: bool,
+    sm_count: int,
+) -> Optional[tuple]:
+    """The program a row runs in place of its cluster program (:func:`k1_dsm_plan`) at a ``K`` of an odd number of
+    64-element K blocks on a device of exactly ``sm_count`` SMs (its range in :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM`):
+    ``()`` for the deterministic program, ``(block_n, splits)`` for the cluster program of that tile, else ``(block_n,
+    splits, chains, order)`` of this package's CTA-pair program.  ``None`` at an even block count, outside those
+    ranges, or at a ``K`` too short for the splits or chains (:func:`k1_splits_fit`, :func:`k1_chains_fit`).
+    :func:`plan_atomic_gemm` asks it only where the row has a cluster range.  ``M``, ``N`` and ``K`` as in
+    :func:`k1_plan`."""
+    if _ceil_div(int(K), K1_BLOCK_K) % 2 == 0:
+        return None
+    key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    for lo, hi, program in K1_DSM_ODD_BLOCK_RANGES_BY_SM.get(
+        (arch, int(sm_count)), {}
+    ).get(key, ()):
+        if lo <= int(K) <= hi:
+            if program is None:
+                return ()
+            if len(program) == 2:
+                block_n, splits = program
+                return (int(block_n), int(splits)) if k1_splits_fit(splits, K) else None
+            block_n, splits, chains, order = program
+            fits = k1_splits_fit(splits, K) and k1_chains_fit(chains, K)
+            return (
+                (int(block_n), int(splits), int(chains), str(order)) if fits else None
+            )
     return None
 
 
@@ -1154,11 +1417,11 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
     "hints": ("none", "none"),
 }
 #: The K1 forward rows of this package that run another plan of the deterministic package's programs than
-#: its own plan of the row, ``(arch, sm_count) -> {(K, N, T): knobs}``: on a part of exactly ``sm_count`` SMs,
+#: its own plan of the row, ``(arch, sm_count) -> {(K, N, T): knobs or program}``: on a part of exactly ``sm_count`` SMs,
 #: :func:`cake_dense_gemm_nondet_train_projection_forward` of ``X[T, K]`` and ``W[N, K]`` (both K-major) into a BF16 ``out`` of exactly these ``K``,
 #: ``N`` and ``T`` runs the program the deterministic planner gives the row with these knobs (:func:`k1_forward_knobs`);
 #: every other part, row, token count, layout and output dtype runs the deterministic plan.  On 152-SM ``sm_100a`` and
-#: ``sm_103a`` parts the deterministic plan of these rows splits K two ways over CTA pairs of 256-wide tiles (stream-K,
+#: ``sm_103a`` parts the deterministic plan of the knob rows (1024 to 4096 tokens) splits K two ways over CTA pairs of 256-wide tiles (stream-K,
 #: the partials added in a fixed order); the single-CTA program (:data:`K1_FORWARD_SINGLE_CTA_KNOBS`) keeps every tile's
 #: whole K in one CTA, so a forward still repeats bit for bit and a recomputed forward reproduces its result, with other
 #: bits than the deterministic package's plan (within the deterministic package's BF16 budget against FP64).  Measured at exactly
@@ -1171,29 +1434,51 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
 #: Not in the table: ``4096 -> 512`` at 4096 tokens (next to a kernel holding 32 SMs it was up to 4.7 % slower), and
 #: ``4096 -> 512`` at 3072 tokens on both parts and ``5120 -> 512`` at 4096 tokens on ``sm_103a`` (in one run a training
 #: step with eager launches was further above the deterministic plan than that plan against itself).
+#:
+#: A row whose entry is a program symbol of the deterministic package (its template without the
+#: ``dense_proj_det_gemm_`` prefix; 16172 to 16384 tokens) runs that program, planned with the knobs that name it
+#: (:func:`k1_program_knobs`): ``kk_n256_ht_cg_pro15`` on 148-SM ``sm_100a`` and 152-SM ``sm_100a`` / ``sm_103a``
+#: parts, where the deterministic plan of the row is ``kk_n256_pro7``.  Measured at exactly these rows and token counts
+#: on one part of each SM count, against the deterministic plan of the row in the same process: faster in eager
+#: launches and in CUDA graph replays in at least 4 of 5 paired groups of a screen, the output equal to the
+#: deterministic plan's bit for bit, and the same bits on 20 repeats.  The other rows of that screen (``5120 -> 512``
+#: at 16172 and 16231 tokens on 152-SM ``sm_100a`` parts: faster in 3 of 5 groups in graph replays) keep the
+#: deterministic plan.  On 212-SM ``sm_107a`` parts these rows keep the deterministic plan ``kk_n256_ht_cg_pro15``:
+#: ``kk_n128_hen_pro15`` took 1.013 to 1.035 times its time there in every paired group of three runs of this
+#: package's A/B against it, eager and in CUDA graph replays.
+# fmt: off
 K1_FORWARD_RULES_BY_SM: dict[
-    tuple[str, int], dict[tuple[int, int, int], dict[str, Any]]
+    tuple[str, int], dict[tuple[int, int, int], Union[dict[str, Any], str]]
 ] = {
+    ("sm_100a", 148): {
+        (4096, 512, 16172): "kk_n256_ht_cg_pro15", (5120, 512, 16172): "kk_n256_ht_cg_pro15",
+        (5120, 512, 16231): "kk_n256_ht_cg_pro15", (5120, 512, 16384): "kk_n256_ht_cg_pro15",
+    },
     ("sm_100a", 152): {
         (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 4096): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (4096, 512, 16172): "kk_n256_ht_cg_pro15", (5120, 512, 16384): "kk_n256_ht_cg_pro15",
     },
     ("sm_103a", 152): {
         (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
+        (4096, 512, 16172): "kk_n256_ht_cg_pro15", (5120, 512, 16172): "kk_n256_ht_cg_pro15",
     },
 }
+# fmt: on
 
 
 def k1_forward_knobs(*, arch: str, sm_count: int, K: int, N: int, T: int) -> tuple:
     """The deterministic package's planner knobs of the forward ``out[T, N] = X[T, K] @ W[N, K].T`` (both operands
     K-major, BF16 ``out``) of this package on a device of exactly ``sm_count`` SMs: the row's entry in
     the table of :data:`K1_FORWARD_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens, as sorted
-    ``(name, value)`` pairs, or ``()`` -- the deterministic plan."""
+    ``(name, value)`` pairs (a program symbol: :func:`k1_program_knobs`), or ``()`` -- the deterministic plan."""
     knobs = K1_FORWARD_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
         (int(K), int(N), int(T))
     )
+    if isinstance(knobs, str):
+        return k1_program_knobs(knobs)
     return tuple(sorted(knobs.items())) if knobs else ()
 
 
@@ -1214,15 +1499,755 @@ def _k1_forward_knobs_of(X: torch.Tensor, W: torch.Tensor, out: torch.Tensor) ->
     return k1_forward_knobs(arch=facts.arch, sm_count=facts.sm_count, K=K, N=N, T=T)
 
 
-def atomic_k1_template(block_n: int, out_f32: bool, chains: int = 1) -> str:
+def k1_program_knobs(program: str) -> tuple:
+    """The deterministic package's planner knobs that name its program ``program`` (a template symbol without the
+    ``dense_proj_det_gemm_`` prefix, e.g. ``kn_n128_f32_tma2_s4_c1``), as sorted ``(name, value)`` pairs: that
+    package's inverse of its symbol (``_template_knobs``).  ``ValueError`` for a symbol that names no planner knobs.
+    The serpentine K walk ``kser`` of that inverse is not a planner keyword: it is dropped when 0, and a ``_ks<P>``
+    program (``kser`` P > 0), which that package plans from its own rules only, names no planner knobs."""
+    det = deterministic_backend()
+    knobs = det._template_knobs(det._TEMPLATE_PREFIX + program)
+    if knobs is None or knobs.pop("kser", 0):
+        raise ValueError(
+            f"cake_dense_gemm_nondet_train: {program!r} names no program of the deterministic planner"
+        )
+    return tuple(sorted(knobs.items()))
+
+
+#: The K1 input-gradient rows of this package that run another program of the deterministic package than its own
+#: plan of the row, ``(arch, sm_count) -> {(K, N, T, out_dtype): program}``: on a part of exactly ``sm_count`` SMs,
+#: :func:`cake_dense_gemm_nondet_train_projection_dgrad` of ``G[T, N]`` and ``W[N, K]`` (both with a unit stride on
+#: their last axis) into an ``out[T, K]`` of ``out_dtype`` (``"bf16"`` or ``"f32"``) at exactly these ``K``, ``N``
+#: and ``T`` runs the deterministic package's program ``program`` (its template without the ``dense_proj_det_gemm_``
+#: prefix), planned with the knobs that name it (:func:`k1_program_knobs`); every other part, row, token count, layout
+#: and output dtype runs the deterministic plan.  The table's programs (``kn_n128_f32_tma2_s4_c1``,
+#: ``kn_n256_tma1_w8`` / ``_w8r`` / ``_w8rs``, ``kn_n256_f32_v8_ef_pro7``; on 212-SM ``sm_107a`` parts
+#: ``kn_n128_f32_tma1_pd2_c1`` and ``kn_n256_tma2_pd2_lw_pro15``) were measured at exactly these rows and token counts on
+#: one part of each SM count, against the deterministic plan of the row in the same process: faster in eager launches
+#: and in CUDA graph replays in at least 4 of 5 paired groups of a screen (``sm_107a``: 5 of 5), the output equal to
+#: the deterministic plan's bit for bit, and the same bits on 20 repeats; the rows and token counts of that screen that
+#: missed keep the deterministic plan.
+# fmt: off
+K1_DGRAD_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
+    ("sm_100a", 148): {
+        (4096, 32, 16172, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16231, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16384, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16172, "bf16"): "kn_n256_tma1_w8rs", (4096, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 64, 16172, "bf16"): "kn_n256_tma1_w8rs", (4096, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (4096, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (4096, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 1024, 16172, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (4096, 1024, 16231, "f32"): "kn_n256_f32_v8_ef_pro7", (4096, 1024, 16384, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (5120, 32, 16172, "bf16"): "kn_n256_tma1_w8r", (5120, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16231, "bf16"): "kn_n256_tma1_w8rs", (5120, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16384, "bf16"): "kn_n256_tma1_w8rs", (5120, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16172, "bf16"): "kn_n256_tma1_w8rs", (5120, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16231, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (5120, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16384, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 1024, 16172, "f32"): "kn_n256_f32_v8_ef_pro7", (5120, 1024, 16231, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (5120, 1024, 16384, "f32"): "kn_n256_f32_v8_ef_pro7", (6144, 32, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 32, 16231, "bf16"): "kn_n256_tma1_w8r", (6144, 32, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16172, "bf16"): "kn_n256_tma1_w8rs", (6144, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 48, 16231, "bf16"): "kn_n256_tma1_w8rs", (6144, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (6144, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16231, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16384, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16231, "bf16"): "kn_n256_tma1_w8rs", (6144, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16384, "bf16"): "kn_n256_tma1_w8rs", (6144, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16172, "bf16"): "kn_n256_tma1_w8r", (8192, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16231, "bf16"): "kn_n256_tma1_w8rs", (8192, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16384, "bf16"): "kn_n256_tma1_w8r", (8192, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+    },
+    ("sm_100a", 152): {
+        (4096, 32, 16172, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16231, "bf16"): "kn_n256_tma1_w8rs", (4096, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16384, "bf16"): "kn_n256_tma1_w8", (4096, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16172, "bf16"): "kn_n256_tma1_w8r", (4096, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 64, 16384, "bf16"): "kn_n256_tma1_w8rs", (4096, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 128, 16172, "bf16"): "kn_n256_tma1_w8rs", (4096, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 128, 16231, "bf16"): "kn_n256_tma1_w8r", (4096, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 128, 16384, "bf16"): "kn_n256_tma1_w8r", (4096, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16172, "bf16"): "kn_n256_tma1_w8", (5120, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16231, "bf16"): "kn_n256_tma1_w8r", (5120, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 32, 16384, "bf16"): "kn_n256_tma1_w8rs", (5120, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16172, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16231, "bf16"): "kn_n256_tma1_w8", (5120, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (5120, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 128, 16384, "bf16"): "kn_n256_tma1_w8r", (5120, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 32, 16172, "bf16"): "kn_n256_tma1_w8rs", (6144, 32, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 32, 16384, "bf16"): "kn_n256_tma1_w8rs", (6144, 48, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 48, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 48, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 64, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 64, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 64, 16384, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 128, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (6144, 128, 16384, "bf16"): "kn_n256_tma1_w8r",
+        (6144, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (8192, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (8192, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (8192, 128, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (8192, 128, 16384, "bf16"): "kn_n256_tma1_w8r", (8192, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+    },
+    ("sm_103a", 152): {
+        (4096, 32, 16172, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16231, "bf16"): "kn_n256_tma1_w8rs", (4096, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 32, 16384, "bf16"): "kn_n256_tma1_w8r", (4096, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 64, 16384, "bf16"): "kn_n256_tma1_w8r",
+        (4096, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16231, "bf16"): "kn_n256_tma1_w8rs",
+        (4096, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (4096, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (4096, 1024, 16172, "f32"): "kn_n256_f32_v8_ef_pro7", (4096, 1024, 16231, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (4096, 1024, 16384, "f32"): "kn_n256_f32_v8_ef_pro7", (5120, 32, 16172, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 32, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 32, 16231, "bf16"): "kn_n256_tma1_w8r",
+        (5120, 32, 16231, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 32, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16172, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16231, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (5120, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (5120, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (5120, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1", (5120, 1024, 16231, "f32"): "kn_n256_f32_v8_ef_pro7",
+        (5120, 1024, 16384, "f32"): "kn_n256_f32_v8_ef_pro7", (6144, 32, 16172, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 32, 16231, "bf16"): "kn_n256_tma1_w8rs", (6144, 32, 16384, "bf16"): "kn_n256_tma1_w8rs",
+        (6144, 48, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 48, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 48, 16231, "bf16"): "kn_n256_tma1_w8rs", (6144, 48, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 48, 16384, "bf16"): "kn_n256_tma1_w8r", (6144, 48, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16231, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 64, 16384, "bf16"): "kn_n256_tma1_w8r", (6144, 64, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16172, "bf16"): "kn_n256_tma1_w8r", (6144, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16231, "bf16"): "kn_n256_tma1_w8r", (6144, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (6144, 128, 16384, "bf16"): "kn_n256_tma1_w8rs", (6144, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16172, "f32"): "kn_n128_f32_tma2_s4_c1", (8192, 128, 16231, "f32"): "kn_n128_f32_tma2_s4_c1",
+        (8192, 128, 16384, "f32"): "kn_n128_f32_tma2_s4_c1",
+    },
+    ("sm_107a", 212): {
+        (4096, 128, 16172, "f32"): "kn_n128_f32_tma1_pd2_c1", (4096, 128, 16231, "f32"): "kn_n128_f32_tma1_pd2_c1",
+        (4096, 128, 16384, "f32"): "kn_n128_f32_tma1_pd2_c1", (5120, 128, 16172, "f32"): "kn_n128_f32_tma1_pd2_c1",
+        (5120, 128, 16231, "f32"): "kn_n128_f32_tma1_pd2_c1", (5120, 128, 16384, "f32"): "kn_n128_f32_tma1_pd2_c1",
+        (6144, 32, 16172, "bf16"): "kn_n256_tma2_pd2_lw_pro15", (6144, 32, 16231, "bf16"): "kn_n256_tma2_pd2_lw_pro15",
+        (6144, 32, 16384, "bf16"): "kn_n256_tma2_pd2_lw_pro15",
+    },
+}
+# fmt: on
+
+
+def k1_dgrad_knobs(
+    *, arch: str, sm_count: int, K: int, N: int, T: int, out_f32: bool
+) -> tuple:
+    """The deterministic package's planner knobs of the input gradient ``out[T, K] = G[T, N] @ W[N, K]`` of this
+    package on a device of exactly ``sm_count`` SMs (``out`` FP32 when ``out_f32``, else BF16): those of the program of
+    the row's entry in the table of :data:`K1_DGRAD_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens
+    (:func:`k1_program_knobs`), or ``()`` -- the deterministic plan."""
+    program = K1_DGRAD_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
+        (int(K), int(N), int(T), "f32" if out_f32 else "bf16")
+    )
+    return k1_program_knobs(program) if program else ()
+
+
+def _k1_dgrad_knobs_of(G: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> tuple:
+    """:func:`k1_dgrad_knobs` of the input-gradient call ``(G, W, out)`` on ``out``'s device; ``()`` (the
+    deterministic plan) without a row of :data:`K1_DGRAD_RULES_BY_SM` of the call's shape and output dtype, and for an
+    operand without a unit stride on its last axis.  The device is read only for a shape of the table."""
+    if G.dim() != 2 or W.dim() != 2 or out.dtype not in (torch.bfloat16, torch.float32):
+        return ()
+    K, N, T = int(W.shape[1]), int(W.shape[0]), int(G.shape[0])
+    key = (K, N, T, "f32" if out.dtype == torch.float32 else "bf16")
+    if not any(key in rows for rows in K1_DGRAD_RULES_BY_SM.values()):
+        return ()
+    if G.stride(1) != 1 or W.stride(1) != 1:
+        return ()
+    facts = deterministic_backend().device_facts(out.device)
+    if facts.arch is None:
+        return ()
+    return k1_dgrad_knobs(
+        arch=facts.arch,
+        sm_count=facts.sm_count,
+        K=K,
+        N=N,
+        T=T,
+        out_f32=out.dtype == torch.float32,
+    )
+
+
+#: The registry template of this package's input-gradient program of 256-wide output tiles with FP32 output
+#: (:data:`K1_DGRAD_PROGRAM_RULES_BY_SM`): row stores, or TMA stores of the tile from shared memory (``tma_store``),
+#: both loading the output gradient with the L2 evict-first hint; ``lean_free``: TMA stores without that hint, the
+#: start path of cuBLAS's nvjet kernels (each role waiting on the cluster barrier only before its first operation that
+#: needs it) and the epilogue freeing the tensor memory (``tma_store`` implied).
+def dgrad_program_template(tma_store: bool, lean_free: bool = False) -> str:
+    if lean_free:
+        return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_tma_lean_free"
+    return f"{cake_jit.TEMPLATE_PREFIXES[9]}kn_n256_f32_ef" + (
+        "_tma" if tma_store else ""
+    )
+
+
+_WAVE_LEAN_N224_PF2_ST = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st"
+_DGRAD_N = "dense_proj_gemm_dgrad_kn_n256_f32_ef"
+_DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
+_DGRAD_N_TMA_LEAN_FREE = "dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free"
+
+#: The K1 forward rows that run a program of this package instead of the deterministic package's,
+#: ``(arch, sm_count) -> {(K, N, T): template}``: on a part of exactly ``sm_count`` SMs,
+#: :func:`cake_dense_gemm_nondet_train_projection_forward` of ``X[T, K]`` and ``W[N, K]`` (both K-major) into a BF16
+#: ``out[T, N]`` (unit inner stride) at exactly these extents and token count runs the forward program ``template``
+#: (``dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st``): one CTA pair per work item of 512 output features by 224
+#: tokens over the whole K (``ceil(N / 512) * ceil(T / 224)`` items: 74 at 512 features, one wave of the SM pairs; 146
+#: or 148 at 1024 features, at most two per CTA pair), each output element one ascending FP32 chain over K, no split of
+#: K, no workspace: the deterministic package's bits, the same on every run.  It comes before
+#: :data:`K1_FORWARD_RULES_BY_SM`; every other part, row, token count, layout and output dtype keeps that table and the
+#: deterministic plan.  The program is the one-wave forward (the same items, ring, MMAs and order of the sums as its
+#: plain form, so the same bits) with the start path of cuBLAS's nvjet kernels (each role waiting on the cluster barrier
+#: only before its first operation that needs it), the epilogue freeing the tensor memory, eight epilogue warps, an L2
+#: prefetch of the X box two ring stages ahead, and each item's last K stage run by token half, so that the first half
+#: of the tile is stored while the MMAs of the second half run.  Measured at exactly these rows and token counts on one
+#: part of each SM count against the former program of the row in the same process, eager launches and CUDA graph
+#: replays, 5 paired groups, the output bits equal to the former program's on every row checked: at 512 features the
+#: same program without the prefetch and the token halves took 1.007 to 1.040 times its time on a B200 part, 1.018 to
+#: 1.055 times on a GB200 part and 1.012 to 1.026 times on a GB300 part, slower in 0 of 5 groups on every row; at 1024
+#: features the deterministic plan's program took 1.032 to 1.057 times its time on a GB200 part and 1.010 to 1.033
+#: times on a GB300 part, slower in at most 1 of 5 groups.  The other 1024-feature rows and parts keep the
+#: deterministic plan.
+# fmt: off
+K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int], str]] = {
+    ("sm_100a", 148): {
+        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
+        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
+    },
+    ("sm_100a", 152): {
+        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
+        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
+        (5120, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
+    },
+    ("sm_103a", 152): {
+        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
+        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
+        (5120, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16231): _WAVE_LEAN_N224_PF2_ST,
+    },
+}
+# fmt: on
+
+#: The K1 input-gradient rows that run a program of this package instead of the deterministic package's,
+#: ``(arch, sm_count) -> {(K, N, T, out_dtype): template}``: on a part of exactly ``sm_count`` SMs,
+#: :func:`cake_dense_gemm_nondet_train_projection_dgrad` of ``G[T, N]`` and ``W[N, K]`` (both with a unit stride on
+#: their last axis) into an ``out[T, K]`` of ``out_dtype`` (unit inner stride) at exactly these extents and token count
+#: runs the input-gradient program ``template`` (:func:`dgrad_program_template`): a persistent CTA pair per SM pair
+#: over ``256 x 256`` tiles of ``out``, the whole ``N`` per tile, each output element one ascending FP32 chain, no split,
+#: no workspace: the deterministic package's bits, the same on every run.  It comes before
+#: :data:`K1_DGRAD_RULES_BY_SM`; every other part, row, token count, layout and output dtype keeps that table and the
+#: deterministic plan.  Measured at exactly these rows and token counts on one part of each SM count against this
+#: package's program of the row in the same process: faster in eager launches and in CUDA graph replays in 5 of 5 paired
+#: groups, the output equal to the deterministic plan's bit for bit, and the same bits on 20 repeats.  On 148-SM
+#: ``sm_100a`` parts ``4096 -> 512``, ``5120 -> 512`` and ``6144 -> 576`` at 16231 tokens run the program without the
+#: evict-first hint (``dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free``): on a B200 part 0.93 to 0.95 times the time
+#: of the program these rows ran before, 5 of 5 paired groups in eager launches and in CUDA graph replays, the same bits.
+# fmt: off
+K1_DGRAD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
+    ("sm_100a", 148): {
+        (4096, 1024, 16172, "f32"): _DGRAD_N, (4096, 1024, 16231, "f32"): _DGRAD_N, (4096, 1024, 16384, "f32"): _DGRAD_N,
+        (5120, 1024, 16172, "f32"): _DGRAD_N, (5120, 1024, 16231, "f32"): _DGRAD_N, (5120, 1024, 16384, "f32"): _DGRAD_N,
+        (4096, 512, 16172, "f32"): _DGRAD_N_TMA, (4096, 512, 16231, "f32"): _DGRAD_N_TMA_LEAN_FREE,
+        (4096, 512, 16384, "f32"): _DGRAD_N_TMA, (5120, 512, 16172, "f32"): _DGRAD_N_TMA,
+        (5120, 512, 16231, "f32"): _DGRAD_N_TMA_LEAN_FREE, (5120, 512, 16384, "f32"): _DGRAD_N_TMA,
+        (6144, 576, 16231, "f32"): _DGRAD_N_TMA_LEAN_FREE,
+    },
+    ("sm_100a", 152): {
+        (4096, 1024, 16172, "f32"): _DGRAD_N_TMA, (4096, 1024, 16231, "f32"): _DGRAD_N_TMA,
+        (4096, 1024, 16384, "f32"): _DGRAD_N_TMA, (5120, 1024, 16172, "f32"): _DGRAD_N_TMA,
+        (5120, 1024, 16231, "f32"): _DGRAD_N_TMA, (5120, 1024, 16384, "f32"): _DGRAD_N_TMA,
+        (4096, 512, 16172, "f32"): _DGRAD_N_TMA, (4096, 512, 16231, "f32"): _DGRAD_N_TMA,
+        (4096, 512, 16384, "f32"): _DGRAD_N_TMA, (5120, 512, 16172, "f32"): _DGRAD_N_TMA,
+        (5120, 512, 16231, "f32"): _DGRAD_N_TMA, (5120, 512, 16384, "f32"): _DGRAD_N_TMA,
+    },
+    ("sm_103a", 152): {
+        (4096, 1024, 16172, "f32"): _DGRAD_N, (4096, 1024, 16231, "f32"): _DGRAD_N, (4096, 1024, 16384, "f32"): _DGRAD_N,
+        (5120, 1024, 16172, "f32"): _DGRAD_N, (5120, 1024, 16231, "f32"): _DGRAD_N, (5120, 1024, 16384, "f32"): _DGRAD_N,
+        (4096, 512, 16172, "f32"): _DGRAD_N_TMA, (4096, 512, 16231, "f32"): _DGRAD_N_TMA,
+        (4096, 512, 16384, "f32"): _DGRAD_N_TMA, (5120, 512, 16172, "f32"): _DGRAD_N_TMA,
+        (5120, 512, 16231, "f32"): _DGRAD_N_TMA, (5120, 512, 16384, "f32"): _DGRAD_N_TMA,
+    },
+}
+# fmt: on
+
+_NVJET_EARLY_LEAN = "dense_proj_gemm_nvjet_early_kn_n256_lean"
+#: The deterministic package's program on whose plan the rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` run this
+#: package's program (a template symbol without the ``dense_proj_det_gemm_`` prefix).
+K1_DGRAD_NVJET_DET_PROGRAM = "kn_n256_tma1_w8r"
+#: The ``(K, N, T)`` rows (BF16 out) measured for :data:`K1_DGRAD_NVJET_RULES_BY_SM`.
+# fmt: off
+_NVJET_DGRAD_ROWS: tuple[tuple[int, int, int], ...] = (
+    *((4096, n, t) for n in (32, 64) for t in (512, 2048, 4864, 9472, 9728, 14592, 16172, 16231, 16384)),
+    *((4096, n, 16231) for n in (16, 48, 96, 128)),
+    *((k, n, 16231) for k, n in ((5120, 32), (5120, 48), (5120, 64), (5120, 128), (6144, 32), (6144, 128), (8192, 128))),
+)
+#: The rows of :data:`_NVJET_DGRAD_ROWS` that 152-SM ``sm_103a`` parts, and 148-SM and 152-SM ``sm_100a`` parts,
+#: leave to the other tables.
+_NVJET_DGRAD_SM103_KEPT = frozenset({(4096, 32, 2048)})
+_NVJET_DGRAD_SM100_KEPT = _NVJET_DGRAD_SM103_KEPT | {(4096, 32, 14592), (4096, 64, 4864)}
+# fmt: on
+#: The K1 input-gradient rows that run this package's nvjet program on the deterministic package's plan of
+#: :data:`K1_DGRAD_NVJET_DET_PROGRAM`, ``(arch, sm_count) -> {(K, N, T, out_dtype): template}``: on a part of exactly
+#: ``sm_count`` SMs, :func:`cake_dense_gemm_nondet_train_projection_dgrad` of ``G[T, N]`` and ``W[N, K]`` (both with a
+#: unit stride on their last axis) into an ``out[T, K]`` of ``out_dtype`` at exactly these extents and token count
+#: plans that program of the deterministic package (the knobs that name it, :func:`k1_program_knobs`) and launches this
+#: package's program ``template`` with the plan's arguments: the same kernel parameters, host plan, shared memory,
+#: cluster and grid, and the same bits as the deterministic plan.  The program (``nvjet_early_kn_n256_lean``) loads the
+#: first item's first K step and prefetches the boxes after it into the L2 in the prologue, and takes the start path of
+#: cuBLAS's nvjet kernels (a relaxed cluster arrive, each role's wait just before its first operation that needs the
+#: peer CTA, the pair's tensor-memory allocation at the constant base 0).  It comes after
+#: :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` and before :data:`K1_DGRAD_RULES_BY_SM`; every other part, row, token count and
+#: output dtype keeps those tables and the deterministic plan.  Measured at exactly these rows and token counts against
+#: the deterministic program it replaces in the same process, on one B200, one GB200 and one GB300 part: faster in eager
+#: launches and in CUDA graph replays in 5 of 5 paired groups (that program's time 1.00 to 1.17 times this one's; on the
+#: GB300 part ``4096 -> 32`` at 14592 tokens in 9 of 10 eager groups), the same bits on every repeat, equal to the
+#: deterministic plan's.  ``4096 -> 32`` at 2048 tokens was slower in eager launches on all three parts (that
+#: program's time 0.96 to 0.99 times this one's) and keeps the other tables on every part; on ``sm_100a``
+#: ``4096 -> 32`` at 14592 tokens and ``4096 -> 64`` at 4864 tokens were not faster in every group on the GB200 part and
+#: keep the other tables too.
+# fmt: off
+K1_DGRAD_NVJET_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
+    ("sm_100a", 148): {
+        (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM100_KEPT
+    },
+    ("sm_100a", 152): {
+        (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM100_KEPT
+    },
+    ("sm_103a", 152): {
+        (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM103_KEPT
+    },
+}
+# fmt: on
+
+#: Rows of the one-wave forward program per work item (512 output features), and the input-gradient program's tile.
+_WAVE_ITEM_ROWS = 512
+_DGRAD_ITEM_ROWS = 256
+
+
+def _k1_program_module(table: dict, key: tuple, out: torch.Tensor) -> Optional[str]:
+    """The registered module of this package that ``table`` (a table of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` /
+    :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` form) names for ``key`` on ``out``'s device, or ``None`` (no entry for the
+    part, or a template this checkout does not register for its architecture)."""
+    facts = deterministic_backend().device_facts(out.device)
+    if facts.arch is None:
+        return None
+    template = table.get((facts.arch, int(facts.sm_count)), {}).get(key)
+    if template is None:
+        return None
+    return cake_jit.KERNELS.get(facts.arch, {}).get(template)
+
+
+def _k1_forward_program_of(
+    X: torch.Tensor, W: torch.Tensor, out: torch.Tensor
+) -> Optional[str]:
+    """The module of this package the forward call ``(X, W, out)`` runs (:data:`K1_FORWARD_PROGRAM_RULES_BY_SM`), or
+    ``None``: a shape without a row of the table, operands that are not BF16 and K-major on one CUDA device, an
+    ``out`` that is not BF16 with a unit inner stride, and a part without the row keep the deterministic routing.  The
+    device is read only for a shape of the table."""
+    if X.dim() != 2 or W.dim() != 2 or out.dim() != 2:
+        return None
+    key = (int(X.shape[1]), int(W.shape[0]), int(X.shape[0]))
+    if not any(key in rows for rows in K1_FORWARD_PROGRAM_RULES_BY_SM.values()):
+        return None
+    if (
+        X.dtype != torch.bfloat16
+        or W.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+    ):
+        return None
+    if (
+        X.stride(1) != 1
+        or W.stride(1) != 1
+        or out.stride(1) != 1
+        or int(W.shape[1]) != key[0]
+    ):
+        return None
+    if tuple(out.shape) != (key[2], key[1]) or _k1_index(X, W, out) < 0:
+        return None
+    return _k1_program_module(K1_FORWARD_PROGRAM_RULES_BY_SM, key, out)
+
+
+def _k1_dgrad_program_of(
+    G: torch.Tensor, W: torch.Tensor, out: torch.Tensor
+) -> Optional[str]:
+    """The module of this package the input-gradient call ``(G, W, out)`` runs (:data:`K1_DGRAD_PROGRAM_RULES_BY_SM`),
+    or ``None``: a shape and output dtype without a row of the table, operands that are not BF16 with a unit stride on
+    their last axis on one CUDA device, an ``out`` without a unit inner stride, and a part without the row keep the
+    deterministic routing.  The device is read only for a shape of the table."""
+    if (
+        G.dim() != 2
+        or W.dim() != 2
+        or out.dim() != 2
+        or out.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        return None
+    key = (
+        int(W.shape[1]),
+        int(W.shape[0]),
+        int(G.shape[0]),
+        "f32" if out.dtype == torch.float32 else "bf16",
+    )
+    if not any(key in rows for rows in K1_DGRAD_PROGRAM_RULES_BY_SM.values()):
+        return None
+    if (
+        G.dtype != torch.bfloat16
+        or W.dtype != torch.bfloat16
+        or int(G.shape[1]) != key[1]
+    ):
+        return None
+    if (
+        G.stride(1) != 1
+        or W.stride(1) != 1
+        or out.stride(1) != 1
+        or tuple(out.shape) != (key[2], key[0])
+    ):
+        return None
+    if _k1_index(G, W, out) < 0:
+        return None
+    return _k1_program_module(K1_DGRAD_PROGRAM_RULES_BY_SM, key, out)
+
+
+def _k1_dgrad_nvjet_of(
+    G: torch.Tensor, W: torch.Tensor, out: torch.Tensor
+) -> Optional[str]:
+    """The module of this package the input-gradient call ``(G, W, out)`` runs on the deterministic package's plan of
+    :data:`K1_DGRAD_NVJET_DET_PROGRAM` (:data:`K1_DGRAD_NVJET_RULES_BY_SM`), or ``None``: a shape and output dtype
+    without a row of the table, an operand without a unit stride on its last axis, tensors not on one CUDA device and a
+    part without the row keep the other tables.  The device is read only for a shape of the table."""
+    if (
+        G.dim() != 2
+        or W.dim() != 2
+        or out.dim() != 2
+        or out.dtype not in (torch.bfloat16, torch.float32)
+    ):
+        return None
+    key = (
+        int(W.shape[1]),
+        int(W.shape[0]),
+        int(G.shape[0]),
+        "f32" if out.dtype == torch.float32 else "bf16",
+    )
+    if not any(key in rows for rows in K1_DGRAD_NVJET_RULES_BY_SM.values()):
+        return None
+    if G.stride(1) != 1 or W.stride(1) != 1 or _k1_index(G, W, out) < 0:
+        return None
+    return _k1_program_module(K1_DGRAD_NVJET_RULES_BY_SM, key, out)
+
+
+def _launch_k1_program(
+    module: str,
+    values: dict[str, Any],
+    items: int,
+    out: torch.Tensor,
+    enable_pdl: Optional[bool],
+    units: Optional[int] = None,
+) -> None:
+    """Launch this package's program ``module`` (a forward / input-gradient program of the tables above, one CTA pair
+    per SM pair up to ``items`` work items) with ``values`` in its argument order, the PDL flag of ``enable_pdl`` for
+    ``out``'s device, on the current stream of that device.  ``units``: the stream-K program's unit count, one unit
+    per CTA pair; a grid of another number of CTA pairs raises ``ValueError`` (a pair running two units could wait on
+    a higher pair that is not resident)."""
+    det = deterministic_backend()
+    index = _k1_index(out, out, out)
+    facts = det.device_facts(out.device)
+    stream = det._current_raw_stream(index)
+    grid = (2 * max(1, min(int(facts.sm_count) // 2, int(items))), 1, 1)
+    if units is not None and grid[0] != 2 * int(units):
+        raise ValueError(
+            f"stream-K launch of {units} units on {grid[0] // 2} CTA pairs: the grid runs one unit per CTA pair"
+        )
+    fn, plan = _atomic_entry(module, grid, facts.arch)
+    values = dict(values, enable_pdl=int(det.pdl_enabled(enable_pdl, index)))
+    arguments = _order_atomic_arguments(module, plan, values, grid)
+    with _k1_stream_context(det, index, stream):
+        fn(*arguments)
+
+
+def _launch_wave_forward(
+    module: str,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    out: torch.Tensor,
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
+    """``out[T, N] = X[T, K] @ W[N, K].T`` on the one-wave forward program ``module``: ``W`` / ``X`` / ``out`` as
+    batches of one (``[1, N, K]``, ``[1, T, K]``, ``[1, T, N]``), ``M = N`` features and ``N = T`` tokens of the
+    program."""
+    tile_n = int(MODULES[module]["build"]["kwargs"]["tile_n"])
+    F, K, T = int(W.shape[0]), int(W.shape[1]), int(X.shape[0])
+    items = _ceil_div(F, _WAVE_ITEM_ROWS) * _ceil_div(T, tile_n)
+    values = dict(
+        A=W.unsqueeze(0), B=X.unsqueeze(0), C=out.unsqueeze(0), M=F, N=T, K=K, L=1
+    )
+    _launch_k1_program(module, values, items, out, enable_pdl)
+    return out
+
+
+def _launch_dgrad_program(
+    module: str,
+    G: torch.Tensor,
+    W: torch.Tensor,
+    out: torch.Tensor,
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
+    """``out[T, K] = G[T, N] @ W[N, K]`` on the input-gradient program ``module``: the program's ``M = T`` rows,
+    ``N = K`` columns and ``K = N`` reduction, ``W`` as ``[1, N, K]``; ``out`` stored through its own pointer and row
+    stride (a padded ``out`` as the contiguous 1-D alias of its span, ``flat_alias``: the binding checks the
+    pointer's contiguity), and through ``[1, T, K]`` TMA maps (the map of the other dtype a per-device dummy the
+    program never touches)."""
+    det = deterministic_backend()
+    T, N, K = int(G.shape[0]), int(W.shape[0]), int(W.shape[1])
+    f32 = out.dtype == torch.float32
+    other = torch.bfloat16 if f32 else torch.float32
+    spare, flat = det._dummy_map(out.device, other), det._dummy(out.device, other)
+    ptr = out if out.is_contiguous() else det.flat_alias(out)
+    items = _ceil_div(T, _DGRAD_ITEM_ROWS) * _ceil_div(K, _DGRAD_ITEM_ROWS)
+    values = dict(
+        A=G,
+        B=W.unsqueeze(0),
+        out=flat if f32 else ptr,
+        out32=ptr if f32 else flat,
+        C16=spare if f32 else out.unsqueeze(0),
+        C32=out.unsqueeze(0) if f32 else spare,
+        M=T,
+        N=K,
+        K=N,
+        ldo=int(out.stride(0)),
+    )
+    _launch_k1_program(module, values, items, out, enable_pdl)
+    return out
+
+
+#: The registry template of this package's stream-K weight-gradient program of ``block_n``-wide transposed-store tiles
+#: (:data:`K1_WGRAD_SK_RULES_BY_SM`).
+def wgrad_sk_template(block_n: int, out_f32: bool) -> str:
+    return (
+        f"{cake_jit.TEMPLATE_PREFIXES[10]}nn_n{int(block_n)}"
+        + ("_f32" if out_f32 else "")
+        + "_t"
+    )
+
+
+_SK_N256_T = "dense_proj_gemm_sk_nn_n256_t"
+_SK_N256_F32_T = "dense_proj_gemm_sk_nn_n256_f32_t"
+#: Flag words of one stream-K unit (one per epilogue warp slice and lane), zero before and after every launch.
+_SK_FLAG_WORDS = 512
+
+#: The K1 weight-gradient rows that run this package's stream-K program, ``(arch, sm_count) -> {(d_in, d_out, T,
+#: out_dtype): template}``: on a part of exactly ``sm_count`` SMs, :func:`cake_dense_gemm_nondet_train_projection_wgrad`
+#: of ``G[T, d_out]`` and ``X[T, d_in]`` (both with a unit stride on their last axis) into an ``out[d_out, d_in]`` of
+#: ``out_dtype`` (unit inner stride) at exactly these extents and token count, with the default ``sk`` and
+#: ``cta_rows``, runs the stream-K program ``template`` (:func:`wgrad_sk_template`): the ``ceil(d_in / 256) x
+#: ceil(d_out / block_n)`` output tiles laid end to end (``d_out`` tiles fastest) on one line of 64-token K blocks, cut
+#: into one unit per CTA pair (``sm_count / 2`` units, the grid one CTA pair per unit); each pair runs its unit in
+#: increasing order, and a tile split across units is summed by the unit that holds its last K block, which adds the
+#: other units' FP32 partials in unit order and rounds once: no atomic, the same bits on every run (other bits than the
+#: deterministic program's).  That unit waits only for the partials of the lower units that hold the tile's earlier K
+#: blocks, and the other units wait for none, so a launch whose CTA pairs are not all resident at once still completes
+#: when the hardware starts lower CTA pairs no later than higher ones (observed on these parts; CUDA does not guarantee
+#: that order).  It comes before every other weight-gradient table; every other part, row, token count and knob keeps
+#: them.  Measured at exactly these rows and token counts on two 148-SM parts against the fastest non-Cake program of
+#: the row (cuBLAS, cuBLASLt with split K, DeepGEMM, QuACK) and against this package's program of the row, in the same
+#: process: 5.0 to 7.6 % faster than the former and 4.3 to 7.8 % faster than the latter in eager launches and in CUDA
+#: graph replays in every paired group, the same bits on 20 repeats, within 1.1 times the reference's median error on
+#: the six input kinds of :data:`K1_DSM_RANGES_BY_SM`'s check.  On a 152-SM ``sm_103a`` part (76 units) the FP32
+#: program at ``5120 -> 1024`` and 16384 tokens, measured the same way on one GB300 node: 6.0 to 6.7 % faster than the
+#: fastest non-Cake program and 3.3 to 4.2 % faster than this package's program of the row, the same bits on 20
+#: repeats and within the same check.  The BF16 program at 16172 tokens and the FP32 program at 16231 tokens, on two
+#: GB300 nodes: this package's program of the row took 1.018 to 1.047 times their median time in eager launches and in
+#: CUDA graph replays, slower in at most 2 of 15 paired groups on one node and 1 of 7 on the other on every GPU, the
+#: same bits on 20 repeats and within the same check.  The other BF16 and FP32 token counts keep this package's program
+#: on ``sm_103a``: the stream-K program missed that group count there.  On a 212-SM ``sm_107a`` part (106 units) the
+#: BF16 program at ``4096 -> 1024`` and 16172 and 16384 tokens, on two parts: this package's program of the row took
+#: 1.017 to 1.042 times its median time in eager launches and in CUDA graph replays, slower in 0 of 7 paired groups,
+#: the same bits on 20 repeats and within the same check; 16231 tokens keep this package's program.
+# fmt: off
+K1_WGRAD_SK_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
+    ("sm_100a", 148): {
+        (5120, 1024, 16172, "bf16"): _SK_N256_T, (5120, 1024, 16231, "bf16"): _SK_N256_T,
+        (5120, 1024, 16384, "bf16"): _SK_N256_T, (5120, 1024, 16172, "f32"): _SK_N256_F32_T,
+        (5120, 1024, 16231, "f32"): _SK_N256_F32_T, (5120, 1024, 16384, "f32"): _SK_N256_F32_T,
+    },
+    ("sm_103a", 152): {
+        (5120, 1024, 16172, "bf16"): _SK_N256_T, (5120, 1024, 16231, "f32"): _SK_N256_F32_T,
+        (5120, 1024, 16384, "f32"): _SK_N256_F32_T,
+    },
+    ("sm_107a", 212): {
+        (4096, 1024, 16172, "bf16"): _SK_N256_T, (4096, 1024, 16384, "bf16"): _SK_N256_T,
+    },
+}
+# fmt: on
+
+
+def _k1_wgrad_sk_program_of(
+    G: torch.Tensor,
+    X: torch.Tensor,
+    out: torch.Tensor,
+    sk: Any,
+    cta_rows: Optional[int],
+) -> Optional[str]:
+    """The stream-K module of this package the weight-gradient call ``(G, X, out)`` runs
+    (:data:`K1_WGRAD_SK_RULES_BY_SM`), or ``None``: a call with a non-default ``sk`` / ``cta_rows``, a shape and output
+    dtype without a row of the table, operands that are not BF16 with a unit stride on their last axis on one CUDA
+    device, an ``out`` of another shape or without a unit inner stride, and a part without the row keep the other
+    tables.  The device is read only for a shape of the table."""
+    if (
+        sk != "auto"
+        or cta_rows is not None
+        or G.dim() != 2
+        or X.dim() != 2
+        or out.dim() != 2
+    ):
+        return None
+    if out.dtype not in (torch.bfloat16, torch.float32):
+        return None
+    T, d_out, d_in = int(G.shape[0]), int(G.shape[1]), int(X.shape[1])
+    key = (d_in, d_out, T, "f32" if out.dtype == torch.float32 else "bf16")
+    if not any(key in rows for rows in K1_WGRAD_SK_RULES_BY_SM.values()):
+        return None
+    if G.dtype != torch.bfloat16 or X.dtype != torch.bfloat16 or int(X.shape[0]) != T:
+        return None
+    if (
+        G.stride(1) != 1
+        or X.stride(1) != 1
+        or out.stride(1) != 1
+        or tuple(out.shape) != (d_out, d_in)
+    ):
+        return None
+    if _k1_index(X, G, out) < 0:
+        return None
+    return _k1_program_module(K1_WGRAD_SK_RULES_BY_SM, key, out)
+
+
+def _launch_wgrad_sk(
+    module: str,
+    G: torch.Tensor,
+    X: torch.Tensor,
+    out: torch.Tensor,
+    enable_pdl: Optional[bool],
+) -> torch.Tensor:
+    """``out[d_out, d_in] = G[T, d_out].T @ X[T, d_in]`` on the stream-K program ``module`` (transposed store: ``A = X``,
+    ``B = G`` as batches of one, ``M = d_in``, ``N = d_out``, ``K = T``): one unit per CTA pair of the part (at most
+    one per 64-token K block of the line), the grid one CTA pair per unit (checked: :func:`_launch_k1_program`), the
+    unit length the line's K blocks over the units, rounded up; the units' FP32 partial slots and flag words from the
+    arena of the (device, stream) (``k1_slots`` / ``k1_tickets``: the flag words are zero before and after every
+    complete launch).  ``out`` is stored through its pointer and row stride (a padded ``out`` as the contiguous 1-D
+    alias of its span, ``flat_alias``)."""
+    det = deterministic_backend()
+    index = _k1_index(out, out, out)
+    stream = det._current_raw_stream(index)
+    facts = det.device_facts(out.device)
+    block_n = int(MODULES[module]["build"]["kwargs"]["block_n"])
+    T, d_out, d_in = int(G.shape[0]), int(G.shape[1]), int(X.shape[1])
+    line = (
+        _ceil_div(d_in, K1_PAIR_ROWS)
+        * _ceil_div(d_out, block_n)
+        * _ceil_div(T, K1_BLOCK_K)
+    )
+    units = max(1, min(int(facts.sm_count) // 2, line))
+    arena = _atomic_arena_for(index, stream, out.device)
+    with _ATOMIC_PLAN_LOCK:
+        ws = arena.require("k1_slots", units * K1_PAIR_ROWS * block_n)
+        flags = arena.require("k1_tickets", units * _SK_FLAG_WORDS)
+    values = dict(
+        A=X.unsqueeze(0),
+        B=G.unsqueeze(0),
+        out=out if out.is_contiguous() else det.flat_alias(out),
+        ws=ws,
+        flags=flags,
+        M=d_in,
+        N=d_out,
+        K=T,
+        num_l=1,
+        num_units=units,
+        unit_len=_ceil_div(line, units),
+        ldo=int(out.stride(0)),
+        out_l=d_out * int(out.stride(0)),
+    )
+    _launch_k1_program(module, values, units, out, enable_pdl, units=units)
+    return out
+
+
+#: The K1 weight-gradient rows this package runs on another program of the deterministic package than its own plan of
+#: the row, where :func:`plan_atomic_gemm` keeps the row on the deterministic program, ``(arch, sm_count) -> {(d_in,
+#: d_out, T, out_dtype): program}``: on a part of exactly ``sm_count`` SMs,
+#: :func:`cake_dense_gemm_nondet_train_projection_wgrad` of ``G[T, d_out]`` and ``X[T, d_in]`` into an ``out[d_out,
+#: d_in]`` of ``out_dtype`` at exactly these extents and token count, with the default ``sk`` and ``cta_rows``, runs the
+#: deterministic package's program ``program`` (its template without the ``dense_proj_det_gemm_`` prefix) in that
+#: package's orientation of the row, planned with the knobs that name it (:func:`k1_program_knobs`); every other part,
+#: row, token count and knob runs the deterministic plan.  These programs split a tile's token reduction in two ranges
+#: and add the two partials in a fixed order (``_sks_sb2``): the same bits on every run, other bits than the
+#: deterministic plan (one chain over the tokens).  Measured on a 148-SM part at exactly these rows and token counts,
+#: against the deterministic plan in the same process: faster in eager launches and in CUDA graph replays in 5 of 5
+#: paired groups of a screen (1.1 to 3.2 %), within the deterministic package's error budgets against FP64, and the same
+#: bits on 20 repeats.
+# fmt: off
+K1_WGRAD_DET_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
+    ("sm_100a", 148): {
+        (5120, 1024, 16172, "bf16"): "nn_n192_bz64_hne_sks_sb2_pro15",
+        (5120, 1024, 16231, "bf16"): "nn_n192_bz64_hne_sks_sb2_pro15",
+        (5120, 1024, 16384, "bf16"): "nn_n192_bz64_hne_sks_sb2_pro15",
+        (5120, 1024, 16172, "f32"): "nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
+        (5120, 1024, 16231, "f32"): "nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
+        (5120, 1024, 16384, "f32"): "nn_n192_bz64_hne_f32_v8_ef_sks_sb2_pro15",
+    },
+}
+# fmt: on
+
+
+def k1_wgrad_det_knobs(
+    *, arch: str, sm_count: int, d_in: int, d_out: int, T: int, out_f32: bool
+) -> tuple:
+    """The deterministic package's planner knobs of this package's deterministic weight gradient ``out[d_out, d_in] =
+    G[T, d_out].T @ X[T, d_in]`` on a device of exactly ``sm_count`` SMs: those of the program of the row's entry in the
+    table of :data:`K1_WGRAD_DET_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens
+    (:func:`k1_program_knobs`), or ``()`` -- the deterministic plan."""
+    program = K1_WGRAD_DET_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
+        (int(d_in), int(d_out), int(T), "f32" if out_f32 else "bf16")
+    )
+    return k1_program_knobs(program) if program else ()
+
+
+def atomic_k1_template(
+    block_n: int, out_f32: bool, chains: int = 1, split_order: str = "arrival"
+) -> str:
     """The registry template of this package's K1 program (both operands MN-major): the transposed-store program of
     the tile width, or the row-major-store one for a width of :data:`K1_ROW_MAJOR_BLOCK_N`; ``_c<chains>`` for more
-    than one accumulation chain."""
+    than one accumulation chain; ``_<split_order>`` for a split order of :data:`K1_SPLIT_ORDERS` other than
+    ``"arrival"``."""
+    if split_order not in K1_SPLIT_ORDERS:
+        raise ValueError(
+            f"split_order is one of {K1_SPLIT_ORDERS}, got {split_order!r}"
+        )
     return (
         f"{cake_jit.TEMPLATE_PREFIXES[0]}nn_n{int(block_n)}"
         + ("_f32" if out_f32 else "")
         + ("" if int(block_n) in K1_ROW_MAJOR_BLOCK_N else "_t")
         + (f"_c{int(chains)}" if int(chains) > 1 else "")
+        + ("" if split_order == "arrival" else f"_{split_order}")
     )
 
 
@@ -1266,6 +2291,7 @@ class CakeDenseGemmNondetProjectionPlan:
     out_t: bool = True
     chains: int = 1
     dsm: bool = False
+    split_order: str = "arrival"
 
     @property
     def swapped(self) -> bool:
@@ -1282,9 +2308,10 @@ class CakeDenseGemmNondetProjectionPlan:
     @property
     def reproducible(self) -> bool:
         """Whether the result repeats bit for bit: one split stores whole tiles (its chains added in order), two add
-        ``own + other`` (one add of two values), the cluster program (``dsm``) adds its splits in cluster-rank order;
-        three or more splits of the CTA-pair program add the partials in the order the splits finish."""
-        return self.dsm or self.splits <= 2
+        ``own + other`` (one add of two values), the cluster program (``dsm``) adds its splits in cluster-rank order,
+        and a fixed split order (``split_order`` other than ``"arrival"``) adds them in one order; three or more splits
+        of the CTA-pair program in the arrival order add the partials in the order the splits finish."""
+        return self.dsm or self.splits <= 2 or self.split_order != "arrival"
 
     @property
     def grid(self) -> tuple[int, int, int]:
@@ -1352,9 +2379,11 @@ def plan_atomic_gemm(
     that width (the row-major-store program for a width of :data:`K1_ROW_MAJOR_BLOCK_N`) whenever the view and the
     registry allow it.  The planner's choice is first :func:`k1_dsm_plan`'s cluster program where the row has a
     range of :data:`K1_DSM_RANGES_BY_SM` (a plan with ``dsm``; ``None`` when this checkout does not register its
-    template for ``arch``), then :func:`k1_plan`'s, with :func:`k1_chain_plan`'s accumulation chains where it has
-    them; an explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names more, at one
-    split, and never the cluster program.
+    template for ``arch``; at an odd number of K blocks in a range of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` that
+    table's program instead, :func:`k1_dsm_odd_block_plan`), then :func:`k1_ordered_plan`'s program where the row
+    has a range of :data:`K1_ORDERED_RANGES_BY_SM`, then :func:`k1_plan`'s, with :func:`k1_chain_plan`'s
+    accumulation chains where it has them; an explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names
+    more, at one split, in the arrival order, and never the cluster program.
     Raises ``ValueError`` for inconsistent shapes (as the deterministic planner does) and for an explicit choice the
     program cannot run."""
     det = deterministic_backend()
@@ -1405,11 +2434,22 @@ def plan_atomic_gemm(
         )
     out_f32 = out.dtype == torch.float32
     c = 1 if chains is None else int(chains)
+    order = "arrival"
     if splits is None and block_n is None and chains is None:
         dsm = k1_dsm_plan(
             arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
         )
+        odd = None
         if dsm is not None:
+            odd = k1_dsm_odd_block_plan(
+                arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+            )
+            if odd == ():
+                return (*none, "the planner keeps the row on the deterministic program")
+            if odd is not None and len(odd) == 2:
+                # the cluster program of the odd-block table's tile
+                dsm, odd = odd, None
+        if dsm is not None and odd is None:
             bn, p = dsm
             template = dsm_k1_template(bn, p)
             if template not in cake_jit.KERNELS.get(arch, {}):
@@ -1430,17 +2470,23 @@ def plan_atomic_gemm(
                 dsm=True,
             )
             return plan, a_launch, b_launch, O3, ""
-        choice = k1_plan(
+        ordered = odd or k1_ordered_plan(
             arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
         )
-        if choice is None:
-            return (*none, "the planner keeps the row on the deterministic program")
-        bn, p = choice
-        chained = k1_chain_plan(
-            arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
-        )
-        if chained is not None:
-            c = chained[1]
+        if ordered is not None:
+            bn, p, c, order = ordered
+        else:
+            choice = k1_plan(
+                arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+            )
+            if choice is None:
+                return (*none, "the planner keeps the row on the deterministic program")
+            bn, p = choice
+            chained = k1_chain_plan(
+                arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+            )
+            if chained is not None:
+                c = chained[1]
     else:
         planned = k1_plan(
             arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
@@ -1467,7 +2513,7 @@ def plan_atomic_gemm(
                 f"cake_dense_gemm_nondet_train_projection: splits must be in [1, {_ceil_div(K, K1_BLOCK_K)}] (the 64-element K blocks "
                 f"of K={K}), got {p}"
             )
-    template = atomic_k1_template(bn, out_f32, c)
+    template = atomic_k1_template(bn, out_f32, c, order)
     if template not in cake_jit.KERNELS.get(arch, {}):
         return (*none, f"{template} is not registered for {arch}")
     out_t = bn not in K1_ROW_MAJOR_BLOCK_N
@@ -1489,6 +2535,7 @@ def plan_atomic_gemm(
         template=template,
         out_t=out_t,
         chains=c,
+        split_order=order,
     )
     return plan, a_launch, b_launch, O3, ""
 
@@ -1614,9 +2661,9 @@ class _VerdictTable(dict):
 #: weight gradient's head/tail program, :func:`router_partition_of`) or one of :func:`router_units_of` (``"forward"``,
 #: ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this package's stream-K program, a SIMT spec
 #: ``"simt_n<tile_n>m<tile_m>s<slices>[<form>]"`` the exact-FP32 program (plain, or compensated with a form) of the
-#: row's layout on the CUDA cores (:func:`router_simt`); ``None`` runs the deterministic program (its production
-#: split count).  A rule is ``None``, token windows ``((min_tokens, max_tokens, spec), ...)`` -- the spec of the window
-#: that holds the launch's token count (``K`` of the weight gradient, ``M`` of the forward and of the input gradient);
+#: row's layout on the CUDA cores (:func:`router_simt`); ``None`` runs the deterministic program (the split count
+#: that package plans for the row, its ``router_splits``).  A rule is ``None``, token windows
+#: ``((min_tokens, max_tokens, spec), ...)`` -- the spec of the window that holds the launch's token count (``K`` of the weight gradient, ``M`` of the forward and of the input gradient);
 #: every other token count runs the deterministic program -- or a spec alone, at every token count (the plan a test or a
 #: measurement forces; no row ships one).  A window carries a spec only where that partition was faster than the
 #: deterministic package's shipped plan in every measurement run at the token counts measured in it (one long-lived
@@ -1630,7 +2677,24 @@ class _VerdictTable(dict):
 #: a device whose SM count is not the measured one, :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a
 #: table for that SM count.  A SIMT window comes first and may overlap the windows after it: on a device where the
 #: table's windows do not hold, the token count takes the next window that holds it (the ``"waves"`` window of hidden
-#: 5120 below 129 tokens, as before the SIMT windows).
+#: 5120 below 129 tokens, as before the SIMT windows).  A ``"waves"`` partition runs only where it gives every element
+#: at most two partials (:func:`router_at_most_two_partials`; the same bits on every run), else the deterministic
+#: program: on the shipped rows (hidden 5120, 256 experts: 40 tiles) only at up to 64 tokens, one or two 32-element
+#: K blocks per tile, and only on an SM count whose wave count caps the units at one or two per tile.
+#:
+#: A ``"det_s<n>"`` window runs the weight gradient on the deterministic program at ``n`` splits
+#: (:func:`router_det_splits`): the partials added in a fixed order, so the result repeats bit for bit.  Its accuracy
+#: was checked against the reference implementation (FlashInfer commit ``2e989556``) on six input kinds (random
+#: normal, long sums, mirrored and permuted cancellation, concentrated values, values near the largest magnitude):
+#: within 1.1 times the reference's median error on every kind.  Hidden 6144 takes six splits from 16129 to 16384
+#: tokens, where the deterministic package's three splits missed that check on every kind (up to 2.0 times) and six,
+#: the reference's count, met it at 1 to 3 % more time.  Hidden 5120 keeps the deterministic package's nine splits
+#: there, and hidden 4096 its six: 16 splits also met the check but took 1.00 to 1.02 times the time of six through
+#: this package's entry on GB200 and GB300 parts (CUDA graph replays, 16172 to 16384 tokens).  The
+#: head/tail partitions these rows ran before (hidden 5120 ``"H0.5x3"`` on both architectures, ``sm_103a`` hidden 4096
+#: ``"H1x4p44"`` and 6144 ``"H1x5p44"``, ``sm_107a`` hidden 5120 ``"H0.5x4"``) were 3 to 23 % faster than the
+#: deterministic program but varied run to run and missed the check (up to 1.94 times the reference's error), so the
+#: rows run the deterministic program there.
 # fmt: off
 ROUTER_RULES: dict[
     tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
@@ -1691,9 +2755,9 @@ ROUTER_RULES: dict[
     # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
     # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
     # 12288 on sm_103a; a later sm_103a measurement passed at 10240 on two parts, between misses at 8192 and 12288, so
-    # 10240 was not added).  On sm_100a the window ends at 16384 tokens: measured again against the current
-    # deterministic plan, it was up to 4.5 % slower than that plan next to a resident kernel at 24576 tokens and up to
-    # 6.9 % at 32768 (16385 to 24575 tokens not measured).
+    # 10240 was not added).  On sm_100a the window ended at 16384 tokens: measured again against six splits, it was
+    # up to 4.5 % slower than that plan next to a resident kernel at 24576 tokens and up to 6.9 % at 32768 (16385 to
+    # 24575 tokens not measured); its windows are 10240 to 16384 and 16400 to 28672 tokens now (below).
     # Hidden 4096 on sm_100a keeps the deterministic plan above its SIMT window: the head/tail partition with 44 head
     # units and five tail units per CTA pair ("H1x5p44"), measured again against the current deterministic plan at
     # 10240 to 16384 tokens, left the checkpointed step (two forwards and the backward pass) up to 2.7 % slower in
@@ -1701,23 +2765,56 @@ ROUTER_RULES: dict[
     # Hidden 4096 on sm_103a: "H1x4p44" (44 head units, then four tail units per CTA pair) from 20480 to 49152 tokens
     # (measured at 20480, 24576, 32768 and 49152 tokens, each on four or five parts); up to 7 % slower than the
     # deterministic plan next to a resident kernel at 8192 to 16384 tokens, and at 65536 the checkpointed step (two
-    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a: "H1x5p44" from 16172 to 20480
-    # tokens (measured at 16172, 16231, 16384 and 20480 tokens, each on four parts); up to 7.8 % slower next to a
-    # resident kernel at 8192 to 12288 tokens, the backward pass (input and weight gradient) no faster at 24576 and up
-    # to 2.3 % slower at 32768.  Hidden 6144 on sm_100a keeps the deterministic plan above its SIMT window: no
-    # partition was faster in every run in CUDA graphs.
+    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a: "H1x5p44" from 16385 to 20480
+    # tokens (first from 16172, measured at 16172, 16231, 16384 and 20480 tokens, each on four parts; 16172 to 16384
+    # below); up to 7.8 % slower next to a resident kernel at 8192 to 12288 tokens, the backward pass (input and weight
+    # gradient) no faster at 24576 and up to 2.3 % slower at 32768.  Hidden 6144 on sm_100a keeps the deterministic
+    # plan above its SIMT window: no partition was faster in every run in CUDA graphs.
     # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
-    # the head spans wait for), at 6144 it left the backward pass no faster
+    # the head spans wait for), at 6144 it left the backward pass no faster.
+    # The deterministic plan of the measurements above is that package's six splits.  From 16129 to 16384 tokens on
+    # 148- and 152-SM sm_100a / sm_103a parts it plans nine splits at hidden 5120 and three at hidden 6144 (its
+    # ROUTER_SPLIT_RULES, router_splits).  The 152-SM head/tail windows at and next to those token counts were measured
+    # again on two parts against the plan the row runs without them (the rule's count from 16129 to 16384 tokens, six
+    # elsewhere), alone, in the backward pass and in the checkpointed step, in eager launches and in CUDA graphs.  A
+    # token count stays in a window where, on both parts, the partition was faster alone in every run (a one-sided
+    # paired sign test, p < 0.05, with a median time ratio below 0.99) and the backward pass and the checkpointed step
+    # were no slower (pooled median ratio at most 1.013, no run slower than the slowest run of that plan against
+    # itself); next to a resident kernel it was up to 4.5 % slower at some kept token counts (data, not a condition
+    # here).  A window ends at kept token counts and holds no token count that missed.  The comparison is what a caller
+    # gets: the window through this package's entry against the deterministic plan through it; alone in eager launches
+    # the entry adds about 14 us to the head/tail program and about 6 us to the deterministic plan, while a direct call
+    # of the deterministic program's binding adds under 1 us, so a miss alone in eager launches against that binding
+    # alone does not remove a window:
+    # - sm_100a hidden 5120 "H0.5x3": main's window (10240 to 16384 tokens) measured again with these tables on two
+    #   parts: faster than the deterministic plan through this package's entry at 12289, 16128 and 16384 tokens on
+    #   both parts, alone, in the backward pass and in the checkpointed step, eager and in CUDA graphs (at 16129 on one
+    #   part; on the other one eager checkpointed-step run was 3.3 % slower), and at 10240, 11264 and 12288 faster than
+    #   the deterministic program in CUDA graphs, in the backward pass and in the checkpointed step (alone in eager
+    #   launches it missed against that program's binding only); kept at 16400, 18432, 20480, 24576 and 28672 (against
+    #   six), missed at 16385 (one eager checkpointed-step run on one part) and at 32768 (the checkpointed step in CUDA
+    #   graphs on one part): the windows are 10240 to 16384 and 16400 to 28672 tokens.
+    # - sm_103a hidden 5120 "H0.5x3": main's window (16172 to 32768 tokens) measured again with these tables on two
+    #   parts: faster than the deterministic plan at 16172 and 16231 tokens (nine splits) on both parts, alone, in the
+    #   backward pass and in the checkpointed step, eager and in CUDA graphs (through the entry against the plan
+    #   through it on one part: 3.9 to 5.1 % faster alone in eager launches, 9.6 to 9.9 % in CUDA graphs), kept at
+    #   16232 (nine splits), 16385, 20480, 24576, 28672 and 32768 (six), and at 16384 (nine) faster except alone in
+    #   eager launches against the deterministic program's binding: the window stays 16172 to 32768 tokens.
+    # - sm_103a hidden 6144 "H1x5p44": main's window (16172 to 20480 tokens) measured again: at 16172, 16231 and 16384
+    #   tokens (three splits) the window through this package's entry was 2.9 to 3.7 % slower alone in eager launches
+    #   than the deterministic plan through it, in every run on one part (no slower in the backward pass and the
+    #   checkpointed step, 1.4 to 2.0 % faster alone in CUDA graphs); at 16385 and 20480 tokens (six splits) it was
+    #   no slower than that plan: the window is 16385 to 20480 tokens.
     ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"),),
-    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 16384, "H0.5x3")),
-    ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
-    ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"), (20480, 49152, "H1x4p44")),
-    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves"), (16172, 32768, "H0.5x3")),
-    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16172, 20480, "H1x5p44")),
+    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves")),
+    ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
+    ("sm_103a", "nn_t", 4096, 256): ((1, 288, "simt_n64m64s2"),),
+    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "simt_n64m64s2"), (1, 192, "waves")),
+    ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
     ("sm_107a", "nn_t", 4096, 256): None,
-    ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+    ("sm_107a", "nn_t", 5120, 256): None,
     ("sm_107a", "nn_t", 6144, 256): None,
     # the input gradient, measured on 152-SM GB200 (sm_100a) parts at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096
     # and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144 (outside the windows: at 192 tokens, at 224 and 256 at
@@ -1737,7 +2834,8 @@ ROUTER_RULES: dict[
 #: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM
 #: R200): on a device with any other SM count a router row runs the deterministic program, except in a ``"waves"``
 #: window, which keeps the condition of :func:`router_waves` on every SM count (the plan of these rows before the
-#: windows).  An explicit ``splits`` is not affected.
+#: windows) and runs its partition only where every element takes at most two partials.  An explicit ``splits`` is not
+#: affected.
 ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 216}
 #: Per-SM-count router verdicts of the parts of an architecture whose SM count is not :data:`ROUTER_SM_COUNT`,
 #: ``(arch, sm_count) -> {key: rule}`` (keys and rules as in :data:`ROUTER_RULES`, measured on parts of exactly that SM
@@ -1748,8 +2846,8 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: too, a window that holds only with the head/tail program of :data:`ROUTER_HEAD_TAIL_TEMPLATES_BY_SM` (with
 #: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` it was up to 9.2 % slower than the deterministic plan next to a resident
 #: kernel).  Hidden 4096 keeps the deterministic plan on both SM counts (on 212 SMs "H0.5x4" with the tensor-memory
-#: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and the forward, as on
-#: 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile, from 1 to 256 tokens at
+#: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and on 208 SMs the forward,
+#: as on 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile, from 1 to 256 tokens at
 #: hidden 4096 and 5120 and from 1 to 224 tokens at hidden 6144 (measured at 64, 128, 192 and 256 tokens on 212-SM
 #: R200 parts, at hidden 6144 also at 192, 224 and 256 tokens in a second measurement on two parts; 128, 160 and 192
 #: CTAs of 256 threads, one wave; at hidden 6144 and 256 tokens it was up to 12 % slower than the deterministic plan
@@ -1761,6 +2859,11 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096 and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144, and at
 #: 192 tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
 #: resident kernel), up to 64 tokens at hidden 6144.
+#: On 212 SMs the forward takes the cluster SIMT program (:func:`router_forward_simt`) at hidden 4096, 5120 and 6144:
+#: the 8 x 4 tile in the compensated form from 1 to 8 tokens and the 16 x 32 FFMA tile from 9 to 192 tokens, measured
+#: under the rule of :data:`ROUTER_RULES` on two 212-SM R200 nodes at 1, 4, 5, 8, 9, 12, 16, 17, 32, 64, 96, 97, 112,
+#: 128, 129, 160, 176 and 192 tokens (every measured token count held); from 193 tokens the deterministic plan (not
+#: measured under the rule).
 #: The 148-SM B200 (sm_100a) and B300 (sm_103a) tables hold SIMT windows measured on one node of each part under the
 #: rule of :data:`ROUTER_RULES` against the plan the token count took before (both launch orders, eager and CUDA
 #: graphs, next to a kernel holding 8, 16 or 32 SMs, the backward pass and the checkpointed step, in a long-lived
@@ -1778,6 +2881,23 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: against FP64 of at most 2.1e-7 at the 124 (B200) and 120 (B300) measured token counts of the windows (10 seeds,
 #: worst of 20 runs; 0.95 to 2.66 times the deterministic program's).  Every other row and token count of these parts
 #: runs the deterministic program.
+#: The ``"det_s<n>"`` windows of these tables follow the check of :data:`ROUTER_RULES`: hidden 6144 takes six splits
+#: from 16129 to 16384 tokens on 148-SM parts (the deterministic package's three missed the check on B200; B300 runs the
+#: same arithmetic, its time not measured), B200 hidden 4096 16 splits at 16384 tokens (2.4 % faster than six there,
+#: not at 16172 or 16231 tokens), and 212-SM ``sm_107a`` parts hidden 5120 12 splits at 16172 to 16384 tokens (0.90 to
+#: 0.92 times the time of six, the deterministic package's count there; hidden 4096 and 6144 keep six, which met the
+#: check).  The 208- and 212-SM ``sm_107a`` head/tail windows ``"H0.5x4"`` missed the check (2 to 6 kinds, up to 1.63
+#: times) and are gone: those rows run the deterministic program.
+#: A ``"ksum_S<n>"`` window runs the weight gradient on the K-order program of the part
+#: (:data:`ROUTER_KSUM_TEMPLATES_BY_SM`, :func:`router_ksum_template`) at ``n`` equal spans per tile: each span stores
+#: its FP32 partial of the tile into a workspace slot and takes a ticket, and the span that draws the tile's last ticket
+#: adds the slots in K order and stores the tile -- the deterministic program's ``n`` split partials summed in K order,
+#: so the result repeats bit for bit (no fill of ``out``, the tickets zero before and after every complete launch).  On
+#: 212-SM ``sm_107a`` parts hidden 6144 takes six spans from 16172 to 16231 tokens: on a R200 part it met the check of
+#: :data:`ROUTER_RULES` on all six kinds at 16172 and 16231 tokens (its worst error 1.09 times the reference's, on
+#: mirrored cancellation) at 0.93 times the time of the deterministic program at six splits there, in eager launches,
+#: on a card without a power cap; the head/tail program of :data:`ROUTER_HEAD_TAIL_TEMPLATES_BY_SM` was 3 % faster but
+#: missed the check (four and one of six kinds).
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -1785,9 +2905,11 @@ ROUTER_RULES_BY_SM: dict[
 ] = _VerdictTable({
     ("sm_100a", 148): _VerdictTable({
         ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
-        ("sm_100a", "nn_t", 4096, 256): ((1, 1, "simt_n64m64s2dot2"), (2, 224, "simt_n128m64s2")),
+        ("sm_100a", "nn_t", 4096, 256): (
+            (1, 1, "simt_n64m64s2dot2"), (2, 224, "simt_n128m64s2"), (16384, 16384, "det_s16"),
+        ),
         ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"),),
-        ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
+        ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
         ("sm_100a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"),),
         ("sm_100a", "kn", 5120, 256): ((1, 32, "simt_n64m32s8"), (64, 128, "simt_n64m32s4")),
         ("sm_100a", "kn", 6144, 256): ((1, 32, "simt_n64m32s8"),),
@@ -1796,7 +2918,7 @@ ROUTER_RULES_BY_SM: dict[
         ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
         ("sm_103a", "nn_t", 4096, 256): ((1, 1, "simt_n64m64s2dot2"), (2, 224, "simt_n128m64s2")),
         ("sm_103a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"),),
-        ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
+        ("sm_103a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"), (16129, 16384, "det_s6")),
         ("sm_103a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"),),
         ("sm_103a", "kn", 5120, 256): ((1, 32, "simt_n64m32s8"),),
         ("sm_103a", "kn", 6144, 256): ((1, 32, "simt_n64m32s8"),),
@@ -1804,14 +2926,16 @@ ROUTER_RULES_BY_SM: dict[
     ("sm_107a", 208): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
         ("sm_107a", "nn_t", 4096, 256): None,
-        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 5120, 256): None,
         ("sm_107a", "nn_t", 6144, 256): None,
     }),
     ("sm_107a", 212): _VerdictTable({
-        ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
+        ("sm_107a", "kk", 4096, 256): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32")),
+        ("sm_107a", "kk", 5120, 256): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32")),
+        ("sm_107a", "kk", 6144, 256): ((1, 8, "simt_c8_kg4_l32_e8t4"), (9, 192, "simt_c8_ffma_l16_e16t32")),
         ("sm_107a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"),),
-        ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
-        ("sm_107a", "nn_t", 6144, 256): ((1, 224, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
+        ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "det_s12")),
+        ("sm_107a", "nn_t", 6144, 256): ((1, 224, "simt_n128m64s2"), (16172, 16231, "ksum_S6")),
         ("sm_107a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"), (65, 128, "simt_n64m64s4")),
         ("sm_107a", "kn", 5120, 256): ((1, 64, "simt_n64m32s8"), (65, 128, "simt_n64m64s4")),
         ("sm_107a", "kn", 6144, 256): ((1, 64, "simt_n64m32s8"),),
@@ -1838,6 +2962,19 @@ ROUTER_HEAD_TAIL_TEMPLATES: dict[str, str] = {
 ROUTER_HEAD_TAIL_TEMPLATES_BY_SM: dict[tuple[str, int], str] = {
     ("sm_107a", 212): "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
 }
+#: The weight gradient's K-order program of the parts of an architecture with exactly ``sm_count`` SMs, ``(arch,
+#: sm_count) -> template``: the program of a ``"ksum_S<n>"`` window of that SM count's table in
+#: :data:`ROUTER_RULES_BY_SM` (the head/tail program with the BF16 parts of ``A`` in tensor memory, its part segments
+#: summed in K order through workspace slots and per-tile tickets instead of added into ``out`` by TMA reductions).  A
+#: part without an entry runs the deterministic program in such a window.
+ROUTER_KSUM_TEMPLATES_BY_SM: dict[tuple[str, int], str] = {
+    ("sm_107a", 212): "router_fp32_gemm_ts_r6p6_atomic_nn_t_ksum_ht_c2_nreg",
+}
+#: A K-order window spec ``"ksum_S<n>"``: ``n`` equal spans per tile, summed in K order (:data:`ROUTER_RULES_BY_SM`).
+_ROUTER_KSUM_SPEC = re.compile(r"ksum_S(\d+)")
+#: FP32 elements of one K-order workspace slot (a ``256 x 128`` tile of one span) and ticket words of one tile.
+ROUTER_KSUM_SLOT_ELEMS = 256 * 128
+ROUTER_KSUM_TILE_WORDS = 512
 _ROUTER_HEAD_TAIL_SPEC = re.compile(r"H(\d+(?:\.\d+)?)x(\d+)(?:p(\d+))?")
 #: A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>[<form>]"``: an exact-FP32 program on the CUDA cores with one
 #: CTA per ``tile_n x tile_m`` tile of ``out`` over the whole K range: ``slices`` slices of the CTA each take every
@@ -1882,13 +3019,15 @@ ROUTER_FWD_SIMT_BLOCK_K = 128
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
 #: recomputed under activation checkpointing repeats bit for bit (``0 + a + b == 0 + b + a``).
 ROUTER_FORWARD_MAX_SPLITS = 2
-#: The deterministic package's production split count of the router weight gradient (its ``ROUTER_SPLITS["nn_t"]``):
-#: the plan the ``"waves"`` partition is measured against.
+#: The deterministic package's default split count of the router weight gradient (its ``ROUTER_SPLITS["nn_t"]``):
+#: the plan the ``"waves"`` partition is measured against, and the count of :func:`router_waves` without one.
+#: :func:`router_partition` passes the count that package plans for the row (its ``router_splits``), which differs
+#: from this one only on the rows of its ``ROUTER_SPLIT_RULES``; none of them meets a ``"waves"`` window.
 ROUTER_DET_WGRAD_SPLITS = 6
 #: The ``"waves"`` partition: about this many K blocks (32 elements each) of one tile per unit ...
 ROUTER_WAVE_K_BLOCKS = 68
 #: ... and only where the deterministic plan fills its last wave of CTA pairs below this fraction
-#: (``w / ceil(w)``, ``w = ROUTER_DET_WGRAD_SPLITS * tiles / pairs``).
+#: (``w / ceil(w)``, ``w = splits * tiles / pairs``, ``splits`` that plan's split count).
 ROUTER_WAVE_MAX_DET_FILL = 0.8
 
 
@@ -1906,15 +3045,21 @@ def router_rules(
 
 
 def router_waves(
-    m_pairs: int, n_tiles: int, k_iters: int, sm_count: int
+    m_pairs: int,
+    n_tiles: int,
+    k_iters: int,
+    sm_count: int,
+    det_splits: int = ROUTER_DET_WGRAD_SPLITS,
 ) -> Optional[int]:
     """The ``"waves"`` unit count on a device of ``sm_count`` SMs (CTA pairs ``sm_count // 2``): whole waves of the
     CTA pairs, ``c * pairs`` units with ``c = max(2, round(tiles * k_iters / (ROUTER_WAVE_K_BLOCKS * pairs))) + 1``
     (spans of about ``ROUTER_WAVE_K_BLOCKS`` K blocks of a tile, one wave more, so a kernel holding SMs on another
     stream delays a fine last wave rather than a coarse one), or ``None`` (the deterministic program) where the
-    deterministic plan's last wave is at least :data:`ROUTER_WAVE_MAX_DET_FILL` full."""
+    deterministic plan's last wave is at least :data:`ROUTER_WAVE_MAX_DET_FILL` full.  ``det_splits`` is that plan's
+    split count (default :data:`ROUTER_DET_WGRAD_SPLITS`; :func:`router_partition` passes the deterministic
+    package's count of the row)."""
     tiles, pairs = m_pairs * n_tiles, max(1, int(sm_count) // 2)
-    det_waves = ROUTER_DET_WGRAD_SPLITS * tiles / pairs
+    det_waves = int(det_splits) * tiles / pairs
     if det_waves / math.ceil(det_waves) >= ROUTER_WAVE_MAX_DET_FILL:
         return None
     return (max(2, round(tiles * k_iters / (ROUTER_WAVE_K_BLOCKS * pairs))) + 1) * pairs
@@ -2008,6 +3153,61 @@ def _router_is_simt(spec: Union[str, int, None]) -> bool:
     """Whether a window spec runs a SIMT program (:func:`router_simt_tile` / :func:`router_forward_simt_tile`)."""
     return (
         router_simt_tile(spec) is not None or router_forward_simt_tile(spec) is not None
+    )
+
+
+_ROUTER_DET_SPEC = re.compile(r"det_s(\d+)")
+
+
+def router_det_spec_splits(spec: Union[str, int, None]) -> Optional[int]:
+    """The split count of a ``"det_s<n>"`` window spec (the deterministic program at ``n`` splits), else ``None``."""
+    if not isinstance(spec, str):
+        return None
+    m = _ROUTER_DET_SPEC.fullmatch(spec)
+    return int(m[1]) if m else None
+
+
+def router_det_splits(
+    layout: str, *, arch: str, M: int, N: int, K: int, sm_count: int
+) -> Optional[int]:
+    """The split count the deterministic program runs a weight-gradient launch ``[M, N] = [M, K] @ [K, N]`` (layout
+    class ``nn_t``, the swapped GEMM: ``M`` hidden, ``N`` experts, ``K`` tokens) with on a device of ``sm_count`` SMs:
+    ``n`` of the ``"det_s<n>"`` spec of the row's token window that holds ``K`` (:data:`ROUTER_RULES`, or the table of
+    the device's own SM count in :data:`ROUTER_RULES_BY_SM`; :func:`router_rules`), on a device where the table's
+    windows hold.  ``None``: no such window -- another layout class, a token or SM count outside those windows -- and
+    a launch without a caller's split count takes the deterministic package's split count of the row
+    (``router_splits``).  The deterministic program adds a tile's ``n`` partials in a fixed order (its ``torch.sum``,
+    or this package's partial sum where it serves the launch), so the result repeats bit for bit."""
+    if layout != "nn_t" or not router_rules(arch, sm_count)[1]:
+        return None
+    return router_det_spec_splits(
+        _router_rule_spec(layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K)
+    )
+
+
+def router_ksum_spec_splits(spec: Union[str, int, None]) -> Optional[int]:
+    """The span count of a ``"ksum_S<n>"`` window spec (the K-order program at ``n`` equal spans per tile), else
+    ``None``."""
+    if not isinstance(spec, str):
+        return None
+    m = _ROUTER_KSUM_SPEC.fullmatch(spec)
+    return int(m.group(1)) if m else None
+
+
+def router_ksum_template(arch: str, sm_count: int) -> Optional[str]:
+    """The weight gradient's K-order program on a device of ``arch`` with ``sm_count`` SMs
+    (:data:`ROUTER_KSUM_TEMPLATES_BY_SM`), or ``None``: the part has none."""
+    return ROUTER_KSUM_TEMPLATES_BY_SM.get((arch, int(sm_count)))
+
+
+def router_ksum_workspace(m_pairs: int, n_tiles: int, units: int) -> tuple[int, int]:
+    """``(slot elements, ticket words)`` of a K-order launch of ``units`` spans over ``m_pairs x n_tiles`` tiles:
+    slot ``(span + pair) * n_tiles + column`` of :data:`ROUTER_KSUM_SLOT_ELEMS` FP32 elements (a span's segments of
+    consecutive row-tile pairs take consecutive slots), and :data:`ROUTER_KSUM_TILE_WORDS` words per tile."""
+    spans = int(units) // int(n_tiles)
+    return (
+        (spans + int(m_pairs) - 1) * int(n_tiles) * ROUTER_KSUM_SLOT_ELEMS,
+        int(m_pairs) * int(n_tiles) * ROUTER_KSUM_TILE_WORDS,
     )
 
 
@@ -2206,9 +3406,14 @@ def router_partition(
       :data:`ROUTER_RULES_BY_SM`, that table; :func:`router_rules`): the spec of its token window that holds the
       launch's token count (``K`` of the weight gradient, ``M`` of the forward), on a device of
       :data:`ROUTER_SM_COUNT` SMs or one with a table of its own (a ``"waves"`` window on every device where
-      :func:`router_waves` gives a partition); a row, token count or SM count without one, or a head/tail partition
-      the token count cannot hold (:func:`router_partition_fits`), runs the deterministic program.  A SIMT window is
-      no partition (``None``): the launch runs the SIMT program there (:func:`router_simt`).
+      :func:`router_waves` gives a partition against the deterministic package's split count of the row, its
+      ``router_splits``, that gives every element at most two partials, :func:`router_at_most_two_partials`); a row,
+      token count or SM count without one, or a head/tail partition the token count cannot hold
+      (:func:`router_partition_fits`), runs the deterministic program.  A SIMT window is no partition (``None``):
+      the launch runs the SIMT program there (:func:`router_simt`); nor is a ``"det_s<n>"`` window: the launch runs the
+      deterministic program at ``n`` splits (:func:`router_det_splits`).  A ``"ksum_S<n>"`` window of the weight
+      gradient is the partition ``"S<n>"`` (``n`` units per tile), which :func:`plan_atomic_router` runs on the
+      K-order program of the part.
 
     A forward partition must give every element at most two partials (:func:`router_at_most_two_partials`) and
     cannot be a head/tail partition: ``ValueError`` otherwise."""
@@ -2233,11 +3438,31 @@ def router_partition(
     else:
         spec = _router_rule_spec(layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K)
         if spec == "waves":  # its own SM-count condition, on every SM count
-            spec = router_waves(m_pairs, n_tiles, k_iters, sm_count)
+            # the deterministic plan the row runs without the partition: that package's split count of the row
+            det_splits = deterministic_backend().router_splits(
+                layout, M, N, K, arch, sm_count
+            )
+            spec = router_waves(m_pairs, n_tiles, k_iters, sm_count, det_splits)
+            if spec is not None and not router_at_most_two_partials(
+                m_pairs,
+                n_tiles,
+                router_units_of(spec, m_pairs, n_tiles, k_iters, sm_count),
+            ):
+                # its bits would vary run to run: the deterministic program
+                return None
         elif not router_rules(arch, sm_count)[1]:
             return None
-        if spec is None or _router_is_simt(spec):
+        if (
+            spec is None
+            or _router_is_simt(spec)
+            or router_det_spec_splits(spec) is not None
+        ):
             return None
+        ksum = router_ksum_spec_splits(spec)
+        if ksum is not None:
+            if layout != "nn_t":
+                return None
+            spec = f"S{ksum}"
     if layout == "kk" and router_head_tail(spec) is not None:
         raise ValueError(
             f"cake_dense_gemm_nondet_train_router: the head/tail partition {spec!r} is the weight gradient's; "
@@ -2347,7 +3572,9 @@ class CakeDenseGemmNondetRouterPlan:
     [K, N]``): ``m_tiles / 2 x n_tiles`` tiles of ``256 x 128``, their ``k_iters`` K blocks cut into ``units``
     stream-K spans (``2 * units`` CTAs; the first ``head_spans`` spans share the first ``head_steps`` steps on the
     head/tail program, every span alike when ``head_spans`` is 0); with part tiles the launch zeroes ``out`` before
-    the program.  With ``simt`` (a SIMT program, its tile, :func:`router_simt`): one CTA per
+    the program.  With ``ksum`` (a ``"ksum_S<n>"`` window, :func:`router_ksum_template`) the K-order program instead:
+    the spans' partials of a tile summed in K order through workspace slots and tickets (:attr:`ksum_workspace`), no
+    fill of ``out``.  With ``simt`` (a SIMT program, its tile, :func:`router_simt`): one CTA per
     ``tile_n x tile_m`` tile of ``out`` over ``k_iters`` K blocks of :data:`ROUTER_SIMT_BLOCK_K` elements, the
     operands' row strides ``lda`` / ``ldb``; ``units`` 0, no part tiles.  The weight gradient's (``nn_t``) launches
     ``m_tiles x n_tiles`` CTAs over the transposed ``out`` (``A`` the activations, ``B`` the output gradient), the
@@ -2375,10 +3602,19 @@ class CakeDenseGemmNondetRouterPlan:
     simt: Optional[tuple[Union[int, str], ...]] = None
     lda: int = 0
     ldb: int = 0
+    ksum: bool = False
 
     @property
     def m_pairs(self) -> int:
         return self.m_tiles // 2
+
+    @property
+    def ksum_workspace(self) -> tuple[int, int]:
+        """``(slot elements, ticket words)`` of the K-order program (:func:`router_ksum_workspace`; ``(0, 0)`` for
+        any other program)."""
+        if not self.ksum:
+            return (0, 0)
+        return router_ksum_workspace(self.m_pairs, self.n_tiles, self.units)
 
     @property
     def tiles(self) -> int:
@@ -2397,8 +3633,8 @@ class CakeDenseGemmNondetRouterPlan:
     @cached_property
     def part_tiles(self) -> bool:
         """Whether some segment adds into ``out`` (the launch zeroes ``out`` before its program runs); computed once
-        per plan."""
-        if self.simt is not None:
+        per plan.  The K-order program (``ksum``) stores every element once."""
+        if self.simt is not None or self.ksum:
             return False
         return router_has_part_tiles(
             self.m_pairs,
@@ -2412,8 +3648,8 @@ class CakeDenseGemmNondetRouterPlan:
     @property
     def reproducible(self) -> bool:
         """Whether every element takes at most two partials, so the result repeats bit for bit (the SIMT program
-        stores every element once)."""
-        if self.simt is not None:
+        stores every element once; the K-order program adds the partials in K order)."""
+        if self.simt is not None or self.ksum:
             return True
         return router_at_most_two_partials(self.m_pairs, self.n_tiles, self.units)
 
@@ -2451,7 +3687,9 @@ def plan_atomic_router(
     the deterministic path, which serves or refuses it as that package does), a template this checkout does not
     register for ``arch``, or the planner (:func:`router_partition`).  An explicit ``splits`` (``1`` included) runs
     this package's program when the view and the registry allow it; a head/tail partition runs the head/tail program
-    of the architecture on a device of ``sm_count`` SMs (:func:`router_head_tail_template`); a SIMT window
+    of the architecture on a device of ``sm_count`` SMs (:func:`router_head_tail_template`), a ``"ksum_S<n>"`` window
+    the K-order program of the part (:func:`router_ksum_template`; the deterministic program where the part has none
+    registered); a SIMT window
     (:func:`router_simt`) runs the SIMT program of its tile when the operands' rows are whole rows of a multiple of 4
     elements (else the deterministic program): the weight gradient's over the swapped launch, the input gradient's
     over ``A`` (the output gradient, K-major) and ``B`` (the router weight, N-major) as they are."""
@@ -2606,7 +3844,24 @@ def plan_atomic_router(
     if partition is None:
         return None, "the planner keeps the row on the deterministic program"
     units, head_spans, head_steps = partition
-    if head_spans:
+    ksum = (
+        splits is None
+        and layout == "nn_t"
+        and router_ksum_spec_splits(
+            _router_rule_spec(
+                layout, arch=arch, sm_count=sm_count, M=M_eff, N=N_eff, K=K
+            )
+        )
+        is not None
+    )
+    if ksum:
+        template = router_ksum_template(arch, sm_count)
+        if template is None or template not in cake_jit.KERNELS.get(arch, {}):
+            return (
+                None,
+                f"no K-order program is registered for {arch} on {sm_count} SMs",
+            )
+    elif head_spans:
         template = router_head_tail_template(arch, sm_count)
         if template not in cake_jit.KERNELS.get(arch, {}):
             return None, f"{template} is not registered for {arch}"
@@ -2626,6 +3881,7 @@ def plan_atomic_router(
         template=template,
         head_spans=head_spans,
         head_steps=head_steps,
+        ksum=ksum,
     )
     return plan, ""
 
@@ -2688,6 +3944,19 @@ def _k2_row_without_verdict(
     the planner can give a plan.  ``False`` leaves the decision (and every refusal of an invalid binding) to the
     planner."""
     return _k2_geometry_without_verdict(_k2_geometry(A, B, out), arch, sm_count)
+
+
+def _k2_det_splits(
+    A: torch.Tensor, B: torch.Tensor, arch: str, sm_count: int
+) -> Optional[int]:
+    """:func:`router_det_splits` of a call ``out = A @ B`` of the weight-gradient class (both operands MN-major, the
+    swapped launch ``[N, M] = [N, K] @ [K, M]``) on a device of ``arch`` with ``sm_count`` SMs; ``None`` for another
+    class or view (the deterministic package's split count of the row)."""
+    if A.dim() != 2 or B.dim() != 2 or not (_router_a_mn(A) and _router_b_mn(B)):
+        return None
+    M, K = (int(s) for s in A.shape)
+    N = int(B.shape[1])
+    return router_det_splits("nn_t", arch=arch, M=N, N=M, K=K, sm_count=sm_count)
 
 
 @dataclass(slots=True)
@@ -2808,15 +4077,20 @@ def _k2_values(
     parts: Any,
     out: torch.Tensor,
     enable_pdl: int = 0,
+    ws: Any = None,
+    counters: Any = None,
 ) -> dict[str, Any]:
     """The keyword arguments of a K2 launch of this package (ordered by the program's argument plan): ``out`` is
-    passed twice, as the store pointer and as the reduce-add map ``D``; ``head_spans`` / ``head_steps`` are read by the
-    head/tail programs only; ``enable_pdl`` is the launch's PDL flag (0 or 1)."""
+    passed twice, as the store pointer and as the reduce-add map ``D``; the K-order program takes its workspace slots
+    ``ws`` and tickets ``counters`` instead of ``D``; ``head_spans`` / ``head_steps`` are read by the head/tail
+    programs only; ``enable_pdl`` is the launch's PDL flag (0 or 1)."""
     return dict(
         A=A,
         B=parts,
         out32=_k2_out32(out),
         D=out,
+        ws=ws,
+        counters=counters,
         M=plan.M,
         N=plan.N,
         m_tiles=plan.m_tiles,
@@ -3159,6 +4433,31 @@ class CakeDenseGemmNondetRouterLaunch:
     __call__ = launch
 
 
+@dataclass
+class CakeDenseGemmNondetProgramLaunch:
+    """One prepared K1 launch of a row that a program table of the device routes (:func:`_k1_table_call`): the call
+    of the convenience entry point of the row's operation, with the views and the PDL flag given when prepared, so it
+    runs that entry point's program and gives its bits -- this package's one-wave forward, input-gradient or stream-K
+    weight-gradient program, its nvjet program on the deterministic package's plan, or the deterministic package's
+    program the table names.  ``table`` names the table that routes the row, ``template`` the program the row names
+    (this package's when ``own``, else the deterministic package's; ``None`` for knobs that name no program).
+    ``launch()`` writes ``out`` and returns it; every program of these tables repeats bit for bit (no alert).  The
+    first launch plans and binds the row as the entry point does (the workspace of a program that has one is the arena
+    of the device and stream); launch it once before capturing it into a CUDA graph."""
+
+    table: str
+    template: Optional[str]
+    own: bool
+    out: torch.Tensor
+    _launch: Callable[[], Any] = field(repr=False)
+
+    def launch(self) -> torch.Tensor:
+        self._launch()
+        return self.out
+
+    __call__ = launch
+
+
 def _device_and_arch(A, B, out) -> tuple[torch.device, str, int]:
     det = deterministic_backend()
     device = det._same_cuda_device(A, B, out)
@@ -3316,7 +4615,22 @@ def _prepare_atomic_k2(
             split_src.shape, device=device, dtype=torch.float32
         )
     module_name = cake_jit.select_module(arch, plan.template)
-    values = _k2_values(plan, A=a_view, parts=parts, out=out, enable_pdl=pdl)
+    ws = counters = None
+    if plan.ksum:
+        slots, words = plan.ksum_workspace
+        ws = tensors["ws"] = torch.empty(slots, device=device, dtype=torch.float32)
+        counters = tensors["counters"] = torch.zeros(
+            words, device=device, dtype=torch.uint32
+        )
+    values = _k2_values(
+        plan,
+        A=a_view,
+        parts=parts,
+        out=out,
+        enable_pdl=pdl,
+        ws=ws,
+        counters=counters,
+    )
     launch = _converted_launch(bind_launch(module_name, values, plan.grid, arch))
     split_launch = None
     if split_module is not None:
@@ -3356,9 +4670,9 @@ def _atomic_k2(
     """This package's K2 GEMM ``out = A @ B`` (FP32 through the BF16x3 emulation, or a SIMT program) of the layout
     classes ``kk`` / ``kn`` / ``nn_t``: ``op`` is ``"plan"``, ``"prepare"`` or ``"launch"`` as for
     :func:`_atomic_k1`.  A plan or a prepared launch :func:`plan_atomic_router` keeps on the deterministic program is
-    the deterministic package's object of ``op`` with the caller's ``splits`` (``None``: its production split count);
-    a launch runs that program through this package's binding (:func:`_launch_cached_atomic_k2`; ``views``: an entry
-    point's own launch views).
+    the deterministic package's object of ``op`` with the caller's ``splits`` (``None``: the row's split count in the
+    router tables, :func:`_k2_det_splits`, else the deterministic package's, ``router_splits``); a launch runs that program through this package's binding (:func:`_launch_cached_atomic_k2`;
+    ``views``: an entry point's own launch views).
     ``enable_pdl`` (default: the device supports it) launches the split and the program as programmatic dependent
     launches."""
     if op == "launch":
@@ -3369,6 +4683,8 @@ def _atomic_k2(
     plan, _ = plan_atomic_router(A, B, out, arch=arch, sm_count=sm_count, splits=splits)
     if plan is None:
         det = deterministic_backend()
+        if splits is None:
+            splits = _k2_det_splits(A, B, arch, sm_count)
         if op == "plan":
             return det.cake_dense_gemm_det_train_router_plan(A, B, out, splits=splits)
         return det.cake_dense_gemm_det_train_router_prepare(
@@ -3445,6 +4761,10 @@ _ATOMIC_ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
     "k1_det_ws": (torch.float32, False),
     # its stream-K slice counters, zeroed: every complete launch leaves the counters it uses zero
     "k1_det_counters": (torch.uint32, True),
+    # the K-order K2 program's workspace slots (every slot it reads is written by the same launch first)
+    "k2_ksum_slots": (torch.float32, False),
+    # its per-tile tickets, zeroed: every complete launch leaves them zero
+    "k2_ksum_tickets": (torch.uint32, True),
 }
 _ATOMIC_ARENA_MIN_ELEMS = 16
 
@@ -3538,6 +4858,9 @@ _K2_CALL_ARGS = (_Arg("A"), _Arg("out32"), _Arg("D"), _Arg("src"))
 _K2_PARTS_ARG = _Arg("parts")
 #: The split-K partials of the deterministic K2 program, bound with the stack (:meth:`_K2Binding.carve`).
 _K2_PARTIALS_ARG = _Arg("partials")
+#: The K-order K2 program's workspace slots and tickets, bound with the stack (:meth:`_K2Binding.carve`).
+_K2_KSUM_WS_ARG = _Arg("ksum_ws")
+_K2_KSUM_TICKETS_ARG = _Arg("ksum_tickets")
 
 #: The template of this package's partial sum: ``out[r, c] = sum_s partials[s, r, c]`` over the deterministic K2
 #: program's split-K partials ``[splits, rows, cols]`` (contiguous) into an FP32 ``out [rows, cols]`` with unit inner
@@ -3551,8 +4874,9 @@ _K2_PARTIALS_ARG = _Arg("partials")
 #: sum is one more launch in the bound launch chain instead of a PyTorch operator.  The tests check the program against
 #: ``torch.sum`` and against the written order on every split count it serves.
 PARTIALS_SUM_TEMPLATE = cake_jit.TEMPLATE_PREFIXES[5]
-#: The split counts the partial sum serves (its kernel requires two to eight; the deterministic router planner issues
-#: four for the forward and six for the weight gradient).
+#: The split counts the partial sum serves (its kernel requires two to eight).  The deterministic router planner issues
+#: four for the forward and six for the weight gradient, except on the rows of its ``ROUTER_SPLIT_RULES``: three
+#: (served) and nine (``torch.sum``) for the weight gradient.
 PARTIALS_SUM_SPLITS = range(2, 9)
 #: Threads per CTA of the partial sum and the ``out`` columns each thread sums (a flat grid over the rows' column
 #: quads).
@@ -3612,7 +4936,8 @@ class _K2Binding:
     """The bound arguments of a cached K2 launch: the kernel's and the fused split's argument lists in the order of
     their argument plans (fixed by the plan and the view geometry of the cache key), with the arena's BF16x3 stack --
     and, for the deterministic program with more than one split, its partials ``[splits, rows, cols]``
-    (``partials_shape``, carved as ``workspace``) -- carved and converted once per arena growth (``version``) and the
+    (``partials_shape``, carved as ``workspace``), and for the K-order program its slots and tickets
+    (``ksum_workspace``) -- carved and converted once per arena growth (``version``) and the
     caller's views left as ``slots``; the geometry of the zero fill of ``out`` (rows, columns, row pitch in bytes;
     ``None`` without part tiles).  Without ``stack`` (the SIMT program, which reads the fp32 operands in place) the
     kernel's list is bound with no stack and no split.  ``sum_template`` is the argument list of the partial sum that
@@ -3637,6 +4962,7 @@ class _K2Binding:
     sum_template: Optional[list] = None
     sum_args: list = field(default_factory=list)
     sum_slots: tuple[tuple[int, int], ...] = ()
+    ksum_workspace: Optional[tuple[int, int]] = None
 
     def carve(self, arena: "_AtomicArena", torch_chain: bool) -> None:
         """Carve the BF16x3 stack (and the torch chain's fp32 scratch) out of ``arena`` and bind the stack into the
@@ -3669,6 +4995,22 @@ class _K2Binding:
                     partials if a is _K2_PARTIALS_ARG else a for a in self.sum_template
                 ]
                 self.sum_slots = _arg_slots(self.sum_args)
+        if self.ksum_workspace is not None:
+            slots, words = self.ksum_workspace
+            ws = tvm_ffi.from_dlpack(
+                arena.buffers["k2_ksum_slots"][:slots], require_contiguous=False
+            )
+            tickets = tvm_ffi.from_dlpack(
+                arena.buffers["k2_ksum_tickets"][:words], require_contiguous=False
+            )
+            args = [
+                ws
+                if a is _K2_KSUM_WS_ARG
+                else tickets
+                if a is _K2_KSUM_TICKETS_ARG
+                else a
+                for a in args
+            ]
         self.kernel_args = args
         self.kernel_slots = _arg_slots(self.kernel_args)
         if self.split_template is not None:
@@ -3758,6 +5100,9 @@ class _CachedAtomic:
     memo: Any = field(default=None, repr=False)
     # the plan's launch can vary run to run (``not plan.reproducible``): PyTorch's alert before every launch
     order_varying: bool = False
+    # K2 without a plan and without a caller's split count: the deterministic program's split count of the row in the
+    # router tables (:func:`router_det_splits`), ``None``: the deterministic package's own
+    det_splits: Optional[int] = None
 
 
 #: An entry of the convenience caches (:data:`_K1_ATOMIC_CACHE`, :data:`_K1_DET_CACHE`, :data:`_K2_ATOMIC_CACHE`,
@@ -4009,6 +5354,8 @@ class _CachedDetK1:
     k1: Optional[_K1Binding] = field(default=None, repr=False)
     # a deterministic program is fixed-order: never alerts (read by :func:`_k1_cached_launch`)
     order_varying: bool = False
+    # this package's program bound on the plan in place of the plan's own (K1_DGRAD_NVJET_RULES_BY_SM), else None
+    module_name: Optional[str] = None
 
 
 def _plan_det_k1(
@@ -4022,15 +5369,18 @@ def _plan_det_k1(
     stream: int,
     pdl: int,
     weights_static: bool = False,
+    module: Optional[str] = None,
 ) -> _CachedDetK1:
     """Plan the deterministic K1 program for the deterministic package's convenience call ``(A, B, out,
     transposed_out, **knobs)`` (under ``_ATOMIC_PLAN_LOCK``): that package's planner (its errors), its program bound
     in its argument order with the PDL flag ``pdl`` (0 or 1; :func:`_k1_binding`; the per-call views rebuilt from the
     call's tensors ``sources``, which hold the data pointers of ``A`` / ``B`` / ``out``), the stream-K slabs and slice
-    counters in this package's arena.  A planner's view the call's tensors do not rebuild leaves the entry unbound
-    (the deterministic package's convenience path), as does a call without knobs that the deterministic package runs
-    on its swapped small-token forward (``_swap_ab_launch`` with the call's ``weights_static`` under PDL: its
-    program, not the planner's)."""
+    counters in this package's arena.  With ``module`` (this package's program of :data:`K1_DGRAD_NVJET_RULES_BY_SM`)
+    a plan of :data:`K1_DGRAD_NVJET_DET_PROGRAM` binds that program in place of the plan's own, in its own argument
+    order; a plan of another program binds its own.  A planner's view the call's tensors do not rebuild leaves the
+    entry unbound (the deterministic package's convenience path), as does a call without knobs that the
+    deterministic package runs on its swapped small-token forward (``_swap_ab_launch`` with the call's
+    ``weights_static`` under PDL: its program, not the planner's)."""
     det = deterministic_backend()
     if not knobs:
         # the deterministic call's swapped small-token forward: its program, not the planner's
@@ -4054,7 +5404,13 @@ def _plan_det_k1(
         out_l=out_l,
         enable_pdl=pdl,
     )
-    fn, template = det._bind(module_name, values, plan.grid, arch)
+    nvjet = module is not None and plan.template == (
+        det._TEMPLATE_PREFIX + K1_DGRAD_NVJET_DET_PROGRAM
+    )
+    if nvjet:
+        fn, template = _atomic_bind(module, values, plan.grid, arch)
+    else:
+        fn, template = det._bind(module_name, values, plan.grid, arch)
     views = dict(
         A=(a_desc, False),
         B=(b_desc, False),
@@ -4068,7 +5424,13 @@ def _plan_det_k1(
     arena = _atomic_arena_for(index, stream, out.device)
     arena.require("k1_det_ws", plan.ws_f32_elems)
     arena.require("k1_det_counters", plan.counters_alloc_u32)
-    return _CachedDetK1(plan=plan, entry=fn, arena=arena, k1=bound)
+    return _CachedDetK1(
+        plan=plan,
+        entry=fn,
+        arena=arena,
+        k1=bound,
+        module_name=module if nvjet else None,
+    )
 
 
 def _det_k1(
@@ -4078,9 +5440,11 @@ def _det_k1(
     det_call: Callable[[], Any],
     enable_pdl: Optional[bool],
     weights_static: bool = False,
+    module: Optional[str] = None,
 ) -> Any:
     """The deterministic package's K1 convenience call -- ``det_args()`` gives its ``(A, B, out, transposed_out,
-    knobs)``, ``det_call()`` makes it with ``enable_pdl`` / ``weights_static`` -- on this package's convenience path:
+    knobs)``, ``det_call()`` makes it with ``enable_pdl`` / ``weights_static`` -- on this package's convenience path
+    (``module``: this package's program bound on the plan, :func:`_plan_det_k1`):
     planned once per key of the entry point's tensors ``sources`` (the last is ``out``), ``flags`` and the PDL flag
     (``enable_pdl`` resolved for the device, bound into the argument list; :func:`_plan_det_k1`: the deterministic
     package's plan, program and so its bits), then the bound launch (:class:`_K1Binding`).  Tensors that are not on
@@ -4112,6 +5476,7 @@ def _det_k1(
                         stream,
                         pdl,
                         weights_static,
+                        module,
                     ),
                 )
     bound, fn = entry.k1, entry.entry
@@ -4297,7 +5662,15 @@ def _k2_binding(
             out_contiguous=out.is_contiguous(),
             stack=False,
         )
-    values = _k2_values(plan, A=a_arg, parts=_K2_PARTS_ARG, out=out, enable_pdl=pdl)
+    values = _k2_values(
+        plan,
+        A=a_arg,
+        parts=_K2_PARTS_ARG,
+        out=out,
+        enable_pdl=pdl,
+        ws=_K2_KSUM_WS_ARG if plan.ksum else None,
+        counters=_K2_KSUM_TICKETS_ARG if plan.ksum else None,
+    )
     values.update(out32=out32_arg, D=d_arg)
     kernel_template = _order_atomic_arguments(module_name, arg_plan, values, plan.grid)
     split_template = None
@@ -4323,6 +5696,7 @@ def _k2_binding(
         split_shape=tuple(int(s) for s in split_src.shape),
         fill=fill,
         out_contiguous=out.is_contiguous(),
+        ksum_workspace=plan.ksum_workspace if plan.ksum else None,
     )
 
 
@@ -4368,22 +5742,25 @@ def _plan_atomic_k2(
 ) -> _CachedAtomic:
     """Plan this package's K2 program for a key of :func:`_launch_cached_atomic_k2` (under ``_ATOMIC_PLAN_LOCK``):
     :func:`plan_atomic_router` on the device's architecture and SM count (``plan=None``: the planner keeps the row on
-    the deterministic program), the program's and fused split's entries, the BF16x3 stack in the arena of (device
+    the deterministic program, at the split count of :func:`_k2_det_splits` without a caller's), the program's and
+    fused split's entries, the BF16x3 stack in the arena of (device
     ``index``, raw ``stream``) and the argument lists bound with the PDL flag ``pdl`` (0 or 1); ``memo`` is the
     router-table memo the call read (``None`` with a caller's split count)."""
     det = deterministic_backend()
     device = out.device
     arch = det.require_arch(device)
+    sm_count = det.device_facts(device).sm_count
     plan, _ = plan_atomic_router(
         A,
         B,
         out,
         arch=arch,
-        sm_count=det.device_facts(device).sm_count,
+        sm_count=sm_count,
         splits=splits,
     )
     if plan is None:
-        return _CachedAtomic(plan=None, arch=arch, memo=memo)
+        det_n = None if splits is not None else _k2_det_splits(A, B, arch, sm_count)
+        return _CachedAtomic(plan=None, arch=arch, memo=memo, det_splits=det_n)
     _, split_src = _k2_views(A, B, plan)
     if plan.simt is not None:
         # the SIMT program: no stack, no split; the arena holds the stream context its launches enter
@@ -4406,6 +5783,10 @@ def _plan_atomic_k2(
     arena.require("k2_stack", 3 * split_src.numel())
     if split_module is None:
         arena.require("k2_split_scratch", split_src.numel())
+    if plan.ksum:
+        slots, words = plan.ksum_workspace
+        arena.require("k2_ksum_slots", slots)
+        arena.require("k2_ksum_tickets", words)
     module_name = cake_jit.select_module(arch, plan.template)
     fn, arg_plan = _atomic_entry(module_name, plan.grid, arch)
     split_fn, split_arg_plan = None, None
@@ -4547,7 +5928,8 @@ def _launch_cached_atomic_k2(
                 )
     plan = entry.plan
     if plan is None:
-        return _launch_cached_splitk_k2(A, B, out, splits, index, geometry, pdl, views)
+        det_n = splits if splits is not None else entry.det_splits
+        return _launch_cached_splitk_k2(A, B, out, det_n, index, geometry, pdl, views)
     a_view, split_src = _launch_views(A, B, plan, views)
     _launch_atomic_k2_binding(
         det, entry, out, a_view, split_src, index, stream, out_ptr
@@ -4822,6 +6204,8 @@ def _plan_k2_entry(
     key = _k2_key(index, stream, (splits, pdl), A, B, out, geometry, out.data_ptr())
     launch: Optional[Union[_CachedSplitK2, _CachedAtomic]] = None
     atomic = False
+    # the deterministic program's split count: the caller's, else the row's in the router tables (the planner's)
+    det_n = splits
     # the forward without a split count while no table gives it a verdict does not read ROUTES
     layout = route = None
     if splits is not None or op != "fwd" or memo.forward_verdicts:
@@ -4843,13 +6227,19 @@ def _plan_k2_entry(
             )
         if cached.plan is not None:
             launch, atomic = cached, True
+        elif splits is None:
+            det_n = cached.det_splits
     if launch is None:
+        if det_n != splits:
+            key = _k2_key(
+                index, stream, (det_n, pdl), A, B, out, geometry, out.data_ptr()
+            )
         launch = det._cache_get(_K2_SPLITK_CACHE, key)
         if launch is None:
             launch = _cache_insert(
                 _K2_SPLITK_CACHE,
                 key,
-                _plan_splitk_k2(A, B, out, splits, index, stream, pdl),
+                _plan_splitk_k2(A, B, out, det_n, index, stream, pdl),
             )
     plan = launch.plan
     if (
@@ -4989,7 +6379,7 @@ def _pdl_kw(enable_pdl: Optional[bool]) -> dict[str, Any]:
 
 def _splits_kw(splits: Optional[int]) -> dict[str, Any]:
     """The ``splits`` keyword for a deterministic call: absent when the caller gave none, so the deterministic
-    package's own default (its production split count) applies."""
+    package's own split count of the row (its ``router_splits``) applies."""
     return {} if splits is None else {"splits": splits}
 
 
@@ -5035,6 +6425,147 @@ def _given_knobs(values: dict[str, Any]) -> dict[str, Any]:
         for name, value in values.items()
         if value is not _UNSET and name not in ("A", "B", "out")
     }
+
+
+#: The program tables whose rows run a program of this package (the other tables of :func:`_k1_table_call` name a
+#: program of the deterministic package).
+_K1_OWN_PROGRAM_TABLES = (
+    "K1_FORWARD_PROGRAM_RULES_BY_SM",
+    "K1_DGRAD_PROGRAM_RULES_BY_SM",
+    "K1_DGRAD_NVJET_RULES_BY_SM",
+    "K1_WGRAD_SK_RULES_BY_SM",
+)
+
+
+def _k1_table_call(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, transposed_out: bool
+) -> Optional[tuple[str, tuple, Callable[[Optional[bool]], torch.Tensor]]]:
+    """``(table, key, call)``: the program table of the device that routes the K1 call ``out = A @ B`` of the generic
+    entry points (2-D views), the row's key in it and the convenience entry point of its operation that runs it with a
+    PDL flag; or ``None``.  ``A`` and ``B`` K-major into ``out`` -- the forward ``(X, W) = (A, B.T)`` -- on a row of
+    :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` or :data:`K1_FORWARD_RULES_BY_SM`; ``A`` K-major and ``B`` MN-major into
+    ``out`` -- the input gradient ``(G, W) = (A, B)`` -- on a row of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`,
+    :data:`K1_DGRAD_NVJET_RULES_BY_SM` or :data:`K1_DGRAD_RULES_BY_SM`; both MN-major into the transposed ``out`` --
+    the weight gradient ``(G, X) = (B, A.T)`` -- on a row of :data:`K1_WGRAD_SK_RULES_BY_SM`.  The call runs the
+    program and gives the bits of :func:`cake_dense_gemm_nondet_train_projection_forward` / ``_dgrad`` / ``_wgrad``.
+    The device is read only for a shape of a table."""
+    if A.dim() != 2 or B.dim() != 2 or out.dim() != 2:
+        return None
+    layout = _k1_layout(A, B)
+    if layout == "k1_kk" and not transposed_out:
+        X, W = A, B.t()
+        key: tuple = (int(X.shape[1]), int(W.shape[0]), int(X.shape[0]))
+        if _k1_forward_program_of(X, W, out) is not None:
+            table = "K1_FORWARD_PROGRAM_RULES_BY_SM"
+        elif _k1_forward_knobs_of(X, W, out):
+            table = "K1_FORWARD_RULES_BY_SM"
+        else:
+            return None
+        return (
+            table,
+            key,
+            lambda pdl: cake_dense_gemm_nondet_train_projection_forward(
+                X, W, out, enable_pdl=pdl
+            ),
+        )
+    if layout == "k1_kn" and not transposed_out:
+        G, W = A, B
+        dt = "f32" if out.dtype == torch.float32 else "bf16"
+        key = (int(W.shape[1]), int(W.shape[0]), int(G.shape[0]), dt)
+        if _k1_dgrad_program_of(G, W, out) is not None:
+            table = "K1_DGRAD_PROGRAM_RULES_BY_SM"
+        elif _k1_dgrad_nvjet_of(G, W, out) is not None:
+            table = "K1_DGRAD_NVJET_RULES_BY_SM"
+        elif _k1_dgrad_knobs_of(G, W, out):
+            table = "K1_DGRAD_RULES_BY_SM"
+        else:
+            return None
+        return (
+            table,
+            key,
+            lambda pdl: cake_dense_gemm_nondet_train_projection_dgrad(
+                G, W, out, enable_pdl=pdl
+            ),
+        )
+    if layout == "k1_nn" and transposed_out:
+        G, X = B, A.t()
+        if _k1_wgrad_sk_program_of(G, X, out, "auto", None) is None:
+            return None
+        return (
+            "K1_WGRAD_SK_RULES_BY_SM",
+            _k1_wgrad_key(G, X, out),
+            lambda pdl: cake_dense_gemm_nondet_train_projection_wgrad(
+                G, X, out, enable_pdl=pdl
+            ),
+        )
+    return None
+
+
+def _k1_wgrad_key(G: torch.Tensor, X: torch.Tensor, out: torch.Tensor) -> tuple:
+    """``(d_in, d_out, T, out_dtype)``: the key of the weight-gradient call ``(G, X, out)`` in its tables."""
+    dt = "f32" if out.dtype == torch.float32 else "bf16"
+    return (int(X.shape[1]), int(G.shape[1]), int(G.shape[0]), dt)
+
+
+def _k1_program_launch(
+    table: str, key: tuple, out: torch.Tensor, launch: Callable[[], Any]
+) -> CakeDenseGemmNondetProgramLaunch:
+    """The prepared launch ``launch`` of the row ``key`` of the program table named ``table`` on ``out``'s device, with
+    the template the row names: this package's, or the deterministic package's for a program symbol of its tables
+    (``None`` for the knobs of a row of :data:`K1_FORWARD_RULES_BY_SM` that name no program)."""
+    det = deterministic_backend()
+    facts = det.device_facts(out.device)
+    rows = globals()[table].get((facts.arch, int(facts.sm_count)), {})
+    template, own = rows.get(key), table in _K1_OWN_PROGRAM_TABLES
+    if not own:
+        template = (
+            det._TEMPLATE_PREFIX + template if isinstance(template, str) else None
+        )
+    return CakeDenseGemmNondetProgramLaunch(
+        table=table, template=template, own=own, out=out, _launch=launch
+    )
+
+
+def _k1_program_prepare(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    transposed_out: bool,
+    enable_pdl: Optional[bool],
+) -> Optional[CakeDenseGemmNondetProgramLaunch]:
+    """The prepared launch of a generic K1 call on a row of a program table of the device (:func:`_k1_table_call`),
+    else ``None``."""
+    call = _k1_table_call(A, B, out, transposed_out)
+    if call is None:
+        return None
+    table, key, run = call
+    return _k1_program_launch(table, key, out, lambda: run(enable_pdl))
+
+
+def _wgrad_det_prepare(
+    G: torch.Tensor,
+    X: torch.Tensor,
+    out: torch.Tensor,
+    sk: bool | str,
+    cta_rows: Optional[int],
+    enable_pdl: Optional[bool],
+) -> Any:
+    """The prepared launch of a weight-gradient row this package's planner keeps on the deterministic program: on a
+    row of :data:`K1_WGRAD_DET_RULES_BY_SM` for the device (the default ``sk`` and ``cta_rows``) the call of
+    :func:`cake_dense_gemm_nondet_train_projection_wgrad`, which runs the table's program; else the deterministic
+    package's ``cake_dense_gemm_det_train_projection_wgrad_prepare``."""
+    if _k1_wgrad_det_row(G, X, out, sk, cta_rows):
+        return _k1_program_launch(
+            "K1_WGRAD_DET_RULES_BY_SM",
+            _k1_wgrad_key(G, X, out),
+            out,
+            lambda: cake_dense_gemm_nondet_train_projection_wgrad(
+                G, X, out, sk=sk, cta_rows=cta_rows, enable_pdl=enable_pdl
+            ),
+        )
+    return deterministic_backend().cake_dense_gemm_det_train_projection_wgrad_prepare(
+        G, X, out, sk=sk, cta_rows=cta_rows, **_pdl_kw(enable_pdl)
+    )
 
 
 def cake_dense_gemm_nondet_train_projection_plan(
@@ -5162,13 +6693,26 @@ def cake_dense_gemm_nondet_train_projection_prepare(
     """Validate one K1 binding, plan it for the device and prepare its allocation-free launch: a weight-gradient
     layout prepares this package's split-K program (:class:`CakeDenseGemmNondetProjectionLaunch`; its workspace is
     owned by the prepared object; ``splits``, ``block_n`` and ``chains`` as for
-    :func:`cake_dense_gemm_nondet_train_projection_plan`).  A row the planner keeps on the deterministic program, and
-    every other layout, prepares the deterministic package's ``cake_dense_gemm_det_train_projection_prepare`` (a
-    ``CakeDenseGemmDetProjectionLaunch``).  The other keyword-only knobs are that entry point's public ones, passed
+    :func:`cake_dense_gemm_nondet_train_projection_plan`).  Without other knobs than ``transposed_out`` and
+    ``enable_pdl``, a row of a program table of the device -- the forward, input-gradient and stream-K
+    weight-gradient tables (:func:`_k1_table_call`) -- prepares the program the convenience entry point of its
+    operation runs (:class:`CakeDenseGemmNondetProgramLaunch`, the same program and bits).  A row the planner keeps on
+    the deterministic program, and every other layout, prepares the deterministic package's
+    ``cake_dense_gemm_det_train_projection_prepare`` (a ``CakeDenseGemmDetProjectionLaunch``).  The other keyword-only knobs are that entry point's public ones, passed
     on only when the caller gives them; ``enable_pdl`` (default: the device supports it) makes either launch a
     programmatic dependent launch."""
     # must stay the first statement: ``locals()`` holds only the parameters here
     knobs = _given_knobs(locals())
+    if not set(knobs) - {"transposed_out", "enable_pdl"}:
+        program = _k1_program_prepare(
+            A,
+            B,
+            out,
+            bool(knobs.get("transposed_out", False)),
+            knobs.get("enable_pdl"),
+        )
+        if program is not None:
+            return program
     if _route(_k1_layout(A, B)) == "det":
         return deterministic_backend().cake_dense_gemm_det_train_projection_prepare(
             A, B, out, **knobs
@@ -5198,7 +6742,9 @@ def cake_dense_gemm_nondet_train_projection(
     weights_static: bool = False,
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path; see the
-    deterministic package for the view contract).  A weight-gradient layout (both operands MN-major) runs this
+    deterministic package for the view contract).  A row of a program table of the device -- the forward,
+    input-gradient and stream-K weight-gradient tables (:func:`_k1_table_call`) -- runs the program and gives the bits
+    of the convenience entry point of its operation; a weight-gradient layout (both operands MN-major) runs this
     package's split-K program where the planner takes the row; every other layout and row runs the deterministic
     program.  ``enable_pdl`` (default: the device supports it)
     launches either program as a programmatic dependent launch; each waits for the preceding kernel before its first
@@ -5218,6 +6764,10 @@ def cake_dense_gemm_nondet_train_projection(
     def det_args() -> tuple:
         return A, B, out, transposed_out, ()
 
+    table = _k1_table_call(A, B, out, transposed_out)
+    if table is not None:
+        # a row of a program table: the program of its operation's entry point
+        return table[2](enable_pdl)
     if _route(_k1_layout(A, B)) == "det":
         # the deterministic program through this package's binding (its plan, program and bits)
         return _det_k1(
@@ -5252,9 +6802,10 @@ def cake_dense_gemm_nondet_train_projection_forward(
     """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default).  The deterministic package's programs (a
     recomputed forward must reproduce its result; where the deterministic plan splits K across CTAs, it adds the
     partials in a fixed order) through this package's binding of them (:func:`_det_k1`): the deterministic plan,
-    program and bits, except on a row of :data:`K1_FORWARD_RULES_BY_SM` for the device, which runs the program the
-    deterministic planner gives it with the table's knobs (:func:`k1_forward_knobs`; other bits, still the same on
-    every run).  ``enable_pdl`` as for :func:`cake_dense_gemm_nondet_train_projection`."""
+    program and bits, except on a row of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` for the device, which runs this
+    package's one-wave forward program (the same bits), and on a row of :data:`K1_FORWARD_RULES_BY_SM` for the device,
+    which runs the program the deterministic planner gives it with the table's knobs (:func:`k1_forward_knobs`; other
+    bits, still the same on every run).  ``enable_pdl`` as for :func:`cake_dense_gemm_nondet_train_projection`."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.bfloat16)
     o = out
@@ -5262,6 +6813,9 @@ def cake_dense_gemm_nondet_train_projection_forward(
         _K1_DET_CACHE, _K1_FWD_HEAD, _K1_NOT_STATIC, (X, W, o), enable_pdl
     ):
         return o
+    module = _k1_forward_program_of(X, W, o)
+    if module is not None:
+        return _launch_wave_forward(module, X, W, o, enable_pdl)
     return _det_k1(
         (X, W, o),
         ("fwd",),
@@ -5282,7 +6836,12 @@ def cake_dense_gemm_nondet_train_projection_dgrad(
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]``.  The deterministic program (whole output tiles) through this package's
-    binding of it (:func:`_det_k1`: the same plan, program and bits).  ``enable_pdl`` as for
+    binding of it (:func:`_det_k1`: the same plan, program and bits), except on a row of
+    :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` for the device, which runs this package's input-gradient program (the same
+    bits), on a row of :data:`K1_DGRAD_NVJET_RULES_BY_SM`, which runs this package's nvjet program on the deterministic
+    package's plan of :data:`K1_DGRAD_NVJET_DET_PROGRAM` (the same bits), and on a row of
+    :data:`K1_DGRAD_RULES_BY_SM` for the device, which runs the table's program of the deterministic package
+    (:func:`k1_dgrad_knobs`; the same bits as the deterministic plan, every run).  ``enable_pdl`` as for
     :func:`cake_dense_gemm_nondet_train_projection`."""
     if out is None:
         out = torch.empty(
@@ -5296,14 +6855,27 @@ def cake_dense_gemm_nondet_train_projection_dgrad(
         _K1_DET_CACHE, _K1_DGRAD_HEAD, _K1_NOT_STATIC, (G, W, o), enable_pdl
     ):
         return o
+    module = _k1_dgrad_program_of(G, W, o)
+    if module is not None:
+        return _launch_dgrad_program(module, G, W, o, enable_pdl)
+    nvjet = _k1_dgrad_nvjet_of(G, W, o)
     return _det_k1(
         (G, W, o),
         ("dgrad",),
-        lambda: (G, W, o, False, ()),
+        lambda: (
+            G,
+            W,
+            o,
+            False,
+            k1_program_knobs(K1_DGRAD_NVJET_DET_PROGRAM)
+            if nvjet
+            else _k1_dgrad_knobs_of(G, W, o),
+        ),
         lambda: deterministic_backend().cake_dense_gemm_det_train_projection_dgrad(
             G, W, o, out_dtype=out_dtype, **_pdl_kw(enable_pdl)
         ),
         enable_pdl,
+        module=nvjet,
     )
 
 
@@ -5316,10 +6888,23 @@ def cake_dense_gemm_nondet_train_projection_wgrad_prepare(
     cta_rows: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> Any:
-    """Prepared ``out[N, K] = G[T, N].T @ X[T, K]``: this package's split-K program as
+    """Prepared ``out[N, K] = G[T, N].T @ X[T, K]``, the program of
+    :func:`cake_dense_gemm_nondet_train_projection_wgrad`: on a row of :data:`K1_WGRAD_SK_RULES_BY_SM` for the device
+    this package's stream-K program (:class:`CakeDenseGemmNondetProgramLaunch`), else this package's split-K program as
     the transposed-store GEMM ``X.T @ G`` (``M = K``, ``N = N``) where the planner takes the row; a row it does not
-    take prepares the deterministic package's ``cake_dense_gemm_det_train_projection_wgrad_prepare`` (its orientation, ``sk``,
-    ``cta_rows``).  ``enable_pdl`` as for :func:`cake_dense_gemm_nondet_train_projection_prepare`."""
+    take runs the program of its row of :data:`K1_WGRAD_DET_RULES_BY_SM` (a
+    :class:`CakeDenseGemmNondetProgramLaunch`) or prepares the deterministic package's
+    ``cake_dense_gemm_det_train_projection_wgrad_prepare`` (its orientation, ``sk``, ``cta_rows``).  ``enable_pdl``
+    as for :func:`cake_dense_gemm_nondet_train_projection_prepare`."""
+    if _k1_wgrad_sk_program_of(G, X, out, sk, cta_rows) is not None:
+        return _k1_program_launch(
+            "K1_WGRAD_SK_RULES_BY_SM",
+            _k1_wgrad_key(G, X, out),
+            out,
+            lambda: cake_dense_gemm_nondet_train_projection_wgrad(
+                G, X, out, enable_pdl=enable_pdl
+            ),
+        )
     return _atomic_k1(
         "prepare",
         X.t(),
@@ -5327,9 +6912,7 @@ def cake_dense_gemm_nondet_train_projection_wgrad_prepare(
         out,
         transposed_out=True,
         own={},
-        det_call=lambda: deterministic_backend().cake_dense_gemm_det_train_projection_wgrad_prepare(
-            G, X, out, sk=sk, cta_rows=cta_rows, **_pdl_kw(enable_pdl)
-        ),
+        det_call=lambda: _wgrad_det_prepare(G, X, out, sk, cta_rows, enable_pdl),
         enable_pdl=enable_pdl,
     )
 
@@ -5344,7 +6927,9 @@ def cake_dense_gemm_nondet_train_projection_wgrad(
     cta_rows: Optional[int] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``): this
+    """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``): on a row of
+    :data:`K1_WGRAD_SK_RULES_BY_SM` for the device this package's stream-K program (a split tile summed by one fixed
+    reducer in unit order), else this
     package's split-K program where the planner takes the row (the split partials summed in the order they finish,
     the output rounded once), else the deterministic package's ``cake_dense_gemm_det_train_projection_wgrad`` program (its orientation,
     ``sk`` and ``cta_rows``) through this package's binding of it (:func:`_launch_cached_atomic_k1`); ``enable_pdl``
@@ -5367,6 +6952,9 @@ def cake_dense_gemm_nondet_train_projection_wgrad(
         enable_pdl,
     ):
         return out
+    module = _k1_wgrad_sk_program_of(G, X, out, sk, cta_rows)
+    if module is not None:
+        return _launch_wgrad_sk(module, G, X, out, enable_pdl)
     return _atomic_k1(
         "launch",
         A,
@@ -5397,12 +6985,51 @@ def _wgrad_det_args(
     cta_rows: Optional[int],
 ) -> tuple:
     """The deterministic package's convenience call of ``cake_dense_gemm_det_train_projection_wgrad(G, X, out, sk=sk,
-    cta_rows=cta_rows)``: ``(A, B, out, transposed_out, knobs)`` in its orientation (``wgrad_views``)."""
+    cta_rows=cta_rows)``: ``(A, B, out, transposed_out, knobs)`` in its orientation (``wgrad_views``); with the
+    default ``sk`` and ``cta_rows``, a row of :data:`K1_WGRAD_DET_RULES_BY_SM` for the device takes the knobs of the
+    table's program instead (:func:`k1_wgrad_det_knobs`)."""
     det = deterministic_backend()
+    out_f32 = out.dtype == torch.float32
     A, B, transposed = det.wgrad_views(
-        G, X, arch=det.arch_for(out.device), out_f32=out.dtype == torch.float32
+        G, X, arch=det.arch_for(out.device), out_f32=out_f32
     )
-    return A, B, out, transposed, (("cta_rows", cta_rows), ("sk", sk))
+    knobs = _k1_wgrad_det_row(G, X, out, sk, cta_rows) or (
+        ("cta_rows", cta_rows),
+        ("sk", sk),
+    )
+    return A, B, out, transposed, knobs
+
+
+def _k1_wgrad_det_row(
+    G: torch.Tensor,
+    X: torch.Tensor,
+    out: torch.Tensor,
+    sk: bool | str,
+    cta_rows: Optional[int],
+) -> tuple:
+    """:func:`k1_wgrad_det_knobs` of the weight-gradient call ``(G, X, out)`` with the default ``sk`` and
+    ``cta_rows`` on ``out``'s device, else ``()``.  The device is read only for a shape of
+    :data:`K1_WGRAD_DET_RULES_BY_SM`."""
+    if sk != "auto" or cta_rows is not None or G.dim() != 2 or X.dim() != 2:
+        return ()
+    out_f32 = out.dtype == torch.float32
+    T, d_out, d_in = int(G.shape[0]), int(G.shape[1]), int(X.shape[1])
+    if not any(
+        (d_in, d_out, T, "f32" if out_f32 else "bf16") in rows
+        for rows in K1_WGRAD_DET_RULES_BY_SM.values()
+    ):
+        return ()
+    facts = deterministic_backend().device_facts(out.device)
+    if facts.arch is None:
+        return ()
+    return k1_wgrad_det_knobs(
+        arch=facts.arch,
+        sm_count=facts.sm_count,
+        d_in=d_in,
+        d_out=d_out,
+        T=T,
+        out_f32=out_f32,
+    )
 
 
 def cake_dense_gemm_nondet_train_router_plan(
@@ -5538,7 +7165,9 @@ def cake_dense_gemm_nondet_train_router_wgrad(
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a
     transposed store; ``splits`` defaults to the partition of the row's verdict in :data:`ROUTER_RULES` or, on a part
     with a table of its own, in :data:`ROUTER_RULES_BY_SM` (:func:`router_partition`; a row or token count without one
-    runs the deterministic program, through this package's binding of it without planning the row here,
+    runs the deterministic program at that package's split count of the row -- its ``router_splits``: six; nine at
+    hidden 5120 and three at hidden 6144 from 16129 to 16384 tokens on 148- and 152-SM ``sm_100a`` / ``sm_103a``
+    parts, its ``ROUTER_SPLIT_RULES`` -- through this package's binding of it without planning the row here,
     :func:`_launch_cached_splitk_k2`)."""
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)

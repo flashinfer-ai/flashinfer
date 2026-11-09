@@ -1639,7 +1639,7 @@ def test_light_akk_is_within_budget_of_light_on_poisoned_memory(
         res.update({n: lf.grad[0] for n, lf in zip(GRAD_NAMES, leaves, strict=True)})
         return res
 
-    light = saved_pass()
+    light = saved_pass(save_mode="light")  # the default with the norm is "light_akk"
     if "segments" in opts:
         assert light["fwd"]["P"] == opts["segments"]
     for n in TENSORS:
@@ -1690,7 +1690,7 @@ def test_light_akk_is_within_budget_of_light_on_poisoned_memory(
         record_property(f"akk_tape_{tag}_nonfinite_pad_rows", int(bad[~real].sum()))
     record_property("akk_tape_bitwise", bool(torch.equal(_bits(akk), _bits(full_akk))))
     del full_saved, full_akk, akk, real, bad
-    a_light = autograd(False)
+    a_light = autograd(False, save_mode="light")
     a_akk = autograd(False, save_mode="light_akk")
     assert kcp.LAST_CALL["bwd"]["akk_source"] == "saved"
     a_ckpt = autograd(True, save_mode="light_akk")

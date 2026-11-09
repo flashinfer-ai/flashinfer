@@ -76,8 +76,9 @@ PREFIX = "cake_gdn_train"
 KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
-# The nine programs of a step and the two output walks (the shipped records by program name: twenty libraries), the
-# three programs of the in-kernel Q / K L2 norm and the light replay of #1_l2n (one library each: 24 shipped records)
+# The nine programs of a step, the two output walks and the cut table of the adjoint offset walk (the shipped records
+# by program name: twenty-one libraries), the three programs of the in-kernel Q / K L2 norm and the light replay of
+# #1_l2n (one library each: 25 shipped records)
 # and the two test-only records.
 SHIPPED_PROGRAMS = (
     "fwd_prep",
@@ -91,6 +92,7 @@ SHIPPED_PROGRAMS = (
     "bwd_prep",
     "kcp_dhu_offset",
     "kcp_dhu_tape",
+    "kcp_dhu_cut_start",
     "bwd_dqkg",
     "gate_epilogue",
     "fwd_prep_l2n",
@@ -106,9 +108,10 @@ TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
 # omitted one, so these pairs are frozen together with the kernels' build signatures.  The kernel modules are, so
 # far, the deterministic family's (``gdn_chunk_det_*``): the digests equal the twin's, the prefix differs, so no library
 # of this package is named like a library of ``cake_gdn_det_train_kcp`` (a lever that replaces a program updates
-# its row here).  The output walks' modules are det-neutral (``gdn_chunk_fwdh_out_v1_kcp``,
-# ``gdn_chunk_fwdh_out_tape_v1_kcp``) and no det twin ships them; the light replay's module
-# (``gdn_chunk_train_fwd_prep_replay_l2n_v1``) is this package's own, with no det twin.
+# its row here).  The output walks' modules are this package's own (``gdn_chunk_fwdh_out_v2_kcp``,
+# ``gdn_chunk_fwdh_out_tape_v2_kcp``) and no det twin ships them; the light replay's module
+# (``gdn_chunk_train_fwd_prep_replay_l2n_v1``) is this package's own, with no det twin; so is the cut module of the
+# adjoint offset walk and its table program (``gdn_chunk_dhu_cut_v1_kcp``; the tape walk keeps the det module).
 IDENTITIES = {
     "fwd_prep": (
         f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_v1",
@@ -130,9 +133,9 @@ IDENTITIES = {
         f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape", "vh": 64},
     ),
-    "kcp_fwdh_out": (f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp", {}),
+    "kcp_fwdh_out": (f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v2_kcp", {}),
     "kcp_fwdh_out_vh64": (
-        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp",
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v2_kcp",
         {"vh": 64},
     ),
     "kcp_transfer_walk": (
@@ -161,7 +164,7 @@ IDENTITIES = {
         {},
     ),
     "kcp_dhu_offset": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_dhu_cut_v1_kcp",
         {"program": "offset"},
     ),
     "kcp_dhu_tape": (
@@ -169,12 +172,16 @@ IDENTITIES = {
         {"program": "tape"},
     ),
     "kcp_dhu_offset_vh64": (
-        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_dhu_cut_v1_kcp",
         {"program": "offset", "vh": 64},
     ),
     "kcp_dhu_tape_vh64": (
         f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_det_dhu_v1_kcp",
         {"program": "tape", "vh": 64},
+    ),
+    "kcp_dhu_cut_start": (
+        f"tart.gdn_chunk_kcp_dhu.{_W}.gdn_chunk_dhu_cut_v1_kcp",
+        {"program": "start"},
     ),
     "bwd_dqkg": (
         f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_det_train_bwd_dqkg_v1",
@@ -203,7 +210,7 @@ IDENTITIES = {
 }
 # The tape-and-output walk: the output walk's kernel family under its own module (records named as the output walk's).
 _FWDH_OUT_TAPE_MODULE = IDENTITIES["kcp_fwdh_out"][0].replace(
-    ".gdn_chunk_fwdh_out_v1_kcp", ".gdn_chunk_fwdh_out_tape_v1_kcp"
+    ".gdn_chunk_fwdh_out_v2_kcp", ".gdn_chunk_fwdh_out_tape_v2_kcp"
 )
 IDENTITIES["kcp_fwdh_out_tape"] = (_FWDH_OUT_TAPE_MODULE, {})
 IDENTITIES["kcp_fwdh_out_tape_vh64"] = (_FWDH_OUT_TAPE_MODULE, {"vh": 64})

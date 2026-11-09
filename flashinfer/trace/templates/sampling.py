@@ -268,6 +268,18 @@ top_k_top_p_sampling_trace = TraceTemplate(
 # ── Free-function sampling utilities ─────────────────────────────────────────
 
 
+def _scaled_fp32_logits(logits, temperature):
+    """The fp32 logits scaled by the temperature as the batch-invariant class scales them (``x / T``)."""
+    x = logits.to(torch.float32)
+    if temperature is not None:
+        if isinstance(temperature, torch.Tensor):
+            t = temperature.to(torch.float32).reshape(-1, 1)
+        else:
+            t = float(temperature)
+        x = x / t
+    return x
+
+
 @torch.no_grad()
 def _softmax_reference(logits, temperature=None, **_unused):
     """Online safe softmax with optional temperature scaling."""
@@ -311,6 +323,14 @@ softmax_trace = TraceTemplate(
             optional=True,
             description="Per-tensor or per-row temperature.",
         ),
+        "out_dtype": Scalar(
+            "dtype",
+            optional=True,
+            description=(
+                "batch_invariant=True only: None keeps the input dtype; torch.float32 returns the fp32 "
+                "probabilities (the softmax_f32 template)."
+            ),
+        ),
     },
     outputs={
         "output": Tensor(["batch_size", "vocab_size"], dtype_from="logits"),
@@ -318,6 +338,256 @@ softmax_trace = TraceTemplate(
     tags=["status:verified"],
     reference=_softmax_reference,
     init=_softmax_init,
+)
+
+
+@torch.no_grad()
+def _softmax_f32_reference(logits, temperature=None, **_unused):
+    """Softmax of the temperature-scaled row in fp32 (``softmax(batch_invariant=True, out_dtype=torch.float32)``)."""
+    return torch.softmax(_scaled_fp32_logits(logits, temperature), dim=-1)
+
+
+def _softmax_f32_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.softmax(..., batch_invariant=True, out_dtype=torch.float32)``."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(
+            batch_size, vocab_size, device=device, dtype=torch.bfloat16
+        ),
+        "temperature": 1.0,
+        "batch_invariant": True,
+        "out_dtype": torch.float32,
+    }
+
+
+softmax_f32_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="softmax_f32",
+    description=(
+        "Batch-invariant softmax with optional temperature scaling returning fp32 probabilities "
+        "(softmax(batch_invariant=True, out_dtype=torch.float32): the fp32 input's class for a 16-bit input)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+        "out_dtype": Scalar("dtype", description="torch.float32."),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "vocab_size"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_softmax_f32_reference,
+    init=_softmax_f32_init,
+)
+
+
+def softmax_trace_dispatch(**kwargs):
+    """``softmax`` returns the input dtype unless ``out_dtype=torch.float32`` (batch-invariant class only)."""
+    if kwargs.get("out_dtype") is torch.float32:
+        return softmax_f32_trace
+    return softmax_trace
+
+
+softmax_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    softmax_trace,
+    softmax_f32_trace,
+)
+
+
+@torch.no_grad()
+def _log_softmax_reference(logits, temperature=None, **_unused):
+    """fp32 log-softmax of the temperature-scaled row (``flashinfer.log_softmax``: the batch-invariant class)."""
+    return torch.log_softmax(_scaled_fp32_logits(logits, temperature), dim=-1)
+
+
+def _log_softmax_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.log_softmax``."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "temperature": 1.0,
+    }
+
+
+log_softmax_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="log_softmax",
+    description=(
+        "Batch-invariant fp32 log-softmax row with optional temperature scaling "
+        "(the class lse.row: one dataflow for every batch, position and SM count)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "vocab_size"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_log_softmax_reference,
+    init=_log_softmax_init,
+)
+
+
+@torch.no_grad()
+def _log_probs_reference(logits, token_ids, temperature=None, **_unused):
+    """fp32 log-probability of ``token_ids`` under the temperature-scaled softmax: one id per row
+    (``token_ids.shape == logits.shape[:-1]``) or ``K`` ids per row (``logits.shape[:-1] + (K,)``)."""
+    logp = torch.log_softmax(_scaled_fp32_logits(logits, temperature), dim=-1)
+    ids = token_ids.to(torch.long)
+    if ids.dim() == logits.dim() - 1:
+        return logp.gather(-1, ids.unsqueeze(-1)).squeeze(-1)
+    return logp.gather(-1, ids)
+
+
+def _log_probs_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.log_probs`` with one token id per row."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "token_ids": torch.randint(
+            0, vocab_size, (batch_size,), dtype=torch.int64, device=device
+        ),
+        "temperature": 1.0,
+    }
+
+
+def _log_probs_k_ids_init(
+    *,
+    batch_size: int,
+    num_ids: int = 4,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.log_probs`` with ``num_ids`` token ids per row."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "token_ids": torch.randint(
+            0, vocab_size, (batch_size, num_ids), dtype=torch.int64, device=device
+        ),
+        "temperature": 1.0,
+    }
+
+
+_log_probs_template = TraceTemplate(
+    op_type="sampling",
+    name_prefix="log_probs",
+    description=(
+        "Batch-invariant fp32 log-probability of one token id per row under the "
+        "temperature-scaled softmax (the class lse.row; the row log-softmax gathered)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "token_ids": Tensor(
+            ["batch_size"],
+            dtype="int64",
+            description="One token id per row (int32 or int64); an id outside the vocabulary gives NaN.",
+        ),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+    },
+    outputs={
+        "logp": Tensor(["batch_size"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_log_probs_reference,
+    init=_log_probs_init,
+)
+
+
+_log_probs_k_ids_template = TraceTemplate(
+    op_type="sampling",
+    name_prefix="log_probs_k_ids",
+    description=(
+        "Batch-invariant fp32 log-probabilities of K token ids per row under the "
+        "temperature-scaled softmax (the class lse.row; the sampled token with its top-k or requested alternatives)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+        "num_ids": Var(description="Token ids per row."),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "token_ids": Tensor(
+            ["batch_size", "num_ids"],
+            dtype="int64",
+            description="K token ids per row (int32 or int64); an id outside the vocabulary gives NaN.",
+        ),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+    },
+    outputs={
+        "logp": Tensor(["batch_size", "num_ids"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_log_probs_reference,
+    init=_log_probs_k_ids_init,
+)
+
+
+def log_probs_trace(**kwargs):
+    """Select the ``log_probs`` template by the rank of ``token_ids``: one id per row or ``K`` ids per row."""
+    logits = kwargs.get("logits")
+    token_ids = kwargs.get("token_ids")
+    if (
+        isinstance(logits, torch.Tensor)
+        and isinstance(token_ids, torch.Tensor)
+        and token_ids.dim() == logits.dim()
+    ):
+        return _log_probs_k_ids_template
+    return _log_probs_template
+
+
+log_probs_trace.templates = (  # type: ignore[attr-defined]
+    _log_probs_template,
+    _log_probs_k_ids_template,
 )
 
 

@@ -231,19 +231,98 @@ def test_fp8_record_replaces_only_its_fields_and_leaves_the_bf16_record():
         "sm_103a": [],
         "sm_107a": ["l6", "narrow", "split_narrow", "wide"],
     }
-    # the FP8 records' own rules: sm_107a keeps no split-fit rule (no FP8 split program is measured under one), and no
-    # FP8 call walks its key tiles in descending order (the descending-walk programs are BF16 programs)
+    # the FP8 records' own rules: every split field pinned (no split-resident rule); sm_107a keeps no split-fit
+    # rule (no FP8 split program is measured under one), and no FP8 call walks its key tiles in descending order
+    # (the descending-walk programs are BF16 programs); the sm_107a FP8 record sets neither BF16 sampling rule (the
+    # #7549 rules are measured on the BF16 programs) and runs no longest-first copy (its static programs draw no
+    # tickets to order; the BF16 record runs the copies of its l6 ticket programs)
+    split_fields = (
+        "split_max",
+        "split_min_range_tiles",
+        "split_wave_rule",
+        "split_wave_scope",
+        "split_fit_rule",
+        "split_resident_rule",
+        "split_units",
+    )
     assert {
-        arch: {f: v for f, v in fields.items() if f != "static_scan_kinds"}
+        arch: {
+            f: v
+            for f, v in fields.items()
+            if f != "static_scan_kinds" and f not in split_fields
+        }
         for arch, fields in cake_jit.POLICY_FP8.items()
     } == {
-        "sm_100a": {"wide_wave_rule": [1.7, 1.3, 84.0], "desc_walk_kinds": None},
-        "sm_103a": {"lsf_single_rule": [64.0], "desc_walk_kinds": None},
+        "sm_100a": {
+            "wide_wave_rule": [1.7, 1.3, 84.0],
+            "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
+        },
+        "sm_103a": {
+            "wide_wave_rule": [
+                1.7,
+                1.15,
+                64.0,
+                2048,
+                1.1,
+                112.0,
+                3.5,
+                14,
+                1.26,
+                40.0,
+                9.0,
+                8.0,
+                55.0,
+                8,
+                60.0,
+            ],
+            "lsf_single_rule": [64.0],
+            "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
+        },
         "sm_107a": {
-            "split_fit_rule": None,
+            "sample_class_rule": None,
+            "sample_long_rule": None,
+            "lsf_programs": False,
             "snake_cap_rule": [1, 40],
             "desc_walk_kinds": None,
+            "snake_packed_rule": None,
+            "snake_l6_fallback_waves": None,
         },
+    }
+    assert {
+        arch: {f: fields[f] for f in split_fields}
+        for arch, fields in cake_jit.POLICY_FP8.items()
+    } == {
+        "sm_100a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=None,
+            split_wave_scope=None,
+            split_fit_rule=[4096],
+            split_resident_rule=None,
+            split_units=["l6", "narrow"],
+        ),
+        "sm_103a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=None,
+            split_wave_scope=None,
+            split_fit_rule=[4096],
+            split_resident_rule=None,
+            split_units=["l6", "narrow"],
+        ),
+        "sm_107a": dict(
+            split_max=16,
+            split_min_range_tiles=32,
+            split_wave_rule=[1000, 0.12],
+            split_wave_scope=[["narrow"], 1, True],
+            split_fit_rule=None,
+            split_resident_rule=None,
+            split_units=["narrow", "wide"],
+        ),
     }
     # the FP8 record never inherits the BF16 programs' static kinds, and takes only record fields
     with pytest.raises(ValueError, match="static_scan_kinds"):
@@ -506,7 +585,9 @@ def test_fp8_one_document_sm103_wide_call_runs_the_lsf_copy_within_the_rule():
         )
     policy = _fp8_policy(arch)
     assert policy.lsf_single_rule == [64.0]
-    # mean unit tiles (Tkv - T / 2) / 128: 544 and 56, both over 6.7 wide rounds per CTA (wide_rule)
+    # mean unit tiles (Tkv - T / 2) / 128: 544 and 56; on 152 CTAs the wide unit needs 7 waves (wide_wave_rule): long
+    # (an l6 call) needs 9 of the l6 unit (>= 1.15 x 7) over the 88.5-tile minimum (64 + 3.5 x (14 - 7)), short (top_k
+    # 256, a narrow call) 14 of the narrow unit (>= 1.7 x 7)
     long = dict(
         num_queries=8192, num_keys=73728, num_segments=1, ratio=1, top_k=2048, grid=152
     )

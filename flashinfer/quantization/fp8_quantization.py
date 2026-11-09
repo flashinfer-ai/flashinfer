@@ -235,6 +235,13 @@ def get_mxfp8_quantization_sm100_module():
                     f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}"
                 )
             out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
+            if input.dtype not in (torch.float16, torch.bfloat16):
+                raise NotImplementedError(
+                    "mxfp8_quantize only supports input tensor with dtypes fp16/bf16."
+                )
+            # A zero-row input would launch a zero-sized CUDA grid.
+            if m == 0:
+                return out_val, out_sf
             module.mxfp8_quantize(
                 input,
                 out_val,

@@ -47,9 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
-
 #include <math_constants.h>
 
 extern "C" {
@@ -80,8 +77,8 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
         int prev_row = -1;
         int run = 0;
         if (lo > 0) {
-            int first_row = (int)(keys[lo] >> 32);
-            prev_row = (int)(keys[lo - 1] >> 32);
+            int first_row = (int)(keys[lo] >> 32ll);
+            prev_row = (int)(keys[lo - 1] >> 32ll);
             if (prev_row == first_row) {
                 int seg = 0;
                 int left = lo;
@@ -89,7 +86,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                 #pragma unroll 1
                 for (int _halving = 0; _halving < 32 - _count_leading_zeros_2; _halving++) {
                     int step = left >> 1;
-                    if ((int)(keys[seg + step] >> 32) < first_row) {
+                    if ((int)(keys[seg + step] >> 32ll) < first_row) {
                         seg = seg + step + 1;
                         left = left - step - 1;
                     } else {
@@ -98,7 +95,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                 }
                 run = (lo - 1 - seg) % split;
                 if (run + 1 != split) {
-                    if ((int)(keys[hi - 1] >> 32) == first_row) {
+                    if ((int)(keys[hi - 1] >> 32ll) == first_row) {
                         start = lo + (split - 1 - run);
                         run = split - 1;
                     }
@@ -130,7 +127,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
             int count = ((limit - base) < (32) ? (limit - base) : (32));
             int _min_3 = ((lane) < (count - 1) ? (lane) : (count - 1));
             int pos_l = base + _min_3;
-            int pair_l = (((int)(keys[pos_l] & 2147483647)) < (M - 1) ? ((int)(keys[pos_l] & 2147483647)) : (M - 1));
+            int pair_l = (((int)(keys[pos_l] & 2147483647ll)) < (M - 1) ? ((int)(keys[pos_l] & 2147483647ll)) : (M - 1));
             int token_lo = 0;
             int token_width = T;
             int _count_leading_zeros_4 = __clz(T - 1);
@@ -160,7 +157,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                 }
                 int _min_7 = ((g) < (count - 1) ? (g) : (count - 1));
-                int row_u_0 = (int)(keys[base + _min_7] >> 32);
+                int row_u_0 = (int)(keys[base + _min_7] >> 32ll);
                 int _min_8 = ((g + 1) < (31) ? (g + 1) : (31));
                 int token_u_1 = __shfl_sync(0xFFFFFFFF, token_l, _min_8);
                 unsigned int words_0[4];
@@ -175,7 +172,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                 }
                 int _min_10 = ((g + 1) < (count - 1) ? (g + 1) : (count - 1));
-                int row_u_1 = (int)(keys[base + _min_10] >> 32);
+                int row_u_1 = (int)(keys[base + _min_10] >> 32ll);
                 int _min_11 = ((g + 2) < (31) ? (g + 2) : (31));
                 int token_u_2 = __shfl_sync(0xFFFFFFFF, token_l, _min_11);
                 unsigned int words_1[4];
@@ -190,7 +187,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                 }
                 int _min_13 = ((g + 2) < (count - 1) ? (g + 2) : (count - 1));
-                int row_u_2 = (int)(keys[base + _min_13] >> 32);
+                int row_u_2 = (int)(keys[base + _min_13] >> 32ll);
                 int _min_14 = ((g + 3) < (31) ? (g + 3) : (31));
                 int token_u_3 = __shfl_sync(0xFFFFFFFF, token_l, _min_14);
                 unsigned int words_2[4];
@@ -205,7 +202,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                 }
                 int _min_16 = ((g + 3) < (count - 1) ? (g + 3) : (count - 1));
-                int row_u_3 = (int)(keys[base + _min_16] >> 32);
+                int row_u_3 = (int)(keys[base + _min_16] >> 32ll);
                 int _min_17 = ((g + 4) < (31) ? (g + 4) : (31));
                 int token_u_4 = __shfl_sync(0xFFFFFFFF, token_l, _min_17);
                 unsigned int words_3[4];
@@ -220,7 +217,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                 }
                 int _min_19 = ((g + 4) < (count - 1) ? (g + 4) : (count - 1));
-                int row_u_4 = (int)(keys[base + _min_19] >> 32);
+                int row_u_4 = (int)(keys[base + _min_19] >> 32ll);
                 int _min_20 = ((g + 5) < (31) ? (g + 5) : (31));
                 int token_u_5 = __shfl_sync(0xFFFFFFFF, token_l, _min_20);
                 unsigned int words_4[4];
@@ -235,7 +232,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                 }
                 int _min_22 = ((g + 5) < (count - 1) ? (g + 5) : (count - 1));
-                int row_u_5 = (int)(keys[base + _min_22] >> 32);
+                int row_u_5 = (int)(keys[base + _min_22] >> 32ll);
                 int _min_23 = ((g + 6) < (31) ? (g + 6) : (31));
                 int token_u_6 = __shfl_sync(0xFFFFFFFF, token_l, _min_23);
                 unsigned int words_5[4];
@@ -250,7 +247,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                 }
                 int _min_25 = ((g + 6) < (count - 1) ? (g + 6) : (count - 1));
-                int row_u_6 = (int)(keys[base + _min_25] >> 32);
+                int row_u_6 = (int)(keys[base + _min_25] >> 32ll);
                 int _min_26 = ((g + 7) < (31) ? (g + 7) : (31));
                 int token_u_7 = __shfl_sync(0xFFFFFFFF, token_l, _min_26);
                 unsigned int words_6[4];
@@ -265,7 +262,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                 }
                 int _min_28 = ((g + 7) < (count - 1) ? (g + 7) : (count - 1));
-                int row_u_7 = (int)(keys[base + _min_28] >> 32);
+                int row_u_7 = (int)(keys[base + _min_28] >> 32ll);
                 int _min_29 = ((g) < (31) ? (g) : (31));
                 float scale_u_0 = __shfl_sync(0xFFFFFFFF, scale_l, _min_29);
                 if (g < count) {
@@ -283,7 +280,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     } else {
                                         float old[8];
@@ -295,7 +292,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                             old[0 + 3] = _v4.w;
                                         }
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                                             old[4 + 0] = _v4.x;
                                             old[4 + 1] = _v4.y;
                                             old[4 + 2] = _v4.z;
@@ -315,7 +312,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(old[4 + 0], old[4 + 1], old[4 + 2], old[4 + 3]);
-                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -371,7 +368,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_1 * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_1 * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     } else {
                                         float old_1[8];
@@ -383,7 +380,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                             old_1[0 + 3] = _v4.w;
                                         }
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                                             old_1[4 + 0] = _v4.x;
                                             old_1[4 + 1] = _v4.y;
                                             old_1[4 + 2] = _v4.z;
@@ -403,7 +400,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(old_1[4 + 0], old_1[4 + 1], old_1[4 + 2], old_1[4 + 3]);
-                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -459,7 +456,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_2 * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_2 * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     } else {
                                         float old_2[8];
@@ -471,7 +468,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                             old_2[0 + 3] = _v4.w;
                                         }
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                                             old_2[4 + 0] = _v4.x;
                                             old_2[4 + 1] = _v4.y;
                                             old_2[4 + 2] = _v4.z;
@@ -491,7 +488,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(old_2[4 + 0], old_2[4 + 1], old_2[4 + 2], old_2[4 + 3]);
-                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -547,7 +544,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_3 * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_3 * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     } else {
                                         float old_3[8];
@@ -559,7 +556,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                             old_3[0 + 3] = _v4.w;
                                         }
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                                             old_3[4 + 0] = _v4.x;
                                             old_3[4 + 1] = _v4.y;
                                             old_3[4 + 2] = _v4.z;
@@ -579,7 +576,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(old_3[4 + 0], old_3[4 + 1], old_3[4 + 2], old_3[4 + 3]);
-                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -635,7 +632,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_4 * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_4 * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     } else {
                                         float old_4[8];
@@ -647,7 +644,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                             old_4[0 + 3] = _v4.w;
                                         }
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                                             old_4[4 + 0] = _v4.x;
                                             old_4[4 + 1] = _v4.y;
                                             old_4[4 + 2] = _v4.z;
@@ -667,7 +664,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(old_4[4 + 0], old_4[4 + 1], old_4[4 + 2], old_4[4 + 3]);
-                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -723,7 +720,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_5 * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_5 * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     } else {
                                         float old_5[8];
@@ -735,7 +732,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                             old_5[0 + 3] = _v4.w;
                                         }
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                                             old_5[4 + 0] = _v4.x;
                                             old_5[4 + 1] = _v4.y;
                                             old_5[4 + 2] = _v4.z;
@@ -755,7 +752,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(old_5[4 + 0], old_5[4 + 1], old_5[4 + 2], old_5[4 + 3]);
-                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -811,7 +808,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_6 * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_6 * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     } else {
                                         float old_6[8];
@@ -823,7 +820,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                             old_6[0 + 3] = _v4.w;
                                         }
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                                             old_6[4 + 0] = _v4.x;
                                             old_6[4 + 1] = _v4.y;
                                             old_6[4 + 2] = _v4.z;
@@ -843,7 +840,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(old_6[4 + 0], old_6[4 + 1], old_6[4 + 2], old_6[4 + 3]);
-                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -899,7 +896,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_7 * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_7 * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     } else {
                                         float old_7[8];
@@ -911,7 +908,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                             old_7[0 + 3] = _v4.w;
                                         }
                                         {
-                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                                            float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                                             old_7[4 + 0] = _v4.x;
                                             old_7[4 + 1] = _v4.y;
                                             old_7[4 + 2] = _v4.z;
@@ -931,7 +928,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                                         }
                                         {
                                             float4 _v4 = make_float4(old_7[4 + 0], old_7[4 + 1], old_7[4 + 2], old_7[4 + 3]);
-                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                                            *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -985,7 +982,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                     {
                         float4 _v4 = make_float4(acc[4 + 0], acc[4 + 1], acc[4 + 2], acc[4 + 3]);
-                        *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_8 * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                        *reinterpret_cast<float4*>((partial + ((unsigned long long)slot_8 * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                     }
                 } else {
                     float old_8[8];
@@ -997,7 +994,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                         old_8[0 + 3] = _v4.w;
                     }
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4);
+                        float4 _v4 = *reinterpret_cast<const float4*>(out + (unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull);
                         old_8[4 + 0] = _v4.x;
                         old_8[4 + 1] = _v4.y;
                         old_8[4 + 2] = _v4.z;
@@ -1017,7 +1014,7 @@ kernel_cake_lm_head_det_loss_b049b326b5e905f4807f(__nv_bfloat16* __restrict__ ro
                     }
                     {
                         float4 _v4 = make_float4(old_8[4 + 0], old_8[4 + 1], old_8[4 + 2], old_8[4 + 3]);
-                        *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4)) + 0) = _v4;
+                        *reinterpret_cast<float4*>((out + ((unsigned long long)open_row * (unsigned long long)H + (unsigned long long)col + 4ull)) + 0) = _v4;
                     }
                 }
             }

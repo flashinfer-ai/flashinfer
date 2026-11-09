@@ -1195,8 +1195,8 @@ FAR = {"far_sample": 1}
 # ``pair_rule`` so the arm is the single-CTA wide program on sm_107a (which registers ``pair_wide``) as well.  The plain-l6
 # and reverse pair arms pin ``wide_first_rule`` to None: without the pin they would inherit an architecture's wide-first
 # precedence and run the wide program on every eligible row at or above its floor.  Every forced unit arm pins
-# ``wide_wave_rule`` to None: a record that sets it (the sm_100a FP8 record) decides narrow / l6 against wide by waves
-# of the persistent grid instead of the rules these arms replace.
+# ``wide_wave_rule`` to None: a record that sets it (the sm_100a and sm_103a FP8 records) decides narrow / l6 against
+# wide by waves of the persistent grid instead of the rules these arms replace.
 WIDE = {"l6_rule": None, "pair_rule": None, "wide_wave_rule": None}
 L6 = {"pair_rule": None, "wide_first_rule": None, "wide_wave_rule": None}
 PAIR_L6 = {

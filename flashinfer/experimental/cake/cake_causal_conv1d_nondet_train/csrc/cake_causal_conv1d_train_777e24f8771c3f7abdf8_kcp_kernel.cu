@@ -161,14 +161,13 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red = reinterpret_cast<float*>(smem_raw + 1024);
     const int red_addr = smem + 1024;
     uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 17408);
     const int stage_buf_addr = smem + 17408;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (8 barriers at smem_raw[0..64))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -275,7 +274,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         {
-                            float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4);
+                            float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4ll);
                             wr[j * 4 + 0] = _v4.x;
                             wr[j * 4 + 1] = _v4.y;
                             wr[j * 4 + 2] = _v4.z;
@@ -469,7 +468,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
                                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_13) : "f"(w4[2]), "f"(win[(u % 4 + 3) % 4 * 8 + j_1]), "f"(_fma_14));
                                     float fma;
                                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma) : "f"(w4[3]), "f"(win[u % 4 * 8 + j_1]), "f"(_fma_13));
-                                    float e = (-fma) * 1.442695f;
+                                    float e = -fma * 1.442695f;
                                     float _exp2_15 = approx_exp2(e);
                                     float den = 1.0f + _exp2_15;
                                     float sg = approx_rcp(den);
@@ -780,7 +779,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
                                                 asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_34) : "f"(w4[2]), "f"(win[(u_1 % 4 + 3) % 4 * 8 + j_6]), "f"(_fma_35));
                                                 float fma_1;
                                                 asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_1) : "f"(w4[3]), "f"(win[u_1 % 4 * 8 + j_6]), "f"(_fma_34));
-                                                float e_1 = (-fma_1) * 1.442695f;
+                                                float e_1 = -fma_1 * 1.442695f;
                                                 float _exp2_36 = approx_exp2(e_1);
                                                 float den_1 = 1.0f + _exp2_36;
                                                 float sg_1 = approx_rcp(den_1);
@@ -815,7 +814,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
                                                 asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_41) : "f"(w4[2]), "f"(win[(u_1 % 4 + 3) % 4 * 8 + j_7]), "f"(_fma_42));
                                                 float fma_2;
                                                 asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_2) : "f"(w4[3]), "f"(win[u_1 % 4 * 8 + j_7]), "f"(_fma_41));
-                                                float e_2 = (-fma_2) * 1.442695f;
+                                                float e_2 = -fma_2 * 1.442695f;
                                                 float _exp2_43 = approx_exp2(e_2);
                                                 float den_2 = 1.0f + _exp2_43;
                                                 float sg_2 = approx_rcp(den_2);
@@ -983,7 +982,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
             #pragma unroll
             for (int j_8 = 0; j_8 < 8; j_8++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_1 + (long long)j_8) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_1 + (long long)j_8) * 4ll);
                     wr_1[j_8 * 4 + 0] = _v4.x;
                     wr_1[j_8 * 4 + 1] = _v4.y;
                     wr_1[j_8 * 4 + 2] = _v4.z;
@@ -1175,7 +1174,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
                             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_65) : "f"(w4_1[2]), "f"(win_1[(u_2 % 4 + 3) % 4 * 8 + j_9]), "f"(_fma_66));
                             float fma_3;
                             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_3) : "f"(w4_1[3]), "f"(win_1[u_2 % 4 * 8 + j_9]), "f"(_fma_65));
-                            float e_3 = (-fma_3) * 1.442695f;
+                            float e_3 = -fma_3 * 1.442695f;
                             float _exp2_67 = approx_exp2(e_3);
                             float den_3 = 1.0f + _exp2_67;
                             float sg_3 = approx_rcp(den_3);
@@ -1486,7 +1485,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
                                         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_86) : "f"(w4_1[2]), "f"(win_1[(u_3 % 4 + 3) % 4 * 8 + j_14]), "f"(_fma_87));
                                         float fma_4;
                                         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_4) : "f"(w4_1[3]), "f"(win_1[u_3 % 4 * 8 + j_14]), "f"(_fma_86));
-                                        float e_4 = (-fma_4) * 1.442695f;
+                                        float e_4 = -fma_4 * 1.442695f;
                                         float _exp2_88 = approx_exp2(e_4);
                                         float den_4 = 1.0f + _exp2_88;
                                         float sg_4 = approx_rcp(den_4);
@@ -1521,7 +1520,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
                                         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_93) : "f"(w4_1[2]), "f"(win_1[(u_3 % 4 + 3) % 4 * 8 + j_15]), "f"(_fma_94));
                                         float fma_5;
                                         asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_5) : "f"(w4_1[3]), "f"(win_1[u_3 % 4 * 8 + j_15]), "f"(_fma_93));
-                                        float e_5 = (-fma_5) * 1.442695f;
+                                        float e_5 = -fma_5 * 1.442695f;
                                         float _exp2_95 = approx_exp2(e_5);
                                         float den_5 = 1.0f + _exp2_95;
                                         float sg_5 = approx_rcp(den_5);
@@ -1670,7 +1669,7 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
             if (c < C) {
                 long long c64_2 = (long long)c;
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + c64_2 * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + c64_2 * 4ll);
                     a4[0 + 0] = _v4.x;
                     a4[0 + 1] = _v4.y;
                     a4[0 + 2] = _v4.z;
@@ -1678,11 +1677,11 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
                 }
                 {
                     float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
+                    *reinterpret_cast<float4*>(dw_acc + c64_2 * 4ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw + c64_2 * 4) = _v4;
+                    *reinterpret_cast<float4*>(dw + c64_2 * 4ll) = _v4;
                 }
             }
         }

@@ -432,7 +432,7 @@ def test_nondet_calls_select_this_package(
         if loader.MODULES[name]["workspace_rule"] is not None
     ]
     assert len(owners) == 1 and len(launched) == (
-        2 if owners[0] == "claim_sum_f64" else 3
+        2 if owners[0] in ("claim_sum_f64", "claim_part_f32") else 3
     ), launched
     y_det, rstd_det = det.cake_rmsnorm_det_train_forward(x, w, eps)
     torch.testing.assert_close(y.float(), y_det.float(), atol=1e-2, rtol=1e-2)

@@ -17,7 +17,7 @@ PACKAGES: dict[str, str] = {
     "cake_rmsnorm_det_train": "flashinfer.experimental.cake.cake_rmsnorm_det_train",
     "cake_rmsnorm_nondet_train": "flashinfer.experimental.cake.cake_rmsnorm_nondet_train",
     "cake_causal_conv1d_det_train": "flashinfer.experimental.cake.cake_causal_conv1d_det_train",
-    "cake_gated_act_mxfp8": "flashinfer.cake_gated_act_mxfp8_backend",
+    "cake_gated_act_mxfp8_det_train": "flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train",
     "cake_rmsnorm_silu_gate_det_train": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train",
     "cake_rmsnorm_silu_gate_nondet_train": "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train",
     "cake_ulysses": "flashinfer.cake_ulysses_backend",
@@ -25,8 +25,11 @@ PACKAGES: dict[str, str] = {
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",
     "cake.cake_mhc_det_train": "flashinfer.experimental.cake.cake_mhc_det_train",
     "cake.cake_mhc_head_det_train": "flashinfer.experimental.cake.cake_mhc_head_det_train",
+    "cake.cake_mhc_head_nondet_train": "flashinfer.experimental.cake.cake_mhc_head_nondet_train",
     "cake.cake_dsa_sparse_attention_nondet_train": "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
+    "cake.cake_dsa_sparse_attention_det_train": "flashinfer.experimental.cake.cake_dsa_sparse_attention_det_train",
     "cake.cake_dsa_indexer_det_train": "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
+    "cake.cake_dsa_indexer_nondet_train": "flashinfer.experimental.cake.cake_dsa_indexer_nondet_train",
     "cake.cake_lm_head_det_train": "flashinfer.experimental.cake.cake_lm_head_det_train",
     # the non-deterministic LM-head package; its key carries the namespace
     "cake.cake_lm_head_nondet_train": "flashinfer.experimental.cake.cake_lm_head_nondet_train",
@@ -36,11 +39,9 @@ PACKAGES: dict[str, str] = {
     "cake_dense_gemm_nondet_train": "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
     "cake_mok_bf16": "flashinfer.experimental.cake_mok_bf16",
     "cake.cake_kda_det_train": "flashinfer.experimental.cake.cake_kda_det_train",
-    # the non-deterministic package (deterministic=False); its key carries the namespace
-    "cake.cake_kda_train": "flashinfer.experimental.cake.cake_kda_train",
-    "cake_kda_det_train_kcp": "flashinfer.experimental.cake_kda_det_train_kcp",
-    # its non-deterministic counterpart (deterministic=False)
-    "cake_kda_train_kcp": "flashinfer.experimental.cake_kda_train_kcp",
+    "cake.cake_kda_nondet_train": "flashinfer.experimental.cake.cake_kda_nondet_train",
+    "cake.cake_kda_det_train_kcp": "flashinfer.experimental.cake.cake_kda_det_train_kcp",
+    "cake.cake_kda_nondet_train_kcp": "flashinfer.experimental.cake.cake_kda_nondet_train_kcp",
     "cake_gdn_det_train_kcp": "flashinfer.experimental.cake.cake_gdn_det_train_kcp",
     "cake_gdn_nondet_train_kcp": "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp",
     "cake_kimi_k3_attn_res": "flashinfer.experimental.cake_kimi_k3_attn_res",
@@ -58,6 +59,7 @@ PACKAGES: dict[str, str] = {
     "cake_gdn_nondet_train": "flashinfer.experimental.cake.cake_gdn_nondet_train",
     # the non-deterministic GQA HD256 training package; its key carries the namespace
     "cake.cake_gqa_nondet_train": "flashinfer.experimental.cake.cake_gqa_nondet_train",
+    "cake.cake_gqa_det_train": "flashinfer.experimental.cake.cake_gqa_det_train",
     "cake.cake_mhc_nondet_train": "flashinfer.experimental.cake.cake_mhc_nondet_train",
     "cake_causal_conv1d_nondet_train": "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train",
 }

@@ -33,7 +33,7 @@ token-owner pass, which take the count as a kernel argument.  This module checks
 
 The cases above run at ``H = 4096``; ``test_counts_match_fp64_at_every_hidden_size`` and
 ``test_paths_agree_bitwise_at_every_hidden_size`` repeat the numerics and the paths at the counts 1, 7, 20 and 64 at
-every hidden size the device's architecture exports (4096, 5120 and 7168 on SM100 / SM103; 4096 on SM107).
+every hidden size the device's architecture exports (4096, 5120 and 7168 on SM100 / SM103 / SM107).
 
 The reference is the same arithmetic as ``test_cake_mhc_det_train.py``'s with the count as a parameter.
 """
