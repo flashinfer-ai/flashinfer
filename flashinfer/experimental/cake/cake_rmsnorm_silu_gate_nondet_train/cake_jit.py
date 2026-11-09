@@ -54,8 +54,9 @@ forward module of this package's own kernels is delivered for every
 architecture, so a new cut between them is a host-plan change; the pipelined
 forwards are delivered where they are routed: the deterministic package's
 forward program on sm_100a and sm_103a, its program of packed rows on
-sm_107a; the repeatable backward, the deterministic package's fused
-backward program, is delivered and routed on every architecture).
+sm_107a; the repeatable backward and its long program, the deterministic
+package's fused backward programs, are delivered and routed on every
+architecture).
 :func:`module_for_rows` picks a call's module from the rows, the device's SM
 count and the layout of the inputs: the forward of packed rows (``x`` and
 ``z`` hold row ``n`` at element ``128 n``, fewer than ``PACKED_ROWS`` rows)
@@ -68,7 +69,9 @@ small-row roles (``BAND_ROLES``: the
 short backward ``bwd_bf16_short`` and the exact tiny backward ``_t512``, each
 up to a count of rows), its fused role (``_fused``: a BF16 weight gradient,
 in a band of rows per SM) and its repeatable role (``_rep``: a BF16
-weight gradient, past the fused band, and on sm_107a also before it), its
+weight gradient, past the fused band, and on sm_107a also before it; on
+packed rows from ``LONG_BACKWARD_ROWS_PER_SM`` rows per SM its long role
+``_rep_long`` in its place), its
 call role (the static backward, where an architecture routes one for the
 role), for a BF16 weight gradient its row-claims roles (``_rc``,
 ``_rc_mid``) and its mid role (the claimed backward).
@@ -154,6 +157,15 @@ fused backward's (so ``dx`` and ``dz`` are the fused backward's bits), each
 chunk's weight-gradient terms added exactly into fixed-point digits and the
 sum rounded once by the CTA that arrives last, so its ``dw`` is the
 deterministic package's bits too, the same for the rows and the SM count.
+Its long program (``bwd_bf16_rep_long``, every architecture; build
+``{"lookahead": True, "math": "ax", "min_blocks": 4, "out": "bf16",
+"prefetch_share": None, "threads": 256}``) is the same build in the
+look-ahead loop: a block's rows load while the previous block's row
+arithmetic runs, with the same FP32 operations in the same order, so its
+outputs are the repeatable backward's bits at every row count and grid.  It
+runs in the repeatable backward's place on packed rows (``dy``, ``x`` and
+``z`` with head stride 128 and token stride ``H * 128``) from
+``LONG_BACKWARD_ROWS_PER_SM`` rows per SM, where it is faster.
 A BF16 weight gradient runs the fused backward only where its varying
 weight gradient makes the checkpointed training step (2 x forward +
 backward) at least 3 % faster than the repeatable backward's, and the
@@ -176,7 +188,8 @@ chunk_limit))`` consecutive blocks a chunk, ``C = ceil(blocks /
 blocks_per_chunk)`` chunks, and launch :func:`backward_ctas` ``G = min(C,
 ctas_per_sm * SMs)`` CTAs; the host passes ``blocks_per_chunk`` to the
 kernel.  A row-claims or a fused backward launches ``G = min(ceil(rows /
-rows_per_cta), ctas_per_sm * SMs)`` CTAs, the repeatable backward ``G =
+rows_per_cta), ctas_per_sm * SMs)`` CTAs, the repeatable backward and its
+long program ``G =
 min(ceil(rows / rows_per_block), ctas_per_sm * SMs)`` (:func:`backward_ctas`;
 the CTAs claim the blocks).  Every backward is correct at any grid, every
 chunked or small-row one gives the same bits at any grid and the
@@ -196,9 +209,9 @@ words), ``dw_spec``, 128 FP32 class words for infinite and NaN partials,
 and ``dw_done``, two 32-bit words (the arrival ticket and the claim counter);
 that of a row-claims or a fused backward is ``dw_sums``, its 4 x 128 FP64
 accumulators, and ``dw_done`` (4104 bytes); that of the repeatable
-backward is ``acc``, its fixed-point digits (2304 u64), ``flags``, a
-32-bit flag word a column, and ``done``, the arrival ticket and the claim
-counter (18952 bytes).  All of it is zero when a
+backward and its long program is ``acc``, its fixed-point digits (2304
+u64), ``flags``, a 32-bit flag word a column, and ``done``, the arrival
+ticket and the claim counter (18952 bytes).  All of it is zero when a
 launch starts and zero again when it ends, so a
 zero-filled workspace stays reusable for any later call on its stream, and
 one of the largest module's size serves every backward module of an
@@ -1864,6 +1877,93 @@ MODULES: dict[str, dict[str, Any]] = {
             "flags": 128,
         },
     },
+    # The repeatable backward's long program into a BF16 weight gradient: the
+    # repeatable backward in the look-ahead loop (the deterministic package's
+    # long program, its build {"lookahead": True, "math": "ax", "min_blocks":
+    # 4, "out": "bf16", "prefetch_share": None, "threads": 256}): a block's
+    # rows load while the previous block's row arithmetic runs, with the same
+    # FP32 operations in the same order, so dx, dz and dw are the repeatable
+    # backward's bits at every row count and grid; it runs in the repeatable
+    # backward's place on packed rows from LONG_BACKWARD_ROWS_PER_SM rows per
+    # SM.
+    "cake_rmsnorm_silu_gate_train_fef9d1cc2cc267219992": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "dx"],
+            ["buffer", "dz"],
+            ["buffer", "acc"],
+            ["buffer", "flags"],
+            ["buffer", "done"],
+            ["buffer", "dw"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "dy_tok"],
+            ["parameter", "dy_head"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["parameter", "accumulate"],
+            ["parameter", "weight_grad"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 4,
+            "kind": "claimed_row_blocks",
+            "rows_per_block": 16,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_fef9d1cc2cc267219992",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_fef9d1cc2cc267219992",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 26368,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_fef9d1cc2cc267219992",
+        "logical": {
+            "acc": "acc",
+            "accumulate": "accumulate",
+            "done": "done",
+            "dw": "dw",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_head": "dy_head",
+            "dy_tok": "dy_tok",
+            "dz": "dz",
+            "eps": "eps",
+            "flags": "flags",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "weight_grad": "weight_grad",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "bwd_bf16_rep_long",
+        "workspace": {
+            "acc": 2304,
+            "done": 2,
+            "flags": 128,
+        },
+    },
 }
 
 ROUTES: dict[str, dict[str, str]] = {
@@ -1882,6 +1982,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
         "bwd_bf16_fused": "cake_rmsnorm_silu_gate_train_1d4b7311041b9046e379",
         "bwd_bf16_rep": "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
+        "bwd_bf16_rep_long": "cake_rmsnorm_silu_gate_train_fef9d1cc2cc267219992",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_421e73578399336342e3",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
@@ -1899,6 +2000,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_bf16_fused": "cake_rmsnorm_silu_gate_train_1d4b7311041b9046e379",
         "bwd_bf16_rep": "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
+        "bwd_bf16_rep_long": "cake_rmsnorm_silu_gate_train_fef9d1cc2cc267219992",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_421e73578399336342e3",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
@@ -1916,6 +2018,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
         "bwd_bf16_fused": "cake_rmsnorm_silu_gate_train_1d4b7311041b9046e379",
         "bwd_bf16_rep": "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
+        "bwd_bf16_rep_long": "cake_rmsnorm_silu_gate_train_fef9d1cc2cc267219992",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_a8cfbb391df971a9cb59",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_75a7f19a91e6ec05dffc",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
@@ -2091,6 +2194,22 @@ BACKWARD_BANDS: dict[
     },
 }
 
+# A band role's long role (the band's name + ``LONG``) runs in its place on
+# packed rows (``dy``, ``x`` and ``z`` with head stride 128 and token stride
+# ``H * 128``, the kernel's own test) from this many rows per SM, by
+# architecture and band role: the repeatable backward's long program (its
+# look-ahead loop, the same bits) is faster there.  The cuts are the
+# deterministic package's for the same pair of programs: 2560 rows per SM on
+# sm_100a and sm_103a and 1536 on sm_107a, where only the last repeatable
+# band (past ``SM107A_BF16_FUSED_LAST``) reaches it.  Other layouts and fewer
+# rows run the band's module.  Host plan only, as the bands.
+LONG = "_long"
+LONG_BACKWARD_ROWS_PER_SM: dict[str, dict[str, int]] = {
+    "sm_100a": {"bwd_bf16_rep": 2560},
+    "sm_103a": {"bwd_bf16_rep": 2560},
+    "sm_107a": {"bwd_bf16_rep": 1536},
+}
+
 
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
@@ -2104,7 +2223,9 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 # role (its own module, the static backward, where an architecture routes
 # one), its small-row roles (``BAND_ROLES``), its fused and repeatable roles
 # (``<role>_fused``, ``<role>_rep``: ``bwd_bf16_fused`` and
-# ``bwd_bf16_rep``, every architecture), for a BF16 weight gradient on
+# ``bwd_bf16_rep``, every architecture) and the repeatable role's long role
+# (``bwd_bf16_rep_long``, every architecture, on packed rows from
+# ``LONG_BACKWARD_ROWS_PER_SM`` rows per SM), for a BF16 weight gradient on
 # sm_100a and sm_103a
 # its row-claims roles (``<role>_rc``, ``<role>_rc_mid``) and its mid role
 # (``<role>_mid``, the claimed backward) in the rows of their
@@ -2184,8 +2305,10 @@ def routes_every_call(arch: str) -> bool:
     """Whether ``arch`` routes a module for every call of every role: every
     band of the forward's ``FORWARD_BANDS`` and ``STRIDED_FORWARD_BANDS`` and
     of each backward role's ``BACKWARD_BANDS`` names a role ``ROUTES[arch]``
-    routes, and a role whose bands do not end with a ``None`` band routes its
-    own module (:func:`module_for_rows` falls back to it past the bands)."""
+    routes, a role whose bands do not end with a ``None`` band routes its
+    own module (:func:`module_for_rows` falls back to it past the bands), and
+    every band role ``LONG_BACKWARD_ROWS_PER_SM[arch]`` names routes its long
+    role."""
 
     routes = ROUTES.get(arch, {})
     tables: list[tuple[str, tuple[tuple[object, str], ...]]] = [
@@ -2200,7 +2323,9 @@ def routes_every_call(arch: str) -> bool:
             return False
         if all(last is not None for last, _ in bands) and role not in routes:
             return False
-    return True
+    return all(
+        band + LONG in routes for band in LONG_BACKWARD_ROWS_PER_SM.get(arch, {})
+    )
 
 
 def backward_chunks(name: str, rows: int) -> tuple[int, int]:
@@ -2229,7 +2354,12 @@ def module_for_rows(
     last * sm_count`` (or no ``last``); for a
     backward role the module of the first of its ``BACKWARD_BANDS[arch]``
     bands whose ``last`` holds: ``(ROWS, n)`` with ``rows <= n``, a number
-    with ``rows <= last * sm_count``, or ``None``; else :func:`route_module`."""
+    with ``rows <= last * sm_count``, or ``None``, and in its place the
+    band's long role (``band + LONG``, the same bits) when ``packed`` holds
+    (``dy``, ``x`` and ``z`` hold packed rows: the caller's test) and the
+    rows reach the band's ``LONG_BACKWARD_ROWS_PER_SM[arch]`` cut, ``rows >=
+    cut * sm_count``; else :func:`route_module`.  ``packed`` defaults to
+    true, the forward's packed rows: a backward caller passes its own test."""
 
     if role == "fwd":
         packed = packed and int(rows) < PACKED_ROWS
@@ -2240,12 +2370,14 @@ def module_for_rows(
         return route_module(arch, role)
     for bound, band in BACKWARD_BANDS.get(arch, {}).get(role, ()):
         name = route_module(arch, band)
-        if bound is None:
-            return name
         if isinstance(bound, tuple):
-            if int(rows) <= int(bound[1]):
-                return name
-        elif int(rows) <= bound * int(sm_count):
+            runs = int(rows) <= int(bound[1])
+        else:
+            runs = bound is None or int(rows) <= bound * int(sm_count)
+        if runs:
+            cut = LONG_BACKWARD_ROWS_PER_SM.get(arch, {}).get(band)
+            if packed and cut is not None and int(rows) >= cut * int(sm_count):
+                return route_module(arch, band + LONG)
             return name
     return route_module(arch, role)
 
@@ -2444,6 +2576,8 @@ __all__ = [
     "GRID_KINDS",
     "HEAD_DIM",
     "INT32_MAX",
+    "LONG",
+    "LONG_BACKWARD_ROWS_PER_SM",
     "MODULES",
     "PACKED_ROWS",
     "ROLES",
