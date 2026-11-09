@@ -20,9 +20,11 @@ The three operations of the deterministic module
 described by an int32 **device** tensor ``offs[E]`` of cumulative end offsets
 (never read on the host):
 
-* ``fwd``:   ``Y[offs[e-1]:offs[e]]  = X[offs[e-1]:offs[e]] @ W[e].T``
-* ``dgrad``: ``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]``
-* ``wgrad``: ``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` (bf16 or fp32 output)
+For group ``e``, ``start = 0 if e == 0 else offs[e - 1]`` and ``end = offs[e]``.
+
+* ``fwd``:   ``Y[start:end]  = X[start:end] @ W[e].T``
+* ``dgrad``: ``dX[start:end] = G[start:end] @ W[e]``
+* ``wgrad``: ``dW[e] = G[start:end].T @ X[start:end]`` (bf16 or fp32 output)
 
 Numerical mode.  This package is the non-deterministic implementation and
 runs nothing else: the module is the mode, so no entry point

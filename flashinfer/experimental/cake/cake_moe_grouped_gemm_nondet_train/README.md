@@ -18,11 +18,13 @@ deterministic package's (see its README): over `E` groups of rows described by
 an int32 **device** tensor `offs[E]` of cumulative end offsets, or
 `m_indptr[E + 1]`, read by the kernels only.
 
+For group `e`, `start = 0 if e == 0 else offs[e - 1]` and `end = offs[e]`.
+
 | helper | computation | output |
 | --- | --- | --- |
-| `cake_moe_grouped_gemm_nondet_train_forward(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `Y [sum_m, N]` bf16 |
-| `cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs, out=None)` | `dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]` (W read in place) | `dX [sum_m, K]` bf16 |
-| `cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, accumulate=False)` | `dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`; with `accumulate=True`, `out[e] += dW[e]` | `dW [E, N, K]` bf16 or fp32 |
+| `cake_moe_grouped_gemm_nondet_train_forward(x, w, offs, out=None)` | `Y[start:end] = X[start:end] @ W[e].T` | `Y [sum_m, N]` bf16 |
+| `cake_moe_grouped_gemm_nondet_train_dgrad(g, w, offs, out=None)` | `dX[start:end] = G[start:end] @ W[e]` (W read in place) | `dX [sum_m, K]` bf16 |
+| `cake_moe_grouped_gemm_nondet_train_wgrad(g, x, offs, out=None, out_dtype=None, num_groups=None, *, accumulate=False)` | `dW[e] = G[start:end].T @ X[start:end]`; with `accumulate=True`, `out[e] += dW[e]` | `dW [E, N, K]` bf16 or fp32 |
 
 ## Mode rules
 
