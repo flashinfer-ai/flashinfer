@@ -119,7 +119,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, unsigned long long* __restrict__ dw_win, float* __restrict__ dw_spec, unsigned int* __restrict__ dw_done, float* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad, int blocks_per_chunk)
+kernel_cake_rmsnorm_silu_gate_train_421e73578399336342e3(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, unsigned long long* __restrict__ dw_win, float* __restrict__ dw_spec, unsigned int* __restrict__ dw_done, float* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad, int blocks_per_chunk)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1440,64 +1440,120 @@ kernel_cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f(__nv_bfloat16* __restri
     if (flag_word[0] != 0) {
         if (weight_grad != 0) {
             unsigned long long words[28];
-            unsigned long long _atomic_fetch_add_214 = atomicAdd(&dw_win[tid], 0ull);
-            words[0] = _atomic_fetch_add_214;
-            unsigned long long _atomic_fetch_add_215 = atomicAdd(&dw_win[128 + tid], 0ull);
-            words[1] = _atomic_fetch_add_215;
-            unsigned long long _atomic_fetch_add_216 = atomicAdd(&dw_win[256 + tid], 0ull);
-            words[2] = _atomic_fetch_add_216;
-            unsigned long long _atomic_fetch_add_217 = atomicAdd(&dw_win[384 + tid], 0ull);
-            words[3] = _atomic_fetch_add_217;
-            unsigned long long _atomic_fetch_add_218 = atomicAdd(&dw_win[512 + tid], 0ull);
-            words[4] = _atomic_fetch_add_218;
-            unsigned long long _atomic_fetch_add_219 = atomicAdd(&dw_win[640 + tid], 0ull);
-            words[5] = _atomic_fetch_add_219;
-            unsigned long long _atomic_fetch_add_220 = atomicAdd(&dw_win[768 + tid], 0ull);
-            words[6] = _atomic_fetch_add_220;
-            unsigned long long _atomic_fetch_add_221 = atomicAdd(&dw_win[896 + tid], 0ull);
-            words[7] = _atomic_fetch_add_221;
-            unsigned long long _atomic_fetch_add_222 = atomicAdd(&dw_win[1024 + tid], 0ull);
-            words[8] = _atomic_fetch_add_222;
-            unsigned long long _atomic_fetch_add_223 = atomicAdd(&dw_win[1152 + tid], 0ull);
-            words[9] = _atomic_fetch_add_223;
-            unsigned long long _atomic_fetch_add_224 = atomicAdd(&dw_win[1280 + tid], 0ull);
-            words[10] = _atomic_fetch_add_224;
-            unsigned long long _atomic_fetch_add_225 = atomicAdd(&dw_win[1408 + tid], 0ull);
-            words[11] = _atomic_fetch_add_225;
-            unsigned long long _atomic_fetch_add_226 = atomicAdd(&dw_win[1536 + tid], 0ull);
-            words[12] = _atomic_fetch_add_226;
-            unsigned long long _atomic_fetch_add_227 = atomicAdd(&dw_win[1664 + tid], 0ull);
-            words[13] = _atomic_fetch_add_227;
-            unsigned long long _atomic_fetch_add_228 = atomicAdd(&dw_win[1792 + tid], 0ull);
-            words[14] = _atomic_fetch_add_228;
-            unsigned long long _atomic_fetch_add_229 = atomicAdd(&dw_win[1920 + tid], 0ull);
-            words[15] = _atomic_fetch_add_229;
-            unsigned long long _atomic_fetch_add_230 = atomicAdd(&dw_win[2048 + tid], 0ull);
-            words[16] = _atomic_fetch_add_230;
-            unsigned long long _atomic_fetch_add_231 = atomicAdd(&dw_win[2176 + tid], 0ull);
-            words[17] = _atomic_fetch_add_231;
-            unsigned long long _atomic_fetch_add_232 = atomicAdd(&dw_win[2304 + tid], 0ull);
-            words[18] = _atomic_fetch_add_232;
-            unsigned long long _atomic_fetch_add_233 = atomicAdd(&dw_win[2432 + tid], 0ull);
-            words[19] = _atomic_fetch_add_233;
-            unsigned long long _atomic_fetch_add_234 = atomicAdd(&dw_win[2560 + tid], 0ull);
-            words[20] = _atomic_fetch_add_234;
-            unsigned long long _atomic_fetch_add_235 = atomicAdd(&dw_win[2688 + tid], 0ull);
-            words[21] = _atomic_fetch_add_235;
-            unsigned long long _atomic_fetch_add_236 = atomicAdd(&dw_win[2816 + tid], 0ull);
-            words[22] = _atomic_fetch_add_236;
-            unsigned long long _atomic_fetch_add_237 = atomicAdd(&dw_win[2944 + tid], 0ull);
-            words[23] = _atomic_fetch_add_237;
-            unsigned long long _atomic_fetch_add_238 = atomicAdd(&dw_win[3072 + tid], 0ull);
-            words[24] = _atomic_fetch_add_238;
-            unsigned long long _atomic_fetch_add_239 = atomicAdd(&dw_win[3200 + tid], 0ull);
-            words[25] = _atomic_fetch_add_239;
-            unsigned long long _atomic_fetch_add_240 = atomicAdd(&dw_win[3328 + tid], 0ull);
-            words[26] = _atomic_fetch_add_240;
-            unsigned long long _atomic_fetch_add_241 = atomicAdd(&dw_win[3456 + tid], 0ull);
-            words[27] = _atomic_fetch_add_241;
-            float _atomic_fetch_add_242 = atomicAdd(&dw_spec[tid], -0.0f);
-            spec = _atomic_fetch_add_242;
+            unsigned long long _atom_bits_215;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_215) : "l"(&dw_win[tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_214 = _atom_bits_215;
+            words[0] = _atomic_exchange_214;
+            unsigned long long _atom_bits_217;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_217) : "l"(&dw_win[128 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_216 = _atom_bits_217;
+            words[1] = _atomic_exchange_216;
+            unsigned long long _atom_bits_219;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_219) : "l"(&dw_win[256 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_218 = _atom_bits_219;
+            words[2] = _atomic_exchange_218;
+            unsigned long long _atom_bits_221;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_221) : "l"(&dw_win[384 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_220 = _atom_bits_221;
+            words[3] = _atomic_exchange_220;
+            unsigned long long _atom_bits_223;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_223) : "l"(&dw_win[512 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_222 = _atom_bits_223;
+            words[4] = _atomic_exchange_222;
+            unsigned long long _atom_bits_225;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_225) : "l"(&dw_win[640 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_224 = _atom_bits_225;
+            words[5] = _atomic_exchange_224;
+            unsigned long long _atom_bits_227;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_227) : "l"(&dw_win[768 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_226 = _atom_bits_227;
+            words[6] = _atomic_exchange_226;
+            unsigned long long _atom_bits_229;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_229) : "l"(&dw_win[896 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_228 = _atom_bits_229;
+            words[7] = _atomic_exchange_228;
+            unsigned long long _atom_bits_231;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_231) : "l"(&dw_win[1024 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_230 = _atom_bits_231;
+            words[8] = _atomic_exchange_230;
+            unsigned long long _atom_bits_233;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_233) : "l"(&dw_win[1152 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_232 = _atom_bits_233;
+            words[9] = _atomic_exchange_232;
+            unsigned long long _atom_bits_235;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_235) : "l"(&dw_win[1280 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_234 = _atom_bits_235;
+            words[10] = _atomic_exchange_234;
+            unsigned long long _atom_bits_237;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_237) : "l"(&dw_win[1408 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_236 = _atom_bits_237;
+            words[11] = _atomic_exchange_236;
+            unsigned long long _atom_bits_239;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_239) : "l"(&dw_win[1536 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_238 = _atom_bits_239;
+            words[12] = _atomic_exchange_238;
+            unsigned long long _atom_bits_241;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_241) : "l"(&dw_win[1664 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_240 = _atom_bits_241;
+            words[13] = _atomic_exchange_240;
+            unsigned long long _atom_bits_243;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_243) : "l"(&dw_win[1792 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_242 = _atom_bits_243;
+            words[14] = _atomic_exchange_242;
+            unsigned long long _atom_bits_245;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_245) : "l"(&dw_win[1920 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_244 = _atom_bits_245;
+            words[15] = _atomic_exchange_244;
+            unsigned long long _atom_bits_247;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_247) : "l"(&dw_win[2048 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_246 = _atom_bits_247;
+            words[16] = _atomic_exchange_246;
+            unsigned long long _atom_bits_249;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_249) : "l"(&dw_win[2176 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_248 = _atom_bits_249;
+            words[17] = _atomic_exchange_248;
+            unsigned long long _atom_bits_251;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_251) : "l"(&dw_win[2304 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_250 = _atom_bits_251;
+            words[18] = _atomic_exchange_250;
+            unsigned long long _atom_bits_253;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_253) : "l"(&dw_win[2432 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_252 = _atom_bits_253;
+            words[19] = _atomic_exchange_252;
+            unsigned long long _atom_bits_255;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_255) : "l"(&dw_win[2560 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_254 = _atom_bits_255;
+            words[20] = _atomic_exchange_254;
+            unsigned long long _atom_bits_257;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_257) : "l"(&dw_win[2688 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_256 = _atom_bits_257;
+            words[21] = _atomic_exchange_256;
+            unsigned long long _atom_bits_259;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_259) : "l"(&dw_win[2816 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_258 = _atom_bits_259;
+            words[22] = _atomic_exchange_258;
+            unsigned long long _atom_bits_261;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_261) : "l"(&dw_win[2944 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_260 = _atom_bits_261;
+            words[23] = _atomic_exchange_260;
+            unsigned long long _atom_bits_263;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_263) : "l"(&dw_win[3072 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_262 = _atom_bits_263;
+            words[24] = _atomic_exchange_262;
+            unsigned long long _atom_bits_265;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_265) : "l"(&dw_win[3200 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_264 = _atom_bits_265;
+            words[25] = _atomic_exchange_264;
+            unsigned long long _atom_bits_267;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_267) : "l"(&dw_win[3328 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_266 = _atom_bits_267;
+            words[26] = _atomic_exchange_266;
+            unsigned long long _atom_bits_269;
+            asm volatile("atom.relaxed.gpu.global.exch.b64 %0, [%1], %2;" : "=l"(_atom_bits_269) : "l"(&dw_win[3456 + tid]), "l"(static_cast<unsigned long long>(0ull)) : "memory");
+            unsigned long long _atomic_exchange_268 = _atom_bits_269;
+            words[27] = _atomic_exchange_268;
+            float _atomic_fetch_add_270 = atomicAdd(&dw_spec[tid], -0.0f);
+            spec = _atomic_fetch_add_270;
             float old = 0.0f;
             if (accumulate != 0) {
                 float prev = atomicAdd(&dw[tid], -0.0f);
@@ -1512,117 +1568,33 @@ kernel_cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f(__nv_bfloat16* __restri
             digits[5] = 0ll;
             digits[6] = 0ll;
             digits[0] = digits[0] + (long long)words[0];
-            if (words[0] != 0ull) {
-                dw_win[tid] = 0ull;
-            }
             digits[1] = digits[1] + (long long)words[1];
-            if (words[1] != 0ull) {
-                dw_win[128 + tid] = 0ull;
-            }
             digits[2] = digits[2] + (long long)words[2];
-            if (words[2] != 0ull) {
-                dw_win[256 + tid] = 0ull;
-            }
             digits[3] = digits[3] + (long long)words[3];
-            if (words[3] != 0ull) {
-                dw_win[384 + tid] = 0ull;
-            }
             digits[4] = digits[4] + (long long)words[4];
-            if (words[4] != 0ull) {
-                dw_win[512 + tid] = 0ull;
-            }
             digits[5] = digits[5] + (long long)words[5];
-            if (words[5] != 0ull) {
-                dw_win[640 + tid] = 0ull;
-            }
             digits[6] = digits[6] + (long long)words[6];
-            if (words[6] != 0ull) {
-                dw_win[768 + tid] = 0ull;
-            }
             digits[0] = digits[0] + (long long)words[7];
-            if (words[7] != 0ull) {
-                dw_win[896 + tid] = 0ull;
-            }
             digits[1] = digits[1] + (long long)words[8];
-            if (words[8] != 0ull) {
-                dw_win[1024 + tid] = 0ull;
-            }
             digits[2] = digits[2] + (long long)words[9];
-            if (words[9] != 0ull) {
-                dw_win[1152 + tid] = 0ull;
-            }
             digits[3] = digits[3] + (long long)words[10];
-            if (words[10] != 0ull) {
-                dw_win[1280 + tid] = 0ull;
-            }
             digits[4] = digits[4] + (long long)words[11];
-            if (words[11] != 0ull) {
-                dw_win[1408 + tid] = 0ull;
-            }
             digits[5] = digits[5] + (long long)words[12];
-            if (words[12] != 0ull) {
-                dw_win[1536 + tid] = 0ull;
-            }
             digits[6] = digits[6] + (long long)words[13];
-            if (words[13] != 0ull) {
-                dw_win[1664 + tid] = 0ull;
-            }
             digits[0] = digits[0] + (long long)words[14];
-            if (words[14] != 0ull) {
-                dw_win[1792 + tid] = 0ull;
-            }
             digits[1] = digits[1] + (long long)words[15];
-            if (words[15] != 0ull) {
-                dw_win[1920 + tid] = 0ull;
-            }
             digits[2] = digits[2] + (long long)words[16];
-            if (words[16] != 0ull) {
-                dw_win[2048 + tid] = 0ull;
-            }
             digits[3] = digits[3] + (long long)words[17];
-            if (words[17] != 0ull) {
-                dw_win[2176 + tid] = 0ull;
-            }
             digits[4] = digits[4] + (long long)words[18];
-            if (words[18] != 0ull) {
-                dw_win[2304 + tid] = 0ull;
-            }
             digits[5] = digits[5] + (long long)words[19];
-            if (words[19] != 0ull) {
-                dw_win[2432 + tid] = 0ull;
-            }
             digits[6] = digits[6] + (long long)words[20];
-            if (words[20] != 0ull) {
-                dw_win[2560 + tid] = 0ull;
-            }
             digits[0] = digits[0] + (long long)words[21];
-            if (words[21] != 0ull) {
-                dw_win[2688 + tid] = 0ull;
-            }
             digits[1] = digits[1] + (long long)words[22];
-            if (words[22] != 0ull) {
-                dw_win[2816 + tid] = 0ull;
-            }
             digits[2] = digits[2] + (long long)words[23];
-            if (words[23] != 0ull) {
-                dw_win[2944 + tid] = 0ull;
-            }
             digits[3] = digits[3] + (long long)words[24];
-            if (words[24] != 0ull) {
-                dw_win[3072 + tid] = 0ull;
-            }
             digits[4] = digits[4] + (long long)words[25];
-            if (words[25] != 0ull) {
-                dw_win[3200 + tid] = 0ull;
-            }
             digits[5] = digits[5] + (long long)words[26];
-            if (words[26] != 0ull) {
-                dw_win[3328 + tid] = 0ull;
-            }
             digits[6] = digits[6] + (long long)words[27];
-            if (words[27] != 0ull) {
-                dw_win[3456 + tid] = 0ull;
-            }
             if (spec != 0.0f) {
                 dw_spec[tid] = 0.0f;
             }
@@ -1631,10 +1603,10 @@ kernel_cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f(__nv_bfloat16* __restri
             } else if ((__as_u32(old) & 2147483647) != 0) {
                 unsigned int bits_1 = __as_u32(old);
                 unsigned int ex_1 = bits_1 >> 23 & 255;
-                unsigned int _max_243 = ((ex_1) > (1) ? (ex_1) : (1));
-                unsigned int idx_1 = _max_243 - 1 + 38;
-                unsigned int _min_244 = ((ex_1) < (1) ? (ex_1) : (1));
-                unsigned long long m_1 = (unsigned long long)(bits_1 & 8388607 | _min_244 << 23);
+                unsigned int _max_271 = ((ex_1) > (1) ? (ex_1) : (1));
+                unsigned int idx_1 = _max_271 - 1 + 38;
+                unsigned int _min_272 = ((ex_1) < (1) ? (ex_1) : (1));
+                unsigned long long m_1 = (unsigned long long)(bits_1 & 8388607 | _min_272 << 23);
                 unsigned int wk_1 = idx_1 / 48;
                 unsigned int sh_1 = idx_1 - wk_1 * 48;
                 long long lo_1 = (long long)(m_1 << (unsigned long long)sh_1 & 281474976710655ull);
