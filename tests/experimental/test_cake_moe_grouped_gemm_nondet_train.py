@@ -173,6 +173,7 @@ K512_FORMS = (
     "main_halves",
     "main_wave_halves",
     "main_halves_k256t",
+    cb.QUEUE_STAGE,
 )
 
 
@@ -325,7 +326,8 @@ def _workspace_kinds(launch):
 def _assert_tail_at_rest(device, stream=None):
     """The kept split-tail workspaces of ``stream`` that have a rest state are at it: the
     tickets are all zero.  The slots (``tail_sums``, ``cb.UNRESTED_STREAM_WORKSPACES``) have
-    none; they must be kept, but their values are not checked."""
+    none; they must be kept, but their values are not checked.  The queue walk's counters
+    (``cb.QUEUE_SCHED``), where a queue launch kept them, are zero too."""
     assert cb.UNRESTED_STREAM_WORKSPACES == ("tail_sums",)
     for kind in ("tail_sums", "tail_tickets"):
         buffer = cb.stream_workspace(kind, device, stream)
@@ -335,6 +337,17 @@ def _assert_tail_at_rest(device, stream=None):
         assert int(buffer.view(torch.int32).count_nonzero()) == 0, (
             f"{kind} is not at rest: {int(buffer.view(torch.int32).count_nonzero())} nonzero words"
         )
+    _assert_queue_at_rest(device, stream)
+
+
+def _assert_queue_at_rest(device, stream=None):
+    """The queue walk's counters kept for ``stream`` (if a queue launch kept them) are
+    ``queue_sched_words`` zero words."""
+    words = cb.stream_workspace(cb.QUEUE_SCHED, device, stream)
+    if words is None:
+        return
+    assert words.numel() == int(HOST_PLAN_CONSTANTS["queue_sched_words"])
+    assert _u32_words(words) == [0] * words.numel(), _u32_words(words)
 
 
 def _poison_tail_sums(device, stream=None):
@@ -353,8 +366,35 @@ def _poison_tail_sums(device, stream=None):
 def _force_form(monkeypatch, form, arch):
     """Constants under which a weight gradient on ``arch`` takes the 512-wide k tile (at
     any rows per group) in stage ``form`` (given a ``K`` of ``_form_ks(form)``); False
-    where the arch has no such form."""
+    where the arch has no such form.  The queue walk (``cb.QUEUE_STAGE``) is forced as
+    the stand-in of ``main_halves`` for every output, SM count and group count; every
+    other form is forced with no ``queue_walk`` rule."""
     c = HOST_PLAN_CONSTANTS
+    queue = form == cb.QUEUE_STAGE
+    if queue:
+        served = any(
+            cake_jit.stage_served(
+                cake_jit.record_name("wgrad", out_dtype=name, tile_k=512),
+                cb.QUEUE_STAGE,
+                arch,
+            )
+            for name in DTYPE_NAMES.values()
+        )
+        if not served:
+            return False
+        form = "main_halves"
+    rules = []
+    if queue:
+        rules = [
+            dict(
+                arch=arch,
+                sm_counts=list(range(1, 1025)),
+                stage="main_halves",
+                outputs=["bfloat16", "float32", "accumulate"],
+                groups=[1, 1 << 30],
+            )
+        ]
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "queue_walk", rules)
     halves = form in ("main_halves", "main_wave_halves", "main_halves_k256t")
     wave = form in ("main_wave", "main_wave_halves")
     if halves and arch not in c["k512_release_archs"]:
@@ -378,6 +418,8 @@ def _force_form(monkeypatch, form, arch):
 def _form_ks(form):
     """Reductions ``K`` a 512-wide k tile shape of ``form`` may take."""
     c = HOST_PLAN_CONSTANTS
+    if form == cb.QUEUE_STAGE:
+        form = "main_halves"
     if form in ("main_wave", "main_wave_halves"):
         return [int(c["wave_sync_min_k"]) + 512 * i for i in range(4)]
     if form == "main_halves_k256t":
@@ -821,11 +863,23 @@ def test_bench_and_expert_rows_take_the_measured_fwd_stage(arch):
 
 
 def test_workspace_arguments_of_the_argument_plans():
-    """``sched`` is followed by ``c0``, ``c1``; ``wave_sync`` by ``wave_mode``;
-    ``tail_sums`` by ``tail_tickets``.  The 512-wide k tile's stages take the split
-    tail's slots and tickets and no partials; every other program takes no tail slots."""
-    for program in PROGRAMS.values():
+    """``sched`` is followed by ``c0``, ``c1`` (a queue-walk program's ``sched``, its tile
+    counters, is its last argument before the grid); ``wave_sync`` by ``wave_mode``; ``tail_sums`` by
+    ``tail_tickets``.  The 512-wide k tile's stages take the split tail's slots and
+    tickets and no partials; every other program takes no tail slots."""
+    queue_programs = {
+        stage["program"]
+        for route in ROUTES.values()
+        for stage in route["stages"]
+        if stage["name"].removesuffix(cb.ACC_SUFFIX) == cb.QUEUE_STAGE
+    }
+    for program_name, program in PROGRAMS.items():
         plan = [tuple(item) for item in program["arg_plan"]]
+        if program_name in queue_programs:
+            at = plan.index(("buffer", "sched"))
+            assert all(kind == "grid" for kind, _ in plan[at + 1 :]), program_name
+            assert ("parameter", "c0") not in plan, program_name
+            plan = plan[:at] + plan[at + 1 :]
         for buffer, following in (
             ("sched", [("parameter", "c0"), ("parameter", "c1")]),
             ("wave_sync", [("parameter", "wave_mode")]),
