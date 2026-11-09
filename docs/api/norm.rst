@@ -395,23 +395,23 @@ FlashInfer 2e989556, and against the deterministic package in this release
   (whole waves of 6 CTAs per SM, each CTA at most 2 blocks of 16 rows), the
   long forward (whole waves of 3 CTAs per SM, each CTA at most 6 blocks of
   32 rows), the extra-long forward (the long forward's grid, also prefetching
-  its next block) or the pipelined forward, this package's copy of the
+  its next block), the pipelined forward, this package's copy of the
   deterministic package's forward (128 threads, one CTA per 16-row block
   below 8192 rows per SM, from there whole waves of 6 CTAs per SM, each CTA
   at most 2 blocks; it loads ``x`` and ``z`` with the L2 ``evict_first``
-  policy).  Packed rows on SM100 and SM107 take the module that makes the
-  checkpointed training step (two forwards and the backward) fastest, since
-  where the rows fit in L2 the pipelined forward is faster alone but makes
-  the step slower: on SM100 pipelined up to 85, mid up to 160, long up to
-  400, extra-long up to 520, pipelined up to 6500, mid past it; on SM107 mid
-  up to 175, extra-long up to 350, pipelined up to 10000, mid past it.  The
-  other bands take the module whose forward alone is fastest: packed rows on
-  SM103 pipelined up to 6000, mid up to 8192, pipelined past it; other
-  layouts on SM100 mid up to 140, long up to 400, extra-long up to 1000, mid
-  past it; on SM103 pipelined up to 100, mid up to 250, extra-long up to
-  550, mid past it; on SM107 mid up to 200, extra-long up to 520, mid past
-  it; the plain forward (one 64-thread CTA per 8-row block) is
-  in no band.  Each module's arithmetic is fixed, but the modules associate a
+  policy), or for other layouts the plain forward (one 64-thread CTA per
+  8-row block).  The cuts follow the checkpointed training step (two
+  forwards and the backward), since where the rows fit in L2 the pipelined
+  forward is faster alone but makes the step slower.  Packed rows on SM100:
+  pipelined up to 85, mid up to 160, long up to 400, extra-long up to 520,
+  pipelined up to 6500, mid past it; on SM103 mid up to 240, extra-long up
+  to 600, pipelined up to 6000, mid up to 8192, pipelined past it; on SM107
+  mid up to 175, extra-long up to 280, pipelined past it (where alone it is
+  about 10 % faster and the step at most about 3.5 % slower).  Other layouts
+  on SM100: mid up to 140, long up to 400, extra-long up to 700, the plain
+  forward past it; on SM103 mid up to 250, extra-long up to 700, the plain
+  forward past it; on SM107 mid up to 480, the plain forward past it.  Each
+  module's arithmetic is fixed, but the modules associate a
   row's sum of squares differently (the tiny and the short forward: 8-term
   FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the others:
   16-term chains of 8 lanes folded by 1, 2, 4, on SM107 the pipelined

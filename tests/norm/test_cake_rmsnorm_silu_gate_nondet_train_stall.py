@@ -37,15 +37,15 @@ extra-long forward launch whole waves of 3 CTAs per SM that each walk at most
 6 blocks of 32 rows.  Their bands past the tiny or the short forward's: packed
 rows on SM100 run the pipelined forward up to 85 rows per SM, the mid forward
 up to 160, the long forward up to 400, the extra-long forward up to 520, the
-pipelined forward up to 6500 and the mid forward past it; on SM103 the
-pipelined forward, but from 6001 to 8192 rows per SM the mid forward; on SM107
-the mid forward up to 175, the extra-long forward up to 350, the pipelined
-forward of packed rows up to 10000 and the mid forward past it.  Other layouts
-on SM100 run the mid forward up to 140 rows per SM, the long forward up to
-400, the extra-long forward up to 1000 and the mid forward past it; on SM103
-the pipelined forward up to 100, the mid forward up to 250, the extra-long
-forward up to 550 and the mid forward past it; on SM107 the mid forward up to
-200, the extra-long forward up to 520 and the mid forward past it.
+pipelined forward up to 6500 and the mid forward past it; on SM103 the mid
+forward up to 240, the extra-long forward up to 600, the pipelined forward up
+to 6000, the mid forward up to 8192 and the pipelined forward past it; on
+SM107 the mid forward up to 175, the extra-long forward up to 280 and the
+pipelined forward of packed rows past it.  Other layouts on SM100 run the mid
+forward up to 140 rows per SM, the long forward up to 400, the extra-long
+forward up to 700 and the plain forward past it; on SM103 the mid forward up
+to 250, the extra-long forward up to 700 and the plain forward past it; on
+SM107 the mid forward up to 480 and the plain forward past it.
 
 The backward runs the program of its architecture's ``BACKWARD_BANDS`` band
 of the weight gradient's dtype (a call without a weight gradient takes the
@@ -162,14 +162,13 @@ the gate columns of a wider projection), at the band's first and last rows
 per SM and at the token counts that give the module's CTA slots the fewest
 whole row blocks each past the previous band's end and the most up to its
 band's end, or four times the fewest in the last band, which has no end: the
-mid forward of the strided layout 1 block of 16 rows in its first band and 11
-and 44 in its second on SM100, 2 in its first band and 6 and 24 in its second
-on SM103, 1 and 2 in its first band and 6 and 24 in its second on SM107, of
-packed rows 1 in its first band and 68 and 272 in its second on SM100, 63 and
-85 on SM103, 1 in its first band and 105 and 420 in its second on SM107; the
-long forward 2 and 4 blocks of 32 rows on SM100; the extra-long forward of
-the strided layout 5 and 10 on SM100, 3 and 5 on SM103 and SM107, of packed
-rows 5 on SM100 and 2 and 3 on SM107.  The pipelined forwards by the same
+mid forward of the strided layout 1 block of 16 rows on SM100, 1 and 2 on
+SM103 and 1 and 5 on SM107 (one band each), of packed rows 1 in its first band
+and 68 and 272 in its second on SM100, 1 and 2 in its first band and 63 and 85
+in its second on SM103 and 1 on SM107; the long forward 2 and 4 blocks of 32
+rows on SM100; the extra-long forward of the strided layout 5 and 7 on SM100
+and 3 and 7 on SM103, of packed rows 5 on SM100, 3 and 6 on SM103 and 2 on
+SM107.  The pipelined forwards by the same
 bound, in each of their bands
 at its first and last rows per SM and at the deterministic package's probes
 the band holds: 85 blocks of 16 rows per slot (the most below 8192 rows per
@@ -1274,15 +1273,14 @@ def test_repeatable_backward_band_edges_slow_in_proportion_to_the_sms_held(
 # "band_last"; the last band has no last), at the fewest whole blocks per slot
 # past the previous band's end ("first") and at the most up to the band's end,
 # or four times "first" in the last band, which has no end ("last"): the mid
-# forward of other layouts 1 block per slot in its first band (its fewest
-# and most) and 11 and 44 in its second on SM100, 2 in its first band and 6
-# and 24 in its second on SM103, 1 and 2 in its first band and 6 and 24 in its
-# second on SM107, of packed rows 1 in its first band and 68 and 272 in its
-# second on SM100, 63 and 85 on SM103, 1 in its first band and 105 and 420 in
-# its second on SM107; the long forward 2 and 4 on SM100; the extra-long
-# forward of other layouts 5 and 10 on SM100, 3 and 5 on SM103 and SM107, of
-# packed rows 5 on SM100 and 2 and 3 on SM107.  A probe outside the band
-# skips, and so does a last probe that is the band's first.
+# forward of other layouts 1 block per slot on SM100 (its fewest and most), 1
+# and 2 on SM103 and 1 and 5 on SM107 (one band each), of packed rows 1 in its
+# first band and 68 and 272 in its second on SM100, 1 and 2 in its first band
+# and 63 and 85 in its second on SM103 and 1 on SM107; the long forward 2 and
+# 4 on SM100; the extra-long forward of other layouts 5 and 7 on SM100 and 3
+# and 7 on SM103, of packed rows 5 on SM100, 3 and 6 on SM103 and 2 on SM107.
+# A probe outside the band skips, and so does a last probe that is the band's
+# first.
 FORWARD_EDGES = ("band_first", "first", "last", "band_last")
 FORWARD_LAYOUTS = ("packed", "strided")
 

@@ -181,16 +181,16 @@ Host design (the input layout rules are the deterministic package's):
   the device's SM count, the forward's by the bands of rows per SM of
   ``cake_jit.FORWARD_BANDS`` where ``x`` and ``z`` hold packed rows, row
   ``n`` at element ``128 n``, else of ``cake_jit.STRIDED_FORWARD_BANDS``): a
-  call runs the tiny, the short, the mid, the long, the extra-long or a
-  pipelined forward.  The plain forward (the call role ``fwd``: one
-  64-thread CTA per block of 8 rows) is routed by no band; it stays in
-  ``ROUTES`` because the support query needs every role routed.  The tiny
-  forward (packed rows, up to 38 rows per SM on sm_100a, 36 on sm_103a and
-  65 on sm_107a) launches one 128-thread CTA per block of 8 rows, with the
-  short forward's arithmetic, so the same ``y`` bits; the short forward
-  (other layouts, up to 12 rows per SM on sm_100a and sm_103a, 59 on
-  sm_107a) launches one 256-thread CTA per block of 16 rows; the other
-  forwards a grid whose CTA ``b`` walks the blocks ``b``, ``b + grid``, ...,
+  call runs the tiny, the short, the plain, the mid, the long, the
+  extra-long or a pipelined forward.  The tiny forward (packed rows, up to
+  38 rows per SM on sm_100a, 36 on sm_103a and 65 on sm_107a) launches one
+  128-thread CTA per block of 8 rows, with the short forward's arithmetic,
+  so the same ``y`` bits; the short forward (other layouts, up to 12 rows
+  per SM on sm_100a and sm_103a, 59 on sm_107a) launches one 256-thread CTA
+  per block of 16 rows; the plain forward (the call role ``fwd``; other
+  layouts past 700 rows per SM on sm_100a and sm_103a and past 480 on
+  sm_107a) one 64-thread CTA per block of 8 rows; the other forwards a grid
+  whose CTA ``b`` walks the blocks ``b``, ``b + grid``, ...,
   loading each next block while it computes the current one, in the fewest
   whole waves that give no CTA more than a few blocks (past one wave the
   CTAs are not persistent): the mid forward (6 CTAs per SM, at most 2 blocks
@@ -208,15 +208,15 @@ Host design (the input layout rules are the deterministic package's):
   rows): on sm_100a the pipelined forward up to 85 rows per SM, the mid
   forward up to 160, the long forward up to 400, the extra-long forward up to
   520, the pipelined forward up to 6500 and the mid forward past it; on
-  sm_103a the pipelined forward up to 6000, the mid forward up to 8192 and
-  the pipelined forward past it; on sm_107a the mid forward up to 175, the
-  extra-long forward up to 350, the pipelined forward up to 10000 and the mid
-  forward past it.  Past the short forward's (other layouts): on sm_100a the
-  mid forward up to 140, the long forward up to 400, the extra-long forward up
-  to 1000 and the mid forward past it; on sm_103a the pipelined forward up to
-  100, the mid forward up to 250, the extra-long forward up to 550 and the mid
-  forward past it; on sm_107a the mid forward up to 200, the extra-long
-  forward up to 520 and the mid forward past it.  The forward programs
+  sm_103a the mid forward up to 240, the extra-long forward up to 600, the
+  pipelined forward up to 6000, the mid forward up to 8192 and the pipelined
+  forward past it; on sm_107a the mid forward up to 175, the extra-long
+  forward up to 280 and the pipelined forward past it.  Past the short
+  forward's (other layouts): on sm_100a the mid forward up to 140, the long
+  forward up to 400, the extra-long forward up to 700 and the plain forward
+  past it; on sm_103a the mid forward up to 250, the extra-long forward up to
+  700 and the plain forward past it; on sm_107a the mid forward up to 480 and
+  the plain forward past it.  The forward programs
   associate a row's sum of squares differently (the tiny and the short
   forward: 8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8;
   the sm_107a pipelined forward: four 4-term chains of 8 lanes added in pairs,

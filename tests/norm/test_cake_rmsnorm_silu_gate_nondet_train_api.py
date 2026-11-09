@@ -1995,8 +1995,8 @@ def test_forward_around_its_bands_within_the_deterministic_error(
     forward launches ``module_for_rows``' module: the module of the first
     ``FORWARD_BANDS`` band of the architecture (``STRIDED_FORWARD_BANDS``
     band where the rows are not packed) with ``rows <= last * SMs`` (the
-    tiny, short, pipelined, mid, long and extra-long forwards, each where the
-    architecture's bands name it).  ``y`` repeats bit for bit and lies
+    tiny, short, pipelined, mid, long, extra-long and plain forwards, each
+    where the architecture's bands name it).  ``y`` repeats bit for bit and lies
     within the error budget of the deterministic package's ``y`` and within
     one BF16 ulp of FP64; where a pipelined forward (a deterministic forward
     program with a gate that does not flush) runs, ``y`` is the deterministic
@@ -2967,7 +2967,8 @@ def test_kernel_view_strides(shape, strides, want) -> None:
 # per tensor where the rows are packed, else each thread its own row), whose
 # bits must not depend on the layout either.  The one-head inputs take one
 # row past the start of each one's band (``_start_rows``); a module that no
-# band of this device runs skips.
+# band of this device runs (a forward module: no ``STRIDED_FORWARD_BANDS``
+# band) skips.
 ONE_HEAD_ROUTES = [
     pytest.param("fwd", "fwd_mid", id="fwd_mid"),
     pytest.param("fwd", "fwd_xlong", id="fwd_xlong"),
@@ -3009,6 +3010,9 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
         module for _, module, _, _ in _band_modules(arch, role, sms)
     }:
         pytest.skip(f"no band of {arch} on {sms} SMs runs {band}")
+    strided_bands = {b for _, b in loader.STRIDED_FORWARD_BANDS[arch]}
+    if role == "fwd" and band not in strided_bands:
+        pytest.skip(f"no band of {arch} of other layouts runs {band}")
     strided = role == "fwd"
     rows = _start_rows(arch, name, sms, packed=not strided) + 1
     assert loader.module_for_rows(arch, role, rows, sms, packed=not strided) == name

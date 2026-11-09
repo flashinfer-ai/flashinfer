@@ -59,8 +59,10 @@ the repeatable backward.  The kernels are those of the standalone package
   on SM103 and 65 on SM107, other layouts up to 12 rows per SM on SM100 and
   SM103 (59 on SM107), and past that, in bands of rows per SM, the pipelined
   forwards (builds of the deterministic package's forward program with a
-  gate that does not flush) and forwards whose CTAs each walk several row
-  blocks.  Each forward program's arithmetic is fixed, but the programs
+  gate that does not flush), forwards whose CTAs each walk several row
+  blocks and, for other layouts past 700 rows per SM on SM100 and SM103 (480
+  on SM107), a forward with 8 threads to a row and one CTA per 8-row block.
+  Each forward program's arithmetic is fixed, but the programs
   associate a row's sum of squares differently (the 16-thread forwards:
   8-term FMA chains of 16 lanes folded by XOR shuffles 1, 2, 4, 8; the SM107
   pipelined forward: four 4-term chains of 8 lanes added in pairs, then
@@ -300,7 +302,9 @@ def cake_rmsnorm_silu_gate_nondet_train_forward(
     36 on SM103 and 65 on SM107 where ``x`` and ``z`` hold packed rows (row
     ``n`` at element ``128 n``), up to 12 on SM100 / SM103 (59 on SM107) for
     other layouts, and past that, in bands of rows per SM, the pipelined
-    forwards and forwards whose CTAs each walk several row blocks; the programs associate a row's sum of
+    forwards, forwards whose CTAs each walk several row blocks and (other
+    layouts past 700 rows per SM on SM100 / SM103, 480 on SM107) a forward of
+    one CTA per 8-row block; the programs associate a row's sum of
     squares differently (the row count, the SM count and the layout pick the
     program), so ``y``'s bits can differ between bands.  The forward does not alert under
     ``torch.use_deterministic_algorithms(True)``.

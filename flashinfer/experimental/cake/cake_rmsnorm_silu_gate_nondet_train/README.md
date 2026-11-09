@@ -218,7 +218,7 @@ each program repeats `y` bit for bit for the same inputs on the same device.
 | --- | --- | --- |
 | `fwd_tiny` | forward of packed rows, 128 threads, 16 lanes a row, one CTA per 8-row block (not persistent), the short forward's arithmetic and bits | its band of `FORWARD_BANDS` (packed rows) |
 | `fwd_short` | forward, 256 threads, 16 lanes a row, one CTA per 16-row block (not persistent) | its band of `STRIDED_FORWARD_BANDS` (other layouts) |
-| `fwd` | forward, 64 threads, 8 lanes a row, one CTA per 8-row block | the call role; no forward band routes it (the support query needs every role routed) |
+| `fwd` | plain forward, 64 threads, 8 lanes a row, one CTA per 8-row block (not persistent) | the call role; its band of `STRIDED_FORWARD_BANDS` (other layouts, past the persistent forwards' bands) |
 | `fwd_mid` | whole waves of 6 CTAs per SM (as many waves as the rows need), each CTA at most 2 blocks of 16 rows | its forward bands |
 | `fwd_long` | whole waves of 3 CTAs per SM (as many waves as the rows need), each CTA at most 6 blocks of 32 rows | its forward band (`sm_100a`) |
 | `fwd_xlong` | the long forward's grid, also prefetching the next block with one bulk prefetch | its forward bands |
@@ -262,20 +262,28 @@ The forward bands (rows per SM: a call of `rows` rows on a device of `SMs`
 SMs runs the first band with `rows <= last * SMs`): `FORWARD_BANDS` where `x`
 and `z` hold packed rows (row `n` at element `128 n`, as contiguous
 `[T, H, 128]` and `[T * H, 128]` inputs do) and there are fewer than
-`PACKED_ROWS` (2^24) rows, `STRIDED_FORWARD_BANDS` otherwise.  On `sm_100a`
-and `sm_107a` each band of packed rows runs the program that makes the
-checkpointed training step (two forwards and the backward) fastest there; the
-pipelined forward loads `x` and `z` with the L2 `evict_first` policy, so
-where the rows fit in L2 it is faster alone but makes the step slower.  The
-other bands run the program whose forward alone is fastest, but the tiny and
-the short forward end where beside a kernel holding 16 SMs they still end no
-later than the deterministic package's forward.  The bands:
+`PACKED_ROWS` (2^24) rows, `STRIDED_FORWARD_BANDS` otherwise.  The cuts
+follow the checkpointed training step (two forwards and the backward) on
+every architecture: the pipelined forward loads `x` and `z` with the L2
+`evict_first` policy, so where the rows fit in L2 it is faster alone but
+makes the step slower.  On `sm_103a` the mid forward up to 240 rows per SM
+and the extra-long forward up to 600 make the step 4 % .. 10 % faster than
+the pipelined forward, which alone is at most 4.5 % faster.  On `sm_107a`
+the pipelined forward runs packed rows past 280 rows per SM, where alone it
+is about 10 % faster than the extra-long forward and makes the step at most
+about 3.5 % slower.  Other layouts run the plain forward (`fwd`) past the
+persistent forwards' bands: where measured there (from 1000 rows per SM on
+`sm_100a` and `sm_103a`, from 520 on `sm_107a`) it is the fastest forward
+alone and makes the step 1 % .. 6 % faster; no band of other layouts runs a
+pipelined forward.  The tiny and the short forward end where beside a kernel
+holding 16 SMs they still end no later than the deterministic package's
+forward.  The bands:
 
 | architecture | packed rows (rows per SM) | other layouts (rows per SM) |
 | --- | --- | --- |
-| `sm_100a` | 1-38 `tiny`, 39-85 `pipe`, 86-160 `mid`, 161-400 `long`, 401-520 `xlong`, 521-6500 `pipe`, past 6500 `mid` | 1-12 `short`, 13-140 `mid`, 141-400 `long`, 401-1000 `xlong`, past 1000 `mid` |
-| `sm_103a` | 1-36 `tiny`, 37-6000 `pipe`, 6001-8192 `mid`, past 8192 `pipe` | 1-12 `short`, 13-100 `pipe`, 101-250 `mid`, 251-550 `xlong`, past 550 `mid` |
-| `sm_107a` | 1-65 `tiny`, 66-175 `mid`, 176-350 `xlong`, 351-10000 `pipe_packed`, past 10000 `mid` | 1-59 `short`, 60-200 `mid`, 201-520 `xlong`, past 520 `mid` |
+| `sm_100a` | 1-38 `tiny`, 39-85 `pipe`, 86-160 `mid`, 161-400 `long`, 401-520 `xlong`, 521-6500 `pipe`, past 6500 `mid` | 1-12 `short`, 13-140 `mid`, 141-400 `long`, 401-700 `xlong`, past 700 `fwd` |
+| `sm_103a` | 1-36 `tiny`, 37-240 `mid`, 241-600 `xlong`, 601-6000 `pipe`, 6001-8192 `mid`, past 8192 `pipe` | 1-12 `short`, 13-250 `mid`, 251-700 `xlong`, past 700 `fwd` |
+| `sm_107a` | 1-65 `tiny`, 66-175 `mid`, 176-280 `xlong`, past 280 `pipe_packed` | 1-59 `short`, 60-480 `mid`, past 480 `fwd` |
 
 The backward bands (`BACKWARD_BANDS`, in order: a call of `rows` rows on a
 device of `SMs` SMs runs the first band it fits, a small-row band while
