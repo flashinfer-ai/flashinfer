@@ -621,6 +621,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_927fea695cd92359d999",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_927fea695cd92359d999_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_927fea695cd92359d999_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
         "sources": [
@@ -1355,6 +1367,14 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_90284e378e31f0382475_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
+    },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_927fea695cd92359d999",
+    },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_927fea695cd92359d999",
     },
     "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f_sm_100a": {
         "arch": "sm_100a",
