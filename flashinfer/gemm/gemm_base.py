@@ -10936,7 +10936,10 @@ def gemm_fp8_nt_groupwise(
         ``flashinfer.batch_invariant.fingerprint("gemm_fp8_nt_groupwise", K=,
         out_dtype=)``. Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
-        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
+        instead of falling back; the operator's own problem-size check runs
+        first on this path, as for every backend, and raises ``ValueError``
+        for an operand that is not 2-D, a ``k`` mismatch or an output dtype
+        other than bf16 / fp16. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
 
     Returns
