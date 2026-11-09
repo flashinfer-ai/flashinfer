@@ -214,33 +214,26 @@ def _moe_core_impl(
             permuted_m, inter, dtype=x.dtype, device=x.device
         )
 
-    # Zero the finalize destination (the fused scatter-reduce accumulates into
-    # it). Under CUDA-graph capture the cudaMemsetAsync runs on an aux stream
-    # overlapped with GEMM1, ordered by events after prior main-stream work and
-    # before GEMM2 (Tensor.record_stream is illegal during capture and
-    # redundant here: the join orders later main-stream reuse of moe_output
-    # after the auxiliary-stream write). Eagerly it runs on the main stream
-    # ahead of GEMM1: the fork/join costs more host time than the memset
-    # (a few microseconds of GPU time) saves. Deterministic mode skips the
-    # zeroing: GEMM2 writes each valid (token, slot) route to its own expanded
-    # row and moe_unpermute fully overwrites moe_output.
+    # Zero the finalize destination on an aux stream, overlapped with GEMM1
+    # (the fused scatter-reduce accumulates into it). Events order the zeroing
+    # after prior main-stream work and before GEMM2. Deterministic mode
+    # skips the zeroing: GEMM2 writes each valid (token, slot) route to its
+    # own expanded row and moe_unpermute fully overwrites moe_output.
     if moe_output is None:
         moe_output = torch.empty(num_tokens, hidden, dtype=x.dtype, device=x.device)
     main_stream = torch.cuda.current_stream()
-    memset_event = None
     if use_fused_finalize:
-        if torch.cuda.is_current_stream_capturing():
-            aux_stream, main_event, memset_event = _get_cuda_graph_resources()
-            main_event.record(main_stream)
-            with torch.cuda.stream(aux_stream):
-                aux_stream.wait_event(main_event)
-                moe_output_memset_inplace(moe_output)
-                memset_event.record(aux_stream)
-        else:
-            if _cuda_graph_resources is None:
-                # Create the capture-path stream and events outside capture.
-                _get_cuda_graph_resources()
+        aux_stream, main_event, memset_event = _get_cuda_graph_resources()
+        # Fork/join via events only. Tensor.record_stream is illegal during
+        # CUDA-graph capture and redundant here: the join orders later
+        # main-stream reuse of moe_output after the auxiliary-stream write.
+        main_event.record(main_stream)
+        with torch.cuda.stream(aux_stream):
+            aux_stream.wait_event(main_event)
+            # cudaMemsetAsync via the C++ binding avoids a tensor-operation
+            # launch for the destination initialization.
             moe_output_memset_inplace(moe_output)
+            memset_event.record(aux_stream)
 
     intermediate = sm90_contiguous_gather_grouped_gemm_act_fusion(
         x,
@@ -265,9 +258,8 @@ def _moe_core_impl(
     )
 
     if use_fused_finalize:
-        if memset_event is not None:
-            # The zeroing must complete before the finalize scatter-reduce.
-            main_stream.wait_event(memset_event)
+        # The zeroing must complete before the finalize scatter-reduce.
+        main_stream.wait_event(memset_event)
         gemm2_output = moe_output
     else:
         # Deterministic path: unscaled expert rows in expanded

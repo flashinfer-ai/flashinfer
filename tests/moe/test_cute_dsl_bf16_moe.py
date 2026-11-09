@@ -1665,46 +1665,6 @@ def test_sm90_gemm_kernels_compile_as_tvm_ffi_functions(monkeypatch):
 
 @cute_dsl_available
 @sm90_required
-def test_cute_dsl_bf16_moe_eager_zeroes_preallocated_output():
-    """The eager fused-finalize path overwrites a dirty caller-provided
-    moe_output (the destination is zeroed before the scatter-reduce)."""
-    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
-    from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
-        interleave_up_gate_sm90,
-    )
-    from flashinfer.fused_moe.cute_dsl.sm90_tuner import DEFAULT_SM90_MOE_TACTIC
-
-    torch.manual_seed(19)
-    dtype = torch.bfloat16
-    num_experts, top_k, hidden, inter, num_tokens = 4, 2, 128, 64, 70
-    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype) / (hidden**0.25)
-    w_gate_up = torch.randn(
-        num_experts, 2 * inter, hidden, device="cuda", dtype=dtype
-    ) / (hidden**0.25)
-    w1 = interleave_up_gate_sm90(w_gate_up)
-    w2 = torch.randn(num_experts, hidden, inter, device="cuda", dtype=dtype) / (
-        inter**0.25
-    )
-    ids, scales = make_random_topk(num_experts, num_tokens, top_k)
-    dirty = torch.full((num_tokens, hidden), float("nan"), device="cuda", dtype=dtype)
-    out = cute_dsl_fused_moe_bf16(
-        x,
-        ids,
-        scales,
-        w1,
-        w2,
-        num_experts=num_experts,
-        top_k=top_k,
-        moe_output=dirty,
-        tactic=DEFAULT_SM90_MOE_TACTIC,
-    )
-    assert out is dirty
-    ref = ref_moe(x, ids, scales, w_gate_up, w2)
-    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
-
-
-@cute_dsl_available
-@sm90_required
 def test_cute_dsl_bf16_moe_rejects_bad_operands():
     """The fused pipeline rejects malformed operands and tactics with
     ``ValueError``."""

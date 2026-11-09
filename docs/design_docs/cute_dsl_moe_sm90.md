@@ -58,14 +58,12 @@ Properties:
   masked by `mn_limit` exactly where they would escape (GEMM2's scatter).
 
 Host-side stream choreography (fused mode): the finalize accumulates into
-`out`, so the host zeroes it first (`moe_output_memset_inplace`, a
-`cudaMemsetAsync` binding — cheaper to launch than `Tensor.zero_`). Under
-CUDA-graph capture the memset runs on an aux stream overlapped with GEMM1,
-with event fork-join only (`main_event` -> aux memset -> `memset_event` ->
-main waits before GEMM2); no `Tensor.record_stream` — it is illegal under
-capture and redundant given the event join. Eagerly the memset runs on the
-main stream ahead of GEMM1: the fork-join costs more host time than the
-few microseconds of GPU time the overlap saves.
+`out`, so the host zeroes it on an aux stream overlapped with GEMM1
+(`moe_output_memset_inplace`, a `cudaMemsetAsync` binding — cheaper to
+launch than `Tensor.zero_`), with event fork-join only (`main_event` ->
+aux memset -> `memset_event` -> main waits before GEMM2). No
+`Tensor.record_stream` — it is illegal under CUDA-graph capture and
+redundant given the event join.
 
 **PDL** (`enable_pdl`, default on) allows dependent kernel setup to overlap
 its predecessor's tail. GEMM1 signals dependents after its epilogue and
