@@ -273,6 +273,10 @@ def test_kimi_k3_public_eager_graph_and_masks(kind, wire):
                 ):
                     with pytest.raises(ValueError, match="Kimi output"):
                         layer.compute_staged(output=invalid_output)
+                    with pytest.raises(ValueError):
+                        layer(
+                            replace(tensors, output=invalid_output), workspace=workspace
+                        )
             staged_output = torch.full(
                 (tokens + 2, HIDDEN), -123.0, dtype=torch.bfloat16, device="cuda"
             )

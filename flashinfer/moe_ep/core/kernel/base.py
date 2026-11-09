@@ -403,6 +403,20 @@ class MegaKernelBackend(ABC):
         zero-copy view of the workspace output, valid under stream ordering
         until the next launch on this session's buffers."""
 
+    def _compute_prepared(
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+        *,
+        output: "torch.Tensor | None",
+    ) -> "torch.Tensor":
+        """Execute immediately after the layer validates and stages a forward.
+
+        Backends may omit checks already covered by that path. Public staged
+        execution continues through ``compute``.
+        """
+        return self.compute(workspace, transformed_weights, output=output)
+
     def compute_unfinalized(
         self,
         workspace: Any,

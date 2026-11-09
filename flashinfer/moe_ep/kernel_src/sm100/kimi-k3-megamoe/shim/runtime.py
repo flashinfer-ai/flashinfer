@@ -375,6 +375,11 @@ class KimiWorkspace:
                 f"on {self.device} with shape [rows >= {live}, "
                 f"{self.fleet_params.token_hidden_size}]"
             )
+        return self._compute(transformed_weights, output=output)
+
+    def _compute(self, transformed_weights, *, output):
+        """Execute with staged inputs and a validated or internally allocated output."""
+        live = self._live
         destination = self.output if output is None or live == 0 else output
         weights = transformed_weights
         stream = torch.cuda.current_stream()

@@ -82,6 +82,44 @@ def test_staged_compute_accepts_valid_output(staged_layer, rows):
         staged_layer.compute_staged(output=output)
 
 
+@pytest.mark.parametrize("caller_output", [False, True])
+def test_forward_does_not_recheck_prepared_output(
+    staged_layer, monkeypatch, caller_output
+):
+    layer = staged_layer
+    workspace, backend = layer._staged_workspace, layer._staged_kernel
+    layer._kernel = backend
+    layer._fleet_params = workspace.fleet_params
+    layer._destroyed = False
+    tensors = moe_ep.MoEEpTensors(
+        torch.empty(2, HIDDEN, dtype=torch.bfloat16),
+        torch.zeros(2, 16, dtype=torch.int32),
+        torch.ones(2, 16),
+        output=torch.empty(2, HIDDEN, dtype=torch.bfloat16) if caller_output else None,
+    )
+    monkeypatch.setattr(
+        layer,
+        "_prepare_inputs",
+        lambda *a, **kw: (
+            workspace.fleet_params,
+            workspace,
+            backend,
+            True,
+            layer._staged_transformed,
+        ),
+    )
+    monkeypatch.setattr(backend, "stage_inputs", mock.Mock())
+    checked = mock.Mock(side_effect=AssertionError("output was checked again"))
+    monkeypatch.setattr(workspace, "compute", checked)
+    monkeypatch.setattr(workspace, "_compute", lambda weights, *, output: output)
+    output = layer(tensors)
+    assert output.shape == (2, HIDDEN) and output.dtype == torch.bfloat16
+    if caller_output:
+        assert output is tensors.output
+    backend.stage_inputs.assert_called_once()
+    checked.assert_not_called()
+
+
 @pytest.mark.parametrize("wire", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("batches", [(5, 1), (1, 5), (32, 1)])
 def test_mx_rejects_oversized_async_batches(runtime, wire, batches):
