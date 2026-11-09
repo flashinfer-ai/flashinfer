@@ -331,6 +331,8 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
     mn_limit_ptr = tile_idx_to_mn_limit.data_ptr()
     token_id_ptr = token_id_mapping.data_ptr()
     num_tiles_ptr = num_non_exiting_tiles.data_ptr()
+    if (a_ptr | b_ptr | c_ptr) % 16:
+        raise ValueError("x, w1_weight and out must be 16-byte aligned")
     stream = torch.cuda.current_stream(x.device).cuda_stream
 
     compiled = _get_compiled_gather_kernel(

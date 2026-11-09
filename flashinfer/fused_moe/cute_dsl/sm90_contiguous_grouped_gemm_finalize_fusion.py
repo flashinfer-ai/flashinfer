@@ -201,6 +201,8 @@ def sm90_contiguous_grouped_gemm_finalize_fusion(
     token_id_ptr = permuted_idx_to_expanded_idx.data_ptr()
     num_tiles_ptr = num_non_exiting_tiles.data_ptr()
     token_scales_ptr = token_final_scales.data_ptr()
+    if (a_ptr | b_ptr | out_ptr) % 16:
+        raise ValueError("a, w2_weight and out must be 16-byte aligned")
     stream = torch.cuda.current_stream(a.device).cuda_stream
 
     compiled = _get_compiled_finalize_kernel(

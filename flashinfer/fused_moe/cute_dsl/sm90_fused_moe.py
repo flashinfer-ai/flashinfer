@@ -169,6 +169,9 @@ def _moe_core_impl(
         raise ValueError(
             f"cute_dsl_fused_moe_bf16 requires SM90 (Hopper). Got SM{major}{minor}."
         )
+    if token_final_scales.dtype != torch.float32:
+        # moe_sort reads the scales as float32.
+        raise ValueError("token_final_scales must be float32")
 
     num_tokens, hidden = x.shape
 

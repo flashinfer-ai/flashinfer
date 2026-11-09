@@ -1707,7 +1707,7 @@ def test_cute_dsl_bf16_moe_eager_zeroes_preallocated_output():
 @sm90_required
 def test_cute_dsl_bf16_moe_rejects_bad_operands():
     """The fused pipeline rejects malformed operands and tactics with
-    ``ValueError`` before the GEMM launches."""
+    ``ValueError``."""
     from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
     from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
         interleave_up_gate_sm90,
@@ -1755,3 +1755,13 @@ def test_cute_dsl_bf16_moe_rejects_bad_operands():
         run(tactic=(128, ((128, 64), 0), ((128, 64), (1, 1), False)))
     with pytest.raises(ValueError, match="cannot implement"):
         run(tactic=(128, ((128, 64), 1), ((128, 64), (2, 2), False)))
+
+    def misaligned(rows, cols):  # contiguous, 2 bytes past a 16-byte boundary
+        buf = torch.empty(rows * cols + 1, device="cuda", dtype=dtype)
+        return buf[1:].view(rows, cols)
+
+    # The kernels are already compiled, so this checks the cached launch path.
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        run(x=misaligned(num_tokens, hidden))
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        run(moe_output=misaligned(num_tokens, hidden))
