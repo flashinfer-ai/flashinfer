@@ -513,16 +513,20 @@ template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
     cudaStream_t stream, bool enable_pdl);
 #endif
 
-// One block per expanded row. Reads the layout nvfp4QuantAndPerTokenScaleKernel writes:
+// One warp per expanded row. Reads the layout nvfp4QuantAndPerTokenScaleKernel writes:
 // n / 2 bytes of packed E2M1 and n / 16 E4M3 scales per permuted row.
 template <QuantizationSFLayout SF_LAYOUT>
-__global__ void nvfp4PermutedRowsToExpandedKernel(uint32_t n,
+__global__ void nvfp4PermutedRowsToExpandedKernel(uint32_t m, uint32_t n,
                                                   int32_t const* expandedIdxToPermutedIdx,
                                                   uint8_t const* weight, uint8_t const* scale,
                                                   float const* perTokenScale, uint8_t* weightOut,
                                                   uint8_t* scaleOut, float* perTokenScaleOut) {
   constexpr uint32_t SF_VEC_SIZE = 16;
-  int64_t const expandedIdx = blockIdx.x;
+  uint32_t const lane = threadIdx.x % 32;
+  int64_t const expandedIdx = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  if (expandedIdx >= m) {
+    return;
+  }
   int32_t const permutedIdx = expandedIdxToPermutedIdx[expandedIdx];
   bool const valid = permutedIdx >= 0;
   // One scale block covers 16 elements, i.e. one 8-byte word of packed E2M1.
@@ -530,7 +534,7 @@ __global__ void nvfp4PermutedRowsToExpandedKernel(uint32_t n,
   auto* dst = reinterpret_cast<uint2*>(weightOut) + expandedIdx * numVecs;
   auto const* src =
       reinterpret_cast<uint2 const*>(weight) + int64_t(valid ? permutedIdx : 0) * numVecs;
-  for (uint32_t vecIdx = threadIdx.x; vecIdx < numVecs; vecIdx += blockDim.x) {
+  for (uint32_t vecIdx = lane; vecIdx < numVecs; vecIdx += 32) {
     uint8_t sf = 0;
     if (valid) {
       int64_t sfOffset;
@@ -546,7 +550,7 @@ __global__ void nvfp4PermutedRowsToExpandedKernel(uint32_t n,
     dst[vecIdx] = valid ? src[vecIdx] : make_uint2(0, 0);
     scaleOut[expandedIdx * numVecs + vecIdx] = sf;
   }
-  if (threadIdx.x == 0) {
+  if (lane == 0) {
     perTokenScaleOut[expandedIdx] = valid ? perTokenScale[permutedIdx] : 0.f;
   }
 }
@@ -563,9 +567,11 @@ void invokeNvfp4PermutedRowsToExpanded(uint32_t m, uint32_t n,
   }
   dispatchSFLayout(sfLayout, [&](auto sfLayoutTag) {
     constexpr QuantizationSFLayout SF_LAYOUT = decltype(sfLayoutTag)::value;
+    constexpr uint32_t kRowsPerBlock = 8;
     nvfp4PermutedRowsToExpandedKernel<SF_LAYOUT>
-        <<<m, 128, 0, stream>>>(n, expandedIdxToPermutedIdx, weight, scale, perTokenScale,
-                                weightOut, scaleOut, perTokenScaleOut);
+        <<<(m + kRowsPerBlock - 1) / kRowsPerBlock, kRowsPerBlock * 32, 0, stream>>>(
+            m, n, expandedIdxToPermutedIdx, weight, scale, perTokenScale, weightOut, scaleOut,
+            perTokenScaleOut);
   });
 }
 
