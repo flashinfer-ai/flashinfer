@@ -19,7 +19,9 @@ the KCP programs.  Each backward program ships twice: the cooperative build (rou
 build (route ``kcp_bwd_split``, FlashInfer issue #8365, built with ``pair=True``: the token arithmetic on packed
 ``f32x2`` channel pairs), an ordinary launch one SM short of co-resident (``reserve_sms``) whose ``dweight`` partial
 rows the zero-history package's fixed-order reduce program sums.  The tail-row program (route ``kcp_bwd_halo``) of the
-overlapped backward is a route of its own, outside ``KINDS``.  No device is needed; nothing is built or launched.
+overlapped backward and the history-row program (route ``kcp_fwd_halo``) of the two-launch forward are routes of their
+own, outside ``KINDS``; the two-launch forward's single-rank main program is the zero-history registry's ``fwd`` route.
+No device is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
@@ -45,6 +47,8 @@ BWD = f"tart.causal_conv1d_kcp_bwd_bf16_silu.{_W}.causal_conv1d_kcp_bwd"
 HEAD = f"tart.causal_conv1d_kcp_bwd_bf16_silu.{_W}.causal_conv1d_kcp_bwd_head"
 # the tail-row program's identity: its kernel's key, with no build keyword
 HALO = "causal_conv1d_kcp_bwd_bf16_silu/causal_conv1d_kcp_bwd_halo"
+# the history-row program's identity, likewise
+FWD_HALO = "causal_conv1d_kcp_fwd_bf16_silu/causal_conv1d_kcp_fwd_halo"
 
 FWD_PLAN = [
     ["buffer", "x"], ["buffer", "w"], ["buffer", "cu"], ["buffer", "y"], ["buffer", "hist"], ["buffer", "hist_row_off"],
@@ -78,6 +82,10 @@ HALO_PLAN = [
     ["buffer", "hist_row_off"], ["buffer", "dpre_tail"], ["buffer", "tail_row_off"], ["parameter", "C"],
     ["parameter", "num_docs"], *GRID,
 ]  # fmt: skip
+FWD_HALO_PLAN = [
+    ["buffer", "x"], ["buffer", "w"], ["buffer", "cu"], ["buffer", "y"], ["buffer", "hist"], ["buffer", "hist_row_off"],
+    ["parameter", "C"], ["parameter", "num_docs"], *GRID,
+]  # fmt: skip
 
 REDUCE = "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5"
 FALLBACK = "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp"
@@ -89,6 +97,7 @@ SPLIT_BIG = "cake_causal_conv1d_det_train_7403791c52dfad8697ca_kcp"
 # sm_107a's big-channel split program: SPLIT_BIG's build with its stage's tokens in two rolled passes
 SPLIT_BIG_ROLL = "cake_causal_conv1d_det_train_8225ee9b6f8caea425da_kcp"
 TAIL = "cake_causal_conv1d_det_train_ae0c093e1e0ac46aec3f_kcp"
+REPAIR = "cake_causal_conv1d_det_train_138311f76132280b1e94_kcp"
 BWD_ROLES = ("kcp_bwd", "kcp_bwd_split")
 
 # program name -> (module, build keywords, arches, role, plan, ctas_per_sm)
@@ -181,6 +190,7 @@ PROGRAMS = {
         5,
     ),
     TAIL: (HALO, {}, ARCHES, "kcp_bwd_halo", HALO_PLAN, 5),
+    REPAIR: (FWD_HALO, {}, ARCHES, "kcp_fwd_halo", FWD_HALO_PLAN, 5),
 }
 BIG_C_MIN = {"sm_100a": 512, "sm_103a": 512, "sm_107a": 1024}
 
@@ -253,9 +263,11 @@ def test_routes_and_selection() -> None:
         "kcp_bwd_split",
         "kcp_bwd_head",
         "kcp_bwd_halo",
+        "kcp_fwd_halo",
     )
     assert kcp_jit.HALO_KIND == "kcp_bwd_halo"
     assert kcp_jit.HALO_KIND not in kcp_jit.KINDS
+    assert "kcp_fwd_halo" not in kcp_jit.KINDS
     assert kcp_jit.BWD_KINDS == BWD_ROLES
     for arch in ARCHES:
         routes = kcp_jit.ROUTES[arch]
@@ -268,6 +280,8 @@ def test_routes_and_selection() -> None:
         ]
         assert routes["kcp_bwd_halo"] == [TAIL]
         assert kcp_jit.selected_modules(arch, "kcp_bwd_halo", C=8192) == (TAIL,)
+        assert routes["kcp_fwd_halo"] == [REPAIR]
+        assert kcp_jit.selected_modules(arch, "kcp_fwd_halo", C=8192) == (REPAIR,)
         for kind, fallback, big in (
             ("kcp_bwd", R200_FALLBACK if arch == "sm_107a" else FALLBACK, BIG),
             (
@@ -302,6 +316,10 @@ def test_routes_and_selection() -> None:
     tail = kcp_jit.MODULES[TAIL]
     assert tail["grid_rule"]["geometry"] == head["grid_rule"]["geometry"]
     assert kcp_jit.head_grid(tail, n_frag=3, C=10240) == (3 * 10, 1, 1)
+    # the history-row program: the same rule
+    repair = kcp_jit.MODULES[REPAIR]
+    assert repair["grid_rule"]["geometry"] == head["grid_rule"]["geometry"]
+    assert kcp_jit.head_grid(repair, n_frag=3, C=10240) == (3 * 10, 1, 1)
 
 
 @pytest.mark.cpu_only
@@ -410,3 +428,34 @@ def test_forward_launches_one_sm_short(monkeypatch) -> None:
             kcp._forward_grid(record, device_index=0, C=0, n_ch_tiles=one_sm[0] + 1)
         seen.add(name)
     assert seen, "no kcp_fwd program in the table"
+
+
+@pytest.mark.cpu_only
+def test_two_launch_forward_programs() -> None:
+    """The two-launch forward's programs (``kcp`` module docstring): the history-row program is the ``kcp_fwd_halo``
+    route's one record and takes the arguments the host passes (``kcp._fwd_repair``); the single-rank main program is
+    a record of the zero-history registry's ``fwd`` route (``kcp.FWD_MAIN_ROUTE``) on every architecture, each record
+    of that route takes only ``x``, ``w``, ``cu``, ``y``, its ``work`` counters (``tile_counters``) and the plan
+    scalars (``kcp._fwd_main``), and launches the co-resident grid (no reserved SM), so the host can launch whichever
+    record ``cake_jit.selected_modules`` picks for the call's ``C`` and token count."""
+
+    kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
+    assert kcp.KCP_FWD_HALO == "kcp_fwd_halo" and kcp.FWD_MAIN_ROUTE == "fwd"
+    passed = {"x", "w", "cu", "y", "hist", "hist_row_off", "C", "num_docs"}
+    assert set(kcp_jit.MODULES[REPAIR]["logical"].values()) == passed
+    main_values = {"x", "w", "cu", "y", "work", *cake_jit.PLAN_SCALARS}
+    for arch in ARCHES:
+        assert kcp_jit.route_modules(arch, kcp.KCP_FWD_HALO) == (REPAIR,)
+        names = cake_jit.route_modules(arch, kcp.FWD_MAIN_ROUTE)
+        assert names, arch
+        for name in names:
+            record = cake_jit.MODULES[name]
+            assert record["role"] == "fwd" and arch in record["arches"], (arch, name)
+            assert set(record["logical"].values()) <= main_values, (arch, name)
+            assert record["workspace_rule"]["kind"] == "tile_counters", (arch, name)
+            assert record["grid_rule"]["kind"] == "co_resident", (arch, name)
+            assert "reserve_sms" not in record["grid_rule"], (arch, name)
+            assert not record["grid_rule"]["cooperative"], (arch, name)
+        for C, S in ((256, 1), (256, 65536), (2048, 1), (8192, 32768), (10240, 32768)):
+            (name,) = cake_jit.selected_modules(arch, kcp.FWD_MAIN_ROUTE, C=C, S=S)
+            assert name in names, (arch, C, S)
