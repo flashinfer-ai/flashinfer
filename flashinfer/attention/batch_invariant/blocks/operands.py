@@ -33,7 +33,7 @@ from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, OperandSource
 
 from ..plan import om_in_tmem as _om_in_tmem
 from ..plan import ws_row
-from ..spec import MMA_K, TILE_KEYS, tiles_per_chunk
+from ..spec import KV_FMTS, MMA_K, TILE_KEYS, tiles_per_chunk
 
 ACC_DTYPE = cutlass.Float32
 IN_DTYPE = cutlass.BFloat16
@@ -104,6 +104,9 @@ STATS_SLOTS_PP = 8  # the same ring under the ping-pong placement: 2 entries per
 SLOT_KEYS_256 = 64  # keys per ring slot at D = 256 (half tiles: 32 KB slots, four of them in the 128 KB ring)
 Q_STAGES = 2  # Q tiles in smem: the load warp prefetches the next unit's Q while the MMA finishes this one
 REGS_SOFTMAX, REGS_OTHER = 192, 32
+REGS_CONVERT = 96  # the last warpgroup's budget in the fp8-KV kernels: the load warp and the two otherwise idle warps convert the
+# low-bit K / V tiles into the bf16 ring (blocks/convert.py), which takes more than the 32 registers of a TMA issuer; the MMA warp
+# shares the warpgroup's setting. One softmax warpgroup only: 192 x 128 + 208 x 128 + 96 x 128 <= 65536 at every D
 
 
 class Roles:
@@ -112,14 +115,21 @@ class Roles:
     their TMEM lanes), then the correction warpgroup, then MMA, load and empty warps completing the last
     warpgroup. Register budget: 65536 = 192 x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
 
-    def __init__(self, n_wg: int, D: int = 128):
+    def __init__(self, n_wg: int, D: int = 128, lowbit: bool = False):
         assert n_wg in (1, 2), n_wg
+        assert not (lowbit and n_wg != 1), (
+            "the fp8-KV kernels run one softmax warpgroup"
+        )
         self.n_wg = n_wg
         self.softmax_warps = tuple(range(4 * n_wg))
         self.correction_warps = tuple(range(4 * n_wg, 4 * n_wg + 4))
         self.mma_warp = 4 * n_wg + 4
         self.load_warp = self.mma_warp + 1
         self.empty_warps = tuple(range(self.mma_warp + 2, self.mma_warp + 4))
+        # the fp8-KV kernels: the load warp and the two empty warps form the conversion stage (96 threads)
+        self.convert_warps = (self.load_warp,) + self.empty_warps
+        self.convert_threads = 32 * len(self.convert_warps)
+        self.regs_other = REGS_CONVERT if lowbit else REGS_OTHER
         self.threads = 32 * (self.mma_warp + 4)
         # the correction warpgroup: 96 with two softmax warpgroups, 128 at D <= 128, 208 when the chunk merge runs through the global scratch
         # (MERGE_DEPTH O_m pieces in flight); the launch allocates 65536 / threads (168 at 384 threads) and the roles move above or below it
@@ -127,9 +137,11 @@ class Roles:
         self.n_tmem_users = 32 * (4 * n_wg + 4 + 1)
         self.regs_launch = (65536 // self.threads) // 8 * 8
         assert (
-            REGS_SOFTMAX * 128 * n_wg + self.regs_correction * 128 + REGS_OTHER * 32 * 4
+            REGS_SOFTMAX * 128 * n_wg
+            + self.regs_correction * 128
+            + self.regs_other * 32 * 4
             <= 65536
-        ), (n_wg, self.regs_correction)
+        ), (n_wg, self.regs_correction, self.regs_other)
 
 
 class StaticPlan:
@@ -144,8 +156,21 @@ class StaticPlan:
         n_wg: int = 1,
         q2: bool = False,
         ragged: bool = False,
+        kv_fmt: str = "bf16",
     ):
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
+        # kv_fmt: the K / V cache format. "bf16": the TMA producer fills the ring. "e4m3" / "e5m2": the cache is one byte per element
+        # (viewed as uint8), and the conversion stage (blocks/convert.py: the load warp and the two empty warps) reads the fp8 tiles
+        # from global memory, widens them to bf16 exactly and writes the SAME ring bytes the TMA would have written for a bf16 cache
+        # holding those values -- the MMAs, the softmax and the correction are the bf16 body's, untouched. One softmax warpgroup, no
+        # pairing (the conversion stage takes the second warpgroup's register budget).
+        # "nvfp4": the cache is packed e2m1 nibbles ((D / 2, page, Hkv, num_pages) bytes) with one e4m3 block scale per 16 elements
+        # ((D / 16, page, Hkv, num_pages) bytes); the conversion stage forms the exact products in bf16
+        assert kv_fmt in KV_FMTS, kv_fmt
+        self.kv_fmt = kv_fmt
+        self.lowbit = kv_fmt != "bf16"
+        self.fp4 = kv_fmt == "nvfp4"
+        assert not self.lowbit or (n_wg == 1 and not q2), (kv_fmt, n_wg, q2)
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
         # the SM; the MMA warp issues both tiles' folds off one K / V stream; the correction warpgroup steps both tiles' statistics, A then B
@@ -172,7 +197,7 @@ class StaticPlan:
             D,
         )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
-        self.roles = Roles(n_wg, D)
+        self.roles = Roles(n_wg, D, self.lowbit)
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (
@@ -454,6 +479,12 @@ class TmaSetup:
         self.atom_q_rep, self.tensor_q_rep = cpasync.make_tiled_tma_atom(
             op, mQ, st.q_slab_rep_layout, st.q_box_rep
         )
+        if st.lowbit:
+            # the fp8 tiles are read by the conversion stage with plain loads: no K / V TMA. The kernel's K / V atom slots carry the Q
+            # atom (unused) and its tensor slots the raw (uint8) caches
+            self.atom_k, self.tensor_k = self.atom_q, mK
+            self.atom_v, self.tensor_v = self.atom_q, mV
+            return
         self.atom_k, self.tensor_k = cpasync.make_tiled_tma_atom(
             op, mK, st.kv_slab_layout, (HALF, st.box_rows, 1, 1)
         )

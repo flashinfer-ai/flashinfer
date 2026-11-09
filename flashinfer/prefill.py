@@ -3026,8 +3026,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            requires ``backend="auto"``. The KV cache is bf16 (the class ``attention.bf16``), fp8 (``kv_data_type``
+            ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
+            with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
+            key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
+            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` in
+            the linear layout plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf). Inputs
+            outside the classes (q / o dtypes other than bf16, per-(token, head)-scaled caches, ``q_scale``, head dims other than
+            64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
@@ -5727,8 +5733,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            requires ``backend="auto"``. The KV cache is bf16 (the class ``attention.bf16``), fp8 (``kv_data_type``
+            ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
+            with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
+            key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
+            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` in
+            the linear layout plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf). Inputs
+            outside the classes (q / o dtypes other than bf16, per-(token, head)-scaled caches, ``q_scale``, head dims other than
+            64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests

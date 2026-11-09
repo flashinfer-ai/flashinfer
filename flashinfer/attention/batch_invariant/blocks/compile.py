@@ -1,7 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the attention kernel: one TVM-FFI object per static tuple ``(D, g, page,
-kv_slots, n_wg, q2)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
+kv_slots, n_wg, q2, ragged, kv_fmt)`` with dynamic shapes, strides, page table, work units and scales; cache module
+``batch_invariant_attention``. ``kv_fmt`` ``"bf16"`` is the bf16 class's kernel; ``"e4m3"`` / ``"e5m2"`` the fp8-KV kernels, whose
+K / V operands are the fp8 caches viewed as bytes (``(D, page, Hkv, num_pages)`` uint8, 16-byte-aligned strides) and which take
+the value scale ``vs``.
 
 Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer-shaped tensors):
 Q as ``(D, Hq, total_q)`` (strides ``(1, D, Hq*D)`` for a packed ``(total_q, Hq, D)`` tensor), K and V as
@@ -32,11 +35,13 @@ def kernel_name(
     n_wg: int = 1,
     q2: bool = False,
     ragged: bool = False,
+    kv_fmt: str = "bf16",
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_d{D}_g{g}_p{page}_s{kv_slots}_w{n_wg}"
         + ("_q2" if q2 else "")
         + ("_rg" if ragged else "")
+        + ("" if kv_fmt == "bf16" else f"_kv{kv_fmt}")
     )
 
 
@@ -49,11 +54,21 @@ def get_compiled_attention(
     n_wg: int = 1,
     q2: bool = False,
     ragged: bool = False,
+    kv_fmt: str = "bf16",
 ):
-    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged)
+    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged, kv_fmt)
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
+        lowbit = kv_fmt != "bf16"
+        fp4 = kv_fmt == "nvfp4"
+        kv_dtype = cutlass.Uint8 if lowbit else bf16
+        kv_div = (
+            16 if lowbit else 8
+        )  # outer strides: 16-byte multiples in either element size
+        kv_d = (
+            D // 2 if fp4 else D
+        )  # the cache row: D bf16 or fp8 elements, or D / 2 packed bytes
         s_hq, s_tq, s_npages, s_nunits, s_hkv = (cute.sym_int(32) for _ in range(5))
         s_ws = (
             cute.sym_int64()
@@ -69,27 +84,48 @@ def get_compiled_attention(
             cute.sym_int(32) if ragged else page
         )  # the ragged pool: one page of total_kv (dynamic) tokens
         k_fake = cute.runtime.make_fake_tensor(
-            bf16,
-            (D, kv_tok, s_hkv, s_npages),
+            kv_dtype,
+            (kv_d, kv_tok, s_hkv, s_npages),
             (
                 1,
-                cute.sym_int64(divisibility=8),
-                cute.sym_int64(divisibility=8),
-                cute.sym_int64(divisibility=8),
+                cute.sym_int64(divisibility=kv_div),
+                cute.sym_int64(divisibility=kv_div),
+                cute.sym_int64(divisibility=kv_div),
             ),
             assumed_align=16,
         )
         v_fake = cute.runtime.make_fake_tensor(
-            bf16,
-            (D, kv_tok, s_hkv, s_npages),
+            kv_dtype,
+            (kv_d, kv_tok, s_hkv, s_npages),
             (
                 1,
-                cute.sym_int64(divisibility=8),
-                cute.sym_int64(divisibility=8),
-                cute.sym_int64(divisibility=8),
+                cute.sym_int64(divisibility=kv_div),
+                cute.sym_int64(divisibility=kv_div),
+                cute.sym_int64(divisibility=kv_div),
             ),
             assumed_align=16,
         )
+        if fp4:
+            # the NVFP4 block scales: one byte per 16 elements, the cache's geometry, byte loads (no stride constraint)
+            ksf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                (D // 16, kv_tok, s_hkv, s_npages),
+                (1, cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=1,
+            )
+            vsf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                (D // 16, kv_tok, s_hkv, s_npages),
+                (1, cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=1,
+            )
+        else:
+            ksf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8, (cute.sym_int(32),), (1,), assumed_align=1
+            )
+            vsf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8, (cute.sym_int(32),), (1,), assumed_align=1
+            )
         o_fake = cute.runtime.make_fake_tensor(
             bf16,
             (cute.sym_int(32), D),
@@ -116,12 +152,14 @@ def get_compiled_attention(
             i32, (s_nidx,), (1,), assumed_align=4
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        k = AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged)
+        k = AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged, kv_fmt)
         return cute.compile(
             k,
             q_fake,
             k_fake,
             v_fake,
+            ksf_fake,
+            vsf_fake,
             o_fake,
             ws_fake,
             scratch_fake,
@@ -132,6 +170,7 @@ def get_compiled_attention(
             indices_fake,
             cutlass.Float32(1.0),
             cutlass.Float32(-1.0),
+            cutlass.Float32(1.0),
             cutlass.Int32(-1),
             cutlass.Int32(1),
             cutlass.Int32(1),

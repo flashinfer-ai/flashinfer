@@ -462,6 +462,7 @@ class SwapsKernel:
                     mDesc[(u, F_GROUP)],
                     c,
                     nc,
+                    Float32(1.0),  # the bf16 class: no value scale in the chain
                     window_left,
                     Hq,
                 )

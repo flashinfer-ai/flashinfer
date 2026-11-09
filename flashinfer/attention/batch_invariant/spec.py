@@ -22,6 +22,21 @@ symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical
 Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` only, so decode at
 position ``p`` and prefill of the token at position ``p`` build the same term (R4), and nothing in
 the term depends on the batch, the page table or the configuration (R2, R3).
+
+The fp8-KV classes ``attn.e4m3kv.d<D>`` / ``attn.e5m2kv.d<D>`` (``KV_FMTS``) are the same dataflow over an fp8 K / V cache
+with the two per-tensor scales of FlashInfer's ``k_scale`` / ``v_scale``: every K and V leaf is the cache's fp8 value
+widened to bf16 exactly (``kv_widen``: every e4m3 / e5m2 value is a bf16 value, so the widening is a bit movement, not a
+rounding step), ``c = fp32(sm_scale * k_scale * log2(e))`` is formed once on the host in double precision and rounded once
+to binary32 (``scale_log2``: the key scale enters the chain through the one constant every exponent argument is formed
+with, as the GEMM's fp8 chain takes its scale through one ``mul.rn``), and the epilogue multiplies by the value scale once
+before the single rounding: ``cvt_bf16(add(mul(mul(O, div(1, l)), v_scale), +0))``. Different leaves and a different
+chain: different classes and fingerprints; the bf16 class is unchanged.
+
+The NVFP4-KV class ``attn.nvfp4kv.d<D>`` takes the cache as e2m1 nibbles with one e4m3 block scale per 16 elements along the
+head dim (FlashInfer's NVFP4 paged KV cache and its ``kv_cache_sf``) and the same two per-tensor scales: every K and V leaf is
+``dq4(values, block_scale)`` -- the e2m1 values times their block scale, a product of at most six significant bits within the
+bf16 range, so the leaf is an exact bf16 value and no rounding step enters the term -- and the chain is the fp8-KV classes'
+(the key scale inside ``c``, one ``mul.rn`` by the value scale before the rounding).
 """
 
 from __future__ import annotations
@@ -50,6 +65,17 @@ HEAD_DIMS = (
     256,
 )  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)))
 NEG_INF = float("-inf")
+KV_FMTS = (
+    "bf16",
+    "e4m3",
+    "e5m2",
+    "nvfp4",
+)  # the K / V cache formats: the bf16 class, the two fp8-KV classes, the NVFP4-KV class
+LOWBIT_KV_FMTS = ("e4m3", "e5m2", "nvfp4")
+FP8_KV_FMTS = ("e4m3", "e5m2")
+SF_BLOCK = (
+    16  # NVFP4: elements per e4m3 block scale along the head dim (one MMA K-step)
+)
 
 
 CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- a class constant (another C would be a different class)
@@ -85,11 +111,18 @@ def d_steps(D: int) -> int:
     return D // MMA_K
 
 
-def scale_log2(sm_scale: float) -> float:
-    """``c = fp32(sm_scale * log2(e))``: formed on the host in double precision and rounded ONCE to
-    binary32; the kernel and the CPU model receive exactly this value (and ``-c``). ``OverflowError`` when the product is not a
-    binary32 number (``struct.pack`` returns ``inf`` for it on some CPython versions and raises on others)."""
-    c = float(sm_scale) * (1.0 / math.log(2.0))
+def class_name(kv_fmt: str = "bf16") -> str:
+    """The class family behind a KV format: ``attention.bf16``, ``attention.e4m3kv``, ``attention.e5m2kv``."""
+    assert kv_fmt in KV_FMTS, kv_fmt
+    return "attention.bf16" if kv_fmt == "bf16" else f"attention.{kv_fmt}kv"
+
+
+def scale_log2(sm_scale: float, k_scale: float = 1.0) -> float:
+    """``c = fp32(sm_scale * k_scale * log2(e))``: formed on the host in double precision and rounded ONCE to
+    binary32; the kernel and the CPU model receive exactly this value (and ``-c``). ``k_scale`` is the fp8-KV classes'
+    per-tensor key scale (1.0 for the bf16 class: the product is then ``sm_scale * log2(e)`` exactly as before). ``OverflowError``
+    when the product is not a binary32 number (``struct.pack`` returns ``inf`` for it on some CPython versions and raises on others)."""
+    c = float(sm_scale) * float(k_scale) * (1.0 / math.log(2.0))
     if not abs(c) <= FLT_MAX:
         raise OverflowError(
             f"sm_scale {sm_scale}: sm_scale * log2(e) is outside the binary32 range"
@@ -200,10 +233,51 @@ def init_state(fp) -> State:
     return State(fp.const(NEG_INF), fp.const(0.0), fp.const(0.0))
 
 
-def score_term(fp, row: RowSpec, k: int, D: int):
+def kv_widen(fp, kv_fmt: str, leaf):
+    """A K / V leaf of the fp8-KV classes: the cache's ``kv_fmt`` value widened to bf16 exactly (a bit movement: every e4m3
+    / e5m2 value is a bf16 value). The bf16 class's leaves are the cache values themselves."""
+    assert kv_fmt in FP8_KV_FMTS, kv_fmt
+    return fp.op("kv_widen", kv_fmt, leaf)
+
+
+def kv_dq4(fp, leaf, sf_leaf):
+    """A K / V leaf of the NVFP4-KV class: the e2m1 values of the slice times their e4m3 block scales, exact in bf16 (at most
+    six significant bits, within the bf16 exponent range), so the dequantization is a leaf, not a rounding step."""
+    return fp.op("kv_dq4", leaf, sf_leaf)
+
+
+def k_leaf(fp, t: int, k: int, kv_fmt: str):
+    """The K (B) slice of score step ``t`` of key ``k`` in the class's format."""
+    leaf = fp.op("b_cols", t, k)
+    if kv_fmt in FP8_KV_FMTS:
+        return kv_widen(fp, kv_fmt, leaf)
+    assert kv_fmt == "nvfp4", kv_fmt
+    return kv_dq4(fp, leaf, fp.op("sfb_cols", t, k))  # step t = block t of the head dim
+
+
+def score_term(fp, row: RowSpec, k: int, D: int, kv_fmt: str = "bf16"):
     """``s_k``: the GEMM's K-fold over ``D`` (``D/16`` opaque ``MMA16`` steps from +0) for A row
-    ``row.row`` and B column ``k``: the same reduction object as ``gemm.bf16.kfold[K=D]``."""
-    return gemm_kfold(D, row.row, k).canonical(fp)
+    ``row.row`` and B column ``k``: the same reduction object as ``gemm.bf16.kfold[K=D]``. For the fp8-KV classes the B
+    (key) slice of every step is the widened fp8 key (``kv_widen``): the same fold over different leaves."""
+    if kv_fmt == "bf16":
+        return gemm_kfold(D, row.row, k).canonical(fp)
+
+    def leaf(fp_, idx):
+        t = idx["kstep"]
+        return fp_.op(
+            "ab_kslice", fp_.op("a_rows", row.row, t), k_leaf(fp_, t, k, kv_fmt)
+        )
+
+    kstep = Digit(
+        "kstep",
+        d_steps(D),
+        "fold",
+        init=lambda fp_: fp_.const(0.0),
+        step=lambda fp_, acc, tile: fp_.op(MMA_OP, acc, tile),
+        identity_note="the same opaque bf16 K-step as gemm.bf16.kfold over exactly dequantized low-bit keys (no padded step: "
+        "D is a multiple of 16)",
+    )
+    return Reduction(f"attn.{kv_fmt}kv.score[K={D}]", (kstep,), leaf).canonical(fp)
 
 
 def alpha_term(fp, m_old, m_new, c, nc):
@@ -258,12 +332,25 @@ def pv_fold(fp, o_scaled, probs_bf16: Sequence[Any], v_slice: Callable[[int], An
     return acc
 
 
-def tile_step(fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int) -> State:
+def v_leaf(fp, vt: int, d: int, kv_fmt: str = "bf16"):
+    """The V slice of PV step ``vt`` for output column ``d``: the cache's bf16 values, the fp8 values widened exactly, or the
+    NVFP4 values times the keys' block scales of block ``d // 16``."""
+    leaf = fp.op("v_slice", vt, d)
+    if kv_fmt == "bf16":
+        return leaf
+    if kv_fmt in FP8_KV_FMTS:
+        return kv_widen(fp, kv_fmt, leaf)
+    return kv_dq4(fp, leaf, fp.op("sfv", vt, d // SF_BLOCK))
+
+
+def tile_step(
+    fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int, kv_fmt: str = "bf16"
+) -> State:
     """One tile of the per-chunk fold (the ``tile`` digit's step). ``tile`` = ``{"t": abs tile index,
     "keys": visible absolute keys, "row": RowSpec}``."""
     row, t, keys, T = tile["row"], tile["t"], tile["keys"], tile["T"]
     scores = [
-        score_term(fp, row, t * T + k, D) if (t * T + k) in keys else None
+        score_term(fp, row, t * T + k, D, kv_fmt) if (t * T + k) in keys else None
         for k in range(T)
     ]
     m_new, alpha, probs, l_new = tile_stats(fp, st.m, st.l, scores, c, nc)
@@ -272,7 +359,7 @@ def tile_step(fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int) -> Sta
         fp,
         fp.mul(st.o, alpha),
         probs_bf16,
-        lambda j: fp.op("v_slice", t * (T // MMA_K) + j, d),
+        lambda j: v_leaf(fp, t * (T // MMA_K) + j, d, kv_fmt),
     )
     return State(m_new, l_new, o_new)
 
@@ -286,18 +373,30 @@ def merge(fp, a: State, b: State, c, nc) -> State:
     return State(m, fp.fma(b.l, a2, fp.mul(a.l, a1)), fp.fma(b.o, a2, fp.mul(a.o, a1)))
 
 
-def output_elem(fp, st: State, out_fmt: str = "bf16"):
+def output_elem(fp, st: State, out_fmt: str = "bf16", v_scale=None):
     """``cvt(add(mul(O, div(1, l)), +0))``: a correctly rounded reciprocal, one multiply, and an
-    ``add +0`` that makes the sign of an exact-zero accumulator unobservable."""
+    ``add +0`` that makes the sign of an exact-zero accumulator unobservable. The fp8-KV classes multiply the normalised
+    row by the per-tensor value scale once before the ``add`` and the single rounding: ``cvt(add(mul(mul(O, inv), v_scale), +0))``
+    (``v_scale`` the binary32 value of the caller's ``v_scale``, a ``sym`` leaf of the term)."""
     inv = fp.div(fp.const(1.0), st.l)
-    return fp.cvt_out(fp.add(fp.mul(st.o, inv), fp.const(0.0)), out_fmt)
+    o = fp.mul(st.o, inv)
+    if v_scale is not None:
+        o = fp.mul(o, v_scale)
+    return fp.cvt_out(fp.add(o, fp.const(0.0)), out_fmt)
 
 
 # ----------------------------------------------------------------------------- the reduction object
 
 
 def attention_reduction(
-    row: RowSpec, D: int, d: int, c, nc, T: int = TILE_KEYS, C: Optional[int] = None
+    row: RowSpec,
+    D: int,
+    d: int,
+    c,
+    nc,
+    T: int = TILE_KEYS,
+    C: Optional[int] = None,
+    kv_fmt: str = "bf16",
 ) -> Reduction:
     """The per-row dataflow as an engine ``Reduction`` with two ``fold`` digits: ``tile`` (radix
     ``C/T``, the online softmax inside a chunk) and ``chunk`` (radix = chunks of the prefix, the
@@ -318,7 +417,7 @@ def attention_reduction(
         C // T,
         "fold",
         init=init_state,
-        step=lambda fp, st, tl: tile_step(fp, st, tl, c, nc, D, d),
+        step=lambda fp, st, tl: tile_step(fp, st, tl, c, nc, D, d, kv_fmt),
         identity_note="absent tiles are dropped; a kernel's null step (P row = 0, alpha = 1) is exact on (m, l) "
         "and exact on O up to the sign of an exact zero, which the epilogue's add(+0) erases",
     )
@@ -330,7 +429,8 @@ def attention_reduction(
         step=lambda fp, a, b: merge(fp, a, b, c, nc),
         identity_note="absent chunks are dropped (never merged)",
     )
-    return Reduction(f"attn.bf16.d{D}[T={T},C={C}]", (tile, chunk), leaf)
+    tag = "bf16" if kv_fmt == "bf16" else f"{kv_fmt}kv"
+    return Reduction(f"attn.{tag}.d{D}[T={T},C={C}]", (tile, chunk), leaf)
 
 
 def fold_placement(red: Reduction) -> canon.Placement:
@@ -362,20 +462,26 @@ class AttentionSpec:
         T: int = TILE_KEYS,
         C: Optional[int] = None,
         out_fmt: str = "bf16",
+        kv_fmt: str = "bf16",
     ):
-        self.D, self.T, self.out_fmt = D, T, out_fmt
+        assert kv_fmt in KV_FMTS, kv_fmt
+        self.D, self.T, self.out_fmt, self.kv_fmt = D, T, out_fmt, kv_fmt
         self.C = chunk_len(D) if C is None else C
         self.alg = alg or TermAlgebra()
         self.c, self.nc = self.alg.sym("c"), self.alg.sym("nc")
+        # the fp8-KV classes' value scale: a runtime scalar the epilogue multiplies by once (the key scale is inside c)
+        self.v_scale = None if kv_fmt == "bf16" else self.alg.sym("v_scale")
 
     def reduction(self, row: RowSpec, d: int) -> Reduction:
-        return attention_reduction(row, self.D, d, self.c, self.nc, self.T, self.C)
+        return attention_reduction(
+            row, self.D, d, self.c, self.nc, self.T, self.C, self.kv_fmt
+        )
 
     def state(self, row: RowSpec, d: int) -> State:
         return self.reduction(row, d).canonical(self.alg)
 
     def output(self, row: RowSpec, d: int) -> Term:
-        return output_elem(self.alg, self.state(row, d), self.out_fmt)
+        return output_elem(self.alg, self.state(row, d), self.out_fmt, self.v_scale)
 
 
 _FINGERPRINTS: Dict[tuple, str] = {}
@@ -389,28 +495,36 @@ FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
 
 
-def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
+def spec_fingerprint(D: int = 128, window_left: int = -1, kv_fmt: str = "bf16") -> str:
     """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose prefix
     spans one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
     masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``. The window is a per-call
     input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
-    is the digest of the no-window sample row; ``window_left`` here only selects another sample row."""
-    key = (D, window_left)
+    is the digest of the no-window sample row; ``window_left`` here only selects another sample row. ``kv_fmt`` names the KV
+    cache format: the fp8-KV classes (``attn-e4m3kv-d<D>-...`` / ``attn-e5m2kv-d<D>-...``) hash their widened leaves and
+    scaled epilogue; the bf16 class's digest is the one recorded before they existed."""
+    assert kv_fmt in KV_FMTS, kv_fmt
+    key = (D, window_left, kv_fmt)
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
-        spec = AttentionSpec(D)
+        spec = AttentionSpec(D, kv_fmt=kv_fmt)
         row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
         parts = [
             f"D={D}",
             f"T={spec.T}",
             f"C={spec.C}",
             f"win={window_left}",
+        ]
+        if kv_fmt != "bf16":
+            parts.append(f"kv={kv_fmt}")
+        parts += [
             fingerprint(spec.output(row, 0)),
             fingerprint(spec.output(row, 1)),
         ]
+        tag = "bf16" if kv_fmt == "bf16" else f"{kv_fmt}kv"
         _FINGERPRINTS[key] = (
-            f"attn-bf16-d{D}-"
+            f"attn-{tag}-d{D}-"
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]
