@@ -661,6 +661,7 @@ class MoERunner(TunableRunner):
                 workspace_buffer,
                 False,  # query_workspace_size
                 self.nvfp4_4over6_code,
+                [],  # fc2_input_out: autotuning profiles do not capture
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)

@@ -770,6 +770,15 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
         reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, recipe, stream, enable_pdl);
+    if (args.fc2_input_out != nullptr) {
+      invokeNvfp4PermutedRowsToExpanded(
+          args.num_tokens * totalExpertsPerToken, args.intermediate_size,
+          workspace.expanded_idx_to_permuted_idx,
+          reinterpret_cast<uint8_t const*>(workspace.activation_output),
+          reinterpret_cast<uint8_t const*>(workspace.activation_output_scale),
+          reinterpret_cast<float const*>(workspace.token_scales_fc2), sfLayout, args.fc2_input_out,
+          args.fc2_input_scale_out, args.fc2_input_token_scale_out, stream);
+    }
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

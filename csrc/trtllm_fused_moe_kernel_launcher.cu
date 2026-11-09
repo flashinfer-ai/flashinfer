@@ -975,6 +975,38 @@ static void validate_routing_replay_out(TensorView const& replay, TensorView con
       << "routing_replay_out must be contiguous (packed row-major)";
 }
 
+// Validate fc2_input_out = [codes, block_scales, token_scales] (see MoERunnerArgs). As for
+// routing_replay_out, dim0 is only bounded from below so that a buffer allocated for the
+// maximum batch can be reused under CUDA graphs.
+static void validate_fc2_input_out(Array<Tensor> const& out, TensorView const& hidden_states,
+                                   int64_t top_k, int64_t intermediate_size) {
+  TVM_FFI_ICHECK_EQ(out.size(), 3) << "fc2_input_out must be [codes, block_scales, token_scales]";
+  TVM_FFI_ICHECK_EQ(intermediate_size % 16, 0) << "fc2_input_out needs intermediate_size % 16 == 0";
+  int64_t const num_tokens = hidden_states.size(0);
+  for (Tensor const& t : out) {
+    TVM_FFI_ICHECK(t.device().device_type == kDLCUDA &&
+                   t.device().device_id == hidden_states.device().device_id)
+        << "fc2_input_out tensors must be on the device of hidden_states";
+    TVM_FFI_ICHECK(t.IsContiguous()) << "fc2_input_out tensors must be contiguous";
+    TVM_FFI_ICHECK(t.ndim() >= 2 && t.size(0) >= num_tokens && t.size(1) == top_k)
+        << "fc2_input_out tensors must be [>= num_tokens, top_k, ...]";
+  }
+  Tensor const& codes = out[0];
+  Tensor const& scales = out[1];
+  Tensor const& token_scales = out[2];
+  TVM_FFI_ICHECK(codes.ndim() == 3 && codes.size(2) == intermediate_size / 2 &&
+                 codes.dtype() == dl_uint8)
+      << "fc2_input_out codes must be uint8 [>= num_tokens, top_k, intermediate_size / 2]";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(codes.data_ptr()) % 8, 0)
+      << "fc2_input_out codes must be 8-byte aligned";
+  TVM_FFI_ICHECK(scales.ndim() == 3 && scales.size(2) == intermediate_size / 16 &&
+                 (scales.dtype() == dl_uint8 || scales.dtype() == dl_float8_e4m3fn))
+      << "fc2_input_out block_scales must be float8_e4m3fn (or uint8) "
+         "[>= num_tokens, top_k, intermediate_size / 16]";
+  TVM_FFI_ICHECK(token_scales.ndim() == 2 && token_scales.dtype() == dl_float32)
+      << "fc2_input_out token_scales must be float32 [>= num_tokens, top_k]";
+}
+
 enum class Fp8QuantizationType {
   NoneFp8,
   DeepSeekFp8,
@@ -6299,7 +6331,8 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
     Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
-    Optional<TensorView> workspace_buffer, bool query_workspace_size, int64_t nvfp4_4over6_code) {
+    Optional<TensorView> workspace_buffer, bool query_workspace_size, int64_t nvfp4_4over6_code,
+    Array<Tensor> fc2_input_out) {
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
@@ -6350,6 +6383,15 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
 
   if (routing_replay_out.has_value()) {
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
+  }
+  if (!fc2_input_out.empty()) {
+    // Only the per-token NvFP4 path quantizes the GEMM2 input in a separate kernel.
+    TVM_FFI_ICHECK(per_token_scales.has_value())
+        << "fc2_input_out requires per_token_scale (per-token NvFP4)";
+    TVM_FFI_ICHECK_EQ(nFusedShared, 0) << "fc2_input_out does not support fused shared experts";
+    TVM_FFI_ICHECK(!is_da_body_preparation && da_routing_metadata.empty())
+        << "fc2_input_out is not supported with precomputed routing metadata";
+    validate_fc2_input_out(fc2_input_out, hidden_states, top_k, intermediate_size);
   }
 
   // Determine activation type
@@ -6417,6 +6459,11 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     args->output = output.data_ptr();
     args->output_scale = nullptr;
     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
+    if (!fc2_input_out.empty()) {
+      args->fc2_input_out = static_cast<uint8_t*>(fc2_input_out[0].data_ptr());
+      args->fc2_input_scale_out = static_cast<uint8_t*>(fc2_input_out[1].data_ptr());
+      args->fc2_input_token_scale_out = static_cast<float*>(fc2_input_out[2].data_ptr());
+    }
 
     // gemm1_bias and gemm1_lora_delta are mutually exclusive
     auto const& gemm1_bias_effective = gemm1_lora_delta.has_value() ? gemm1_lora_delta : gemm1_bias;
