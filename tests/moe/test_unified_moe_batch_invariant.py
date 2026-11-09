@@ -1414,54 +1414,10 @@ def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
     ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
     out2 = layer(_routed_pack(x, ids, wts), W)
     assert torch.equal(bits(out), bits(out2))
-def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
-    """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``: a framework's dropped slot) is dropped: the plan
-    does not count it (``dest -1``, ``src -1`` past the valid rows), the gather and the GEMMs never touch it, and the
-    combine folds the remaining slots in slot order with the term ``+0`` in its place, so the output equals the class's on
-    the same rows with those slots at a valid id and weight ``+0``; a token whose slots are all dropped gives a zero row;
-    the other tokens keep their bits. No host validation, no fault; the one-launch plan below ``PLAN_MULTI_MIN_N``
-    expanded rows and the two-launch form (a partial final block) above it."""
-    from flashinfer.fused_moe.batch_invariant import api
-    from flashinfer.fused_moe.batch_invariant import spec as S
-    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N
-
-    k, H, I, E = 8, 256, 128, 64
-    bad = (-1, E, 1 << 30)
-    for T in (96, PLAN_MULTI_MIN_N // k + 3):
-        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=21, adversarial=True)
-        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
-        ids_bad = ids.clone()
-        rows = torch.randperm(T, generator=torch.Generator().manual_seed(T))[: T // 4]
-        for j, t in enumerate(rows.tolist()):
-            ids_bad[t, j % k] = bad[j % 3]
-            ids_bad[t, (j + 3) % k] = bad[(j + 1) % 3]
-        ids_bad[rows[0]] = torch.tensor(
-            [bad[i % 3] for i in range(k)], dtype=torch.int32
-        )
-        dropped = (ids_bad < 0) | (ids_bad >= E)
-        counts, dest, src = api.permute_plan(ids_bad.cuda(), E)
-        n_valid = int((~dropped).sum())
-        assert int(counts.sum()) == n_valid
-        assert torch.equal(dest.cpu().view(-1) < 0, dropped.view(-1))
-        assert torch.all(src[n_valid:] == -1) and torch.all(src[:n_valid] >= 0)
-        valid_pos = dest.view(-1)[~dropped.view(-1).cuda()].long()
-        assert torch.equal(
-            src[valid_pos].cpu(), torch.nonzero(~dropped.view(-1)).view(-1).int()
-        )
-        layer, W = _layer(k, E, I), _weights(w1, w2)
-        out = layer(_routed_pack(x, ids_bad.cuda(), wts.cuda()), W)
-        ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
-        wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
-        ref = _reference_ffn(
-            x, ids_ref.cuda(), wts_ref.cuda(), w1, w2, S.activation_of(_SWIGLU)
-        )
-        assert torch.equal(bits(out.cpu()), bits(ref))
-        assert torch.all(out[rows[0]] == 0)
-        whole = (~dropped.any(dim=1)).cuda()
-        ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W)
-        assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
 
 
+@needs_device
+@pytest.mark.parametrize("E", [48, 64])
 def test_nan_logits_route_to_the_lowest_untaken_experts_with_nan_weights(E):
     """An expert whose selection score is NaN is never selected. A row with fewer than ``top_k`` non-NaN logits (one with
     none at all) gets the lowest expert indices it has not taken in its remaining slots, with NaN weights: every id stays
@@ -1525,6 +1481,57 @@ def test_nan_logits_route_to_the_lowest_untaken_experts_with_nan_weights(E):
         assert torch.equal(bits(out[clean.cuda()]), bits(ref))
 
 
+@needs_device
+def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
+    """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``: a framework's dropped slot) is dropped: the plan
+    does not count it (``dest -1``, ``src -1`` past the valid rows), the gather and the GEMMs never touch it, and the
+    combine folds the remaining slots in slot order with the term ``+0`` in its place, so the output equals the class's on
+    the same rows with those slots at a valid id and weight ``+0``; a token whose slots are all dropped gives a zero row;
+    the other tokens keep their bits. No host validation, no fault; the one-launch plan below ``PLAN_MULTI_MIN_N``
+    expanded rows and the two-launch form (a partial final block) above it."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N
+
+    k, H, I, E = 8, 256, 128, 64
+    bad = (-1, E, 1 << 30)
+    for T in (96, PLAN_MULTI_MIN_N // k + 3):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=21, adversarial=True)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids_bad = ids.clone()
+        rows = torch.randperm(T, generator=torch.Generator().manual_seed(T))[: T // 4]
+        for j, t in enumerate(rows.tolist()):
+            ids_bad[t, j % k] = bad[j % 3]
+            ids_bad[t, (j + 3) % k] = bad[(j + 1) % 3]
+        ids_bad[rows[0]] = torch.tensor(
+            [bad[i % 3] for i in range(k)], dtype=torch.int32
+        )
+        dropped = (ids_bad < 0) | (ids_bad >= E)
+        counts, dest, src = api.permute_plan(ids_bad.cuda(), E)
+        n_valid = int((~dropped).sum())
+        assert int(counts.sum()) == n_valid
+        assert torch.equal(dest.cpu().view(-1) < 0, dropped.view(-1))
+        assert torch.all(src[n_valid:] == -1) and torch.all(src[:n_valid] >= 0)
+        valid_pos = dest.view(-1)[~dropped.view(-1).cuda()].long()
+        assert torch.equal(
+            src[valid_pos].cpu(), torch.nonzero(~dropped.view(-1)).view(-1).int()
+        )
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+        out = layer(_routed_pack(x, ids_bad.cuda(), wts.cuda()), W)
+        ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
+        wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
+        ref = _reference_ffn(
+            x, ids_ref.cuda(), wts_ref.cuda(), w1, w2, S.activation_of(_SWIGLU)
+        )
+        assert torch.equal(bits(out.cpu()), bits(ref))
+        assert torch.all(out[rows[0]] == 0)
+        whole = (~dropped.any(dim=1)).cuda()
+        ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W)
+        assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
+
+
+@needs_device
+@pytest.mark.parametrize("T,k,E", [(2048, 8, 64), (2049, 8, 256), (1100, 16, 1024)])
 def test_multi_launch_plan_equals_the_host_plan(T, k, E):
     """At and above ``PLAN_MULTI_MIN_N`` expanded rows ``permute_plan`` runs the two-launch block form (``PlanBlocksKernel``
     / ``PlanFinishKernel``): at the threshold exactly (whole blocks), one token past it (a partial final block) and at the
