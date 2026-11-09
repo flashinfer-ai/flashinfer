@@ -415,8 +415,15 @@ keyword.
   V)`, so no `[V, H]` BF16 output is held beside the accumulator; a backward
   that keeps the graph, and `ForwardResult.backward`, cast out of place),
   `"unfused"` (every chunk accumulated, one flat cast after `dX` is written),
+  `"partial_ip"` (loss entry, two or more chunks: the split accumulator
+  covers the vocabulary rows `[0, dw_rows)` only, `dw_rows >= a`, as the
+  parts `[0, a)` and `[a, dw_rows)`; the backward keeps the deferred last
+  chunk's BF16 `dz` and per-row gradient scale, casts the rows `[0, dw_rows)`
+  as `"fused_ip"` does and recomputes the other rows as below, reading the
+  last chunk's block from the kept `dz`, so per block it runs one logits
+  GEMM fewer than `"partial"`),
   `"partial"` (the chunk loop accumulates the vocabulary rows `[0, dw_rows)`
-  only) or `"recompute"` (none).  The last two recompute the other rows of
+  only) or `"recompute"` (none).  The last three recompute the other rows of
   `dW` in the backward, one vocabulary block at a time: per block and chunk the
   logits GEMM's `dz` arm (`gemm_logits_dz`) on `W[v0:v1]` recomputes the
   block's `dz` from the saved row statistic `lse` and per-row gradient scale

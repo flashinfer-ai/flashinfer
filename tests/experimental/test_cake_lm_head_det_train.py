@@ -6682,10 +6682,13 @@ def test_memory_plan_forms():
                     assert mp.form in opt_in.MEMORY_FORMS, key
                     assert mp.fits and mp.predicted_bytes <= mp.budget_bytes < head, key
                     if mp.recompute:
-                        assert mp.form in ("partial", "recompute"), key
+                        assert mp.form in ("partial_ip", "partial", "recompute"), key
                         assert mp.dw_rows % step == 0 and mp.block_rows % step == 0, key
                         assert 0 < mp.block_rows <= V - mp.dw_rows, key
-                        assert (mp.dw_rows > 0) == (mp.form == "partial"), key
+                        assert (mp.dw_rows > 0) == (mp.form != "recompute"), key
+                        if mp.form == "partial_ip":
+                            assert entry == "loss", key
+                            assert mp.dw_rows >= opt_in.dw_split_rows(V, g), key
                     else:
                         assert mp.dw_rows == V, key
     # the accumulated prefix is searched with the block it leaves (and the saved row scale): at a shape whose partial
@@ -6703,7 +6706,8 @@ def test_memory_plan_forms():
                 dx_ws_slabs=slabs,
                 buffer_rows=4096,
             )
-            assert mp.form == "partial" and mp.fits and mp.dw_rows > 0, (
+            forms = ("partial",) if entry == "logprob" else ("partial_ip", "partial")
+            assert mp.form in forms and mp.fits and mp.dw_rows > 0, (
                 entry,
                 slabs,
                 mp,
@@ -6755,7 +6759,7 @@ def test_memory_plan_fused_ip():
     multiples with ``m1 <= 2 * m0`` after the first piece.  The loss entry's multi-chunk calls with the fused cast get
     it after the fused form and before the unfused one: the issue's four-chunk call with 5 % of the labels ignored
     (H 6144) and the H 4096 call with a third ignored, where the fused form does not fit -- with or without the
-    recompute arm -- while the H 6144 call with a third ignored keeps the partial form.  Its prediction is the fused
+    recompute arm -- while the H 6144 call with a third ignored gets the pinned partial form (``"partial_ip"``).  Its prediction is the fused
     form's phases with the two accumulators and, in the ``dW`` phase, the first piece's temporary in place of the
     ``[V, H]`` output.  The log-probability entry, a one-chunk call and ``fuse_dw_cast=False`` never get it."""
     g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
@@ -6776,7 +6780,7 @@ def test_memory_plan_fused_ip():
     for H, T, R, form in (
         (6144, 16384, 15565, "fused_ip"),
         (4096, 16384, 10977, "fused_ip"),
-        (6144, 16384, 10977, "partial"),
+        (6144, 16384, 10977, "partial_ip"),
     ):
         args = dict(num_rows=T, rows=R, hidden=H, vocab=V, chunk=C, geometry=g)
         mp = opt_in.memory_plan("loss", **args)
@@ -6827,6 +6831,73 @@ def test_memory_plan_fused_ip():
         "loss", num_rows=4096, rows=3891, hidden=6144, vocab=V, chunk=C, geometry=g
     )
     assert one.form != "fused_ip", one
+
+
+def test_memory_plan_partial_ip():
+    """The budget form ``"partial_ip"`` (:attr:`Plan.dw_split_end`): ``"fused_ip"``'s split accumulator over the rows
+    ``[0, dw_rows)`` with ``dw_rows`` at least the split row, the backward recomputing the rows ``[dw_rows, V)`` of the
+    chunks before the last (the last chunk's ``dz`` pinned).  The loss entry's calls of the issue's H 6144 head that no
+    unrecomputed form fits -- a third of the labels ignored (three chunks), T 8117 (two chunks) -- get it ahead of the
+    partial form, recomputing fewer chunk rows of the vocabulary than that form would; its prediction is the largest
+    of its phases (forward, held state, ``dX``, the in-place cast with the first piece's temporary, the recompute
+    block on ``dW``'s storage beside the pinned chunk).  The log-probability entry, ``fuse_dw_cast=False`` and a call
+    without the recompute arm never get it."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    step = opt_in.dw_block_step(g)
+    blocks = opt_in._allocated_bytes
+    tile = int(g.stats_tile)
+    V, C, H = 154880, 4096, 6144
+    a = opt_in.dw_split_rows(V, g)
+    p0 = opt_in._dw_split_pieces(a, step)[0][1]
+    for T, R in ((16384, 10977), (8117, 7711)):
+        args = dict(num_rows=T, rows=R, hidden=H, vocab=V, chunk=C, geometry=g)
+        mp = opt_in.memory_plan("loss", **args)
+        key = (T, R, mp)
+        assert mp.form == "partial_ip" and mp.fits and mp.recompute, key
+        v0, vb = mp.dw_rows, mp.block_rows
+        assert a <= v0 < V and v0 % step == 0, key
+        assert vb % step == 0 and 0 < vb <= V - v0, key
+        n = -(-R // C)
+        partial = opt_in.memory_plan("loss", fuse_dw_cast=False, **args)
+        assert partial.form == "partial" and partial.fits, (key, partial)
+        assert (n - 1) * (V - v0) < n * (V - partial.dw_rows), (key, partial)
+        assert opt_in.memory_plan("logprob", **args).form != "partial_ip"
+        assert opt_in.memory_plan("loss", recompute=False, **args).form not in (
+            "partial_ip",
+            "partial",
+            "recompute",
+        )
+        # the phases (``buffer_rows`` = a chunk, compacted, the fused dX finalize, no K-slice slabs)
+        r_last = R - (n - 1) * C
+        dxacc, dx_out = blocks(4 * R * H), blocks(2 * T * H)
+        lower = blocks(4 * a * H)
+        upper = blocks(4 * (v0 - a) * H) if v0 > a else 0
+        keep = blocks(4 * R)
+        logits = blocks(2 * C * V)
+        bufs = logits + blocks(8 * C * -(-V // tile)) + blocks(2 * C * H)
+        rowvec = blocks(4 * T, 4) + blocks(4 * R, 8)
+        x_last = blocks(2 * r_last * H)
+        block = (
+            blocks(2 * C * H)
+            + blocks(2 * C * vb)
+            + blocks(8 * C * -(-vb // tile))
+            + blocks(4 * vb * H)
+            + blocks(8 * R)
+            + blocks(4 * R)
+        )
+        held = dxacc + lower + upper + logits + rowvec + keep
+        phases = (
+            dxacc + lower + upper + bufs + rowvec + keep,
+            held + dx_out + blocks(4 * T),
+            dx_out + lower + upper + logits + x_last + blocks(2 * p0 * H) + rowvec + keep,
+            dx_out + lower + logits + x_last + block + rowvec + keep,
+        )
+        assert mp.predicted_bytes == max(phases), (key, phases)
+    # one chunk: no accumulator to split
+    one = opt_in.memory_plan(
+        "loss", num_rows=4096, rows=3891, hidden=H, vocab=V, chunk=C, geometry=g
+    )
+    assert one.form != "partial_ip", one
 
 
 def test_memory_plan_counts_the_x_copy():
@@ -9254,9 +9325,12 @@ def _force_budget_plan(monkeypatch, form, calls: list) -> None:
 @pytest.mark.parametrize("objective", ["ce", "policy"])
 def test_device_budget_forms_are_bitwise(glm_weight, monkeypatch, objective):
     """Every ``memory_mode="budget"`` form of the loss entry -- fused, the fused cast into the split accumulator's
-    storage (``"fused_ip"``; a one-chunk call runs the fused form), unfused, an accumulate of the leading vocabulary
-    rows with the others recomputed in vocabulary blocks (several blocks with a short last one; one granule), a
-    recompute of every row (three blocks; one block) -- gives the bits (integer views) of the fast form: one chunk,
+    storage (``"fused_ip"``; a one-chunk call runs the fused form), unfused, the split accumulator over the leading
+    vocabulary rows with the other rows of the chunks before the last recomputed and the last chunk's pinned ``dz``
+    (``"partial_ip"``: without an upper part, several blocks with a short last one, one granule; a one-chunk call runs
+    the fused form), an accumulate of the leading vocabulary rows with the others recomputed in vocabulary blocks
+    (several blocks with a short last one; one granule), a recompute of every row (three blocks; one block) -- gives
+    the bits (integer views) of the fast form: one chunk,
     two chunks, three compacted chunks (the dW side stream), three uncompacted chunks and the
     caller's count, with the caching allocator poisoned between the arms."""
     _require_program(entry="loss")
@@ -9280,7 +9354,19 @@ def test_device_budget_forms_are_bitwise(glm_weight, monkeypatch, objective):
             backend="cake",
             **(dict(kw, memory_mode="fast") if "num_valid_rows" in kw else kw),
         )
-        for form in _budget_forms(step) + (("fused_ip", DEFAULT_V, None),):
+        a = opt_in.dw_split_rows(
+            DEFAULT_V, Geometry.from_record(cake_backend.record_for(CUDA)[1])
+        )
+        g = DEFAULT_V // step
+        split_forms = (
+            ("fused_ip", DEFAULT_V, None),
+            # the pinned partial form: no upper part (one tail block), several blocks with a short last one, one
+            # granule recomputed
+            ("partial_ip", a, DEFAULT_V - a),
+            ("partial_ip", a + 50 * step, 64 * step),
+            ("partial_ip", (g - 1) * step, step),
+        )
+        for form in _budget_forms(step) + split_forms:
             calls: list = []
             _force_budget_plan(monkeypatch, form, calls)
             _poison_allocator()
@@ -9291,21 +9377,28 @@ def test_device_budget_forms_are_bitwise(glm_weight, monkeypatch, objective):
 
 
 @pytest.mark.parametrize(
-    "H, T, ignore, objective",
+    "H, T, ignore, objective, form",
     [
-        (4096, 16384, 0.33, "ce"),
-        (4096, 16384, 0.33, "policy"),
-        (6144, 16384, 0.05, "ce"),
+        (4096, 16384, 0.33, "ce", "fused_ip"),
+        (4096, 16384, 0.33, "policy", "fused_ip"),
+        (6144, 16384, 0.05, "ce", "fused_ip"),
+        (6144, 16384, 0.33, "ce", "partial_ip"),
+        (6144, 16384, 0.33, "policy", "partial_ip"),
+        (6144, 8117, 0.05, "ce", "partial_ip"),
     ],
 )
-def test_device_fused_ip_casts_dw_in_place(monkeypatch, H, T, ignore, objective):
-    """The budget form ``"fused_ip"`` at the default call's shapes it serves (H 4096 with a third of the labels
-    ignored; H 6144 with 5 % ignored, four chunks): the default step picks it and its outputs are bitwise the fast
+def test_device_split_forms_cast_dw_in_place(
+    monkeypatch, H, T, ignore, objective, form
+):
+    """The budget forms with a split accumulator at the default call's shapes they serve: ``"fused_ip"`` (H 4096 with
+    a third of the labels ignored; H 6144 with 5 % ignored, four chunks) and ``"partial_ip"`` (H 6144 with a third
+    ignored, three chunks; T 8117, two chunks).  The default step picks the form and its outputs are bitwise the fast
     step's; its backward casts ``dW`` into the lower accumulator's storage, which autograd takes as ``W.grad`` without
-    a copy (``4 a H`` bytes); the step's peak -- of the call that binds and of one from the remembered binding -- stays
-    within the planned budget (``0.98 B``) and below the fast step's.  A non-reentrant checkpointed step gives the
-    same bits; a retained graph casts out of place (the accumulators read, never written) and the following backward
-    in place, both to the fast bits; a :class:`ForwardResult` casts out of place, repeatably."""
+    a copy (``4 a H`` bytes) -- ``"partial_ip"`` recomputes its other rows with the last chunk's pinned ``dz`` -- and
+    the step's peak, of the call that binds and of one from the remembered binding, stays within the planned budget
+    (``0.98 B``) and below the fast step's.  A non-reentrant checkpointed step gives the same bits; a retained graph
+    casts out of place (the accumulators read, never written) and the following backward in place, both to the fast
+    bits; a :class:`ForwardResult` casts out of place, repeatably."""
     _require_program(entry="loss")
     V = DEFAULT_V
     inp = make_inputs(
@@ -9328,12 +9421,20 @@ def test_device_fused_ip_casts_dw_in_place(monkeypatch, H, T, ignore, objective)
         return split_cast(*args, **kw)
 
     monkeypatch.setattr(opt_in, "_dw_cast_split", spy)
+    tails: list = []
+    vocab_blocks = opt_in._dw_vocab_blocks
+
+    def tail_spy(*args, **kw):
+        tails.append(kw.get("dz_last") is not None)
+        return vocab_blocks(*args, **kw)
+
+    monkeypatch.setattr(opt_in, "_dw_vocab_blocks", tail_spy)
     peaks = []
     for _ in range(
         2
     ):  # the first call also binds; the second launches from the remembered binding
         result, peak, mplan = _budget_step(inp, 4096, "loss")
-        assert mplan is not None and mplan.form == "fused_ip" and mplan.fits, mplan
+        assert mplan is not None and mplan.form == form and mplan.fits, mplan
         _assert_same_bits(fast, result)
         assert result["dW"].untyped_storage().nbytes() == 4 * a * H, (
             result["dW"].untyped_storage().nbytes(),
@@ -9342,6 +9443,7 @@ def test_device_fused_ip_casts_dw_in_place(monkeypatch, H, T, ignore, objective)
         peaks.append(peak)
         del result
     assert casts == [True, True], casts
+    assert tails == ([True, True] if form == "partial_ip" else []), tails
     assert max(peaks) <= mplan.budget_bytes < fast_peak, (peaks, mplan, fast_peak)
 
     def step_through(fn):
@@ -9387,7 +9489,7 @@ def test_device_fused_ip_casts_dw_in_place(monkeypatch, H, T, ignore, objective)
     res = opt_in.forward_loss(
         inp.X, inp.W, inp.labels, need_dx=True, need_dw=True, memory_mode="auto", **kw
     )
-    assert res.memory_plan is not None and res.memory_plan.form == "fused_ip"
+    assert res.memory_plan is not None and res.memory_plan.form == form
     for _ in range(2):
         dX, dW = res.backward()
         _assert_same_bits(fast, dict(dX=dX, dW=dW), keys=("dX", "dW"))
@@ -13465,8 +13567,8 @@ def _auto_planned(rows: int, chunk: int = 4096) -> bool:
 
 def test_auto_memory_plan_decisions(monkeypatch):
     """The automatic form's decision (``auto_memory_plan``, host integer arithmetic) at the GLM head (H 6144, V 154880,
-    chunk 4096): two thirds of the rows valid (three chunks) switches both entries to the partial form, the budget
-    call's own plan; many valid rows (T 32463, 5 % ignored) keep the fast form, which fits with its own lifetimes; one
+    chunk 4096): two thirds of the rows valid (three chunks) switches the loss entry to the pinned partial form
+    (``"partial_ip"``) and the log-probability entry to the partial form, the budget call's own plans; many valid rows (T 32463, 5 % ignored) keep the fast form, which fits with its own lifetimes; one
     chunk (T 4096, 5 % ignored) switches to a recompute form; one row, where no form fits, and a program without the
     recompute arm keep the fast form; ``_AUTO_MIN_CHUNKS`` sets the smallest chunk count that is planned at all (a
     call of fewer chunks keeps the fast form; the expectations follow the module's value)."""
@@ -13476,7 +13578,8 @@ def test_auto_memory_plan_decisions(monkeypatch):
         mp = opt_in.auto_memory_plan(entry, **issue)
         assert not opt_in.fast_form_fits(entry, **issue), entry
         if _auto_planned(10980):
-            assert mp is not None and mp.form == "partial" and mp.fits, (entry, mp)
+            form = "partial_ip" if entry == "loss" else "partial"
+            assert mp is not None and mp.form == form and mp.fits, (entry, mp)
             assert mp == opt_in.memory_plan(entry, **issue), entry
         else:
             assert mp is None, (entry, mp)
