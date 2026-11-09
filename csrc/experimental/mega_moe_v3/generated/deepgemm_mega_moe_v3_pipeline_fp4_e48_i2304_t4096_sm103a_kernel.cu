@@ -785,19 +785,28 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a(int* __restrict_
                     PrivateCounters[482 + block] = (unsigned int)0;
                 }
             }
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             unsigned int epi_warp = warp + 8;
+            unsigned int walk_first = (epi_warp + 68) * (unsigned int)NUM_CTAS + (unsigned int)bid;
+            unsigned int walk_end = (unsigned int)(num_tokens * 4);
+            unsigned int walk_step = (unsigned int)(NUM_CTAS * 4);
             unsigned int values[4];
             float reduced[40];
             unsigned int store_values[4];
             unsigned int buffers = epi_warp * 6;
+            int next_row = -1;
+            if (lane < 6 && walk_first < walk_end) {
+                next_row = token_to_permuted[walk_first / 4 * 6 + (unsigned int)lane];
+            }
             unsigned int _phase_combine_barriers = 0;
             #pragma unroll 1
-            for (unsigned int token_chunk = epi_warp * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += NUM_CTAS * 12) {
+            for (unsigned int token_chunk = walk_first; token_chunk < walk_end; token_chunk += walk_step) {
                 unsigned int token = token_chunk / 4;
                 unsigned int chunk = token_chunk % 4;
-                int stored_row = -1;
-                if (lane < 6) {
-                    stored_row = token_to_permuted[token * 6 + (unsigned int)lane];
+                int stored_row = next_row;
+                next_row = -1;
+                if (lane < 6 && token_chunk + walk_step < walk_end) {
+                    next_row = token_to_permuted[(token_chunk + walk_step) / 4 * 6 + (unsigned int)lane];
                 }
                 unsigned int routed = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
                 #pragma unroll 1
@@ -1015,6 +1024,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a(int* __restrict_
                     }
                     mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
                     if (elect_sync()) {
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
                         if (task[0] == 1) {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192, (&A), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                             if (a_rows32 == 0) {
@@ -1075,11 +1085,27 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a(int* __restrict_
                     unsigned int sf_k_offset = task_1[1] * (task_1[7] / 128) + (unsigned int)k_1;
                     if (elect_sync()) {
                         if (task_1[0] == 1) {
-                            tma_2d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B1), k_1 * 128, task_1[1] * task_1[6] + n_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
-                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 512, (&SFB1), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(smem_b_addr + b_stage * 16384), "l"((&B1)), "r"(k_1 * 128), "r"(task_1[1] * task_1[6] + n_offset),
+                                   "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(smem_sfb_addr + b_stage * 512), "l"((&SFB1)), "r"(n_offset), "r"(sf_k_offset),
+                                   "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                         } else {
-                            tma_2d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B2), k_1 * 128, task_1[1] * task_1[6] + n_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
-                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 512, (&SFB2), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(smem_b_addr + b_stage * 16384), "l"((&B2)), "r"(k_1 * 128), "r"(task_1[1] * task_1[6] + n_offset),
+                                   "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                " [%0], [%1, {%2, %3}], [%4], %5;"
+                                :: "r"(smem_sfb_addr + b_stage * 512), "l"((&SFB2)), "r"(n_offset), "r"(sf_k_offset),
+                                   "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                         }
                         if (cta_rank == 0) {
                             mbarrier_arrive_expect_tx(full_addr + (b_stage) * 8, 17408);
@@ -1764,7 +1790,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a(int* __restrict_
                                 : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
                                 : "r"(read_address));
                             unsigned long long dst_index = (unsigned long long)(pool_m + row_3) * 2560 + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
-                            reinterpret_cast<int4*>(PublicExpertOutput + dst_index)[0] = reinterpret_cast<int4*>(packed)[0];
+                            asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(PublicExpertOutput + dst_index), "r"(packed[(0) + 0]), "r"(packed[(0) + 1]), "r"(packed[(0) + 2]), "r"(packed[(0) + 3]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                     }
                     asm volatile("barrier.sync 2, 256;" ::: "memory");
@@ -1805,19 +1831,28 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a(int* __restrict_
             }
             asm volatile("barrier.sync 15, 256;" ::: "memory");
             asm volatile("barrier.sync 1, 384;" ::: "memory");
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             unsigned int epi_warp_3 = warp - 8;
+            unsigned int walk_first_1 = epi_warp_3 * (unsigned int)NUM_CTAS + (unsigned int)bid;
+            unsigned int walk_end_1 = (((unsigned int)(num_tokens * 4)) < ((unsigned int)(76 * NUM_CTAS) + (unsigned int)bid) ? ((unsigned int)(num_tokens * 4)) : ((unsigned int)(76 * NUM_CTAS) + (unsigned int)bid));
+            unsigned int walk_step_1 = (unsigned int)(NUM_CTAS * 8);
             unsigned int values_1[4];
             float reduced_1[40];
             unsigned int store_values_1[4];
             unsigned int buffers_1 = epi_warp_3 * 6;
+            int next_row_1 = -1;
+            if (lane < 6 && walk_first_1 < walk_end_1) {
+                next_row_1 = token_to_permuted[walk_first_1 / 4 * 6 + (unsigned int)lane];
+            }
             unsigned int _phase_combine_barriers_1 = 0;
             #pragma unroll 1
-            for (unsigned int token_chunk_1 = epi_warp_3 * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk_1 < num_tokens * 4; token_chunk_1 += NUM_CTAS * 12) {
+            for (unsigned int token_chunk_1 = walk_first_1; token_chunk_1 < walk_end_1; token_chunk_1 += walk_step_1) {
                 unsigned int token_1 = token_chunk_1 / 4;
                 unsigned int chunk_1 = token_chunk_1 % 4;
-                int stored_row_1 = -1;
-                if (lane < 6) {
-                    stored_row_1 = token_to_permuted[token_1 * 6 + (unsigned int)lane];
+                int stored_row_1 = next_row_1;
+                next_row_1 = -1;
+                if (lane < 6 && token_chunk_1 + walk_step_1 < walk_end_1) {
+                    next_row_1 = token_to_permuted[(token_chunk_1 + walk_step_1) / 4 * 6 + (unsigned int)lane];
                 }
                 unsigned int routed_1 = __ballot_sync(0xFFFFFFFF, stored_row_1 >= 0);
                 #pragma unroll 1

@@ -18,9 +18,9 @@ the sample count to stay within the rotating-state capacity and set
 iterations fit. `--dry-run-iters` and `--repeat-iters` request fixed iteration
 counts; they are not duration targets.
 
-`diag_cake_dsa_indexer_sampling.py` replays the sampled first threshold of the
+`diag_cake_dsa_indexer_det_train_sampling.py` replays the sampled first threshold of the
 experimental Cake DSA indexer top-k backend on the host: for one call's inputs
-(a saved rank's tensors, a row of `bench_cake_dsa_indexer.py`, or a synthetic
+(a saved rank's tensors, a row of `bench_cake_dsa_indexer_det_train.py`, or a synthetic
 16-way context-parallel rank) it reports how many work units would fail their
 verdict and be streamed twice under the plan the backend picks. The console
 prints totals, per-segment counts and a per-CTA summary (CTAs with a failure,

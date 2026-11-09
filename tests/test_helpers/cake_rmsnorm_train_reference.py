@@ -1,6 +1,6 @@
 """FP64 references, accuracy checks and registry readers shared by the coverage
 suites of the Cake RMSNorm training package with the non-deterministic weight
-gradient (``tests/norm/test_cake_rmsnorm_train_{ckpt,windows,all_sm,dist}.py``).
+gradient (``tests/norm/test_cake_rmsnorm_nondet_train_{ckpt,windows,all_sm,dist}.py``).
 
 The budget is the deterministic package's: BF16 ``y`` / ``dx`` at ``atol = rtol =
 1e-2`` after normalizing both sides to unit scale, FP32 ``rstd`` at relative L2
@@ -162,12 +162,13 @@ def window_records(
 
 
 def form(loader, names: list[str]) -> str:
-    """``single`` (one ``claim_sum_f64`` kernel) or ``pair`` (a ``chunk_partials``
-    main kernel and its dw reduce) of one backward window's records."""
+    """``single`` (one ``claim_sum_f64`` kernel, or one ``claim_part_f32``
+    pair-row single kernel) or ``pair`` (a ``chunk_partials`` main kernel and its
+    dw reduce) of one backward window's records."""
     records = [loader.MODULES[name] for name in names]
     owners = [r["workspace_rule"]["kind"] for r in records if r["workspace_rule"]]
     reduces = [r for r in records if r["role"] == "bwd_reduce"]
-    if len(records) == 1 and owners == ["claim_sum_f64"]:
+    if len(records) == 1 and owners in (["claim_sum_f64"], ["claim_part_f32"]):
         return "single"
     if len(records) == 2 and owners == ["chunk_partials"] and len(reduces) == 1:
         return "pair"

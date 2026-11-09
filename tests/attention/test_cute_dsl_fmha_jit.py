@@ -328,7 +328,8 @@ def _sf_ref_5d(ref_flat, s, b, h_k, h_r, d):
 @pytest.mark.parametrize("qk_mode", list(_BS_MODES))
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("with_lse", [False, True])
-def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
+@pytest.mark.parametrize("p_exp_mode", ["exp2", "expcast"])
+def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse, p_exp_mode):
     """Block-scaled (MXFP8 / NVFP4) non-varlen prefill, JIT-compiled."""
     torch.manual_seed(0)
     qk_dt, sf_dt, sf_vec = _BS_MODES[qk_mode]
@@ -370,6 +371,8 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse):
         enable_ex2_emulation=ENABLE_EX2,
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
+        p_exp_mode=p_exp_mode,
+        rescale_threshold=2**-8,
         use_tma_store=True,  # non-varlen
     )
     stream = _default_stream()

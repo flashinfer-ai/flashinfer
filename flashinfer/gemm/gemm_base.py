@@ -398,6 +398,20 @@ def _require_contiguous_a_column_major_b(
         )
 
 
+def _cutlass_bf16_is_aligned(k: int, n: int, out_dtype: torch.dtype) -> bool:
+    # The kernel computes out^T, so K and N are the contiguous dimensions of its
+    # TMA operands; can_implement() rejects rows that are not 16-byte aligned.
+    return k % 8 == 0 and n % (16 // out_dtype.itemsize) == 0
+
+
+def _require_cutlass_bf16_alignment(k: int, n: int, out_dtype: torch.dtype) -> None:
+    if not _cutlass_bf16_is_aligned(k, n, out_dtype):
+        raise ValueError(
+            "The CUTLASS backend requires K divisible by 8 and N divisible by "
+            f"{16 // out_dtype.itemsize} for {out_dtype} output, got K={k} and N={n}."
+        )
+
+
 @supported_compute_capability([100, 103, 107])
 def _cutlass_mm_bf16_requirement(
     a: torch.Tensor,
@@ -422,6 +436,9 @@ def _cutlass_mm_bf16_requirement(
     _require_contiguous_a_column_major_b(a, b, "CUTLASS")
 
     _validate_bf16_output_dtype(out_dtype)
+    _require_cutlass_bf16_alignment(
+        a.shape[-1], b.shape[-1], out.dtype if out is not None else out_dtype
+    )
 
     return True
 
@@ -722,6 +739,13 @@ def _heuristic_func_mm_bf16(
     return heuristic_backends
 
 
+def _batch_invariant_requested(*args, **kwargs) -> bool:
+    # ``batch_invariant`` is keyword-only in every GEMM API that has it. The batch-invariant class replaces the backends
+    # (it never runs one) and validates every input itself with typed errors, so the backend checks and the auto
+    # heuristic are skipped for it.
+    return bool(kwargs.get("batch_invariant", False))
+
+
 @backend_requirement(
     {
         "cudnn": _cudnn_mm_bf16_requirement,
@@ -734,6 +758,7 @@ def _heuristic_func_mm_bf16(
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_bf16_trace)
 def mm_bf16(
@@ -819,13 +844,17 @@ def mm_bf16(
 
     batch_invariant: bool
         ``True`` runs the batch-invariant bf16 GEMM class in place of the
-        backends (requires ``backend="auto"``, bf16 output and no bias): a
+        backends (requires ``backend="auto"`` and bf16 output): a
         row of the output is bit-identical whatever the number of rows, the
         row's position in the batch or the configuration chosen, and the
         result is deterministic. Under autotuning the class's top
         configurations for the shape are profiled; all of them compute the
         same bits. ``b`` may be the row-major ``(k, n)`` tensor or the
-        transpose of a row-major ``(n, k)`` weight. Unsupported inputs raise
+        transpose of a row-major ``(n, k)`` weight. A bf16 ``bias`` of shape
+        ``(n,)`` is added once, in fp32, to the fully reduced accumulator
+        before the single rounding to bf16 (a biased call is a different
+        specification: ``flashinfer.batch_invariant.fingerprint("mm_bf16", N=,
+        K=, bias=True)``). Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
@@ -932,6 +961,9 @@ def _cutlass_bmm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
     _validate_bf16_output_dtype(out_dtype)
+    _require_cutlass_bf16_alignment(
+        A.shape[-1], B.shape[-1], out.dtype if out is not None else out_dtype
+    )
 
     return True
 
@@ -2221,6 +2253,9 @@ def get_gemm_sm100_module_cutlass_bf16():
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
+                a, b, _, _, out, _ = inputs
+                if not _cutlass_bf16_is_aligned(a.shape[-1], b.shape[-1], out.dtype):
+                    return []
                 return list(range(module.bf16_gemm_tactic_num()))
 
             def forward(
@@ -6625,6 +6660,7 @@ def _check_mm_mxfp8_problem_size(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
+    batch_invariant: bool = False,
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -6744,6 +6780,7 @@ def _cutlass_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
+    batch_invariant: bool = False,
 ):
     # CUTLASS reads scales as 1D 128x4-swizzled atoms only; all other layouts raise ValueError.
     if is_sm12x_supported(a.device):
@@ -6774,6 +6811,7 @@ def _trtllm_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["trtllm", "auto"] = "auto",
+    batch_invariant: bool = False,
 ):
     if out_dtype != torch.bfloat16:
         return False
@@ -6802,6 +6840,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = True,  # unused
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    batch_invariant: bool = False,
 ):
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
     # in F8_128x4 layout for both A and B.
@@ -6824,6 +6863,7 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
+    batch_invariant: bool = False,
 ):
     if use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
         if backend != "cutedsl_low_latency":
@@ -6855,6 +6895,7 @@ def _cudnn_mm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cudnn", "auto"] = "cudnn",
+    batch_invariant: bool = False,
 ):
     # The cuDNN MXFP8 GEMM graph consumes block scales reordered in the
     # F8_128x4 swizzled layout, so it requires 1D swizzled (128x4) scales and
@@ -7780,7 +7821,11 @@ def _heuristic_func_mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
+    batch_invariant: bool = False,
 ) -> List[str]:
+    if batch_invariant:
+        # the batch-invariant class runs in place of the backends: their availability does not decide the call
+        return ["batch_invariant"]
     # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
         order = ["b12x", "cutlass"] + (["cudnn"] if CUDNN_AVAILABLE else [])
@@ -7808,6 +7853,7 @@ def _heuristic_func_mm_mxfp8(
     },
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_mxfp8_trace)
 def mm_mxfp8(
@@ -7821,6 +7867,8 @@ def mm_mxfp8(
     backend: Literal[
         "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
     ] = "auto",
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -7881,6 +7929,23 @@ def mm_mxfp8(
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
 
+    batch_invariant: bool
+        ``True`` runs the batch-invariant MXFP8 GEMM class in place of the
+        backends (requires ``backend="auto"``, the 128x4 swizzled scale layout
+        and bf16 / fp16 output): a row of the output is bit-identical whatever
+        the number of rows, the row's position in the batch or the
+        configuration chosen, and the result is deterministic. Under autotuning
+        the class's top configurations for the shape are profiled; all of them
+        compute the same bits. ``b`` must be the transpose of a row-major
+        ``(n, k)`` weight (the block-scaled instruction takes K-major operands
+        only). The class is the architecture's (the SM107 instruction folds 64
+        elements per step, the SM100 / SM103 one 32), so the specification is
+        ``flashinfer.batch_invariant.fingerprint("mm_mxfp8", N=, K=, out_dtype=,
+        arch=)``. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
+        Defaults to ``False``.
+
     Returns
     -------
     out: torch.Tensor
@@ -7904,6 +7969,13 @@ def mm_mxfp8(
     >>> out.shape
     torch.Size([512, 256])
     """
+
+    if batch_invariant:
+        from .batch_invariant.tuning import mm_mxfp8_batch_invariant_auto
+
+        return mm_mxfp8_batch_invariant_auto(
+            a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout, backend
+        )
 
     assert a.ndim == 2, f"mm_mxfp8: a must be 2D, got {a.ndim}D with shape {a.shape}"
     assert b.ndim == 2, f"mm_mxfp8: b must be 2D, got {b.ndim}D with shape {b.shape}"
@@ -8295,6 +8367,7 @@ def _check_mm_fp4_problem_size(
     ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     # Generic checks
     ## pre-check the input tensor, block scale tensor and alpha tensor
@@ -8364,6 +8437,7 @@ def _cudnn_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
@@ -8406,6 +8480,7 @@ def _trtllm_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
@@ -8433,6 +8508,7 @@ def _cutlass_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
@@ -8459,6 +8535,7 @@ def _cute_dsl_gemm_fp4_requirement(
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if _match_sm_version(a.device, ["120", "121"]):
         if backend == "auto":
@@ -8518,6 +8595,7 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if use_8x4_sf_layout:
         if backend != "cutedsl_low_latency":
@@ -8557,6 +8635,7 @@ def _b12x_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     cuda_version = get_cuda_version()
     min_cuda_version = _MIN_B12X_CUDA_VERSION if use_nvfp4 else Version("13.0")
@@ -9803,6 +9882,7 @@ def _heuristic_func_mm_fp4(
     ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,
 ):
     r"""
     Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
@@ -9823,6 +9903,9 @@ def _heuristic_func_mm_fp4(
     backend has one too, but it is explicit opt-in only (``backend="cake"``) and
     never auto-selected.
     """
+    if batch_invariant:
+        # the batch-invariant class runs in place of the backends: their availability does not decide the call
+        return ["batch_invariant"]
     if _is_per_token_alpha(alpha):
         return [c for c in ("cute-dsl",) if c in suitable_backends]
 
@@ -10017,6 +10100,7 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     },
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_fp4_trace)
 def mm_fp4(
@@ -10041,6 +10125,8 @@ def mm_fp4(
     ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -10110,6 +10196,18 @@ def mm_fp4(
         The SM120/SM121 ``"cute-dsl"`` implementation uses ordinary
         stream-ordered launches for either value. This parameter is ignored
         by other backends.
+    batch_invariant: bool
+        ``True`` runs the batch-invariant NVFP4 (``use_nvfp4=True``) or MXFP4
+        GEMM class in place of the backends (requires ``backend="auto"``, the
+        128x4 swizzled scale layout, a scalar ``alpha`` and bf16 / fp16
+        output): a row of the output is bit-identical whatever the number of
+        rows, the row's position in the batch or the configuration chosen, and
+        the result is deterministic. Under autotuning the class is profiled
+        like a backend; any tactic computes the class. The receipt of the
+        specification: ``flashinfer.batch_invariant.fingerprint("mm_fp4", N=,
+        K=, out_dtype=, use_nvfp4=, arch=)``. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
 
     Notes
     -----
@@ -10138,6 +10236,22 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
+    if batch_invariant:
+        from .batch_invariant.tuning import mm_fp4_batch_invariant_auto
+
+        return mm_fp4_batch_invariant_auto(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            alpha,
+            out_dtype,
+            out,
+            block_size,
+            use_8x4_sf_layout,
+            backend,
+            use_nvfp4,
+        )
 
     # allocate the output tensor if not provided
     if out is None:
@@ -10242,6 +10356,7 @@ def _cudnn_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     return _cudnn_available_or_raise_for_backend(backend)
 
@@ -10255,6 +10370,7 @@ def _cublas_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     return True
 
@@ -10268,6 +10384,7 @@ def _cutlass_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     if A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2:
         raise ValueError("e5m2 is not supported for bmm_fp8 with cutlass backend")
@@ -10286,6 +10403,7 @@ def _cute_dsl_bmm_fp8_requirement(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     """Requirement check for CuTe-DSL FP8 BMM backend."""
     if not CUTE_DSL_AVAILABLE:
@@ -10323,6 +10441,7 @@ def _check_bmm_fp8_problem_size(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     _validate_fp8_output_dtype(dtype)
     return True
@@ -10342,6 +10461,7 @@ def _heuristic_func_bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    batch_invariant: bool = False,
 ):
     # No e5m2 for cutlass (but cute-dsl supports it)
     is_e5m2 = A.dtype == torch.float8_e5m2 or B.dtype == torch.float8_e5m2
@@ -10414,6 +10534,7 @@ def _heuristic_func_bmm_fp8(
     },
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=bmm_fp8_trace)
 def bmm_fp8(
@@ -10424,6 +10545,8 @@ def bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "cute-dsl", "auto"] = "cublas",
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -10451,6 +10574,21 @@ def bmm_fp8(
         The backend to use for the operation. Defaults to ``"cublas"``.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
         ``"cute-dsl"`` uses CuTe-DSL kernels optimized for SM100+ (Blackwell/Rubin) architectures.
+
+    batch_invariant: bool
+        ``True`` runs the batch-invariant fp8 GEMM class in place of the
+        backends (requires ``backend="auto"``, A and B of one fp8 dtype, bf16
+        or fp16 output): every batch element is one launch of the class, so a
+        row's bits are identical whatever the number of rows, the row's
+        position, the batch size, the element's position in the batch or the
+        configuration chosen, and the result is deterministic.
+        ``A_scale * B_scale`` is formed once on the device and applied after
+        the fold. Under autotuning the class's top configurations for the
+        shape are profiled; all of them compute the same bits. Unsupported
+        inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
+        Defaults to ``False``.
 
     Returns
     -------
@@ -10481,6 +10619,11 @@ def bmm_fp8(
     >>> out.dtype
     torch.bfloat16
     """
+
+    if batch_invariant:
+        from .batch_invariant.tuning import bmm_fp8_batch_invariant_auto
+
+        return bmm_fp8_batch_invariant_auto(A, B, A_scale, B_scale, dtype, out, backend)
 
     if out is None:
         out = torch.empty(
@@ -12282,7 +12425,7 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     )
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -12297,8 +12440,8 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
 ) -> bool:
     """Admission of the generated Cake programs: exactly the band the Cake dispatcher owns.
 
-    SM100a / SM103a devices with an exported SM count, the eight inventory
-    ``(N, K)`` geometries, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
+    SM100a / SM103a / SM107a devices with an exported SM count, the ``(N, K)``
+    geometries the architecture's route chain owns, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
     operands with float32 ``(1, 128, 128)`` scales (or the native MN-major packed
     UE8M0 int32 scales of the serving routes), int32 ``masked_m`` and a bfloat16
     output.  Every other problem raises through ``backend_requirement``.
@@ -12428,12 +12571,15 @@ def batch_deepgemm_fp8_nt_groupwise(
         ``"cake"`` runs the generated Cake programs for the band they own
         (SM100a / SM103a; ``(n, k)`` in ``{(128, 512), (512, 128),
         (4096, 7168), (7168, 2048), (6144, 7168), (7168, 3072), (4096, 4096),
-        (4096, 2048)}``; bfloat16 output; FP32 accumulation with the same
+        (4096, 2048)}``; SM107a: the masked BLOCK_N programs, ``(n, k)`` in
+        ``{(128, 512), (512, 128), (4096, 7168), (7168, 2048)}``; bfloat16 output; FP32 accumulation with the same
         ordered block-scale application as DeepGEMM) and raises for every other
         problem.  With ``backend="cake"`` the scales may also be the native
         MN-major packed UE8M0 ``torch.int32`` tensors of the serving routes
         (``a_scale`` of shape ``(batch_size, m, k // 512)``, ``b_scale`` of
-        shape ``(batch_size, n, k // 512)``), consumed without conversion.
+        shape ``(batch_size, n, k // 512)``) for ``(n, k)`` in
+        ``{(4096, 7168), (7168, 2048)}`` and ``batch_size`` 32 or 64 on
+        SM100a, SM103a and SM107a, consumed without conversion.
         Every launch of the Cake backend, including the first, may be captured
         into a CUDA graph; see
         :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.prepare_batch_deepgemm_fp8_nt_groupwise`

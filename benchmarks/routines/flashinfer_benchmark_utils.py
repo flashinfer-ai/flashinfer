@@ -155,6 +155,17 @@ output_column_dict = {
         "weight_dtype",
         "has_z",
         "dt_softplus",
+        "conv_tokens_per_sequence",
+        "conv_seq_lens",
+        "conv_bias",
+        "conv_speculative",
+        "conv_initial_state",
+        "conv_layout",
+        "conv_input_row_stride",
+        "conv_graph_refcheck_passed",
+        "conv_workspace_bytes",
+        "conv_host_submit_us",
+        "conv_cuda_ops",
     ],
     "gdn": [
         "num_q_heads",
@@ -326,6 +337,8 @@ benchmark_apis = {
     ],
     "mamba": [
         "selective_state_update",
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
     ],
     "gdn": [
         "gated_delta_rule_decode",
@@ -1180,6 +1193,14 @@ routine_cc_to_supported_backends = {
         "12.1": ["cuda"],
     },
     # MAMBA
+    "causal_conv1d_fn": {
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+    },
+    "causal_conv1d_update": {
+        "10.0": ["flashinfer", "triton"],
+        "10.3": ["flashinfer", "triton"],
+    },
     "selective_state_update": {
         "7.5": ["flashinfer", "triton"],
         "8.0": ["flashinfer", "triton"],

@@ -47,8 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
 #define QUANT_UNITS 1
 #define SF_TILE_BYTES 512
 
@@ -115,7 +113,7 @@ kernel_cake_kimi_k3_fp8_projection_c42daab0663b6ed697fe(__nv_bfloat16* __restric
     unsigned long long row_base = (unsigned long long)row_c * (unsigned long long)K;
     int m_tile = row_c / sf_rows;
     int row_in_tile = row_c - m_tile * sf_rows;
-    unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4;
+    unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16ull + (unsigned long long)(row_in_tile >> 5) * 4ull;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     float staged[8];
     #pragma unroll

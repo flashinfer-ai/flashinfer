@@ -43,8 +43,8 @@ and run the two halves back to back on the current stream.
 
     ugpu_state_pool
 
-ReplaySSM speculative verification (SM100/SM103)
----------------------------------------------
+ReplaySSM speculative verification (SM100/SM103, SM120)
+-------------------------------------------------------
 
 Use ``gated_delta_rule_mtp(cache_replayssm=True, disable_state_update=True)``
 with FP32 128x128 checkpoints. For each layer, pass contiguous views into
@@ -59,16 +59,26 @@ The next verify overwrites the raw windows; no circular cache or deferred
 state update is retained between rounds. Use identical Q/K normalization
 settings for verify and commit.
 
-The tcgen05 verify specialization uses TMA and TF32 tensor cores for T=4..8,
-B=1..256, BF16 output, int32 indices, contiguous FP32 checkpoints, normalized
-Q/K and an even value-head/key-head ratio. Other supported SM100 inputs use
-the FP32 MTP fallback. TF32 contraction changes numerical reduction precision.
-See the API docstrings for shape, index uniqueness, padding and optional
-tracked-checkpoint contracts.
+Verify has a TF32 tensor-core specialization on each architecture. Both
+require T=4..8, B=1..256, BF16 output, int32 indices, contiguous FP32
+checkpoints and normalized Q/K; other supported inputs use the FP32 MTP
+fallback. TF32 contraction changes numerical reduction precision, so outputs
+need not be bitwise equal to the fallback. See the API docstrings for shape,
+index uniqueness, padding and optional tracked-checkpoint contracts.
 
-Commit defaults to ``backend="auto"``. With normalized K and no tracking,
-T=8 uses tcgen05; T=6/7 uses tcgen05 when B>1 and ``layers * B * HV >= 256``.
-Other cases use SIMT. Explicit ``backend="tcgen05"`` supports T=4..8.
-The heuristic uses tensor metadata, not device-resident accepted lengths;
-short accepted prefixes may favor ``backend="simt"``. SIMT also retains FP32
-contractions when checkpoint accuracy is preferred over tensor-core throughput.
+- SM100/SM103: the tcgen05 specialization uses TMA and tcgen05 MMA, and also
+  requires an even value-head/key-head ratio.
+- SM120 has no tcgen05. Its specialization uses warp-level ``mma.sync`` TF32
+  MMA and splits each head's value rows across several CTAs. It is selected
+  when ``B * HV <= 128`` or T>=7, where it is generally faster than the FP32
+  fallback; larger batches at T<=6 keep the fallback.
+
+Commit defaults to ``backend="auto"``. On SM100/SM103, with normalized K and
+no tracking, T=8 uses tcgen05; T=6/7 uses tcgen05 when B>1 and
+``layers * B * HV >= 256``. Other cases use SIMT. Explicit
+``backend="tcgen05"`` supports T=4..8. The heuristic uses tensor metadata,
+not device-resident accepted lengths; short accepted prefixes may favor
+``backend="simt"``. SIMT also retains FP32 contractions when checkpoint
+accuracy is preferred over tensor-core throughput. On SM120, commit always
+uses the FP32 SIMT kernel: ``auto`` resolves to ``simt`` and explicit
+``backend="tcgen05"`` is rejected.
