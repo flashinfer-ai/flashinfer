@@ -1502,10 +1502,12 @@ def _k1_forward_knobs_of(X: torch.Tensor, W: torch.Tensor, out: torch.Tensor) ->
 def k1_program_knobs(program: str) -> tuple:
     """The deterministic package's planner knobs that name its program ``program`` (a template symbol without the
     ``dense_proj_det_gemm_`` prefix, e.g. ``kn_n128_f32_tma2_s4_c1``), as sorted ``(name, value)`` pairs: that
-    package's inverse of its symbol (``_template_knobs``).  ``ValueError`` for a symbol that names no planner knobs."""
+    package's inverse of its symbol (``_template_knobs``).  ``ValueError`` for a symbol that names no planner knobs.
+    The serpentine K walk ``kser`` of that inverse is not a planner keyword: it is dropped when 0, and a ``_ks<P>``
+    program (``kser`` P > 0), which that package plans from its own rules only, names no planner knobs."""
     det = deterministic_backend()
     knobs = det._template_knobs(det._TEMPLATE_PREFIX + program)
-    if knobs is None:
+    if knobs is None or knobs.pop("kser", 0):
         raise ValueError(
             f"cake_dense_gemm_nondet_train: {program!r} names no program of the deterministic planner"
         )
