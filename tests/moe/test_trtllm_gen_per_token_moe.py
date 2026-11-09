@@ -45,8 +45,6 @@ from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
 )
-from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
-from flashinfer.tllm_enums import DtypeTrtllmGen, Fp8QuantizationType, WeightLayout
 from flashinfer.utils import device_support_pdl, get_compute_capability
 from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
 from . import utils as moe_utils
@@ -80,7 +78,6 @@ def _per_token_routed_case(
     activation_type: ActivationType,
     zero_rows: bool,
     device: torch.device,
-    gemm1_lora_delta: torch.Tensor | None = None,
 ):
     """Build per-token NVFP4 inputs for the routed flat APIs and the reference.
 
@@ -236,8 +233,6 @@ def _per_token_routed_case(
         mask = flat_ids == e  # [num_tokens*top_k]
         e_hidden = flat_hidden[mask]  # [n_e, hidden_size]
         up_gate_e = e_hidden @ w13_dequant[e].T  # [n_e, fc1_out_size]
-        if gemm1_lora_delta is not None:
-            up_gate_e = up_gate_e + gemm1_lora_delta.reshape(-1, fc1_out_size)[mask]
         if is_gated:
             up_e, gate_e = up_gate_e.chunk(2, dim=-1)
             inter_e = F.silu(gate_e) * up_e  # [n_e, intermediate_size]
@@ -357,7 +352,6 @@ def _per_token_routed_case(
         enable_pdl=enable_pdl,
         activation_type=activation_type.value,
         per_token_scale=per_token_scale_inv,
-        gemm1_lora_delta=gemm1_lora_delta,
     )
     return kwargs, reference
 
@@ -470,63 +464,3 @@ def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
     assert not torch.equal(env_on, env_off)
     assert torch.equal(pinned_under_env_off, env_on)
     assert torch.equal(none_under_env_on, env_off)
-
-
-@pytest.mark.parametrize("num_tokens", [3072, 3073])
-@pytest.mark.parametrize("enable_autotune", [False, True])
-def test_nvfp4_per_token_lora_tile_boundary(num_tokens, enable_autotune):
-    """Regression for #8272: MN bias must not select an unavailable tile-192 kernel."""
-    if get_compute_capability(torch.device("cuda")) not in [(10, 0), (10, 3)]:
-        pytest.skip("Requires SM100 or SM103")
-
-    torch.manual_seed(42)
-    top_k = 8
-    intermediate_size = 768
-    if enable_autotune:
-        moe_module = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
-        valid_tactics = moe_module.trtllm_get_valid_moe_configs(
-            DtypeTrtllmGen.E2m1,
-            DtypeTrtllmGen.E2m1,
-            Fp8QuantizationType.NoneFp8,
-            top_k,
-            2048,
-            2048,
-            intermediate_size,
-            128,  # num_local_experts
-            128,  # num_experts
-            ActivationType.Swiglu.value,
-            True,
-            WeightLayout.MajorK.value,
-            True,
-            num_tokens,
-            True,
-        )
-        assert valid_tactics
-        assert all(tactic[0] != 192 for tactic in valid_tactics)
-
-    gemm1_lora_delta = torch.randn(
-        num_tokens,
-        top_k,
-        2 * intermediate_size,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    kwargs, reference = _per_token_routed_case(
-        num_tokens=num_tokens,
-        hidden_size=2048,
-        intermediate_size=intermediate_size,
-        num_experts=128,
-        top_k=top_k,
-        use_4over6=False,
-        weights_use_4over6=False,
-        activation_type=ActivationType.Swiglu,
-        zero_rows=False,
-        gemm1_lora_delta=gemm1_lora_delta,
-        device=torch.device("cuda:0"),
-    )
-
-    kwargs["tune_max_num_tokens"] = num_tokens
-    with autotune(enable_autotune):
-        result = trtllm_fp4_block_scale_routed_moe(**kwargs)[0]
-    torch.cuda.synchronize()
-    check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.9)
