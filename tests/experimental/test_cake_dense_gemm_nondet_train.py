@@ -13041,6 +13041,8 @@ def test_gpu_router_partials_sum_eager_graph_and_recompute():
     eager = (Y.clone(), dW.clone())
     for t in (Y, dW):
         t.fill_(float("nan"))
+    # the fill runs on the current stream: the recompute's stores must come after it
+    stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
         step()  # the recompute
     stream.synchronize()
