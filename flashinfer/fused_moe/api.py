@@ -3296,8 +3296,24 @@ class BatchInvariantBf16Config:
     never an atomic finalize).
     All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
     ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm`` and ``DeepSeekV3`` with ``n_group <= 1``), the pre-routed modes take the caller's ids
-    and weights. Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend
-    never falls back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout).
+    and weights. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
+    its argument below, so a masked expert keeps a positive score of the smallest magnitudes; while ``top_k`` unmasked
+    experts exist it is never selected and the weights are exactly those of the row without it, otherwise masked experts
+    fill the remaining slots (in index order; by their bias for the biased methods) with such weights, and a fully masked
+    row is not a defined routing. An expert whose selection score is NaN is never selected; when fewer than ``top_k``
+    experts of a row have a non-NaN score (NaN logits), each remaining slot takes the lowest expert index the row has not
+    taken, with a NaN weight: the row's output is NaN and every id stays in range. A pre-routed expert id outside
+    ``[0, num_experts)`` is a dropped slot: neither gathered nor computed, it contributes ``+0`` to its token's combine
+    whatever its weight (a token whose slots are all dropped gives a zero row); nothing is validated on the host.
+    Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls
+    back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout). The layer's own
+    checks come first: ``MoELayer`` runs every candidate's support check at construction (the base runner refuses an
+    expert-parallel shard; this backend ``do_finalize=False``, ``top_k`` / ``num_experts`` beyond its bounds and fused
+    shared experts) and reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
+    filter admits only a bf16 ``[num_tokens, H]`` activation (an fp16 one is its ``NotImplementedError``: no usable
+    backend); what reaches the runner (``n_group > 1`` or an unimplemented method from logits, a bias against the method,
+    a weight view of another activation or configuration, the runner driven directly) raises
+    ``BatchInvariantUnsupportedError``.
 
     Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) for the gated activations or
     ``w1 [E, I, H]`` for the ungated ones, and ``w2 [E, H, I]``, bf16; the activation names the chain of the view;
@@ -3320,11 +3336,28 @@ class BatchInvariantBf16Config:
         device: Optional[torch.device] = None,
     ) -> Dict[str, Any]:
         """The backend's weight view: the gate / up rows interleaved for a gated activation, as given for an ungated one,
-        and the activation's chain (``activation`` defaults to ``SwiGLU()``)."""
+        and the activation's chain (``activation`` defaults to ``SwiGLU()``). A supplied ``num_local_experts`` /
+        ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry (``ValueError`` otherwise)."""
         from .batch_invariant.api import MoEWeights
         from .batch_invariant.spec import activation_of
 
         chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1.dim() != 3 or w2.dim() != 3:
+            raise TypeError(
+                "BatchInvariantBf16Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise ValueError(
+                    f"BatchInvariantBf16Config.prepare_weights: {name} {given} does not match the weights' "
+                    f"{actual} (w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)"
+                )
         w1 = w1.to(device=device) if device is not None else w1
         w2 = w2.to(device=device) if device is not None else w2
         return MoEWeights.prepare(

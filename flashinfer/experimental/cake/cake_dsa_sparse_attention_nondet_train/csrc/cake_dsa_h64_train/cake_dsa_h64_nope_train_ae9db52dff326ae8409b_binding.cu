@@ -37,12 +37,15 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
 }
 
-int64_t CMod(int64_t a, int64_t b) { return a % NonZero(b); }
+int64_t CMod(int64_t a, int64_t b) {
+  if (b == 0) NoInt64(a, "%", b);
+  return b == -1 ? 0 : a % b;
+}
 
 void Run(TensorView a_dout, TensorView a_out, TensorView a_o_lo, TensorView a_delta, int64_t a_num_rows, int64_t a_dout_token_stride, int64_t a_dout_head_stride, int64_t a_dout_offset, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_dout.device();
@@ -73,15 +76,15 @@ void Run(TensorView a_dout, TensorView a_out, TensorView a_o_lo, TensorView a_de
   check_same_device(a_o_lo, a_dout, "o_lo", "dout");
   check_contiguous(a_delta, "delta");
   check_same_device(a_delta, a_dout, "delta", "dout");
-  TVM_FFI_CHECK((a_num_rows >= 0), ValueError)
+  TVM_FFI_CHECK((a_num_rows >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (num_rows >= 0)";
-  TVM_FFI_CHECK((CMod(a_dout_token_stride, 8) == 0), ValueError)
+  TVM_FFI_CHECK((CMod(a_dout_token_stride, 8LL) == 0LL), ValueError)
       << KERNEL_NAME << ": requires (CMod(dout_token_stride, 8) == 0)";
-  TVM_FFI_CHECK((CMod(a_dout_head_stride, 8) == 0), ValueError)
+  TVM_FFI_CHECK((CMod(a_dout_head_stride, 8LL) == 0LL), ValueError)
       << KERNEL_NAME << ": requires (CMod(dout_head_stride, 8) == 0)";
-  TVM_FFI_CHECK((CMod(a_dout_offset, 8) == 0), ValueError)
+  TVM_FFI_CHECK((CMod(a_dout_offset, 8LL) == 0LL), ValueError)
       << KERNEL_NAME << ": requires (CMod(dout_offset, 8) == 0)";
-  TVM_FFI_CHECK((a_dout_offset >= 0), ValueError)
+  TVM_FFI_CHECK((a_dout_offset >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (dout_offset >= 0)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

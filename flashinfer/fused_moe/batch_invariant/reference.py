@@ -263,9 +263,10 @@ def combine_exact(
 
 
 def ulp_error(got: torch.Tensor, ref64: torch.Tensor) -> float:
-    """max |got - ref| in units of the binary32 ulp at ref (for accuracy yardsticks)."""
+    """max |got - ref| in units of the binary32 ulp at ref (for accuracy yardsticks); a zero or subnormal reference
+    counts in the subnormal spacing (its magnitude clamped to the smallest normal binary32 before the log)."""
     r = ref64.double()
     ulp = torch.ldexp(
-        torch.ones_like(r), torch.floor(torch.log2(r.abs().clamp_min(1e-38))) - 23
+        torch.ones_like(r), torch.floor(torch.log2(r.abs().clamp_min(2.0**-126))) - 23
     )
     return ((got.double() - r).abs() / ulp).max().item()

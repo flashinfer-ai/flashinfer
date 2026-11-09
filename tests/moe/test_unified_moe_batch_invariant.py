@@ -408,6 +408,83 @@ def test_registry_fingerprint_takes_an_activation_config():
     )
 
 
+def test_prepare_weights_rejects_dimensions_that_disagree_with_the_weights():
+    """A supplied ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must be the weights' own (``ValueError``
+    before any view is built, naming the dimension); the consistent call and the call without dimensions give the view,
+    for the gated geometry (``I`` = half of w1's rows) and the ungated one (``I`` = w1's rows)."""
+    E, I, H = 4, 16, 32
+    w1 = torch.randn(E, 2 * I, H).to(torch.bfloat16)
+    w2 = torch.randn(E, H, I).to(torch.bfloat16)
+    view = BatchInvariantBf16Config.prepare_weights(
+        w1, w2, num_local_experts=E, hidden_size=H, intermediate_size=I
+    )
+    assert view["w1i"].shape == (E, 2 * I, H) and view["gated"]
+    assert BatchInvariantBf16Config.prepare_weights(w1, w2)["w2"].shape == (E, H, I)
+    for kw in (
+        dict(num_local_experts=E + 1),
+        dict(hidden_size=H // 2),
+        dict(intermediate_size=2 * I),
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            BatchInvariantBf16Config.prepare_weights(w1, w2, **kw)
+        assert next(iter(kw)) in str(excinfo.value)
+    w1u = torch.randn(E, I, H).to(torch.bfloat16)
+    view_u = BatchInvariantBf16Config.prepare_weights(
+        w1u, w2, intermediate_size=I, activation=ReLU2()
+    )
+    assert not view_u["gated"] and view_u["w1i"].shape == (E, I, H)
+    with pytest.raises(ValueError):
+        BatchInvariantBf16Config.prepare_weights(
+            w1u, w2, intermediate_size=I // 2, activation=ReLU2()
+        )
+    with pytest.raises(TypeError):
+        BatchInvariantBf16Config.prepare_weights(w1[0], w2)
+
+
+def test_fingerprint_is_bounded_in_the_expert_count():
+    """The class identifier hashes its terms as DAGs: at the widest class (1024 experts, top-k 16) the default chain and
+    the largest ones (a parameterised ``SwiGLU``, ``SiTU``, ``PowLU``) fingerprint within a bounded time and host memory
+    (a routing weight's printed S-expression embeds the softmax sum once per leaf, the combine's once more per slot: a size
+    unbounded in the expert count), deterministically and distinctly."""
+    import time
+    import tracemalloc
+
+    dims = dict(H=4096, I=1536, top_k=16, num_experts=1024)
+    fps = set()
+    for act in (
+        SwiGLU(),
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+        SiTU(),
+        PowLU(),
+        PowLU(m=1.5, limit=4.0),
+    ):
+        tracemalloc.start()
+        t0 = time.monotonic()
+        fp = bi.fingerprint("fused_moe", act=act, **dims)
+        elapsed = time.monotonic() - t0
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert elapsed < 60.0 and peak < 256 * 2**20, (act, elapsed, peak)
+        assert fp.startswith("moe-") and fp == bi.fingerprint(
+            "fused_moe", act=act, **dims
+        )
+        fps.add(fp)
+    assert len(fps) == 5
+
+
+def test_ulp_error_counts_subnormal_spacing_at_zero_and_subnormal_references():
+    """The accuracy yardstick measures a zero or subnormal reference in the binary32 subnormal spacing: the smallest
+    subnormal against zero is one ulp, as is one spacing step between two subnormals and the step above the smallest
+    normal; a normal reference keeps its own ulp."""
+    from flashinfer.fused_moe.batch_invariant.reference import ulp_error
+
+    tiny, normal = 2.0**-149, 2.0**-126
+    assert ulp_error(torch.tensor([tiny]), torch.tensor([0.0])) == 1.0
+    assert ulp_error(torch.tensor([3 * tiny]), torch.tensor([2 * tiny])) == 1.0
+    assert ulp_error(torch.tensor([normal + tiny]), torch.tensor([normal])) == 1.0
+    assert ulp_error(torch.tensor([1.0 + 2.0**-23]), torch.tensor([1.0])) == 1.0
+
+
 def _adversarial_accumulators(
     limits: list[float], n_random: int, seed: int
 ) -> torch.Tensor:
@@ -799,6 +876,48 @@ def test_three_routing_modes_agree_and_runs_are_deterministic():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out_g), bits(out_l))
+
+
+@needs_device
+def test_routing_constants_first_made_under_graph_capture_are_not_cached():
+    """A routing constant (the absent bias, the scale) first materialised while a CUDA graph is being captured is a
+    graph-pool allocation whose fill runs only at replay: it serves that capture alone and is never cached, so an eager
+    call after the capture gives the bits of an eager call before it, and the replay gives them too."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, E = 64, 8, 96
+    g = torch.Generator().manual_seed(11)
+    logits = (torch.randn(T, E, generator=g) * 2).cuda()
+    bias = (torch.randn(E, generator=g) * 0.1).cuda()
+    calls = (
+        # the absent bias: a cached zero vector per expert count
+        dict(method=S.METHOD_OF_FLASHINFER[RoutingMethodType.Renormalize]),
+        # the scale given as a number: a cached one-element tensor
+        dict(
+            method=S.METHOD_OF_FLASHINFER[RoutingMethodType.DeepSeekV3],
+            bias=bias,
+            scaling_factor=2.5,
+        ),
+    )
+    for kw in calls:
+        ex0, w0 = api.route(logits, k, **kw)  # eager: the compile, the constants cached
+        torch.cuda.synchronize()
+        api._CONST.clear()
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                ex_g, w_g = api.route(logits, k, **kw)
+        torch.cuda.synchronize()
+        assert not api._CONST  # nothing made under capture is served to later calls
+        ex1, w1 = api.route(logits, k, **kw)
+        assert torch.equal(ex1, ex0) and torch.equal(bits(w1), bits(w0))
+        ex_g.fill_(-1)
+        w_g.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(ex_g, ex0) and torch.equal(bits(w_g), bits(w0))
 
 
 @needs_device
@@ -1295,3 +1414,148 @@ def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
     ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
     out2 = layer(_routed_pack(x, ids, wts), W)
     assert torch.equal(bits(out), bits(out2))
+
+
+@needs_device
+@pytest.mark.parametrize("E", [48, 64])
+def test_nan_logits_route_to_the_lowest_untaken_experts_with_nan_weights(E):
+    """An expert whose selection score is NaN is never selected. A row with fewer than ``top_k`` non-NaN logits (one with
+    none at all) gets the lowest expert indices it has not taken in its remaining slots, with NaN weights: every id stays
+    in ``[0, E)`` (never the bucket's absent experts at ``E = 48``, never the argmax sentinel at ``E = 64``), the row's
+    output is NaN, nothing faults, and the rows without a NaN keep the class's bits, in the fused route + plan form (a
+    small token count) and the two-launch form; ``route_plan`` gives ``route`` + ``permute_plan``'s integers on such
+    logits. A row with exactly ``top_k`` finite logits selects them in the strict order."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    k, H, I = 8, 256, 128
+    keep = {
+        1: 3,
+        5: 0,
+        9: 1,
+        7: k,
+    }  # token -> its finite logits (7: a boundary row, k of them)
+    for T in (12, 40):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5, adversarial=True)
+        logits = logits.clone()
+        finite = {}
+        for t, m in keep.items():
+            cols = torch.randperm(E, generator=torch.Generator().manual_seed(t))[:m]
+            finite[t] = cols.tolist()
+            mask = torch.ones(E, dtype=torch.bool)
+            mask[cols] = False
+            logits[t, mask.cuda()] = float("nan")
+        ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
+        ids_c, wts_c, logits_c = ids.cpu(), wts.cpu(), logits.cpu()
+        assert torch.all((ids_c >= 0) & (ids_c < E))
+        for t, cols in finite.items():
+            order = sorted(cols, key=lambda e: (-float(logits_c[t, e]), e))
+            m = len(cols)
+            assert ids_c[t, :m].tolist() == order, t
+            taken, pad = set(order), []
+            for _ in range(k - m):
+                pad.append(min(set(range(E)) - taken))
+                taken.add(pad[-1])
+            assert ids_c[t, m:].tolist() == pad, t
+            if m < k:
+                assert torch.isnan(wts_c[t]).all(), (
+                    t
+                )  # the renormalisation spreads the NaN over the row
+        clean = torch.tensor([t not in keep for t in range(T)])
+        ref_ids, ref_w = _reference_route(
+            logits_c[clean], k, RoutingMethodType.Renormalize
+        )
+        assert torch.equal(ids_c[clean], ref_ids) and torch.equal(
+            bits(wts_c[clean]), bits(ref_w)
+        )
+        ex2, w2_, counts2, dest2, src2 = api.route_plan(logits, k, S.SOFTMAX_RENORM)
+        counts, dest, src = api.permute_plan(ids, E)
+        assert torch.equal(ids, ex2) and torch.equal(bits(wts), bits(w2_))
+        assert torch.equal(counts, counts2) and torch.equal(dest, dest2)
+        assert torch.equal(src, src2)
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+        out = layer(_logits_pack(x, logits), W)
+        nan_rows = torch.tensor([keep.get(t, k) < k for t in range(T)]).cuda()
+        assert torch.isnan(out[nan_rows]).all()
+        ref = layer(_routed_pack(x[clean.cuda()], ref_ids.cuda(), ref_w.cuda()), W)
+        assert torch.equal(bits(out[clean.cuda()]), bits(ref))
+
+
+@needs_device
+def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
+    """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``: a framework's dropped slot) is dropped: the plan
+    does not count it (``dest -1``, ``src -1`` past the valid rows), the gather and the GEMMs never touch it, and the
+    combine folds the remaining slots in slot order with the term ``+0`` in its place, so the output equals the class's on
+    the same rows with those slots at a valid id and weight ``+0``; a token whose slots are all dropped gives a zero row;
+    the other tokens keep their bits. No host validation, no fault; the one-launch plan below ``PLAN_MULTI_MIN_N``
+    expanded rows and the two-launch form (a partial final block) above it."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N
+
+    k, H, I, E = 8, 256, 128, 64
+    bad = (-1, E, 1 << 30)
+    for T in (96, PLAN_MULTI_MIN_N // k + 3):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=21, adversarial=True)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids_bad = ids.clone()
+        rows = torch.randperm(T, generator=torch.Generator().manual_seed(T))[: T // 4]
+        for j, t in enumerate(rows.tolist()):
+            ids_bad[t, j % k] = bad[j % 3]
+            ids_bad[t, (j + 3) % k] = bad[(j + 1) % 3]
+        ids_bad[rows[0]] = torch.tensor(
+            [bad[i % 3] for i in range(k)], dtype=torch.int32
+        )
+        dropped = (ids_bad < 0) | (ids_bad >= E)
+        counts, dest, src = api.permute_plan(ids_bad.cuda(), E)
+        n_valid = int((~dropped).sum())
+        assert int(counts.sum()) == n_valid
+        assert torch.equal(dest.cpu().view(-1) < 0, dropped.view(-1))
+        assert torch.all(src[n_valid:] == -1) and torch.all(src[:n_valid] >= 0)
+        valid_pos = dest.view(-1)[~dropped.view(-1).cuda()].long()
+        assert torch.equal(
+            src[valid_pos].cpu(), torch.nonzero(~dropped.view(-1)).view(-1).int()
+        )
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+        out = layer(_routed_pack(x, ids_bad.cuda(), wts.cuda()), W)
+        ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
+        wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
+        ref = _reference_ffn(
+            x, ids_ref.cuda(), wts_ref.cuda(), w1, w2, S.activation_of(_SWIGLU)
+        )
+        assert torch.equal(bits(out.cpu()), bits(ref))
+        assert torch.all(out[rows[0]] == 0)
+        whole = (~dropped.any(dim=1)).cuda()
+        ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W)
+        assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
+
+
+@needs_device
+@pytest.mark.parametrize("T,k,E", [(2048, 8, 64), (2049, 8, 256), (1100, 16, 1024)])
+def test_multi_launch_plan_equals_the_host_plan(T, k, E):
+    """At and above ``PLAN_MULTI_MIN_N`` expanded rows ``permute_plan`` runs the two-launch block form (``PlanBlocksKernel``
+    / ``PlanFinishKernel``): at the threshold exactly (whole blocks), one token past it (a partial final block) and at the
+    widest expert count, its ``counts`` / ``dest`` / ``src`` equal an independent host plan (a stable sort by expert, slot
+    order inside a group) and the one-launch form's on the same ids."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N
+    from flashinfer.fused_moe.batch_invariant.permute import (
+        PLAN_BLOCK,
+        get_compiled_plan,
+    )
+
+    n = T * k
+    assert n >= PLAN_MULTI_MIN_N and (n % PLAN_BLOCK == 0) == (T == 2048)
+    ids = torch.randint(
+        0, E, (T, k), generator=torch.Generator().manual_seed(n), dtype=torch.int32
+    )
+    counts, dest, src = api.permute_plan(ids.cuda(), E)
+    counts_h, dest_h, src_h = _padded_plan_host(ids, E, 1)
+    assert torch.equal(counts, counts_h) and torch.equal(dest, dest_h)
+    assert torch.equal(src, src_h)
+    c1 = torch.empty(E, dtype=torch.int32, device="cuda")
+    d1 = torch.empty(n, dtype=torch.int32, device="cuda")
+    s1 = torch.empty(n, dtype=torch.int32, device="cuda")
+    get_compiled_plan(1, False)(ids.cuda().view(-1), c1, d1, s1, d1, d1, n, E)
+    assert torch.equal(c1, counts) and torch.equal(d1.view(T, k), dest)
+    assert torch.equal(s1, src)

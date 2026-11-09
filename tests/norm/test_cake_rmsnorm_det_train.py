@@ -1106,6 +1106,103 @@ def _fp32_case(
     )
 
 
+# The backward windows where the FP32-weight route runs a program that the BF16 route does not run over those rows
+# (``RECUT_FP32_ROUTES`` of the pairs test): a program of the BF16 route's earlier windows where the BF16 route runs a
+# pipelined program that has no FP32-weight build, and at T = 1 another column-task program than the BF16 route's.
+# (arch, hidden) -> {FP32-weight window: (the BF16 window, the first 8 hex digits of the BF16 program) whose program
+# and dw reduce are the BF16 twins of the FP32-weight window's}.  The twin records share the FP32-weight records' grid
+# and workspace rules; a twin window the BF16 route no longer runs keeps its records in the registry under no route.
+RECUT_FP32_BACKWARD_TWINS: dict[
+    tuple[str, int], dict[tuple[int, int], tuple[tuple[int, int], str]]
+] = {
+    ("sm_100a", 2048): {
+        (768, 1024): ((288, 768), "caf6978e"),
+        (1024, 16384): ((1024, 2047), "c73074cf"),
+        (16384, 58880): ((22528, 58880), "ceeef043"),
+    },
+    ("sm_100a", 5120): {(0, 1): ((1, 256), "baa071a2")},
+    ("sm_100a", 6144): {(384, 4096): ((384, 767), "5c804aed")},
+    ("sm_103a", 4096): {(0, 1): ((0, 152), "ff0156d5")},
+    ("sm_103a", 6144): {
+        (0, 1): ((0, 20), "38b1c6bc"),
+        (256, 4096): ((256, 767), "5c804aed"),
+    },
+}
+
+
+def _twin_records(names, twin: tuple[int, int], program: str) -> list[str]:
+    """The records among ``names`` whose window is ``twin``: the program ``program`` (the first 8 hex digits of its
+    name) and the dw reduces."""
+
+    return [
+        name
+        for name in names
+        if (
+            (loader.MODULES[name]["select_rule"] or {}).get("above"),
+            (loader.MODULES[name]["select_rule"] or {}).get("at_most"),
+        )
+        == twin
+        and (
+            loader.MODULES[name]["role"] == "bwd_reduce"
+            or loader.MODULES[name]["library"].startswith(
+                f"cake_rmsnorm_det_train_{program}"
+            )
+        )
+    ]
+
+
+def _recut_backward_twin(hidden: int, residual: bool, rows: int) -> tuple[str, ...]:
+    """The BF16 twin modules (the main program and its dw reduce, or a column-task program alone) of the FP32-weight
+    backward program a call of ``rows`` tokens launches in a window of ``RECUT_FP32_BACKWARD_TWINS``; empty elsewhere.
+    The twin records are the BF16 route's where it runs the twin's window, else the registry's records of that
+    window."""
+
+    if residual:
+        return ()
+    arch = loader.arch_for_capability(_capability())
+    for (above, at_most), (twin, program) in RECUT_FP32_BACKWARD_TWINS.get(
+        (arch, hidden), {}
+    ).items():
+        if above < rows <= at_most:
+            names = _twin_records(
+                loader.route_modules(arch, hidden, "bwd", False), twin, program
+            ) or _twin_records(
+                (
+                    name
+                    for name, record in loader.MODULES.items()
+                    if arch in record["arches"]
+                    and int(record["hidden"]) == hidden
+                    and "_w32" not in record["role"]
+                    and not record["role"].endswith("_residual")
+                ),
+                twin,
+                program,
+            )
+            mains = [n for n in names if loader.MODULES[n]["role"] != "bwd_reduce"]
+            assert len(mains) == 1, (arch, hidden, twin, program, names)
+            workspace = loader.MODULES[mains[0]]["workspace_rule"] or {}
+            if workspace.get("kind") != "chunk_partials":
+                return (mains[0],)  # a column-task program runs alone
+            reduces = [n for n in names if loader.MODULES[n]["role"] == "bwd_reduce"]
+            assert len(reduces) == 1, (arch, hidden, twin, names)
+            return (mains[0], reduces[0])
+    return ()
+
+
+def _launching(twin: tuple[str, ...]):
+    """A ``selected_modules`` under which a BF16 backward call launches the modules ``twin``; every other call
+    selects its route's modules."""
+
+    original = loader.selected_modules
+
+    def select(arch, hidden, kind, residual, *, rows, w_dtype="bf16"):
+        if kind == "bwd" and w_dtype == "bf16":
+            return twin
+        return original(arch, hidden, kind, residual, rows=rows, w_dtype=w_dtype)
+
+    return select
+
+
 def _window_rows(hidden: int, residual: bool) -> tuple[int, ...]:
     """The row counts that visit every window of the route's forward and backward programs:
     both sides of every window edge, the smallest counts and the training shape."""
@@ -1129,7 +1226,10 @@ def test_fp32_weight_equal_to_the_bf16_weight_matches_it_bitwise(
 ) -> None:
     """``w32 = float(w16)`` gives bitwise the BF16 path's y, rstd, h_new, dx and dw in every
     window of the route: the FP32-weight programs are the BF16 programs with the weight loaded
-    at FP32, selected over the same windows."""
+    at FP32, selected over the same windows.  In the backward windows of
+    ``RECUT_FP32_BACKWARD_TWINS`` the FP32-weight route keeps a program of the BF16 route's
+    earlier windows, so there its dx and dw are bitwise those of a BF16 call that launches the
+    BF16 twin of that program (and its dw reduce) over the same rows."""
 
     _skip_unless_fp32_routes(hidden, residual)
     for rows in _window_rows(hidden, residual):
@@ -1150,6 +1250,16 @@ def test_fp32_weight_equal_to_the_bf16_weight_matches_it_bitwise(
             )
         label = f"hidden={hidden} residual={residual} rows={rows}"
         assert torch.equal(dx16, dx32), f"{label}: dx differs"
+        twin = _recut_backward_twin(hidden, residual, rows)
+        if twin:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(pkg, "selected_modules", _launching(twin))
+                generator.set_state(seed)
+                _outputs, dx16, dw16, _ = _fp32_case(
+                    hidden, rows, residual, w16, generator
+                )
+            label = f"{label} (BF16 twin {twin})"
+            assert torch.equal(dx16, dx32), f"{label}: dx differs"
         assert torch.equal(dw16, dw32), f"{label}: dw differs"
 
 
@@ -1269,10 +1379,11 @@ def test_deterministic_dw_is_bitwise_reproducible(hidden: int, rows: int) -> Non
     assert torch.isfinite(results[0][1]).all()
 
 
-def _taper_rows(record: dict, sms: int, limit: int) -> list[int]:
+def _taper_rows(record: dict, limit: int) -> list[int]:
     """Row counts of the record's window where its taper cuts another chunk
-    table than the module constants would: the first, a middle and the last
-    within ``limit`` (none for a program at the default taper)."""
+    table than the module constants would on device 0 (the host's slot count
+    of the record, ``slot_count``): the first, a middle and the last within
+    ``limit`` (none for a program at the default taper)."""
 
     rule = record["grid_rule"]
     taper = loader.chunk_taper(rule)
@@ -1282,7 +1393,8 @@ def _taper_rows(record: dict, sms: int, limit: int) -> list[int]:
     above = 0 if select is None else int(select["above"])
     at_most = None if select is None else select["at_most"]
     last = limit if at_most is None else min(limit, int(at_most))
-    slots, rpi = int(rule["ctas_per_sm"]) * sms, int(rule["rows_per_issue"])
+    slots = loader.slot_count(rule, device_index=0)
+    rpi = int(rule["rows_per_issue"])
     differing = [
         rows
         for rows in range(above + 1, last + 1)
@@ -1314,7 +1426,6 @@ def test_backward_reuses_a_poisoned_workspace_across_row_counts(
     ):
         pytest.skip(f"hidden={hidden} has no exported residual backward route")
     arch = loader.arch_for_capability(_capability())
-    sms = loader.sm_count(0)
     limit = 32768
     rows_set = {
         rows for rows in _switch_rows(arch, hidden, "bwd", residual) if rows <= limit
@@ -1322,7 +1433,7 @@ def test_backward_reuses_a_poisoned_workspace_across_row_counts(
     for name in loader.route_modules(arch, hidden, "bwd", residual):
         record = loader.MODULES[name]
         if record.get("workspace_rule") is not None:
-            rows_set.update(_taper_rows(record, sms, limit))
+            rows_set.update(_taper_rows(record, limit))
     descending = sorted(rows_set, reverse=True)
     order = descending + descending[-2::-1]
     eps = EPS[hidden]
@@ -1502,7 +1613,8 @@ def test_argument_validation(hidden: int) -> None:
     y_odd_ref, _, _ = _reference_forward(odd_view, w, eps)
     _assert_bf16_close(y_odd, y_odd_ref, "y odd row stride")
     y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
-    with pytest.raises(ValueError):
+    # The det package takes no ``deterministic`` keyword.
+    with pytest.raises(TypeError, match="unexpected keyword argument 'deterministic'"):
         cake_rmsnorm_det_train_backward(y, x, w, rstd, deterministic=False)
     with pytest.raises(ValueError):
         cake_rmsnorm_det_train_backward(y, x, w, rstd.double())
@@ -1526,7 +1638,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     # build.json names the package's FlashInfer import path; a vendored copy ships the file unchanged under its own name.
-    assert manifest["package"] == "flashinfer.cake_rmsnorm_det_train_backend"
+    assert manifest["package"] == "flashinfer.experimental.cake.cake_rmsnorm_det_train"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()

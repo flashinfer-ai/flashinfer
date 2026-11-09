@@ -47,9 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {
@@ -72,7 +69,7 @@ kernel_cake_lm_head_det_loss_dc45b3bd617f038cbddb(float* __restrict__ dx, float*
     unsigned long long slab64 = (unsigned long long)ws_slab;
     #pragma unroll 2
     for (int vi = bid * 256 + tid; vi < num_vecs; vi += stride) {
-        unsigned long long off = (unsigned long long)vi * 8;
+        unsigned long long off = (unsigned long long)vi * 8ull;
         float _vec_load_0[4];
         {
             float4 _v4 = *reinterpret_cast<const float4*>(dx + off + 0);
@@ -83,7 +80,7 @@ kernel_cake_lm_head_det_loss_dc45b3bd617f038cbddb(float* __restrict__ dx, float*
         }
         float _vec_load_1[4];
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(dx + (off + 4) + 0);
+            float4 _v4 = *reinterpret_cast<const float4*>(dx + (off + 4ull) + 0);
             _vec_load_1[0 + 0] = _v4.x;
             _vec_load_1[0 + 1] = _v4.y;
             _vec_load_1[0 + 2] = _v4.z;
@@ -107,7 +104,7 @@ kernel_cake_lm_head_det_loss_dc45b3bd617f038cbddb(float* __restrict__ dx, float*
             }
             float _vec_load_3[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(ws + (soff + 4) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(ws + (soff + 4ull) + 0);
                 _vec_load_3[0 + 0] = _v4.x;
                 _vec_load_3[0 + 1] = _v4.y;
                 _vec_load_3[0 + 2] = _v4.z;
@@ -125,7 +122,7 @@ kernel_cake_lm_head_det_loss_dc45b3bd617f038cbddb(float* __restrict__ dx, float*
         }
         {
             float4 _v4 = make_float4(o[4 + 0], o[4 + 1], o[4 + 2], o[4 + 3]);
-            *reinterpret_cast<float4*>((dx + (off + 4)) + 0) = _v4;
+            *reinterpret_cast<float4*>((dx + (off + 4ull)) + 0) = _v4;
         }
     }
 }

@@ -400,7 +400,7 @@ void Run(TensorView a_tmap_qn, TensorView a_tmap_qs, TensorView a_tmap_qr, Tenso
     const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
     if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
       CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
-      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_mla_nvfp4_paged_decode_32a47bbfa05aebbc97c5), cudaFuncAttributeMaxDynamicSharedMemorySize, 207872), "cudaFuncSetAttribute");
+      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_mla_nvfp4_paged_decode_32a47bbfa05aebbc97c5), cudaFuncAttributeMaxDynamicSharedMemorySize, 208896), "cudaFuncSetAttribute");
       prepared_devices |= device_bit;
     }
   }
@@ -433,7 +433,7 @@ void Run(TensorView a_tmap_qn, TensorView a_tmap_qs, TensorView a_tmap_qr, Tenso
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(512, 1, 1);
-  config.dynamicSmemBytes = 207872;
+  config.dynamicSmemBytes = 208896;
   config.stream = stream;
   cudaLaunchAttribute attrs[2] = {};
   attrs[0].id = cudaLaunchAttributeClusterDimension;

@@ -387,7 +387,9 @@ def gelu_term(fp: Any, x: Any) -> Any:
 def log_term(fp: Any, x: Any) -> Any:
     """The declared natural log of a positive ``x`` (Cephes logf): ``x = m 2^e`` with ``m`` in [1/2, 1) (``frexpm`` /
     ``frexpe``, exact bit operations), recentred by the exact select ``lt = clamp((sqrt(1/2) - m) 2^100, 0, 1)`` into
-    ``z = m + lt m - 1``, ``e' = e - lt``; ``z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi``."""
+    ``z = m + lt m - 1``, ``e' = e - lt``; ``z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi``. On a positive subnormal
+    ``x`` the split is the raw fields (``frexpm`` / ``frexpe`` do not renormalise), so the chain's value there is the
+    declared term's, not the natural log's; the PowLU chain clamps it by ``gp 2^100``."""
     m = fp.frexpm(x)
     ex = fp.frexpe(x)
     lt = fp.fmax(
@@ -468,7 +470,8 @@ def glu_pre(
     * ``swiglu_step (limit,)``: ``mul(fmin(silu(g), limit), clamp(u, +-limit))`` (``SwiGLUStep``);
     * ``situ (gate_scale, linear_scale, clamp_limit)``: the optional clamps first (``fmin(g, cl)``, ``clamp(u, +-cl)``),
       then ``mul(mul(mul(gs, tanh(div(g, gs))), sigmoid(g)), mul(ls, tanh(div(u, ls))))`` (``u`` as is without a
-      linear scale) (``SiTU``);
+      linear scale) (``SiTU``); small gate and linear accumulators round through the declared tanh form, whose
+      subtraction from ``2 sigmoid(2 z)`` rounds the smallest magnitudes to zero;
     * ``powlu (m, limit)``: ``gp = fmaxc(g, 0)`` (the device's zero rule), ``e = div(m, add(sqrt(gp), 1))``, the positive branch
       ``pos = fmin(exp(mul(e, log(gp))), mul(gp, 2^100))`` (zero exactly at ``gp = 0``), the activation
       ``mul(add(pos, fmin(g, 0)), sigmoid(g))`` (SiLU on the negative side), ``fmin(., limit)`` when a limit is given,
@@ -721,7 +724,8 @@ def spec_fingerprint(
 ) -> str:
     """Identifier of the class: the routing weight of slot 0 and slot k-1, the GEMM1 chain term (the gated ``silu``
     chain by default; any other chain, its gating and its binary32 parameters name a distinct class), the two GEMM
-    classes (``gemm.bf16.kfold[K=H]``, ``[K=I]``) and the combine term."""
+    classes (``gemm.bf16.kfold[K=H]``, ``[K=I]``) and the combine term, the terms hashed as DAGs
+    (:func:`.mterm.fingerprint`: linear in the expert count and ``k``)."""
     s = MoESpec(H, I, k, E, method, out_fmt, act=act, params=params, gated=gated)
     default_chain = s.gated and act == "silu" and not s.params
     parts = (

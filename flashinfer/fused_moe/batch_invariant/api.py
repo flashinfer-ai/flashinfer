@@ -13,6 +13,7 @@ proofs are the ``MoE`` Lean module of the mode).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple, Union
 
@@ -24,11 +25,22 @@ from . import spec as S
 from .blocks.epilogue import GroupedChain
 
 _CONST: Dict[Tuple[int, int, float], torch.Tensor] = {}
+_CONST_VALUES = (
+    0.0,
+    1.0,
+)  # the cached constants: the absent bias (per expert count) and the unit scale
 
 
 def _const(dev: torch.device, n: int, value: float) -> torch.Tensor:
-    """A cached fp32 constant tensor (``value`` repeated ``n`` times) per device: the route kernel reads an absent bias
-    or scale from it instead of a per-call fill (a fill is one more kernel in the caller's stream or graph)."""
+    """An fp32 constant tensor (``value`` repeated ``n`` times) the route kernel reads for an absent bias or scale. The
+    defaults (``+0`` per expert count, ``1``) are cached per device, so the cache is bounded by the devices and the expert
+    counts seen; a cached constant is built on the host and copied with a blocking copy, so its bytes are on the device
+    before the call returns and any stream may read it. Any other value, and every call under CUDA graph capture (a
+    graph-pool allocation whose fill runs only at replay: it serves that capture alone), is a fresh device fill, one more
+    kernel in the caller's stream or graph (a tensor argument avoids it)."""
+    cacheable = value in _CONST_VALUES and math.copysign(1.0, value) > 0
+    if not cacheable or torch.cuda.is_current_stream_capturing():
+        return torch.full((n,), value, dtype=torch.float32, device=dev)
     key = (
         dev.index if dev.index is not None else torch.cuda.current_device(),
         n,
@@ -36,7 +48,7 @@ def _const(dev: torch.device, n: int, value: float) -> torch.Tensor:
     )
     t = _CONST.get(key)
     if t is None:
-        t = torch.full((n,), value, dtype=torch.float32, device=dev)
+        t = torch.full((n,), value, dtype=torch.float32).to(dev)
         _CONST[key] = t
     return t
 
@@ -261,7 +273,10 @@ def route(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(experts [T, k] int32, weights [T, k] f32)`` in slot (rank) order from ``logits [T, E]`` (f32 or bf16): the
     class's routing (:mod:`.spec`: the declared ``exp``, the strict selection order ``(score desc, index asc)`` on exact
-    binary32 scores, the method's weight formula)."""
+    binary32 scores, the method's weight formula). An expert whose selection score is NaN is never selected; when fewer
+    than ``top_k`` experts of a row have a non-NaN score, each remaining slot takes the lowest expert index the row has
+    not taken, with a NaN weight (the row's output is NaN; every id stays in ``[0, E)``). A Python ``scaling_factor``
+    other than ``1`` costs a fill per call; a one-element tensor is read as given."""
     from .route import get_compiled_route
 
     method = S.METHODS[method] if isinstance(method, str) else method
@@ -408,7 +423,9 @@ def permute_plan(
     experts: torch.Tensor, E: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(counts [E] int32, dest [T, k] int32, src [Tk] int32)``: the deterministic permutation of the expanded rows,
-    grouped by expert in expert order and, inside a group, in token-slot order (a function of the routing alone)."""
+    grouped by expert in expert order and, inside a group, in token-slot order (a function of the routing alone). An id
+    outside ``[0, E)`` is a dropped slot: ``counts`` excludes it, its ``dest`` is ``-1`` and ``src`` holds ``-1`` past
+    the valid rows."""
     from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
 
     T, k = experts.shape
@@ -447,8 +464,10 @@ def fused_moe(
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
-    slot order in fp32 and converted once. ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space
-    gives the same bits; the dispatcher's pick by default)."""
+    slot order in fp32 and converted once. An expert id outside ``[0, E)`` is a dropped slot: neither gathered nor
+    computed, the term ``+0`` in its token's fold whatever its weight (a token whose slots are all dropped gives a zero
+    row). ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space gives the same bits; the
+    dispatcher's pick by default)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs

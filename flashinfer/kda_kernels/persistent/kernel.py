@@ -2565,7 +2565,10 @@ def _launch_pkd(
     )
     if cutlass.const_expr(GATE2_ == 1):
         vT = cute.make_tensor(
-            v.iterator, cute.make_layout((D, H_, v.shape[0]), stride=(1, D, H_ * D))
+            v.iterator,
+            cute.make_layout(
+                (D, H_, v.shape[0]), stride=(v.stride[2], v.stride[1], v.stride[0])
+            ),
         )
         lv = cute.select(lay_v, mode=[0, 1, 2])
         tma_v, mV = cpasync.make_tiled_tma_atom(

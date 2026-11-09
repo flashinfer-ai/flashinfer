@@ -7,7 +7,9 @@ softmax sum; experts beyond ``E`` are absent and padded with ``+0``, which is ex
 row maximum is a warp max (exact in every order; the sign of a zero maximum never reaches the bits), the softmax sum
 runs the engine's plan with lane shuffles, the top-k selection is k rounds of a warp argmax under the strict order
 ``(score desc, index asc)`` (equal to the rank definition the CPU uses), and the weights are ``spec.slot_weights``
-through ``CuteF32``. All arithmetic through ``CuteF32``; comparisons are exact.
+through ``CuteF32``. All arithmetic through ``CuteF32``; comparisons are exact. A slot no selectable expert reaches
+(fewer than ``k`` experts with a non-NaN score) takes the lowest expert index the row has not taken, with a NaN weight:
+the row's output is NaN and every id stays in ``[0, E)``.
 """
 
 from __future__ import annotations
@@ -133,7 +135,9 @@ def route_token(
 ):
     """One token's routing by one warp (the class's routing term): the warp-uniform results land in ``out_e[r]`` /
     ``out_w[r]`` for the ``k`` slots. Shared by the route kernel and the fused route + plan kernel: the same traced code,
-    the same bits."""
+    the same bits. An expert whose selection score is NaN is never selected (no comparison holds); when fewer than ``k``
+    experts are selectable, each remaining slot takes the lowest expert index the row has not taken with a NaN weight
+    (the row's output is NaN; every id stays in ``[0, E)``)."""
     neg_inf = CuteF32.const(float("-inf"))
     # the lane's experts: logits (absent -> -inf), selection scores q, weights
     logits = []
@@ -197,6 +201,22 @@ def route_token(
             if take:
                 bv = ov
                 bi = oi
+        # no selectable expert left (fewer than k experts with a non-NaN score: the round reached an absent expert of the
+        # bucket or the sentinel): the slot takes the lowest expert index the row has not taken, with a NaN weight, so the
+        # row's output is NaN and no id outside [0, E) leaves the kernel (a per-row rule: batch-invariant); a row with k
+        # selectable experts never takes the branch (bi is warp-uniform after the reduction)
+        no_pick = bi >= E
+        if no_pick:
+            cand = Int32(0x7FFFFFFF)
+            for i in cutlass.range_constexpr(P):
+                e = Int32(lane * P + i)
+                free = ((taken >> i) & Int32(1)) == Int32(0)
+                if free & (e < E) & (e < cand):
+                    cand = e
+            for sh in cutlass.range_constexpr(5):
+                oc = cute.arch.shuffle_sync_bfly(cand, offset=1 << sh)
+                cand = cutlass.min(cand, oc)
+            bi = cand
         owner = bi // Int32(P)
         slot = bi % Int32(P)
         wv = CuteF32.const(0.0)
@@ -204,6 +224,8 @@ def route_token(
             if slot == Int32(i):
                 wv = wgt[i]
         wv = cute.arch.shuffle_sync(wv, offset=owner)
+        if no_pick:
+            wv = CuteF32.const(float("nan"))
         if lane == owner:
             taken = taken | (Int32(1) << slot)
         sel_e.append(bi)

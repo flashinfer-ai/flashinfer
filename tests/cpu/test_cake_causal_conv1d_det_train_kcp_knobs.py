@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CPU tests of the conv KCP module's private test knobs and of the bookkeeping of its CUDA-graph replay cache
-(the graph replay of the KCP route): the knob is refused without ``CAKE_KCP_TEST_KNOBS=1``, validated against
-``GRAPH_MODES`` and off by default; the validity key tells operands apart by data pointer, shape, stride and
+(the graph replay of the KCP route): the knob is a private setter (no environment variable opens it), validated
+against ``GRAPH_MODES`` and off by default; the validity key tells operands apart by data pointer, shape, stride and
 dtype, keeps one entry per key, and the first call of a key runs eagerly.  No kernel runs here.
 """
 
@@ -26,20 +26,28 @@ import types
 import pytest
 import torch
 
-from flashinfer.cake_causal_conv1d_det_train_backend import kcp as conv_kcp
+from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv_kcp
 
 
 @pytest.mark.cpu_only
-def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
+def test_graph_knob_is_validated() -> None:
+    # no environment gate: the backend reads no environment variable
+    assert not hasattr(conv_kcp, "TEST_KNOBS_ENV")
     assert conv_kcp.GRAPH_MODES == ("off", "replay")
-    assert conv_kcp._set_test_knobs(None) == {"graph": "off", "host_trim": 1}
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"graph": "replay"})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"host_trim": 1})
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
+    assert conv_kcp._set_test_knobs(None) == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_overlap": 1,
+        "fwd_main": None,
+        "fwd_overlap": None,
+    }
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_overlap": 1,
+        "fwd_main": None,
+        "fwd_overlap": None,
+    }
     try:
         with pytest.raises(ValueError, match="unknown"):
             conv_kcp._set_test_knobs({"grap": "replay"})
@@ -50,41 +58,58 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._set_test_knobs({"graph": "off"}) == {
             "graph": "off",
             "host_trim": 1,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
     finally:
         conv_kcp._set_test_knobs(None)
 
 
 @pytest.mark.cpu_only
-def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
-    """``host_trim`` (the trimmed host path): refused without ``CAKE_KCP_TEST_KNOBS=1``,
+def test_host_trim_knob_is_validated() -> None:
+    """``host_trim`` (the trimmed host path): a private setter (no environment gate),
     validated against ``HOST_TRIMS`` (1 shipped = the trimmed host path of the eager halo call,
     0 = the previous host path), independent of ``graph``; a dict naming one knob keeps the other at its shipped default."""
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
     assert conv_kcp.HOST_TRIMS == (0, 1) and conv_kcp.HOST_TRIM_DEFAULT == 1
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
-        conv_kcp._set_test_knobs({"host_trim": 0})
     assert conv_kcp._TEST_KNOBS["host_trim"] == 1
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         assert conv_kcp._set_test_knobs({"host_trim": 1}) == {
             "graph": "off",
             "host_trim": 1,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._graph_mode(None) == "off"
         assert conv_kcp._set_test_knobs({"host_trim": 1, "graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
-        assert conv_kcp._set_test_knobs({}) == {"graph": "off", "host_trim": 1}
+        assert conv_kcp._set_test_knobs({}) == {
+            "graph": "off",
+            "host_trim": 1,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
+        }
         for bad in (
             {"host_trim": 2},
             {"host_trim": "1"},
@@ -96,15 +121,210 @@ def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
         assert conv_kcp._set_test_knobs({"host_trim": 0}) == {
             "graph": "off",
             "host_trim": 0,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
     finally:
         conv_kcp._set_test_knobs(None)
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_overlap": 1,
+        "fwd_main": None,
+        "fwd_overlap": None,
+    }
 
 
 @pytest.mark.cpu_only
-def test_graph_cache_key_and_eager_first_call(monkeypatch) -> None:
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
+def test_bwd_overlap_knob_is_validated() -> None:
+    """``bwd_overlap`` (the overlapped backward): a private setter validated against ``BWD_OVERLAPS`` (1 shipped = the
+    split program before the exchange's wait and the tail-row program after it, 0 = the wait before the main
+    program), independent of the other knobs; ``_overlapped`` holds only for the split form with an exchange in flight
+    under the shipped value, and a non-shipped value is part of the backward's graph-key variant."""
+    assert conv_kcp.BWD_OVERLAPS == (0, 1) and conv_kcp.BWD_OVERLAP_DEFAULT == 1
+    work = object()
+    try:
+        assert conv_kcp._overlapped(False, work) is True
+        assert conv_kcp._overlapped(True, work) is False
+        assert conv_kcp._overlapped(False, None) is False
+        assert conv_kcp._bwd_variant(False) is False
+        assert conv_kcp._bwd_variant(True) is True
+        assert conv_kcp._set_test_knobs({"bwd_overlap": 0}) == {
+            "graph": "off",
+            "host_trim": 1,
+            "bwd_overlap": 0,
+            "fwd_main": None,
+            "fwd_overlap": None,
+        }
+        assert conv_kcp._overlapped(False, work) is False
+        assert conv_kcp._bwd_variant(False) == (False, ("bwd_overlap", 0))
+        for bad in ({"bwd_overlap": 2}, {"bwd_overlap": True}, {"bwd_overlap": "1"}):
+            with pytest.raises(ValueError):
+                conv_kcp._set_test_knobs(bad)
+    finally:
+        conv_kcp._set_test_knobs(None)
+    assert conv_kcp._TEST_KNOBS["bwd_overlap"] == 1
+
+
+ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+FORMS = ((False, False), (True, False), (False, True), (True, True))
+# The shipped ``_fwd_form(arch, multi=...)`` (single-rank main program, overlapped) of the single call and the multi
+# entry per architecture
+SHIPPED_FWD_FORMS = {
+    "sm_100a": ((True, False), (True, False)),
+    "sm_103a": ((True, False), (True, False)),
+    "sm_107a": ((True, False), (True, True)),
+}
+FWD_SETS = (
+    "FWD_MAIN_ARCHS",
+    "FWD_OVERLAP_ARCHS",
+    "MULTI_FWD_MAIN_ARCHS",
+    "MULTI_FWD_OVERLAP_ARCHS",
+)
+
+
+@pytest.mark.cpu_only
+def test_fwd_form_knobs_are_validated(monkeypatch) -> None:
+    """``fwd_main`` / ``fwd_overlap`` (the two-launch forward): private setters validated against ``FWD_MAINS`` /
+    ``FWD_OVERLAPS`` (``None`` shipped = the architecture sets, ``0`` = off, ``1`` = on), independent of each other
+    and of the other knobs.  With the knobs ``None``, ``_fwd_form`` is the shipped form of ``SHIPPED_FWD_FORMS`` (the
+    sets hold exactly its architectures); a ``0`` / ``1`` knob forces its form on every architecture and entry; with
+    every set emptied, an architecture added to one set takes that form in that set's entry only."""
+    assert conv_kcp.FWD_MAINS == (None, 0, 1) and conv_kcp.FWD_MAIN_DEFAULT is None
+    assert conv_kcp.FWD_OVERLAPS == (None, 0, 1)
+    assert conv_kcp.FWD_OVERLAP_DEFAULT is None
+    for i, name in enumerate(FWD_SETS):
+        # FWD_SETS[i] holds the architectures whose entry (i // 2: single, multi) ships form field i % 2 on
+        multi, field = divmod(i, 2)
+        want = {a for a in ARCHES if SHIPPED_FWD_FORMS[a][multi][field]}
+        assert getattr(conv_kcp, name) == frozenset(want), name
+    try:
+        for arch in ARCHES:
+            for multi in (False, True):
+                assert (
+                    conv_kcp._fwd_form(arch, multi=multi)
+                    == SHIPPED_FWD_FORMS[arch][multi]
+                )
+        for main in (0, 1):
+            for overlap in (0, 1):
+                knobs = {"fwd_main": main, "fwd_overlap": overlap}
+                assert conv_kcp._set_test_knobs(knobs) == {
+                    "graph": "off",
+                    "host_trim": 1,
+                    "bwd_overlap": 1,
+                    **knobs,
+                }
+                for arch in ARCHES:
+                    for multi in (False, True):
+                        assert conv_kcp._fwd_form(arch, multi=multi) == (
+                            bool(main),
+                            bool(overlap),
+                        )
+        assert conv_kcp._set_test_knobs({"fwd_overlap": 1})["fwd_main"] is None
+        assert conv_kcp._fwd_form("sm_100a") == (
+            SHIPPED_FWD_FORMS["sm_100a"][0][0],
+            True,
+        )
+        for bad in (
+            {"fwd_main": 2},
+            {"fwd_main": True},
+            {"fwd_main": "1"},
+            {"fwd_overlap": -1},
+            {"fwd_overlap": False},
+            {"fwd_overlap": "0"},
+            {"fwd_mian": 1},
+        ):
+            with pytest.raises(ValueError):
+                conv_kcp._set_test_knobs(bad)
+        conv_kcp._set_test_knobs(None)
+        # every set emptied and an architecture added to one: that form in that entry only, and a knob of 0 / 1
+        # still forces its form
+        for name, form, multi in (
+            ("FWD_MAIN_ARCHS", (True, False), False),
+            ("FWD_OVERLAP_ARCHS", (False, True), False),
+            ("MULTI_FWD_MAIN_ARCHS", (True, False), True),
+            ("MULTI_FWD_OVERLAP_ARCHS", (False, True), True),
+        ):
+            for other in FWD_SETS:
+                monkeypatch.setattr(conv_kcp, other, frozenset())
+            monkeypatch.setattr(conv_kcp, name, frozenset({"sm_103a"}))
+            assert conv_kcp._fwd_form("sm_103a", multi=multi) == form, name
+            assert conv_kcp._fwd_form("sm_103a", multi=not multi) == (False, False)
+            assert conv_kcp._fwd_form("sm_100a", multi=multi) == (False, False)
+            conv_kcp._set_test_knobs({"fwd_main": 0, "fwd_overlap": 0})
+            assert conv_kcp._fwd_form("sm_103a", multi=multi) == (False, False)
+            conv_kcp._set_test_knobs(None)
+            monkeypatch.undo()
+    finally:
+        monkeypatch.undo()
+        conv_kcp._set_test_knobs(None)
+    assert conv_kcp._TEST_KNOBS["fwd_main"] is None
+    assert conv_kcp._TEST_KNOBS["fwd_overlap"] is None
+
+
+@pytest.mark.cpu_only
+def test_graph_key_and_record_of_the_forward_form() -> None:
+    """The forward's graph-key variant is its effective form (``_fwd_variant`` = ``_fwd_form`` of the device: the four
+    forms are four keys, the same form one key), and ``LAST_CALL[kind]`` holds the launch form the body records
+    (``_fwd_record``) beside the graph event: afresh on an eager call, the captured call's on a replay.  No kernel runs
+    here (a stand-in graph replays)."""
+    ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
+    x = torch.zeros(8, 16, dtype=torch.bfloat16)
+    try:
+        keys = {
+            form: conv_kcp._graph_entry("fwd", ctx, (x, None), "replay", variant=form)
+            for form in FORMS
+        }
+        assert len({id(e) for e in keys.values()}) == len(FORMS)
+        for form in FORMS:
+            again = conv_kcp._graph_entry("fwd", ctx, (x, None), "replay", variant=form)
+            assert again is keys[form], form
+        e = keys[(True, True)]
+
+        def body():
+            conv_kcp._fwd_record("fwd", True, True, True)
+            return ("y", "hist")
+
+        conv_kcp.LAST_CALL["fwd"] = {"stale": 1}
+        assert conv_kcp._graph_run("fwd", e, body, "replay") == ("y", "hist")
+        assert conv_kcp.LAST_CALL["fwd"] == {
+            "main": "sr",
+            "form": "pair",
+            "repair": True,
+            "graph": "replay",
+            "graph_event": "eager",
+            "graph_key": e.digest,
+            "graph_fallback": None,
+        }
+        e.graph = types.SimpleNamespace(replay=lambda: None)
+        e.result = ("y", "hist")
+        e.record = {"main": "f", "form": "pair", "repair": False}
+        conv_kcp.LAST_CALL["fwd"] = {"stale": 1}
+        assert conv_kcp._graph_run("fwd", e, body, "replay") == ("y", "hist")
+        assert conv_kcp.LAST_CALL["fwd"] == {
+            "main": "f",
+            "form": "pair",
+            "repair": False,
+            "graph": "replay",
+            "graph_event": "replay",
+            "graph_key": e.digest,
+            "graph_fallback": None,
+        }
+        # a rank without tokens launches nothing
+        conv_kcp._fwd_record("fwd_multi", None, False, False)
+        assert conv_kcp.LAST_CALL["fwd_multi"] == {
+            "main": None,
+            "form": "wait",
+            "repair": False,
+        }
+    finally:
+        conv_kcp._GRAPHS.clear()
+        conv_kcp.LAST_CALL.clear()
+
+
+@pytest.mark.cpu_only
+def test_graph_cache_key_and_eager_first_call() -> None:
     x = torch.empty(8, 16, dtype=torch.bfloat16)
     w = torch.empty(16, 4, dtype=torch.float32)
     ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
@@ -144,11 +364,19 @@ def test_graph_cache_key_and_eager_first_call(monkeypatch) -> None:
         }
         assert conv_kcp._graph_run("fwd", None, lambda: ("y", "hist")) == ("y", "hist")
         assert conv_kcp.LAST_CALL["fwd"]["graph_key"] is None
-        # graph_cache_clear(): drops every entry (to be called before destroy_process_group), reports the count
+        # cake_causal_conv1d_det_train_kcp_graph_cache_clear(): drops every entry (to be called before destroy_process_group), reports the count
         n_entries = len(conv_kcp._GRAPHS)
-        assert n_entries >= 2 and "graph_cache_clear" in conv_kcp.__all__
-        assert conv_kcp.graph_cache_clear() == n_entries
-        assert conv_kcp._GRAPHS == {} and conv_kcp.graph_cache_clear() == 0
+        assert (
+            n_entries >= 2
+            and "cake_causal_conv1d_det_train_kcp_graph_cache_clear" in conv_kcp.__all__
+        )
+        assert (
+            conv_kcp.cake_causal_conv1d_det_train_kcp_graph_cache_clear() == n_entries
+        )
+        assert (
+            conv_kcp._GRAPHS == {}
+            and conv_kcp.cake_causal_conv1d_det_train_kcp_graph_cache_clear() == 0
+        )
     finally:
         conv_kcp._set_test_knobs(None)
         conv_kcp._GRAPHS.clear()
@@ -156,11 +384,10 @@ def test_graph_cache_key_and_eager_first_call(monkeypatch) -> None:
 
 
 @pytest.mark.cpu_only
-def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
+def test_graph_public_keyword_mode_and_key() -> None:
     """``graph=`` is a public keyword of the conv KCP calls (no environment gate): validated against
     ``GRAPH_MODES``, ``None`` = the module's shipped default (``GRAPH_DEFAULT == "off"``), keyed and recorded like the
     knob; a keyword contradicting an active knob is a ``ValueError``.  No kernel runs here."""
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
     conv_kcp._set_test_knobs(None)
     assert conv_kcp.GRAPH_DEFAULT == "off" and "GRAPH_DEFAULT" in conv_kcp.__all__
     assert conv_kcp._graph_mode(None) == "off"
@@ -175,8 +402,10 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
     ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
     for call in (  # validated on the caller's frame, before any device work
         lambda: conv_kcp.cake_causal_conv1d_det_kcp(x, w, ctx, graph="capture"),
-        lambda: conv_kcp.cake_causal_conv1d_det_forward_kcp(x, w, ctx, graph="capture"),
-        lambda: conv_kcp.cake_causal_conv1d_det_backward_kcp(
+        lambda: conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
+            x, w, ctx, graph="capture"
+        ),
+        lambda: conv_kcp.cake_causal_conv1d_det_train_kcp_backward(
             x, w, ctx, x, x, graph="capture"
         ),
     ):
@@ -201,7 +430,6 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
             "graph_key": e.digest,
             "graph_fallback": None,
         }
-        monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
         conv_kcp._set_test_knobs({"graph": "replay"})
         assert (
             conv_kcp._graph_mode(None) == "replay"
@@ -218,8 +446,8 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
 @pytest.mark.cpu_only
 def test_host_trim_cache_is_per_context_and_bounded(monkeypatch) -> None:
     """The trimmed host path keeps one entry set per context object (by identity, the context pinned), bounded
-    by ``HOST_CACHE_MAX`` (the oldest context dropped) and cleared by ``host_cache_clear()``."""
-    conv_kcp.host_cache_clear()
+    by ``HOST_CACHE_MAX`` (the oldest context dropped) and cleared by ``cake_causal_conv1d_det_train_kcp_host_cache_clear()``."""
+    conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
     a, b = types.SimpleNamespace(), types.SimpleNamespace()
     key = ("fwd", 8, 16, "cpu", (0, 8))
     ea = conv_kcp._host_cache_entry(a, key)
@@ -234,11 +462,14 @@ def test_host_trim_cache_is_per_context_and_bounded(monkeypatch) -> None:
         types.SimpleNamespace(), key
     )  # a third context evicts the oldest (a)
     assert id(a) not in conv_kcp._HOST_CACHE and id(b) in conv_kcp._HOST_CACHE
-    assert conv_kcp.host_cache_clear() == 2 and conv_kcp._HOST_CACHE == {}
+    assert (
+        conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear() == 2
+        and conv_kcp._HOST_CACHE == {}
+    )
 
 
 @pytest.mark.cpu_only
-def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
+def test_host_trim_ffi_device_and_cpu_refusal() -> None:
     """Trimmed host path: the FFI device object is built once per index; the trimmed forward / backward are selected by the knob
     and refuse CPU tensors like today's path (the operand checks first, then the architecture check)."""
     dev = conv_kcp._ffi_device(0)
@@ -251,7 +482,6 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
     w = torch.zeros(16, 4, dtype=torch.float32)
     hist = torch.zeros(1, 16, dtype=torch.bfloat16)
     ctx = types.SimpleNamespace(cu_seqlens_local_cpu=(0, 4))
-    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     try:
         conv_kcp._set_test_knobs({"host_trim": 1})
         with pytest.raises(ValueError, match="CUDA"):
@@ -262,7 +492,7 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
         conv_kcp._set_test_knobs(None)
     with pytest.raises(ValueError, match="CUDA"):
         conv_kcp._kcp_forward(x, w, ctx)
-    conv_kcp.host_cache_clear()
+    conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -271,8 +501,8 @@ def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
 
 @pytest.mark.cpu_only
 def test_recompute_handle_object() -> None:
-    h = conv_kcp.RecomputeHandleDetKcp()
-    assert conv_kcp.RecomputeHandleDetKcp.__slots__ == ("entries",)
+    h = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
+    assert conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle.__slots__ == ("entries",)
     assert h.entries == {} and h.nbytes() == 0
     with pytest.raises(AttributeError):
         h.other = 1
@@ -283,7 +513,9 @@ def test_recompute_handle_object() -> None:
     h.clear()
     assert h.entries == {} and h.nbytes() == 0
     assert conv_kcp.HANDLE_KEY == "conv"
-    assert {"RecomputeHandleDetKcp", "HANDLE_KEY"} <= set(conv_kcp.__all__)
+    assert {"CakeCausalConv1dDetKcpRecomputeHandle", "HANDLE_KEY"} <= set(
+        conv_kcp.__all__
+    )
 
 
 @pytest.mark.cpu_only
@@ -301,18 +533,23 @@ def test_recompute_handle_phase_and_entry_rules() -> None:
         @staticmethod
         def backward(fctx, g):
             seen["in_backward"] = conv_kcp._kcp_in_backward()
-            seen["empty"] = conv_kcp._handle_lookup(conv_kcp.RecomputeHandleDetKcp())
+            seen["empty"] = conv_kcp._handle_lookup(
+                conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
+            )
             seen["entry"] = conv_kcp._handle_lookup(full)
             return g
 
-    full = conv_kcp.RecomputeHandleDetKcp()
+    full = conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle()
     full.entries["conv"] = {"hist": torch.zeros(1, 8, dtype=torch.bfloat16)}
     t = torch.zeros(4, requires_grad=True)
     Probe.apply(t).sum().backward()
     assert seen["in_backward"] is True
     assert seen["empty"] is None
     assert seen["entry"] is full.entries["conv"] and "conv" in full.entries
-    assert conv_kcp._handle_lookup(conv_kcp.RecomputeHandleDetKcp()) is None
+    assert (
+        conv_kcp._handle_lookup(conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle())
+        is None
+    )
     with pytest.raises(RuntimeError, match="micro-step"):
         conv_kcp._handle_lookup(full)
     with pytest.raises(TypeError, match="entries"):
@@ -326,7 +563,7 @@ def test_recompute_handle_needs_the_graph_task_binding(monkeypatch) -> None:
     monkeypatch.setattr(conv_kcp, "_GRAPH_TASK_ID_BINDING", None)
     monkeypatch.setattr(conv_kcp, "_GRAPH_TASK_ID_USABLE", None)
     with pytest.raises(RuntimeError, match="_current_graph_task_id"):
-        conv_kcp._handle_lookup(conv_kcp.RecomputeHandleDetKcp())
+        conv_kcp._handle_lookup(conv_kcp.CakeCausalConv1dDetKcpRecomputeHandle())
     with pytest.raises(RuntimeError, match="_current_graph_task_id"):
         conv_kcp._kcp_in_backward()
 
@@ -362,10 +599,11 @@ def test_recompute_handle_hist_validation() -> None:
 
 @pytest.mark.cpu_only
 def test_facade_reexports_the_handle_lazily() -> None:
-    """``flashinfer.cake_causal_conv1d_det_train_kcp.RecomputeHandleDetKcp`` is the backend's class; importing the KCP
-    facade (or the single-rank det facade) does not import the KCP host modules (``kcp`` imports torch.distributed;
-    ``kcp_jit``) -- checked in a fresh interpreter; the facade's KCP entry carries the keyword-only
-    ``recompute_handle=None``, and the names before the det rename are bound nowhere."""
+    """``flashinfer.cake_causal_conv1d_det_train_kcp.CakeCausalConv1dDetKcpRecomputeHandle`` (and the two autograd
+    Functions) are the backend's classes; importing the KCP facade (or the single-rank det facade) imports neither the
+    backend package nor the KCP host modules (``kcp`` imports torch.distributed; ``kcp_jit``) -- checked in a fresh
+    interpreter; the facade's KCP entry carries the keyword-only ``recompute_handle=None``, and the names before the
+    det rename are bound nowhere."""
     import subprocess
     import sys
 
@@ -373,17 +611,22 @@ def test_facade_reexports_the_handle_lazily() -> None:
         "import inspect, sys\n"
         "import flashinfer.cake_causal_conv1d_det_train_kcp as f\n"
         "import flashinfer.cake_causal_conv1d_det_train as d\n"
-        "kcp = 'flashinfer.cake_causal_conv1d_det_train_backend.kcp'\n"
-        "jit = 'flashinfer.cake_causal_conv1d_det_train_backend.kcp_jit'\n"
+        "pkg = 'flashinfer.experimental.cake.cake_causal_conv1d_det_train'\n"
+        "kcp = pkg + '.kcp'\n"
+        "jit = pkg + '.kcp_jit'\n"
         "assert kcp not in sys.modules and jit not in sys.modules, sorted(m for m in sys.modules if 'kcp' in m)\n"
+        "assert pkg not in sys.modules, sorted(m for m in sys.modules if 'conv1d' in m)\n"
         "p = inspect.signature(f.cake_causal_conv1d_det_kcp).parameters['recompute_handle']\n"
         "assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None\n"
         "assert not hasattr(d, 'cake_causal_conv1d_kcp') and not hasattr(d, 'KcpRecomputeHandle')\n"
         "assert kcp not in sys.modules\n"
-        "from flashinfer.cake_causal_conv1d_det_train_kcp import RecomputeHandleDetKcp\n"
-        "from flashinfer.cake_causal_conv1d_det_train_backend.kcp import RecomputeHandleDetKcp as B\n"
-        "import flashinfer.cake_causal_conv1d_det_train_backend.kcp as C\n"
-        "assert RecomputeHandleDetKcp is B and 'RecomputeHandleDetKcp' in f.__all__\n"
+        "from flashinfer.cake_causal_conv1d_det_train_kcp import CakeCausalConv1dDetKcpRecomputeHandle\n"
+        "from flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp import CakeCausalConv1dDetKcpRecomputeHandle as B\n"
+        "import flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp as C\n"
+        "assert CakeCausalConv1dDetKcpRecomputeHandle is B and 'CakeCausalConv1dDetKcpRecomputeHandle' in f.__all__\n"
+        "assert f.CakeCausalConv1dDetKcpFunction is C.CakeCausalConv1dDetKcpFunction\n"
+        "assert f.CakeCausalConv1dDetKcpMultiFunction is C.CakeCausalConv1dDetKcpMultiFunction\n"
+        "assert {'CakeCausalConv1dDetKcpFunction', 'CakeCausalConv1dDetKcpMultiFunction'} <= set(f.__all__) & set(dir(f))\n"
         "assert not hasattr(C, 'KcpRecomputeHandle') and not hasattr(f, 'KcpRecomputeHandle')\n"
         "print('FACADE_IMPORT_OK')\n"
     )
@@ -394,10 +637,9 @@ def test_facade_reexports_the_handle_lazily() -> None:
 
 
 @pytest.mark.cpu_only
-def test_graph_key_holds_the_backward_launch_form(monkeypatch) -> None:
+def test_graph_key_holds_the_backward_launch_form() -> None:
     """The backward's launch form (``cooperative``, FlashInfer issue #8365) is part of the graph validity key: the same
     operands under the two forms are two keys, the same form one.  No kernel runs here."""
-    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
     ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
     x = torch.zeros(8, 16, dtype=torch.bfloat16)
     try:

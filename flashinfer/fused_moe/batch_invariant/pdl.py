@@ -2,21 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Programmatic dependent launch: where a kernel lets its dependents start. Every kernel waits for its predecessor before
 its first dependent read (``griddepcontrol.wait``); the trigger (``griddepcontrol.launch_dependents``) decides when the next
-kernel's CTAs may become resident. No kernel of this backend triggers: the dependents launch at completion (``none``), the
-placement that measured fastest for the MoE chain (an early trigger lets the dependents' CTAs occupy SM slots during the
-main work; a trigger after the persistent body's last loads still overlaps its epilogue, which at decode is most of the
-kernel). ``TRIGGER`` selects the placement for measurement: ``none``, ``late`` (after the CTA's last tile's loads) or
-``early`` (right after the wait)."""
+kernel's CTAs may become resident. No kernel of this backend triggers: the dependents launch at completion (``TRIGGER =
+"none"``), the placement that measured fastest for the MoE chain (an early trigger lets the dependents' CTAs occupy SM slots
+during the main work; a trigger after the persistent body's last loads still overlaps its epilogue, which at decode is most
+of the kernel). The trigger sites below mark where the other placements would go (``late``: after the CTA's last tile's
+loads; ``early``: right after the wait). The placement is baked into every compiled object and the kernel names do not
+carry it, so it is a constant of the module, not a runtime or environment setting."""
 
 from __future__ import annotations
-
-import os
 
 import cutlass
 import cutlass.cute as cute
 
-TRIGGER = os.environ.get("RLK_PDL_TRIGGER", "none")
-assert TRIGGER in ("early", "late", "none"), TRIGGER
+#: The trigger placement of every kernel of the backend: ``none`` (the dependents launch at completion).
+TRIGGER = "none"
 
 
 @cute.jit

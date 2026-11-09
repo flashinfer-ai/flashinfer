@@ -205,7 +205,8 @@ def test_removed_package_paths_do_not_import(name):
 
 def test_former_entries_fail_at_import():
     """In a fresh interpreter, no former deterministic entry and no entry of this module imports from
-    ``flashinfer.chunked_lm_head`` (the module of the non-deterministic dispatchers)."""
+    ``flashinfer.chunked_lm_head`` (a removed module; its non-deterministic entries are now
+    ``flashinfer.cake_lm_head_nondet_train``)."""
     names = REMOVED_ENTRIES + ENTRIES
     code = (
         "import json\n"
@@ -306,7 +307,8 @@ def test_no_entry_takes_a_mode_keyword():
         for name, cls in _autograd_functions(_backend(module_name)):
             fns[f"{module_name}.{name}.forward"] = cls.forward
             classes += 1
-    assert classes == 8
+    # the opt-in module's two automatic-form log-probability subclasses and its one-chunk function among them
+    assert classes == 11
     for label, fn in fns.items():
         try:
             inspect.signature(fn).bind_partial(deterministic=False)
