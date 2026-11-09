@@ -408,6 +408,39 @@ def test_registry_fingerprint_takes_an_activation_config():
     )
 
 
+def test_prepare_weights_rejects_dimensions_that_disagree_with_the_weights():
+    """A supplied ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must be the weights' own (``ValueError``
+    before any view is built, naming the dimension); the consistent call and the call without dimensions give the view,
+    for the gated geometry (``I`` = half of w1's rows) and the ungated one (``I`` = w1's rows)."""
+    E, I, H = 4, 16, 32
+    w1 = torch.randn(E, 2 * I, H).to(torch.bfloat16)
+    w2 = torch.randn(E, H, I).to(torch.bfloat16)
+    view = BatchInvariantBf16Config.prepare_weights(
+        w1, w2, num_local_experts=E, hidden_size=H, intermediate_size=I
+    )
+    assert view["w1i"].shape == (E, 2 * I, H) and view["gated"]
+    assert BatchInvariantBf16Config.prepare_weights(w1, w2)["w2"].shape == (E, H, I)
+    for kw in (
+        dict(num_local_experts=E + 1),
+        dict(hidden_size=H // 2),
+        dict(intermediate_size=2 * I),
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            BatchInvariantBf16Config.prepare_weights(w1, w2, **kw)
+        assert next(iter(kw)) in str(excinfo.value)
+    w1u = torch.randn(E, I, H).to(torch.bfloat16)
+    view_u = BatchInvariantBf16Config.prepare_weights(
+        w1u, w2, intermediate_size=I, activation=ReLU2()
+    )
+    assert not view_u["gated"] and view_u["w1i"].shape == (E, I, H)
+    with pytest.raises(ValueError):
+        BatchInvariantBf16Config.prepare_weights(
+            w1u, w2, intermediate_size=I // 2, activation=ReLU2()
+        )
+    with pytest.raises(TypeError):
+        BatchInvariantBf16Config.prepare_weights(w1[0], w2)
+
+
 def test_fingerprint_is_bounded_in_the_expert_count():
     """The class identifier hashes its terms as DAGs: at the widest class (1024 experts, top-k 16) the default chain and
     the largest ones (a parameterised ``SwiGLU``, ``SiTU``, ``PowLU``) fingerprint within a bounded time and host memory

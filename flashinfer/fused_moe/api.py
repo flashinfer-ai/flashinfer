@@ -3336,11 +3336,28 @@ class BatchInvariantBf16Config:
         device: Optional[torch.device] = None,
     ) -> Dict[str, Any]:
         """The backend's weight view: the gate / up rows interleaved for a gated activation, as given for an ungated one,
-        and the activation's chain (``activation`` defaults to ``SwiGLU()``)."""
+        and the activation's chain (``activation`` defaults to ``SwiGLU()``). A supplied ``num_local_experts`` /
+        ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry (``ValueError`` otherwise)."""
         from .batch_invariant.api import MoEWeights
         from .batch_invariant.spec import activation_of
 
         chain = activation_of(activation if activation is not None else SwiGLU())
+        if w1.dim() != 3 or w2.dim() != 3:
+            raise TypeError(
+                "BatchInvariantBf16Config.prepare_weights takes w1 [E, N1, H] and w2 [E, H, I]"
+            )
+        E, N1, H = w1.shape
+        for name, given, actual in (
+            ("num_local_experts", num_local_experts, E),
+            ("hidden_size", hidden_size, H),
+            ("intermediate_size", intermediate_size, N1 // 2 if chain.gated else N1),
+        ):
+            if given is not None and int(given) != actual:
+                raise ValueError(
+                    f"BatchInvariantBf16Config.prepare_weights: {name} {given} does not match the weights' "
+                    f"{actual} (w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}, "
+                    f"{'gated' if chain.gated else 'ungated'} activation)"
+                )
         w1 = w1.to(device=device) if device is not None else w1
         w2 = w2.to(device=device) if device is not None else w2
         return MoEWeights.prepare(
