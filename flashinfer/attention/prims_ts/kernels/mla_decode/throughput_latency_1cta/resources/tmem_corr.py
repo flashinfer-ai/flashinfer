@@ -147,12 +147,47 @@ class TmemCorrResource(MlaResource):
     _sum_scratch: object = None
     _cluster_reduction_smem: object = None
     _cluster_reduction_barrier: object = None
+    _o_coalesce_alloc: object = None
+    _smem_o_coalesce: object = None
+    _tail_sink: object = None
+
+    def _prefetches_tail_sink(self):
+        # Keep-AB fused epilogues read one sink per row-owning lane. WS native-E
+        # maps lanes to rows differently; its tail keeps the direct sink load.
+        return (
+            self.inst_id == 1
+            and self.cfg.kernel_variant == "keeps_mma_ab"
+            and not self.cfg.ws_native_e
+            and self.cfg.fuse_sparse_epilogue
+            and self.attention_sinks is not None
+        )
 
     def _keeps_direct_output(self):
         return (
             self.cfg.kernel_variant == "keeps_mma_ab"
             and (self.cfg.num_tokens_per_page == 1 and not self.cfg.sparse_d576_reload)
             and self.cfg.use_cluster_reduction != 1
+        )
+
+    def _coalesced_keeps_output(self):
+        # Final BF16 rows only; partials, FP8 and quantized outputs keep the
+        # direct per-lane stores.
+        return (
+            self.inst_id == 1
+            and self._keeps_direct_output()
+            and self.cfg.coalesce_keeps_output
+            and self.output_quant is None
+            and self.acc_o_tensor is None
+            and self.cfg.use_fp8_output != 1
+        )
+
+    def _o_coalesce_bytes(self):
+        # One D stage of sixteen rows per correction warp.
+        return (
+            self.cfg.correction_num_warps
+            * 16
+            * self.cfg.head_dim_per_stage_v
+            * self.cfg.o_dtype_bytes
         )
 
     def get_smem_requirements(self):
@@ -166,6 +201,14 @@ class TmemCorrResource(MlaResource):
                 )
             return [self._ws_scale_alloc]
 
+        if self._coalesced_keeps_output():
+            if self._o_coalesce_alloc is None:
+                self._o_coalesce_alloc = SmemAllocation(
+                    name=f"{self.name}_oCoalesce",
+                    size_bytes=self._o_coalesce_bytes(),
+                    alignment=128,
+                )
+            return [self._o_coalesce_alloc]
         if self.inst_id != 1 or self._keeps_direct_output():
             # Keeps-AB normalizes through warp shuffles and stores from TMEM
             # directly to GMEM. Its output and sum scratch are never used.
@@ -203,6 +246,11 @@ class TmemCorrResource(MlaResource):
     @cute.jit
     def _init_store_state_from_context(self, context) -> None:
         """Create correction/output SMEM views and initialize cluster state."""
+        if cutlass.const_expr(self._coalesced_keeps_output()):
+            self._smem_o_coalesce = smem_array(
+                context, self._o_coalesce_alloc, Int32, self._o_coalesce_bytes() // 4
+            )
+            return
         if cutlass.const_expr(self.inst_id != 1 or self._keeps_direct_output()):
             return
         self._smem_o = smem_array(
@@ -267,6 +315,39 @@ class TmemCorrResource(MlaResource):
         # Producer aux work initializes the correction task's view of TMEM O.
         # Runtime SMEM views are initialized once in initialize_runtime_state_internal().
         self._init_tmem_state(stage_info)
+        if cutlass.const_expr(self._prefetches_tail_sink()):
+            # Persistent work-tile loops carry the per-tile sink; define it
+            # before the loop.
+            self._tail_sink = Float32(-Float32.inf)
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def prefetch_tail_inputs(self, stage_info: StageInfo) -> None:
+        """Load this work tile's row sinks before any wait for O.
+
+        The tail otherwise issues this global load after the final PV, where
+        its full L2 round trip precedes every output store.
+        """
+        if cutlass.const_expr(self._prefetches_tail_sink()):
+            task_cache = decode_gen_task_cache(stage_info)
+            logical_head = self._keeps_tail_logical_head(stage_info, task_cache)
+            sink = Float32(-Float32.inf)
+            if logical_head < self.cfg.logical_num_heads_q:
+                sink = Float32(self.attention_sinks[logical_head])
+            self._tail_sink = sink
+
+    @cute.jit
+    def _keeps_tail_logical_head(self, stage_info: StageInfo, task_cache):
+        """Logical query head of this lane's Keep-AB row (one per half-warp lane)."""
+        cfg = self.cfg
+        warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        return (
+            cta_idx_q_for_stage(self.cta_idx_q, stage_info) * cfg.tile_size_q
+            + head_idx_for_stage(self.head_idx, cfg, stage_info)
+            + warp_idx * Int32(16)
+            + (lane_idx & Int32(15))
+        )
 
     @cute.jit
     def _o_base_col(self):
@@ -1571,8 +1652,7 @@ class TmemCorrResource(MlaResource):
             if reduced_sum[scale_idx] != Float32(0.0):
                 norm_scale = self.output_scale / reduced_sum[scale_idx]
             if cutlass.const_expr(cfg.fuse_sparse_epilogue):
-                # Four lanes compute the distinct row factors. Broadcast to
-                # their peers instead of repeating sink SFU work eight times.
+                # Only row-owning lanes compute sink factors; broadcast to peers.
                 norm_lane = (
                     lane_idx & Int32(15)
                     if cfg.kernel_variant == "keeps_mma_ab"
@@ -1602,7 +1682,11 @@ class TmemCorrResource(MlaResource):
                     count = Float32(final_max[scale_idx] != neg_max_f32())
                     norm_scale = Float32(0)
                     if logical_head < cfg.logical_num_heads_q and count > Float32(0):
-                        sink = Float32(self.attention_sinks[logical_head])
+                        sink = Float32(-Float32.inf)
+                        if cutlass.const_expr(self._prefetches_tail_sink()):
+                            sink = self._tail_sink
+                        elif cutlass.const_expr(self.attention_sinks is not None):
+                            sink = Float32(self.attention_sinks[logical_head])
                         if sink == Float32(-Float32.inf):
                             norm_scale = self.output_scale / reduced_sum[scale_idx]
                         elif sink != Float32(Float32.inf):
@@ -1742,6 +1826,17 @@ class TmemCorrResource(MlaResource):
                     )
             return
 
+        if cutlass.const_expr(self._coalesced_keeps_output()):
+            self._store_keeps_tail_o_stage_coalesced(
+                stage_info,
+                task_cache,
+                base_addr0=base_addr0,
+                final_scale0=final_scale0,
+                v_stage_idx=v_stage_idx,
+                head_dim_offset=head_dim_offset,
+            )
+            return
+
         store_col_base = (
             head_dim_offset
             + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
@@ -1863,6 +1958,125 @@ class TmemCorrResource(MlaResource):
                 else:
                     if valid_store:
                         dst_ptr.store(packed_o.load(0, 4), alignment=16)
+
+    @cute.jit
+    def _store_keeps_tail_o_stage_coalesced(
+        self,
+        stage_info: StageInfo,
+        task_cache,
+        *,
+        base_addr0,
+        final_scale0,
+        v_stage_idx: int,
+        head_dim_offset,
+    ):
+        """Normalize one Keep-AB O stage and store full 128B lines via SMEM.
+
+        Each lane owns half of one head row, so direct stores touched 32 lines
+        per instruction. The warp's sixteen rows are transposed through a
+        private SMEM slice; each store then writes two contiguous rows.
+        """
+        cfg = self.cfg
+        batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        head_base_idx = head_idx_for_stage(self.head_idx, cfg, stage_info)
+        cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
+        warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        half_cols = cfg.head_dim_per_stage_v // 2
+        row_bytes = cfg.head_dim_per_stage_v * cfg.o_dtype_bytes
+        chunks_per_row = row_bytes // 16
+        load_cols = 32 if half_cols % 32 == 0 else 8
+        o_blocks = []
+        for block_idx in cutlass.range_constexpr(0, half_cols, load_cols):
+            o_blocks.append(
+                tcgen05_ld_16x32bx2_f32(
+                    prims.make_tmem_ptr(base_addr0 + Int32(block_idx), Float32),
+                    num=load_cols,
+                    offset=Int32(half_cols),
+                )
+            )
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        cute.arch.fence_view_async_tmem_load()
+
+        warp_base = self._smem_o_coalesce.data_ptr().toint(Int32) + warp_idx * Int32(
+            16 * row_bytes
+        )
+        row = lane_idx & Int32(0xF)
+        half = lane_idx >> Int32(4)
+        # XOR the 16B chunk with the row's low bits: each quarter-warp phase of
+        # the row-major writes and the two-row reads hits all 32 banks once.
+        for chunk_idx in cutlass.range_constexpr(0, half_cols, 8):
+            o_block = o_blocks[chunk_idx // load_cols]
+            packed_o = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+            for pair_idx in cutlass.range_constexpr(4):
+                reg_base = chunk_idx % load_cols + pair_idx * 2
+                final_pair = fmul2(
+                    (final_scale0[0], final_scale0[0]),
+                    (o_block[reg_base], o_block[reg_base + 1]),
+                )
+                packed_o[pair_idx] = pack_float2_to_bf16(final_pair[0], final_pair[1])
+            chunk = half * Int32(half_cols // 8) + Int32(chunk_idx // 8)
+            dst = cutlass.inttoptr(
+                warp_base + row * Int32(row_bytes) + ((chunk ^ (row & 7)) << 4),
+                mem_space=3,
+                dtype=Int32,
+            )
+            dst.store(packed_o.load(0, 4), alignment=16)
+        cute.arch.sync_warp()
+
+        rows_per_store = 32 // chunks_per_row
+        chunk = lane_idx % Int32(chunks_per_row)
+        # Read every staged row and form every address before the predicated
+        # stores. A store branch holding its load or address math kept them
+        # adjacent, serializing one SMEM round trip per store.
+        staged_rows = []
+        for store_idx in cutlass.range_constexpr(16 // rows_per_store):
+            local_row = Int32(store_idx * rows_per_store) + lane_idx // Int32(
+                chunks_per_row
+            )
+            src = cutlass.inttoptr(
+                warp_base
+                + local_row * Int32(row_bytes)
+                + ((chunk ^ (local_row & 7)) << 4),
+                mem_space=3,
+                dtype=Int32,
+            )
+            staged_rows.append(src.load(count=4, alignment=16))
+        for store_idx in cutlass.range_constexpr(16 // rows_per_store):
+            local_row = Int32(store_idx * rows_per_store) + lane_idx // Int32(
+                chunks_per_row
+            )
+            values = staged_rows[store_idx]
+            global_head_idx = head_base_idx + warp_idx * Int32(16) + local_row
+            storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
+                global_head_idx,
+                cta_idx_q,
+                cfg.tile_size_q,
+                cfg.logical_num_heads_q,
+                cfg.logical_seq_len_q,
+                cu_seqlens_q=self.cu_seqlens_q,
+                batch_idx=batch_idx,
+            )
+            # Invalid rows form an unused address from safe coordinates.
+            output_query_row = public_query_flat_row(
+                cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
+            )
+            col = (
+                head_dim_offset
+                + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
+                + chunk * Int32(16 // cfg.o_dtype_bytes)
+            )
+            elem = Int64(output_query_row) * Int64(cfg.head_dim_v) + Int64(col)
+            dst_ptr = cutlass.inttoptr(
+                self.o_tensor.iterator.raw_ptr().toint(Int64)
+                + elem * Int64(cfg.o_dtype_bytes),
+                mem_space=1,
+                dtype=Int32,
+            )
+            if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
+                dst_ptr.store(values, alignment=16)
+        # The next stage overwrites this warp's slice.
+        cute.arch.sync_warp()
 
     @cute.jit
     def _stage_tile32_tail_o_to_smem(
