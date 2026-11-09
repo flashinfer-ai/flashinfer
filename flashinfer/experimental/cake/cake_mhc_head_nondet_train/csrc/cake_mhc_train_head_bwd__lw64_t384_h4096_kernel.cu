@@ -54,8 +54,8 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 extern "C" {
 
-__global__ __launch_bounds__(480) void
-kernel_cake_mhc_train_head_bwd__lw64_t480_h4096(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, int T, CakeFastDivmod hv)
+__global__ __launch_bounds__(384) void
+kernel_cake_mhc_train_head_bwd__lw64_t384_h4096(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, int T, CakeFastDivmod hv)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -71,9 +71,9 @@ kernel_cake_mhc_train_head_bwd__lw64_t480_h4096(__nv_bfloat16* __restrict__ dy, 
     asm volatile("griddepcontrol.wait;" ::: "memory");
     unsigned int cta_q = (unsigned int)bid / 1024;
     unsigned int cta_r = (unsigned int)bid - cta_q * 1024;
-    unsigned int within = cta_r * 480 + (unsigned int)tid;
+    unsigned int within = cta_r * 384 + (unsigned int)tid;
     unsigned int sub = within / 1024;
-    unsigned int token = cta_q * 480 + sub;
+    unsigned int token = cta_q * 384 + sub;
     unsigned int col = within - sub * 1024;
     if (token < (unsigned int)T) {
         long long row = 4096ll;
