@@ -8,8 +8,8 @@ JIT flags are built from ``supported_major_versions=[10, 12]``, so on Hopper
 nothing survives the filter and the failure surfaces as
 ``No supported CUDA architectures found for major versions [10, 12]`` from
 ``CompilationContext`` -- naming neither this module nor trtllm-gen.
-``is_trtllm_moe_supported`` has answered ``False`` for ``arch[0] < 10`` all
-along; this is that answer acted on.
+``is_trtllm_moe_supported`` answers ``False`` for ``arch[0] < 10`` and nothing in the
+tree acts on it; this is that answer acted on.
 
 The builder itself is stubbed, so nothing is compiled and no cubin is fetched.
 """

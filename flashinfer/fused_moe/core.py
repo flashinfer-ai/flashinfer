@@ -2124,8 +2124,8 @@ def get_trtllm_moe_sm100_module():
     major, minor = get_compute_capability(device)
     if major < 10:
         # Every trtllm-gen MoE entry point comes through here, and
-        # is_trtllm_moe_supported has returned False for arch[0] < 10 since it
-        # was added without anything acting on it. Asking for the module on
+        # is_trtllm_moe_supported answers False for arch[0] < 10 with nothing
+        # in the tree acting on it. Asking for the module on
         # this device fails anyway -- the trtllm-gen cubin manifest carries no
         # SM90 kernels, and the module's JIT flags are built from
         # supported_major_versions=[10, 12] (jit/fused_moe.py) so nothing
