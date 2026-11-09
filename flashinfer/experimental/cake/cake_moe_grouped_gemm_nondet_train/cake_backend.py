@@ -137,6 +137,27 @@ as for the 256-wide k tile) then binds.  The preparation raises ``ValueError``
 for an architecture in both lists, and for one in neither whose route serves
 no ``tail_reduce`` stage there or whose bound build takes the one-launch tail.
 
+The queue walk.  On sm_100a and sm_103a the 512-wide k tile routes also serve
+``main_halves_queue`` (and, on the fp32 route, ``main_halves_queue_acc``):
+the wave-free half-release build with the planned split tail whose tiles
+before the tail are claimed from one global counter in tile order, so the
+tiles in flight are consecutive tile indices and tiles that read the same G
+or X strip run at nearly the same time.  Every tile keeps its k-step order,
+so it gives the bits of the same build on the strided walk.  Where a rule of
+``queue_walk`` names the call (``wgrad_queue_walk``: the device's
+architecture and SM count, the selected ``main_halves`` /
+``main_wave_halves`` stage, the output -- ``"bfloat16"`` / ``"float32"``,
+or ``"accumulate"`` for a fused accumulate -- and a range of group counts)
+and the route serves that stage (for a fused accumulate: its accumulate
+build, loadable), the host binds the queue stage in place of the selected
+one, with the selected stage's plan (grid, tail split, raster; the queue
+program takes no wave arguments, so ``plan["wave_mode"]`` goes unused);
+``stages`` names the bound stage.  The queue build places its tail as the
+host plans it: unlike the slack tail placement of ``main_halves``, a planned
+split tail is always split, so on skewed groups its split tail tiles can
+differ in bits from ``main_halves``'s (both are ordered and repeat bit for
+bit).  Every other call keeps its stage.
+
 Stream workspaces.  The forward and data-gradient programs take a scheduler
 workspace (``sched``: ``sched_words`` u32 words whose first three rest at
 ``sched_rest``) and the split of their clusters over the two claim queues
@@ -174,7 +195,16 @@ their rest state, set at the launch (a capture records that set with the
 launch and allocates the buffers from the graph's pool; ``tail_sums`` is
 allocated without a set, so no fill of it is recorded) and the even split.  The static
 sm_107a forward and data-gradient programs take ``sched``, ``c0`` and ``c1`` and
-ignore them.
+ignore them.  The weight gradient's queue-walk programs name their two tile
+counters (the next tile and the clusters retired) ``sched`` too; the host
+binds that argument to a stream workspace kind of its own, ``queue_sched``
+(``queue_sched_words`` u32 words at zero, ``BINDING_WORKSPACE_KINDS``), kept
+and allocated like the others.  A queue launch needs the counters zero at its
+start and leaves them zero (its last cluster to retire sets both back to
+zero), so launches on one stream reuse one pair of words with no fill per
+launch, and no two launches in flight share a pair: another stream, a capture
+and a launch for another device take words of their own (a capture records
+their zero fill with the launch).
 
 The 512-wide k tile's weight-gradient programs take the fp32 slots of the
 split tail tiles (``tail_sums``: ``num_tail * tail_splits * cluster_m *
@@ -1071,6 +1101,37 @@ def select_wgrad_stage(
     return stage, wave
 
 
+def wgrad_queue_walk(
+    stage: str,
+    output: str,
+    arch: str,
+    sm_count: int,
+    num_groups: int,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether a 512-wide k tile weight gradient binds the queue walk (``QUEUE_STAGE``, or its accumulate
+    stage for a fused accumulate) in place of the main stage ``stage`` the host selected
+    (:func:`select_wgrad_stage`, one of ``QUEUE_SELECTED_STAGES``): some rule of ``queue_walk`` names ``arch``,
+    the device's ``sm_count``, ``stage``, the ``output`` (``"bfloat16"`` / ``"float32"`` for the overwrite of
+    that dtype, the bound programs of a composed accumulate included; ``"accumulate"`` for a fused FP32
+    accumulate) and a group range ``[min, max]`` that holds ``num_groups`` (module docstring, program choice).
+    The caller also needs the route to serve the queue stage on ``arch``."""
+    c = constants or host_plan_constants()
+    if stage not in QUEUE_SELECTED_STAGES:
+        return False
+    for rule in c.get("queue_walk", ()):
+        low, high = (int(v) for v in rule["groups"])
+        if (
+            rule["arch"] == arch
+            and int(sm_count) in {int(v) for v in rule["sm_counts"]}
+            and rule["stage"] == stage
+            and output in rule["outputs"]
+            and low <= int(num_groups) <= high
+        ):
+            return True
+    return False
+
+
 def wgrad_accumulate_mode(
     name: str,
     stage: str,
@@ -1139,6 +1200,19 @@ except AttributeError:  # pragma: no cover - older torch
 
 # The workspace kinds a program's argument plan may name, by argument name.
 STREAM_WORKSPACES = ("sched", "wave_sync", "tail_sums", "tail_tickets")
+# The weight gradient's queue-walk programs name their tile counters ``sched`` too; the host binds that
+# argument to a kind of its own, ``queue_sched`` (``queue_sched_words`` u32 words resting at zero), not to the
+# row programs' scheduler workspace, whose words rest at ``sched_rest``.
+QUEUE_SCHED = "queue_sched"
+# The stream workspace kind each host binding binds an argument name to where it is not the name itself.
+BINDING_WORKSPACE_KINDS: dict[str, dict[str, str]] = {"wgrad": {"sched": QUEUE_SCHED}}
+# Every stream workspace kind.
+WORKSPACE_KINDS = STREAM_WORKSPACES + (QUEUE_SCHED,)
+# The queue walk's stage of the 512-wide k tile routes (``wgrad_queue_walk``); its fused accumulate stage is
+# this name with ``ACC_SUFFIX``.
+QUEUE_STAGE = "main_halves_queue"
+# The stages the queue walk may stand in for.
+QUEUE_SELECTED_STAGES = ("main_halves", "main_wave_halves")
 # The kinds whose size is the launch's (the split tail's slots and tickets); the others have a fixed size.
 SIZED_STREAM_WORKSPACES = ("tail_sums", "tail_tickets")
 # The kinds with no rest state (each launch overwrites what it reads); the others rest at fixed values.
@@ -1273,8 +1347,12 @@ def _rest_workspace(kind: str, device: torch.device, size: int = 0) -> torch.Ten
         return torch.zeros(
             int(c["wave_sync_words"]), dtype=torch.int32, device=device
         ).view(torch.uint32)
+    if kind == QUEUE_SCHED:
+        return torch.zeros(
+            int(c["queue_sched_words"]), dtype=torch.int32, device=device
+        ).view(torch.uint32)
     raise KeyError(
-        f"unknown stream workspace {kind!r}; expected one of {STREAM_WORKSPACES}"
+        f"unknown stream workspace {kind!r}; expected one of {WORKSPACE_KINDS}"
     )
 
 
@@ -1309,12 +1387,12 @@ def _launch_workspace(
 def stream_workspace(
     kind: str, device: torch.device, stream: Optional[torch.cuda.Stream] = None
 ) -> Optional[torch.Tensor]:
-    """The ``kind`` (``"sched"`` / ``"wave_sync"`` / ``"tail_sums"`` / ``"tail_tickets"``) workspace kept for
-    ``stream`` (the current stream of ``device`` by default), or ``None`` before a launch on that stream needed
-    one."""
-    if kind not in STREAM_WORKSPACES:
+    """The ``kind`` (``"sched"`` / ``"wave_sync"`` / ``"tail_sums"`` / ``"tail_tickets"`` /
+    ``"queue_sched"``) workspace kept for ``stream`` (the current stream of ``device`` by default), or ``None``
+    before a launch on that stream needed one."""
+    if kind not in WORKSPACE_KINDS:
         raise KeyError(
-            f"unknown stream workspace {kind!r}; expected one of {STREAM_WORKSPACES}"
+            f"unknown stream workspace {kind!r}; expected one of {WORKSPACE_KINDS}"
         )
     index = _device_index(device)
     handle = _current_raw_stream(index) if stream is None else int(stream.cuda_stream)
@@ -1705,7 +1783,8 @@ def _bind(
     """Order ``kwargs`` by the generated argument plan of ``stage`` of route ``name`` on ``arch`` and load
     its entry (the binding encodes the operands' TMA descriptors by value at every launch).  A buffer the
     plan names after a stream workspace kind and ``kwargs`` does not bind is left to
-    ``CakeMoEGroupedGemmNondetLaunch.launch`` (a sized kind with its element count from ``sizes``); with ``split`` so
+    ``CakeMoEGroupedGemmNondetLaunch.launch`` (a sized kind with its element count from ``sizes``; the kind
+    of ``BINDING_WORKSPACE_KINDS`` where the host binding renames the argument); with ``split`` so
     are ``c0`` / ``c1``, which a launch replaces by the probed split of its ``sched`` once known, and the
     queue probe is built here."""
     binding = stage_binding(name, stage, arch)
@@ -1718,6 +1797,7 @@ def _bind(
             f"HOST_ARGUMENTS[{host_binding(op, stage)!r}] does not list"
         )
     grid = dict(zip(GRID_ARGUMENTS, kwargs["grid"], strict=True))
+    kinds = BINDING_WORKSPACE_KINDS.get(host_binding(op, stage), {})
     arguments: list[Any] = []
     slots: list[tuple[int, str, int]] = []
     for kind, arg in program["arg_plan"]:
@@ -1730,7 +1810,7 @@ def _bind(
                     f"generated program {binding['program']!r} (route {name!r}, stage {stage!r}) "
                     f"takes the stream workspace {arg!r}; the host binding gives neither a buffer nor its size"
                 )
-            slots.append((len(arguments), arg, size))
+            slots.append((len(arguments), kinds.get(arg, arg), size))
             arguments.append(None)
         elif kind == "buffer" and arg in ROW_BASES and ROW_BASES[arg] in kwargs:
             arguments.append(
@@ -2149,13 +2229,14 @@ def _prepare_wgrad(
             f"{'one-launch' if one_launch else 'two-launch'} tail (ordered_tail_archs / "
             "unordered_tail_archs)"
         )
+    sms = sm_count(device)
     plan = plan_wgrad(
         sum_m=sum_m,
         num_groups=num_groups,
         n=n,
         k=k,
         tile_k=tile_k,
-        sm_count=sm_count(device),
+        sm_count=sms,
         reduce_threads=reduce_threads,
         k256_tail=k256_tail,
         unordered_tail=unordered,
@@ -2197,6 +2278,22 @@ def _prepare_wgrad(
     plan["accumulate"] = mode
     if reason is not None:
         plan["accumulate_reason"] = reason
+    # The queue walk (module docstring, program choice): the route's queue stage in place of the selected one,
+    # with the same plan (the queue programs take no wave arguments).
+    fused = mode == "fused"
+    queue_stage = QUEUE_STAGE + (ACC_SUFFIX if fused else "")
+    queue = (
+        wgrad_queue_walk(
+            main_stage,
+            "accumulate" if fused else _DTYPE_NAMES[out_dtype],
+            arch,
+            sms,
+            num_groups,
+            c,
+        )
+        and stage_served(name, queue_stage, arch)
+        and (not fused or acc_library_loadable(name, queue_stage, arch))
+    )
     if sum_m == 0:
         # No row: an overwrite stores exact zeros, an accumulate leaves out as it is (no launch, no add).
         return _finish("wgrad", name, plan, out, (), [], [], zero_fill=not accumulate)
@@ -2258,7 +2355,10 @@ def _prepare_wgrad(
         )
         main_kwargs["partials"] = partials
         workspaces.append(partials)
-    bound = main_stage + ACC_SUFFIX if mode == "fused" else main_stage
+    if queue:
+        bound = queue_stage
+    else:
+        bound = main_stage + ACC_SUFFIX if fused else main_stage
     stages = [bound]
     launches = [_bind(name, bound, main_kwargs, arch, sizes=sizes)]
     if plan["tail_reduce_grid"] is not None:

@@ -75,6 +75,18 @@ from . import cake_build
 # once).  Each launch overwrites the slots it reads, so ``tail_sums`` needs no
 # value between launches; only the tickets rest at zero (the last unit wraps
 # them).  Those routes have no ``tail_reduce`` stage and launch one kernel.
+# The k512 routes also name this package's queue-walk builds on sm_100a and
+# sm_103a: ``main_halves_queue`` (both routes) and ``main_halves_queue_acc``
+# (the fp32 route), the wave-free half-release builds with the planned split
+# tail whose tiles before the tail are claimed from one global counter in tile
+# order instead of strided over the clusters.  Each tile keeps its k-step order,
+# so a queue build gives the bits of its strided twin (the same build on the
+# strided walk).  It takes one more workspace, ``sched``: two u32 words, the
+# counter and the retired-cluster count, at zero before and after a launch
+# (the last cluster to retire sets them back to zero).  The deterministic
+# package has no such stage; the host binds it in place of ``main_halves`` /
+# ``main_wave_halves`` (and their accumulate stages) where ``queue_walk``
+# names the call.
 # Every whole tile is reduced in a fixed order by one CTA pair, as in the
 # deterministic package, so the output repeats bit for bit for the same
 # inputs, shapes, device SM count and ``tail_splits``.  With the slack tail
@@ -90,7 +102,9 @@ from . import cake_build
 # those routes; ``unordered_tail_archs`` is empty (the registry holds no build
 # that adds its split tail with unordered reductions); and
 # ``atomic_tail_plan`` holds the cost-model constants of the one-launch split
-# tail (``tail_plan`` stays the two-launch tail reduce's).
+# tail (``tail_plan`` stays the two-launch tail reduce's); ``queue_walk`` names
+# the calls that bind the queue walk and ``queue_sched_words`` sizes its
+# counters (this package's keys).
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_001f83d4fc1d538b8731": {
         "library": "cake_moe_grouped_gemm_001f83d4fc1d538b8731",
@@ -1046,6 +1060,60 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
         "launch_us": 5.0,
         "cycles_per_step": {256: 512, 512: 1024},
     },
+    # Where a 512-wide k tile weight gradient binds the queue walk
+    # (``cake_backend.wgrad_queue_walk``): the ``main_halves_queue`` stage, or
+    # ``main_halves_queue_acc`` for a fused FP32 accumulate, in place of the
+    # stage the host selects.  A call takes it when one rule names the device's
+    # architecture and SM count, the selected stage, the kind of output
+    # (``"bfloat16"`` / ``"float32"`` overwrite, ``"accumulate"`` for the
+    # fused FP32 accumulate) and a range ``[min, max]`` holding the group count;
+    # every other call keeps its stage.
+    "queue_walk": [
+        {
+            "arch": "sm_100a",
+            "sm_counts": [148],
+            "stage": "main_wave_halves",
+            "outputs": ["bfloat16", "accumulate"],
+            "groups": [4, 32],
+        },
+        {
+            "arch": "sm_100a",
+            "sm_counts": [148],
+            "stage": "main_halves",
+            "outputs": ["bfloat16", "accumulate"],
+            "groups": [8, 32],
+        },
+        {
+            "arch": "sm_100a",
+            "sm_counts": [152],
+            "stage": "main_wave_halves",
+            "outputs": ["accumulate"],
+            "groups": [4, 32],
+        },
+        {
+            "arch": "sm_100a",
+            "sm_counts": [152],
+            "stage": "main_halves",
+            "outputs": ["bfloat16"],
+            "groups": [16, 32],
+        },
+        {
+            "arch": "sm_103a",
+            "sm_counts": [152],
+            "stage": "main_wave_halves",
+            "outputs": ["bfloat16", "accumulate"],
+            "groups": [4, 32],
+        },
+        {
+            "arch": "sm_103a",
+            "sm_counts": [152],
+            "stage": "main_halves",
+            "outputs": ["accumulate"],
+            "groups": [8, 16],
+        },
+    ],
+    # The u32 words of the queue walk's tile counters (``queue_sched``).
+    "queue_sched_words": 2,
     "int32_elems": 2147483647,
 }
 
