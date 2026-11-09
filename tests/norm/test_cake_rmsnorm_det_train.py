@@ -1106,6 +1106,62 @@ def _fp32_case(
     )
 
 
+# The backward windows where the FP32-weight route keeps a program of the BF16 route's earlier windows (the BF16 route
+# runs a pipelined program there that has no FP32-weight build; ``RECUT_FP32_ROUTES`` of the pairs test): (arch,
+# hidden) -> {FP32-weight window: the BF16 window whose program and dw reduce are the BF16 twins of the FP32-weight
+# window's}.  The twin records share the FP32-weight records' grid and workspace rules.
+RECUT_FP32_BACKWARD_TWINS: dict[
+    tuple[str, int], dict[tuple[int, int], tuple[int, int]]
+] = {
+    ("sm_100a", 2048): {
+        (288, 1024): (288, 768),
+        (1024, 16384): (1024, 2047),
+        (16384, 58880): (22528, 58880),
+    },
+    ("sm_100a", 6144): {(256, 4096): (256, 767)},
+    ("sm_103a", 6144): {(20, 4096): (20, 767)},
+}
+
+
+def _recut_backward_twin(hidden: int, residual: bool, rows: int) -> tuple[str, ...]:
+    """The BF16 twin modules (main program and dw reduce) of the FP32-weight backward program a call of ``rows``
+    tokens launches in a window of ``RECUT_FP32_BACKWARD_TWINS``; empty elsewhere."""
+
+    if residual:
+        return ()
+    arch = loader.arch_for_capability(_capability())
+    for (above, at_most), twin in RECUT_FP32_BACKWARD_TWINS.get(
+        (arch, hidden), {}
+    ).items():
+        if above < rows <= at_most:
+            names = tuple(
+                name
+                for name in loader.route_modules(arch, hidden, "bwd", False)
+                if (
+                    (loader.MODULES[name]["select_rule"] or {}).get("above"),
+                    (loader.MODULES[name]["select_rule"] or {}).get("at_most"),
+                )
+                == twin
+            )
+            assert names, (arch, hidden, twin)
+            return names
+    return ()
+
+
+def _launching(twin: tuple[str, ...]):
+    """A ``selected_modules`` under which a BF16 backward call launches the modules ``twin``; every other call
+    selects its route's modules."""
+
+    original = loader.selected_modules
+
+    def select(arch, hidden, kind, residual, *, rows, w_dtype="bf16"):
+        if kind == "bwd" and w_dtype == "bf16":
+            return twin
+        return original(arch, hidden, kind, residual, rows=rows, w_dtype=w_dtype)
+
+    return select
+
+
 def _window_rows(hidden: int, residual: bool) -> tuple[int, ...]:
     """The row counts that visit every window of the route's forward and backward programs:
     both sides of every window edge, the smallest counts and the training shape."""
@@ -1129,7 +1185,10 @@ def test_fp32_weight_equal_to_the_bf16_weight_matches_it_bitwise(
 ) -> None:
     """``w32 = float(w16)`` gives bitwise the BF16 path's y, rstd, h_new, dx and dw in every
     window of the route: the FP32-weight programs are the BF16 programs with the weight loaded
-    at FP32, selected over the same windows."""
+    at FP32, selected over the same windows.  In the backward windows of
+    ``RECUT_FP32_BACKWARD_TWINS`` the FP32-weight route keeps a program of the BF16 route's
+    earlier windows, so there its dx and dw are bitwise those of a BF16 call that launches the
+    BF16 twin of that program (and its dw reduce) over the same rows."""
 
     _skip_unless_fp32_routes(hidden, residual)
     for rows in _window_rows(hidden, residual):
@@ -1150,6 +1209,16 @@ def test_fp32_weight_equal_to_the_bf16_weight_matches_it_bitwise(
             )
         label = f"hidden={hidden} residual={residual} rows={rows}"
         assert torch.equal(dx16, dx32), f"{label}: dx differs"
+        twin = _recut_backward_twin(hidden, residual, rows)
+        if twin:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(pkg, "selected_modules", _launching(twin))
+                generator.set_state(seed)
+                _outputs, dx16, dw16, _ = _fp32_case(
+                    hidden, rows, residual, w16, generator
+                )
+            label = f"{label} (BF16 twin {twin})"
+            assert torch.equal(dx16, dx32), f"{label}: dx differs"
         assert torch.equal(dw16, dw32), f"{label}: dw differs"
 
 
