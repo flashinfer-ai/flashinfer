@@ -749,7 +749,8 @@ def tail_gy_split_n_pad(
 # cells where it measured faster than the route without it on that part (paired CUDA-graph timing, cold L2, both
 # passes beyond the A/A band, with and without a preceding front launch).
 TAIL_STAGED_PARTIALS_ROUTES: dict[tuple[int, str], dict[int, int]] = {
-    (152, "sm_103a"): {1: 2},
+    (152, "sm_100a"): {1: 2, 2: 3},
+    (152, "sm_103a"): {1: 2, 2: 3},
 }
 
 

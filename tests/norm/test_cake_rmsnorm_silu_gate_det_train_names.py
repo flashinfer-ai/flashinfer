@@ -367,14 +367,25 @@ def test_the_two_modes_are_separate_modules() -> None:
         name.startswith("cake_rmsnorm_silu_gate_det_train_")
         for name in det_backend.cake_jit.MODULES
     )
+    # the non-deterministic package routes its call roles, the roles its
+    # forward and backward bands name and backward roles of a BF16 weight
+    # gradient that no band runs
     loader = nd_backend.cake_jit
     roles = {record["role"] for record in loader.MODULES.values()}
-    assert roles == (
-        set(loader.ROLES)
-        | set(loader.XLONG_ROLES)
-        | set(loader.LONG_ROLES)
-        | set(loader.MID_ROLES)
-        | set(loader.SHORT_ROLES)
+    banded = {
+        role
+        for table in (loader.FORWARD_BANDS, loader.STRIDED_FORWARD_BANDS)
+        for bands in table.values()
+        for _, role in bands
+    } | {
+        role
+        for by_role in loader.BACKWARD_BANDS.values()
+        for bands in by_role.values()
+        for _, role in bands
+    }
+    assert set(loader.ROLES) | banded <= roles
+    assert all(
+        role.startswith("bwd_bf16_") for role in roles - set(loader.ROLES) - banded
     )
     # the deterministic package routes its call roles, the long modules of its
     # backward roles and, on some architectures, a forward of packed rows

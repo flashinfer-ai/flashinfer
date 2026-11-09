@@ -1597,8 +1597,9 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
     selection = loader.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
     assert [name for name, _ in loaded[start:]] == list(selection), loaded[start:]
     assert loader.MODULES[selection[0]]["role"] == "bwd_token", selection
+    chain = "dep1" if (arch, hidden) == ("sm_107a", 4096) else "dep"
     assert selection[1] == (
-        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1, hidden)}_dep"
+        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1, hidden)}_{chain}"
         + _suffix(hidden)
     )
     program = loader.bwd_slab_atomic_program(T, sm, arch, hidden)

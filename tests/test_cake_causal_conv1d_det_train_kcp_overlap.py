@@ -76,20 +76,31 @@ class _TwoRanks:
 
 
 def _recorder(monkeypatch) -> list[str]:
-    """The roles of the programs the backward launches, in launch order, with ``"wait"`` where it waits for the
-    exchange (the exchange returns a copy of the rank's receive pool and a work object that records its wait)."""
+    """The roles of the programs the forward and the backward launch, in launch order, with ``"wait"`` where they wait
+    for the exchange (the exchange returns a copy of the rank's receive pool and a work object that records its wait).
+    A record of the zero-history registry (the reduce program, the two-launch forward's single-rank main program)
+    reports its own role there (``"reduce"``, ``"fwd"``)."""
 
     order: list[str] = []
     roles: dict[int, str] = {}
     launch_plan, reduce_plan = conv_kcp._launch_plan, conv_kcp._reduce_plan
+    zero_history_plan = conv_kcp._zero_history_plan
     launch_trim, launch_with_grid = conv_kcp._launch_trim, conv_kcp._launch_with_grid
     run_module, exchange = conv_kcp.run_module, conv_kcp._exchange
 
     def role(name: str) -> str:
-        return conv_kcp._loader.MODULES[name]["role"]
+        record = conv_kcp._loader.MODULES.get(name)
+        if record is None:
+            record = conv_kcp._zero_history.MODULES[name]
+        return record["role"]
 
     def recording_plan(name, grid, device_index):
         info = launch_plan(name, grid, device_index)
+        roles[id(info)] = role(name)
+        return info
+
+    def recording_zero_history_plan(name, grid, device_index):
+        info = zero_history_plan(name, grid, device_index)
         roles[id(info)] = role(name)
         return info
 
@@ -124,6 +135,7 @@ def _recorder(monkeypatch) -> list[str]:
 
     monkeypatch.setattr(conv_kcp, "_launch_plan", recording_plan)
     monkeypatch.setattr(conv_kcp, "_reduce_plan", recording_reduce)
+    monkeypatch.setattr(conv_kcp, "_zero_history_plan", recording_zero_history_plan)
     monkeypatch.setattr(conv_kcp, "_launch_trim", recording_trim)
     monkeypatch.setattr(conv_kcp, "_launch_with_grid", recording_with_grid)
     monkeypatch.setattr(conv_kcp, "run_module", recording_run)

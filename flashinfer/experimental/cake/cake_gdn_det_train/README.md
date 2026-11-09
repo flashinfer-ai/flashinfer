@@ -107,10 +107,33 @@ split `(64, 1)` plan runs the second pass of its adjoint scan on `dhu_tc2`,
 from the stitched segment states, where a second cost rule prices it at most
 0.95 of `dv_local` plus the register pass and, on `sm_100a`, at least 40 us
 cheaper; its pre-scan then computes the `dv_local` tiles of its chunks itself,
-so no `dv_local` stage runs.  Both forms give the same bits.  For a value-head
+so no `dv_local` stage runs.  Both forms give the same bits on `dhu_tc2`; a
+value-head group of three on the architectures of `DVL32_ARCHS` runs
+`dhu_tc2_dvl32` instead (below).  For a value-head
 group of two (`HV == 2 * H`) or of three (`HV == 3 * H`) one fused tcgen05
 cluster kernel then computes `dq`, `dk`, `dv`, `dg` and `dbeta`; other groups
 run `dqkwg`, the WY pullback and the finalize.
+
+For a value-head group of three, on `sm_100a`, `sm_103a` and `sm_107a`, the
+fused tail rounds `dq` and `dk` once: its three CTAs exchange the group's FP32
+`dq` / `dk` partials over distributed shared memory and sum them in value-head
+order before one BF16 rounding (`tail_g3_f32x`; `tail_g3` rounds each value
+head's partials before their sum).  The tail writes `dq`, `dk` and `dv`
+through their token-row strides, so when `q`, `k` and `v` are the head views of
+one packed BF16 row that requires grad (`row.split((H * 128, H * 128, HV *
+128), -1)`, each viewed as `[B, T, heads, 128]`), the row is the autograd input
+and the backward writes one packed gradient row, with no concatenation and the
+same bits as on the views.  The tcgen05 adjoint scan of such a call adds the
+FP32 `dv_local` values to `dv2` before its one rounding (`dhu_tc2_dvl32`), on
+serial plans and in the second pass of split ones.
+Both are fixed-order with one writer per element, so the gradients repeat bit
+for bit; they differ from the previous release of this package (within its
+accuracy budgets).  The register adjoint forms still round `dv_local` to BF16
+first, so for such a call they give the same `o` and final state as
+`dhu_tc2_dvl32`, but other bits of `dk`, `dv`, `dg`, `dbeta` and the
+initial-state gradient (within the budgets): the cost rules and the `dhu_scan`
+pin pick the bits, and on a split `(64, 1)` plan the device-table route always
+runs the register pass.  Groups of two keep `tail_g2` and `dhu_tc2`.
 
 On the host-table route, a call with FP32 `beta`, `use_qk_l2norm_in_kernel`,
 `HV <= 3 * H` and no `prep`, `scan_config` or `segment_chunks` pin runs one of
@@ -232,9 +255,9 @@ per-stream ones.
 |---|---|---|
 | `scan_config` | planner | register-scan `(value block, key split)` of both scans: `(32, 2)`, `(32, 1)` or `(64, 1)`; keeps the call on the prep forward |
 | `segment_chunks` | planner | segment length in chunks of the segment-parallel scans; `0` forces the serial scan; lengths above 128 (the chunks one pre-scan CTA covers) are not supported: a call whose plan then splits a sequence raises `ValueError`; keeps the call on the prep forward |
-| `finalize` | by size | finalize of the unfused tail (`HV != 2 * H`): `"finalize"` or `"finalize_mlp"` (the latter needs `HV == 3 * H`); for `HV == 3 * H` a pin runs the unfused tail instead of the fused kernel (the same bits) |
+| `finalize` | by size | finalize of the unfused tail (`HV != 2 * H`): `"finalize"` or `"finalize_mlp"` (the latter needs `HV == 3 * H`); for `HV == 3 * H` a pin runs the unfused tail instead of the fused kernel (`dv`, `dg` and `dbeta` the same bits; `dq` / `dk` rounded per value head) |
 | `warmup_log2` | `-10 / ln 2` | warm-up threshold of the pre-scans |
-| `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan; the same bits) |
+| `dhu_scan` | rule | adjoint scan of a serial plan: `"reg"` (`dv_local` + register scan) or `"tc"` (`dhu_tc2`; `dhu_tc2_dvl32` for `HV == 3 * H` on `DVL32_ARCHS`); also the second pass of a split `(64, 1)` plan on the host-table route (`"tc"` with the fused pre-scan); `"tc"` gives the bits of `"reg"` on `dhu_tc2`, and on `dhu_tc2_dvl32` the same `o` and final state with other gradient bits within the budgets |
 | `prep` | rule | forward prep: `"plain"` or `"tma"` (`prep_tma`; Q or K not 16-byte aligned still take the plain prep); keeps the call on the prep forward |
 | `save_state` | `True` | keep the forward state of the tape level (`w`, `h`, `v_new`) for the backward; `False` recomputes them |
 | `host_cache` | `True` | keep the chunk tables, the `dhu_tc2` selections and the per-stream workspaces between calls (a CUDA graph capture takes its own workspaces) |
