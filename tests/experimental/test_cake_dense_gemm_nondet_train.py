@@ -30,6 +30,7 @@ import contextlib
 import dataclasses
 import functools
 import gc
+import inspect
 import json
 import os
 import re
@@ -13751,6 +13752,58 @@ def test_k1_dgrad_rules_by_sm():
     )
     with pytest.raises(ValueError):
         cake_backend.k1_program_knobs("kn_n128_f32_tma2_s4_c1_box64")
+
+
+def test_k1_program_knobs_are_planner_keywords(monkeypatch):
+    """Every knob set this package hands the deterministic package's planner names keywords of
+    ``cake_dense_gemm_det_train_projection_plan``: the knobs of every deterministic program its tables name
+    (:data:`K1_DGRAD_RULES_BY_SM`, :data:`K1_WGRAD_DET_RULES_BY_SM`, the program entries of
+    :data:`K1_FORWARD_RULES_BY_SM` and :data:`K1_DGRAD_NVJET_DET_PROGRAM`, through :func:`k1_program_knobs`) and the
+    knob entries of :data:`K1_FORWARD_RULES_BY_SM`.  A knob that package's symbol inverse adds but its planner does not
+    take fails here, not at a call on the GPU.  :func:`k1_program_knobs` drops a serpentine K walk (``kser``) of 0 and
+    refuses a ``_ks<P>`` program, which that package plans from its own rules only."""
+    keywords = set(
+        inspect.signature(
+            det_backend.cake_dense_gemm_det_train_projection_plan
+        ).parameters
+    )
+    programs = {cake_backend.K1_DGRAD_NVJET_DET_PROGRAM}
+    for table in (
+        cake_backend.K1_DGRAD_RULES_BY_SM,
+        cake_backend.K1_WGRAD_DET_RULES_BY_SM,
+    ):
+        programs |= {program for rows in table.values() for program in rows.values()}
+    knob_sets = []
+    for rows in cake_backend.K1_FORWARD_RULES_BY_SM.values():
+        for value in rows.values():
+            if isinstance(value, str):
+                programs.add(value)
+            else:
+                knob_sets.append(("forward knobs", dict(value)))
+    knob_sets += [
+        (program, dict(cake_backend.k1_program_knobs(program)))
+        for program in sorted(programs)
+    ]
+    assert len(knob_sets) > len(programs) > 1
+    for what, knobs in knob_sets:
+        assert knobs and set(knobs) <= keywords, (what, sorted(set(knobs) - keywords))
+    # the serpentine K walk of the symbol inverse: dropped at 0, a ``_ks<P>`` program names no planner knobs
+    inverse = det_backend._template_knobs
+    program = cake_backend.K1_DGRAD_NVJET_DET_PROGRAM
+    plain = cake_backend.k1_program_knobs(program)
+    monkeypatch.setattr(
+        det_backend,
+        "_template_knobs",
+        lambda name, *a, **k: {**inverse(name, *a, **k), "kser": 0},
+    )
+    assert cake_backend.k1_program_knobs(program) == plain
+    monkeypatch.setattr(
+        det_backend,
+        "_template_knobs",
+        lambda name, *a, **k: {**inverse(name, *a, **k), "kser": 76},
+    )
+    with pytest.raises(ValueError):
+        cake_backend.k1_program_knobs(program)
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
