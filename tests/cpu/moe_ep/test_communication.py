@@ -570,7 +570,11 @@ class _FakeOneSidedModule:
         self.calls: dict = {}
 
     def moe_a2a_get_workspace_layout(self, *args):
-        self.calls["layout"] = args[:-1]
+        # (ep_size, max_tokens, top_k, dispatch, combine input, CFT receive
+        # inbox, EPLB experts, CFT), then the sentinel limit, format and hidden
+        # size.
+        self.calls["layout"] = args[:8]
+        self.calls["sentinel_layout"] = args[8:11]
         metainfo = args[-1]
         metainfo.zero_()
         metainfo[_ONE_SIDED_LAYOUT["COMBINE_INPUT_SIZE_INDEX"]] = 1 << 16
@@ -692,12 +696,16 @@ def _fake_sentinel(monkeypatch, module) -> list:
     )
 
     extended = []
+    layout = module.moe_a2a_get_workspace_layout
 
-    def extend(metainfo, max_tokens, fmt, hidden):
-        extended.append(max_tokens)
-        metainfo[_ONE_SIDED_LAYOUT["WORKSPACE_SIZE_INDEX"]] += 1 << 12
+    def layout_with_sentinel(*args):
+        layout(*args)
+        max_tokens, metainfo = args[8], args[-1]
+        if max_tokens:
+            extended.append(max_tokens)
+            metainfo[_ONE_SIDED_LAYOUT["WORKSPACE_SIZE_INDEX"]] += 1 << 12
 
-    module.moe_a2a_sentinel_extend_workspace_layout = extend
+    module.moe_a2a_get_workspace_layout = layout_with_sentinel
     monkeypatch.setattr(
         one_sided,
         "layout_constants",
