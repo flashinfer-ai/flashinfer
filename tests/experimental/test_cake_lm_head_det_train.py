@@ -14476,9 +14476,10 @@ def test_device_default_step_peak_within_the_head_bytes(
     within the bytes of a head that materializes the BF16 logits of the valid rows (``2 * T_v * V + 2 * V * H + 2 * T
     * H``; forward through a backward that frees the graph, outputs and gradients included) and gives the explicit
     fast form's bits (integer views); the call runs the opt-in loss function or the automatic log-probability
-    function, whose plan is a budget form that fits; the four-chunk loss call at H 6144 keeps the hidden valid-row
-    count.  A call of fewer chunks than ``_AUTO_MIN_CHUNKS`` keeps the fast form (no plan, the same bits) and is not
-    bounded by the head's bytes."""
+    function (the one-chunk rule's function below three chunks), whose plan is a budget form that fits; the
+    four-chunk loss call at H 6144 keeps the hidden valid-row count.  A call of fewer chunks than ``_AUTO_MIN_CHUNKS``
+    keeps the fast form or, where the one-chunk rule keeps a log-probability call's logits, the kept form (no budget
+    plan either way, the same bits) and is not bounded by the head's bytes."""
     _require_program(entry=entry)
     _require_recompute()
     V = DEFAULT_V
@@ -14492,18 +14493,37 @@ def test_device_default_step_peak_within_the_head_bytes(
     }
     logprob_plans = _record_auto_logprob_plans(monkeypatch)
     begun = _record_hidden_counts(monkeypatch)
+    # a log-probability call of fewer than HIDDEN_COUNT_MIN_CHUNKS chunks runs the one-chunk rule's function, which
+    # keeps the logits where its valid rows fit one chunk and the device's zero-gradient row skip cannot run on them
+    # (test_device_logprob_one_chunk_keep_rule); its backward then forms dz from the kept logits and plans nothing
+    one_chunk = (
+        entry == "logprob" and -(-T // 4096) < cake_backend.HIDDEN_COUNT_MIN_CHUNKS
+    )
+    index = torch.cuda.current_device()
+    floor = cake_backend.zero_dlogp_min_rows(index)
+    skip_forms = bool(cake_backend._skip_record(index)[3])
     for name, case in (("inp", inp), ("inp", inp), ("other", other)):
         R = int(case.valid.sum())
         head = 2 * R * V + 2 * V * H + 2 * T * H
+        kept = (
+            one_chunk
+            and R <= 4096
+            and not (skip_forms and floor is not None and floor <= R)
+        )
+        planned = len(logprob_plans)
         torch.cuda.empty_cache()
         result, peak, mplan = _budget_step(case, 4096, entry)
         _assert_same_bits(fast[name], result, keys=keys)
         del result
         if not _auto_planned(R):
-            # fewer chunks than the automatic form plans: the fast form, whose one-chunk peak exceeds the head's bytes
+            # fewer chunks than the automatic form plans: the fast form (its backward plans None) or the kept logits
+            # (no plan), whose one-chunk peak exceeds the head's bytes
             assert mplan is None, mplan
             if entry == "logprob":
-                assert logprob_plans[-1:] == [None], logprob_plans
+                assert logprob_plans[planned:] == ([] if kept else [None]), (
+                    kept,
+                    logprob_plans,
+                )
             continue
         if entry == "loss":
             assert mplan is not None and mplan.fits and mplan.budget_bytes < head, mplan
@@ -14528,7 +14548,11 @@ def test_device_default_step_peak_within_the_head_bytes(
         out = opt_in.cake_lm_head_det_train_logprob(
             X, W, inp.labels, chunk_size=4096, backend="cake"
         )
-        assert out.grad_fn._forward_cls is opt_in.CakeLMHeadDetLogprobAutoFunction
+        assert out.grad_fn._forward_cls is (
+            opt_in.CakeLMHeadDetLogprobOneChunkFunction
+            if one_chunk
+            else opt_in.CakeLMHeadDetLogprobAutoFunction
+        )
 
 
 @pytest.mark.parametrize(
@@ -15305,7 +15329,9 @@ def test_device_auto_min_chunks_keeps_short_calls_fast(glm_weight, monkeypatch):
     them checks the fast form's fit, and every output is the explicit fast form's bits.  Set to 1, the two calls
     without zero-weight rows run a budget form that fits; the policy call checks its fast call's fit once and runs the
     fast form exactly when that call fits or neither of its two budget plans does, else the fitting one of them (it
-    decides its split as ``"budget"`` does: ``loss`` / ``logp`` bits only)."""
+    decides its split as ``"budget"`` does: ``loss`` / ``logp`` bits only).  The log-probability call runs with the
+    one-chunk kept logits off (the gates above) and on (the default): a device that keeps its logits plans nothing at
+    either setting and gives the fast form's bits."""
     _require_program(entry="loss")
     _require_program(entry="logprob")
     _require_recompute()
@@ -15323,14 +15349,30 @@ def test_device_auto_min_chunks_keeps_short_calls_fast(glm_weight, monkeypatch):
     weights[::5] = 0.0
     policy = replace(policy, loss_weights=weights.contiguous())
     assert int((policy.valid & (policy.loss_weights == 0)).sum()) > 0
-    cases = (("loss", ce), ("logprob", ce), ("loss", policy))
-    fast = [_budget_step(inp, C, entry, memory_mode="fast")[0] for entry, inp in cases]
+    # the log-probability call twice: with the one-chunk kept logits off (the automatic form's gates on every device)
+    # and as the default call, which keeps its logits where the one-chunk rule does (its valid rows fit one chunk and
+    # the device's zero-gradient row skip cannot run on them: test_device_logprob_one_chunk_keep_rule)
+    index = torch.cuda.current_device()
+    floor = cake_backend.zero_dlogp_min_rows(index)
+    R = int(ce.valid.sum())
+    kept = R <= C and not (
+        bool(cake_backend._skip_record(index)[3]) and floor is not None and floor <= R
+    )
+    cases = (
+        ("loss", ce, True),
+        ("logprob", ce, False),
+        ("logprob", ce, True),
+        ("loss", policy, True),
+    )
+    fast = [
+        _budget_step(inp, C, entry, memory_mode="fast")[0] for entry, inp, _ in cases
+    ]
     logprob_plans = _record_auto_logprob_plans(monkeypatch)
     fast_checks = _record_fast_fits(monkeypatch)
     budget_plans = _record_budget_plans(monkeypatch)
     for minimum in (2, 1):
         monkeypatch.setattr(opt_in, "_AUTO_MIN_CHUNKS", minimum)
-        for (entry, inp), want in zip(cases, fast, strict=True):
+        for (entry, inp, one_chunk), want in zip(cases, fast, strict=True):
             keys = (
                 ("loss", "logp", "dX", "dW")
                 if entry == "loss"
@@ -15339,7 +15381,17 @@ def test_device_auto_min_chunks_keeps_short_calls_fast(glm_weight, monkeypatch):
             logprob_plans.clear()
             fast_checks.clear()
             budget_plans.clear()
-            result, _, mplan = _budget_step(inp, C, entry)
+            previous = opt_in.set_logprob_one_chunk_keep(one_chunk)
+            try:
+                result, _, mplan = _budget_step(inp, C, entry)
+            finally:
+                assert opt_in.set_logprob_one_chunk_keep(previous) is one_chunk
+            if entry == "logprob" and one_chunk and kept:
+                # the kept logits: no plan and no fit check whatever _AUTO_MIN_CHUNKS is, the fast form's bits
+                case = (minimum, R, logprob_plans, fast_checks, budget_plans)
+                assert logprob_plans == [] and fast_checks == [], case
+                _assert_same_bits(want, result, keys=keys)
+                continue
             if entry == "logprob":
                 assert len(logprob_plans) == 1, logprob_plans
                 mplan = logprob_plans[0]
