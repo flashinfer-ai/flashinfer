@@ -174,9 +174,9 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "library": "cake_dsa_indexer_nondet_topk_31ea61c2c7a160221f01",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_dsa_indexer_nondet_topk_4192ea34f6519197720b": {
+    "cake_dsa_indexer_nondet_topk_47acefcdee217bade960": {
         "role": "scan",
-        "library": "cake_dsa_indexer_nondet_topk_4192ea34f6519197720b",
+        "library": "cake_dsa_indexer_nondet_topk_47acefcdee217bade960",
         "arches": ["sm_107a"],
         "ticket_arg_arches": ["sm_107a"],
     },
@@ -517,7 +517,7 @@ PROGRAM_KEYS: dict[str, dict[str, str]] = {
         "merge": "cake_dsa_indexer_nondet_topk_b8440d1d1d54917a47d7",
         "scan:l6:u1:s0:f0": "cake_dsa_indexer_nondet_topk_d188e52d69dea931ebd1",
         "scan:l6:u1:s0:f1": "cake_dsa_indexer_nondet_topk_7182498450255eae7083",
-        "scan:l6:u1:s1:f1": "cake_dsa_indexer_nondet_topk_4192ea34f6519197720b",
+        "scan:l6:u1:s1:f1": "cake_dsa_indexer_nondet_topk_47acefcdee217bade960",
         "scan:narrow:u1:s0:f0": "cake_dsa_indexer_nondet_topk_23a4ebeaa3ba23c23c80",
         "scan:narrow:u1:s0:f1": "cake_dsa_indexer_nondet_topk_af8d290aa9010d180ed0",
         "scan:narrow:u1:s1:f1": "cake_dsa_indexer_nondet_topk_506cb2b2c57f0a514cde",

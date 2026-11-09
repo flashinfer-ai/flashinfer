@@ -9861,7 +9861,7 @@
     },
     "grid": {
      "sm_103a": [
-      152,
+      148,
       1,
       1
      ]
@@ -9875,6 +9875,7 @@
      "local_expert_filter": true,
      "w1_expert_map": true,
      "a_source": "x",
+     "num_ctas": 148,
      "kernel_intermediate": 640,
      "args": {
       "num_experts": 384,

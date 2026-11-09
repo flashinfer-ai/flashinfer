@@ -452,9 +452,11 @@ def cake_causal_conv1d_det_train_backward_workspace_bytes(
     the channel count the program, every program writes the leading rows of
     its own grid inside
     this buffer, and its reduce
-    program sums exactly those.  So one buffer serves every route (the bias
-    routes' fifth slab makes it 25 % larger than the dweight partials alone,
-    for every caller) and, as it depends on ``C`` and the device only, every
+    program sums exactly those.  So one buffer serves every route (a bias
+    route's fifth slab makes it 25 % larger than the dweight partials alone,
+    and in its channel bands the SM-wide row-group program's one channel tile
+    per CTA can need more, on sm_107a from C 520) and, as it depends on ``C``
+    and the device only, every
     token count; the main program fully writes the rows the reduce program
     sums, so the buffer needs no zeroing between launches or CUDA Graph
     replays.  ``bwd_grid_mult`` (one of ``BWD_GRID_MULTS``, default 1) sizes

@@ -52,7 +52,7 @@ FACADE = "flashinfer.cake_gdn_det_train"
 KCP_FACADE = "flashinfer.cake_gdn_det_train_kcp"
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train"
 KCP_PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
-SUBMODULES = ("cake_backend", "cake_build", "cake_chain", "cake_jit")
+SUBMODULES = ("cake_backend", "cake_build", "cake_chain", "cake_jit", "cake_plan")
 KCP_SUBMODULES = (
     "cake_backend",
     "cake_build",

@@ -76,35 +76,35 @@ the modules of this package are their backend.
 
 ### Per-output determinism and accuracy
 
-Every output repeats bit for bit: two calls on the same inputs and the same topology return bitwise-equal tensors.  Errors against an FP64 reference recurrence (GB300, BF16 inputs, 10 rows at CP8, 9 at CP16 and 3 at CP32 with 1M-token documents, including adversarial inputs):
+Every output repeats bit for bit: two calls on the same inputs and the same topology return bitwise-equal tensors.  Errors against an FP64 reference recurrence (GB300, BF16 inputs, 10 rows at CP8, 9 at CP16, 3 at CP32 and 2 at CP64 with 1M-token documents, including adversarial inputs):
 
-| output | determinism | rel-L2 vs FP64, CP8 (x1e-3) | rel-L2 vs FP64, CP16 (x1e-3) | rel-L2 vs FP64, CP32 (x1e-3) | ratio to det@2e989556, CP8 | ratio to det@2e989556, CP16 | ratio to det@2e989556, CP32 | ratio to single-rank, CP8 | ratio to single-rank, CP16 | ratio to single-rank, CP32 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| out | repeats bit for bit | 4.13-6.47 | 4.12-5.57 | 4.13 | 1.000 | 1.000 | 1.000 | 0.840-1.000 | 0.924-1.000 | 1.000 |
-| dq | repeats bit for bit | 3.40-6.14 | 3.40-5.00 | 3.40 | 1.000 | 1.000 | 1.000 | 0.809-1.000 | 0.906-1.000 | 1.000 |
-| dk | repeats bit for bit | 3.50-6.18 | 3.50-5.90 | 3.50 | 0.996-1.000 | 0.996-1.000 | 1.000 | 0.846-1.000 | 0.927-1.000 | 1.000 |
-| dv | repeats bit for bit | 3.74-5.93 | 3.72-5.00 | 3.79 | 0.980-0.999 | 0.981-1.000 | 0.992 | 0.839-1.000 | 0.926-1.000 | 1.000 |
-| dg | repeats bit for bit | 3.53-6.51 | 3.53-6.09 | 3.53-3.94 | 0.998-1.000 | 0.998-1.000 | 1.000 | 0.736-1.000 | 0.867-1.001 | 1.000 |
-| dbeta | repeats bit for bit | 3.75-10.68 | 3.74-5.55 | 3.79 | 0.986-0.999 | 0.985-1.000 | 0.992 | 0.839-1.001 | 0.927-1.000 | 1.000 |
-| dA_log (raw-gate mode) | repeats bit for bit | 3.23-5.37 | 2.67-5.16 | 3.38 | 0.957-0.998 | 0.998-1.137 | 1.005 | 0.839-1.243 | 1.000-1.407 | 1.000 |
-| ddt_bias (raw-gate mode) | repeats bit for bit | 3.57-5.58 | 3.56-5.51 | 4.96 | 0.997-1.000 | 0.993-1.001 | 1.000 | 0.519-1.023 | 0.730-1.025 | 1.000 |
+| output | determinism | rel-L2 vs FP64, CP8 (x1e-3) | rel-L2 vs FP64, CP16 (x1e-3) | rel-L2 vs FP64, CP32 (x1e-3) | rel-L2 vs FP64, CP64 (x1e-3) | ratio to det@2e989556, CP8 | ratio to det@2e989556, CP16 | ratio to det@2e989556, CP32 | ratio to det@2e989556, CP64 | ratio to single-rank, CP8 | ratio to single-rank, CP16 | ratio to single-rank, CP32 | ratio to single-rank, CP64 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| out | repeats bit for bit | 4.13-6.47 | 4.12-5.57 | 4.13 | 4.13 | 1.000 | 1.000 | 1.000 | 1.000 | 0.840-1.000 | 0.924-1.000 | 1.000 | 1.000 |
+| dq | repeats bit for bit | 3.40-6.14 | 3.40-5.00 | 3.40 | 3.40 | 1.000 | 1.000 | 1.000 | 1.000 | 0.809-1.000 | 0.906-1.000 | 1.000 | 1.000 |
+| dk | repeats bit for bit | 3.50-6.18 | 3.50-5.90 | 3.50 | 3.50 | 0.996-1.000 | 0.996-1.000 | 1.000 | 1.000 | 0.846-1.000 | 0.927-1.000 | 1.000 | 1.000 |
+| dv | repeats bit for bit | 3.74-5.93 | 3.72-5.00 | 3.79 | 3.79 | 0.980-0.999 | 0.981-1.000 | 0.992 | 0.992 | 0.839-1.000 | 0.926-1.000 | 1.000 | 1.000 |
+| dg | repeats bit for bit | 3.53-6.51 | 3.53-6.09 | 3.53-3.94 | 3.53-3.94 | 0.998-1.000 | 0.998-1.000 | 1.000 | 1.000 | 0.736-1.000 | 0.867-1.001 | 1.000 | 1.000 |
+| dbeta | repeats bit for bit | 3.75-10.68 | 3.74-5.55 | 3.79 | 3.79 | 0.986-0.999 | 0.985-1.000 | 0.992 | 0.992 | 0.839-1.001 | 0.927-1.000 | 1.000 | 1.000 |
+| dA_log (raw-gate mode) | repeats bit for bit | 3.23-5.37 | 2.67-5.16 | 3.38 | 3.38 | 0.957-0.998 | 0.998-1.137 | 1.005 | 1.005 | 0.839-1.243 | 1.000-1.407 | 1.000 | 1.000 |
+| ddt_bias (raw-gate mode) | repeats bit for bit | 3.57-5.58 | 3.56-5.51 | 4.96 | 4.96 | 0.997-1.000 | 0.993-1.001 | 1.000 | 1.000 | 0.519-1.023 | 0.730-1.025 | 1.000 | 1.000 |
 
-| output | worst-element ratio to det@2e989556, CP8 | worst-element ratio to det@2e989556, CP16 | worst-element ratio to det@2e989556, CP32 |
-| --- | --- | --- | --- |
-| out | 1.000 | 1.000 | 1.000 |
-| dq | 1.000 | 1.000 | 1.000 |
-| dk | 0.959-1.064 | 0.922-1.000 | 1.000 |
-| dv | 0.974-1.003 | 0.802-1.000 | 1.000 |
-| dg | 0.905-1.003 | 0.901-1.021 | 1.000 |
-| dbeta | 0.909-1.154 | 0.886-1.030 | 1.000 |
-| dA_log (raw-gate mode) | 0.915-1.005 | 0.993-1.024 | 0.987 |
-| ddt_bias (raw-gate mode) | 0.996-1.152 | 0.961-1.001 | 0.998 |
+| output | worst-element ratio to det@2e989556, CP8 | worst-element ratio to det@2e989556, CP16 | worst-element ratio to det@2e989556, CP32 | worst-element ratio to det@2e989556, CP64 |
+| --- | --- | --- | --- | --- |
+| out | 1.000 | 1.000 | 1.000 | 1.000 |
+| dq | 1.000 | 1.000 | 1.000 | 1.000 |
+| dk | 0.959-1.064 | 0.922-1.000 | 1.000 | 1.000 |
+| dv | 0.974-1.003 | 0.802-1.000 | 1.000 | 1.000 |
+| dg | 0.905-1.003 | 0.901-1.021 | 1.000 | 1.000 |
+| dbeta | 0.909-1.154 | 0.886-1.030 | 1.000 | 1.000 |
+| dA_log (raw-gate mode) | 0.915-1.005 | 0.993-1.024 | 0.987 | 0.987 |
+| ddt_bias (raw-gate mode) | 0.996-1.152 | 0.961-1.001 | 0.998 | 0.998 |
 
 rel-L2 = ||x - ref|| / ||ref||; worst element = max|x - ref| / max|ref|.  Each cell is the range over the measured rows of the median over 5 seeds.  Ratio to det@2e989556 = median over seeds of this package / median over seeds of the deterministic package at FlashInfer 2e989556 on the same inputs (bound 1.1).  Ratio to single-rank = worst seed of this package / the single-rank package on the same inputs, rel-L2 (bound 1.10 for `out`, `dq`, `dk`, `dv`, `dg` and `dbeta`; reported for `dA_log` and `ddt_bias`, which hold one value per head).
 
 Three adversarial cells are above 1.1 at 5 seeds and within it over 25 seeds: CP8 `dbeta` worst element 1.154 at 5 seeds, 0.932 at 25 seeds; CP8 `ddt_bias` worst element 1.152 at 5 seeds, 1.026 at 25 seeds; CP16 `dA_log` rel-L2 1.137 at 5 seeds, 1.022 at 25 seeds.  The worst-element metric follows a single element per tensor, and `dA_log` holds one value per head (16 here); the deterministic package at 2e989556 itself varies 1.6-2.5x across seeds on these three rows.
 
-Determinism check: two calls on the same inputs and topology gave bitwise-equal outputs on every measured row and seed (out 22/22 rows, dq 22/22 rows, dk 22/22 rows, dv 22/22 rows, dg 22/22 rows, dbeta 22/22 rows, dA_log 13/13 rows, ddt_bias 13/13 rows).
+Determinism check: two calls on the same inputs and topology gave bitwise-equal outputs on every measured row and seed (out 24/24 rows, dq 24/24 rows, dk 24/24 rows, dv 24/24 rows, dg 24/24 rows, dbeta 24/24 rows, dA_log 14/14 rows, ddt_bias 14/14 rows).
 
 ### Names
 
@@ -454,7 +454,8 @@ block each request gets depends on what the allocator has cached (on GB300,
 from 3.4 MiB lower to 1.4 MiB higher per rank in the tests). At most
 `DEFAULT_WS_KEYS = 16` keys with `DEFAULT_WS_PER_KEY = 2` workspaces each
 are kept (least recently used key dropped); `cake_kcp.default_workspace_cache_clear()`
-and `cake_kcp.set_backend` drop them and `cake_kcp.DEFAULT_WS_STATS` /
+and `cake_kcp.set_backend` drop them (and the kept-set pools, "Kept-set pool"
+below) and `cake_kcp.DEFAULT_WS_STATS` /
 `LAST_CALL[kind]["default_ws"]` record hits, misses, bypasses and evictions.
 Calls that cycle through more keys, such as a new stream per step (the
 stream is part of the key), miss on every call (`DEFAULT_WS_STATS["evict"]`
@@ -778,6 +779,40 @@ where the hand-off engages: on GB300 at CP4, H 64, 16384 tokens per rank it
 is 0.21-0.33 ms faster per checkpointed layer than the tape set and keeps
 528 MiB less per layer and rank (768 instead of 1280 B per internal
 token-head).  `saved_rows="tape"` keeps the tape set.
+
+Kept-set pool: in a checkpoint pass of a `workspace=None` call the kept set
+(the tape set or a rows set) comes from a package-private `torch.cuda.MemPool`
+per device, each tensor's block cut for its leading extent rounded up to 16
+steps per power of two (at most 1/16 more), so packs of nearby sizes reuse its
+blocks; once a block of that size exists, a tensor takes its exact shape from
+it.  Such a call allocates its arena at its start and frees it at its end; in
+the caching allocator's default pool the set, which lives from the recompute
+to the node's backward, would take the rest of the forward arena's freed
+block, the backward arena a new segment, and the reserved memory would grow
+over the steps.  A caller-held workspace's arena stays allocated, so its calls
+keep the default pool.  Reserved memory per rank on GB300 (CP4, H 64, packs of
+65536 tokens, max over ranks, MiB; first step after `torch.cuda.empty_cache()`
+and the steady state of the next 3 steps; outputs and gradients bitwise
+unchanged):
+
+| gate | recompute | first step: before / pool | steady: before / pool | steady, `checkpoint_handoff="off"` |
+| --- | --- | --- | --- | --- |
+| `g` | plain | 35370 / 32340 | 36570 / 32340 | 31524 |
+| `g` | handle | 31986 / 32340 | 36570 / 32340 | 31524 |
+| `g`, L2 norm | plain | 35370 / 32188 | 36568 / 32342 | 31526 |
+| `g`, L2 norm | handle | 31986 / 32188 | 36568 / 32188 | 31372 |
+| raw, L2 norm | plain | 30540 / 30556 | 39718 / 30556 | 29740 |
+| raw, L2 norm | handle | 30540 / 30556 | 39558 / 30556 | 29740 |
+
+The pool costs one kept set over `"off"` (816 MiB here); the allocated peak
+stays within 3 MiB of the default pool's, and the host time of a kept set's
+allocation within 2 us of it (measured on GB300).  It keeps its blocks reserved
+between calls, and `torch.cuda.empty_cache()` does not release the blocks of a
+live pool: measured after the `workspace=None` steps, caller-held calls in the
+same process reserve those 816 MiB more.  A process that stops making
+`workspace=None` checkpointed calls drops the pools with
+`cake_kcp.default_workspace_cache_clear()`, after which `empty_cache()`
+releases them.
 
 Under `saved_rows="auto"` the call keeps the light set outside a checkpoint
 pass, with `graph="replay"`, `spec3_probe`, `boundary_mode="replay"`, inside a
