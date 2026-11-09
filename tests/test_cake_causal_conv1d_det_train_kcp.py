@@ -448,6 +448,8 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
     y_full = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
     for knobs in ({"fwd_main": 0, "fwd_overlap": 0}, None):
         calls.clear()
+        # the trimmed host path caches its plans per context: each form plans afresh
+        conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
         conv_kcp._set_test_knobs(knobs)
         try:
             y, hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
