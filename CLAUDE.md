@@ -488,9 +488,10 @@ root, e.g. `tests/gemm/test_mm_fp4.py tests/utils/`; name the test files or dire
 change touches. Bare `run` asks AI for a recommendation; focused or inconclusive
 results only post advice. `run all` starts the expensive **full** suite, appropriate
 for a cross-cutting change or final pre-merge check. The PR template has a checkbox
-to declare and justify that full-suite request. Every public run, whatever its targets,
-also runs all of `tests/cpu` in the "CPU Unittest" lane on a CPU runner (no GPU), so
-tests under `tests/cpu` must not need one.
+to declare and justify that full-suite request. Every public run that runs tests,
+whatever its targets, also runs all of `tests/cpu` in the "CPU Unittest" lane on a CPU
+runner (no GPU), so tests under `tests/cpu` must not need one. Docs-only PRs run no
+tests, and a `workflow_dispatch` with `skip_gpu` drops this lane too.
 
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
 
