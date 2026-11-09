@@ -36,7 +36,9 @@ device and stream while another device is current; the dS^T chunk and the window
 to the saved-set run); no device synchronization in steady state, with one chunk and with the minimum chunks; the
 speed of the forward and the backward beside a kernel resident on another stream; under
 ``torch.use_deterministic_algorithms(True)``, strict and with ``warn_only=True``, no alert and no warning, and the
-bits of a run outside that mode.
+bits of a run outside that mode.  Also: a caller's ``dq`` off a 32-byte boundary (the bits of an allocated one); the
+workspace scratch and the caller's ``dq`` filled with 0x00 and then with 0xFF bytes before the backward (the same
+bits: no unwritten read).
 
 The suite names its package once, through the shared alias helper, and imports nothing else from flashinfer.
 """
@@ -112,8 +114,11 @@ LAYOUTS = (
     ("zigzag_cp2", (250, 250, 129, 130), (250, 1000, 129, 517), 24, 4),
     ("long_keys", (256, 255), (4099, 2049), 24, 4),
     ("group_2", (300, 77), (513, 77), 8, 4),
+    # 133 key blocks: the dQ GEMM flushes its accumulator every 64 key blocks.
+    ("over_64_blocks", (200, 64), (9000, 17000), 24, 4),
 )
 LAYOUT_IDS = [layout[0] for layout in LAYOUTS]
+LAYOUTS_BY_NAME = {layout[0]: layout for layout in LAYOUTS}
 DKV_FORMS = ("bf16", "fp32", "rowmap")
 OUTPUTS = ("out", "lse", "dq", "dk", "dv")
 # The stages whose CTAs run as pairs (``cta_group::2``), and the first kernel parameter of each stage's plan.
@@ -126,7 +131,6 @@ FIRST_PARAMETER = {
     "bwd_main_bf16": "Q",
     "bwd_dq": "dsw",
     "bwd_fold": "dk_win",
-    "bwd_post": "dQ_accum",
 }
 
 
@@ -207,7 +211,6 @@ def test_registry_records_are_well_formed() -> None:
         "bwd_main_bf16",
         "bwd_dq",
         "bwd_fold",
-        "bwd_post",
     )
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -366,8 +369,8 @@ def test_chunk_plan_and_grids_cover_every_tile() -> None:
     """The workspace chunks of random layouts and budgets: the KV-head ranges and the key-block ranges each tile
     their axis exactly once (so every (KV head, key block) is in exactly one chunk), each chunk's exact dS^T tiles
     of one head pair fit its ``tile_stride``, the dS^T workspace fits the budget unless at the minimum chunk (one KV
-    head, two key blocks), and the grids of every chunk's launches; the forward, pre/postprocess and fold grids
-    against the exact counts."""
+    head, two key blocks), and the grids of every chunk's launches; the forward, preprocess and fold grids against
+    the exact counts."""
     rng = random.Random(7073)
     sm_count = 148
     for trial in range(200):
@@ -470,7 +473,6 @@ def test_chunk_plan_and_grids_cover_every_tile() -> None:
         assert rows % 128 == 0 and rows >= sum(-(-2 * q // 128) * 128 for q in q_lens)
         assert cake_jit.grid("bwd_pre", **dims) == (rows // 32, h_q // 2, 1)
         assert cake_jit.grid("bwd_plan", **dims) == (1, 1, 1)
-        assert cake_jit.grid("bwd_post", **dims) == (rows // 64, h_q // 2, 1)
         # The fold: one warp per (window row, key head), every one in the grid, no CTA without one.
         gx, gy, gz = cake_jit.grid("bwd_fold", **dims)
         items = t_k * h_kv
@@ -992,6 +994,41 @@ def test_the_forward_of_every_group_matches_the_reference(h_q, h_kv, device) -> 
 
 
 @pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
+def test_a_dq_off_a_32_byte_boundary_gets_the_bits_of_an_allocated_one(
+    layout, device
+) -> None:
+    """The dQ GEMM stores dQ in 32-byte pieces: a caller's ``dq`` on a 32-byte boundary, 16 bytes past one and 2
+    bytes past one, each full of NaN before the call, gets the dQ, dK and dV bits of an allocated ``dq``."""
+    name, q_lens, k_lens, h_q, h_kv = layout
+    x = _inputs(q_lens, k_lens, h_q, h_kv, device)
+    ws = cake_backend.CakeGQANondetWorkspace(device)
+    out, lse = cake_backend.cake_gqa_nondet_train_forward(
+        x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"], softmax_scale=SCALE, workspace=ws
+    )
+    args = (x["q"], x["k"], x["v"], out, lse, x["dout"], x["cu_q"], x["cu_k"])
+    names = ("dq", "dk", "dv")
+
+    def backward(dq=None):
+        grads = cake_backend.cake_gqa_nondet_train_backward(
+            *args, softmax_scale=SCALE, workspace=ws, dq=dq
+        )
+        return dict(zip(names, grads, strict=True))
+
+    want = backward()
+    for skip, offset in ((0, 0), (8, 16), (1, 2)):
+        # Caching-allocator blocks are 512-byte aligned, so ``buf[skip:]`` is ``offset`` bytes past a 32-byte boundary.
+        buf = torch.empty(x["q"].numel() + skip, dtype=torch.bfloat16, device=device)
+        buf.view(torch.int16).fill_(-1)  # every bit set: NaN
+        dq = buf[skip:].view(x["q"].shape)
+        assert dq.data_ptr() % 32 == offset
+        got = backward(dq)
+        torch.cuda.synchronize()
+        assert got["dq"] is dq
+        label = f"{name}: dq {offset} bytes past a 32-byte boundary"
+        _assert_outputs_same_bits(got, want, label, names)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
 def test_every_output_repeats_bit_for_bit(layout, device) -> None:
     """``REPEATS`` runs of every form, through the per-stream default workspace, a reused workspace and fresh ones,
     give the same bits for out, lse, dq and dK / dV (BF16, FP32 window, row-map adds into non-zero destinations
@@ -1232,6 +1269,49 @@ def _check_host_boundaries(layout, kind, device) -> None:
         )
         _assert_dq_close(got["dq"], base["dq"])
         _assert_matches_reference(label, x, form, got, ref, dst_init, row_map)
+
+
+# Layouts of the unwritten-read test: rows that see no key and a segment without keys, empty and short segments, and
+# a key range past 64 key blocks.
+UNWRITTEN_READ_LAYOUTS = ("keys_fewer_than_queries", "empty_segments", "over_64_blocks")
+
+
+@pytest.mark.parametrize("host", (False, True), ids=("device_bounds", "host_bounds"))
+@pytest.mark.parametrize("kind", HOST_BUDGETS)
+@pytest.mark.parametrize("name", UNWRITTEN_READ_LAYOUTS)
+def test_no_kernel_reads_scratch_or_dq_bytes_it_did_not_write(
+    name, kind, host, device
+) -> None:
+    """The workspace scratch (the FP32 dQ accumulator, ``LSE * log2(e)`` and ``dPsum``) and the caller's ``dq``
+    filled with 0x00 bytes and then with 0xFF bytes (NaN) before the backward give the same dQ, dK and dV bits, at
+    the default budget, at about three key-block ranges and at the minimum chunks, with and without host boundaries:
+    no kernel reads a byte of them that the call did not write."""
+    _name, q_lens, k_lens, h_q, h_kv = LAYOUTS_BY_NAME[name]
+    x = _inputs(q_lens, k_lens, h_q, h_kv, device)
+    budget = _host_budget(kind, x, h_q, h_kv)
+    ws = cake_backend.CakeGQANondetWorkspace(device, budget_bytes=budget)
+    out, lse = cake_backend.cake_gqa_nondet_train_forward(
+        x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"], softmax_scale=SCALE, workspace=ws
+    )
+    args = (x["q"], x["k"], x["v"], out, lse, x["dout"], x["cu_q"], x["cu_k"])
+    kwargs = {"softmax_scale": SCALE, "workspace": ws}
+    if host:
+        kwargs.update(cu_seqlens_q_host=x["cq"], cu_seqlens_k_host=x["ck"])
+    key = (x["cq"][-1], h_q, len(q_lens))
+    names = ("dq", "dk", "dv")
+    runs = {}
+    for byte in (0x00, 0xFF):
+        # The views the backward gets (one shape, one key): the scratch grows here when it must, not in the call.
+        scratch = ws.scratch(*key)
+        scratch[0].untyped_storage().fill_(byte)
+        dq = torch.empty_like(x["q"])
+        dq.untyped_storage().fill_(byte)
+        grads = cake_backend.cake_gqa_nondet_train_backward(*args, dq=dq, **kwargs)
+        runs[byte] = dict(zip(names, grads, strict=True))
+        assert ws.scratch(*key)[0].data_ptr() == scratch[0].data_ptr()
+    torch.cuda.synchronize()
+    label = f"{name} budget={kind} host={host}: 0xFF vs 0x00"
+    _assert_outputs_same_bits(runs[0xFF], runs[0x00], label, names)
 
 
 def _child_backward(
