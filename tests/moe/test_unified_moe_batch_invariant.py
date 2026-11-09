@@ -1448,3 +1448,30 @@ def test_nan_logits_route_to_the_lowest_untaken_experts_with_nan_weights(E):
         assert torch.equal(bits(out[clean.cuda()]), bits(ref))
 
 
+def test_multi_launch_plan_equals_the_host_plan(T, k, E):
+    """At and above ``PLAN_MULTI_MIN_N`` expanded rows ``permute_plan`` runs the two-launch block form (``PlanBlocksKernel``
+    / ``PlanFinishKernel``): at the threshold exactly (whole blocks), one token past it (a partial final block) and at the
+    widest expert count, its ``counts`` / ``dest`` / ``src`` equal an independent host plan (a stable sort by expert, slot
+    order inside a group) and the one-launch form's on the same ids."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N
+    from flashinfer.fused_moe.batch_invariant.permute import (
+        PLAN_BLOCK,
+        get_compiled_plan,
+    )
+
+    n = T * k
+    assert n >= PLAN_MULTI_MIN_N and (n % PLAN_BLOCK == 0) == (T == 2048)
+    ids = torch.randint(
+        0, E, (T, k), generator=torch.Generator().manual_seed(n), dtype=torch.int32
+    )
+    counts, dest, src = api.permute_plan(ids.cuda(), E)
+    counts_h, dest_h, src_h = _padded_plan_host(ids, E, 1)
+    assert torch.equal(counts, counts_h) and torch.equal(dest, dest_h)
+    assert torch.equal(src, src_h)
+    c1 = torch.empty(E, dtype=torch.int32, device="cuda")
+    d1 = torch.empty(n, dtype=torch.int32, device="cuda")
+    s1 = torch.empty(n, dtype=torch.int32, device="cuda")
+    get_compiled_plan(1, False)(ids.cuda().view(-1), c1, d1, s1, d1, d1, n, E)
+    assert torch.equal(c1, counts) and torch.equal(d1.view(T, k), dest)
+    assert torch.equal(s1, src)
