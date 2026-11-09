@@ -65,11 +65,12 @@ forward, the mid, long and extra-long forwards and the pipelined forwards,
 each where the architecture's bands name it); the backward by
 ``BACKWARD_BANDS``, bands of rows or of rows per SM: its small-row roles (``BAND_ROLES``: the
 short backward ``bwd_bf16_short`` and the exact tiny backward ``_t512``, each
-up to a count of rows), its fused role (``_fused``: a BF16 weight
-gradient, up to a count of rows per SM) and its repeatable role
-(``_rep``: a BF16 weight gradient, past the fused band), its call role (the static backward, where an architecture routes
-one for the role), for a BF16 weight gradient its row-claims roles
-(``_rc``, ``_rc_mid``) and its mid role (the claimed backward).
+up to a count of rows), its fused role (``_fused``: a BF16 weight gradient,
+up to a count of rows per SM) and its repeatable role (``_rep``: a BF16
+weight gradient, past the fused band), its call role (the static backward,
+where an architecture routes one for the role), for a BF16 weight gradient
+its row-claims roles (``_rc``, ``_rc_mid``) and its mid role (the claimed
+backward).
 The forward's programs: the tiny forward (16 threads to a row, one 8-row
 block per 128-thread CTA, the gate before the sum of squares, packed rows
 only; the short forward's arithmetic and bits), the short forward (16

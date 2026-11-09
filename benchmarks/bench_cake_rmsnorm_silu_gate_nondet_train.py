@@ -20,7 +20,8 @@ approximate FP32 intrinsics, and one backward kernel whose CTAs add the
 weight-gradient partials exactly as 64-bit integer windows, the last CTA
 rounding the sum once, or, for a BF16 weight gradient in its fused band, run
 the deterministic package's fused backward's schedule and row arithmetic and
-add FP32 runs of rows to FP64 accumulators with atomics) against the
+add FP32 runs of rows to FP64 accumulators with atomics, and past that band
+run its copy of the deterministic package's backward) against the
 deterministic package
 (``flashinfer.cake_rmsnorm_silu_gate_det_train``: its one-kernel backward with
 the exact fixed-point weight-gradient sum), each called through its own public
@@ -46,8 +47,11 @@ of rows per SM (``cake_jit.BACKWARD_BANDS``).  A BF16 weight gradient (the one
 timed here) runs, on SM100 and SM107, the short backward (one cluster, a
 fixed-order sum) up to 256 rows, the exact tiny backward (one cluster, the bits
 of the deterministic pair at FlashInfer 2e989556) up to 512 rows and past that
-the fused backward (256-thread CTAs of 16-row blocks, at most 4 per SM); on
-SM103 the short backward up to 256 rows and the fused backward past that.
+the fused backward (256-thread CTAs of 16-row blocks, at most 4 per SM) up to
+1000 rows per SM; on SM103 the short backward up to 256 rows and the fused
+backward past that up to 1000 rows per SM; past 1000 rows per SM, on every
+architecture, the repeatable backward (its copy of the deterministic
+package's backward, the same grid; its ``dw`` repeats its bits).
 An FP32 weight gradient runs the exact tiny backward up to 512 rows, the
 static backward up to 256 rows per SM on SM100 and SM103 (64 on SM107) and the
 claimed backward past that.  At ``--heads 48`` the default token counts reach
@@ -118,10 +122,14 @@ MODES = tuple(API)
 STAGES = ("fwd", "bwd", "ckpt")
 # The issue's token counts and a spread around them, then small and irregular ones.
 # The BF16 backward each reaches at 48 heads (``cake_jit.BACKWARD_BANDS``):
-# - 148-SM B200 (sm_100a) and 212-SM R200 (sm_107a): 1 and 5 tokens the short
-#   backward; 7 the exact tiny backward; 16 and more the fused backward.
-# - 152-SM GB300 (sm_103a): 1 and 5 tokens the short backward; 7 and more the
-#   fused backward.
+# - 148-SM B200 (sm_100a): 1 and 5 tokens the short backward; 7 the exact tiny
+#   backward; 16 to 2048 the fused backward; 4097 and more the repeatable
+#   backward.
+# - 152-SM GB300 (sm_103a): 1 and 5 tokens the short backward; 7 to 2048 the
+#   fused backward; 4097 and more the repeatable backward.
+# - 212-SM R200 (sm_107a): 1 and 5 tokens the short backward; 7 the exact tiny
+#   backward; 16 to 4097 the fused backward; 30000 and more the repeatable
+#   backward.
 TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 2048, 4097)
 
 

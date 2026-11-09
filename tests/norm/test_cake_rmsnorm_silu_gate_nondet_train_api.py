@@ -2663,16 +2663,16 @@ def test_backward_with_infinite_grad_out_keeps_the_fp64_classes(
 def _block_rows(name: str) -> int:
     """The rows of one row block of the backward module ``name``, from its
     record: ``rows_per_block`` of its grid rule for a chunked backward (grid
-    kind ``chunks``: the static and the claimed backwards, 8),
-    ``rows_per_cta`` for the fused and a row-claims backward (``row_claims``,
-    16), and for
-    a small-row backward (``cluster``) its launch block's threads over the
+    kind ``chunks``: the static and the claimed backwards, 8) and for the
+    repeatable backward (``claimed_row_blocks``, 16), ``rows_per_cta`` for
+    the fused and a row-claims backward (``row_claims``, 16), and for a
+    small-row backward (``cluster``) its launch block's threads over the
     teams of its CTA over 16 threads a row (``suite._cluster_block_rows``):
     16 rows for the short backward (one 256-thread team a CTA), 8 for the
     exact tiny backwards (4 teams of the deterministic backward's 128-thread
     CTA in a 512-thread CTA, each team its own 8-row block)."""
     rule = loader.MODULES[name]["grid_rule"]
-    if rule["kind"] == "chunks":
+    if rule["kind"] in ("chunks", "claimed_row_blocks"):
         return int(rule["rows_per_block"])
     if rule["kind"] == "row_claims":
         return int(rule["rows_per_cta"])
@@ -2716,8 +2716,9 @@ def test_backward_with_infinite_grad_out_in_the_last_row_keeps_the_fp64_classes(
     their other elements within one BF16 ulp of FP64, on every repeat the
     same bits (but a BF16 ``dw`` in a fused or row-claims band,
     whose every launch meets the weight gradient's checks instead), in the
-    fused band ``dx`` and ``dz`` the deterministic package's bits (``NaN``
-    payloads included), with the workspace zero after every call."""
+    fused band ``dx`` and ``dz`` and in the repeatable band ``dx``, ``dz``
+    and ``dw`` the deterministic package's bits (``NaN`` payloads included),
+    with the workspace zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     sms = _sm_count()
     dw_dtype = _band_role_dtype(band)

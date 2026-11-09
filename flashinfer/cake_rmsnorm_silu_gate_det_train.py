@@ -71,11 +71,11 @@ Mode and dispatch rules:
    inputs on the same device (a sum across CTAs is exact).  A call of
    :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train` alerts only when it
    is a backward that computes a BF16 weight gradient in the fused band
-   (every architecture; see that module): it raises PyTorch's alert immediately
-   before that launch (``RuntimeError``; with ``warn_only=True`` a
-   ``UserWarning``, then the call runs), and no other call of that module
-   alerts.  The check runs on the host: a CUDA Graph checks it when it is
-   captured, not when it is replayed.
+   (every architecture, up to 1000 rows per SM; see that module): it raises
+   PyTorch's alert immediately before that launch (``RuntimeError``; with
+   ``warn_only=True`` a ``UserWarning``, then the call runs), and no other
+   call of that module alerts.  The check runs on the host: a CUDA Graph
+   checks it when it is captured, not when it is replayed.
 4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
    and run the backward of their own package.  A backward workspace serves
