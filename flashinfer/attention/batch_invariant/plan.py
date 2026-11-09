@@ -51,6 +51,10 @@ SWAPS_FUSE_MAX_CHUNKS = 4  # Swaps-body batches (small_swap): units of at most t
 SWAPS_FUSE_MIN_UNITS = 48  # SWAPS_FUSE_MIN_UNITS of them (the split kind's second
 # ramp + fold cost more than 1-3 extra chunks of streaming -- measured fused faster at B = 8 / 64 with short rows, every D;
 # at B = 1 (4-8 units) the split's parallelism wins from 2 chunks up and the batch stays below the unit floor)
+WIDE_SPLIT_SM_FRACTION = 4  # merge-agnostic unit-kind rule of ``"auto"`` for units wider than INKERNEL_MAX_ROWS rows (prefill tiles): they
+# split only when the fused units would occupy fewer than 1 / this of the SMs. A wide split unit costs its 128 x D fp32 partial rows
+# and the fixup's fold of them, so a split that merely balances a part-filled machine loses to the fused unit; the narrow (decode)
+# units keep the 2 x SM rule below
 INKERNEL_MAX_CHUNKS_OF = {
     64: INKERNEL_MAX_CHUNKS,
     128: INKERNEL_MAX_CHUNKS,
@@ -155,8 +159,9 @@ def build_plan(
     small_swap: bool = False,
     swap_max_rows: int = INKERNEL_MAX_ROWS,
 ) -> Plan:
-    """``split_policy``: ``"auto"`` splits every multi-chunk tile when the fused unit count would leave
-    the machine underfilled (``< 2 x SM``) -- and, at head dims whose merged state is not in TMEM (D = 256), every multi-chunk
+    """``split_policy``: ``"auto"`` splits every multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows (a decode unit) when the fused
+    unit count would leave the machine underfilled (``< 2 x SM``), a wider tile (a prefill unit) only when the fused units would fill
+    under ``1 / WIDE_SPLIT_SM_FRACTION`` of the SMs -- and, at head dims whose merged state is not in TMEM (D = 256), every multi-chunk
     tile of at most ``INKERNEL_MAX_ROWS`` rows (decode units) whatever the count: a fused decode unit there merges a 128 x 256 fp32
     state through the global scratch at every chunk end, and the split kind measured faster at long KV lengths
     -- except the TWO-chunk decode-sized units of at least ``FUSE2_MIN_ROWS`` live rows in a batch whose fused unit count exceeds
@@ -206,11 +211,12 @@ def build_plan(
                     )
                 )
     if split_policy == "split":
-        do_split = True
+        do_split_narrow = do_split_wide = True
     elif split_policy == "fused":
-        do_split = False
+        do_split_narrow = do_split_wide = False
     else:
-        do_split = len(tiles) < 2 * sm_count
+        do_split_narrow = len(tiles) < 2 * sm_count
+        do_split_wide = WIDE_SPLIT_SM_FRACTION * len(tiles) < sm_count
     # the merged chunk state's home decides the D = 256 rules below: the row body keeps it in a global scratch at D = 256, the Swaps-AB
     # kernel (every unit of the batch <= 32 rows under small = "swap") in TMEM at every D -- those batches take the D = 128 rules
     swap_batch = (
@@ -240,6 +246,7 @@ def build_plan(
             and FUSE2_MIN_ROWS <= rows <= INKERNEL_MAX_ROWS
         )
         swaps_fused = swaps_fuse and chi - clo <= SWAPS_FUSE_MAX_CHUNKS
+        do_split = do_split_narrow if rows <= INKERNEL_MAX_ROWS else do_split_wide
         if (
             chi - clo == 1
             or two_chunk_fused
