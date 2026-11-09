@@ -42,10 +42,10 @@ from tests.test_helpers.cake_host_sync import (
 )
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
-cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
-cake_kcp_jit = cake_package("cake_kda_det_train_kcp", "cake_kcp_jit")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
+cake_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")
+cake_kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 
 # the previous path (A/B, negative control)
 OLD = {"upload": "blocking", "table_cache": "workspace"}
@@ -140,7 +140,7 @@ def _ops(ctx, H: int, device: torch.device, seed: int = 0x7815) -> dict:
 
 def _new_ws():
     backend = cake_kcp.get_backend()
-    return cake_kcp.WorkspaceDetKcp(
+    return cake_kcp.CakeKDADetKcpWorkspace(
         state_dtype=backend.dtypes["state"], local=backend.local_stages
     )
 
@@ -151,16 +151,16 @@ def _passes(ctx, o: dict, ws, **opts) -> tuple:
     q, k, v, g, beta, dout = (o[n] for n in ("q", "k", "v", "g", "beta", "dout"))
     res = []
     for mode in ("saved", "replay"):
-        out, saved = cake_kcp.chunk_kda_det_fwd_kcp(
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
             q, k, v, g, beta, ctx, boundary_mode=mode, workspace=ws, **opts
         )
-        grads = cake_kcp.chunk_kda_det_bwd_kcp(
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
             q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, **opts
         )
         res += [out, *grads]
     leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
     out = torch.utils.checkpoint.checkpoint(
-        lambda *a: cake_kcp.chunk_kda_det_kcp(*a, ctx, None, "light", "saved", ws),
+        lambda *a: cake_kcp.cake_kda_det_kcp(*a, ctx, None, "light", "saved", ws),
         *leaves,
         use_reentrant=False,
     )
@@ -213,36 +213,44 @@ def test_upload_tables_layout_and_refusals(monkeypatch) -> None:
 
 
 def test_upload_knobs_are_gated_context_knobs(monkeypatch) -> None:
-    """``upload`` / ``table_cache`` are private context knobs of ``build_context_det_kcp``: refused without
+    """``upload`` / ``table_cache`` are private context knobs of ``cake_kda_det_train_kcp_build_context``: refused without
     ``enable_test_knobs()``, validated, recorded on the context; ``table_cache="workspace"`` (the previous path) only
     with ``upload="blocking"`` (its table sets are not recorded on the context); the KDA entry points refuse them (they
     are no call option); ``heads=`` takes an int-like scalar (0-d integer tensor) or a sequence; the head plan's device
     tables and the ``frag_table`` are uploaded on first read (CPU device here)."""
-    part = kp.partition_det_kcp(list(CU), 1)
+    part = kp.cake_kda_det_train_kcp_partition(list(CU), 1)
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     with pytest.raises(ValueError, match="enable_test_knobs"):
-        kp.build_context_det_kcp(part, None, 0, "cpu", _kcp_test_knobs=dict(OLD))
+        kp.cake_kda_det_train_kcp_build_context(
+            part, None, 0, "cpu", _kcp_test_knobs=dict(OLD)
+        )
     monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     with pytest.raises(ValueError, match="upload must be one of"):
-        kp.build_context_det_kcp(part, None, 0, "cpu", _kcp_test_knobs={"upload": "x"})
+        kp.cake_kda_det_train_kcp_build_context(
+            part, None, 0, "cpu", _kcp_test_knobs={"upload": "x"}
+        )
     with pytest.raises(ValueError, match="table_cache must be one of"):
-        kp.build_context_det_kcp(
+        kp.cake_kda_det_train_kcp_build_context(
             part, None, 0, "cpu", _kcp_test_knobs={"table_cache": "x"}
         )
     with pytest.raises(ValueError, match="needs upload='blocking'"):
-        kp.build_context_det_kcp(
+        kp.cake_kda_det_train_kcp_build_context(
             part, None, 0, "cpu", _kcp_test_knobs={"table_cache": "workspace"}
         )
-    blocking = kp.build_context_det_kcp(
+    blocking = kp.cake_kda_det_train_kcp_build_context(
         part, None, 0, "cpu", _kcp_test_knobs={"upload": "blocking"}
     )
     assert (blocking.upload, blocking.table_cache) == ("blocking", "context")
-    scalar = kp.build_context_det_kcp(part, None, 0, "cpu", heads=torch.tensor(64))
+    scalar = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 0, "cpu", heads=torch.tensor(64)
+    )
     assert set(scalar._head_plans) == {64}
     with pytest.raises(ValueError, match="unknown knob"):
         cake_kcp._options({"_kcp_test_knobs": {"upload": "blocking"}})
-    old = kp.build_context_det_kcp(part, None, 0, "cpu", _kcp_test_knobs=dict(OLD))
-    new = kp.build_context_det_kcp(part, None, 0, "cpu", heads=(4, 64))
+    old = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 0, "cpu", _kcp_test_knobs=dict(OLD)
+    )
+    new = kp.cake_kda_det_train_kcp_build_context(part, None, 0, "cpu", heads=(4, 64))
     assert (old.upload, old.table_cache) == ("blocking", "workspace")
     assert (new.upload, new.table_cache) == (
         kp.UPLOAD_DEFAULT,
@@ -264,8 +272,8 @@ def test_upload_knobs_are_gated_context_knobs(monkeypatch) -> None:
     )
     # the table set lives on the context (shared by workspaces); the knob keeps it per workspace
     ws1, ws2 = (
-        cake_kcp.WorkspaceDetKcp(local=False),
-        cake_kcp.WorkspaceDetKcp(local=False),
+        cake_kcp.CakeKDADetKcpWorkspace(local=False),
+        cake_kcp.CakeKDADetKcpWorkspace(local=False),
     )
     assert ws1.tables(new, 4) is ws2.tables(new, 4) and not ws1._tables
     assert ws1.tables(old, 4) is not ws2.tables(old, 4) and ws1._tables
@@ -275,31 +283,37 @@ def test_upload_knobs_are_gated_context_knobs(monkeypatch) -> None:
 
 
 def test_gpu_prepare_does_not_wait_for_queued_work(device, knobs) -> None:
-    """B T1: ``build_context_det_kcp(..., heads=H)`` behind ~1 s of queued device work: no synchronizing operation,
+    """B T1: ``cake_kda_det_train_kcp_build_context(..., heads=H)`` behind ~1 s of queued device work: no synchronizing operation,
     no pageable copy, exactly one pinned copy (the context's tables; the head plans are host work), the host returns
     while the queued work still runs and the context's ready event is still pending.  After the queue drains every
     device table equals the CPU-built context's.  The previous path (knob) waits: pageable copies and synchronizing
     operations are counted and the queue has drained when it returns.  Rows: every rank of C / Z / D at W = 4, H = 64.
     Copy counts: the upload counter (and the profiler where it traces the device, equal to the counter)."""
     H = 64
-    warm = kp.build_context_det_kcp(
-        kp.partition_det_kcp(list(CU), 1), None, 0, device, heads=H
+    warm = kp.cake_kda_det_train_kcp_build_context(
+        kp.cake_kda_det_train_kcp_partition(list(CU), 1), None, 0, device, heads=H
     )
     del warm  # the pinned staging size class and the allocator blocks are warm
     seen = 0
     for layout in kp.LAYOUTS:
-        part = kp.partition_det_kcp([0, 700, 701, 2001, 3000], 4, layout=layout)
+        part = kp.cake_kda_det_train_kcp_partition(
+            [0, 700, 701, 2001, 3000], 4, layout=layout
+        )
         for r in range(4):
 
             def prepare():
-                ctx = kp.build_context_det_kcp(part, None, r, device, heads=H)
+                ctx = kp.cake_kda_det_train_kcp_build_context(
+                    part, None, r, device, heads=H
+                )
                 return ctx, not ctx.ready.query()
 
             c = census(prepare, device)
             ctx, pending = c["out"]
             _assert_nonblocking(c, (layout, r))
             assert c["pinned"] == 1 and pending, (layout, r, summary(c))
-            ref = kp.build_context_det_kcp(part, None, r, "cpu", sm_count=ctx.sm_count)
+            ref = kp.cake_kda_det_train_kcp_build_context(
+                part, None, r, "cpu", sm_count=ctx.sm_count
+            )
             for name in ref.tables:
                 assert torch.equal(ctx.tables[name].cpu(), ref.tables[name]), name
             for name in ref.halo_tables:
@@ -315,7 +329,7 @@ def test_gpu_prepare_does_not_wait_for_queued_work(device, knobs) -> None:
                 ), name
             seen += 1
             old = census(
-                lambda: kp.build_context_det_kcp(
+                lambda: kp.cake_kda_det_train_kcp_build_context(
                     part, None, r, device, heads=H, _kcp_test_knobs=dict(OLD)
                 ),
                 device,
@@ -328,25 +342,25 @@ def test_gpu_prepare_does_not_wait_for_queued_work(device, knobs) -> None:
 def test_gpu_prepare_inside_a_capture_is_refused(device) -> None:
     """A context is never prepared under CUDA-graph capture (the copy would re-read host memory the graph does not
     own): the upload's own ``RuntimeError``, not a CUDA capture error of an operation that ran under the capture."""
-    part = kp.partition_det_kcp(list(CU), 1)
+    part = kp.cake_kda_det_train_kcp_partition(list(CU), 1)
     g = torch.cuda.CUDAGraph()
     with pytest.raises(RuntimeError, match="re-read host memory"), torch.cuda.graph(g):
-        kp.build_context_det_kcp(part, None, 0, device)
+        kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
 
 
 def test_gpu_byte_queries_and_head_plans_are_host_only(device) -> None:
     """The byte queries and ``heads=`` touch no device: no upload is recorded on the context and the head plan's
     device tables stay unread."""
-    part = kp.partition_det_kcp(
+    part = kp.cake_kda_det_train_kcp_partition(
         [0, 700, 701, 2001, 3000], 4, layout="zigzag_per_document"
     )
-    ctx = kp.build_context_det_kcp(part, None, 1, device, heads=(4, 64))
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 1, device, heads=(4, 64))
     n = len(ctx._uploads)
     assert n == 1
     for H in (4, 64):
-        kp.kda_det_workspace_bytes_kcp(ctx, H=H)
-        kp.kda_det_saved_bytes_kcp(ctx, H=H)
-        kp.kda_det_comm_bytes_kcp(ctx, H=H, C=1024)
+        kp.cake_kda_det_train_kcp_workspace_bytes(ctx, H=H)
+        kp.cake_kda_det_train_kcp_saved_bytes(ctx, H=H)
+        kp.cake_kda_det_train_kcp_comm_bytes(ctx, H=H, C=1024)
         assert not ctx.heads(H).device_tables.uploaded
     assert len(ctx._uploads) == n
 
@@ -356,12 +370,12 @@ def _row_of(device: torch.device, p_class: str) -> tuple[tuple, int, int]:
     and its P."""
     sms = None
     for cu in ROW_CUS:
-        probe = kp.build_context_det_kcp(
-            kp.partition_det_kcp(list(cu), 1), None, 0, device
+        probe = kp.cake_kda_det_train_kcp_build_context(
+            kp.cake_kda_det_train_kcp_partition(list(cu), 1), None, 0, device
         )
         sms = probe.sm_count
         for H in P_CLASSES[p_class]:
-            P = cake_kcp.WorkspaceDetKcp(local=False).tables(probe, H).P
+            P = cake_kcp.CakeKDADetKcpWorkspace(local=False).tables(probe, H).P
             if (P > 1) == (p_class == "P>1"):
                 return cu, H, P
     pytest.skip(
@@ -384,10 +398,10 @@ def _other_of_class(cu: tuple, H: int, P: int, device: torch.device) -> tuple[in
         other = [0]
         for n in cand:
             other.append(other[-1] + n)
-        probe = kp.build_context_det_kcp(
-            kp.partition_det_kcp(other, 1), None, 0, device
+        probe = kp.cake_kda_det_train_kcp_build_context(
+            kp.cake_kda_det_train_kcp_partition(other, 1), None, 0, device
         )
-        if cake_kcp.WorkspaceDetKcp(local=False).tables(probe, H).P == P:
+        if cake_kcp.CakeKDADetKcpWorkspace(local=False).tables(probe, H).P == P:
             return tuple(other)
     raise AssertionError(f"no partition of the class of {cu} (H {H}, P {P}) found")
 
@@ -406,20 +420,20 @@ def test_gpu_calls_issue_no_blocking_upload(device, knobs, p_class, ws_mode) -> 
     cu, H, P = _row_of(device, p_class)
     other = _other_of_class(cu, H, P, device)
     print(f"ROW {p_class}: documents {cu} H {H} P {P}; warmed by {other}")
-    part = kp.partition_det_kcp(list(cu), 1)
+    part = kp.cake_kda_det_train_kcp_partition(list(cu), 1)
 
     def run(ctx, o, ws):
         return _passes(ctx, o, ws if ws_mode == "reused" else None)
 
-    warm = kp.build_context_det_kcp(
-        kp.partition_det_kcp(list(other), 1), None, 0, device
+    warm = kp.cake_kda_det_train_kcp_build_context(
+        kp.cake_kda_det_train_kcp_partition(list(other), 1), None, 0, device
     )
     # the class: modules loaded, allocator blocks cached
     run(warm, _ops(warm, H, device), _new_ws())
     del warm
     _clear_content_caches()
     torch.cuda.synchronize(device)
-    ctx = kp.build_context_det_kcp(part, None, 0, device)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     o = _ops(ctx, H, device)
     ws = _new_ws()
     torch.cuda.synchronize(device)
@@ -436,7 +450,9 @@ def test_gpu_calls_issue_no_blocking_upload(device, knobs, p_class, ws_mode) -> 
     for a, b in zip(first["out"], steady["out"], strict=True):
         assert torch.equal(a, b)
     if ws_mode == "none":
-        old = kp.build_context_det_kcp(part, None, 0, device, _kcp_test_knobs=dict(OLD))
+        old = kp.cake_kda_det_train_kcp_build_context(
+            part, None, 0, device, _kcp_test_knobs=dict(OLD)
+        )
         for _ in range(2):
             run(old, o, None)
         neg = census(lambda: run(old, o, None), device)
@@ -456,9 +472,11 @@ def test_gpu_new_path_is_bitwise_the_previous_path(device, knobs, p_class) -> No
     the new path and the previous one (knob), with ``workspace=None`` and with a reused workspace."""
     cu, H, P = _row_of(device, p_class)
     print(f"ROW {p_class}: documents {cu} H {H} P {P}")
-    part = kp.partition_det_kcp(list(cu), 1)
-    new = kp.build_context_det_kcp(part, None, 0, device)
-    old = kp.build_context_det_kcp(part, None, 0, device, _kcp_test_knobs=dict(OLD))
+    part = kp.cake_kda_det_train_kcp_partition(list(cu), 1)
+    new = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
+    old = kp.cake_kda_det_train_kcp_build_context(
+        part, None, 0, device, _kcp_test_knobs=dict(OLD)
+    )
     o = _ops(new, H, device)
     for ws_new, ws_old in ((None, None), (_new_ws(), _new_ws())):
         a, b = _passes(new, o, ws_new), _passes(old, o, ws_old)
@@ -488,17 +506,17 @@ def test_gpu_graph_replay_issues_no_copy(device) -> None:
     private pool and synchronizes by design."""
     alloc_ok = allocator_counts(device)
     H = 2
-    part = kp.partition_det_kcp(list(CU), 1)
-    ctx = kp.build_context_det_kcp(part, None, 0, device)
+    part = kp.cake_kda_det_train_kcp_partition(list(CU), 1)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     o = _ops(ctx, H, device)
     ws = _new_ws()
     q, k, v, g, beta, dout = (o[n] for n in ("q", "k", "v", "g", "beta", "dout"))
 
     def call(clone: bool = True):
-        out, saved = cake_kcp.chunk_kda_det_fwd_kcp(
+        out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
             q, k, v, g, beta, ctx, workspace=ws, graph="replay"
         )
-        grads = cake_kcp.chunk_kda_det_bwd_kcp(
+        grads = cake_kcp.cake_kda_det_train_kcp_backward(
             q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, graph="replay"
         )
         events = (
@@ -552,8 +570,8 @@ def test_gpu_side_stream_preparation_is_ordered(device, form, hook) -> None:
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
     H = 2
-    part = kp.partition_det_kcp(list(CU), 1)
-    ref_ctx = kp.build_context_det_kcp(part, None, 0, device)
+    part = kp.cake_kda_det_train_kcp_partition(list(CU), 1)
+    ref_ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     o = _ops(ref_ctx, H, device)
     gen = torch.Generator(device=device).manual_seed(9)
     x = torch.randn(ref_ctx.T_r, C_CONV, device=device, generator=gen).to(
@@ -579,7 +597,9 @@ def test_gpu_side_stream_preparation_is_ordered(device, form, hook) -> None:
     holder = {}
 
     def prepare():
-        holder["ctx"] = kp.build_context_det_kcp(part, None, 0, device, stream=side)
+        holder["ctx"] = kp.cake_kda_det_train_kcp_build_context(
+            part, None, 0, device, stream=side
+        )
 
     with torch.cuda.stream(side):
         torch.cuda._sleep(sleep_cycles(device, SLEEP_MS))
@@ -611,8 +631,8 @@ def test_gpu_conv_halo_orders_a_cached_context_on_every_stream(device) -> None:
     context's wait record names A and B (``wait_event`` plus ``record_stream`` of the blob on each)."""
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
-    part = kp.partition_det_kcp(list(CU), 1)
-    ref_ctx = kp.build_context_det_kcp(part, None, 0, device)
+    part = kp.cake_kda_det_train_kcp_partition(list(CU), 1)
+    ref_ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device)
     nbytes = ref_ctx._uploads[0].blob.numel()
     gen = torch.Generator(device=device).manual_seed(13)
     x = torch.randn(ref_ctx.T_r, C_CONV, device=device, generator=gen).to(
@@ -627,7 +647,7 @@ def test_gpu_conv_halo_orders_a_cached_context_on_every_stream(device) -> None:
         poison_ptr = poison.data_ptr()
         torch.cuda._sleep(sleep_cycles(device, SLEEP_MS))
         del poison  # its block returns to the side stream's pool, zeroed
-    ctx = kp.build_context_det_kcp(part, None, 0, device, stream=prep)
+    ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device, stream=prep)
     on_zeros = ctx._uploads[0].blob.data_ptr() == poison_ptr
     print(f"blob on the zeroed block: {on_zeros}")
     assert not ctx.ready.query()
@@ -666,8 +686,8 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import kcp as conv
 
     H = 2
-    part = kp.partition_det_kcp(list(CU), 1)
-    o = _ops(kp.build_context_det_kcp(part, None, 0, device), H, device)
+    part = kp.cake_kda_det_train_kcp_partition(list(CU), 1)
+    o = _ops(kp.cake_kda_det_train_kcp_build_context(part, None, 0, device), H, device)
     q, k, v, g, beta, dout = (o[n] for n in ("q", "k", "v", "g", "beta", "dout"))
     gen = torch.Generator(device=device).manual_seed(11)
     T = int(CU[-1])
@@ -675,17 +695,17 @@ def test_gpu_fresh_context_with_conv_halo_releases_everything(device) -> None:
     w = (0.5 * torch.randn(C_CONV, 4, device=device, generator=gen)).contiguous()
 
     def step(checkpointed: bool):
-        ctx = kp.build_context_det_kcp(part, None, 0, device, heads=H)
+        ctx = kp.cake_kda_det_train_kcp_build_context(part, None, 0, device, heads=H)
         y, _hist = conv.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
         if checkpointed:
             res = tuple(t.detach().clone() for t in (y, *_passes(ctx, o, None)))
         else:
             res = [y.detach().clone()]
             for mode in ("saved", "replay"):
-                out, saved = cake_kcp.chunk_kda_det_fwd_kcp(
+                out, saved = cake_kcp.cake_kda_det_train_kcp_forward(
                     q, k, v, g, beta, ctx, boundary_mode=mode, workspace=None
                 )
-                grads = cake_kcp.chunk_kda_det_bwd_kcp(
+                grads = cake_kcp.cake_kda_det_train_kcp_backward(
                     q, k, v, g, beta, ctx, dout, saved=saved, workspace=None
                 )
                 res += [out, *grads]

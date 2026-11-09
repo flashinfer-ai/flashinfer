@@ -333,6 +333,7 @@ install_released_sccache() {
   local sccache_url="https://github.com/${sccache_repo}/releases/download/v${sccache_version}/${sccache_archive}"
   local sccache_tmpdir
   local sccache_install_started_at=${SECONDS}
+  local suffix attempt delay http_status
 
   echo "::group::Install ${sccache_repo} v${sccache_version} (${sccache_arch})"
 
@@ -342,9 +343,33 @@ install_released_sccache() {
   fi
 
   sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
+  # Match the Docker image pull policy: four attempts with 5/10/20s backoff.
+  # Retry each file independently so a checksum retry keeps the downloaded archive.
+  # A pinned checksum (e.g. the rapidsai fork) skips the .sha256 download.
+  local suffixes=("")
   if [ -z "${sccache_sha256}" ]; then
-    curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
+    suffixes+=(".sha256")
+  fi
+  for suffix in "${suffixes[@]}"; do
+    for attempt in 1 2 3 4; do
+      if http_status=$(curl -fsSL -w '%{http_code}' "${sccache_url}${suffix}" -o "${sccache_tmpdir}/${sccache_archive}${suffix}"); then
+        break
+      fi
+      # Missing release files will not recover with another download attempt.
+      if [ "${http_status}" = "404" ]; then
+        echo "Release file not found (HTTP 404): ${sccache_archive}${suffix}" >&2
+        return 1
+      fi
+      if (( attempt == 4 )); then
+        echo "Failed to download ${sccache_archive}${suffix} after ${attempt} attempts" >&2
+        return 1
+      fi
+      delay=$(( 5 * 2 ** (attempt - 1) ))
+      echo "sccache download failed; retrying in ${delay}s (attempt $(( attempt + 1 ))/4)" >&2
+      sleep "${delay}"
+    done
+  done
+  if [ -z "${sccache_sha256}" ]; then
     sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
   fi
   if [ -z "${sccache_sha256}" ]; then

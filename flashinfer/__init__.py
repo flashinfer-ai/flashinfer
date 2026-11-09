@@ -29,12 +29,6 @@ from .activation import silu_and_mul as silu_and_mul
 from .activation import (
     silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
-)
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
-)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
@@ -178,6 +172,23 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 # import the experimental tree.
 _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     **{name: (".fused_moe", name) for name in sorted(_PRIMS_TS_LAZY_EXPORTS)},
+    # RMSNorm training: det names from the det facade, and both facades as modules.
+    "cake_rmsnorm_det": (".cake_rmsnorm_det_train", "cake_rmsnorm_det"),
+    "CakeRMSNormDetFunction": (".cake_rmsnorm_det_train", "CakeRMSNormDetFunction"),
+    "cake_rmsnorm_det_train_forward": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_forward",
+    ),
+    "cake_rmsnorm_det_train_backward": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_backward",
+    ),
+    "cake_rmsnorm_det_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_det_train",
+        "cake_rmsnorm_det_train_backward_workspace_bytes",
+    ),
+    "cake_rmsnorm_det_train": (".cake_rmsnorm_det_train", None),
+    "cake_rmsnorm_nondet_train": (".cake_rmsnorm_nondet_train", None),
     "CakeCausalConv1dDetFunction": (
         ".cake_causal_conv1d_det_train",
         "CakeCausalConv1dDetFunction",
@@ -190,7 +201,26 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
         ".cake_causal_conv1d_det_train",
         "cake_causal_conv1d_det_train_forward_workspace_bytes",
     ),
+    "cake_gdn_det_train": (".cake_gdn_det_train", None),
+    "cake_gdn_det_train_kcp": (".cake_gdn_det_train_kcp", None),
+    "cake_gdn_nondet_train": (".cake_gdn_nondet_train", None),
+    "cake_gdn_nondet_train_kcp": (".cake_gdn_nondet_train_kcp", None),
+    "CakeMHCDetFinishFunction": (".cake_mhc_det_train", "CakeMHCDetFinishFunction"),
+    "CakeMHCDetPrepareFunction": (".cake_mhc_det_train", "CakeMHCDetPrepareFunction"),
+    "CakeMHCHeadDetFunction": (".cake_mhc_head_det_train", "CakeMHCHeadDetFunction"),
+    # The deterministic Cake fused SwiGLU + MXFP8 quantization: its module and
+    # the names of its module (the backend package loads on first use).
+    "cake_gated_act_mxfp8_det_train": (".cake_gated_act_mxfp8_det_train", None),
+    **{
+        name: (".cake_gated_act_mxfp8_det_train", name)
+        for name in (
+            "cake_gated_act_mxfp8_det_train_backward",
+            "cake_gated_act_mxfp8_det_train_forward",
+            "is_cake_gated_act_mxfp8_det_train_supported",
+        )
+    },
     "cake_lm_head_det_train": (".cake_lm_head_det_train", None),
+    "cake_lm_head_nondet_train": (".cake_lm_head_nondet_train", None),
     # The deterministic Cake MoE grouped GEMM: the names of its module.
     **{
         name: (".cake_moe_grouped_gemm_det_train", name)
@@ -256,6 +286,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
         ".cake_rmsnorm_silu_gate_nondet_train",
         "CakeRMSNormSiLUGateNondetFunction",
     ),
+    # KDA chunked training (Cake), both modes, single rank and KCP: the facade
+    # modules; each imports its backend package (under
+    # flashinfer.experimental.cake) on first use.
+    "cake_kda_det_train": (".cake_kda_det_train", None),
+    "cake_kda_det_train_kcp": (".cake_kda_det_train_kcp", None),
+    "cake_kda_nondet_train": (".cake_kda_nondet_train", None),
+    "cake_kda_nondet_train_kcp": (".cake_kda_nondet_train_kcp", None),
 }
 
 
@@ -361,33 +398,6 @@ from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
 from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
-from .cake_rmsnorm_det_train import CakeRMSNormDetFunction as CakeRMSNormDetFunction
-from .cake_rmsnorm_det_train import cake_rmsnorm_det as cake_rmsnorm_det
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_backward as cake_rmsnorm_det_train_backward,
-)
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_backward_workspace_bytes as cake_rmsnorm_det_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_det_train import (
-    cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
-)
-
-# The names before the det rename: the package with the deterministic default and the
-# opt-in non-deterministic weight gradient (``deterministic=False``).
-from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
-from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
-)
-from . import cake_rmsnorm_train as cake_rmsnorm_train
-from . import cake_rmsnorm_train_backend as cake_rmsnorm_train_backend
 
 # CakeCausalConv1dDetFunction and the workspace-bytes helpers are served by
 # ``_LAZY_EXPORTS`` above: they live in the backend package under flashinfer/experimental/cake/.
@@ -401,15 +411,6 @@ from .cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward as cake_causal_conv1d_det_train_forward,
 )
 
-from .cake_mhc_det_train import (
-    CakeMHCDetTrainFinishFunction as CakeMHCDetTrainFinishFunction,
-)
-from .cake_mhc_det_train import (
-    CakeMHCDetTrainHeadFunction as CakeMHCDetTrainHeadFunction,
-)
-from .cake_mhc_det_train import (
-    CakeMHCDetTrainPrepareFunction as CakeMHCDetTrainPrepareFunction,
-)
 from .cake_mhc_det_train import (
     cake_mhc_det_train_backward_finish as cake_mhc_det_train_backward_finish,
 )
@@ -432,14 +433,14 @@ from .cake_mhc_det_train import (
 from .cake_mhc_det_train import (
     cake_mhc_det_train_forward_workspace_bytes as cake_mhc_det_train_forward_workspace_bytes,
 )
-from .cake_mhc_det_train import cake_mhc_det_train_head as cake_mhc_det_train_head
-from .cake_mhc_det_train import (
-    cake_mhc_det_train_head_backward as cake_mhc_det_train_head_backward,
-)
-from .cake_mhc_det_train import (
-    cake_mhc_det_train_head_forward as cake_mhc_det_train_head_forward,
-)
 from .cake_mhc_det_train import cake_mhc_det_train_prepare as cake_mhc_det_train_prepare
+from .cake_mhc_head_det_train import cake_mhc_head_det as cake_mhc_head_det
+from .cake_mhc_head_det_train import (
+    cake_mhc_head_det_train_backward as cake_mhc_head_det_train_backward,
+)
+from .cake_mhc_head_det_train import (
+    cake_mhc_head_det_train_forward as cake_mhc_head_det_train_forward,
+)
 from .cake_gdp import (
     cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
 )
@@ -526,6 +527,8 @@ from .rope import (
 )
 from .sampling import chain_speculative_sampling as chain_speculative_sampling
 from .sampling import min_p_sampling_from_probs as min_p_sampling_from_probs
+from .sampling import log_probs as log_probs
+from .sampling import log_softmax as log_softmax
 from .sampling import sampling_from_logits as sampling_from_logits
 from .sampling import sampling_from_probs as sampling_from_probs
 from .sampling import softmax as softmax

@@ -19,8 +19,9 @@ The public names are the facade's ``__all__`` and the backend objects it forward
 (``flashinfer.experimental.cake.cake_gqa_nondet_train``): each carries the mode (``nondet``) as a token, the
 former names and package paths are gone (no alias), and no entry point takes a ``deterministic`` keyword.  The rules
 shared by every #8928 family are checked with ``tests.test_helpers.cake_mode_names``; the checks here are this
-family's own.  Torch's deterministic mode is read only by the backward's alert.  Internal helpers and build identities (program and library
-stems ``cake_gqa_train_<hex>``, kernel symbols, csrc file names) keep their names.
+family's own.  Nothing reads torch's deterministic mode: every output repeats bit for bit, so the package raises no
+alert.  Internal helpers and build identities (program and library stems ``cake_gqa_train_<hex>``, kernel symbols,
+csrc file names) keep their names.
 """
 
 import importlib
@@ -29,7 +30,6 @@ import json
 import re
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 
 import pytest
@@ -116,17 +116,6 @@ def _fresh(code: str):
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-@pytest.fixture
-def deterministic_algorithms():
-    """Restores torch's deterministic-algorithms mode after a test that sets it."""
-    was = (
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    yield
-    torch.use_deterministic_algorithms(was[0], warn_only=was[1])
-
-
 @pytest.mark.parametrize("name", REMOVED_MODULES)
 def test_removed_module_paths_do_not_import(name):
     """A former module path does not import (a stale ``__pycache__`` or ``aot`` directory can still make the bare
@@ -207,8 +196,8 @@ def test_the_shared_mode_rules_hold():
 
 def test_public_names_carry_the_mode():
     """Every backend object the facade forwards to or re-exports carries ``nondet`` after the op (the shared rule,
-    applied to the backend's names); every package ``__all__`` name is such an object, an ALL_CAPS constant or the
-    internal ``default_workspace`` helper."""
+    applied to the backend's names); every package ``__all__`` name is such an object or an ALL_CAPS constant, and
+    the backend's internal helpers (``default_workspace``, ``load``, ``record``, ...) are not package attributes."""
     backend = _backend("cake_backend")
     package = _backend()
     assert_mode_names(package, names=FORWARDED)
@@ -216,11 +205,15 @@ def test_public_names_carry_the_mode():
         assert name in backend.__all__ and name in package.__all__, name
         assert getattr(package, name) is getattr(backend, name), name
     for name in package.__all__:
-        assert (
-            re.fullmatch(r"[A-Z][A-Z0-9_]*", name)
-            or name in FORWARDED
-            or name == "default_workspace"
-        ), name
+        assert re.fullmatch(r"[A-Z][A-Z0-9_]*", name) or name in FORWARDED, name
+    internal = [
+        name
+        for name in backend.__all__
+        if name not in FORWARDED and not re.fullmatch(r"[A-Z][A-Z0-9_]*", name)
+    ]
+    assert "default_workspace" in internal
+    for name in internal:
+        assert not hasattr(package, name), name
 
 
 def test_no_entry_takes_a_mode_keyword():
@@ -267,53 +260,17 @@ def test_no_entry_takes_a_mode_keyword():
                 getattr(public, name)(*args, deterministic=value)
 
 
-def test_only_the_alert_reads_torch_mode():
-    """The facade never reads torch's deterministic mode; the backend reads it only in ``_alert_nondeterministic``,
-    which only ``cake_gqa_nondet_train_backward`` calls (the forward never alerts)."""
+def test_nothing_reads_torch_mode():
+    """The facade and the backend never read torch's deterministic mode and never raise its alert: every sum has one
+    fixed order, so there is nothing to alert about (the backend suite checks the strict and ``warn_only`` modes on a
+    device)."""
     reads = re.compile(r"torch\.(?:are|is)_deterministic_algorithms_\w*enabled\(")
     assert not reads.search(inspect.getsource(public))
-    backend = _backend("cake_backend")
-    readers = [
-        name
-        for name, value in vars(backend).items()
-        if inspect.isfunction(value)
-        and value.__module__ == backend.__name__
-        and reads.search(inspect.getsource(value))
-    ]
-    assert readers == ["_alert_nondeterministic"]
-    callers = [
-        name
-        for name, value in vars(backend).items()
-        if inspect.isfunction(value)
-        and value.__module__ == backend.__name__
-        and "_alert_nondeterministic(" in inspect.getsource(value)
-        and name != "_alert_nondeterministic"
-    ]
-    assert callers == ["cake_gqa_nondet_train_backward"]
-
-
-def test_the_alert_follows_torch_mode(deterministic_algorithms):
-    """``_alert_nondeterministic``: nothing outside deterministic mode, PyTorch's ``RuntimeError`` in it, one
-    ``UserWarning`` (and no error) with ``warn_only=True``.  The backward's ordering against its checks and launches
-    is covered on a device (``test_cake_gqa_nondet_train.py``)."""
-    alert = _backend("cake_backend")._alert_nondeterministic
-    torch.use_deterministic_algorithms(False)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        alert("entry")
-    torch.use_deterministic_algorithms(True)
-    with pytest.raises(
-        RuntimeError, match="entry does not have a deterministic implementation"
-    ):
-        alert("entry")
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        alert("entry")
-    assert len(caught) == 1 and issubclass(caught[0].category, UserWarning)
-    assert "entry does not have a deterministic implementation" in str(
-        caught[0].message
-    )
+    for module_name in ("cake_backend", "cake_jit", None):
+        source = inspect.getsource(_backend(module_name))
+        assert not reads.search(source), module_name
+        assert "alert_not_deterministic" not in source, module_name
+        assert "_alert_nondeterministic" not in source, module_name
 
 
 def test_package_identity_and_build_identity():

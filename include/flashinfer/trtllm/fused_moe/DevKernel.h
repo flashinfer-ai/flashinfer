@@ -191,6 +191,10 @@ struct Data {
   tg::Dtype mDtypeElt{tg::Dtype::Fp16};
   bool mUsePdl{false};
   bool mUseDeepSeekFp8{false};
+  // DeepSeek FP8 only: side of the square FP32 scale block, 128 (checkpoint
+  // layout) or 32 (vLLM's re-blocked TP shards). The CTA always spans 128
+  // output elements; at 32 each warp owns one scale block.
+  int32_t mDeepSeekSfBlockSize{128};
 
   void* inPtr;
   void* outPtr;
@@ -228,6 +232,7 @@ struct KernelParams {
 
   float* inDqSfsPtr = nullptr;
   float* outDqSfsPtr = nullptr;
+  int32_t deepSeekSfBlockSize{128};
 
   int32_t innerDim;
   int32_t numTokens;
@@ -249,6 +254,7 @@ struct KernelParams {
     params.outPtr = (Type*)data.outPtr;
     params.inDqSfsPtr = data.inDqSfsPtr;
     params.outDqSfsPtr = data.outDqSfsPtr;
+    params.deepSeekSfBlockSize = data.mDeepSeekSfBlockSize;
 
     params.expandedIdxToPermutedIdx = data.expandedIdxToPermutedIdx;
 

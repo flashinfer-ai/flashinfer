@@ -197,9 +197,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_0 = sb_1_0;
     unsigned int kw_1_0 = sb_1_0 & 4294967280u | 0;
-    if (td_1_0 >= lim || sb_1_0 == 4278190080u) {
-        vw_1_0 = 4278190080u;
+    if (sb_1_0 == 4278190080u) {
         kw_1_0 = 4278190080u;
+    }
+    if (raw[0] == 4286578688u) {
+        vw_1_0 = 4282384384u;
+        kw_1_0 = 4282384384u;
     }
     scr[xrow * 17] = __uint_as_float(vw_1_0);
     kb[0] = __uint_as_float(kw_1_0);
@@ -213,9 +216,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_1 = sb_1_1;
     unsigned int kw_1_1 = sb_1_1 & 4294967280u | 1;
-    if (td_1_1 >= lim || sb_1_1 == 4278190080u) {
-        vw_1_1 = 4278190080u;
+    if (sb_1_1 == 4278190080u) {
         kw_1_1 = 4278190097u;
+    }
+    if (raw[1] == 4286578688u) {
+        vw_1_1 = 4282384384u;
+        kw_1_1 = 4282384401u;
     }
     scr[xrow * 17 + 1] = __uint_as_float(vw_1_1);
     kb[1] = __uint_as_float(kw_1_1);
@@ -229,9 +235,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_2 = sb_1_2;
     unsigned int kw_1_2 = sb_1_2 & 4294967280u | 2;
-    if (td_1_2 >= lim || sb_1_2 == 4278190080u) {
-        vw_1_2 = 4278190080u;
+    if (sb_1_2 == 4278190080u) {
         kw_1_2 = 4278190114u;
+    }
+    if (raw[2] == 4286578688u) {
+        vw_1_2 = 4282384384u;
+        kw_1_2 = 4282384418u;
     }
     scr[xrow * 17 + 2] = __uint_as_float(vw_1_2);
     kb[2] = __uint_as_float(kw_1_2);
@@ -245,9 +254,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_3 = sb_1_3;
     unsigned int kw_1_3 = sb_1_3 & 4294967280u | 3;
-    if (td_1_3 >= lim || sb_1_3 == 4278190080u) {
-        vw_1_3 = 4278190080u;
+    if (sb_1_3 == 4278190080u) {
         kw_1_3 = 4278190131u;
+    }
+    if (raw[3] == 4286578688u) {
+        vw_1_3 = 4282384384u;
+        kw_1_3 = 4282384435u;
     }
     scr[xrow * 17 + 3] = __uint_as_float(vw_1_3);
     kb[3] = __uint_as_float(kw_1_3);
@@ -261,9 +273,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_4 = sb_1_4;
     unsigned int kw_1_4 = sb_1_4 & 4294967280u | 4;
-    if (td_1_4 >= lim || sb_1_4 == 4278190080u) {
-        vw_1_4 = 4278190080u;
+    if (sb_1_4 == 4278190080u) {
         kw_1_4 = 4278190148u;
+    }
+    if (raw[4] == 4286578688u) {
+        vw_1_4 = 4282384384u;
+        kw_1_4 = 4282384452u;
     }
     scr[xrow * 17 + 4] = __uint_as_float(vw_1_4);
     kb[4] = __uint_as_float(kw_1_4);
@@ -277,9 +292,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_5 = sb_1_5;
     unsigned int kw_1_5 = sb_1_5 & 4294967280u | 5;
-    if (td_1_5 >= lim || sb_1_5 == 4278190080u) {
-        vw_1_5 = 4278190080u;
+    if (sb_1_5 == 4278190080u) {
         kw_1_5 = 4278190165u;
+    }
+    if (raw[5] == 4286578688u) {
+        vw_1_5 = 4282384384u;
+        kw_1_5 = 4282384469u;
     }
     scr[xrow * 17 + 5] = __uint_as_float(vw_1_5);
     kb[5] = __uint_as_float(kw_1_5);
@@ -293,9 +311,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_6 = sb_1_6;
     unsigned int kw_1_6 = sb_1_6 & 4294967280u | 6;
-    if (td_1_6 >= lim || sb_1_6 == 4278190080u) {
-        vw_1_6 = 4278190080u;
+    if (sb_1_6 == 4278190080u) {
         kw_1_6 = 4278190182u;
+    }
+    if (raw[6] == 4286578688u) {
+        vw_1_6 = 4282384384u;
+        kw_1_6 = 4282384486u;
     }
     scr[xrow * 17 + 6] = __uint_as_float(vw_1_6);
     kb[6] = __uint_as_float(kw_1_6);
@@ -309,9 +330,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_7 = sb_1_7;
     unsigned int kw_1_7 = sb_1_7 & 4294967280u | 7;
-    if (td_1_7 >= lim || sb_1_7 == 4278190080u) {
-        vw_1_7 = 4278190080u;
+    if (sb_1_7 == 4278190080u) {
         kw_1_7 = 4278190199u;
+    }
+    if (raw[7] == 4286578688u) {
+        vw_1_7 = 4282384384u;
+        kw_1_7 = 4282384503u;
     }
     scr[xrow * 17 + 7] = __uint_as_float(vw_1_7);
     kb[7] = __uint_as_float(kw_1_7);
@@ -325,9 +349,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_8 = sb_1_8;
     unsigned int kw_1_8 = sb_1_8 & 4294967280u | 8;
-    if (td_1_8 >= lim || sb_1_8 == 4278190080u) {
-        vw_1_8 = 4278190080u;
+    if (sb_1_8 == 4278190080u) {
         kw_1_8 = 4278190216u;
+    }
+    if (raw[8] == 4286578688u) {
+        vw_1_8 = 4282384384u;
+        kw_1_8 = 4282384520u;
     }
     scr[xrow * 17 + 8] = __uint_as_float(vw_1_8);
     kb[8] = __uint_as_float(kw_1_8);
@@ -341,9 +368,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_9 = sb_1_9;
     unsigned int kw_1_9 = sb_1_9 & 4294967280u | 9;
-    if (td_1_9 >= lim || sb_1_9 == 4278190080u) {
-        vw_1_9 = 4278190080u;
+    if (sb_1_9 == 4278190080u) {
         kw_1_9 = 4278190233u;
+    }
+    if (raw[9] == 4286578688u) {
+        vw_1_9 = 4282384384u;
+        kw_1_9 = 4282384537u;
     }
     scr[xrow * 17 + 9] = __uint_as_float(vw_1_9);
     kb[9] = __uint_as_float(kw_1_9);
@@ -357,9 +387,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_10 = sb_1_10;
     unsigned int kw_1_10 = sb_1_10 & 4294967280u | 10;
-    if (td_1_10 >= lim || sb_1_10 == 4278190080u) {
-        vw_1_10 = 4278190080u;
+    if (sb_1_10 == 4278190080u) {
         kw_1_10 = 4278190250u;
+    }
+    if (raw[10] == 4286578688u) {
+        vw_1_10 = 4282384384u;
+        kw_1_10 = 4282384554u;
     }
     scr[xrow * 17 + 10] = __uint_as_float(vw_1_10);
     kb[10] = __uint_as_float(kw_1_10);
@@ -373,9 +406,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_11 = sb_1_11;
     unsigned int kw_1_11 = sb_1_11 & 4294967280u | 11;
-    if (td_1_11 >= lim || sb_1_11 == 4278190080u) {
-        vw_1_11 = 4278190080u;
+    if (sb_1_11 == 4278190080u) {
         kw_1_11 = 4278190267u;
+    }
+    if (raw[11] == 4286578688u) {
+        vw_1_11 = 4282384384u;
+        kw_1_11 = 4282384571u;
     }
     scr[xrow * 17 + 11] = __uint_as_float(vw_1_11);
     kb[11] = __uint_as_float(kw_1_11);
@@ -389,9 +425,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_12 = sb_1_12;
     unsigned int kw_1_12 = sb_1_12 & 4294967280u | 12;
-    if (td_1_12 >= lim || sb_1_12 == 4278190080u) {
-        vw_1_12 = 4278190080u;
+    if (sb_1_12 == 4278190080u) {
         kw_1_12 = 4278190284u;
+    }
+    if (raw[12] == 4286578688u) {
+        vw_1_12 = 4282384384u;
+        kw_1_12 = 4282384588u;
     }
     scr[xrow * 17 + 12] = __uint_as_float(vw_1_12);
     kb[12] = __uint_as_float(kw_1_12);
@@ -405,9 +444,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_13 = sb_1_13;
     unsigned int kw_1_13 = sb_1_13 & 4294967280u | 13;
-    if (td_1_13 >= lim || sb_1_13 == 4278190080u) {
-        vw_1_13 = 4278190080u;
+    if (sb_1_13 == 4278190080u) {
         kw_1_13 = 4278190301u;
+    }
+    if (raw[13] == 4286578688u) {
+        vw_1_13 = 4282384384u;
+        kw_1_13 = 4282384605u;
     }
     scr[xrow * 17 + 13] = __uint_as_float(vw_1_13);
     kb[13] = __uint_as_float(kw_1_13);
@@ -421,9 +463,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_14 = sb_1_14;
     unsigned int kw_1_14 = sb_1_14 & 4294967280u | 14;
-    if (td_1_14 >= lim || sb_1_14 == 4278190080u) {
-        vw_1_14 = 4278190080u;
+    if (sb_1_14 == 4278190080u) {
         kw_1_14 = 4278190318u;
+    }
+    if (raw[14] == 4286578688u) {
+        vw_1_14 = 4282384384u;
+        kw_1_14 = 4282384622u;
     }
     scr[xrow * 17 + 14] = __uint_as_float(vw_1_14);
     kb[14] = __uint_as_float(kw_1_14);
@@ -437,9 +482,12 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
     }
     unsigned int vw_1_15 = sb_1_15;
     unsigned int kw_1_15 = sb_1_15 & 4294967280u | 15;
-    if (td_1_15 >= lim || sb_1_15 == 4278190080u) {
-        vw_1_15 = 4278190080u;
+    if (sb_1_15 == 4278190080u) {
         kw_1_15 = 4278190335u;
+    }
+    if (raw[15] == 4286578688u) {
+        vw_1_15 = 4282384384u;
+        kw_1_15 = 4282384639u;
     }
     scr[xrow * 17 + 15] = __uint_as_float(vw_1_15);
     kb[15] = __uint_as_float(kw_1_15);
@@ -3072,7 +3120,7 @@ kernel_cake_hopper_msa_025cfebce8c49b67ec28(unsigned int* __restrict__ S, int* _
         }
         unsigned int kk = __as_u32(KV);
         unsigned int idx = 2048;
-        if (kk < 4278190080u) {
+        if (kk < 4282384384u) {
             idx = KX;
         }
         unsigned int rkey = idx << 4 | (unsigned int)lnx;
