@@ -197,5 +197,5 @@ device stream gets its own default workspace.
   with up to about 2K query and 8K key tokens, 0.1 to 0.5 ms long, takes up
   to about 0.1 ms more for the extra launches (`bwd_plan`, the dQ GEMM, the
   fold and the row-map sort).  From 16K query and 25K key tokens up, a step
-  takes 2 to 8 % less time on a GB200, 6 to 11 % less on a B300 and 5 to
-  14 % less on an R200.
+  takes at least 2 % less time on a GB200, 6 % less on a B300 and 5 % less
+  on an R200.
