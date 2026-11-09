@@ -63,8 +63,9 @@ LARGE_TOKENS = (8192, 16384)
 REFERENCE_SM_COUNT = 148
 
 # Architectures whose 8- and 16-token routes run the FC1 + FC2 programs with evict_first cache
-# hints on their weight-stream TMA loads (four kernels) -- sm_100a today; sm_103a keeps the
-# "n8_feature" / "n8_w2a_m16" routes.
+# hints on their weight-stream TMA loads (four kernels) and whose single-token route runs the
+# FC1 program with that hint (a fifth kernel) -- sm_100a today; sm_103a keeps the
+# "n8_feature" / "n8_w2a_m16" / "m1_s2a" routes.
 SMALL_L2POLICY_ARCHES = ("sm_100a",)
 # Architectures and token counts whose large route runs the routing histogram
 # and scatter kernels with per-CTA shared-memory privatization and block
@@ -79,10 +80,14 @@ LARGE_P1024_TOKENS = (16384,)
 # row of sm_100a.
 LARGE_P512FH2QR_ARCHES = ("sm_100a",)
 LARGE_P512FH2QR_TOKENS = (8192,)
-# Architectures whose 4096-token route stores the FC2 result as the same 8-bit
+# Architectures whose 2048- and 4096-token routes run seven launches: the
+# quantization fused with the routing-table reset, then the routing histogram and
+# scatter kernels with per-CTA privatization and block reservation at 256 routed
+# pairs per CTA (the "mid_work5fd_p256fh2qr" / "mid_q8i_p256fh2qr" selectors) --
+# sm_103a today.  Its 4096-token route stores the FC2 result as the 8-bit
 # per-tile partial behind the work5fd FC1; the 2048-token route keeps the BF16
-# expert output everywhere.
-MID_Q8I_ARCHES = ("sm_103a",)
+# expert output.
+MID_P256FH2QR_ARCHES = ("sm_103a",)
 MID_Q8I_TOKENS = (4096,)
 # Architectures and token counts whose tile-N16 claim8 route quantizes and routes
 # in one launch with the 8- and 16-token routes' quant_route program (four
@@ -120,6 +125,7 @@ GENERIC_STAGES = [
 QR_GENERIC_STAGES = ["quant_reset"] + GENERIC_STAGES[2:]
 STAGES_BY_SELECTOR = {
     "m1_s2a": ["fc1", "fc2", "finalize"],
+    "m1_s2a_m1ef": ["fc1", "fc2", "finalize"],
     "n8_feature": ["quant_route", "fc1", "fc2", "finalize"],
     "n8_w2a_m16": ["quant_route", "fc1", "fc2", "finalize"],
     "n8_feature_ef_f2e": ["quant_route", "fc1", "fc2", "finalize"],
@@ -128,7 +134,8 @@ STAGES_BY_SELECTOR = {
     "m64_claim8_qr": ["quant_route", "fc1", "fc2", "finalize"],
     "n32_claim8": ["quant", "fused_router", "fc1", "fc2", "finalize"],
     "mid_work5fd": GENERIC_STAGES,
-    "mid_q8i": GENERIC_STAGES,
+    "mid_work5fd_p256fh2qr": QR_GENERIC_STAGES,
+    "mid_q8i_p256fh2qr": QR_GENERIC_STAGES,
     "large_q8i": GENERIC_STAGES,
     "large_q8i_p1024": GENERIC_STAGES,
     "large_q8i_p512fh2qr": QR_GENERIC_STAGES,
@@ -146,6 +153,8 @@ def _tile_bucket(num_tokens):
 
 
 def _expected_selector(arch, num_tokens):
+    if num_tokens == 1 and arch in SMALL_L2POLICY_ARCHES:
+        return "m1_s2a_m1ef"
     if num_tokens == 8 and arch in SMALL_L2POLICY_ARCHES:
         return "n8_feature_ef_f2e"
     if num_tokens == 16 and arch in SMALL_L2POLICY_ARCHES:
@@ -154,8 +163,10 @@ def _expected_selector(arch, num_tokens):
         return "large_q8i_p512fh2qr"
     if num_tokens in LARGE_P1024_TOKENS and arch in LARGE_P1024_ARCHES:
         return "large_q8i_p1024"
-    if num_tokens in MID_Q8I_TOKENS and arch in MID_Q8I_ARCHES:
-        return "mid_q8i"
+    if num_tokens in (2048, 4096) and arch in MID_P256FH2QR_ARCHES:
+        if num_tokens in MID_Q8I_TOKENS:
+            return "mid_q8i_p256fh2qr"
+        return "mid_work5fd_p256fh2qr"
     if num_tokens in MID_QR_TOKENS and arch in MID_QR_ARCHES:
         return "m64_claim8_qr"
     return ROUTED.get(num_tokens, _tile_bucket(num_tokens))
@@ -475,10 +486,17 @@ def _skewed_routing(num_tokens, device):
     return ids.contiguous()
 
 
+def _hot_routing(num_tokens, device):
+    # Every token routes to the same 16 experts; the other 880 receive none.
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
+    return slots[None, :].expand(num_tokens, TOP_K).contiguous()
+
+
 ROUTINGS = {
     "uniform": _uniform_routing,
     "grouped": _grouped_routing,
     "skewed": _skewed_routing,
+    "hot": _hot_routing,
 }
 
 
@@ -773,6 +791,38 @@ def test_cake_situ_every_route_eager_and_external_graph(
                 1,
             )
             assert bindings[stage]["total_pairs"] == prepared["total_pairs"]
+    if prepared["selector"] in ("mid_work5fd_p256fh2qr", "mid_q8i_p256fh2qr"):
+        # Seven launches: the quantization and the routing-table reset share one
+        # launch (the 8192-token route's program), the routing histogram and
+        # scatter privatize per CTA at 256 routed pairs per CTA (the production
+        # routing grid); FC1, FC2 and the finalize are those of the eight-launch
+        # route of the same row.
+        bindings = _cake_situ_stage_bindings(
+            _options(x, ids, route_weights, output, weights, workspace), prepared
+        )
+        assert list(bindings) == QR_GENERIC_STAGES
+        assert prepared["modules"]["quant_reset"] == cake_situ_program(
+            "sm_100a", "quant_reset:n128_p512fh2qr"
+        )
+        reset_items = max(EXPERTS, prepared["max_tiles"] * 128 + 1)
+        assert bindings["quant_reset"]["grid"] == (
+            num_tokens + (reset_items + 255) // 256,
+            1,
+            1,
+        )
+        for stage in ("route_histogram", "route_scatter"):
+            assert bindings[stage]["grid"] == (
+                (prepared["total_pairs"] + 255) // 256,
+                1,
+                1,
+            )
+        q8i = prepared["selector"] == "mid_q8i_p256fh2qr"
+        for stage, key in (
+            ("fc1", "fc1:n128_work5fd"),
+            ("fc2", "fc2:n128_q8i" if q8i else "fc2:n128"),
+            ("finalize", "finalize:n128_q8i" if q8i else "finalize:n128"),
+        ):
+            assert prepared["modules"][stage] == cake_situ_program(arch, key)
     if prepared["selector"] == "m64_claim8_qr":
         # One launch quantizes and routes: the 8- and 16-token routes'
         # quant_route program (block 0 routes, blocks 1..num_tokens quantize)
@@ -798,8 +848,23 @@ def test_cake_situ_every_route_eager_and_external_graph(
         # activation scale and the expert ids).
         options = _options(x, ids, route_weights, output, weights, workspace)
         bindings = _cake_situ_stage_bindings(options, prepared)
-        assert prepared["selector"] == "m1_s2a"
+        assert prepared["selector"] == _expected_selector(arch, num_tokens)
         assert list(bindings) == STAGES_BY_SELECTOR[prepared["selector"]]
+        if prepared["selector"] == "m1_s2a_m1ef":
+            # The FC1 program puts an evict_first cache hint on its weight-stream
+            # TMA loads and keeps the argument plan of the "m1_s2a" FC1; FC2 and
+            # the finalize are those of "m1_s2a".
+            assert prepared["modules"]["fc1"] == cake_situ_program(
+                arch, "fc1:n8_s2a_m1ef"
+            )
+            assert (
+                MODULES[prepared["modules"]["fc1"]]["arg_plan"]
+                == MODULES[cake_situ_program("sm_103a", "fc1:n8_s2a")]["arg_plan"]
+            )
+            for stage in ("fc2", "finalize"):
+                assert prepared["modules"][stage] == cake_situ_program(
+                    arch, _SELECTORS["m1_s2a"][1][stage]
+                )
         assert "x" in bindings["fc1"]
         assert bindings["fc1"]["x"].data_ptr() == x.data_ptr()
         assert bindings["fc1"]["topk_ids"].data_ptr() == ids.data_ptr()
@@ -813,7 +878,7 @@ def test_cake_situ_every_route_eager_and_external_graph(
         "large_q8i",
         "large_q8i_p1024",
         "large_q8i_p512fh2qr",
-        "mid_q8i",
+        "mid_q8i_p256fh2qr",
     ):
         # The FC2 stage stores an 8-bit per-tile partial and its per-tile FP32
         # scales inside the BF16 expert-output scratch, and the finalize reads
@@ -877,7 +942,7 @@ def test_cake_situ_every_route_eager_and_external_graph(
         "large_q8i",
         "large_q8i_p1024",
         "large_q8i_p512fh2qr",
-        "mid_q8i",
+        "mid_q8i_p256fh2qr",
     ):
         # The 8-bit FC2 partial of this route carries one FP32 scale per
         # 128x128 tile, and the atomic-counter routing assigns rows to tiles
@@ -1086,10 +1151,45 @@ def test_cake_situ_per_cta_privatized_routing_matches_the_production_routing(
     print(f"largest absolute difference between the two routings' outputs: {recorded}")
 
 
+# The seven-launch routes: selector -> (routed pairs per CTA of the histogram and
+# scatter, their kernel keys, the quant_reset kernel key).
+QR_ROUTES = {
+    "large_q8i_p512fh2qr": (
+        512,
+        ("route_histogram:n128_p512f", "route_scatter:n128_p512fh2"),
+        "quant_reset:n128_p512fh2qr",
+    ),
+    "mid_work5fd_p256fh2qr": (
+        256,
+        ("route_histogram:n128_p256f", "route_scatter:n128_p256fh2"),
+        "quant_reset:n128_p256fh2qr",
+    ),
+    "mid_q8i_p256fh2qr": (
+        256,
+        ("route_histogram:n128_p256f", "route_scatter:n128_p256fh2"),
+        "quant_reset:n128_p256fh2qr",
+    ),
+}
+
+
 @pytest.mark.parametrize(
     "num_tokens, routing",
-    [(8192, "uniform"), (8192, "skewed")],
-    ids=["m8192_uniform", "m8192_skewed"],
+    [
+        (8192, "uniform"),
+        (8192, "skewed"),
+        (2048, "uniform"),
+        (2048, "skewed"),
+        (4096, "uniform"),
+        (4096, "skewed"),
+    ],
+    ids=[
+        "m8192_uniform",
+        "m8192_skewed",
+        "m2048_uniform",
+        "m2048_skewed",
+        "m4096_uniform",
+        "m4096_skewed",
+    ],
 )
 def test_cake_situ_fused_quant_reset_routing_matches_the_production_routing(
     num_tokens,
@@ -1098,44 +1198,48 @@ def test_cake_situ_fused_quant_reset_routing_matches_the_production_routing(
     cake_situ_weights,
     cake_situ_workspace,
 ):
-    # The sm_100a 8192-token route runs seven launches: the quantization fused
-    # with the routing-table reset, then the routing histogram and scatter
-    # kernels that privatize the expert histogram in per-CTA shared memory
-    # (first-toucher flush) and reserve a block of rows per CTA (512 routed
-    # pairs per CTA). Their routing tables, quantized activations, the FC1
-    # scratch of every routed pair and the complete call are compared, in pair
-    # order, with the production route (route_reset, quant, histogram, scatter;
-    # 256 pairs per CTA) run on the same workspace, inputs and stage bindings:
+    # The sm_100a 8192-token route and the sm_103a 2048- and 4096-token routes
+    # run seven launches: the quantization fused with the routing-table reset,
+    # then the routing histogram and scatter kernels that privatize the expert
+    # histogram in per-CTA shared memory (first-toucher flush) and reserve a
+    # block of rows per CTA (512 routed pairs per CTA on the 8192-token route,
+    # 256 on the 2048- and 4096-token routes). Their routing tables, quantized
+    # activations, the FC1 scratch of every routed pair and the complete call
+    # are compared, in pair order, with the production route (route_reset,
+    # quant, histogram, scatter; 256 pairs per CTA) run on the same workspace,
+    # inputs and stage bindings:
     # expert counts, tile tables, quantized activations and the per-pair expert,
     # row set, route map and FC1 output must be bitwise identical, and each
     # call's output must match the reference within the published tolerance.
-    # The two outputs are not compared with each other (the INT8 per-tile FC2
-    # partial's accumulation order depends on tile membership); their largest
-    # absolute difference is recorded.
+    # The two outputs are not compared with each other (the order of the rows
+    # within a tile depends on the routing kernels, and with it the INT8
+    # per-tile FC2 partial's accumulation); their largest absolute difference is
+    # recorded.
     device, weights, workspace = (
         cake_situ_device,
         cake_situ_weights,
         cake_situ_workspace,
     )
     arch = _arch(device)
-    if _expected_selector(arch, num_tokens) != "large_q8i_p512fh2qr":
+    selector = _expected_selector(arch, num_tokens)
+    if selector not in QR_ROUTES:
         pytest.skip(
-            f"{arch} routes {num_tokens} tokens to {_expected_selector(arch, num_tokens)}; "
+            f"{arch} routes {num_tokens} tokens to {selector}; "
             "the fused quant_reset routing programs are not delivered for it"
         )
+    pairs_per_cta, route_keys, quant_reset_key = QR_ROUTES[selector]
     x, ids, route_weights, output, options = _submit_prepared(
         num_tokens, routing, device, weights, workspace
     )
     prepared = _prepared(workspace, num_tokens)
-    assert prepared["selector"] == "large_q8i_p512fh2qr"
+    assert prepared["selector"] == selector
     assert prepared["stages"] == QR_GENERIC_STAGES
     production = {
         stage: cake_situ_program(arch, stage)
         for stage in ("route_reset", "quant", "route_histogram", "route_scatter")
     }
-    for stage, key in (
-        ("route_histogram", "route_histogram:n128_p512f"),
-        ("route_scatter", "route_scatter:n128_p512fh2"),
+    for stage, key in zip(
+        ("route_histogram", "route_scatter"), route_keys, strict=True
     ):
         assert prepared["modules"][stage] == cake_situ_program(arch, key)
         assert prepared["modules"][stage] != production[stage]
@@ -1144,13 +1248,17 @@ def test_cake_situ_fused_quant_reset_routing_matches_the_production_routing(
             == MODULES[production[stage]]["arg_plan"]
         )
     assert prepared["modules"]["quant_reset"] == cake_situ_program(
-        arch, "quant_reset:n128_p512fh2qr"
+        arch, quant_reset_key
     )
     bindings = _cake_situ_stage_bindings(options, prepared)
     total_pairs = prepared["total_pairs"]
     assert total_pairs == num_tokens * TOP_K
     for stage in ("route_histogram", "route_scatter"):
-        assert bindings[stage]["grid"] == ((total_pairs + 511) // 512, 1, 1)
+        assert bindings[stage]["grid"] == (
+            (total_pairs + pairs_per_cta - 1) // pairs_per_cta,
+            1,
+            1,
+        )
         assert bindings[stage]["total_pairs"] == total_pairs
     expected = _trtllm_reference(x, ids, route_weights, weights)
     torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
@@ -1237,8 +1345,8 @@ def _tile_n16_routing_in_pair_order(views, ids):
 
 @pytest.mark.parametrize(
     "num_tokens, routing",
-    [(64, "uniform"), (64, "skewed")],
-    ids=["m64_uniform", "m64_skewed"],
+    [(64, "uniform"), (64, "skewed"), (64, "hot")],
+    ids=["m64_uniform", "m64_skewed", "m64_hot"],
 )
 def test_cake_situ_fused_quant_route_matches_the_two_launch_route(
     num_tokens,
@@ -1280,6 +1388,9 @@ def test_cake_situ_fused_quant_route_matches_the_two_launch_route(
     fused = _tile_n16_routing_in_pair_order(views, ids)
     fused_output = output.clone()
     assert 0 < fused["total_tiles"] <= prepared["max_tiles"]
+    if routing == "hot":
+        # Experts 0..15 receive every token: num_tokens / 16 full tiles each.
+        assert fused["total_tiles"] == TOP_K * num_tokens // 16
     for name in ("intermediate_packed", "intermediate_scales", "x_packed", "x_scales"):
         views[name].zero_()
     views["token_to_permuted"].fill_(-1)

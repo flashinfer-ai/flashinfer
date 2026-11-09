@@ -58,6 +58,10 @@ class Mxfp8Mxfp4Kernel:
         return self.op != _FC2
 
     @property
+    def gathers_input(self):
+        return self.contract.get("moe_mode") == "gather"
+
+    @property
     def activation(self):
         return self.contract["activation"]
 
@@ -80,7 +84,10 @@ class Mxfp8Mxfp4Kernel:
 
 @runtime.cache_discovery
 def discover(
-    root: Path | None = None, *, quantized_output: bool = False
+    root: Path | None = None,
+    *,
+    quantized_output: bool = False,
+    include_gather: bool = False,
 ) -> tuple[Mxfp8Mxfp4Kernel, ...]:
     """Load BF16 grouped kernels or FC1 kernels with fused output quantization."""
     root = runtime.artifact_root("mxfp8_mxfp4") if root is None else Path(root)
@@ -98,7 +105,16 @@ def discover(
         seen.add(identity)
         contract = raw.get("contract", {})
         fused = contract.get("output_dtype") == "float8_e4m3fn"
-        runtime._validate_abi(raw, f"{op}_quantized" if fused else op)
+        gather = contract.get("moe_mode") == "gather"
+        runtime._validate_abi(
+            raw, f"{op}{'_gather' if gather else ''}{'_quantized' if fused else ''}"
+        )
+        if gather and (
+            op == _FC2
+            or raw["arch"] != "sm_107a"
+            or raw.get("launch", {}).get("prefix") != ["token_index"]
+        ):
+            raise RuntimeError(f"invalid GATHER contract: {identity}")
         expected = dict(
             token_dtype="float8_e4m3fn",
             weight_dtype="float4_e2m1fn_x2",
@@ -109,7 +125,7 @@ def discover(
             global_scale_position="gemm_output_before_activation",
             block_size=32,
             scale_layout="F8_128x4",
-            token_scale_layout="segmented_F8_128x4",
+            token_scale_layout="linear" if gather else "segmented_F8_128x4",
             activation=(
                 "identity"
                 if op == _FC2
@@ -152,7 +168,7 @@ def discover(
             raise RuntimeError(
                 "MXFP8 × MXFP4 workspace must be a positive multiple of 128"
             )
-        if fused != quantized_output:
+        if fused != quantized_output or (gather and not include_gather):
             continue
         source, digest = runtime._read_source(root, raw)
         result.append(

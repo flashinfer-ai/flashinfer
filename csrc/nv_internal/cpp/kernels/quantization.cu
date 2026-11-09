@@ -426,7 +426,7 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
       encode_func(&tensor_map, data_type, rank, global_address, gmem_dim, stride_in_bytes, smem_dim,
                   elem_strides, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle_type,
                   CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
+                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Failed to encode TMA tensor map");
   return tensor_map;
 }
@@ -516,6 +516,25 @@ template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization
 
+// The TMA kernel's work items are (batch, row tile) pairs over the rows its SF layout pads to.
+template <typename T>
+int64_t tmaWorkTiles(int b, int m, QuantizationSFLayout layout) {
+  constexpr int rowTile = TmaKernelTraits<T>::TMA_ROW_TILE;
+  int64_t rowTiles = (computeEffectiveRows(m, layout) + rowTile - 1) / rowTile;
+  return rowTiles * std::max(b, 1);
+}
+
+// Filling and draining the TMA pipeline costs ~2 us more than the vectorized kernel's launch, which
+// its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2). Its
+// grid spans the work tiles, which must also give every SM one.
+template <typename T>
+bool useTmaQuantization(int b, int m, int n, QuantizationSFLayout layout, int multiProcessorCount) {
+  constexpr int64_t kMinTmaInputBytes = 32ll << 20;
+  return m >= 1024 && tmaWorkTiles<T>(b, m, layout) >= multiProcessorCount &&
+         n % TmaKernelTraits<T>::TMA_COL_CHUNK == 0 &&
+         static_cast<int64_t>(b) * m * n * sizeof(T) >= kMinTmaInputBytes;
+}
+
 // Helper function to launch TMA quantization kernel
 template <BlockScaleQuantizationType quantization_type, typename T, int SF_VEC_SIZE>
 void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* SFScale,
@@ -529,16 +548,11 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
   constexpr int TMA_COL_TILE = Traits::TMA_COL_TILE;
   constexpr int NUM_CONSUMER_WARPS = 8;
 
-  // Compute effective rows for swizzled layouts
-  int effectiveRows = computeEffectiveRows(m, layout);
-
   // Grid and block configuration for TMA kernel
   // TMA kernel uses 288 threads: 1 producer warp + 8 consumer warps
   dim3 block(288);
-  // Each block handles (batch, TMA_ROW_TILE rows) work items.
-  int numRowTiles = (effectiveRows + TMA_ROW_TILE - 1) / TMA_ROW_TILE;
-  int64_t numWorkTiles = static_cast<int64_t>(numRowTiles) * std::max(b, 1);
-  dim3 grid(static_cast<unsigned>(std::min<int64_t>(numWorkTiles, multiProcessorCount * 2)));
+  dim3 grid(static_cast<unsigned>(
+      std::min<int64_t>(tmaWorkTiles<T>(b, m, layout), multiProcessorCount * 2)));
 
   // Dynamic shared memory size
   size_t smem_size = get_tma_smem_size<T>();
@@ -612,11 +626,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   // recipe was always silently ignored there. Python rejects an explicit one.
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-    // Use TMA kernel for large m (high throughput mode)
-    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
+    // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
-      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (useTmaQuantization<T>(b, m, n, layout, multiProcessorCount)) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, false, inverse_scale, false, NVFP44Over6ErrMode::MAE,
@@ -624,7 +636,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         return;
       }
     }
-    // Original non-TMA path for small m or SF_VEC_SIZE != 16
+    // Original non-TMA path for small inputs or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 16 values.
     dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
@@ -650,11 +662,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   } else
 #endif
   {
-    // Use TMA kernel for large m (high throughput mode)
-    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
+    // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
-      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (useTmaQuantization<T>(b, m, n, layout, multiProcessorCount)) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, recipe.use4Over6, inverse_scale,
@@ -663,7 +673,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         return;
       }
     }
-    // Original non-TMA path for small m or SF_VEC_SIZE != 16
+    // Original non-TMA path for small inputs or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 8 values.
     // MXFP4 two-load path: block = half a row of vectors.

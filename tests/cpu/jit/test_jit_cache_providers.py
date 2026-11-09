@@ -492,19 +492,33 @@ test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
 
 
 def _write_test_sccache_fakes(
-    tmp_path, sccache_version, *, serve_archive=False, start_server_fails=False
+    tmp_path,
+    sccache_version,
+    *,
+    serve_archive=False,
+    start_server_fails=False,
+    zero_stats_fails=False,
+    stop_server_status=0,
 ):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     sccache_log = tmp_path / "sccache.log"
     sccache = fake_bin / "sccache"
-    start_server_status = 1 if start_server_fails else 0
+    start_server_status = 23 if start_server_fails else 0
+    zero_stats_status = 24 if zero_stats_fails else 0
+    daemon_marker = tmp_path / "daemon-running"
     sccache.write_text(
         "#!/bin/bash\n"
         f'echo "$*" >> "{sccache_log}"\n'
         f'if [ "$1" = --version ]; then echo "sccache {sccache_version}"; fi\n'
         'if [ "$1" = --show-stats ]; then echo "Cache hits 1"; fi\n'
-        f'if [ "$1" = --start-server ]; then exit {start_server_status}; fi\n'
+        # Model a daemon created before startup reports failure.
+        f'if [ "$1" = --start-server ]; then touch "{daemon_marker}"; exit {start_server_status}; fi\n'
+        f'if [ "$1" = --zero-stats ]; then exit {zero_stats_status}; fi\n'
+        'if [ "$1" = --stop-server ]; then\n'
+        f'  if [ {stop_server_status} -eq 0 ]; then rm -f "{daemon_marker}"; fi\n'
+        f"  exit {stop_server_status}\n"
+        "fi\n"
     )
     # Downloads fail by default so a version mismatch takes the fail-open path
     # offline. serve_archive instead "downloads" an archive whose published
@@ -542,6 +556,8 @@ def _write_test_sccache_fakes(
         "#!/bin/bash\n"
         'echo "nvcc_launcher=${FLASHINFER_NVCC_LAUNCHER:-}"\n'
         'echo "cxx_launcher=${FLASHINFER_CXX_LAUNCHER:-}"\n'
+        'echo "active=${FLASHINFER_SCCACHE_ACTIVE:-}"\n'
+        'echo "stats_collected=${FLASHINFER_SCCACHE_STATS_COLLECTED:-}"\n'
         'echo "prefix=${SCCACHE_S3_KEY_PREFIX:-}"\n'
         'echo "basedirs=${SCCACHE_BASEDIRS:-}"\n'
         'echo "args=$*"\n'
@@ -554,6 +570,11 @@ def _write_test_sccache_fakes(
         "CUDA_HOME": str(tmp_path / "cuda"),
         "FLASHINFER_WORKSPACE_BASE": str(tmp_path / "home"),
         "SCCACHE_STATS_DIR": str(tmp_path / "stats"),
+        # Every path must handle runtime state inherited from an outer lane.
+        "FLASHINFER_NVCC_LAUNCHER": "inherited-launcher",
+        "FLASHINFER_CXX_LAUNCHER": "inherited-launcher",
+        "FLASHINFER_SCCACHE_ACTIVE": "true",
+        "FLASHINFER_SCCACHE_STATS_COLLECTED": "true",
     }
     return child, sccache_log, tar_log, env
 
@@ -576,6 +597,8 @@ def _assert_ran_uncached(result):
     assert "running without the compiler cache" in result.stdout
     assert "nvcc_launcher=\n" in result.stdout
     assert "cxx_launcher=\n" in result.stdout
+    assert "active=\n" in result.stdout
+    assert "stats_collected=\n" in result.stdout
     assert "args=--workers-per-gpu 2\n" in result.stdout
 
 
@@ -591,6 +614,8 @@ def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
     )
     assert lines["nvcc_launcher"] == "sccache"
     assert lines["cxx_launcher"] == "sccache"
+    assert lines["active"] == "true"
+    assert lines["stats_collected"] == ""
     assert lines["prefix"] == "cuda129-x86_64"
     jit_root = (tmp_path / "home" / ".cache" / "flashinfer").resolve()
     assert lines["basedirs"] == f"{tmp_path.resolve()}:{jit_root}"
@@ -599,11 +624,14 @@ def test_gpu_lane_sccache_wrapper_enables_cache_and_keeps_exit_code(tmp_path):
     assert "--start-server" in calls
     assert "--stop-server" in calls
     assert (tmp_path / "stats" / "sccache-stats.txt").read_text() == "Cache hits 1\n"
+    assert not (tmp_path / "daemon-running").exists()
 
 
 @pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_fails_open_when_download_fails(tmp_path):
     child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.0.0")
+    env["FLASHINFER_NVCC_LAUNCHER"] = "sccache"
+    env["FLASHINFER_CXX_LAUNCHER"] = "sccache"
 
     result = _run_with_test_sccache(tmp_path, child, env)
 
@@ -628,6 +656,8 @@ def test_gpu_lane_sccache_wrapper_rejects_checksum_mismatch(tmp_path):
 @pytest.mark.cpu_only
 def test_gpu_lane_sccache_wrapper_fails_open_without_nvcc(tmp_path):
     child, sccache_log, _, env = _write_test_sccache_fakes(tmp_path, "0.18.0")
+    env["FLASHINFER_NVCC_LAUNCHER"] = "sccache"
+    env["FLASHINFER_CXX_LAUNCHER"] = "sccache"
     (tmp_path / "cuda" / "bin" / "nvcc").unlink()
 
     result = _run_with_test_sccache(tmp_path, child, env)
@@ -645,8 +675,104 @@ def test_gpu_lane_sccache_wrapper_fails_open_when_server_start_fails(tmp_path):
     result = _run_with_test_sccache(tmp_path, child, env)
 
     _assert_ran_uncached(result)
-    assert "--start-server" in sccache_log.read_text().splitlines()
+    calls = sccache_log.read_text().splitlines()
+    assert [call for call in calls if call != "--version"] == [
+        "--start-server",
+        "--stop-server",
+    ]
+    assert not (tmp_path / "daemon-running").exists()
     assert not (tmp_path / "stats" / "sccache-stats.txt").exists()
+
+
+@pytest.mark.cpu_only
+def test_gpu_lane_sccache_wrapper_fails_open_when_zero_stats_fails(tmp_path):
+    child, sccache_log, _, env = _write_test_sccache_fakes(
+        tmp_path, "0.18.0", zero_stats_fails=True
+    )
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    calls = sccache_log.read_text().splitlines()
+    assert [call for call in calls if call != "--version"] == [
+        "--start-server",
+        "--zero-stats",
+        "--stop-server",
+    ]
+    assert not (tmp_path / "daemon-running").exists()
+    assert not (tmp_path / "stats").exists()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failed_command", ["start-server", "zero-stats"])
+@pytest.mark.parametrize("stop_server_status", [0, 42])
+def test_sccache_setup_failure_preserves_status_and_clears_state(
+    tmp_path, failed_command, stop_server_status
+):
+    _, sccache_log, _, env = _write_test_sccache_fakes(
+        tmp_path,
+        "0.18.0",
+        start_server_fails=failed_command == "start-server",
+        zero_stats_fails=failed_command == "zero-stats",
+        stop_server_status=stop_server_status,
+    )
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    env["SCCACHE_BUCKET"] = "test-bucket"
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+if setup_sccache test-prefix "{tmp_path}"; then
+  exit 99
+else
+  setup_status=$?
+fi
+test -z "${{FLASHINFER_CXX_LAUNCHER+x}}"
+test -z "${{FLASHINFER_NVCC_LAUNCHER+x}}"
+test -z "${{FLASHINFER_SCCACHE_ACTIVE+x}}"
+test -z "${{FLASHINFER_SCCACHE_STATS_COLLECTED+x}}"
+exit "$setup_status"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, capture_output=True, text=True
+    )
+
+    assert result.returncode == (23 if failed_command == "start-server" else 24), (
+        result.stdout + result.stderr
+    )
+    calls = [
+        call for call in sccache_log.read_text().splitlines() if call != "--version"
+    ]
+    expected = ["--start-server"]
+    if failed_command == "zero-stats":
+        expected.append("--zero-stats")
+    assert calls == [*expected, "--stop-server"]
+    assert ("WARNING: Failed to stop sccache" in result.stderr) == bool(
+        stop_server_status
+    )
+    assert (tmp_path / "daemon-running").exists() == bool(stop_server_status)
+    assert not (tmp_path / "stats").exists()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failed_command", ["start-server", "zero-stats"])
+def test_gpu_lane_sccache_wrapper_fails_open_when_cleanup_fails(
+    tmp_path, failed_command
+):
+    child, _, _, env = _write_test_sccache_fakes(
+        tmp_path,
+        "0.18.0",
+        start_server_fails=failed_command == "start-server",
+        zero_stats_fails=failed_command == "zero-stats",
+        stop_server_status=42,
+    )
+
+    result = _run_with_test_sccache(tmp_path, child, env)
+
+    _assert_ran_uncached(result)
+    assert "WARNING: Failed to stop sccache" in result.stderr
+    assert not (tmp_path / "stats").exists()
 
 
 @pytest.mark.cpu_only
@@ -1083,3 +1209,137 @@ def test_get_aot_path_prefers_bundled_package_module(monkeypatch, tmp_path):
     )
 
     assert jit_env.get_aot_path("attention_module") == expected
+
+
+def _run_bounded_parallel(
+    tmp_path, concurrency, items, fail_item=None, ok_delay=0.3, launch_delay=False
+):
+    """Run the pool with a fake build that logs start/end and sleeps briefly."""
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    log = tmp_path / "events.log"
+    script = f"""
+set -eo pipefail
+source "{common_script}"
+# Time passes before each launch decision, as it does while a pool of long
+# builds runs: wait until the first item has exited, so one that fails at once
+# is already finished when the next launch is decided.
+eval "$(declare -f _reap_finished_items | sed '1s/_reap_finished_items/_reap_items_now/')"
+_reap_finished_items() {{
+  if {str(launch_delay).lower()} && (( ${{#pids[@]}} > 0 )); then
+    while kill -0 "${{pids[0]}}" 2>/dev/null; do sleep 0.01; done
+  fi
+  _reap_items_now
+}}
+fake_build() {{
+  echo "start $1" >> "{log}"
+  if [ "$1" = "{fail_item}" ]; then return 1; fi
+  sleep {ok_delay}
+  echo "end $1" >> "{log}"
+}}
+if run_bounded_parallel {concurrency} fake_build {" ".join(items)}; then
+  echo ok
+else
+  echo failed
+fi
+"""
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    events = log.read_text().split("\n") if log.exists() else []
+    return result.stdout.strip(), [e for e in events if e]
+
+
+def _bash_supports_wait_n():
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) ))",
+        ]
+    )
+    return result.returncode == 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_limits_and_reuses_slots(tmp_path):
+    status, events = _run_bounded_parallel(tmp_path, 2, ["a", "b", "c", "d"])
+
+    assert status == "ok"
+    assert sorted(e for e in events if e.startswith("end")) == [
+        f"end {x}" for x in "abcd"
+    ]
+    running = peak = 0
+    for event in events:
+        running += 1 if event.startswith("start") else -1
+        peak = max(peak, running)
+    assert peak == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_stops_running_items_when_a_final_item_fails(tmp_path):
+    # Both items start at once, so the failure arrives in the drain phase.
+    status, events = _run_bounded_parallel(
+        tmp_path, 2, ["a", "b"], fail_item="b", ok_delay=3
+    )
+
+    assert status == "failed"
+    assert "end a" not in events
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_reports_failure_and_stops_starting_items(tmp_path):
+    status, events = _run_bounded_parallel(tmp_path, 1, ["a", "b", "c"], fail_item="b")
+
+    assert status == "failed"
+    assert "start c" not in events
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_does_not_start_items_after_a_finished_failure(tmp_path):
+    # The pool never fills, so nothing waits on the item that failed at once:
+    # only a check before each launch can notice it. The delay before each
+    # launch guarantees that item has exited by the next one.
+    status, events = _run_bounded_parallel(
+        tmp_path, 16, ["bad", "ok1", "ok2"], fail_item="bad", launch_delay=True
+    )
+
+    assert status == "failed"
+    assert events == ["start bad"]
+
+
+@pytest.mark.cpu_only
+def test_aot_script_overlaps_providers_in_private_package_copies():
+    text = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "task_test_jit_cache_package_build_import.sh"
+    ).read_text()
+    subprocess.run(
+        [
+            "bash",
+            "-n",
+            str(
+                Path(__file__).resolve().parents[3]
+                / "scripts"
+                / "task_test_jit_cache_package_build_import.sh"
+            ),
+        ],
+        check=True,
+    )
+    assert "run_bounded_parallel" in text
+    # Concurrent builds must not share the package dir `python -m build` writes to.
+    assert 'cp -a flashinfer-jit-cache-provider "${provider_dir}"' in text
+    # Reports are registered in the parent shell, not lost in the pool's subshells.
+    registration = text.split("PROVIDER_BUILD_STARTED_AT")[0]
+    assert "AOT_MEMORY_REPORT_FILES+=" in registration
+    # The loop that registers the reports must walk the providers that get built.
+    assert (
+        'for provider_architecture in "${PROVIDER_ARCHITECTURE_LIST[@]}"; do\n'
+        "    report_label="
+    ) in registration
+    assert "BUILD_ARCHITECTURE_LIST" not in text
+    assert "AOT_PROVIDER_CONCURRENCY > MAX_JOBS" in text

@@ -10,6 +10,7 @@ import contextlib
 import datetime
 import gc
 import importlib
+import inspect
 import math
 import multiprocessing as std_mp
 import os
@@ -1080,6 +1081,75 @@ def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
     comm.close()
 
 
+# ---- constructor: deprecated v0.7.2 ``max_elems`` capacity (#8000) ------------
+
+
+def test_ctor_signature_keeps_both_capacity_keywords():
+    """Source-level check from #8000: needs neither a process group nor a GPU."""
+    params = inspect.signature(UlyssesCommunicator.__init__).parameters
+    assert params["max_bytes"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["max_elems"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["max_bytes"].default is None
+    assert params["max_elems"].default is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_normalize_capacity_converts_elements_with_itemsize(dtype):
+    normalize = UlyssesCommunicator._normalize_capacity
+    assert normalize(None, 1024, dtype) == (1024 * dtype.itemsize, "")
+    assert normalize(4096, None, dtype) == (4096, "")
+
+
+@pytest.mark.parametrize(
+    "max_bytes, max_elems, match",
+    [
+        (None, None, "max_bytes is required"),
+        (2048, 1024, "not both"),
+        (None, 0, "max_elems must be a positive int"),
+        (None, -4, "max_elems must be a positive int"),
+        (None, True, "max_elems must be a positive int"),
+        (None, "big", "max_elems must be a positive int"),
+        (None, 2**31, "max_elems must be at most"),
+    ],
+)
+def test_normalize_capacity_reports_invalid_alias(max_bytes, max_elems, match):
+    _capacity, error = UlyssesCommunicator._normalize_capacity(
+        max_bytes, max_elems, torch.float16
+    )
+    assert match in error
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_ctor_legacy_element_capacity(gloo_pg, monkeypatch, dtype):
+    """A v0.7.2 ``max_elems=`` call still constructs, warns, and sizes the
+    capacity exactly as the old element count in ``dtype`` did."""
+    forbid_ipc_and_jit(monkeypatch)
+    with pytest.warns(DeprecationWarning, match="max_elems.*max_bytes"):
+        comm = UlyssesCommunicator(gloo_pg, max_elems=1024, dtype=dtype, backend="nccl")
+    assert comm.max_bytes == 1024 * dtype.itemsize
+    assert comm.max_elems == 1024  # the v0.7.2 attribute, now derived
+    comm.close()
+
+
+@requires_cuda
+def test_ctor_max_bytes_does_not_warn(gloo_pg, monkeypatch):
+    forbid_ipc_and_jit(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        comm = UlyssesCommunicator(
+            gloo_pg, max_bytes=2048, dtype=torch.float16, backend="nccl"
+        )
+    assert not [
+        w
+        for w in caught
+        if issubclass(w.category, DeprecationWarning) and "max_elems" in str(w.message)
+    ]
+    assert comm.max_bytes == 2048
+    assert comm.max_elems == 1024
+    comm.close()
+
+
 @requires_cuda
 def test_ctor_auto_fallback_never_touches_ipc_jit(gloo_pg, monkeypatch):
     forbid_ipc_and_jit(monkeypatch)
@@ -1114,6 +1184,13 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         (dict(max_bytes="big", dtype=torch.float16), "max_bytes"),
         (dict(max_bytes=True, dtype=torch.float16), "max_bytes"),
         (dict(max_bytes=2**33, dtype=torch.float16), "int32"),
+        (dict(max_elems=0, dtype=torch.float16), "max_elems"),
+        (dict(max_elems=2**31, dtype=torch.float16), "max_elems"),
+        (
+            dict(max_bytes=2048, max_elems=1024, dtype=torch.float16),
+            "not both",
+        ),
+        (dict(dtype=torch.float16), "max_bytes is required"),
         (dict(max_bytes=2048, dtype=torch.int32), "dtype"),
         (dict(max_bytes=2048, dtype="float16"), "dtype"),
         (dict(max_bytes=2048, dtype=torch.float16, device="cpu"), "CUDA device"),
@@ -1447,7 +1524,8 @@ def _worker_main(rank, world_size, rendezvous, body_name, arg, allow_skip, q):
     hardware limitation. Runtime init/JIT/IPC failures always FAIL, except
     that PCIe bodies pre-probe the verbs/mlx5 toolchain and re-raise a missing
     one as UlyssesBackendError so a machine without RDMA headers skips."""
-    body = globals()[body_name]
+    # Lowp tests reuse this runner with a top-level, spawn-safe callable.
+    body = body_name if callable(body_name) else globals()[body_name]
     outcome = None
     try:
         group = _init_pg(
@@ -1545,14 +1623,7 @@ def _destination_passing_body(rank, world_size, group, backend):
     for iteration in range(3):
         torch.manual_seed(1000 + iteration + rank)
         x = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device="cuda")
-        scatter_out = torch.empty(
-            B,
-            S_local * world_size,
-            H // world_size,
-            D,
-            dtype=x.dtype,
-            device=x.device,
-        )
+        scatter_out = comm.allocate_output(x, "scatter_heads")
         returned = comm.scatter_heads(x, out=scatter_out, workspace=workspace)
         ref = _ref_scatter_heads(x, world_size, rank, group)
         torch.cuda.synchronize()
@@ -1561,7 +1632,7 @@ def _destination_passing_body(rank, world_size, group, backend):
 
         torch.manual_seed(2000 + iteration + rank)
         y = torch.randn_like(scatter_out)
-        gather_out = torch.empty_like(x)
+        gather_out = comm.allocate_output(y, "gather_heads")
         returned = comm.gather_heads(y, out=gather_out, workspace=workspace)
         ref = _ref_gather_heads(y, world_size, rank, group)
         torch.cuda.synchronize()

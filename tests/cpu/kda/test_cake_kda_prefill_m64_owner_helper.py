@@ -13,7 +13,10 @@ it and the device holds the cooperative grid ``(tasks, 2 + helpers)`` at once;
 the packet ring and the zeroed ready / consumed words ride in its
 ``final_state`` and ``seq_order`` slots.  A launch the driver refuses as a too
 large cooperative grid switches the plan for good to the pair-share or routed
-program it would otherwise have taken.
+program it would otherwise have taken.  A rule row of one helper takes the
+module's hybrid build (``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES``, grid
+``(tasks, 3)``) for an equal-length launch the pair-share rule takes, and
+nothing else.
 
 The device queries are stubbed (SM100a / SM103a, 148 or 152 SMs, the
 cooperative and cluster capacities), the tensors live on the meta device and
@@ -37,6 +40,7 @@ HEAD_DIM = 128
 NAME = "compiled_bf16_fused_m64"
 M64_BODY = {"state_dtype_is_fp32": True, "active_beta_f32": False}
 OWNER_HELPER = "cake_kda_prefill_00000000000000000064"
+HYBRID = "cake_kda_prefill_00000000000000000065"
 REFUSED = RuntimeError(
     "kernel_cake_kda_prefill_00000000000000000064: cudaLaunchKernelExC failed: "
     "too many blocks in cooperative launch"
@@ -49,6 +53,10 @@ RULES["sm_103a"] = "M64_OWNER_HELPER_MIN_SEQ_LEN_GB300"
 
 def _m64_module(arch):
     return registry.FACTORIES[arch][NAME][registry._key((), M64_BODY)]
+
+
+# The shipped rule tables, before any test stubs them.
+SHIPPED_RULES = {arch: getattr(runtime, table) for arch, table in RULES.items()}
 
 
 # The loader's pair-share tables, before any test stubs them.
@@ -76,6 +84,13 @@ PAIR_SHARE = {
         (((16, 4096),), 16, 4096, 63, 0),
         (((16, 4096),), 16, 4096, 0, 0),  # the probe failed
         (((16, 4096, 5),), 8, 4096, 148, 3),  # never beyond three
+        (((48, 2048, 1),), 40, 2048, 148, 1),  # a row of one helper
+        (((48, 2048, 1),), 48, 2048, 144, 1),  # 48 x (2 + 1) CTAs at capacity
+        (((48, 2048, 1),), 48, 2048, 143, 0),
+        (((48, 2048, 1),), 48, 2047, 148, 0),
+        (((36, 1024), (48, 2048, 1)), 36, 1024, 148, 2),  # the first row decides
+        (((36, 1024), (48, 2048, 1)), 37, 2048, 148, 1),
+        (((36, 1024), (48, 2048, 1)), 49, 4096, 148, 0),
     ],
 )
 @pytest.mark.parametrize(("arch", "capability", "sm_count"), PARTS, ids=PART_IDS)
@@ -133,8 +148,8 @@ def test_gb300_table_is_the_152_sm_sm103a_part(monkeypatch):
 
 
 def test_rule_tables_ship_the_measured_rows():
-    assert runtime.M64_OWNER_HELPER_MIN_SEQ_LEN == ((36, 1024),)
-    assert runtime.M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 == ((36, 1024),)
+    assert runtime.M64_OWNER_HELPER_MIN_SEQ_LEN == ((36, 1024), (48, 2048, 1))
+    assert runtime.M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 == ((36, 1024), (50, 2048, 1))
 
 
 @pytest.mark.parametrize("arch,sm_count", [("sm_100a", 148), ("sm_103a", 152)])
@@ -149,7 +164,14 @@ def test_shipped_rows_take_long_launches_up_to_36_tasks(monkeypatch, arch, sm_co
     assert count(total_tasks=8, min_seq_len=1024) == 2
     assert count(total_tasks=36, min_seq_len=16384) == 2
     assert count(total_tasks=36, min_seq_len=1023) == 0
-    assert count(total_tasks=37, min_seq_len=4096) == 0
+    # The row of one helper (the hybrid build's): 37 to 48 tasks on B200 and
+    # 37 to 50 on GB300, at 2048 tokens or more.
+    last = 48 if arch == "sm_100a" else 50
+    assert count(total_tasks=37, min_seq_len=4096) == 1
+    assert count(total_tasks=48, min_seq_len=2048) == 1
+    assert count(total_tasks=48, min_seq_len=2047) == 0
+    assert count(total_tasks=last, min_seq_len=2048) == 1
+    assert count(total_tasks=last + 1, min_seq_len=4096) == 0
 
 
 class _Raising(contextlib.AbstractContextManager):
@@ -259,7 +281,7 @@ class _Kernel:
             raise error
 
 
-def _stub_tables(monkeypatch, arch, *, pair_share=True, owner_helper=True):
+def _stub_tables(monkeypatch, arch, *, pair_share=True, owner_helper=True, hybrid=True):
     module = _m64_module(arch)
     monkeypatch.setattr(runtime, "detect_gpu_arch", lambda *args, **kwargs: arch)
     monkeypatch.setattr(registry, "device_arch", lambda *args, **kwargs: arch)
@@ -272,6 +294,11 @@ def _stub_tables(monkeypatch, arch, *, pair_share=True, owner_helper=True):
         registry,
         "_RENDERED_M64_OWNER_HELPER_ROUTES",
         {arch: {module: OWNER_HELPER} if owner_helper else {}},
+    )
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
+        {arch: {module: HYBRID} if hybrid else {}},
     )
     monkeypatch.setattr(registry, "PreparedKernel", _Kernel)
     monkeypatch.setattr(_Kernel, "made", [])
@@ -299,6 +326,31 @@ def test_factory_takes_the_build_only_beside_a_pair_share_build(monkeypatch, arc
     assert not getattr(kept, "m64_owner_helper", False)
     _stub_tables(monkeypatch, arch, owner_helper=False)
     assert runtime._m64_owner_helper_program(NAME, **M64_BODY) is None
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_hybrid_factory_takes_the_build_only_beside_an_owner_helper_build(
+    monkeypatch, arch
+):
+    _stub_tables(monkeypatch, arch)
+    assert runtime._m64_owner_helper_hybrid_program(NAME, **M64_BODY) == HYBRID
+    kernel = runtime._m64_owner_helper_hybrid_factory(NAME, **M64_BODY)
+    assert kernel.name == HYBRID
+    assert kernel.m64_owner_helper and kernel.m64_owner_helper_hybrid
+    # BF16 state has no owner/helper build, so no hybrid build either.
+    other = {**M64_BODY, "state_dtype_is_fp32": False}
+    if registry._key((), other) in registry.FACTORIES[arch][NAME]:
+        assert runtime._m64_owner_helper_hybrid_program(NAME, **other) is None
+    # Without the hybrid build the factory makes the owner/helper build; without
+    # the owner/helper or the pair-share build there is no hybrid build.
+    _stub_tables(monkeypatch, arch, hybrid=False)
+    assert runtime._m64_owner_helper_hybrid_program(NAME, **M64_BODY) is None
+    kept = runtime._m64_owner_helper_hybrid_factory(NAME, **M64_BODY)
+    assert kept.name == OWNER_HELPER and kept.m64_owner_helper
+    assert not getattr(kept, "m64_owner_helper_hybrid", False)
+    for missing in ("owner_helper", "pair_share"):
+        _stub_tables(monkeypatch, arch, **{missing: False})
+        assert runtime._m64_owner_helper_hybrid_program(NAME, **M64_BODY) is None
 
 
 # ------------------------------------------------------------- the plan
@@ -497,6 +549,102 @@ def test_rule_keeps_the_pair_share_or_routed_program(
     module, grid, schedule, _ = plan._m64_owner_helper_fallback
     assert module.name == registry._RENDERED_ROUTES[arch][_m64_module(arch)]
     assert (grid, schedule) == ((32, 1, 1), BASE)
+
+
+B200_ROWS = ((36, 1024), (48, 2048, 1))
+HYBRID_SCHEDULE = BASE + "_owner1helper_hybrid"
+
+
+@pytest.mark.parametrize("rows", [True, False], ids=["checkpoints", "no-checkpoints"])
+def test_one_helper_row_takes_the_hybrid_build(planner, rows):
+    planner.configure("sm_100a", rows=B200_ROWS)
+    plan = _plan([4096] * 4, 12, rows=rows)
+    assert plan.m64_owner_helpers == 1
+    assert plan.module.name == HYBRID and plan.schedule == HYBRID_SCHEDULE
+    assert plan.grid == (48, 3, 1)
+    ring, words = plan.args["final_state"], plan.args["seq_order"]
+    assert ring.dtype == torch.bfloat16 and ring.shape == (48 * 1 * 5 * 16384,)
+    assert words.dtype == torch.int32 and words.shape == (2 * 3 * 5 * 48,)
+    # A refused launch takes the pair-share build the launch would have taken.
+    module, grid, schedule, bindings = plan._m64_owner_helper_fallback
+    pair = registry._RENDERED_PAIR_SHARE_ROUTES["sm_100a"][_m64_module("sm_100a")]
+    assert module.name == pair
+    assert grid == (96, 1, 1) and schedule == BASE + "_pair_share"
+    assert set(bindings) == {"final_state", "seq_order"}
+
+
+@pytest.mark.parametrize(
+    ("lengths", "heads", "values", "schedule"),
+    [
+        ([2048] * 3, 12, {}, BASE + "_owner2helper"),  # 36 tasks: two helpers
+        ([4096], 37, {}, HYBRID_SCHEDULE),  # 37 tasks
+        ([2048] * 4, 12, {}, HYBRID_SCHEDULE),  # 48 tasks at 2048 tokens
+        ([2047] * 4, 12, {}, BASE),  # 2047 tokens: no pair share either
+        ([4096] * 7, 7, {}, BASE),  # 49 tasks: no row, no pair share
+        ([2048, 4096] * 2, 12, {}, BASE + "_pair_share"),  # unequal lengths
+        ([4096] * 4, 12, dict(capacity=143), BASE + "_pair_share"),  # 48 x 3 > 143
+        ([4096] * 4, 12, dict(clusters=47), BASE),  # no pair share: no hybrid
+    ],
+    ids=["36", "37", "48x2048", "2047", "49", "unequal", "capacity", "clusters"],
+)
+def test_hybrid_rule_edges(planner, lengths, heads, values, schedule):
+    planner.configure("sm_100a", rows=B200_ROWS, **values)
+    plan = _plan(lengths, heads)
+    assert plan.schedule == schedule, (lengths, heads, values)
+    assert (plan.module.name == HYBRID) == (schedule == HYBRID_SCHEDULE)
+    helpers = {HYBRID_SCHEDULE: 1, BASE + "_owner2helper": 2}
+    assert plan.m64_owner_helpers == helpers.get(schedule, 0)
+    if schedule == HYBRID_SCHEDULE:
+        assert plan.grid == (len(lengths) * heads, 3, 1)
+
+
+def test_hybrid_rule_without_the_build_keeps_the_pair_share_program(
+    planner, monkeypatch
+):
+    module = planner.configure("sm_100a", rows=B200_ROWS)
+    monkeypatch.setattr(
+        registry, "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES", {"sm_100a": {}}
+    )
+    plan = _plan([4096] * 4, 12)
+    assert plan.m64_owner_helpers == 0 and plan.schedule == BASE + "_pair_share"
+    assert HYBRID not in {kernel.name for kernel in _Kernel.made}
+    assert module in registry._RENDERED_PAIR_SHARE_ROUTES["sm_100a"]
+
+
+@pytest.mark.parametrize(("arch", "capability", "sm_count"), PARTS, ids=PART_IDS)
+def test_shipped_rules_take_the_hybrid_build_on_both_parts(
+    planner, arch, capability, sm_count
+):
+    planner.configure(arch, rows=SHIPPED_RULES[arch], capacity=sm_count)
+    plan = _plan([4096] * 4, 12)
+    assert plan.schedule == HYBRID_SCHEDULE and plan.module.name == HYBRID
+    assert plan.m64_owner_helpers == 1 and plan.grid == (48, 3, 1)
+    # 50 tasks: the GB300 row takes the launch, the B200 table stops at 48.
+    plan = _plan([4096] * 5, 10)
+    if arch == "sm_103a":
+        assert plan.schedule == HYBRID_SCHEDULE and plan.grid == (50, 3, 1)
+    else:
+        assert plan.m64_owner_helpers == 0 and plan.schedule == BASE
+
+
+def test_refused_hybrid_launch_switches_the_plan_to_its_pair_share_program(
+    planner, monkeypatch
+):
+    monkeypatch.setattr(runtime, "_clear_cuda_launch_error", lambda: None)
+    planner.configure("sm_100a", rows=B200_ROWS)
+    plan = _plan([4096] * 4, 12)
+    plan.module.prepare(grid=plan.grid, **plan.args)
+    hybrid, ps = plan.module, plan._m64_owner_helper_fallback[0]
+    assert hybrid.name == HYBRID
+    _Kernel.refuse[HYBRID] = REFUSED
+    plan._launch_in_stream()
+    assert len(hybrid.launches) == 1 and plan.m64_owner_helpers == 0
+    assert plan.module is ps and plan.grid == (96, 1, 1)
+    assert plan.schedule == BASE + "_pair_share"
+    _Kernel.refuse.clear()
+    plan._launch_in_stream()
+    assert len(hybrid.launches) == 1
+    assert [grid for grid, _ in ps.launches] == [(96, 1, 1)] * 2
 
 
 def test_modules_without_a_pair_share_build_never_take_the_build(planner, monkeypatch):

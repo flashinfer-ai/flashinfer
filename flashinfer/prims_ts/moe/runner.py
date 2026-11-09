@@ -69,6 +69,7 @@ from .config_mapper import (
 from .support import (
     is_prims_ts_bf16_supported,
     is_prims_ts_fp8_block_scale_supported,
+    deepseek_fp8_scale_block_size,
     is_prims_ts_fp8_per_tensor_supported,
     is_prims_ts_mxfp4_bf16_supported,
     is_prims_ts_mxfp4_mxfp8_supported,
@@ -2010,6 +2011,21 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             **kwargs,
         )
 
+    def _gemm_hidden_states_scale(
+        self, moe_inputs: MoeRunnerInputs, num_tokens: int
+    ) -> torch.Tensor:
+        """MXFP8 activation scales in the layout the routed FC1 GEMM reads.
+
+        Callers pass the compact TRT-LLM row of ``hidden_size // 32`` UE8M0
+        bytes per token; the GEMM reads ``round_up(hidden_size // 32, 16)``
+        bytes per token. Already padded input is returned unchanged.
+        """
+        return _pad_mxfp8_linear_scale_for_prims(
+            moe_inputs.hidden_states_scale,
+            num_tokens=num_tokens,
+            hidden_size=self.hidden_size,
+        ).view(torch.float8_e4m3fn)
+
     def get_valid_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -2146,7 +2162,9 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
                 common_io_kwargs = dict(
                     hidden_states=hidden_states,
-                    hidden_states_scale=moe_inputs.hidden_states_scale,
+                    hidden_states_scale=self._gemm_hidden_states_scale(
+                        moe_inputs, num_tokens
+                    ),
                     gemm1_weights=kwargs["gemm1_weights"],
                     gemm1_weights_scale=kwargs["gemm1_weights_scale"],
                     gemm1_bias=kwargs.get("gemm1_bias"),
@@ -2296,7 +2314,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         common_io_kwargs = dict(
             hidden_states=hidden_states,
-            hidden_states_scale=moe_inputs.hidden_states_scale,
+            hidden_states_scale=self._gemm_hidden_states_scale(moe_inputs, num_tokens),
             gemm1_weights=kwargs["gemm1_weights"],
             gemm1_weights_scale=kwargs["gemm1_weights_scale"],
             gemm1_bias=kwargs.get("gemm1_bias"),
@@ -3067,6 +3085,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 num_experts=common["num_experts"],
                 weight_layout=common["weight_layout"],
                 enable_pdl=common["enable_pdl"],
+                deepseek_fp8_block_size=deepseek_fp8_scale_block_size(
+                    self.hidden_size, moe_inputs.hidden_states_scale
+                ),
             )
         return map_trtllm_mxfp8_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
 
@@ -3116,6 +3137,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             sm_arch,
             False,
             _gemm_config_flags_cache_key(gemm_config_flags),
+            deepseek_fp8_scale_block_size(
+                self.hidden_size, moe_inputs.hidden_states_scale
+            ),
         )
         if instance_key not in PrimsTsFp8BlockScaleMoERunner.valid_tactics_dict:
             try:
@@ -3315,6 +3339,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 self.intermediate_size,
                 int(self.activation_type),
                 kwargs["enable_pdl"],
+                fc1_cfg.deepseek_fp8_block_size,
             )
 
         fc2_io = build_fp8_block_scale_launch_io(

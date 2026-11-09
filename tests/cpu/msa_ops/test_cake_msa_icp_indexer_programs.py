@@ -51,6 +51,7 @@ import torch
 import flashinfer.msa_ops as msa_ops
 from flashinfer.experimental.cake_msa_icp_indexer import cake_backend as cb
 from flashinfer.experimental.cake_msa_icp_indexer import cake_indexer, cake_jit
+from flashinfer.msa_ops import cake_icp_indexer as msa_icp
 from tests.test_helpers import cake_msa_icp_inputs as ref
 
 FP8 = torch.float8_e4m3fn
@@ -59,7 +60,13 @@ PACKAGE = "flashinfer.experimental.cake_msa_icp_indexer"
 LAYOUTS = tuple((p, w) for p in (128, 256) for w in (2, 4))
 LAYOUT_ROWS = tuple(sorted({p // w for p, w in LAYOUTS}))
 # Roles whose program depends on the local K rows per page (tensor-core scorers).
-LAYOUT_ROLES = ("score", "decode_plane", "decode_topk")
+LAYOUT_ROLES = (
+    "score",
+    "score_topk16",
+    "score_topk16_n256",
+    "decode_plane",
+    "decode_topk",
+)
 REQUIRED_ROLES = (
     "plan",
     "score",
@@ -69,9 +76,13 @@ REQUIRED_ROLES = (
     "merge",
     "merge_legacy",
     "merge_prefill",
+    "merge_tagged",
 )
 # The fused decode chain ships as one unit (DESIGN O-4): both roles or neither.
 FUSED_ROLES = ("decode_topk", "topk16_publish")
+# The fused prefill path (list scorer, list-to-carrier merge) ships as one unit
+# too: both roles or neither.
+FUSED_PREFILL_ROLES = ("score_topk16", "prefill_list_carrier")
 SM_COUNT = 148
 H = 4
 
@@ -333,6 +344,30 @@ def fused_args(
     )
 
 
+def fused_prefill_args(page: int = 128, tp: int = 2, *, device=META) -> dict:
+    """One query chunk of the fused prefill path: the ``score_args`` window
+    (T = 6 tokens, 2 segments, 10 B128 columns) with a list pool of exactly
+    ``prefill_pool_pieces`` pieces and a carrier."""
+    t, batch, columns = 6, 2, 10
+    pieces = cb.prefill_pool_pieces(total_q=t, batch=batch, num_ctas=SM_COUNT)
+    return dict(
+        q=_t((t, H, 128), FP8, device),
+        k=_k(7, page // tp, device=device),
+        block_table=_t(
+            (batch, (columns + page // 128 - 1) // (page // 128)), torch.int32, device
+        ),
+        plan=_plan(total_q=t, batch=batch, columns=columns, device=device),
+        num_valid_pages=_t((t,), torch.int32, device),
+        pool=_t((pieces * cb.PREFILL_PIECE_WORDS * 8,), torch.uint8, device),
+        carrier=_t((H, t, 33), torch.int32, device),
+        rank=tp - 1,
+        tp=tp,
+        compact=page == 256,
+        force_begin_blocks=1,
+        force_end_blocks=2,
+    )
+
+
 def merge_args(
     world: int = 2,
     *,
@@ -361,6 +396,21 @@ def merge_args(
     )
 
 
+def publish_rows(tp: int, *, t: int = 6, device=META) -> dict:
+    """A prefill publish of ``fused_prefill_args``' 6 tokens into slot 1 of
+    every rank's receive rows (``prefill_publish_layout``, capacity ``t``)."""
+    layout = cb.prefill_publish_layout(tp, H // tp, t)
+    return dict(
+        peer_rows=tuple(
+            _t(layout["rows_shape"], torch.int64, device) for _ in range(tp)
+        ),
+        generations=_t(layout["generations_shape"], torch.int32, device),
+        slot=1,
+        t_base=0,
+        capacity=t,
+    )
+
+
 def plan_device_args(batch: int = 3, total_q: int = 300, device=META) -> dict:
     i32 = lambda n: _t((n,), torch.int32, device)  # noqa: E731
     storage = ref.plan_storage(H, total_q, batch)
@@ -385,6 +435,15 @@ def _call(entry: Callable, args: dict) -> None:
     positional = {
         msa_ops.msa_icp_index_score_sharded: ("q", "k", "block_table", "plan"),
         msa_ops.msa_icp_topk_select_prefill: ("scores", "num_valid_pages", "carrier"),
+        msa_ops.msa_icp_prefill_score_select: (
+            "q",
+            "k",
+            "block_table",
+            "plan",
+            "num_valid_pages",
+            "pool",
+            "carrier",
+        ),
         msa_ops.msa_icp_decode_index_score_sharded: (
             "index_q",
             "index_k",
@@ -486,6 +545,20 @@ def test_fused_decode_programs_are_all_or_nothing() -> None:
     )
 
 
+def test_fused_prefill_programs_are_all_or_nothing() -> None:
+    routes = _routes()
+    want = {
+        (role, rows, page, arch)
+        for role in FUSED_PREFILL_ROLES
+        for rows, page in _keys_of(role)
+        for arch in ARCHES
+    }
+    have = {key for key in want if _served(routes, *key) is not None}
+    assert have in (set(), want), (
+        f"partial fused prefill path: missing {sorted(want - have, key=str)}"
+    )
+
+
 def test_route_names_a_missing_program() -> None:
     with pytest.raises(NotImplementedError, match="decode_plane.*48 K rows.*sm_107a"):
         cake_jit.route("decode_plane", 48, "sm_107a")
@@ -498,6 +571,8 @@ def test_records_are_well_formed() -> None:
     vocabulary = _vocabulary()
     grid_kind = {
         "score": ("per_sm",),
+        "score_topk16": ("per_sm",),
+        "score_topk16_n256": ("per_sm",),
         "decode_plane": ("request_splits",),
         "decode_topk": ("request_splits",),
         "select_prefill": ("tokens_per_cta_by_head",),
@@ -506,8 +581,14 @@ def test_records_are_well_formed() -> None:
         "merge": ("tokens_per_cta_by_head",),
         "merge_legacy": ("tokens_per_cta_by_head",),
         "merge_prefill": ("tokens_per_cta_by_head",),
+        "merge_tagged": ("tokens_per_cta_by_head",),
+        "prefill_list_carrier": ("tokens_per_cta_by_head",),
+        "prefill_list_publish": ("tokens_per_cta_by_head",),
+        "merge_prefill_tagged": ("tokens_per_cta_by_head",),
         "plan": cake_jit.GRID_RULES,
     }
+    for role in DEVICE_COUNT_ROLES:
+        grid_kind[role + "_dc"] = grid_kind[role]
     for name, record in cake_jit.MODULES.items():
         assert re.fullmatch(r"[a-z][a-z0-9_]*", name), name
         assert re.fullmatch(rf"{cake_jit.PREFIX}_[0-9a-f]{{20}}", record["library"]), (
@@ -567,7 +648,7 @@ def test_routes_are_unique_and_layout_roles_split_by_rows() -> None:
             assert role in LAYOUT_ROLES and (page, page // rows) in LAYOUTS, name
 
 
-@pytest.mark.parametrize("role", ("score", "decode_plane"))
+@pytest.mark.parametrize("role", ("score", "score_topk16", "decode_plane"))
 def test_sm107a_tensor_core_roles_run_their_own_programs(role: str) -> None:
     """VR200 never runs an sm_100a / sm_103a schedule: each tensor-core program
     serving sm_107a is built for sm_107a alone (fused scorer included when it ships)."""
@@ -682,18 +763,63 @@ def test_package_supersedes_the_top_level_sources() -> None:
         )
 
 
-@pytest.mark.parametrize("arch", ARCHES)
-def test_backend_binds_every_kernel_parameter(monkeypatch, arch: str) -> None:
-    """Drive one valid call per role through the exported registry and check
-    that each launched record receives a value for every kernel parameter."""
-    launches = _intercept(monkeypatch, arch, real_registry=True)
-    vocabulary = _vocabulary()
+DEVICE_COUNT_ROLES = (
+    "select_prefill",
+    "select_publish",
+    "topk16_publish",
+    "merge",
+    "merge_legacy",
+    "merge_prefill",
+    "merge_prefill_tagged",
+)
+_TOKEN_COUNT_ENTRIES = frozenset(
+    (
+        "topk_select_prefill",
+        "topk_select_publish",
+        "decode_score_publish",
+        "merge_candidates",
+    )
+)
+_REAL_CAKE = msa_icp._cake
+
+
+class _WithTokenCount:
+    """The backend with ``token_count`` passed to every entry that takes one."""
+
+    def __init__(self, inner: Any, count: torch.Tensor) -> None:
+        self._inner, self._count = inner, count
+
+    def __getattr__(self, name: str) -> Any:
+        fn = getattr(self._inner, name)
+        if name not in _TOKEN_COUNT_ENTRIES:
+            return fn
+        return lambda *a, **k: fn(*a, token_count=self._count, **k)
+
+
+def _drive_every_role(arch: str) -> None:
+    """One valid call per exported role (every layout, tagged and legacy)."""
     for page, tp in LAYOUTS:
         _call(
             msa_ops.msa_icp_index_score_sharded,
             score_args(page, tp, compact=page == 256),
         )
         _call(msa_ops.msa_icp_decode_index_score_sharded, decode_args(page, tp))
+        if cake_jit.has_role("score_topk16", arch):
+            _call(msa_ops.msa_icp_prefill_score_select, fused_prefill_args(page, tp))
+            # the prefill exchange as a peer publish (the facade's step)
+            cb.prefill_score_select(
+                **{**fused_prefill_args(page, tp), "carrier": None},
+                publish=publish_rows(tp),
+            )
+        if (page, tp) == (256, 2) and cake_jit.has_role("score_topk16_n256", arch):
+            # a long TP2 P256 window takes the two-pages-per-MMA list build
+            saved, cb.N256_MIN_TOKENS = cb.N256_MIN_TOKENS, 1
+            try:
+                _call(
+                    msa_ops.msa_icp_prefill_score_select, fused_prefill_args(page, tp)
+                )
+            finally:
+                cb.N256_MIN_TOKENS = saved
         if cake_jit.has_role("decode_topk", arch):
             for tagged in (False, True):
                 _call(
@@ -707,8 +833,32 @@ def test_backend_binds_every_kernel_parameter(monkeypatch, arch: str) -> None:
             _call(msa_ops.msa_icp_topk_select_publish, publish_args(tp, tagged=tagged))
             _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, tagged=tagged))
         _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, prefill=True))
+        _call(
+            msa_ops.msa_icp_merge_candidates,
+            merge_args(tp, tagged=True, prefill=True),
+        )
         # legacy decode merges of 8+ tokens take the one-token-per-CTA program
         _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, t=9, cap=9))
+        # the facade's tagged decode merge polls first (merge_tagged)
+        cb.merge_candidates(
+            **merge_args(tp, tagged=True), enable_pdl=True, _poll_first=True
+        )
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_backend_binds_every_kernel_parameter(monkeypatch, arch: str) -> None:
+    """Drive one valid call per role through the exported registry and check
+    that each launched record receives a value for every kernel parameter."""
+    launches = _intercept(monkeypatch, arch, real_registry=True)
+    vocabulary = _vocabulary()
+    _drive_every_role(arch)
+    # The device-count programs: the same calls with a device token count.
+    count = torch.empty((1,), dtype=torch.int32, device=META)
+    monkeypatch.setattr(cb, "_token_count", lambda t: "" if t is None else "_dc")
+    monkeypatch.setattr(
+        msa_icp, "_cake", lambda backend: _WithTokenCount(_REAL_CAKE(backend), count)
+    )
+    _drive_every_role(arch)
     launched = {launch.name for launch in launches}
     want = {
         name for name, record in cake_jit.MODULES.items() if arch in record["arches"]
@@ -1235,6 +1385,116 @@ def test_select_prefill_writes_a_carrier_slice(fake) -> None:
     assert len(fake) == 2
 
 
+def test_fused_prefill_rejects_invalid_metadata(fake) -> None:
+    e = msa_ops.msa_icp_prefill_score_select
+    a = fused_prefill_args(128, 2)
+    t = a["q"].shape[0]
+    need = a["pool"].numel()
+    # the pool: uint8, contiguous, a multiple of 8, 16-byte aligned, at least
+    # the plan's pieces
+    _expect_rejected(fake, e, _with(a, pool=_t((need - 8,), torch.uint8)), "pool")
+    _expect_rejected(fake, e, _with(a, pool=_t((need,), torch.int8)), "pool")
+    _expect_rejected(fake, e, _with(a, pool=_t((need // 8,), torch.int64)), "pool")
+    _expect_rejected(fake, e, _with(a, pool=_t((2 * need,), torch.uint8)[::2]), "pool")
+    _expect_rejected(fake, e, _with(a, pool=_t((need + 1,), torch.uint8)), "pool")
+    misaligned = torch.empty(need + 16, dtype=torch.uint8)[8 : 8 + need]
+    _expect_rejected(
+        fake,
+        e,
+        _with(fused_prefill_args(128, 2, device="cpu"), pool=misaligned),
+        "pool",
+    )
+    # P256 lists come from the compact columns only; P128 has no compact form
+    _expect_rejected(
+        fake, e, _with(fused_prefill_args(256, 4), compact=False), "compact"
+    )
+    _expect_rejected(fake, e, _with(a, compact=True), "compact")
+    for fb, fe in ((-1, 0), (0, -1), (9, 8), (17, 0)):
+        _expect_rejected(
+            fake, e, _with(a, force_begin_blocks=fb, force_end_blocks=fe), "forced"
+        )
+    _expect_rejected(
+        fake, e, _with(a, num_valid_pages=_t((t,), torch.int64)), "num_valid_pages"
+    )
+    _expect_rejected(
+        fake, e, _with(a, num_valid_pages=_t((t - 1,), torch.int32)), "num_valid_pages"
+    )
+    _expect_rejected(fake, e, _with(a, carrier=_t((H, t, 32), torch.int32)), "carrier")
+    _expect_rejected(fake, e, _with(a, carrier=_t((t, H, 33), torch.int32)), "carrier")
+    _expect_rejected(
+        fake,
+        e,
+        _with(a, carrier=_strided((H, t, 33), torch.int32, last_stride=2)),
+        "carrier",
+    )
+    _expect_rejected(fake, e, _with(a, q=_t((t + 1, H, 128), FP8)), "plan")
+    _expect_rejected(fake, e, _with(a, q=_t((t, 8, 128), FP8)), "4 index heads")
+    _expect_rejected(fake, e, _with(a, plan="not a plan"))
+    _expect_rejected(fake, e, _with(a, k=_k(7, 48)))
+    _expect_rejected(fake, e, _with(a, tp=3))
+    _expect_rejected(fake, e, _with(a, rank=2))
+    _expect_rejected(
+        fake, e, _with(a, block_table=_t((2, 4), torch.int32)), "block_table"
+    )
+    assert not fake
+
+
+@pytest.mark.parametrize("enable_pdl", (False, True))
+@pytest.mark.parametrize("page,tp", LAYOUTS)
+def test_fused_prefill_launches_scorer_then_list_carrier(
+    fake, page: int, tp: int, enable_pdl: bool
+) -> None:
+    """One call: the list scorer of the layout's rows (one CTA per SM of the
+    plan), then the layout-independent list-to-carrier merge over the
+    carrier slice (4 tokens of one head per CTA).  Both read one argument
+    set: the pool as uint64 keys with 4096-key pieces, the layout scalars of
+    the materialized scorer and the carrier strides of the select."""
+    a = fused_prefill_args(page, tp)
+    t = a["q"].shape[0]
+    send = _t((H, 64, 33), torch.int32)
+    a["carrier"] = send[:, 9 : 9 + t]
+    _call(msa_ops.msa_icp_prefill_score_select, {**a, "enable_pdl": enable_pdl})
+    scorer, merger = fake
+    assert (scorer.role, scorer.rows, merger.role, merger.rows) == (
+        "score_topk16",
+        page // tp,
+        "prefill_list_carrier",
+        None,
+    )
+    assert scorer.enable_pdl == merger.enable_pdl == enable_pdl
+    assert scorer.values == merger.values
+    v = scorer.values
+    pool = v["pool"]
+    assert pool.dtype == torch.uint64 and pool.numel() * 8 == a["pool"].numel()
+    assert _same_storage(pool, a["pool"])
+    assert v["pool_piece_stride"] == cb.PREFILL_PIECE_WORDS == 64 * H * 16
+    assert _fp8_bytes_of(v["q"], a["q"]) and _fp8_bytes_of(v["k"], a["k"])
+    plan = a["plan"]
+    assert (v["num_ctas"], v["batch"], v["total_q"], v["num_heads"]) == (
+        SM_COUNT,
+        plan.batch,
+        t,
+        H,
+    )
+    assert v["work_range"] is plan.packed_work_range
+    assert v["work_info"] is plan.packed_work_info
+    assert v["qo_indptr"] is plan.qo_segment_offsets
+    # the candidate column bound: the plan's columns (compact at P256)
+    cols = (plan.columns + 1) // 2 if page == 256 else plan.columns
+    assert (v["score_cols"], v["compact"], v["rank"], v["page_size"]) == (
+        cols,
+        int(page == 256),
+        tp - 1,
+        page,
+    )
+    assert (v["force_begin"], v["force_end"]) == (1, 2)
+    assert (v["carrier_stride_h"], v["carrier_stride_t"]) == (64 * 33, 33)
+    assert v["carrier"] is a["carrier"] and v["num_valid_pages"] is a["num_valid_pages"]
+    assert v["bt_stride"] == a["block_table"].stride(0)
+    assert scorer.grid_args == {"sm_count": SM_COUNT}
+    assert merger.grid_args == {"tokens": t, "heads": H}
+
+
 def test_decode_scorer_rejects_invalid_metadata(fake) -> None:
     e = msa_ops.msa_icp_decode_index_score_sharded
     a = decode_args(128, 2, dql=2, batch=3)
@@ -1559,8 +1819,12 @@ def test_facade_decode_defaults_to_plane_and_select_publish(
     t = a["index_q"].shape[0]
     bases = comm.tagged_recv_bases if tagged else comm.recv_bases
     plan.decode(*inputs, **kwargs)
-    # T = 8 tokens: a legacy merge takes merge_legacy (one token per CTA)
-    merge_role = "merge" if tagged or t < cb.LEGACY_MERGE_MIN_TOKENS else "merge_legacy"
+    # T = 8 tokens: a legacy merge takes merge_legacy (one token per CTA); a
+    # tagged one the merge that polls first at world 4 and merge at world 2
+    if tagged:
+        merge_role = "merge_tagged" if world == 4 else "merge"
+    else:
+        merge_role = "merge" if t < cb.LEGACY_MERGE_MIN_TOKENS else "merge_legacy"
     assert fake.roles() == ["decode_plane", "select_publish", merge_role]
     plane, publish, merge = fake
     assert all(launch.enable_pdl for launch in fake)
@@ -1631,7 +1895,9 @@ def test_facade_decode_takes_the_fused_chain_by_rule(
             )
         ]
         kwargs = dict(comm=comm, slot=1, tagged=tagged, decode_query_len=4)
-        merge = cb.merge_role(prefill=False, tagged=tagged, num_tokens=t)
+        merge = cb.merge_role(
+            prefill=False, tagged=tagged, num_tokens=t, poll_first=world == 4
+        )
         fake.clear()
         plan.decode(*inputs, scores, output, **kwargs)
         fused = rule is not None and batch >= rule
@@ -1653,6 +1919,122 @@ def test_facade_decode_takes_the_fused_chain_by_rule(
         plan.decode(*inputs, scores, output, **kwargs, pool=a["pool"])
         assert fake.roles() == ["decode_topk", "topk16_publish", merge]
         assert _same_storage(fake[0].values["pool"], a["pool"])
+
+
+def test_fused_prefill_rule_starts_empty(monkeypatch) -> None:
+    """No (architecture, page, world) combination defaults to the fused prefill
+    path until a model-level measurement shows a win; a rule entry needs both
+    fused programs on its architecture."""
+    assert isinstance(cb.FUSED_PREFILL, frozenset) and not cb.FUSED_PREFILL
+    for arch in ARCHES:
+        for page, world in LAYOUTS:
+            assert cb.fused_prefill(arch, page, world) is False, (arch, page, world)
+    monkeypatch.setattr(cb, "FUSED_PREFILL", frozenset({("sm_103a", 128, 4)}))
+    delivered = all(cake_jit.has_role(r, "sm_103a") for r in FUSED_PREFILL_ROLES)
+    assert cb.fused_prefill("sm_103a", 128, 4) is delivered
+    assert cb.fused_prefill("sm_103a", 128, 2) is False
+    assert cb.fused_prefill("sm_100a", 128, 4) is False
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+@pytest.mark.parametrize(("page", "world"), LAYOUTS)
+def test_facade_prefill_takes_the_fused_path_with_a_pool(
+    monkeypatch, page: int, world: int, arch: str
+) -> None:
+    """``prefill_local`` without ``pool`` scores into ``score_scratch`` and
+    selects (score -> select_prefill); with a caller pool it runs the list
+    scorer -> list-to-carrier merge into the same carrier and needs no score
+    scratch (``None``).  The facade allocates no prefill pool (the rule is
+    empty), sizes the caller's from its limits and windows from the plan
+    capacity, and ``prefill_local`` allocates nothing.  No short windows here
+    (an empty short-window table), so every window with a pool is fused."""
+    fake = _intercept(monkeypatch, arch, real_registry=False)
+    monkeypatch.setattr(cb, "SHORT_PREFILL_MAX_TOKENS", {})
+    plan = _decode_facade(page, world, capacity=16)
+    assert plan.prefill_short_tokens == 0 and plan._short_scratch is None
+    assert plan.fused_prefill is False
+    assert plan.prefill_window_tokens() == 256  # min(8192, max_num_batched_tokens)
+    (nbytes,) = plan.prefill_pool_shape()
+    assert nbytes == cb.prefill_pool_bytes(total_q=256, batch=4, device="cuda:0")
+    assert nbytes == (256 // 64 + 4 - 1 + SM_COUNT - 1) * 32 * 1024
+    a = fused_prefill_args(page, world)
+    assert a["rank"] == plan.rank
+    scratch = _t((8, H, 16), torch.float32)
+    args = [a["q"], a["k"], a["block_table"], a["plan"], scratch]
+    args += [a["num_valid_pages"], a["carrier"]]
+    monkeypatch.setattr(cake_indexer, "torch", _NoAllocTorch())
+    plan.prefill_local(*args)
+    assert fake.roles() == ["score", "select_prefill"]
+    assert fake[1].values["carrier"] is a["carrier"]
+    for scratch_arg in (scratch, None):
+        fake.clear()
+        args[4] = scratch_arg
+        plan.prefill_local(*args, pool=a["pool"])
+        assert fake.roles() == ["score_topk16", "prefill_list_carrier"]
+        scorer, merger = fake
+        assert scorer.rows == page // world
+        v = scorer.values
+        assert _same_storage(v["pool"], a["pool"]) and v["carrier"] is a["carrier"]
+        assert (v["rank"], v["compact"]) == (world - 1, int(page == 256))
+        assert (v["force_begin"], v["force_end"]) == (
+            plan.init_blocks,
+            plan.local_blocks,
+        )
+        assert not any(_same_storage(x, scratch) for x in v.values())
+        assert not scorer.enable_pdl and not merger.enable_pdl
+    fake.clear()
+    args[4] = None
+    with pytest.raises(ValueError, match="score_scratch"):
+        plan.prefill_local(*args)
+    assert not fake
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+@pytest.mark.parametrize(("page", "world"), LAYOUTS)
+def test_facade_prefill_short_window_runs_the_score_rows_with_a_pool(
+    monkeypatch, page: int, world: int, arch: str
+) -> None:
+    """With a pool, a window of at most ``prefill_short_tokens`` tokens runs
+    score -> select_prefill into the facade's own score scratch (allocated
+    once at construction: ``[min(table, max_num_batched_tokens), H, pitch]``
+    float32), never the caller's; a longer window runs the fused path.
+    ``prefill_local`` allocates nothing either way."""
+    fake = _intercept(monkeypatch, arch, real_registry=False)
+    plan = _decode_facade(page, world, capacity=16)
+    short = min(cb.SHORT_PREFILL_MAX_TOKENS[(arch, page, world)], 256)
+    assert plan.prefill_short_tokens == short
+    assert tuple(plan._short_scratch.shape) == (short, H, plan.prefill_score_columns)
+    assert plan._short_scratch.dtype == torch.float32
+    a = fused_prefill_args(page, world)
+    t = a["q"].shape[0]
+    assert t <= short
+    caller = _t((8, H, 16), torch.float32)
+    args = [a["q"], a["k"], a["block_table"], a["plan"], None]
+    args += [a["num_valid_pages"], a["carrier"]]
+    monkeypatch.setattr(cake_indexer, "torch", _NoAllocTorch())
+    for scratch_arg in (None, caller):
+        fake.clear()
+        args[4] = scratch_arg
+        plan.prefill_local(*args, pool=a["pool"])
+        assert fake.roles() == ["score", "select_prefill"]
+        scorer, select = fake
+        assert _same_storage(scorer.values["max_score"], plan._short_scratch)
+        assert _same_storage(select.values["scores"], plan._short_scratch)
+        assert select.values["carrier"] is a["carrier"]
+        assert not any(
+            _same_storage(x, a["pool"]) for f in fake for x in f.values.values()
+        )
+        assert not any(
+            _same_storage(x, caller) for f in fake for x in f.values.values()
+        )
+    monkeypatch.setattr(cake_indexer, "torch", torch)
+    monkeypatch.setattr(cb, "SHORT_PREFILL_MAX_TOKENS", {(arch, page, world): t - 1})
+    plan = _decode_facade(page, world, capacity=16)
+    assert plan.prefill_short_tokens == t - 1
+    fake.clear()
+    args[4] = None
+    plan.prefill_local(*args, pool=a["pool"])
+    assert fake.roles() == ["score_topk16", "prefill_list_carrier"]
 
 
 # The per-call tensors and arguments ``decode`` still checks once its comm is
@@ -1831,7 +2213,8 @@ def test_merge_routes_wide_legacy_decode_merges_to_merge_legacy(
     """Prefill carrier merges run the prefill program ``merge_prefill``; legacy
     decode merges of at least 8 tokens run the one-token-per-CTA
     ``merge_legacy`` program; tagged rows and fewer tokens run ``merge`` (4
-    tokens per CTA).  Same launch arguments either way."""
+    tokens per CTA).  Same launch arguments either way.  Only the facade's
+    decode chain (``poll_first``) picks ``merge_tagged`` for tagged rows."""
     assert cb.LEGACY_MERGE_MIN_TOKENS == 8
     world = 2
     a = merge_args(
@@ -1857,6 +2240,13 @@ def test_merge_routes_wide_legacy_decode_merges_to_merge_legacy(
         prefill=mode == "prefill", tagged=mode == "tagged", num_tokens=t
     )
     assert role == want
+    polled = cb.merge_role(
+        prefill=mode == "prefill",
+        tagged=mode == "tagged",
+        num_tokens=t,
+        poll_first=True,
+    )
+    assert polled == ("merge_tagged" if mode == "tagged" else want)
     assert launch.grid_args == {"tokens": t, "heads": H // world}
     assert launch.values["num_tokens"] == t
     assert launch.values["tagged"] == int(mode == "tagged")
@@ -1869,14 +2259,14 @@ def test_merge_programs_launch_one_or_four_tokens_per_cta(
     monkeypatch, arch: str
 ) -> None:
     """With the exported records: ``merge_legacy`` launches (T, hpr) CTAs,
-    ``merge`` and ``merge_prefill`` (ceil(T / 4), hpr)."""
+    ``merge``, ``merge_prefill`` and ``merge_tagged`` (ceil(T / 4), hpr)."""
     fake = _intercept(monkeypatch, arch, real_registry=True)
     rules = {
         name: record["grid_rule"]
         for name, record in cake_jit.MODULES.items()
-        if record["role"] in ("merge", "merge_legacy", "merge_prefill")
+        if record["role"] in ("merge", "merge_legacy", "merge_prefill", "merge_tagged")
     }
-    assert sorted(r["rows"] for r in rules.values()) == [1, 4, 4], rules
+    assert sorted(r["rows"] for r in rules.values()) == [1, 4, 4, 4], rules
     for mode, t, want_x in (
         ("legacy", 9, 9),
         ("legacy", 7, 2),
@@ -1902,7 +2292,10 @@ def test_merge_rejects_invalid_metadata(fake) -> None:
     a = merge_args(2, t=5, cap=8)
     _expect_rejected(fake, e, _with(a, prefill=True, enable_pdl=True), "prefill")
     _expect_rejected(
-        fake, e, _with(merge_args(2, tagged=True), prefill=True), "prefill"
+        fake,
+        e,
+        _with(merge_args(2, tagged=True), prefill=True, enable_pdl=True),
+        "prefill",
     )
     _expect_rejected(
         fake, e, _with(a, recv_slot=_t((2, 2, 8 * 33), torch.int32)), "recv_slot"
@@ -2169,6 +2562,57 @@ def test_decode_pool_bytes() -> None:
         msa_ops.msa_icp_decode_pool_bytes(max_decode_tokens=0)
     with pytest.raises(ValueError, match="4 index heads"):
         msa_ops.msa_icp_decode_pool_bytes(max_decode_tokens=8, num_heads=8)
+
+
+def test_prefill_pool_bytes(monkeypatch) -> None:
+    """One 32 KiB piece (64 query rows x 4 heads x 16 uint64 keys) per
+    (scorer CTA, plan item) cell: ``ceil(T / 64) + batch - 1`` items over
+    ``num_sms`` monotone CTA slices give at most ``items + num_sms - 1``
+    pieces."""
+    monkeypatch.setattr(cake_jit, "sm_count", lambda index: SM_COUNT)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    assert cb.PREFILL_PIECE_WORDS * 8 == 32 * 1024
+    for total_q, batch in ((1, 1), (64, 1), (65, 1), (8192, 1), (8192, 15), (300, 3)):
+        pieces = -(-total_q // 64) + batch - 1 + SM_COUNT - 1
+        assert (
+            cb.prefill_pool_pieces(total_q=total_q, batch=batch, num_ctas=SM_COUNT)
+            == pieces
+        )
+        want = pieces * 32 * 1024
+        assert (
+            msa_ops.msa_icp_prefill_pool_bytes(
+                total_q=total_q, batch=batch, device="cuda:0"
+            )
+            == want
+        ), (total_q, batch)
+    # 8192 query tokens of one segment on 148 SMs: 275 pieces, 8.6 MiB
+    assert (
+        msa_ops.msa_icp_prefill_pool_bytes(total_q=8192, batch=1, device="cuda:0")
+        == 275 * 32768
+    )
+    for bad in (dict(total_q=0, batch=1), dict(total_q=1, batch=0)):
+        with pytest.raises(ValueError):
+            msa_ops.msa_icp_prefill_pool_bytes(device="cuda:0", **bad)
+    with pytest.raises(ValueError, match="4 index heads"):
+        msa_ops.msa_icp_prefill_pool_bytes(
+            total_q=8, batch=1, device="cuda:0", num_heads=8
+        )
+    with pytest.raises(ValueError):
+        cb.prefill_pool_pieces(total_q=8, batch=1, num_ctas=0)
+
+
+@pytest.mark.parametrize("page", (128, 256))
+def test_fused_prefill_windows_follow_the_plan_capacity(page: int) -> None:
+    """The fused path's windows are the plan storage's capacity, whatever the
+    history: ``min(8192, max_num_batched_tokens)``; the materialized path's
+    shrink with the score rows' width."""
+    for mnbt in (1, 128, 4096, 8192, 8193, 16384, 65536):
+        assert cake_indexer.prefill_window_tokens(mnbt) == min(8192, mnbt)
+    for length in (8192, 122880, 204800, 212992):
+        assert cake_indexer.prefill_window_tokens(8192) == 8192
+        assert cake_indexer.prefill_chunk_tokens(length, page, H) <= 8192
+    with pytest.raises(ValueError):
+        cake_indexer.prefill_window_tokens(0)
 
 
 @pytest.mark.parametrize("page,world", LAYOUTS)

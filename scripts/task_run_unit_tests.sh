@@ -8,6 +8,8 @@ UNIT_TEST_RUN_STARTED_SECONDS=${SECONDS}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER="${SCRIPT_DIR}/unit_test_runner.py"
+# shellcheck source=scripts/test_resource_monitor.sh
+source "${SCRIPT_DIR}/test_resource_monitor.sh"
 SUMMARY_PRINTED=false
 CURRENT_PHASE="preflight"
 LAST_ERROR_COMMAND=""
@@ -35,6 +37,7 @@ print_fallback_summary() {
     if [ "$#" -gt 0 ]; then
         shell_status=$1
     fi
+    stop_resource_monitor
     if [ "${SUMMARY_PRINTED}" = "true" ]; then
         return
     fi
@@ -119,12 +122,19 @@ main() {
     TEST_PATH="${runner_settings[1]}"
 
     export JUNIT_DIR SAMPLE_RATE SAMPLE_OFFSET TEST_PATH
+    start_resource_monitor
 
     if [ "$operation" = "plan" ]; then
         echo "🔍 DRY RUN MODE - collecting and writing a deterministic plan only"
     else
         CURRENT_PHASE="dependency-setup"
         echo "📋 DETERMINISTIC SHARD MODE - finalized batches resume automatically"
+
+        # Workflow integration tests need jq; support CI images built before it was added.
+        if ! command -v jq >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y --no-install-recommends jq
+        fi
 
         # nvshmem4py-cu12 pins cuda-python<=12.9. The CI image already carries
         # compatible cuda-python and NVIDIA NVSHMEM libraries, so avoid allowing

@@ -70,7 +70,22 @@ def expert(x, gate, up, down, swiglu_limit=None):
     return hidden @ down.T
 
 
-def reference(
+def reference(global_data, weights, **options):
+    """Autograd reference of one training step, computed with cuBLASLt.
+
+    The cuBLAS 13.1 default path on SM103 returns some BF16/FP16 ``A^T B``
+    weight-gradient products without their last 1-3 rows of the reduction
+    (for example K = 9475); cuBLASLt includes them.
+    """
+    previous = torch.backends.cuda.preferred_blas_library()
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+    try:
+        return _reference(global_data, weights, **options)
+    finally:
+        torch.backends.cuda.preferred_blas_library(previous)
+
+
+def _reference(
     global_data, weights, *, fp32=False, source_counts=None, swiglu_limit=None
 ):
     rank, ep = dist.get_rank(), dist.get_world_size()

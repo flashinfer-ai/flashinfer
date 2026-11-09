@@ -24,15 +24,33 @@ limitations under the License.
 # rendezvous of the receive storage, the prefill exchange) stays with the
 # caller.
 
-from .cake_backend import MSAIcpScorePlan, comm_layout, is_supported
-from .cake_indexer import MSAIcpIndexerPlan
+from .cake_backend import (
+    MSAIcpScorePlan,
+    comm_layout,
+    is_supported,
+    prefill_publish_layout,
+)
+from .cake_indexer import (
+    MSAIcpDecodeStep,
+    MSAIcpGraphStep,
+    MSAIcpIndexerPlan,
+    MSAIcpLayerGraphs,
+    MSAIcpPrefillPublish,
+    MSAIcpPrefillStep,
+)
 from .cake_jit import ARCH_BY_CAPABILITY, ARCHES
 
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
+    "MSAIcpDecodeStep",
+    "MSAIcpGraphStep",
     "MSAIcpIndexerPlan",
+    "MSAIcpLayerGraphs",
+    "MSAIcpPrefillPublish",
+    "MSAIcpPrefillStep",
     "MSAIcpScorePlan",
     "comm_layout",
     "is_supported",
+    "prefill_publish_layout",
 ]
