@@ -52,6 +52,7 @@ Processors
     TopP
     MinP
     Sample
+    sampling_softmax
 
 Types
 -----
