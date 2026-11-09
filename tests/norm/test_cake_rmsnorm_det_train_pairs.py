@@ -51,13 +51,13 @@ SHIPPED_SLABS = (4, 16, 32, 64)
 # (``test_rows_cover_every_backward_window_edge``) and the training shapes.
 ROWS = (
     1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 25, 26, 31, 32, 33, 63, 64, 65, 87, 88, 109, 110, 121, 122, 127, 128, 129, 152, 153,
-    171, 172, 203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 368, 369, 576, 577, 767, 768, 769, 960, 961, 1023,
-    1024, 1025, 1152, 1153, 1216, 1217, 1280, 1281, 1664, 1665, 1680, 1681, 2047, 2048, 2049, 3072, 3073, 4096, 4097,
-    5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968,
-    19969, 20480, 20481, 22528, 22529, 24064, 24065, 24576, 24577, 32768, 32769, 36352, 36353, 40448, 40449, 40960,
-    40961, 42496, 42497, 44032, 44033, 45056, 45057, 48640, 48641, 50176, 50177, 50688, 50689, 51200, 51201, 52736,
-    52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688,
-    114689, 139264, 139265, 720896, 720897, 1179648, 1179649, 1572864, 1572865,
+    171, 172, 203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 368, 369, 384, 385, 512, 513, 576, 577, 767, 768,
+    769, 960, 961, 1023, 1024, 1025, 1152, 1153, 1216, 1217, 1280, 1281, 1664, 1665, 1680, 1681, 2047, 2048, 2049, 3072,
+    3073, 4096, 4097, 5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385,
+    19456, 19457, 19968, 19969, 20480, 20481, 22528, 22529, 24064, 24065, 24576, 24577, 32768, 32769, 36352, 36353,
+    40448, 40449, 40960, 40961, 42496, 42497, 44032, 44033, 45056, 45057, 48640, 48641, 50176, 50177, 50688, 50689,
+    51200, 51201, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921,
+    99840, 99841, 114688, 114689, 139264, 139265, 720896, 720897, 1179648, 1179649, 1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -373,15 +373,17 @@ def test_rows_cover_every_backward_window_edge() -> None:
 # architecture (BF16 and FP32 weight alike).  Above the ring's dw accuracy edge (80896 rows on sm_100a, 99840 on
 # sm_103a) the ring with compensated dw sums runs instead: its lean form ``dcln`` (two rows per iteration with the same
 # arithmetic in the same order), on sm_103a to 720896 rows and the ring itself (``dc``) above; above 1572864 rows its
-# form with hi / lo partial rows (``dchl``).  On sm_100a and sm_103a the lean compensated ring also runs the smallest
-# row counts (to 87 and 1680 rows), where the plain windows' dw drifts with the SM count; sm_107a runs it at every row
-# count to 1572864.
+# form with hi / lo partial rows (``dchl``).  On sm_103a the lean compensated ring also runs the smallest row counts
+# (to 1680 rows), where the plain windows' dw drifts with the SM count; on sm_100a the column-task program ``fcwl``
+# runs them (to 87 rows; one CTA sums each column of dw over every row, so dw does not depend on the SM count);
+# sm_107a runs the lean ring at every row count to 1572864.
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
     "dc": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdf_k_s32_split_pts_cl_td4_cs",
     "dcln": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfln_k_s32_split_pts_cl_td4_cs",
     "dchl": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfhl_k_s32_split_pts_cl_td4_cs",
+    "fcwl": "rmsnorm_train_bwd_atomic_h256_i8r8d1b2_c8_fx_wl_ts_l2evict_last",
 }
 H256_BWD_RING = (
     (2048, 5120, "pd4"),
@@ -390,7 +392,7 @@ H256_BWD_RING = (
 )
 H256_BWD_SPLIT = {
     "sm_100a": (
-        (0, 87, "dcln"),
+        (0, 87, "fcwl"),
         (87, 2048, "a3"),
         *H256_BWD_RING,
         (40960, 80896, "a3"),
@@ -421,8 +423,9 @@ def _program_name(symbol: str) -> str:
 def test_h256_backward_route_runs_the_measured_split(arch: str) -> None:
     """The H = 256 backward windows of ``arch`` are the measured split, each at its
     program's launch bound (four or five CTAs per SM) with the dw reduce of the
-    same window, for the BF16 and the FP32-weight route; both rows of every edge
-    are in ``ROWS`` (so the route test launches each side)."""
+    same window, or the column-task program alone at two CTAs per SM, for the
+    BF16 and the FP32-weight route; both rows of every edge are in ``ROWS`` (so
+    the route test launches each side)."""
     for w_dtype in ("bf16", "f32"):
         suffix = "_w32" if w_dtype == "f32" else ""
         found = loader.program_windows(arch, 256, "bwd", False, w_dtype)
@@ -432,14 +435,20 @@ def test_h256_backward_route_runs_the_measured_split(arch: str) -> None:
         )
         assert tuple(tuple(window) for window in found) == want, (arch, w_dtype)
         for low, high, key in H256_BWD_SPLIT[arch]:
-            owner, companion = loader.selected_modules(
+            selected = loader.selected_modules(
                 arch, 256, "bwd", False, rows=low + 1, w_dtype=w_dtype
             )
-            rule = loader.MODULES[owner]["grid_rule"]
-            cps = 4 if key == "pd4" else 5
+            rule = loader.MODULES[selected[0]]["grid_rule"]
+            if key == "fcwl":
+                (single,) = selected
+                assert loader.MODULES[single]["role"].startswith("bwd_col"), (arch, low)
+                cps = 2
+            else:
+                _owner, companion = selected
+                assert loader.MODULES[companion]["role"] == REDUCE_ROLE
+                cps = 4 if key == "pd4" else 5
             assert rule["ctas_per_sm"] == cps, (arch, low)
             assert rule["launch_bound_ctas_per_sm"] == cps, (arch, low)
-            assert loader.MODULES[companion]["role"] == REDUCE_ROLE
             if high is not None:
                 assert high in ROWS and high + 1 in ROWS, (arch, high)
 
@@ -448,20 +457,22 @@ def test_h256_backward_route_runs_the_measured_split(arch: str) -> None:
 # that replace the BF16 route's windows they tile (``(above, at_most)`` in rows): between 1024 and 6144 rows the packed
 # H = 6144 forward's FP32-weight twin trails its BF16 kernel, a pipelined FP32-weight kernel does not; the packed twin
 # keeps the rows above.  H = 5120 runs a parked or a pipelined FP32-weight kernel above 6144 rows at a grid of its
-# own, and on SM100 up to 640 rows the FP32-weight twin of the trip kernel.  Such a window's record is the twin route's
-# own (this architecture alone, its own grid rule).
+# own, on SM100 between 64 and 640 rows the FP32-weight twin of the trip kernel, and on SM100 and SM103 up to 64 rows
+# the FP32-weight twin of the small-row program.  Such a window's record is the twin route's own (this architecture
+# alone, its own grid rule).
 RECUT_FP32_ROUTES: dict[
     tuple[str, int, str, bool], tuple[tuple[int, int | None], ...]
 ] = {
     ("sm_100a", 6144, "fwd", False): ((1024, 6144), (6144, None)),
     ("sm_103a", 6144, "fwd", False): ((1024, 6144), (6144, None)),
     ("sm_100a", 5120, "fwd", False): (
-        (0, 640),
+        (0, 64),
+        (64, 640),
         (640, 6144),
         (6144, 16384),
         (16384, None),
     ),
-    ("sm_103a", 5120, "fwd", False): ((0, 640), (640, 6144), (6144, None)),
+    ("sm_103a", 5120, "fwd", False): ((0, 64), (64, 640), (640, 6144), (6144, None)),
     # sm_107a: the forward routes W32_ROUTE_OVERRIDES re-cuts there (a window of another twin of the route, the
     # windows between kept by the route's own twin under override records of its program)
     ("sm_107a", 2048, "fwd", False): ((12288, 16384),),
@@ -474,9 +485,14 @@ RECUT_FP32_ROUTES: dict[
     ("sm_107a", 5120, "fwd", False): ((49152, None),),
     # the backward windows where the BF16 route runs a pipelined program that has no FP32-weight build: the
     # FP32-weight route keeps the programs of its earlier windows there, each with the dw reduce of its window
-    ("sm_100a", 2048, "bwd", False): ((288, 1024), (1024, 16384), (16384, 58880)),
-    ("sm_100a", 6144, "bwd", False): ((256, 4096),),
-    ("sm_103a", 6144, "bwd", False): ((20, 4096),),
+    ("sm_100a", 2048, "bwd", False): ((768, 1024), (1024, 16384), (16384, 58880)),
+    ("sm_100a", 6144, "bwd", False): ((384, 4096),),
+    # and T = 1, where the FP32-weight route runs another column-task program than the BF16 route (the twin of the
+    # next window's program on SM100 H = 5120, its earlier column-task program on SM103 H = 4096 and 6144); a re-cut
+    # span takes the BF16 window it splits whole
+    ("sm_100a", 5120, "bwd", False): ((0, 1),),
+    ("sm_103a", 4096, "bwd", False): ((0, 1), (1, 512)),
+    ("sm_103a", 6144, "bwd", False): ((0, 1), (1, 256), (256, 4096)),
 }
 
 
