@@ -7196,18 +7196,26 @@ def test_settle_completes_a_pending_sizing_before_any_read() -> None:
 def _arg_print(values: dict) -> tuple:
     """A launch's logical arguments as comparable values: an int32 / int64 tensor (a plan device table, cached on the
     shared context) by its identity (data pointer), shape, stride and dtype; any other tensor (operands, outputs,
-    tapes, pools, ticket slots: per call) by shape, stride, storage offset and dtype; scalars as they are."""
+    tapes, pools: per call) by shape, stride, storage offset and dtype; a ticket slot (u32, per call) by its
+    128-byte alignment in place of its storage offset, which carries the allocator's skew (``_new_ticket_slots``:
+    the CPU allocator aligns a buffer to 64 bytes only, so the slots start 0 or 16 words into it, call by call);
+    scalars as they are."""
+    slot_bytes = _package("cake_kcp").TICKET_SLOT_BYTES
     out = []
     for k in sorted(values):
         v = values[k]
         if isinstance(v, torch.Tensor):
             ptr = v.data_ptr() if v.dtype in (torch.int32, torch.int64) else None
+            if v.dtype == torch.uint32:
+                offset = ("aligned", v.data_ptr() % slot_bytes)
+            else:
+                offset = v.storage_offset()
             v = (
                 "T",
                 ptr,
                 tuple(v.shape),
                 tuple(v.stride()),
-                v.storage_offset(),
+                offset,
                 str(v.dtype),
             )
         out.append((k, v))
