@@ -385,11 +385,16 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     # LAST_CALL["fwd_multi"] (the first tensor's main program before the exchange's wait on a rank with tokens; the
     # history-row program when the rank receives history rows and the form has two launches) and gives every
     # tensor's y / hist bitwise the one-launch single call's.
-    refs = [
-        conv_kcp.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
-        for x, w in zip(xs, ws, strict=True)
-    ]
-    torch.cuda.synchronize(device)
+    conv_kcp._set_test_knobs({"fwd_main": 0, "fwd_overlap": 0})
+    try:
+        refs = [
+            conv_kcp.cake_causal_conv1d_det_train_kcp_forward(x, w, ctx)
+            for x, w in zip(xs, ws, strict=True)
+        ]
+        torch.cuda.synchronize(device)
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
     fwd_bitwise, fwd_recorded = True, True
     for fwd_main in (0, 1):
         for fwd_overlap in (0, 1):

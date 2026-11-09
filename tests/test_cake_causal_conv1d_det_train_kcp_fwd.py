@@ -25,7 +25,8 @@ exchanges).  Per row of the single-GPU suites:
 - every form (``fwd_main`` x ``fwd_overlap``) on both host paths: the order of the launches and the wait
   (``[main, wait(, kcp_fwd_halo)]`` overlapped, ``[wait, main(, kcp_fwd_halo)]`` waiting; the history-row program
   when the rank receives history rows and the form has two launches), ``LAST_CALL["fwd"]``, and ``y`` / ``hist`` of
-  each of ``REPEATS`` calls into a NaN-filled ``out=`` bitwise those of the shipped one-launch forward;
+  each of ``REPEATS`` calls into a NaN-filled ``out=`` bitwise those of the one-launch forward (knobs ``0`` / ``0``,
+  the reference of every test here, whichever form the architecture ships);
 - the main program alone (the history-row program skipped) is the zero-history forward of the rank's fragments as
   documents of their own and differs from the final ``y`` at most on the rows the history-row program writes;
 - the multi entry with the device's architecture put into or taken out of ``MULTI_FWD_MAIN_ARCHS`` /
@@ -40,14 +41,14 @@ exchanges).  Per row of the single-GPU suites:
 - ``graph="replay"`` of every two-launch form, single and multi entry: ``LAST_CALL`` holds the form on every call,
   bitwise the one-launch forward;
 - at one rank (the package's own exchange: no work object, no recorder) ``fwd_overlap`` 1 takes the waiting form,
-  single entry on both host paths and multi entry, bitwise the shipped forward;
+  single entry on both host paths and multi entry, bitwise the one-launch forward;
 - a checkpoint with a recompute handle: the original forward takes the configured form, the recompute the waiting
   form on the stored pool (no exchange, no wait); bitwise the shipped direct pass;
 - a steady round of every two-launch form (single and multi entry) issues no host-to-device copy, no synchronizing
   operation and no device allocation, bitwise its first round;
 - the single-rank main program is the record ``cake_jit.selected_modules`` picks for the call, on both host paths:
   rows of ``C`` = 2048 and of ``C`` = 256 at 65536 tokens and below, which on sm_107a are the three programs of the
-  route.
+  route, and a row of ``C`` = 640 above every architecture's token floor of the narrow forward's whole tiles.
 """
 
 from __future__ import annotations
@@ -85,10 +86,13 @@ REPEATS = 3
 FORMS = [(0, 0), (1, 0), (0, 1), (1, 1)]
 # The rows of the zero-history fwd route's programs on sm_107a: C = 2048 (the c_band program), C = 256 from 65536
 # tokens (the two-stage program) and below (the route's fallback); on sm_100a and sm_103a the fallback serves all three.
+# C = 640 from 40003 tokens is above every architecture's floor of the whole 40-vector tiles of the narrow forward
+# plan, so the main program's plan names the architecture as the single-rank forward's does.
 ROUTE_ROWS = [
     ("c2048", (5000, 1003), (1, 2, 4997, 1003), 2048),
     ("c256-s66536", (40000, 25536, 1000), (1, 2, 39997, 26536), 256),
     ("c256-s6003", (5000, 1003), (1, 2, 4997, 1003), 256),
+    ("c640-s40003", (30000, 10003), (1, 2, 29997, 10003), 640),
 ]
 
 pytestmark = pytest.mark.skipif(
@@ -102,6 +106,17 @@ def _reset() -> None:
     conv_kcp._set_test_knobs(None)
     conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
     conv_kcp.cake_causal_conv1d_det_train_kcp_graph_cache_clear()
+
+
+def _one_launch(p) -> tuple[torch.Tensor, torch.Tensor]:
+    """``y`` / ``hist`` of the one-launch forward (the ``kcp_fwd`` program with the context's table, after the wait):
+    the reference of every form, whichever form the device's architecture ships."""
+    _reset()
+    conv_kcp._set_test_knobs({"fwd_main": 0, "fwd_overlap": 0})
+    try:
+        return conv_kcp.cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+    finally:
+        _reset()
 
 
 def _want(ctx, *, sr: bool, overlap: bool, n: int = 1) -> list[str]:
@@ -140,10 +155,7 @@ def test_forward_forms_order_and_bits(
 ) -> None:
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    _reset()
-    ref_y, ref_hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
-        p.x_local, p.w, p.ctx
-    )
+    ref_y, ref_hist = _one_launch(p)
     y_global = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
     torch.cuda.synchronize()
     assert torch.equal(_bits(ref_y), _bits(y_global[p.l2g]))
@@ -191,8 +203,7 @@ def test_main_program_alone_is_the_fragments_zero_history_forward(
     the first ``min(3, len)`` rows of the fragments with a history row, the rows the history-row program writes."""
     device = torch.device("cuda")
     p = _problem(lens, cuts, C, device)
-    _reset()
-    ref_y, _ = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+    ref_y, _ = _one_launch(p)
     frag_y = cake_causal_conv1d_det_train_forward(
         p.x_local, p.w, p.ctx.cu_seqlens_local
     )
@@ -299,10 +310,7 @@ def test_single_forward_follows_its_architecture_sets(
     arch = conv_kcp._device_arch(device)
     name, lens, cuts, C = ROWS[0]
     p = _problem(lens, cuts, C, device)
-    _reset()
-    ref_y, ref_hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
-        p.x_local, p.w, p.ctx
-    )
+    ref_y, ref_hist = _one_launch(p)
     torch.cuda.synchronize()
     try:
         _move(monkeypatch, "FWD_MAIN_ARCHS", arch, main_in)
@@ -347,10 +355,7 @@ def test_single_rank_main_counters_are_zero_after_every_call(
     name, lens, cuts, C = ROWS[0]
     p = _problem(lens, cuts, C, device)
     xs, ws = (p.x_local,) * 3, (p.w,) * 3
-    _reset()
-    ref_y, ref_hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
-        p.x_local, p.w, p.ctx
-    )
+    ref_y, ref_hist = _one_launch(p)
     torch.cuda.synchronize()
     buffers: list[torch.Tensor] = []
     forward_work = conv_kcp._forward_work
@@ -410,10 +415,7 @@ def test_two_launch_forward_graph_replay_keeps_the_form(
     name, lens, cuts, C = ROWS[0]
     p = _problem(lens, cuts, C, device)
     xs, ws = (p.x_local,) * 3, (p.w,) * 3
-    _reset()
-    ref_y, ref_hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
-        p.x_local, p.w, p.ctx
-    )
+    ref_y, ref_hist = _one_launch(p)
     torch.cuda.synchronize()
     form = _record(p.ctx, sr=bool(fwd_main), overlap=bool(fwd_overlap))
     try:
@@ -458,10 +460,7 @@ def test_one_rank_forward_takes_the_waiting_form(name, lens, cuts, C, fwd_main) 
     p = _problem(lens, cuts, C, device)
     assert int(p.ctx.world_size) == 1
     xs, ws = (p.x_local,) * 2, (p.w,) * 2
-    _reset()
-    ref_y, ref_hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
-        p.x_local, p.w, p.ctx
-    )
+    ref_y, ref_hist = _one_launch(p)
     torch.cuda.synchronize()
     sr = bool(fwd_main)
     want = {
@@ -629,10 +628,7 @@ def test_single_rank_main_is_the_selected_route_program(
     p = _problem(lens, cuts, C, device)
     S = int(p.x_local.shape[0])
     (expected,) = cake_jit.selected_modules(arch, conv_kcp.FWD_MAIN_ROUTE, C=C, S=S)
-    _reset()
-    ref_y, ref_hist = conv_kcp.cake_causal_conv1d_det_train_kcp_forward(
-        p.x_local, p.w, p.ctx
-    )
+    ref_y, ref_hist = _one_launch(p)
     y_global = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
     torch.cuda.synchronize()
     names: list[str] = []

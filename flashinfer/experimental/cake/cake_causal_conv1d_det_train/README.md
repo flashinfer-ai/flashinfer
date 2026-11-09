@@ -174,11 +174,11 @@ receives history rows.
   `kcp.MULTI_FWD_OVERLAP_ARCHS`.  It overlaps its first tensor only; the other
   tensors run after the wait.
 
-The sets are filled from measurements of each entry against the one-launch
-forward.  In this revision they are empty, so every architecture runs the
-one-launch forward: the `kcp_fwd` program once, after the wait, with the
-context's table.  The exchange, its wait and the collectives are the same in
-every form.
+The sets come from measurements of each entry against the one-launch forward
+(their comment in `kcp.py`).  On every architecture the single call runs the
+single-rank main program after the wait; so does the multi entry on sm_100a
+and sm_103a, and on sm_107a the multi entry overlaps its first tensor.  The
+exchange, its wait and the collectives are the same in every form.
 
 ### Halo exchange
 

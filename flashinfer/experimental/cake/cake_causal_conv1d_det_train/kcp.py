@@ -131,9 +131,10 @@ waiting form launches after the wait: the single-rank main program and the histo
 program).  ``FWD_MAIN_ARCHS`` names the architectures whose forward runs the single-rank main program (else the
 ``kcp_fwd`` program), ``FWD_OVERLAP_ARCHS`` those whose forward overlaps; ``MULTI_FWD_MAIN_ARCHS`` and
 ``MULTI_FWD_OVERLAP_ARCHS`` are the multi entry's, which overlaps its first tensor only (the other tensors take the
-waiting form after the wait).  The sets are filled from measurements; in this revision they are empty, so every
-architecture runs the one-launch forward: the ``kcp_fwd`` program with the context's table, after the wait.  The
-exchange, its wait and the collectives are the same in every form.  The private test knobs ``fwd_main`` and
+waiting form after the wait).  The sets come from measurements against the one-launch forward (their comment): every
+architecture's single call runs the single-rank main program after the wait, and so does the multi entry on sm_100a
+and sm_103a; on sm_107a the multi entry overlaps.  The exchange, its wait and the collectives are the same in every
+form.  The private test knobs ``fwd_main`` and
 ``fwd_overlap`` (``None`` shipped = the architecture sets, ``0`` = off, ``1`` = on) select the forms for the A/B
 record, and ``LAST_CALL["fwd"]`` / ``LAST_CALL["fwd_multi"]`` record the form a call took (:func:`_fwd_record`).
 
@@ -664,13 +665,22 @@ FWD_MAIN_DEFAULT = None
 FWD_OVERLAPS = (None, 0, 1)
 FWD_OVERLAP_DEFAULT = None
 # The architectures whose single call runs the single-rank main program (``FWD_MAIN_ARCHS``) and launches its main
-# program before the exchange's wait (``FWD_OVERLAP_ARCHS``), and the multi entry's (``MULTI_*``).  Each set is
-# filled from the measurements of its entry against the one-launch forward on that architecture; all are empty in
-# this revision, so every architecture launches the ``kcp_fwd`` program once after the wait.
-FWD_MAIN_ARCHS: frozenset[str] = frozenset()
+# program before the exchange's wait (``FWD_OVERLAP_ARCHS``), and the multi entry's (``MULTI_*``).  Each entry takes,
+# per architecture, the form faster than the one-launch forward on every forward, forward + backward and checkpointed
+# step row, the simpler form of a tie (launch-to-launch time with the split backward; CP4, and CP8 on B200; contiguous,
+# zigzag and per-document zigzag layouts; one tensor of C = 10240, three of C = 8192):
+# - the single call waits and runs the single-rank main program on every architecture: forward 1.13-1.15x / 1.08x /
+#   1.08-1.09x, forward + backward 1.05-1.06x / 1.03x / 1.03-1.04x, checkpointed step 1.07-1.09x / 1.04x / 1.04-1.05x
+#   (B200 / GB300 / R200).  Overlapped, its forward gains more, but beside the overlapped backward the contiguous row
+#   loses (forward + backward 0.88-0.89x on B200 and GB300, checkpointed step 0.94-0.96x on all three);
+# - the multi entry waits and runs the single-rank main program on sm_100a and sm_103a (forward 1.08-1.10x /
+#   1.03-1.05x, forward + backward 1.03-1.04x / 1.02x, checkpointed step 1.05-1.06x / 1.02-1.03x; overlapped is up to
+#   1.2% faster again, also on every row, and the tie goes to the waiting form) and overlaps on sm_107a (forward 1.03x,
+#   forward + backward 1.01-1.02x, checkpointed step 1.02x; waiting reads 0.99-1.00x there).
+FWD_MAIN_ARCHS = frozenset(("sm_100a", "sm_103a", "sm_107a"))
 FWD_OVERLAP_ARCHS: frozenset[str] = frozenset()
-MULTI_FWD_MAIN_ARCHS: frozenset[str] = frozenset()
-MULTI_FWD_OVERLAP_ARCHS: frozenset[str] = frozenset()
+MULTI_FWD_MAIN_ARCHS = frozenset(("sm_100a", "sm_103a", "sm_107a"))
+MULTI_FWD_OVERLAP_ARCHS = frozenset(("sm_107a",))
 _TEST_KNOBS: dict[str, Any] = {
     "graph": "off",
     "host_trim": HOST_TRIM_DEFAULT,
@@ -1126,6 +1136,7 @@ def _kcp_forward(
             geometry=record["grid_rule"]["geometry"],
             role=record["role"],
             route=_zero_history.record_route(record, arch),
+            arch=arch,
         )
         grid = _record_launch_grid(record, device_index=device_index, C=C, S=S)
         if scalars["n_ch_tiles"] > grid[0]:
@@ -1256,6 +1267,7 @@ def _fwd_host(
                     geometry=record["grid_rule"]["geometry"],
                     role=record["role"],
                     route=_zero_history.record_route(record, arch),
+                    arch=arch,
                 )
                 grid = _record_launch_grid(record, device_index=device_index, C=C, S=S)
                 if scalars["n_ch_tiles"] > grid[0]:

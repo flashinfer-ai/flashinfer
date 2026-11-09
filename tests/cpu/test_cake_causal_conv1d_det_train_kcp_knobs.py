@@ -169,30 +169,43 @@ def test_bwd_overlap_knob_is_validated() -> None:
 
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 FORMS = ((False, False), (True, False), (False, True), (True, True))
+# The shipped ``_fwd_form(arch, multi=...)`` (single-rank main program, overlapped) of the single call and the multi
+# entry per architecture
+SHIPPED_FWD_FORMS = {
+    "sm_100a": ((True, False), (True, False)),
+    "sm_103a": ((True, False), (True, False)),
+    "sm_107a": ((True, False), (True, True)),
+}
+FWD_SETS = (
+    "FWD_MAIN_ARCHS",
+    "FWD_OVERLAP_ARCHS",
+    "MULTI_FWD_MAIN_ARCHS",
+    "MULTI_FWD_OVERLAP_ARCHS",
+)
 
 
 @pytest.mark.cpu_only
 def test_fwd_form_knobs_are_validated(monkeypatch) -> None:
     """``fwd_main`` / ``fwd_overlap`` (the two-launch forward): private setters validated against ``FWD_MAINS`` /
     ``FWD_OVERLAPS`` (``None`` shipped = the architecture sets, ``0`` = off, ``1`` = on), independent of each other
-    and of the other knobs.  The shipped sets are empty, so ``_fwd_form`` is the one-launch forward ``(False, False)``
-    on every architecture and entry; a ``0`` / ``1`` knob forces its form on every architecture and entry; with the
-    knob ``None`` an architecture added to a set takes that form in that set's entry only."""
+    and of the other knobs.  With the knobs ``None``, ``_fwd_form`` is the shipped form of ``SHIPPED_FWD_FORMS`` (the
+    sets hold exactly its architectures); a ``0`` / ``1`` knob forces its form on every architecture and entry; with
+    every set emptied, an architecture added to one set takes that form in that set's entry only."""
     assert conv_kcp.FWD_MAINS == (None, 0, 1) and conv_kcp.FWD_MAIN_DEFAULT is None
     assert conv_kcp.FWD_OVERLAPS == (None, 0, 1)
     assert conv_kcp.FWD_OVERLAP_DEFAULT is None
-    sets = (
-        "FWD_MAIN_ARCHS",
-        "FWD_OVERLAP_ARCHS",
-        "MULTI_FWD_MAIN_ARCHS",
-        "MULTI_FWD_OVERLAP_ARCHS",
-    )
-    for name in sets:
-        assert getattr(conv_kcp, name) == frozenset(), name
+    for i, name in enumerate(FWD_SETS):
+        # FWD_SETS[i] holds the architectures whose entry (i // 2: single, multi) ships form field i % 2 on
+        multi, field = divmod(i, 2)
+        want = {a for a in ARCHES if SHIPPED_FWD_FORMS[a][multi][field]}
+        assert getattr(conv_kcp, name) == frozenset(want), name
     try:
         for arch in ARCHES:
             for multi in (False, True):
-                assert conv_kcp._fwd_form(arch, multi=multi) == (False, False)
+                assert (
+                    conv_kcp._fwd_form(arch, multi=multi)
+                    == SHIPPED_FWD_FORMS[arch][multi]
+                )
         for main in (0, 1):
             for overlap in (0, 1):
                 knobs = {"fwd_main": main, "fwd_overlap": overlap}
@@ -209,7 +222,10 @@ def test_fwd_form_knobs_are_validated(monkeypatch) -> None:
                             bool(overlap),
                         )
         assert conv_kcp._set_test_knobs({"fwd_overlap": 1})["fwd_main"] is None
-        assert conv_kcp._fwd_form("sm_100a") == (False, True)
+        assert conv_kcp._fwd_form("sm_100a") == (
+            SHIPPED_FWD_FORMS["sm_100a"][0][0],
+            True,
+        )
         for bad in (
             {"fwd_main": 2},
             {"fwd_main": True},
@@ -222,13 +238,16 @@ def test_fwd_form_knobs_are_validated(monkeypatch) -> None:
             with pytest.raises(ValueError):
                 conv_kcp._set_test_knobs(bad)
         conv_kcp._set_test_knobs(None)
-        # an architecture added to one set: that form in that entry only, and a knob of 0 / 1 still forces its form
+        # every set emptied and an architecture added to one: that form in that entry only, and a knob of 0 / 1
+        # still forces its form
         for name, form, multi in (
             ("FWD_MAIN_ARCHS", (True, False), False),
             ("FWD_OVERLAP_ARCHS", (False, True), False),
             ("MULTI_FWD_MAIN_ARCHS", (True, False), True),
             ("MULTI_FWD_OVERLAP_ARCHS", (False, True), True),
         ):
+            for other in FWD_SETS:
+                monkeypatch.setattr(conv_kcp, other, frozenset())
             monkeypatch.setattr(conv_kcp, name, frozenset({"sm_103a"}))
             assert conv_kcp._fwd_form("sm_103a", multi=multi) == form, name
             assert conv_kcp._fwd_form("sm_103a", multi=not multi) == (False, False)
