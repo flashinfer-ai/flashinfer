@@ -70,7 +70,7 @@ REMOVED_PREFIXES = (
 REMOVED_NAMES = ("route_key", "route_modules")
 # The registry's records: library -> (role, architectures, CTA threads, BF16 values per vector, the hidden size the
 # build is for, 0 for any).  On sm_100a and sm_103a a 64-bit library per hidden size: the forward in 256-thread CTAs
-# on sm_100a and 128-thread CTAs on sm_103a, the backward in 512-thread CTAs (480 on sm_100a and 640 on sm_103a at
+# on sm_100a and 128-thread CTAs on sm_103a, the backward in 512-thread CTAs (384 on sm_100a at
 # 4096, 256 on sm_100a at 5120 and 7168), the accumulating backward in 768-thread CTAs.  On sm_107a the hidden-4096
 # forward and writing backward move 256-bit vectors in 128-thread CTAs and the accumulating backward is the L2
 # bulk-reduce library (128-bit vectors, 256-thread CTAs).  The unsuffixed libraries take any hidden size: 128-bit
@@ -107,10 +107,10 @@ RECORDS = {
         4096,
     ),
     "cake_mhc_det_train_head_bwd": ("head_bwd", (*_LW64, "sm_107a"), 256, 16, 0),
-    "cake_mhc_det_train_head_bwd__lw64_t480_h4096": (
+    "cake_mhc_det_train_head_bwd__lw64_t384_h4096": (
         "head_bwd",
         ("sm_100a",),
-        480,
+        384,
         4,
         4096,
     ),
@@ -375,7 +375,7 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
             loader.route_module(arch, role, hidden, 16384)
     with pytest.raises(ValueError, match="is built for hidden 4096, got 5120"):
         loader.vectors_per_token(
-            loader.MODULES["cake_mhc_det_train_head_bwd__lw64_t480_h4096"], 5120
+            loader.MODULES["cake_mhc_det_train_head_bwd__lw64_t384_h4096"], 5120
         )
 
 
