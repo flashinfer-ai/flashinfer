@@ -3269,11 +3269,11 @@ def _cached_bf16(t):
 
 
 def _umma_unavailable_reason(
-    device, T, H, HK, HV, pools_contig, pdl_trigger
+    device, T, H, HK, HV, pools_contig, pdl_trigger, require_legacy=True
 ) -> Optional[str]:
     """None when the UMMA backend can serve this call, else why not (``backend="umma"``
     raises with it; ``"auto"`` falls back to the HMMA kernel)."""
-    if _UMMA is None:
+    if require_legacy and _UMMA is None:
         return "flashinfer.gdn_kernels.gdn_replay_mtp_umma could not be imported"
     if gdn_device_target(device).major != 10:
         return "needs an SM100-class GPU (tcgen05 / TMEM)"
@@ -3622,7 +3622,9 @@ def gated_delta_rule_mtp_ucache_flush(
         _why = (
             "flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 could not be imported"
             if _r64 is None
-            else _umma_unavailable_reason(device, T, H, HK, HV, _pc, pdl_trigger)
+            else _umma_unavailable_reason(
+                device, T, H, HK, HV, _pc, pdl_trigger, require_legacy=False
+            )
         )
         if _why is None and (
             k_cache.dtype != torch.bfloat16

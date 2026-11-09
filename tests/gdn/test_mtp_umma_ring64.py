@@ -482,9 +482,9 @@ def test_padded_rows_untouched():
     for r in (1, 3):
         assert torch.all(out[r] == 7.0), "padded row wrote output"
         for before, after in zip(snap, (pool, kc, uc, gc), strict=False):
-            assert torch.equal(before[r], after[r]) or torch.equal(
-                before[r].nan_to_num(), after[r].nan_to_num()
-            ), "padded row touched pool/rings"
+            assert torch.equal(_bits(before[r]), _bits(after[r])), (
+                "padded row touched pool/rings"
+            )
 
 
 @pytest.mark.parametrize("T", [4, 8])
@@ -1108,6 +1108,14 @@ def test_stochastic_rounding_rejects_bad_seed():
             rand_seed=torch.tensor([1], dtype=torch.int64, device=DEV),
             stochastic_rounding="philox",
             philox_rounds=0,
+        )
+    with pytest.raises(ValueError):
+        _sr_call(
+            case,
+            fm,
+            rand_seed=torch.tensor([1], dtype=torch.int64, device=DEV),
+            stochastic_rounding="philox",
+            philox_rounds=1,
         )
     with pytest.raises(ValueError):
         _sr_call(case, fm, stochastic_rounding="philox")  # philox needs a seed

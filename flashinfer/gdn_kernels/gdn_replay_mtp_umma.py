@@ -1494,8 +1494,8 @@ def gated_delta_rule_mtp_ucache_flush_umma(
         raise NotImplementedError(
             "stochastic rounding needs cvt.rs (sm_100a / sm_103a / sm_107a)"
         )
-    if mode == "philox" and philox_rounds <= 0:
-        raise ValueError(f"philox_rounds must be > 0, got {philox_rounds}")
+    if mode == "philox" and philox_rounds < 2:
+        raise ValueError(f"philox_rounds must be >= 2, got {philox_rounds}")
     sr = {
         "none": "",
         "philox": "philox",
