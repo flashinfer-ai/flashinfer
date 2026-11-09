@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -32,7 +32,25 @@ KV_FORMAT_OF_DTYPE = {
     torch.bfloat16: "bf16",
     torch.float8_e4m3fn: "e4m3",
     torch.float8_e5m2: "e5m2",
+    torch.uint8: "nvfp4",  # FlashInfer's NVFP4 paged KV cache: two e2m1 nibbles per byte, e4m3 block scales in kv_cache_sf
 }
+if hasattr(torch, "float4_e2m1fn_x2"):
+    KV_FORMAT_OF_DTYPE[torch.float4_e2m1fn_x2] = "nvfp4"
+SF_BLOCK = 16  # NVFP4 elements per block scale
+_DUMMY: dict = {}  # per device: the one-element byte tensor the non-NVFP4 kernels receive in the block-scale slots
+
+
+def _dummy(device) -> torch.Tensor:
+    t = _DUMMY.get(device)
+    if t is None:
+        t = _DUMMY[device] = torch.zeros(1, dtype=torch.uint8, device=device)
+    return t
+
+
+def cache_width(D: int, kv_fmt: str) -> int:
+    """The last dimension of a K / V cache tensor of head dim ``D`` in the class's format: ``D`` elements, or ``D / 2`` packed
+    bytes for NVFP4."""
+    return D // 2 if kv_fmt == "nvfp4" else D
 
 
 def kv_format(dtype: torch.dtype) -> str:
@@ -40,7 +58,7 @@ def kv_format(dtype: torch.dtype) -> str:
     fmt = KV_FORMAT_OF_DTYPE.get(dtype)
     if fmt is None:
         raise ValueError(
-            f"a KV cache of dtype {dtype}: the classes take bf16, float8_e4m3fn or float8_e5m2 caches"
+            f"a KV cache of dtype {dtype}: the classes take bf16, float8_e4m3fn, float8_e5m2 or uint8 (NVFP4) caches"
         )
     return fmt
 
@@ -539,11 +557,38 @@ def run_attention(
     ragged: bool = False,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """``k_scale`` / ``v_scale``: the fp8-KV classes' per-tensor scales (Python floats; 1.0 when None), refused for a bf16 cache
-    (the bf16 class has no scale in its chain)."""
+    """``k_scale`` / ``v_scale``: the low-bit-KV classes' per-tensor scales (Python floats; 1.0 when None), refused for a bf16 cache
+    (the bf16 class has no scale in its chain). ``kv_cache_sf``: the NVFP4-KV class's ``(k_sf, v_sf)`` block scales (e4m3 or
+    uint8 bytes of the cache's geometry with ``D / 16`` per row), required by it and refused by the others."""
     total_q, Hq, D = q.shape
     kv_fmt = kv_format(k_cache.dtype)
+    fp4 = kv_fmt == "nvfp4"
+    if fp4:
+        if kv_cache_sf is None or len(kv_cache_sf) != 2:
+            raise ValueError(
+                "an NVFP4 KV cache needs kv_cache_sf=(k_sf, v_sf): the e4m3 block scales, one per 16 elements of the head dim"
+            )
+        k_cache, v_cache = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
+        k_sf, v_sf = (t.view(torch.uint8) for t in kv_cache_sf)
+        for name, sf, cache in (("k_sf", k_sf, k_cache), ("v_sf", v_sf, v_cache)):
+            if (
+                sf.dim() != cache.dim()
+                or tuple(sf.shape[:-1]) != tuple(cache.shape[:-1])
+                or sf.shape[-1] != D // SF_BLOCK
+                or sf.stride(-1) != 1
+            ):
+                raise ValueError(
+                    f"{name} of shape {tuple(sf.shape)} for a cache of shape {tuple(cache.shape)}: the block scales take the "
+                    f"cache's leading dimensions and {D // SF_BLOCK} unit-stride scales per row"
+                )
+    elif kv_cache_sf is not None:
+        raise ValueError(
+            "kv_cache_sf with a bf16 or fp8 KV cache: only the NVFP4-KV class takes block scales"
+        )
+    else:
+        k_sf = v_sf = None
     if v_cache.dtype != k_cache.dtype:
         raise ValueError(
             f"K and V caches of different dtypes ({k_cache.dtype}, {v_cache.dtype}): one class per cache format"
@@ -570,14 +615,15 @@ def run_attention(
         raise ValueError(
             f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
         )
+    W = cache_width(D, kv_fmt)  # the cache row: D elements, or D / 2 packed bytes
     if ragged:
-        # Packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND.
+        # Packed K / V: (total_kv, Hkv, W) under NHD, (Hkv, total_kv, W) under HND.
         Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
         for cache in (k_cache, v_cache):
             assert (
-                cache.shape[1:] == (Hkv, D)
+                cache.shape[1:] == (Hkv, W)
                 if kv_layout == "NHD"
-                else cache.shape[0] == Hkv and cache.shape[2] == D
+                else cache.shape[0] == Hkv and cache.shape[2] == W
             ), cache.shape
     else:
         page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
@@ -588,7 +634,7 @@ def run_attention(
         Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
         for cache in (k_cache, v_cache):
             assert cache.shape[1:] == (
-                (page, Hkv, D) if kv_layout == "NHD" else (Hkv, page, D)
+                (page, Hkv, W) if kv_layout == "NHD" else (Hkv, page, W)
             ), cache.shape
     if planned.total_q is not None and int(total_q) != planned.total_q:
         raise ValueError(
@@ -646,6 +692,8 @@ def run_attention(
         ragged,
         kv_fmt,
         vs,
+        k_sf,
+        v_sf,
     )
 
 
@@ -664,29 +712,45 @@ def _run_attention_validated(
     ragged: bool,
     kv_fmt: str = "bf16",
     vs: float = 1.0,
+    k_sf: Optional[torch.Tensor] = None,
+    v_sf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale (the key scale inside it for
-    the fp8-KV classes), ``vs`` the binary32 value scale (1.0 for the bf16 class, whose kernels ignore it), ``kv_fmt`` the cache
-    format (``spec.KV_FMTS``): the fp8 caches reach the kernels as byte tensors of the cache's geometry."""
+    the low-bit-KV classes), ``vs`` the binary32 value scale (1.0 for the bf16 class, whose kernels ignore it), ``kv_fmt`` the cache
+    format (``spec.KV_FMTS``): the fp8 caches reach the kernels as byte tensors of the cache's geometry, the NVFP4 caches as their
+    packed bytes with the block scales ``k_sf`` / ``v_sf`` (bytes, ``D / 16`` per row)."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
 
     total_q, Hq, D = q.shape
     lowbit = kv_fmt != "bf16"
+    fp4 = kv_fmt == "nvfp4"
     if lowbit:
         k_cache = k_cache.view(torch.uint8)
         v_cache = v_cache.view(torch.uint8)
+    W = cache_width(D, kv_fmt)
+    if fp4:
+        assert k_sf is not None and v_sf is not None
+        k_sf, v_sf = k_sf.view(torch.uint8), v_sf.view(torch.uint8)
+    else:
+        k_sf = v_sf = _dummy(q.device)
     if ragged:
         page = TILE_KEYS
         Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
-        kv_k = _kv_view_ragged(k_cache, kv_layout, Hkv, D)
-        kv_v = _kv_view_ragged(v_cache, kv_layout, Hkv, D)
+        kv_k = _kv_view_ragged(k_cache, kv_layout, Hkv, W)
+        kv_v = _kv_view_ragged(v_cache, kv_layout, Hkv, W)
+        if fp4:
+            k_sf = _kv_view_ragged(k_sf, kv_layout, Hkv, D // SF_BLOCK)
+            v_sf = _kv_view_ragged(v_sf, kv_layout, Hkv, D // SF_BLOCK)
     else:
         page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
         Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
-        kv_k = _kv_view(k_cache, kv_layout, Hkv, page, D)
-        kv_v = _kv_view(v_cache, kv_layout, Hkv, page, D)
+        kv_k = _kv_view(k_cache, kv_layout, Hkv, page, W)
+        kv_v = _kv_view(v_cache, kv_layout, Hkv, page, W)
+        if fp4:
+            k_sf = _kv_view(k_sf, kv_layout, Hkv, page, D // SF_BLOCK)
+            v_sf = _kv_view(v_sf, kv_layout, Hkv, page, D // SF_BLOCK)
     g = Hq // Hkv
     plan = planned.plan
     if total_q == 0 or plan.num_units == 0:
@@ -766,6 +830,8 @@ def _run_attention_validated(
             q_view,
             kv_k,
             kv_v,
+            k_sf,
+            v_sf,
             o_view,
             planned.ws,
             planned.scratch,
@@ -816,9 +882,10 @@ def attention_paged(
     workspace: Optional[torch.Tensor] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned); an fp8 cache runs the fp8-KV class
-    of its dtype with the per-tensor ``k_scale`` / ``v_scale``."""
+    of its dtype with the per-tensor ``k_scale`` / ``v_scale``, a uint8 (NVFP4) cache the NVFP4-KV class with its ``kv_cache_sf``."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -851,4 +918,5 @@ def attention_paged(
         config,
         k_scale=k_scale,
         v_scale=v_scale,
+        kv_cache_sf=kv_cache_sf,
     )
