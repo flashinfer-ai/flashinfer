@@ -1581,9 +1581,12 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
 #: launches and in CUDA graph replays in at least 4 of 5 paired groups of a screen, the output equal to the
 #: deterministic plan's bit for bit, and the same bits on 20 repeats.  The other rows of that screen (``5120 -> 512``
 #: at 16172 and 16231 tokens on 152-SM ``sm_100a`` parts: faster in 3 of 5 groups in graph replays) keep the
-#: deterministic plan.  On 212-SM ``sm_107a`` parts these rows keep the deterministic plan ``kk_n256_ht_cg_pro15``:
-#: ``kk_n128_hen_pro15`` took 1.013 to 1.035 times its time there in every paired group of three runs of this
-#: package's A/B against it, eager and in CUDA graph replays.
+#: deterministic plan.  On 212-SM ``sm_107a`` parts ``kk_n128_hen_pro15`` took 1.013 to 1.035 times the time of the
+#: deterministic plan ``kk_n256_ht_cg_pro15`` of these rows in every paired group of three runs of this package's A/B
+#: against it, eager and in CUDA graph replays; there they run ``kk_n192_m256_hen_s5_pro15`` (0.934 to 0.960 times the
+#: time of the deterministic plan, 17 paired groups, eager and graph), and ``5120 -> 32`` / ``48`` / ``64`` and
+#: ``8192 -> 128`` run ``kk_n128_hen_pro15`` instead of the deterministic plan's ``kk_n128_hen_pro7`` (0.979 to 0.989
+#: times its time, 17 of 17 groups, on two R200 parts), at 16172, 16231 and 16384 tokens; the same bits as that plan.
 # fmt: off
 K1_FORWARD_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[int, int, int], Union[dict[str, Any], str]]
@@ -1602,6 +1605,11 @@ K1_FORWARD_RULES_BY_SM: dict[
         (4096, 512, 2048): K1_FORWARD_SINGLE_CTA_KNOBS,
         (5120, 512, 1024): K1_FORWARD_SINGLE_CTA_KNOBS,
         (4096, 512, 16172): "kk_n256_ht_cg_pro15", (5120, 512, 16172): "kk_n256_ht_cg_pro15",
+    },
+    ("sm_107a", 212): {
+        **{(k, n, t): "kk_n128_hen_pro15" for k, n in ((5120, 32), (5120, 48), (5120, 64), (8192, 128))
+           for t in (16172, 16231, 16384)},
+        **{(k, 512, t): "kk_n192_m256_hen_s5_pro15" for k in (4096, 5120) for t in (16172, 16231, 16384)},
     },
 }
 # fmt: on
@@ -2330,11 +2338,13 @@ _SK_FLAG_WORDS = 512
 #: repeats and within the same check.  The BF16 program at 16172 tokens and the FP32 program at 16231 tokens, on two
 #: GB300 nodes: this package's program of the row took 1.018 to 1.047 times their median time in eager launches and in
 #: CUDA graph replays, slower in at most 2 of 15 paired groups on one node and 1 of 7 on the other on every GPU, the
-#: same bits on 20 repeats and within the same check.  The other BF16 and FP32 token counts keep this package's program
-#: on ``sm_103a``: the stream-K program missed that group count there.  On a 212-SM ``sm_107a`` part (106 units) the
-#: BF16 program at ``4096 -> 1024`` and 16172 and 16384 tokens, on two parts: this package's program of the row took
-#: 1.017 to 1.042 times its median time in eager launches and in CUDA graph replays, slower in 0 of 7 paired groups,
-#: the same bits on 20 repeats and within the same check; 16231 tokens keep this package's program.
+#: same bits on 20 repeats and within the same check.  The FP32 program at 16100, 16172 and 16300 tokens, on one GB300
+#: node (four GPUs, 17 paired groups each): the deterministic program the row ran before took 1.030 to 1.070 times its
+#: median time in eager launches and in CUDA graph replays on every GPU.  The other BF16 token counts keep this
+#: package's program on ``sm_103a``: the stream-K program missed that group count there.  On a 212-SM ``sm_107a`` part
+#: (106 units) the BF16 program at ``4096 -> 1024`` and 16172 and 16384 tokens, on two parts: this package's program of
+#: the row took 1.017 to 1.042 times its median time in eager launches and in CUDA graph replays, slower in 0 of 7
+#: paired groups, the same bits on 20 repeats and within the same check; 16231 tokens keep this package's program.
 # fmt: off
 K1_WGRAD_SK_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
     ("sm_100a", 148): {
@@ -2344,7 +2354,8 @@ K1_WGRAD_SK_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], s
     },
     ("sm_103a", 152): {
         (5120, 1024, 16172, "bf16"): _SK_N256_T, (5120, 1024, 16231, "f32"): _SK_N256_F32_T,
-        (5120, 1024, 16384, "f32"): _SK_N256_F32_T,
+        (5120, 1024, 16384, "f32"): _SK_N256_F32_T, (5120, 1024, 16100, "f32"): _SK_N256_F32_T,
+        (5120, 1024, 16172, "f32"): _SK_N256_F32_T, (5120, 1024, 16300, "f32"): _SK_N256_F32_T,
     },
     ("sm_107a", 212): {
         (4096, 1024, 16172, "bf16"): _SK_N256_T, (4096, 1024, 16384, "bf16"): _SK_N256_T,

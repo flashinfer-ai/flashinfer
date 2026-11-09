@@ -6332,6 +6332,9 @@ K1_WGRAD_SK_ROWS = {
         (5120, 1024, 16172, "bf16"): "dense_proj_gemm_sk_nn_n256_t",
         (5120, 1024, 16231, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t",
         (5120, 1024, 16384, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t",
+        (5120, 1024, 16100, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t",
+        (5120, 1024, 16172, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t",
+        (5120, 1024, 16300, "f32"): "dense_proj_gemm_sk_nn_n256_f32_t",
     },
     ("sm_107a", 212): {
         (4096, 1024, 16172, "bf16"): "dense_proj_gemm_sk_nn_n256_t",
@@ -14492,24 +14495,30 @@ def test_k1_dgrad_nvjet_rows_bind_the_nvjet_program(monkeypatch, arch):
 #: The program the rows of :data:`K1_FORWARD_RULES_BY_SM` that name one run per part, and the deterministic plan of
 #: those rows there: ``(arch, sm_count) -> (program, deterministic plan)``.
 K1_FORWARD_NAMED = {
-    ("sm_100a", 148): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
-    ("sm_100a", 152): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
-    ("sm_103a", 152): ("kk_n256_ht_cg_pro15", "kk_n256_pro7"),
+    ("sm_100a", 148): {"kk_n256_ht_cg_pro15": "kk_n256_pro7"},
+    ("sm_100a", 152): {"kk_n256_ht_cg_pro15": "kk_n256_pro7"},
+    ("sm_103a", 152): {"kk_n256_ht_cg_pro15": "kk_n256_pro7"},
+    ("sm_107a", 212): {
+        "kk_n128_hen_pro15": "kk_n128_hen_pro7",
+        "kk_n192_m256_hen_s5_pro15": "kk_n256_ht_cg_pro15",
+    },
 }
 
 
 def test_k1_forward_named_rows_plan_their_program():
     """The rows of :data:`K1_FORWARD_RULES_BY_SM` that name a program (:data:`K1_FORWARD_NAMED`, at the measured
-    token counts of ``4096 -> 512`` and ``5120 -> 512``) plan exactly that program with the knobs that name it, where
-    the deterministic plan of the row is the part's other program of :data:`K1_FORWARD_NAMED`."""
+    token counts of ``4096 -> 512`` and ``5120 -> 512``, and on 212-SM ``sm_107a`` parts of ``5120 -> 32`` / ``48`` /
+    ``64`` and ``8192 -> 128``) plan exactly that program with the knobs that name it, where the deterministic plan of
+    the row is the program :data:`K1_FORWARD_NAMED` pairs with it."""
     named = 0
     bf16 = torch.bfloat16
     for (arch, sms), rows in cake_backend.K1_FORWARD_RULES_BY_SM.items():
         for (K, N, T), value in rows.items():
             if not isinstance(value, str):
                 continue
-            program, plain = K1_FORWARD_NAMED[(arch, sms)]
-            assert value == program and N == 512 and T in K1_SCREEN_TOKENS
+            program, plain = value, K1_FORWARD_NAMED[(arch, sms)][value]
+            assert T in K1_SCREEN_TOKENS, (arch, sms, K, N, T)
+            assert N == 512 or (arch, program) == ("sm_107a", "kk_n128_hen_pro15")
             knobs = cake_backend.k1_forward_knobs(
                 arch=arch, sm_count=sms, K=K, N=N, T=T
             )
@@ -14528,7 +14537,7 @@ def test_k1_forward_named_rows_plan_their_program():
                 default.template,
             )
             named += 1
-    assert named == 8
+    assert named == 26
 
 
 #: The B200 weight-gradient rows of :data:`K1_WGRAD_DET_RULES_BY_SM`: (d_in, d_out) -> program per output dtype.
