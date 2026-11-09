@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 CUDA-graph capture of the Cake four-stream mHC training entry points (hidden
-4096, 5120 and 7168, 4 streams; SM100 / SM103 at the three hidden sizes, SM107
-at 4096).  Every case runs at each hidden size the device's architecture
+4096, 5120 and 7168, 4 streams; SM100 / SM103 / SM107 at the three hidden
+sizes).  Every case runs at each hidden size the device's architecture
 exports (workspaces sized with ``hidden=``); a size it does not export is
 skipped with the reason.
 

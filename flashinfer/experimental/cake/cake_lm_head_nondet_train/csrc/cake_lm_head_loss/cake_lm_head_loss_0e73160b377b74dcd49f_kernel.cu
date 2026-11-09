@@ -639,9 +639,9 @@ kernel_cake_lm_head_loss_0e73160b377b74dcd49f(const __grid_constant__ CUtensorMa
                         }
                     }
                     if (global_row < m_lim) {
-                        unsigned long long st_off = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2;
+                        unsigned long long st_off = ((unsigned long long)global_row * (unsigned long long)(ldc / 256) + (unsigned long long)bid_n_1) * 2ull;
                         STATS_OUT[st_off] = pmax;
-                        STATS_OUT[st_off + 1] = psum;
+                        STATS_OUT[st_off + 1ull] = psum;
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     if (elect_sync()) {

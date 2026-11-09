@@ -134,9 +134,11 @@ def test_public_api_switch_keywords():
 def test_public_api_memory_and_count_keywords(monkeypatch):
     """Both public entries take ``memory_mode`` (default ``None``, no environment variable), ``num_valid_rows``
     (``None``) and ``check_num_valid_rows`` (``False``) as keyword-only arguments and document them; a call with
-    ``memory_mode`` or ``num_valid_rows`` passes all three to the opt-in backend module unchanged, a call with neither
-    calls the default backend entry without them; ``cake_lm_head_det_train_preload`` is experimental and needs a CUDA
-    device."""
+    ``memory_mode`` or ``num_valid_rows`` passes all three to the opt-in backend module unchanged, and so does a call
+    with neither whose ``W`` requires a gradient (with grad mode on its automatic memory form can pick a budget form;
+    with it off its hidden valid-row count is checked against the step's bound); any other call with neither calls
+    the default backend entry without them;
+    ``cake_lm_head_det_train_preload`` is experimental and needs a CUDA device."""
     _clear(monkeypatch)
     for fn in (cake_lm_head_det_train_loss, cake_lm_head_det_train_logprob):
         params = inspect.signature(fn).parameters
@@ -194,6 +196,20 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
             not {"memory_mode", "num_valid_rows", "check_num_valid_rows"}
             & seen[name].keys()
         ), name
+    # neither, with a ``W`` that requires a gradient: the opt-in module's automatic form (memory_mode None), also
+    # without grad mode (a reentrant checkpoint's first pass: its hidden valid-row count is checked there)
+    trained = W.detach().requires_grad_(True)
+    for grad_mode in (True, False):
+        seen.clear()
+        with warnings.catch_warnings(), torch.set_grad_enabled(grad_mode):
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            cake_lm_head_det_train_loss(X, trained, labels, loss_div=1.0)
+            cake_lm_head_det_train_logprob(X, trained, labels)
+        assert set(seen) == {"opt_in_loss", "opt_in_logprob"}, (grad_mode, seen)
+        for name in ("opt_in_loss", "opt_in_logprob"):
+            assert seen[name]["memory_mode"] is None, name
+            assert seen[name]["num_valid_rows"] is None, name
+            assert seen[name]["check_num_valid_rows"] is False, name
     # check_num_valid_rows=True without a count: ValueError before either backend entry runs
     seen.clear()
     with warnings.catch_warnings():
@@ -573,7 +589,8 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
     three-chunk call) and ``FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST=0`` binds the accumulate + flat cast instead of
     the fused cast GEMM (its TMA-store form where :func:`dw_cast_tma_rule` routes the short last chunk); an explicit
     keyword wins over the variable; ``loss`` / ``logp`` / ``dX`` / ``dW`` are bitwise (integer views) the same under
-    every setting."""
+    every setting.  The calls pin ``memory_mode="fast"`` (the default call of this shape takes a budget form, whose
+    stages differ)."""
     _require_program()
     _clear(monkeypatch)
     inp = make_inputs(
@@ -615,6 +632,7 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
                 loss_div=inp.loss_div,
                 chunk_size=4096,
                 return_logp=True,
+                memory_mode="fast",
                 **kw,
             )
         loss.backward()
@@ -653,7 +671,8 @@ def test_device_temperature_through_the_public_entry(monkeypatch):
     """Through the public entry on the generated program: a heterogeneous per-token temperature and a scalar give the
     bits (integer views) of the backend entry with the same argument, ``temperature=1.0`` the bits of the call
     without the keyword (default ``None``); ``cake_lm_head_det_train_preload(temperature=True)`` loads the temperature forms and a call after it
-    gives the same bits."""
+    gives the same bits.  The public calls pin ``memory_mode="fast"``, the backend entry's form (the default call of
+    this shape takes a budget form, tested in ``test_cake_lm_head_det_train.py``)."""
     _require_program()
     _clear(monkeypatch)
     name, _ = cake_backend.record_for(CUDA)
@@ -672,6 +691,8 @@ def test_device_temperature_through_the_public_entry(monkeypatch):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ExperimentalWarning)
             kw.setdefault("backend", "cake")
+            if fn is cake_lm_head_det_train_logprob:
+                kw.setdefault("memory_mode", "fast")
             logp = fn(X, W, inp.labels, chunk_size=4096, **kw)
         logp.backward(inp.dlogp)
         torch.cuda.synchronize()
@@ -709,7 +730,8 @@ def test_device_public_entry_places_the_gradients(monkeypatch):
     """Through the public entry on the generated program, gradient placement ``"auto"`` (the backend default): a call
     under ``torch.no_grad`` launches no dX / dW GEMM and gives the plain call's ``loss`` / ``logp`` bits; a
     non-reentrant checkpointed step launches the plain step's dX / dW GEMMs once and gives its ``loss`` / ``logp`` /
-    ``dX`` / ``dW`` bits."""
+    ``dX`` / ``dW`` bits.  The calls pin ``memory_mode="fast"`` (the default call of this shape takes a budget form;
+    its checkpointed steps are tested in ``test_cake_lm_head_det_train.py``)."""
     _require_program()
     _clear(monkeypatch)
     inp = make_inputs(8700, seed=SEED + 8700, device=CUDA, ignore_frac=0.05)
@@ -743,6 +765,7 @@ def test_device_public_entry_places_the_gradients(monkeypatch):
                 loss_div=inp.loss_div,
                 chunk_size=4096,
                 return_logp=True,
+                memory_mode="fast",
             )
             logps.append(logp)
             return loss
@@ -777,3 +800,64 @@ def test_device_public_entry_places_the_gradients(monkeypatch):
         assert torch.equal(_bits(nograd[key]), _bits(plain[key])), key
     for key in ("loss", "logp", "dX", "dW"):
         assert torch.equal(_bits(ckpt[key]), _bits(plain[key])), key
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_device_public_default_step_peak_within_the_head_bytes(monkeypatch, entry):
+    """Through the public entry on the generated program, the default call (no ``memory_mode``) at flashinfer#7545's
+    shape (H 6144, V 154880, T 16384, a third of the labels ignored, chunk 4096): its training step -- the call that
+    binds and one from the remembered binding, forward through a backward that frees the graph, outputs and gradients
+    included -- peaks within the bytes of a head that materializes the BF16 logits of the valid rows
+    (``2 * T_v * V + 2 * V * H + 2 * T * H``) and gives the bits (integer views) of the explicit fast form."""
+    _require_program()
+    _clear(monkeypatch)
+    name, _ = cake_backend.record_for(CUDA)
+    if cake_backend.LOGPROB_DZ_STAGE not in cake_backend.registered_stages(name):
+        pytest.skip(
+            "the registered program has no dz arm of the logits GEMM (no recompute forms)"
+        )
+    T = 16384
+    inp = make_inputs(T, seed=SEED + 7545, device=CUDA, ignore_frac=0.33)
+    R, H, V = int(inp.valid.sum()), inp.H, inp.V
+    head = 2 * R * V + 2 * V * H + 2 * T * H
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+
+    def step(**kw):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            if entry == "loss":
+                loss, logp = cake_lm_head_det_train_loss(
+                    X,
+                    W,
+                    inp.labels,
+                    objective="ce",
+                    loss_div=inp.loss_div,
+                    chunk_size=4096,
+                    return_logp=True,
+                    **kw,
+                )
+                loss.backward()
+                loss = loss.detach()
+            else:
+                logp = cake_lm_head_det_train_logprob(
+                    X, W, inp.labels, chunk_size=4096, **kw
+                )
+                logp.backward(inp.dlogp)
+                loss = None
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        return dict(loss=loss, logp=logp.detach(), dX=X.grad, dW=W.grad), peak
+
+    fast, _ = step(memory_mode="fast")
+    for _ in range(2):
+        torch.cuda.empty_cache()
+        result, peak = step()
+        for key in keys:
+            assert torch.equal(_bits(result[key]), _bits(fast[key])), key
+        del result
+        assert peak <= head, (peak, head)

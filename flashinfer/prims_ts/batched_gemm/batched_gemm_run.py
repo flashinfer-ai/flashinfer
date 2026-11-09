@@ -552,18 +552,38 @@ def _normalize_early_exit_launch_extent(
     return int(early_exit_max_token_ctas)
 
 
+def _validate_swap_ab_out_hidden(cfg, out_hidden: int) -> None:
+    """Reject swapAB output widths the weight-row tiling cannot serve.
+
+    DeepSeek FP8 predicates a partial last ``tile_m`` tile in the epilogue and
+    zero-fills its rows through the TMA map, so it only needs whole scale row
+    groups: a multiple of 32, the smallest ``deepseek_fp8_block_size``. The
+    other swapAB paths keep the whole-tile requirement.
+    """
+    if not cfg.is_swap_ab:
+        return
+    unit = 32 if cfg.use_deepseek_fp8 else cfg.tile_m
+    if out_hidden % unit != 0:
+        raise ValueError(
+            f"swapAB requires out_hidden to be a multiple of {unit}, got {out_hidden}"
+        )
+
+
 def _runtime_config(cfg, in_hidden: int):
     """Normalize runtime options for a concrete K."""
     if cfg.use_deepseek_fp8:
+        block = cfg.deepseek_fp8_block_size
         if cfg.tile_k != 128:
             raise ValueError(
                 "use_deepseek_fp8=1 requires tile_k=128 to match the "
-                f"128-K DeepSeek scale-factor blocks, got {cfg.tile_k}"
+                f"DeepSeek scale-factor tiles, got {cfg.tile_k}"
             )
-        if in_hidden % cfg.tile_k != 0:
+        # A partial last K tile is zero-filled by TMA and its sub-blocks past
+        # K are skipped by the epilogue, so K only has to be block-aligned.
+        if in_hidden % block != 0:
             raise ValueError(
                 "use_deepseek_fp8=1 requires problem_k to be a multiple of "
-                f"tile_k={cfg.tile_k}, got problem_k={in_hidden}"
+                f"deepseek_fp8_block_size={block}, got problem_k={in_hidden}"
             )
     return resolve_problem_config(cfg, in_hidden)
 
@@ -703,14 +723,17 @@ def _create_deepseek_fp8_sf_tensors(
     """Create DeepSeek FP8 AB dequant scale tensors.
 
     Activation scales are K-major: ``sf_activations[k_block, token_row]``.
-    Weight scales are per expert, output tile, and 128-K block.
+    Weight scales are per expert, output row group, and K block. SwapAB groups
+    output rows by ``deepseek_fp8_block_size``; the non-swap path groups them
+    by ``tile_n``.
     """
     if not cfg.use_deepseek_fp8:
         raise ValueError("DeepSeek FP8 scale tensors require use_deepseek_fp8=1")
 
-    ds_k_blocks = _round_up(in_hidden, 128) // 128
+    block = cfg.deepseek_fp8_block_size
+    ds_k_blocks = _round_up(in_hidden, block) // block
     if cfg.is_swap_ab:
-        ds_weight_tiles = _round_up(out_hidden, cfg.tile_m) // cfg.tile_m
+        ds_weight_tiles = _round_up(out_hidden, block) // block
     else:
         ds_weight_tiles = _round_up(out_hidden, cfg.tile_n) // cfg.tile_n
     ds_act_rows = num_tokens if cfg.has_routed_act else total_padded_tokens
@@ -1124,26 +1147,27 @@ def compute_reference_dsfp8(
     n_dim: int,
 ) -> torch.Tensor:
     """
-    DeepSeek FP8 reference: per-128K FP32 dequant before accumulation.
+    DeepSeek FP8 reference: per-K-block FP32 dequant before accumulation.
     For DSFP8, the scale factors are separate FP32 tensors and are applied per K-block.
     The reference implementation needs to loop over expanded token, expert, output tile, and K-block.
     """
     ref_gemm = torch.zeros(
         (m_dim, n_dim), dtype=torch.float32, device=weights_ref.device
     )
-    k_block = 128
+    k_block = cfg.deepseek_fp8_block_size
     num_k_blocks = _round_up(in_hidden, k_block) // k_block
 
     if cfg.is_swap_ab:
-        num_weight_tiles = _round_up(m_dim, cfg.tile_m) // cfg.tile_m
+        m_block = cfg.deepseek_fp8_block_size
+        num_weight_tiles = _round_up(m_dim, m_block) // m_block
         for expanded_idx, expert_idx in enumerate(token_layout.expanded_to_expert):
             if expert_idx < 0:
                 continue
             token_idx = token_layout.expanded_to_token[expanded_idx]
             act_sf_row = token_idx if cfg.has_routed_act else expanded_idx
             for m_tile in range(num_weight_tiles):
-                m0 = m_tile * cfg.tile_m
-                m1 = min(m0 + cfg.tile_m, m_dim)
+                m0 = m_tile * m_block
+                m1 = min(m0 + m_block, m_dim)
                 for kb in range(num_k_blocks):
                     k0 = kb * k_block
                     k1 = min(k0 + k_block, in_hidden)
@@ -1367,10 +1391,10 @@ def _sf_c_numel(
     raise ValueError(f"Unsupported sfLayoutC for quantized output: {layout}")
 
 
-def _dsfp8_c_numel(output_m: int, n: int, *, is_swap_ab: bool) -> int:
+def _dsfp8_c_numel(output_m: int, n: int, *, is_swap_ab: bool, block: int = 128) -> int:
     """Number of FP32 DeepSeek output dq-scale values."""
     if is_swap_ab:
-        return _round_up(output_m, 128) // 128 * n
+        return _round_up(output_m, block) // block * n
     return _round_up(n, 128) // 128 * output_m
 
 
@@ -1381,6 +1405,7 @@ def _dsfp8_c_scale_index_grid(
     is_swap_ab: bool,
     device: str,
     scale_stride: int | None = None,
+    block: int = 128,
 ) -> torch.Tensor:
     m_idx = torch.arange(output_m, device=device).view(output_m, 1)
     n_idx = torch.arange(n, device=device).view(1, n)
@@ -1388,23 +1413,25 @@ def _dsfp8_c_scale_index_grid(
         # The swapAB epilogue strides scale blocks by the routed padded token
         # count, which is narrower than N when the caller declares a wider
         # token capacity.
-        return (m_idx // 128) * (n if scale_stride is None else scale_stride) + n_idx
+        return (m_idx // block) * (n if scale_stride is None else scale_stride) + n_idx
     return (n_idx // 128) * output_m + m_idx
 
 
-def _reference_dsfp8_c_scales(ref: torch.Tensor, *, is_swap_ab: bool) -> torch.Tensor:
+def _reference_dsfp8_c_scales(
+    ref: torch.Tensor, *, is_swap_ab: bool, block: int = 128
+) -> torch.Tensor:
     """Compute DeepSeek FP8 C dequant scales for an FP32 reference."""
     output_m, n = ref.shape
     sf_c = torch.zeros(
-        (_dsfp8_c_numel(output_m, n, is_swap_ab=is_swap_ab),),
+        (_dsfp8_c_numel(output_m, n, is_swap_ab=is_swap_ab, block=block),),
         dtype=torch.float32,
         device=ref.device,
     )
     if is_swap_ab:
-        for m0 in range(0, output_m, 128):
-            m1 = min(m0 + 128, output_m)
-            block = ref[m0:m1, :].abs().amax(dim=0)
-            sf_c[(m0 // 128) * n : (m0 // 128) * n + n] = block / 448.0
+        for m0 in range(0, output_m, block):
+            m1 = min(m0 + block, output_m)
+            group = m0 // block
+            sf_c[group * n : group * n + n] = ref[m0:m1, :].abs().amax(dim=0) / 448.0
     else:
         for n0 in range(0, n, 128):
             n1 = min(n0 + 128, n)
@@ -1566,8 +1593,9 @@ def _dequantize_dsfp8_output(
     n: int,
     is_swap_ab: bool,
     scale_stride: int | None = None,
+    block: int = 128,
 ) -> torch.Tensor:
-    """Decode E4M3 C using DeepSeek FP32 per-128-hidden dequant scales."""
+    """Decode E4M3 C using DeepSeek FP32 per-block-row dequant scales."""
     fp8_view = _decode_fp8_output(
         c_storage,
         output_m=output_m,
@@ -1580,6 +1608,7 @@ def _dequantize_dsfp8_output(
         is_swap_ab=is_swap_ab,
         device=c_storage.device,
         scale_stride=scale_stride,
+        block=block,
     )
     return fp8_view * sf_c.float()[sf_idx]
 
@@ -2115,11 +2144,7 @@ def reference_check(
         scale_gate_value=scale_gate_value,
     )
 
-    if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_out_hidden(cfg, out_hidden)
 
     token_tile_size = cfg.token_tile_size
     cluster_dim_in_token = cfg.token_cluster_dim
@@ -2645,6 +2670,7 @@ def reference_check(
                         logical_output_m,
                         logical_output_n,
                         is_swap_ab=cfg.is_swap_ab,
+                        block=cfg.deepseek_fp8_block_size,
                     ),
                 ),
                 dtype=torch.float32,
@@ -3084,6 +3110,7 @@ def reference_check(
             n=logical_output_n,
             is_swap_ab=cfg.is_swap_ab,
             scale_stride=total_padded_tokens if cfg.is_swap_ab else None,
+            block=cfg.deepseek_fp8_block_size,
         )
     elif cfg.uses_fp8_output:
         c_logical = _decode_fp8_output(
@@ -3580,7 +3607,9 @@ def reference_check(
         if cfg.is_swap_ab and declared_padded_tokens > total_padded_tokens:
             sf_c_ref_source = sf_c_ref_source[:, :total_padded_tokens]
         expected_sf_c = _reference_dsfp8_c_scales(
-            sf_c_ref_source, is_swap_ab=cfg.is_swap_ab
+            sf_c_ref_source,
+            is_swap_ab=cfg.is_swap_ab,
+            block=cfg.deepseek_fp8_block_size,
         )
         sf_c_diff = (sf_c_torch.float()[: expected_sf_c.numel()] - expected_sf_c).abs()
         sf_c_max_abs = sf_c_diff.max().item()
@@ -3754,11 +3783,7 @@ def _build_launch_io(
         in_hidden=in_hidden,
         scale_gate_value=scale_gate_value,
     )
-    if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_out_hidden(cfg, out_hidden)
 
     token_tile_size = cfg.token_tile_size
     cluster_dim_in_token = cfg.token_cluster_dim
@@ -4085,6 +4110,7 @@ def _build_launch_io(
                         logical_output_m,
                         logical_output_n,
                         is_swap_ab=cfg.is_swap_ab,
+                        block=cfg.deepseek_fp8_block_size,
                     ),
                 ),
                 dtype=torch.float32,

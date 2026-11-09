@@ -411,7 +411,7 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    "gemm_dx_red": [
+    "gemm_dx_ord": [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
         ["tma_buffer", "C"],
@@ -422,6 +422,7 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "k_slices"],
         ["parameter", "k_slice_iters"],
         ["parameter", "group_m"],
+        ["tma_buffer", "SLAB"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -504,7 +505,7 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
-    "gemm_dx_red_dcnt": [
+    "gemm_dx_ord_dcnt": [
         ["tma_buffer", "A"],
         ["tma_buffer", "B"],
         ["tma_buffer", "C"],
@@ -515,6 +516,29 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "k_slices"],
         ["parameter", "k_slice_iters"],
         ["parameter", "group_m"],
+        ["tma_buffer", "SLAB"],
+        ["buffer", "CNT"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "dx_slab_sum": [
+        ["buffer", "dx"],
+        ["buffer", "ws"],
+        ["parameter", "ws_slab"],
+        ["parameter", "num_vecs"],
+        ["parameter", "n_slabs"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "dx_slab_sum_dcnt": [
+        ["buffer", "dx"],
+        ["buffer", "ws"],
+        ["parameter", "ws_slab"],
+        ["parameter", "num_vecs"],
+        ["parameter", "n_slabs"],
+        ["parameter", "row_vecs"],
         ["buffer", "CNT"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
@@ -773,6 +797,71 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "one_pass_fwd": [
+        ["buffer", "W"],
+        ["buffer", "X"],
+        ["buffer", "labels"],
+        ["buffer", "Z"],
+        ["buffer", "PU"],
+        ["buffer", "PMS"],
+        ["parameter", "V"],
+        ["parameter", "ldx"],
+        ["parameter", "rpc"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "one_pass_fwd_nodx": [
+        ["buffer", "W"],
+        ["buffer", "X"],
+        ["buffer", "labels"],
+        ["buffer", "Z"],
+        ["buffer", "PMS"],
+        ["parameter", "V"],
+        ["parameter", "ldx"],
+        ["parameter", "rpc"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "one_pass_combine": [
+        ["buffer", "PU"],
+        ["buffer", "PMS"],
+        ["buffer", "W"],
+        ["buffer", "Z"],
+        ["buffer", "labels"],
+        ["buffer", "DXA"],
+        ["buffer", "ROWS"],
+        ["buffer", "LOGP"],
+        ["buffer", "LOSS"],
+        ["buffer", "LAB"],
+        ["parameter", "parts"],
+        ["parameter", "T"],
+        ["parameter", "V"],
+        ["parameter", "H"],
+        ["parameter", "with_u"],
+        ["parameter", "loss_div"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "one_pass_dw": [
+        ["buffer", "Z"],
+        ["buffer", "ROWS"],
+        ["buffer", "LAB"],
+        ["buffer", "X"],
+        ["buffer", "DXA"],
+        ["buffer", "grad"],
+        ["buffer", "DW"],
+        ["buffer", "DX"],
+        ["parameter", "V"],
+        ["parameter", "T"],
+        ["parameter", "ldx"],
+        ["parameter", "dw_blocks"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
 }
 _LAUNCHES: dict[str, dict[str, list[int]]] = {
     "b256_c1": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
@@ -780,6 +869,7 @@ _LAUNCHES: dict[str, dict[str, list[int]]] = {
     "b128_c1": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
     "b320_c1": {"block": [320, 1, 1], "cluster": [1, 1, 1]},
     "b1024_c1": {"block": [1024, 1, 1], "cluster": [1, 1, 1]},
+    "b288_c1": {"block": [288, 1, 1], "cluster": [1, 1, 1]},
 }
 _REGISTRY: dict[str, dict[str, Any]] = {
     "cake_lm_head_loss_sm_100a": {
@@ -946,16 +1036,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red": [
-                "d349713eae71a22b63ca",
-                "gemm_dx_red",
+                "7f062b421e394a9b16d1",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_dcnt": [
-                "f757f14c628bee899a8b",
-                "gemm_dx_red_dcnt",
+                "15a109a1b8b03e09eec7",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
@@ -970,16 +1060,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_tn256": [
-                "8fac37f18451d7ab7f8c",
-                "gemm_dx_red",
+                "e06856ee6f85842651af",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*4",
                 1,
                 1,
             ],
             "gemm_dx_red_tn256_dcnt": [
-                "41fae70f1613629d1b77",
-                "gemm_dx_red_dcnt",
+                "c9487680594292720555",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*4",
                 1,
@@ -994,16 +1084,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_st3": [
-                "d349713eae71a22b63ca",
-                "gemm_dx_red",
+                "7f062b421e394a9b16d1",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_st3_dcnt": [
-                "f757f14c628bee899a8b",
-                "gemm_dx_red_dcnt",
+                "15a109a1b8b03e09eec7",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
@@ -1018,16 +1108,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_split": [
-                "855c7771cd80451ba0bc",
-                "gemm_dx_red",
+                "d892427182667b467f40",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_split_dcnt": [
-                "93ae19ffc625a0e34c61",
-                "gemm_dx_red_dcnt",
+                "c7056c7d4d7937d332f5",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
@@ -1042,18 +1132,42 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_st3_split": [
-                "855c7771cd80451ba0bc",
-                "gemm_dx_red",
+                "d892427182667b467f40",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_st3_split_dcnt": [
-                "93ae19ffc625a0e34c61",
-                "gemm_dx_red_dcnt",
+                "c7056c7d4d7937d332f5",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
+                1,
+                1,
+            ],
+            "dx_slab_sum": [
+                "131a5aefbbd88a7ce71d",
+                "dx_slab_sum",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "dx_slab_sum_dcnt": [
+                "5bb06ecfeaa68da7a456",
+                "dx_slab_sum_dcnt",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "dx_slab_sum_acc": [
+                "5f3b145300c721d746fe",
+                "dx_slab_sum",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
                 1,
                 1,
             ],
@@ -1303,6 +1417,54 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 "b128_c1",
                 "n_keys/span",
                 "H/1024",
+                1,
+            ],
+            "one_pass_fwd_t1": [
+                "5b8030688ea7d5dfe067",
+                "one_pass_fwd",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_nodx_t1": [
+                "b246af8af132e0fdeb23",
+                "one_pass_fwd_nodx",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_t2": [
+                "830bfe91eb5f93d7ed73",
+                "one_pass_fwd",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_nodx_t2": [
+                "1289e65d0180e4b8aaf7",
+                "one_pass_fwd_nodx",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_combine": [
+                "aee298db0b852a88517a",
+                "one_pass_combine",
+                "b256_c1",
+                "max(1, H/256*with_u)",
+                1,
+                1,
+            ],
+            "one_pass_dw": [
+                "16ad7c2d5bbc9f682ad7",
+                "one_pass_dw",
+                "b256_c1",
+                "dw_blocks + dx_blocks",
+                1,
                 1,
             ],
         },
@@ -1471,16 +1633,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red": [
-                "6f0834bda13f3e7f3c4b",
-                "gemm_dx_red",
+                "b86cca457eed5708c6b3",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_dcnt": [
-                "98704d2b1eb947ac0100",
-                "gemm_dx_red_dcnt",
+                "33ca39ac15bb4547218c",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
@@ -1495,16 +1657,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_tn256": [
-                "8fac37f18451d7ab7f8c",
-                "gemm_dx_red",
+                "e06856ee6f85842651af",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*4",
                 1,
                 1,
             ],
             "gemm_dx_red_tn256_dcnt": [
-                "41fae70f1613629d1b77",
-                "gemm_dx_red_dcnt",
+                "c9487680594292720555",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*4",
                 1,
@@ -1519,16 +1681,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_st3": [
-                "b6cc83ec28675234575f",
-                "gemm_dx_red",
+                "4781f1d853230015bc82",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_st3_dcnt": [
-                "51c700693d1491e46704",
-                "gemm_dx_red_dcnt",
+                "ee40b813f5b38c032927",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
@@ -1543,16 +1705,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_split": [
-                "254fee4132e11fc54959",
-                "gemm_dx_red",
+                "d75a4804114d84dc05c3",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_split_dcnt": [
-                "f99c3efda2bca8ae63db",
-                "gemm_dx_red_dcnt",
+                "ad0993452ea5a81f182e",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
@@ -1567,16 +1729,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_st3_split": [
-                "2528a3b18f768419f7ab",
-                "gemm_dx_red",
+                "cbdeb6dbff7156543f91",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_st3_split_dcnt": [
-                "215e839696749bfb9433",
-                "gemm_dx_red_dcnt",
+                "1ff1537aabba3cfc1bb0",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
@@ -1591,10 +1753,34 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_swab": [
-                "896fe483cd77d7865548",
-                "gemm_dx_red",
+                "bec767b138420271441e",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, ldc//256*(M/512)*k_slices)*2",
+                1,
+                1,
+            ],
+            "dx_slab_sum": [
+                "131a5aefbbd88a7ce71d",
+                "dx_slab_sum",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "dx_slab_sum_dcnt": [
+                "5bb06ecfeaa68da7a456",
+                "dx_slab_sum_dcnt",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "dx_slab_sum_acc": [
+                "5f3b145300c721d746fe",
+                "dx_slab_sum",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
                 1,
                 1,
             ],
@@ -1846,6 +2032,54 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 "H/1024",
                 1,
             ],
+            "one_pass_fwd_t1": [
+                "5b8030688ea7d5dfe067",
+                "one_pass_fwd",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_nodx_t1": [
+                "b246af8af132e0fdeb23",
+                "one_pass_fwd_nodx",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_t2": [
+                "830bfe91eb5f93d7ed73",
+                "one_pass_fwd",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_nodx_t2": [
+                "1289e65d0180e4b8aaf7",
+                "one_pass_fwd_nodx",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_combine": [
+                "aee298db0b852a88517a",
+                "one_pass_combine",
+                "b256_c1",
+                "max(1, H/256*with_u)",
+                1,
+                1,
+            ],
+            "one_pass_dw": [
+                "16ad7c2d5bbc9f682ad7",
+                "one_pass_dw",
+                "b256_c1",
+                "dw_blocks + dx_blocks",
+                1,
+                1,
+            ],
         },
     },
     "cake_lm_head_loss_sm_107a": {
@@ -2012,16 +2246,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red": [
-                "6f0834bda13f3e7f3c4b",
-                "gemm_dx_red",
+                "b86cca457eed5708c6b3",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_dcnt": [
-                "98704d2b1eb947ac0100",
-                "gemm_dx_red_dcnt",
+                "33ca39ac15bb4547218c",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
@@ -2036,16 +2270,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_tn256": [
-                "8fac37f18451d7ab7f8c",
-                "gemm_dx_red",
+                "e06856ee6f85842651af",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*4",
                 1,
                 1,
             ],
             "gemm_dx_red_tn256_dcnt": [
-                "41fae70f1613629d1b77",
-                "gemm_dx_red_dcnt",
+                "c9487680594292720555",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*4",
                 1,
@@ -2060,16 +2294,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_st3": [
-                "b6cc83ec28675234575f",
-                "gemm_dx_red",
+                "4781f1d853230015bc82",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_st3_dcnt": [
-                "51c700693d1491e46704",
-                "gemm_dx_red_dcnt",
+                "ee40b813f5b38c032927",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices)*2",
                 1,
@@ -2084,16 +2318,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_split": [
-                "254fee4132e11fc54959",
-                "gemm_dx_red",
+                "d75a4804114d84dc05c3",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_split_dcnt": [
-                "f99c3efda2bca8ae63db",
-                "gemm_dx_red_dcnt",
+                "ad0993452ea5a81f182e",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
@@ -2108,16 +2342,16 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_st3_split": [
-                "2528a3b18f768419f7ab",
-                "gemm_dx_red",
+                "cbdeb6dbff7156543f91",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
                 1,
             ],
             "gemm_dx_red_st3_split_dcnt": [
-                "215e839696749bfb9433",
-                "gemm_dx_red_dcnt",
+                "1ff1537aabba3cfc1bb0",
+                "gemm_dx_ord_dcnt",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512)*k_slices+dx_split)*2",
                 1,
@@ -2132,10 +2366,34 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
             ],
             "gemm_dx_red_swab": [
-                "896fe483cd77d7865548",
-                "gemm_dx_red",
+                "bec767b138420271441e",
+                "gemm_dx_ord",
                 "b224_c2",
                 "max(1, ldc//256*(M/512)*k_slices)*2",
+                1,
+                1,
+            ],
+            "dx_slab_sum": [
+                "131a5aefbbd88a7ce71d",
+                "dx_slab_sum",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "dx_slab_sum_dcnt": [
+                "5bb06ecfeaa68da7a456",
+                "dx_slab_sum_dcnt",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
+                1,
+                1,
+            ],
+            "dx_slab_sum_acc": [
+                "5f3b145300c721d746fe",
+                "dx_slab_sum",
+                "b256_c1",
+                "max(1, min(num_vecs/2048, 65535))",
                 1,
                 1,
             ],
@@ -2150,6 +2408,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_dw_acc_dcnt": [
                 "345ace0c1cf3205d4ef3",
                 "gemm_dw_dcnt",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_acc_lc_dcnt": [
+                "a67940a5db46a847e634",
+                "gemm_dw_cast_dcnt_lc",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
                 1,
@@ -2171,6 +2437,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dw_acc_gn_lc_dcnt": [
+                "a76b523c0c39085875cb",
+                "gemm_dw_cast_dcnt_lc",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
             "gemm_dw_cast_bf16": [
                 "fee47365dff8c41b26a6",
                 "gemm_logits",
@@ -2187,6 +2461,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dw_cast_bf16_lc_dcnt": [
+                "2408401cfc1a9f7a022b",
+                "gemm_dw_cast_dcnt",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
             "gemm_dw_cast_bf16_tma": [
                 "09ef1e4bd18f200203e8",
                 "gemm_dx_2",
@@ -2197,6 +2479,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             ],
             "gemm_dw_cast_bf16_tma_dcnt": [
                 "b1e91ee98fdb0aa397ff",
+                "gemm_dw_cast_dcnt_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16_tma_lc_dcnt": [
+                "3a49c4ed930a1853c79d",
                 "gemm_dw_cast_dcnt_tma",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
@@ -2355,6 +2645,54 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 "H/1024",
                 1,
             ],
+            "one_pass_fwd_t1": [
+                "5b8030688ea7d5dfe067",
+                "one_pass_fwd",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_nodx_t1": [
+                "b246af8af132e0fdeb23",
+                "one_pass_fwd_nodx",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_t2": [
+                "830bfe91eb5f93d7ed73",
+                "one_pass_fwd",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_fwd_nodx_t2": [
+                "1289e65d0180e4b8aaf7",
+                "one_pass_fwd_nodx",
+                "b288_c1",
+                "parts",
+                1,
+                1,
+            ],
+            "one_pass_combine": [
+                "aee298db0b852a88517a",
+                "one_pass_combine",
+                "b256_c1",
+                "max(1, H/256*with_u)",
+                1,
+                1,
+            ],
+            "one_pass_dw": [
+                "16ad7c2d5bbc9f682ad7",
+                "one_pass_dw",
+                "b256_c1",
+                "dw_blocks + dx_blocks",
+                1,
+                1,
+            ],
         },
     },
 }
@@ -2458,13 +2796,28 @@ MODULES: dict[str, dict[str, Any]] = _expand_registry(_REGISTRY, _ARG_PLANS, _LA
 # ``gemm_dx``              dX_acc[rows] = fp32(dz_c @ W) (one K slice, plain
 #                          store: the deterministic package's program).
 # ``gemm_dx_red``          the same GEMM as ``k_slices`` (a launch scalar)
-#                          K-slice work items per output tile, every slice's
-#                          FP32 tile added into the chunk's rows of dX_acc by a
-#                          TMA / bulk ``.add.f32`` reduction in the order the
-#                          items finish (no slab workspace, no slab sum); the
-#                          host fills those rows with -0.0 first and picks the
-#                          slice count per chunk (a chunk of one slice runs
-#                          ``gemm_dx``).
+#                          K-slice work items per output tile; above one slice
+#                          every slice's FP32 tile is stored into its own rows
+#                          of the call's slab workspace (TMA tensor stores); the
+#                          host picks the slice count per chunk (a chunk of one
+#                          slice runs ``gemm_dx``).  A one-slice launch (the
+#                          vocabulary-major backward's and the candidate-support
+#                          dense dX's later vocabulary blocks) TMA-adds its tile
+#                          into C (dX_acc) itself: no slab, no slab sum.
+# ``dx_slab_sum``          after each ``gemm_dx_red`` launch of more than one
+#                          slice: dX_acc[rows] = ((s_0 + s_1) + ...) over the
+#                          launch's slabs in slice order, so dX repeats bit for
+#                          bit; it never reads dX_acc, which no call fills or
+#                          zeroes.  Launched
+#                          with programmatic dependent launch (it waits on the
+#                          GEMM first).  ``dx_slab_sum_dcnt`` stores the rows
+#                          below the chunk's live-row bound and -0.0 into the
+#                          rows after (after a ``_dcnt`` GEMM).
+# ``dx_slab_sum_acc``      dX_c[rows] += ((s_0 + s_1) + ...), one FP32 add per
+#                          element: the candidate-support path's dense dX after
+#                          a later vocabulary block above one slice (the
+#                          chunk's first block stores with ``dx_slab_sum``).
+#                          Outside ``STAGES``, as are the support programs.
 # ``gemm_dw_acc``          dW_acc (=|+=) fp32(dz_c^T @ X_c): store on the first
 #                          chunk, accumulate afterwards (chunk order = the
 #                          reduction order, no atomics).
@@ -2534,6 +2887,8 @@ STAGES = (
     "gemm_dx_red_st3_dcnt",
     "gemm_dx_red_split_dcnt",
     "gemm_dx_red_st3_split_dcnt",
+    "dx_slab_sum",
+    "dx_slab_sum_dcnt",
     "gemm_dw_acc",
     "gemm_dw_acc_gn",
     "gemm_dw_acc_dcnt",
@@ -2562,19 +2917,20 @@ STAGES = (
 # dX tile whose last wave's trailing items run as 256-wide half items (the grid
 # carries the split count), ``_swab`` the wide dX tile with swapped operands
 # (dX^T = W^T dz^T: the chunk's tokens on the MMA's N; ``gemm_dx_swab`` stores
-# C per thread, ``gemm_dx_red_swab`` adds 32 x 16 boxes by TMA reduce),
+# C per thread, ``gemm_dx_red_swab`` stores its slices into the slab as 32 x 16
+# boxes by TMA store),
 # ``_tma`` the TMA-epilogue form of a GEMM's stores (the bf16 fused weight-
 # gradient cast of a multi-chunk call's last chunk reads the old FP32 sum and
 # stores the bf16 tile as TMA sub-tiles: the same per-element arithmetic),
 # ``_gn`` the 2-D blocked raster of the weight-gradient accumulate / fp32 fused cast,
 # ``_dcnt`` the form bounded by the device count of the chunk's live rows (the
 # log-probability backward's zero-gradient row skip: the dz arm, the K-sliced dX
-# reductions but the swapped tile, the weight-gradient accumulate and bf16 fused
+# reductions but the swapped tile and their slab sum, the weight-gradient accumulate and bf16 fused
 # cast, the latter's TMA form too; ``cake_backend.DCNT_BASES``), ``_lc`` (before ``_dcnt``) the cast at
 # the last live chunk of those counted weight-gradient forms (the accumulate, plain and blocked raster, reads
 # the next chunk's count cell and casts when it is zero; the deferred cast, both stores, then writes nothing:
-# ``cake_backend.DW_LIVE_CAST_BASES``, the log-probability backward's eager skip path only; sm_100a and
-# sm_103a), ``_tau`` the temperature form of the
+# ``cake_backend.DW_LIVE_CAST_BASES``, the log-probability backward's eager skip path only; sm_100a, sm_103a
+# and sm_107a), ``_tau`` the temperature form of the
 # log-probability entry's logits GEMM arms, of the device-count logits GEMM with
 # the statistics and of ``row_finalize`` (a per-token FP32 temperature operand;
 # selected by the call's ``temperature``, not by a rule; ``row_finalize_tau`` is a
@@ -2603,6 +2959,7 @@ BASE_STAGES = (
     "row_grad",
     "gemm_dx",
     "gemm_dx_red",
+    "dx_slab_sum",
     "gemm_dw_acc",
     "gemm_dw_cast_bf16",
     "gemm_dw_cast_f32",
@@ -2617,6 +2974,8 @@ ROW_STAGES = (
     "row_finalize",
     "loss_reduce",
     "row_grad",
+    "dx_slab_sum",
+    "dx_slab_sum_dcnt",
     "scale_cast_bf16",
     "scale_cast_f32",
     "scale_cast_scatter_bf16",

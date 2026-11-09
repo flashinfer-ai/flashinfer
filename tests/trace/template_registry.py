@@ -81,7 +81,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.gdn_kernels.experimental.gdn_fused_decode",
     "flashinfer.gdn_paged",
     "flashinfer.gdn_prefill",
-    "flashinfer.gated_act_mxfp8",
+    "flashinfer.cake_gated_act_mxfp8_det_train",
     "flashinfer.gemm.gemm_base",
     "flashinfer.gemm.gemm_bf16_fp4",
     "flashinfer.gemm.gemm_svdquant",

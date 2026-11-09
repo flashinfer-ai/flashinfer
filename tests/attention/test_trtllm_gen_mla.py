@@ -2746,13 +2746,70 @@ def test_functional_dispatch_cake_routes(functional_request, monkeypatch, family
     torch.testing.assert_close(result, torch.full_like(result, 7))
 
 
-def test_functional_dispatch_cake_kimi_rejects_lse(functional_request, monkeypatch):
+@pytest.mark.parametrize("caller_lse", [False, True])
+@pytest.mark.parametrize("lse_base", [None, "basee", "base2"])
+def test_functional_dispatch_cake_kimi_returns_lse(
+    functional_request, monkeypatch, lse_base, caller_lse
+):
+    import sys
+
+    case = functional_request
+    case.update(
+        backend="cake",
+        query=case["query"].to(torch.float8_e4m3fn),
+        kv_cache=case["kv_cache"].to(torch.float8_e4m3fn),
+        return_lse=True,
+        return_lse_base=lse_base,
+    )
+    user_lse = None
+    if caller_lse:
+        user_lse = torch.empty(
+            case["query"].shape[:-1], dtype=torch.float32, device="cuda"
+        )
+        case.update(lse=user_lse)
+    calls = []
+
+    def launch(*args, **kwargs):
+        calls.append((args, kwargs))
+        args[4].fill_(7)
+        kwargs["lse"].fill_(3)
+
     monkeypatch.setattr(
         core, "_cake_trtllm_mla_blackwell_supports", lambda *args: False
     )
-    with pytest.raises(ValueError, match="backend='cake' does not support return_lse"):
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.mla.cake_kimi_k3_mla",
+        SimpleNamespace(run_cake_kimi_k3_mla_fp8_paged_attention=launch),
+    )
+    out, lse = core.trtllm_batch_decode_with_kv_cache_mla(**case)
+    assert out is case["out"]
+    assert len(calls) == 1
+    kwargs = calls[0][1]
+    assert kwargs["lse"] is lse
+    if caller_lse:
+        assert lse is user_lse
+    assert kwargs["lse_base"] == ("2" if lse_base == "base2" else "e")
+    assert lse.dtype == torch.float32
+    assert lse.shape == case["query"].shape[:-1]
+    torch.testing.assert_close(out, torch.full_like(out, 7))
+    torch.testing.assert_close(lse, torch.full_like(lse, 3))
+
+
+def test_functional_dispatch_cake_kimi_rejects_pdl(functional_request, monkeypatch):
+    monkeypatch.setattr(
+        core, "_cake_trtllm_mla_blackwell_supports", lambda *args: False
+    )
+    with pytest.raises(ValueError, match="backend='cake' does not support enable_pdl"):
         core.trtllm_batch_decode_with_kv_cache_mla(
-            **{**functional_request, "backend": "cake", "return_lse": True}
+            **{
+                **functional_request,
+                "backend": "cake",
+                "query": functional_request["query"].to(torch.float8_e4m3fn),
+                "kv_cache": functional_request["kv_cache"].to(torch.float8_e4m3fn),
+                "return_lse": True,
+                "enable_pdl": True,
+            }
         )
 
 

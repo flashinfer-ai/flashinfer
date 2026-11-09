@@ -118,7 +118,7 @@ kernel_cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp(__nv_bfloat16* __restri
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4ll);
                     wr[j * 4 + 0] = _v4.x;
                     wr[j * 4 + 1] = _v4.y;
                     wr[j * 4 + 2] = _v4.z;
@@ -225,7 +225,7 @@ kernel_cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp(__nv_bfloat16* __restri
                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_6) : "f"(w4[2]), "f"(win[24 + j_0]), "f"(_fma_7));
                     float fma;
                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma) : "f"(w4[3]), "f"(win[j_0]), "f"(_fma_6));
-                    float e = (-fma) * 1.442695f;
+                    float e = -fma * 1.442695f;
                     float _exp2_8 = approx_exp2(e);
                     float den = 1.0f + _exp2_8;
                     float sg = approx_rcp(den);
@@ -327,7 +327,7 @@ kernel_cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp(__nv_bfloat16* __restri
                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_15) : "f"(w4[2]), "f"(win[j_1]), "f"(_fma_16));
                     float fma_1;
                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_1) : "f"(w4[3]), "f"(win[8 + j_1]), "f"(_fma_15));
-                    float e_1 = (-fma_1) * 1.442695f;
+                    float e_1 = -fma_1 * 1.442695f;
                     float _exp2_17 = approx_exp2(e_1);
                     float den_1 = 1.0f + _exp2_17;
                     float sg_1 = approx_rcp(den_1);
@@ -429,7 +429,7 @@ kernel_cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp(__nv_bfloat16* __restri
                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_24) : "f"(w4[2]), "f"(win[8 + j_2]), "f"(_fma_25));
                     float fma_2;
                     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(fma_2) : "f"(w4[3]), "f"(win[16 + j_2]), "f"(_fma_24));
-                    float e_2 = (-fma_2) * 1.442695f;
+                    float e_2 = -fma_2 * 1.442695f;
                     float _exp2_26 = approx_exp2(e_2);
                     float den_2 = 1.0f + _exp2_26;
                     float sg_2 = approx_rcp(den_2);

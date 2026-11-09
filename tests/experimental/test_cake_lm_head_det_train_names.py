@@ -307,7 +307,8 @@ def test_no_entry_takes_a_mode_keyword():
         for name, cls in _autograd_functions(_backend(module_name)):
             fns[f"{module_name}.{name}.forward"] = cls.forward
             classes += 1
-    assert classes == 8
+    # the opt-in module's two automatic-form log-probability subclasses among them
+    assert classes == 10
     for label, fn in fns.items():
         try:
             inspect.signature(fn).bind_partial(deterministic=False)

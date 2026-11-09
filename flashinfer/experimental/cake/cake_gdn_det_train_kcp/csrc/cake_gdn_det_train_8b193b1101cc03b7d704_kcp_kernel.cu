@@ -286,7 +286,7 @@ kernel_cake_gdn_det_train_8b193b1101cc03b7d704_kcp(const __grid_constant__ CUten
             int dht_slot = dht_index[seg];
             if (dht_slot >= 0) {
                 int dht_tile = (head / dht_hg * dht_n + dht_slot) * dht_hg + head % dht_hg;
-                long long dht_base = (long long)dht_tile * (long long)tile_stride * 16384 + (long long)(k_row * 128);
+                long long dht_base = (long long)dht_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
                 for (int blk = 0; blk < 8; blk++) {
                     #pragma unroll
@@ -330,7 +330,7 @@ kernel_cake_gdn_det_train_8b193b1101cc03b7d704_kcp(const __grid_constant__ CUten
             for (int rc = 0; rc < nc; rc++) {
                 int c = nc - 1 - rc;
                 int gc = c0 + c;
-                long long dh_base = ((long long)gc * (long long)num_heads + (long long)head) * 16384 + (long long)(k_row * 128);
+                long long dh_base = ((long long)gc * (long long)num_heads + (long long)head) * 16384ll + (long long)(k_row * 128);
                 float decay = gamma[(long long)gc * (long long)num_heads + (long long)head];
                 #pragma unroll
                 for (int g = 0; g < 2; g++) {
@@ -421,7 +421,7 @@ kernel_cake_gdn_det_train_8b193b1101cc03b7d704_kcp(const __grid_constant__ CUten
                 _phase_dv_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int trow = row0 + c * 64 + t_row;
-                long long t_base = ((long long)trow * (long long)num_heads + (long long)head) * 128;
+                long long t_base = ((long long)trow * (long long)num_heads + (long long)head) * 128ll;
                 float rs_t = rowscale[(long long)trow * (long long)num_heads + (long long)head];
                 bool valid = t_row < chunk_len[gc];
                 float dv4[64];

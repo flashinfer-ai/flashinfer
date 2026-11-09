@@ -18,7 +18,8 @@ The KCP registry (``cake_kcp_jit``) and manifests of the non-deterministic Cake 
 the identity rule (under this package's ``cake_kda_train_`` prefix), ``build.json`` (the shipped programs, never a
 test-only one) and ``build.test.json`` (the test-only programs, loadable only after ``cake_kcp_plan.enable_test_knobs()``),
 and the carried programs: every record and unit is the deterministic package's under this package's names (the KCP
-programs have no non-deterministic form).  No device is needed; nothing is built or launched.
+programs have no non-deterministic form), and the architecture the workspace byte query selects the local
+arena's records for.  No device is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import re
 from pathlib import Path
 
 import pytest
+import torch
 
 from tests.test_helpers.cake_package import cake_package
 
@@ -51,7 +53,7 @@ FWDH_PLAN = [
     ["buffer", "v_new"], *GRID,
 ]  # fmt: skip
 DHU_PLAN = [
-    ["buffer", "kg_tma"], ["buffer", "qg_tma"], ["buffer", "w_tma"], ["buffer", "do_tma"], ["buffer", "dv1"],
+    ["buffer", "kg_tma"], ["buffer", "qg_tma"], ["buffer", "w_tma"], ["buffer", "do_tma"], ["buffer", "aqk_tma"],
     ["buffer", "gk"], ["parameter", "num_heads"], ["buffer", "seq_chunk_start"], ["parameter", "num_seqs"],
     ["parameter", "scale"], ["buffer", "walk_seg"], ["buffer", "dht"], ["buffer", "dht_index"], ["parameter", "dht_hg"],
     ["parameter", "dht_n"], ["buffer", "out"], ["buffer", "out_index"], ["parameter", "out_hg"], ["parameter", "out_n"],
@@ -182,19 +184,19 @@ IDENTITIES = {
     ),
     "kcp_dhu_offset": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "offset"},
+        {"program": "offset", "fuse_dv1": 1},
     ),
     "kcp_dhu_offset_overlap": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_det_dhu_v2_kcp",
-        {"program": "offset", "tile_prefetch": 0},
+        {"program": "offset", "tile_prefetch": 0, "fuse_dv1": 1},
     ),
     "kcp_dhu_offset_vh64": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "offset", "vh": 64},
+        {"program": "offset", "vh": 64, "fuse_dv1": 1},
     ),
     "kcp_dhu_tape": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape", "vh": 64, "tape_store": "tma"},
+        {"program": "tape", "vh": 64, "tape_store": "tma", "fuse_dv1": 1},
     ),
     "kcp_transfer_walk": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_det_transfer_walk_bf16x3_v2_kcp",
@@ -233,7 +235,7 @@ IDENTITIES = {
     ),
     "kcp_dhu_tape_full": (
         f"tart.kda_chunk_kcp_dhu.{_W}.kda_chunk_kcp_dhu_v1",
-        {"program": "tape"},
+        {"program": "tape", "fuse_dv1": 1},
     ),
 }
 
@@ -822,3 +824,88 @@ def test_the_units_are_the_deterministic_units_under_this_packages_names(
                 name,
                 source,
             )
+
+
+# --------------------------------------------------------------------------- the byte query's architecture
+
+BYTE_QUERY_CALLS = ("plan", "workspace_bytes", "tables_bytes")
+
+
+def _context_on(device: str):
+    """Rank 0's context of a two-rank contiguous pack (148 SMs), seen as a context on ``device``: the byte query reads
+    the context's host fields and its ``device``; a CPU host builds the context on the CPU."""
+    part = kcp_plan.cake_kda_nondet_train_kcp_partition([0, 3000, 8192], 2)
+    ctx = kcp_plan.cake_kda_nondet_train_kcp_build_context(
+        part, None, 0, "cpu", 4, sm_count=148
+    )
+    assert ctx.T_r > 0
+
+    class OnDevice:
+        def __getattr__(self, name: str):
+            return getattr(ctx, name)
+
+    view = OnDevice()
+    view.device = torch.device(device)
+    return view
+
+
+def _spy_byte_query(monkeypatch) -> list[tuple[str, object]]:
+    """Record the ``arch`` each of :data:`BYTE_QUERY_CALLS` of the single-rank backend receives (the real function
+    then runs); every context's intra record is taken to write its scratch table set, so all three are called."""
+    single_rank = cake_package("cake.cake_kda_nondet_train_kcp", "_single_rank")
+    backend = single_rank.module("cake_backend")
+    seen: list[tuple[str, object]] = []
+    for name in BYTE_QUERY_CALLS:
+        real = getattr(backend, name)
+
+        def spy(*args, _real=real, _name=name, **kwargs):
+            seen.append((_name, kwargs.get("arch", "not passed")))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(backend, name, spy)
+    monkeypatch.setattr(kcp_plan, "intra_writes_tables", lambda *a, **k: True)
+    return seen
+
+
+def test_workspace_bytes_plan_for_the_contexts_device_architecture(
+    monkeypatch,
+) -> None:
+    """The byte query plans each context's local arena, its arena bytes and its scratch tables for the architecture
+    of the context's device, as the forward plans its local stages, never for that of the current CUDA device: here
+    the current device (``cuda:0``) is another model than the context's (``cuda:1``)."""
+    current, own = cake_jit.ARCHES[0], cake_jit.ARCHES[1]
+    by_index = {0: current, 1: own}
+    capability = {arch: cap for cap, arch in cake_jit.ARCH_BY_CAPABILITY.items()}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda index=None: capability[by_index[0 if index is None else int(index)]],
+    )
+    monkeypatch.setattr(kcp_plan, "_cuda_arch", lambda index: by_index[int(index)])
+    ctx = _context_on("cuda:1")
+    seen = _spy_byte_query(monkeypatch)
+    nbytes = kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=64)
+    assert nbytes > 0
+    assert seen == [(name, own) for name in BYTE_QUERY_CALLS]
+
+
+@pytest.mark.parametrize("device", ["cuda:1", "cpu"])
+def test_workspace_bytes_without_cuda_pass_no_architecture(
+    monkeypatch, device: str
+) -> None:
+    """On a host without CUDA the byte query passes ``arch=None`` (the existing backend's default) and makes no CUDA
+    call, whatever device the context names."""
+
+    def no_cuda_call(*args, **kwargs):
+        raise AssertionError("the byte query made a CUDA call on a host without CUDA")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    for name in ("current_device", "get_device_capability", "get_device_properties"):
+        monkeypatch.setattr(torch.cuda, name, no_cuda_call)
+    monkeypatch.setattr(kcp_plan, "_cuda_arch", no_cuda_call)
+    ctx = _context_on(device)
+    seen = _spy_byte_query(monkeypatch)
+    assert kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes(ctx, H=64) > 0
+    assert seen == [(name, None) for name in BYTE_QUERY_CALLS]

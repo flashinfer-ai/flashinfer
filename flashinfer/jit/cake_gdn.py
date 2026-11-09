@@ -685,6 +685,34 @@ _GATE_STREAM_FULL_BASES = frozenset(
 # ``select_cake_gdn_prefill_variant``); every stored value equals the twin's without it.
 _GATE_STREAM_PF_ARCHES = frozenset({"sm_107a"})
 
+# The sm_107a vec2-full twins of the three shared full-DV bodies that store a final state without
+# state indices: BF16 I/O with BF16 state and an initial state (without the gate-stream twin), and
+# BF16 or FP16 I/O with FP32 state and no initial state.  Each twin is a record of its own beside the
+# shared record of the same key (schedule ``..._sm107a_vec2full_i64meta``) and moves the final (and
+# initial) state as sector-complete 16x256b rows; every other operation, and every stored value, is
+# the shared body's.  It is faster where every sequence of the batch is short, and lost up to 0.8% on
+# an R200 (216 SMs) on ragged batches where one sequence of 8192 tokens (128 chunks) bounds the
+# launch (BF16 state Hq8/Hv32 0.997x, FP32 state Hq16/Hv32 0.992-0.996x).  Batches bounded by 4096
+# tokens still ran 1.011-1.020x with BF16 state, but as low as 0.999x on a ragged FP32-state batch
+# without an initial state (Hq16/Hv32), while every measured batch bounded by 2048 tokens ran 1.011x
+# or faster.  So the resolver takes the twin only when the longest sequence spans at most
+# ``_VEC2FULL_MAX_TILE_CHUNKS`` 64-token chunks (2048 tokens).  ``max_seq_len`` is an upper bound: a
+# loose bound only raises it, so the batch keeps the shared record.
+_VEC2FULL_MAX_TILE_CHUNKS = 32
+_VEC2FULL_SHARED_SCHEDULES = frozenset(
+    {
+        "flashinfer_blackwell_gdn_prefill_initial_bf16state_sm107a_i64meta",
+        "flashinfer_blackwell_gdn_prefill_sm107a_i64meta",
+        "flashinfer_blackwell_gdn_prefill_f16io_sm107a_i64meta",
+    }
+)
+
+
+def _vec2full_twin_schedule(shared_schedule: str) -> str:
+    """The schedule of the vec2-full twin of a ``_VEC2FULL_SHARED_SCHEDULES`` schedule."""
+
+    return shared_schedule.replace("_sm107a_i64meta", "_sm107a_vec2full_i64meta")
+
 
 def _cake_gdn_prefill_gate_stream_full(
     *, num_seqs: int, total_seq_len: int, total_tiles: int, grid_x: int
@@ -904,52 +932,65 @@ def _has_variant(
 # 668 and a held-out sample of 191), where the DV-split launch ran 0.57x to 1.20x the full-DV
 # launch: the rule routes 190 of them, all at least 1.05x (the first slower batch is at 1.05x the
 # longest-first limit and 1.29x the other).  On a second held-out sample, every one of the 87
-# batches it routes was faster as well (at least 1.02x).
+# batches it routes was faster as well (at least 1.02x).  The fit is on the BF16-I/O FP32-state
+# contract with an initial state; the other contracts of ``_RAGGED_DVSPLIT_CONTRACTS`` take the
+# same rule and constants.
 RAGGED_DVSPLIT_SEQ_TOKENS = 384
 RAGGED_DVSPLIT_LOAD_LONGEST_FIRST = 90
 RAGGED_DVSPLIT_LOAD = 20
+
+
+# The stateful contracts of the ragged DV-split route: (I/O dtype, state dtype, initial state).
+# Each stores a final state without checkpoints or state indices.
+_RAGGED_DVSPLIT_CONTRACTS: tuple[tuple[str, str, bool], ...] = (
+    ("bfloat16", "float32", True),
+    ("bfloat16", "bfloat16", True),
+    ("float16", "float32", True),
+    ("bfloat16", "float32", False),
+    ("float16", "float32", False),
+)
 
 
 @functools.cache
 def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
     """The ragged DV-split route: full-DV record name -> the route of its DV-split twin.
 
-    On sm_107a a BF16-I/O FP32-state full-DV batch with initial and final state (no
-    checkpoints, no state indices) is over the DV-split tile budget (``2 * num_seqs *
-    max(Hq, Hv) > 212``).  When its key also ships the DV-split record, a ragged batch runs
-    that record with one CTA per half tile (``one_cta_per_tile``; the launch grid is the
-    half-tile count): the two halves of a long sequence's tile run on two SMs and the short
-    sequences fill the others.  The resolver takes the route only for the batches whose longest
-    sequence bounds the launch (``RAGGED_DVSPLIT_LOAD``); on a balanced batch the doubled tile
-    count makes the DV-split launch slower.
+    On sm_107a a full-DV batch of a ``_RAGGED_DVSPLIT_CONTRACTS`` contract (BF16 I/O with
+    FP32 or BF16 state, or FP16 I/O with FP32 state, with an initial state; BF16 or FP16
+    I/O with FP32 state without one; a final state, no checkpoints, no state indices) is
+    over the DV-split tile budget (``2 * num_seqs * max(Hq, Hv) > 212``).  When its key also
+    ships the DV-split record of its contract, a ragged batch runs that record with one CTA
+    per half tile (``one_cta_per_tile``; the launch grid is the half-tile count): the two
+    halves of a long sequence's tile run on two SMs and the short sequences fill the others.
+    The resolver takes the route only for the batches whose longest sequence bounds the
+    launch (``RAGGED_DVSPLIT_LOAD``, the same rule and constants for every contract); on a
+    balanced batch the doubled tile count makes the DV-split launch slower.
 
     Keys: the sm_107a-only full-DV base and gate-stream records (and the gate-stream records'
-    prefetch twins) of that contract whose exact specializations also have a DV-split record (a
-    key without either record is not here, so it keeps its route or fails closed as before).  A
-    resolved full-DV record of these keys is over the tile budget: under it the key's own
-    DV-split record is served first.  Built once from the manifest.
+    prefetch twins) of each contract whose exact specializations also have a DV-split record
+    of that contract (a key without either record is not here, so it keeps its route or fails
+    closed as before).  A resolved full-DV record of these keys is over the tile budget: under
+    it the key's own DV-split record is served first.  Built once from the manifest.
     """
 
     arch: CakeGDNArch = "sm_107a"
-    stateful = {
-        "ENABLE_CHECKPOINTS": 0,
-        "SINGLE_CHUNK_NO_STATE": 0,
-        "STORE_FINAL_STATE": 1,
-        "UNIT_GATES": 0,
-        "USE_INITIAL_STATE": 1,
-        "USE_STATE_INDICES": 0,
-    }
 
     def schedule(
-        *, dvsplit: bool, gate_stream_full: bool, initial_state_prefetch: bool = False
+        *,
+        io_dtype: str,
+        state_dtype: str,
+        use_initial_state: bool,
+        dvsplit: bool,
+        gate_stream_full: bool,
+        initial_state_prefetch: bool = False,
     ) -> str:
         return cake_gdn_prefill_seq_schedule(
             arch,
             _prefill_schedule_attr(
                 dvsplit=dvsplit,
-                use_initial_state=True,
-                io_dtype="bfloat16",
-                state_dtype="float32",
+                use_initial_state=use_initial_state,
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
                 single_chunk=False,
                 gatepipe4=False,
                 fullgrid_vhold=False,
@@ -962,33 +1003,54 @@ def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
         )
 
     prefix = "flashinfer.cake_gdn.generated.prefill:"
-    full_dv = {
-        prefix
-        + schedule(
-            dvsplit=False,
-            gate_stream_full=gate_stream_full,
-            initial_state_prefetch=initial_state_prefetch,
+    # full-DV source schedule -> (the contract's DV-split schedule, its stateful specializations)
+    contracts: dict[str, tuple[str, dict[str, int]]] = {}
+    for io_dtype, state_dtype, use_initial_state in _RAGGED_DVSPLIT_CONTRACTS:
+        stateful = {
+            "ENABLE_CHECKPOINTS": 0,
+            "SINGLE_CHUNK_NO_STATE": 0,
+            "STORE_FINAL_STATE": 1,
+            "UNIT_GATES": 0,
+            "USE_INITIAL_STATE": int(use_initial_state),
+            "USE_STATE_INDICES": 0,
+        }
+        split = schedule(
+            io_dtype=io_dtype,
+            state_dtype=state_dtype,
+            use_initial_state=use_initial_state,
+            dvsplit=True,
+            gate_stream_full=False,
         )
         for gate_stream_full, initial_state_prefetch in (
             (False, False),
             (True, False),
             (True, True),
-        )
-    }
-    split = schedule(dvsplit=True, gate_stream_full=False)
+        ):
+            full_dv = schedule(
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
+                use_initial_state=use_initial_state,
+                dvsplit=False,
+                gate_stream_full=gate_stream_full,
+                initial_state_prefetch=initial_state_prefetch,
+            )
+            contracts[prefix + full_dv] = (split, stateful)
     routes: dict[str, CakeGDNRoute] = {}
     for record in _manifest()["variants"]:
         specializations = record["specializations"]
+        entry = contracts.get(record["source_schedule"])
+        if entry is None:
+            continue
+        twin_schedule, twin_stateful = entry
         if (
             record["domain"] != "prefill"
-            or record["source_schedule"] not in full_dv
             or record["tma_abi"] != "grid_constant"
             or record["architectures"] != [arch]
-            or any(specializations.get(k) != v for k, v in stateful.items())
+            or any(specializations.get(k) != v for k, v in twin_stateful.items())
             or not _has_variant(
                 arch=arch,
                 domain="prefill",
-                schedule_attr=split,
+                schedule_attr=twin_schedule,
                 specializations=specializations,
             )
         ):
@@ -996,7 +1058,7 @@ def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
         twin = _variant_for(
             arch=arch,
             domain="prefill",
-            schedule_attr=split,
+            schedule_attr=twin_schedule,
             specializations=specializations,
         )
         routes[record["name"]] = CakeGDNRoute(
@@ -1070,6 +1132,14 @@ def select_cake_gdn_prefill_variant(
     twin itself, as the prefetch twin issues no prefetch when each CTA owns
     one tile.  The launch evaluates the same grid rule with the same count,
     so the two agree.
+
+    On sm_107a a batch that resolves the shared full-DV record of the BF16-state
+    contract without gate streaming or of the FP32-state contracts without an
+    initial state runs that key's vec2-full twin record when ``max_seq_len``
+    spans at most ``_VEC2FULL_MAX_TILE_CHUNKS`` chunks (2048 tokens), else the
+    shared record; outputs and final states are bitwise equal either way.  A
+    loose bound keeps the shared record, and the ragged DV-split route keeps
+    precedence.
     """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
@@ -1383,10 +1453,11 @@ def select_cake_gdn_prefill_variant(
         schedule_attr=schedule_attr,
         specializations=specializations,
     )
-    # Ragged DV-split route (``_ragged_dvsplit_routes``): with the host lengths, a batch whose
-    # full-DV record has a DV-split twin runs that twin, one CTA per half tile, when its longest
-    # sequence bounds the launch.  The rule itself keeps equal lengths (``max_seq_len`` exact):
-    # their load exceeds ``num_seqs * num_o_heads * max_seq_len``, and over the tile budget
+    # Ragged DV-split route (``_ragged_dvsplit_routes``): with the host lengths, a batch of a
+    # ``_RAGGED_DVSPLIT_CONTRACTS`` contract whose full-DV record has a DV-split twin runs that
+    # twin, one CTA per half tile, when its longest sequence bounds the launch.  The rule itself
+    # keeps equal lengths (``max_seq_len`` exact): their load exceeds
+    # ``num_seqs * num_o_heads * max_seq_len``, and over the tile budget
     # ``num_seqs * num_o_heads > 106`` is above both limits.  A DV-split record (``dvsplit``) is
     # never a key.  Host integers first, then one lookup on the resolved record; every other
     # call returns as before.
@@ -1403,6 +1474,31 @@ def select_cake_gdn_prefill_variant(
             ragged = _ragged_dvsplit_routes().get(record["name"])
             if ragged is not None:
                 return ragged
+    # The vec2-full twin of a shared full-DV record (``_VEC2FULL_SHARED_SCHEDULES``): when the
+    # longest sequence spans at most ``_VEC2FULL_MAX_TILE_CHUNKS`` chunks and the key ships the
+    # twin record, the batch runs the twin; the ragged DV-split route above keeps precedence and
+    # every other record (gate-stream twins, indexed state, checkpoints) stays as resolved.
+    if (
+        arch == "sm_107a"
+        and not dvsplit
+        and not use_state_indices
+        and _prefill_tile_chunks(max_seq_len) <= _VEC2FULL_MAX_TILE_CHUNKS
+    ):
+        shared_schedule = record.get("source_schedule", "").rsplit(":", 1)[-1]
+        if shared_schedule in _VEC2FULL_SHARED_SCHEDULES:
+            twin_schedule = _vec2full_twin_schedule(shared_schedule)
+            if _has_variant(
+                arch=arch,
+                domain="prefill",
+                schedule_attr=twin_schedule,
+                specializations=specializations,
+            ):
+                record = _variant_for(
+                    arch=arch,
+                    domain="prefill",
+                    schedule_attr=twin_schedule,
+                    specializations=specializations,
+                )
     if single_chunk:
         route = "flashinfer.gdn_prefill.noncp.single_chunk"
     elif enable_checkpoints:
@@ -1776,9 +1872,9 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # The fp32-state T=1 K-major (nontranspose) bodies (`direct_fp32_t1_nontranspose_*`) are
 # routed per (architecture, rule band): the shipped `_small` body (eight CTAs per state
 # head) below 32 batch rows and the shipped large body (one CTA per state head) from 32
-# on, except on Rubin (sm_107a), which runs the `mid4` twin below 21 rows -- four CTAs
+# on, except on Rubin (sm_107a), which runs the `mid4` twin below 10 rows -- four CTAs
 # per state head, each owning one Kx32 value panel over 128-byte state segments -- and the
-# `hqsplit_tma3` twin from 21 rows on (the upper small band 21 <= B < 32 and the whole
+# `hqsplit_tma3` twin from 10 rows on (the upper small band 10 <= B < 32 and the whole
 # large band B >= 32): the large body's update loop split in two (`hqsplit`), with each
 # 32-wide V panel of the state loaded and stored by TMA through a three-stage ring of
 # 128-byte-swizzled shared-memory panels instead of cp.async loads and per-thread
@@ -1802,8 +1898,8 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` of the
 # Cake decode kernel program; they are kept in step by hand (no test compares them).
 CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
-# First batch size of the upper small band (21 <= B < 32).
-CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START = 21
+# First batch size of the upper small band (10 <= B < 32; 21 before 2026-11-08).
+CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START = 10
 CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = (
     37  # 35 -> 37; see the Cake launcher
 )
@@ -1823,8 +1919,11 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
     # Adopted 2026-11-02: the `_rc_kq128` twin of `mid4` (q/k fetched from shared memory
     # as 128-bit loads into registers; bitwise-identical output).
     ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
-    # Adopted 2026-11-03: the upper small band 21 <= B < 32 (formerly `mid4_rc_kq128`)
-    # runs the TMA-state `hqsplit_tma3` twin on sm_107a where it ships a record.
+    # Adopted 2026-11-03: the upper small band (formerly `mid4_rc_kq128`) runs the
+    # TMA-state `hqsplit_tma3` twin on sm_107a where it ships a record; the band starts at
+    # B = 10 since 2026-11-08 (21 before), when the TMA-state host shim began to reuse the
+    # tensor map it encoded for the same state and the public nontranspose decode began to
+    # reuse its launch per row (``gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES``).
     ("sm_107a", "small_upper"): "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
     # Adopted 2026-11-03: the whole large band (B >= 32; formerly `tilev32_x2` for
     # 32 <= B < 37 and the ``hqsplit`` recurrence twin from 37) runs the TMA-state
@@ -1866,7 +1965,7 @@ CAKE_GDN_DECODE_TMA_STATE_SCHEDULES = frozenset(
 
 
 def cake_gdn_nontranspose_fp32_t1_rule_band(batch_size: int) -> str:
-    """Rule band of ``batch_size`` rows: ``small`` (B < 21), ``small_upper`` (21 <= B < 32), ``large_wavefit`` (32 <= B < 37) or ``large``."""
+    """Rule band of ``batch_size`` rows: ``small`` (B < 10), ``small_upper`` (10 <= B < 32), ``large_wavefit`` (32 <= B < 37) or ``large``."""
 
     if int(batch_size) < CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START:
         return "small"
@@ -2267,7 +2366,7 @@ def select_cake_gdn_decode_variant(
         )
     elif layout == "nontranspose":
         # The body follows the batch band per architecture (sm_107a runs the `mid4`
-        # twin below 21 rows); the route id names a twin and the host reads the
+        # twin below 10 rows); the route id names a twin and the host reads the
         # record's CTAs per state head for the grid.  A band whose twin ships no
         # record for the row's specializations keeps its fallback band's body; a row
         # listed in the per-row table runs the body of the band it names.

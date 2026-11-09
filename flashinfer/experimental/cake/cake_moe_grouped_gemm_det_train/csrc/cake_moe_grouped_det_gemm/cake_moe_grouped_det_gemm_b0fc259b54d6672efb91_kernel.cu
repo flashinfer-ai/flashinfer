@@ -54,24 +54,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_PROGRAM_KERNEL kernel_cake_moe_grouped_det_gemm_b0fc259b54d6672efb91
 #endif
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 4
-#define NUM_MAINLOOP_PIPE_STAGES 1
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 49152
-#define SMEM_SMEM_B0_OFF 17408
-#define SMEM_SMEM_B0_STAGE_BYTES 16384
-#define SMEM_SMEM_B0_STRIDE 49152
-#define SMEM_SMEM_B1_OFF 33792
-#define SMEM_SMEM_B1_STAGE_BYTES 16384
-#define SMEM_SMEM_B1_STRIDE 49152
-#define SMEM_PLAN_S_OFF 197632
-#define SMEM_PLAN_S_STAGE_BYTES 64
-#define SMEM_PLAN_S_STRIDE 64
-#define SMEM_TOTAL 197760
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
@@ -79,6 +61,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CTA_GROUP 2
 #define NUM_STAGES 4
 #define TILE_K 512
+#define TMEM_NCOLS 512
 #define NUM_EPILOGUE_WARPS 8
 #define CLUSTER_M 256
 #define EPI_CHUNK 16
@@ -220,7 +203,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     __nv_bfloat16* smem_b0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -230,8 +213,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     int* plan_s = reinterpret_cast<int*>(smem_raw + 197632);
     const int plan_s_addr = smem + 197632;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 12 barriers)
-    // Mbarriers at smem_raw[0..96)
+    // Mbarrier init (12 barriers at smem_raw[0..96))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -276,10 +258,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -2105,7 +2085,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     }
                 }
                 unsigned int _warp_redux_0;
-                asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_0) : "r"(pl_last));
+                asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_0) : "r"(pl_last));
                 unsigned int pl_ne = _warp_redux_0 * tiles_per_group_e;
                 unsigned int pl_f = pl_ne / pl_c_n;
                 unsigned int pl_r = pl_ne - pl_f * pl_c_n;
@@ -2156,7 +2136,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         }
                     }
                     unsigned int pl_m0;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(pl_m0) : "r"(pl_mx));
+                    asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(pl_m0) : "r"(pl_mx));
                     unsigned int pl_nlt = 0;
                     #pragma unroll
                     for (int pk2 = 0; pk2 < 4; pk2++) {
@@ -2167,7 +2147,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         }
                     }
                     unsigned int pl_nlt_w;
-                    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(pl_nlt_w) : "r"(pl_nlt));
+                    asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(pl_nlt_w) : "r"(pl_nlt));
                     unsigned int pl_nover = 0;
                     if (pl_r > pl_nlt_w) {
                         pl_nover = pl_r - pl_nlt_w;
@@ -2239,7 +2219,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         }
                     }
                     unsigned int pl_r2w;
-                    asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(pl_r2w) : "r"(pl_r2));
+                    asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(pl_r2w) : "r"(pl_r2));
                     if (pl_own_r1 < pl_nwhole) {
                         pl_whole = (int)(pl_f * pl_c_n + pl_own_r1);
                     }

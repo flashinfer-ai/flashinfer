@@ -125,8 +125,8 @@ kernel_cake_mhc_train_bwd_prepare__t224__h7168(__nv_bfloat16* __restrict__ dy, _
         }
         if (row < T) {
             long long row64 = (long long)row;
-            long long xbase = row64 * 28672 + col0;
-            long long bbase = row64 * 7168 + col0;
+            long long xbase = row64 * 28672ll + col0;
+            long long bbase = row64 * 7168ll + col0;
             unsigned int cache[144];
             #pragma unroll
             for (int r = 0; r < 9; r++) {
@@ -150,10 +150,10 @@ kernel_cake_mhc_train_bwd_prepare__t224__h7168(__nv_bfloat16* __restrict__ dy, _
                     }
                 }
             }
-            long long sbase = row64 * 64;
+            long long sbase = row64 * 64ll;
             float _vec_load_0[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(stats + (sbase + 28) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(stats + (sbase + 28ll) + 0);
                 _vec_load_0[0 + 0] = _v4.x;
                 _vec_load_0[0 + 1] = _v4.y;
                 _vec_load_0[0 + 2] = _v4.z;
@@ -161,7 +161,7 @@ kernel_cake_mhc_train_bwd_prepare__t224__h7168(__nv_bfloat16* __restrict__ dy, _
             }
             float _vec_load_1[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(stats + (sbase + 32) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(stats + (sbase + 32ll) + 0);
                 _vec_load_1[0 + 0] = _v4.x;
                 _vec_load_1[0 + 1] = _v4.y;
                 _vec_load_1[0 + 2] = _v4.z;
@@ -435,7 +435,7 @@ kernel_cake_mhc_train_bwd_prepare__t224__h7168(__nv_bfloat16* __restrict__ dy, _
                         vals[0] = _add_41;
                     }
                 }
-                long long gidx = (long long)row * 32 + (long long)lane_1;
+                long long gidx = (long long)row * 32ll + (long long)lane_1;
                 gstats[gidx] = vals[0];
             }
         }

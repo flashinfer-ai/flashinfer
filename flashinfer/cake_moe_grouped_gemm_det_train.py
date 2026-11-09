@@ -156,14 +156,17 @@ def cake_moe_grouped_gemm_det_train_wgrad(
     instead, ``out[e] += G[e].T @ X[e]`` (Megatron's gradient-accumulation
     fusion into an fp32 or bf16 ``main_grad``; ``out`` required, bfloat16 or
     float32, ``out_dtype`` None or its dtype, no overlap of ``out`` with itself,
-    ``g``, ``x`` or ``offs``: ``ValueError``), and returns ``out``: the
-    deterministic weight gradient in ``out``'s dtype is written into a scratch
-    of that dtype and added with ``out.add_`` on the same stream, so ``out``
-    holds AccumulateGrad's bits of it, bitwise reproducible run to run.  The
-    scratch takes ``E * N * K`` elements (``4 * E * N * K`` bytes for fp32)
-    for the call; ``cake_moe_grouped_gemm_det_train_prepare_wgrad(..., accumulate=True)``
-    keeps it with a prepared launch (CUDA-graph capturable; every launch and
-    replay adds again).  ``sum_m == 0`` leaves ``out`` unchanged.
+    ``g``, ``x`` or ``offs``: ``ValueError``), and returns ``out``, which holds
+    AccumulateGrad's bits of the deterministic weight gradient in its dtype,
+    bitwise reproducible run to run: fused into the 512-wide k tile's programs
+    (the main stage and the ordered tail reduce add into ``out`` in place)
+    where the route serves their accumulate builds for ``out``'s dtype, else
+    the overwrite into a scratch of ``out``'s dtype (``E * N * K`` elements,
+    ``4 * E * N * K`` bytes for fp32) added with ``out.add_`` on the same
+    stream; both give the same bits
+    (``cake_moe_grouped_gemm_det_train_prepare_wgrad`` and the package README
+    give the routes; a prepared launch is CUDA-graph capturable and every
+    launch and replay adds again).  ``sum_m == 0`` leaves ``out`` unchanged.
     """
     from .experimental.cake.cake_moe_grouped_gemm_det_train import (
         cake_moe_grouped_gemm_det_train_wgrad as _impl,
@@ -192,7 +195,9 @@ def cake_moe_grouped_gemm_det_train_prepare_forward(
     ``x``: ``[sum_m, K]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``N % 256 == 0``, ``K % 64 == 0`` (the
     512-column tile when ``N % 512 == 0`` on the architectures of
-    ``wide_fwd_archs``, its 3 / 3 head / tail twin where ``fwd_wide_ts33`` holds).
+    ``wide_fwd_archs``, its L2 evict-first twin where ``fwd_lwh_ef`` or
+    ``fwd_evict_first`` holds for ``K``, its 3 / 3 head / tail twin where
+    ``fwd_wide_ts33`` holds).
     ``out`` may be row-padded (any row stride, unit column
     stride).
     """
@@ -251,17 +256,20 @@ def cake_moe_grouped_gemm_det_train_prepare_wgrad(
     ``out`` (required, bf16 or fp32; ``out_dtype`` None or ``out.dtype``; rows
     and experts that do not overlap, no memory shared with ``g``, ``x`` or
     ``offs``; ``ValueError`` otherwise, before anything is allocated or
-    bound).  The launch runs the overwrite of this plan into a contiguous
-    scratch of ``out.dtype`` (``E * N * K`` elements: ``4 * E * N * K`` bytes
-    for fp32) that this preparation allocates and the launch owns, then
-    ``out.add_(scratch)`` on the same stream, so ``out`` holds AccumulateGrad's
-    bits of the deterministic weight gradient in its dtype, bitwise
-    reproducible run to run (an empty group adds exact zeros: its values stay,
-    ``-0.0`` may become ``+0.0``).  ``plan["accumulate"]`` is ``"composed"``
-    (``"off"`` for an overwrite) and every other plan key is the overwrite's.
-    No row (``sum_m == 0``) launches nothing and leaves ``out`` unchanged.  Each
-    ``launch()`` and each replay of a graph that captured it adds again; keep
-    the launch alive while such a graph may replay.
+    bound), so ``out`` holds AccumulateGrad's bits of the deterministic weight
+    gradient in its dtype, bitwise reproducible run to run (an empty group
+    adds exact zeros: its values stay, ``-0.0`` becomes ``+0.0``).
+    ``plan["accumulate"]`` is ``"fused"`` (the accumulate builds of the main
+    stage and, for a split tail, of the tail reduce add into ``out`` in place:
+    ``stages`` is the overwrite's with ``ACC_SUFFIX`` on each) or
+    ``"composed"`` (the overwrite of this plan into a contiguous scratch of
+    ``out.dtype``, ``E * N * K`` elements that this preparation allocates and
+    the launch owns, then ``out.add_(scratch)`` on the same stream;
+    ``plan["accumulate_reason"]`` says why); both give the same bits, and
+    every other plan key is the overwrite's (module docstring, accumulate
+    mode).  No row (``sum_m == 0``) launches nothing and leaves ``out``
+    unchanged.  Each ``launch()`` and each replay of a graph that captured it
+    adds again; keep the launch alive while such a graph may replay.
     """
     from .experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
         cake_moe_grouped_gemm_det_train_prepare_wgrad as _impl,
@@ -309,10 +317,12 @@ def cake_moe_grouped_gemm_det(
         and also refuses one that shares memory with the operands).  Under
         ``torch.no_grad()`` or inference mode the forward needs no
         ``main_grad``.  The backward adds the deterministic ``dW`` into it in
-        place (``main_grad[e] += G[e].T @ X[e]``: ``dW`` in ``main_grad``'s
-        dtype into a scratch, then ``main_grad.add_`` on the same stream, the
-        package's accumulate mode), which gives AccumulateGrad's bits of that
-        ``dW``, bitwise reproducible run to run, and returns for ``w`` a fresh
+        place (``main_grad[e] += G[e].T @ X[e]``, the package's accumulate
+        mode: fused into the weight-gradient programs where the route serves
+        their accumulate builds for ``main_grad``'s dtype, else ``dW`` in
+        ``main_grad``'s dtype into a scratch, then ``main_grad.add_`` on the
+        same stream), which gives AccumulateGrad's bits of that ``dW`` on
+        either route, bitwise reproducible run to run, and returns for ``w`` a fresh
         ``torch.empty`` of ``w``'s shape and dtype when ``w`` has the attribute
         ``grad_added_to_main_grad`` (set to ``True``; ``torch.zeros`` when
         ``w.zero_out_wgrad`` is true), else ``None``: ``w.grad`` is then
@@ -323,11 +333,12 @@ def cake_moe_grouped_gemm_det(
         supported (``NotImplementedError``) under ``torch.jit.trace``,
         ``torch.compile`` and a ``create_graph`` backward; under a reentrant
         checkpoint ``w`` arrives detached, without ``main_grad``
-        (``ValueError``).  Cost: the weight-gradient launch holds a scratch of
-        ``E * N * K`` elements of ``main_grad``'s dtype (``4 * E * N * K``
-        bytes for fp32, freed after the add), which the programs write and the
-        add reads back besides its read and write of ``main_grad``; the
-        placeholder takes ``2 * E * N * K`` bytes.  Under
+        (``ValueError``).  Cost: on the composed route the weight-gradient
+        launch holds a scratch of ``E * N * K`` elements of ``main_grad``'s
+        dtype (``4 * E * N * K`` bytes for fp32, freed after the add), which
+        the programs write and the add reads back besides its read and write
+        of ``main_grad``; the fused route holds none.  The placeholder takes
+        ``2 * E * N * K`` bytes.  Under
         ``torch.use_deterministic_algorithms(True)`` with
         ``torch.utils.deterministic.fill_uninitialized_memory`` on (the
         default) torch also fills the scratch and the ``torch.empty``
