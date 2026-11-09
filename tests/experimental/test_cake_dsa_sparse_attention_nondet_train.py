@@ -693,6 +693,15 @@ def test_binding_keys_cover_geometry_scale_and_lengths_not_pointers():
     assert bwd != backward_binding_key(
         ql, qr, kl, kr, idx, out, out, lse, out, None, scale, False, 2
     )  # key_passes
+    # the segment count enters as its class: one segment, or more (every multi-segment count shares one key)
+    by_count = {
+        n: backward_binding_key(
+            ql, qr, kl, kr, idx, out, out, lse, out, None, scale, False, None, n
+        )
+        for n in (1, 2, 3, 7)
+    }
+    assert by_count[1] == bwd and by_count[2] != bwd
+    assert by_count[2] == by_count[3] == by_count[7]
 
 
 def test_binding_cache_is_least_recently_used_and_bounded_by_capacity():
@@ -2475,6 +2484,8 @@ forward_binding_key_nope = cake_backend.forward_binding_key_nope
 backward_binding_key_nope = cake_backend.backward_binding_key_nope
 NOPE_INDEX_PREP_STAGE = cake_backend.NOPE_INDEX_PREP_STAGE
 nope_globalize_indices = cake_backend.nope_globalize_indices
+# the tag of the NoPE autograd backward's predictions in the binding cache
+NOPE_BWD_PREDICTION = cake_backend._NOPE_BWD_PREDICTION
 
 # The kernels' argument lists of the NoPE stages (the generated launchers bind them by name, in this order; the
 # delta, compaction and cast stages are the rope program's kernels and keep their lists).
@@ -3752,7 +3763,20 @@ def test_nope_binding_keys_are_tagged_and_cover_geometry_scale_lengths_and_dkv_o
     )  # key_passes
     assert bwd != backward_binding_key_nope(
         q, kv, idx, out, out, lse, out, None, scale, None, 3
-    )  # num_segments
+    )  # num_segments: one segment or more
+    # the key holds the segment class: every multi-segment count shares one key, a count below 1 stays as given
+    multi = backward_binding_key_nope(
+        q, kv, idx, out, out, lse, out, None, scale, None, 2
+    )
+    for count in (3, 4, 7):
+        assert multi == backward_binding_key_nope(
+            q, kv, idx, out, out, lse, out, None, scale, None, count
+        )
+    below = {
+        backward_binding_key_nope(q, kv, idx, out, out, lse, out, None, scale, None, n)
+        for n in (0, -1)
+    }
+    assert len({bwd, multi} | below) == 4
     acc = torch.zeros(16, D_LATENT)
     with_acc = backward_binding_key_nope(
         q, kv, idx, out, out, lse, out, None, scale, None, 1, acc
@@ -4441,17 +4465,17 @@ def test_nope_varlen_index_mode_follows_the_table_size(monkeypatch):
         )
 
 
-def test_nope_autograd_backward_is_settled_at_forward_and_launches_back_to_back(
+def test_nope_autograd_backward_is_settled_at_forward_and_launches_delta_first(
     monkeypatch,
 ):
     """The autograd wrappers settle the backward at forward time (``ctx.nope_prep``: the binding key without
     ``dout``, the options, the accumulator validated once and kept as a ctx attribute in its tensor form) and save
     seven tensors in a fixed order (``q``, ``kv``, ``out``, ``lse``, ``o_lo``, the index rows, the lengths or a
     zero-size placeholder: everything of size the backward reads, so a checkpointed forward retains nothing,
-    flashinfer-ai/flashinfer#7039); the backward's host work before its first launch is the key completion, the
-    lookup, the fresh allocations and the value binding -- every allocation and the accumulator check precede the
-    first launch, the zero fills of the buffers the call owns and the stages follow back to back, and nothing is
-    allocated or validated after a launch."""
+    flashinfer-ai/flashinfer#7039).  The first backward of a geometry looks its binding up (a miss: one plan) and
+    remembers it; a later backward with a ``dout`` of that layout runs it with no lookup.  The backward allocates
+    ``delta`` and launches the delta stage first; ``dq``, the other fresh buffers and the zero fills of the buffers
+    the call owns follow, then the remaining stages.  The accumulator check precedes every launch."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     events = []
@@ -4504,8 +4528,8 @@ def test_nope_autograd_backward_is_settled_at_forward_and_launches_back_to_back(
     q.requires_grad_()
     dout = torch.zeros_like(q)
     acc = torch.empty(S, D_LATENT, device="cuda")
-    # the packed entry with a caller accumulator: the check runs at forward time, the backward allocates dq and
-    # delta, binds and launches delta + main with no fill (the caller owns the zeroing)
+    # the packed entry with a caller accumulator: the check runs at forward time, the backward allocates delta,
+    # launches it, allocates dq and launches main with no fill (the caller owns the zeroing)
     out, lse = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
         q, kv, local, cu_q, cu_k, return_lse=True, dkv_acc=acc
     )
@@ -4523,15 +4547,16 @@ def test_nope_autograd_backward_is_settled_at_forward_and_launches_back_to_back(
     del events[:], calls[:]
     (dq,) = torch.autograd.grad(out, (q,), dout)
     kinds = [e[0] for e in events]
-    assert kinds == ["cache", "alloc", "alloc", "launch"], events
-    assert events[0][1] is True  # the binding the first backward planned and cached
-    assert events[1][1] == (T, NUM_HEADS, D_LATENT) and events[2][1] == (T, NUM_HEADS)
-    assert events[3][1][0] == "nope_bwd_delta" and len(events[3][1]) >= 2
-    assert [c[0] for c in calls] == list(events[3][1])
+    # the binding the first backward planned, run from the prediction: no lookup; delta first
+    assert kinds == ["alloc", "launch", "alloc", "launch"], events
+    assert events[0][1] == (T, NUM_HEADS) and events[1][1] == ("nope_bwd_delta",)
+    assert events[2][1] == (T, NUM_HEADS, D_LATENT) and len(events[3][1]) >= 1
+    assert [c[0] for c in calls] == list(events[1][1] + events[3][1])
     assert tuple(dq.shape) == (T, NUM_HEADS, D_LATENT)
     fwd_main = calls[-1][1]
     assert fwd_main["dkv_f32"] is acc or fwd_main.get("dst_packed") is acc
-    # the flat entry without an accumulator: the fresh dkv's zero fill sits right before the stages
+    # the flat entry without an accumulator: the fresh dkv's zero fill sits between the delta launch and the
+    # remaining stages
     del events[:], calls[:]
     idx = torch.zeros(T, K, dtype=torch.int32, device="cuda")
     out2 = cake_backend.cake_dsa_sparse_attention_nondet_nope(q, kv, idx)
@@ -4546,11 +4571,11 @@ def test_nope_autograd_backward_is_settled_at_forward_and_launches_back_to_back(
     (dq2,) = torch.autograd.grad(out2, (q,), dout)
     kinds = [e[0] for e in events]
     assert (
-        kinds[:4] == ["cache", "alloc", "alloc", "alloc"] and kinds[-1] == "launch"
+        kinds[:4] == ["alloc", "launch", "alloc", "alloc"] and kinds[-1] == "launch"
     ), events
-    assert events[0][1] is True
-    assert all(k in ("alloc", "fill") for k in kinds[1:-1]) and "fill" in kinds, events
-    assert events[3][1] == (S, D_LATENT)
+    assert events[0][1] == (T, NUM_HEADS) and events[1][1] == ("nope_bwd_delta",)
+    assert all(k in ("alloc", "fill") for k in kinds[2:-1]) and "fill" in kinds, events
+    assert events[2][1] == (T, NUM_HEADS, D_LATENT) and events[3][1] == (S, D_LATENT)
     assert tuple(dq2.shape) == (T, NUM_HEADS, D_LATENT)
 
 
@@ -4629,28 +4654,34 @@ def test_nope_index_prep_route_issues_the_forward_with_nothing_left_to_do(
     assert calls[0][1]["convert"] == cake_backend.NOPE_CONVERT_MASK
 
 
-def test_nope_autograd_entries_settle_the_backward_before_their_first_launch(
+def test_nope_autograd_entries_validate_before_their_first_launch_and_settle_after(
     monkeypatch,
 ):
-    """On every route the NoPE autograd entries allocate and bind the forward, settle the backward
-    (:class:`_NopeBackwardPrep`: the key, the accumulator check, the saved list) and only then launch, so the
-    forward's launches are the last events of the call; an invalid accumulator argument is rejected before any
-    launch."""
+    """On every route the NoPE autograd entries allocate and bind the forward, validate the accumulator arguments
+    (:class:`_NopeBackwardPrep`'s constructor) and launch; the backward's settlement (:meth:`_NopeBackwardPrep.settle`:
+    the key, the saved list, the prediction) follows the last launch, so it overlaps the forward kernel.  An invalid
+    accumulator argument is rejected before any launch."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     events = []
     real_init = cake_backend._NopeBackwardPrep.__init__
+    real_settle = cake_backend._NopeBackwardPrep.settle
     real_check = cake_backend._check_dkv_acc
 
     def init(self, *args, **kwargs):
-        events.append("settle")
+        events.append("validate")
         real_init(self, *args, **kwargs)
+
+    def settle(self, *args, **kwargs):
+        events.append("settle")
+        real_settle(self, *args, **kwargs)
 
     def check(*args, **kwargs):
         events.append("check_dkv_acc")
         return real_check(*args, **kwargs)
 
     monkeypatch.setattr(cake_backend._NopeBackwardPrep, "__init__", init)
+    monkeypatch.setattr(cake_backend._NopeBackwardPrep, "settle", settle)
     monkeypatch.setattr(cake_backend, "_check_dkv_acc", check)
     for stage in (NOPE_INDEX_PREP_STAGE, "nope_fwd"):
         real_launch = cake_launch.LAUNCH[stage]
@@ -4695,9 +4726,11 @@ def test_nope_autograd_entries_settle_the_backward_before_their_first_launch(
             del events[:]
             call(dkv_acc=acc)
             launches = [e for e in events if e in both]
-            assert launches == stages and events[-len(stages) :] == stages, events
+            assert launches == stages and events[-len(stages) - 1 :] == stages + [
+                "settle"
+            ], events
             first = events.index(stages[0])
-            assert events.index("settle") < events.index("check_dkv_acc") < first
+            assert events.index("validate") < events.index("check_dkv_acc") < first
         for kw, match in (
             (dict(dkv_dst_map=mine), "only meaningful together with dkv_acc"),
             (dict(dkv_acc=torch.zeros(S, 16, device="cuda")), ""),
@@ -4707,6 +4740,7 @@ def test_nope_autograd_entries_settle_the_backward_before_their_first_launch(
             with pytest.raises((ValueError, TypeError), match=match):
                 call(**kw)
             assert not [e for e in events if e in both], (kw, events)
+            assert "settle" not in events, (kw, events)
 
 
 def test_nope_backward_key_is_settled_at_forward_unless_a_callable_gives_the_accumulator(
@@ -4716,7 +4750,8 @@ def test_nope_backward_key_is_settled_at_forward_unless_a_callable_gives_the_acc
     without an accumulator or with a tensor one the accumulator's geometry is part of it (``key_tail``); with a
     callable it is keyed in the backward from the produced tensor (and map).  Every form completes to
     :func:`backward_binding_key_nope` of the backward's own operands, and the backward launches over the accumulator
-    the call gave."""
+    the call gave.  The forms with a settled ``key_tail`` remember the binding and ``dout``'s geometry under the
+    tagged prediction key; a callable's form remembers nothing."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     cache = cake_backend.BINDING_CACHE
@@ -4762,10 +4797,23 @@ def test_nope_backward_key_is_settled_at_forward_unless_a_callable_gives_the_acc
             want_map,
             None,
         ), form
+        predictions = {
+            k: v for k, v in cache._entries.items() if k[0] == NOPE_BWD_PREDICTION
+        }
         if prep.key_tail is not None:
             assert (
                 key == prep.key_head + (cake_backend._geometry(dout),) + prep.key_tail
             )
+            assert prep.prediction_key == (
+                NOPE_BWD_PREDICTION,
+                prep.key_head,
+                prep.key_tail,
+            )
+            assert predictions == {
+                prep.prediction_key: (cake_backend._geometry(dout), cache._entries[key])
+            }, form
+        else:
+            assert prep.prediction_key is None and not predictions, form
         launched = [v for _, values in calls for v in values.values()]
         assert (want_acc is None) != any(v is acc for v in launched), form
         if want_map is not None:
@@ -4777,7 +4825,8 @@ def test_nope_varlen_step_makes_no_capture_query_once_its_bindings_are_cached(
 ):
     """The NoPE varlen entry hands its own lengths to the forward and the backward binding, so neither owns a
     ``topk_length`` vector: a first step under capture plans both privately (one capture query each) and stores
-    nothing; once an eager step has planned them, a step -- captured or not -- is served from the cache with no
+    nothing -- no binding and no prediction; once an eager step has planned them (and remembered the backward's
+    binding as the next forward's prediction), a step -- captured or not -- is served from the cache with no
     capture query."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
@@ -4810,14 +4859,279 @@ def test_nope_varlen_step_makes_no_capture_query_once_its_bindings_are_cached(
     capturing[0] = False
     del queries[:]
     step()
-    assert queries == [False, False] and len(cache) == 2
-    assert all(binding.topk_length is None for binding in cache._entries.values())
+    # the forward and backward bindings plus the backward's prediction
+    assert queries == [False, False] and len(cache) == 3
+    bindings = [b for k, b in cache._entries.items() if k[0] != NOPE_BWD_PREDICTION]
+    assert len(bindings) == 2 and all(b.topk_length is None for b in bindings)
     for state in (False, True):
         capturing[0] = state
         del queries[:], calls[:]
         step()
-        assert queries == [] and len(cache) == 2, state
+        assert queries == [] and len(cache) == 3, state
         assert calls[0][0] == "nope_fwd" or calls[0][0] == NOPE_INDEX_PREP_STAGE
+
+
+@pytest.mark.parametrize("form", [None, "tensor", "callable"])
+def test_nope_backward_launches_delta_first_and_checks_before_it(monkeypatch, form):
+    """The NoPE autograd backward allocates ``delta`` and launches the delta stage before any other allocation;
+    ``dq`` and the other fresh buffers follow while it runs, then the remaining stages.  The nondeterminism alert and
+    a callable accumulator's resolution and check precede the delta launch (a tensor accumulator is checked at
+    forward time).  An allocation failure after the delta launch (``dq``'s, injected) raises with the delta stage
+    alone launched: the caller's ``dkv_acc`` is the operand of no launch, so it is left as it was."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    events = []
+    fail_dq = [False]
+    real_alloc, real_check = cake_backend._alloc, cake_backend._check_dkv_acc
+    real_alert = cake_backend._alert_nondeterministic
+    real_resolve = cake_backend._resolve_dkv_acc
+    real_launch = cake_backend._NopeBinding._launch_stages
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    S = int(cu_k[-1])
+
+    def alloc(shape, dtype, device, *, zero=False):
+        shape = tuple(int(d) for d in shape)
+        events.append(("alloc", shape))
+        if fail_dq[0] and shape == (T, NUM_HEADS, D_LATENT):
+            raise RuntimeError("injected dq allocation failure")
+        return real_alloc(shape, dtype, device, zero=zero)
+
+    def check(*args, **kwargs):
+        events.append(("check_dkv_acc",))
+        return real_check(*args, **kwargs)
+
+    def alert(entry):
+        events.append(("alert",))
+        return real_alert(entry)
+
+    def resolve(*args):
+        events.append(("resolve",))
+        return real_resolve(*args)
+
+    def launch(self, values, keys):
+        events.append(
+            ("launch", tuple(k if isinstance(k, str) else k[0] for k in keys))
+        )
+        return real_launch(self, values, keys)
+
+    monkeypatch.setattr(cake_backend, "_alloc", alloc)
+    monkeypatch.setattr(cake_backend, "_check_dkv_acc", check)
+    monkeypatch.setattr(cake_backend, "_alert_nondeterministic", alert)
+    monkeypatch.setattr(cake_backend, "_resolve_dkv_acc", resolve)
+    monkeypatch.setattr(cake_backend._NopeBinding, "_launch_stages", launch)
+    q, kv, _ = _nope_host_inputs(total_q=T, total_k=S, topk=K, device="cuda")
+    q.requires_grad_()
+    dout = torch.zeros_like(q)
+    acc = torch.full((S, D_LATENT), 0.5, device="cuda")
+    kw = {}
+    if form is not None:
+        kw["dkv_acc"] = acc if form == "tensor" else (lambda: acc)
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen
+    # a planning backward, then one over the cached (or predicted) binding
+    for _ in range(2):
+        out = varlen(q, kv, local, cu_q, cu_k, causal=True, **kw)
+        del events[:], calls[:]
+        torch.autograd.grad(out, (q,), dout)
+        launches = [e for e in events if e[0] == "launch"]
+        assert len(launches) == 2 and launches[0][1] == ("nope_bwd_delta",), events
+        first, second = events.index(launches[0]), events.index(launches[1])
+        before, between = events[:first], events[first + 1 : second]
+        # the alert and every check precede the delta launch; delta's buffer is the last host work before it
+        assert ("alert",) in before and before[-1] == ("alloc", (T, NUM_HEADS)), events
+        assert [e for e in before if e[0] == "alloc"] == [("alloc", (T, NUM_HEADS))]
+        if form == "callable":
+            order = [before.index((e,)) for e in ("resolve", "check_dkv_acc", "alert")]
+            assert order == sorted(order), events
+        assert ("check_dkv_acc",) not in events[first:], events
+        # dq first among the allocations that follow the delta launch
+        assert between[0] == ("alloc", (T, NUM_HEADS, D_LATENT)), events
+        assert all(e[0] == "alloc" for e in between), events
+        assert [c[0] for c in calls] == list(launches[0][1] + launches[1][1])
+    # an allocation failure after the delta launch: delta alone was launched, the accumulator reached no launch
+    out = varlen(q, kv, local, cu_q, cu_k, causal=True, **kw)
+    before_acc = acc.clone()
+    del events[:], calls[:]
+    fail_dq[0] = True
+    with pytest.raises(RuntimeError, match="injected dq allocation failure"):
+        torch.autograd.grad(out, (q,), dout)
+    fail_dq[0] = False
+    assert [c[0] for c in calls] == ["nope_bwd_delta"], calls
+    assert not any(v is acc for _, values in calls for v in values.values())
+    torch.cuda.synchronize()
+    assert torch.equal(acc, before_acc)
+
+
+def test_nope_autograd_backward_runs_the_prediction_of_its_dout_layout(monkeypatch):
+    """The NoPE autograd forward looks up, after its launch, the binding its backward is predicted to run: the
+    binding the last backward with the same key without ``dout`` ran, with that ``dout``'s geometry.  A backward whose
+    ``dout`` has that geometry runs it with no lookup; another ``dout`` layout takes the lookup (a plan on a miss)
+    and replaces the prediction.  Every backward runs the binding of its own ``dout`` layout -- the delta stage
+    receives that layout's strides -- however the layouts alternate.  No prediction is looked up when neither
+    ``q`` nor ``kv`` requires a gradient; ``clear()`` drops the predictions with the bindings, and one capacity
+    bounds both."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    cache = cake_backend.BINDING_CACHE
+    counts: dict = {}
+    real_get, real_predict, real_remember = cache.get, cache.predict, cache.remember
+    real_plan = cake_backend._plan_nope
+
+    def bump(name):
+        counts[name] = counts.get(name, 0) + 1
+
+    def get(key):
+        if key[0] == "nope_bwd":
+            bump("lookup")
+        return real_get(key)
+
+    def predict(key):
+        bump("predict")
+        return real_predict(key)
+
+    def remember(*args):
+        bump("remember")
+        return real_remember(*args)
+
+    def plan(*args, **kwargs):
+        if kwargs.get("backward"):
+            bump("plan")
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(cache, "get", get)
+    monkeypatch.setattr(cache, "predict", predict)
+    monkeypatch.setattr(cache, "remember", remember)
+    monkeypatch.setattr(cake_backend, "_plan_nope", plan)
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    S = int(cu_k[-1])
+    q, kv, _ = _nope_host_inputs(total_q=T, total_k=S, topk=K, device="cuda")
+    q.requires_grad_()
+    dense = torch.zeros_like(q)
+    layouts = {
+        "dense": dense,
+        "head_major": dense.permute(1, 0, 2).contiguous().permute(1, 0, 2),
+    }
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen
+
+    def step(name):
+        dout = layouts[name]
+        counts.clear()
+        out = varlen(q, kv, local, cu_q, cu_k, causal=True)
+        del calls[:]
+        torch.autograd.grad(out, (q,), dout)
+        stage, delta = calls[0]
+        assert stage == "nope_bwd_delta" and delta["dout"] is dout, name
+        assert (
+            delta["dout_token_stride"],
+            delta["dout_head_stride"],
+        ) == dout.stride()[:2], name
+        main = [v for s, v in calls if s.startswith("nope_bwd_main")]
+        assert main and all(v["dout"] is dout for v in main), name
+        return tuple(
+            counts.get(k, 0) for k in ("predict", "lookup", "plan", "remember")
+        )
+
+    # (predict, lookup, plan, remember): the first backward plans and remembers; the next runs the prediction
+    assert step("dense") == (1, 1, 1, 1)
+    assert step("dense") == (1, 0, 0, 0)
+    # another layout misses the prediction: a lookup (a plan the first time) and a new prediction
+    assert step("head_major") == (1, 1, 1, 1)
+    assert step("head_major") == (1, 0, 0, 0)
+    # back to the first layout: its binding is still cached
+    assert step("dense") == (1, 1, 0, 1)
+    assert step("dense") == (1, 0, 0, 0)
+    # neither q nor kv requires a gradient: no prediction is looked up
+    counts.clear()
+    with torch.no_grad():
+        varlen(q.detach(), kv, local, cu_q, cu_k, causal=True)
+    varlen(q.detach(), kv, local, cu_q, cu_k, causal=True)
+    assert counts.get("predict", 0) == 0
+    # clear() drops the predictions with the bindings: the next backward plans again
+    cache.clear()
+    assert step("dense") == (1, 1, 1, 1)
+    assert len([k for k in cache._entries if k[0] == NOPE_BWD_PREDICTION]) == 1
+    # one capacity bounds bindings and predictions alike
+    monkeypatch.setattr(cache, "capacity", cache.capacity)  # restored after the test
+    cache.configure(capacity=1)
+    assert len(cache) == 1
+    for name in ("dense", "head_major", "dense"):
+        step(name)
+        assert len(cache) == 1, name
+
+
+def _documents(total_q: int, total_k: int, num_docs: int):
+    """``(cu_seqlens_q, cu_seqlens_k)`` of ``num_docs`` documents that split ``total_q`` queries and ``total_k``
+    keys as evenly as possible (every query segment no longer than its key segment when ``total_q <= total_k``)."""
+    return tuple(
+        torch.tensor(
+            [total * i // num_docs for i in range(num_docs + 1)],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        for total in (total_q, total_k)
+    )
+
+
+@pytest.mark.parametrize("form", [None, "callable"], ids=["fresh", "callable_dkv_acc"])
+@pytest.mark.parametrize("name", ["nope_varlen", "rope_varlen"])
+def test_varlen_backward_binding_serves_every_document_count(monkeypatch, name, form):
+    """The backward binding keys hold the segment class (one segment, or more), not the count: once a step has
+    planned its bindings, steps over the same geometry with other multi-document counts (3, 4, 7, 3 after 2) plan
+    nothing and add no cache entry -- through the NoPE prediction and through the lookup alike (a callable
+    accumulator predicts nothing; the rotary backward always looks up) -- and a one-document step plans its own
+    backward binding."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    if name == "rope_varlen":
+        _stand_in_rope_program(monkeypatch, calls)
+    plans = []
+    for attr in ("_plan", "_plan_nope"):
+        real_plan = getattr(cake_backend, attr)
+
+        def plan(*args, _real=real_plan, **kwargs):
+            plans.append(bool(kwargs.get("backward")))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(cake_backend, attr, plan)
+    cache = cake_backend.BINDING_CACHE
+    T, S, K = 16, 32, 4
+    local = torch.zeros(T, K, dtype=torch.int32, device="cuda")
+    if name == "nope_varlen":
+        q, kv, _ = _nope_host_inputs(total_q=T, total_k=S, topk=K, device="cuda")
+        leaf = q.requires_grad_()
+        acc = torch.zeros(S, D_LATENT, device="cuda")
+
+        def entry(cu_q, cu_k, **kw):
+            return cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen(
+                q, kv, local, cu_q, cu_k, causal=True, **kw
+            )
+
+    else:
+        rope = [t.requires_grad_() for t in _rope_device_inputs(T, S, K)[:4]]
+        leaf = rope[0]
+        acc = torch.zeros(S, D_QK, device="cuda")
+
+        def entry(cu_q, cu_k, **kw):
+            return cake_backend.cake_dsa_sparse_attention_nondet_varlen(
+                *rope, local, cu_q, cu_k, causal=True, **kw
+            )
+
+    kw = {} if form is None else {"dkv_acc": lambda: acc}
+
+    def step(num_docs):
+        del plans[:]
+        out = entry(*_documents(T, S, num_docs), **kw)
+        torch.autograd.grad(out, (leaf,), torch.ones_like(out))
+        return list(plans)
+
+    assert True in step(2)  # the forward and backward bindings of the geometry
+    size = len(cache)
+    for num_docs in (3, 4, 7, 3):
+        assert step(num_docs) == [], num_docs
+        assert len(cache) == size, num_docs
+    assert step(1) == [True]  # one segment: its own backward binding
+    assert step(2) == []
 
 
 def test_nope_kernel_level_packed_forward_is_the_public_entry_without_autograd(
@@ -9057,3 +9371,52 @@ def test_autograd_entries_capture_the_first_call_of_a_new_geometry(
     out_e, grads_e, acc_e = _eager_step(fn, leaves, inp.dout, acc)
     assert len(cache) > warm  # the eager step stores what the capture planned privately
     _assert_same_results(got, (out_e, grads_e), acc_got=acc_got, acc_want=acc_e)
+
+
+@pytest.mark.parametrize("form", [None, "tensor"], ids=["fresh", "tensor_dkv_acc"])
+def test_nope_backward_over_alternating_dout_layouts_matches_a_planning_backward(
+    monkeypatch, form
+):
+    """With the registered kernels, through the NoPE varlen entry: backwards over alternating ``dout`` layouts
+    (dense and head-major) -- each running the prediction, a lookup or a plan -- give ``out`` and ``dq`` of a backward
+    planned from an empty binding cache with the same layout bitwise, and its ``dkv`` (or accumulator) within the
+    atomics spread.  With a tensor accumulator, an allocation failure injected after the delta launch (``dq``'s)
+    leaves the accumulator bitwise as it was."""
+    inp = _ckpt_inputs()
+    _private_binding_cache(monkeypatch)
+    cache = cake_backend.BINDING_CACHE
+    fn, leaves, acc = _ckpt_entry("nope_varlen", inp, acc_form=form)
+    layouts = {
+        "dense": inp.dout,
+        "head_major": inp.dout.permute(1, 0, 2).contiguous().permute(1, 0, 2),
+    }
+    want = {}
+    for name, dout in layouts.items():
+        cache.clear()
+        want[name] = _eager_step(fn, leaves, dout, acc)
+    cache.clear()
+    for name in ("dense", "dense", "head_major", "head_major", "dense", "head_major"):
+        out, grads, acc_got = _eager_step(fn, leaves, layouts[name], acc)
+        out_w, grads_w, acc_w = want[name]
+        _assert_same_results(
+            (out, grads), (out_w, grads_w), acc_got=acc_got, acc_want=acc_w
+        )
+    if acc is None:
+        return
+    gen = torch.Generator(device="cuda").manual_seed(SEED + 140)
+    acc.copy_(torch.randn(acc.shape, device="cuda", generator=gen))
+    before = acc.clone()
+    out = fn(*leaves)
+    T = int(inp.q.shape[0])
+    real_alloc = cake_backend._alloc
+
+    def alloc(shape, dtype, device, *, zero=False):
+        if tuple(int(d) for d in shape) == (T, NUM_HEADS, D_LATENT):
+            raise RuntimeError("injected dq allocation failure")
+        return real_alloc(shape, dtype, device, zero=zero)
+
+    monkeypatch.setattr(cake_backend, "_alloc", alloc)
+    with pytest.raises(RuntimeError, match="injected dq allocation failure"):
+        torch.autograd.grad(out, leaves, layouts["dense"], allow_unused=True)
+    torch.cuda.synchronize()
+    assert torch.equal(acc, before)
