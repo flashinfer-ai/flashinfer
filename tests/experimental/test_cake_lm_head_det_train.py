@@ -6495,7 +6495,9 @@ def test_budget_result_backward_refuses_the_reference_backend():
         ("unfused", None, None),
     ):
         res = replace(fr)
-        res.memory_plan = opt_in.MemoryPlan(form, V if block is None else 8, block, 0, 0)
+        res.memory_plan = opt_in.MemoryPlan(
+            form, V if block is None else 8, block, 0, 0
+        )
         res.dw_split = split
         if split is None and block is None:
             dX, dW = res.backward(backend="reference")
