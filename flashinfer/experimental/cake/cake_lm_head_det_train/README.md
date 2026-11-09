@@ -491,14 +491,17 @@ keyword.
   the threshold the cost depends on the form the call gets (B200, step
   medians of the default and `"fast"` calls in one process, `C = 4096`):
   at the issue's shapes (`T = 16384`, a third of the labels ignored) the
-  step peak went from 6.971 to 5.020 GiB at `H = 6144` (`"partial"`, 42.5
-  against 40.3 ms, about 5 % slower) and from 5.041 to 3.838 GiB at
+  step peak went from 6.971 to 5.015 GiB at `H = 6144` (`"partial_ip"`,
+  42.6 against 41.5 ms, about 3 % slower) and from 5.041 to 3.838 GiB at
   `H = 4096` (`"fused_ip"`, 27.3 against 27.2 ms, within the noise); with
   5 % of the labels ignored, at `H = 6144`, from 7.081 to 5.430 GiB
   (`"fused_ip"`, 57.0 against 56.9 ms, within the noise; a checkpointed step
-  about 2 % slower); at `T = 8117` (two chunks, `H = 6144`, `"partial"`)
-  from 6.811 to 4.005 GiB, 33.5 against 28.9 ms (about 15 % slower); a
-  short call that recomputes most of the vocabulary costs more.  The margin above was measured for the `"budget"`
+  about 2 % slower); at `T = 8117` (two chunks, `H = 6144`, `"partial_ip"`)
+  from 6.811 to 3.996 GiB, 31.8 against 29.7 ms (about 7 % slower).  The
+  log-probability entry's backward runs `"partial"` there: 56.4 against
+  54.0 ms (about 4 % slower) at `T = 16384` with a third of the labels
+  ignored, 43.6 against 39.1 ms (about 11 % slower) at `T = 8117`.  A short
+  call that recomputes most of the vocabulary costs more.  The margin above was measured for the `"budget"`
   form; the fast form's own-lifetime model is checked against measured peaks
   of the issue's shapes.  The hidden valid-row count allocates a whole
   chunk's buffers before the count is known.  A call that misses the binding
