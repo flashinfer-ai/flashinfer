@@ -38,37 +38,39 @@ def build_and_load_gdn_kernel(
         return compile_fn()
 
     env = CuTeDSL._get_dsl().envar
+    compile_started = False
+
+    def compile_if_enabled():
+        nonlocal compile_started
+        # An unreadable source key can make the shared cache call this directly.
+        if os.environ.get("FLASHINFER_DISABLE_JIT"):
+            raise MissingJITCacheError(
+                "JIT compilation is disabled via FLASHINFER_DISABLE_JIT. "
+                "This GDN specialization requires compilation."
+            )
+        compile_started = True
+        return compile_fn()
+
     # Diagnostic modes need to run the compiler. Overrides can change the
-    # target or calling convention supplied by the caller.
+    # target or calling convention. With JIT disabled, NO_CACHE alone can be
+    # served by a matching FlashInfer disk artifact.
     if (
         env.dryrun
         or env.keep_tokens
         or env.print_ir
         or env.print_after_preprocessor
-        or env.no_cache
+        or (env.no_cache and not os.environ.get("FLASHINFER_DISABLE_JIT"))
         or env.compiler_opt
         or (env.enable_tvm_ffi and not enable_tvm_ffi)
     ):
-        if os.environ.get("FLASHINFER_DISABLE_JIT"):
-            raise MissingJITCacheError(
-                "JIT compilation is disabled via FLASHINFER_DISABLE_JIT, but "
-                "the CuTe-DSL compiler settings require compiling this GDN kernel."
-            )
-        return compile_fn()
+        return compile_if_enabled()
 
     name = _kernel_name(kind, specialization, args, env.cache_key_str())
-    compile_started = False
-
-    def compile_for_cache():
-        nonlocal compile_started
-        compile_started = True
-        return compile_fn()
-
     try:
         return build_and_load_cute_dsl_kernel(
             module_name,
             name,
-            compile_for_cache,
+            compile_if_enabled,
             extra_key_files=extra_key_files,
             enable_tvm_ffi=enable_tvm_ffi,
             target_arch=target_arch,
@@ -86,4 +88,4 @@ def build_and_load_gdn_kernel(
             f"Cannot access the CuTe-DSL cache for {module_name}: {exc}. "
             "Compiling in process."
         )
-        return compile_fn()
+        return compile_if_enabled()

@@ -180,16 +180,60 @@ def test_gdn_compile_override_uses_process_cache(
     disk_cache.assert_not_called()
 
 
-def test_gdn_compile_override_honors_disabled_jit(monkeypatch, gdn_compile):
+@pytest.mark.parametrize("missing_source", [False, True])
+def test_gdn_no_cache_flag_honors_disabled_jit_on_miss(
+    monkeypatch, tmp_path, gdn_compile, missing_source
+):
     from cutlass.cutlass_dsl import CuTeDSL
 
     from flashinfer.jit import MissingJITCacheError
+    from flashinfer.jit import env as jit_env
 
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
     monkeypatch.setattr(CuTeDSL._get_dsl().envar, "no_cache", True)
     monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    key_files = (str(tmp_path / "missing.py"),) if missing_source else ()
     compile_fn = Mock()
     with pytest.raises(MissingJITCacheError, match="FLASHINFER_DISABLE_JIT"):
-        gdn_compile(compile_fn)
+        gdn_compile(compile_fn, extra_key_files=key_files)
+    compile_fn.assert_not_called()
+
+
+@pytest.mark.parametrize("print_ir", [False, True])
+def test_gdn_no_cache_flag_with_prebuilt_object(
+    monkeypatch, tmp_path, gdn_compile, print_ir
+):
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    from flashinfer.jit import MissingJITCacheError, cute_dsl_core
+    from flashinfer.jit import env as jit_env
+
+    env = CuTeDSL._get_dsl().envar
+    monkeypatch.setattr(env, "no_cache", False)
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(
+        cute_dsl_core.JitSpecCuteDsl,
+        "_load_from_disk",
+        lambda spec: spec.object_path.read_bytes(),
+    )
+    compiled = Mock()
+    compiled.dump_to_object.return_value = b"kernel object"
+    assert gdn_compile(lambda: compiled) == b"kernel object"
+
+    monkeypatch.setattr(env, "no_cache", True)
+    monkeypatch.setattr(env, "print_ir", print_ir)
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    compile_fn = Mock()
+    if print_ir:
+        with pytest.raises(MissingJITCacheError, match="FLASHINFER_DISABLE_JIT"):
+            gdn_compile(compile_fn)
+    else:
+        try:
+            loaded = gdn_compile(compile_fn)
+        except MissingJITCacheError as exc:
+            # The JIT cache test plugin would otherwise skip this failure.
+            raise AssertionError("expected to load the prebuilt object") from exc
+        assert loaded == b"kernel object"
     compile_fn.assert_not_called()
 
 
