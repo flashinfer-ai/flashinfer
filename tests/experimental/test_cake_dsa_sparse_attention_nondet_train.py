@@ -9099,25 +9099,26 @@ def _nope_flat_step(q, kv, rows, dout, cut, *, offload=None):
     return out.detach(), grads, saved_rows
 
 
-@pytest.mark.parametrize("pin_memory", [False, True])
 @pytest.mark.parametrize("order", ["eager_first", "offload_first"])
 @pytest.mark.parametrize("lengths", [False, True], ids=["mask", "topk_length"])
 @pytest.mark.parametrize("view", NOPE_ROW_VIEWS)
 def test_nope_backward_keys_offloaded_strided_rows_by_their_saved_layout(
-    monkeypatch, view, lengths, order, pin_memory
+    monkeypatch, view, lengths, order
 ):
     """The flat NoPE entry over strided caller rows -- a column slice of a wider buffer, a view at an offset into a
     flat buffer -- saves the rows as given, on the mask route and with caller lengths; ``save_on_cpu`` hands them
     back contiguous at offset 0, and the backward's plan bakes the rows' stride and start offset.  An eager and an
     offloaded step in either order, from an empty binding cache, each give the cache-cleared eager step's ``out``
     and ``dq`` bitwise and its ``dkv`` within the atomics spread: the backward keys by the rows it reads, so each
-    layout keeps its own backward binding and neither step runs over the other's."""
+    layout keeps its own backward binding and neither step runs over the other's.  The offload packs to pinned host
+    memory; a pageable pack hands back the same contiguous rows, and the pageable path is
+    ``test_save_on_cpu_outputs_and_gradients_match_the_eager_pair``'s."""
     q, kv, rows, dout, cut = _nope_offload_case(view, lengths)
     _private_binding_cache(monkeypatch)
     cache = cake_backend.BINDING_CACHE
     want = _nope_flat_step(q, kv, rows, dout, cut)[:2]
     cache.clear()
-    modes = [None, pin_memory] if order == "eager_first" else [pin_memory, None]
+    modes = [None, True] if order == "eager_first" else [True, None]
     layouts = set()
     for offload in modes:
         out, grads, saved = _nope_flat_step(q, kv, rows, dout, cut, offload=offload)
