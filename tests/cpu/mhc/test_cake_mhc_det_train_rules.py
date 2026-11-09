@@ -151,7 +151,7 @@ RUN_TIME_ITERS = {
     "cake_mhc_det_train_fwd_coef__rt64": "cake_mhc_det_train_fwd_coef",
     "cake_mhc_det_train_bwd_token__rt64": "cake_mhc_det_train_bwd_token",
 }
-# (xrsg ships at H 5120 / 7168 alone: no architecture routes it at H 4096)
+# (no architecture routes xrsg at any hidden size: xrsg_p160 / dynr / dynl take its token counts)
 SLAB_LIBRARY = {
     "xrsg_p160": "cake_mhc_det_train_bwd_slab__xrsg_p160",
     "dynr": "cake_mhc_det_train_bwd_slab__dynr",
