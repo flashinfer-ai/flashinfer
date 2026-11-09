@@ -3,8 +3,10 @@
 """The delegate behind ``batch_invariant=True`` on ``BatchDecodeWithPagedKVCacheWrapper``, ``BatchPrefillWithPagedKVCacheWrapper`` and
 ``BatchPrefillWithRaggedKVCacheWrapper``: the wrappers' ``plan`` / ``run`` hand their arguments here, the class's typed checks raise
 :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for everything the class does not cover (nothing falls back), and the
-engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim: a token's output bits depend on
-its KV position, its head and the window alone, so the three wrappers compute the same bits for the same token.
+engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim and mask mode: under the causal
+class a token's output bits depend on its KV position, its head and the window alone; under the non-causal class (``causal=False`` on
+the prefill wrappers, ``is_causal=False`` with ``q_len_per_req > 1`` on the decode wrapper) on its request's key count and its head
+alone. The three wrappers compute the same bits for the same token of the same class.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
@@ -87,6 +89,7 @@ class BatchInvariantAttention:
         self._sm_scale: Optional[float] = None
         self._scale_log2 = 0.0
         self._window_left = -1
+        self._causal = True  # the planned class's mask mode
         self._total_q = 0
         self._heads: Tuple[int, int, int] = (0, 0, 0)
         self._page = 1
@@ -150,6 +153,7 @@ class BatchInvariantAttention:
         page_size: int,
         window_left: int = -1,
         q_len_per_req: int = 1,
+        causal: bool = True,
     ) -> int:
         """The wrappers' ``workspace_size``: the float workspace bytes the split-KV plan of this batch needs (0 when every unit is
         fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits)."""
@@ -181,6 +185,7 @@ class BatchInvariantAttention:
             engine.default_config(D=D),
             self.device,
             ragged=self.kind == "ragged",
+            causal=bool(causal),
         )
 
     # ------------------------------------------------------------------ plan
@@ -257,10 +262,7 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
             )
-        if self.kind != "decode" and not causal:
-            raise unsupported(
-                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
-            )
+        causal = bool(causal)
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise unsupported(
                 CLASS, f"logits_soft_cap {logits_soft_cap}", "no logits soft cap"
@@ -300,6 +302,13 @@ class BatchInvariantAttention:
                 CLASS,
                 f"window_left {window_left}",
                 "window_left >= 0, or -1 for no window",
+            )
+        if not causal and window_left >= 0:
+            # a symmetric window over a non-causal row would be a further class; the non-causal class sees every key
+            raise unsupported(
+                CLASS,
+                f"window_left {window_left} with causal=False",
+                "the whole key range under the non-causal class (a window belongs to the causal class)",
             )
         if sm_scale is not None:
             ok = math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0
@@ -413,11 +422,17 @@ class BatchInvariantAttention:
                     f"request {i} with a decreasing qo_indptr / kv_indptr",
                     "non-decreasing offsets",
                 )
-            if ql > kl:
+            if causal and ql > kl:
                 raise unsupported(
                     CLASS,
                     f"request {i} with {ql} query tokens over {kl} keys",
                     "kv_len >= q_len per request (the causal class)",
+                )
+            if not causal and ql > 0 and kl == 0:
+                raise unsupported(
+                    CLASS,
+                    f"request {i} with {ql} query tokens over no key",
+                    "at least one key per request with query tokens (a non-causal row sees its request's keys)",
                 )
         config = engine.default_config(D=D)
         if D == 64 and self.kind != "decode":
@@ -443,6 +458,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 ragged=self.kind == "ragged",
+                causal=causal,
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -464,6 +480,7 @@ class BatchInvariantAttention:
                     self.workspace,
                     self.device,
                     ragged=self.kind == "ragged",
+                    causal=causal,
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
@@ -496,6 +513,7 @@ class BatchInvariantAttention:
         self._sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
         self._scale_log2 = scale_log2(self._sm_scale)
         self._window_left = int(window_left)
+        self._causal = causal
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         self._heads = (num_qo_heads, num_kv_heads, D)
         self._page = page_size
@@ -544,9 +562,11 @@ class BatchInvariantAttention:
                 'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
             )
         self.refuse(rope_scale=rope_scale, rope_theta=rope_theta)
-        if causal is not None and not causal and self.kind != "decode":
+        if causal is not None and bool(causal) != self._causal:
             raise unsupported(
-                CLASS, "non-causal attention", "causal attention (bottom-right aligned)"
+                CLASS,
+                f"causal={bool(causal)} at forward() after planning causal={self._causal}",
+                "the planned mask mode (the causal and the non-causal class are two classes)",
             )
         if use_fp16_qk_reduction:
             raise unsupported(

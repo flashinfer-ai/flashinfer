@@ -90,10 +90,10 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int) -> str:
+def _attention_fingerprint(head_dim: int, causal: bool = True) -> str:
     from ..attention.batch_invariant.spec import spec_fingerprint
 
-    return spec_fingerprint(head_dim)
+    return spec_fingerprint(head_dim, causal=bool(causal))
 
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
@@ -178,16 +178,17 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
     ),
-    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    # the three attention wrappers compute one class per head dim and mask mode: under the causal class (the default) a token's
+    # output depends on its KV position, its head and the window alone, under the non-causal class (`causal=False`) on its request's
+    # key count and its head alone; prefill and decode (and the paged and ragged KV layouts) are one class per mode
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
     ),
 }
 
@@ -229,13 +230,18 @@ def fingerprint(op: str, **dims) -> str:
     functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
     ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
-    sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too.
+    sliding window (``window_left``) is a per-call input of the causal class, like the KV position: the receipt is the digest of the
+    class's no-window sample row and covers windowed calls too. The optional ``causal=False`` names the non-causal class (prefill
+    with ``causal=False``, decode with ``q_len_per_req > 1`` and ``is_causal=False``): every token sees its request's whole key
+    range, so the same token has a different term and a different fingerprint (``attn-bf16-d<D>-nc-*``); a single-token decode
+    step is the causal class whatever ``is_causal`` says.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
     'gemm-bf16-kfold-bias-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, causal=False)  # doctest: +SKIP
+    'attn-bf16-d128-nc-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
     >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
