@@ -27,8 +27,9 @@ the deterministic package ``flashinfer.cake_rmsnorm_silu_gate_det_train``.
 
 Every output of the package repeats bit for bit, except a BF16 weight
 gradient of the fused backward (``bwd_bf16_fused``, the band past the
-small-row bands of ``BACKWARD_BANDS`` on every architecture; an FP32 weight
-gradient runs no fused backward) and of the row-claims backwards
+small-row bands of ``BACKWARD_BANDS`` up to the repeatable backward's band on
+every architecture; an FP32 weight gradient runs no fused backward) and of
+the row-claims backwards
 (``bwd_bf16_rc``, ``bwd_bf16_rc_mid``, where a band runs them), whose CTAs
 claim 16-row blocks at run time and add FP64 atomics (grid kind
 ``row_claims``), so its last bits may vary from run to run; there every
@@ -37,12 +38,16 @@ launch's bits.  The fused backward (:func:`_fused`) runs the row arithmetic
 of the deterministic package's BF16 backward program (``DET_FUSED_DIGEST``),
 so its ``dx`` and ``dz`` are the deterministic package's bits at every grid
 while that package routes that program on the device
-(:func:`assert_det_bits_where_fused`); its ``dw`` need not be.  In every other
+(:func:`assert_det_bits_where_fused`); its ``dw`` need not be.  The
+repeatable backward (``bwd_bf16_rep``, :func:`_rep`, the last BF16 band on
+every architecture) is that program itself, so its ``dx``, ``dz`` and ``dw``
+(accumulated too) are the deterministic package's bits.  In every other
 band the backward writes ``dx`` and ``dz`` with this package's one row
 arithmetic; in every band they are held to FP64 (within one BF16 ulp plus
 1/64 ulp of the tensor's largest finite magnitude,
 :func:`assert_dx_dz_within_fp64`) on every path checked here, and outside the
-fused band they need not be the deterministic package's bits.  Nor is
+fused and the repeatable bands they need not be the deterministic package's
+bits.  Nor is
 ``y``: the forward computes ``rstd`` and the SiLU gate with approximate FP32
 intrinsics.  Nor, near rounding boundaries, is ``dw``: the chunked backwards
 add the chunk partials of the weight gradient of the deterministic package
@@ -458,6 +463,17 @@ def _fused(name: str) -> bool:
     return loader.MODULES[name]["role"] == "bwd_bf16_fused"
 
 
+def _rep(name: str) -> bool:
+    """Whether the backward module ``name`` is the repeatable backward
+    (``bwd_bf16_rep``, on every architecture; grid kind
+    ``claimed_row_blocks``): the deterministic package's BF16 backward program
+    (``DET_FUSED_DIGEST``) under this package's name, whose CTAs claim 16-row
+    blocks and sum the weight gradient exactly in fixed point, so its ``dx``,
+    ``dz`` and ``dw`` (accumulated too) are the deterministic package's bits
+    on the same inputs and device, and repeat them."""
+    return loader.MODULES[name]["role"] == "bwd_bf16_rep"
+
+
 def _det_routes_same_program() -> bool:
     """Whether the deterministic package's BF16 backward on the current
     device is the program of ``DET_FUSED_DIGEST``; once that package ships
@@ -468,19 +484,22 @@ def _det_routes_same_program() -> bool:
 
 
 def assert_det_bits_where_fused(name: str, got, det) -> None:
-    """Where the backward module ``name`` is the fused backward
-    (:func:`_fused`) and the deterministic package routes the program whose
-    row arithmetic it runs (:func:`_det_routes_same_program`), ``dx`` and
-    ``dz`` of ``got`` (``dx``, ``dz`` and, when given, ``dw``) are the bits
-    of the deterministic package's output of the same call in ``det``; its
-    ``dw`` and the other backwards' outputs need not be that package's bits,
-    so nothing more is checked."""
-    if not _fused(name) or not _det_routes_same_program():
+    """Where the backward module ``name`` is the fused or the repeatable
+    backward (:func:`_fused`, :func:`_rep`) and the deterministic package
+    routes the program whose row arithmetic it runs
+    (:func:`_det_routes_same_program`), ``dx`` and ``dz`` of ``got`` (``dx``,
+    ``dz`` and, when given, ``dw``) are the bits of the deterministic
+    package's output of the same call in ``det``, and so is the repeatable
+    backward's ``dw``; the fused backward's ``dw`` and the other backwards'
+    outputs need not be that package's bits, so nothing more is checked."""
+    if not (_fused(name) or _rep(name)) or not _det_routes_same_program():
         return
     assert len(got) == len(det) and 2 <= len(got) <= 3, (len(got), len(det))
-    for what, g, d in zip(("dx", "dz"), got[:2], det[:2], strict=True):
+    which = "repeatable" if _rep(name) else "fused"
+    count = len(got) if _rep(name) else 2
+    for what, g, d in zip(("dx", "dz", "dw")[:count], got, det, strict=False):
         assert_same_bits(
-            f"{what} of the fused backward vs the deterministic package", g, d
+            f"{what} of the {which} backward vs the deterministic package", g, d
         )
 
 
@@ -930,8 +949,8 @@ def test_no_call_alerts_under_deterministic_algorithms(
     bits runs with no warning and no error: the forward and the backward
     into a BF16 and an FP32 weight gradient at the first rows of each
     ``BACKWARD_BANDS`` band of this device (``_band_modules``; for a BF16
-    weight gradient every band but the fused band, whose backward
-    alerts: :func:`test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled`),
+    weight gradient every band but the fused band, whose backward alerts:
+    :func:`test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled`),
     and the autograd backward, with the weight gradient, of
     :func:`cake_rmsnorm_silu_gate_nondet`, of
     :class:`CakeRMSNormSiLUGateNondetFunction` and of a non-reentrant
@@ -1336,7 +1355,9 @@ def test_accuracy_matrix_within_the_deterministic_error(
 
 @requires_device
 @pytest.mark.parametrize(
-    "band", [None, "bwd_bf16_fused"], ids=["1031x48", "bwd_bf16_fused"]
+    "band",
+    [None, "bwd_bf16_fused", "bwd_bf16_rep"],
+    ids=["1031x48", "bwd_bf16_fused", "bwd_bf16_rep"],
 )
 def test_accumulation_within_the_deterministic_error(band, determinism_setting) -> None:
     """Two microbatches of ``T x H`` rows (1031 tokens of 48 heads; for
@@ -1394,6 +1415,14 @@ def test_accumulation_within_the_deterministic_error(band, determinism_setting) 
             assert_error_within_det(
                 f"{dtype} accumulator", main, main_reference, want, mag=mag
             )
+        module = suite._backward_module(rows, dtype)
+        if _rep(module) and _det_routes_same_program():
+            assert_same_bits(
+                f"{dtype} accumulator of the repeatable backward vs the "
+                "deterministic package",
+                mains[0],
+                main_reference,
+            )
     # autograd accumulation into .grad over two microbatches
     xa, za, wa = (t.clone().requires_grad_(True) for t in (x, z, w))
     node_dws: list[torch.Tensor] = []
@@ -1427,7 +1456,9 @@ def test_accumulation_within_the_deterministic_error(band, determinism_setting) 
 
 @requires_device
 @pytest.mark.parametrize(
-    "band", [None, "bwd_bf16_fused"], ids=["257x48", "bwd_bf16_fused"]
+    "band",
+    [None, "bwd_bf16_fused", "bwd_bf16_rep"],
+    ids=["257x48", "bwd_bf16_fused", "bwd_bf16_rep"],
 )
 def test_compute_grad_weight_false_within_the_deterministic_error(
     band,
@@ -2322,6 +2353,12 @@ def _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch) -> None:
     for acc_dw in acc if varies else acc[:1]:
         assert_error_within_det("accumulated dw", acc_dw, acc_d, 0.25 + dw64, mag=mag)
         suite.assert_dw_within(acc_dw, 0.25 + dw64, mag, what="accumulated dw vs FP64")
+    if _rep(name) and _det_routes_same_program():
+        assert_same_bits(
+            "accumulated dw of the repeatable backward vs the deterministic package",
+            acc[0],
+            acc_d,
+        )
     assert launched == [name] * (suite.REPEATS + 2), launched
 
 
@@ -2890,6 +2927,7 @@ ONE_HEAD_ROUTES = [
     pytest.param("bwd_bf16", "bwd_bf16_mid", id="bwd_bf16_claimed"),
     pytest.param("bwd_f32", "bwd_f32_mid", id="bwd_f32_claimed"),
     pytest.param("bwd_bf16", "bwd_bf16_fused", id="bwd_bf16_fused"),
+    pytest.param("bwd_bf16", "bwd_bf16_rep", id="bwd_bf16_rep"),
 ]
 
 
