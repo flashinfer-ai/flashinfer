@@ -128,6 +128,17 @@ to 128 channels and the FlashInfer adapter explicitly requests its existing
 64-channel contract. Input and weight scale blocks remain 128. The scale choice
 also selects the matching reference and heuristic table.
 
+BF16xMXFP8 transform and MMA issue (local, 2026-11-09):
+`kernel_mxfp8_bf16_glu_fc12.py` adds `direct_bf16_cvt` (direct E4M3x2->BF16x2
+convert in the transform warps), `runtime_mma_split` (N128 only: one N64
+instruction for tiles of at most 64 valid tokens, one N128 instruction above
+that) and the `((256, 64, 128), "tmem", False, 128)` implementation tuple.
+`epilogue_mxfp8_bf16.py` stores FC1 hand-off rows in the N128 block-swapped
+order, which FC2's N128 instruction undoes. `num_weight_stages` decouples the
+raw weight/scale SMEM stages from the transformed stages, and
+`megamoe_kernel_mxfp8_bf16.py` forwards the arguments. All are bit-identical to
+the previous kernel. Upstream candidate.
+
 BF16xMXFP8 B-stage count (`bangyus/cutedsl_megamoe!91`, 2026-11-09):
 `kernel_mxfp8_bf16_glu_fc12.py` raises the default `"b"` pipeline depth from 2
 to 4 (3 for the N256/`smem` implementation, whose 4-stage launch exceeds the

@@ -180,11 +180,18 @@ _BF16_MXFP8_TOKEN_KNOBS: Dict[str, Any] = {
     "accumulator_overlap": False,
     "transform_k_tile": 128,
     "cluster_shape_mnk": (2, 1, 1),
-    "flag_batch": 1,
-    "epi_flag_batch": (1, 1),
+    "group_hint": 512,
+    "flag_batch": 4,
+    "epi_flag_batch": (2, 4),
     "token_back_mode": "epi_warps",
     "load_balance_mode": "static",
+    "direct_bf16_cvt": True,
+    "mma_inst_n": 64,
+    "full_tile_mma": True,
+    "num_weight_stages": 6,
+    "num_activation_stages": 5,
 }
+_BF16_MXFP8_ATOMIC_MIN_LOCAL_EXPERTS = 16
 
 
 def _nvfp4_default_knobs(
@@ -254,10 +261,16 @@ def _bf16_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
     return knobs
 
 
-# TODO: Actually implement some heuristics
-def _bf16_mxfp8_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
+def _bf16_mxfp8_default_knobs(
+    *, enable_in_kernel_fc2_reduce: bool, experts_per_rank: Optional[int]
+) -> Dict[str, Any]:
     """The default mixed implementation tuple (``is_valid_bf16_mxfp8``)."""
     knobs = dict(_BF16_MXFP8_TOKEN_KNOBS)
+    if (
+        experts_per_rank is not None
+        and experts_per_rank >= _BF16_MXFP8_ATOMIC_MIN_LOCAL_EXPERTS
+    ):
+        knobs["load_balance_mode"] = "atomic_counter"
     # Default to IKR if enabled by the user
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
     return knobs
@@ -278,6 +291,7 @@ def default_knobs(
     dtype: str = "nvfp4",
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
+    experts_per_rank: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Default perf/tile knobs for a compile-time token count (buffer size).
 
@@ -301,7 +315,8 @@ def default_knobs(
         )
     if dtype == "bf16_mxfp8":
         return _bf16_mxfp8_default_knobs(
-            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            experts_per_rank=experts_per_rank,
         )
     if dtype == "mxfp8":
         return _mxfp8_default_knobs(
@@ -404,6 +419,14 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         and knobs.get("token_back_mode", "epi_warps")
         in ("epi_warps", "reuse_dispatch_warps")
         and knobs.get("clc_bundle_size") is None
+        and knobs.get("mma_inst_n") in (None, 64, impl[0][1])
+        and (
+            not knobs.get("full_tile_mma", False)
+            or (
+                impl == ((256, 128, 128), "tmem", False, 128)
+                and knobs.get("mma_inst_n") == 64
+            )
+        )
         and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
     )
 

@@ -366,10 +366,16 @@ class _MixedSwapABFc1Epilogue(_ImmutableAfterInit):
                     up[i] = fmin(up[i], self.gate_up_clamp)
                     up[i] = fmax(up[i], -self.gate_up_clamp)
 
+            token_block = subtile_idx * cutlass.Int32(2) + cutlass.Int32(
+                token_half
+            )
+            if cutlass.const_expr(self.fc1_n128_block_swap):
+                if valid_tokens > cutlass.Int32(2 * WarpThreadCount):
+                    token_block = ((token_block & cutlass.Int32(1)) << 1) | (
+                        token_block >> 1
+                    )
             token_in_cta = (
-                subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize)
-                + cutlass.Int32(token_half * WarpThreadCount)
-                + self.lane_idx
+                token_block * cutlass.Int32(WarpThreadCount) + self.lane_idx
             )
             token_in_expert = (
                 work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
@@ -486,6 +492,7 @@ class MixedGluBf16Epilogue:
         accumulator_overlap: bool = False,
         batch_invariant: bool = False,
         batch_invariant_activation=None,
+        fc1_n128_block_swap: bool = False,
     ) -> None:
         self.batch_invariant_chain = batch_invariant
         self.batch_invariant_activation = batch_invariant_activation
@@ -512,6 +519,15 @@ class MixedGluBf16Epilogue:
         atom_thr_size = 2 if use_2cta_instrs else 1
         self.cta_tile_m = mma_tiler_mnk[0] // atom_thr_size
         self.cta_tile_n = mma_tiler_mnk[1]
+        # FC1 tiles with more than 64 valid tokens hold token blocks
+        # (0, 2, 1, 3) in their four 32-column accumulator blocks.
+        self.fc1_n128_block_swap = fc1_n128_block_swap
+        if fc1_n128_block_swap and (
+            self.cta_tile_n != 128 or accumulator_overlap
+        ):
+            raise ValueError(
+                "fc1_n128_block_swap requires N=128 without accumulator overlap."
+            )
         self.cta_tile_k = mma_tiler_mnk[2]
         if self.cta_tile_m != self._EpilogueFc2HiddenTileSize:
             raise ValueError(
