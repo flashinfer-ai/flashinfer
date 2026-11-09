@@ -199,7 +199,7 @@ __device__ __forceinline__ void cp_async_bulk_gmem2smem(
 extern "C" {
 
 __global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* dw_acc, unsigned int* __restrict__ tile_tk, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, float* __restrict__ dpre_tail, int* __restrict__ tail_row_off, unsigned int* claims, unsigned int* __restrict__ departs, int S, int C, int num_docs, int M, int NL, int P, int L, int n_ctas, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map)
+kernel_cake_causal_conv1d_train_4fb1b7f750457bfedfdb_kcp(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* dw_acc, unsigned int* __restrict__ tile_tk, __nv_bfloat16* __restrict__ hist, int* __restrict__ hist_row_off, float* __restrict__ dpre_tail, int* __restrict__ tail_row_off, int* __restrict__ skip_row_off, unsigned int* claims, unsigned int* __restrict__ departs, int S, int C, int num_docs, int M, int NL, int P, int L, int n_ctas, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map)
 {
     // Grid-dependency payloads: written while the kernel runs, read with coherent loads only.
     asm volatile("" : "+l"(dw_acc));
@@ -923,10 +923,17 @@ kernel_cake_causal_conv1d_train_6f0876a0958bd143d61a_kcp(__nv_bfloat16* __restri
                                                     pend[(v % 4 + 4 + 2 - 3) % 4 * 8 + j_2] = _fma_50;
                                                 }
                                             }
+                                            int own_rows = 1;
+                                            #pragma unroll
+                                            for (int r_s = 0; r_s < 3; r_s++) {
+                                                if (skip_row_off[frag * 3 + r_s] >= 0) {
+                                                    own_rows = 0;
+                                                }
+                                            }
                                             #pragma unroll
                                             for (int m = 1; m < 4; m++) {
                                                 int tm = tcur - m;
-                                                if (tm >= run_t0 && tm < t1 && tm >= doc_start) {
+                                                if (own_rows != 0 && tm >= run_t0 && tm < t1 && tm >= doc_start) {
                                                     long long rowm = (long long)tm * C64 + c64;
                                                     unsigned int _packed_4[4];
                                                     #pragma unroll

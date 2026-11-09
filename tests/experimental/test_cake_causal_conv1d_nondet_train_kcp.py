@@ -246,6 +246,11 @@ def test_fp32_dweight_must_be_16_byte_aligned():
 
 
 def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
+    """The KCP programs plan their launches with ``cake_jit.plan(..., legacy=True)``: the single backward program
+    (the ``bwd_route`` test knob ``"single"``; the overlapped pair plans with its own work plan) and the one-launch
+    forward (knobs ``fwd_main`` 0, ``fwd_overlap`` 0), while the shipped forward's single-rank main program
+    (``FWD_MAIN_ARCHS``) plans with the ``fwd`` route's rule for the device's architecture.  ``y`` is bitwise the
+    deterministic KCP forward's and ``dx`` its backward's either way."""
     calls = []
     original = conv_kcp.plan
 
@@ -253,25 +258,37 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
         calls.append(kwargs)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(conv_kcp, "plan", recording_plan)
     device = torch.device("cuda")
+    arch = conv_kcp._device_arch(device)
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 1280, device)
-    y, hist = _fwd(p.x_local, p.w, p.ctx)
-    # The single backward program plans with the legacy rule too; the overlapped pair plans with its own work plan.
-    conv_kcp._set_test_knobs({"bwd_route": "single"})
-    try:
-        dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
-    finally:
-        conv_kcp._set_test_knobs(None)
-    assert len(calls) == 2 and all(call.get("legacy") is True for call in calls), calls
-    monkeypatch.undo()
-    _, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
+    y_det, hist_det = det_kcp.cake_causal_conv1d_det_train_kcp_forward(
         p.x_local, p.w, p.ctx
     )
     dx_det, _ = det_kcp.cake_causal_conv1d_det_train_kcp_backward(
         p.x_local, p.w, p.ctx, p.dy_local, hist_det
     )
-    assert torch.equal(dx, dx_det) and torch.isfinite(dw).all()
+    monkeypatch.setattr(conv_kcp, "plan", recording_plan)
+    for knobs in ({"fwd_main": 0, "fwd_overlap": 0}, {}):
+        calls.clear()
+        # the trimmed host path caches its plans per context: each form plans afresh
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+        conv_kcp._set_test_knobs(knobs)
+        try:
+            y, hist = _fwd(p.x_local, p.w, p.ctx)
+            conv_kcp._set_test_knobs({**knobs, "bwd_route": "single"})
+            dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
+        finally:
+            conv_kcp._set_test_knobs(None)
+        assert len(calls) == 2 and calls[1].get("legacy") is True, (knobs, calls)
+        if not knobs and arch in conv_kcp.FWD_MAIN_ARCHS:
+            assert calls[0].get("legacy") is not True, calls
+            assert (calls[0].get("route"), calls[0].get("arch")) == ("fwd", arch), calls
+        else:
+            assert calls[0].get("legacy") is True, (knobs, calls)
+        assert torch.equal(_bits(y), _bits(y_det)), knobs
+        assert torch.equal(_bits(hist), _bits(hist_det)), knobs
+        assert torch.equal(dx, dx_det) and torch.isfinite(dw).all(), knobs
+    conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
 
 
 def _one_sm_rows(device: torch.device) -> list[tuple[int, tuple[int, int, int]]]:
@@ -386,8 +403,9 @@ def _record_forward_grids(monkeypatch) -> list:
 
 
 def _check_forward_grid(seen: list, expected: tuple, Cs: tuple, arch: str) -> None:
-    """For each ``C`` of ``Cs`` and both host paths: one forward launch of grid ``expected``, ``y`` and ``hist``
-    bitwise the deterministic KCP forward's."""
+    """For each ``C`` of ``Cs`` and both host paths, the one-launch forward (knobs ``fwd_main`` 0, ``fwd_overlap`` 0:
+    the ``kcp_fwd`` program): one forward launch of grid ``expected``, ``y`` and ``hist`` bitwise the deterministic
+    KCP forward's."""
 
     device = torch.device("cuda")
     try:
@@ -397,7 +415,9 @@ def _check_forward_grid(seen: list, expected: tuple, Cs: tuple, arch: str) -> No
                 p.x_local, p.w, p.ctx
             )
             for host_trim in (1, 0):
-                conv_kcp._set_test_knobs({"host_trim": host_trim})
+                conv_kcp._set_test_knobs(
+                    {"host_trim": host_trim, "fwd_main": 0, "fwd_overlap": 0}
+                )
                 conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
                 seen.clear()
                 y, hist = _fwd(p.x_local, p.w, p.ctx)
@@ -412,9 +432,10 @@ def _check_forward_grid(seen: list, expected: tuple, Cs: tuple, arch: str) -> No
 
 
 def test_forward_grid_per_architecture(monkeypatch) -> None:
-    """The forward launches the record's co-resident grid less ``FWD_RESERVE_SMS[arch]`` SMs of CTAs (sm_107a: one
-    SM, the deterministic KCP forward's grid; sm_100a / sm_103a: the full grid), on both host paths; ``y`` and
-    ``hist`` are bitwise the deterministic KCP forward's either way."""
+    """The one-launch forward (knobs ``fwd_main`` 0, ``fwd_overlap`` 0: the ``kcp_fwd`` program) launches the
+    record's co-resident grid less ``FWD_RESERVE_SMS[arch]`` SMs of CTAs (sm_107a: one SM, the deterministic KCP
+    forward's grid; sm_100a / sm_103a: the full grid), on both host paths; ``y`` and ``hist`` are bitwise the
+    deterministic KCP forward's either way."""
 
     arch, record, full = _forward_record(torch.device("cuda"))
     assert conv_kcp.FWD_RESERVE_SMS == {"sm_107a": 1}
