@@ -35,8 +35,9 @@ class Workspace(SimpleNamespace):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_tokens", [0, 1, 512, 8192])
+@pytest.mark.parametrize("sample_size", [1, 64])
 def test_reference_row_sampling_under_model_default_dtype(
-    monkeypatch, dtype, num_tokens
+    monkeypatch, dtype, num_tokens, sample_size
 ):
     def on_cpu(factory):
         def call(*args, **kwargs):
@@ -76,15 +77,15 @@ def test_reference_row_sampling_under_model_default_dtype(
     try:
         torch.set_default_dtype(dtype)
         indices, expected = correctness.sampled_reference(
-            workspace, weights, weights, num_tokens
+            workspace, weights, weights, num_tokens, sample_size=sample_size
         )
     finally:
         torch.set_default_dtype(original)
     assert indices.dtype == torch.int64
-    assert len(indices) == min(num_tokens, 64)
+    assert len(indices) == min(num_tokens, sample_size)
     if num_tokens:
         assert int(indices[0]) == 0
-        assert int(indices[-1]) == num_tokens - 1
+        assert int(indices[-1]) == (num_tokens - 1 if len(indices) > 1 else 0)
         assert bool((indices[1:] > indices[:-1]).all())
     torch.testing.assert_close(expected, x[indices].bfloat16())
 

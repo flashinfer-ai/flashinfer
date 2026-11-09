@@ -13,7 +13,9 @@ from .kernel_helpers import compute_megamoe_reference_block_scaled
 def sampled_reference(
     symm_buffer, l1, l2, num_tokens: int, *, process_group=None, sample_size=64
 ):
-    """Reference evenly spaced rows including both ends, using actual staged bytes.
+    """Reference evenly spaced rows using actual staged bytes.
+
+    Samples of two or more rows include both endpoints; a one-row sample uses row 0.
 
     Each rank evaluates its local experts for one source rank at a time.
     Communication and FP32 expert scratch are bounded by ``sample_size`` and
