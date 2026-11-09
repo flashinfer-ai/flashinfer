@@ -316,14 +316,14 @@ def test_autotune_second_call_hits_cache_and_epilogues_stay_separate(monkeypatch
     a_scale = torch.ones((m,), device=device)
     weight_scale = torch.ones((n,), device=device)
     with autotune(True, tuning_buckets=(32,)):
-        fp8_linear(a, weight, a_scale, weight_scale)
+        fp8_linear(a, weight, a_scale, weight_scale, enable_pdl=True)
         assert calls["n"] == 1
-        fp8_linear(a, weight, a_scale, weight_scale)
+        fp8_linear(a, weight, a_scale, weight_scale, enable_pdl=True)
         assert calls["n"] == 1
         ops = {key.custom_op for key in AutoTuner.get().profiling_cache}
         assert "prims_ts_fp8_linear" in ops
         assert "prims_ts_fp8_swiglu" not in ops
-        fp8_linear_swiglu(a, weight, a_scale, weight_scale)
+        fp8_linear_swiglu(a, weight, a_scale, weight_scale, enable_pdl=True)
         ops = {key.custom_op for key in AutoTuner.get().profiling_cache}
         assert "prims_ts_fp8_swiglu" in ops
         assert calls["n"] == 2
