@@ -51,9 +51,7 @@ def _call(monkeypatch, capability, sm100_kernel=None):
 
 @pytest.mark.parametrize("capability", [(12, 0), (12, 1), (11, 1), (9, 0)])
 def test_unsupported_architectures_are_refused_at_the_entry(monkeypatch, capability):
-    with pytest.raises(
-        ValueError, match=r"only supported on SM100, SM103 and SM107"
-    ):
+    with pytest.raises(ValueError, match=r"only supported on SM100, SM103 and SM107"):
         _call(monkeypatch, capability)
 
 
