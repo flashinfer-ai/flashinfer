@@ -6,12 +6,21 @@ The public Actions handler and internal ci-bot deploy identical copies separatel
 import json
 from pathlib import PurePosixPath
 
+CONFIGURATION_PATHS = (
+    "pytest.ini",
+    "pyproject.toml",
+    "tests/conftest.py",
+    "scripts/task_run_unit_tests.sh",
+)
+
 
 class EvidenceContext:
+    """Account for complete evidence and a separate bounded omission map."""
+
     def __init__(self, pr, snapshot, changed, inventory, candidates, ci_files, limit):
         self.limit = limit
-        # Leave room for omission diagnostics; never truncate source or CI bodies.
-        self.content_limit = limit - min(4096, limit // 10)
+        self.diagnostic_limit = min(4096, limit // 10)
+        self.content_limit = limit - self.diagnostic_limit
         self.context = {
             "pr": {
                 "title": (pr.get("title") or "")[:1000],
@@ -22,6 +31,9 @@ class EvidenceContext:
             "changed_files": [],
             "inventory_at_merged_tree": [],
             "candidate_test_files": [],
+            "configuration_files": [
+                path for path in CONFIGURATION_PATHS if path in inventory
+            ],
             "source_files": {},
             "ci_files": ci_files,
             "unavailable_evidence": {},
@@ -128,17 +140,35 @@ class EvidenceContext:
         self._set(counts, key, counts[key] + change, self.limit)
 
     def unavailable(self, path, reason):
+        """Bound per-path diagnostics separately; count entries that cannot fit."""
+        diagnostic_ceiling = (
+            self.chars + self.diagnostic_limit - self._diagnostic_chars()
+        )
         if not self._set(
-            self.context["unavailable_evidence"], path, reason, self.limit - 128
+            self.context["unavailable_evidence"],
+            path,
+            reason,
+            min(diagnostic_ceiling, self.limit - 128),
         ):
             self._count("unavailable_paths", 1)
 
+    def _diagnostic_chars(self):
+        return len(json.dumps(self.context["unavailable_evidence"])) - 2
+
     def add_source(self, path, text, reserve=0):
+        """Reserve space for later bodies without charging omission records to it."""
         unavailable = self.context["unavailable_evidence"]
         if path in unavailable:
             self._remove(unavailable, path)
+        # Keep headroom for omission counters even when requested bodies fill the budget.
         if not self._set(
-            self.context["source_files"], path, text, self.content_limit - reserve
+            self.context["source_files"],
+            path,
+            text,
+            min(
+                self.content_limit + self._diagnostic_chars() - reserve,
+                self.limit - 128,
+            ),
         ):
             self.unavailable(path, "context budget")
 

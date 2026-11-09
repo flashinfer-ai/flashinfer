@@ -59,7 +59,9 @@ Avoid overlapping targets. Leave experimental-tests unchanged.
 
 EVIDENCE_PROMPT = """Choose additional files needed to connect changed behavior to test assertions
 and an applicable CI launcher. Return JSON with only "read_paths": an array of
-at most 20 distinct paths from inventory_at_merged_tree or candidate_test_files.
+at most 20 distinct paths from inventory_at_merged_tree, candidate_test_files,
+or configuration_files. Configuration files may be retried when their eager
+inspection was omitted from source_files to reserve space for this request.
 Prioritize implementation, test bodies, conftest/configuration, and runner scripts.
 Do not request contents already in source_files or ci_files. Return [] if sufficient.
 This is your only file-request opportunity; do not select final targets yet.
@@ -491,6 +493,10 @@ class PytestTargetSelector:
             if item["type"] == "blob" and item.get("mode") in ("100644", "100755")
         }
         changed = self.github.get_pr_files(pr["number"])
+        expected_files = pr.get("changed_files")
+        file_count_mismatch = (
+            isinstance(expected_files, int) and len(changed) != expected_files
+        )
         # The files endpoint is live. Recheck before combining it with a pinned tree.
         latest = self.github.get_pr_details(pr["number"])
         if not snapshot_matches(
@@ -539,7 +545,9 @@ class PytestTargetSelector:
         context = budget.context
         files = context["source_files"]
         visible_paths = set(
-            context["inventory_at_merged_tree"] + context["candidate_test_files"]
+            context["inventory_at_merged_tree"]
+            + context["candidate_test_files"]
+            + context["configuration_files"]
         )
 
         secrets = (
@@ -588,14 +596,8 @@ class PytestTargetSelector:
                 reserve,
             )
 
-        for path in (
-            "pytest.ini",
-            "pyproject.toml",
-            "tests/conftest.py",
-            "scripts/task_run_unit_tests.sh",
-        ):
-            if path in blobs:
-                inspect(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
+        for path in context["configuration_files"]:
+            inspect(path, reserve=min(50_000, MAX_CONTEXT_CHARS // 4))
 
         # Include changed test bodies before asking the model for more evidence.
         for path in sorted(changed_paths & set(context["candidate_test_files"])):
@@ -636,14 +638,15 @@ class PytestTargetSelector:
                 raise TargetSelectionError("AI decision is missing its explanation")
             reason = _public_prose(reason, secrets)
             if outcome == "full_suite" and (
-                context["omitted_evidence"]["changed_files"]
+                file_count_mismatch
+                or context["omitted_evidence"]["changed_files"]
                 or context["omitted_evidence"]["pr_metadata"]
             ):
                 return TargetSelection(
                     [],
                     "needs_maintainer",
                     snapshot,
-                    "The complete PR change description did not fit the evidence budget; review the scope manually.",
+                    "The complete PR change description could not be verified; review the scope manually.",
                 )
             return TargetSelection([], outcome, snapshot, reason)
         if not 1 <= len(raw) <= MAX_TARGETS:

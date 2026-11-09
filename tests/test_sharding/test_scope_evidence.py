@@ -71,6 +71,22 @@ class EvidenceContextTests(unittest.TestCase):
         )
         self.assertEqual(len(json.dumps(budget.context)), budget.chars)
 
+    def test_omission_records_do_not_spend_reserved_source_space(self):
+        budget = self.build(limit=60_000)
+        budget.add_source("tests/test_seed.py", "x" * 30_000, reserve=20_000)
+        for index in range(200):
+            budget.unavailable(
+                "tests/" + "long_name_" * 15 + str(index) + ".py", "context budget"
+            )
+        body = "x" * 20_000
+        budget.add_source("tests/test_requested.py", body)
+        self.assertEqual(
+            body, budget.context["source_files"]["tests/test_requested.py"]
+        )
+        self.assertGreater(budget.context["omitted_evidence"]["unavailable_paths"], 0)
+        self.assertLessEqual(len(json.dumps(budget.context)), budget.limit)
+        self.assertEqual(len(json.dumps(budget.context)), budget.chars)
+
     def test_trusted_ci_bodies_are_never_silently_truncated(self):
         with self.assertRaisesRegex(ValueError, "Mandatory CI evidence"):
             self.build(ci_files={"ci.yml": "x" * 30_000})

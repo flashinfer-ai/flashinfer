@@ -144,8 +144,12 @@ metadata first, prefer changed tests and nearby files in the inventory, and omit
 whole patches or whole source bodies when they cannot fit. Omission counts are
 included in `omitted_evidence`, and unread source paths in `unavailable_evidence`.
 CI routing bodies stay complete. Eager file reads reserve space for the model's
-second-stage file requests. A full-suite decision is downgraded to maintainer
-review if the PR description or changed-file metadata was incomplete.
+second-stage file requests, including retries of omitted `configuration_files`
+that exist in the pinned tree. Per-path omission records have a separate bounded
+allowance; excess records increment a count without consuming source space.
+A full-suite decision is downgraded to maintainer review if the PR description
+or changed-file metadata was incomplete, or the files response count differs
+from the captured PR count. Matching counts alone do not prove snapshot identity.
 
 The Actions log records each request stage, serialized size, section sizes, and
 omission counts without logging source contents or credentials. The internal
