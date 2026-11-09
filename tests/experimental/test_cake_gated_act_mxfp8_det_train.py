@@ -66,8 +66,8 @@ ROUTES = {
     "bwd_both": (True, True, True),
 }
 # Entry-point shapes (M, K): M * K = 2^14, 2^16, 2^17, 2^19, 2^21, 3 * 2^20,
-# 2^22, 3 * 2^21, 2^23, 2^24, 2^25, 2^26, 2^28 and 2^29, at which the selection
-# rule picks every program of each route on each architecture.
+# 2^22, 3 * 2^21, 2^23, 2^24, 2^25, 7 * 2^23, 2^26, 2^28 and 2^29, at which the
+# selection rule picks every program of each route on each architecture.
 ENTRY_SHAPES = (
     (128, 128),
     (256, 256),
@@ -80,6 +80,7 @@ ENTRY_SHAPES = (
     (4096, 2048),
     (4096, 4096),
     (8192, 4096),
+    (7168, 8192),
     (8192, 8192),
     (32768, 8192),
     (65536, 8192),
