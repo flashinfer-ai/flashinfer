@@ -2125,15 +2125,17 @@ def get_trtllm_moe_sm100_module():
     if major < 10:
         # Every trtllm-gen MoE entry point comes through here, and
         # is_trtllm_moe_supported has returned False for arch[0] < 10 since it
-        # was added without anything acting on it. Without this check the
-        # module is still requested, its JIT flags are built from
-        # supported_major_versions=[10, 12] (jit/fused_moe.py), the filter
-        # leaves nothing for this device, and the user gets
+        # was added without anything acting on it. Asking for the module on
+        # this device fails anyway -- the trtllm-gen cubin manifest carries no
+        # SM90 kernels, and the module's JIT flags are built from
+        # supported_major_versions=[10, 12] (jit/fused_moe.py) so nothing
+        # survives the filter. Which of the two it dies on depends on whether
+        # the manifest can be fetched: cubin_loader's retry exhaustion, or
         # "No supported CUDA architectures found for major versions [10, 12]"
-        # from CompilationContext -- a message that names neither this module
-        # nor trtllm-gen. SM120/SM121 compile here but have no trtllm-gen MoE
-        # cubins yet, which is a different gap (see _TRTLLM_ROUTED_ARCHS above)
-        # and this check says nothing about it.
+        # from CompilationContext. Neither names this module, and both happen
+        # after the caller has already committed to the trtllm-gen path.
+        # SM120/SM121 do compile here and fail for the manifest reason alone
+        # (see _TRTLLM_ROUTED_ARCHS above); this check says nothing about them.
         raise ValueError(
             f"trtllm-gen MoE requires an SM100-family GPU (SM100/SM103, plus "
             f"SM107 on the Rubin cubin build); this device is SM{major}{minor}. "
