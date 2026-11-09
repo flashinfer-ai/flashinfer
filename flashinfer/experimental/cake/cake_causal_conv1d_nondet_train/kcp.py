@@ -2766,9 +2766,7 @@ def _kcp_backward_multi(
         ):
             if e["dyn"] is not None:
                 args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx, S=S, C=C)
-                _launch_dyn(
-                    e["dyn"], dw_out=dw, spare=head, S=S, device=device, **args
-                )
+                _launch_dyn(e["dyn"], dw_out=dw, spare=head, S=S, device=device, **args)
     finally:
         _join_side(side, device)
     if work is not None:
