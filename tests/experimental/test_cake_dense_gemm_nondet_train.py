@@ -532,13 +532,15 @@ SM_COUNTS = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 216}
 
 @pytest.fixture
 def no_k1_chains(monkeypatch):
-    """Take :data:`K1_CHAIN_RANGES_BY_SM` out of the planner: its ranges come before every other K1 table
+    """Take :data:`K1_PARITY_RANGES_BY_SM` (``test_k1_parity_ranges_plan_their_program`` holds it) and
+    :data:`K1_CHAIN_RANGES_BY_SM` out of the planner: their ranges come before every other K1 table
     (:func:`k1_chain_plan`), so a test of those tables holds them without it (``test_k1_chain_ranges`` holds the
     chain ranges).  The one-split ranges of :data:`K1_ONE_SPLIT_RANGES_BY_SM`, which come next, go too
     (``test_k1_152_sm_one_split_ranges`` holds them), and so do the cluster ranges of :data:`K1_DSM_RANGES_BY_SM`,
     which :func:`plan_atomic_gemm` reads before all of them (``test_k1_dsm_ranges`` holds them), and the fixed-order
     ranges of :data:`K1_ORDERED_RANGES_BY_SM`, which it reads next (``test_k1_ordered_ranges_plan_their_program``
     holds them)."""
+    monkeypatch.setattr(cake_backend, "K1_PARITY_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_ONE_SPLIT_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
@@ -3058,7 +3060,9 @@ def test_k1_chain_plans_run_the_chain_programs(monkeypatch):
     chain range the two-split range plans two splits of one chain.  An explicit ``splits`` / ``block_n`` runs one chain;
     ``chains=3`` names the three-chain program of any row at one split; a chain count outside :data:`K1_CHAINS_CHOICES`,
     ``chains=3`` with more than one split or on fewer than three K blocks raise ``ValueError``; a BF16 three-chain
-    program is not registered."""
+    program is not registered.  :data:`K1_PARITY_RANGES_BY_SM`, which comes first at these token counts, is taken out
+    (``test_k1_parity_ranges_plan_their_program`` holds it)."""
+    monkeypatch.setattr(cake_backend, "K1_PARITY_RANGES_BY_SM", {})
     arch = "sm_107a"
     _register_k1(monkeypatch, arch)
     kw = dict(transposed_out=True, arch=arch, sm_count=212)
@@ -3137,24 +3141,27 @@ def test_k1_chain_programs_are_registered():
     """The chain programs ship on the architectures of their one-chain programs: the three-chain 128-wide and 256-wide
     FP32 transposed-store programs on sm_100a, sm_103a and sm_107a, the three-chain 192-wide FP32 row-major-store
     program on sm_107a, and for :data:`K1_ORDERED_RANGES_BY_SM` on sm_107a the two- and four-chain 192-wide row-major
-    and 256-wide transposed-store FP32 programs and the two-chain 128-wide one, on sm_100a the two-chain 256-wide
-    transposed-store BF16 program; each is the one-chain program's build with ``chains`` set (``split_order`` at its
-    default, "arrival", whether the record names it or not)."""
+    and 256-wide transposed-store FP32 programs and the two-chain 128-wide one, for :data:`K1_PARITY_RANGES_BY_SM`
+    on sm_107a the four-chain 128-wide and the eight-chain 256-wide transposed-store FP32 programs, on sm_100a the
+    two-chain 256-wide transposed-store BF16 program; each is the one-chain program's build with ``chains`` set
+    (``split_order`` at its default, "arrival", whether the record names it or not)."""
     want = {
         "dense_proj_gemm_atomic_nn_n128_f32_t_c3": ("sm_100a", "sm_103a", "sm_107a"),
         "dense_proj_gemm_atomic_nn_n256_f32_t_c3": ("sm_100a", "sm_103a", "sm_107a"),
         "dense_proj_gemm_atomic_nn_n192_f32_c3": ("sm_107a",),
         "dense_proj_gemm_atomic_nn_n192_f32_c2": ("sm_107a",),
         "dense_proj_gemm_atomic_nn_n128_f32_t_c2": ("sm_107a",),
+        "dense_proj_gemm_atomic_nn_n128_f32_t_c4": ("sm_107a",),
         "dense_proj_gemm_atomic_nn_n256_f32_t_c2": ("sm_107a",),
         "dense_proj_gemm_atomic_nn_n192_f32_c4": ("sm_107a",),
         "dense_proj_gemm_atomic_nn_n256_f32_t_c4": ("sm_107a",),
+        "dense_proj_gemm_atomic_nn_n256_f32_t_c8": ("sm_107a",),
         "dense_proj_gemm_atomic_nn_n256_t_c2": ("sm_100a",),
     }
     got = {}
     for arch, kernels in cake_jit.KERNELS.items():
         for template in kernels:
-            if template.endswith(("_c2", "_c3", "_c4")):
+            if template.endswith(("_c2", "_c3", "_c4", "_c8")):
                 got.setdefault(template, []).append(arch)
     assert {t: tuple(sorted(a)) for t, a in got.items()} == want
     for template, arches in want.items():
@@ -6442,7 +6449,9 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
     split and chain counts; the split workspace with more than one split) in place of the split tables' choice, a plan
     that repeats (four splits in the mirror order, or one split of two or four chains, by the parity of the K-block
     count on 212-SM sm_107a; two chains at either parity on 148-SM sm_100a); one token outside the ranges keeps that
-    choice."""
+    choice.  :data:`K1_PARITY_RANGES_BY_SM`, which comes first and holds these 212-SM token counts too, is taken out
+    (``test_k1_parity_ranges_plan_their_program`` holds it)."""
+    monkeypatch.setattr(cake_backend, "K1_PARITY_RANGES_BY_SM", {})
     arch = "sm_107a"
     _register_k1(monkeypatch, arch)
     kw = dict(transposed_out=True, arch=arch, sm_count=212)
@@ -6515,6 +6524,238 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
         plan = cake_backend.plan_atomic_gemm(*operands(T, d_in, d_out), **kw)[0]
         assert plan is None or plan.split_order == "arrival", (d_in, d_out, T)
         assert plan is None or plan.chains in (1, 3), (d_in, d_out, T)
+
+
+#: The ranges of :data:`K1_PARITY_RANGES_BY_SM`: ``(arch, sm_count) -> {key: ((lo, hi, even, odd), ...)}``; a program
+#: ``(block_n, splits, chains, order)``, ``()`` the deterministic program, ``None`` the other tables.
+_P2_128, _P4_128 = (128, 1, 2, "arrival"), (128, 1, 4, "arrival")
+_P2_192, _P4_192 = (192, 1, 2, "arrival"), (192, 1, 4, "arrival")
+_P2_256, _P8_256 = (256, 1, 2, "arrival"), (256, 1, 8, "arrival")
+# fmt: off
+_PARITY_BASE = {
+    ("sm_107a", 1, 4096, 512, "f32"): (
+        (961, 12000, _P2_128, _P4_128), (12001, 32767, (), _P4_128), (32768, 40961, (), ()),
+    ),
+    ("sm_107a", 1, 5120, 512, "f32"): ((961, 40961, _P2_128, _P4_128),),
+    ("sm_107a", 1, 4096, 1024, "f32"): ((961, 40961, _P2_192, _P4_192),),
+    ("sm_107a", 1, 5120, 1024, "f32"): ((961, 40961, _P2_256, _P8_256),),
+}
+_PARITY_212 = {
+    **_PARITY_BASE,
+    ("sm_107a", 1, 5120, 512, "f32"): ((961, 40961, _P2_128, _P4_128), (40962, 65536, (), ())),
+    ("sm_107a", 1, 4096, 1024, "f32"): ((961, 40961, _P2_192, _P4_192), (40962, 65536, None, _P4_192)),
+}
+_PARITY_216 = {
+    **_PARITY_BASE,
+    ("sm_107a", 1, 4096, 1024, "f32"): ((961, 40961, _P2_192, _P4_192), (40962, 65536, None, _P4_192)),
+}
+_PARITY_208 = {
+    **_PARITY_212,
+    ("sm_107a", 1, 4096, 512, "f32"): (
+        (961, 12000, _P2_128, _P4_128), (12001, 16171, (), _P4_128), (16172, 16230, _P2_128, _P4_128),
+        (16231, 16231, (), ()), (16232, 16383, _P2_128, _P4_128), (16384, 16384, (), ()),
+        (16385, 32767, (), _P4_128), (32768, 40961, (), ()),
+    ),
+    ("sm_107a", 1, 4096, 1024, "f32"): (
+        (961, 16230, _P2_192, _P4_192), (16231, 16231, (), ()), (16232, 16383, _P2_192, _P4_192),
+        (16384, 16384, (), ()), (16385, 40961, _P2_192, _P4_192), (40962, 65536, None, _P4_192),
+    ),
+}
+K1_PARITY_ROWS = {
+    ("sm_107a", 208): _PARITY_208,
+    ("sm_107a", 212): _PARITY_212,
+    ("sm_107a", 216): _PARITY_216,
+}
+# fmt: on
+
+
+def _wgrad_operands(T, d_in, d_out):
+    """``(X.T, G, out)`` of a weight gradient on CPU tensors (never written: nothing is launched)."""
+    G = torch.empty(T, d_out, dtype=torch.bfloat16)
+    X = torch.empty(T, d_in, dtype=torch.bfloat16)
+    return X.t(), G, torch.empty(d_out, d_in, dtype=torch.float32)
+
+
+def test_k1_parity_ranges_plan_their_program(monkeypatch):
+    """:data:`K1_PARITY_RANGES_BY_SM` holds the measured ranges; at both ends of every range, one token inside them and
+    its middle, :func:`k1_parity_plan` names the program of the token count's K-block parity (two chains at an even
+    count, four at an odd one -- eight at ``5120 -> 1024`` --, the deterministic program or the other tables), and
+    :func:`plan_atomic_gemm` plans that program (template, tile width, one split, chain count, a plan that repeats, no
+    workspace) or keeps the row on the deterministic program; one token below the first range, an SM count without
+    ranges, another output dtype and a batch keep the other tables; a part of more SMs than 216 takes the 216-SM ranges
+    (:data:`K1_PARITY_RANGES_ABOVE_SM`)."""
+    assert cake_backend.K1_PARITY_RANGES_BY_SM == K1_PARITY_ROWS
+    assert cake_backend.K1_PARITY_RANGES_ABOVE_SM == {"sm_107a": 216}
+    arch = "sm_107a"
+    _register_k1(monkeypatch, arch)
+    _register(
+        monkeypatch,
+        arch,
+        *(
+            cake_backend.atomic_k1_template(bn, True, c)
+            for bn in (128, 192, 256)
+            for c in (2, 4)
+        ),
+        cake_backend.atomic_k1_template(256, True, 8),
+    )
+    for (_, sms), rows in K1_PARITY_ROWS.items():
+        kw = dict(transposed_out=True, arch=arch, sm_count=sms)
+        for (_, _, d_in, d_out, _), ranges in rows.items():
+            pk = dict(arch=arch, L=1, M=d_in, N=d_out, out_f32=True, sm_count=sms)
+            for lo, hi, even, odd in ranges:
+                points = {lo, lo + 1, (lo + hi) // 2, hi - 1, hi}
+                for T in sorted(t for t in points if lo <= t <= hi):
+                    want = odd if -(-T // 64) % 2 else even
+                    what = (sms, d_in, d_out, T)
+                    assert cake_backend.k1_parity_plan(K=T, **pk) == want, what
+                    if want is None:
+                        continue
+                    plan, *_, reason = cake_backend.plan_atomic_gemm(
+                        *_wgrad_operands(T, d_in, d_out), **kw
+                    )
+                    if want == ():
+                        assert plan is None and "deterministic" in reason, what
+                        continue
+                    bn, splits, chains, order = want
+                    assert plan is not None and reason == "", (what, reason)
+                    assert (
+                        plan.template,
+                        plan.block_n,
+                        plan.splits,
+                        plan.chains,
+                        plan.split_order,
+                    ) == (
+                        cake_backend.atomic_k1_template(bn, True, chains, order),
+                        bn,
+                        splits,
+                        chains,
+                        order,
+                    ), what
+                    assert plan.reproducible and not plan.workspace, what
+            assert cake_backend.k1_parity_plan(K=ranges[0][0] - 1, **pk) is None
+    w512 = dict(arch=arch, L=1, M=4096, N=512, K=16172, out_f32=True)
+    for sms in (148, 152, 204, 210, 214):
+        assert cake_backend.k1_parity_plan(sm_count=sms, **w512) is None, sms
+    for sms in (217, 224, 264):
+        for (_, _, d_in, d_out, _), ranges in K1_PARITY_ROWS[("sm_107a", 216)].items():
+            for lo, hi, _even, _odd in ranges:
+                for T in (lo - 1, lo, lo + 1, hi - 1, hi, hi + 1):
+                    pk = dict(arch=arch, L=1, M=d_in, N=d_out, K=T, out_f32=True)
+                    assert cake_backend.k1_parity_plan(
+                        sm_count=sms, **pk
+                    ) == cake_backend.k1_parity_plan(sm_count=216, **pk), (sms, T)
+    assert (
+        cake_backend.k1_parity_plan(sm_count=212, **dict(w512, out_f32=False)) is None
+    )
+    assert cake_backend.k1_parity_plan(sm_count=212, **dict(w512, L=2)) is None
+
+
+#: Token counts at which :func:`test_k1_sm107a_fp32_wgrad_rows_run_no_one_or_three_chains` plans the four FP32 rows:
+#: the ends of the ranges of every table that routes them on 208, 212 and 216 SMs, one token on each side, and the
+#: token counts of the accuracy sweep.
+# fmt: off
+_PARITY_SWEEP_T = sorted({
+    t + d
+    for t in (961, 1024, 2048, 4096, 7680, 8192, 12000, 12001, 16172, 16192, 16231, 16256, 16300, 16320, 16384,
+              20000, 24577, 32767, 32768, 36000, 40961, 40962, 45057, 65536)
+    for d in (-1, 0, 1)
+    if t + d >= 961
+})
+# fmt: on
+
+
+@pytest.mark.parametrize("sms", [208, 212, 216, 224])
+def test_k1_sm107a_fp32_wgrad_rows_run_no_one_or_three_chains(sms):
+    """On ``sm_107a`` parts of 208, 212, 216 and more SMs (224: the 216-SM ranges, :data:`K1_PARITY_RANGES_ABOVE_SM`)
+    the FP32 weight gradients ``4096 / 5120 -> 512 / 1024`` run, from 961 tokens up, no one-split program of one or
+    three accumulation chains (one chain missed the accuracy check on all six input kinds, three chains on mirrored
+    cancelling inputs): every token count of :data:`_PARITY_SWEEP_T` runs the program :func:`k1_parity_plan` names for
+    it where it names one (one split of two chains at an even number of K blocks and of four at an odd number -- eight
+    at ``5120 -> 1024`` --, at the range's tile width), the deterministic program where it names that, and else the
+    deterministic program or two splits; every program planned is one this checkout registers for ``sm_107a``."""
+    kw = dict(transposed_out=True, arch="sm_107a", sm_count=sms)
+    routed = 0
+    for d_in, d_out in ((4096, 512), (5120, 512), (4096, 1024), (5120, 1024)):
+        for T in _PARITY_SWEEP_T:
+            plan, *_, reason = cake_backend.plan_atomic_gemm(
+                *_wgrad_operands(T, d_in, d_out), **kw
+            )
+            want = cake_backend.k1_parity_plan(
+                arch="sm_107a", L=1, M=d_in, N=d_out, K=T, out_f32=True, sm_count=sms
+            )
+            what = (sms, d_in, d_out, T, want, reason)
+            if plan is None:
+                assert want in (None, ()) and "deterministic" in reason, what
+                continue
+            assert want != (), what
+            routed += 1
+            assert plan.template in cake_jit.KERNELS["sm_107a"], what
+            if want is not None:
+                assert (
+                    plan.block_n,
+                    plan.splits,
+                    plan.chains,
+                    plan.split_order,
+                ) == want, what
+            if plan.splits > 1:
+                assert (plan.splits, plan.chains) == (2, 1), what
+                continue
+            odd = 8 if (d_in, d_out) == (5120, 1024) else 4
+            assert plan.chains == (odd if -(-T // 64) % 2 else 2), what
+            assert plan.reproducible, what
+    assert routed
+
+
+@pytest.mark.parametrize("sm_count", [208, 212, 216, 224])
+def test_k1_parity_ranges_bind_per_token_count(monkeypatch, sm_count):
+    """The convenience path plans each token count of a K1 call at the part's SM count, so the ranges of
+    :data:`K1_PARITY_RANGES_BY_SM` hold there too: on ``sm_107a`` parts of 208, 212, 216 and 224 SMs the weight gradient
+    of each FP32 row binds, at both ends of each of its ranges and at an even and an odd token count inside it, the
+    program of the token count's parity (the 216-SM ranges on 224 SMs), or the deterministic program, each token count
+    its own cache entry."""
+    arch = "sm_107a"
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=sm_count, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    rows = K1_PARITY_ROWS[("sm_107a", min(sm_count, 216))]
+    bf16 = torch.bfloat16
+    bound = 0
+    for (_, _, d_in, d_out, _), ranges in rows.items():
+        cake_backend._K1_ATOMIC_CACHE.clear()
+        entry_fn.calls.clear()
+        out = torch.empty(d_out, d_in, dtype=torch.float32)
+        cases = set()
+        for lo, hi, even, odd in ranges:
+            mid = (lo + hi) // 2
+            for T in {lo, hi, mid, mid + 64}:
+                if lo <= T <= hi:
+                    cases.add((T, odd if -(-T // 64) % 2 else even))
+        for T, want in sorted(cases):
+            G, X = torch.empty(T, d_out, dtype=bf16), torch.empty(T, d_in, dtype=bf16)
+            assert (
+                cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(G, X, out)
+                is out
+            )
+            entry = next(reversed(cake_backend._K1_ATOMIC_CACHE.values()))
+            where = (sm_count, d_in, d_out, T, want)
+            assert entry.k1 is not None, where
+            if want == ():
+                assert entry.plan is None and entry.det_plan is not None, where
+                continue
+            if want is None:
+                continue
+            assert entry.det_plan is None, where
+            plan = entry.plan
+            assert (plan.block_n, plan.splits, plan.chains, plan.split_order) == want, (
+                where
+            )
+            bound += 1
+        assert len(cake_backend._K1_ATOMIC_CACHE) == len(cases)
+        assert len(entry_fn.calls) == len(cases)
+    assert bound
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
@@ -7033,7 +7274,10 @@ def test_k1_chain_ranges_bind_per_token_count(monkeypatch, sm_count):
     tables at the measured token counts where the program failed (the deterministic program, or a program of one chain:
     the one-split program of ``5120 -> 1024`` at 32768 tokens on 216 SMs; the fixed-order program of
     :data:`K1_ORDERED_RANGES_BY_SM` where one of its ranges holds the token count: two chains of ``4096 -> 1024`` at
-    16384 tokens and four at 16172 tokens on 212 SMs), each token count its own cache entry."""
+    16384 tokens and four at 16172 tokens on 212 SMs), each token count its own cache entry.
+    :data:`K1_PARITY_RANGES_BY_SM`, which comes first from 961 tokens, is taken out
+    (``test_k1_parity_ranges_bind_per_token_count`` binds it)."""
+    monkeypatch.setattr(cake_backend, "K1_PARITY_RANGES_BY_SM", {})
     arch = "sm_107a"
     entry_fn = _cpu_k1_launches(monkeypatch, arch)
     facts = det_backend.DeviceFacts(
@@ -9237,15 +9481,25 @@ def test_registered_templates_are_the_ones_the_planners_name():
         for bn in cake_backend.K1_BLOCK_N_CHOICES
         for chains in cake_backend.K1_CHAINS_CHOICES
     }
-    # the programs of K1_ORDERED_RANGES_BY_SM and the programs the forward / input-gradient (this package's and the
-    # nvjet program on the deterministic plan) / stream-K weight-gradient tables name, each registered for the
-    # architecture of its table
+    # the programs of K1_ORDERED_RANGES_BY_SM and K1_PARITY_RANGES_BY_SM and the programs the forward /
+    # input-gradient (this package's and the nvjet program on the deterministic plan) / stream-K weight-gradient
+    # tables name, each registered for the architecture of its table
     named = {}
     for (arch, _), rows in cake_backend.K1_ORDERED_RANGES_BY_SM.items():
         for key, ranges in rows.items():
             for _, _, (bn, _, chains, order) in ranges:
                 t = cake_backend.atomic_k1_template(bn, key[4] == "f32", chains, order)
                 named.setdefault(arch, set()).add(t)
+    for (arch, _), rows in cake_backend.K1_PARITY_RANGES_BY_SM.items():
+        for key, ranges in rows.items():
+            for _, _, *programs in ranges:
+                for program in programs:
+                    if program:
+                        bn, _, chains, order = program
+                        t = cake_backend.atomic_k1_template(
+                            bn, key[4] == "f32", chains, order
+                        )
+                        named.setdefault(arch, set()).add(t)
     for table in (
         cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM,
         cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM,
@@ -9640,6 +9894,7 @@ def _force_k1_rule(monkeypatch, G, X, out, splits, block_n=None):
     monkeypatch.setattr(cake_backend, "K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_SPLIT_RANGE_OVERRIDES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_TWO_SPLIT_RANGES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_PARITY_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_CHAIN_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_ONE_SPLIT_RANGES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_DSM_RANGES_BY_SM", {})
@@ -9857,9 +10112,11 @@ def test_gpu_k1_chain_programs(shape, monkeypatch):
         {(arch, sm_count): {key: ((T, T, (block_n, 3)),)}},
     )
     monkeypatch.setattr(cake_backend, "K1_TWO_SPLIT_RANGES_BY_SM", {})
-    # the stream-K rows and the ranges of K1_ORDERED_RANGES_BY_SM come before the chain ranges
+    # the stream-K rows and the ranges of K1_ORDERED_RANGES_BY_SM and K1_PARITY_RANGES_BY_SM come before the chain
+    # ranges
     monkeypatch.setattr(cake_backend, "K1_WGRAD_SK_RULES_BY_SM", {})
     monkeypatch.setattr(cake_backend, "K1_ORDERED_RANGES_BY_SM", {})
+    monkeypatch.setattr(cake_backend, "K1_PARITY_RANGES_BY_SM", {})
     cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
     try:
         out.fill_(float("nan"))
@@ -11712,7 +11969,7 @@ K1_P1_EDGES = {
 }
 
 
-def test_gpu_k1_sm_count_token_ranges_run_at_their_edges(no_k1_dsm):
+def test_gpu_k1_sm_count_token_ranges_run_at_their_edges(no_k1_dsm, monkeypatch):
     """Unforced (no split count), on a part of exactly the SM count of a table of
     :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` or
     :data:`K1_TWO_SPLIT_RANGES_BY_SM` (``sm_107a``: 212 SMs; ``sm_100a`` / ``sm_103a``: 152 SMs): at the first and the
@@ -11728,7 +11985,10 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges(no_k1_dsm):
     ``K1_P1_EDGES`` the deterministic program itself misses the BF16 budget for some seed: the edge asserts the route
     only, and the FP64 rule runs at the entry's token count of the same range instead (none: no check).  The cluster
     ranges of :data:`K1_DSM_RANGES_BY_SM`, which come before these tables, are taken out
-    (``test_gpu_k1_dsm_ranges_run_at_their_edges`` holds them).  A part of any other SM count skips."""
+    (``test_gpu_k1_dsm_ranges_run_at_their_edges`` holds them), and so are the ranges of
+    :data:`K1_PARITY_RANGES_BY_SM` (``test_k1_parity_ranges_bind_per_token_count`` holds them).  A part of any other SM
+    count skips."""
+    monkeypatch.setattr(cake_backend, "K1_PARITY_RANGES_BY_SM", {})
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     cases = _k1_token_range_edges(arch, sm_count)
@@ -11794,7 +12054,9 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges(no_k1_dsm):
     assert ran
 
 
-def test_gpu_k1_sm_count_token_ranges_through_the_convenience_binding(no_k1_dsm):
+def test_gpu_k1_sm_count_token_ranges_through_the_convenience_binding(
+    no_k1_dsm, monkeypatch
+):
     """Unforced (no split count), on a part of exactly the SM count of a table of
     :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` or
     :data:`K1_TWO_SPLIT_RANGES_BY_SM` (``sm_107a``: 212 SMs; ``sm_100a`` / ``sm_103a``: 152 SMs): the
@@ -11805,8 +12067,9 @@ def test_gpu_k1_sm_count_token_ranges_through_the_convenience_binding(no_k1_dsm)
     of a two-split range, it binds the deterministic package's plan.  On a part of exactly the SM count of a table
     of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` the reverse.  An edge inside a range of :data:`K1_CHAIN_RANGES_BY_SM`
     for the part binds that range's program of several chains instead (one split: the bits of the prepared launch).  The
-    cluster ranges of :data:`K1_DSM_RANGES_BY_SM` are taken out, as in
-    ``test_gpu_k1_sm_count_token_ranges_run_at_their_edges``.  A part of any other SM count skips."""
+    cluster ranges of :data:`K1_DSM_RANGES_BY_SM` and the ranges of :data:`K1_PARITY_RANGES_BY_SM` are taken out, as
+    in ``test_gpu_k1_sm_count_token_ranges_run_at_their_edges``.  A part of any other SM count skips."""
+    monkeypatch.setattr(cake_backend, "K1_PARITY_RANGES_BY_SM", {})
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
     cases = _k1_token_range_edges(arch, sm_count)
@@ -14090,11 +14353,15 @@ K1_WGRAD_CHANGED_ROWS = {
 def _k1_fixed_program(arch, sms, d_in, d_out, T, f32, L=1):
     """``(block_n, splits, chains, order)`` of the CTA-pair program a row runs from a range of
     :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` (inside a cluster range, at an odd number of K blocks; a range there that
-    names a cluster tile is ``None``) or of :data:`K1_ORDERED_RANGES_BY_SM`, else ``None``."""
+    names a cluster tile is ``None``), of :data:`K1_PARITY_RANGES_BY_SM` (which comes before the next table) or of
+    :data:`K1_ORDERED_RANGES_BY_SM`, else ``None``."""
     kw = dict(arch=arch, L=L, M=d_in, N=d_out, K=T, out_f32=f32, sm_count=sms)
     if cake_backend.k1_dsm_plan(**kw) is not None:
         odd = cake_backend.k1_dsm_odd_block_plan(**kw)
         return odd if odd and len(odd) == 4 else None
+    parity = cake_backend.k1_parity_plan(**kw)
+    if parity:
+        return parity
     return cake_backend.k1_ordered_plan(**kw)
 
 
@@ -14941,6 +15208,77 @@ def test_gpu_k1_wgrad_changed_rows_repeat_and_meet_the_budget():
             _meets_the_budget_into_nan(run, out, ref64, what)
         else:
             _repeats_into_nan(run, out, what)
+
+
+def test_gpu_k1_parity_ranges_run_at_their_edges():
+    """On a part with ranges in :data:`K1_PARITY_RANGES_BY_SM` for its SM count (or above
+    :data:`K1_PARITY_RANGES_ABOVE_SM`, those of that count): at both ends of every range of a row and at an even and an
+    odd number of K blocks inside it, the weight gradient binds the program of the token count's parity
+    (:func:`k1_parity_plan`) -- one split, its chains added in order -- meets the deterministic package's budget against
+    FP64 and repeats bit for bit over ``RERUNS`` calls into NaN-poisoned outputs; where the range gives the
+    deterministic program it binds the deterministic package's plan and gives that package's bits.  A part without
+    ranges skips."""
+    device, arch, sms = _part_or_skip()
+    part = cake_backend.K1_PARITY_RANGES_BY_SM.get((arch, sms))
+    top = cake_backend.K1_PARITY_RANGES_ABOVE_SM.get(arch)
+    if part is None and top is not None and sms > top:
+        part = cake_backend.K1_PARITY_RANGES_BY_SM.get((arch, top))
+    if not part:
+        pytest.skip(f"no K1 parity range of {arch} on {sms} SMs")
+    g = torch.Generator(device=device).manual_seed(SEED + 173)
+    ran = 0
+    for (_, L, d_in, d_out, dt), ranges in sorted(part.items()):
+        f32 = dt == "f32"
+        cases = set()
+        for lo, hi, _, _ in ranges:
+            mid = (lo + hi) // 2
+            cases |= {T for T in (lo, hi, mid, mid + 64) if lo <= T <= hi}
+        for T in sorted(cases):
+            want = cake_backend.k1_parity_plan(
+                arch=arch, L=L, M=d_in, N=d_out, K=T, out_f32=f32, sm_count=sms
+            )
+            if want is None:
+                continue
+            what = f"parity {d_in} {d_out} {dt} {T} {want}"
+            G, X = _bf16((T, d_out), device, g), _bf16((T, d_in), device, g)
+            cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
+            out = torch.full(
+                (d_out, d_in),
+                float("nan"),
+                device=device,
+                dtype=torch.float32 if f32 else torch.bfloat16,
+            )
+
+            def run(dst, G=G, X=X):
+                cake_backend.cake_dense_gemm_nondet_train_projection_wgrad(G, X, dst)
+
+            run(out)
+            torch.cuda.synchronize()
+            ((_, entry),) = cake_backend._K1_ATOMIC_CACHE.items()
+            if want == ():
+                assert entry.plan is None and entry.det_plan is not None, what
+                ref = torch.full_like(out, float("nan"))
+                det_backend.cake_dense_gemm_det_train_projection_wgrad(G, X, ref)
+                torch.cuda.synchronize()
+                assert torch.equal(out, ref), what
+                continue
+            plan = entry.plan
+            assert plan is not None and entry.k1 is not None, what
+            assert (
+                plan.block_n,
+                plan.splits,
+                plan.chains,
+                plan.split_order,
+            ) == want, what
+            assert plan.reproducible, what
+            _k1_check(out, G.double().t() @ X.double(), what)
+            _repeats_into_nan(run, out, what)
+            ran += 1
+    cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
+    print(
+        f"K1_PARITY_RANGES {arch} sm_count={sms}: {ran} parity programs ran at range edges"
+    )
+    assert ran
 
 
 _RESIDENT_SOURCE = r"""

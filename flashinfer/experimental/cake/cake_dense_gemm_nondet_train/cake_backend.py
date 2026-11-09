@@ -38,8 +38,10 @@ The module selects the mode: no entry point takes a mode argument.  Every entry 
   deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row repeats bit for
   bit; three or more add in the order the splits finish (no row of the shipped tables: only a caller's explicit
   ``splits``).  The rows of :data:`K1_ORDERED_RANGES_BY_SM` (212-SM sm_107a parts, and one 148-SM sm_100a BF16 row)
-  add four splits in the fixed mirror order or run two or four chains of one split, the one-split rows store whole
-  tiles, and the rows of
+  add four splits in the fixed mirror order or run two or four chains of one split, the FP32 rows of
+  :data:`K1_PARITY_RANGES_BY_SM` (sm_107a parts of 208, 212, 216 and more SMs)
+  run two, four or eight chains of one split by the parity of their number of K blocks, the one-split rows store
+  whole tiles, and the rows of
   :data:`K1_WGRAD_DET_RULES_BY_SM` run another fixed-order program of the deterministic package;
 * the K1 weight gradient of the FP32 rows of :data:`K1_DSM_RANGES_BY_SM` (thin ``d_out`` on 148-SM and 152-SM
   ``sm_100a``, 152-SM ``sm_103a`` and 212-SM ``sm_107a`` parts, in that table's token ranges; the odd numbers of K
@@ -513,7 +515,8 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: there).  The 217-SM entries keep the four rows on the deterministic program from 961 tokens up on parts of more than
 #: 216 SMs, the route they took before that measurement: the one-split program's time at 961 to 40960 tokens was
 #: measured on 216-SM parts only (where the ranges of :data:`K1_CHAIN_RANGES_BY_SM` come first), and no part of more
-#: SMs was measured.  The sm_107a rows that now run the deterministic program at every token count (their three- or
+#: SMs was measured.  From 961 to 40961 tokens the ranges of :data:`K1_PARITY_RANGES_BY_SM` come first on those parts
+#: (:data:`K1_PARITY_RANGES_ABOVE_SM`).  The sm_107a rows that now run the deterministic program at every token count (their three- or
 #: four-split verdicts are gone, :data:`K1_SPLIT_RULES`) have no entries.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
@@ -698,7 +701,8 @@ K1_SPLIT_ODD_BLOCK_EXCLUDED_TOKENS: dict[
 #: :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` runs this package's program).  On 212 SMs ``4096 -> 1024`` FP32 takes the
 #: 192-wide row-major program at one split (88 tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, 176 CTAs, one wave
 #: next to a kernel holding 32 SMs), which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile.  The
-#: token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for a part's SM count run the deterministic program.
+#: token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for a part's SM count run the deterministic program.  The FP32
+#: rows ``4096 / 5120 -> 512 / 1024`` take the ranges of :data:`K1_PARITY_RANGES_BY_SM` first (on 208 and 212 SMs).
 # fmt: off
 K1_SPLIT_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
@@ -899,7 +903,9 @@ K1_SPLIT_OVERRIDES_BY_SM: dict[
 #: tokens on 212 SMs (in one of the two jobs) and ``5120 -> 1024`` at 32768 tokens on 216 SMs left the checkpointed step
 #: more than 1.3 % slower than the deterministic program.  Outside these ranges the rows keep the routing of the tables
 #: above (on 216 SMs the one-chain program up to 40960 tokens, on more SMs up to 960 tokens, except the token counts
-#: of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`).
+#: of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`).  From 961 tokens the ranges of :data:`K1_PARITY_RANGES_BY_SM` come first
+#: for these rows on both SM counts (three chains missed the accuracy check on mirrored cancelling inputs): the three
+#: chains of this table run only at 960 tokens on 212 SMs.
 # fmt: off
 K1_CHAIN_RANGES_BY_SM: dict[
     tuple[str, int],
@@ -1165,7 +1171,9 @@ K1_SPLIT_ORDERS: tuple[str, ...] = ("arrival", "mirror")
 #: 16256, 16300 and 16384 tokens in one process: two chains had the bits of two splits on all six kinds and repeated
 #: bit for bit; they took 86.5 to 88.9 us, 1.003 to 1.005 times one chain's time, 0.897 to 0.906 times two splits'
 #: (96.0 to 98.4 us) and 0.74 to 0.84 times the deterministic program's (103.9 to 120.0 us), in eager launches and in
-#: CUDA graph replays.
+#: CUDA graph replays.  The 212-SM ranges of the FP32 rows ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` lie
+#: inside ranges of :data:`K1_PARITY_RANGES_BY_SM`, which comes first and runs the same programs there, except eight
+#: chains at the odd counts of ``5120 -> 1024`` (and four chains at the odd counts of ``5120 -> 512``).
 # fmt: off
 K1_ORDERED_RANGES_BY_SM: dict[
     tuple[str, int],
@@ -1215,6 +1223,130 @@ def k1_ordered_plan(
             return (
                 (int(block_n), int(splits), int(chains), str(order)) if fits else None
             )
+    return None
+
+
+#: Token ranges at which a row runs a program chosen by the parity of its number of 64-token K blocks, on the parts of
+#: exactly one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, even, odd), ...)}`` (keys as in
+#: :data:`K1_SPLIT_RULES`): a token count from ``min_tokens`` to ``max_tokens`` runs ``even`` at an even number of K
+#: blocks and ``odd`` at an odd number (:func:`k1_parity_plan`), each a ``(block_n, splits, chains, order)`` of this
+#: package's CTA-pair program as in :data:`K1_ORDERED_RANGES_BY_SM`, ``()`` for the deterministic program, or ``None``
+#: for the routing of the other tables.  A part of more SMs than every SM count of the table for its architecture takes
+#: the ranges of the SM count of :data:`K1_PARITY_RANGES_ABOVE_SM`.  It comes before every K1 table except the cluster
+#: tables of :data:`K1_DSM_RANGES_BY_SM`: on 212-SM and 216-SM ``sm_107a`` parts the ranges of
+#: :data:`K1_ORDERED_RANGES_BY_SM` and :data:`K1_CHAIN_RANGES_BY_SM` of these rows hold only where this table has none
+#: (960 tokens on 212 SMs), and on 208-SM parts the window verdicts of :data:`K1_SPLIT_RULES_BY_SM` (one chain) hold
+#: nowhere for these rows.
+#: The FP32 weight gradients ``4096 / 5120 -> 512 / 1024`` from 961 tokens: two chains of one split at an even count
+#: (the bits of two splits of one chain), four chains at an odd count (eight for ``5120 -> 1024``), where three chains
+#: (equal thirds of the K blocks) missed the accuracy check on mirrored cancelling inputs and one chain (an output's
+#: whole token reduction in one accumulator) missed it on all six input kinds; the 512-feature rows on the 128-wide
+#: transposed-store program, ``4096 -> 1024`` on the 192-wide row-major one and ``5120 -> 1024`` on the 256-wide
+#: transposed-store one.  Four chains of ``5120 -> 1024`` missed the check by up to 1.27 times on one input kind at 255
+#: and 257 K blocks (16300 and 16385 tokens); eight chains meet it at every measured token count (at most 1.00 times,
+#: 0.63 and 0.65 times there) at 1.002 to 1.007 times the time of four.
+#: ``4096 -> 512`` runs the deterministic program at its even counts from 12001 tokens and at every count from 32768 to
+#: 40961 tokens, faster there and within the check; ``5120 -> 512`` runs it from 40962 to 65536 tokens on 212 SMs, where
+#: two splits missed the check at the odd counts, and ``4096 -> 1024`` four chains at the odd counts there.  The check is
+#: the one of :data:`K1_DSM_RANGES_BY_SM` (at most 1.1 times the reference's median error on each of six input kinds,
+#: five runs each), measured on a 212-SM R200 part at the ends of every range, one token on each side of them and the
+#: token counts between (22 to 27 per row), the 216-SM ranges as the same plans forced on that part (the accuracy and
+#: the bits are the plan's; no 216-SM time is claimed); every program repeated its bits on 20 and 200 runs.  Measured
+#: against the routes they replace in the same process (17 paired groups, eager launches and CUDA graph replays): two
+#: chains at 1.00 to 1.01 times their time, four chains at 1.00 to 1.005 times at 1024 features.  On 208-SM parts the
+#: rows take the 212-SM ranges, except, from 16172 to 16384 tokens (the window of their one-chain verdicts), the token
+#: counts at which the two ``4096 ->`` rows ran the deterministic program there (16231 and 16384 tokens), which they
+#: keep, and the even counts of ``4096 -> 512``, which run two chains; outside that window the deterministic plan of
+#: 208 SMs missed the check (``4096 -> 1024`` at 16171 and 16385 tokens up to 1.38 times the reference's error,
+#: ``4096 -> 512`` at 16385 tokens 1.15 times).  Parts of 216 and more SMs take the 216-SM ranges and the 212-SM range
+#: of ``4096 -> 1024`` past 40961 tokens (four chains at the odd counts, where the deterministic plan of 224 SMs missed
+#: the check, 1.29 times at 40962 tokens); parts of more than 216 SMs ran the deterministic program from 961 tokens up
+#: (the 217-SM entries of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`), whose ``sm_107a`` program missed the check at some of
+#: these token counts on the 212-SM part (``5120 -> 512`` at 20000 and 32000 tokens up to 12 times the reference's
+#: error).  The 208-SM and the larger plans were measured forced on the 212-SM part (one split, the chains of one CTA
+#: pair: the accumulation order does not depend on the SM count); no time is claimed for them.
+_C2_N128, _C4_N128 = (128, 1, 2, "arrival"), (128, 1, 4, "arrival")
+_C2_N192, _C4_N192 = (192, 1, 2, "arrival"), (192, 1, 4, "arrival")
+_C2_N256, _C8_N256 = (256, 1, 2, "arrival"), (256, 1, 8, "arrival")
+# fmt: off
+_K1_PARITY_SM107A: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ...]] = {
+    (4096, 512): ((961, 12000, _C2_N128, _C4_N128), (12001, 32767, (), _C4_N128), (32768, 40961, (), ())),
+    (5120, 512): ((961, 40961, _C2_N128, _C4_N128),),
+    (4096, 1024): ((961, 40961, _C2_N192, _C4_N192),),
+    (5120, 1024): ((961, 40961, _C2_N256, _C8_N256),),
+}
+#: The ranges past 40961 tokens: on 212 SMs (the two-split ranges of :data:`K1_TWO_SPLIT_RANGES_BY_SM` end at 65536) and
+#: 208 SMs both rows, on 216 and more SMs ``4096 -> 1024``.
+_K1_PARITY_SM107A_TAIL: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ...]] = {
+    (5120, 512): ((40962, 65536, (), ()),),
+    (4096, 1024): ((40962, 65536, None, _C4_N192),),
+}
+#: The two ``4096 ->`` rows on 208 SMs: the 212-SM ranges, but from 16172 to 16384 tokens (the window of their
+#: one-chain verdicts) the deterministic program at the token counts that ran it there and two chains at every even
+#: count of ``4096 -> 512``.
+_K1_PARITY_SM107A_208: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ...]] = {
+    (4096, 512): (
+        (961, 12000, _C2_N128, _C4_N128), (12001, 16171, (), _C4_N128), (16172, 16230, _C2_N128, _C4_N128),
+        (16231, 16231, (), ()), (16232, 16383, _C2_N128, _C4_N128), (16384, 16384, (), ()),
+        (16385, 32767, (), _C4_N128), (32768, 40961, (), ()),
+    ),
+    (4096, 1024): (
+        (961, 16230, _C2_N192, _C4_N192), (16231, 16231, (), ()), (16232, 16383, _C2_N192, _C4_N192),
+        (16384, 16384, (), ()), (16385, 40961, _C2_N192, _C4_N192),
+    ),
+}
+K1_PARITY_RANGES_BY_SM: dict[
+    tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int, Any, Any], ...]]
+] = {
+    ("sm_107a", 208): {
+        ("sm_107a", 1, M, N, "f32"): _K1_PARITY_SM107A_208.get((M, N), ranges) + _K1_PARITY_SM107A_TAIL.get((M, N), ())
+        for (M, N), ranges in _K1_PARITY_SM107A.items()
+    },
+    ("sm_107a", 212): {
+        ("sm_107a", 1, M, N, "f32"): ranges + _K1_PARITY_SM107A_TAIL.get((M, N), ())
+        for (M, N), ranges in _K1_PARITY_SM107A.items()
+    },
+    ("sm_107a", 216): {
+        ("sm_107a", 1, M, N, "f32"): ranges + (_K1_PARITY_SM107A_TAIL[(M, N)] if (M, N) == (4096, 1024) else ())
+        for (M, N), ranges in _K1_PARITY_SM107A.items()
+    },
+}
+# fmt: on
+#: The SM count whose ranges of :data:`K1_PARITY_RANGES_BY_SM` a part of more SMs takes, ``arch -> sm_count`` (the
+#: largest SM count of that architecture in the table).
+K1_PARITY_RANGES_ABOVE_SM: dict[str, int] = {"sm_107a": 216}
+
+
+def k1_parity_plan(
+    *,
+    arch: str,
+    L: int,
+    M: int,
+    N: int,
+    K: int,
+    out_f32: bool,
+    sm_count: int,
+) -> Union[None, tuple[()], tuple[int, int, int, str]]:
+    """The program the row runs at ``K`` on a device of ``sm_count`` SMs by the parity of ``K``'s 64-element K blocks
+    (its range in :data:`K1_PARITY_RANGES_BY_SM` for exactly ``sm_count``, or, above every SM count of ``arch`` there,
+    for :data:`K1_PARITY_RANGES_ABOVE_SM`): ``(block_n, splits, chains, order)``, ``()`` for the deterministic program,
+    or ``None``: the row keeps the routing of the other tables -- outside those ranges, at a parity whose entry is
+    ``None``, or at a ``K`` too short for the splits or chains (:func:`k1_splits_fit`, :func:`k1_chains_fit`).  ``M``,
+    ``N`` and ``K`` as in :func:`k1_plan`."""
+    key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
+    part = K1_PARITY_RANGES_BY_SM.get((arch, int(sm_count)))
+    top = K1_PARITY_RANGES_ABOVE_SM.get(arch)
+    if part is None and top is not None and int(sm_count) > top:
+        part = K1_PARITY_RANGES_BY_SM.get((arch, top))
+    for lo, hi, even, odd in (part or {}).get(key, ()):
+        if lo <= int(K) <= hi:
+            program = odd if _ceil_div(int(K), K1_BLOCK_K) % 2 else even
+            if program is None or program == ():
+                return program
+            block_n, splits, chains, order = program
+            if not (k1_splits_fit(splits, K) and k1_chains_fit(chains, K)):
+                return None
+            return int(block_n), int(splits), int(chains), str(order)
     return None
 
 
@@ -2380,8 +2512,10 @@ def plan_atomic_gemm(
     registry allow it.  The planner's choice is first :func:`k1_dsm_plan`'s cluster program where the row has a
     range of :data:`K1_DSM_RANGES_BY_SM` (a plan with ``dsm``; ``None`` when this checkout does not register its
     template for ``arch``; at an odd number of K blocks in a range of :data:`K1_DSM_ODD_BLOCK_RANGES_BY_SM` that
-    table's program instead, :func:`k1_dsm_odd_block_plan`), then :func:`k1_ordered_plan`'s program where the row
-    has a range of :data:`K1_ORDERED_RANGES_BY_SM`, then :func:`k1_plan`'s, with :func:`k1_chain_plan`'s
+    table's program instead, :func:`k1_dsm_odd_block_plan`), then :func:`k1_parity_plan`'s program or the
+    deterministic program where the row has a range of :data:`K1_PARITY_RANGES_BY_SM`, then
+    :func:`k1_ordered_plan`'s program where the row has a range of :data:`K1_ORDERED_RANGES_BY_SM`, then
+    :func:`k1_plan`'s, with :func:`k1_chain_plan`'s
     accumulation chains where it has them; an explicit choice runs one chain unless ``chains`` (one of :data:`K1_CHAINS_CHOICES`) names
     more, at one split, in the arrival order, and never the cluster program.
     Raises ``ValueError`` for inconsistent shapes (as the deterministic planner does) and for an explicit choice the
@@ -2470,8 +2604,19 @@ def plan_atomic_gemm(
                 dsm=True,
             )
             return plan, a_launch, b_launch, O3, ""
-        ordered = odd or k1_ordered_plan(
-            arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+        parity = None
+        if odd is None:
+            parity = k1_parity_plan(
+                arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+            )
+            if parity == ():
+                return (*none, "the planner keeps the row on the deterministic program")
+        ordered = (
+            odd
+            or parity
+            or k1_ordered_plan(
+                arch=arch, L=L, M=M_, N=N_, K=K, out_f32=out_f32, sm_count=sm_count
+            )
         )
         if ordered is not None:
             bn, p, c, order = ordered
