@@ -93,7 +93,7 @@ Program and reduce names are the first eight hex digits of the program name.
 | `bwd_h4096` | (1024, 22528] | 5572b267 | plain | row-strided slots, 8 SMs left out | 5d75ea5f (tree, Kahan) |
 | `bwd_h4096` | (22528, 32768] | 5abcdc29 | plain | tail_div 12, max_halving 5 | 5d75ea5f (tree, Kahan) |
 | `bwd_h4096` | (32768, 44032] | 35a0b0ca | plain | tail_div 12, max_halving 5 | fcbfa14d (chain, Kahan) |
-| `bwd_h4096` | (44032, inf) | 073edafa | compensated, 8-row blocks | one chunk per slot | fcbfa14d (chain, Kahan) |
+| `bwd_h4096` | (44032, inf) | 7122dbcd | compensated, 8-row blocks | tail_div 12, max_halving 5 | fcbfa14d (chain, Kahan) |
 | `bwd_h512` | (0, 227] | 5f3e3fcc | column task | - | - |
 | `bwd_h512` | (227, 1024] | 09601d42 | plain | tail_div 12, max_halving 5 | 7097069b (tree, Kahan) |
 | `bwd_h512` | (1024, 4096] | 123db0b2 | plain | tail_div 12, max_halving 5 | fef03ce5 (tree, Kahan) |
@@ -108,14 +108,12 @@ Program and reduce names are the first eight hex digits of the program name.
 | `bwd_h6144` | (20, 256] | b93bf060 | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_h6144` | (256, 767] | 5c804aed | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_h6144` | (767, 4096] | 61421bc7 | plain | row-strided slots, 8 SMs left out | 5f5cdc51 (tree, Kahan) |
-| `bwd_h6144` | (4096, 16384] | b93bf060 | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
-| `bwd_h6144` | (16384, 42496] | 9207e4a3 | compensated, 8-row blocks | one chunk per slot | 89047c18 (tree, TwoSum) |
+| `bwd_h6144` | (4096, 42496] | b93bf060 | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_h6144` | (42496, inf) | c440e57b | compensated, 8-row blocks | tail_div 12, max_halving 5 | 89047c18 (tree, TwoSum) |
 | `bwd_w32_h6144` | (0, 20] | 44c5b870 | column task | - | - |
 | `bwd_w32_h6144` | (20, 256] | 62beb52f | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_w32_h6144` | (256, 4096] | 41b80b6a | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
-| `bwd_w32_h6144` | (4096, 16384] | 62beb52f | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
-| `bwd_w32_h6144` | (16384, 42496] | 615e2d63 | compensated, 8-row blocks | one chunk per slot | 89047c18 (tree, TwoSum) |
+| `bwd_w32_h6144` | (4096, 42496] | 62beb52f | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_w32_h6144` | (42496, inf) | 0ae6eb51 | compensated, 8-row blocks | tail_div 12, max_halving 5 | 89047c18 (tree, TwoSum) |
 | `bwd_residual_h6144` | (0, 1152] | d2749326 | column task | - | - |
 | `bwd_residual_h6144` | (1152, 42496] | c1a3be94 | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
@@ -155,7 +153,8 @@ Program and reduce names are the first eight hex digits of the program name.
 | `bwd_h4096` | (1024, 24576] | 5572b267 | plain | row-strided slots, 8 SMs left out | 5d75ea5f (tree, Kahan) |
 | `bwd_h4096` | (24576, 32768] | 5abcdc29 | plain | tail_div 12, max_halving 5 | 5d75ea5f (tree, Kahan) |
 | `bwd_h4096` | (32768, 48640] | 35a0b0ca | plain | tail_div 12, max_halving 5 | fcbfa14d (chain, Kahan) |
-| `bwd_h4096` | (48640, inf) | 073edafa | compensated, 8-row blocks | one chunk per slot | fcbfa14d (chain, Kahan) |
+| `bwd_h4096` | (48640, 51200] | 850eec3a | compensated, 8-row blocks | tail_div 4, max_halving 2 | 5d75ea5f (tree, Kahan) |
+| `bwd_h4096` | (51200, inf) | e813cc30 | compensated, 8-row blocks | tail_div 4, max_halving 2 | 5d75ea5f (tree, Kahan) |
 | `bwd_h512` | (0, 4] | 117a66e4 | column task | - | - |
 | `bwd_h512` | (4, 227] | 877751ba | column task | - | - |
 | `bwd_h512` | (227, 1024] | 09601d42 | plain | tail_div 12, max_halving 5 | 7097069b (tree, Kahan) |
@@ -164,17 +163,16 @@ Program and reduce names are the first eight hex digits of the program name.
 | `bwd_h512` | (32768, inf) | cfaae3ce | plain | tail_div 12, max_halving 5 | 122721bd (tree, Kahan) |
 | `bwd_h5120` | (0, 25] | 505283a5 | column task | - | - |
 | `bwd_h5120` | (25, 5120] | 2fc4932f | plain | tail_div 4, max_halving 2 | c5831b29 (tree, Kahan) |
-| `bwd_h5120` | (5120, 16384] | 7ffb443a | compensated, 8-row blocks | tail_div 4, max_halving 2 | c5831b29 (tree, Kahan) |
-| `bwd_h5120` | (16384, inf) | 7dc46e3c | compensated, 8-row blocks | one chunk per slot | cdcd68d9 (tree, TwoSum) |
+| `bwd_h5120` | (5120, inf) | 7ffb443a | compensated, 8-row blocks | tail_div 4, max_halving 2 | c5831b29 (tree, Kahan) |
 | `bwd_h6144` | (0, 20] | 38b1c6bc | column task | - | - |
 | `bwd_h6144` | (20, 767] | 5c804aed | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_h6144` | (767, 4096] | 61421bc7 | plain | row-strided slots, 8 SMs left out | 5f5cdc51 (tree, Kahan) |
-| `bwd_h6144` | (4096, 16384] | 322574af | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
-| `bwd_h6144` | (16384, inf) | 9207e4a3 | compensated, 8-row blocks | one chunk per slot | 89047c18 (tree, TwoSum) |
+| `bwd_h6144` | (4096, 48640] | 322574af | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
+| `bwd_h6144` | (48640, inf) | 289dc9ab | compensated, 8-row blocks | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_w32_h6144` | (0, 20] | 017091c7 | column task | - | - |
 | `bwd_w32_h6144` | (20, 4096] | 41b80b6a | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
-| `bwd_w32_h6144` | (4096, 16384] | 9a8c0396 | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
-| `bwd_w32_h6144` | (16384, inf) | 615e2d63 | compensated, 8-row blocks | one chunk per slot | 89047c18 (tree, TwoSum) |
+| `bwd_w32_h6144` | (4096, 48640] | 9a8c0396 | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
+| `bwd_w32_h6144` | (48640, inf) | aa46aa07 | compensated, 8-row blocks | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_residual_h6144` | (0, 1216] | 07135550 | column task | - | - |
 | `bwd_residual_h6144` | (1216, 48640] | 04ebec87 | plain | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
 | `bwd_residual_h6144` | (48640, inf) | 21b5e791 | compensated, 8-row blocks | tail_div 12, max_halving 5 | 5f5cdc51 (tree, Kahan) |
