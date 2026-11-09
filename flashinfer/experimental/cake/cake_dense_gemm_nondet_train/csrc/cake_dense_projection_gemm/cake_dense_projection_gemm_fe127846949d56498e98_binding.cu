@@ -262,6 +262,8 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_out, TensorView a_out32, T
       << KERNEL_NAME << ": requires (CMod(N, 256) == 0)";
   TVM_FFI_CHECK((CMod(a_ldo, 8LL) == 0LL), ValueError)
       << KERNEL_NAME << ": requires (CMod(ldo, 8) == 0)";
+  TVM_FFI_CHECK((a_K == a_K), ValueError)
+      << KERNEL_NAME << ": requires (K == K)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

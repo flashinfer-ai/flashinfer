@@ -82,6 +82,25 @@ def _skip_unless_cake_gpu(*, sm107: bool = False) -> None:
         )
 
 
+def _lowhead_prefill_variant(rows: int) -> str:
+    """The variant the host launches for a low-head prefill launch of ``rows``
+    query rows on this GPU: on SM107 the V-block sibling up to 27 rows and the
+    early-PV sibling up to 64 rows (both ceilings scaled down with the SM count
+    below 216 SMs), the route's program above them; elsewhere the route's
+    program."""
+    import flashinfer.mla.cake_dsv4 as cake
+
+    route = "fp8_lowhead_prefill"
+    if cake._target_arch(torch.device("cuda", 0)) != "sm_107a":
+        return route
+    sm_count = min(torch.cuda.get_device_properties(0).multi_processor_count, 216)
+    if rows <= 27 * sm_count // 216:
+        return f"{route}_vblock"
+    if rows <= 64 * sm_count // 216:
+        return f"{route}_overlap"
+    return route
+
+
 def _compressed_topk(h_q: int) -> int:
     # swa128+topk4x profiles: sparse_topk 384 / 640 / 1152 (page size 64).
     return {32: 256, 64: 512, 128: 1024}[h_q]
@@ -1461,10 +1480,11 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
     monkeypatch, form
 ):
     """The SWA-only FP8/H64 rows of one wave run the low-head prefill route: on
-    SM107 its early-PV sibling up to 64 rows (8 and 20 rows) and the route's
-    program above (68 rows), elsewhere the route's program.  As a programmatic
-    dependent each is bitwise equal to the plain launch and, inside a graph,
-    reads the query the copy right before it writes."""
+    SM107 its V-block sibling up to 27 rows (8 and 20 rows) and the route's
+    program above the early-PV sibling's 64 rows (68 rows), elsewhere the
+    route's program.  As a programmatic dependent each is bitwise equal to the
+    plain launch and, inside a graph, reads the query the copy right before it
+    writes."""
     _skip_unless_cake_gpu(sm107=True)
     import flashinfer.mla.cake_dsv4 as cake
 
@@ -1490,11 +1510,9 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
         sm_count=sm_count,
     )
     assert route == "fp8_lowhead_prefill", route
-    sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
-    early = sm107 and case.rows <= 64 * min(sm_count, 216) // 216
     workspace = _workspace_128mib()
     plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
-    assert set(launched) == {f"{route}_overlap" if early else route}, launched
+    assert set(launched) == {_lowhead_prefill_variant(case.rows)}, launched
     pdl = case.run(
         workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
     )
@@ -1813,8 +1831,9 @@ def _align_case(route, heads, dtype, q_lens, layout="dense", width=0, page=64, f
 
 # ---------------------------------------------------------- index tables off the 16-byte row loads
 # The SWA-only FP8 8-head rows of the low-head prefill route on SM107's early-PV
-# sibling (48 rows: at most 62 rows on 212 SMs, 64 on 216) and on the route's
-# own program above it (68 rows); elsewhere both run the route's program.  Then
+# sibling (48 rows: above the V-block sibling's 26 rows on 212 SMs and 27 on
+# 216, at most 62 rows on 212 SMs and 64 on 216) and on the route's own program
+# above it (68 rows); elsewhere both run the route's program.  Then
 # the persistent FP8/H128 route, whose topk4x rows every architecture builds and
 # routes there, and two routes SM107 does not build (the tests skip there).
 _INDEX_ALIGN_CASES = [
@@ -1873,10 +1892,7 @@ def test_index_tables_off_the_row_loads_raise_before_launch(
     torch.cuda.synchronize()
     assert calls and {r for r, _ in calls} == {route}
     if route == "fp8_lowhead_prefill":
-        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-        sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
-        early = sm107 and rows <= 64 * min(sm_count, 216) // 216
-        assert set(launched) == {f"{route}_overlap" if early else route}, launched
+        assert set(launched) == {_lowhead_prefill_variant(rows)}, launched
     contiguous = (list(calls), set(launched))
 
     off = torch.full((rows, cols + 1), -1, dtype=torch.int32, device="cuda:0")
@@ -2047,9 +2063,9 @@ def test_misaligned_caller_out_matches_aligned(
     (``_OUT_ALIGN_BY_ROUTE``). A contiguous caller ``out`` 2 or 16 bytes off a
     32-byte boundary gets bitwise the aligned call's result through an aligned
     staging buffer, the bytes around it stay untouched, and an aligned ``out``
-    allocates nothing.  On SM107 the low-head prefill cases run the early-PV
-    sibling up to its row ceiling (12 rows) and the route's program above it
-    (66 rows); elsewhere they run the route's program."""
+    allocates nothing.  On SM107 the low-head prefill cases run the V-block
+    sibling up to its row ceiling (12 rows) and the route's program above the
+    early-PV sibling's (66 rows); elsewhere they run the route's program."""
     _skip_unless_cake_gpu(sm107=route == "fp8_lowhead_prefill")
     import flashinfer.mla.cake_dsv4 as cake
 
@@ -2078,10 +2094,7 @@ def test_misaligned_caller_out_matches_aligned(
     torch.cuda.synchronize()
     assert calls and {r for r, _ in calls} == {route}
     if route == "fp8_lowhead_prefill":
-        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-        sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
-        early = sm107 and sum(q_lens) <= 64 * min(sm_count, 216) // 216
-        assert set(launched) == {f"{route}_overlap" if early else route}, launched
+        assert set(launched) == {_lowhead_prefill_variant(sum(q_lens))}, launched
 
     again = case.nan_out()
     after_alloc = _allocation_requests()
