@@ -27,6 +27,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover - older/newer CuTeDSL API location
@@ -57,6 +59,41 @@ from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     MoEFusedFc12SchedulerParams,
 )
 from moe_nvfp4_swapab.moe_utils import spin_wait
+
+
+@dsl_user_op
+def _e4m3x2_to_bf16x2(word: cutlass.Int32, high: bool, *, loc=None, ip=None):
+    """One ``cvt.rn.satfinite.bf16x2.e4m3x2`` on the low or high half of ``word``."""
+    half = "hi" if high else "lo"
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [word.ir_value(loc=loc, ip=ip)],
+            "{\n.reg .b16 lo, hi;\nmov.b32 {lo, hi}, $1;\n"
+            f"cvt.rn.satfinite.bf16x2.e4m3x2 $0, {half};\n}}",
+            "=r,r",
+            has_side_effects=False,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def _cvt_e4m3_to_bf16_direct(src: cute.Tensor) -> cute.TensorSSA:
+    """``src.load().to(BFloat16)`` via the direct E4M3x2->BF16x2 convert.
+
+    Bit-identical to the F16/F32 route for all 256 E4M3 encodings.
+    """
+    n = cute.size(src)
+    src_words = cute.recast_tensor(src, cutlass.Int32)
+    dst = cute.make_rmem_tensor((n,), cutlass.BFloat16)
+    dst_words = cute.recast_tensor(dst, cutlass.Int32)
+    for i in range(n // 4):  # Trace-time unroll; not preprocessed outside cute.jit.
+        word = src_words[i]
+        dst_words[2 * i] = _e4m3x2_to_bf16x2(word, False)
+        dst_words[2 * i + 1] = _e4m3x2_to_bf16x2(word, True)
+    return cute.TensorSSA(dst.load(), src.shape, cutlass.BFloat16)
 
 
 def _scale_partition_mxfp8(
@@ -143,6 +180,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
     _DefaultBStages = {"smem": 3, "tmem": 4}
 
     _SupportedImplementationConfigs = {
+        ((256, 64, 128), "tmem", False, 128),
         ((256, 128, 128), "tmem", False, 128),
         ((256, 256, 128), "smem", False, 128),
         ((256, 256, 128), "tmem", True, 64),
@@ -295,8 +333,13 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         transform_buffer: Literal["smem", "tmem"] = "tmem",
         accumulator_overlap: bool = False,
         transform_k_tile: Literal[64, 128] = 128,
+        mma_inst_n: Optional[int] = None,
+        direct_bf16_cvt: bool = False,
+        full_tile_mma: bool = False,
+        num_weight_stages: Optional[int] = None,
     ) -> None:
         supported_mma_tilers = (
+            (256, 64, 128),
             (256, 128, 128),
             (256, 256, 128),
         )
@@ -353,6 +396,33 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         self.transform_buffer = transform_buffer
         self.overlapping_accum = accumulator_overlap
         self.transform_k_tile = transform_k_tile
+        self.direct_bf16_cvt = direct_bf16_cvt
+        # MMA instruction N. Below the tile N, the tile is issued as N chunks
+        # and chunks without valid tokens are skipped.
+        self.mma_inst_n = mma_tiler_mnk[1] if mma_inst_n is None else mma_inst_n
+        if (
+            self.mma_inst_n not in (64, mma_tiler_mnk[1])
+            or mma_tiler_mnk[1] % self.mma_inst_n != 0
+        ):
+            raise ValueError(
+                "mma_inst_n must be 64 or the MMA tile N; "
+                f"got {mma_inst_n} for {mma_tiler_mnk}."
+            )
+        # Larger tiles issue one full-N instruction: FC1 above ``mma_inst_n``
+        # tokens over chunk-interleaved B rows (the FC1 epilogue undoes the
+        # 32-token block swap), FC2 above ``mma_inst_n // 2`` tokens over B
+        # rows loaded in plain order.
+        self.full_tile_mma = full_tile_mma
+        if full_tile_mma and not (
+            mma_tiler_mnk[1] == 128
+            and self.mma_inst_n == 64
+            and transform_buffer == "tmem"
+            and not accumulator_overlap
+        ):
+            raise ValueError(
+                "full_tile_mma requires mma_tiler N=128, mma_inst_n=64, "
+                "a TMEM transform buffer and no accumulator overlap."
+            )
         # mma_tiler_mnk describes the public/raw tile. transform_k_tile
         # explicitly describes the internal transform/MMA subdivision.
         self.mma_tiler = (
@@ -419,8 +489,18 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         # Derive concrete pipeline depths from the validated implementation
         # tuple and its SMEM/TMEM capacity instead of exposing stage-count
         # knobs to the runner.
-        self.num_a_stage = pipeline_stages["a"]
-        self.num_scale_stage = pipeline_stages["scale"]
+        # Raw FP8 weight/scale stages live in SMEM and may run deeper than
+        # the TMEM-bound transformed stages.
+        if num_weight_stages is not None and num_weight_stages < 2:
+            raise ValueError("num_weight_stages must be at least 2.")
+        self.num_a_stage = (
+            pipeline_stages["a"] if num_weight_stages is None else num_weight_stages
+        )
+        self.num_scale_stage = (
+            pipeline_stages["scale"]
+            if num_weight_stages is None
+            else num_weight_stages
+        )
         self.num_b_stage = pipeline_stages["b"] if num_activation_stages is None else num_activation_stages
         self.num_transformed_a_stage = pipeline_stages["transformed_a"]
         self.num_acc_stage = pipeline_stages["acc"]
@@ -515,7 +595,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         total = fc1_bytes + counter_bytes + load_balance_bytes
         return ((total + 127) // 128) * 128
 
-    def _create_tiled_mma(self) -> cute.TiledMma:
+    def _create_tiled_mma(self, full_n: bool = False) -> cute.TiledMma:
         return sm100_utils.make_trivial_tiled_mma(
             cutlass.BFloat16,
             cutlass.BFloat16,
@@ -523,7 +603,10 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             self.b_major_mode,
             self.acc_dtype,
             self.cta_group,
-            self.mma_tiler[:2],
+            (
+                self.mma_tiler[0],
+                self.mma_tiler[1] if full_n else self.mma_inst_n,
+            ),
             self.transform_a_source,
         )
 
@@ -559,6 +642,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             batch_invariant_activation=getattr(self, "batch_invariant_activation", None),
             epi_flag_batch=self.epi_flag_batch,
             accumulator_overlap=self.overlapping_accum,
+            fc1_n128_block_swap=self.full_tile_mma,
         )
         self.num_acc_stage = self.epilogue.num_acc_stage
         self.num_acc_pipeline_stages = (
@@ -1081,13 +1165,28 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                 self.cluster_layout_vmnk.shape,
             )
         )
+        # With full_tile_mma, FC2 loads its B rows in plain N order so a
+        # full-N instruction keeps the epilogue's token order.
+        fc2_b_mma = tiled_mma
+        fc2_b_smem_stage = b_smem_stage
+        if cutlass.const_expr(self.full_tile_mma):
+            fc2_b_mma = self._create_tiled_mma(full_n=True)
+            fc2_b_smem_stage = cute.slice_(
+                sm100_utils.make_smem_layout_b(
+                    fc2_b_mma,
+                    self.tma_tiler,
+                    cutlass.BFloat16,
+                    self.num_b_stage,
+                ),
+                (None, None, None, 0),
+            )
         tma_atom_fc1_output, tma_tensor_fc1_output = (
             cute.nvgpu.make_tiled_tma_atom_B(
                 b_op,
                 fc1_output_gemm,
-                b_smem_stage,
+                fc2_b_smem_stage,
                 self.tma_tiler,
-                tiled_mma,
+                fc2_b_mma,
                 self.cluster_layout_vmnk.shape,
             )
         )
@@ -1375,11 +1474,19 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                     ):
                         a_consumer_state.advance()
 
-                    transformed = mixed_input_utils.cvt_tensor_a(
-                        tArA_load[(None, fragment_idx)],
-                        cutlass.BFloat16,
-                        False,
-                    )
+                    if cutlass.const_expr(
+                        self.direct_bf16_cvt
+                        and self.a_dtype == cutlass.Float8E4M3FN
+                    ):
+                        transformed = _cvt_e4m3_to_bf16_direct(
+                            tArA_load[(None, fragment_idx)]
+                        )
+                    else:
+                        transformed = mixed_input_utils.cvt_tensor_a(
+                            tArA_load[(None, fragment_idx)],
+                            cutlass.BFloat16,
+                            False,
+                        )
                     value_count = cute.size(transformed.shape)
                     if cutlass.const_expr(
                         self.transform_a_source
@@ -1511,6 +1618,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         transformed_consumer_state,
         b_consumer_state,
         acc_producer_state,
+        valid_tokens,
     ):
         """Consume one transformed-A/B work tile with a specialized K bound."""
 
@@ -1564,27 +1672,59 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                         if cutlass.const_expr(self.tma_k_reuse == 2)
                         else kblock
                     )
-                    cute.gemm(
-                        tiled_mma,
-                        tCtAcc,
-                        tCrA[
-                            (
-                                None,
-                                None,
-                                kblock,
-                                transformed_consumer_state.index,
-                            )
-                        ],
-                        tCrB[
-                            (
-                                None,
-                                None,
-                                b_k_coord,
-                                b_consumer_state.index,
-                            )
-                        ],
-                        tCtAcc,
-                    )
+                    if cutlass.const_expr(cute.size(tCrB, mode=[1]) == 1):
+                        cute.gemm(
+                            tiled_mma,
+                            tCtAcc,
+                            tCrA[
+                                (
+                                    None,
+                                    None,
+                                    kblock,
+                                    transformed_consumer_state.index,
+                                )
+                            ],
+                            tCrB[
+                                (
+                                    None,
+                                    None,
+                                    b_k_coord,
+                                    b_consumer_state.index,
+                                )
+                            ],
+                            tCtAcc,
+                        )
+                    else:
+                        # Columns of skipped chunks hold no valid token; the
+                        # epilogue never reads those subtiles.
+                        for n_chunk in cutlass.range_constexpr(
+                            self.mma_tiler[1] // self.mma_inst_n
+                        ):
+                            if (
+                                cutlass.Int32(n_chunk * self.mma_inst_n)
+                                < valid_tokens
+                            ):
+                                cute.gemm(
+                                    tiled_mma,
+                                    tCtAcc[(None, 0, n_chunk)],
+                                    tCrA[
+                                        (
+                                            None,
+                                            0,
+                                            kblock,
+                                            transformed_consumer_state.index,
+                                        )
+                                    ],
+                                    tCrB[
+                                        (
+                                            None,
+                                            n_chunk,
+                                            b_k_coord,
+                                            b_consumer_state.index,
+                                        )
+                                    ],
+                                    tCtAcc[(None, 0, n_chunk)],
+                                )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                 transformed_a_pipeline.consumer_release(
                     transformed_consumer_state
@@ -1925,6 +2065,39 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             )
         else:
             tCrA = tiled_mma.make_fragment_A(sATransformed)
+
+        if cutlass.const_expr(self.full_tile_mma):
+            # Same SMEM/TMEM bytes, viewed through a full-N instruction.
+            tiled_mma_full = self._create_tiled_mma(full_n=True)
+            b_layout_full = sm100_utils.make_smem_layout_b(
+                tiled_mma_full,
+                self.tma_tiler,
+                cutlass.BFloat16,
+                self.num_b_stage,
+            )
+            sB_full = cute.make_tensor(sB.iterator, b_layout_full.outer)
+            tCrB_full = tiled_mma_full.make_fragment_B(sB_full)
+            tCrA_full = cute.make_tensor(
+                tCrA.iterator,
+                tiled_mma_full.make_fragment_A(
+                    transformed_a_layout_staged.outer
+                ).layout,
+            )
+            acc_full_fake = tiled_mma_full.make_fragment_C(
+                cute.append(
+                    tiled_mma_full.partition_shape_C(self.mma_tiler[:2]),
+                    self.num_acc_stage,
+                )
+            )
+            accumulators_full = cute.make_tensor(
+                tmem_ptr, acc_full_fake.layout
+            )
+        else:
+            tiled_mma_full = tiled_mma
+            sB_full = sB
+            tCrA_full = tCrA
+            tCrB_full = tCrB
+            accumulators_full = accumulators
 
         # Count complete raw-TMA macro tiles, then expand each macro tile into
         # its transform/MMA substages.  This matters for the overlap path,
@@ -2531,12 +2704,14 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                         ),
                         (None, None, None),
                     )
-                    tCgB = thr_mma.partition_B(gB)
+                    tCgB = tiled_mma_full.get_slice(
+                        mma_tile_coord_v
+                    ).partition_B(gB)
                     tBsB, tBgB = cpasync.tma_partition(
                         tma_atom_fc1_output,
                         block_in_cluster_coord_vmnk[1],
                         b_cta_layout,
-                        cute.group_modes(sB, 0, 3),
+                        cute.group_modes(sB_full, 0, 3),
                         cute.group_modes(tCgB, 0, 3),
                     )
                     tBgB_slice = tBgB[
@@ -2901,60 +3076,132 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                         # each runtime branch a fresh wrapper and fresh
                         # consumer states, then explicitly rebind the values
                         # returned by that helper specialization.
-                        if is_fc1:
-                            fc1_tiled_mma = tiled_mma.with_()
-                            fc1_transformed_consumer_state = (
-                                transformed_consumer_state.clone()
+                        run_full = False
+                        if cutlass.const_expr(self.full_tile_mma):
+                            # FC1 B rows are chunk-interleaved (full-N needs
+                            # the epilogue block swap above 64 tokens); FC2 B
+                            # rows are plain, so one N64 chunk only covers
+                            # tiles of at most 32 tokens.
+                            full_threshold = cutlass.Int32(self.mma_inst_n // 2)
+                            if is_fc1:
+                                full_threshold = cutlass.Int32(self.mma_inst_n)
+                            run_full = cutlass.Boolean(
+                                work.valid_tokens_in_cta_tile > full_threshold
                             )
-                            fc1_b_consumer_state = (
-                                b_consumer_state.clone()
-                            )
-                            (
-                                tiled_mma,
-                                transformed_consumer_state,
-                                b_consumer_state,
-                            ) = self._mma_k_tiles(
-                                k_tile_cnt_fc1,
-                                is_fc1,
-                                mma_iket_active,
-                                fc1_tiled_mma,
-                                tCtAcc,
-                                tCrA,
-                                tCrB,
-                                transformed_a_pipeline,
-                                b_load_pipeline,
-                                acc_pipeline,
-                                fc1_transformed_consumer_state,
-                                fc1_b_consumer_state,
-                                acc_producer_state,
-                            )
+                        if run_full:
+                            if is_fc1:
+                                full_tiled_mma = tiled_mma_full.with_()
+                                full_transformed_consumer_state = (
+                                    transformed_consumer_state.clone()
+                                )
+                                full_b_consumer_state = b_consumer_state.clone()
+                                (
+                                    tiled_mma_full,
+                                    transformed_consumer_state,
+                                    b_consumer_state,
+                                ) = self._mma_k_tiles(
+                                    k_tile_cnt_fc1,
+                                    is_fc1,
+                                    mma_iket_active,
+                                    full_tiled_mma,
+                                    accumulators_full[
+                                        (None, None, None, acc_stage_idx)
+                                    ],
+                                    tCrA_full,
+                                    tCrB_full,
+                                    transformed_a_pipeline,
+                                    b_load_pipeline,
+                                    acc_pipeline,
+                                    full_transformed_consumer_state,
+                                    full_b_consumer_state,
+                                    acc_producer_state,
+                                    work.valid_tokens_in_cta_tile,
+                                )
+                            else:
+                                full_tiled_mma = tiled_mma_full.with_()
+                                full_transformed_consumer_state = (
+                                    transformed_consumer_state.clone()
+                                )
+                                full_b_consumer_state = b_consumer_state.clone()
+                                (
+                                    tiled_mma_full,
+                                    transformed_consumer_state,
+                                    b_consumer_state,
+                                ) = self._mma_k_tiles(
+                                    k_tile_cnt_fc2,
+                                    is_fc1,
+                                    mma_iket_active,
+                                    full_tiled_mma,
+                                    accumulators_full[
+                                        (None, None, None, acc_stage_idx)
+                                    ],
+                                    tCrA_full,
+                                    tCrB_full,
+                                    transformed_a_pipeline,
+                                    b_load_pipeline,
+                                    acc_pipeline,
+                                    full_transformed_consumer_state,
+                                    full_b_consumer_state,
+                                    acc_producer_state,
+                                    work.valid_tokens_in_cta_tile,
+                                )
                         else:
-                            fc2_tiled_mma = tiled_mma.with_()
-                            fc2_transformed_consumer_state = (
-                                transformed_consumer_state.clone()
-                            )
-                            fc2_b_consumer_state = (
-                                b_consumer_state.clone()
-                            )
-                            (
-                                tiled_mma,
-                                transformed_consumer_state,
-                                b_consumer_state,
-                            ) = self._mma_k_tiles(
-                                k_tile_cnt_fc2,
-                                is_fc1,
-                                mma_iket_active,
-                                fc2_tiled_mma,
-                                tCtAcc,
-                                tCrA,
-                                tCrB,
-                                transformed_a_pipeline,
-                                b_load_pipeline,
-                                acc_pipeline,
-                                fc2_transformed_consumer_state,
-                                fc2_b_consumer_state,
-                                acc_producer_state,
-                            )
+                            if is_fc1:
+                                fc1_tiled_mma = tiled_mma.with_()
+                                fc1_transformed_consumer_state = (
+                                    transformed_consumer_state.clone()
+                                )
+                                fc1_b_consumer_state = (
+                                    b_consumer_state.clone()
+                                )
+                                (
+                                    tiled_mma,
+                                    transformed_consumer_state,
+                                    b_consumer_state,
+                                ) = self._mma_k_tiles(
+                                    k_tile_cnt_fc1,
+                                    is_fc1,
+                                    mma_iket_active,
+                                    fc1_tiled_mma,
+                                    tCtAcc,
+                                    tCrA,
+                                    tCrB,
+                                    transformed_a_pipeline,
+                                    b_load_pipeline,
+                                    acc_pipeline,
+                                    fc1_transformed_consumer_state,
+                                    fc1_b_consumer_state,
+                                    acc_producer_state,
+                                    work.valid_tokens_in_cta_tile,
+                                )
+                            else:
+                                fc2_tiled_mma = tiled_mma.with_()
+                                fc2_transformed_consumer_state = (
+                                    transformed_consumer_state.clone()
+                                )
+                                fc2_b_consumer_state = (
+                                    b_consumer_state.clone()
+                                )
+                                (
+                                    tiled_mma,
+                                    transformed_consumer_state,
+                                    b_consumer_state,
+                                ) = self._mma_k_tiles(
+                                    k_tile_cnt_fc2,
+                                    is_fc1,
+                                    mma_iket_active,
+                                    fc2_tiled_mma,
+                                    tCtAcc,
+                                    tCrA,
+                                    tCrB,
+                                    transformed_a_pipeline,
+                                    b_load_pipeline,
+                                    acc_pipeline,
+                                    fc2_transformed_consumer_state,
+                                    fc2_b_consumer_state,
+                                    acc_producer_state,
+                                    work.valid_tokens_in_cta_tile,
+                                )
                     else:
                         k_tile_cnt = cutlass.Int32(0)
                         if is_fc1:
@@ -2979,6 +3226,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                             transformed_consumer_state,
                             b_consumer_state,
                             acc_producer_state,
+                            work.valid_tokens_in_cta_tile,
                         )
                 if is_leader_cta:
                     if mma_iket_active:
