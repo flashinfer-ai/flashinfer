@@ -397,7 +397,9 @@ def test_snapshot_output_completion(snapshot_logging, monkeypatch, captured, com
     if complete:
         assert replay["execution_result"] is None
         assert set(replay["expected_tensors"]) == {"mutated_input__arg_0"}
-        torch.testing.assert_close(replay["expected_tensors"]["mutated_input__arg_0"], x)
+        torch.testing.assert_close(
+            replay["expected_tensors"]["mutated_input__arg_0"], x
+        )
         assert replay["comparison_match"] is True
     else:
         assert replay["comparison_match"] is None
@@ -406,7 +408,9 @@ def test_snapshot_output_completion(snapshot_logging, monkeypatch, captured, com
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("captured", [False, True])
-def test_graph_snapshot_readonly_stride0_arg_cpu(snapshot_logging, monkeypatch, captured):
+def test_graph_snapshot_readonly_stride0_arg_cpu(
+    snapshot_logging, monkeypatch, captured
+):
     """A read-only singleton must not veto the whole call's dump."""
     logging, root = snapshot_logging
     logged_op = logging.flashinfer_api(inspect.unwrap(_graph_snapshot_readonly_op))
