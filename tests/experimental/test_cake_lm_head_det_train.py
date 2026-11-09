@@ -6948,13 +6948,7 @@ def test_memory_plan_partial_ip():
         lp_phases = (
             dxacc + lower + upper + bufs + keep + rowvec,
             dxacc + dx_out + lower + upper + logits + rowvec + blocks(4 * T),
-            dx_out
-            + lower
-            + upper
-            + logits
-            + x_last
-            + blocks(2 * p0 * H)
-            + rowvec,
+            dx_out + lower + upper + logits + x_last + blocks(2 * p0 * H) + rowvec,
             dx_out + lower + logits + x_last + block + rowvec + keep,
         )
         assert lp.predicted_bytes == max(lp_phases), (key, lp_phases)
