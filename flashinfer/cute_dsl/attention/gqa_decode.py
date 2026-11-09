@@ -9,6 +9,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -52,6 +53,22 @@ exp2 = partial(cute.math.exp2, fastmath=True)
 warp_fmax = partial(cute.arch.warp_redux_sync, kind="fmax", nan=True)
 smem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="cta")
 gmem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="gpu")
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
+    Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``, which
+    lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
+    ):
+        pass
 
 
 class GroupedQueryAttentionDecode:
@@ -1817,7 +1834,9 @@ class GroupedQueryAttentionDecode:
                         dsmem_store_atom_r, tRrM_final, tRsR_peer, mbar_ptr=peer_mbar
                     )
                     cute.arch.fence_acq_rel_cta()  # dont reorder dsmem store after wait
-                    cute.arch.mbarrier_wait(local_mbar, phase=0)
+                    # The peer's st.async complete-tx releases at cluster scope: acquire
+                    # at cluster scope before reading its slot.
+                    _mbarrier_wait_acquire_cluster(local_mbar, Int32(0))
                     tRrR = tRsR_local.load()
                     for j in cutlass.range_constexpr(cute.size(tRrM_final)):
                         tRrM_final[j] = cute.arch.fmax(tRrM_final[j], tRrR[j])
@@ -1853,7 +1872,9 @@ class GroupedQueryAttentionDecode:
                         dsmem_store_atom_r, tRrL_local, tRsR_peer, mbar_ptr=peer_mbar
                     )
                     cute.arch.fence_acq_rel_cta()  # dont reorder dsmem store after wait
-                    cute.arch.mbarrier_wait(local_mbar, phase=0)
+                    # The peer's st.async complete-tx releases at cluster scope: acquire
+                    # at cluster scope before reading its slot.
+                    _mbarrier_wait_acquire_cluster(local_mbar, Int32(0))
                     colsum += tRsR_local.load()
 
             if cutlass.const_expr(sSink is not None):
