@@ -61,9 +61,10 @@ count and the layout of the inputs: the forward of packed rows (``x`` and
 ``z`` hold row ``n`` at element ``128 n``, fewer than ``PACKED_ROWS`` rows)
 by ``FORWARD_BANDS``, of other layouts by ``STRIDED_FORWARD_BANDS``, bands of
 rows per SM (the tiny forward, which reads packed rows only, the short
-forward, the mid, long and extra-long forwards and the pipelined forwards,
-each where the architecture's bands name it); the backward by
-``BACKWARD_BANDS``, bands of rows or of rows per SM: its small-row roles (``BAND_ROLES``: the
+forward, the mid, long and extra-long forwards, the pipelined forwards and
+the forward of the call role, each where the architecture's bands name it);
+the backward by ``BACKWARD_BANDS``, bands of rows or of rows per SM: its
+small-row roles (``BAND_ROLES``: the
 short backward ``bwd_bf16_short`` and the exact tiny backward ``_t512``, each
 up to a count of rows), its fused role (``_fused``: a BF16 weight gradient,
 in a band of rows per SM) and its repeatable role (``_rep``: a BF16
@@ -86,7 +87,9 @@ deterministic package's forward kernel file with a gate that does not flush
 does not flush where the deterministic gate gives 0, ``z`` from about -87.34
 down, and gives the deterministic bits elsewhere), under this package's names,
 routed where they make the training step, two forwards and the backward, faster
-than this package's own: 128-thread CTAs walking 16-row blocks, each thread
+than this package's own, and on sm_107a from 281 rows per SM, where with them
+the forward alone is about 10 % faster and the step at most about 3.5 %
+slower: 128-thread CTAs walking 16-row blocks, each thread
 loading its row of the CTA's next block into registers while it computes the
 current one, with the mid forward's L2 prefetches and the L2 ``evict_first``
 policy on the loads of ``x`` and ``z``, one CTA per block below 8192 rows per
@@ -1923,23 +1926,28 @@ ROUTES: dict[str, dict[str, str]] = {
 # packed rows: ``(last, role)`` bands in increasing ``last`` (``None``: no
 # end); a call of ``rows`` rows on a device of ``sm_count`` SMs runs the
 # module of the first band's routed ``role`` with ``rows <= last *
-# sm_count``.  On sm_100a and sm_107a the cuts are the program that makes the
-# checkpointed training step fastest at each rows per SM (two forwards and the
-# backward, of a BF16 and of an FP32 weight gradient; CUPTI, cold L2): the
-# pipelined forwards load ``x`` and ``z`` with the L2 ``evict_first``
-# policy, so where the rows fit in L2 the step's later kernels read them
-# from memory again and this package's own forwards make the step faster,
-# though the pipelined forward alone is faster.  On sm_103a the cuts are the
-# fastest forward alone (CUPTI, cold L2): the pipelined forward past the
-# tiny forward, but the mid forward from 6001 to 8192 rows per SM, where the
-# pipelined forward still launches a CTA per block.  The tiny forward ends
-# where beside a kernel holding 16 SMs it still ends no later than the
-# deterministic package's forward: 38 rows per SM on sm_100a and 36 on
-# sm_103a (past 38, beside 16 CTAs of 1024 threads with the max-shared
-# carveout, it can end up to 2 microseconds later, and sm_103a keeps two rows
-# per SM of margin; the pipelined forward, which is that forward, runs from
-# there, up to 85 rows per SM on sm_100a and 6000 on sm_103a), and 65 on
-# sm_107a.  Host plan only: a new cut needs no new program.
+# sm_count``.  The cuts follow the checkpointed training step at each rows
+# per SM (two forwards and the backward, of a BF16 and of an FP32 weight
+# gradient; CUPTI, cold L2) on every architecture: the pipelined forwards
+# load ``x`` and ``z`` with the L2 ``evict_first`` policy, so where the rows
+# fit in L2 the step's later kernels read them from memory again and this
+# package's own forwards make the step faster, though the pipelined forward
+# alone is faster.  On sm_100a each band runs the program of the fastest
+# step.  On sm_103a the mid forward up to 240 rows per SM and the extra-long
+# forward up to 600 make the step 4 to 10 % faster than the pipelined
+# forward, which alone is at most 4.5 % faster; past 600 the pipelined
+# forward runs, but the mid forward from 6001 to 8192 rows per SM, where the
+# pipelined forward still launches a CTA per block.  One cut is not the
+# step's: on sm_107a the pipelined forward runs past 280 rows per SM, where
+# it is about 10 % faster alone than the extra-long forward and makes the
+# step at most about 3.5 % slower.  The tiny forward ends where beside a
+# kernel holding 16 SMs it still ends no later than the deterministic
+# package's forward: 38 rows per SM on sm_100a and 36 on sm_103a (past 38,
+# beside 16 CTAs of 1024 threads with the max-shared carveout, it can end up
+# to 2 microseconds later, and sm_103a keeps two rows per SM of margin; on
+# sm_100a the pipelined forward, which is that forward, runs from there up
+# to 85 rows per SM), and 65 on sm_107a.  Host plan only: a new cut needs no
+# new program.
 FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (38, "fwd_tiny"),
@@ -1952,6 +1960,8 @@ FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     ),
     "sm_103a": (
         (36, "fwd_tiny"),
+        (240, "fwd_mid"),
+        (600, "fwd_xlong"),
         (6000, "fwd_pipe"),
         (8192, "fwd_mid"),
         (None, "fwd_pipe"),
@@ -1959,43 +1969,45 @@ FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_107a": (
         (65, "fwd_tiny"),
         (175, "fwd_mid"),
-        (350, "fwd_xlong"),
-        (10000, "fwd_pipe_packed"),
-        (None, "fwd_mid"),
+        (280, "fwd_xlong"),
+        (None, "fwd_pipe_packed"),
     ),
 }
 
 # The forward bands of a call whose ``x`` or ``z`` rows are not packed (the
 # tiny forward reads packed rows only), or of packed rows from
-# ``PACKED_ROWS`` on, as ``FORWARD_BANDS``.  The cuts are the measured fastest
-# program at each rows per SM (CUPTI, cold L2), except the short forward's
-# end: 12 rows per SM on sm_100a and sm_103a, where its grid of one 16-row
-# block a CTA has at most as many CTAs as the SMs less 16 (from 64 SMs), and
-# 59 on sm_107a, where it fits one wave of 4 CTAs per SM on all SMs but 16
-# (from 205 SMs), so beside a kernel holding 16 SMs it ends no later than the
-# plain forward.  On sm_100a and sm_107a no band runs the pipelined forward,
-# which makes the training step slower at every rows per SM measured; on
-# sm_103a it runs up to 100 rows per SM.
+# ``PACKED_ROWS`` on, as ``FORWARD_BANDS``.  The cuts follow the
+# checkpointed training step as ``FORWARD_BANDS`` do, except the short
+# forward's end: 12 rows per SM on sm_100a and sm_103a, where its grid of
+# one 16-row block a CTA has at most as many CTAs as the SMs less 16 (from 64
+# SMs), and 59 on sm_107a, where it fits one wave of 4 CTAs per SM on all SMs
+# but 16 (from 205 SMs), so beside a kernel holding 16 SMs it ends no later
+# than the plain forward.  The plain forward (the call role ``fwd``: one
+# 64-thread CTA per 8-row block) runs past the persistent forwards' bands,
+# from 701 rows per SM on sm_100a and sm_103a and from 481 on sm_107a: where
+# measured there (from 1000 rows per SM on sm_100a and sm_103a, from 520 on
+# sm_107a) it is the fastest forward alone and makes the step 1 to 6 %
+# faster.  No band of this table runs a pipelined forward, which makes the
+# step slower at every rows per SM measured (on sm_103a 3 to 7 % slower than
+# the mid forward from 13 to 100 rows per SM).
 STRIDED_FORWARD_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_100a": (
         (12, "fwd_short"),
         (140, "fwd_mid"),
         (400, "fwd_long"),
-        (1000, "fwd_xlong"),
-        (None, "fwd_mid"),
+        (700, "fwd_xlong"),
+        (None, "fwd"),
     ),
     "sm_103a": (
         (12, "fwd_short"),
-        (100, "fwd_pipe"),
         (250, "fwd_mid"),
-        (550, "fwd_xlong"),
-        (None, "fwd_mid"),
+        (700, "fwd_xlong"),
+        (None, "fwd"),
     ),
     "sm_107a": (
         (59, "fwd_short"),
-        (200, "fwd_mid"),
-        (520, "fwd_xlong"),
-        (None, "fwd_mid"),
+        (480, "fwd_mid"),
+        (None, "fwd"),
     ),
 }
 
