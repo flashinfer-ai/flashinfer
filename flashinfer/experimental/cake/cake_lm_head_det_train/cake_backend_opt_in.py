@@ -79,7 +79,7 @@ import functools
 import math
 from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Callable, ClassVar, Optional, Union, cast
+from typing import Any, Callable, ClassVar, NamedTuple, Optional, Union, cast
 
 import torch
 
@@ -732,11 +732,11 @@ class Plan(_main.Plan):
     # per-row gradient scale ``d`` in the ``[rows]`` vector ``d_rows`` for the backward's recompute of the other rows
     dw_rows: Optional[int] = None
     keep_row_grad: bool = False
-    # the budget form ``"fused_ip"`` (:func:`memory_plan`; loss entry, deferred last chunk, BF16 ``dW``): the chunk
-    # loop's FP32 accumulator is two allocations, ``dw_acc`` of the vocabulary rows ``[0, dw_split)`` and ``dw_acc_hi``
-    # of ``[dw_split, V)``, each chunk adding into both (two launches of its accumulate form, the second keyed by
-    # :class:`_UpperRows`), so the backward's fused cast can write the BF16 ``dW`` into ``dw_acc``'s own storage
-    # (:func:`_dw_cast_split`); ``None`` = one accumulator, as before
+    # the budget form ``"fused_ip"`` (:func:`memory_plan`; deferred last chunk, BF16 ``dW``): the chunk loop's FP32
+    # accumulator -- the loss entry's forward, the log-probability backward's -- is two allocations, ``dw_acc`` of
+    # the vocabulary rows ``[0, dw_split)`` and ``dw_acc_hi`` of ``[dw_split, V)``, each chunk adding into both (two
+    # launches of its accumulate form, the second keyed by :class:`_UpperRows`), so the backward's fused cast can write
+    # the BF16 ``dW`` into ``dw_acc``'s own storage (:func:`_dw_cast_split`); ``None`` = one accumulator, as before
     dw_split: Optional[int] = None
     # the budget form ``"partial_ip"``: the split accumulator's upper part covers the rows ``[dw_split, dw_split_end)``
     # only (none when equal; the backward recomputes the rows ``[dw_split_end, V)``, :func:`_dw_vocab_blocks`);
@@ -838,11 +838,12 @@ def make_plan(
     FP32 accumulator uncast for the caller; ``keep_row_grad`` (loss entry) keeps every chunk's per-row gradient scale
     (:attr:`Plan.dw_rows`, :attr:`Plan.keep_row_grad`; the budget forms of :func:`memory_plan`).  ``dx_slices_cap``
     (the zero-weight split): no chunk's rule-picked dX slice count exceeds it (:func:`.cake_backend.capped_k_slices`; an
-    explicit ``k_slices`` knob is not capped).  ``dw_split`` (a multi-chunk loss plan with the deferred last chunk and a
-    BF16 ``dW``; a multiple of :func:`dw_block_step` strictly inside ``(0, V)``, at least half of ``V``): the chunk
-    loop's FP32 accumulator splits at that vocabulary row (:attr:`Plan.dw_split`, the budget form ``"fused_ip"``);
-    ``dw_split_end`` (with ``dw_split``; a multiple of :func:`dw_block_step` in ``[dw_split, V]``, default ``V``) ends
-    its upper part there (:attr:`Plan.dw_split_end`, the budget form ``"partial_ip"``, with ``keep_row_grad``)."""
+    explicit ``k_slices`` knob is not capped).  ``dw_split`` (a multi-chunk plan of either entry with the deferred last
+    chunk and a BF16 ``dW``; a multiple of :func:`dw_block_step` strictly inside ``(0, V)``, at least half of ``V``):
+    the chunk loop's FP32 accumulator splits at that vocabulary row (:attr:`Plan.dw_split`, the budget form
+    ``"fused_ip"``); ``dw_split_end`` (with ``dw_split``; a multiple of :func:`dw_block_step` in ``[dw_split, V]``,
+    default ``V``) ends its upper part there (:attr:`Plan.dw_split_end`, the budget form ``"partial_ip"``; the loss
+    entry with ``keep_row_grad``)."""
     if (logprob_dz or logprob_lbl) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
     if keep_row_grad and problem.entry != "loss":
@@ -866,15 +867,14 @@ def make_plan(
         dw_split = int(dw_split)
         step = dw_block_step(geometry)
         if not (
-            problem.entry == "loss"
-            and need_dw
+            need_dw
             and fuse_dw_cast
             and dw_rows is None
             and problem.grad_weight_dtype == torch.bfloat16
             and len(chunks) > 1
         ):
             raise ValueError(
-                "dw_split belongs to a multi-chunk loss plan with the deferred last chunk (fuse_dw_cast=True, "
+                "dw_split belongs to a multi-chunk plan with the deferred last chunk (fuse_dw_cast=True, "
                 "need_dw=True, no dw_rows) and a BF16 weight gradient"
             )
         if dw_split % step or not 2 * dw_split >= int(problem.vocab) > dw_split:
@@ -1059,13 +1059,14 @@ class MemoryPlan:
     """The weight-gradient form :func:`memory_plan` picked for one call of a budget form (``memory_mode="budget"``, or
     a default call whose automatic form switched to it, :func:`auto_memory_plan`).
 
-    ``form``: ``"fused"`` (the fast form: the deferred last chunk's fused cast), ``"fused_ip"`` (loss entry: the fused
-    cast with the FP32 accumulator split at :func:`dw_split_rows`, written into the lower accumulator's own storage in
-    place, :attr:`Plan.dw_split`), ``"unfused"`` (every chunk accumulated
-    into the FP32 ``[V, H]`` accumulator, one flat cast after ``dX`` is written), ``"partial_ip"`` (loss entry:
+    ``form``: ``"fused"`` (the fast form: the deferred last chunk's fused cast), ``"fused_ip"`` (two or more chunks: the
+    fused cast with the FP32 accumulator split at :func:`dw_split_rows`, written into the lower accumulator's own
+    storage in place, :attr:`Plan.dw_split`), ``"unfused"`` (every chunk accumulated
+    into the FP32 ``[V, H]`` accumulator, one flat cast after ``dX`` is written), ``"partial_ip"`` (two or more chunks:
     ``"fused_ip"``'s chunk loop and in-place cast over the vocabulary rows ``[0, dw_rows)``, ``dw_rows`` at least the
-    split row; the backward recomputes the other rows of the chunks before the last, whose ``dz`` stays pinned since
-    the forward, :attr:`Plan.dw_split_end`), ``"partial"`` (the chunk loop accumulates the vocabulary rows
+    split row; the recompute of the other rows covers the chunks before the last, whose ``dz`` stays pinned -- since
+    the loss entry's forward, through the log-probability backward's chunk loop -- :attr:`Plan.dw_split_end`),
+    ``"partial"`` (the chunk loop accumulates the vocabulary rows
     ``[0, dw_rows)``; the backward recomputes the others) or ``"recompute"`` (the backward recomputes every row).  ``dw_rows``: the vocabulary rows the chunk loop -- the loss entry's forward, the
     log-probability entry's backward -- accumulates (``V`` for the first two forms).  ``block_rows``: the rows of one
     vocabulary block of the backward's recompute (``None`` = no recompute; :func:`_dw_vocab_blocks`).
@@ -1123,13 +1124,13 @@ def memory_plan(
     whatever rows the chunk loop runs over: ``rows`` when compacted, while an uncompacted call (``rows = T``) still
     budgets the logits of its valid rows only; the model below counts the ``rows`` the chunk loop processes.
 
-    Candidates in latency order: ``"fused"`` (when ``fuse_dw_cast`` allows it), ``"fused_ip"`` (the loss entry's
-    multi-chunk call with ``fuse_dw_cast``: the fused cast's chunk loop with the accumulator split at
+    Candidates in latency order: ``"fused"`` (when ``fuse_dw_cast`` allows it), ``"fused_ip"`` (a multi-chunk call
+    with ``fuse_dw_cast``, either entry: the fused cast's chunk loop with the accumulator split at
     :func:`dw_split_rows`, whose backward writes ``dW`` into the lower accumulator's storage in the pieces of
     :func:`_dw_split_pieces` -- the ``dW`` phase holds the two accumulators, the deferred chunk and the first piece's
     temporary, no ``[V, H]`` output beside them), ``"unfused"``, then, when the record
-    registers the recompute's logits arm (``recompute``), ``"partial_ip"`` (the loss entry's multi-chunk call with
-    ``fuse_dw_cast``: ``"fused_ip"`` over the rows ``[0, dw_rows)``, ``dw_rows`` at least :func:`dw_split_rows`, with
+    registers the recompute's logits arm (``recompute``), ``"partial_ip"`` (a multi-chunk call with ``fuse_dw_cast``,
+    either entry: ``"fused_ip"`` over the rows ``[0, dw_rows)``, ``dw_rows`` at least :func:`dw_split_rows`, with
     the largest ``dw_rows``; its backward recomputes the rows ``[dw_rows, V)`` of the chunks before the last, the
     deferred chunk's pinned ``dz`` serving the last) and ``"partial"`` with the largest ``dw_rows`` -- the one that
     recomputes fewer chunk-rows of the vocabulary first -- and ``"recompute"``, each with the largest vocabulary block
@@ -1146,7 +1147,9 @@ def memory_plan(
     caching allocator's bound (``PYTORCH_CUDA_ALLOC_CONF`` unset; :func:`_allocated_bytes`), so a phase's prediction
     is its tensors' bytes plus 1 MiB per live tensor of 1 MiB or more and 512 bytes per live tensor.  Loss entry:
     forward, forward-to-backward state plus the ``dX`` output, then the ``dW`` phase; log-probability entry: its
-    backward (the forward holds the chunk buffers only).  ``buffer_rows`` defaults to ``min(chunk, rows)``: an
+    backward (the forward holds the chunk buffers only) -- the chunk loop, the ``dX`` output and, for the split
+    accumulator, the cast and recompute phases beside the deferred chunk's ``dz`` (its chunk buffer) and ``X`` rows
+    (gathered again when compacted).  ``buffer_rows`` defaults to ``min(chunk, rows)``: an
     explicit budget call runs without the hidden valid-row count, whose chunk-0 buffers take ``min(chunk, T)`` rows
     before the count is known; a default call that keeps the hidden count plans with ``buffer_rows=chunk`` (the count
     runs on calls of three chunks or more), ``compact=True`` (its gather buffer exists also when every row is valid)
@@ -1393,6 +1396,23 @@ def memory_plan(
         loop = (
             bufs + live(4 * R) + rowvec + xc + dx_rows
         )  # the backward's chunk buffers, compact dlogp and dX cast
+        x_last = (
+            live(2 * r_last * H) if compact else 0
+        )  # the deferred chunk's X rows, gathered again for the split accumulator's cast
+
+        def tail_ip(vb: int) -> int:
+            """``"partial_ip"``'s recompute of the rows ``[v0, V)``: ``dW`` on the lower accumulator's storage, the
+            deferred chunk (its ``dz`` columns feed each block's cast), one block and the compact ``dlogp``."""
+            return (
+                dx_out
+                + live(4 * split * H)
+                + logits
+                + x_last
+                + block(vb)
+                + rowvec
+                + live(4 * R)
+                + xc
+            )
 
         def peak(form: str, v0: int, vb: int) -> int:
             if form == "fused":
@@ -1401,6 +1421,27 @@ def memory_plan(
                     dxacc + acc + dw_out + loop,
                     dxacc + dx_out + dw_out + rowvec + live(4 * T) + xc,
                 )
+            if form in ("fused_ip", "partial_ip"):
+                # the split accumulator of the rows [0, v0) (lower [0, split), upper [split, v0)); after the chunk
+                # loop the deferred chunk's dz pins its chunk buffer until the cast and the recompute have read it
+                lower = live(4 * split * H)
+                upper = live(4 * (v0 - split) * H) if v0 > split else 0
+                out = max(
+                    dxacc + lower + upper + loop,
+                    dxacc + dx_out + lower + upper + logits + rowvec + live(4 * T) + xc,
+                    # the in-place cast of [0, v0): both accumulators, the deferred chunk, the first piece's temporary
+                    dx_out
+                    + lower
+                    + upper
+                    + logits
+                    + x_last
+                    + live(2 * piece0 * H)
+                    + rowvec
+                    + xc,
+                )
+                if vb:
+                    out = max(out, tail_ip(vb))
+                return out
             acc = live(4 * v0 * H)
             out = max(
                 dxacc + acc + loop, dxacc + dx_out + acc + rowvec + live(4 * T) + xc
@@ -1425,7 +1466,7 @@ def memory_plan(
     candidates: list[tuple[str, int, Optional[int]]] = []
     if fuse_dw_cast:
         candidates.append(("fused", V, None))
-        if entry == "loss" and n > 1 and split < V:
+        if n > 1 and split < V:
             candidates.append(("fused_ip", V, None))
     candidates.append(("unfused", V, None))
     if recompute and step < V:
@@ -1438,7 +1479,7 @@ def memory_plan(
         )
         partial = [("partial", v0, min(vb_max, V - v0))] if v0 else []
         ip = []
-        if entry == "loss" and fuse_dw_cast and n > 1 and step <= split < V:
+        if fuse_dw_cast and n > 1 and step <= split < V:
             # ``"partial_ip"``: the largest tail block (its phase does not depend on the accumulated rows), then the
             # largest accumulated end ``v0 >= split`` whose phases fit with the block it leaves
             vb_ip = largest(lambda vb: tail_ip(vb) <= budget, V - split)
@@ -2014,12 +2055,13 @@ def _slot_values_temperature(
     elif stage == "slab_sum":
         values.update(dx=t["dx_acc"][row0:stop], ws=t["dx_ws"])
     elif base == "gemm_dw_acc":
+        # a ``dw_rows`` / ``dw_split`` plan: the accumulated vocabulary rows (:meth:`Plan.dw_acc_rows`; the
+        # :class:`_UpperRows` launch into ``dw_acc_hi``)
+        v0, v1 = plan.dw_acc_rows(index)
         values.update(
-            A=logits[:rows_c]
-            if plan.dw_rows is None
-            else logits[:rows_c, : plan.dw_rows],
+            A=logits[:rows_c] if (v0, v1) == (0, p.vocab) else logits[:rows_c, v0:v1],
             B=x_chunk,
-            C=t["dw_acc"],
+            C=t["dw_acc_hi"] if isinstance(index, _UpperRows) else t["dw_acc"],
             STATS_OUT=t["stats"],
             WS=t["f32_dummy"],
         )
@@ -2143,13 +2185,15 @@ def _run_split_keys(
     keys: tuple,
     run_key: Callable[[Any], None],
     dw_stream: Optional[Union[bool, str]] = None,
+    run_keys: Callable[..., None] = _run_keys,
 ) -> None:
-    """:func:`.cake_backend._run_keys` of a plan with a split weight-gradient accumulator (:attr:`Plan.dw_split`; any
-    other plan: that function).  Each chunk's second accumulate (its :class:`_UpperRows` key) runs right behind the
-    first, on the same stream -- the dW side stream where the placement of :func:`side_stream_schedule` puts the
-    chunk's accumulate -- so that placement sees one accumulate per chunk, as without the split."""
+    """``run_keys`` (:func:`.cake_backend._run_keys`, or ``_run_keys_temperature`` for a plan with the temperature
+    forms) of a plan with a split weight-gradient accumulator (:attr:`Plan.dw_split`; any other plan: that function).
+    Each chunk's second accumulate (its :class:`_UpperRows` key) runs right behind the first, on the same stream -- the
+    dW side stream where the placement of :func:`side_stream_schedule` puts the chunk's accumulate -- so that placement
+    sees one accumulate per chunk, as without the split."""
     if plan.dw_split is None:
-        _run_keys(plan, device_index, keys, run_key, dw_stream)
+        run_keys(plan, device_index, keys, run_key, dw_stream)
         return
     upper = {key[1]: key for key in keys if isinstance(key[1], _UpperRows)}
 
@@ -2161,7 +2205,7 @@ def _run_split_keys(
         ):  # the chunk's first accumulate: its second right behind
             run_key(pair)
 
-    _run_keys(
+    run_keys(
         plan,
         device_index,
         tuple(key for key in keys if not isinstance(key[1], _UpperRows)),
@@ -2190,6 +2234,57 @@ def cast_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
                 keys.append(("gather_rows", last))
             keys.append((plan.dw_cast_stage, last))
     return tuple(keys)
+
+
+def _with_split_keys(plan: Plan, keys: tuple) -> tuple[tuple[str, Any], ...]:
+    """The log-probability backward's launch keys (:func:`.cake_backend.recompute_keys` or its temperature form) of a
+    plan with a split weight-gradient accumulator (:attr:`Plan.dw_split`; any other plan: ``keys``): each chunk's
+    accumulate is followed by its :class:`_UpperRows` key when the accumulator has an upper part, and the deferred last
+    chunk runs no weight-gradient GEMM -- its ``dz`` stays in the chunk buffer and the caller casts ``dW`` from it
+    (:func:`_dw_cast_split`)."""
+    if plan.dw_split is None:
+        return keys
+    last = plan.num_chunks - 1
+    out: list[tuple[str, Any]] = []
+    for stage, index in keys:
+        if type(index) is int and index == last and stage == plan.dw_cast_stage:
+            continue  # the deferred chunk's fused cast: the caller's (:func:`_dw_cast_split`)
+        out.append((stage, index))
+        if (
+            plan.dw_split_upper
+            and type(index) is int
+            and stage == plan.dw_acc_stage(index)
+        ):
+            out.append((stage, _UpperRows(index)))
+    return tuple(out)
+
+
+class _SplitDw(NamedTuple):
+    """The weight-gradient state a log-probability backward with a split accumulator (:attr:`Plan.dw_split`) leaves
+    to its caller: ``acc`` = ``[lower, upper]`` (the FP32 sums of the vocabulary rows ``[0, dw_split)`` and
+    ``[dw_split, dw_split_end)`` over the chunks before the last; ``upper`` ``None`` when empty) and the deferred last
+    chunk's operands of :func:`.cake_backend._deferred_operands` -- its BF16 ``dz`` rows (a view of the chunk buffer)
+    and ``X`` rows (``x_last``; or ``x_src`` / ``x_idx`` to gather when compacted)."""
+
+    acc: list
+    dz_last: torch.Tensor
+    x_last: Optional[torch.Tensor]
+    x_src: Optional[torch.Tensor]
+    x_idx: Optional[torch.Tensor]
+
+    def x_rows(self) -> torch.Tensor:
+        """The deferred chunk's BF16 ``X`` rows (gathered when compacted)."""
+        if self.x_last is not None:
+            return self.x_last
+        return torch.index_select(self.x_src, 0, self.x_idx)
+
+
+def _logprob_dw_result(plan: Plan, t: dict[str, Any]) -> Any:
+    """The weight-gradient result of a log-probability backward over the bound tensors ``t``: the BF16 ``dw_out``, a
+    ``dw_rows`` plan's FP32 accumulator, a ``dw_split`` plan's :class:`_SplitDw`."""
+    if plan.dw_split is not None and plan.need_dw:
+        return _SplitDw([t["dw_acc"], t.get("dw_acc_hi")], *_deferred_operands(plan, t))
+    return t.get("dw_out") if plan.dw_rows is None else t.get("dw_acc")
 
 
 @dataclass
@@ -2366,7 +2461,10 @@ class LmHeadDetLossRunner:
         dx = (
             t.get("dx_out") if self.plan.dx_cast else t.get("dx_acc")
         )  # dx_cast=False: the caller finalizes the accumulator
-        # a ``dw_rows`` plan: the caller casts the FP32 accumulator of the rows it covers
+        # a ``dw_rows`` plan: the caller casts the FP32 accumulator of the rows it covers; a log-probability
+        # ``dw_split`` plan: the caller casts from the split accumulator and the deferred chunk (:class:`_SplitDw`)
+        if self.problem.entry == "logprob":
+            return dx, _logprob_dw_result(self.plan, t)
         return dx, (t.get("dw_out") if self.plan.dw_rows is None else t.get("dw_acc"))
 
     def step(self, grad: Optional[torch.Tensor] = None):
@@ -2393,8 +2491,13 @@ class _TemperatureRunner(LmHeadDetLossRunner):
             else:
                 self.launches[key]()
 
-        _run_keys_temperature(
-            self.plan, self.device_index, keys, run_key, self.dw_stream
+        _run_split_keys(
+            self.plan,
+            self.device_index,
+            keys,
+            run_key,
+            self.dw_stream,
+            run_keys=_run_keys_temperature,
         )
 
 
@@ -2564,7 +2667,8 @@ def prepare_lm_head_det_loss(
     form ``"fused_ip"``, :attr:`Plan.dw_split`): the chunk loop accumulates into ``dw_acc`` (FP32 ``[dw_split, H]``)
     and ``tensors["dw_acc_hi"]`` (FP32 ``[dw_split_end - dw_split, H]``, ``dw_split_end`` default ``V``; none when
     empty); the deferred last chunk's cast is left to the caller (:func:`_dw_cast_split`): ``dw_out`` is neither bound
-    nor allocated and ``backward()`` returns no ``dW``.  ``dw_split_end`` (the budget form ``"partial_ip"``, with
+    nor allocated and ``backward()`` returns no ``dW`` (a log-probability runner: the split accumulator and the
+    deferred chunk, :class:`_SplitDw`).  ``dw_split_end`` (the budget form ``"partial_ip"``; the loss entry with
     ``keep_row_grad``): the upper part ends there; the caller recomputes the rows above it.
 
     ``_template_only`` (internal; the eager entry points, ``cake`` backend): the runner only templates a remembered
@@ -2866,7 +2970,9 @@ def prepare_lm_head_det_loss(
         )
 
     fwd = forward_keys(plan)
-    bwd = (recompute_keys(plan) if entry == "logprob" else ()) + cast_keys(plan)
+    bwd = (
+        _with_split_keys(plan, recompute_keys(plan)) if entry == "logprob" else ()
+    ) + cast_keys(plan)
     # a ``dz``-arm plan also binds chunk 0's ``row_grad``: the hidden valid-row count's backward recomputes chunk 0 in
     # the device-count form, which stores ``z`` (:meth:`_Binding.from_runner`); the runner itself never launches it
     spare = (("row_grad", 0),) if plan.logprob_dz else ()
@@ -2958,6 +3064,8 @@ def prepare_lm_head_det_loss_temperature(
     keep_row_grad: bool = False,
     temperature: Optional[torch.Tensor] = None,
     _template_only: bool = False,
+    dw_split: Optional[int] = None,
+    dw_split_end: Optional[int] = None,
 ) -> LmHeadDetLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -3013,7 +3121,10 @@ def prepare_lm_head_det_loss_temperature(
     ``dw_rows`` / ``keep_row_grad`` (the budget forms of :func:`memory_plan`; :attr:`Plan.dw_rows`,
     :attr:`Plan.keep_row_grad`): the weight-gradient accumulate covers the vocabulary rows ``[0, dw_rows)`` of an
     unfused plan and ``backward()`` returns the FP32 ``[dw_rows, H]`` accumulator in place of ``dw_out`` (no cast);
-    ``keep_row_grad`` keeps every chunk's per-row gradient scale in ``tensors["d_rows"]``.
+    ``keep_row_grad`` keeps every chunk's per-row gradient scale in ``tensors["d_rows"]``.  ``dw_split`` /
+    ``dw_split_end`` (the log-probability budget forms ``"fused_ip"`` / ``"partial_ip"``, :attr:`Plan.dw_split`): as
+    in :func:`prepare_lm_head_det_loss`; ``backward()`` returns the split accumulator and the deferred chunk
+    (:class:`_SplitDw`) in place of ``dw_out``.
 
     ``temperature`` (log-probability entry only; ``None`` = none): the contiguous FP32 per-row temperature of the
     chunk loop's rows -- like ``lse``, the compact ``[T_v]`` rows of the valid-row index when the runner is compacted,
@@ -3162,6 +3273,8 @@ def prepare_lm_head_det_loss_temperature(
         ),
         dw_rows=dw_rows,
         keep_row_grad=keep_row_grad,
+        dw_split=dw_split,
+        dw_split_end=dw_split_end,
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
@@ -3197,11 +3310,21 @@ def prepare_lm_head_det_loss_temperature(
             "dx_out": rows_loop * H * 2
             if plan.need_dx and plan.dx_cast and dx_out is None
             else 0,
-            "dw_acc": (V if plan.dw_rows is None else plan.dw_rows) * H * 4
+            "dw_acc": (plan.dw_acc_rows(0)[1] - plan.dw_acc_rows(0)[0]) * H * 4
             if plan.need_dw and plan.dw_acc_needed and dw_acc is None
             else 0,
+            "dw_acc_hi": (
+                plan.dw_acc_rows(_UpperRows(0))[1] - plan.dw_acc_rows(_UpperRows(0))[0]
+            )
+            * H
+            * 4
+            if plan.need_dw and plan.dw_split_upper
+            else 0,
             "dw_out": V * H * (4 if f32 else 2)
-            if plan.need_dw and plan.dw_rows is None and dw_out is None
+            if plan.need_dw
+            and plan.dw_rows is None
+            and plan.dw_split is None
+            and dw_out is None
             else 0,
         }
         alias = {name: n for name, n in sizes.items() if n}
@@ -3295,15 +3418,15 @@ def prepare_lm_head_det_loss_temperature(
             t["dx_out"] = output(dx_out, "dx_out", (rows_loop, H), torch.bfloat16)
     if plan.need_dw:
         if plan.dw_acc_needed:
-            t["dw_acc"] = output(
-                dw_acc,
-                "dw_acc",
-                (V if plan.dw_rows is None else plan.dw_rows, H),
-                torch.float32,
-            )
+            v0, v1 = plan.dw_acc_rows(0)
+            t["dw_acc"] = output(dw_acc, "dw_acc", (v1 - v0, H), torch.float32)
+        if plan.dw_split_upper:
+            # the split accumulator's upper rows (a template's view aliases the arena like the other buffers)
+            u0, u1 = plan.dw_acc_rows(_UpperRows(0))
+            t["dw_acc_hi"] = output(None, "dw_acc_hi", (u1 - u0, H), torch.float32)
         if (
-            plan.dw_rows is None
-        ):  # a ``dw_rows`` plan leaves its accumulator to the caller
+            plan.dw_rows is None and plan.dw_split is None
+        ):  # a ``dw_rows`` / ``dw_split`` plan leaves its accumulator(s) to the caller
             t["dw_out"] = output(
                 dw_out,
                 "dw_out",
@@ -3328,9 +3451,11 @@ def prepare_lm_head_det_loss_temperature(
         )
 
     fwd = _forward_keys_temperature(plan)
-    bwd = (_recompute_keys_temperature(plan) if entry == "logprob" else ()) + cast_keys(
-        plan
-    )
+    bwd = (
+        _with_split_keys(plan, _recompute_keys_temperature(plan))
+        if entry == "logprob"
+        else ()
+    ) + cast_keys(plan)
     # a ``dz``-arm plan also binds chunk 0's ``row_grad``: the hidden valid-row count's backward recomputes chunk 0 in
     # the device-count form, which stores ``z`` (:meth:`_Binding.from_runner`); the runner itself never launches it.  A
     # call with a temperature never recounts on the hidden path (no temperature form of ``row_grad``)
@@ -3475,7 +3600,8 @@ def logprob_backward_binding_key(
     logprob_dz=False,
 ) -> tuple:
     """Cache key of a log-probability backward binding (as :func:`forward_binding_key`); ``logprob_dz`` the resolved
-    recompute form (:func:`logprob_dz_default`).  A budget form appends its accumulated rows (:attr:`Plan.dw_rows`).
+    recompute form (:func:`logprob_dz_default`).  A budget form appends its accumulated rows (:attr:`Plan.dw_rows`),
+    the forms ``"fused_ip"`` / ``"partial_ip"`` ``("dw_split", dw_split, dw_split_end)``.
     ``lse`` and ``dlogp`` are keyed by layout alone (:func:`_layout`), as in :mod:`.cake_backend`."""
     return (
         "bwd",
@@ -3543,7 +3669,9 @@ class _Binding:
             )
             forward_order = forward_keys(plan)
             backward_order = (
-                recompute_keys(plan) if p.entry == "logprob" else ()
+                _with_split_keys(plan, recompute_keys(plan))
+                if p.entry == "logprob"
+                else ()
             ) + cast_keys(plan)
             memory = _hidden_count_memory(
                 memory,
@@ -3848,14 +3976,19 @@ class _Binding:
                 )
         if plan.need_dw:
             if plan.dw_acc_needed:
+                v0, v1 = plan.dw_acc_rows(0)
                 t["dw_acc"] = torch.empty(
-                    (V if plan.dw_rows is None else plan.dw_rows, H),
-                    dtype=torch.float32,
-                    device=self.device,
+                    (v1 - v0, H), dtype=torch.float32, device=self.device
                 )
+                if plan.dw_split_upper:
+                    # the split accumulator's upper rows: an allocation of its own (:func:`_dw_cast_split`)
+                    u0, u1 = plan.dw_acc_rows(_UpperRows(0))
+                    t["dw_acc_hi"] = torch.empty(
+                        (u1 - u0, H), dtype=torch.float32, device=self.device
+                    )
             if (
-                plan.dw_rows is None
-            ):  # a ``dw_rows`` plan leaves its accumulator to the caller
+                plan.dw_rows is None and plan.dw_split is None
+            ):  # a ``dw_rows`` / ``dw_split`` plan leaves its accumulator(s) to the caller
                 t["dw_out"] = torch.empty(
                     (V, H), dtype=torch.bfloat16, device=self.device
                 )
@@ -3863,7 +3996,7 @@ class _Binding:
         dx = (
             t.get("dx_out") if plan.dx_cast else t.get("dx_acc")
         )  # dx_cast=False: the caller finalizes the accumulator
-        return dx, (t.get("dw_out") if plan.dw_rows is None else t.get("dw_acc"))
+        return dx, _logprob_dw_result(plan, t)
 
 
 class _TemperatureBinding(_Binding):
@@ -3896,7 +4029,9 @@ class _TemperatureBinding(_Binding):
             )
             forward_order = _forward_keys_temperature(plan)
             backward_order = (
-                _recompute_keys_temperature(plan) if p.entry == "logprob" else ()
+                _with_split_keys(plan, _recompute_keys_temperature(plan))
+                if p.entry == "logprob"
+                else ()
             ) + cast_keys(plan)
             memory = _hidden_count_memory_temperature(
                 memory,
@@ -4096,14 +4231,19 @@ class _TemperatureBinding(_Binding):
                 )
         if plan.need_dw:
             if plan.dw_acc_needed:
+                v0, v1 = plan.dw_acc_rows(0)
                 t["dw_acc"] = torch.empty(
-                    (V if plan.dw_rows is None else plan.dw_rows, H),
-                    dtype=torch.float32,
-                    device=self.device,
+                    (v1 - v0, H), dtype=torch.float32, device=self.device
                 )
+                if plan.dw_split_upper:
+                    # the split accumulator's upper rows: an allocation of its own (:func:`_dw_cast_split`)
+                    u0, u1 = plan.dw_acc_rows(_UpperRows(0))
+                    t["dw_acc_hi"] = torch.empty(
+                        (u1 - u0, H), dtype=torch.float32, device=self.device
+                    )
             if (
-                plan.dw_rows is None
-            ):  # a ``dw_rows`` plan leaves its accumulator to the caller
+                plan.dw_rows is None and plan.dw_split is None
+            ):  # a ``dw_rows`` / ``dw_split`` plan leaves its accumulator(s) to the caller
                 t["dw_out"] = torch.empty(
                     (V, H), dtype=torch.bfloat16, device=self.device
                 )
@@ -4111,7 +4251,7 @@ class _TemperatureBinding(_Binding):
         dx = (
             t.get("dx_out") if plan.dx_cast else t.get("dx_acc")
         )  # dx_cast=False: the caller finalizes the accumulator
-        return dx, (t.get("dw_out") if plan.dw_rows is None else t.get("dw_acc"))
+        return dx, _logprob_dw_result(plan, t)
 
     def _launch(self, keys: tuple, t: dict[str, Any], dw_stream: str = "auto") -> None:
         plan, launches = self.plan, self.launches
@@ -4136,7 +4276,14 @@ class _TemperatureBinding(_Binding):
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
-        _run_keys_temperature(self.plan, self.device_index, keys, run_key, dw_stream)
+        _run_split_keys(
+            self.plan,
+            self.device_index,
+            keys,
+            run_key,
+            dw_stream,
+            run_keys=_run_keys_temperature,
+        )
 
 
 class BindingCache:
@@ -6613,8 +6760,11 @@ def _dw_vocab_blocks_temperature(
     block_rows: int,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     temperature_rows: Optional[torch.Tensor] = None,
+    dz_last: Optional[torch.Tensor] = None,
+    x_last: Optional[torch.Tensor] = None,
 ) -> None:
-    """:func:`_dw_vocab_blocks` of a call with a temperature (``temperature_rows``).
+    """:func:`_dw_vocab_blocks` of a call with a temperature (``temperature_rows``; ``dz_last`` / ``x_last``, the
+    pinned last chunk of ``"partial_ip"``, as there).
 
     The weight-gradient rows ``[v_start, V)`` written into ``dw_out[v_start:]`` (BF16 ``[V, H]``) in vocabulary
     blocks of ``block_rows`` rows, from the row statistics of the call (the budget forms of :func:`memory_plan`).
@@ -6670,6 +6820,16 @@ def _dw_vocab_blocks_temperature(
     )
     chunks = plan.chunks
     n = len(chunks)
+    pinned = dz_last is not None
+    if pinned and (
+        x_last is None
+        or n < 2
+        or tuple(dz_last.shape) != (int(chunks[-1][1]), V)
+        or tuple(x_last.shape) != (int(chunks[-1][1]), H)
+    ):
+        raise ValueError(
+            "_dw_vocab_blocks: the pinned last chunk needs a multi-chunk plan, its [rows, V] dz and [rows, H] X rows"
+        )
     rows_max = max(rows_c for _, rows_c in chunks)
     T_loop = int(plan.rows)
     gather = row_index is not None or not _x_rows_readable(X)
@@ -6708,50 +6868,57 @@ def _dw_vocab_blocks_temperature(
         )
         Wb = W[v0:v1]
         for i, (row0, rows_c) in enumerate(chunks):
-            if row_index is not None:
-                xc = torch.index_select(
-                    X, 0, row_index[row0 : row0 + rows_c], out=x_buf[:rows_c]
-                )
-            elif gather:
-                xc = x_buf[:rows_c]
-                xc.copy_(X[row0 : row0 + rows_c])
-            else:
-                xc = X[row0 : row0 + rows_c]
             v = plan.variants_of(i)
-            values = base_values()
-            values.update(
-                A=xc,
-                B=Wb,
-                C=dz[:rows_c],
-                STATS_OUT=stats,
-                WS=dummy,
-                labels=lb,
-                lse=lse_c,
-                d_in=d_c,
-                rows_c=int(rows_c),
-                row0=int(row0),
-                d_off=int(row0),
-                T=T_loop,
-                H=H,
-                V=vb,
-                loss_div=1.0,
-                **gemm_scalars(
-                    dz_stage,
-                    geometry,
-                    hidden=H,
-                    vocab=vb,
+            if pinned and i == n - 1:
+                # the deferred chunk: its own ``dz`` columns of this block and its ``X`` rows, no recompute
+                a_op, xc = dz_last[:, v0:v1], x_last
+            else:
+                a_op = None
+            if a_op is None:
+                if row_index is not None:
+                    xc = torch.index_select(
+                        X, 0, row_index[row0 : row0 + rows_c], out=x_buf[:rows_c]
+                    )
+                elif gather:
+                    xc = x_buf[:rows_c]
+                    xc.copy_(X[row0 : row0 + rows_c])
+                else:
+                    xc = X[row0 : row0 + rows_c]
+                a_op = dz[:rows_c]
+                values = base_values()
+                values.update(
+                    A=xc,
+                    B=Wb,
+                    C=a_op,
+                    STATS_OUT=stats,
+                    WS=dummy,
+                    labels=lb,
+                    lse=lse_c,
+                    d_in=d_c,
                     rows_c=int(rows_c),
-                    group_m=v.logits_group_m,
-                ),
-            )
-            if temperature_rows is not None:
-                values.update(temperature=temperature_rows)  # read at row0 + r
-            _launch_stage(record, module_name, dz_stage, values, device)
+                    row0=int(row0),
+                    d_off=int(row0),
+                    T=T_loop,
+                    H=H,
+                    V=vb,
+                    loss_div=1.0,
+                    **gemm_scalars(
+                        dz_stage,
+                        geometry,
+                        hidden=H,
+                        vocab=vb,
+                        rows_c=int(rows_c),
+                        group_m=v.logits_group_m,
+                    ),
+                )
+                if temperature_rows is not None:
+                    values.update(temperature=temperature_rows)  # read at row0 + r
+                _launch_stage(record, module_name, dz_stage, values, device)
             values = base_values()
             if i < n - 1:
                 stage = plan.dw_acc_stage(i)
                 values.update(
-                    A=dz[:rows_c],
+                    A=a_op,
                     B=xc,
                     C=acc,
                     STATS_OUT=stats,
@@ -6792,7 +6959,7 @@ def _dw_vocab_blocks_temperature(
                     else None,
                 )
                 values.update(
-                    A=dz[:rows_c],
+                    A=a_op,
                     B=xc,
                     C=dw_out[v0:v1],
                     STATS_OUT=g,
@@ -6815,7 +6982,7 @@ def _dw_vocab_blocks_temperature(
                 )
             _launch_stage(record, module_name, stage, values, device)
         # the launch values hold views of this block's buffers: drop them before the next block allocates its own
-        del values, xc, acc, dz, stats, lb, Wb
+        del values, xc, a_op, acc, dz, stats, lb, Wb
 
 
 def _dw_with_recompute(
@@ -7150,7 +7317,9 @@ def backward_logprob(
     num_valid_rows=None,
     check_num_valid_rows: bool = False,
     dw_rows: Optional[int] = None,
-) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    dw_split: Optional[int] = None,
+    dw_split_end: Optional[int] = None,
+) -> tuple[Optional[torch.Tensor], Any]:
     """Backward of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
     the FP32 accumulators.  ``(None, None)`` when neither input is trainable.  ``compact_rows``
@@ -7172,7 +7341,11 @@ def backward_logprob(
     (with the forward's index or without gradients too).  ``dw_rows`` (``cake`` backend, ``fuse_dw_cast=False``;
     :attr:`Plan.dw_rows`): the chunk loop accumulates the weight gradient of the vocabulary rows ``[0, dw_rows)`` only
     and the second result is that FP32 ``[dw_rows, H]`` accumulator, uncast (the budget forms of
-    :func:`memory_plan`)."""
+    :func:`memory_plan`).  ``dw_split`` / ``dw_split_end`` (``cake`` backend, ``fuse_dw_cast=True``, two or more chunks;
+    :attr:`Plan.dw_split`, :attr:`Plan.dw_split_end`, the budget forms ``"fused_ip"`` / ``"partial_ip"``): the chunk
+    loop accumulates the vocabulary rows ``[0, dw_split_end)`` into the split accumulator and the deferred last chunk
+    runs no weight-gradient GEMM; the second result is the :class:`_SplitDw` of the caller's cast
+    (:func:`_dw_cast_split`)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_det_inputs(
@@ -7239,6 +7412,13 @@ def backward_logprob(
             "dw_rows belongs to a cake-backend log-probability backward with an unfused weight gradient "
             "(need_dw=True, fuse_dw_cast=False)"
         )
+    if dw_split is not None and (backend != "cake" or not fuse or dw_rows is not None):
+        raise ValueError(
+            "dw_split belongs to a cake-backend log-probability backward with the fused weight-gradient cast "
+            "(need_dw=True, fuse_dw_cast=True, no dw_rows)"
+        )
+    elif dw_split is None and dw_split_end is not None:
+        raise ValueError("dw_split_end belongs to a backward with dw_split")
     if rows == 0:  # no rows, or every row ignored
         return (
             torch.zeros((T, H), dtype=torch.bfloat16, device=X.device)
@@ -7291,6 +7471,9 @@ def backward_logprob(
             key += (
                 int(dw_rows),
             )  # a budget form's accumulated rows (:attr:`Plan.dw_rows`)
+        if dw_split is not None:
+            # a split accumulator's row and end (:attr:`Plan.dw_split`)
+            key += ("dw_split", int(dw_split), dw_split_end)
         binding = cache.lookup(key)
         if binding is not None:
             dx, dw = binding.backward_logprob(
@@ -7316,9 +7499,13 @@ def backward_logprob(
         dw_stream=stream_mode,
         logprob_dz=dz_arm,
         dw_rows=dw_rows,
-        _template_only=backend == "cake" and hc is not None,
+        dw_split=dw_split,
+        dw_split_end=dw_split_end,
+        # a split accumulator: the per-call buffers of a binding also on the first call (the deferred chunk's ``dz``
+        # pins its chunk buffer only, not the runner's whole workspace)
+        _template_only=backend == "cake" and (hc is not None or dw_split is not None),
     )
-    if hc is not None:
+    if hc is not None or dw_split is not None:
         binding = _Binding.from_runner(runner, hc)
         del runner
         if key is not None:
@@ -7545,7 +7732,9 @@ def backward_logprob_temperature(
     temperature=None,
     check_temperature: bool = False,
     temperature_rows: Optional[torch.Tensor] = None,
-) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    dw_split: Optional[int] = None,
+    dw_split_end: Optional[int] = None,
+) -> tuple[Optional[torch.Tensor], Any]:
     """:func:`backward_logprob` with a temperature (:func:`_backward_logprob` is the path without one).  Backward
     of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
@@ -7662,6 +7851,13 @@ def backward_logprob_temperature(
             "dw_rows belongs to a cake-backend log-probability backward with an unfused weight gradient "
             "(need_dw=True, fuse_dw_cast=False)"
         )
+    if dw_split is not None and (backend != "cake" or not fuse or dw_rows is not None):
+        raise ValueError(
+            "dw_split belongs to a cake-backend log-probability backward with the fused weight-gradient cast "
+            "(need_dw=True, fuse_dw_cast=True, no dw_rows)"
+        )
+    elif dw_split is None and dw_split_end is not None:
+        raise ValueError("dw_split_end belongs to a backward with dw_split")
     if rows == 0:  # no rows, or every row ignored
         return (
             torch.zeros((T, H), dtype=torch.bfloat16, device=X.device)
@@ -7723,6 +7919,9 @@ def backward_logprob_temperature(
             key += (
                 int(dw_rows),
             )  # a budget form's accumulated rows (:attr:`Plan.dw_rows`)
+        if dw_split is not None:
+            # a split accumulator's row and end (:attr:`Plan.dw_split`)
+            key += ("dw_split", int(dw_split), dw_split_end)
         if has_tau:
             key = temperature_binding_key(key)
         binding = cache.lookup(key)
@@ -7765,7 +7964,11 @@ def backward_logprob_temperature(
         logprob_dz=dz_arm,
         dw_rows=dw_rows,
         temperature=tau_rows,
-        _template_only=backend == "cake" and hc is not None,
+        dw_split=dw_split,
+        dw_split_end=dw_split_end,
+        # a split accumulator: the per-call buffers of a binding also on the first call (the deferred chunk's ``dz``
+        # pins its chunk buffer only, not the runner's whole workspace)
+        _template_only=backend == "cake" and (hc is not None or dw_split is not None),
     )
     if hc is not None:
         binding = _TemperatureBinding.from_runner(runner, hc)
@@ -7774,6 +7977,29 @@ def backward_logprob_temperature(
             cache.remember(key, binding)
         dx, dw = binding.backward_logprob(
             X, W, labels, lse, dlogp, row_index, hc, stream_mode
+        )
+        return finish_dx(dx), dw
+    if dw_split is not None:
+        binding = _TemperatureBinding.from_runner(runner)
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+        dx, dw = (
+            cast(_TemperatureBinding, binding).backward_logprob(
+                X,
+                W,
+                labels,
+                lse,
+                dlogp,
+                row_index,
+                None,
+                stream_mode,
+                temperature=tau_rows,
+            )
+            if has_tau
+            else binding.backward_logprob(
+                X, W, labels, lse, dlogp, row_index, None, stream_mode
+            )
         )
         return finish_dx(dx), dw
     dx, dw = runner.backward()
@@ -8687,12 +8913,16 @@ def _backward_logprob_budget(
     """:func:`backward_logprob` (with ``dW``) in the form :func:`memory_plan` picks for ``memory_mode="budget"``
     against the budget of the valid rows (``row_index``'s, else the caller's ``num_valid_rows`` -- checked by the
     forward with ``check_num_valid_rows`` --, else one host count of an uncompacted call; :func:`_budget_valid_rows`):
-    ``"fused"`` -- the fast form; ``"unfused"`` -- the chunk loop accumulates every row and the FP32 accumulator is
-    cast after ``dX`` is written; ``"partial"`` / ``"recompute"`` -- the chunk loop accumulates the rows ``[0,
-    dw_rows)`` (none for ``"recompute"``), their cast fills the top rows of ``dW`` and the other rows are recomputed in
-    vocabulary blocks from the saved ``lse`` and ``dlogp`` (:func:`_dw_vocab_blocks`).  ``mplan``: the form a default
-    call's automatic form picked (:func:`_auto_logprob_plan`), which this backward runs instead of planning.  Bitwise
-    the fast form's ``dX`` / ``dW``."""
+    ``"fused"`` -- the fast form; ``"fused_ip"`` / ``"partial_ip"`` (two or more chunks; one chunk runs the fused
+    form) -- the chunk loop accumulates the rows ``[0, dw_rows)`` into the split accumulator (:attr:`Plan.dw_split`)
+    and keeps the deferred last chunk's ``dz``, whose fused cast writes ``dW`` into the lower accumulator's storage
+    (:func:`_dw_cast_split`), and ``"partial_ip"`` recomputes the other rows of the chunks before the last
+    (:func:`_dw_vocab_blocks` with the pinned last chunk); ``"unfused"`` -- the chunk loop accumulates every row and
+    the FP32 accumulator is cast after ``dX`` is written; ``"partial"`` / ``"recompute"`` -- the chunk loop
+    accumulates the rows ``[0, dw_rows)`` (none for ``"recompute"``), their cast fills the top rows of ``dW`` and the
+    other rows are recomputed in vocabulary blocks from the saved ``lse`` and ``dlogp`` (:func:`_dw_vocab_blocks`).
+    ``mplan``: the form a default call's automatic form picked (:func:`_auto_logprob_plan`), which this backward runs
+    instead of planning.  Bitwise the fast form's ``dX`` / ``dW``."""
     T, H, V = int(X.shape[0]), int(W.shape[1]), int(W.shape[0])
     rows = T if row_index is None else int(row_index.numel())
     chunk = int(common["chunk_size"])
@@ -8738,6 +8968,9 @@ def _backward_logprob_budget(
         )
     )
     loop = dict(common, row_index=row_index)
+    if mplan.form in _SPLIT_FORMS and -(-rows // chunk) < 2:
+        # one chunk: no accumulator to split (the fused form)
+        mplan = replace(mplan, form="fused", dw_rows=V, block_rows=None)
     if mplan.form == "fused":
         return backward_logprob(
             X,
@@ -8749,6 +8982,36 @@ def _backward_logprob_budget(
             need_dw=True,
             fuse_dw_cast=True,
             **loop,
+        )
+    if mplan.form in _SPLIT_FORMS:
+        geometry = Geometry.from_record(record_for(X.device)[1])
+        end = V if mplan.form == "fused_ip" else int(mplan.dw_rows)
+        dx, split = backward_logprob(
+            X,
+            W,
+            labels,
+            lse,
+            dlogp,
+            need_dx=need_dx,
+            need_dw=True,
+            fuse_dw_cast=True,
+            dw_split=dw_split_rows(V, geometry),
+            dw_split_end=end,
+            **loop,
+        )
+        return dx, _split_dw(
+            split,
+            mplan,
+            end,
+            X=X,
+            W=W,
+            labels=labels,
+            lse=lse,
+            dlogp=dlogp,
+            row_index=row_index,
+            problem=problem,
+            geometry=geometry,
+            gemm_tuning=common["gemm_tuning"],
         )
     if mplan.form == "unfused":
         dx, acc = backward_logprob(
@@ -8847,11 +9110,12 @@ def _backward_logprob_budget_temperature(
     :func:`backward_logprob` (with ``dW``) in the form :func:`memory_plan` picks for ``memory_mode="budget"``
     against the budget of the valid rows (``row_index``'s, else the caller's ``num_valid_rows`` -- checked by the
     forward with ``check_num_valid_rows`` --, else one host count of an uncompacted call; :func:`_budget_valid_rows`):
-    ``"fused"`` -- the fast form; ``"unfused"`` -- the chunk loop accumulates every row and the FP32 accumulator is
-    cast after ``dX`` is written; ``"partial"`` / ``"recompute"`` -- the chunk loop accumulates the rows ``[0,
-    dw_rows)`` (none for ``"recompute"``), their cast fills the top rows of ``dW`` and the other rows are recomputed in
-    vocabulary blocks from the saved ``lse`` and ``dlogp`` (:func:`_dw_vocab_blocks`).  Bitwise the fast form's
-    ``dX`` / ``dW``."""
+    ``"fused"`` -- the fast form; ``"fused_ip"`` / ``"partial_ip"`` -- the split accumulator and the pinned last chunk
+    as in :func:`_backward_logprob_budget`; ``"unfused"`` -- the chunk loop accumulates every row and the FP32
+    accumulator is cast after ``dX`` is written; ``"partial"`` / ``"recompute"`` -- the chunk loop accumulates the rows
+    ``[0, dw_rows)`` (none for ``"recompute"``), their cast fills the top rows of ``dW`` and the other rows are
+    recomputed in vocabulary blocks from the saved ``lse`` and ``dlogp`` (:func:`_dw_vocab_blocks`).  Bitwise the fast
+    form's ``dX`` / ``dW``."""
     T, H, V = int(X.shape[0]), int(W.shape[1]), int(W.shape[0])
     rows = T if row_index is None else int(row_index.numel())
     chunk = int(common["chunk_size"])
@@ -8909,6 +9173,9 @@ def _backward_logprob_budget_temperature(
         )
     )
     loop = dict(common, row_index=row_index)
+    if mplan.form in _SPLIT_FORMS and -(-rows // chunk) < 2:
+        # one chunk: no accumulator to split (the fused form)
+        mplan = replace(mplan, form="fused", dw_rows=V, block_rows=None)
     if mplan.form == "fused":
         return backward_logprob_temperature(
             X,
@@ -8920,6 +9187,37 @@ def _backward_logprob_budget_temperature(
             need_dw=True,
             fuse_dw_cast=True,
             **loop,
+        )
+    if mplan.form in _SPLIT_FORMS:
+        geometry = Geometry.from_record(record_for(X.device)[1])
+        end = V if mplan.form == "fused_ip" else int(mplan.dw_rows)
+        dx, split = backward_logprob_temperature(
+            X,
+            W,
+            labels,
+            lse,
+            dlogp,
+            need_dx=need_dx,
+            need_dw=True,
+            fuse_dw_cast=True,
+            dw_split=dw_split_rows(V, geometry),
+            dw_split_end=end,
+            **loop,
+        )
+        return dx, _split_dw(
+            split,
+            mplan,
+            end,
+            X=X,
+            W=W,
+            labels=labels,
+            lse=lse,
+            dlogp=dlogp,
+            row_index=row_index,
+            problem=problem,
+            geometry=geometry,
+            gemm_tuning=common["gemm_tuning"],
+            temperature_rows=tau_rows,
         )
     if mplan.form == "unfused":
         dx, acc = backward_logprob_temperature(
@@ -8998,6 +9296,85 @@ def _backward_logprob_budget_temperature(
         temperature_rows=tau_rows,
     )
     return dx, dw
+
+
+# the budget forms with a split accumulator (:attr:`Plan.dw_split`)
+_SPLIT_FORMS = ("fused_ip", "partial_ip")
+
+
+def _split_dw(
+    split: _SplitDw,
+    mplan: MemoryPlan,
+    end: int,
+    *,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    lse: torch.Tensor,
+    dlogp: torch.Tensor,
+    row_index: Optional[torch.Tensor],
+    problem: Problem,
+    geometry: Geometry,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]],
+    temperature_rows: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The BF16 ``dW`` of a log-probability backward with a split accumulator (``"fused_ip"`` / ``"partial_ip"``):
+    the deferred last chunk's fused cast into the lower accumulator's storage (:func:`_dw_cast_split`, in place: the
+    accumulators are this backward's own), then for ``"partial_ip"`` (``end < V``) the recompute of the rows ``[end,
+    V)`` of the chunks before the last, the last chunk's block read from its pinned ``dz``
+    (:func:`_dw_vocab_blocks`; with ``temperature_rows``, :func:`_dw_vocab_blocks_temperature`).  ``problem``: the
+    call's (with its temperature for a call with one)."""
+    T, V = int(X.shape[0]), int(W.shape[0])
+    x_last = split.x_rows()
+    dz_last, acc = split.dz_last, split.acc
+    del split
+    dw = _dw_cast_split(
+        dz_last, x_last, acc, None, in_place=True, gemm_tuning=gemm_tuning
+    )
+    if end < V:
+        rows = T if row_index is None else int(row_index.numel())
+        module_name, record = record_for(X.device)
+        plan = make_plan(
+            problem,
+            need_dx=False,
+            need_dw=True,
+            geometry=geometry,
+            num_sms=int(
+                torch.cuda.get_device_properties(X.device).multi_processor_count
+            ),
+            valid_rows=None if row_index is None else rows,
+            arch=record["arch"],
+            gemm_tuning=gemm_tuning,
+        )
+        d = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+        d_c = d if row_index is None else d.index_select(0, row_index)
+        labels_c = _prepare_labels(labels, geometry, row_index)
+        tail = dict(
+            v_start=int(end),
+            block_rows=int(mplan.block_rows),
+            gemm_tuning=gemm_tuning,
+            dz_last=dz_last,
+            x_last=x_last,
+        )
+        if temperature_rows is None and not problem.temperature:
+            _dw_vocab_blocks(
+                X, W, row_index, labels_c, lse, d_c, plan, None, dw, **tail
+            )
+        else:
+            _dw_vocab_blocks_temperature(
+                X,
+                W,
+                row_index,
+                labels_c,
+                lse,
+                d_c,
+                plan,
+                None,
+                dw,
+                temperature_rows=temperature_rows,
+                **tail,
+            )
+    return dw
 
 
 def _dw_cast_taken(acc: list) -> torch.Tensor:

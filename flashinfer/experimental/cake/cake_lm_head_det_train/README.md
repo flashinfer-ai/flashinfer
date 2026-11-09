@@ -403,7 +403,7 @@ keyword.
   weight-gradient form whose predicted peak stays within `B` less a 2 % margin
   (`cake_backend_opt_in.memory_plan`, which returns the form and both byte counts;
   `ForwardResult.memory_plan` carries it): `"fused"` (the fast form),
-  `"fused_ip"` (loss entry, two or more chunks: the fast form's kernels with
+  `"fused_ip"` (two or more chunks: the fast form's kernels with
   the FP32 accumulator split at the vocabulary row `a =
   cake_backend_opt_in.dw_split_rows(V)`, half the vocabulary rounded up to
   the weight-gradient block, so each chunk runs the accumulate GEMM on rows
@@ -413,12 +413,15 @@ keyword.
   most twice as far in as the previous one ends (the first one, `a / 16`
   rows rounded up to the block, through a temporary), then the rows `[a,
   V)`, so no `[V, H]` BF16 output is held beside the accumulator; a backward
-  that keeps the graph, and `ForwardResult.backward`, cast out of place),
+  that keeps the graph, and `ForwardResult.backward`, cast out of place; the
+  log-probability backward runs the same split accumulator in its own chunk
+  loop and always casts in place),
   `"unfused"` (every chunk accumulated, one flat cast after `dX` is written),
-  `"partial_ip"` (loss entry, two or more chunks: the split accumulator
+  `"partial_ip"` (two or more chunks: the split accumulator
   covers the vocabulary rows `[0, dw_rows)` only, `dw_rows >= a`, as the
   parts `[0, a)` and `[a, dw_rows)`; the backward keeps the deferred last
-  chunk's BF16 `dz` and per-row gradient scale, casts the rows `[0, dw_rows)`
+  chunk's BF16 `dz` (and the loss entry's per-row gradient scale; the
+  log-probability entry's is `dlogp`), casts the rows `[0, dw_rows)`
   as `"fused_ip"` does and recomputes the other rows as below, reading the
   last chunk's block from the kept `dz`, so per block it runs one logits
   GEMM fewer than `"partial"`),

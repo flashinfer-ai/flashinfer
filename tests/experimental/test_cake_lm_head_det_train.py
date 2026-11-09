@@ -6687,7 +6687,6 @@ def test_memory_plan_forms():
                         assert 0 < mp.block_rows <= V - mp.dw_rows, key
                         assert (mp.dw_rows > 0) == (mp.form != "recompute"), key
                         if mp.form == "partial_ip":
-                            assert entry == "loss", key
                             assert mp.dw_rows >= opt_in.dw_split_rows(V, g), key
                     else:
                         assert mp.dw_rows == V, key
@@ -6706,12 +6705,12 @@ def test_memory_plan_forms():
                 dx_ws_slabs=slabs,
                 buffer_rows=4096,
             )
-            forms = ("partial",) if entry == "logprob" else ("partial_ip", "partial")
-            assert mp.form in forms and mp.fits and mp.dw_rows > 0, (
+            assert mp.form in ("partial_ip", "partial") and mp.fits, (
                 entry,
                 slabs,
                 mp,
             )
+            assert mp.dw_rows > 0, (entry, slabs, mp)
     # many rows per vocabulary row: the fast (fused) form fits; without it, the unfused one
     small = dict(
         num_rows=16384, rows=16384, hidden=512, vocab=2048, chunk=4096, geometry=g
@@ -6761,7 +6760,9 @@ def test_memory_plan_fused_ip():
     (H 6144) and the H 4096 call with a third ignored, where the fused form does not fit -- with or without the
     recompute arm -- while the H 6144 call with a third ignored gets the pinned partial form (``"partial_ip"``).  Its prediction is the fused
     form's phases with the two accumulators and, in the ``dW`` phase, the first piece's temporary in place of the
-    ``[V, H]`` output.  The log-probability entry, a one-chunk call and ``fuse_dw_cast=False`` never get it."""
+    ``[V, H]`` output.  The log-probability entry's backward gets the same form at these calls: its chunk loop with
+    the two accumulators, the ``dX`` output beside the deferred chunk's ``dz``, then the in-place cast beside it and
+    the gathered ``X`` rows.  A one-chunk call and ``fuse_dw_cast=False`` never get it."""
     g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     step = opt_in.dw_block_step(g)
     for V in (154880, 151936, 248320, 4 * step, 5 * step):
@@ -6785,12 +6786,17 @@ def test_memory_plan_fused_ip():
         args = dict(num_rows=T, rows=R, hidden=H, vocab=V, chunk=C, geometry=g)
         mp = opt_in.memory_plan("loss", **args)
         assert mp.form == form and mp.fits, (H, R, mp)
+        lp = opt_in.memory_plan("logprob", **args)
+        assert lp.form == form and lp.fits, (H, R, lp)
         if form != "fused_ip":
             continue
         assert mp.dw_rows == V and mp.block_rows is None and not mp.recompute, mp
         assert opt_in.memory_plan("loss", recompute=False, **args) == mp
-        assert opt_in.memory_plan("logprob", **args).form != "fused_ip"
+        assert opt_in.memory_plan("logprob", recompute=False, **args) == lp
         assert opt_in.memory_plan("loss", fuse_dw_cast=False, **args).form != "fused_ip"
+        assert (
+            opt_in.memory_plan("logprob", fuse_dw_cast=False, **args).form != "fused_ip"
+        )
         # the phases (``buffer_rows`` = a chunk, compacted, the fused dX finalize, no K-slice slabs)
         a = opt_in.dw_split_rows(V, g)
         p0 = opt_in._dw_split_pieces(a, step)[0][1]
@@ -6812,6 +6818,19 @@ def test_memory_plan_fused_ip():
             + rowvec,
         )
         assert mp.predicted_bytes == max(phases), (H, R, mp, phases)
+        # the log-probability backward: its chunk loop (compact dlogp), the dX output beside the deferred chunk's dz,
+        # the in-place cast beside the gathered X rows
+        lp_phases = (
+            dxacc + acc + bufs + blocks(4 * R) + rowvec,
+            dxacc + dx_out + acc + logits + rowvec + blocks(4 * T),
+            dx_out
+            + acc
+            + logits
+            + blocks(2 * r_last * H)
+            + blocks(2 * p0 * H)
+            + rowvec,
+        )
+        assert lp.predicted_bytes == max(lp_phases), (H, R, lp, lp_phases)
         unfused = opt_in.memory_plan(
             "loss", recompute=False, fuse_dw_cast=False, **args
         )
@@ -6827,10 +6846,11 @@ def test_memory_plan_fused_ip():
         )
         assert last_fused > mp.budget_bytes, (H, R, last_fused, mp)
     # one chunk: no accumulator to split
-    one = opt_in.memory_plan(
-        "loss", num_rows=4096, rows=3891, hidden=6144, vocab=V, chunk=C, geometry=g
-    )
-    assert one.form != "fused_ip", one
+    for entry in ("loss", "logprob"):
+        one = opt_in.memory_plan(
+            entry, num_rows=4096, rows=3891, hidden=6144, vocab=V, chunk=C, geometry=g
+        )
+        assert one.form != "fused_ip", (entry, one)
 
 
 def test_memory_plan_partial_ip():
@@ -6840,8 +6860,10 @@ def test_memory_plan_partial_ip():
     unrecomputed form fits -- a third of the labels ignored (three chunks), T 8117 (two chunks) -- get it ahead of the
     partial form, recomputing fewer chunk rows of the vocabulary than that form would; its prediction is the largest
     of its phases (forward, held state, ``dX``, the in-place cast with the first piece's temporary, the recompute
-    block on ``dW``'s storage beside the pinned chunk).  The log-probability entry, ``fuse_dw_cast=False`` and a call
-    without the recompute arm never get it."""
+    block on ``dW``'s storage beside the pinned chunk).  The log-probability entry's backward gets it at the same
+    calls (its chunk loop with the compact ``dlogp``, the ``dX`` output beside the deferred chunk's ``dz``, the
+    in-place cast, the recompute block beside the compact ``dlogp``).  ``fuse_dw_cast=False`` and a call without the
+    recompute arm never get it."""
     g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     step = opt_in.dw_block_step(g)
     blocks = opt_in._allocated_bytes
@@ -6861,7 +6883,6 @@ def test_memory_plan_partial_ip():
         partial = opt_in.memory_plan("loss", fuse_dw_cast=False, **args)
         assert partial.form == "partial" and partial.fits, (key, partial)
         assert (n - 1) * (V - v0) < n * (V - partial.dw_rows), (key, partial)
-        assert opt_in.memory_plan("logprob", **args).form != "partial_ip"
         assert opt_in.memory_plan("loss", recompute=False, **args).form not in (
             "partial_ip",
             "partial",
@@ -6900,11 +6921,49 @@ def test_memory_plan_partial_ip():
             dx_out + lower + logits + x_last + block + rowvec + keep,
         )
         assert mp.predicted_bytes == max(phases), (key, phases)
+        # the log-probability backward
+        lp = opt_in.memory_plan("logprob", **args)
+        key = (T, R, lp)
+        assert lp.form == "partial_ip" and lp.fits and lp.recompute, key
+        v0, vb = lp.dw_rows, lp.block_rows
+        assert a <= v0 < V and v0 % step == 0, key
+        assert vb % step == 0 and 0 < vb <= V - v0, key
+        lp_partial = opt_in.memory_plan("logprob", fuse_dw_cast=False, **args)
+        assert lp_partial.form == "partial" and lp_partial.fits, (key, lp_partial)
+        assert (n - 1) * (V - v0) < n * (V - lp_partial.dw_rows), (key, lp_partial)
+        assert opt_in.memory_plan("logprob", recompute=False, **args).form not in (
+            "partial_ip",
+            "partial",
+            "recompute",
+        )
+        upper = blocks(4 * (v0 - a) * H) if v0 > a else 0
+        block = (
+            blocks(2 * C * H)
+            + blocks(2 * C * vb)
+            + blocks(8 * C * -(-vb // tile))
+            + blocks(4 * vb * H)
+            + blocks(8 * R)
+            + blocks(4 * R)
+        )
+        lp_phases = (
+            dxacc + lower + upper + bufs + keep + rowvec,
+            dxacc + dx_out + lower + upper + logits + rowvec + blocks(4 * T),
+            dx_out
+            + lower
+            + upper
+            + logits
+            + x_last
+            + blocks(2 * p0 * H)
+            + rowvec,
+            dx_out + lower + logits + x_last + block + rowvec + keep,
+        )
+        assert lp.predicted_bytes == max(lp_phases), (key, lp_phases)
     # one chunk: no accumulator to split
-    one = opt_in.memory_plan(
-        "loss", num_rows=4096, rows=3891, hidden=H, vocab=V, chunk=C, geometry=g
-    )
-    assert one.form != "partial_ip", one
+    for entry in ("loss", "logprob"):
+        one = opt_in.memory_plan(
+            entry, num_rows=4096, rows=3891, hidden=H, vocab=V, chunk=C, geometry=g
+        )
+        assert one.form != "partial_ip", (entry, one)
 
 
 def test_memory_plan_counts_the_x_copy():
@@ -9505,14 +9564,31 @@ def test_device_split_forms_cast_dw_in_place(
 
 def test_device_logprob_budget_forms_are_bitwise(glm_weight, monkeypatch):
     """Every budget form of the log-probability backward gives the fast form's bits (integer views), with and without
-    ``dX``; a frozen ``W`` takes the fast backward (no budget plan)."""
+    ``dX``, compacted and uncompacted -- the split accumulator's forms too (``"fused_ip"``; ``"partial_ip"`` without
+    an upper part, several blocks with a short last one, one granule; a one-chunk call runs the fused form); a frozen
+    ``W`` takes the fast backward (no budget plan)."""
     _require_program(entry="logprob")
     step = _require_recompute()
-    for T, C, train_x in ((1500, 4096, True), (8700, 4096, True), (8700, 4096, False)):
+    a = opt_in.dw_split_rows(
+        DEFAULT_V, Geometry.from_record(cake_backend.record_for(CUDA)[1])
+    )
+    g = DEFAULT_V // step
+    split_forms = (
+        ("fused_ip", DEFAULT_V, None),
+        ("partial_ip", a, DEFAULT_V - a),
+        ("partial_ip", a + 50 * step, 64 * step),
+        ("partial_ip", (g - 1) * step, step),
+    )
+    for T, C, train_x, kw in (
+        (1500, 4096, True, {}),
+        (8700, 4096, True, {}),
+        (8700, 4096, False, {}),
+        (8700, 4096, True, dict(compact_rows=False)),
+    ):
         inp = _device_inputs(T, W=glm_weight)
         _poison_allocator()
-        fast = _run(inp, C, entry="logprob", backend="cake", train_x=train_x)
-        for form in _budget_forms(step):
+        fast = _run(inp, C, entry="logprob", backend="cake", train_x=train_x, **kw)
+        for form in _budget_forms(step) + split_forms:
             calls: list = []
             _force_budget_plan(monkeypatch, form, calls)
             _poison_allocator()
@@ -9523,8 +9599,9 @@ def test_device_logprob_budget_forms_are_bitwise(glm_weight, monkeypatch):
                 backend="cake",
                 train_x=train_x,
                 memory_mode="budget",
+                **kw,
             )
-            assert calls == ["logprob"], (T, C, train_x, form)
+            assert calls == ["logprob"], (T, C, train_x, kw, form)
             _assert_same_bits(fast, budget, keys=("logp", "dX", "dW"))
         calls = []
         _force_budget_plan(monkeypatch, ("recompute", 0, step), calls)
@@ -9538,6 +9615,108 @@ def test_device_logprob_budget_forms_are_bitwise(glm_weight, monkeypatch):
             keys=("logp", "dX"),
         )
         monkeypatch.undo()
+
+
+@pytest.mark.parametrize(
+    "H, T, ignore, form, tau",
+    [
+        (4096, 16384, 0.33, "fused_ip", False),
+        (6144, 16384, 0.05, "fused_ip", False),
+        (6144, 16384, 0.33, "partial_ip", False),
+        (6144, 8117, 0.05, "partial_ip", False),
+        (6144, 8117, 0.05, "partial_ip", True),
+    ],
+)
+def test_device_logprob_split_forms_cast_dw_in_place(
+    monkeypatch, H, T, ignore, form, tau
+):
+    """The log-probability backward's forms with a split accumulator at the default call's shapes they serve:
+    ``"fused_ip"`` (H 4096 with a third of the labels ignored; H 6144 with 5 % ignored, four chunks) and
+    ``"partial_ip"`` (H 6144 with a third ignored, three chunks; T 8117, two chunks, also with a heterogeneous
+    temperature).  The default step picks the form and its outputs are bitwise the fast step's; its backward casts
+    ``dW`` into the lower accumulator's storage, which autograd takes as ``W.grad`` without a copy (``4 a H`` bytes)
+    -- ``"partial_ip"`` recomputes its other rows with the last chunk's pinned ``dz`` -- and the step's peak, of the
+    call that binds and of one from the remembered binding, stays within the planned budget (``0.98 B``) and below
+    the fast step's.  A retained graph gives the same bits twice."""
+    _require_program(entry="logprob")
+    _require_recompute()
+    if tau:
+        _require_tau_program()
+    V = DEFAULT_V
+    inp = make_inputs(
+        T,
+        seed=SEED + 9300 + H,
+        H=H,
+        V=V,
+        device=CUDA,
+        ignore_frac=ignore,
+        temperature="hetero" if tau else None,
+    )
+    kw = dict(temperature=inp.temperature) if tau else {}
+    keys = ("logp", "dX", "dW")
+    module_name, record = cake_backend.record_for(CUDA)
+    a = opt_in.dw_split_rows(V, Geometry.from_record(record))
+    fast, fast_peak, _ = _budget_step(inp, 4096, "logprob", memory_mode="fast", **kw)
+    plans: list = []
+    budget_fn = (
+        "_backward_logprob_budget_temperature" if tau else "_backward_logprob_budget"
+    )
+    real_budget = getattr(opt_in, budget_fn)
+
+    def plan_spy(*args, **kwargs):
+        plans.append(kwargs.get("mplan"))
+        return real_budget(*args, **kwargs)
+
+    monkeypatch.setattr(opt_in, budget_fn, plan_spy)
+    casts: list = []
+    split_cast = opt_in._dw_cast_split
+
+    def spy(*args, **kwargs):
+        casts.append(bool(kwargs["in_place"]))
+        return split_cast(*args, **kwargs)
+
+    monkeypatch.setattr(opt_in, "_dw_cast_split", spy)
+    tails: list = []
+    tail_fn = "_dw_vocab_blocks_temperature" if tau else "_dw_vocab_blocks"
+    vocab_blocks = getattr(opt_in, tail_fn)
+
+    def tail_spy(*args, **kwargs):
+        tails.append(kwargs.get("dz_last") is not None)
+        return vocab_blocks(*args, **kwargs)
+
+    monkeypatch.setattr(opt_in, tail_fn, tail_spy)
+    peaks = []
+    for _ in range(
+        2
+    ):  # the first call also binds; the second launches from the remembered binding
+        result, peak, _ = _budget_step(inp, 4096, "logprob", **kw)
+        mplan = plans[-1]
+        assert mplan is not None and mplan.form == form and mplan.fits, mplan
+        _assert_same_bits(fast, result, keys=keys)
+        assert result["dW"].untyped_storage().nbytes() == 4 * a * H, (
+            result["dW"].untyped_storage().nbytes(),
+            a,
+        )
+        peaks.append(peak)
+        del result
+    assert len(plans) == 2 and casts == [True, True], (plans, casts)
+    assert tails == ([True, True] if form == "partial_ip" else []), tails
+    assert max(peaks) <= mplan.budget_bytes < fast_peak, (peaks, mplan, fast_peak)
+    # a retained graph: the backward's accumulators are its own, cast in place both times
+    casts.clear()
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    entry_fn = (
+        opt_in.cake_lm_head_det_train_logprob_temperature
+        if tau
+        else opt_in.cake_lm_head_det_train_logprob
+    )
+    logp = entry_fn(X, W, inp.labels, chunk_size=4096, backend="cake", **kw)
+    kept = torch.autograd.grad(logp, (X, W), inp.dlogp, retain_graph=True)
+    freed = torch.autograd.grad(logp, (X, W), inp.dlogp)
+    assert casts == [True, True], casts
+    for dX, dW in (kept, freed):
+        _assert_same_bits(fast, dict(dX=dX, dW=dW), keys=("dX", "dW"))
 
 
 def _budget_step(inp, C, entry, **kw):
@@ -11625,16 +11804,27 @@ def test_device_temperature_switches_are_bitwise(glm_weight, monkeypatch):
 
 
 def test_device_temperature_budget_forms_are_bitwise(glm_weight, monkeypatch):
-    """Every budget form of the log-probability backward with a heterogeneous temperature gives the fast form's
-    bits (integer views), with and without ``dX``; the vocabulary-block recompute binds the ``dz`` temperature form
-    and none of the stages the temperature forms replace."""
+    """Every budget form of the log-probability backward with a heterogeneous temperature -- the split
+    accumulator's forms too, with the pinned last chunk of ``"partial_ip"`` -- gives the fast form's bits (integer
+    views), with and without ``dX``; the vocabulary-block recompute binds the ``dz`` temperature form and none of the
+    stages the temperature forms replace."""
     _require_tau_program()
     step = _require_recompute()
+    a = opt_in.dw_split_rows(
+        DEFAULT_V, Geometry.from_record(cake_backend.record_for(CUDA)[1])
+    )
+    g = DEFAULT_V // step
+    split_forms = (
+        ("fused_ip", DEFAULT_V, None),
+        ("partial_ip", a, DEFAULT_V - a),
+        ("partial_ip", a + 50 * step, 64 * step),
+        ("partial_ip", (g - 1) * step, step),
+    )
     for T, C, train_x in ((1500, 4096, True), (8700, 4096, True), (8700, 4096, False)):
         inp = _tau_inputs(T, W=glm_weight, seed_offset=7638)
         _poison_allocator()
         fast = _run(inp, C, entry="logprob", backend="cake", train_x=train_x)
-        for form in _budget_forms(step):
+        for form in _budget_forms(step) + split_forms:
             calls: list = []
             _force_budget_plan(monkeypatch, form, calls)
             monkeypatch.setattr(opt_in, "_budget_plan_temperature", opt_in._budget_plan)
@@ -13574,8 +13764,8 @@ def _auto_planned(rows: int, chunk: int = 4096) -> bool:
 
 def test_auto_memory_plan_decisions(monkeypatch):
     """The automatic form's decision (``auto_memory_plan``, host integer arithmetic) at the GLM head (H 6144, V 154880,
-    chunk 4096): two thirds of the rows valid (three chunks) switches the loss entry to the pinned partial form
-    (``"partial_ip"``) and the log-probability entry to the partial form, the budget call's own plans; many valid rows (T 32463, 5 % ignored) keep the fast form, which fits with its own lifetimes; one
+    chunk 4096): two thirds of the rows valid (three chunks) switches both entries to the pinned partial form
+    (``"partial_ip"``), the budget call's own plans; many valid rows (T 32463, 5 % ignored) keep the fast form, which fits with its own lifetimes; one
     chunk (T 4096, 5 % ignored) switches to a recompute form; one row, where no form fits, and a program without the
     recompute arm keep the fast form; ``_AUTO_MIN_CHUNKS`` sets the smallest chunk count that is planned at all (a
     call of fewer chunks keeps the fast form; the expectations follow the module's value)."""
@@ -13585,8 +13775,7 @@ def test_auto_memory_plan_decisions(monkeypatch):
         mp = opt_in.auto_memory_plan(entry, **issue)
         assert not opt_in.fast_form_fits(entry, **issue), entry
         if _auto_planned(10980):
-            form = "partial_ip" if entry == "loss" else "partial"
-            assert mp is not None and mp.form == form and mp.fits, (entry, mp)
+            assert mp is not None and mp.form == "partial_ip" and mp.fits, (entry, mp)
             assert mp == opt_in.memory_plan(entry, **issue), entry
         else:
             assert mp is None, (entry, mp)
