@@ -37,7 +37,8 @@ entry through this module's autograd function, the log-probability entries
 without ``num_valid_rows`` through :mod:`.cake_backend`'s forward with a
 backward that decides (:class:`CakeLMHeadDetLogprobAutoFunction`), with it
 through this module's autograd functions.  A default log-probability call
-without a temperature whose valid rows fit one chunk keeps their BF16 logits
+without a temperature, of at most two chunks of rows, whose valid rows fit one
+chunk keeps their BF16 logits
 from its forward to its backward where the fast backward would run no
 zero-gradient row skip (:func:`_one_chunk_keep_rule`, also with a frozen ``W``;
 :class:`CakeLMHeadDetLogprobOneChunkFunction`; bitwise the fast form's
@@ -2836,7 +2837,7 @@ def prepare_lm_head_det_loss(
     if _template_only:
         # the buffers allocated below (never launched on): the workspace and the accumulators / casts the call leaves
         # to this function, each a view at the start of one allocation of the largest
-        f32 = plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
+        f32 = _main._dw_cast_f32(plan.dw_cast_stage)
         sizes = {
             "dx_acc": rows_loop * H * 4 if plan.need_dx and dx_acc is None else 0,
             "dx_out": rows_loop * H * 2
@@ -2963,7 +2964,7 @@ def prepare_lm_head_det_loss(
                 "dw_out",
                 (V, H),
                 torch.float32
-                if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
+                if _main._dw_cast_f32(plan.dw_cast_stage)
                 else torch.bfloat16,
             )
     if plan.keep_row_grad:
@@ -3312,7 +3313,7 @@ def prepare_lm_head_det_loss_temperature(
     if _template_only:
         # the buffers allocated below (never launched on): the workspace and the accumulators / casts the call leaves
         # to this function, each a view at the start of one allocation of the largest
-        f32 = plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
+        f32 = _main._dw_cast_f32(plan.dw_cast_stage)
         sizes = {
             "dx_acc": rows_loop * H * 4 if plan.need_dx and dx_acc is None else 0,
             "dx_out": rows_loop * H * 2
@@ -3440,7 +3441,7 @@ def prepare_lm_head_det_loss_temperature(
                 "dw_out",
                 (V, H),
                 torch.float32
-                if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
+                if _main._dw_cast_f32(plan.dw_cast_stage)
                 else torch.bfloat16,
             )
     if plan.keep_row_grad:

@@ -344,8 +344,11 @@ keyword.
   a frozen `W`); no `torch.utils.checkpoint` (no saved-tensor hooks on top,
   so neither pass of a non-reentrant checkpoint and no CPU offload; outside
   a backward, so not a reentrant checkpoint's recomputation, whose first
-  pass runs with grad mode off); the valid rows fit one chunk (`T_v <=
-  chunk_size`; every row of an uncompacted call); and the fast backward
+  pass runs with grad mode off); fewer than three chunks of rows
+  (`cake_backend.HIDDEN_COUNT_MIN_CHUNKS`; a longer call counts its valid
+  rows on the device and keeps the default form); the valid rows fit one
+  chunk (`T_v <= chunk_size`; every row of an uncompacted call); and the
+  fast backward
   would run no zero-gradient row skip on the call (fewer valid rows than
   the device's `cake_backend.zero_dlogp_min_rows`, or the skip off; see
   "Zero-gradient rows of the log-probability backward").  The kept backward
@@ -1276,7 +1279,7 @@ the knobs it names.  An explicit `"split"`, or a `"stages"` other than the
 table ring depth 4, keeps that form and turns the `_swab` rule off.
 `"swap_ab": true` applies to every chunk; it raises with such a `"stages"`,
 with a nonzero `"split"`, on an architecture without the swapped program
-(only SM103 has it), and on a chunk whose dX tile is the 256-column one
+(SM103 and SM107 have it), and on a chunk whose dX tile is the 256-column one
 (pin `"tile_n": 512` as well).  A `"k_slices"` pin that leaves a slice without
 a K step raises (e.g. 3 slices over `V` = 256's four K steps).
 

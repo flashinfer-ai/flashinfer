@@ -468,6 +468,14 @@ DX_SLICED_STAGE = "gemm_dx_s"
 # operations in the same order as ``gemm_dw_acc`` followed by ``scale_cast_*``, so the weight gradient is bitwise
 # identical; the flat ``scale_cast`` pass over ``dW`` disappears.  Selected by ``fuse_dw_cast`` (default on).
 DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
+
+
+def _dw_cast_f32(stage: str) -> bool:
+    """Whether the stage that writes the final ``dW`` (:attr:`Plan.dw_cast_stage`) writes it in FP32: the flat FP32
+    cast or the fused FP32 cast in every form (the 2-D blocked ``_gn`` raster included)."""
+    return stage == "scale_cast_f32" or stage.startswith("gemm_dw_cast_f32")
+
+
 # TMA-epilogue form of the deferred BF16 dW cast (``gemm_dw_cast_bf16_tma``): the old FP32 sum is read and the
 # BF16 tile is stored as TMA sub-tiles.  It runs the cast of the LAST chunk of a call of >= 2 chunks whose last
 # chunk has 1 .. DW_CAST_TMA_MAX_ROWS[arch] rows (:func:`dw_cast_tma_rule`); the per-element (old + acc) * g
@@ -6915,9 +6923,7 @@ def prepare_lm_head_det_loss(
             dw_out,
             "dw_out",
             (V, H),
-            torch.float32
-            if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
-            else torch.bfloat16,
+            torch.float32 if _dw_cast_f32(plan.dw_cast_stage) else torch.bfloat16,
         )
     if layout.get("workspace"):
         t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
@@ -7365,9 +7371,7 @@ def prepare_lm_head_det_loss_temperature(
             dw_out,
             "dw_out",
             (V, H),
-            torch.float32
-            if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
-            else torch.bfloat16,
+            torch.float32 if _dw_cast_f32(plan.dw_cast_stage) else torch.bfloat16,
         )
     if layout.get("workspace"):
         t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
@@ -9797,6 +9801,8 @@ def forward_logprob(
     other work between them, and either form runs on that one count."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if keep is not None and backend != "cake":
+        raise ValueError("the kept logits (logprob_keep) run on the cake backend")
     problem = validate_lm_head_det_inputs(
         X,
         W,
@@ -10714,8 +10720,11 @@ def forward_logprob_keep(
             row_index = hc.row_index()
         else:
             row_index = valid_row_index(labels) if compact else None
-    elif row_index is not None and not compact:
-        raise ValueError("a valid-row index belongs to a compacted forward")
+    elif row_index is not None:
+        if not compact:
+            raise ValueError("a valid-row index belongs to a compacted forward")
+        if isinstance(row_index, torch.Tensor):
+            row_index = row_index.contiguous()  # the dX finalize reads a dense index
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _kept_result(
             _empty_forward(

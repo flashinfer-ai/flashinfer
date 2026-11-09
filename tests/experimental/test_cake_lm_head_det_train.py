@@ -4096,6 +4096,36 @@ def test_grad_weight_dtype_fp32():
     )
 
 
+def test_dw_cast_f32_every_form():
+    """The prepared runner allocates ``dW`` in FP32 for every form of the final FP32 cast, the 2-D blocked ``_gn``
+    raster of the fused cast included, and in BF16 for every form of the BF16 cast."""
+    f32 = cake_backend._dw_cast_f32
+    for stage in (
+        "scale_cast_f32",
+        "gemm_dw_cast_f32",
+        cake_backend.stage_variant("gemm_dw_cast_f32", blocked=True),
+    ):
+        assert f32(stage), stage
+    for stage in (
+        "scale_cast_bf16",
+        "gemm_dw_cast_bf16",
+        cake_backend.stage_variant("gemm_dw_cast_bf16", epi_store="tma"),
+    ):
+        assert not f32(stage), stage
+
+
+def test_kept_logits_reject_the_reference_backend():
+    """The kept logits run on the ``cake`` backend only: :func:`forward_logprob` with a ``keep`` predicate raises on
+    the reference backend before it counts the valid rows, as :func:`forward_logprob_keep` does."""
+    inp = _host_inputs(65)
+    for fn, kw in (
+        (cake_backend.forward_logprob, dict(keep=lambda row_index: True)),
+        (cake_backend.forward_logprob_keep, {}),
+    ):
+        with pytest.raises(ValueError, match="cake backend"):
+            fn(inp.X, inp.W, inp.labels, chunk_size=64, backend="reference", **kw)
+
+
 def test_frozen_inputs():
     inp = _host_inputs(37)
     both = _run(inp, 16)
@@ -7473,6 +7503,36 @@ def test_device_logprob_entry(glm_weight):
     assert torch.all(result["dX"][~inp.valid] == 0)
 
 
+@pytest.mark.parametrize("module_name", ["main", "opt_in"])
+def test_device_fp32_dw_blocked_cast(glm_weight, module_name):
+    """An FP32 ``dW`` whose deferred last chunk takes the 2-D blocked fused FP32 cast (``gemm_dw_cast_f32_gn``: ``H``
+    below ``RASTER_RULE_MIN_HIDDEN``, ``DW_BLOCK_MIN_ROWS .. DW_BLOCK_MAX_ROWS`` rows) gets an FP32 output from the
+    prepared runner: the bits of the flat FP32 cast (``fuse_dw_cast=False``)."""
+    _require_program(entry="loss")
+    mod = cake_backend if module_name == "main" else opt_in
+    inp = _device_inputs(3000, W=glm_weight)
+    common = dict(
+        objective="ce",
+        loss_div=inp.loss_div,
+        chunk_size=4096,
+        grad_weight_dtype=torch.float32,
+    )
+    fused = mod.prepare_lm_head_det_loss(
+        inp.X, inp.W, inp.labels, fuse_dw_cast=True, **common
+    )
+    assert fused.plan.dw_cast_stage == "gemm_dw_cast_f32_gn"
+    fused.step()
+    dw = fused.dw_out
+    assert dw.dtype == torch.float32 and tuple(dw.shape) == tuple(inp.W.shape)
+    del fused
+    flat = mod.prepare_lm_head_det_loss(
+        inp.X, inp.W, inp.labels, fuse_dw_cast=False, **common
+    )
+    assert flat.plan.dw_cast_stage == "scale_cast_f32"
+    flat.step()
+    assert torch.equal(dw, flat.dw_out)
+
+
 # the default plan's dX slice counts per chunk (chunk size 4096) where the unfitted rule empties a slice on the
 # 148- and 152-SM devices: 3 slices at T = 1000, H = 6144 and [4, 3] for the 4097-row plan's 1-row tail chunk
 _VOCAB_256_DEFAULT_DX_SLICES = {(1000, 6144): (2,), (4097, 6144): (4, 2)}
@@ -9449,6 +9509,26 @@ def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):
             cake_backend.backward_logprob_keep(
                 inp.X, inp.W, inp.labels, fr.lse, dlogp, again, **kw
             )
+    del fr, dx, dw
+    # a caller's valid-row index given as a strided view: the forward keeps its dense copy for the backward
+    idx = torch.nonzero(inp.labels >= 0).flatten()
+    strided = torch.stack((idx, idx), dim=1)[:, 0]
+    assert not strided.is_contiguous()
+    fr = cake_backend.forward_logprob_keep(
+        inp.X, inp.W, inp.labels, chunk_size=C, row_index=strided
+    )
+    assert fr.row_index.is_contiguous() and torch.equal(fr.row_index, idx)
+    dx, dw = cake_backend.backward_logprob_keep(
+        inp.X,
+        inp.W,
+        inp.labels,
+        fr.lse,
+        dlogp,
+        fr.logits,
+        chunk_size=C,
+        row_index=fr.row_index,
+    )
+    assert torch.equal(dx, ref["dX"]) and torch.equal(dw, ref["dW"])
     del fr, dx, dw
     runner = prepare_lm_head_det_loss(
         inp.X,

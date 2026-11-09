@@ -539,9 +539,10 @@ def cake_lm_head_det_train_logprob(
     the same values); ``dW`` is returned in BF16.  ``memory_mode``
     (``"budget"``: the backward's weight-gradient form within the same bound;
     the default ``None``: the automatic form, decided in the backward, which
-    keeps the default entry's forward; a default call without a temperature
-    whose valid rows fit one chunk keeps their BF16 logits, at most one chunk,
-    from the forward to its backward, which forms the logit gradient from them
+    keeps the default entry's forward; a default call without a temperature,
+    of at most two chunks of rows, whose valid rows fit one chunk keeps their
+    BF16 logits, at most one chunk, from the forward to its backward, which
+    forms the logit gradient from them
     instead of recomputing the logits, where the fast backward would run no
     zero-gradient row skip -- not under ``torch.utils.checkpoint``, bitwise the
     same outputs; ``"fast"`` turns this off), ``num_valid_rows`` and
