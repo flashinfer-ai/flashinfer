@@ -627,7 +627,10 @@ SB_SPLIT_ROUTES = {
 }
 # The TP8 tail cells served by the staged-rows resident-B instance with the routed partials staged in shared memory:
 # {(SM count, architecture): {tokens: most partials (from 2)}}.
-STAGED_PARTIALS_ROUTES = {(152, "sm_103a"): {1: 2}}
+STAGED_PARTIALS_ROUTES = {
+    (152, "sm_100a"): {1: 2, 2: 3},
+    (152, "sm_103a"): {1: 2, 2: 3},
+}
 # The decode tail cells served by the global-y instances with the routed partials prefetched and each row split over
 # the epilogue warps, keeping the global-y arithmetic: {(SM count, architecture): {TP: {tokens: fewest partials}}}, at
 # the row's own N_PAD (TP8) or N_PAD 32 (TP1), and the registered program key of each (TP, N_PAD).
@@ -835,7 +838,8 @@ def test_cooperative_launch_follows_grid_wide_waits():
 def test_plans_follow_the_device_sm_count():
     """152-SM parts (GB200 / GB300) re-plan the resident-pair windows from their own count; the
     decode grids are tile-bound and identical on both qualified counts, and the decode tail plans
-    too but on the cells of ``TAIL_GY_SPLIT_ROUTES`` (152-SM parts only)."""
+    too but on the cells of ``TAIL_GY_SPLIT_ROUTES`` and ``TAIL_STAGED_PARTIALS_ROUTES`` (152-SM parts
+    only)."""
     for tp in SUPPORTED_TP:
         il = i_local_for_tp(tp)
         for tokens in (1, 8, 16, 64, 128):
@@ -844,10 +848,11 @@ def test_plans_follow_the_device_sm_count():
             )
             for num_partials in COVERAGE_PARTIALS:
                 gy = cb.tail_gy_split_n_pad(tokens, tp, num_partials, sm_count=152)
+                staged = cb.tail_staged_partials(tokens, tp, num_partials, sm_count=152)
                 same = decode_tail_plan(
                     tokens, il, tp, num_partials, 148
                 ) == decode_tail_plan(tokens, il, tp, num_partials, 152)
-                assert same is not bool(gy), (tp, tokens, num_partials)
+                assert same is not (bool(gy) or staged), (tp, tokens, num_partials)
     assert decode_front_plan(1, i_local_for_tp(8), 152)["grid"] == 94
     assert decode_front_plan(1, i_local_for_tp(1), 152)["grid"] == 131
     assert decode_tail_plan(1, i_local_for_tp(8), 8, 1, 152)["grid"] == 112
@@ -2192,6 +2197,18 @@ def no_gy_split(monkeypatch):
 
 
 @pytest.fixture
+def no_staged_partials(monkeypatch):
+    """The routes without the staged-partials cells of ``TAIL_STAGED_PARTIALS_ROUTES`` (which overlay the split-rows
+    cells of 2 tokens and 3 partials on 152-SM parts; their own rules and outputs are tested below), the plan cache
+    cleared around."""
+    monkeypatch.setattr(cb, "TAIL_STAGED_PARTIALS_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    yield
+    monkeypatch.undo()
+    decode_tail_plan.cache_clear()
+
+
+@pytest.fixture
 def no_partial_prefetch(monkeypatch):
     """The routes without the prefetch cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` (which overlay
     ``TAIL_SB_NORM_ROUTES``; their own rules and outputs are tested below), the plan cache cleared around."""
@@ -2477,7 +2494,7 @@ def test_tail_partial_prefetch_is_bitwise_the_resident_b_instance(
         decode_tail_plan.cache_clear()
 
 
-def test_tail_sb_split_rules(monkeypatch, no_gy_split):
+def test_tail_sb_split_rules(monkeypatch, no_gy_split, no_staged_partials):
     """The cells of ``TAIL_SB_SPLIT_ROUTES`` take the global-y instance of the table's N_PAD with the resident-B
     arithmetic, the routed partials prefetched and each row split over the epilogue warps (``_sbs``) on the table's
     parts (SM count, architecture): its plan is the ``_sbn_ppf`` instance's but for the flag, up to 17 partials; every
@@ -2679,7 +2696,15 @@ def test_tail_staged_partials_rules(monkeypatch):
                         assert key == decode_kernel_key(one) + "_mp"
                         assert key in KERNELS and cake_jit.route_available(arch, (key,))
                         taken[sm_count, arch, tp, tokens, num_partials] = key
-    assert set(taken) == {(152, "sm_103a", 8, 1, 2)}
+    assert set(taken) == {
+        (152, "sm_100a", 8, 1, 2),
+        (152, "sm_100a", 8, 2, 2),
+        (152, "sm_100a", 8, 2, 3),
+        (152, "sm_103a", 8, 1, 2),
+        (152, "sm_103a", 8, 2, 2),
+        (152, "sm_103a", 8, 2, 3),
+    }
+    assert len(set(taken.values())) == 1
     monkeypatch.setattr(cb, "TAIL_STAGED_PARTIALS_ROUTES", {})
     decode_tail_plan.cache_clear()
     try:
@@ -2694,7 +2719,9 @@ def test_tail_staged_partials_rules(monkeypatch):
         decode_tail_plan.cache_clear()
 
 
-@pytest.mark.parametrize(("tp", "tokens", "num_partials"), ((8, 1, 2),))
+@pytest.mark.parametrize(
+    ("tp", "tokens", "num_partials"), ((8, 1, 2), (8, 2, 2), (8, 2, 3))
+)
 def test_tail_staged_partials_is_bitwise_the_resident_b_arithmetic(
     monkeypatch, tp, tokens, num_partials
 ):
@@ -2723,6 +2750,7 @@ def test_tail_staged_partials_is_bitwise_the_resident_b_arithmetic(
     cancel = pick < 0.25
     parts[0] = torch.where(cancel, -a, parts[0])
     parts[1] = torch.where(cancel, a - m * 2.0**-133, parts[1])
+    parts[2:] = torch.where(cancel, 0.0, parts[2:])
     parts = torch.where((pick >= 0.25) & (pick < 0.5), parts * 2.0**-130, parts)
     routed.copy_(parts.to(torch.float32).to(torch.bfloat16).to(device))
     args = (
@@ -3892,9 +3920,7 @@ def test_functional_two_streams(monkeypatch, row):
 def test_functional_first_call_on_fresh_slab(monkeypatch, stage, tp, tokens):
     """A one-shot call that is the process's first control-word request (no slab yet) creates the slab, takes
     its lane and reproduces a prepared runner bitwise (no lock re-entry)."""
-    device = torch.device("cuda", 0) if torch.cuda.is_available() else None
-    if device is None:
-        pytest.skip("requires a GPU")
+    device = _require_program(stage, tp, tokens)
     if stage == "front":
         args, kwargs = _front_args(device, tp, tokens, 31), {}
         call, prepare = kimi_k3_latent_moe_front, prepare_kimi_k3_latent_moe_front
