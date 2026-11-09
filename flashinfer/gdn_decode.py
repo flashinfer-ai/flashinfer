@@ -526,6 +526,17 @@ def _run_cake_gdn_decode_pretranspose(
     return output
 
 
+# Launch of the Cake GDN nontranspose FP32 T=1 decode per (device index, B, H, HK, HV,
+# scale, use_qk_l2norm): the kernel entry and its grid.  Everything else the route
+# depends on is fixed by the checks before the lookup (BF16 I/O, FP32 state, T=1,
+# K=V=128, contiguous tensors) and the architecture follows the device, so a hit
+# launches what the resolver and the loader return for the call.  A row the resolver
+# refuses is never stored: it raises again on every call.  The table is cleared when it
+# reaches ``_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT`` keys.
+_CAKE_GDN_NONTRANSPOSE_LAUNCHES: dict[tuple, tuple] = {}
+_CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT = 1024
+
+
 def _run_cake_gdn_decode_nontranspose(
     *,
     q: torch.Tensor,
@@ -540,27 +551,55 @@ def _run_cake_gdn_decode_nontranspose(
     output: torch.Tensor,
     use_qk_l2norm: bool,
 ) -> torch.Tensor:
-    """Launch one exact manifest-backed GDN non-CP nontranspose T=1 row."""
+    """Launch one exact manifest-backed GDN non-CP nontranspose T=1 row.
+
+    Runs on every eager decode call, so the checks compare the device index, dtype
+    identity and shapes directly (no ``torch.device`` built per tensor) and the launch
+    comes from ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES``; the checks, their order, the error
+    types and the messages are those of the resolver path.
+    """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
         raise RuntimeError("the source-only Cake GDN backend is not installed")
     batch_size, seq_len, num_q_heads, head_size = q.shape
-    num_v_heads, value_size = int(v.shape[2]), int(v.shape[3])
-    tensors = (q, k, v, state, A_log, a, dt_bias, b, output)
-    if q.device.type != "cuda" or any(tensor.device != q.device for tensor in tensors):
+    v_shape = v.shape
+    num_v_heads, value_size = int(v_shape[2]), int(v_shape[3])
+    # All nine tensors on the CUDA device of q: for CUDA tensors, equal device indices
+    # is equal devices.
+    device_index = q.get_device()
+    if not (
+        q.is_cuda
+        and k.is_cuda
+        and v.is_cuda
+        and state.is_cuda
+        and A_log.is_cuda
+        and a.is_cuda
+        and dt_bias.is_cuda
+        and b.is_cuda
+        and output.is_cuda
+        and k.get_device() == device_index
+        and v.get_device() == device_index
+        and state.get_device() == device_index
+        and A_log.get_device() == device_index
+        and a.get_device() == device_index
+        and dt_bias.get_device() == device_index
+        and b.get_device() == device_index
+        and output.get_device() == device_index
+    ):
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP nontranspose decode requires one CUDA device"
         )
+    bf16, fp32 = torch.bfloat16, torch.float32
     if (
-        q.dtype != torch.bfloat16
-        or k.dtype != torch.bfloat16
-        or v.dtype != torch.bfloat16
-        or a.dtype != torch.bfloat16
-        or b.dtype != torch.bfloat16
-        or state.dtype != torch.float32
-        or A_log.dtype != torch.float32
-        or dt_bias.dtype != torch.float32
-        or output.dtype != torch.bfloat16
+        q.dtype is not bf16
+        or k.dtype is not bf16
+        or v.dtype is not bf16
+        or a.dtype is not bf16
+        or b.dtype is not bf16
+        or state.dtype is not fp32
+        or A_log.dtype is not fp32
+        or dt_bias.dtype is not fp32
+        or output.dtype is not bf16
     ):
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP nontranspose decode requires BF16 I/O/gates and FP32 state/decay"
@@ -570,52 +609,66 @@ def _run_cake_gdn_decode_nontranspose(
         or head_size != 128
         or value_size != 128
         or k.shape != q.shape
-        or v.shape != (batch_size, 1, num_v_heads, 128)
+        or v_shape != (batch_size, 1, num_v_heads, 128)
         or state.shape != (batch_size, num_v_heads, 128, 128)
         or a.shape != (batch_size, 1, num_v_heads)
         or b.shape != (batch_size, 1, num_v_heads)
         or A_log.shape != (num_v_heads,)
         or dt_bias.shape != (num_v_heads,)
         or output.shape != (batch_size, 1, num_v_heads, 128)
-        or not all(tensor.is_contiguous() for tensor in tensors)
+        or not (
+            q.is_contiguous()
+            and k.is_contiguous()
+            and v.is_contiguous()
+            and state.is_contiguous()
+            and A_log.is_contiguous()
+            and a.is_contiguous()
+            and dt_bias.is_contiguous()
+            and b.is_contiguous()
+            and output.is_contiguous()
+        )
     ):
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP nontranspose decode requires exact contiguous T=1 tensors"
         )
-    major, minor = get_compute_capability(q.device)
-    arch = _cake_gdn.arch_for_compute_capability(major, minor)
-    route = _cake_gdn.select_cake_gdn_decode_variant(
-        arch=arch,
-        batch_size=int(batch_size),
-        io_dtype="bfloat16",
-        state_dtype="float32",
-        head_size=128,
-        layout="nontranspose",
-        num_k_heads=int(k.shape[2]),
-        num_q_heads=int(num_q_heads),
-        num_v_heads=int(num_v_heads),
-        scale=scale,
-        seq_len=1,
-        use_qk_l2norm=use_qk_l2norm,
+    num_k_heads = k.shape[2]
+    key = (
+        device_index,
+        batch_size,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        scale,
+        use_qk_l2norm,
     )
-    entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
-    blocks_per_state = _cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
-        route.variant_name
-    )
-    entry(
-        q,
-        k,
-        v,
-        state,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        output,
-        batch_size * num_v_heads * blocks_per_state,
-        1,
-        1,
-    )
+    launch = _CAKE_GDN_NONTRANSPOSE_LAUNCHES.get(key)
+    if launch is None:
+        major, minor = get_compute_capability(q.device)
+        arch = _cake_gdn.arch_for_compute_capability(major, minor)
+        route = _cake_gdn.select_cake_gdn_decode_variant(
+            arch=arch,
+            batch_size=int(batch_size),
+            io_dtype="bfloat16",
+            state_dtype="float32",
+            head_size=128,
+            layout="nontranspose",
+            num_k_heads=int(num_k_heads),
+            num_q_heads=int(num_q_heads),
+            num_v_heads=int(num_v_heads),
+            scale=scale,
+            seq_len=1,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+        entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
+        blocks_per_state = _cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
+            route.variant_name
+        )
+        launch = (entry, batch_size * num_v_heads * blocks_per_state)
+        if len(_CAKE_GDN_NONTRANSPOSE_LAUNCHES) >= _CAKE_GDN_NONTRANSPOSE_LAUNCH_LIMIT:
+            _CAKE_GDN_NONTRANSPOSE_LAUNCHES.clear()
+        _CAKE_GDN_NONTRANSPOSE_LAUNCHES[key] = launch
+    entry, grid_x = launch
+    entry(q, k, v, state, A_log, a, dt_bias, b, output, grid_x, 1, 1)
     return output
 
 

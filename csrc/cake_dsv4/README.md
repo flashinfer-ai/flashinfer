@@ -22,7 +22,11 @@ it. On SM107 the FP8 low-head prefill route's `_overlap` sibling, the same work
 with the P x V MMAs started on the low half of P and the output drained per V
 block, runs on launches of at most 64 query rows (scaled down with the SM count
 below 216 SMs); routing its `VARIANTS` key to the route's program retires it.
-The TRTLLM-GEN RopeQuant epilogue is not supported.
+Its `_vblock` sibling, the same work split into one 128-column V block of the
+output per CTA (four CTAs per query row) with the same output bits, runs before
+it on launches of at most 27 query rows (scaled down with the SM count below
+216 SMs); routing its `VARIANTS` key to the route's or the `_overlap` sibling's
+program retires it. The TRTLLM-GEN RopeQuant epilogue is not supported.
 
 ```python
 from flashinfer.mla import (

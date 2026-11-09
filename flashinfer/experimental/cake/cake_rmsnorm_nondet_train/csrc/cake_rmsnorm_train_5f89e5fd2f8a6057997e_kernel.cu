@@ -102,7 +102,7 @@ kernel_cake_rmsnorm_train_5f89e5fd2f8a6057997e(__nv_bfloat16* __restrict__ x, __
         int row = row0 + group;
         long long row64 = (long long)row;
         long long xbase = row64 * x_stride_p0;
-        long long obase = row64 * 6144;
+        long long obase = row64 * 6144ll;
         unsigned int x_words[12];
         float sum_sq = 0.0f;
         if (row < T) {
