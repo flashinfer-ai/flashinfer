@@ -1897,6 +1897,7 @@ def dgrad_program_template(tma_store: bool, lean_free: bool = False) -> str:
 
 
 _WAVE_LEAN_N224_PF2_ST = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st"
+_WAVE_LEAN_N224_PF2_ST_LH = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st_lh"
 _DGRAD_N = "dense_proj_gemm_dgrad_kn_n256_f32_ef"
 _DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
 _DGRAD_N_TMA_LEAN_FREE = "dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free"
@@ -1928,26 +1929,30 @@ _DGRAD_WINDOW_TOKENS = range(16172, 16385)
 #: ``5120 -> 1024`` at 16384 tokens on ``sm_103a``), 17 paired groups in eager launches and in CUDA graph replays each:
 #: the deterministic plan's program took 1.017 to 1.036 times its time in two processes on a GB200 part and 1.011 to
 #: 1.033 times on a GB300 part, slower in at most 2 of 17 groups, the same bits on 20 repeats.  The 1024-feature rows of
-#: the 148-SM parts keep the deterministic plan.
+#: the 148-SM parts keep the deterministic plan.  ``4096 -> 512`` and ``5120 -> 512`` at 16172 and 16231 tokens run the
+#: same program with L2 eviction priorities on its loads and stores (``dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st_lh``:
+#: the same items, MMAs and bits): on a GB300 part 0.965 to 0.975 times the time of the program without them, below 1 in
+#: both modes on all four rows; on a B200 part below 1 in 8 of 8 row-modes; on a GB200 part a median below 1 in 16 of 16
+#: row-modes over two processes; the same bits on 20 repeats.
 # fmt: off
 K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int], str]] = {
     ("sm_100a", 148): {
-        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
-        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
-        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST_LH, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST_LH,
+        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST_LH,
+        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST_LH, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
     },
     ("sm_100a", 152): {
-        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
-        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
-        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST_LH, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST_LH,
+        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST_LH,
+        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST_LH, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
         (4096, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 1024, 16231): _WAVE_LEAN_N224_PF2_ST,
         (4096, 1024, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16172): _WAVE_LEAN_N224_PF2_ST,
         (5120, 1024, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
     },
     ("sm_103a", 152): {
-        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
-        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
-        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
+        (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST_LH, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST_LH,
+        (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST_LH,
+        (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST_LH, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
         (4096, 1024, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 1024, 16231): _WAVE_LEAN_N224_PF2_ST,
         (4096, 1024, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16172): _WAVE_LEAN_N224_PF2_ST,
         (5120, 1024, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 1024, 16384): _WAVE_LEAN_N224_PF2_ST,
@@ -2006,6 +2011,7 @@ K1_DGRAD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, st
 # fmt: on
 
 _NVJET_EARLY_LEAN = "dense_proj_gemm_nvjet_early_kn_n256_lean"
+_NVJET_EARLY_LEAN_FREE = "dense_proj_gemm_nvjet_early_kn_n256_lean_free"
 #: The deterministic package's program on whose plan the rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` run this
 #: package's program (a template symbol without the ``dense_proj_det_gemm_`` prefix).
 K1_DGRAD_NVJET_DET_PROGRAM = "kn_n256_tma1_w8r"
@@ -2020,6 +2026,25 @@ _NVJET_DGRAD_ROWS: tuple[tuple[int, int, int], ...] = (
 #: leave to the other tables.
 _NVJET_DGRAD_SM103_KEPT = frozenset({(4096, 32, 2048)})
 _NVJET_DGRAD_SM100_KEPT = _NVJET_DGRAD_SM103_KEPT | {(4096, 32, 14592), (4096, 64, 4864)}
+_GLM3 = (16172, 16231, 16384)
+#: The ``(K, N, T)`` rows (BF16 out) per part that run ``dense_proj_gemm_nvjet_early_kn_n256_lean_free`` in
+#: :data:`K1_DGRAD_NVJET_RULES_BY_SM`.
+_NVJET_FREE_ROWS: dict[tuple[str, int], tuple[tuple[int, int, int], ...]] = {
+    ("sm_100a", 148): (
+        *((k, n, t) for k, n in ((4096, 32), (4096, 48), (4096, 128), (5120, 32), (6144, 32), (6144, 128)) for t in _GLM3),
+        *((k, n, t) for k, n in ((5120, 48), (5120, 64), (5120, 128), (8192, 128)) for t in (16172, 16384)),
+    ),
+    ("sm_103a", 152): (
+        *((k, n, t) for k, n in ((4096, 128), (5120, 128), (6144, 32), (6144, 128)) for t in _GLM3),
+        *((k, n, t) for k, n in ((4096, 48), (5120, 32), (5120, 48), (5120, 64), (8192, 128)) for t in (16172, 16384)),
+    ),
+    ("sm_107a", 212): tuple(
+        (k, n, t)
+        for k, n in ((4096, 32), (4096, 48), (4096, 64), (4096, 128), (5120, 32), (5120, 48), (5120, 64), (5120, 128),
+                     (6144, 32), (6144, 128), (8192, 128))
+        for t in _GLM3
+    ),
+}
 # fmt: on
 #: The K1 input-gradient rows that run this package's nvjet program on the deterministic package's plan of
 #: :data:`K1_DGRAD_NVJET_DET_PROGRAM`, ``(arch, sm_count) -> {(K, N, T, out_dtype): template}``: on a part of exactly
@@ -2040,17 +2065,28 @@ _NVJET_DGRAD_SM100_KEPT = _NVJET_DGRAD_SM103_KEPT | {(4096, 32, 14592), (4096, 6
 #: program's time 0.96 to 0.99 times this one's) and keeps the other tables on every part; on ``sm_100a``
 #: ``4096 -> 32`` at 14592 tokens and ``4096 -> 64`` at 4864 tokens were not faster in every group on the GB200 part and
 #: keep the other tables too.
+#:
+#: The rows that run the program with the epilogue freeing the tensor memory under the last store drain
+#: (``dense_proj_gemm_nvjet_early_kn_n256_lean_free``, :data:`_NVJET_FREE_ROWS`; the same items, MMAs and bits) on
+#: 148-SM ``sm_100a``, 152-SM ``sm_103a`` and 212-SM ``sm_107a`` parts: measured at exactly these rows and token counts
+#: against the package's former route of the row in the same process, 17 paired groups in eager launches and in CUDA
+#: graph replays, faster in 17 of 17 groups in both: on a B200 part that route took 1.006 to 1.043 times its time, on a
+#: GB300 part 1.005 to 1.053 times, on an R200 part 1.036 to 1.108 times (and 1.07 to 1.11 times on two more cards for
+#: 8 rows).  The other rows of those screens (within 0.998 to 1.014 times) keep their routes.
 # fmt: off
 K1_DGRAD_NVJET_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
     ("sm_100a", 148): {
-        (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM100_KEPT
+        **{(*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM100_KEPT},
+        **{(*row, "bf16"): _NVJET_EARLY_LEAN_FREE for row in _NVJET_FREE_ROWS[("sm_100a", 148)]},
     },
     ("sm_100a", 152): {
         (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM100_KEPT
     },
     ("sm_103a", 152): {
-        (*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM103_KEPT
+        **{(*row, "bf16"): _NVJET_EARLY_LEAN for row in _NVJET_DGRAD_ROWS if row not in _NVJET_DGRAD_SM103_KEPT},
+        **{(*row, "bf16"): _NVJET_EARLY_LEAN_FREE for row in _NVJET_FREE_ROWS[("sm_103a", 152)]},
     },
+    ("sm_107a", 212): {(*row, "bf16"): _NVJET_EARLY_LEAN_FREE for row in _NVJET_FREE_ROWS[("sm_107a", 212)]},
 }
 # fmt: on
 
@@ -5682,7 +5718,8 @@ def _plan_det_k1(
     call's tensors ``sources``, which hold the data pointers of ``A`` / ``B`` / ``out``), the stream-K slabs and slice
     counters in this package's arena.  With ``module`` (this package's program of :data:`K1_DGRAD_NVJET_RULES_BY_SM`)
     a plan of :data:`K1_DGRAD_NVJET_DET_PROGRAM` binds that program in place of the plan's own, in its own argument
-    order; a plan of another program binds its own.  A planner's view the call's tensors do not rebuild leaves the
+    order (the deterministic package need not register its program on the part: on ``sm_107a`` it does not); a plan
+    of another program binds its own.  A planner's view the call's tensors do not rebuild leaves the
     entry unbound (the deterministic package's convenience path), as does a call without knobs that the
     deterministic package runs on its swapped small-token forward (``_swap_ab_launch`` with the call's
     ``weights_static`` under PDL: its program, not the planner's)."""
@@ -5692,9 +5729,26 @@ def _plan_det_k1(
         static = bool(weights_static) and bool(pdl)
         if det._swap_ab_launch(A, B, out, transposed_out, static) is not None:
             return _CachedDetK1(plan=None)
-    plan, a_desc, b_desc, O3, arch, module_name = det._k1_plan(
-        A, B, out, transposed_out=transposed_out, knobs=dict(knobs)
-    )
+    if module is None:
+        plan, a_desc, b_desc, O3, arch, module_name = det._k1_plan(
+            A, B, out, transposed_out=transposed_out, knobs=dict(knobs)
+        )
+    else:
+        # the deterministic planner's plan without its registry lookup (``det._k1_plan`` less ``select_module``)
+        device = det._same_cuda_device(A, B, out)
+        facts = det.device_facts(device)
+        arch = det.require_arch(device)
+        plan, a_desc, b_desc, O3 = det.cake_dense_gemm_det_train_projection_plan(
+            A,
+            B,
+            out,
+            sm_count=facts.sm_count,
+            l2_bytes=facts.l2_bytes,
+            transposed_out=transposed_out,
+            arch=arch,
+            **dict(knobs),
+        )
+        module_name = None
     ldo, out_l = det._out_strides(O3)
     values = det._k1_values(
         plan,
@@ -5715,6 +5769,8 @@ def _plan_det_k1(
     if nvjet:
         fn, template = _atomic_bind(module, values, plan.grid, arch)
     else:
+        if module_name is None:
+            module_name = det.select_module(arch, plan.template)
         fn, template = det._bind(module_name, values, plan.grid, arch)
     views = dict(
         A=(a_desc, False),

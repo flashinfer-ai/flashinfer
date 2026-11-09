@@ -6246,14 +6246,25 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
 
 #: The rows of the program tables, ``(arch, sm_count) -> {key: template}`` (keys as in the tables): the lean
 #: one-wave forward of eight epilogue warps with the X prefetch and the token-half last stage, at 512 features on
-#: every part of the table and at 1024 features on the 152-SM parts.
+#: every part of the table and at 1024 features on the 152-SM parts; the 512-feature rows at 16172 and 16231 tokens
+#: with the L2 eviction priorities (``_lh``).
 _WAVE_PF2_ST = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st"
+_WAVE_PF2_ST_LH = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st_lh"
 _F512_ROWS = {(K, 512, T) for K in (4096, 5120) for T in (16172, 16231, 16384)}
 _F1024_ROWS = {(K, 1024, T) for K in (4096, 5120) for T in (16172, 16231, 16384)}
+_F512_LH = dict.fromkeys(
+    ((K, 512, T) for K in (4096, 5120) for T in (16172, 16231)), _WAVE_PF2_ST_LH
+)
 K1_FORWARD_PROGRAM_ROWS = {
-    ("sm_100a", 148): dict.fromkeys(_F512_ROWS, _WAVE_PF2_ST),
-    ("sm_100a", 152): dict.fromkeys(_F512_ROWS | _F1024_ROWS, _WAVE_PF2_ST),
-    ("sm_103a", 152): dict.fromkeys(_F512_ROWS | _F1024_ROWS, _WAVE_PF2_ST),
+    ("sm_100a", 148): {**dict.fromkeys(_F512_ROWS, _WAVE_PF2_ST), **_F512_LH},
+    ("sm_100a", 152): {
+        **dict.fromkeys(_F512_ROWS | _F1024_ROWS, _WAVE_PF2_ST),
+        **_F512_LH,
+    },
+    ("sm_103a", 152): {
+        **dict.fromkeys(_F512_ROWS | _F1024_ROWS, _WAVE_PF2_ST),
+        **_F512_LH,
+    },
 }
 #: The rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` (BF16 out, all on the lean nvjet program): ``4096 -> 32`` and
 #: ``4096 -> 64`` at the token counts of the thin scan, ``4096 -> 16, 48, 96, 128``, ``5120 -> 32, 48, 64, 128``,
@@ -6274,10 +6285,60 @@ _NVJET_ROWS = {
 }
 _NVJET_SM103_KEPT = {(4096, 32, 2048)}
 _NVJET_SM100_KEPT = _NVJET_SM103_KEPT | {(4096, 32, 14592), (4096, 64, 4864)}
+#: The rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` on the program that frees the tensor memory under the last store
+#: drain (``_lean_free``) per part.
+_NVJET_FREE = "dense_proj_gemm_nvjet_early_kn_n256_lean_free"
+_GLM = (16172, 16231, 16384)
+_NVJET_FREE_ROWS = {
+    ("sm_100a", 148): {
+        *(
+            (K, N, T)
+            for K, N in (
+                (4096, 32),
+                (4096, 48),
+                (4096, 128),
+                (5120, 32),
+                (6144, 32),
+                (6144, 128),
+            )
+            for T in _GLM
+        ),
+        *(
+            (K, N, T)
+            for K, N in ((5120, 48), (5120, 64), (5120, 128), (8192, 128))
+            for T in (16172, 16384)
+        ),
+    },
+    ("sm_103a", 152): {
+        *(
+            (K, N, T)
+            for K, N in ((4096, 128), (5120, 128), (6144, 32), (6144, 128))
+            for T in _GLM
+        ),
+        *(
+            (K, N, T)
+            for K, N in ((4096, 48), (5120, 32), (5120, 48), (5120, 64), (8192, 128))
+            for T in (16172, 16384)
+        ),
+    },
+    ("sm_107a", 212): {
+        (K, N, T) for K in (4096, 5120) for N in (32, 48, 64, 128) for T in _GLM
+    }
+    | {(K, N, T) for K, N in ((6144, 32), (6144, 128), (8192, 128)) for T in _GLM},
+}
 K1_DGRAD_NVJET_ROWS = {
-    ("sm_100a", 148): {(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM100_KEPT},
+    ("sm_100a", 148): {
+        **{(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM100_KEPT},
+        **{(*r, "bf16"): _NVJET_FREE for r in _NVJET_FREE_ROWS[("sm_100a", 148)]},
+    },
     ("sm_100a", 152): {(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM100_KEPT},
-    ("sm_103a", 152): {(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM103_KEPT},
+    ("sm_103a", 152): {
+        **{(*r, "bf16"): _NVJET for r in _NVJET_ROWS - _NVJET_SM103_KEPT},
+        **{(*r, "bf16"): _NVJET_FREE for r in _NVJET_FREE_ROWS[("sm_103a", 152)]},
+    },
+    ("sm_107a", 212): {
+        (*r, "bf16"): _NVJET_FREE for r in _NVJET_FREE_ROWS[("sm_107a", 212)]
+    },
 }
 _KD, _KD_TMA, _KD_TMA_LEAN_FREE = (
     "dense_proj_gemm_dgrad_kn_n256_f32_ef",
@@ -6377,10 +6438,10 @@ def test_k1_program_tables():
     :data:`K1_ORDERED_RANGES_BY_SM` hold the measured rows and plan their program (:func:`k1_ordered_plan`) at their
     token counts only, on their part only, before :func:`k1_plan`'s routing."""
     assert len(_NVJET_ROWS) == 29
-    assert {part: len(rows) for part, rows in K1_DGRAD_NVJET_ROWS.items()} == {
+    assert {part: len(rows) for part, rows in _NVJET_FREE_ROWS.items()} == {
         ("sm_100a", 148): 26,
-        ("sm_100a", 152): 26,
-        ("sm_103a", 152): 28,
+        ("sm_103a", 152): 22,
+        ("sm_107a", 212): 33,
     }
     for table, want in (
         (cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM, K1_FORWARD_PROGRAM_ROWS),
@@ -14492,6 +14553,73 @@ def test_k1_dgrad_nvjet_rows_bind_the_nvjet_program(monkeypatch, arch):
         )
         monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
         assert cake_backend._k1_dgrad_nvjet_of(G, W, out) is None, sms
+
+
+def test_k1_dgrad_nvjet_sm107a_rows_bind_the_nvjet_program(monkeypatch):
+    """On a 212-SM ``sm_107a`` part, where the deterministic package does not register
+    :data:`K1_DGRAD_NVJET_DET_PROGRAM`, ``cake_dense_gemm_nondet_train_projection_dgrad()`` binds for a row of
+    :data:`K1_DGRAD_NVJET_RULES_BY_SM` this package's nvjet program on the deterministic planner's plan of that
+    program: the cached entry holds that plan and names the program, with the deterministic program's argument plan
+    and cluster.  Another token count and another SM count keep the other tables (no program)."""
+    arch, sms = "sm_107a", 212
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=sms, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16 = torch.bfloat16
+    rows = cake_backend.K1_DGRAD_NVJET_RULES_BY_SM[(arch, sms)]
+    knobs = dict(cake_backend.k1_program_knobs(cake_backend.K1_DGRAD_NVJET_DET_PROGRAM))
+    det_template = (
+        det_backend._TEMPLATE_PREFIX + cake_backend.K1_DGRAD_NVJET_DET_PROGRAM
+    )
+    det_record = det_backend.MODULES[det_backend.select_module("sm_100a", det_template)]
+    for (K, N, T, dt), template in sorted(rows.items())[::4]:
+        what = (K, N, T, dt)
+        module = cake_jit.KERNELS[arch][template]
+        G, W = torch.empty(T, N, dtype=bf16), torch.empty(N, K, dtype=bf16)
+        out = torch.empty(T, K, dtype=bf16)
+        assert cake_backend._k1_dgrad_nvjet_of(G, W, out) == module, what
+        cake_backend._K1_DET_CACHE.clear()
+        entry_fn.calls.clear()
+        for _ in range(2):
+            assert (
+                cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out)
+                is out
+            ), what
+        assert len(entry_fn.calls) == 2, what
+        ((key, entry),) = cake_backend._K1_DET_CACHE.items()
+        assert key[2][0] == ("dgrad",) and entry.k1 is not None, what
+        plan = det_backend.cake_dense_gemm_det_train_projection_plan(
+            G,
+            W,
+            out,
+            sm_count=sms,
+            l2_bytes=facts.l2_bytes,
+            transposed_out=False,
+            arch=arch,
+            **knobs,
+        )[0]
+        assert entry.plan == plan and entry.module_name == module, what
+        assert plan.template == det_template, what
+        record = cake_jit.MODULES[module]
+        assert cake_jit.arg_plan_of(record) == det_backend.arg_plan_of(det_record), what
+        assert record["launch"]["cluster"] == det_record["launch"]["cluster"], what
+        assert len(entry_fn.calls[-1][0]) == len(cake_jit.arg_plan_of(record)), what
+        for t in (T - 1, T + 1):
+            if (K, N, t, dt) not in rows:
+                Gt, outt = torch.empty(t, N, dtype=bf16), torch.empty(t, K, dtype=bf16)
+                assert cake_backend._k1_dgrad_nvjet_of(Gt, W, outt) is None, (what, t)
+    (K, N, T, _), _ = min(rows.items())
+    G, W = torch.empty(T, N, dtype=bf16), torch.empty(N, K, dtype=bf16)
+    out = torch.empty(T, K, dtype=bf16)
+    for other in (208, 211, 213, 216):
+        facts = det_backend.DeviceFacts(
+            index=0, arch=arch, sm_count=other, l2_bytes=126 << 20
+        )
+        monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+        assert cake_backend._k1_dgrad_nvjet_of(G, W, out) is None, other
 
 
 #: The program the rows of :data:`K1_FORWARD_RULES_BY_SM` that name one run per part, and the deterministic plan of
