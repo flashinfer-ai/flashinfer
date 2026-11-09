@@ -1556,7 +1556,7 @@ def test_forward_programs_switch_on_channel_count(kind) -> None:
         (floor, "perf", C)
         for floored, floor in _token_floors(arch, kind).values()
         for C in NARROW_SPLIT_TABLE["fwd"]
-        if C >= min(floored)
+        if min(floored) <= C
     ]
     launched = set()
     for S, docs, C in rows:
@@ -2160,7 +2160,7 @@ def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
                 NARROW_SPLIT_TABLE[role][C] if narrow else (C // 8, 128 // (C // 8), 1)
             )
             floor = FWD_NARROW_FLOORS.get(arch, {}).get(C // 8)
-            if role == "fwd" and narrow and floor is not None and S >= floor:
+            if role == "fwd" and narrow and floor is not None and floor <= S:
                 want = FWD_WIDE_SPLIT_TABLE[C]
             got = (values["ct_vec"], values["n_sub"], values["n_ch_tiles"])
             assert got == want, (kind, route, C, got, want)

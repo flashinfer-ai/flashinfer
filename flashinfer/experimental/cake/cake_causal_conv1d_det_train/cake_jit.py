@@ -3862,9 +3862,10 @@ NARROW_TILE_WIDTHS: dict[str, dict[int, int]] = {"fwd": {72: 18, 80: 40}, "bwd":
 # The token count ``S`` from which a row of :data:`NARROW_TILE_WIDTHS` runs
 # its width, per role and architecture: ``cv -> S``.  Below it, in a plan
 # made without ``S`` or without the architecture, and on an architecture or
-# row the table does not list, the row runs the 32-vector tiles.  The whole
-# tiles split a launch into fewer token chunks, so at a small ``S`` they
-# underfill the grid, the more so the more SMs the device has.  Paired
+# row the table does not list, the row runs the 32-vector tiles.  At a small
+# ``S`` the whole tiles lose, likely because they split a launch into fewer
+# token chunks and underfill the grid (the break-even rises with the SM
+# count).  Paired
 # probes against the 32-vector tiles on the fwd / fwd_dt / fwd_bias routes
 # (same GPU, 9 rotated rounds, ``y`` bit for bit): on GB300 (152 SMs) C =
 # 640 reads 0.95-0.99x up to S = 20480 and 1.02-1.12x from 24576, C = 576
@@ -3874,9 +3875,10 @@ NARROW_TILE_WIDTHS: dict[str, dict[int, int]] = {"fwd": {72: 18, 80: 40}, "bwd":
 # 20480) and 1.02-1.08x from 36864, C = 576 0.91-0.98x up to 16384, down to
 # 0.96x on fwd_bias at 24576-36864 and 1.006-1.14x from 40960.  At S =
 # 250340 C = 576 reads 1.20x on B200, 1.15-1.17x on GB300 and 1.11-1.13x on
-# R200, C = 640 1.12x, 1.10-1.12x and 1.02-1.08x.  B200 (148 SMs; 1.05-1.08x
-# and 1.02-1.03x at S = 31292) takes GB300's floors until it is probed at a
-# smaller ``S``.
+# R200, C = 640 1.12x, 1.10-1.12x and 1.02-1.08x.  B200 (148 SMs) takes
+# GB300's floors with margin: C = 640 reads 1.007-1.018x at S = 22528 (mixed
+# at 16384-20480, down to 0.987x) and 1.04-1.12x from 24576, C = 576
+# 0.89-0.92x at 12288, mixed at 20480-24576 and 1.05-1.19x from 28672.
 NARROW_WIDTH_FLOORS: dict[str, dict[str, dict[int, int]]] = {
     "fwd": {
         "sm_100a": {72: 32768, 80: 24576},
