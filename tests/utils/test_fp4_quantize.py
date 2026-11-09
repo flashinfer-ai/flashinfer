@@ -2014,11 +2014,13 @@ def test_nvfp4_quantize_fp8_backend_parity(
 # Input takes the TMA kernel only with m >= 1024, at least 32 MiB of input, n a
 # multiple of its column chunk (512 for half/bf16, 1024 for FP8) and at least as
 # many b x row tiles as SMs, which 4096 rows give on every supported GPU; the
-# other shapes guard that routing. SM107 takes it from m = 2048 at any size.
+# other shapes guard that routing. SM107 ignores the size and tile rules: m >= 2048 for
+# the 128x4 layout, m >= 3072 for the others.
 NVFP4_TMA_SHAPES = [
     (1024, 1024),  # below the size threshold
     (1024, 32768),  # 64 half/bf16 row tiles, fewer than SMs
-    (2048, 3072),  # SM107 TMA from m = 2048
+    (2048, 3072),  # SM107 128x4 takes TMA here
+    (3072, 3072),  # SM107 takes TMA in every layout
     (4096, 8192),
     (4096, 8704),  # odd multiple of 512
     (4100, 8192),  # m not a multiple of 128
