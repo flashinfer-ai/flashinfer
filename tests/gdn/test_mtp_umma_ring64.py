@@ -631,10 +631,10 @@ def test_build_constants_match_the_tests():
 
 @pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_window_rows_derivation_is_bit_exact_vs_full_window(T):
-    """The wrapper compiles the shared-memory u window for flush_min - 1 + T rows (window_rows): on histories that
-    obey the commit rule (P <= flush_min - 1 + T) outputs, committed state and every ring must be bit-identical
-    (NaN-poisoned slots included) to the build with the whole window (window_rows = nu). Rows deeper than the
-    derived window are truncated, which the same comparison shows: the check is able to fail."""
+    """An explicit shallow window (window_rows = flush_min - 1 + T) on histories that obey the commit rule
+    (P <= flush_min - 1 + T) must give outputs, committed state and every ring bit-identical (NaN-poisoned slots
+    included) to the default full window (nu rows). Rows deeper than the explicit window are truncated, which the
+    same comparison shows: the check is able to fail."""
     _skip_if_not_sm100()
     fn = _umma()
     top = _p_max(T)
@@ -670,7 +670,7 @@ def test_window_rows_derivation_is_bit_exact_vs_full_window(T):
         )
         bases = [_SWEEP_BASES[j % 8] for j in range(len(hist))]
         res = {}
-        for name, wr in (("derived", None), ("full", top)):
+        for name, wr in (("derived", deepest), ("full", None)):
             res[name] = call(
                 _make_case(len(hist), T, hist, 300 + T + fm, bases), fm, wr
             )
@@ -690,7 +690,7 @@ def test_window_rows_derivation_is_bit_exact_vs_full_window(T):
         hist = [min(fm - 1 + T + 1, top)]
         outs = [
             call(_make_case(1, T, hist, 399 + T, [5]), fm, wr)[0]
-            for wr in (fm - 1 + T, top)
+            for wr in (fm - 1 + T, None)
         ]
         assert not torch.equal(_bits(outs[0]), _bits(outs[1])), (
             "a window shallower than P must change the result"
@@ -699,8 +699,8 @@ def test_window_rows_derivation_is_bit_exact_vs_full_window(T):
 
 @pytest.mark.parametrize("T", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_launch_shared_memory_matches_the_budget(T):
-    """Launch shared memory as the profiler reports it (kineto) equals the module's formula for the default window and
-    for the window derived from a lower flush_min, and stays inside the per-CTA budget of the build's CTAs/SM
+    """Launch shared memory as the profiler reports it (kineto) equals the module's formula for the default (full nu-row)
+    window and for an explicit shallower window_rows, and stays inside the per-CTA budget of the build's CTAs/SM
     (57,344 B for 4 CTAs/SM at W_RING = 32)."""
     _skip_if_not_sm100()
     import json
@@ -712,8 +712,11 @@ def test_launch_shared_memory_matches_the_budget(T):
 
     fn = _umma()
     budget = m._SMEM_PER_SM // m._SMEM_CTAS_PER_SM - m._SMEM_RESERVED_PER_CTA
-    for fm in sorted({_fm_max(T), max(1, _fm_max(T) - 8)}):
-        wr = min(fm - 1 + T, _p_max(T))
+    for fm, wr_arg in (
+        (_fm_max(T), None),
+        (max(1, _fm_max(T) - 8), min(max(1, _fm_max(T) - 8) - 1 + T, _p_max(T))),
+    ):
+        wr = _p_max(T) if wr_arg is None else wr_arg
         case = _make_case(2, T, [0, 1], 5, [0, 3])
 
         def launch():
@@ -735,6 +738,7 @@ def test_launch_shared_memory_matches_the_budget(T):
                 scale=SCALE,
                 flush_min=fm,
                 restart_hist_on_flush=False,
+                window_rows=wr_arg,
             )
 
         launch()  # compile outside the profiled launch
@@ -1312,10 +1316,15 @@ def test_stochastic_rounding_seed_and_graph():
     T = 4
     case, extra, hist, fm = _sr_case(T, False, seed=91)
     seed_t = torch.tensor([7], dtype=torch.int64, device=DEV)
-    _, a1, _ = _sr_call(case, extra, fm, rand_seed=seed_t)
-    _, a2, _ = _sr_call(case, extra, fm, rand_seed=seed_t)
+    sr = dict(stochastic_rounding="philox")
+    _, a1, _ = _sr_call(case, extra, fm, rand_seed=seed_t, **sr)
+    _, a2, _ = _sr_call(case, extra, fm, rand_seed=seed_t, **sr)
     _, b1, _ = _sr_call(
-        case, extra, fm, rand_seed=torch.tensor([8], dtype=torch.int64, device=DEV)
+        case,
+        extra,
+        fm,
+        rand_seed=torch.tensor([8], dtype=torch.int64, device=DEV),
+        **sr,
     )
     _, rn, _ = _sr_call(case, extra, fm)
     assert torch.equal(a1, a2)
@@ -1342,6 +1351,7 @@ def test_stochastic_rounding_seed_and_graph():
         flush_min=fm,
         restart_hist_on_flush=False,
         rand_seed=seed_t,
+        stochastic_rounding="philox",
     )
     fn(A_log, a, dt_bias, **kw)  # compile outside the capture
     torch.cuda.synchronize()
@@ -1386,6 +1396,20 @@ def test_lcg_unseeded_uses_clock(vf):
         assert abs((step != 0).float().mean().item() - 0.25) < 0.05
 
 
+def test_rand_seed_alone_does_not_enable_stochastic_rounding():
+    """stochastic_rounding=None with a rand_seed is round-to-nearest, bit-identical to "none" (matches
+    backend='umma' and the facade docstring: off unless set)."""
+    _skip_if_not_sm100()
+    case, extra, _, fm = _sr_case(4, False, seed=33)
+    seed_t = torch.tensor([5], dtype=torch.int64, device=DEV)
+    _, rn, _ = _sr_call(case, extra, fm)
+    _, seeded, _ = _sr_call(case, extra, fm, rand_seed=seed_t)
+    _, none, _ = _sr_call(case, extra, fm, rand_seed=seed_t, stochastic_rounding="none")
+    _, sr, _ = _sr_call(case, extra, fm, rand_seed=seed_t, stochastic_rounding="philox")
+    assert torch.equal(rn, seeded) and torch.equal(rn, none)
+    assert not torch.equal(rn, sr)
+
+
 def test_stochastic_rounding_rejects_bad_seed():
     _skip_if_not_sm100()
     case, extra, _, fm = _sr_case(4, False, seed=5)
@@ -1395,13 +1419,14 @@ def test_stochastic_rounding_rejects_bad_seed():
         torch.tensor([1], dtype=torch.int64),
     ):
         with pytest.raises(ValueError):
-            _sr_call(case, extra, fm, rand_seed=bad)
+            _sr_call(case, extra, fm, rand_seed=bad, stochastic_rounding="philox")
     with pytest.raises(ValueError):
         _sr_call(
             case,
             extra,
             fm,
             rand_seed=torch.tensor([1], dtype=torch.int64, device=DEV),
+            stochastic_rounding="philox",
             philox_rounds=0,
         )
     with pytest.raises(ValueError):
@@ -1872,6 +1897,38 @@ def test_public_restart_cursor_check_bounds_ring64(T, flush_min, hist, bases, ma
     case[12].copy_(torch.tensor([bases], dtype=torch.int32))
     with pytest.raises(AssertionError, match=match):
         _public_call(case, flush_min, backend="umma_ring64", restart_hist_on_flush=True)
+
+
+@pytest.mark.parametrize("P", [20, 24, 28, 29, 30, 31, 32])
+def test_public_t1_step_after_t4_step_folds_the_full_window(P):
+    """Rings advanced by a T=4 step can hold up to nu = 32 rows, while the T=1 default flush_min is 16: the
+    T=1 build must still fold every live row (state and output against the fp32 oracle)."""
+    _skip_if_not_sm100()
+    bases = [3, 40]
+    B = len(bases)
+    case4 = _make_case(B, 4, [P - 4] * B, 11, bases)
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case4
+    _public_call(case4, backend="umma_ring64")
+    torch.cuda.synchronize()
+    for r in range(B):
+        assert torch.isfinite(uc[r][:, (bases[r] + P - 1) % RING].float()).all()
+    q1, k1, v1, a1, b1 = _make_case(B, 1, [P] * B, 12, bases)[:5]
+    pool0, kc0, uc0, gc0 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
+    hl.fill_(P)
+    cb.copy_(torch.tensor(bases, dtype=torch.int32))
+    y = _public_call(
+        (q1, k1, v1, a1, b1, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx),
+        backend="umma_ring64",
+        restart_hist_on_flush=False,
+    )
+    torch.cuda.synchronize()
+    for r in range(B):
+        kl, ul, gl = _logical(kc0[r], uc0[r], gc0[r], bases[r])
+        y_ref, S_ref, *_ = _ref_fp32(
+            q1[r], k1[r], v1[r], a1[r], b1[r], A_log, dt_bias, pool0[r], kl, ul, gl, P
+        )
+        assert (y[r].float() - y_ref).abs().max().item() < Y_TOL
+        assert (pool[r].float() - S_ref).abs().max().item() < STATE_TOL
 
 
 @pytest.mark.parametrize("backend", ["auto", "umma", "hmma"])

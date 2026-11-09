@@ -2774,16 +2774,16 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
     ``heads_per_cta`` (1, 2 or 4; None = by batch size, see ``auto_heads_per_cta``) sets how many
     of a key head's 4 value heads one CTA runs.
 
-    ``window_rows`` (compile-time, part of the compile-cache key; default ``flush_min - 1 + T``, clamped to the
-    build's window nu = min(W_RING, RING_SLOTS - T)): rows of the shared-memory u window, i.e. the deepest live
-    window P a call may present. A verify row (P < flush_min) advances by at most T, so with the host-side
-    cursor commit at the same flush_min every call has P <= flush_min - 1 + T. A deeper window is silently
-    truncated: pass ``window_rows`` explicitly for histories that violate the commit rule.
+    ``window_rows`` (compile-time, part of the compile-cache key; default the full window
+    nu = min(W_RING, RING_SLOTS - T)): rows of the shared-memory u window, i.e. the deepest live
+    window P a call may present. The default holds any history the ring can carry, including rings
+    advanced at a larger T than this call's. A smaller explicit value saves shared memory but silently
+    truncates deeper histories.
 
     ``stochastic_rounding`` rounds the fp16 state written by flush rows stochastically
     (``cvt.rs.f16x2``, sm_100a / sm_103a / sm_107a); outputs, rings and verify rows are unchanged:
 
-    * None (default): off, unless ``rand_seed`` is given, which selects "philox".
+    * None (default): off; ``rand_seed`` alone does not turn it on.
     * "philox": FlashInfer Mamba's scheme and defaults -- Philox4x32 with ``philox_rounds``
       rounds, key = ``rand_seed``, counter = flat offset of the 8-element chunk in the state
       pool, one draw per chunk feeding 4 pairs. Reproducible per seed.
@@ -2873,7 +2873,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
             stacklevel=2,
         )
     if window_rows is None:
-        window_rows = min(nu, flush_min - 1 + T)
+        window_rows = nu
     assert 1 <= window_rows <= nu, (
         f"window_rows={window_rows} outside [1, {nu}] (W_RING={W_RING}, RING_SLOTS={RING_SLOTS}, T={T})"
     )
@@ -2893,11 +2893,11 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         output = torch.empty(B, T, HV, V_, dtype=torch.bfloat16, device=q.device)
     use_ro = row_order is not None
     if not use_ro:
-        key = (B, str(q.device))
-        row_order = _ROW_ID.get(key)
+        ro_key = (B, str(q.device))
+        row_order = _ROW_ID.get(ro_key)
         if row_order is None:
             row_order = torch.arange(B, dtype=torch.int32, device=q.device)
-            _ROW_ID[key] = row_order
+            _ROW_ID[ro_key] = row_order
     hpc = (
         auto_heads_per_cta(B, H, _num_sms(q.device), T)
         if heads_per_cta is None
@@ -2906,11 +2906,11 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
     assert hpc in (1, 2, 4)
     prof = prof_buf is not None
     if not prof:
-        key = ("prof", str(q.device))
-        prof_buf = _ROW_ID.get(key)
+        prof_key = ("prof", str(q.device))
+        prof_buf = _ROW_ID.get(prof_key)
         if prof_buf is None:
             prof_buf = torch.zeros(1, PROF_COLS, dtype=torch.int64, device=q.device)
-            _ROW_ID[key] = prof_buf
+            _ROW_ID[prof_key] = prof_buf
     else:
         assert (
             prof_buf.shape == (B * H * (HPK // hpc), PROF_COLS)
@@ -2929,7 +2929,7 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         v_cache, beta_cache = u_cache, g_cache  # unused placeholders (unf_uf)
     mode = stochastic_rounding
     if mode is None:
-        mode = "philox" if rand_seed is not None else "none"
+        mode = "none"
     if mode not in ("none", "philox", "lcg"):
         raise ValueError(
             f"stochastic_rounding={stochastic_rounding!r}: use None, 'none', 'philox' or 'lcg'"
@@ -2958,13 +2958,13 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
             raise ValueError("rand_seed must be a single-element int64 CUDA tensor")
         rand_seed = rand_seed.reshape(1)
     else:
-        key = ("seed", str(q.device))
-        rand_seed = _ROW_ID.get(key)
+        seed_key = ("seed", str(q.device))
+        rand_seed = _ROW_ID.get(seed_key)
         if rand_seed is None:
             rand_seed = torch.zeros(
                 1, dtype=torch.int64, device=q.device
             )  # unread placeholder
-            _ROW_ID[key] = rand_seed
+            _ROW_ID[seed_key] = rand_seed
     minb = _MINB if min_blocks_per_mp is None else int(min_blocks_per_mp)
     assert 3 <= minb <= 4, (
         f"min_blocks_per_mp={minb}: the warpgroups re-split a launch cap of 64 (4 CTAs/SM) or 80 "
@@ -2973,11 +2973,11 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
     slots = _num_sms(q.device) * minb if _PERSIST else 0
     if _PERSIST and not _PERSIST_PAD:
         # caller guarantees no padded rows: every row is an item, no per-call ordering work
-        key = ("nvalid", B, str(q.device))
-        n_valid = _ROW_ID.get(key)
+        nv_key = ("nvalid", B, str(q.device))
+        n_valid = _ROW_ID.get(nv_key)
         if n_valid is None:
             n_valid = torch.full((1,), B, dtype=torch.int32, device=q.device)
-            _ROW_ID[key] = n_valid
+            _ROW_ID[nv_key] = n_valid
     elif _PERSIST:
         # persistent CTAs stream items; padded rows (state index < 0) must not be items, so the
         # row order puts valid rows first (keeping the caller's order among them) and the kernel
@@ -2994,13 +2994,13 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         use_ro = True
         n_valid = valid.sum().to(torch.int32).reshape(1)
     else:
-        key = ("nvalid", str(q.device))
-        n_valid = _ROW_ID.get(key)
+        nv_key2 = ("nvalid", str(q.device))
+        n_valid = _ROW_ID.get(nv_key2)
         if n_valid is None:
             n_valid = torch.ones(
                 1, dtype=torch.int32, device=q.device
             )  # unread placeholder
-            _ROW_ID[key] = n_valid
+            _ROW_ID[nv_key2] = n_valid
     fn = GdnReplayMtpUmma.compile(
         q.device,
         T,
