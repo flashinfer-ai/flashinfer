@@ -86,12 +86,11 @@ entry takes a `deterministic=` keyword.
 | stage | kernel |
 |---|---|
 | `fwd` | O and the natural-log LSE `[H_q, T_q]`: a CTA pair per 128 query rows of two query heads of one key head, persistent tile tickets from a self-resetting counter |
-| `bwd_pre` | `dPsum = sum(O * dO)`, `LSE * log2(e)` and the zeroed FP32 dQ accumulator, two query heads per scratch head |
+| `bwd_pre` | `dPsum = sum(O * dO)` and `LSE * log2(e)`, two query heads per scratch head |
 | `bwd_plan` | one CTA: the workspace tile numbering and the dQ work order from `cu_seqlens_q` / `cu_seqlens_k` (PyTorch ops instead past 1024 pairs of 128 query rows) |
 | `bwd_main_fp32` / `bwd_main_bf16` | per workspace chunk: a CTA pair per 128 keys of one (segment, key head): S^T, dP^T, dK and dV, dK and dV summed in tensor memory over every query head of the key head and stored once (FP32 window or BF16), dS^T stored to the workspace |
-| `bwd_dq` | per chunk: dQ = dS K over the workspace into the FP32 accumulator (persistent over the Q-tile pairs) |
+| `bwd_dq` | per chunk: dQ = dS K over the workspace (persistent over the Q-tile pairs): partial sums into the FP32 accumulator; a Q tile's last chunk writes `dQ = bf16(acc * softmax_scale)` |
 | `bwd_fold` | row-map form only: the FP32 window rows added into their destination rows in ascending window order (a stable sort of the row map) |
-| `bwd_post` | `dQ = bf16(acc * softmax_scale)` |
 
 Numerics: FP32 accumulation for the scores, `dP`, dK, dV, dQ and the row
 sums; P and dS are rounded to BF16 only as MMA operands.  Every launch is a
@@ -112,7 +111,8 @@ tile.  The workspace's `budget_bytes` (default 16 GiB) bounds a chunk: all KV
 heads and key blocks in one chunk when they fit, else as many KV heads as fit,
 else one KV head and the widest even key-block range that fits; at least one
 KV head and two key blocks, even past the budget.  Each extra key-block chunk
-re-reads and rewrites the FP32 dQ accumulator once.
+re-reads the FP32 dQ accumulator once and rewrites it for the Q tiles it does
+not finish (a Q tile's last chunk writes its BF16 dQ instead).
 
 A caller that holds the boundaries on the host can pass them as
 `cu_seqlens_q_host` / `cu_seqlens_k_host` (lists or 1-D CPU tensors, both or

@@ -38,7 +38,7 @@ no alert and no warning, the bits of a run outside that mode, and no extra kerne
 filled).  Also: the issue's rows (the benchmark's layouts) bitwise over repeated runs, alone and beside a resident
 kernel; a key range past 64 key blocks; the package's buffers filled with 0xFF before use (no unwritten read); the
 small-budget chunks the backward launches; a workspace dropped between the forward and the backward (same budget,
-same bits); the plan kernel's dispatch bound.
+same bits); the plan kernel's dispatch bound; a caller's ``dq`` off a 32-byte boundary (the bits of an allocated one).
 
 The suite names its package once, through the shared alias helper, and imports nothing else from flashinfer.
 """
@@ -146,7 +146,6 @@ FIRST_PARAMETER = {
     "bwd_main_bf16": "Q",
     "bwd_dq": "dsw",
     "bwd_fold": "dk_win",
-    "bwd_post": "dQ_accum",
 }
 
 
@@ -234,7 +233,6 @@ def test_registry_records_are_well_formed() -> None:
         "bwd_main_bf16",
         "bwd_dq",
         "bwd_fold",
-        "bwd_post",
     )
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -397,8 +395,8 @@ def test_chunk_plan_and_grids_cover_every_tile() -> None:
     """The workspace chunks of random layouts and budgets: the KV-head ranges and the key-block ranges each tile
     their axis exactly once (so every (KV head, key block) is in exactly one chunk), each chunk's exact dS^T tiles
     of one head pair fit its ``tile_stride``, the dS^T workspace fits the budget unless at the minimum chunk (one KV
-    head, two key blocks), and the grids of every chunk's launches; the forward, pre/postprocess and fold grids
-    against the exact counts."""
+    head, two key blocks), and the grids of every chunk's launches; the forward, preprocess and fold grids against
+    the exact counts."""
     rng = random.Random(7073)
     sm_count = 148
     for trial in range(200):
@@ -501,7 +499,6 @@ def test_chunk_plan_and_grids_cover_every_tile() -> None:
         assert rows % 128 == 0 and rows >= sum(-(-2 * q // 128) * 128 for q in q_lens)
         assert cake_jit.grid("bwd_pre", **dims) == (rows // 32, h_q // 2, 1)
         assert cake_jit.grid("bwd_plan", **dims) == (1, 1, 1)
-        assert cake_jit.grid("bwd_post", **dims) == (rows // 64, h_q // 2, 1)
         # The fold: one warp per (window row, key head), every one in the grid, no CTA without one.
         gx, gy, gz = cake_jit.grid("bwd_fold", **dims)
         items = t_k * h_kv
@@ -1071,6 +1068,41 @@ def test_the_forward_of_every_group_matches_the_reference(h_q, h_kv, device) -> 
 
 
 @pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
+def test_a_dq_off_a_32_byte_boundary_gets_the_bits_of_an_allocated_one(
+    layout, device
+) -> None:
+    """The dQ GEMM stores dQ in 32-byte pieces: a caller's ``dq`` on a 32-byte boundary, 16 bytes past one and 2
+    bytes past one, each full of NaN before the call, gets the dQ, dK and dV bits of an allocated ``dq``."""
+    name, q_lens, k_lens, h_q, h_kv = layout
+    x = _inputs(q_lens, k_lens, h_q, h_kv, device)
+    ws = cake_backend.CakeGQADetWorkspace(device)
+    out, lse = cake_backend.cake_gqa_det_train_forward(
+        x["q"], x["k"], x["v"], x["cu_q"], x["cu_k"], softmax_scale=SCALE, workspace=ws
+    )
+    args = (x["q"], x["k"], x["v"], out, lse, x["dout"], x["cu_q"], x["cu_k"])
+    names = ("dq", "dk", "dv")
+
+    def backward(dq=None):
+        grads = cake_backend.cake_gqa_det_train_backward(
+            *args, softmax_scale=SCALE, workspace=ws, dq=dq
+        )
+        return dict(zip(names, grads, strict=True))
+
+    want = backward()
+    for skip, offset in ((0, 0), (8, 16), (1, 2)):
+        # Caching-allocator blocks are 512-byte aligned, so ``buf[skip:]`` is ``offset`` bytes past a 32-byte boundary.
+        buf = torch.empty(x["q"].numel() + skip, dtype=torch.bfloat16, device=device)
+        buf.view(torch.int16).fill_(-1)  # every bit set: NaN
+        dq = buf[skip:].view(x["q"].shape)
+        assert dq.data_ptr() % 32 == offset
+        got = backward(dq)
+        torch.cuda.synchronize()
+        assert got["dq"] is dq
+        label = f"{name}: dq {offset} bytes past a 32-byte boundary"
+        _assert_outputs_same_bits(got, want, label, names)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
 def test_every_output_repeats_bit_for_bit(layout, device) -> None:
     """``REPEATS`` runs of every form, through the per-stream default workspace, a reused workspace and fresh ones,
     give the same bits for out, lse, dq and dK / dV (BF16, FP32 window, row-map adds into non-zero destinations
@@ -1313,21 +1345,19 @@ def test_a_small_budget_matches_the_reference_and_repeats(layout, kind, device) 
 @pytest.mark.parametrize("layout", LAYOUTS, ids=LAYOUT_IDS)
 def test_a_small_budget_launches_its_chunks(layout, kind, device, monkeypatch) -> None:
     """Under a small budget the backward launches main and dQ once per chunk of the expected size, in that order:
-    the chunks cover every (KV head, key block) once, and the first key-block chunk of each KV-head chunk stores
-    where the later ones add."""
+    the chunks cover every (KV head, key block) once, the first key-block chunk of each KV-head chunk stores where
+    the later ones add, and the last one finishes every Q tile left (``finalize`` 2; 1 before it)."""
     name, q_lens, k_lens, h_q, h_kv = layout
     x = _inputs(q_lens, k_lens, h_q, h_kv, device)
     budget, (h_chunk, n_chunk), default = _budget_plan(kind, x, h_q, h_kv)
     blocks = default["key_blocks"]
     launches = []
     launch = cake_backend._launch
+    keys = ("h0", "hc", "n0", "n1", "accumulate", "finalize")
 
     def record(stage, values, dims, device_index, **chunk):
         if stage.startswith(("bwd_main", "bwd_dq")):
-            launches.append(
-                (stage.split("_")[1],)
-                + tuple(values[key] for key in ("h0", "hc", "n0", "n1", "accumulate"))
-            )
+            launches.append((stage.split("_")[1],) + tuple(values[key] for key in keys))
         return launch(stage, values, dims, device_index, **chunk)
 
     monkeypatch.setattr(cake_backend, "_launch", record)
@@ -1345,12 +1375,13 @@ def test_a_small_budget_launches_its_chunks(layout, kind, device, monkeypatch) -
         chunks,
     )
     covered = collections.Counter()
-    for _stage, h0, hc, n0, n1, accumulate in chunks:
+    for _stage, h0, hc, n0, n1, accumulate, finalize in chunks:
         assert hc == min(h_chunk, h_kv - h0) and n1 - n0 == min(width, blocks - n0), (
             name,
             kind,
         )
         assert accumulate == (1 if n0 else 0), (name, kind, n0)
+        assert finalize == (2 if n1 == blocks else 1), (name, kind, n1)
         covered.update(itertools.product(range(h0, h0 + hc), range(n0, n1)))
     assert covered == collections.Counter(itertools.product(range(h_kv), range(blocks)))
 
