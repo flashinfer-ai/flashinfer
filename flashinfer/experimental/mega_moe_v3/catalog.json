@@ -3112,7 +3112,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
    ],
-   "closure_sha256": "f18d3b8d906718af09de9b6e474069590fabca2a2436b59f5242a92671d4c21c",
+   "closure_sha256": "0c08e83457a374277936448a8f014fe2464612e9131f37c8e6f6144efd8b29cf",
    "compile_flags": [
     "--use_fast_math",
     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a",
