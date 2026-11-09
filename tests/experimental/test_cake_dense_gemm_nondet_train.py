@@ -14313,6 +14313,111 @@ def test_k1_dgrad_rows_bind_their_plan(monkeypatch, arch):
         assert cake_backend._k1_dgrad_knobs_of(G, W, out) == (), sms
 
 
+#: The rows of :data:`K1_DGRAD_PROMO_RANGES_BY_SM` (148-SM ``sm_100a``, BF16 out, 16172 to 16384 tokens).
+K1_DGRAD_PROMO_ROWS = (
+    (4096, 512),
+    (4096, 1024),
+    (5120, 512),
+    (5120, 1024),
+    (6144, 576),
+)
+
+
+def test_k1_dgrad_promo_ranges_bind_the_promoted_plan(monkeypatch):
+    """:data:`K1_DGRAD_PROMO_RANGES_BY_SM` holds the BF16 input-gradient rows of :data:`K1_DGRAD_PROMO_ROWS` on
+    148-SM ``sm_100a`` parts from 16172 to 16384 tokens with the TMA L2 promotion of 256 bytes.  :func:`k1_dgrad_knobs`
+    gives that ``promo`` inside the range only (BF16 out, exactly 148 SMs), and
+    ``cake_dense_gemm_nondet_train_projection_dgrad()`` binds the deterministic plan of the row with it -- every field
+    of that plan, which promotes none, but the promotion, so the same program, grid and bits -- and the deterministic
+    plan outside the range.  The generic prepare routes a row of the range to the input-gradient entry point and names
+    the table and no template (a launch parameter, not a program); an operand without a unit stride on its last axis
+    and another SM count get no knobs."""
+    table = cake_backend.K1_DGRAD_PROMO_RANGES_BY_SM
+    assert table == {
+        ("sm_100a", 148): {
+            (K, N, "bf16"): ((16172, 16384, "l2_256b"),) for K, N in K1_DGRAD_PROMO_ROWS
+        }
+    }
+    _cpu_k1_launches(monkeypatch, "sm_100a")
+    facts = dataclasses.replace(det_backend.device_facts(), sm_count=148)
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16 = torch.bfloat16
+    rules = cake_backend.K1_DGRAD_RULES_BY_SM[("sm_100a", 148)]
+
+    def bound_plan(G, W, out):
+        cake_backend._K1_DET_CACHE.clear()
+        assert (
+            cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(G, W, out) is out
+        )
+        ((key, entry),) = cake_backend._K1_DET_CACHE.items()
+        assert key[2][0] == ("dgrad",) and entry.k1 is not None
+        return entry.plan
+
+    for K, N in K1_DGRAD_PROMO_ROWS:
+        W = torch.empty(N, K, dtype=bf16)
+        for T in (16171, 16172, 16231, 16300, 16384, 16385):
+            inside = 16172 <= T <= 16384
+            G = torch.empty(T, N, dtype=bf16)
+            for f32 in (False, True):
+                what = (K, N, T, f32)
+                out = torch.empty(T, K, dtype=torch.float32 if f32 else bf16)
+                program = rules.get((K, N, T, "f32" if f32 else "bf16"))
+                if program:
+                    want = cake_backend.k1_program_knobs(program)
+                else:
+                    want = (("promo", "l2_256b"),) if inside and not f32 else ()
+                knobs = cake_backend.k1_dgrad_knobs(
+                    arch="sm_100a", sm_count=148, K=K, N=N, T=T, out_f32=f32
+                )
+                assert knobs == want, what
+                assert cake_backend._k1_dgrad_knobs_of(G, W, out) == want, what
+                for arch, sms in (("sm_100a", 152), ("sm_103a", 152), ("sm_107a", 212)):
+                    other = cake_backend.k1_dgrad_knobs(
+                        arch=arch, sm_count=sms, K=K, N=N, T=T, out_f32=f32
+                    )
+                    assert "promo" not in dict(other), (what, arch, sms)
+                if f32:
+                    continue  # FP32 out: the other input-gradient tables of the part
+                plain = det_backend._k1_plan(G, W, out, transposed_out=False, knobs={})[
+                    0
+                ]
+                plan = bound_plan(G, W, out)
+                if not inside:
+                    assert plan == plain, what
+                    continue
+                assert plain.promo == "none" and plan.promo == "l2_256b", what
+                assert plan == dataclasses.replace(plain, promo="l2_256b"), what
+                routed = cake_backend._k1_table_call(G, W, out, False)
+                assert routed is not None and routed[:2] == (
+                    "K1_DGRAD_PROMO_RANGES_BY_SM",
+                    (K, N, T, "bf16"),
+                ), what
+                prepared = cake_backend.cake_dense_gemm_nondet_train_projection_prepare(
+                    G, W, out
+                )
+                assert isinstance(
+                    prepared, cake_backend.CakeDenseGemmNondetProgramLaunch
+                )
+                assert (prepared.table, prepared.template, prepared.own) == (
+                    "K1_DGRAD_PROMO_RANGES_BY_SM",
+                    None,
+                    False,
+                ), what
+        # an operand without a unit stride on its last axis: no knobs
+        G, out = torch.empty(16231, N, dtype=bf16), torch.empty(16231, K, dtype=bf16)
+        Wmn = torch.empty(K, N, dtype=bf16).t()
+        assert cake_backend._k1_dgrad_knobs_of(G, Wmn, out) == ()
+    # another SM count of the architecture: no knobs
+    K, N = K1_DGRAD_PROMO_ROWS[0]
+    G, W = torch.empty(16231, N, dtype=bf16), torch.empty(N, K, dtype=bf16)
+    out = torch.empty(16231, K, dtype=bf16)
+    for sms in (144, 147, 149, 152):
+        facts = dataclasses.replace(det_backend.device_facts(), sm_count=sms)
+        monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
+        assert cake_backend._k1_dgrad_knobs_of(G, W, out) == (), sms
+
+
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 def test_k1_dgrad_nvjet_rows_bind_the_nvjet_program(monkeypatch, arch):
     """``cake_dense_gemm_nondet_train_projection_dgrad()`` binds, for a row of :data:`K1_DGRAD_NVJET_RULES_BY_SM` on its
@@ -15172,6 +15277,50 @@ def test_gpu_k1_dgrad_rows_run_their_program_with_the_det_bits():
         f"K1_DGRAD_ROWS {arch} sm_count={sms}: {ran} rows ran their program with the deterministic bits"
     )
     assert ran == len(rows)
+
+
+def test_gpu_k1_dgrad_promo_ranges_keep_the_det_bits():
+    """On a part of a table of :data:`K1_DGRAD_PROMO_RANGES_BY_SM`: the input gradient of every row at the edges and
+    inside of each range binds the deterministic plan of the row with the range's TMA L2 promotion (the deterministic
+    plan's program), gives the deterministic package's input gradient bit for bit, meets the deterministic package's
+    budget against FP64 and repeats bit for bit over ``RERUNS`` calls into NaN-poisoned outputs.  A part without such
+    rows skips."""
+    device, arch, sms = _part_or_skip()
+    rows = cake_backend.K1_DGRAD_PROMO_RANGES_BY_SM.get((arch, sms), {})
+    if not rows:
+        pytest.skip(f"no K1 input-gradient promotion range of {arch} on {sms} SMs")
+    g = torch.Generator(device=device).manual_seed(SEED + 176)
+    ran = 0
+    for (K, N, dt), ranges in sorted(rows.items()):
+        out_dtype = torch.float32 if dt == "f32" else torch.bfloat16
+        W = _bf16((N, K), device, g)
+        for lo, hi, promo in ranges:
+            for T in sorted({lo, (lo + hi) // 2, hi}):
+                what = f"dgrad {K} {N} {T} {dt} promo {promo}"
+                G = _bf16((T, N), device, g)
+                cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
+                out = torch.full((T, K), float("nan"), device=device, dtype=out_dtype)
+
+                def run(dst, G=G, W=W):
+                    cake_backend.cake_dense_gemm_nondet_train_projection_dgrad(
+                        G, W, dst
+                    )
+
+                run(out)
+                torch.cuda.synchronize()
+                ((_, entry),) = cake_backend._K1_DET_CACHE.items()
+                assert entry.k1 is not None and entry.plan.promo == promo, what
+                det_out = torch.full_like(out, float("nan"))
+                det_backend.cake_dense_gemm_det_train_projection_dgrad(G, W, det_out)
+                torch.cuda.synchronize()
+                assert torch.equal(out, det_out), what
+                _k1_check(out, G.double() @ W.double(), what)
+                _repeats_into_nan(run, out, what)
+                ran += 1
+    print(
+        f"K1_DGRAD_PROMO {arch} sm_count={sms}: {ran} rows ran the promoted plan with the deterministic bits"
+    )
+    assert ran
 
 
 def test_gpu_k1_dgrad_nvjet_rows_keep_the_det_bits():

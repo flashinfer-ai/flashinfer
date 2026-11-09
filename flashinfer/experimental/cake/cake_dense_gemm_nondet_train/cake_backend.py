@@ -77,8 +77,8 @@ recomputed forward must reproduce its result, and where the deterministic plan o
 splits K across CTAs (its automatic two-way split), it adds the partials in a fixed order.  The K1 forward rows of
 :data:`K1_FORWARD_RULES_BY_SM` (exact token counts on 148-SM ``sm_100a`` and 152-SM ``sm_100a`` / ``sm_103a`` parts)
 run another plan of those programs (the single-CTA program, every tile's whole K in one CTA, or another named
-program), and the input-gradient rows of :data:`K1_DGRAD_RULES_BY_SM` another named program of that package (the
-deterministic plan's bits).  The K1 forward rows of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` run this package's one-wave
+program), the input-gradient rows of :data:`K1_DGRAD_RULES_BY_SM` another named program of that package and those of
+:data:`K1_DGRAD_PROMO_RANGES_BY_SM` its plan with another TMA L2 promotion (the deterministic plan's bits).  The K1 forward rows of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` run this package's one-wave
 forward program and the input-gradient rows of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` this package's input-gradient
 program: both add each output element's whole K in one ascending FP32 chain, with the deterministic plan's bits.  The
 input-gradient rows of :data:`K1_DGRAD_NVJET_RULES_BY_SM` launch this package's nvjet program on the deterministic
@@ -279,7 +279,8 @@ ROUTES: dict[str, str] = {
     "k1_kk": "det",  # forward: feeds the recompute of checkpointing; whole tiles or a fixed-order two-way K split (the
     # rows of K1_FORWARD_RULES_BY_SM: another plan of the deterministic programs, whole K per tile)
     "k1_kn": "det",  # input gradient: whole tiles or a fixed-order two-way K split (the rows of
-    # K1_DGRAD_RULES_BY_SM: another program of the deterministic package, the same bits)
+    # K1_DGRAD_RULES_BY_SM: another program of the deterministic package, of K1_DGRAD_PROMO_RANGES_BY_SM: its plan
+    # with another TMA L2 promotion; the same bits)
     "k1_nk": "det",
     "k1_nn": "atomic",  # weight gradient: split-K over the ragged token count; the rows of the tables repeat bit for
     # bit (two splits, the cluster program, one split, a fixed split order) but the four-split arrival-order rows of
@@ -1786,6 +1787,44 @@ K1_DGRAD_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]
 }
 # fmt: on
 
+#: The K1 input-gradient rows of this package that run the deterministic plan of the row with another TMA L2
+#: promotion of its operands, ``(arch, sm_count) -> {(K, N, out_dtype): ((lo, hi, promo), ...)}``: on a part of
+#: exactly ``sm_count`` SMs, :func:`cake_dense_gemm_nondet_train_projection_dgrad` of ``G[T, N]`` and ``W[N, K]``
+#: (both with a unit stride on their last axis) into an ``out[T, K]`` of ``out_dtype`` at ``lo <= T <= hi`` tokens
+#: runs the deterministic planner's plan of the row with the planner knob ``promo`` (:func:`k1_dgrad_knobs`), a launch
+#: parameter of that plan: the same program, grid and raster, so the deterministic plan's bits.  A row of
+#: :data:`K1_DGRAD_RULES_BY_SM` comes first; every other part, row, token count, layout and output dtype keeps the
+#: deterministic plan.  On 148-SM ``sm_100a`` parts the BF16 rows ``4096 / 5120 -> 512 / 1024`` and ``6144 -> 576``
+#: from 16172 to 16384 tokens promote 256 bytes (the deterministic plan of these rows promotes none).  Measured on one
+#: B200 part at 16172, 16231 and 16384 tokens, 17 paired groups in eager launches and in CUDA graph replays, against
+#: the deterministic plan in the same process: 0.979 to 0.997 times its time (``4096 -> 512`` 0.980 to 0.987,
+#: ``5120 -> 512`` 0.978 to 0.983, the other three rows 0.994 to 0.997), faster in 15 to 17 of 17 groups, the same
+#: kernel and grid, the same bits on 20 launches; at 16172 and 16384 tokens on a second GPU of the part 0.976 to 0.998
+#: times its time, faster in 15 to 17 of 17 groups.
+# fmt: off
+K1_DGRAD_PROMO_RANGES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, str], tuple[tuple[int, int, str], ...]]] = {
+    ("sm_100a", 148): {
+        (K, N, "bf16"): ((16172, 16384, "l2_256b"),)
+        for K, N in ((4096, 512), (4096, 1024), (5120, 512), (5120, 1024), (6144, 576))
+    },
+}
+# fmt: on
+
+
+def k1_dgrad_promo(
+    *, arch: str, sm_count: int, K: int, N: int, T: int, out_f32: bool
+) -> Optional[str]:
+    """The TMA L2 promotion of the input gradient ``out[T, K] = G[T, N] @ W[N, K]`` on a device of exactly
+    ``sm_count`` SMs (``out`` FP32 when ``out_f32``, else BF16): that of the row's range in the table of
+    :data:`K1_DGRAD_PROMO_RANGES_BY_SM` for ``(arch, sm_count)`` that holds ``T``, or ``None``."""
+    ranges = K1_DGRAD_PROMO_RANGES_BY_SM.get((arch, int(sm_count)), {}).get(
+        (int(K), int(N), "f32" if out_f32 else "bf16"), ()
+    )
+    for lo, hi, promo in ranges:
+        if lo <= int(T) <= hi:
+            return promo
+    return None
+
 
 def k1_dgrad_knobs(
     *, arch: str, sm_count: int, K: int, N: int, T: int, out_f32: bool
@@ -1793,22 +1832,33 @@ def k1_dgrad_knobs(
     """The deterministic package's planner knobs of the input gradient ``out[T, K] = G[T, N] @ W[N, K]`` of this
     package on a device of exactly ``sm_count`` SMs (``out`` FP32 when ``out_f32``, else BF16): those of the program of
     the row's entry in the table of :data:`K1_DGRAD_RULES_BY_SM` for ``(arch, sm_count)`` at exactly ``T`` tokens
-    (:func:`k1_program_knobs`), or ``()`` -- the deterministic plan."""
+    (:func:`k1_program_knobs`), else the ``promo`` of the row's range of :data:`K1_DGRAD_PROMO_RANGES_BY_SM`
+    (:func:`k1_dgrad_promo`), or ``()`` -- the deterministic plan."""
     program = K1_DGRAD_RULES_BY_SM.get((arch, int(sm_count)), {}).get(
         (int(K), int(N), int(T), "f32" if out_f32 else "bf16")
     )
-    return k1_program_knobs(program) if program else ()
+    if program:
+        return k1_program_knobs(program)
+    promo = k1_dgrad_promo(arch=arch, sm_count=sm_count, K=K, N=N, T=T, out_f32=out_f32)
+    return (("promo", promo),) if promo else ()
 
 
 def _k1_dgrad_knobs_of(G: torch.Tensor, W: torch.Tensor, out: torch.Tensor) -> tuple:
     """:func:`k1_dgrad_knobs` of the input-gradient call ``(G, W, out)`` on ``out``'s device; ``()`` (the
-    deterministic plan) without a row of :data:`K1_DGRAD_RULES_BY_SM` of the call's shape and output dtype, and for an
-    operand without a unit stride on its last axis.  The device is read only for a shape of the table."""
+    deterministic plan) without a row of :data:`K1_DGRAD_RULES_BY_SM` or :data:`K1_DGRAD_PROMO_RANGES_BY_SM` of the
+    call's shape and output dtype, and for an operand without a unit stride on its last axis.  The device is read only
+    for a shape of the tables."""
     if G.dim() != 2 or W.dim() != 2 or out.dtype not in (torch.bfloat16, torch.float32):
         return ()
     K, N, T = int(W.shape[1]), int(W.shape[0]), int(G.shape[0])
-    key = (K, N, T, "f32" if out.dtype == torch.float32 else "bf16")
-    if not any(key in rows for rows in K1_DGRAD_RULES_BY_SM.values()):
+    dt = "f32" if out.dtype == torch.float32 else "bf16"
+    if not any(
+        (K, N, T, dt) in rows for rows in K1_DGRAD_RULES_BY_SM.values()
+    ) and not any(
+        lo <= T <= hi
+        for rows in K1_DGRAD_PROMO_RANGES_BY_SM.values()
+        for lo, hi, _ in rows.get((K, N, dt), ())
+    ):
         return ()
     if G.stride(1) != 1 or W.stride(1) != 1:
         return ()
@@ -6690,7 +6740,7 @@ def _k1_table_call(
     PDL flag; or ``None``.  ``A`` and ``B`` K-major into ``out`` -- the forward ``(X, W) = (A, B.T)`` -- on a row of
     :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` or :data:`K1_FORWARD_RULES_BY_SM`; ``A`` K-major and ``B`` MN-major into
     ``out`` -- the input gradient ``(G, W) = (A, B)`` -- on a row of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`,
-    :data:`K1_DGRAD_NVJET_RULES_BY_SM` or :data:`K1_DGRAD_RULES_BY_SM`; both MN-major into the transposed ``out`` --
+    :data:`K1_DGRAD_NVJET_RULES_BY_SM`, :data:`K1_DGRAD_RULES_BY_SM` or :data:`K1_DGRAD_PROMO_RANGES_BY_SM`; both MN-major into the transposed ``out`` --
     the weight gradient ``(G, X) = (B, A.T)`` -- on a row of :data:`K1_WGRAD_SK_RULES_BY_SM`.  The call runs the
     program and gives the bits of :func:`cake_dense_gemm_nondet_train_projection_forward` / ``_dgrad`` / ``_wgrad``.
     The device is read only for a shape of a table."""
@@ -6722,7 +6772,13 @@ def _k1_table_call(
         elif _k1_dgrad_nvjet_of(G, W, out) is not None:
             table = "K1_DGRAD_NVJET_RULES_BY_SM"
         elif _k1_dgrad_knobs_of(G, W, out):
-            table = "K1_DGRAD_RULES_BY_SM"
+            facts = deterministic_backend().device_facts(out.device)
+            rules = K1_DGRAD_RULES_BY_SM.get((facts.arch, int(facts.sm_count)), {})
+            table = (
+                "K1_DGRAD_RULES_BY_SM"
+                if key in rules
+                else "K1_DGRAD_PROMO_RANGES_BY_SM"
+            )
         else:
             return None
         return (
@@ -6757,7 +6813,8 @@ def _k1_program_launch(
 ) -> CakeDenseGemmNondetProgramLaunch:
     """The prepared launch ``launch`` of the row ``key`` of the program table named ``table`` on ``out``'s device, with
     the template the row names: this package's, or the deterministic package's for a program symbol of its tables
-    (``None`` for the knobs of a row of :data:`K1_FORWARD_RULES_BY_SM` that name no program)."""
+    (``None`` for the knobs of a row of :data:`K1_FORWARD_RULES_BY_SM` that name no program and for a row of
+    :data:`K1_DGRAD_PROMO_RANGES_BY_SM`)."""
     det = deterministic_backend()
     facts = det.device_facts(out.device)
     rows = globals()[table].get((facts.arch, int(facts.sm_count)), {})
@@ -7090,7 +7147,8 @@ def cake_dense_gemm_nondet_train_projection_dgrad(
     :data:`K1_DGRAD_PROGRAM_RULES_BY_SM` for the device, which runs this package's input-gradient program (the same
     bits), on a row of :data:`K1_DGRAD_NVJET_RULES_BY_SM`, which runs this package's nvjet program on the deterministic
     package's plan of :data:`K1_DGRAD_NVJET_DET_PROGRAM` (the same bits), and on a row of
-    :data:`K1_DGRAD_RULES_BY_SM` for the device, which runs the table's program of the deterministic package
+    :data:`K1_DGRAD_RULES_BY_SM` for the device, which runs the table's program of the deterministic package, and in a
+    range of :data:`K1_DGRAD_PROMO_RANGES_BY_SM`, which runs the deterministic plan with the range's TMA L2 promotion
     (:func:`k1_dgrad_knobs`; the same bits as the deterministic plan, every run).  ``enable_pdl`` as for
     :func:`cake_dense_gemm_nondet_train_projection`."""
     if out is None:
