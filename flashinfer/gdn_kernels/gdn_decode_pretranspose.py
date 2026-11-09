@@ -912,9 +912,9 @@ def _decode_launch_config(
 ) -> tuple:
     """(num_stages, blocks_per_state) for the pipelined pretranspose kernel.
 
-    SM107 needs more bytes in flight per CTA once there are enough states to
-    fill the GPU; elsewhere few states want more CTAs per state and many want
-    fewer. Each CTA owns V // TILE_V // blocks_per_state tiles with no tail.
+    Few states want more CTAs per state on every architecture; many states
+    want a deeper pipeline and fewer CTAs per state only on CC 10.x (SM120
+    regresses). Each CTA owns V // TILE_V // blocks_per_state tiles with no tail.
     """
     num_states = B * HV
     num_v_tiles = V // TILE_V
@@ -926,7 +926,7 @@ def _decode_launch_config(
         return NUM_STAGES, NUM_BLOCKS_PER_STATE
     if num_states <= 64 and num_v_tiles % 16 == 0:
         return NUM_STAGES, 16
-    if num_states < 384:
+    if num_states < 384 or major != 10:
         return NUM_STAGES, NUM_BLOCKS_PER_STATE
     return 3, 4
 
@@ -1049,7 +1049,6 @@ def run_pretranspose_decode(
     num_stages, blocks_per_state = _decode_launch_config(
         target.major, target.minor, B, HV, V
     )
-    assert num_stages >= 2, "pretranspose decode pipeline needs at least 2 stages"
     assert (V // TILE_V) % blocks_per_state == 0, (
         f"V={V} is not covered by blocks_per_state={blocks_per_state}"
     )
