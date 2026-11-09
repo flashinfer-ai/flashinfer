@@ -1483,7 +1483,13 @@ _FFI_DEVICES: dict[int, Any] = {}
 
 
 def _ffi_stream_context(index: int):
-    """tvm-ffi environment-stream context for torch's current stream on device ``index``."""
+    """tvm-ffi environment-stream context for torch's current stream on device ``index``.
+
+    A binding call that receives a torch tensor needs none: tvm-ffi binds the call to torch's current stream of
+    that tensor's device (a side stream or a capture stream alike) and restores the environment stream after it,
+    so the launches over torch tensors run without it.  A launch whose operands are all converted tvm-ffi views
+    (:func:`_ffi_values`: the NoPE forward's pre-bound launches) has no tensor to take the stream from and runs
+    inside this context, as do the prepared runner's launches."""
     device = _FFI_DEVICES.get(index)
     if device is None:
         device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
@@ -2451,20 +2457,21 @@ class _Binding:
         self.topk_length = topk_length
 
     def _run(self, values: dict[str, Any], keys: tuple) -> None:
+        """The stage launches of ``keys`` over ``values``, whose tensors are torch tensors: each binding call runs on
+        torch's current stream without an FFI stream context (:func:`_ffi_stream_context`)."""
         plan = self.plan
-        with _ffi_stream_context(plan.device_index):
-            for key in keys:
-                if isinstance(key, tuple):
-                    stage, chunk, index = key
-                    e = plan.entries[(stage, chunk)]
-                    e.launcher(
-                        e.run,
-                        dict(values, **plan.pass_overrides[chunk][index]),
-                        e.grid,
-                    )
-                else:
-                    e = plan.entries[key]
-                    e.launcher(e.run, values, e.grid)
+        for key in keys:
+            if isinstance(key, tuple):
+                stage, chunk, index = key
+                e = plan.entries[(stage, chunk)]
+                e.launcher(
+                    e.run,
+                    dict(values, **plan.pass_overrides[chunk][index]),
+                    e.grid,
+                )
+            else:
+                e = plan.entries[key]
+                e.launcher(e.run, values, e.grid)
 
     def forward(self, q_latent, q_rope, kv_latent, k_rope, indices, topk_length):
         T, device = self.plan.num_queries, q_latent.device
@@ -3204,10 +3211,11 @@ class _RopeVarlenBinding(_Binding):
         indices: torch.Tensor,
         lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Issue both launches of one call in one FFI stream context: the index-preparation stage -- the compacted
-        rows into ``indices``, the valid counts into ``lengths``, ``length_in`` as the caller's cut -- then the
-        forward over them into fresh ``(out, lse, o_lo)`` (the allocations of :meth:`_Binding.forward`), which it
-        returns for :class:`CakeDSASparseAttentionNondetFunction`."""
+        """Issue both launches of one call: the index-preparation stage -- the compacted rows into ``indices``, the
+        valid counts into ``lengths``, ``length_in`` as the caller's cut -- then the forward over them into fresh
+        ``(out, lse, o_lo)`` (the allocations of :meth:`_Binding.forward`), which it returns for
+        :class:`CakeDSASparseAttentionNondetFunction`.  Both pass torch tensors, so each runs on torch's current
+        stream without an FFI stream context (:func:`_ffi_stream_context`)."""
         plan, prep = self.plan, self.prep
         T, device = plan.num_queries, q_latent.device
         entry = prep.entry
@@ -3220,28 +3228,27 @@ class _RopeVarlenBinding(_Binding):
             length_in,
             in_place=self.rows_in_place,
         )
-        with _ffi_stream_context(plan.device_index):
-            entry.launcher(entry.run, values, entry.grid)
-            out = _alloc((T, NUM_HEADS, D_LATENT), torch.bfloat16, device)
-            lse = _alloc((T, NUM_HEADS), torch.float32, device)
-            o_lo = _alloc((T, NUM_HEADS, D_LATENT), torch.bfloat16, device)
-            values = _bound_values(
-                plan,
-                dict(
-                    q_latent=q_latent,
-                    q_rope=q_rope,
-                    kv_latent=kv_latent,
-                    k_rope=k_rope,
-                    indices=indices,
-                    topk_length=lengths,
-                    out=out,
-                    lse=lse,
-                    o_lo=o_lo,
-                ),
-            )
-            for stage in FORWARD_STAGES:  # the forward has no key-range passes
-                e = plan.entries[stage]
-                e.launcher(e.run, values, e.grid)
+        entry.launcher(entry.run, values, entry.grid)
+        out = _alloc((T, NUM_HEADS, D_LATENT), torch.bfloat16, device)
+        lse = _alloc((T, NUM_HEADS), torch.float32, device)
+        o_lo = _alloc((T, NUM_HEADS, D_LATENT), torch.bfloat16, device)
+        values = _bound_values(
+            plan,
+            dict(
+                q_latent=q_latent,
+                q_rope=q_rope,
+                kv_latent=kv_latent,
+                k_rope=k_rope,
+                indices=indices,
+                topk_length=lengths,
+                out=out,
+                lse=lse,
+                o_lo=o_lo,
+            ),
+        )
+        for stage in FORWARD_STAGES:  # the forward has no key-range passes
+            e = plan.entries[stage]
+            e.launcher(e.run, values, e.grid)
         return out, lse, o_lo
 
 
@@ -4153,8 +4160,9 @@ class _NopeBinding(_Binding):
     ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple[_Launch, ...]]:
         """``((out, lse, o_lo), launches)``: as :meth:`prepared_forward`, with every tensor operand converted to its
         tvm-ffi view now and the forward's stage entries bound to those values.  Each launch, issued by the caller
-        inside its own FFI stream context, costs one binding call and nothing else: the packed entry issues the
-        forward this way right after the index-preparation launch."""
+        inside its own FFI stream context (no operand is a torch tensor to take the stream from), costs one binding
+        call and nothing else: the packed entry issues the forward this way right after the index-preparation
+        launch."""
         (out, lse, o_lo), values = self._forward_values(
             q_latent, kv_latent, indices, topk_length, extra
         )
@@ -4179,7 +4187,8 @@ class _NopeBinding(_Binding):
         return outputs
 
     def _launch_stages(self, values: dict[str, Any], keys: tuple) -> None:
-        """The stage launches of ``keys`` over ``values``, inside the caller's FFI stream context."""
+        """The stage launches of ``keys`` over ``values`` (torch tensors: each binding call runs on torch's current
+        stream, :meth:`_Binding._run`)."""
         plan = self.plan
         for key in keys:
             if isinstance(key, tuple):
@@ -4269,10 +4278,9 @@ class _NopeBinding(_Binding):
             if plan.dkv_direct:
                 fills.append(dkv)
         values = _bound_values_nope(plan, t)
-        with _ffi_stream_context(plan.device_index):
-            for buffer in fills:
-                buffer.zero_()
-            self._launch_stages(values, plan.backward_order)
+        for buffer in fills:
+            buffer.zero_()
+        self._launch_stages(values, plan.backward_order)
         return dq, dkv
 
     def backward(
@@ -5313,10 +5321,10 @@ def _index_prep_launch(
     flat: bool = False,
     num_kv: Optional[int] = None,
 ) -> _Launch:
-    """The bound launch (not yet issued; the caller provides the FFI stream context) of one index-preparation
-    stage call over the index rows ``gather_kv_indices`` (int32 ``[T, K_slots]``, ``T >= 1``, any row stride, on a
-    device the stage serves): the global key rows (invalid slots ``-1``) go to the caller's contiguous int32
-    ``out [T, K_slots]``, the row lengths to the caller's int32 ``topk_length [T]``.
+    """The bound launch (not yet issued; its operands are torch tensors, so it needs no FFI stream context) of one
+    index-preparation stage call over the index rows ``gather_kv_indices`` (int32 ``[T, K_slots]``, ``T >= 1``,
+    any row stride, on a device the stage serves): the global key rows (invalid slots ``-1``) go to the caller's
+    contiguous int32 ``out [T, K_slots]``, the row lengths to the caller's int32 ``topk_length [T]``.
 
     Modes.  Document mode (``flat=False``): row ``t`` belongs to the last document ``n`` with ``cu_seqlens_q[n] <=
     t``; a slot is valid iff ``0 <= idx <= bound`` with the query's own key position as the bound under ``causal``
@@ -5364,7 +5372,7 @@ def _launch_index_prep(
     flat: bool = False,
     num_kv: Optional[int] = None,
 ) -> None:
-    """:func:`_index_prep_launch` issued inside the FFI stream context of the index rows' device."""
+    """:func:`_index_prep_launch` issued now, on torch's current stream of the index rows' device."""
     launch = _index_prep_launch(
         arch,
         gather_kv_indices,
@@ -5378,8 +5386,7 @@ def _launch_index_prep(
         flat=flat,
         num_kv=num_kv,
     )
-    with _ffi_stream_context(_device_index(gather_kv_indices.device)):
-        launch()
+    launch()
 
 
 def _require_index_prep_stage() -> None:

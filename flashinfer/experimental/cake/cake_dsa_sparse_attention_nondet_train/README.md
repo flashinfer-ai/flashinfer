@@ -289,7 +289,13 @@ when that variable is set; least recently used first out; a plan owns only the
 full-length `topk_length` vector it materializes when the caller passes none)
 and, per call, allocate the outputs
 and the backward scratch from the caching allocator and launch the stages
-through the generated positional launchers of `cake_launch.py`.  During
+through the generated positional launchers of `cake_launch.py`.  Every launch
+runs on torch's current stream of the tensors' device, a side stream or a
+capture stream alike: a launch that passes torch tensors needs no stream
+context, since tvm-ffi binds each binding call to that stream; the NoPE
+forward's pre-bound launches (operands converted to tvm-ffi views ahead of the
+stage launch) and the prepared runner issue theirs inside an explicit tvm-ffi
+stream context.  During
 CUDA-graph capture the eager entry points never store a plan in the cache;
 they reuse a cached plan only when it owns no `topk_length` vector (the call
 passes its own lengths, as the autograd entries do), since such a plan holds

@@ -8797,3 +8797,263 @@ def test_nope_selective_offload_of_one_of_two_same_geometry_layers(
     torch.cuda.synchronize()
     for layer, out in enumerate(outs):
         _assert_same_results((out.detach(), grads[2 * layer : 2 * layer + 2]), want)
+
+
+# --- streams: every launch runs on torch's current stream; a launch over torch tensors takes it from its arguments
+# through tvm-ffi, a launch over converted operands alone from an explicit FFI stream context ---
+
+
+def test_only_launches_over_converted_operands_run_inside_an_ffi_stream_context(
+    monkeypatch,
+):
+    """A launch with a torch tensor among its arguments runs outside any FFI stream context -- tvm-ffi binds the
+    call to torch's current stream from that tensor -- and a launch whose operands are all converted tvm-ffi views
+    runs inside one.  On the stand-in programs the rope varlen stage route, the flat rope entry, the NoPE one-launch
+    route, every backward and the stage helpers enter no context; the NoPE preparation routes (the flat entry with
+    the slot limit at 0, the varlen entry with caller lengths) issue the stage launch and the pre-bound forward,
+    which has no torch tensor argument, inside one context."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    # a converted operand is opaque to the recording entries: a launch over converted operands alone has no tensor
+    monkeypatch.setattr(
+        cake_backend, "_ffi_tensor", lambda tensor: SimpleNamespace(converted=tensor)
+    )
+
+    class Context:
+        def __init__(self, index):
+            self.index = index
+
+        def __enter__(self):
+            calls.append(("enter", {}))
+
+        def __exit__(self, *exc):
+            calls.append(("exit", {}))
+
+    monkeypatch.setattr(cake_backend, "_ffi_stream_context", Context)
+
+    def launches():
+        """``(stage, inside a context, a torch tensor among its arguments)`` of every launch in ``calls``."""
+        inside, seen = False, []
+        for stage, args in calls:
+            if stage in ("enter", "exit"):
+                inside = stage == "enter"
+            else:
+                tensor = any(isinstance(v, torch.Tensor) for v in args.values())
+                seen.append((stage, inside, tensor))
+        return seen
+
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    S = int(cu_k[-1])
+    rope = [t.requires_grad_() for t in _rope_device_inputs(T, S, K)[:4]]
+    q, kv, _ = _nope_host_inputs(total_q=T, total_k=S, topk=K, device="cuda")
+    q.requires_grad_()
+    rows = offset_gather_kv_indices(local, cu_q, cu_k)
+    mine = torch.full((T,), 2, dtype=torch.int32, device="cuda")
+    nope = cake_backend.cake_dsa_sparse_attention_nondet_nope
+    nope_varlen = cake_backend.cake_dsa_sparse_attention_nondet_nope_varlen
+    limit = cake_backend.NOPE_CONVERT_SLOT_LIMIT
+    prebound = [(NOPE_INDEX_PREP_STAGE, True, True), ("nope_fwd", True, False)]
+    steps = (
+        (
+            limit,
+            lambda: cake_backend.cake_dsa_sparse_attention_nondet_varlen(
+                *rope, local, cu_q, cu_k, causal=True
+            ),
+            rope[0],
+            [(NOPE_INDEX_PREP_STAGE, False, True), ("fwd", False, True)],
+        ),
+        (
+            limit,
+            lambda: cake_backend.cake_dsa_sparse_attention_nondet(*rope, rows),
+            rope[0],
+            [("fwd", False, True)],
+        ),
+        (limit, lambda: nope(q, kv, rows), q, [("nope_fwd", False, True)]),
+        (0, lambda: nope(q, kv, rows), q, prebound),
+        (
+            limit,
+            lambda: nope_varlen(
+                q, kv, local, cu_q, cu_k, causal=True, topk_length=mine
+            ),
+            q,
+            prebound,
+        ),
+    )
+    for slot_limit, call, leaf, forward in steps:
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", slot_limit)
+        del calls[:]
+        out = call()
+        assert launches() == forward, calls
+        events = [c[0] for c in calls]
+        if forward is prebound:
+            assert events == ["enter", NOPE_INDEX_PREP_STAGE, "nope_fwd", "exit"]
+        else:
+            assert "enter" not in events, events
+        del calls[:]
+        torch.autograd.grad(out, (leaf,), torch.ones_like(out))
+        backward = launches()
+        assert backward and all(
+            not inside and tensor for _, inside, tensor in backward
+        ), backward
+    for helper in (
+        lambda: cake_backend.nope_globalize_indices(local, cu_q, cu_k, causal=True),
+        lambda: cake_backend.nope_compact_indices(rows, S),
+    ):
+        del calls[:]
+        helper()
+        assert launches() == [(NOPE_INDEX_PREP_STAGE, False, True)], calls
+
+
+# ``torch.cuda._sleep`` cycles that hold a side stream far longer than the host takes to issue one warm step
+SIDE_STREAM_SLEEP_CYCLES = 200_000_000
+
+
+def _record_launch_streams(monkeypatch) -> list:
+    """Wrap every generated launcher so that each launch appends ``(stage, raw handle of torch's current stream)``
+    to the returned list; the binding cache is made private, so every binding of the test is planned over the
+    wrappers."""
+    streams = []
+    for stage, real in list(cake_launch.LAUNCH.items()):
+
+        def launch(run, values, grid, _real=real, _stage=stage):
+            streams.append((_stage, torch.cuda.current_stream().cuda_stream))
+            return _real(run, values, grid)
+
+        monkeypatch.setitem(cake_launch.LAUNCH, stage, launch)
+    _private_binding_cache(monkeypatch)
+    return streams
+
+
+def _late_on_a_side_stream(sources: dict, run):
+    """``(run(buffers), stream)``: ``run`` issued on a fresh side stream whose inputs arrive late -- the stream
+    sleeps, then copies ``sources`` into ``buffers``, fresh tensors of their layout that hold values no launch may
+    read until then (NaN, or ``-1`` index rows) -- so a launch on any other stream of the device reads the stale
+    buffers.  Returns once the device is idle."""
+    buffers = {
+        name: torch.full_like(
+            t, float("nan") if t.is_floating_point() else -1
+        ).requires_grad_(t.requires_grad)
+        for name, t in sources.items()
+    }
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(SIDE_STREAM_SLEEP_CYCLES)
+        with torch.no_grad():
+            for name, t in sources.items():
+                buffers[name].copy_(t)
+        results = run(buffers)
+    torch.cuda.synchronize()
+    return results, stream
+
+
+SIDE_STREAM_CASES = (
+    ("nope_varlen", None),
+    ("nope_flat", None),
+    ("nope_flat", 0),
+    ("rope", None),
+    ("rope_varlen", None),
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "slot_limit"),
+    SIDE_STREAM_CASES,
+    ids=[n + ("" if s is None else "+index_prep") for n, s in SIDE_STREAM_CASES],
+)
+def test_autograd_entries_launch_on_the_callers_side_stream(
+    monkeypatch, name, slot_limit
+):
+    """Forward + backward of every autograd entry issued on a side stream whose inputs arrive late (the stream
+    sleeps, then writes them) give the default-stream step's ``out`` and query gradients bitwise and its key
+    gradients within the atomics spread, with the same launches in the same order, each issued while that stream is
+    torch's current stream -- the backward's on autograd's device thread too.  A launch on any other stream would
+    read the stale inputs: the launches over torch tensors take the stream through tvm-ffi, the pre-bound forward of
+    the NoPE preparation route (the flat entry with the slot limit at 0) from its explicit context.  The rope varlen
+    entry takes the stage route."""
+    inp = _ckpt_inputs()
+    stage_route = name == "rope_varlen" or slot_limit is not None
+    if stage_route:
+        _require_nope_compacting_stage()
+    if slot_limit is not None:
+        monkeypatch.setattr(cake_backend, "NOPE_CONVERT_SLOT_LIMIT", slot_limit)
+    streams = _record_launch_streams(monkeypatch)
+    fn, leaves, _ = _ckpt_entry(name, inp)
+    want = _eager_step(fn, leaves, inp.dout, None)
+    stages = [stage for stage, _ in streams]
+    assert {s for _, s in streams} == {torch.cuda.current_stream().cuda_stream}
+    assert any(stage.endswith("bwd_delta") for stage in stages), stages
+    if stage_route:
+        assert stages[0] == NOPE_INDEX_PREP_STAGE, stages
+    late = ("q", "kv", "q_rope", "k_rope", "dout", "idx")
+
+    def step(buffers):
+        side = SimpleNamespace(**{**vars(inp), **buffers})
+        side_fn, side_leaves, _ = _ckpt_entry(name, side)
+        out = side_fn(*side_leaves)
+        grads = torch.autograd.grad(out, side_leaves, side.dout, allow_unused=True)
+        return out.detach(), grads
+
+    del streams[:]
+    got, stream = _late_on_a_side_stream({n: getattr(inp, n) for n in late}, step)
+    assert [stage for stage, _ in streams] == stages
+    assert {s for _, s in streams} == {stream.cuda_stream}, streams
+    _assert_same_results(got, want[:2])
+
+
+@pytest.mark.parametrize(
+    "form", CKPT_ACC_FORMS, ids=lambda form: f"dkv_acc[{form}]" if form else "fresh"
+)
+@pytest.mark.parametrize("name", CKPT_ENTRIES)
+def test_autograd_entries_capture_the_first_call_of_a_new_geometry(
+    monkeypatch, name, form
+):
+    """The first call of a geometry captured into a CUDA graph -- every binding of the step planned during the
+    capture, privately and not stored, after the entry has run eagerly on another geometry only -- replays twice to
+    the eager step that follows: ``out`` and the query gradients bitwise, the key gradients and the accumulator
+    (zero-filled inside the graph) within the atomics spread, without an accumulator and with its tensor and
+    callable forms.  Every launch of the capture runs on the capture stream, torch's current stream there."""
+    inp = _ckpt_inputs()
+    _private_binding_cache(monkeypatch)
+    cache = cake_backend.BINDING_CACHE
+    n = 512
+    other = SimpleNamespace(
+        q=inp.q[:n],
+        kv=inp.kv[:n],
+        q_rope=inp.q_rope[:n],
+        k_rope=inp.k_rope[:n],
+        dout=inp.dout[:n],
+        idx=inp.idx[:n],
+        cu=inp.cu.new_tensor([0, n]),
+        dst_map=inp.dst_map[:n],
+    )
+    # one eager step on another geometry: the loaded modules, the per-device constants, autograd's device thread
+    other_fn, other_leaves, other_acc = _ckpt_entry(name, other, acc_form=form)
+    try:
+        _eager_step(other_fn, other_leaves, other.dout, other_acc)
+    except DEFERRED_FORM_ERRORS as exc:
+        if form == "callable":
+            _skip_if_deferred_form_unsupported(exc)
+        raise
+    warm = len(cache)
+    fn, leaves, acc = _ckpt_entry(name, inp, acc_form=form)
+    # fresh leaves, first used on the capture stream (a leaf's AccumulateGrad node records the stream of its first
+    # use)
+    captured_leaves = tuple(t.detach().clone().requires_grad_() for t in leaves)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        if acc is not None:
+            acc.zero_()
+        out = fn(*captured_leaves)
+        grads = torch.autograd.grad(out, captured_leaves, inp.dout, allow_unused=True)
+    assert len(cache) == warm  # the capture stored nothing
+    for _ in range(2):
+        graph.replay()
+    torch.cuda.synchronize()
+    got = (out.detach().clone(), tuple(None if g is None else g.clone() for g in grads))
+    acc_got = None if acc is None else acc.clone()
+    out_e, grads_e, acc_e = _eager_step(fn, leaves, inp.dout, acc)
+    assert len(cache) > warm  # the eager step stores what the capture planned privately
+    _assert_same_results(got, (out_e, grads_e), acc_got=acc_got, acc_want=acc_e)
