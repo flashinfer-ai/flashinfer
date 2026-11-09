@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant MoE backend of the unified MoE layer (``BatchInvariantMoeConfig`` -> ``BatchInvariantMoeRunner``).
+"""The batch-invariant MoE backend of the unified MoE layer (``BatchInvariantBf16Config`` -> ``BatchInvariantMoeRunner``).
 
 The runner serves the bf16 classes ``moe.bf16.swiglu`` (``SwiGLU`` with the default parameters) and ``moe.bf16.relu2``
 (``ReLU2``) on SM100 / SM103 / SM107. It takes every routing input mode: ``FromLogits`` runs the class's own routing kernel
@@ -79,7 +79,7 @@ def _configs_from_tactic(t: tuple):
 class BatchInvariantMoeRunner(MoERunner):
     """The unified layer's runner for the batch-invariant bf16 MoE classes."""
 
-    backend_key = "batch_invariant"
+    backend_key = "batch_invariant_bf16"
     supported_routing_modes = (
         RoutingInputMode.FromLogits,
         RoutingInputMode.PackedPrecomputed,

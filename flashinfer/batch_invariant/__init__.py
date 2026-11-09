@@ -143,7 +143,7 @@ def _moe_bf16_fingerprint(
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
 ) -> str:
-    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantMoeConfig``: ``method`` is a
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
     :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements; ``act`` an
     ``ActivationConfig`` of the layer (its scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default
     gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the
@@ -238,7 +238,7 @@ def _moe_fp8_fingerprint(
 
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
-    # the unified MoE layer with `BatchInvariantMoeConfig`: the routing method and the activation (gated SwiGLU / ungated
+    # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
     # ReLU^2) are dimensions of the class; the hidden and intermediate sizes fix the two GEMM classes
     "fused_moe": ClassInfo(
         "moe.bf16",

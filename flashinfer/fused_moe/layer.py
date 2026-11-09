@@ -66,7 +66,7 @@ from .api import (
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
-    BatchInvariantMoeConfig,
+    BatchInvariantBf16Config,
     BatchInvariantMoeFp8Config,
     FrostLowLatencyConfig,
     MoEActivationPack,
@@ -182,7 +182,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
-    BatchInvariantMoeConfig: BatchInvariantMoeRunner,
+    BatchInvariantBf16Config: BatchInvariantMoeRunner,
     FrostLowLatencyConfig: FrostLowLatencyRunner,
     CakeStepFunConfig: CakeStepFunRunner,
     CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,

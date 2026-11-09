@@ -3280,7 +3280,7 @@ class FrostLowLatencyConfig:
 
 
 @dataclass(frozen=True)
-class BatchInvariantMoeConfig:
+class BatchInvariantBf16Config:
     """The batch-invariant MoE backend: the bf16 classes of the mode documented in ``flashinfer/batch_invariant/README.md``
     (one class per typed activation and parameter set: ``SwiGLU`` with any ``alpha`` / ``beta`` / ``limit``,
     ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU``, ``PowLU``; ``ReLU2``, ``Identity``, ``GELU``, ``ReLU``, ``SiLU``),
@@ -3343,7 +3343,7 @@ class BatchInvariantMoeConfig:
         return hidden_states.to(torch.bfloat16).contiguous(), None
 
     def __repr__(self) -> str:
-        return "BatchInvariantMoeConfig()"
+        return "BatchInvariantBf16Config()"
 
 
 @dataclass(frozen=True)
@@ -3421,7 +3421,7 @@ class BatchInvariantMoeFp8Config:
 
 # Union type for backend config
 BackendConfigType = Union[
-    BatchInvariantMoeConfig,
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
@@ -3468,7 +3468,7 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
-    BatchInvariantMoeConfig,
+    BatchInvariantBf16Config,
     FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
