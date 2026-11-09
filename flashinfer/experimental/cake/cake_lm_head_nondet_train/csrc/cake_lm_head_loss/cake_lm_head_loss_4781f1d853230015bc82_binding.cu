@@ -26,10 +26,10 @@
 #define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
 
 #ifndef CAKE_KERNEL_SYMBOL
-#define CAKE_KERNEL_SYMBOL kernel_cake_lm_head_loss_2528a3b18f768419f7ab
+#define CAKE_KERNEL_SYMBOL kernel_cake_lm_head_loss_4781f1d853230015bc82
 #endif
 #ifndef CAKE_PROGRAM_SHIM
-#define CAKE_PROGRAM_SHIM cake_binding_kernel_cake_lm_head_loss_2528a3b18f768419f7ab
+#define CAKE_PROGRAM_SHIM cake_binding_kernel_cake_lm_head_loss_4781f1d853230015bc82
 #endif
 #ifndef CAKE_BINDING_THREADS
 #define CAKE_BINDING_THREADS 224
@@ -38,7 +38,7 @@
 #define CAKE_BINDING_SMEM 181376
 #endif
 
-extern "C" __global__ void CAKE_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int M, int m_tiles, int k_iters, int ldc, int k_slices, int k_slice_iters, int group_m);
+extern "C" __global__ void CAKE_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int M, int m_tiles, int k_iters, int ldc, int k_slices, int k_slice_iters, int group_m, const __grid_constant__ CUtensorMap SLAB);
 
 namespace CAKE_PROGRAM_SHIM {
 
@@ -215,7 +215,39 @@ CUtensorMap EncodeTma_C(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_A, TensorView a_B, TensorView a_C, int64_t a_M, int64_t a_m_tiles, int64_t a_k_iters, int64_t a_ldc, int64_t a_k_slices, int64_t a_k_slice_iters, int64_t a_group_m, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+CUtensorMap EncodeTma_SLAB(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << KERNEL_NAME << ": descriptor 'SLAB' takes a source of at least 2 dims, got " << t.ndim();
+  CheckUnitInnerStride(t, "SLAB");
+  int64_t d1 = t.size(-1);
+  int64_t outer1 = NumelAbove(t, 1);
+  check_dense_leading_dims(t, 1, "SLAB");
+  int64_t s2 = t.stride(-2) * 4;
+  cuuint64_t global_dim[2] = {Extent(d1, "SLAB"), Extent(outer1, "SLAB")};
+  cuuint64_t global_strides[1] = {Stride(s2, "SLAB")};
+  cuuint32_t box_dim[2] = {32u, 128u};
+  cuuint32_t elem_strides[2] = {1u, 1u};
+  const bool allow_oob_box[2] = {false, true};
+  for (int axis = 0; axis < 2; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'SLAB' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
+  TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the strides of descriptor 'SLAB' must be multiples of 16 bytes";
+  void* address = DataPtr(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the address of descriptor 'SLAB' must be 16-byte aligned";
+  CUtensorMap map{};
+  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, address, global_dim, global_strides,
+                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+          "cuTensorMapEncodeTiled of SLAB");
+  return map;
+}
+
+void Run(TensorView a_A, TensorView a_B, TensorView a_C, int64_t a_M, int64_t a_m_tiles, int64_t a_k_iters, int64_t a_ldc, int64_t a_k_slices, int64_t a_k_slice_iters, int64_t a_group_m, TensorView a_SLAB, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_A, "A");
@@ -245,8 +277,11 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_C, int64_t a_M, int64_t a_
   TVM_FFI_CHECK(a_group_m >= -2147483648LL && a_group_m <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'group_m' = " << a_group_m
       << " is outside the i32 range [-2147483648, 2147483647]";
+  check_cuda_tensor(a_SLAB, "SLAB");
+  check_dtype(a_SLAB, DLDataType{kDLFloat, 32, 1}, "SLAB");
   check_same_device(a_B, a_A, "B", "A");
   check_same_device(a_C, a_A, "C", "A");
+  check_same_device(a_SLAB, a_A, "SLAB", "A");
   TVM_FFI_CHECK((CMod(a_ldc, 512LL) == 0LL), ValueError)
       << KERNEL_NAME << ": requires (CMod(ldc, 512) == 0)";
   TVM_FFI_CHECK((a_k_slice_iters >= 1LL), ValueError)
@@ -281,7 +316,8 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_C, int64_t a_M, int64_t a_
   int32_t v_k_slices = static_cast<int32_t>(a_k_slices);
   int32_t v_k_slice_iters = static_cast<int32_t>(a_k_slice_iters);
   int32_t v_group_m = static_cast<int32_t>(a_group_m);
-  void* kernel_args[] = {&v_A, &v_B, &v_C, &v_M, &v_m_tiles, &v_k_iters, &v_ldc, &v_k_slices, &v_k_slice_iters, &v_group_m};
+  CUtensorMap v_SLAB = EncodeTma_SLAB(a_SLAB);
+  void* kernel_args[] = {&v_A, &v_B, &v_C, &v_M, &v_m_tiles, &v_k_iters, &v_ldc, &v_k_slices, &v_k_slice_iters, &v_group_m, &v_SLAB};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(CAKE_BINDING_THREADS, 1, 1);

@@ -75,7 +75,7 @@ kernel_cake_lm_head_loss_ca5145901164bcebaf88(__nv_bfloat16* __restrict__ dz, in
     for (int r = bid; r < rows; r += gridDim.x) {
         long long row_base = (long long)r * (long long)ldc;
         for (int c = tid_1; c < row_vecs; c += 256) {
-            reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dzblk + (row_base + (long long)c * 8)))[0] = reinterpret_cast<int4*>(zeros)[0];
+            reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dzblk + (row_base + (long long)c * 8ll)))[0] = reinterpret_cast<int4*>(zeros)[0];
         }
         __syncthreads();
         int t = t0 + r;
