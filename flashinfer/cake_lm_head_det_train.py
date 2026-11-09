@@ -95,6 +95,24 @@ def _opt_in_call(W, memory_mode, num_valid_rows) -> bool:
     )
 
 
+def _kept_logits_reach(X, labels, chunk_size) -> bool:
+    # A default log-probability call without a temperature whose ``X`` requires
+    # a gradient under grad mode and whose rows fit two chunks also takes the
+    # opt-in forms when its ``W`` is frozen: their one-chunk kept logits
+    # (``cake_backend_opt_in._one_chunk_keep_rule``, the rule) can apply to it.
+    # A pre-filter only: a call the rule does not keep runs the default entry's
+    # form there.
+    return (
+        isinstance(X, torch.Tensor)
+        and X.is_cuda
+        and X.requires_grad
+        and torch.is_grad_enabled()
+        and isinstance(labels, torch.Tensor)
+        and isinstance(chunk_size, int)
+        and 0 < labels.numel() <= 2 * chunk_size
+    )
+
+
 @flashinfer_api
 def cake_lm_head_det_train_loss(
     X: torch.Tensor,
@@ -521,14 +539,21 @@ def cake_lm_head_det_train_logprob(
     the same values); ``dW`` is returned in BF16.  ``memory_mode``
     (``"budget"``: the backward's weight-gradient form within the same bound;
     the default ``None``: the automatic form, decided in the backward, which
-    keeps the default entry's forward), ``num_valid_rows`` and
+    keeps the default entry's forward; a default call without a temperature,
+    of at most two chunks of rows, whose valid rows fit one chunk keeps their
+    BF16 logits, at most one chunk, from the forward to its backward, which
+    forms the logit gradient from them
+    instead of recomputing the logits, where the fast backward would run no
+    zero-gradient row skip -- not under ``torch.utils.checkpoint``, bitwise the
+    same outputs; ``"fast"`` turns this off), ``num_valid_rows`` and
     ``check_num_valid_rows`` (the forward's count) as in
     :func:`cake_lm_head_det_train_loss`.  A default call whose backward runs
     a budget form runs it without the zero-gradient row skip: its ``dX`` /
     ``dW`` bits can then differ from the fastest form's where valid rows have
     a zero upstream gradient (within the accuracy budget, the same bits on
     every run).  ``memory_mode="keep_logits"`` (this
-    entry only, without ``num_valid_rows``; opt-in): where a backward can
+    entry only; opt-in; with ``num_valid_rows`` its forward runs on the index
+    formed from the caller's count, without a readback): where a backward can
     follow (grad mode on, ``X`` or ``W`` trainable) the forward keeps the BF16
     logits of the valid rows, ``2 * T_v * V`` bytes from the forward to the
     backward (the chunk bound of the memory rule does not hold for them), and
@@ -589,7 +614,9 @@ def cake_lm_head_det_train_logprob(
         )
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_knobs.CHECK_WITHOUT_COUNT)
-    if _opt_in_call(W, memory_mode, num_valid_rows):
+    if _opt_in_call(W, memory_mode, num_valid_rows) or _kept_logits_reach(
+        X, labels, chunk_size
+    ):
         return _cake_backend_opt_in().cake_lm_head_det_train_logprob(
             X,
             W,

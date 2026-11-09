@@ -861,3 +861,51 @@ def test_device_public_default_step_peak_within_the_head_bytes(monkeypatch, entr
             assert torch.equal(_bits(result[key]), _bits(fast[key])), key
         del result
         assert peak <= head, (peak, head)
+
+
+def test_device_public_logprob_keeps_one_chunk_with_a_frozen_weight(monkeypatch):
+    """Through the public entry on the generated program, a default log-probability call whose valid rows fit one
+    chunk (T 1500, 5 % of the labels ignored: below every architecture's zero-gradient row skip floor) keeps its
+    logits with a trainable ``W`` and with a frozen one (``X`` trainable: the facade hands the call to the opt-in
+    module's rule) and gives the ``logp`` / ``dX`` (/ ``dW``) bits (integer views) of ``memory_mode="fast"``; under
+    ``torch.no_grad`` it runs the default forward."""
+    _require_program()
+    _clear(monkeypatch)
+    inp = make_inputs(1500, seed=SEED + 1500, device=CUDA, ignore_frac=0.05)
+    applied: list = []
+    bound = cake_backend._forward_keep_bound
+
+    def spy(*args, **kw):
+        applied.append(len(args))
+        return bound(*args, **kw)
+
+    def step(train_w, **kw):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(train_w)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            logp = cake_lm_head_det_train_logprob(
+                X, W, inp.labels, chunk_size=4096, **kw
+            )
+            logp.backward(inp.dlogp)
+        torch.cuda.synchronize()
+        return dict(logp=logp.detach(), dX=X.grad, dW=W.grad)
+
+    for train_w in (True, False):
+        fast = step(train_w, memory_mode="fast")
+        with monkeypatch.context() as m:
+            m.setattr(cake_backend, "_forward_keep_bound", spy)
+            applied.clear()
+            out = step(train_w)
+            assert applied, train_w
+            applied.clear()
+            with torch.no_grad(), warnings.catch_warnings():
+                warnings.simplefilter("ignore", ExperimentalWarning)
+                lp = cake_lm_head_det_train_logprob(
+                    inp.X, inp.W, inp.labels, chunk_size=4096
+                )
+            assert not applied, train_w
+        assert torch.equal(_bits(lp), _bits(fast["logp"])), train_w
+        for key in ("logp", "dX", "dW") if train_w else ("logp", "dX"):
+            assert torch.equal(_bits(out[key]), _bits(fast[key])), (train_w, key)
+        assert train_w or out["dW"] is None

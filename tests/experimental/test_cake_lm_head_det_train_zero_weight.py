@@ -24,6 +24,7 @@ accuracy gates of ``test_cake_lm_head_det_train.py`` and the peak memory against
 
 import contextlib
 import dataclasses
+import gc
 import inspect
 import math
 import warnings
@@ -1473,7 +1474,16 @@ def test_device_budget_mode(glm_weight, train):
 
 def _peaks(call):
     """``(allocated, reserved)`` peak bytes of ``call()`` above its start, after one warm-up call (the binding is
-    remembered) with the caching allocator emptied before each measured call."""
+    remembered) with the caching allocator emptied before each measured call.  The warm-up starts from the same
+    cleared state for every measured path: both modules' binding caches are cleared and the caching allocator emptied
+    first, so the reserved peak does not depend on which allocator segments the remembered bindings of earlier calls
+    -- an earlier path's or an earlier test's in the same process -- leave partly used (the measured calls still find
+    their own binding remembered)."""
+    for mod in (cake_backend, opt_in):
+        mod.BINDING_CACHE.clear()
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     call()
     out = []
     for _ in range(2):
