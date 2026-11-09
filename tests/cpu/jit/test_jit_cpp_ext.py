@@ -566,3 +566,193 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     assert ("batch", "fa3", 512, 512) not in calls
     assert ("single", "fa2", 512, 512) in calls
     assert ("batch", "fa2", 512, 512) in calls
+
+
+@pytest.mark.cpu_only
+def test_get_cuda_path_canonicalizes_symlinked_toolkit(monkeypatch, tmp_path):
+    real = tmp_path / "cuda-13.2"
+    (real / "bin").mkdir(parents=True)
+    link = tmp_path / "cuda"
+    link.symlink_to(real)
+
+    cpp_ext.get_cuda_path.cache_clear()
+    monkeypatch.setenv("CUDA_HOME", str(link))
+    try:
+        assert cpp_ext.get_cuda_path() == str(real.resolve())
+    finally:
+        cpp_ext.get_cuda_path.cache_clear()
+
+
+@pytest.mark.cpu_only
+def test_trusted_stamp_skips_ninja_for_restored_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.delenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", raising=False)
+    ninja_content = "ninja_required_version = 1.3\n"
+    monkeypatch.setattr(core, "generate_ninja_build_for_op", lambda **kw: ninja_content)
+    runs = []
+    monkeypatch.setattr(core, "run_ninja", lambda *a, **k: runs.append(1))
+    monkeypatch.setattr(core, "clean_ninja", lambda *a, **k: None)
+
+    spec = core.gen_jit_spec(name="stamp_module", sources=[])
+    spec.build()
+    assert runs == [1]
+
+    # run_ninja is stubbed, so fake the library it would have produced.
+    spec.jit_library_path.parent.mkdir(parents=True, exist_ok=True)
+    spec.jit_library_path.touch()
+
+    # Default behaviour is unchanged: ninja still runs.
+    spec.build()
+    assert runs == [1, 1]
+
+    # Opting in trusts the stamp: identical build.ninja -> no ninja invocation.
+    monkeypatch.setenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", "1")
+    spec.build()
+    assert runs == [1, 1]
+
+    # Any change to the generated build.ninja invalidates the stamp.
+    monkeypatch.setattr(
+        core,
+        "generate_ninja_build_for_op",
+        lambda **kw: ninja_content + "# toolchain changed\n",
+    )
+    spec.build()
+    assert runs == [1, 1, 1]
+
+
+@pytest.mark.cpu_only
+def test_trusted_stamp_rehashes_source_contents(monkeypatch, tmp_path):
+    """Editing a source in place must invalidate the stamp even though the
+    generated build.ninja is byte-identical."""
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(
+        core,
+        "generate_ninja_build_for_op",
+        lambda **kw: "ninja_required_version = 1.3\n",
+    )
+    runs = []
+    monkeypatch.setattr(core, "run_ninja", lambda *a, **k: runs.append(1))
+    monkeypatch.setattr(core, "clean_ninja", lambda *a, **k: None)
+    monkeypatch.setenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", "1")
+
+    source = tmp_path / "kernel.cu"
+    source.write_text("__global__ void k() {}\n")
+    spec = core.gen_jit_spec(name="stamp_source_module", sources=[source])
+    spec.build()
+    spec.jit_library_path.parent.mkdir(parents=True, exist_ok=True)
+    spec.jit_library_path.touch()
+    spec.build()
+    assert runs == [1]  # stamp trusted, ninja skipped
+
+    source.write_text("__global__ void k() { /* changed */ }\n")
+    spec.build()
+    assert runs == [1, 1]  # content change re-runs ninja
+
+
+@pytest.mark.cpu_only
+def test_trusted_stamp_rehashes_embedded_cubins(monkeypatch, tmp_path):
+    """A cubin regenerated in place under the same path must invalidate the
+    stamp even though the generated build.ninja is byte-identical."""
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(
+        core,
+        "generate_ninja_build_for_op",
+        lambda **kw: "ninja_required_version = 1.3\n",
+    )
+    runs = []
+    monkeypatch.setattr(core, "run_ninja", lambda *a, **k: runs.append(1))
+    monkeypatch.setattr(core, "clean_ninja", lambda *a, **k: None)
+    monkeypatch.setenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", "1")
+
+    cubin = tmp_path / "kernel.cubin"
+    cubin.write_bytes(b"cubin-v1")
+    spec = core.gen_jit_spec(
+        name="stamp_cubin_module",
+        sources=[],
+        embedded_cubin_factory=lambda build_dir: {"kernel_cubin": cubin},
+    )
+    spec.build()
+    spec.jit_library_path.parent.mkdir(parents=True, exist_ok=True)
+    spec.jit_library_path.touch()
+    spec.build()
+    assert runs == [1]  # stamp trusted, ninja skipped
+
+    cubin.write_bytes(b"cubin-v2")
+    spec.build()
+    assert runs == [1, 1]  # cubin content change re-runs ninja
+
+
+def _stub_stamp_build(monkeypatch, tmp_path, events):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(
+        core,
+        "generate_ninja_build_for_op",
+        lambda **kw: "ninja_required_version = 1.3\n",
+    )
+    monkeypatch.setattr(core, "run_ninja", lambda *a, **k: events.append("run"))
+    monkeypatch.setattr(core, "clean_ninja", lambda *a, **k: events.append("clean"))
+
+
+@pytest.mark.cpu_only
+def test_trusted_stamp_rebuilds_in_full_when_stale(monkeypatch, tmp_path):
+    """With the stamp trusted, a stale stamp must not fall back to ninja's
+    mtime scan, which can keep a restored object newer than a changed source:
+    the module is cleaned and rebuilt. The default mode stays incremental."""
+    events = []
+    _stub_stamp_build(monkeypatch, tmp_path, events)
+    monkeypatch.delenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", raising=False)
+    source = tmp_path / "kernel.cu"
+    source.write_text("v1\n")
+    spec = core.gen_jit_spec(name="stamp_clean_module", sources=[source])
+    spec.build()
+    spec.jit_library_path.parent.mkdir(parents=True, exist_ok=True)
+    spec.jit_library_path.touch()
+    source.write_text("v2\n")
+    spec.build()
+    assert events == ["run", "run"]  # default mode: no clean
+
+    monkeypatch.setenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", "1")
+    source.write_text("v3\n")
+    spec.build()
+    assert events == ["run", "run", "clean", "run"]
+
+
+@pytest.mark.cpu_only
+def test_trusted_stamp_records_inputs_from_before_the_build(monkeypatch, tmp_path):
+    """A source edited while ninja runs must leave the stamp stale, since the
+    library was compiled from the content that was there before."""
+    events = []
+    _stub_stamp_build(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", "1")
+    source = tmp_path / "kernel.cu"
+    source.write_text("v1\n")
+    spec = core.gen_jit_spec(name="stamp_midbuild_module", sources=[source])
+
+    def run_and_edit(*a, **k):
+        events.append("run")
+        spec.jit_library_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.jit_library_path.touch()
+        source.write_text("edited during build\n")
+
+    monkeypatch.setattr(core, "run_ninja", run_and_edit)
+    spec.build()
+    assert not spec._stamp_is_current()
+
+
+@pytest.mark.cpu_only
+def test_trusted_stamp_never_vouches_for_unreadable_input(monkeypatch, tmp_path):
+    events = []
+    _stub_stamp_build(monkeypatch, tmp_path, events)
+    monkeypatch.setenv("FLASHINFER_JIT_TRUST_CACHE_STAMP", "1")
+    missing = tmp_path / "missing.cu"
+    spec = core.gen_jit_spec(name="stamp_unreadable_module", sources=[missing])
+    spec.build()
+    spec.jit_library_path.parent.mkdir(parents=True, exist_ok=True)
+    spec.jit_library_path.touch()
+    assert not spec.stamp_path.exists()
+    spec.build()
+    assert events.count("run") == 2  # nothing trusted, ninja runs again
