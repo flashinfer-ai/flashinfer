@@ -6467,6 +6467,44 @@ def test_memory_mode_and_count_keywords_are_validated():
         given(np.float32(n), T)
 
 
+def test_budget_result_backward_refuses_the_reference_backend():
+    """``ForwardResult.backward`` of a budget form whose ``dW`` the cake kernels finish -- the split accumulator's
+    cast (``"fused_ip"`` / ``"partial_ip"``) or the vocabulary-block recompute (``"partial_ip"`` / ``"partial"`` /
+    ``"recompute"``) -- refuses a ``backend="reference"`` override with a ``ValueError`` before any work (these forms
+    run on the cake backend only); the fast form and ``"unfused"`` take it (the reference cast of
+    :func:`backward_loss`, the fast form's bits)."""
+    inp = _host_inputs(37)
+    V = int(inp.W.shape[0])
+    fr = opt_in.forward_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        loss_div=inp.loss_div,
+        chunk_size=16,
+        backend="reference",
+        need_dx=True,
+        need_dw=True,
+    )
+    fast = fr.backward()
+    for form, split, block in (
+        ("fused_ip", (V // 2, V), None),
+        ("partial_ip", (V // 2, V - 4), 4),
+        ("partial", None, 4),
+        ("recompute", None, 4),
+        ("fused", None, None),
+        ("unfused", None, None),
+    ):
+        res = replace(fr)
+        res.memory_plan = opt_in.MemoryPlan(form, V if block is None else 8, block, 0, 0)
+        res.dw_split = split
+        if split is None and block is None:
+            dX, dW = res.backward(backend="reference")
+            assert torch.equal(dX, fast[0]) and torch.equal(dW, fast[1]), form
+            continue
+        with pytest.raises(ValueError, match="backend='cake'"):
+            res.backward(backend="reference")
+
+
 @pytest.mark.parametrize("entry", ["loss", "logprob"])
 def test_given_valid_row_count_is_bitwise(entry):
     """``num_valid_rows`` (the caller's count: the valid-row index formed on the device) gives the bits of the counted
@@ -9725,7 +9763,8 @@ def test_device_split_forms_cast_dw_in_place(
     casts out of place (the accumulators read, never written) and the following backward in place, both to the fast
     bits; a :class:`ForwardResult` casts out of place, repeatably.  The explicit pair: ``backward_loss`` with the split
     accumulator's upper rows (``dw_acc_hi``) and the deferred operands finishes ``"fused_ip"`` to the same bits, and
-    refuses ``"partial_ip"`` (rows recomputed from the forward's inputs) and the lower part alone (``ValueError``)."""
+    refuses ``"partial_ip"`` (rows recomputed from the forward's inputs) and the lower part alone (``ValueError``);
+    ``ForwardResult.backward(backend="reference")`` is a ``ValueError`` for both forms (cake kernels finish ``dW``)."""
     _require_program(entry="loss")
     V = DEFAULT_V
     inp = make_inputs(
@@ -9849,6 +9888,10 @@ def test_device_split_forms_cast_dw_in_place(
             opt_in.backward_loss(
                 res.dx_acc, res.dw_acc, dw_acc_hi=res.dw_acc_hi, **pair
             )
+    with pytest.raises(ValueError, match="backend='cake'"):
+        res.backward(backend="reference")
+    dX, dW = res.backward()  # unchanged by the refusals
+    _assert_same_bits(fast, dict(dX=dX, dW=dW), keys=("dX", "dW"))
 
 
 def test_device_logprob_budget_forms_are_bitwise(glm_weight, monkeypatch):

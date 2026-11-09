@@ -500,8 +500,11 @@ keyword.
   B200 (other allocator settings are not measured): every measured
   `"budget"` step peak of a call whose plan fits, single calls and repeated
   calls that miss or hit the binding cache, at the issue's shapes and at
-  small heads, stayed within `B`; the highest reached 0.9794 `B`.  No
-  environment variable selects it.
+  small heads, stayed within `B`; the highest reached 0.9794 `B`.  The
+  forms whose `dW` the cake kernels finish (`"fused_ip"`, `"partial_ip"`,
+  `"partial"`, `"recompute"`) take no `backend="reference"` override in
+  `ForwardResult.backward` (`ValueError`; their forward runs on the `cake`
+  backend only).  No environment variable selects it.
 * Automatic memory form (the default, `memory_mode=None`;
   `cake_backend_opt_in.MEMORY_AUTO`, accepted by the resolver but not one of
   `MEMORY_MODES`): a call that forms a BF16 `dW` on the `cake` backend on

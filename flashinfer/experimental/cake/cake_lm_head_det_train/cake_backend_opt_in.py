@@ -4490,10 +4490,23 @@ class ForwardResult(_BudgetResultState, _main._TemperatureResultState):
 
     def backward(self, grad=None, *, grad_weight_dtype=torch.bfloat16, backend=None):
         """``(dX, dW)`` of this forward through :func:`backward_loss` (``grad`` = the upstream scalar, ``None`` = 1);
-        a recompute form of ``memory_mode="budget"`` finishes ``dW`` through the vocabulary-block recompute (BF16)."""
+        a recompute form of ``memory_mode="budget"`` finishes ``dW`` through the vocabulary-block recompute (BF16).
+        ``backend`` (default: the forward's) overrides the backend of the finishing casts; the budget forms whose
+        ``dW`` the cake kernels finish -- the split accumulator's cast (``"fused_ip"`` / ``"partial_ip"``) and the
+        vocabulary-block recompute (``"partial_ip"`` / ``"partial"`` / ``"recompute"``) -- take the ``cake`` backend
+        only (``ValueError`` for ``"reference"``), as their forward does."""
         if self.loss is None:
             raise ValueError(
                 "ForwardResult.backward belongs to the loss entry (use backward_logprob)"
+            )
+        if (
+            self.dw_split is not None
+            or (self.memory_plan is not None and self.memory_plan.recompute)
+        ) and (self.backend if backend is None else backend) != "cake":
+            form = None if self.memory_plan is None else self.memory_plan.form
+            raise ValueError(
+                f"the weight gradient of the budget form {form!r} is finished by the cake kernels: the budget forms "
+                f"{_SPLIT_FORMS + ('partial', 'recompute')} take backend='cake' only"
             )
         if self.dw_split is not None and self.dz_last is not None:
             # a split accumulator (``"fused_ip"`` / ``"partial_ip"``), read, never written (a repeatable backward)
