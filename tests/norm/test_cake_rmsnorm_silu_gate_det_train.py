@@ -1214,7 +1214,7 @@ def test_each_call_launches_one_module_of_its_role(T, H, launches):
     forward_name = loader.forward_module(arch, T * H, H, sms, tok, D, tok, D)
     packed = routes.get("fwd_packed", routes["fwd"])
     assert forward_name == (packed if T > 1 else routes["fwd"])
-    long = T > 1 and T * H >= LONG_MIN_ROWS_PER_SM[arch] * sms
+    long = T > 1 and LONG_MIN_ROWS_PER_SM[arch] * sms <= T * H
     names = {"fwd": forward_name}
     for role in ("bwd_bf16", "bwd_f32"):
         names[role] = routes[role + loader.LONG] if long else routes[role]
