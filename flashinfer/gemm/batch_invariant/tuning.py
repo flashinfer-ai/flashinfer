@@ -626,7 +626,7 @@ def gemm_fp8_nt_groupwise_batch_invariant_auto(
     if out_dtype not in GEMM_FP8BS_API_OUT_DTYPES:
         raise unsupported(CLASS_FP8BS, f"out_dtype={out_dtype}", "bf16 or fp16 output")
     a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
-        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype, mn_copy=False
+        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
     )
     if M == 0:
         return out

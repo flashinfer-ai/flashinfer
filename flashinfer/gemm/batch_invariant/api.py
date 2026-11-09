@@ -1413,13 +1413,11 @@ def _blockscale_scale_view(
     KB: int,
     major: str,
     device: torch.device,
-    mn_copy: bool = False,
 ) -> torch.Tensor:
     """The (rows, KB) view of a block-scale tensor: ``major == "K"`` takes it as ``(rows, KB)``, ``"MN"`` as ``(KB, rows)``
     (:func:`flashinfer.gemm_fp8_nt_groupwise`'s ``scale_major_mode``); fp32 on the operands' device, any strides (the
-    kernel's producer warp stages a block's scales in smem from the tensor's own layout). ``mn_copy``: a K-major tensor is
-    handed over as its MN-major copy -- a layout copy, no arithmetic: the gather of one scale per row from K-major rows
-    is bound by the memory system, the MN-major rows of a block are contiguous."""
+    kernel's producer warp stages a block's scales in smem from the tensor's own layout; the ``K`` layout's staging is
+    the callers' choice, :func:`gemm_fp8_nt_groupwise_batch_invariant`)."""
     if not isinstance(s, torch.Tensor) or s.dtype != torch.float32:
         raise unsupported(
             CLASS_FP8BS,
@@ -1440,9 +1438,7 @@ def _blockscale_scale_view(
             f"{name} of shape {want} for scale_major_mode={major!r} (one fp32 scale per 1x{BLOCK_K} block of A, per "
             f"{SCALE_BLOCK_N}x{BLOCK_K} block of B)",
         )
-    if major == "K":
-        return s.t().contiguous().t() if mn_copy else s
-    return s.t()
+    return s if major == "K" else s.t()
 
 
 def prepare_fp8_blockscale_operands(
@@ -1453,14 +1449,13 @@ def prepare_fp8_blockscale_operands(
     scale_major_mode: Optional[str],
     out: Optional[torch.Tensor],
     out_dtype: torch.dtype,
-    mn_copy: bool = True,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int
 ]:
     """The block-scale class's typed checks: device and architecture, e4m3 A and B, 2-D shapes with matching K, K a whole
     number of 128-element scale blocks, N a multiple of 8, A's row placement, B a row-major (N, K) weight (the NT
-    operator: K contiguous, 16-byte rows), the scale tensors of the layout's shapes (the ``K`` layout's A scales handed
-    over as their MN-major copy when ``mn_copy``), the output's dtype / shape / layout (allocated when absent). Returns
+    operator: K contiguous, 16-byte rows), the scale tensors of the layout's shapes (handed over with their own strides),
+    the output's dtype / shape / layout (allocated when absent). Returns
     ``(a, b, sfa, sfb, out, M, N, K)`` with ``sfa`` (M, K / 128) and ``sfb`` (ceil(N / 128), K / 128) views."""
     cls = CLASS_FP8BS
     check_device(a.device, cls, GEMM_FP8BS_ARCHS)
@@ -1507,9 +1502,7 @@ def prepare_fp8_blockscale_operands(
         )
     _check_base(b, "B", cls)
     KB, NB = K // BLOCK_K, -(-N // SCALE_BLOCK_N)
-    sfa = _blockscale_scale_view(
-        a_scale, "a_scale", M, KB, scale_major_mode, a.device, mn_copy=mn_copy
-    )
+    sfa = _blockscale_scale_view(a_scale, "a_scale", M, KB, scale_major_mode, a.device)
     sfb = _blockscale_scale_view(b_scale, "b_scale", NB, KB, scale_major_mode, a.device)
     if out_dtype not in GEMM_FP8BS_OUT_DTYPES:
         raise unsupported(cls, f"out_dtype={out_dtype}", "bf16 or fp16 output")
@@ -1538,7 +1531,7 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     bits), ``native_k`` the ``K`` layout's scale staging (:func:`native_k_staging` by default; a placement). One launch,
     no split, no workspace."""
     a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
-        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype, mn_copy=False
+        a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
     )
     cls = CLASS_FP8BS
     if M == 0:
@@ -1567,13 +1560,6 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     )
     if scale_major_mode == "K" and not native_k:
         sfa = sfa.t().contiguous().t()
-    kernel = get_compiled_fp8bs(
-        config,
-        persistent_clusters(a.device, config),
-        OUT_FMT_OF_DTYPE[out_dtype],
-        family=part_of(a.device)[1],
-        native_k=native_k,
-    )
     _require_disjoint(
         cls,
         [(out, "the output")],
@@ -1583,5 +1569,14 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     a3 = a.as_strided((M, K, 1), (a.stride(0), 1, K))
     b3 = b.as_strided((N, K, 1), (b.stride(0), 1, K))
     c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
-    kernel(a3, b3, sfa, sfb, c3)
+    # the compile's architecture query and the launch follow A's device, not the current one
+    with torch.cuda.device(a.device):
+        kernel = get_compiled_fp8bs(
+            config,
+            persistent_clusters(a.device, config),
+            OUT_FMT_OF_DTYPE[out_dtype],
+            family=part_of(a.device)[1],
+            native_k=native_k,
+        )
+        kernel(a3, b3, sfa, sfb, c3)
     return out

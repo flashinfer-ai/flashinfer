@@ -99,6 +99,9 @@ BAR_GROUP = (
     BAR_EPILOGUE,
     BAR_EPILOGUE + 2,
 )  # one named barrier per promotion warpgroup (the C stage hand-off to its TMA store)
+BAR_PROMO_JOIN = (
+    BAR_GROUP[1] + 1
+)  # both promotion warpgroups once, after their last TMEM loads, before the TMEM free
 NUM_B_BLOCKS = 2  # B block scales per ring stage: a tile up to 256 wide spans two 128-column weight scale blocks (one per promotion group)
 PROMO_BATCH = 2  # subtiles of a group's half loaded from TMEM before their fmas: the register budget's bound at the 256-wide tile
 NUM_SCALE_STAGES = 16  # the scale ring's depth in blocks: blocks whose scales wait in smem ahead of the promotion; deeper than the operand
@@ -928,6 +931,9 @@ class BlockScaleFp8Gemm:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(PROMO_WARPS) + 1)
         )
+        promo_join = pipeline.NamedBarrier(
+            barrier_id=BAR_PROMO_JOIN, num_threads=32 * NUM_PROMO_WARPS
+        )
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -1123,6 +1129,10 @@ class BlockScaleFp8Gemm:
                 self.native_k,
             )
             tmem.relinquish_alloc_permit()
+            # the allocator warp alone frees the columns (`TmemAllocator.free`): the other warpgroup's last TMEM loads must be
+            # complete first; its store barriers are its own, so the groups join here (the dense bodies' one epilogue group is
+            # joined by its store barrier already)
+            promo_join.arrive_and_wait()
             tmem.free(tmem_ptr)
         if warp_idx > TMA_WARP_BS:
             cute.arch.setmaxregister_decrease(
