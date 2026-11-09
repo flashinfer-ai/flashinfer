@@ -47,7 +47,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LAUNCH_MIN_BLOCKS 2
+#define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
 
@@ -163,7 +163,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorMap q_tma, const __grid_constant__ CUtensorMap k_tma, const __grid_constant__ CUtensorMap w_tma, const __grid_constant__ CUtensorMap do_g_tma, __nv_bfloat16* __restrict__ dv_intra, float* __restrict__ rowscale, float* __restrict__ gamma, int num_heads, int num_qk_heads, int* __restrict__ seq_chunk_start, int num_seqs, int* __restrict__ walk_seg, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float* __restrict__ dht, int* __restrict__ dht_index, int dht_hg, int dht_n, float* __restrict__ out, int* __restrict__ out_index, int out_hg, int out_n, int tile_stride, __nv_bfloat16* __restrict__ dh_tape, __nv_bfloat16* __restrict__ dv_new)
+kernel_cake_gdn_train_99ac580e589bb83c39a2_kcp(const __grid_constant__ CUtensorMap q_tma, const __grid_constant__ CUtensorMap k_tma, const __grid_constant__ CUtensorMap w_tma, const __grid_constant__ CUtensorMap do_g_tma, __nv_bfloat16* __restrict__ dv_intra, float* __restrict__ rowscale, float* __restrict__ gamma, int num_heads, int num_qk_heads, int* __restrict__ seq_chunk_start, int num_seqs, int* __restrict__ walk_seg, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, float* __restrict__ dht, int* __restrict__ dht_index, int dht_hg, int dht_n, float* __restrict__ out, int* __restrict__ out_index, int out_hg, int out_n, int tile_stride, __nv_bfloat16* __restrict__ dh_tape, __nv_bfloat16* __restrict__ dv_new, int* __restrict__ c_start)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -212,16 +212,16 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
     const int w_mn_addr = smem + 33792;
     __nv_bfloat16* do_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 50176);
     const int do_mn_addr = smem + 50176;
-    __nv_bfloat16* dhs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 58368);
-    const int dhs_addr = smem + 58368;
-    __nv_bfloat16* dhs_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 58368);
-    const int dhs_mn_addr = smem + 58368;
-    __nv_bfloat16* bdv = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
-    const int bdv_addr = smem + 74752;
-    __nv_bfloat16* bdv_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 74752);
-    const int bdv_mn_addr = smem + 74752;
-    float* tab = reinterpret_cast<float*>(smem_raw + 82944);
-    const int tab_addr = smem + 82944;
+    __nv_bfloat16* dhs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
+    const int dhs_addr = smem + 66560;
+    __nv_bfloat16* dhs_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
+    const int dhs_mn_addr = smem + 66560;
+    __nv_bfloat16* bdv = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
+    const int bdv_addr = smem + 99328;
+    __nv_bfloat16* bdv_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
+    const int bdv_mn_addr = smem + 99328;
+    float* tab = reinterpret_cast<float*>(smem_raw + 115712);
+    const int tab_addr = smem + 115712;
 
     // Mbarrier init (12 barriers at smem_raw[0..96))
 
@@ -260,11 +260,11 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
 
     __syncwarp();
 
-    // TMEM alloc (128 columns, 128 used)
+    // TMEM alloc (256 columns, 256 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -274,18 +274,23 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
 
     const unsigned int taddr = tmem_addr_storage[0];
     const unsigned int tmem_acc_dh = taddr;
-    const unsigned int tmem_acc_dv = taddr + 64;
+    const unsigned int tmem_acc_dv = taddr + 128;
 
     // ---- Role: compute ----
     if (warp <= 3) {
         { // compute_main
-            int hb = blockIdx.x / 2;
-            int vbase = blockIdx.x % 2 * 64;
+            int hb = blockIdx.x;
+            int vbase = 0;
             int head = hb % num_heads;
             int walk = hb / num_heads;
             int seg = walk_seg[walk];
             int c0 = seq_chunk_start[seg];
             int nc = seq_chunk_start[seg + 1] - c0;
+            if ((unsigned long long)c_start != 0ull) {
+                int _max_1 = ((c_start[(long long)seg * (long long)num_heads + (long long)head] + 1) > (0) ? (c_start[(long long)seg * (long long)num_heads + (long long)head] + 1) : (0));
+                int _min_0 = ((_max_1) < (nc) ? (_max_1) : (nc));
+                nc = _min_0;
+            }
             int row0 = c0 * 64;
             int qk_head = head / (num_heads / num_qk_heads);
             int warp_in_wg = warp % 4;
@@ -298,9 +303,9 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
             int dht_slot = dht_index[seg];
             if (dht_slot >= 0) {
                 int dht_tile = (head / dht_hg * dht_n + dht_slot) * dht_hg + head % dht_hg;
-                long long dht_base = (long long)dht_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128 + vbase);
+                long long dht_base = (long long)dht_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
-                for (int blk = 0; blk < 4; blk++) {
+                for (int blk = 0; blk < 8; blk++) {
                     #pragma unroll
                     for (int q = 0; q < 4; q++) {
                         {
@@ -331,18 +336,18 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                 init_row[14] = 0.0f;
                 init_row[15] = 0.0f;
                 #pragma unroll
-                for (int blk_1 = 0; blk_1 < 4; blk_1++) {
+                for (int blk_1 = 0; blk_1 < 8; blk_1++) {
                     tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + (unsigned int)(blk_1 * 16), init_row);
                 }
             }
             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
             unsigned int ts = 0;
-            unsigned int dvi_c[16];
+            unsigned int dvi_c[32];
             if (nc > 0) {
                 int trow_s = row0 + (nc - 1) * 64 + t_row;
-                long long t_base_s = ((long long)trow_s * (long long)num_heads + (long long)head) * 128ll + (long long)vbase;
+                long long t_base_s = ((long long)trow_s * (long long)num_heads + (long long)head) * 128ll;
                 #pragma unroll
-                for (int blk_2 = 0; blk_2 < 2; blk_2++) {
+                for (int blk_2 = 0; blk_2 < 4; blk_2++) {
                     {
                         asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                             : "=r"(dvi_c[blk_2 * 8 + 0]), "=r"(dvi_c[blk_2 * 8 + 1]), "=r"(dvi_c[blk_2 * 8 + 2]), "=r"(dvi_c[blk_2 * 8 + 3]), "=r"(dvi_c[blk_2 * 8 + 4]), "=r"(dvi_c[blk_2 * 8 + 5]), "=r"(dvi_c[blk_2 * 8 + 6]), "=r"(dvi_c[blk_2 * 8 + 7]) : "l"((const void*)((const char*)(dv_intra + t_base_s + (long long)(blk_2 * 32 + lane_half * 16)) + 0)) : "memory");
@@ -358,9 +363,9 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                 int gc = c0 + c;
                 float decay = gamma[(long long)gc * (long long)num_heads + (long long)head];
                 int trow = row0 + c * 64 + t_row;
-                long long t_base = ((long long)trow * (long long)num_heads + (long long)head) * 128ll + (long long)vbase;
+                long long t_base = ((long long)trow * (long long)num_heads + (long long)head) * 128ll;
                 #pragma unroll
-                for (int g = 0; g < 1; g++) {
+                for (int g = 0; g < 2; g++) {
                     float dh4[64];
                     tmem_ld_x16(&dh4[0], taddr + (unsigned int)m128_row_base + (unsigned int)(g * 64));
                     tmem_ld_x16(&dh4[16], taddr + (unsigned int)m128_row_base + (unsigned int)(g * 64 + 16));
@@ -407,20 +412,30 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                 mbarrier_wait(dv_ready_addr, _phase_dv_ready_0);
                 _phase_dv_ready_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
-                float dv4[32];
+                float dv4[64];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 16;"
                     : "=r"(*reinterpret_cast<uint32_t*>(&dv4[0])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[1])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[2])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[3])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[4])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[5])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[6])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[7])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[8])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[9])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[10])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[11])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[12])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[13])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[14])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[15]))
-                    : "r"(taddr + 64 + (unsigned int)m64_row_base));
+                    : "r"(taddr + 128 + (unsigned int)m64_row_base));
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 16;"
                     : "=r"(*reinterpret_cast<uint32_t*>(&dv4[16])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[17])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[18])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[19])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[20])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[21])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[22])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[23])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[24])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[25])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[26])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[27])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[28])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[29])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[30])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[31]))
-                    : "r"(taddr + 64 + (unsigned int)m64_row_base + 32));
+                    : "r"(taddr + 128 + (unsigned int)m64_row_base + 32));
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 16;"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&dv4[32])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[33])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[34])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[35])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[36])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[37])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[38])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[39])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[40])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[41])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[42])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[43])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[44])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[45])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[46])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[47]))
+                    : "r"(taddr + 128 + (unsigned int)m64_row_base + 64));
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 16;"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&dv4[48])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[49])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[50])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[51])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[52])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[53])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[54])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[55])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[56])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[57])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[58])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[59])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[60])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[61])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[62])), "=r"(*reinterpret_cast<uint32_t*>(&dv4[63]))
+                    : "r"(taddr + 128 + (unsigned int)m64_row_base + 96));
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 #pragma unroll
-                for (int blk_3 = 0; blk_3 < 2; blk_3++) {
+                for (int blk_3 = 0; blk_3 < 4; blk_3++) {
                     int col = blk_3 * 32 + lane_half * 16;
                     float d1[16];
                     #pragma unroll
@@ -449,9 +464,9 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                 mbarrier_arrive(bdv_ready_addr);
                 int c_n = ((c > 0) ? c - 1 : 0);
                 int trow_n = row0 + c_n * 64 + t_row;
-                long long t_base_n = ((long long)trow_n * (long long)num_heads + (long long)head) * 128ll + (long long)vbase;
+                long long t_base_n = ((long long)trow_n * (long long)num_heads + (long long)head) * 128ll;
                 #pragma unroll
-                for (int blk_4 = 0; blk_4 < 2; blk_4++) {
+                for (int blk_4 = 0; blk_4 < 4; blk_4++) {
                     {
                         asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                             : "=r"(dvi_c[blk_4 * 8 + 0]), "=r"(dvi_c[blk_4 * 8 + 1]), "=r"(dvi_c[blk_4 * 8 + 2]), "=r"(dvi_c[blk_4 * 8 + 3]), "=r"(dvi_c[blk_4 * 8 + 4]), "=r"(dvi_c[blk_4 * 8 + 5]), "=r"(dvi_c[blk_4 * 8 + 6]), "=r"(dvi_c[blk_4 * 8 + 7]) : "l"((const void*)((const char*)(dv_intra + t_base_n + (long long)(blk_4 * 32 + lane_half * 16)) + 0)) : "memory");
@@ -464,9 +479,9 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
             int out_slot = out_index[seg];
             if (out_slot >= 0) {
                 int out_tile = (head / out_hg * out_n + out_slot) * out_hg + head % out_hg;
-                long long out_base = (long long)out_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128 + vbase);
+                long long out_base = (long long)out_tile * (long long)tile_stride * 16384ll + (long long)(k_row * 128);
                 #pragma unroll
-                for (int blk_5 = 0; blk_5 < 4; blk_5++) {
+                for (int blk_5 = 0; blk_5 < 8; blk_5++) {
                     float _tmem_load_0[16];
                     tmem_ld_x16(&_tmem_load_0[0], taddr + (unsigned int)m128_row_base + (unsigned int)(blk_5 * 16));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -482,20 +497,25 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
             asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 1, 128;" ::: "memory");
             if (warp == 0) {
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(128));
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
             }
         }
     }
     // ---- Role: load ----
     if (warp == 4) {
         { // load_main
-            int hb_1 = blockIdx.x / 2;
-            int vbase_1 = blockIdx.x % 2 * 64;
+            int hb_1 = blockIdx.x;
+            int vbase_1 = 0;
             int head_1 = hb_1 % num_heads;
             int walk_1 = hb_1 / num_heads;
             int seg_1 = walk_seg[walk_1];
             int c0_1 = seq_chunk_start[seg_1];
             int nc_1 = seq_chunk_start[seg_1 + 1] - c0_1;
+            if ((unsigned long long)c_start != 0ull) {
+                int _max_1_1 = ((c_start[(long long)seg_1 * (long long)num_heads + (long long)head_1] + 1) > (0) ? (c_start[(long long)seg_1 * (long long)num_heads + (long long)head_1] + 1) : (0));
+                int _min_0_1 = ((_max_1_1) < (nc_1) ? (_max_1_1) : (nc_1));
+                nc_1 = _min_0_1;
+            }
             int row0_1 = c0_1 * 64;
             int qk_head_1 = head_1 / (num_heads / num_qk_heads);
             unsigned int ts_l = 0;
@@ -540,37 +560,18 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                 tab_rs[0] = rowscale[(long long)(trow_n_1 + lane) * (long long)num_heads + (long long)head_1];
                 tab_rs[1] = rowscale[(long long)(trow_n_1 + 32 + lane) * (long long)num_heads + (long long)head_1];
                 tab_cl[0] = (unsigned int)chunk_len[c0_1 + c_n_1];
-#if __CUDA_ARCH__ == 1000
-#else
-                int tok_n = chunk_bos[c0_1 + c_n_1];
-#endif
                 mbarrier_wait(rest_empty_addr, _phase_rest_empty);
                 __syncwarp();
                 if (elect_sync()) {
-                    mbarrier_arrive_expect_tx(rest_full_addr, 40960);
+                    mbarrier_arrive_expect_tx(rest_full_addr, 49152);
                     #pragma unroll
                     for (int panel_1 = 0; panel_1 < 2; panel_1++) {
                         tma_3d_gmem2smem(q_panel_addr + (unsigned int)(panel_1 * 8192), (&q_tma), panel_1 * 64, qk_head_1, tok, rest_full_addr);
                         tma_3d_gmem2smem(w_panel_addr + (unsigned int)(panel_1 * 8192), (&w_tma), panel_1 * 64, head_1, trow_1, rest_full_addr);
                     }
                     #pragma unroll
-                    for (int panel_2 = 0; panel_2 < 1; panel_2++) {
-                        tma_3d_gmem2smem(do_panel_addr + (unsigned int)(panel_2 * 8192), (&do_g_tma), panel_2 * 64 + vbase_1, head_1, trow_1, rest_full_addr);
-#if __CUDA_ARCH__ == 1000
-#else
-                    }
-                    if (c_1 > 0) {
-                        #pragma unroll
-                        for (int panel_3 = 0; panel_3 < 2; panel_3++) {
-                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&k_tma))), "r"((int)(panel_3 * 64)), "r"((int)(qk_head_1)), "r"((int)(tok_n)) : "memory");
-                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&q_tma))), "r"((int)(panel_3 * 64)), "r"((int)(qk_head_1)), "r"((int)(tok_n)) : "memory");
-                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&w_tma))), "r"((int)(panel_3 * 64)), "r"((int)(head_1)), "r"((int)(trow_n_1)) : "memory");
-                        }
-                        #pragma unroll
-                        for (int panel_4 = 0; panel_4 < 1; panel_4++) {
-                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&do_g_tma))), "r"((int)(panel_4 * 64 + vbase_1)), "r"((int)(head_1)), "r"((int)(trow_n_1)) : "memory");
-                        }
-#endif
+                    for (int panel_2 = 0; panel_2 < 2; panel_2++) {
+                        tma_3d_gmem2smem(do_panel_addr + (unsigned int)(panel_2 * 8192), (&do_g_tma), panel_2 * 64, head_1, trow_1, rest_full_addr);
                     }
                 }
                 _phase_rest_empty ^= 1;
@@ -580,13 +581,18 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
     // ---- Role: mma ----
     if (warp == 5) {
         { // mma_main
-            int hb_2 = blockIdx.x / 2;
-            int vbase_2 = blockIdx.x % 2 * 64;
+            int hb_2 = blockIdx.x;
+            int vbase_2 = 0;
             int head_2 = hb_2 % num_heads;
             int walk_2 = hb_2 / num_heads;
             int seg_2 = walk_seg[walk_2];
             int c0_2 = seq_chunk_start[seg_2];
             int nc_2 = seq_chunk_start[seg_2 + 1] - c0_2;
+            if ((unsigned long long)c_start != 0ull) {
+                int _max_1_2 = ((c_start[(long long)seg_2 * (long long)num_heads + (long long)head_2] + 1) > (0) ? (c_start[(long long)seg_2 * (long long)num_heads + (long long)head_2] + 1) : (0));
+                int _min_0_2 = ((_max_1_2) < (nc_2) ? (_max_1_2) : (nc_2));
+                nc_2 = _min_0_2;
+            }
             int row0_2 = c0_2 * 64;
             int qk_head_2 = head_2 / (num_heads / num_qk_heads);
             unsigned int _phase_k_full = 0;
@@ -600,12 +606,12 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                     mbarrier_wait(dhs_ready_addr, _phase_dhs_ready_0);
                     _phase_dhs_ready_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
-                    int _smem_desc_lo_0 = ((k_op_addr) >> 4) & 0x3FFF;
-                    int _smem_desc_lo_1 = (((dhs_mn_addr) >> 4) & 0x3FFF) | 0x4000000;
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_2 = ((k_op_addr) >> 4) & 0x7FFF;
+                    int _smem_desc_lo_3 = (((dhs_mn_addr) >> 4) & 0x7FFF) | 0x4000000;
 #else
-                    int _smem_desc_lo_0 = ((k_op_addr) >> 4) & 0x7FFF;
-                    int _smem_desc_lo_1 = (((dhs_mn_addr) >> 4) & 0x7FFF) | 0x4000000;
+                    int _smem_desc_lo_2 = ((k_op_addr) >> 4) & 0x3FFF;
+                    int _smem_desc_lo_3 = (((dhs_mn_addr) >> 4) & 0x3FFF) | 0x4000000;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -618,7 +624,7 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68224144;\n\t"
+                    "mov.b32 id, 69272720;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -660,18 +666,18 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc_dv), "r"(0) : "memory");
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_acc_dv), "r"(0) : "memory");
                     tcgen05_commit(dv_ready_addr);
                     tcgen05_commit(k_empty_addr);
                     _phase_k_full ^= 1;
                     mbarrier_wait(rest_full_addr, _phase_rest_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
-                    int _smem_desc_lo_2 = (((q_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
-                    int _smem_desc_lo_3 = (((do_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_4 = (((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
+                    int _smem_desc_lo_5 = (((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
 #else
-                    int _smem_desc_lo_2 = (((q_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
-                    int _smem_desc_lo_3 = (((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
+                    int _smem_desc_lo_4 = (((q_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
+                    int _smem_desc_lo_5 = (((do_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -684,7 +690,7 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135365776;\n\t"
+                    "mov.b32 id, 136414352;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -706,16 +712,16 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_acc_dh), "r"(1) : "memory");
+                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc_dh), "r"(1) : "memory");
                     mbarrier_wait(bdv_ready_addr, _phase_bdv_ready_0);
                     _phase_bdv_ready_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
-                    int _smem_desc_lo_4 = (((w_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
-                    int _smem_desc_lo_5 = (((bdv_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
+#if __CUDA_ARCH__ == 1070
+                    int _smem_desc_lo_6 = (((w_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
+                    int _smem_desc_lo_7 = (((bdv_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
 #else
-                    int _smem_desc_lo_4 = (((w_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
-                    int _smem_desc_lo_5 = (((bdv_mn_addr) >> 4) & 0x7FFF) | 0x2000000;
+                    int _smem_desc_lo_6 = (((w_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
+                    int _smem_desc_lo_7 = (((bdv_mn_addr) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                     asm volatile(
                     "{\n\t"
@@ -750,7 +756,7 @@ kernel_cake_gdn_train_0ed5c4450f8dbac6fb1e_kcp(const __grid_constant__ CUtensorM
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc_dh), "r"(1), "r"((((uint32_t)(135365776)) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
+                    :: "r"(_smem_desc_lo_6), "r"(_smem_desc_lo_7), "r"(tmem_acc_dh), "r"(1), "r"((((uint32_t)(136414352)) | ((uint32_t)(1) << 13) | ((uint32_t)(0) << 14))) : "memory");
                     tcgen05_commit(dh_ready_addr);
                     tcgen05_commit(rest_empty_addr);
                     _phase_rest_full ^= 1;
