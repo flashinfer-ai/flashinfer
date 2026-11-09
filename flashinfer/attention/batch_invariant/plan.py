@@ -311,7 +311,23 @@ def build_plan(
                 ]
             )
         plan.ws_rows += n * rows
-    # longest units first (stable): the persistent CTAs walk units u = bidx, bidx + grid, ..., so a descending order
-    # balances their loads (LPT). A placement: the order of units reaches no value (every unit restarts its state)
+    # longest units first, then the waves of ``grid`` units alternate direction (``snake_order``): the persistent CTAs walk units
+    # u = bidx, bidx + grid, ..., so CTA j takes the j-th unit of every wave and the alternation pairs a wave's long units with the
+    # next wave's short ones. A placement: the order of units reaches no value (every unit restarts its state)
     plan.desc.sort(key=lambda d: -(d[F_TILE_HI] - d[F_TILE_LO]))
+    plan.desc = snake_order(plan.desc, min(len(plan.desc), sm_count))
     return plan
+
+
+def snake_order(units: list, grid: int) -> list:
+    """``units`` (longest first) in the order the persistent walk ``u = bidx, bidx + grid, ...`` balances best without a per-CTA
+    table: consecutive waves of ``grid`` units alternate direction, so the CTA that takes the longest unit of one wave takes the
+    shortest of the next (a boustrophedon over the LPT order). With a descending order alone, CTA 0 takes the longest unit of EVERY
+    wave and finishes last. A placement: the order of units reaches no value."""
+    if grid <= 0:
+        return list(units)
+    out = []
+    for w, start in enumerate(range(0, len(units), grid)):
+        wave = units[start : start + grid]
+        out.extend(wave[::-1] if w % 2 else wave)
+    return out

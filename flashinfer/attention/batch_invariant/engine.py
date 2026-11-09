@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .plan import DESC_FIELDS, GROUP_FIELDS, build_plan, ws_row
+from .plan import DESC_FIELDS, GROUP_FIELDS, build_plan, snake_order, ws_row
 from .spec import HEAD_DIMS, scale_log2
 
 
@@ -157,10 +157,11 @@ Q2_MIN_UNITS_PER_SM = 4  # the paired placement halves the unit count: below thi
 # outweighs the overlap of the two softmax warpgroups, so smaller batches take the one-warpgroup body (a placement rule: same bits)
 
 
-def pair_units(desc: list) -> list:
+def pair_units(desc: list, grid: int = 0) -> list:
     """The paired placement's unit table: rows ``2 u`` (Q tile A) and ``2 u + 1`` (Q tile B) of pair ``u``. Two units pair when they share the
     request, the KV head, the chunk range and the kind (``F_MODE``): consecutive Q tiles of one (request, head, chunk range) in token order; an
-    odd one out pairs with an empty B (no rows, empty tile range, no group). Pairs are ordered longest first (LPT, as ``build_plan``). A
+    odd one out pairs with an empty B (no rows, empty tile range, no group). Pairs are ordered longest first, in waves of ``grid`` pairs
+    of alternating direction (``plan.snake_order``, as ``build_plan`` orders its units; ``grid`` 0 keeps the descending order). A
     placement: every unit's descriptor is unchanged, only its CTA and warpgroup move."""
     from .plan import (
         F_CHUNK_HI,
@@ -200,6 +201,7 @@ def pair_units(desc: list) -> list:
             )
         )
     )
+    pairs = snake_order(pairs, min(len(pairs), grid))
     return [row for ab in pairs for row in ab]
 
 
@@ -350,7 +352,7 @@ def plan_attention(
         and len(plan.desc) >= Q2_MIN_UNITS_PER_SM * sm
         and not (config.small == "swap" and D in SWAPS_DIMS and swaps_n_pad(plan))
     ):
-        paired = pair_units(plan.desc)
+        paired = pair_units(plan.desc, sm)
         plan.num_launch = len(paired) // 2
         desc = torch.tensor(paired, dtype=torch.int32, device=device)
     groups = torch.tensor(
