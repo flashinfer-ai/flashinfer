@@ -35,8 +35,9 @@ the backward stages and, without a caller `topk_length`, allocates and fills
 the binding's row-length vector) and the validation of `dkv_acc` /
 `dkv_dst_map`.  It never falls back to another package.  A
 backward without query rows launches nothing and does not alert.  The
-deterministic package `flashinfer.cake_dsa_sparse_attention_det_train` is a
-reserved name (planned) and does not exist yet.
+deterministic package `flashinfer.cake_dsa_sparse_attention_det_train` has
+the same entry points (`det` in place of `nondet`); its outputs repeat bit for
+bit run to run.
 
 Run to run, with identical inputs on the same GPU, and the error of each output
 against an FP64 reference: relative L2 / worst element over max |reference|,

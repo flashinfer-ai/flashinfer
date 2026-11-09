@@ -587,8 +587,9 @@ def _alert_nondeterministic(entry: str) -> None:
     backward buffers or launches a backward kernel; the deterministic preparation of the outer entries (a ``dout``
     copy, the plan of a new binding and its row-length vector, the ``dkv_acc`` checks) may run before it.  A backward without query rows launches
     nothing and does not alert.  There is no fallback: the
-    deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` is a reserved name (planned).  The alert
-    is raised here because PyTorch exposes no public Python entry for it."""
+    deterministic package ``flashinfer.cake_dsa_sparse_attention_det_train`` has the same entry points (``det`` in
+    place of ``nondet``); its outputs repeat bit for bit run to run.  The alert is raised here because PyTorch
+    exposes no public Python entry for it."""
     if not torch.are_deterministic_algorithms_enabled():
         return
     if torch.is_deterministic_algorithms_warn_only_enabled():
