@@ -1899,9 +1899,11 @@ def test_runner_step_does_not_synchronize_or_allocate():
 # (GPU)
 # ---------------------------------------------------------------------------
 
-# The saved-tensor hooks of an offloaded step: ``save_on_cpu`` into pageable or pinned host memory, and a generic
-# offloader that hands every saved tensor back as a contiguous copy.
-OFFLOADS = ("pageable", "pinned", "contiguous_copy")
+# The saved-tensor hooks of an offloaded step: ``save_on_cpu`` into pinned host memory, and a generic offloader
+# that hands every saved tensor back as a contiguous copy.  Pageable ``save_on_cpu`` hands these row views back
+# the same way (contiguous at offset 0), and its pageable device-to-host copies can stall a long test process on
+# sm_107a, so it is not a separate case.
+OFFLOADS = ("pinned", "contiguous_copy")
 NOPE_ROW_VIEWS = ("column_slice", "offset_view")
 
 
