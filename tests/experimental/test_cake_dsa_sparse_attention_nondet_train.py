@@ -7500,6 +7500,20 @@ def test_rope_backward_head_major_dout_matches_the_dense_path_without_a_copy():
     _check_backward(grads_h, ref)
 
 
+def _record_without_index_prep(record: dict) -> dict:
+    """A copy of the NoPE ``record`` without the index-preparation stage (nor in its declared stage list): swapped
+    into ``cake_jit.MODULES`` as a registry change is, so a cached stage binding of the rope varlen entry no longer
+    serves its calls (the entry checks the registered record's identity on a hit, not the stage availability)."""
+    stageless = {
+        name: value for name, value in record.items() if name != NOPE_INDEX_PREP_STAGE
+    }
+    if "stages" in stageless:
+        stageless["stages"] = [
+            stage for stage in stageless["stages"] if stage != NOPE_INDEX_PREP_STAGE
+        ]
+    return stageless
+
+
 def test_rope_varlen_entry_takes_the_compacting_stage_then_the_forward(monkeypatch):
     """With stand-in launches of both records the rope varlen entry issues the NoPE record's index-preparation
     stage (``compact = 1``; a caller ``topk_length`` as ``length_in``) into fresh rows and counts, then the rope
@@ -7507,7 +7521,7 @@ def test_rope_varlen_entry_takes_the_compacting_stage_then_the_forward(monkeypat
     launch -- for host tensors, no query rows, non-contiguous prefix sums and a record without the stage, and
     ``"index_prep"`` otherwise."""
     calls = []
-    _stand_in_index_prep(monkeypatch, calls)
+    record = _stand_in_index_prep(monkeypatch, calls)
     _stand_in_rope_program(monkeypatch, calls)
     local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
     T, K = (int(d) for d in local.shape)
@@ -7552,8 +7566,11 @@ def test_rope_varlen_entry_takes_the_compacting_stage_then_the_forward(monkeypat
         "length_in"
     ] is mine
     assert fwd["topk_length"] is prep["topk_length"] and fwd["topk_length"] is not mine
-    # a record without the stage: the twin glue, then the forward alone
-    monkeypatch.setattr(cake_backend, "nope_index_prep_available", lambda device: False)
+    # a record without the stage, swapped in after the stage route cached its binding: the twin glue, then the
+    # forward alone
+    monkeypatch.setitem(
+        cake_jit.MODULES, NOPE_PROGRAM, _record_without_index_prep(record)
+    )
     assert mode(local, cu_q, cu_k, T) == "torch"
     calls.clear()
     varlen(q_latent, q_rope, kv_latent, k_rope, local, cu_q, cu_k, causal=True)
@@ -7600,7 +7617,12 @@ def test_rope_varlen_fallback_routes_give_the_stage_route_results_on_hole_rows()
     strided_cu = torch.stack([cu_q, cu_q], 1)[:, 0]
     twin = run(strided_cu, cu_k, "torch")
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(cake_backend, "nope_index_prep_available", lambda device: False)
+        # swapped in after the stage route cached its binding of the same geometry, which must not serve this call
+        mp.setitem(
+            cake_jit.MODULES,
+            NOPE_PROGRAM,
+            _record_without_index_prep(cake_jit.record(NOPE_PROGRAM)),
+        )
         no_stage = run(cu_q, cu_k, "torch")
     for other in (twin, no_stage):
         assert torch.equal(other[0], stage[0]) and torch.equal(other[1], stage[1])
@@ -7654,11 +7676,12 @@ def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry
     """The rope varlen entry's stage route keeps one cached binding per call geometry (tag ``"rope_varlen_fwd"``): the
     forward plan, the stage's resolved entry and its geometry-derived launch values, and no tensor (no
     ``topk_length`` vector either).  A call of the same geometry with other storage and contents hits it and binds
-    its own tensors; the stage's launch values are those of the uncached stage launch and the forward's those of
-    the flat entry over the stage's rows and counts.  Another document count over the same rows hits it too and
-    binds its own ``num_docs`` / ``search_iters`` (training changes the count from step to step).  ``causal``, a
-    caller cut, a column slice and a misaligned start of the rows are other keys; a strided prefix sum of a cached
-    shape takes the torch twin, since the route is decided on every call."""
+    its own tensors; the stage's launch values are those of the uncached stage launch (the contiguous rows go in
+    as they are, at the pointer of its flat alias) and the forward's those of the flat entry over the stage's rows
+    and counts.  Another document count over the same rows hits it too and binds its own ``num_docs`` /
+    ``search_iters`` (training changes the count from step to step).  ``causal``, a caller cut, a column slice and
+    a misaligned start of the rows are other keys; a strided prefix sum of a cached shape takes the torch twin,
+    since the route is decided on every call."""
     calls = []
     _stand_in_index_prep(monkeypatch, calls)
     _stand_in_rope_program(monkeypatch, calls)
@@ -7691,7 +7714,8 @@ def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry
         binding.prep.span,
         binding.prep.offset,
     )
-    # the stage's values are those of the uncached launch over the same tensors
+    # the stage's values are those of the uncached launch over the same tensors; the contiguous rows go in as they
+    # are, at the pointer of that launch's flat alias
     ref = cake_backend._index_prep_launch(
         cake_backend.arch_for(local.device),
         local,
@@ -7703,8 +7727,10 @@ def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry
         compact=True,
     )
     _assert_launch_values(
-        {name: prep[name] for name in ref.values}, ref.values, fresh=()
+        {name: prep[name] for name in ref.values}, ref.values, fresh=("indices",)
     )
+    assert prep["indices"] is local
+    assert ref.values["indices"].data_ptr() == local.data_ptr()
     assert (prep["grid_x"], prep["grid_y"], prep["grid_z"]) == tuple(ref.grid)
     # the same geometry over other storage and contents: a hit that binds the call's own tensors
     acts2 = [t.clone() for t in acts]
@@ -7712,7 +7738,7 @@ def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry
     stages2, (prep2, fwd2) = launched(*acts2, local2, cu_q2, cu_k2, causal=True)
     assert stages2 == stages and list(cache._entries) == [key]
     assert cache._entries[key] is binding
-    assert prep2["indices"].data_ptr() == local2.data_ptr()
+    assert prep2["indices"] is local2
     assert prep2["cu_seqlens_q"] is cu_q2 and prep2["cu_seqlens_k"] is cu_k2
     assert fwd2["q_latent"] is acts2[0] and fwd2["k_rope"] is acts2[3]
     assert (
@@ -7762,8 +7788,11 @@ def test_rope_varlen_stage_route_keeps_one_tensor_free_binding_per_call_geometry
         compact=True,
     )
     _assert_launch_values(
-        {name: prep_m[name] for name in ref_m.values}, ref_m.values, fresh=()
+        {name: prep_m[name] for name in ref_m.values},
+        ref_m.values,
+        fresh=("indices",),
     )
+    assert prep_m["indices"] is local
     assert (prep["num_docs"], prep["search_iters"]) == (4, 3)
     assert (prep_m["num_docs"], prep_m["search_iters"]) == (2, 2)
     assert fwd_m["indices"] is prep_m["out"]
@@ -7851,6 +7880,283 @@ def test_rope_varlen_stage_route_rejects_a_bad_length_cut_before_any_launch(
                 varlen(*acts, local, cu_q, cu_k, causal=True, topk_length=length)
             assert calls == [], name
             assert list(cache._entries) == keys, name
+
+
+def test_rope_varlen_stage_reads_contiguous_rows_in_place_and_other_rows_through_their_alias(
+    monkeypatch,
+):
+    """The rope varlen stage route hands rows with the strides ``(K_slots, 1)`` at a vector-aligned start to the
+    stage as they are -- at the pointer, ``idx_stride`` and ``indices_offset`` of their flat alias -- and every other
+    layout through the flat alias the NoPE entries pass (:func:`_index_prep_launch`): a column slice, every other
+    row, a start off the vector granule and one row with another row stride.  The other launch values are those of
+    the uncached launch, on the planning call and on a hit."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    S = int(cu_k[-1])
+    granule = cake_backend.POINTER_GRANULE
+    acts = _rope_device_inputs(T, S, K)[:4]
+    one_acts = _rope_device_inputs(1, S, K)[:4]
+    one_cu_q, one_cu_k = _i32(0, 1).cuda(), _i32(0, S).cuda()
+    one = local[:1].clone()
+
+    def at(start, rows):
+        # a copy of ``rows`` in a fresh storage, starting at element ``start``
+        flat = torch.zeros(start + rows.numel(), dtype=torch.int32, device="cuda")
+        view = flat[start:].view(rows.shape)
+        view.copy_(rows)
+        return view
+
+    wide = torch.zeros(T, K + 8, dtype=torch.int32, device="cuda")
+    wide[:, 3 : 3 + K] = local
+    tall = torch.zeros(2 * T, K, dtype=torch.int32, device="cuda")
+    tall[::2] = local
+    one_wide = torch.zeros(1, K + 3, dtype=torch.int32, device="cuda")
+    one_wide[:, :K] = one
+    cases = {
+        "contiguous": (acts, local, cu_q, cu_k, True),
+        "aligned start": (acts, at(granule, local), cu_q, cu_k, True),
+        "column slice": (acts, wide[:, 3 : 3 + K], cu_q, cu_k, False),
+        "every other row": (acts, tall[::2], cu_q, cu_k, False),
+        "start off the granule": (acts, at(5, local), cu_q, cu_k, False),
+        "one row": (one_acts, one, one_cu_q, one_cu_k, True),
+        "one row, another row stride": (
+            one_acts,
+            one_wide[:, :K],
+            one_cu_q,
+            one_cu_k,
+            False,
+        ),
+    }
+    for name, (case_acts, rows, cq, ck, in_place) in cases.items():
+        aligned = rows.storage_offset() % granule == 0
+        assert (rows.stride() == (K, 1) and aligned) is in_place, name
+        # the planning call (a hit of "contiguous" for "aligned start"), then a hit
+        for _ in range(2):
+            del calls[:]
+            cake_backend.cake_dsa_sparse_attention_nondet_varlen(
+                *case_acts, rows, cq, ck, causal=True
+            )
+            assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "fwd"], name
+            prep, fwd = calls[0][1], calls[1][1]
+            ref = cake_backend._index_prep_launch(
+                cake_backend.arch_for(rows.device),
+                rows,
+                cq,
+                ck,
+                causal=True,
+                out=prep["out"],
+                topk_length=prep["topk_length"],
+                compact=True,
+            )
+            _assert_launch_values(
+                {n: prep[n] for n in ref.values}, ref.values, fresh=("indices",)
+            )
+            alias = ref.values["indices"]
+            assert prep["indices"].data_ptr() == alias.data_ptr(), name
+            if in_place:
+                assert prep["indices"] is rows, name
+            else:
+                assert prep["indices"].dim() == 1, name
+                assert prep["indices"].shape == alias.shape, name
+            assert fwd["indices"] is prep["out"], name
+
+
+def test_rope_varlen_cached_binding_serves_only_calls_the_route_admits(monkeypatch):
+    """A cached stage binding serves a call only when the prefix sums pass the route's checks -- the key does not
+    hold them -- and the NoPE record it was resolved from is still the registered one.  After a stage call has
+    cached its binding, a strided, host, int64 or two-dimensional prefix sum, one shorter or longer than the other,
+    one-element prefix sums and a record without the stage each give what the same call gives on an empty cache --
+    the torch twin's forward alone, or the same error -- and never launch the stage (a short or long ``cu_k``
+    would make the stage read ``cu_seqlens_k[num_docs]`` out of range)."""
+    calls = []
+    record = _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    cache = cake_backend.BINDING_CACHE
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    acts = _rope_device_inputs(T, int(cu_k[-1]), K)[:4]
+    varlen = cake_backend.cake_dsa_sparse_attention_nondet_varlen
+    cases = {
+        "strided cu_q": (torch.stack([cu_q, cu_q], 1)[:, 0], cu_k, record),
+        "host cu_k": (cu_q, cu_k.cpu(), record),
+        "int64 cu_q": (cu_q.long(), cu_k, record),
+        "[n, 1] cu_k": (cu_q, cu_k[:, None], record),
+        "short cu_k": (cu_q, cu_k[:-1], record),
+        "long cu_k": (cu_q, torch.cat([cu_k, cu_k[-1:]]), record),
+        "one-element prefix sums": (cu_q[:1], cu_k[:1], record),
+        "record without the stage": (cu_q, cu_k, _record_without_index_prep(record)),
+    }
+
+    def outcome(cu_q_arg, cu_k_arg, registered):
+        cake_jit.MODULES[NOPE_PROGRAM] = registered
+        del calls[:]
+        error = None
+        try:
+            varlen(*acts, local, cu_q_arg, cu_k_arg, causal=True)
+        except Exception as e:  # compared between the two calls, not handled
+            error = (type(e), str(e))
+        finally:
+            cake_jit.MODULES[NOPE_PROGRAM] = record
+        return [c[0] for c in calls], error
+
+    for name, case in cases.items():
+        cache.clear()
+        cold = outcome(*case)
+        assert NOPE_INDEX_PREP_STAGE not in cold[0], name
+        cache.clear()
+        assert outcome(cu_q, cu_k, record) == ([NOPE_INDEX_PREP_STAGE, "fwd"], None)
+        assert len(cache) == 1
+        assert outcome(*case) == cold, name
+
+
+def test_rope_varlen_hit_skips_the_registry_queries_of_the_route_decision(
+    monkeypatch,
+):
+    """A stage call served from its cached binding makes none of the registry and device queries of the route
+    decision and the planning (``nope_index_prep_available``, ``record_for``, ``arch_for``); every miss makes the
+    same ones as the first call of its geometry."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    queries = {}
+
+    def spy(name, real):
+        def counted(*args, **kwargs):
+            queries[name] = queries.get(name, 0) + 1
+            return real(*args, **kwargs)
+
+        return counted
+
+    names = ("nope_index_prep_available", "record_for", "arch_for")
+    for name in names:
+        monkeypatch.setattr(cake_backend, name, spy(name, getattr(cake_backend, name)))
+    cache = cake_backend.BINDING_CACHE
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    acts = _rope_device_inputs(T, int(cu_k[-1]), K)[:4]
+
+    def counted_call(**kwargs):
+        queries.clear()
+        del calls[:]
+        cake_backend.cake_dsa_sparse_attention_nondet_varlen(
+            *acts, local, cu_q, cu_k, **kwargs
+        )
+        assert [c[0] for c in calls] == [NOPE_INDEX_PREP_STAGE, "fwd"]
+        return dict(queries)
+
+    miss = counted_call(causal=True)
+    assert set(miss) == set(names) and all(n > 0 for n in miss.values())
+    assert counted_call(causal=True) == {}
+    cache.clear()
+    assert counted_call(causal=True) == miss
+    assert counted_call(causal=True) == {}
+    assert counted_call(causal=False) == miss  # another key of the same rows
+    assert counted_call(causal=False) == {}
+
+
+def test_rope_varlen_stage_route_launches_before_the_autograd_function(monkeypatch):
+    """On the stage route both launches -- the stage, then the forward -- are issued before
+    ``CakeDSASparseAttentionNondetFunction.forward`` runs, on the planning call and on a hit; the function takes the
+    forward's outputs as they are and launches nothing itself.  They are not among its tensor inputs: the node's
+    edges are the four activations, the rows and the counts, ``out`` and ``lse`` are its outputs and not views, the
+    node keeps no reference to the launched tuple, and an in-place change of ``out`` before the backward raises
+    autograd's saved-version error."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    function = cake_backend.CakeDSASparseAttentionNondetFunction
+    real_forward = function.forward
+
+    def forward(ctx, *args):
+        calls.append(("Function.forward", {}))
+        return real_forward(ctx, *args)
+
+    monkeypatch.setattr(function, "forward", staticmethod(forward))
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    acts = [t.requires_grad_() for t in _rope_device_inputs(T, int(cu_k[-1]), K)[:4]]
+    for _ in range(2):  # the planning call, then a hit
+        del calls[:]
+        out, lse = cake_backend.cake_dsa_sparse_attention_nondet_varlen(
+            *acts, local, cu_q, cu_k, causal=True, return_lse=True
+        )
+        assert [c[0] for c in calls] == [
+            NOPE_INDEX_PREP_STAGE,
+            "fwd",
+            "Function.forward",
+        ]
+        prep, fwd = calls[0][1], calls[1][1]
+        assert fwd["out"].data_ptr() == out.data_ptr()
+        assert fwd["lse"].data_ptr() == lse.data_ptr()
+        assert not out._is_view() and not lse._is_view()
+        node = out.grad_fn
+        assert type(node).__name__ == "CakeDSASparseAttentionNondetFunctionBackward"
+        assert lse.grad_fn is node and lse.requires_grad
+        edges = node.next_functions
+        # q_latent, q_rope, kv_latent, k_rope, the rows, the counts: no output among the inputs
+        assert len(edges) == 6
+        assert all(edges[i][0].variable is acts[i] for i in range(4))
+        assert edges[4] == (None, 0) and edges[5] == (None, 0)
+        saved = node.saved_tensors
+        assert saved[4].data_ptr() == prep["out"].data_ptr()
+        assert saved[7].data_ptr() == fwd["o_lo"].data_ptr()
+        assert not hasattr(node, "launched") and not hasattr(node, "binding")
+    out.add_(1)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        torch.autograd.grad(out, acts[:2], torch.ones_like(out))
+
+
+def test_rope_accumulator_errors_follow_the_forward_launches(monkeypatch):
+    """The rope autograd entries check ``dkv_acc`` / ``dkv_dst_map`` in the autograd function's forward, after the
+    launches, which write only fresh buffers (checked ahead of them, the work would sit before the forward's launch
+    on the host path): a map without an accumulator, an accumulator that is neither a tensor nor a callable and
+    invalid accumulator tensors each raise after the flat entry's forward launch and after both launches of the
+    varlen stage route, on the planning call and on a hit."""
+    calls = []
+    _stand_in_index_prep(monkeypatch, calls)
+    _stand_in_rope_program(monkeypatch, calls)
+    local, cu_q, cu_k = (t.cuda() for t in _index_prep_example())
+    T, K = (int(d) for d in local.shape)
+    S = int(cu_k[-1])
+    acts = _rope_device_inputs(T, S, K)[:4]
+    rows, _ = compact_rows(offset_gather_kv_indices(local, cu_q, cu_k, causal=True), S)
+    bad = (
+        (
+            {"dkv_dst_map": torch.arange(S, dtype=torch.int32, device="cuda")},
+            ValueError,
+            "only meaningful together with dkv_acc",
+        ),
+        ({"dkv_acc": 3}, TypeError, "float32 tensor or a zero-argument callable"),
+        (
+            {"dkv_acc": torch.zeros(S, D_QK, dtype=torch.bfloat16, device="cuda")},
+            ValueError,
+            "dkv_acc must be a float32 tensor",
+        ),
+        (
+            {"dkv_acc": torch.zeros(S, D_LATENT, device="cuda")},
+            ValueError,
+            "dkv_acc must be a 2-D",
+        ),
+    )
+
+    def flat(**kwargs):
+        return cake_backend.cake_dsa_sparse_attention_nondet(*acts, rows, **kwargs)
+
+    def varlen(**kwargs):
+        return cake_backend.cake_dsa_sparse_attention_nondet_varlen(
+            *acts, local, cu_q, cu_k, causal=True, **kwargs
+        )
+
+    for entry, launches in ((flat, ["fwd"]), (varlen, [NOPE_INDEX_PREP_STAGE, "fwd"])):
+        for kwargs, error, message in bad:
+            for _ in range(2):  # the planning call, then a hit
+                del calls[:]
+                with pytest.raises(error, match=message):
+                    entry(**kwargs)
+                assert [c[0] for c in calls] == launches, (entry.__name__, kwargs)
 
 
 def test_rope_varlen_binding_serves_captured_calls_and_a_capture_miss_stays_private(

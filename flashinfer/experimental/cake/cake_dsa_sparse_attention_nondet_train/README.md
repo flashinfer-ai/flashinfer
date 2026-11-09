@@ -296,11 +296,17 @@ passes its own lengths, as the autograd entries do), since such a plan holds
 no storage, and otherwise plan privately.  A cache hit of that kind also skips
 the capture query.  The rope varlen entry decides its index route on every
 call; on the stage route its cached binding is keyed by the geometry of the
-activations, the per-document rows, both prefix sums and a caller cut, plus
-`causal` and the scale, and holds the forward plan with the stage's resolved
+activations, the per-document rows and a caller cut, plus `causal` and the
+scale -- not by the prefix sums, whose length (the document count) is a launch
+value of each call -- and holds the forward plan with the stage's resolved
 entry and the launch values that follow from that geometry -- no tensor.  The
-entry launches the stage and hands the binding to the autograd function, whose
-forward launches over it without a second lookup.  The bindings encode the
+entry looks the binding up first: a hit checks only what the key does not hold
+(the structure and device of the prefix sums, and that the NoPE record is still
+the registered one), any other call takes the full route decision.  Rows with
+strides `(K_slots, 1)` at a vector-aligned start reach the stage as they are,
+other layouts through their flat alias.  The stage and the forward are both
+launched before the autograd function runs; it receives the forward's outputs
+and launches nothing itself.  The bindings encode the
 tensor maps by value, so a step is its
 kernels -- one launch for the forward; three for the single-pass backward
 (`bwd_delta`, `bwd_main`, `bwd_cast`); `2 + 2 x chunks x passes` for the
