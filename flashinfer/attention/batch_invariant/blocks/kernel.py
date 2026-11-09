@@ -102,6 +102,7 @@ class AttentionKernel:
         n_wg: int = 1,
         q2: bool = False,
         ragged: bool = False,
+        causal: bool = True,
     ):
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
@@ -112,6 +113,7 @@ class AttentionKernel:
             q2,
             ragged,
         )
+        self.causal = causal  # the mask mode (a class dimension; compile-time)
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -139,7 +141,14 @@ class AttentionKernel:
         parameter, never a quantity that reaches the bits (I10). ``mScratch`` is the per-CTA ``O_m`` scratch (``grid x 128 x D``
         fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor."""
         st = StaticPlan(
-            self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged
+            self.D,
+            self.g,
+            self.page,
+            self.kv_slots,
+            self.n_wg,
+            self.q2,
+            self.ragged,
+            self.causal,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)

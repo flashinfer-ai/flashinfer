@@ -164,17 +164,21 @@ def unit_loop(
         spec.rowsum_reduction(LANES, None),
         canon.Placement.make({"key": [(LANES, "lane")]}),
     )
-    # the rows' visible ranges: row n is token n // g of the unit (bottom-right causal), head n % g
+    # the rows' visible ranges: row n is token n // g of the unit (bottom-right causal), head n % g; under the non-causal class
+    # every row sees [0, kv_len) -- as if it sat at the last position with no window (a static choice)
     L_row = []
     lo_row = []
     for n in cutlass.range_constexpr(NP):
         pos = kv_len - q_len + q_tok0 + n // g
+        if cutlass.const_expr(not st.causal):
+            pos = kv_len - 1
         L_row.append(pos + 1)
         lo = Int32(0)
-        if window_left >= 0:
-            lo = pos - window_left
-            if lo < 0:
-                lo = Int32(0)
+        if cutlass.const_expr(st.causal):
+            if window_left >= 0:
+                lo = pos - window_left
+                if lo < 0:
+                    lo = Int32(0)
         lo_row.append(lo)
     neg_inf = Float32(_NEG_INF)
     N = tile_hi - tile_lo
