@@ -4218,7 +4218,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 0,
+            "dynamic_smem_bytes": 16384,
             "use_pdl": False,
         },
         "library": "cake_gated_act_mxfp8_43b7d4d5cc26486e8036",
