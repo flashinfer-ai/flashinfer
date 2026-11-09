@@ -207,9 +207,14 @@ zeroes them while it reads `o_lo`).
   forward again into the saved `out`, `lse` and `o_lo` (same kernel, same
   operands: the same bits; derived lengths are derived again into a temporary).
   Under non-reentrant activation checkpointing the backward receives a
-  recomputed `o_lo`.  A CUDA graph that captures forward and backward together
-  replays correctly; a graph that holds only the backward and is replayed twice
-  without a forward replay in between is not supported.
+  recomputed `o_lo`.  Saved-tensor hooks such as
+  `torch.autograd.graph.save_on_cpu` may hand the index rows, `q_latent` and
+  `kv_latent` back in another layout (a column slice or an offset view comes
+  back contiguous); the NoPE backward keys and plans by the tensors it
+  receives, so the bits are those of the eager step.  A CUDA graph that
+  captures forward and backward together replays correctly; a graph that holds
+  only the backward and is replayed twice without a forward replay in between
+  is not supported.
 * The eager `backward` / `backward_nope` and the prepared runners take
   `o_lo_scratch` (default `False`: the region is allocated, or held in the
   runner's workspace; `dsa_train_workspace_size` / `dsa_nope_train_workspace_size`
@@ -291,7 +296,10 @@ natural-layout FP32 `dkv = dK + dV [S, 512]` -- fresh, or added into the
 caller's `dkv_acc`.  The index routes (in-kernel length derivation below
 `NOPE_CONVERT_SLOT_LIMIT` slots, the index-preparation stage at or above it,
 the packed varlen conversion) are those of the non-deterministic package; the
-backward reads the saved global rows and lengths on every route.
+backward reads the saved global rows and lengths on every route.  On the stage
+route of `cake_dsa_sparse_attention_det_varlen` a caller `topk_length` that is
+not a contiguous int32 `[T]` tensor on the rows' device raises `ValueError`
+before either launch.
 
 ## Layout of this package
 
