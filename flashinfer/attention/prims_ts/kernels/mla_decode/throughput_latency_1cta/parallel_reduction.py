@@ -498,7 +498,9 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                         if cutlass.const_expr(split_i > window_floor):
                             # Clamp to a live split so the load needs no branch;
                             # its zero weight drops the duplicate contribution.
-                            load_idx = split_idx if split_idx < split_limit else last_split
+                            load_idx = (
+                                split_idx if split_idx < split_limit else last_split
+                            )
                         scale = Float32(
                             smem_scale[
                                 row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + load_idx
@@ -527,17 +529,22 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                                         (scale, scale),
                                         (output_acc[elem_i], output_acc[elem_i + 1]),
                                     )
-            if cutlass.const_expr(windows[len(windows) - 1][1] < cfg.num_ctas_per_seq_kv):
+            if cutlass.const_expr(
+                windows[len(windows) - 1][1] < cfg.num_ctas_per_seq_kv
+            ):
                 if split_limit > Int32(windows[len(windows) - 1][1]):
                     chunk = GMEM_REDUCTION_RUNTIME_SPLIT_CHUNK
                     num_chunks = (split_limit + Int32(chunk - 1)) // Int32(chunk)
                     for chunk_i in cutlass.range(num_chunks):
                         for lane_i in cutlass.range_constexpr(chunk):
                             split_idx = chunk_i * Int32(chunk) + Int32(lane_i)
-                            load_idx = split_idx if split_idx < split_limit else last_split
+                            load_idx = (
+                                split_idx if split_idx < split_limit else last_split
+                            )
                             scale = Float32(
                                 smem_scale[
-                                    row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + load_idx
+                                    row_in_slice * Int32(cfg.num_ctas_per_seq_kv)
+                                    + load_idx
                                 ]
                             )
                             scale = scale if split_idx < split_limit else Float32(0)
@@ -556,10 +563,18 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                                     for elem_i in cutlass.range_constexpr(
                                         0, output_elements_per_thread, 2
                                     ):
-                                        output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
-                                            (partial_o[elem_i], partial_o[elem_i + 1]),
-                                            (scale, scale),
-                                            (output_acc[elem_i], output_acc[elem_i + 1]),
+                                        output_acc[elem_i], output_acc[elem_i + 1] = (
+                                            ffma2(
+                                                (
+                                                    partial_o[elem_i],
+                                                    partial_o[elem_i + 1],
+                                                ),
+                                                (scale, scale),
+                                                (
+                                                    output_acc[elem_i],
+                                                    output_acc[elem_i + 1],
+                                                ),
+                                            )
                                         )
 
         output_query_row = public_query_flat_row(

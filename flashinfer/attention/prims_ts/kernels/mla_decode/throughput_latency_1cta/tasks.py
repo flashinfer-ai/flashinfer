@@ -82,6 +82,11 @@ class MlaDecodeTask(Task):
         else:
             super().run_body(**task_context_kwargs(context))
 
+    # Deliberately not @cute.jit, like make_task_cache and get_domain: these
+    # mutate Python-held task state, which a jitted method under FrontendNext
+    # commits later than the jitted readers that follow. run_body above needs
+    # @cute.jit for its runtime branch. test_deepseek_v41_defaults_cpu checks
+    # the three stay undecorated.
     def init_variables(self, context=None):
         """Initialize per-task thread cache and TMEM base state."""
         super().init_variables(context)
@@ -433,7 +438,15 @@ def create_keeps_mma_ab_softmax_task(
     correction then overlaps P materialization instead of following it, and
     PV no longer waits for both in sequence. The running sum still updates
     after P, before the tail stats that normalize the output.
+
+    Loop stats therefore carry the previous tile's running sum. That is safe
+    only because the Keep-AB loop correction (``correct_loop_and_store``)
+    reads the maxima alone and Keep-AB never takes cluster finishing, which
+    configure_sparse_mla rejects; a loop correction that reads the sum needs
+    ``store_stats_before_p=False``.
     """
+    if cfg.use_cluster_reduction:
+        raise ValueError("Keep-AB early loop stats require non-cluster finishing")
     return create_throughput_latency_softmax_task_impl(
         tmem_s,
         tmem_softmax_local,
@@ -622,6 +635,23 @@ def create_keeps_mma_ab_correction_task(
                 inst_idx=0,
                 is_tail=True,
             )
+            if cfg.ws_tail_staged_stripes:
+                # Read O, release it to the next tile's PV, then finish the tail.
+                tmem_corr.correct_tail_and_stage(
+                    old_max_arr=old_max_arr,
+                    new_max_arr=new_max_arr,
+                    sum_arr=sum_arr,
+                    inst0_new_max_arr=inst0_new_max_arr,
+                    inst0_sum_arr=inst0_sum_arr,
+                    inst1_new_max_arr=inst1_new_max_arr,
+                    inst1_sum_arr=inst1_sum_arr,
+                    o_stage_idx=o_stage_idx,
+                    tail_o_stage_idx_0=tail_o_stage_idx_0,
+                    tail_o_stage_idx_1=tail_o_stage_idx_1,
+                )
+                tmem_o.release()
+                tmem_corr.store_staged_tail()
+                return local_state, tail_o_stage_idx_0, tail_o_stage_idx_1
             tmem_corr.correct_tail_and_store(
                 old_max_arr=old_max_arr,
                 new_max_arr=new_max_arr,
@@ -674,6 +704,8 @@ def create_keeps_mma_ab_correction_task(
                 tail_o_stage_idx_0,
                 tail_o_stage_idx_1,
             ) = correct_tail_o(local_state, tail_o_stage_idx_0, tail_o_stage_idx_1)
+        if cfg.ws_tma_output:
+            tmem_corr.drain_output_stores()
 
     schedule_result = (
         correction_schedule(tmem_softmax_local, tmem_o, tmem_corr)
@@ -1315,8 +1347,17 @@ def create_throughput_latency_load_task(
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             schedule_token_throttle_head(schedule_token_throttle)
             smem_q.acquire()
-            smem_q.load_q()
-            smem_q.commit()
+            if cfg.q_in_kv:
+                # The Q pipeline hands the tile over without bytes; its Q lands
+                # in the next two K/V ring slices, ahead of the tile's K.
+                smem_q.commit()
+                for half in range(2):
+                    smem_kv.acquire()
+                    smem_kv.load_q_half(half=half)
+                    smem_kv.commit()
+            else:
+                smem_q.load_q()
+                smem_q.commit()
             if cfg.serial_swap_reuse:
                 load_kv(
                     head_dim_stages=cfg.qk_head_dim_stages,
@@ -1946,7 +1987,13 @@ def create_single_kv_pipe_mma_task(
                 if not swap:
                     p_resource.init_stage_work_tile_state()
             smem_q.wait()
-            q_desc, q_desc_rope = smem_q.q_desc()
+            if cfg.q_in_kv:
+                # Both K/V ring slices of the tile's Q, then the copy to TMEM.
+                smem_kv.wait()
+                smem_kv.wait()
+                q_desc, q_desc_rope = smem_kv.q_desc_from_kv()
+            else:
+                q_desc, q_desc_rope = smem_q.q_desc()
             tmem_s.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
             staged_qk_mma(
                 smem_kv,
@@ -1956,6 +2003,16 @@ def create_single_kv_pipe_mma_task(
                 consumer_label="k_desc_0",
                 release_k=not cfg.sparse_reuse_kv,
             )
+            if cfg.q_tmem_mma_copy:
+                # QK reads Q from TMEM, so the commit-based release arrives after
+                # the copy and the first QK; the loader prefetches the next Q
+                # during the rest of this tile.
+                smem_q.release()
+                if cfg.q_in_kv:
+                    # The oldest unreleased ring slices are Q's: release them
+                    # before any of the K slices QK retains for PV.
+                    smem_kv.release()
+                    smem_kv.release()
             with domain_loop(0, domain, 1):
                 if pv_before_qk:
                     pv_mma(
@@ -2000,7 +2057,8 @@ def create_single_kv_pipe_mma_task(
                 producer_label=pv_tail,
                 **pv_kwargs,
             )
-            smem_q.release()
+            if not cfg.q_tmem_mma_copy:
+                smem_q.release()
 
     schedule_result = (
         mma_schedule(smem_q, smem_kv, tmem_s, p_resource, tmem_o)
