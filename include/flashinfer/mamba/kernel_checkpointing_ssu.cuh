@@ -51,6 +51,7 @@
 // Phase 3: old_x / old_dt / old_cumAdt cache writes.
 
 #include "kernel_checkpointing_ssu_common.cuh"
+#include "stochastic_rounding.cuh"
 
 namespace flashinfer::mamba::checkpointing {
 
@@ -182,13 +183,10 @@ struct CheckpointingSsuStorage {
 };
 
 // =============================================================================
-// Stochastic-round one fp32 pair to a packed f16x2 u32 with amortized philox
-// refresh.  rand_idx[4] is mutated in place every 4th call (when pair_idx & 3
-// == 0): a single philox_randint4x feeds 4 consecutive cvt_rs calls, then
-// gets refreshed.  Each refresh uses a per-lane unique `philox_off` so the
-// generated randints don't collide across threads.  Triton bit-equality is
-// intentionally given up here; unbiasedness still holds since each pair's
-// cvt_rs gets its own dedicated 32-bit randint.
+// Round an fp32 pair to packed f16x2. The default Philox policy refreshes
+// rand_idx[4] every fourth call using a per-lane unique offset. Shared-seed
+// mode keeps the same refresh sites but repeats correlated low32 seed bits.
+// The packed conversion and store ownership are identical under both policies.
 // =============================================================================
 template <int PHILOX_ROUNDS>
 __device__ __forceinline__ uint32_t
@@ -196,8 +194,8 @@ stochastic_round_pair_with_philox_refresh(float a, float b, int pair_idx, int64_
                                           int64_t philox_off, uint32_t (&rand_idx)[4]) {
   int const rand_pos = pair_idx & 3;
   if (rand_pos == 0) {
-    conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0], rand_idx[1],
-                                                rand_idx[2], rand_idx[3]);
+    conversion::sr_random4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0], rand_idx[1],
+                                           rand_idx[2], rand_idx[3]);
   }
   return conversion::cvt_rs_f16x2_f32(a, b, rand_idx[rand_pos]);
 }
@@ -227,8 +225,9 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
   for (int p = 0; p < PAIRS_PER_PASS; ++p) {
     int const i = p * 2;
     // xor mask = 1 swaps neighbor lanes: lane 0 <-> lane 1, lane 2 <-> lane 3, ...
-    uint32_t const peer_p0 = __shfl_xor_sync(constants::MASK_ALL_LANES, my_packed[0][p], 1);
-    uint32_t const peer_p1 = __shfl_xor_sync(constants::MASK_ALL_LANES, my_packed[1][p], 1);
+    // Even lanes transmit pass1 to odd peers; odd lanes transmit pass0 to even peers.
+    uint32_t const selected = (lane & 1) ? my_packed[0][p] : my_packed[1][p];
+    uint32_t const peer = __shfl_xor_sync(constants::MASK_ALL_LANES, selected, 1);
 
     int const row = get<0>(id_part(i));
     int const col_p0 = get<1>(id_part(i)) + n_base_p0;
@@ -239,12 +238,12 @@ __device__ __forceinline__ void exchange_ntile_state_store_global(
     if ((lane & 1) == 0) {
       // Even lane: store PASS n0 — my (lower col) in low, peer in high.
       combined = static_cast<uint64_t>(my_packed[0][p]) |
-                 (static_cast<uint64_t>(peer_p0) << constants::num_bits_uint32);
+                 (static_cast<uint64_t>(peer) << constants::num_bits_uint32);
       gmem_off = row * DSTATE + col_p0;
     } else {
       // Odd lane: store PASS n1 — peer (lower col) in low, my in high.
       // STG addr = gmem[row*DSTATE + (peer's col base)] = col_p1 - 2.
-      combined = static_cast<uint64_t>(peer_p1) |
+      combined = static_cast<uint64_t>(peer) |
                  (static_cast<uint64_t>(my_packed[1][p]) << constants::num_bits_uint32);
       gmem_off = row * DSTATE + (col_p1 - 2);
     }
@@ -1418,14 +1417,14 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
   if constexpr (ENABLE_PDL) {
     load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                            NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
-                                      ring_start, A_val, dt_bias_val, dt_seq_base, z_seq_base,
-                                      seq_len);
+                                      ring_start, prev_k, A_val, dt_bias_val, dt_seq_base,
+                                      z_seq_base, seq_len);
     cudaGridDependencySynchronize();
     load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
         smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
   } else {
     load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, ring_start, A_val,
+        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, ring_start, prev_k, A_val,
         dt_bias_val, outer, seq_len);
   }
 

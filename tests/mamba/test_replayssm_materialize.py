@@ -8,7 +8,6 @@ from flashinfer.mamba.replayssm_materialize import replayssm_materialize
 from flashinfer.jit.mamba.replayssm_materialize import (
     gen_replayssm_materialize_module,
 )
-from flashinfer.utils import is_cvt_rs_supported
 
 
 def _ptr_table(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -46,6 +45,7 @@ def _materialize(
     pad_slot_id: int = -1,
     rand_seed: torch.Tensor | None = None,
     philox_rounds: int = 0,
+    sr_rng: str = "philox",
     dependency_inputs: list[torch.Tensor] | None = None,
     dependency_outputs: list[torch.Tensor] | None = None,
     state_scales: list[torch.Tensor] | None = None,
@@ -87,6 +87,7 @@ def _materialize(
         pad_slot_id=pad_slot_id,
         rand_seed=rand_seed,
         philox_rounds=philox_rounds,
+        sr_rng=sr_rng,
         dependency_inputs=dependency_inputs,
         dependency_outputs=dependency_outputs,
     )
@@ -351,8 +352,6 @@ def test_replayssm_materialize_matches_checkpointing_ssu_replay(
     """Replay matches checkpointing_ssu for deterministic and Philox stores."""
     torch.manual_seed(2)
     cache_size, ring_buffer_len, predicted = 2, 12, 4
-    if philox_rounds and not is_cvt_rs_supported():
-        pytest.skip("FP16 Philox stochastic rounding requires SM100a/SM103a")
     state = torch.randn(cache_size, 1, 64, 64, dtype=state_dtype, device="cuda")
     x_cache = torch.randn(
         cache_size, 1, ring_buffer_len, 64, dtype=torch.bfloat16, device="cuda"
@@ -541,3 +540,245 @@ def test_replayssm_materialize_8bit_zero_count_copies_state_and_scale(
     assert torch.equal(state[1], state_before[0])
     assert torch.equal(scales[0], scales_before[0])
     assert torch.equal(scales[1], scales_before[0])
+
+
+def _layer_philox_seed(base_seed: int, layer: int) -> int:
+    """Match the existing scalar-base materializer seed contract."""
+    mask = (1 << 64) - 1
+    value = base_seed ^ ((0x9E3779B97F4A7C15 * (layer + 1)) & mask)
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    value ^= value >> 31
+    return value if value < (1 << 63) else value - (1 << 64)
+
+
+@pytest.mark.parametrize("sr_rng", ["philox", "shared_seed"])
+@pytest.mark.parametrize(
+    "state_dtype",
+    [torch.float16, torch.float8_e4m3fn, torch.int8],
+    ids=["fp16", "fp8", "int8"],
+)
+def test_replayssm_materialize_multilayer_sr_matches_checkpointing(
+    state_dtype: torch.dtype, sr_rng: str
+) -> None:
+    """Each layer uses its selected provider for replay; zero/inactive rows copy or stay."""
+    torch.manual_seed(21)
+    layers, slots, heads, dim, dstate, ring_len, predicted = 2, 8, 1, 64, 128, 12, 4
+    quantized = state_dtype != torch.float16
+    state = [
+        (torch.randn(slots, heads, dim, dstate, device="cuda") * 8).to(state_dtype)
+        for _ in range(layers)
+    ]
+    scales = (
+        [torch.rand(slots, heads, dim, device="cuda") + 0.01 for _ in range(layers)]
+        if quantized
+        else None
+    )
+    x_cache = [
+        torch.randn(slots, heads, ring_len, dim, device="cuda", dtype=torch.bfloat16)
+        for _ in range(layers)
+    ]
+    b_cache = [
+        torch.randn(slots, heads, ring_len, dstate, device="cuda", dtype=torch.bfloat16)
+        for _ in range(layers)
+    ]
+    dt_cache = [
+        torch.rand(slots, heads, ring_len, device="cuda") * 0.05 for _ in range(layers)
+    ]
+    a_values = [-torch.rand(heads, device="cuda") for _ in range(layers)]
+    seeds = torch.tensor(
+        [0x12345678, 0xFEDCBA98] if sr_rng == "shared_seed" else [12345],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    before = [tensor.clone() for tensor in state]
+    before_scales = [tensor.clone() for tensor in scales] if quantized else None
+    expected = [tensor.clone() for tensor in state]
+    expected_scales = [tensor.clone() for tensor in scales] if quantized else None
+    ring_start = torch.tensor([8, 3, 0, 0], dtype=torch.int32, device="cuda")
+    count = torch.tensor([5, 0, -1, -1], dtype=torch.int32, device="cuda")
+    for layer in range(layers):
+        # Match physical destination offsets too: Philox counters include them.
+        expected[layer][1].copy_(state[layer][0])
+        if quantized:
+            expected_scales[layer][1].copy_(scales[layer][0])
+        ref_x, ref_b, ref_dt = (
+            tensor[layer].clone() for tensor in (x_cache, b_cache, dt_cache)
+        )
+        for cache in (ref_x, ref_b, ref_dt):
+            cache[1].copy_(cache[0])
+        seed = (
+            seeds[layer : layer + 1]
+            if sr_rng == "shared_seed"
+            else torch.tensor(
+                [_layer_philox_seed(12345, layer)], dtype=torch.int64, device="cuda"
+            )
+        )
+        x = torch.randn(1, predicted, heads, dim, dtype=torch.bfloat16, device="cuda")
+        dt = torch.rand(
+            1, predicted, heads, 1, dtype=torch.bfloat16, device="cuda"
+        ).expand_as(x)
+        bc = torch.zeros(
+            1, predicted, heads, dstate, dtype=torch.bfloat16, device="cuda"
+        )
+        ref_start = torch.zeros(slots, dtype=torch.int32, device="cuda")
+        ref_count = torch.zeros_like(ref_start)
+        ref_start[1] = ring_start[0]
+        ref_count[1] = count[0]
+        checkpointing_ssu(
+            expected[layer],
+            ref_x,
+            ref_b,
+            ref_dt,
+            ref_start,
+            ref_count,
+            x,
+            dt,
+            a_values[layer].as_strided((heads, dim, dstate), (1, 0, 0)),
+            bc,
+            bc,
+            torch.empty_like(x),
+            state_batch_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            state_scale=expected_scales[layer] if quantized else None,
+            algorithm="monolith",
+            rand_seed=seed,
+            philox_rounds=5,
+            sr_rng=sr_rng,
+        )
+    _materialize(
+        state,
+        x_cache,
+        b_cache,
+        dt_cache,
+        a_values,
+        torch.tensor([[0, 2, 3, -1]] * layers, dtype=torch.int32, device="cuda"),
+        torch.tensor([[1, 5, 6, 7]] * layers, dtype=torch.int32, device="cuda"),
+        ring_start,
+        count,
+        ring_len,
+        active_request_indices=torch.tensor(
+            [1, 0, -1, -1], dtype=torch.int32, device="cuda"
+        ),
+        rand_seed=seeds,
+        philox_rounds=5,
+        sr_rng=sr_rng,
+        state_scales=scales,
+    )
+    torch.cuda.synchronize()
+    for layer in range(layers):
+        assert torch.equal(
+            state[layer][1].view(torch.uint8), expected[layer][1].view(torch.uint8)
+        )
+        assert torch.equal(
+            state[layer][5].view(torch.uint8), before[layer][2].view(torch.uint8)
+        )
+        for slot in (0, 2, 3, 4, 6, 7):
+            assert torch.equal(
+                state[layer][slot].view(torch.uint8),
+                before[layer][slot].view(torch.uint8),
+            )
+        if quantized:
+            assert torch.equal(scales[layer][1], expected_scales[layer][1])
+            assert torch.equal(scales[layer][5], before_scales[layer][2])
+            for slot in (0, 2, 3, 4, 6, 7):
+                assert torch.equal(scales[layer][slot], before_scales[layer][slot])
+
+    after = [tensor.clone() for tensor in state]
+    after_scales = [tensor.clone() for tensor in scales] if quantized else None
+    _materialize(
+        state,
+        x_cache,
+        b_cache,
+        dt_cache,
+        a_values,
+        torch.tensor([[0, 2, 3, -1]] * layers, dtype=torch.int32, device="cuda"),
+        torch.tensor([[1, 5, 6, 7]] * layers, dtype=torch.int32, device="cuda"),
+        ring_start,
+        count,
+        ring_len,
+        active_request_indices=torch.full((4,), -1, dtype=torch.int32, device="cuda"),
+        rand_seed=seeds,
+        philox_rounds=5,
+        sr_rng=sr_rng,
+        state_scales=scales,
+    )
+    torch.cuda.synchronize()
+    for layer in range(layers):
+        assert torch.equal(
+            state[layer].view(torch.uint8), after[layer].view(torch.uint8)
+        )
+        if quantized:
+            assert torch.equal(scales[layer], after_scales[layer])
+
+
+@pytest.mark.parametrize(
+    ("state_dtype", "rounds", "sr_rng"),
+    [
+        (torch.bfloat16, 5, "shared_seed"),
+        (torch.float16, 0, "shared_seed"),
+        (torch.float16, 5, "unknown"),
+    ],
+)
+def test_replayssm_materialize_rejects_invalid_rng(state_dtype, rounds, sr_rng):
+    with pytest.raises(ValueError, match="sr_rng|shared_seed"):
+        gen_replayssm_materialize_module(
+            state_dtype, torch.bfloat16, torch.float32, 64, 128, 1, 8, rounds, sr_rng
+        )
+
+
+def test_replayssm_materialize_shared_seed_jit_contract(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from flashinfer.jit.mamba import replayssm_materialize as jit
+
+    monkeypatch.setattr(jit.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
+    monkeypatch.setattr(
+        jit,
+        "CompilationContext",
+        lambda: SimpleNamespace(get_nvcc_flags_list=lambda **kwargs: []),
+    )
+    monkeypatch.setattr(
+        jit, "gen_jit_spec", lambda uri, sources, **kwargs: (uri, sources, kwargs)
+    )
+    flag = "-DFLASHINFER_MAMBA_SR_SHARED_SEED=1"
+    for dtype in (torch.float16, torch.float8_e4m3fn, torch.int8):
+        args = (dtype, torch.bfloat16, torch.float32, 64, 128, 1, 8, 5)
+        phi = jit.gen_replayssm_materialize_module(*args)
+        explicit = jit.gen_replayssm_materialize_module(*args, sr_rng="philox")
+        shared = jit.gen_replayssm_materialize_module(*args, sr_rng="shared_seed")
+        assert phi[0] == explicit[0]
+        assert shared[0] == phi[0] + "_sr_shared_seed"
+        assert flag not in phi[2]["extra_cuda_cflags"]
+        assert flag in shared[2]["extra_cuda_cflags"]
+        assert (
+            "constexpr bool SHARED_SEED = true;"
+            in (tmp_path / shared[0] / "replayssm_materialize_config.inc").read_text()
+        )
+
+
+@pytest.mark.parametrize("seed_kind", ["missing", "scalar", "matrix", "wrong_dtype"])
+def test_replayssm_materialize_shared_seed_requires_per_layer_seeds(seed_kind):
+    seeds = {
+        "missing": None,
+        "scalar": torch.ones(1, dtype=torch.int64, device="cuda"),
+        "matrix": torch.ones(1, 2, dtype=torch.int64, device="cuda"),
+        "wrong_dtype": torch.ones(2, dtype=torch.int32, device="cuda"),
+    }
+    state = [
+        torch.empty(2, 1, 64, 128, dtype=torch.float16, device="cuda") for _ in range(2)
+    ]
+    with pytest.raises(ValueError, match=r"shape \(2,\)"):
+        _materialize(
+            state,
+            [torch.empty(1, 1, 1, 64, dtype=torch.bfloat16, device="cuda")] * 2,
+            [torch.empty(1, 1, 1, 128, dtype=torch.bfloat16, device="cuda")] * 2,
+            [torch.empty(1, 1, 1, device="cuda")] * 2,
+            [torch.empty(1, device="cuda")] * 2,
+            torch.zeros(2, 1, dtype=torch.int32, device="cuda"),
+            torch.ones(2, 1, dtype=torch.int32, device="cuda"),
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            ring_buffer_len=1,
+            rand_seed=seeds[seed_kind],
+            philox_rounds=5,
+            sr_rng="shared_seed",
+        )
