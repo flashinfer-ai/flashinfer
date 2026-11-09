@@ -12,6 +12,8 @@ builds the histogram, the group tables and the positions from the shared copy wi
 form up to ``ROUTE_PLAN_MAX_TOKENS`` tokens (one CTA's warps route the tokens serially beyond a few per warp, where the two-launch
 form's parallel plan wins). ``align``: the group offsets rounded up to ``align`` rows (the block-scaled classes' padded packing:
 ``src`` then spans the padded bound and the launch writes ``-1`` into every padding slot, the two-launch form's host fill).
+An id outside ``[0, E)`` (a dropped slot of a caller's plan) is not counted and gets ``dest -1``; ``src`` holds ``-1`` past
+the valid rows.
 ``dual``: the dense positions and, next to them, the positions with the groups padded to ``pad_align`` rows (``dest_pad``,
 ``pos_pad``: the block-scaled classes' dense packing, whose scale factors and row scales sit at the padded positions).
 """
@@ -168,13 +170,16 @@ class RoutePlanKernel:
                 e = Int32(-1)
                 if valid:
                     e = s_exp[i]
+                ok = (
+                    valid & (e >= Int32(0)) & (e < E)
+                )  # a dropped slot (id outside [0, E)) is ranked by nothing
                 m = cute.arch.match_sync(Uint32(0xFFFFFFFF), e)
                 intra = Int32(cute.arch.popc(m & cute.arch.lanemask_lt()))
                 r = Int32(0)
-                if valid:
+                if ok:
                     r = wcnt[warp * MAX_E + e].to(Int32) + intra
                 cute.arch.sync_warp()
-                if valid & (intra == Int32(0)):
+                if ok & (intra == Int32(0)):
                     wcnt[warp * MAX_E + e] = (
                         wcnt[warp * MAX_E + e].to(Int32) + Int32(cute.arch.popc(m))
                     ).to(Int16)
@@ -204,25 +209,31 @@ class RoutePlanKernel:
                 i = base_w + Int32(c * LANES) + lane
                 if i < n:
                     e = es[c]
-                    rank = wcnt[warp * MAX_E + e].to(Int32) + rs[c]
-                    p = s_off[e] + rank
-                    mDest[i] = p
-                    mSrc[p] = i
-                    if cutlass.const_expr(self.dual):
-                        pp = s_off_pad[e] + rank
-                        mDestPad[i] = pp
-                        mPosPad[p] = pp
+                    if (e >= Int32(0)) & (e < E):
+                        rank = wcnt[warp * MAX_E + e].to(Int32) + rs[c]
+                        p = s_off[e] + rank
+                        mDest[i] = p
+                        mSrc[p] = i
+                        if cutlass.const_expr(self.dual):
+                            pp = s_off_pad[e] + rank
+                            mDestPad[i] = pp
+                            mPosPad[p] = pp
+                    if (e < Int32(0)) | (e >= E):
+                        mDest[i] = Int32(-1)  # a dropped slot has no position
+                        if cutlass.const_expr(self.dual):
+                            mDestPad[i] = Int32(-1)
         if cutlass.const_expr(self.align > 1):
-            # the padded packing's -1 slots: every group's rows past its count up to its rounded extent (one warp per expert),
-            # and the rows past the padded total up to the buffer's end (the host's bound)
+            # the padded packing's -1 slots: every group's rows past its count up to its rounded extent (one warp per expert)
             al = Int32(self.align)
             for e in cutlass.range(warp, E, WARPS_RP):
                 lo = s_off[e] + hist[e]
                 hi = s_off[e] + ((hist[e] + al - Int32(1)) // al) * al
                 for r in cutlass.range(lo + lane, hi, LANES):
                     mSrc[r] = Int32(-1)
-            for r in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
-                mSrc[r] = Int32(-1)
+        # the rows past the (padded) total up to the buffer's end: the dropped slots' share of the buffer and the padded
+        # form's host bound hold -1, which the gather skips
+        for r in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
+            mSrc[r] = Int32(-1)
         pdl.trigger_one_wave()
 
 

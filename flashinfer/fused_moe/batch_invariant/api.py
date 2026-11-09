@@ -265,7 +265,10 @@ def route(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(experts [T, k] int32, weights [T, k] f32)`` in slot (rank) order from ``logits [T, E]`` (f32 or bf16): the
     class's routing (:mod:`.spec`: the declared ``exp``, the strict selection order ``(score desc, index asc)`` on exact
-    binary32 scores, the method's weight formula)."""
+    binary32 scores, the method's weight formula). An expert whose selection score is NaN is never selected; when fewer
+    than ``top_k`` experts of a row have a non-NaN score, each remaining slot takes the lowest expert index the row has
+    not taken, with a NaN weight (the row's output is NaN; every id stays in ``[0, E)``). A Python ``scaling_factor``
+    other than ``1`` costs a fill per call; a one-element tensor is read as given."""
     from .route import get_compiled_route
 
     method = S.METHODS[method] if isinstance(method, str) else method
@@ -412,7 +415,9 @@ def permute_plan(
     experts: torch.Tensor, E: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(counts [E] int32, dest [T, k] int32, src [Tk] int32)``: the deterministic permutation of the expanded rows,
-    grouped by expert in expert order and, inside a group, in token-slot order (a function of the routing alone)."""
+    grouped by expert in expert order and, inside a group, in token-slot order (a function of the routing alone). An id
+    outside ``[0, E)`` is a dropped slot: ``counts`` excludes it, its ``dest`` is ``-1`` and ``src`` holds ``-1`` past
+    the valid rows."""
     from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
 
     T, k = experts.shape
@@ -451,8 +456,10 @@ def fused_moe(
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
-    slot order in fp32 and converted once. ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space
-    gives the same bits; the dispatcher's pick by default)."""
+    slot order in fp32 and converted once. An expert id outside ``[0, E)`` is a dropped slot: neither gathered nor
+    computed, the term ``+0`` in its token's fold whatever its weight (a token whose slots are all dropped gives a zero
+    row). ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space gives the same bits; the
+    dispatcher's pick by default)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs

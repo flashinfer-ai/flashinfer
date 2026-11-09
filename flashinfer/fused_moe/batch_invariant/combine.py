@@ -4,7 +4,8 @@
 ``+0``. The fold is the engine's plan of ``spec.combine_reduction`` (one register-level ``slot`` fold, fused with the
 loads by ``canon.init_state``); ``wpt`` warps per token (a placement: warp ``w`` of a token owns the 32-vector slabs
 ``w, w + wpt, ...`` of the row; at small ``T`` the row is spread over several warps so the k dependent loads per vector
-are not serialised in one warp), lanes stride over 16-byte vectors of ``h``; every op through ``CuteF32``. Launched with
+are not serialised in one warp), lanes stride over 16-byte vectors of ``h``; every op through ``CuteF32``. A dropped slot
+(``dest[t, r] = -1``: an expert id outside ``[0, E)``) contributes the term ``+0``, whatever its weight. Launched with
 programmatic dependent launch (waits for GEMM2's grid before reading ``y``)."""
 
 from __future__ import annotations
@@ -28,11 +29,27 @@ LANES = 32
 VEC = 8
 
 
-def _fold_slots(plan, frags, ws, i):
+def _select_f32(cond, a, b):
+    """``a`` where ``cond`` else ``b`` (``arith.select``, one ``selp.f32``: no arithmetic)."""
+    from cutlass._mlir.dialects import arith
+
+    return Float32(
+        arith.select(cond.ir_value(), Float32(a).ir_value(), Float32(b).ir_value())
+    )
+
+
+def _fold_slots(plan, frags, ws, oks, i):
     """The engine's slot fold for element ``i`` of the vectors: ``init_state`` fuses the loads ``mul(f32(y_r), w_r)``
-    with the fold steps in slot order (a plain Python helper, so the staged loop body assigns only device values)."""
+    with the fold steps in slot order (a plain Python helper, so the staged loop body assigns only device values); a
+    dropped slot (``oks[r]`` false) enters as the term ``+0``."""
     state, start = canon.init_state(
-        plan, CuteF32, lambda key: CuteF32.mul(frags[key[0]][i].to(Float32), ws[key[0]])
+        plan,
+        CuteF32,
+        lambda key: _select_f32(
+            oks[key[0]],
+            CuteF32.mul(frags[key[0]][i].to(Float32), ws[key[0]]),
+            CuteF32.const(0.0),
+        ),
     )
     return canon.run(plan, state, start, None, CuteF32)
 
@@ -90,6 +107,9 @@ class CombineKernel:
         if cutlass.const_expr(True):
             ps = [mDest[t, r] for r in range(k)]
             ws = [mW[t, r] for r in range(k)]
+            # a dropped slot (dest -1: an expert id outside [0, E)) has no expert row: its loads take row 0 and its term is +0
+            oks = [p >= Int32(0) for p in ps]
+            ps = [cutlass.max(p, Int32(0)) for p in ps]
             atom_in = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 mY.element_type,
@@ -121,7 +141,7 @@ class CombineKernel:
                     )
                 for i in cutlass.range_constexpr(VEC):
                     out[i] = CuteF32.cvt_out(
-                        _fold_slots(self.plan, frags, ws, i), self.out_fmt
+                        _fold_slots(self.plan, frags, ws, oks, i), self.out_fmt
                     )
                 if valid & (j < n_vec):
                     cute.copy(atom_out, out, cute.local_tile(row_out, (VEC,), (jc,)))

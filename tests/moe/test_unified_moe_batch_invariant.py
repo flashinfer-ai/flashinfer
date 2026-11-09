@@ -1337,3 +1337,114 @@ def test_layer_fused_routing_at_small_t_matches_prerouted_routing():
     ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
     out2 = layer(_routed_pack(x, ids, wts), W)
     assert torch.equal(bits(out), bits(out2))
+def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
+    """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``: a framework's dropped slot) is dropped: the plan
+    does not count it (``dest -1``, ``src -1`` past the valid rows), the gather and the GEMMs never touch it, and the
+    combine folds the remaining slots in slot order with the term ``+0`` in its place, so the output equals the class's on
+    the same rows with those slots at a valid id and weight ``+0``; a token whose slots are all dropped gives a zero row;
+    the other tokens keep their bits. No host validation, no fault; the one-launch plan below ``PLAN_MULTI_MIN_N``
+    expanded rows and the two-launch form (a partial final block) above it."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant.api import PLAN_MULTI_MIN_N
+
+    k, H, I, E = 8, 256, 128, 64
+    bad = (-1, E, 1 << 30)
+    for T in (96, PLAN_MULTI_MIN_N // k + 3):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=21, adversarial=True)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids_bad = ids.clone()
+        rows = torch.randperm(T, generator=torch.Generator().manual_seed(T))[: T // 4]
+        for j, t in enumerate(rows.tolist()):
+            ids_bad[t, j % k] = bad[j % 3]
+            ids_bad[t, (j + 3) % k] = bad[(j + 1) % 3]
+        ids_bad[rows[0]] = torch.tensor(
+            [bad[i % 3] for i in range(k)], dtype=torch.int32
+        )
+        dropped = (ids_bad < 0) | (ids_bad >= E)
+        counts, dest, src = api.permute_plan(ids_bad.cuda(), E)
+        n_valid = int((~dropped).sum())
+        assert int(counts.sum()) == n_valid
+        assert torch.equal(dest.cpu().view(-1) < 0, dropped.view(-1))
+        assert torch.all(src[n_valid:] == -1) and torch.all(src[:n_valid] >= 0)
+        valid_pos = dest.view(-1)[~dropped.view(-1).cuda()].long()
+        assert torch.equal(
+            src[valid_pos].cpu(), torch.nonzero(~dropped.view(-1)).view(-1).int()
+        )
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+        out = layer(_routed_pack(x, ids_bad.cuda(), wts.cuda()), W)
+        ids_ref = torch.where(dropped, torch.zeros_like(ids), ids)
+        wts_ref = torch.where(dropped, torch.zeros_like(wts), wts)
+        ref = _reference_ffn(
+            x, ids_ref.cuda(), wts_ref.cuda(), w1, w2, S.activation_of(_SWIGLU)
+        )
+        assert torch.equal(bits(out.cpu()), bits(ref))
+        assert torch.all(out[rows[0]] == 0)
+        whole = (~dropped.any(dim=1)).cuda()
+        ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W)
+        assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
+
+
+def test_nan_logits_route_to_the_lowest_untaken_experts_with_nan_weights(E):
+    """An expert whose selection score is NaN is never selected. A row with fewer than ``top_k`` non-NaN logits (one with
+    none at all) gets the lowest expert indices it has not taken in its remaining slots, with NaN weights: every id stays
+    in ``[0, E)`` (never the bucket's absent experts at ``E = 48``, never the argmax sentinel at ``E = 64``), the row's
+    output is NaN, nothing faults, and the rows without a NaN keep the class's bits, in the fused route + plan form (a
+    small token count) and the two-launch form; ``route_plan`` gives ``route`` + ``permute_plan``'s integers on such
+    logits. A row with exactly ``top_k`` finite logits selects them in the strict order."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    k, H, I = 8, 256, 128
+    keep = {
+        1: 3,
+        5: 0,
+        9: 1,
+        7: k,
+    }  # token -> its finite logits (7: a boundary row, k of them)
+    for T in (12, 40):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5, adversarial=True)
+        logits = logits.clone()
+        finite = {}
+        for t, m in keep.items():
+            cols = torch.randperm(E, generator=torch.Generator().manual_seed(t))[:m]
+            finite[t] = cols.tolist()
+            mask = torch.ones(E, dtype=torch.bool)
+            mask[cols] = False
+            logits[t, mask.cuda()] = float("nan")
+        ids, wts = api.route(logits, k, S.SOFTMAX_RENORM)
+        ids_c, wts_c, logits_c = ids.cpu(), wts.cpu(), logits.cpu()
+        assert torch.all((ids_c >= 0) & (ids_c < E))
+        for t, cols in finite.items():
+            order = sorted(cols, key=lambda e: (-float(logits_c[t, e]), e))
+            m = len(cols)
+            assert ids_c[t, :m].tolist() == order, t
+            taken, pad = set(order), []
+            for _ in range(k - m):
+                pad.append(min(set(range(E)) - taken))
+                taken.add(pad[-1])
+            assert ids_c[t, m:].tolist() == pad, t
+            if m < k:
+                assert torch.isnan(wts_c[t]).all(), (
+                    t
+                )  # the renormalisation spreads the NaN over the row
+        clean = torch.tensor([t not in keep for t in range(T)])
+        ref_ids, ref_w = _reference_route(
+            logits_c[clean], k, RoutingMethodType.Renormalize
+        )
+        assert torch.equal(ids_c[clean], ref_ids) and torch.equal(
+            bits(wts_c[clean]), bits(ref_w)
+        )
+        ex2, w2_, counts2, dest2, src2 = api.route_plan(logits, k, S.SOFTMAX_RENORM)
+        counts, dest, src = api.permute_plan(ids, E)
+        assert torch.equal(ids, ex2) and torch.equal(bits(wts), bits(w2_))
+        assert torch.equal(counts, counts2) and torch.equal(dest, dest2)
+        assert torch.equal(src, src2)
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+        out = layer(_logits_pack(x, logits), W)
+        nan_rows = torch.tensor([keep.get(t, k) < k for t in range(T)]).cuda()
+        assert torch.isnan(out[nan_rows]).all()
+        ref = layer(_routed_pack(x[clean.cuda()], ref_ids.cuda(), ref_w.cuda()), W)
+        assert torch.equal(bits(out[clean.cuda()]), bits(ref))
+
+

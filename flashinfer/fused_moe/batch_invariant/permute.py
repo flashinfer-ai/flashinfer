@@ -22,6 +22,9 @@
   whole histogram (``E x T k`` shared-memory atomics); the two-launch form reads every slot three times in all;
 * ``gather``: ``x_perm[p, :] = x[src[p] // k, :]`` in 16-byte vectors (the bf16 class, dense packing).
 
+An expert id outside ``[0, E)`` (a caller's dropped slot) is dropped: no plan counts it, its ``dest`` is ``-1``,
+``src`` holds ``-1`` past the valid rows and the gather skips those rows.
+
 Every kernel here launches with programmatic dependent launch (``use_pdl``): it waits for its predecessor's grid
 (``griddepcontrol.wait``) before touching dependent data and lets its successor start its prologue once its own work
 is done (``griddepcontrol.launch_dependents``) -- a scheduling placement, no bits.
@@ -75,7 +78,10 @@ class HistogramKernel:
         end = cutlass.min(n, (bidx + 1) * CHUNK)
         for i in cutlass.range(bidx * CHUNK + tidx, end, THREADS):
             e = mExp[i]
-            cute.arch.atomic_add(hist.iterator + e, Int32(1))
+            if (e >= Int32(0)) & (
+                e < E
+            ):  # an id outside [0, E) is a dropped slot: not counted
+                cute.arch.atomic_add(hist.iterator + e, Int32(1))
         cute.arch.barrier()
         if tidx < E:
             v = hist[tidx]
@@ -139,9 +145,10 @@ class PositionKernel:
         n_chunks = cute.ceil_div(n, THREADS)
         for c in cutlass.range(0, n_chunks, 1):
             i = c * THREADS + tidx
-            match = Boolean(False)
+            ei = Int32(0)
             if i < n:
-                match = mExp[i] == e
+                ei = mExp[i]
+            match = (i < n) & (ei == e)
             ballot = cute.arch.vote_ballot_sync(match)
             lane_prefix = cute.arch.popc(Uint32(ballot) & cute.arch.lanemask_lt())
             if lane == 0:
@@ -157,8 +164,16 @@ class PositionKernel:
             if match:
                 mDest[i] = base + prefix
                 mSrc[base + prefix] = i
+            if (e == Int32(0)) & (i < n) & ((ei < Int32(0)) | (ei >= E)):
+                mDest[i] = Int32(
+                    -1
+                )  # a dropped slot (id outside [0, E)) has no position; CTA 0 marks it
             running = running + total
             cute.arch.barrier()
+        if e == Int32(0):
+            # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
+            for p in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
+                mSrc[p] = Int32(-1)
         pdl.trigger_one_wave()
 
 
@@ -238,7 +253,14 @@ class PlanKernel:
             hist[tidx] = Int32(0)
         cute.arch.barrier()
         for i in cutlass.range(tidx, n, THREADS):
-            cute.arch.atomic_add(hist.iterator + mExp[i], Int32(1))
+            ei = mExp[i]
+            if (ei >= Int32(0)) & (ei < E):
+                cute.arch.atomic_add(hist.iterator + ei, Int32(1))
+            if (e == Int32(0)) & ((ei < Int32(0)) | (ei >= E)):
+                # a dropped slot (id outside [0, E)): not counted, no position; CTA 0 marks it
+                mDest[i] = Int32(-1)
+                if cutlass.const_expr(self.dual):
+                    mDestPad[i] = Int32(-1)
         cute.arch.barrier()
         if (e == 0) & (tidx < E):
             mCounts[tidx] = hist[tidx]
@@ -262,6 +284,10 @@ class PlanKernel:
         if lane == 0:
             warp_tot[warp] = local
         cute.arch.barrier()  # the tables and the warp totals are complete
+        if e == Int32(0):
+            # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
+            for p in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
+                mSrc[p] = Int32(-1)
         base = s_off[e]
         base_pad = Int32(0)
         if cutlass.const_expr(self.dual):
@@ -346,25 +372,30 @@ class PlanBlocksKernel:
         base_w = b * PLAN_BLOCK + warp * (PLAN_IDS_PER_THREAD * LANES)
         es = []
         rs = []
+        oks = []
         for c in cutlass.range_constexpr(PLAN_IDS_PER_THREAD):
             i = base_w + c * LANES + lane
             valid = i < n
             e = Int32(-1)
             if valid:
                 e = mExp[i]
+            ok = (
+                valid & (e >= Int32(0)) & (e < E)
+            )  # a dropped slot (id outside [0, E)) is ranked by nothing
             m = cute.arch.match_sync(Uint32(0xFFFFFFFF), e)
             intra = Int32(cute.arch.popc(m & cute.arch.lanemask_lt()))
             r = Int32(0)
-            if valid:
+            if ok:
                 r = wcnt[warp * MAX_E + e] + intra
             cute.arch.sync_warp()
-            if valid & (intra == Int32(0)):
+            if ok & (intra == Int32(0)):
                 wcnt[warp * MAX_E + e] = wcnt[warp * MAX_E + e] + Int32(
                     cute.arch.popc(m)
                 )
             cute.arch.sync_warp()
             es.append(e)
             rs.append(r)
+            oks.append(ok)
         cute.arch.barrier()
         # per expert: the exclusive prefix over the warps (in place) and the block total
         for e in cutlass.range(tidx, E, PLAN_THREADS):
@@ -378,7 +409,10 @@ class PlanBlocksKernel:
         for c in cutlass.range_constexpr(PLAN_IDS_PER_THREAD):
             i = base_w + c * LANES + lane
             if i < n:
-                mDest[i] = rs[c] + wcnt[warp * MAX_E + es[c]]
+                d = Int32(-1)  # a dropped slot: no rank, no position
+                if oks[c]:
+                    d = rs[c] + wcnt[warp * MAX_E + es[c]]
+                mDest[i] = d
         pdl.trigger_one_wave()
 
 
@@ -470,18 +504,28 @@ class PlanFinishKernel:
             if cutlass.const_expr(self.dual):
                 build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
         cute.arch.barrier()
+        if b == Int32(0):
+            # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
+            for p in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], PLAN_THREADS):
+                mSrc[p] = Int32(-1)
         for c in cutlass.range_constexpr(PLAN_IDS_PER_THREAD):
             i = b * PLAN_BLOCK + c * PLAN_THREADS + tidx
             if i < n:
                 e = mExp[i]
-                r = mDest[i]
-                p = s_off[e] + pre_b[e] + r
-                mDest[i] = p
-                mSrc[p] = i
+                if (e >= Int32(0)) & (
+                    e < E
+                ):  # a dropped slot keeps the blocks kernel's -1
+                    r = mDest[i]
+                    p = s_off[e] + pre_b[e] + r
+                    mDest[i] = p
+                    mSrc[p] = i
+                    if cutlass.const_expr(self.dual):
+                        pp = s_off_pad[e] + pre_b[e] + r
+                        mDestPad[i] = pp
+                        mPosPad[p] = pp
                 if cutlass.const_expr(self.dual):
-                    pp = s_off_pad[e] + pre_b[e] + r
-                    mDestPad[i] = pp
-                    mPosPad[p] = pp
+                    if (e < Int32(0)) | (e >= E):
+                        mDestPad[i] = Int32(-1)
         pdl.trigger_one_wave()
 
 
@@ -581,7 +625,11 @@ class GatherKernel:
         part = g % Int32(wpr)
         valid = p_raw < Tk
         p = cutlass.min(p_raw, Tk - Int32(1))
-        t = mSrc[p] // Int32(self.k)
+        s = mSrc[p]
+        valid = valid & (
+            s >= Int32(0)
+        )  # -1: a row past the valid rows (the dropped slots' share), nothing to gather
+        t = cutlass.max(s, Int32(0)) // Int32(self.k)
         atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), mX.element_type, num_bits_per_copy=128
         )
