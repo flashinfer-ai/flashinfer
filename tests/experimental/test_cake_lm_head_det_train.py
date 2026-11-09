@@ -9099,6 +9099,74 @@ def test_device_logprob_keep_takes_num_valid_rows(glm_weight, monkeypatch):
         del base, given
 
 
+def test_device_logprob_one_chunk_keep_switch(glm_weight, monkeypatch):
+    """The opt-in module's one-chunk kept-logits switch (``set_logprob_one_chunk_keep``, off by default): with it on, a
+    default log-probability call of one chunk of rows whose backward can follow runs the kept-logits function, and
+    every other call keeps its route (more than one chunk of rows, the caller's count, no backward, a non-reentrant
+    checkpoint); ``logp`` / ``dX`` / ``dW`` are bitwise the switch-off call's either way."""
+    _require_program(entry="logprob")
+    assert opt_in.set_logprob_one_chunk_keep(False) is False  # the default
+    applied = []
+    apply = cake_backend.CakeLMHeadDetLogprobKeepFunction.apply
+
+    def spy(*args):
+        applied.append(len(args))
+        return apply(*args)
+
+    for T, C, ignore, extra, kept in (
+        (1500, 4096, 0.05, {}, True),
+        (1500, 4096, 0.0, {}, True),
+        (4096, 4096, 0.6, {}, True),
+        (4500, 4096, 0.33, {}, False),
+        (1500, 4096, 0.05, "count", False),
+    ):
+        inp = make_inputs(
+            T, seed=SEED + 390 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
+        )
+        kw = dict(num_valid_rows=int(inp.valid.sum())) if extra == "count" else {}
+        case = (T, C, ignore, extra, kept)
+        base = _run(inp, C, entry="logprob", backend="cake", memory_mode=None, **kw)
+        previous = opt_in.set_logprob_one_chunk_keep(True)
+        monkeypatch.setattr(cake_backend.CakeLMHeadDetLogprobKeepFunction, "apply", spy)
+        try:
+            applied.clear()
+            out = _run(inp, C, entry="logprob", backend="cake", memory_mode=None, **kw)
+            routed = list(applied)
+            applied.clear()
+            with torch.no_grad():
+                lp = opt_in.cake_lm_head_det_train_logprob(
+                    inp.X,
+                    inp.W.detach().requires_grad_(True),
+                    inp.labels,
+                    chunk_size=C,
+                    **kw,
+                )
+            assert not applied, case
+            X = inp.X.detach().requires_grad_(True)
+            W = inp.W.detach().requires_grad_(True)
+            ck = torch.utils.checkpoint.checkpoint(
+                lambda x, w: opt_in.cake_lm_head_det_train_logprob(
+                    x, w, inp.labels, chunk_size=C, **kw
+                ),
+                X,
+                W,
+                use_reentrant=False,
+            )
+            ck.backward(inp.dlogp)
+            torch.cuda.synchronize()
+            assert not applied, case
+        finally:
+            monkeypatch.undo()
+            assert opt_in.set_logprob_one_chunk_keep(previous) is True
+        assert bool(routed) == kept, (case, routed)
+        for key in ("logp", "dX", "dW"):
+            assert torch.equal(out[key], base[key]), (case, key)
+        assert torch.equal(lp, base["logp"]), case
+        assert torch.equal(ck.detach(), base["logp"]), case
+        assert torch.equal(X.grad, base["dX"]) and torch.equal(W.grad, base["dW"]), case
+        del base, out, lp, ck
+
+
 def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):
     """Where the kept logits live and what they cost: a kept-entry call no backward can follow (``torch.no_grad``,
     ``torch.inference_mode``, frozen inputs) is the default call -- the same launches (the label-column forward),

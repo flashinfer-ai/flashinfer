@@ -9770,6 +9770,26 @@ def _logprob_keep_given(
     )
 
 
+# The one-chunk kept-logits route of the default log-probability entry (L4a prototype, off by default): measured for
+# an owner decision on keeping the logits of a one-chunk call (at most one chunk, the chunk bound of the memory rule)
+# from its forward to its backward.
+_ONE_CHUNK_KEEP: dict[str, bool] = {"on": False}
+
+
+def set_logprob_one_chunk_keep(on: bool) -> bool:
+    """Experimental process switch of the default log-probability entry (default ``False``): with it on, a default
+    call (``memory_mode=None``, no ``num_valid_rows``, no temperature, ``cake`` backend, ``X`` on a CUDA device) whose
+    rows fit one chunk (``T <= chunk_size``) and whose backward can follow (grad mode on, ``X`` or ``W`` trainable)
+    without saved-tensor hooks on top (a non-reentrant checkpoint keeps the default entry's hand-over) runs the
+    kept-logits form of ``memory_mode="keep_logits"``: the forward keeps the BF16 logits of the valid rows
+    (``2 * T_v * V`` bytes, at most one chunk) until the backward, which forms ``dz`` from them instead of recomputing
+    them (bitwise the same ``logp`` / ``dX`` / ``dW``).  Every other call keeps its route.  Returns the previous
+    setting."""
+    previous = _ONE_CHUNK_KEEP["on"]
+    _ONE_CHUNK_KEEP["on"] = bool(on)
+    return previous
+
+
 def cake_lm_head_det_train_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -9821,6 +9841,34 @@ def cake_lm_head_det_train_logprob(
         # the resolver rejects every mode outside MEMORY_MODES (and the default's); this entry takes KEEP_LOGITS below
         if not (isinstance(memory_mode, str) and memory_mode == KEEP_LOGITS):
             raise
+    if (
+        _ONE_CHUNK_KEEP["on"]
+        and memory_mode is None
+        and num_valid_rows is None
+        and backend == "cake"
+        and isinstance(X, torch.Tensor)
+        and X.is_cuda
+        and 0 < int(labels.numel()) <= int(chunk_size)
+        and torch.is_grad_enabled()
+        and (X.requires_grad or W.requires_grad)
+        and _main._TOP_SAVED_HOOKS(False) is None
+    ):
+        # the one-chunk kept-logits route (:func:`set_logprob_one_chunk_keep`, off by default)
+        return _main.cake_lm_head_det_train_logprob_keep(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            backend="cake",
+            compact_rows=compact_rows,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=dx_finalize,
+            dw_stream=dw_stream,
+            hidden_count=hidden_count,
+            gemm_tuning=gemm_tuning,
+            logprob_dz=logprob_dz,
+            logprob_lbl=logprob_lbl,
+        )
     if num_valid_rows is None and (
         mode == "fast" or (mode == MEMORY_AUTO and not _auto_reaches(backend, X, W))
     ):
