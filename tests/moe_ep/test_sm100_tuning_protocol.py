@@ -21,6 +21,7 @@ from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
 )
 from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
     autotune as native,
+    correctness,
     knob_cache,
     tuning,
     tuning_protocol,
@@ -30,6 +31,62 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100 import automatic
 
 class Workspace(SimpleNamespace):
     _build_kernel = staticmethod(lambda cfg: None)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens", [0, 1, 512, 8192])
+def test_reference_row_sampling_under_model_default_dtype(
+    monkeypatch, dtype, num_tokens
+):
+    def on_cpu(factory):
+        def call(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return factory(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(torch, "arange", on_cpu(torch.arange))
+    monkeypatch.setattr(torch, "linspace", on_cpu(torch.linspace))
+    config = SimpleNamespace(
+        rank=0,
+        world_size=1,
+        experts_per_rank=1,
+        quant_kind="nvfp4",
+        combine_dtype="bf16",
+        gate_up_clamp=None,
+        apply_routing_weights_before_fc2=False,
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+    x = torch.arange(num_tokens * 2, dtype=torch.int64).to(torch.uint8).view(-1, 2)
+    workspace = SimpleNamespace(
+        config=config,
+        x=x,
+        x_sf=torch.zeros((num_tokens, 1), dtype=torch.uint8),
+        topk_idx=torch.zeros((num_tokens, 1), dtype=torch.int32),
+        topk_weights=torch.ones((num_tokens, 1), dtype=torch.float32),
+    )
+    weights = (torch.zeros((1, 1, 1)), torch.zeros((1, 1, 1)))
+    monkeypatch.setattr(
+        correctness,
+        "compute_megamoe_reference_block_scaled",
+        lambda inputs, *args, **kwargs: inputs.float(),
+    )
+    original = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        indices, expected = correctness.sampled_reference(
+            workspace, weights, weights, num_tokens
+        )
+    finally:
+        torch.set_default_dtype(original)
+    assert indices.dtype == torch.int64
+    assert len(indices) == min(num_tokens, 64)
+    if num_tokens:
+        assert int(indices[0]) == 0
+        assert int(indices[-1]) == num_tokens - 1
+        assert bool((indices[1:] > indices[:-1]).all())
+    torch.testing.assert_close(expected, x[indices].bfloat16())
 
 
 @pytest.fixture(params=["standard", "genphase"])

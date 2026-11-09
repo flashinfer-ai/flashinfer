@@ -21,7 +21,11 @@ def sampled_reference(
     """
     cfg = symm_buffer.config
     count = min(sample_size, num_tokens)
-    indices = torch.linspace(0, max(num_tokens - 1, 0), count, device="cuda").long()
+    indices = (
+        torch.arange(count, device="cuda", dtype=torch.int64)
+        * max(num_tokens - 1, 0)
+        // max(count - 1, 1)
+    )
     sources = [
         symm_buffer.x,
         symm_buffer.x_sf,
