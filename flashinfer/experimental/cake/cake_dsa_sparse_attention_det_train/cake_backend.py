@@ -3471,7 +3471,9 @@ def cake_dsa_sparse_attention_det_varlen(
     index rows as is (the behaviour of the first release).  A caller
     ``topk_length`` is a position cut applied before compaction (slots at
     positions ``>= topk_length[t]`` are invalid regardless of content); the
-    kernels then read the compacted rows and their counts.  ``max_seqlen_q/k``
+    kernels then read the compacted rows and their counts.  On the stage route
+    a cut that is not a contiguous int32 ``[T]`` tensor on the rows' device
+    raises ``ValueError`` before either launch.  ``max_seqlen_q/k``
     are accepted for signature parity and not used on the host.  ``dkv_acc`` /
     ``dkv_dst_map`` / ``key_passes`` / ``dkv_direct`` (default ``None``) /
     ``check_dst_map`` (default ``False``) as in
@@ -3485,6 +3487,8 @@ def cake_dsa_sparse_attention_det_varlen(
         )
         == "index_prep"
     ):
+        # the stage reads T lengths through the pointer: a caller cut is checked before anything is allocated
+        _check_length_cut(topk_length, gather_kv_indices)
         arch = _nope_arch(gather_kv_indices)
         topk = int(gather_kv_indices.shape[1])
         device = gather_kv_indices.device
@@ -4603,16 +4607,18 @@ class CakeDSASparseAttentionDetNopeFunction(torch.autograd.Function):
 
 
 class _NopeBackwardPrep:
-    """What the NoPE autograd wrappers settle at forward time for their backward, so that the backward's host work
-    before its first launch is the completion of the binding key with ``dout``'s geometry, the cache lookup, the
-    per-call allocations and the binding of the launch values: the options, the geometry key without ``dout`` and
-    without the accumulator, the presence flag of the lengths and the replay recipe of a consumed ``o_lo``.  It
-    holds no produced tensor: the saved outputs, the index rows, ``o_lo`` and the lengths go through
-    ``ctx.save_for_backward`` in one fixed order (seven tensors), so that under activation checkpointing nothing of
-    size outlives the forward.  The caller-owned accumulator stays here -- a tensor ``dkv_acc`` (validated here,
-    :func:`_check_dkv_acc`; ``check_dst_map`` synchronizes here) with its pointer operand and ``dkv_dst_map`` in
-    ``operands`` -- or as the zero-argument callable a deferred accumulator comes from, resolved and validated in
-    the backward (:data:`DkvAccSource`).
+    """What the NoPE autograd wrappers settle at forward time for their backward: the options, the presence flag of
+    the lengths and the replay recipe of a consumed ``o_lo``.  The backward keys its binding by the tensors it
+    receives (:func:`backward_binding_key_nope` over the saved tensors, ``dout`` and the accumulator), not by the
+    forward's: the plan bakes the strides and start offset of the index rows, ``q_latent`` and ``kv_latent``, and a
+    saved-tensor hook (``torch.autograd.graph.save_on_cpu``, an activation offloader) may hand them back in another
+    layout -- a column slice or an offset view comes back contiguous at offset 0 -- so an eager and an offloaded
+    step of one geometry each plan and run over their own layout.  It holds no produced tensor: the saved outputs,
+    the index rows, ``o_lo`` and the lengths go through ``ctx.save_for_backward`` in one fixed order (seven
+    tensors), so that under activation checkpointing nothing of size outlives the forward.  The caller-owned
+    accumulator stays here -- a tensor ``dkv_acc`` (validated here, :func:`_check_dkv_acc`; ``check_dst_map``
+    synchronizes here) with its pointer operand and ``dkv_dst_map`` in ``operands`` -- or as the zero-argument
+    callable a deferred accumulator comes from, resolved and validated in the backward (:data:`DkvAccSource`).
 
     The backward uses the storage of the saved ``o_lo`` as scratch (``o_lo_spent``); a later backward of the same
     node (``retain_graph=True``) first runs the forward again over the saved rows into the saved ``out`` / ``lse`` /
@@ -4627,8 +4633,6 @@ class _NopeBackwardPrep:
         "dkv_dst_map",
         "dkv_acc_source",
         "operands",
-        "key_head",
-        "key_mid",
         "replay_derive",
         "o_lo_spent",
     )
@@ -4675,20 +4679,6 @@ class _NopeBackwardPrep:
         self.dkv_acc, self.dkv_dst_map = acc_tensor, dkv_dst_map
         self.dkv_acc_source = None if acc_tensor is not None else dkv_acc
         self.has_topk_length = topk_length is not None
-        # the backward key with dout's slot (index 7) and the accumulator's geometry and the o_lo flag (indices
-        # 10, 11, 12) left open: completed per backward call
-        key = backward_binding_key_nope(
-            q_latent,
-            kv_latent,
-            indices,
-            out,
-            o_lo,
-            lse,
-            None,
-            topk_length,
-            self.softmax_scale,
-        )
-        self.key_head, self.key_mid = key[:7], key[8:10]
         ctx.save_for_backward(
             q_latent,
             kv_latent,
@@ -4743,11 +4733,21 @@ class _NopeBackwardPrep:
             self._replay_forward(
                 q_latent, kv_latent, indices, out, lse, o_lo, topk_length
             )
-        key = (
-            self.key_head
-            + (_geometry(dout),)
-            + self.key_mid
-            + (_geometry(dkv_acc), _geometry(dst_map), True)
+        # keyed by the saved tensors, which a saved-tensor hook may have handed back in another layout than the
+        # forward's (see the class docstring)
+        key = backward_binding_key_nope(
+            q_latent,
+            kv_latent,
+            indices,
+            out,
+            o_lo,
+            lse,
+            dout,
+            topk_length,
+            self.softmax_scale,
+            dkv_acc=dkv_acc,
+            dkv_dst_map=dst_map,
+            o_lo_scratch=True,
         )
         binding = _binding(
             key,
@@ -5123,6 +5123,21 @@ def _check_index_rows(
     ):
         raise ValueError("topk_length must be a contiguous int32 [T] tensor")
     return num_rows, topk
+
+
+def _check_length_cut(topk_length: Optional[torch.Tensor], rows: torch.Tensor) -> None:
+    """A caller cut for the index-preparation stage over the ``[T, K_slots]`` index ``rows``: ``None`` or a
+    contiguous int32 ``[T]`` tensor on the rows' device.  The stage reads ``T`` lengths through the pointer and its
+    binding checks no shape, so a shorter cut would be read past its end."""
+    if topk_length is not None and (
+        topk_length.shape != rows.shape[:1]
+        or topk_length.dtype != torch.int32
+        or not topk_length.is_contiguous()
+        or topk_length.device != rows.device
+    ):
+        raise ValueError(
+            "topk_length must be a contiguous int32 [T] tensor on the device of the index rows"
+        )
 
 
 def _index_prep_launch(
