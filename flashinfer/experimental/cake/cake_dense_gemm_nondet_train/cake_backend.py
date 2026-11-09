@@ -1171,16 +1171,21 @@ K1_SPLIT_ORDERS: tuple[str, ...] = ("arrival", "mirror")
 #: 16256, 16300 and 16384 tokens in one process: two chains had the bits of two splits on all six kinds and repeated
 #: bit for bit; they took 86.5 to 88.9 us, 1.003 to 1.005 times one chain's time, 0.897 to 0.906 times two splits'
 #: (96.0 to 98.4 us) and 0.74 to 0.84 times the deterministic program's (103.9 to 120.0 us), in eager launches and in
-#: CUDA graph replays.  The 212-SM ranges of the FP32 rows ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` lie
-#: inside ranges of :data:`K1_PARITY_RANGES_BY_SM`, which comes first and runs the same programs there, except eight
-#: chains at the odd counts of ``5120 -> 1024`` (and four chains at the odd counts of ``5120 -> 512``).
+#: CUDA graph replays.  From 961 to 16171 tokens (16 K blocks up), where the row ran the deterministic program, it runs
+#: the same two chains: on a B200 part at 961 to 16171 tokens (10 token counts) every kind within the check (at most
+#: 1.006 times the reference's error), the same bits on 20 and 200 repeats and, at an even number of K blocks, the
+#: deterministic program's bits; on four B200 parts, 17 paired groups in eager launches and in CUDA graph replays each,
+#: at 1024 to 16171 tokens (8 token counts), 12.1 to 87.3 us, 0.42 to 0.84 times the deterministic program's time.  The
+#: 212-SM ranges of the FP32 rows ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` lie inside ranges of
+#: :data:`K1_PARITY_RANGES_BY_SM`, which comes first and runs the same programs there, except eight chains at the odd
+#: counts of ``5120 -> 1024`` (and four chains at the odd counts of ``5120 -> 512``).
 # fmt: off
 K1_ORDERED_RANGES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, int, int, int, str], tuple[tuple[int, int, tuple[int, int, int, str]], ...]],
 ] = {
     ("sm_100a", 148): {
-        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 1, 2, "arrival")),),
+        ("sm_100a", 1, 4096, 1024, "bf16"): ((961, 16384, (256, 1, 2, "arrival")),),
     },
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
@@ -1848,8 +1853,6 @@ _DGRAD_N_EF_TMA_LEAN_FREE_R9 = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma_lean_fr
 #: The token counts of the 148-SM ``sm_100a`` and 152-SM ``sm_103a`` input-gradient windows of
 #: :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`.
 _DGRAD_WINDOW_TOKENS = range(16172, 16385)
-#: The token counts of the 148-SM ``sm_100a`` forward window of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` (``5120 -> 1024``).
-_FORWARD_WINDOW_TOKENS = range(16231, 16385)
 
 #: The K1 forward rows that run a program of this package instead of the deterministic package's,
 #: ``(arch, sm_count) -> {(K, N, T): template}``: on a part of exactly ``sm_count`` SMs,
@@ -1870,18 +1873,14 @@ _FORWARD_WINDOW_TOKENS = range(16231, 16385)
 #: same program without the prefetch and the token halves took 1.007 to 1.040 times its time on a B200 part, 1.018 to
 #: 1.055 times on a GB200 part and 1.012 to 1.026 times on a GB300 part, slower in 0 of 5 groups on every row; at 1024
 #: features the deterministic plan's program took 1.032 to 1.057 times its time on a GB200 part and 1.010 to 1.033
-#: times on a GB300 part, slower in at most 1 of 5 groups.  On 148-SM ``sm_100a`` parts ``5120 -> 1024`` runs it at
-#: every token count from 16231 to 16384 (:data:`_FORWARD_WINDOW_TOKENS`): on one B200 part, 17 paired groups in eager
-#: launches and in CUDA graph replays each, at 16231 and 16384 tokens, it took 0.994 to 0.995 times the time of the
-#: deterministic plan (the median of the paired ratios; faster in 12 to 17 of 17 groups), with that plan's bits on 20
-#: repeats.  The other 1024-feature rows and parts keep the deterministic plan.
+#: times on a GB300 part, slower in at most 1 of 5 groups.  The other 1024-feature rows and parts keep the
+#: deterministic plan.
 # fmt: off
 K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int], str]] = {
     ("sm_100a", 148): {
         (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
         (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
         (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
-        **{(5120, 1024, T): _WAVE_LEAN_N224_PF2_ST for T in _FORWARD_WINDOW_TOKENS},
     },
     ("sm_100a", 152): {
         (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,

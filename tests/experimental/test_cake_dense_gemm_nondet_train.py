@@ -6246,16 +6246,11 @@ def test_k1_forward_rows_bind_their_plan(monkeypatch, arch):
 
 #: The rows of the program tables, ``(arch, sm_count) -> {key: template}`` (keys as in the tables): the lean
 #: one-wave forward of eight epilogue warps with the X prefetch and the token-half last stage, at 512 features on
-#: every part of the table, at the measured 1024-feature rows of the 152-SM parts and at ``5120 -> 1024`` over the
-#: 148-SM forward window (16231 to 16384 tokens; the GPU tests run it at its ends and at 16300).
+#: every part of the table and at the measured 1024-feature rows of the 152-SM parts.
 _WAVE_PF2_ST = "dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st"
 _F512_ROWS = {(K, 512, T) for K in (4096, 5120) for T in (16172, 16231, 16384)}
-_FW_WINDOW = range(16231, 16385)
-_FW_WINDOW_SAMPLE = frozenset({16231, 16300, 16384})
 K1_FORWARD_PROGRAM_ROWS = {
-    ("sm_100a", 148): dict.fromkeys(
-        _F512_ROWS | {(5120, 1024, T) for T in _FW_WINDOW}, _WAVE_PF2_ST
-    ),
+    ("sm_100a", 148): dict.fromkeys(_F512_ROWS, _WAVE_PF2_ST),
     ("sm_100a", 152): dict.fromkeys(
         _F512_ROWS | {(K, 1024, T) for K in (4096, 5120) for T in (16172, 16384)},
         _WAVE_PF2_ST,
@@ -6365,7 +6360,7 @@ _KB_PARITY_RANGES = (
 )
 K1_ORDERED_ROWS = {
     ("sm_100a", 148): {
-        ("sm_100a", 1, 4096, 1024, "bf16"): ((16172, 16384, (256, 1, 2, "arrival")),),
+        ("sm_100a", 1, 4096, 1024, "bf16"): ((961, 16384, (256, 1, 2, "arrival")),),
     },
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 32, "f32"): ((16172, 16384, (64, 4, 1, "mirror")),),
@@ -6508,10 +6503,10 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
             again.chains,
             again.split_order,
         ) == (plan.template, plan.block_n, plan.splits, plan.chains, plan.split_order)
-    # 148-SM sm_100a: BF16 4096 -> 1024 runs one split of two chains at either K-block parity
+    # 148-SM sm_100a: BF16 4096 -> 1024 runs one split of two chains at either K-block parity, from 961 tokens
     _register_k1(monkeypatch, "sm_100a")
     kw100 = dict(transposed_out=True, arch="sm_100a", sm_count=148)
-    for T in (16172, 16231, 16300, 16384):
+    for T in (961, 1024, 4097, 8192, 16170, 16171, 16172, 16231, 16300, 16384):
         X, G, out = operands(T, 4096, 1024)
         plan, *_, reason = cake_backend.plan_atomic_gemm(
             X, G, out.to(torch.bfloat16), **kw100
@@ -6524,6 +6519,10 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
             "arrival",
         )
         assert plan.reproducible and not plan.workspace
+    # below the range (960 tokens, 15 K blocks): no two-chain plan
+    X, G, out = operands(960, 4096, 1024)
+    plan = cake_backend.plan_atomic_gemm(X, G, out.to(torch.bfloat16), **kw100)[0]
+    assert plan is None or plan.chains == 1
     # outside the ranges: the split tables' choice
     for d_in, d_out, T in (
         (4096, 32, 16171),
@@ -6859,50 +6858,6 @@ def test_k1_program_rows_bind_their_program(monkeypatch, arch):
         torch.empty(T, N, dtype=bf16),
     )
     assert cake_backend._k1_forward_program_of(X, W, out) is None
-
-
-def test_k1_forward_window_rows_bind_their_program(monkeypatch):
-    """On a 148-SM ``sm_100a`` part the forward entry point runs ``5120 -> 1024`` at the first, an inner and the last
-    token count of its window of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` (16231 to 16384 tokens) on
-    ``dense_proj_gemm_wave_lean_kk_n224_ef_e8_pf2_st`` with the program's argument order (no cached deterministic
-    plan); one token outside the window keeps the deterministic routing."""
-    entry_fn = _cpu_k1_launches(monkeypatch, "sm_100a")
-    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
-    facts = dataclasses.replace(det_backend.device_facts(), sm_count=148)
-    monkeypatch.setattr(det_backend, "device_facts", lambda device=None, f=facts: f)
-    bf16 = torch.bfloat16
-    rows = K1_FORWARD_PROGRAM_ROWS[("sm_100a", 148)]
-    K, N = 5120, 1024
-    assert {key[2] for key in rows if key[:2] == (K, N)} == set(_FW_WINDOW)
-    module = cake_jit.KERNELS["sm_100a"][_WAVE_PF2_ST]
-    record = cake_jit.MODULES[module]
-    for T in (16231, 16300, 16384):
-        X, W, out = (
-            torch.empty(T, K, dtype=bf16),
-            torch.empty(N, K, dtype=bf16),
-            torch.empty(T, N, dtype=bf16),
-        )
-        assert cake_backend._k1_forward_program_of(X, W, out) == module
-        n = len(entry_fn.calls)
-        assert (
-            cake_backend.cake_dense_gemm_nondet_train_projection_forward(X, W, out)
-            is out
-        )
-        assert len(entry_fn.calls) == n + 1 and not cake_backend._K1_DET_CACHE
-        items = -(-N // 512) * -(-T // record["build"]["kwargs"]["tile_n"])
-        grid = (2 * min(74, items), 1, 1)
-        values = dict(A=W.unsqueeze(0), B=X.unsqueeze(0), C=out.unsqueeze(0), M=N, N=T, K=K, L=1,
-                      enable_pdl=1)  # fmt: skip
-        plan = cake_jit.arg_plan_of(record)
-        want = cake_backend._order_atomic_arguments(module, plan, values, grid)
-        _same_k1_arguments(list(entry_fn.calls[-1][0]), want, plan)
-    for T in (16230, 16385):
-        X, W, out = (
-            torch.empty(T, K, dtype=bf16),
-            torch.empty(N, K, dtype=bf16),
-            torch.empty(T, N, dtype=bf16),
-        )
-        assert cake_backend._k1_forward_program_of(X, W, out) is None, T
 
 
 _KD_WINDOW_PROGRAMS = {
@@ -15203,13 +15158,7 @@ def test_gpu_k1_program_rows_keep_the_det_bits():
     package's result bit for bit, meets the deterministic package's budget against FP64 and repeats bit for bit over
     ``RERUNS`` calls into NaN-poisoned outputs.  A part without rows skips."""
     device, arch, sms = _part_or_skip()
-    fwd = {
-        key: template
-        for key, template in cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM.get(
-            (arch, sms), {}
-        ).items()
-        if key[2] not in _FW_WINDOW or key[2] in _FW_WINDOW_SAMPLE
-    }
+    fwd = cake_backend.K1_FORWARD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
     dgrad_rows = cake_backend.K1_DGRAD_PROGRAM_RULES_BY_SM.get((arch, sms), {})
     dgrad = {
         key: template
