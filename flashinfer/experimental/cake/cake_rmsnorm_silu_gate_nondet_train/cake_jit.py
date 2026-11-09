@@ -106,7 +106,8 @@ runs the chunks ``b``, ``b + grid``, ... and claims nothing); its mid role is
 the claimed backward (the CTAs claim runs of chunks from the workspace's
 claim counter at run time, so a CTA slowed beside another kernel takes
 fewer).  Each is a build per architecture.  On sm_100a and sm_103a: the
-static backward with no prefetch, and the claimed backward warming the
+static backward with no prefetch, whose CTA that arrives last reads each
+window by an atomic exchange with 0, and the claimed backward warming the
 CTA's next block in L2, thread 0 with one bulk prefetch per tensor where
 ``dy``, ``x`` and ``z`` hold packed rows (head stride 128 and token stride
 ``H * 128``; other layouts: a prefetch per thread).  On sm_107a: the static
@@ -1268,12 +1269,14 @@ MODULES: dict[str, dict[str, Any]] = {
     # 128 threads, 16 lanes per row (8-row blocks), the deterministic
     # backward's chunks, CTA b running the chunks b, b + grid, ... with no
     # claim and no prefetch, the chunk partials summed exactly in integer
-    # windows, the weight gradient rounded once to FP32; BACKWARD_BANDS gives
-    # it its rows, at most 256 rows per SM (4 row blocks a CTA of its grid of 8
-    # CTAs per SM) (build {"bulk": 0, "chunks_per_step": 0, "min_blocks": 8,
+    # windows, the CTA that arrives last reading each window by an atomic
+    # exchange with 0 (the same sums in fewer instructions), the weight
+    # gradient rounded once to FP32; BACKWARD_BANDS gives it its rows, at most
+    # 256 rows per SM (4 row blocks a CTA of its grid of 8 CTAs per SM) (build
+    # {"bulk": 0, "chunks_per_step": 0, "finish": "exch", "min_blocks": 8,
     # "out": "f32", "prefetch_ahead": 0, "schedule": "static", "slots": 4,
     # "sparse": 0}).
-    "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f": {
+    "cake_rmsnorm_silu_gate_train_421e73578399336342e3": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -1312,8 +1315,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunks",
             "rows_per_block": 8,
         },
-        "kernel": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
-        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
+        "kernel": "cake_rmsnorm_silu_gate_train_421e73578399336342e3",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_421e73578399336342e3",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1321,7 +1324,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 15616,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
+        "library": "cake_rmsnorm_silu_gate_train_421e73578399336342e3",
         "logical": {
             "accumulate": "accumulate",
             "blocks_per_chunk": "blocks_per_chunk",
@@ -1876,7 +1879,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_bf16_t512": "cake_rmsnorm_silu_gate_train_f6a3420d9aaa20a99e8d",
         "bwd_bf16_fused": "cake_rmsnorm_silu_gate_train_1d4b7311041b9046e379",
         "bwd_bf16_rep": "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
-        "bwd_f32": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
+        "bwd_f32": "cake_rmsnorm_silu_gate_train_421e73578399336342e3",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
     },
@@ -1893,7 +1896,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "bwd_bf16_short": "cake_rmsnorm_silu_gate_train_cb597a0bebd6145e2024",
         "bwd_bf16_fused": "cake_rmsnorm_silu_gate_train_1d4b7311041b9046e379",
         "bwd_bf16_rep": "cake_rmsnorm_silu_gate_train_8a6cb16beff15b6ffbfe",
-        "bwd_f32": "cake_rmsnorm_silu_gate_train_f2915438ea54b487d93f",
+        "bwd_f32": "cake_rmsnorm_silu_gate_train_421e73578399336342e3",
         "bwd_f32_mid": "cake_rmsnorm_silu_gate_train_f2f608aa8d7a81906c9b",
         "bwd_f32_t512": "cake_rmsnorm_silu_gate_train_348a297be36a61e8f015",
     },
