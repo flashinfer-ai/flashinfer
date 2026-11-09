@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The batch-invariant MoE backend of the unified MoE layer (``BatchInvariantMoeConfig``): the bf16 classes
+"""The batch-invariant MoE backend of the unified MoE layer (``BatchInvariantBf16Config``): the bf16 classes
 ``moe.bf16.<act>``, one per typed activation of the layer and its scalars (the gated chains on the (gate, up) accumulator
 pair -- ``SwiGLU`` with any parameters, ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU``, ``PowLU`` -- and the ungated
 ones on a single accumulator -- ``ReLU2``, ``Identity``, ``GELU``, ``ReLU``, ``SiLU``; the default ``SwiGLU`` is
@@ -28,7 +28,7 @@ from flashinfer.fused_moe import (
     GELU,
     ActivationConfig,
     BackendOptions,
-    BatchInvariantMoeConfig,
+    BatchInvariantBf16Config,
     ExecutionConfig,
     ExpertConfig,
     GeGLU,
@@ -160,7 +160,7 @@ def _config(
         quant=QuantConfig(),
         experts=ExpertConfig(intermediate_size=I),
         activation=act,
-        backend=BackendOptions((BatchInvariantMoeConfig(),)),
+        backend=BackendOptions((BatchInvariantBf16Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tune_max),
         finalize=MoEFinalizeConfig(do_finalize=True),
     )
@@ -173,7 +173,7 @@ def _layer(*args, device="cuda", **kw):
 
 def _weights(w1: torch.Tensor, w2: torch.Tensor, act=_SWIGLU) -> MoEWeightPack:
     pack = MoEWeightPack({})
-    view = BatchInvariantMoeConfig.prepare_weights(
+    view = BatchInvariantBf16Config.prepare_weights(
         w1,
         w2,
         num_local_experts=w1.shape[0],
@@ -222,15 +222,15 @@ def _routed_pack(
 def test_backend_is_registered_and_never_a_default_candidate():
     """The config is a known backend of the layer, mapped to its runner, absent from the default candidates (it is
     reached by naming it), and declares the three routing modes and every activation class of the layer."""
-    assert BatchInvariantMoeConfig in ALL_BACKEND_CONFIGS
-    assert _BACKEND_RUNNERS[BatchInvariantMoeConfig] is BatchInvariantMoeRunner
+    assert BatchInvariantBf16Config in ALL_BACKEND_CONFIGS
+    assert _BACKEND_RUNNERS[BatchInvariantBf16Config] is BatchInvariantMoeRunner
     assert not any(
-        isinstance(c, BatchInvariantMoeConfig) for c in _DEFAULT_BACKEND.candidates
+        isinstance(c, BatchInvariantBf16Config) for c in _DEFAULT_BACKEND.candidates
     )
     assert [
         a
         for a in (89, 90, 100, 103, 107, 110, 120, 121)
-        if BatchInvariantMoeConfig.supported(a)
+        if BatchInvariantBf16Config.supported(a)
     ] == [100, 103, 107]
     assert set(BatchInvariantMoeRunner.supported_routing_modes) == {
         RoutingInputMode.FromLogits,
@@ -250,7 +250,7 @@ def test_backend_is_registered_and_never_a_default_candidate():
         ReLU,
         SiLU,
     }
-    assert repr(BatchInvariantMoeConfig()) == "BatchInvariantMoeConfig()"
+    assert repr(BatchInvariantBf16Config()) == "BatchInvariantBf16Config()"
 
 
 def test_fingerprint_dimensions_and_classes():
@@ -926,7 +926,7 @@ def test_routing_methods_from_logits_match_the_cpu_model():
                 quant=QuantConfig(),
                 experts=ExpertConfig(intermediate_size=I),
                 activation=SwiGLU(),
-                backend=BackendOptions((BatchInvariantMoeConfig(),)),
+                backend=BackendOptions((BatchInvariantBf16Config(),)),
                 execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
             ),
             device=torch.device("cuda"),
@@ -992,7 +992,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                     routing=kw.get("routing", routing),
                     quant=QuantConfig(),
                     experts=kw.get("experts", experts),
-                    backend=BackendOptions((BatchInvariantMoeConfig(),)),
+                    backend=BackendOptions((BatchInvariantBf16Config(),)),
                     finalize=kw.get("finalize", MoEFinalizeConfig(do_finalize=True)),
                 ),
                 device=torch.device("cuda"),
@@ -1020,7 +1020,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             quant=QuantConfig(),
             experts=ExpertConfig(intermediate_size=I),
-            backend=BackendOptions((BatchInvariantMoeConfig(),)),
+            backend=BackendOptions((BatchInvariantBf16Config(),)),
         ),
         device=torch.device("cuda"),
     )
@@ -1040,7 +1040,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             quant=QuantConfig(),
             experts=ExpertConfig(intermediate_size=I),
-            backend=BackendOptions((BatchInvariantMoeConfig(),)),
+            backend=BackendOptions((BatchInvariantBf16Config(),)),
         ),
         device=torch.device("cuda"),
     )
