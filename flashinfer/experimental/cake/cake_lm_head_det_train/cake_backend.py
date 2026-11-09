@@ -9778,6 +9778,7 @@ def forward_logprob(
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     logprob_lbl: Optional[bool] = None,
+    row_index: Any = _RECOUNT,
 ) -> ForwardResult:
     """Forward of the log-probability entry: ``logp`` (FP32 ``[T]``, 0 on ignored rows) plus the saved statistic
     ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back,
@@ -9785,7 +9786,10 @@ def forward_logprob(
     :func:`hidden_count_default`) and ``gemm_tuning`` (default :func:`gemm_tuning_default`) as in
     :func:`forward_loss`; ``logprob_lbl`` (default :func:`logprob_lbl_default`) writes only the row statistics and
     the label column's logit from the logits GEMM (bitwise the same ``lse`` / ``logp``).  This forward has no
-    weight gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``."""
+    weight gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``.  ``row_index``: the valid-row
+    index the caller already formed with :func:`valid_row_index` (``None`` when every row is valid or the call is
+    uncompacted; the opt-in module's one-chunk kept-logits route counts the rows before it picks a form) -- the call
+    then counts nothing (no hidden count); the default counts the valid rows itself."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_det_inputs(
@@ -9801,20 +9805,25 @@ def forward_logprob(
     if T == 0:
         return _empty_forward(problem, X, need_dx=False, need_dw=False)
     compact = _resolve_compact(compact_rows)
-    hc = _hidden_count(
-        problem,
-        X,
-        W,
-        labels,
-        backend=backend,
-        compact=compact,
-        stats=True,
-        hidden_count=_resolve_hidden_count(hidden_count),
-    )
-    if hc is not None:
-        row_index = hc.row_index()
+    hc = None
+    if row_index is not _RECOUNT:
+        if row_index is not None and not compact:
+            raise ValueError("a valid-row index belongs to a compacted forward")
     else:
-        row_index = valid_row_index(labels) if compact else None
+        hc = _hidden_count(
+            problem,
+            X,
+            W,
+            labels,
+            backend=backend,
+            compact=compact,
+            stats=True,
+            hidden_count=_resolve_hidden_count(hidden_count),
+        )
+        if hc is not None:
+            row_index = hc.row_index()
+        else:
+            row_index = valid_row_index(labels) if compact else None
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _empty_forward(
             problem, X, need_dx=False, need_dw=False, row_index=row_index
@@ -11571,7 +11580,10 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
 
 
 class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
-    """Entry (b): the forward saves the row statistic; the backward recomputes the logits."""
+    """Entry (b): the forward saves the row statistic; the backward recomputes the logits.  ``row_index`` (optional,
+    last): the valid-row index the caller already formed (:func:`forward_logprob`; the opt-in module's one-chunk
+    kept-logits route when it keeps the default form); omitted, the forward counts the valid rows itself.  The backward
+    returns one gradient slot per input either way (PyTorch drops trailing ``None`` slots past the inputs given)."""
 
     @staticmethod
     def forward(
@@ -11589,6 +11601,7 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
         gemm_tuning,
         logprob_dz,
         logprob_lbl,
+        row_index=_RECOUNT,
     ):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
@@ -11607,6 +11620,7 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
                     gemm_tuning,
                     logprob_dz,
                     logprob_lbl,
+                    row_index,
                 )
         # every switch is resolved (and validated) once here, before any launch: the backward plans its chunks on the
         # forward's valid-row index under the same switches, the forward and the backward bind with the same GEMM knobs
@@ -11641,6 +11655,7 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
                 hidden_count=hidden,
                 gemm_tuning=tuning,
                 logprob_lbl=lbl_arm,
+                row_index=row_index,
             )
             logp, lse, row_index = result.logp, result.lse, result.row_index
             if ckpt is not None and ckpt.first:
@@ -11663,9 +11678,9 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 13
+            return (None,) * 14
         dx, dw = _logprob_backward(ctx, dlogp, ctx.saved_tensors)
-        return (dx, dw) + (None,) * 11
+        return (dx, dw) + (None,) * 12
 
 
 def _logprob_backward(ctx, dlogp, saved) -> tuple:

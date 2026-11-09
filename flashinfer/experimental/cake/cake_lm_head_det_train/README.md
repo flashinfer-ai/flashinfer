@@ -326,14 +326,50 @@ keyword.
   B200 and +9.6 to +13.1 us on GB300; at `T` = 32 and 128 -3.3 to +1.2 us on
   B200 and 5.4 to 13.0 us faster on GB300) and holds the kept logits until its
   graph is freed.  The kept logits are outside the chunk bound of the memory
-  rule below.  The default entries are unchanged: the kept form has its own
-  entry points, plan (`_KeptPlan`), binding and cache keys.
+  rule below.  The kept form has its own entry points, plan (`_KeptPlan`),
+  binding and cache keys; a default log-probability call reaches it through
+  the one-chunk rule below.
   `prepare_lm_head_det_loss(..., logprob_keep=True)` prepares the kept plan for
   those entry points only (its runner's `forward` / `backward` raise
   `NotImplementedError`).  Like `"budget"`, `memory_mode="keep_logits"` is a
   `ValueError` on the reference backend (the backend-level
   `cake_lm_head_det_train_logprob_keep` runs the default entry there).
-* Memory rule (except the opt-in kept logits above): no logits, probability or
+* One-chunk kept logits (the default log-probability call;
+  `cake_backend_opt_in.set_logprob_one_chunk_keep`, on by default; the one
+  rule is `cake_backend_opt_in._one_chunk_keep_rows`): a default call of
+  `cake_lm_head_det_train_logprob` (`memory_mode=None`, no
+  `num_valid_rows`, no temperature) runs the kept form above when all of
+  these hold: the `cake` backend with `X` on CUDA; a backward can follow
+  (grad mode on, `X` or `W` trainable -- through the public entry also with
+  a frozen `W`); no `torch.utils.checkpoint` (no saved-tensor hooks on top,
+  so neither pass of a non-reentrant checkpoint and no CPU offload; outside
+  a backward, so not a reentrant checkpoint's recomputation, whose first
+  pass runs with grad mode off); the valid rows fit one chunk (`T_v <=
+  chunk_size`; every row of an uncompacted call); and the fast backward
+  would run no zero-gradient row skip on the call (fewer valid rows than
+  the device's `cake_backend.zero_dlogp_min_rows`, or the skip off; see
+  "Zero-gradient rows of the log-probability backward").  The kept backward
+  has no skip: with valid rows of a zero `dlogp` its `dW` would add the rows
+  in another order than the skip, so a call the skip can take keeps the
+  default form, and every output stays the bits of `memory_mode="fast"`, in
+  a checkpointed step too (which keeps the default form on every pass).  The
+  rule reads the valid-row count once, on the host count's path that the
+  forward of a call of fewer than three chunks of rows takes anyway (a
+  longer call keeps its route without counting), and either form then runs
+  on that count's index.  A kept call runs three GEMMs instead of four: its
+  forward writes the whole `z_c` (the label-column arm is off) and its
+  backward forms `dz` with `row_grad` over the kept logits.  Memory: the
+  forward keeps `2 * T_v * V` bytes until the backward, at most one chunk
+  (`chunk_size` rows) of BF16 logits, which the backward overwrites with
+  `dz` in place; no logits or `dlogits` allocation spans more than one
+  chunk, so the memory rule below (#5680) holds.  Each pending forward holds its own
+  chunk: a caller that runs several forwards before their backwards (heads
+  of several positions, for example) holds one chunk per forward until each
+  backward runs, and a forward whose backward never runs holds it until its
+  graph is freed.  `memory_mode="fast"` (per call) or
+  `set_logprob_one_chunk_keep(False)` (per process) runs the call without it.
+* Memory rule (except the opt-in kept logits above; the default call's
+  one-chunk kept logits hold at most one chunk): no logits, probability or
   `dlogits` buffer ever spans more than `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
   an empty `logp` and zero gradients without binding or launching (`dW` is
@@ -359,7 +395,10 @@ keyword.
   trainable head) it runs the fast form's forward -- the loss entry's in
   `cake_backend_opt_in.py`, the log-probability entries' in
   `cake_backend.py` -- with its hidden valid-row count checked as below
-  (bitwise the same outputs).  Every other call without either keyword -- a
+  (bitwise the same outputs).  So does a default log-probability call
+  without a temperature whose `X` requires a gradient under grad mode and
+  whose rows fit two chunks, also with a frozen `W` (the one-chunk kept
+  logits below).  Every other call without either keyword -- a
   frozen `W`, an FP32 `W`, `X` off CUDA, another backend -- runs
   `cake_backend.py`'s entry unchanged, with its buffer lifetimes; the public
   entries of `flashinfer.cake_lm_head_det_train` run their argument checks

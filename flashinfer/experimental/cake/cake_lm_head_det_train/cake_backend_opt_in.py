@@ -36,7 +36,11 @@ predicted step peak stays within :func:`memory_plan`'s budget and the form
 entry through this module's autograd function, the log-probability entries
 without ``num_valid_rows`` through :mod:`.cake_backend`'s forward with a
 backward that decides (:class:`CakeLMHeadDetLogprobAutoFunction`), with it
-through this module's autograd functions.  A
+through this module's autograd functions.  A default log-probability call
+without a temperature whose valid rows fit one chunk keeps their BF16 logits
+from its forward to its backward where the fast backward would run no
+zero-gradient row skip (:func:`_one_chunk_keep_rows`, also with a frozen ``W``;
+bitwise the fast form's outputs).  A
 call without ``num_valid_rows`` that forms no such gradient, and an explicit
 ``memory_mode="fast"`` without it, runs :mod:`.cake_backend`'s entry
 unchanged.  The forms here share that module's kernels, launch helpers and
@@ -8894,12 +8898,13 @@ class CakeLMHeadDetLogprobAutoFunction(_main.CakeLMHeadDetLogprobFunction):
     :class:`.cake_backend.CakeLMHeadDetLogprobFunction`'s forward (the hidden valid-row count, a checkpoint's kept row
     results) and, where the fast form fits the budget with its own lifetimes, its backward (the zero-gradient row skip
     included); else the budget form its backward picks (:func:`_auto_logprob_plan`, :func:`_backward_logprob_budget`;
-    no zero-gradient row skip there)."""
+    no zero-gradient row skip there).  One gradient slot per input of the backend forward, its optional ``row_index``
+    included (PyTorch drops trailing ``None`` slots past the inputs given)."""
 
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 13
+            return (None,) * 14
         # unpacked once: a second unpack inside a non-reentrant checkpoint raises
         saved = ctx.saved_tensors
         X, W, labels, lse, row_index = saved
@@ -8944,7 +8949,7 @@ class CakeLMHeadDetLogprobAutoFunction(_main.CakeLMHeadDetLogprobFunction):
                 row_index=row_index,
                 mplan=mplan,
             )
-        return (dx, dw) + (None,) * 11
+        return (dx, dw) + (None,) * 12
 
 
 class CakeLMHeadDetLogprobTemperatureAutoFunction(
@@ -9770,24 +9775,82 @@ def _logprob_keep_given(
     )
 
 
-# The one-chunk kept-logits route of the default log-probability entry (L4a prototype, off by default): measured for
-# an owner decision on keeping the logits of a one-chunk call (at most one chunk, the chunk bound of the memory rule)
-# from its forward to its backward.
-_ONE_CHUNK_KEEP: dict[str, bool] = {"on": False}
+# The one-chunk kept logits of the default log-probability call (:func:`set_logprob_one_chunk_keep`, on by default;
+# the rule is :func:`_one_chunk_keep_rows`): a call whose valid rows fit one chunk keeps their BF16 logits -- at most
+# one chunk, the chunk bound of the memory rule -- from its forward to its backward.
+_ONE_CHUNK_KEEP: dict[str, bool] = {"on": True}
 
 
 def set_logprob_one_chunk_keep(on: bool) -> bool:
-    """Experimental process switch of the default log-probability entry (default ``False``): with it on, a default
-    call (``memory_mode=None``, no ``num_valid_rows``, no temperature, ``cake`` backend, ``X`` on a CUDA device) whose
-    rows fit one chunk (``T <= chunk_size``) and whose backward can follow (grad mode on, ``X`` or ``W`` trainable)
-    without saved-tensor hooks on top (a non-reentrant checkpoint keeps the default entry's hand-over) runs the
-    kept-logits form of ``memory_mode="keep_logits"``: the forward keeps the BF16 logits of the valid rows
-    (``2 * T_v * V`` bytes, at most one chunk) until the backward, which forms ``dz`` from them instead of recomputing
-    them (bitwise the same ``logp`` / ``dX`` / ``dW``).  Every other call keeps its route.  Returns the previous
-    setting."""
+    """Process switch of the default log-probability call's one-chunk kept logits (default ``True``; read once per
+    call) and return the previous setting.  On: a default call that :func:`_one_chunk_keep_rows` keeps runs
+    :mod:`.cake_backend`'s kept-logits function -- the forward keeps the BF16 logits of the valid rows (``2 * T_v * V``
+    bytes, at most one chunk) until the backward, which forms ``dz`` from them instead of recomputing them (three
+    GEMMs instead of four; bitwise the same ``logp`` / ``dX`` / ``dW``).  ``False``: every default call runs as with
+    ``memory_mode="fast"`` (which turns the route off for one call)."""
     previous = _ONE_CHUNK_KEEP["on"]
     _ONE_CHUNK_KEEP["on"] = bool(on)
     return previous
+
+
+def _one_chunk_keep_rows(
+    X: Any,
+    W: Any,
+    labels: Any,
+    chunk_size: Any,
+    backend: str,
+    compact_rows: Optional[bool],
+    dx_finalize: Optional[bool],
+    logprob_dz: Optional[bool],
+) -> Optional[tuple[bool, Optional[torch.Tensor]]]:
+    """The one rule of the one-chunk kept logits (:func:`set_logprob_one_chunk_keep`) for a default
+    log-probability call -- the automatic memory form, no ``num_valid_rows``, no temperature: ``None`` when the call
+    keeps its route without counting, else ``(keep, row_index)``.
+
+    Counted: the switch on, the ``cake`` backend, ``X`` on a CUDA device, a backward that can follow (grad mode on,
+    ``X`` or ``W`` trainable), no saved-tensor hooks on top (neither pass of a non-reentrant checkpoint, no CPU
+    offload), outside a backward (a reentrant checkpoint's recomputation) and fewer than
+    :data:`.cake_backend.HIDDEN_COUNT_MIN_CHUNKS` chunks of rows, whose forward reads its valid-row count back on the
+    host either way: ``row_index`` is that one count's index (:func:`.cake_backend.valid_row_index`; ``None`` when every
+    row is valid or the call is uncompacted), and both routes run on it without counting again.
+
+    Kept (``keep``): the valid rows (every row of an uncompacted call) fit one chunk (``0 < T_v <= chunk_size``) and
+    the fast backward would run no zero-gradient row skip on them (:func:`.cake_backend._zero_dlogp_skip`: fewer valid
+    rows than the device's floor, :func:`.cake_backend.zero_dlogp_min_rows`, or the skip off).  The kept backward has
+    no skip: with valid rows of a zero ``dlogp`` it would sum ``dW`` over the rows in the forward's order where the
+    skip sums the live rows first, so a call the skip can take keeps the default form, and every output is the bits of
+    ``memory_mode="fast"`` -- also in a checkpointed step, which keeps the default form on every pass."""
+    if not (
+        _ONE_CHUNK_KEEP["on"]
+        and backend == "cake"
+        and isinstance(X, torch.Tensor)
+        and isinstance(W, torch.Tensor)
+        and isinstance(labels, torch.Tensor)
+        and X.is_cuda
+        and torch.is_grad_enabled()
+        and (X.requires_grad or W.requires_grad)
+        and _main._TOP_SAVED_HOOKS(False) is None
+        and torch._C._current_graph_task_id() == -1
+    ):
+        return None
+    problem = validate_lm_head_det_inputs(
+        X, W, labels, chunk_size=chunk_size, entry="logprob"
+    )
+    T, C = int(problem.num_rows), int(problem.chunk)
+    if T == 0 or -(-T // C) >= _main.HIDDEN_COUNT_MIN_CHUNKS:
+        return None
+    row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
+    rows = T if row_index is None else int(row_index.numel())
+    need_dx = bool(X.requires_grad)
+    keep = 0 < rows <= C and not _main._zero_dlogp_skip(
+        X.device,
+        row_index,
+        "cake",
+        _resolve_logprob_dz(logprob_dz),
+        need_dx,
+        bool(need_dx and _resolve_dx_finalize(dx_finalize)),
+    )
+    return keep, row_index
 
 
 def cake_lm_head_det_train_logprob(
@@ -9824,8 +9887,11 @@ def cake_lm_head_det_train_logprob(
     without ``num_valid_rows``, with ``"fast"`` or a default call whose step forms no BF16 weight gradient on the
     ``cake`` backend, the call is :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob``, and so is a default call
     under gradient mode off whose ``W`` requires a gradient, with its hidden valid-row count checked against the
-    step's budget (:func:`_auto_hidden_count`).  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`; ``cake``
-    backend): :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob_keep`` -- where a backward can follow, the
+    step's budget (:func:`_auto_hidden_count`).  A default call whose valid rows fit one chunk and on which the fast
+    backward runs no zero-gradient row skip keeps their BF16 logits from the forward to the backward
+    (:func:`_one_chunk_keep_rows`, the one rule; :func:`set_logprob_one_chunk_keep`; bitwise the outputs of
+    ``memory_mode="fast"``, which turns it off for the call).  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`;
+    ``cake`` backend): :mod:`.cake_backend`'s ``cake_lm_head_det_train_logprob_keep`` -- where a backward can follow, the
     forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes until the backward) and the backward forms
     ``dz`` from them instead of recomputing them (bitwise the same ``logp`` / ``dX`` / ``dW``); where none can, the
     default entry.  With ``num_valid_rows`` (:func:`_logprob_keep_given`) the kept forward runs on the valid-row
@@ -9841,37 +9907,51 @@ def cake_lm_head_det_train_logprob(
         # the resolver rejects every mode outside MEMORY_MODES (and the default's); this entry takes KEEP_LOGITS below
         if not (isinstance(memory_mode, str) and memory_mode == KEEP_LOGITS):
             raise
-    if (
-        _ONE_CHUNK_KEEP["on"]
-        and memory_mode is None
-        and num_valid_rows is None
-        and backend == "cake"
-        and isinstance(X, torch.Tensor)
-        and X.is_cuda
-        and 0 < int(labels.numel()) <= int(chunk_size)
-        and torch.is_grad_enabled()
-        and (X.requires_grad or W.requires_grad)
-        and _main._TOP_SAVED_HOOKS(False) is None
-    ):
-        # the one-chunk kept-logits route (:func:`set_logprob_one_chunk_keep`, off by default)
-        return _main.cake_lm_head_det_train_logprob_keep(
+    route = (
+        _one_chunk_keep_rows(
+            X, W, labels, chunk_size, backend, compact_rows, dx_finalize, logprob_dz
+        )
+        if num_valid_rows is None and mode == MEMORY_AUTO
+        else None
+    )
+    if route is not None and route[0]:
+        # the one-chunk kept logits (:func:`_one_chunk_keep_rows`) on the index of the rule's count
+        return _main.CakeLMHeadDetLogprobKeepFunction.apply(
             X,
             W,
             labels,
-            chunk_size=chunk_size,
-            backend="cake",
-            compact_rows=compact_rows,
-            fuse_dw_cast=fuse_dw_cast,
-            dx_finalize=dx_finalize,
-            dw_stream=dw_stream,
-            hidden_count=hidden_count,
-            gemm_tuning=gemm_tuning,
-            logprob_dz=logprob_dz,
-            logprob_lbl=logprob_lbl,
+            int(chunk_size),
+            compact_rows,
+            fuse_dw_cast,
+            dx_finalize,
+            dw_stream,
+            hidden_count,
+            gemm_tuning,
+            logprob_dz,
+            route[1],
         )
+    # a call the rule counted and left on the default form runs on that count's index (no second count)
+    counted = _RECOUNT if route is None else route[1]
     if num_valid_rows is None and (
         mode == "fast" or (mode == MEMORY_AUTO and not _auto_reaches(backend, X, W))
     ):
+        if counted is not _RECOUNT:
+            return _main.CakeLMHeadDetLogprobFunction.apply(
+                X,
+                W,
+                labels,
+                int(chunk_size),
+                backend,
+                compact_rows,
+                fuse_dw_cast,
+                dx_finalize,
+                dw_stream,
+                hidden_count,
+                gemm_tuning,
+                logprob_dz,
+                logprob_lbl,
+                counted,
+            )
         return _main.cake_lm_head_det_train_logprob(
             X,
             W,
@@ -9966,6 +10046,7 @@ def cake_lm_head_det_train_logprob(
             gemm_tuning,
             logprob_dz,
             logprob_lbl,
+            counted,
         )
     return CakeLMHeadDetLogprobFunction.apply(
         X,

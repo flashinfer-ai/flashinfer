@@ -9099,72 +9099,138 @@ def test_device_logprob_keep_takes_num_valid_rows(glm_weight, monkeypatch):
         del base, given
 
 
-def test_device_logprob_one_chunk_keep_switch(glm_weight, monkeypatch):
-    """The opt-in module's one-chunk kept-logits switch (``set_logprob_one_chunk_keep``, off by default): with it on, a
-    default log-probability call of one chunk of rows whose backward can follow runs the kept-logits function, and
-    every other call keeps its route (more than one chunk of rows, the caller's count, no backward, a non-reentrant
-    checkpoint); ``logp`` / ``dX`` / ``dW`` are bitwise the switch-off call's either way."""
+def _with_zero_dlogp(inp):
+    """``inp`` with zero-gradient rows: every fourth valid row's ``dlogp`` ``+0`` and the second valid row's ``-0``."""
+    dlogp = inp.dlogp.clone()
+    rows = inp.valid.nonzero().reshape(-1)
+    dlogp[rows[::4]] = 0.0
+    if rows.numel() > 1:
+        dlogp[rows[1]] = -0.0
+    return replace(inp, dlogp=dlogp.contiguous())
+
+
+def test_device_logprob_one_chunk_keep_rule(glm_weight, monkeypatch):
+    """The default log-probability call's one-chunk kept logits (``set_logprob_one_chunk_keep``, on by default; the
+    rule ``_one_chunk_keep_rows``), with a quarter of the valid rows' ``dlogp`` zero: a default call runs the
+    kept-logits function exactly when its valid rows (every row of an uncompacted call) fit one chunk and the fast
+    backward runs no zero-gradient row skip on it -- the skip's floor set here (``None``: off; ``0``: every eligible
+    call) or the device's own (a call below every architecture's floor keeps the logits; at ``T_v`` 3973, at or
+    above the sm_100a and sm_103a floors, a device whose skip can run keeps the default form) -- counts its valid rows
+    on the host once where it compacts (either form runs on that index), and gives the bits (integer views) of
+    ``memory_mode="fast"``: ``logp``, ``dX`` and ``dW``.  The caller's count, the switch off, grad mode off and both
+    passes of a non-reentrant and a reentrant checkpoint keep the default form with the same bits; a frozen ``W``
+    keeps the logits for ``dX``."""
     _require_program(entry="logprob")
-    assert opt_in.set_logprob_one_chunk_keep(False) is False  # the default
-    applied = []
+    assert opt_in.set_logprob_one_chunk_keep(True) is True  # the default
+    index = torch.cuda.current_device()
+    skip_forms = bool(cake_backend._skip_record(index)[3])
+    arch = cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+    C = 4096
+    applied: list = []
     apply = cake_backend.CakeLMHeadDetLogprobKeepFunction.apply
 
     def spy(*args):
-        applied.append(len(args))
+        applied.append(args[-1])
         return apply(*args)
 
-    for T, C, ignore, extra, kept in (
-        (1500, 4096, 0.05, {}, True),
-        (1500, 4096, 0.0, {}, True),
-        (4096, 4096, 0.6, {}, True),
-        (4500, 4096, 0.33, {}, False),
-        (1500, 4096, 0.05, "count", False),
-    ):
-        inp = make_inputs(
-            T, seed=SEED + 390 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
-        )
-        kw = dict(num_valid_rows=int(inp.valid.sum())) if extra == "count" else {}
-        case = (T, C, ignore, extra, kept)
-        base = _run(inp, C, entry="logprob", backend="cake", memory_mode=None, **kw)
-        previous = opt_in.set_logprob_one_chunk_keep(True)
+    def default_call(inp, **kw):
         monkeypatch.setattr(cake_backend.CakeLMHeadDetLogprobKeepFunction, "apply", spy)
+        counts = _record_host_counts(monkeypatch)
+        applied.clear()
         try:
-            applied.clear()
             out = _run(inp, C, entry="logprob", backend="cake", memory_mode=None, **kw)
-            routed = list(applied)
-            applied.clear()
-            with torch.no_grad():
-                lp = opt_in.cake_lm_head_det_train_logprob(
-                    inp.X,
-                    inp.W.detach().requires_grad_(True),
-                    inp.labels,
-                    chunk_size=C,
-                    **kw,
+        finally:
+            monkeypatch.undo()
+        return out, list(applied), counts.count("cake_backend.valid_rows")
+
+    # (T, ignored fraction, skip floor, switches, kept; None: the device's floor decides)
+    for T, ignore, floor, switches, kept in (
+        (1500, 0.05, None, {}, True),
+        (1500, 0.0, None, {}, True),
+        (4500, 0.33, None, {}, True),
+        (6000, 0.05, None, {}, False),
+        (1500, 0.05, None, dict(compact_rows=False), True),
+        (4500, 0.33, None, dict(compact_rows=False), False),
+        (1500, 1.0, None, {}, False),
+        (1500, 0.05, 0, {}, not skip_forms),
+        (1500, 0.05, arch, {}, None),
+        (4096, 0.03, arch, {}, None),
+    ):
+        inp = _with_zero_dlogp(
+            make_inputs(
+                T, seed=SEED + 391 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
+            )
+        )
+        compact = switches.get("compact_rows") is not False
+        rows = int(inp.valid.sum()) if compact else T
+        previous = cake_backend.set_zero_dlogp_min_rows(floor)
+        try:
+            if kept is None:
+                least = cake_backend.zero_dlogp_min_rows(index)
+                kept = rows <= C and not (
+                    skip_forms and least is not None and rows >= least
                 )
-            assert not applied, case
+            case = (T, ignore, floor, switches, rows, kept)
+            fast = _run(
+                inp, C, entry="logprob", backend="cake", memory_mode="fast", **switches
+            )
+            out, routed, counts = default_call(inp, **switches)
+        finally:
+            cake_backend.set_zero_dlogp_min_rows(previous)
+        assert bool(routed) == kept, case
+        assert counts == (1 if compact else 0), (case, counts)
+        _assert_same_bits(fast, out, keys=("logp", "dX", "dW"))
+        del fast, out
+    inp = _with_zero_dlogp(
+        make_inputs(1500, seed=SEED + 397, device=CUDA, W=glm_weight, ignore_frac=0.05)
+    )
+    fast = _run(inp, C, entry="logprob", backend="cake", memory_mode="fast")
+    out, routed, _ = default_call(inp, num_valid_rows=int(inp.valid.sum()))
+    assert not routed
+    _assert_same_bits(fast, out, keys=("logp", "dX", "dW"))
+    previous = opt_in.set_logprob_one_chunk_keep(False)
+    try:
+        out, routed, _ = default_call(inp)
+    finally:
+        assert opt_in.set_logprob_one_chunk_keep(previous) is False
+    assert not routed
+    _assert_same_bits(fast, out, keys=("logp", "dX", "dW"))
+    fast_x = _run(
+        inp, C, entry="logprob", backend="cake", memory_mode="fast", train_w=False
+    )
+    out, routed, _ = default_call(inp, train_w=False)
+    assert routed
+    _assert_same_bits(fast_x, out, keys=("logp", "dX"))
+    monkeypatch.setattr(cake_backend.CakeLMHeadDetLogprobKeepFunction, "apply", spy)
+    applied.clear()
+    try:
+        with torch.no_grad():
+            lp = opt_in.cake_lm_head_det_train_logprob(
+                inp.X, inp.W.detach().requires_grad_(True), inp.labels, chunk_size=C
+            )
+        assert not applied
+        assert torch.equal(_bits(lp), _bits(fast["logp"]))
+        for reentrant in (False, True):
             X = inp.X.detach().requires_grad_(True)
             W = inp.W.detach().requires_grad_(True)
             ck = torch.utils.checkpoint.checkpoint(
                 lambda x, w: opt_in.cake_lm_head_det_train_logprob(
-                    x, w, inp.labels, chunk_size=C, **kw
+                    x, w, inp.labels, chunk_size=C
                 ),
                 X,
                 W,
-                use_reentrant=False,
+                use_reentrant=reentrant,
             )
             ck.backward(inp.dlogp)
             torch.cuda.synchronize()
-            assert not applied, case
-        finally:
-            monkeypatch.undo()
-            assert opt_in.set_logprob_one_chunk_keep(previous) is True
-        assert bool(routed) == kept, (case, routed)
-        for key in ("logp", "dX", "dW"):
-            assert torch.equal(out[key], base[key]), (case, key)
-        assert torch.equal(lp, base["logp"]), case
-        assert torch.equal(ck.detach(), base["logp"]), case
-        assert torch.equal(X.grad, base["dX"]) and torch.equal(W.grad, base["dW"]), case
-        del base, out, lp, ck
+            assert not applied, reentrant
+            _assert_same_bits(
+                fast,
+                dict(logp=ck.detach(), dX=X.grad, dW=W.grad),
+                keys=("logp", "dX", "dW"),
+            )
+    finally:
+        monkeypatch.undo()
 
 
 def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):
