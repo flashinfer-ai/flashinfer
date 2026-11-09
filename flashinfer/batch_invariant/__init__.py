@@ -91,11 +91,15 @@ def _attention_kv_fmt(kv_dtype: Union[torch.dtype, str, None]) -> str:
         torch.float8_e5m2: "e5m2",
         "e4m3": "e4m3",
         "e5m2": "e5m2",
+        torch.uint8: "nvfp4",  # FlashInfer's NVFP4 paged KV cache: packed e2m1 nibbles with e4m3 block scales
+        "nvfp4": "nvfp4",
     }
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        names[torch.float4_e2m1fn_x2] = "nvfp4"
     if kv_dtype not in names:
         raise ValueError(
-            "fingerprint(<attention wrapper>) takes kv_dtype torch.bfloat16 (the default), torch.float8_e4m3fn or "
-            f"torch.float8_e5m2 (or 'bf16' / 'e4m3' / 'e5m2'), not {kv_dtype!r}"
+            "fingerprint(<attention wrapper>) takes kv_dtype torch.bfloat16 (the default), torch.float8_e4m3fn, "
+            f"torch.float8_e5m2 or torch.uint8 (NVFP4) (or 'bf16' / 'e4m3' / 'e5m2' / 'nvfp4'), not {kv_dtype!r}"
         )
     return names[kv_dtype]
 
@@ -189,7 +193,8 @@ CLASSES: Dict[str, ClassInfo] = {
     # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class; the KV cache dtype is an optional
     # dimension: bf16 (the default) names the bf16 class, torch.float8_e4m3fn / torch.float8_e5m2 the fp8-KV classes
     # (attention.e4m3kv / attention.e5m2kv: exactly widened fp8 leaves, the key scale inside the log2 constant, one mul by the
-    # value scale before the conversion)
+    # value scale before the conversion) and torch.uint8 the NVFP4-KV class (attention.nvfp4kv: e2m1 values times their e4m3
+    # block scales as exact bf16 leaves, the same chain)
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint, ("kv_dtype",)
     ),
@@ -239,7 +244,8 @@ def fingerprint(op: str, **dims) -> str:
     ``torch.bfloat16`` (the default) is the bf16 class, ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` the fp8-KV classes
     (``attn-e4m3kv-d...`` / ``attn-e5m2kv-d...``: the fp8 keys and values widened to bf16 exactly at every leaf, the per-tensor
     ``k_scale`` inside the one binary32 constant ``c = fp32(sm_scale * k_scale * log2 e)``, and one ``mul.rn`` by ``v_scale``
-    before the single rounding); the scales' values, like the cache, are inputs.
+    before the single rounding) and ``torch.uint8`` the NVFP4-KV class (``attn-nvfp4kv-d...``: the e2m1 values times their e4m3
+    block scales as exact bf16 leaves, the same chain); the scales' values, like the cache, are inputs.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'

@@ -100,6 +100,17 @@ ATTN_CASES = [
         0,
         "e4m3",
     ),  # two PV slices per tile at D = 256 over an e4m3 cache
+    (
+        "a13",
+        128,
+        16,
+        32,
+        33,
+        5,
+        1,
+        17,
+        "nvfp4",
+    ),  # the NVFP4-KV class: dq4 leaves (output column 17: block 1 of the V scales)
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
 
@@ -486,6 +497,7 @@ MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_D_64",
     "Attn.output_depends_on_kv",
     "Attn.output_depends_on_kv_fmt",
+    "Attn.output_depends_on_kv_nvfp4",
 )
 
 

@@ -31,6 +31,12 @@ to binary32 (``scale_log2``: the key scale enters the chain through the one cons
 with, as the GEMM's fp8 chain takes its scale through one ``mul.rn``), and the epilogue multiplies by the value scale once
 before the single rounding: ``cvt_bf16(add(mul(mul(O, div(1, l)), v_scale), +0))``. Different leaves and a different
 chain: different classes and fingerprints; the bf16 class is unchanged.
+
+The NVFP4-KV class ``attn.nvfp4kv.d<D>`` takes the cache as e2m1 nibbles with one e4m3 block scale per 16 elements along the
+head dim (FlashInfer's NVFP4 paged KV cache and its ``kv_cache_sf``) and the same two per-tensor scales: every K and V leaf is
+``dq4(values, block_scale)`` -- the e2m1 values times their block scale, a product of at most six significant bits within the
+bf16 range, so the leaf is an exact bf16 value and no rounding step enters the term -- and the chain is the fp8-KV classes'
+(the key scale inside ``c``, one ``mul.rn`` by the value scale before the rounding).
 """
 
 from __future__ import annotations
@@ -63,8 +69,13 @@ KV_FMTS = (
     "bf16",
     "e4m3",
     "e5m2",
-)  # the K / V cache formats: the bf16 class and the two fp8-KV classes
-LOWBIT_KV_FMTS = ("e4m3", "e5m2")
+    "nvfp4",
+)  # the K / V cache formats: the bf16 class, the two fp8-KV classes, the NVFP4-KV class
+LOWBIT_KV_FMTS = ("e4m3", "e5m2", "nvfp4")
+FP8_KV_FMTS = ("e4m3", "e5m2")
+SF_BLOCK = (
+    16  # NVFP4: elements per e4m3 block scale along the head dim (one MMA K-step)
+)
 
 
 CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- a class constant (another C would be a different class)
@@ -225,8 +236,23 @@ def init_state(fp) -> State:
 def kv_widen(fp, kv_fmt: str, leaf):
     """A K / V leaf of the fp8-KV classes: the cache's ``kv_fmt`` value widened to bf16 exactly (a bit movement: every e4m3
     / e5m2 value is a bf16 value). The bf16 class's leaves are the cache values themselves."""
-    assert kv_fmt in LOWBIT_KV_FMTS, kv_fmt
+    assert kv_fmt in FP8_KV_FMTS, kv_fmt
     return fp.op("kv_widen", kv_fmt, leaf)
+
+
+def kv_dq4(fp, leaf, sf_leaf):
+    """A K / V leaf of the NVFP4-KV class: the e2m1 values of the slice times their e4m3 block scales, exact in bf16 (at most
+    six significant bits, within the bf16 exponent range), so the dequantization is a leaf, not a rounding step."""
+    return fp.op("kv_dq4", leaf, sf_leaf)
+
+
+def k_leaf(fp, t: int, k: int, kv_fmt: str):
+    """The K (B) slice of score step ``t`` of key ``k`` in the class's format."""
+    leaf = fp.op("b_cols", t, k)
+    if kv_fmt in FP8_KV_FMTS:
+        return kv_widen(fp, kv_fmt, leaf)
+    assert kv_fmt == "nvfp4", kv_fmt
+    return kv_dq4(fp, leaf, fp.op("sfb_cols", t, k))  # step t = block t of the head dim
 
 
 def score_term(fp, row: RowSpec, k: int, D: int, kv_fmt: str = "bf16"):
@@ -239,9 +265,7 @@ def score_term(fp, row: RowSpec, k: int, D: int, kv_fmt: str = "bf16"):
     def leaf(fp_, idx):
         t = idx["kstep"]
         return fp_.op(
-            "ab_kslice",
-            fp_.op("a_rows", row.row, t),
-            kv_widen(fp_, kv_fmt, fp_.op("b_cols", t, k)),
+            "ab_kslice", fp_.op("a_rows", row.row, t), k_leaf(fp_, t, k, kv_fmt)
         )
 
     kstep = Digit(
@@ -250,8 +274,8 @@ def score_term(fp, row: RowSpec, k: int, D: int, kv_fmt: str = "bf16"):
         "fold",
         init=lambda fp_: fp_.const(0.0),
         step=lambda fp_, acc, tile: fp_.op(MMA_OP, acc, tile),
-        identity_note="the same opaque bf16 K-step as gemm.bf16.kfold over exactly widened fp8 keys (no padded step: D is a "
-        "multiple of 16)",
+        identity_note="the same opaque bf16 K-step as gemm.bf16.kfold over exactly dequantized low-bit keys (no padded step: "
+        "D is a multiple of 16)",
     )
     return Reduction(f"attn.{kv_fmt}kv.score[K={D}]", (kstep,), leaf).canonical(fp)
 
@@ -309,9 +333,14 @@ def pv_fold(fp, o_scaled, probs_bf16: Sequence[Any], v_slice: Callable[[int], An
 
 
 def v_leaf(fp, vt: int, d: int, kv_fmt: str = "bf16"):
-    """The V slice of PV step ``vt`` for output column ``d``: the cache's bf16 values, or the fp8 values widened exactly."""
+    """The V slice of PV step ``vt`` for output column ``d``: the cache's bf16 values, the fp8 values widened exactly, or the
+    NVFP4 values times the keys' block scales of block ``d // 16``."""
     leaf = fp.op("v_slice", vt, d)
-    return leaf if kv_fmt == "bf16" else kv_widen(fp, kv_fmt, leaf)
+    if kv_fmt == "bf16":
+        return leaf
+    if kv_fmt in FP8_KV_FMTS:
+        return kv_widen(fp, kv_fmt, leaf)
+    return kv_dq4(fp, leaf, fp.op("sfv", vt, d // SF_BLOCK))
 
 
 def tile_step(

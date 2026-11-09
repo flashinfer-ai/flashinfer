@@ -25,7 +25,9 @@ The fp8-KV classes (`Params.kv = "e4m3"` / `"e5m2"`; `""` is the bf16 class) are
 and V leaf is the cache value widened to bf16 exactly (`(widen <fmt> leaf)`), the key scale is inside the host constant `c`
 (`c = fp32(sm_scale * k_scale * log2 e)`, a leaf of the term either way) and the epilogue multiplies the normalised row by
 the value scale once before the rounding: `cvt_bf16(add(mul(mul(O, div(1, l)), v_scale), +0))`. Different leaves and a
-different chain: different terms (`output_depends_on_kv`, `output_depends_on_kv_fmt`), hence different classes.
+different chain: different terms (`output_depends_on_kv`, `output_depends_on_kv_fmt`), hence different classes. The NVFP4-KV
+class (`Params.kv = "nvfp4"`) has the leaves `(dq4 values block_scale)`: the e2m1 values of a slice times their e4m3 block scale
+(one per 16 elements along the head dim: one score K-step, or block `d / 16` of a V column), exact in bf16, and the same chain.
 
 Tile and chunk boundaries are absolute multiples of `T` and `C`, functions of `D` only: the term of
 a token depends on its position `p`, the window and the head, never on the batch, the page table
@@ -59,15 +61,23 @@ inductive ATerm where
   | mma (acc : ATerm) (pslice : String) (kv : String) (vt d : Nat)
   deriving DecidableEq, Repr, Inhabited
 
-/-- The score fold of the fp8-KV classes: the GEMM's `kfold` (`steps` `mma16` K-steps from +0) whose B (key) slice of every
-step is the widened fp8 key, printed as `term.sexpr` prints `(ab (a m t) (widen <fmt> (b t n)))`. -/
+/-- The K (B) slice leaf of score step `t` of key `k`: the fp8 key widened exactly (`(widen <fmt> (b t k))`), or the NVFP4
+key's e2m1 values times their block scale of block `t` (`(dq4 (b t k) (sfb t k))`), as `term.sexpr` prints them. -/
+def kLeaf (kv : String) (t k : Nat) : String :=
+  if kv == "nvfp4" then s!"(dq4 (b {t} {k}) (sfb {t} {k}))" else s!"(widen {kv} (b {t} {k}))"
+
+/-- The score fold of the low-bit-KV classes: the GEMM's `kfold` (`steps` `mma16` K-steps from +0) whose B (key) slice of every
+step is the dequantized low-bit key (`kLeaf`). -/
 def scoreW (kv : String) (row k : Nat) : Nat → String
   | 0 => "(const 0.0)"
-  | n+1 => s!"(mma16 {scoreW kv row k n} (ab (a {row} {n}) (widen {kv} (b {n} {k}))))"
+  | n+1 => s!"(mma16 {scoreW kv row k n} (ab (a {row} {n}) {kLeaf kv n k}))"
 
-/-- The V slice leaf of one PV step: the cache's bf16 values (`kv = ""`) or the fp8 values widened exactly. -/
+/-- The V slice leaf of one PV step: the cache's bf16 values (`kv = ""`), the fp8 values widened exactly, or the NVFP4 values
+times the keys' block scales of block `d / 16`. -/
 def vLeaf (kv : String) (vt d : Nat) : String :=
-  if kv == "" then s!"(op:v_slice {vt} {d})" else s!"(widen {kv} (op:v_slice {vt} {d}))"
+  if kv == "" then s!"(op:v_slice {vt} {d})"
+  else if kv == "nvfp4" then s!"(dq4 (op:v_slice {vt} {d}) (sfv {vt} {d / 16}))"
+  else s!"(widen {kv} (op:v_slice {vt} {d}))"
 
 def ATerm.sexpr : ATerm → String
   | .const c => s!"(const {c})"
@@ -295,6 +305,9 @@ theorem output_depends_on_kv :
 
 theorem output_depends_on_kv_fmt :
     output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3"⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, "e5m2"⟩ := by native_decide
+
+theorem output_depends_on_kv_nvfp4 :
+    output ⟨8, 2, 8, 9, -1, 0, 0, "nvfp4"⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3"⟩ := by native_decide
 
 /-- The visible keys, the tiles and the chunks of a row depend on `(p, win, T, C)` only: the page
 table, the batch and the configuration do not appear. -/
