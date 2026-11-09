@@ -103,9 +103,9 @@ keyword.
   `"forward"`: every call with a trainable input forms the gradients in its
   forward (the previous behavior).  The same `loss`, `logp`, `dX` and `dW`
   bits either way.  `cake_lm_head_det_train_logprob` (with or without a
-  temperature, without `num_valid_rows`; a default call also when its
-  backward runs a budget form; not its explicit `"budget"` or kept-logits
-  forms, nor calls with `num_valid_rows`) forms no gradient in its
+  temperature; a default call also when its backward runs a budget form, an
+  explicit `"budget"` call and a call with `num_valid_rows`; not its
+  kept-logits form) forms no gradient in its
   forward; under `"auto"` inside a non-reentrant `torch.utils.checkpoint` its
   checkpointed forward keeps the call's row results (`logp`, the FP32 `lse`,
   the valid-row index and the compact temperature: O(T) bytes until the

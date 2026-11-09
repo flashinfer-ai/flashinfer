@@ -13228,11 +13228,11 @@ def test_device_checkpointed_logprob_step_launches_the_gradient_gemms_once(glm_w
 
 
 @contextlib.contextmanager
-def _logprob_forwards():
-    """The log-probability forwards (``forward_logprob`` / ``forward_logprob_temperature``) the main module's autograd
-    entries run, in order."""
+def _logprob_forwards(module=cake_backend):
+    """The log-probability forwards (``forward_logprob`` / ``forward_logprob_temperature``) the autograd entries of
+    ``module`` (the main module, or the opt-in one) run, in order."""
     seen: list = []
-    originals = (cake_backend.forward_logprob, cake_backend.forward_logprob_temperature)
+    originals = (module.forward_logprob, module.forward_logprob_temperature)
 
     def recording(original, name):
         def forward(*args, **kwargs):
@@ -13241,14 +13241,12 @@ def _logprob_forwards():
 
         return forward
 
-    cake_backend.forward_logprob = recording(originals[0], "logprob")
-    cake_backend.forward_logprob_temperature = recording(originals[1], "temperature")
+    module.forward_logprob = recording(originals[0], "logprob")
+    module.forward_logprob_temperature = recording(originals[1], "temperature")
     try:
         yield seen
     finally:
-        cake_backend.forward_logprob, cake_backend.forward_logprob_temperature = (
-            originals
-        )
+        module.forward_logprob, module.forward_logprob_temperature = originals
 
 
 def _logprob_temperature(inp, form):
@@ -13259,9 +13257,10 @@ def _logprob_temperature(inp, form):
     return make_temperature(inp.T, "hetero", seed=inp.seed, device=inp.X.device)
 
 
-def _logprob_step(inp, kind, form, *, C=64, between=None, **kw):
-    """One step of the log-probability entry (``form``: no temperature, a scalar or a per-token one) under ``kind``;
-    ``between(X, W, logp)`` runs after the forward, before the backward.  Returns ``logp`` / ``dX`` / ``dW``."""
+def _logprob_step(inp, kind, form, *, C=64, between=None, module=cake_backend, **kw):
+    """One step of the log-probability entry of ``module`` (the main module, or the opt-in one) (``form``: no
+    temperature, a scalar or a per-token one) under ``kind``; ``between(X, W, logp)`` runs after the forward, before
+    the backward.  Returns ``logp`` / ``dX`` / ``dW``."""
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
     tau = _logprob_temperature(inp, form)
@@ -13269,11 +13268,11 @@ def _logprob_step(inp, kind, form, *, C=64, between=None, **kw):
 
     def head(a, b):
         if tau is None:
-            logp = cake_backend.cake_lm_head_det_train_logprob(
+            logp = module.cake_lm_head_det_train_logprob(
                 a, b, inp.labels, chunk_size=C, **kw
             )
         else:
-            logp = cake_backend.cake_lm_head_det_train_logprob_temperature(
+            logp = module.cake_lm_head_det_train_logprob_temperature(
                 a, b, inp.labels, chunk_size=C, temperature=tau, **kw
             )
         logps.append(logp)
@@ -13326,6 +13325,29 @@ def test_checkpointed_logprob_step_runs_the_forward_once(kind, form):
         else:
             assert len(seen) == 2, seen
         _assert_step_bits(again, plain, keys=("logp", "dX", "dW"))
+    gc.collect()
+    assert len(cake_backend._LOGPROB_CHECKPOINT_CALLS) == 0
+
+
+@pytest.mark.parametrize("form", [None, "scalar", "tensor"])
+@pytest.mark.parametrize("kind", CHECKPOINT_KINDS)
+def test_checkpointed_logprob_step_with_num_valid_rows_runs_the_forward_once(
+    kind, form
+):
+    """The opt-in log-probability entry with the caller's count (``num_valid_rows``, also checked): a non-reentrant
+    checkpointed step runs the logits forward once, as the default entry's (the recomputation takes the checkpointed
+    call's ``logp`` and row results); ``logp`` / ``dX`` / ``dW`` are the uncheckpointed step's bits for every
+    checkpoint kind.  No frame record is left behind."""
+    inp = _host_inputs(200, "ce")
+    n = int(inp.valid.sum())
+    kw = dict(backend="reference", module=opt_in, num_valid_rows=n)
+    plain = _logprob_step(inp, "plain", form, **kw)
+    for check in (False, True):
+        with _logprob_forwards(opt_in) as seen:
+            run = _logprob_step(inp, kind, form, check_num_valid_rows=check, **kw)
+        want = _LOGPROB_FORWARDS.get(kind)
+        assert len(seen) == want if want is not None else 1 <= len(seen) <= 2, seen
+        _assert_step_bits(run, plain, keys=("logp", "dX", "dW"))
     gc.collect()
     assert len(cake_backend._LOGPROB_CHECKPOINT_CALLS) == 0
 
@@ -13449,6 +13471,49 @@ def test_device_checkpointed_logprob_step_runs_the_logits_gemms_once(glm_weight,
         assert _logits_gemm_keys(launched) == logits, kind
         assert _gradient_gemm_keys(launched) == grads, kind
         _assert_step_bits(run, plain, keys=("logp", "dX", "dW"))
+
+
+@pytest.mark.parametrize("call", ["num_valid_rows", "budget"])
+@pytest.mark.parametrize("form", [None, "scalar", "tensor"])
+def test_device_checkpointed_opt_in_logprob_step_runs_the_logits_gemms_once(
+    glm_weight, form, call
+):
+    """The opt-in log-probability calls outside the default entry's function -- with the caller's count
+    (``num_valid_rows``) and ``memory_mode="budget"`` --, checkpointed (plain non-reentrant, selective, under a
+    dispatch mode): the logits forward runs once, as in the uncheckpointed step (the same logits and gradient GEMM
+    launches, no more), with its ``logp`` / ``dX`` / ``dW`` bits."""
+    _require_program(entry="logprob")
+    inp = _device_inputs(12289, "ce", W=glm_weight)
+    kw = dict(
+        module=opt_in,
+        **(
+            dict(num_valid_rows=int(inp.valid.sum()))
+            if call == "num_valid_rows"
+            else dict(memory_mode="budget")
+        ),
+    )
+    _logprob_step(inp, "plain", form, C=4096, **kw)
+    with _launch_record() as launched, _logprob_forwards(opt_in) as seen:
+        plain = _logprob_step(inp, "plain", form, C=4096, **kw)
+    logits, grads = _logits_gemm_keys(launched), _gradient_gemm_keys(launched)
+    assert len(seen) == 1, seen
+    if form is None:
+        assert logits > 0 and grads > 0, sorted({k[0] for k in launched})
+    for kind in (
+        "nonreentrant",
+        "selective_recompute",
+        "selective_save_mm",
+        "selective_save_all",
+        "dispatch_mode",
+    ):
+        with _launch_record() as launched, _logprob_forwards(opt_in) as seen:
+            run = _logprob_step(inp, kind, form, C=4096, **kw)
+        assert len(seen) == 1, (kind, seen)
+        assert _logits_gemm_keys(launched) == logits, kind
+        assert _gradient_gemm_keys(launched) == grads, kind
+        _assert_step_bits(run, plain, keys=("logp", "dX", "dW"))
+    gc.collect()
+    assert len(cake_backend._LOGPROB_CHECKPOINT_CALLS) == 0
 
 
 def _region_entry(entry, inp, X, W):

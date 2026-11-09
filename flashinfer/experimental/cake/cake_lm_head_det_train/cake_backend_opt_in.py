@@ -8393,8 +8393,45 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
         return (dx, dw) + none[2:]
 
 
+def _logprob_call_key(
+    inputs: tuple,
+    labels: torch.Tensor,
+    chunk_size,
+    backend,
+    compact: bool,
+    hidden: bool,
+    tuning,
+    lbl_arm: bool,
+    mode,
+    num_valid_rows,
+    check_num_valid_rows,
+    *extra,
+) -> tuple:
+    """What a recomputed call of this module's log-probability functions must match to take its checkpointed call's
+    row results (:func:`.cake_backend._logprob_call_key` over this module's options, the memory mode and the caller's
+    count among them; ``extra``: the temperature's)."""
+    return _main._logprob_call_key(
+        inputs,
+        (
+            "opt_in",
+            chunk_size,
+            backend,
+            compact,
+            hidden,
+            _main._tuning_key(tuning),
+            lbl_arm,
+            mode,
+            _given_count(num_valid_rows, int(labels.numel())),
+            bool(check_num_valid_rows),
+        )
+        + extra,
+    )
+
+
 class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
-    """Entry (b): the forward saves the row statistic; the backward recomputes the logits."""
+    """Entry (b): the forward saves the row statistic; the backward recomputes the logits.  Inside a non-reentrant
+    ``torch.utils.checkpoint`` the recomputation takes the checkpointed call's ``logp`` and row results instead of
+    running the logits forward again (as :class:`.cake_backend.CakeLMHeadDetLogprobFunction`)."""
 
     @staticmethod
     def forward(
@@ -8455,39 +8492,74 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
             _check_budget_call(backend, torch.bfloat16)
         # the automatic form (a default call): its backward picks the fast form or a budget form
         auto = _logprob_auto(mode, backend, X, W)
-        result = forward_logprob(
-            X,
-            W,
-            labels,
-            chunk_size=chunk_size,
-            backend=backend,
-            compact_rows=compact,
-            # ``"budget"``: no hidden valid-row count (as :func:`forward_loss`); the automatic form keeps it where its
-            # chunk-0 buffers fit the budget (:func:`_auto_hidden_count`)
-            hidden_count=(
-                False
-                if budget
-                else (
-                    _auto_hidden_count(
-                        hidden,
-                        X,
-                        W,
-                        chunk_size,
-                        need_dx=bool(ctx.needs_input_grad[0]),
-                        entry="logprob",
-                    )
-                    if auto and ctx.needs_input_grad[1]
-                    else hidden
-                )
-            ),
-            gemm_tuning=tuning,
-            logprob_lbl=_resolve_logprob_lbl(logprob_lbl),
-            num_valid_rows=num_valid_rows,
-            check_num_valid_rows=check_num_valid_rows,
+        lbl_arm = _resolve_logprob_lbl(logprob_lbl)
+        # inside a non-reentrant checkpoint: the recomputation takes the checkpointed call's row results (as
+        # :mod:`.cake_backend`'s entry; the same frame record, see :class:`.cake_backend._LogprobKept`)
+        ckpt = (
+            _main._checkpoint_pass()
+            if _main._TOP_SAVED_HOOKS(False) is not None
+            else None
         )
+        kept = None
+        if ckpt is not None:
+            inputs = (X, W, labels)
+            key = _logprob_call_key(
+                inputs,
+                labels,
+                chunk_size,
+                backend,
+                compact,
+                hidden,
+                tuning,
+                lbl_arm,
+                mode,
+                num_valid_rows,
+                check_num_valid_rows,
+            )
+            if not ckpt.first:
+                kept = _main._logprob_checkpoint_take(ckpt, key, inputs)
+        if kept is not None:
+            # the recomputation of a checkpointed call: its row results, no logits GEMM
+            logp, (lse, row_index) = kept.logp.clone(), kept.saved
+        else:
+            result = forward_logprob(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                backend=backend,
+                compact_rows=compact,
+                # ``"budget"``: no hidden valid-row count (as :func:`forward_loss`); the automatic form keeps it where
+                # its chunk-0 buffers fit the budget (:func:`_auto_hidden_count`)
+                hidden_count=(
+                    False
+                    if budget
+                    else (
+                        _auto_hidden_count(
+                            hidden,
+                            X,
+                            W,
+                            chunk_size,
+                            need_dx=bool(ctx.needs_input_grad[0]),
+                            entry="logprob",
+                        )
+                        if auto and ctx.needs_input_grad[1]
+                        else hidden
+                    )
+                ),
+                gemm_tuning=tuning,
+                logprob_lbl=lbl_arm,
+                num_valid_rows=num_valid_rows,
+                check_num_valid_rows=check_num_valid_rows,
+            )
+            logp, lse, row_index = result.logp, result.lse, result.row_index
+            if ckpt is not None and ckpt.first:
+                _main._logprob_checkpoint_keep(
+                    ctx, ckpt, key, inputs, logp, (lse, row_index)
+                )
         ctx.set_materialize_grads(False)
         # the valid-row index rides along: the backward plans its chunks without counting the rows again
-        ctx.save_for_backward(X, W, labels, result.lse, result.row_index)
+        ctx.save_for_backward(X, W, labels, lse, row_index)
         ctx.chunk_size, ctx.backend, ctx.compact = (
             chunk_size,
             backend,
@@ -8507,7 +8579,7 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
             if budget or auto
             else None
         )
-        return result.logp
+        return logp
 
     @staticmethod
     def backward(ctx, dlogp):
@@ -8578,7 +8650,8 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
 
 
 class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
-    """:class:`CakeLMHeadDetLogprobFunction` of a call with a temperature (:func:`cake_lm_head_det_train_logprob`)."""
+    """:class:`CakeLMHeadDetLogprobFunction` of a call with a temperature (:func:`cake_lm_head_det_train_logprob`),
+    with the same checkpoint hand-over."""
 
     @staticmethod
     def forward(
@@ -8643,51 +8716,87 @@ class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
             _check_budget_call(backend, torch.bfloat16)
         # the automatic form (a default call): its backward picks the fast form or a budget form
         auto = _logprob_auto(mode, backend, X, W)
-        # the temperature is validated once, before any launch (both arms' explicit switches are known here)
-        tau = _resolve_temperature(
-            temperature,
-            int(X.shape[0]) if X.ndim else 0,
-            X.device,
-            check=bool(check_temperature),
+        lbl_arm = _resolve_logprob_lbl(logprob_lbl)
+        # inside a non-reentrant checkpoint: the recomputation takes the checkpointed call's row results (as
+        # :class:`CakeLMHeadDetLogprobFunction`)
+        ckpt = (
+            _main._checkpoint_pass()
+            if _main._TOP_SAVED_HOOKS(False) is not None
+            else None
         )
-        _check_temperature_arms(tau is not None, logprob_lbl, logprob_dz)
-        result = forward_logprob_temperature(
-            X,
-            W,
-            labels,
-            chunk_size=chunk_size,
-            backend=backend,
-            compact_rows=compact,
-            # ``"budget"``: no hidden valid-row count (as :func:`forward_loss`); the automatic form keeps it where its
-            # chunk-0 buffers fit the budget (:func:`_auto_hidden_count`)
-            hidden_count=(
-                False
-                if budget
-                else (
-                    _auto_hidden_count(
-                        hidden,
-                        X,
-                        W,
-                        chunk_size,
-                        need_dx=bool(ctx.needs_input_grad[0]),
-                        entry="logprob",
+        kept = None
+        if ckpt is not None:
+            tau_in = temperature if isinstance(temperature, torch.Tensor) else None
+            inputs = (X, W, labels, tau_in)
+            key = _logprob_call_key(
+                inputs,
+                labels,
+                chunk_size,
+                backend,
+                compact,
+                hidden,
+                tuning,
+                lbl_arm,
+                mode,
+                num_valid_rows,
+                check_num_valid_rows,
+                logprob_dz,
+                None if tau_in is not None else temperature,
+                bool(check_temperature),
+            )
+            if not ckpt.first:
+                kept = _main._logprob_checkpoint_take(ckpt, key, inputs)
+        if kept is not None:
+            # the recomputation of a checkpointed call: its row results, no logits GEMM
+            logp, saved = kept.logp.clone(), kept.saved
+        else:
+            # the temperature is validated once, before any launch (both arms' explicit switches are known here)
+            tau = _resolve_temperature(
+                temperature,
+                int(X.shape[0]) if X.ndim else 0,
+                X.device,
+                check=bool(check_temperature),
+            )
+            _check_temperature_arms(tau is not None, logprob_lbl, logprob_dz)
+            result = forward_logprob_temperature(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                backend=backend,
+                compact_rows=compact,
+                # ``"budget"``: no hidden valid-row count (as :func:`forward_loss`); the automatic form keeps it where
+                # its chunk-0 buffers fit the budget (:func:`_auto_hidden_count`)
+                hidden_count=(
+                    False
+                    if budget
+                    else (
+                        _auto_hidden_count(
+                            hidden,
+                            X,
+                            W,
+                            chunk_size,
+                            need_dx=bool(ctx.needs_input_grad[0]),
+                            entry="logprob",
+                        )
+                        if auto and ctx.needs_input_grad[1]
+                        else hidden
                     )
-                    if auto and ctx.needs_input_grad[1]
-                    else hidden
-                )
-            ),
-            gemm_tuning=tuning,
-            logprob_lbl=_resolve_logprob_lbl(logprob_lbl),
-            num_valid_rows=num_valid_rows,
-            check_num_valid_rows=check_num_valid_rows,
-            temperature=tau,
-        )
+                ),
+                gemm_tuning=tuning,
+                logprob_lbl=lbl_arm,
+                num_valid_rows=num_valid_rows,
+                check_num_valid_rows=check_num_valid_rows,
+                temperature=tau,
+            )
+            logp = result.logp
+            saved = (result.lse, result.row_index, result.temperature_rows)
+            if ckpt is not None and ckpt.first:
+                _main._logprob_checkpoint_keep(ctx, ckpt, key, inputs, logp, saved)
         ctx.set_materialize_grads(False)
         # the valid-row index rides along: the backward plans its chunks without counting the rows again; so does the
         # compact temperature the forward's kernels read (no second gather)
-        ctx.save_for_backward(
-            X, W, labels, result.lse, result.row_index, result.temperature_rows
-        )
+        ctx.save_for_backward(X, W, labels, *saved)
         ctx.chunk_size, ctx.backend, ctx.compact = (
             chunk_size,
             backend,
@@ -8707,7 +8816,7 @@ class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
             if budget or auto
             else None
         )
-        return result.logp
+        return logp
 
     @staticmethod
     def backward(ctx, dlogp):
