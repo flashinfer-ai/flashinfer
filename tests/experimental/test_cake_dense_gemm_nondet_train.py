@@ -6591,6 +6591,7 @@ def test_k1_ordered_ranges_plan_their_program(monkeypatch):
 _P2_128, _P4_128 = (128, 1, 2, "arrival"), (128, 1, 4, "arrival")
 _P2_192, _P4_192 = (192, 1, 2, "arrival"), (192, 1, 4, "arrival")
 _P2_256, _P8_256 = (256, 1, 2, "arrival"), (256, 1, 8, "arrival")
+_P4_256 = (256, 1, 4, "arrival")
 # fmt: off
 _PARITY_BASE = {
     ("sm_107a", 1, 4096, 512, "f32"): (
@@ -6601,16 +6602,24 @@ _PARITY_BASE = {
     ("sm_107a", 1, 5120, 1024, "f32"): ((961, 40961, _P2_256, _P8_256),),
 }
 _PARITY_212 = {
-    **_PARITY_BASE,
-    ("sm_107a", 1, 5120, 512, "f32"): ((961, 40961, _P2_128, _P4_128), (40962, 65536, (), ())),
-    ("sm_107a", 1, 4096, 1024, "f32"): ((961, 40961, _P2_192, _P4_192), (40962, 65536, None, _P4_192)),
+    ("sm_107a", 1, 4096, 512, "f32"): (
+        (961, 12000, _P2_128, _P4_128), (12001, 24576, (), _P4_128), (24577, 40961, (), ()),
+    ),
+    ("sm_107a", 1, 5120, 512, "f32"): ((961, 40961, _P2_128, _P4_128),),
+    ("sm_107a", 1, 4096, 1024, "f32"): (
+        (961, 24575, _P2_192, _P4_192), (24576, 40961, (), _P4_192), (40962, 65536, None, _P4_192),
+    ),
+    ("sm_107a", 1, 5120, 1024, "f32"): (
+        (961, 16169, _P2_256, _P8_256), (16170, 16172, _P2_256, _P4_256), (16173, 40961, _P2_256, _P8_256),
+    ),
 }
 _PARITY_216 = {
     **_PARITY_BASE,
     ("sm_107a", 1, 4096, 1024, "f32"): ((961, 40961, _P2_192, _P4_192), (40962, 65536, None, _P4_192)),
 }
 _PARITY_208 = {
-    **_PARITY_212,
+    **_PARITY_BASE,
+    ("sm_107a", 1, 5120, 512, "f32"): ((961, 40961, _P2_128, _P4_128), (40962, 65536, (), ())),
     ("sm_107a", 1, 4096, 512, "f32"): (
         (961, 12000, _P2_128, _P4_128), (12001, 16171, (), _P4_128), (16172, 16230, _P2_128, _P4_128),
         (16231, 16231, (), ()), (16232, 16383, _P2_128, _P4_128), (16384, 16384, (), ()),
@@ -6717,7 +6726,7 @@ def test_k1_parity_ranges_plan_their_program(monkeypatch):
 _PARITY_SWEEP_T = sorted({
     t + d
     for t in (961, 1024, 2048, 4096, 7680, 8192, 12000, 12001, 16172, 16192, 16231, 16256, 16300, 16320, 16384,
-              20000, 24577, 32767, 32768, 36000, 40961, 40962, 45057, 65536)
+              16170, 20000, 24577, 32767, 32768, 36000, 40961, 40962, 45057, 49153, 65536)
     for d in (-1, 0, 1)
     if t + d >= 961
 })
@@ -6730,9 +6739,9 @@ def test_k1_sm107a_fp32_wgrad_rows_run_no_one_or_three_chains(sms):
     the FP32 weight gradients ``4096 / 5120 -> 512 / 1024`` run, from 961 tokens up, no one-split program of one or
     three accumulation chains (one chain missed the accuracy check on all six input kinds, three chains on mirrored
     cancelling inputs): every token count of :data:`_PARITY_SWEEP_T` runs the program :func:`k1_parity_plan` names for
-    it where it names one (one split of two chains at an even number of K blocks and of four at an odd number -- eight
-    at ``5120 -> 1024`` --, at the range's tile width), the deterministic program where it names that, and else the
-    deterministic program or two splits; every program planned is one this checkout registers for ``sm_107a``."""
+    it where it names one (one split of two, four or eight chains at the range's tile width), the deterministic program
+    where it names that, and else the deterministic program or two splits; every program planned is one this checkout
+    registers for ``sm_107a``."""
     kw = dict(transposed_out=True, arch="sm_107a", sm_count=sms)
     routed = 0
     for d_in, d_out in ((4096, 512), (5120, 512), (4096, 1024), (5120, 1024)):
@@ -6760,8 +6769,7 @@ def test_k1_sm107a_fp32_wgrad_rows_run_no_one_or_three_chains(sms):
             if plan.splits > 1:
                 assert (plan.splits, plan.chains) == (2, 1), what
                 continue
-            odd = 8 if (d_in, d_out) == (5120, 1024) else 4
-            assert plan.chains == (odd if -(-T // 64) % 2 else 2), what
+            assert plan.chains in (2, 4, 8), what
             assert plan.reproducible, what
     assert routed
 
@@ -14669,7 +14677,7 @@ def test_k1_forward_named_rows_plan_their_program():
                 default.template,
             )
             named += 1
-    assert named == 26
+    assert named == 25
 
 
 #: The B200 weight-gradient rows of :data:`K1_WGRAD_DET_RULES_BY_SM`: (d_in, d_out) -> program per output dtype.

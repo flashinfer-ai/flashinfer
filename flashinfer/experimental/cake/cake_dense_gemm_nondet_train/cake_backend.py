@@ -1274,6 +1274,7 @@ def k1_ordered_plan(
 _C2_N128, _C4_N128 = (128, 1, 2, "arrival"), (128, 1, 4, "arrival")
 _C2_N192, _C4_N192 = (192, 1, 2, "arrival"), (192, 1, 4, "arrival")
 _C2_N256, _C8_N256 = (256, 1, 2, "arrival"), (256, 1, 8, "arrival")
+_C4_N256 = (256, 1, 4, "arrival")
 # fmt: off
 _K1_PARITY_SM107A: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ...]] = {
     (4096, 512): ((961, 12000, _C2_N128, _C4_N128), (12001, 32767, (), _C4_N128), (32768, 40961, (), ())),
@@ -1301,6 +1302,27 @@ _K1_PARITY_SM107A_208: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ..
         (16384, 16384, (), ()), (16385, 40961, _C2_N192, _C4_N192),
     ),
 }
+#: The 212-SM ranges: the ranges above and the ones past 40961 tokens, rechecked where they ran slower than the routing
+#: they replaced (this package's A/B against FI main on a 212-SM R200 part) per range and K-block parity against every
+#: token count measured on that part under the same accuracy check (FI main's program where it met the check at every
+#: measured count of the range, else the fastest program that did).  ``4096 -> 512`` runs FI main's deterministic
+#: program at the odd counts from 24577 tokens: it met the check at 24577, 28673, 30721 and 32641 tokens and missed it
+#: at 25601 (1.12 times); below 24577 four chains stay (it missed the check at 16385 and 20001 tokens, up to 1.15
+#: times).  ``4096 -> 1024`` runs the deterministic program at the even counts from 24576 tokens (FI main's program
+#: up to 32767 tokens, where it met the check at every measured even count; FI main's three chains from 32768 tokens
+#: missed it; 0.94 to 0.98 times the time of two chains).  ``5120 -> 1024`` runs four chains from 16170 to 16172 tokens
+#: (FI main's program at 16172 tokens; they met the check at all three counts and missed it at 16300 and 16385).
+#: ``5120 -> 512`` keeps FI main's routing from 40962 tokens (two splits: the bits of the deterministic program at the
+#: even counts; at the odd counts they missed the check at 40962 and 57345 tokens, up to 1.83 times, and met it at 49153
+#: and 65409).
+_K1_PARITY_SM107A_212: dict[tuple[int, int], tuple[tuple[int, int, Any, Any], ...]] = {
+    (4096, 512): ((961, 12000, _C2_N128, _C4_N128), (12001, 24576, (), _C4_N128), (24577, 40961, (), ())),
+    (5120, 512): ((961, 40961, _C2_N128, _C4_N128),),
+    (4096, 1024): ((961, 24575, _C2_N192, _C4_N192), (24576, 40961, (), _C4_N192), (40962, 65536, None, _C4_N192)),
+    (5120, 1024): (
+        (961, 16169, _C2_N256, _C8_N256), (16170, 16172, _C2_N256, _C4_N256), (16173, 40961, _C2_N256, _C8_N256),
+    ),
+}
 K1_PARITY_RANGES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], tuple[tuple[int, int, Any, Any], ...]]
 ] = {
@@ -1308,10 +1330,7 @@ K1_PARITY_RANGES_BY_SM: dict[
         ("sm_107a", 1, M, N, "f32"): _K1_PARITY_SM107A_208.get((M, N), ranges) + _K1_PARITY_SM107A_TAIL.get((M, N), ())
         for (M, N), ranges in _K1_PARITY_SM107A.items()
     },
-    ("sm_107a", 212): {
-        ("sm_107a", 1, M, N, "f32"): ranges + _K1_PARITY_SM107A_TAIL.get((M, N), ())
-        for (M, N), ranges in _K1_PARITY_SM107A.items()
-    },
+    ("sm_107a", 212): {("sm_107a", 1, M, N, "f32"): ranges for (M, N), ranges in _K1_PARITY_SM107A_212.items()},
     ("sm_107a", 216): {
         ("sm_107a", 1, M, N, "f32"): ranges + (_K1_PARITY_SM107A_TAIL[(M, N)] if (M, N) == (4096, 1024) else ())
         for (M, N), ranges in _K1_PARITY_SM107A.items()
@@ -1584,7 +1603,8 @@ K1_FORWARD_SINGLE_CTA_KNOBS: dict[str, Any] = {
 #: deterministic plan.  On 212-SM ``sm_107a`` parts ``kk_n128_hen_pro15`` took 1.013 to 1.035 times the time of the
 #: deterministic plan ``kk_n256_ht_cg_pro15`` of these rows in every paired group of three runs of this package's A/B
 #: against it, eager and in CUDA graph replays; there they run ``kk_n192_m256_hen_s5_pro15`` (0.934 to 0.960 times the
-#: time of the deterministic plan, 17 paired groups, eager and graph), and ``5120 -> 32`` / ``48`` / ``64`` and
+#: time of the deterministic plan, 17 paired groups, eager and graph; ``4096 -> 512`` at 16384 tokens, at 1.007 times
+#: its time in eager launches in this package's A/B against FI main, keeps it), and ``5120 -> 32`` / ``48`` / ``64`` and
 #: ``8192 -> 128`` run ``kk_n128_hen_pro15`` instead of the deterministic plan's ``kk_n128_hen_pro7`` (0.979 to 0.989
 #: times its time, 17 of 17 groups, on two R200 parts), at 16172, 16231 and 16384 tokens; the same bits as that plan.
 # fmt: off
@@ -1609,7 +1629,8 @@ K1_FORWARD_RULES_BY_SM: dict[
     ("sm_107a", 212): {
         **{(k, n, t): "kk_n128_hen_pro15" for k, n in ((5120, 32), (5120, 48), (5120, 64), (8192, 128))
            for t in (16172, 16231, 16384)},
-        **{(k, 512, t): "kk_n192_m256_hen_s5_pro15" for k in (4096, 5120) for t in (16172, 16231, 16384)},
+        **{(k, 512, t): "kk_n192_m256_hen_s5_pro15" for k in (4096, 5120) for t in (16172, 16231, 16384)
+           if (k, t) != (4096, 16384)},
     },
 }
 # fmt: on
