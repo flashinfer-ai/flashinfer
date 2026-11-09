@@ -1528,6 +1528,84 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
         whole = (~dropped.any(dim=1)).cuda()
         ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W)
         assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
+        # the dual plan forms (the block-scaled classes' second packing), both launches: the dense integers of the plan above,
+        # dest_pad -1 at the dropped slots, pos_pad -1 past the valid rows (every entry written: the buffers start poisoned)
+        from flashinfer.fused_moe.batch_invariant.permute import (
+            PLAN_BLOCK,
+            get_compiled_plan,
+            get_compiled_plan_multi,
+        )
+
+        n = T * k
+        flat = ids_bad.cuda().view(-1)
+        valid_i = torch.nonzero(~dropped.view(-1)).view(-1).cuda()
+        for multi in (False, True):
+            c2 = torch.empty(E, dtype=torch.int32, device="cuda")
+            d2, s2, dp, pp = (
+                torch.full((n,), -7, dtype=torch.int32, device="cuda") for _ in range(4)
+            )
+            if multi:
+                nb = (n + PLAN_BLOCK - 1) // PLAN_BLOCK
+                hist_blk = torch.empty(nb * E, dtype=torch.int32, device="cuda")
+                get_compiled_plan_multi(1, True, 128)(
+                    flat, c2, d2, s2, dp, pp, hist_blk, n, E, nb
+                )
+            else:
+                get_compiled_plan(1, True, 128)(flat, c2, d2, s2, dp, pp, n, E)
+            torch.cuda.synchronize()
+            assert torch.equal(c2, counts) and torch.equal(d2.view(T, k), dest)
+            assert torch.equal(s2, src)
+            assert torch.all(dp.view(T, k)[dropped.cuda()] == -1), multi
+            assert torch.all(pp[n_valid:] == -1) and torch.all(pp[:n_valid] >= 0), multi
+            assert torch.all(dp[valid_i] >= 0)
+            assert torch.equal(pp[d2[valid_i].long()], dp[valid_i]), multi
+
+
+@needs_device
+def test_cold_scaled_runner_first_forward_under_graph_capture():
+    """A fresh layer of a scaled method (``DeepSeekV3``: ``routed_scaling_factor``) whose first forward runs under CUDA graph
+    capture captures and replays the eager bits, and an eager call after the capture gives them too: the scale constant is
+    built at the runner's construction (a blocking copy, before any capture), never copied to the device inside a forward. The
+    kernels are warmed by a sibling layer (the JIT compiles outside captures); the captured layer itself is cold."""
+    T, k, H, I, E = 48, 6, 256, 128, 32
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=31, adversarial=True)
+    bias = (torch.randn(E, generator=torch.Generator().manual_seed(32)) * 0.1).cuda()
+
+    def make():
+        return MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(
+                    num_experts=E,
+                    top_k=k,
+                    method=RoutingMethodType.DeepSeekV3,
+                    routed_scaling_factor=1.75,
+                ),
+                quant=QuantConfig(),
+                experts=ExpertConfig(intermediate_size=I),
+                activation=SwiGLU(),
+                backend=BackendOptions((BatchInvariantBf16Config(),)),
+                execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
+            ),
+            device=torch.device("cuda"),
+        )
+
+    W = _weights(w1, w2)
+    ref = make()(_logits_pack(x, logits, bias), W)
+    torch.cuda.synchronize()
+    cold = make()
+    pack = _logits_pack(x, logits, bias)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out_g = cold(pack, W)
+    torch.cuda.synchronize()
+    for _ in range(2):
+        out_g.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out_g), bits(ref))
+    assert torch.equal(bits(cold(pack, W)), bits(ref))
 
 
 @needs_device

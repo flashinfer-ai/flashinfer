@@ -178,16 +178,34 @@ class BatchInvariantMoeRunner(MoERunner):
         from ...gemm.batch_invariant.api import part_of
 
         self._part = part_of(self.device)
+        method = getattr(self, "_method", None)
+        if (
+            method is not None
+            and method.scaled
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # the routed scaling factor is a constant of the configuration: its tensor is built here, at the layer's
+            # construction, so no forward (a first one under CUDA graph capture included) copies it to the device
+            self._scale = self._scale_constant()
+
+    def _scale_constant(self) -> torch.Tensor:
+        """The routed scaling factor as a one-element fp32 tensor on the runner's device: a blocking host copy outside CUDA
+        graph capture (complete before any stream reads it), a device fill (a node of that capture alone) inside one."""
+        v = self.config.routing.routed_scaling_factor
+        v = 1.0 if v is None else float(v)
+        if torch.cuda.is_current_stream_capturing():
+            return torch.full((1,), v, dtype=torch.float32, device=self.device)
+        return torch.tensor([v], dtype=torch.float32).to(self.device)
 
     def _scale_tensor(self) -> torch.Tensor:
-        """The routed scaling factor as a one-element fp32 tensor on the runner's device, built once with a blocking copy
-        (the route kernel reads it as given: no per-call fill, no process-wide cache keyed by the value)."""
-        if self._scale is None:
-            v = self.config.routing.routed_scaling_factor
-            self._scale = torch.tensor(
-                [1.0 if v is None else float(v)], dtype=torch.float32
-            ).to(self.device)
-        return self._scale
+        """The scale tensor the route kernel reads as given: the one built at construction; a runner built inside a capture
+        takes a fill per call until it runs outside one, which then keeps the constant."""
+        if self._scale is not None:
+            return self._scale
+        s = self._scale_constant()
+        if not torch.cuda.is_current_stream_capturing():
+            self._scale = s
+        return s
 
     # ---- inputs ----------------------------------------------------------------------------------------------------
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
