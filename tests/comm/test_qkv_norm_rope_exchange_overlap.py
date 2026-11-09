@@ -1679,6 +1679,42 @@ def test_producer_variant_default_table():
             )
 
 
+def test_producer_shipped_rows_table():
+    """The rows that keep the baseline build under the default build
+    (``PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``: SM90 with 8 ranks at hidden 6144 and above from 8192 rows on), the
+    session's per-row build (the baseline build on such a row under the default build only) and its delivery: the
+    baseline build of every SM90 tile width that delivers the default build, with both rendezvous phases."""
+
+    assert plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD == {("sm_90a", 8): (6144, 8192)}
+    gated = {
+        (hidden, rows)
+        for hidden in (3072, 4096, 6144, 8192)
+        for rows in (4096, 8191, 8192, 16384)
+        if plans.default_shipped_producer_row("sm_90a", 8, hidden, rows)
+    }
+    assert gated == {(6144, 8192), (6144, 16384), (8192, 8192), (8192, 16384)}
+    for arch in ("sm_90a", "sm_100a", "sm_103a", "sm_107a"):
+        for world_size in plans.SUPPORTED_WORLD_SIZES:
+            if (arch, world_size) != ("sm_90a", 8):
+                assert not plans.default_shipped_producer_row(
+                    arch, world_size, 8192, 65536
+                )
+    session = backend.CakeQkvExchangeSession.__new__(backend.CakeQkvExchangeSession)
+    session.arch, session.world_size, session.hidden = "sm_90a", 8, 8192
+    session.producer_variant, session.producer_variant_source = "sw3", "default"
+    assert session._row_variant(16384) == loader.SHIPPED_VARIANT
+    assert session._row_variant(4096) == "sw3"
+    session.producer_variant_source = "env"
+    assert session._row_variant(16384) == "sw3"
+    if not loader.ROUTES:
+        return
+    for block_n in plans.BLOCK_N_CHOICES:
+        for pair in (False, True):
+            if loader.has_producer("sm_90a", block_n, pair, "sw3"):
+                assert loader.has_producer("sm_90a", block_n, pair)
+                assert loader.has_fold_producer("sm_90a", block_n, pair)
+
+
 def test_producer_variant_resolution(monkeypatch):
     """Environment over the (architecture, world size) default: ``auto`` keeps the table, ``shipped`` selects the
     baseline build, a delivered name selects that build; an undelivered build named by the environment fails closed

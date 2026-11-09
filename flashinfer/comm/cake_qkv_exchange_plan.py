@@ -1481,6 +1481,52 @@ def hopper_bn128_max_m(arch: str, world_size: int, hidden: int) -> int:
     return int(cells.get(int(hidden), 0))
 
 
+# Rows that keep the baseline producer build under the default build: per ``(arch, world_size)``, ``(min_hidden,
+# min_M)`` -- a row with ``hidden >= min_hidden`` and ``M >= min_M`` launches the baseline build's programs instead of
+# the session's default build (the loader's ``PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``).  SM90 with 8 ranks at
+# ``hidden >= 6144``, ``M >= 8192``: there the decoupled-storer build measured slower than the baseline build on
+# 8 x H100.  A build named by the environment variable runs on every row.
+PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD: dict[tuple[str, int], tuple[int, int]] = {
+    ("sm_90a", 8): (6144, 8192),
+}
+
+
+def _check_producer_shipped_rows_table() -> None:
+    for (arch, world_size), cell in PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD.items():
+        if (
+            arch not in SHAPE_GATE_DEFAULT_BY_ARCH
+            or world_size not in SUPPORTED_WORLD_SIZES
+        ):
+            raise ValueError(
+                f"PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD[{(arch, world_size)!r}] is not a delivered cell"
+            )
+        if (
+            not isinstance(cell, tuple)
+            or len(cell) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in cell
+            )
+            or cell[0] % HEAD_DIM
+        ):
+            raise ValueError(
+                f"PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD[{(arch, world_size)!r}] = {cell!r}: (min_hidden, min_M) must be "
+                f"positive ints, min_hidden a multiple of {HEAD_DIM}"
+            )
+
+
+_check_producer_shipped_rows_table()
+
+
+def default_shipped_producer_row(
+    arch: str, world_size: int, hidden: int, rows: int
+) -> bool:
+    """Whether a row of ``M = rows`` at ``(arch, world_size, hidden)`` launches the baseline producer build under the
+    default build (:data:`PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD`)."""
+
+    cell = PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD.get((arch, int(world_size)))
+    return cell is not None and int(hidden) >= cell[0] and int(rows) >= cell[1]
+
+
 # The 128-column pair tile table of the pair architectures: per ``(arch, world_size)``, ``hidden -> largest M``
 # (inclusive) of the 256-column band rows whose policy is the 2-CTA pair tile but which run the 128-column pair tile
 # (:func:`plan_for`; tile order, ``group_m`` and the row-count gates stay the band policy's; a single-CTA row and a
@@ -2058,6 +2104,7 @@ __all__ = [
     "PAIR_LOCKSTEP",
     "PAIR_MIN_GROUPS",
     "PAIR_MIN_M",
+    "PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD",
     "RESERVED_SMS",
     "SHAPE_GATE_ALL_ROWS",
     "SHAPE_GATE_ALL_ROWS_NAMES",
@@ -2090,6 +2137,7 @@ __all__ = [
     "default_group_m_scale",
     "default_shape_gate_k_table",
     "default_shape_gates",
+    "default_shipped_producer_row",
     "default_xband_min_m",
     "dest_interleave_band",
     "dest_interleave_row",

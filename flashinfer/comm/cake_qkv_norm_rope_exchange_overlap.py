@@ -53,7 +53,11 @@ multiply-add epilogue), SM100 groups of 4 ranks and SM103 groups of 8 or 4 ranks
 the ``ow256_fma`` build (wide operand loads and the fused multiply-add
 epilogue), SM100 and SM103 groups of 2 ranks the ``fma`` build (the fused
 multiply-add epilogue), SM107 groups of 4 ranks the ``bulk`` build (bulk row
-stores), the other groups and SM90 the baseline build.  The builds without the
+stores), SM90 the ``sw3`` build (SMEM-staged epilogue with three storer warps),
+the other groups the baseline build.  Under the default build, the rows of
+``plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD`` launch the baseline build (SM90
+groups of 8 ranks at hidden 6144 and above from 8192 rows on); a build named by
+the environment variable runs on every row.  The builds without the
 fused multiply-add epilogue store identical bits; an ``fma`` build rounds the
 norm and RoPE multiply-adds once, so its stored bits can differ from theirs
 within the kernel's accuracy tolerance.  Every build requires ``cos_sin`` and
@@ -577,6 +581,9 @@ class _RowPlan:
     parts: tuple[tuple[int, int, int, torch.Tensor], ...]
     # SMs every producer launch of this row leaves free (0 when the large-row gate fired, else plans.RESERVED_SMS).
     reserved_sms: int
+    # The producer build of this row's programs: the session's build, the baseline build ("") on a row of
+    # plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD, or the cross-destination-band build.
+    variant: str = ""
 
     @property
     def launches_per_call(self) -> int:
@@ -884,6 +891,18 @@ class CakeQkvExchangeSession:
                     bn=plans.HOPPER_BN128_BN,
                 ):
                     self._producers[name] = loader.load(name, self.arch)
+        # The rows of plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD launch the baseline build (the gate fires from a
+        # row count on, so max_tokens says whether any row reaches it).
+        if self._row_variant(self.max_tokens) != self.producer_variant:
+            for pair in self._reachable_pairs():
+                if not loader.has_producer(
+                    self.arch, self.bn, pair, loader.SHIPPED_VARIANT
+                ):
+                    continue
+                for name in self._launched_producers(
+                    pair, per_dest=per_dest_reachable, variant=loader.SHIPPED_VARIANT
+                ):
+                    self._producers[name] = loader.load(name, self.arch)
 
         # Symmetric memory: receive slots, readiness pad, barrier flags (rendezvous = collective).  The
         # readiness pad holds ``words`` symmetric words the peers publish into, then one rank-local word: the
@@ -967,6 +986,18 @@ class CakeQkvExchangeSession:
             self.prepare_rows(int(sample_batch), int(sample_s_local))
 
     # ------------------------------------------------------------------ preparation
+
+    def _row_variant(self, rows: int) -> str:
+        """The producer build of a call of ``rows`` rows outside the cross-destination-band plan: the session's
+        build, or the baseline build on a row of ``plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD`` while the session
+        runs its default build (a build named by the environment variable runs on every row)."""
+
+        if self.producer_variant_source != "default":
+            return self.producer_variant
+        shipped = plans.default_shipped_producer_row(
+            self.arch, self.world_size, self.hidden, rows
+        )
+        return loader.SHIPPED_VARIANT if shipped else self.producer_variant
 
     def _reachable_pairs(self) -> tuple[bool, ...]:
         """Pair flags the policy and the pair-tile gate can select for row counts up to ``max_tokens`` (programs to
@@ -1154,11 +1185,11 @@ class CakeQkvExchangeSession:
         expected_bn = plans.XBAND_BN if plan.xband else row_bn
         if plan.bn != expected_bn or plan.num_words > self.words_cap:
             raise RuntimeError("tile plan disagrees with the session capacity")
-        variant = (
-            loader.xband_variant(self.producer_variant)
-            if plan.xband
-            else self.producer_variant
-        )
+        variant = self._row_variant(geometry.rows)
+        if plan.xband:
+            variant = loader.xband_variant(self.producer_variant)
+        elif not loader.has_producer(self.arch, plan.bn, plan.pair, variant):
+            variant = self.producer_variant
         program = loader.producer_program(self.arch, plan.bn, plan.pair, variant)
         per_dest = verdict.producer_launches == "per_dest"
         for name in self._launched_producers(
@@ -1210,14 +1241,16 @@ class CakeQkvExchangeSession:
             verdict=verdict,
             parts=parts,
             reserved_sms=int(reserved_sms),
+            variant=variant,
         )
         self._plans[key] = row
         return row
 
     def bound_programs(self, batch: int, s_local: int) -> dict[str, str]:
         """Program names of every delivered stage of a ``(batch, s_local)`` call (prepares the row eagerly):
-        the barrier programs, the plain producer of the session's build, its folded producers where delivered
-        (``producer_fold0`` / ``producer_fold1``), the baseline build's three programs where the session's build
+        the barrier programs, the plain producer of the row's build (the session's, or the baseline build on a row of
+        ``plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``), its folded producers where delivered
+        (``producer_fold0`` / ``producer_fold1``), the baseline build's three programs where the row's build
         is a variant (``producer_shipped``, ``producer_shipped_fold0`` / ``producer_shipped_fold1``: the
         ``shipped`` opt-out path of this row) and the wait kernel -- six or nine names.  On a row that runs the
         cross-destination-band plan the ``producer*`` names stay the programs of the session's tile width (the
@@ -1229,18 +1262,19 @@ class CakeQkvExchangeSession:
         row = self.prepare_rows(batch, s_local)
         pair = bool(row.policy.pair)
         bn = int(row.policy.bn)
+        # The build of the row's band programs: the row's own (the baseline build on a row of
+        # plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD), the session's on a cross-destination-band row.
+        variant = self.producer_variant if row.plan.xband else row.variant
         bound = {
             "barrier_p0": self._barrier_names[0],
             "barrier_p1": self._barrier_names[1],
-            "producer": loader.producer_program(
-                self.arch, bn, pair, self.producer_variant
-            ),
+            "producer": loader.producer_program(self.arch, bn, pair, variant),
         }
-        folds = self._fold_producer_names(pair, bn=bn)
+        folds = self._fold_producer_names(pair, variant, bn=bn)
         if folds:
             for phase, name in zip(loader.FOLD_PHASES, folds, strict=True):
                 bound[f"producer_fold{phase}"] = name
-        if self.producer_variant != loader.SHIPPED_VARIANT:
+        if variant != loader.SHIPPED_VARIANT:
             bound["producer_shipped"] = loader.producer_program(
                 self.arch, bn, pair, loader.SHIPPED_VARIANT
             )
@@ -1626,6 +1660,11 @@ class CakeQkvExchangeSession:
                         if row.plan.xband
                         else {"block_n": row.plan.bn}
                         if row.plan.bn != self.bn
+                        else {}
+                    ),
+                    **(
+                        {"producer_variant": row.variant}
+                        if not row.plan.xband and row.variant != self.producer_variant
                         else {}
                     ),
                     "num_words": row.plan.num_words,
