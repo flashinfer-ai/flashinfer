@@ -49,7 +49,9 @@ are this module's.  Beyond the two keywords they differ from
   forward's saved accumulators as soon as it has used them (a second backward
   through that graph raises; ``retain_graph=True`` keeps them);
 * a call that misses the binding cache binds on buffers that share one
-  allocation of the largest of them and never launches on them.
+  allocation of the largest of them -- with the hidden valid-row count, on
+  views of the count's chunk-0 buffers for the chunk buffers -- and never
+  launches on them.
 
 Every output is bitwise the same as :mod:`.cake_backend`'s, with two
 exceptions of a default call whose automatic form is a budget form (both within
@@ -119,8 +121,11 @@ from .cake_backend import (
     _RECOUNT,
     _TemperatureGeometry,
     _assert_on_device,
+    CHUNK_VIEW_REGIONS,
     _carve,
     _check_output,
+    _chunk_view,
+    _chunk_view_layout,
     _check_temperature_arms,
     _check_temperature_operands,
     _deferred_operands,
@@ -727,6 +732,45 @@ class Plan(_main.Plan):
     # per-row gradient scale ``d`` in the ``[rows]`` vector ``d_rows`` for the backward's recompute of the other rows
     dw_rows: Optional[int] = None
     keep_row_grad: bool = False
+    # the budget form ``"fused_ip"`` (:func:`memory_plan`; loss entry, deferred last chunk, BF16 ``dW``): the chunk
+    # loop's FP32 accumulator is two allocations, ``dw_acc`` of the vocabulary rows ``[0, dw_split)`` and ``dw_acc_hi``
+    # of ``[dw_split, V)``, each chunk adding into both (two launches of its accumulate form, the second keyed by
+    # :class:`_UpperRows`), so the backward's fused cast can write the BF16 ``dW`` into ``dw_acc``'s own storage
+    # (:func:`_dw_cast_split`); ``None`` = one accumulator, as before
+    dw_split: Optional[int] = None
+
+    def dw_acc_rows(self, index) -> tuple[int, int]:
+        """The vocabulary rows ``[v0, v1)`` the weight-gradient accumulate of launch index ``index`` adds into its FP32
+        accumulator: ``[0, dw_rows)`` (``[0, V)`` without ``dw_rows``), or with :attr:`dw_split` ``[0, dw_split)`` for
+        a chunk index and ``[dw_split, V)`` for its :class:`_UpperRows`."""
+        V = int(self.problem.vocab)
+        if self.dw_split is None:
+            return 0, (V if self.dw_rows is None else int(self.dw_rows))
+        if isinstance(index, _UpperRows):
+            return int(self.dw_split), V
+        return 0, int(self.dw_split)
+
+
+class _UpperRows(int):
+    """The launch index of a chunk's second weight-gradient accumulate under a split accumulator
+    (:attr:`Plan.dw_split`): the key ``(stage, _UpperRows(i))`` adds chunk ``i``'s ``dz`` columns ``[dw_split, V)`` into
+    ``dw_acc_hi`` beside the key ``(stage, i)`` of the rows ``[0, dw_split)``.  An ``int`` for indexing (the chunk's
+    rows, variants and accumulate form are chunk ``i``'s), never equal to the plain index: the two keys are two
+    launches."""
+
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        return type(other) is _UpperRows and int(self) == int(other)
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(("dw_split", int(self)))
+
+    def __repr__(self) -> str:
+        return f"_UpperRows({int(self)})"
 
 
 class _TemperaturePlan(Plan, _main._TemperaturePlan):
@@ -761,6 +805,7 @@ def make_plan(
     dw_rows: Optional[int] = None,
     keep_row_grad: bool = False,
     dx_slices_cap: Optional[int] = None,
+    dw_split: Optional[int] = None,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count
     (``dx_resident`` = the device's co-resident dX clusters, :func:`cluster_resident`); ``valid_rows`` (compaction)
@@ -778,7 +823,9 @@ def make_plan(
     FP32 accumulator uncast for the caller; ``keep_row_grad`` (loss entry) keeps every chunk's per-row gradient scale
     (:attr:`Plan.dw_rows`, :attr:`Plan.keep_row_grad`; the budget forms of :func:`memory_plan`).  ``dx_slices_cap``
     (the zero-weight split): no chunk's rule-picked dX slice count exceeds it (:func:`.cake_backend.capped_k_slices`; an
-    explicit ``k_slices`` knob is not capped)."""
+    explicit ``k_slices`` knob is not capped).  ``dw_split`` (a multi-chunk loss plan with the deferred last chunk and a
+    BF16 ``dW``; a multiple of :func:`dw_block_step` strictly inside ``(0, V)``, at least half of ``V``): the chunk
+    loop's FP32 accumulator splits at that vocabulary row (:attr:`Plan.dw_split`, the budget form ``"fused_ip"``)."""
     if (logprob_dz or logprob_lbl) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
     if keep_row_grad and problem.entry != "loss":
@@ -798,6 +845,25 @@ def make_plan(
             )
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
+    if dw_split is not None:
+        dw_split = int(dw_split)
+        step = dw_block_step(geometry)
+        if not (
+            problem.entry == "loss"
+            and need_dw
+            and fuse_dw_cast
+            and dw_rows is None
+            and problem.grad_weight_dtype == torch.bfloat16
+            and len(chunks) > 1
+        ):
+            raise ValueError(
+                "dw_split belongs to a multi-chunk loss plan with the deferred last chunk (fuse_dw_cast=True, "
+                "need_dw=True, no dw_rows) and a BF16 weight gradient"
+            )
+        if dw_split % step or not 2 * dw_split >= int(problem.vocab) > dw_split:
+            raise ValueError(
+                f"dw_split={dw_split}: a multiple of {step} in [V / 2, V) for V = {problem.vocab}"
+            )
     tuning = gemm_tuning or {}
     dx_tuning = tuning.get("dx", {})
     slices: tuple[int, ...] = ()
@@ -902,6 +968,7 @@ def make_plan(
         logprob_lbl=bool(logprob_lbl),
         dw_rows=dw_rows,
         keep_row_grad=bool(keep_row_grad),
+        dw_split=dw_split,
     )
 
 
@@ -936,12 +1003,36 @@ def dw_block_step(geometry: Geometry = DEFAULT_GEOMETRY) -> int:
     )
 
 
+def dw_split_rows(vocab: int, geometry: Geometry = DEFAULT_GEOMETRY) -> int:
+    """The vocabulary row at which the budget form ``"fused_ip"`` splits the chunk loop's FP32 weight-gradient
+    accumulator (:attr:`Plan.dw_split`): ``V / 2`` rounded up to a multiple of :func:`dw_block_step`, so the lower
+    accumulator's ``4 * a * H`` bytes hold the BF16 ``[V, H]`` ``dW`` the backward writes into them
+    (:func:`_dw_cast_split`).  The form needs ``a < V``."""
+    step = dw_block_step(geometry)
+    return -(-int(vocab) // (2 * step)) * step
+
+
+def _dw_split_pieces(rows: int, step: int) -> tuple[tuple[int, int], ...]:
+    """The vocabulary row pieces ``[m0, m1)`` of the lower accumulator's in-place fused cast (:func:`_dw_cast_split`)
+    over its ``rows`` rows: a first piece of ``rows / 16`` rows rounded up to ``step`` (written through a temporary),
+    then pieces that double up to ``rows``, each with ``m1 <= 2 * m0``.  The BF16 rows ``[m0, m1)`` of ``dW`` take the
+    storage bytes ``[2 m0 H, 2 m1 H)``, which hold FP32 rows below ``m0`` only -- rows the earlier pieces have read --
+    while the piece reads its own FP32 rows from byte ``4 m0 H`` on."""
+    p0 = min(int(rows), max(int(step), -(-int(rows) // (16 * int(step))) * int(step)))
+    bounds = [0, p0]
+    while bounds[-1] < rows:
+        bounds.append(min(int(rows), 2 * bounds[-1]))
+    return tuple(zip(bounds[:-1], bounds[1:], strict=True))
+
+
 @dataclass(frozen=True)
 class MemoryPlan:
     """The weight-gradient form :func:`memory_plan` picked for one call of a budget form (``memory_mode="budget"``, or
     a default call whose automatic form switched to it, :func:`auto_memory_plan`).
 
-    ``form``: ``"fused"`` (the fast form: the deferred last chunk's fused cast), ``"unfused"`` (every chunk accumulated
+    ``form``: ``"fused"`` (the fast form: the deferred last chunk's fused cast), ``"fused_ip"`` (loss entry: the fused
+    cast with the FP32 accumulator split at :func:`dw_split_rows`, written into the lower accumulator's own storage in
+    place, :attr:`Plan.dw_split`), ``"unfused"`` (every chunk accumulated
     into the FP32 ``[V, H]`` accumulator, one flat cast after ``dX`` is written), ``"partial"`` (the chunk loop
     accumulates the vocabulary rows ``[0, dw_rows)``; the backward recomputes the others) or ``"recompute"`` (the
     backward recomputes every row).  ``dw_rows``: the vocabulary rows the chunk loop -- the loss entry's forward, the
@@ -966,7 +1057,7 @@ class MemoryPlan:
         return self.predicted_bytes <= self.budget_bytes
 
 
-MEMORY_FORMS = ("fused", "unfused", "partial", "recompute")
+MEMORY_FORMS = ("fused", "fused_ip", "unfused", "partial", "recompute")
 
 
 def memory_plan(
@@ -1001,7 +1092,11 @@ def memory_plan(
     whatever rows the chunk loop runs over: ``rows`` when compacted, while an uncompacted call (``rows = T``) still
     budgets the logits of its valid rows only; the model below counts the ``rows`` the chunk loop processes.
 
-    Candidates in latency order: ``"fused"`` (when ``fuse_dw_cast`` allows it), ``"unfused"``, then, when the record
+    Candidates in latency order: ``"fused"`` (when ``fuse_dw_cast`` allows it), ``"fused_ip"`` (the loss entry's
+    multi-chunk call with ``fuse_dw_cast``: the fused cast's chunk loop with the accumulator split at
+    :func:`dw_split_rows`, whose backward writes ``dW`` into the lower accumulator's storage in the pieces of
+    :func:`_dw_split_pieces` -- the ``dW`` phase holds the two accumulators, the deferred chunk and the first piece's
+    temporary, no ``[V, H]`` output beside them), ``"unfused"``, then, when the record
     registers the recompute's logits arm (``recompute``), ``"partial"`` with the largest ``dw_rows`` and
     ``"recompute"`` -- each with the largest vocabulary block that fits; ``dw_rows`` and the block are multiples of
     :func:`dw_block_step`.  When no candidate fits (the chunk buffers of the ``chunk_size``, the dX cast, the copy of ``X``
@@ -1045,8 +1140,9 @@ def memory_plan(
     above release it once ``dX`` is written), so the ``dW`` phases hold it too; ``hidden_count`` (loss entry; also a
     budget form of a default call that keeps the count) -- the call runs with the hidden valid-row count, whose
     chunk-0 buffers (logits, statistics and gather buffer of ``buffer_rows`` rows) exist beside a zero-weight pass
-    ahead of the loop and beside the chunk workspace a call that misses the binding cache allocates to prepare its
-    binding (:func:`.cake_backend.workspace_layout` of ``min(chunk, rows)`` rows, one more phase); ``zero_pass`` --
+    ahead of the loop and beside the rest of the chunk workspace a call that misses the binding cache allocates to
+    prepare its binding on views of them (:func:`.cake_backend.workspace_layout` of ``min(chunk, rows)`` rows without
+    its chunk buffers, :func:`.cake_backend._chunk_view_layout`; one more phase); ``zero_pass`` --
     where the zero-weight rows' pass runs
     (:func:`.cake_backend.zero_weight_memory`'s order): ``"first"`` ahead of the loop on its own chunk buffers,
     ``"arena"`` ahead of the loop on chunk buffers carved out of the loop's FP32 ``[V, H]`` accumulator (allocated
@@ -1074,6 +1170,9 @@ def memory_plan(
     tile = int(geometry.stats_tile)
     n = -(-R // C)
     r_last = R - (n - 1) * C
+    # ``"fused_ip"``: the accumulator's split row and the rows of the in-place cast's first piece
+    split = dw_split_rows(V, geometry)
+    piece0 = _dw_split_pieces(split, step)[0][1] if split < V else 0
     Cr = min(C, R)  # rows of the largest chunk
     Cb = Cr if buffer_rows is None else int(buffer_rows)
     live = _allocated_bytes  # every term below: its tensors with the allocator's per-tensor bound
@@ -1101,21 +1200,24 @@ def memory_plan(
     chunk0 = (
         logits + live(8 * Cb * -(-V // tile)) + live(2 * Cb * H) if hidden_count else 0
     )
-    # a loss call that misses the binding cache prepares its binding -- one allocation of the chunk workspace of
-    # ``min(chunk, rows)`` rows (:func:`.cake_backend.workspace_layout`: logits, statistics, row terms, K-slice slabs,
-    # gather buffer) -- while the hidden count's chunk-0 buffers are alive: a phase of its own.  The accumulators and
-    # outputs the templated binding aliases into that allocation are no larger than the forward phase's, which holds
-    # them beside chunk buffers of the same ``buffer_rows``.
+    # a loss call that misses the binding cache prepares its binding while the hidden count's chunk-0 buffers are
+    # alive: its template's logits, statistics and gather regions are views of those buffers, the other regions of the
+    # chunk workspace of ``min(chunk, rows)`` rows (:func:`.cake_backend.workspace_layout`: row terms, K-slice slabs)
+    # one allocation (``_chunk_views`` of :func:`prepare_lm_head_det_loss`) -- a phase of its own.  The accumulators
+    # and outputs the template aliases into that allocation are no larger than the forward phase's, which holds them
+    # beside chunk buffers of the same ``buffer_rows``.
     miss_phase = 0
     if entry == "loss" and hidden_count:
-        workspace = workspace_layout(
-            Cr,
-            V,
-            C,
-            stats_tile=tile,
-            dx_ws_slabs=int(dx_ws_slabs),
-            hidden=H,
-            compact=compact,
+        workspace = _chunk_view_layout(
+            workspace_layout(
+                Cr,
+                V,
+                C,
+                stats_tile=tile,
+                dx_ws_slabs=int(dx_ws_slabs),
+                hidden=H,
+                compact=compact,
+            )
         )["total"]
         miss_phase = chunk0 + live(workspace) + rowvec
     # the zero-weight rows' pass ahead of the chunk loop: a phase of its own
@@ -1160,8 +1262,13 @@ def memory_plan(
     if entry == "loss":
 
         def peak(form: str, v0: int, vb: int) -> int:
-            if form == "fused":
-                acc = live(4 * V * H) if n > 1 else 0
+            if form in ("fused", "fused_ip"):
+                if n == 1:
+                    acc = 0
+                elif form == "fused":
+                    acc = live(4 * V * H)
+                else:  # the split accumulator: two allocations
+                    acc = live(4 * split * H) + live(4 * (V - split) * H)
                 fwd = dxacc + acc + bufs + rowvec + xc
                 held = (
                     dxacc + acc + logits + rowvec + xc
@@ -1171,7 +1278,8 @@ def memory_plan(
                     + acc
                     + logits
                     + (live(2 * r_last * H) if compact else 0)
-                    + dw_out
+                    # ``"fused_ip"``: ``dW`` takes the lower accumulator's storage; the first piece's temporary
+                    + (dw_out if form == "fused" else live(2 * piece0 * H))
                     + rowvec
                     + xc
                     + kept
@@ -1239,6 +1347,8 @@ def memory_plan(
     candidates: list[tuple[str, int, Optional[int]]] = []
     if fuse_dw_cast:
         candidates.append(("fused", V, None))
+        if entry == "loss" and n > 1 and split < V:
+            candidates.append(("fused_ip", V, None))
     candidates.append(("unfused", V, None))
     if recompute and step < V:
         # the largest block whose phase fits (it does not depend on the accumulated rows), at least one granule
@@ -1402,7 +1512,8 @@ def stage_values(
         return values
     row0, rows_c = plan.chunks[index]
     stop = row0 + rows_c
-    first, last = int(index == 0), int(index == plan.num_chunks - 1)
+    # (``int``: an :class:`_UpperRows` index is chunk ``index``'s, though never equal to the plain index)
+    first, last = int(int(index) == 0), int(int(index) == plan.num_chunks - 1)
     values.update(
         rows_c=int(rows_c), row0=int(row0), first_chunk=first, last_chunk=last, d_off=0
     )
@@ -1507,18 +1618,21 @@ def stage_values(
                 f"chunk {index} plans the weight-gradient accumulate {want!r}; stage {stage!r} was requested"
             )
         v = plan.variants_of(index)
+        # a ``dw_rows`` plan: the GEMM's M is the vocabulary rows [0, dw_rows), A the chunk's dz columns of them; a
+        # ``dw_split`` plan: [0, dw_split) into ``dw_acc``, [dw_split, V) into ``dw_acc_hi`` (the :class:`_UpperRows`
+        # launch; A's base the column offset)
+        v0, v1 = plan.dw_acc_rows(index)
         values.update(
-            # a ``dw_rows`` plan: the GEMM's M is the vocabulary rows [0, dw_rows), A the chunk's dz columns of them
-            A=dz_chunk if plan.dw_rows is None else dz_chunk[:, : plan.dw_rows],
+            A=dz_chunk if (v0, v1) == (0, p.vocab) else dz_chunk[:, v0:v1],
             B=x_chunk,
-            C=t["dw_acc"],
+            C=t["dw_acc_hi"] if isinstance(index, _UpperRows) else t["dw_acc"],
             STATS_OUT=t["stats"],
             WS=t["f32_dummy"],
             **gemm_scalars(
                 stage,
                 g,
                 hidden=p.hidden,
-                vocab=p.vocab if plan.dw_rows is None else plan.dw_rows,
+                vocab=v1 - v0,
                 rows_c=rows_c,
                 group_m=v.dw_group_m,
                 group_n=v.dw_group_n,
@@ -1688,12 +1802,11 @@ def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, 
     elif stage == "slab_sum":
         values.update(dx=t["dx_acc"][row0:stop], ws=t["dx_ws"])
     elif base == "gemm_dw_acc":
+        v0, v1 = plan.dw_acc_rows(index)
         values.update(
-            A=logits[:rows_c]
-            if plan.dw_rows is None
-            else logits[:rows_c, : plan.dw_rows],
+            A=logits[:rows_c] if (v0, v1) == (0, p.vocab) else logits[:rows_c, v0:v1],
             B=x_chunk,
-            C=t["dw_acc"],
+            C=t["dw_acc_hi"] if isinstance(index, _UpperRows) else t["dw_acc"],
             STATS_OUT=t["stats"],
             WS=t["f32_dummy"],
         )
@@ -1884,6 +1997,10 @@ def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
                 keys.append(
                     (plan.dw_acc_stage(index), index)
                 )  # a deferred last chunk runs in the backward (cast_keys)
+                if plan.dw_split is not None:
+                    # the split accumulator's upper rows: the same form again (:func:`_run_split_keys` runs it right
+                    # behind the first, on the same stream)
+                    keys.append((plan.dw_acc_stage(index), _UpperRows(index)))
     return tuple(keys)
 
 
@@ -1921,6 +2038,39 @@ def _forward_keys_temperature(plan: Plan) -> tuple[tuple[str, Any], ...]:
     return tuple(keys)
 
 
+def _run_split_keys(
+    plan: Plan,
+    device_index: int,
+    keys: tuple,
+    run_key: Callable[[Any], None],
+    dw_stream: Optional[Union[bool, str]] = None,
+) -> None:
+    """:func:`.cake_backend._run_keys` of a plan with a split weight-gradient accumulator (:attr:`Plan.dw_split`; any
+    other plan: that function).  Each chunk's second accumulate (its :class:`_UpperRows` key) runs right behind the
+    first, on the same stream -- the dW side stream where the placement of :func:`side_stream_schedule` puts the
+    chunk's accumulate -- so that placement sees one accumulate per chunk, as without the split."""
+    if plan.dw_split is None:
+        _run_keys(plan, device_index, keys, run_key, dw_stream)
+        return
+    upper = {key[1]: key for key in keys if isinstance(key[1], _UpperRows)}
+
+    def run_pair(key) -> None:
+        run_key(key)
+        pair = upper.get(_UpperRows(key[1])) if type(key[1]) is int else None
+        if (
+            pair is not None and pair[0] == key[0]
+        ):  # the chunk's first accumulate: its second right behind
+            run_key(pair)
+
+    _run_keys(
+        plan,
+        device_index,
+        tuple(key for key in keys if not isinstance(key[1], _UpperRows)),
+        run_pair,
+        dw_stream,
+    )
+
+
 def cast_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     """Launch keys of the output casts: the flat ``dX`` cast and, for ``dW``, the flat cast of the accumulator or -- when
     the plan defers its last chunk -- that chunk's fused GEMM (its ``X`` rows gathered again first when the rows are
@@ -1933,7 +2083,9 @@ def cast_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     ):  # a ``dw_rows`` plan leaves its accumulator to the caller
         if not plan.dw_deferred:
             keys.append((plan.dw_cast_stage, "dw"))
-        elif plan.problem.entry == "loss":
+        elif (
+            plan.problem.entry == "loss" and plan.dw_split is None
+        ):  # a ``dw_split`` plan leaves its cast to the caller (:func:`_dw_cast_split`)
             last = plan.num_chunks - 1
             if plan.compact:
                 keys.append(("gather_rows", last))
@@ -2073,7 +2225,7 @@ class LmHeadDetLossRunner:
                 else:
                     self.launches[key]()
 
-            _run_keys(self.plan, self.device_index, keys, run_key, self.dw_stream)
+            _run_split_keys(self.plan, self.device_index, keys, run_key, self.dw_stream)
         else:
             for key in keys:
                 host = HOST_STAGES.get(key[0])
@@ -2251,6 +2403,8 @@ def prepare_lm_head_det_loss(
     keep_row_grad: bool = False,
     _template_only: bool = False,
     dx_slices_cap: Optional[int] = None,
+    _chunk_views: Optional[_HiddenCount] = None,
+    dw_split: Optional[int] = None,
 ) -> LmHeadDetLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -2306,12 +2460,19 @@ def prepare_lm_head_det_loss(
     ``dw_rows`` / ``keep_row_grad`` (the budget forms of :func:`memory_plan`; :attr:`Plan.dw_rows`,
     :attr:`Plan.keep_row_grad`): the weight-gradient accumulate covers the vocabulary rows ``[0, dw_rows)`` of an
     unfused plan and ``backward()`` returns the FP32 ``[dw_rows, H]`` accumulator in place of ``dw_out`` (no cast);
-    ``keep_row_grad`` keeps every chunk's per-row gradient scale in ``tensors["d_rows"]``.
+    ``keep_row_grad`` keeps every chunk's per-row gradient scale in ``tensors["d_rows"]``.  ``dw_split`` (the budget
+    form ``"fused_ip"``, :attr:`Plan.dw_split`): the chunk loop accumulates into ``dw_acc`` (FP32 ``[dw_split, H]``)
+    and ``tensors["dw_acc_hi"]`` (FP32 ``[V - dw_split, H]``); the deferred last chunk's cast is left to the caller
+    (:func:`_dw_cast_split`): ``dw_out`` is neither bound nor allocated and ``backward()`` returns no ``dW``.
 
     ``_template_only`` (internal; the eager entry points, ``cake`` backend): the runner only templates a remembered
     binding (:meth:`_Binding.from_runner`), which launches with per-call buffers of its own.  The workspace and the
     accumulators / casts allocated here then share one allocation of the largest of them (views of it that alias one
     another), so building a binding costs the largest buffer rather than their sum; such a runner never launches.
+    ``_chunk_views`` (internal; with ``_template_only``, the call's hidden valid-row count): the template's logits,
+    statistics and gather regions are views of the count's chunk-0 buffers (:data:`.cake_backend.CHUNK_VIEW_REGIONS`)
+    and the other regions share that one allocation (:func:`.cake_backend._chunk_view_layout`): a call that misses the
+    binding cache prepares its binding beside the count's chunk buffers without a second chunk buffer.
     """
     if _template_only and backend != "cake":
         raise ValueError("a template-only runner templates a cake-backend binding")
@@ -2422,6 +2583,7 @@ def prepare_lm_head_det_loss(
         dw_rows=dw_rows,
         keep_row_grad=keep_row_grad,
         dx_slices_cap=None if dx_slices_cap is None else int(dx_slices_cap),
+        dw_split=dw_split,
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
@@ -2446,6 +2608,14 @@ def prepare_lm_head_det_loss(
         hidden=H,
         compact=plan.compact,
     )
+    if _chunk_views is not None and (
+        not _template_only or backend != "cake" or workspace_buffer is not None
+    ):
+        raise ValueError(
+            "_chunk_views templates a cake-backend runner (_template_only) on its own workspace"
+        )
+    # a template on the hidden valid-row count's chunk-0 buffers: the other regions in one smaller allocation
+    carved = layout if _chunk_views is None else _chunk_view_layout(layout)
     arena = None
     alias: dict[str, int] = {}
     if _template_only:
@@ -2457,16 +2627,22 @@ def prepare_lm_head_det_loss(
             "dx_out": rows_loop * H * 2
             if plan.need_dx and plan.dx_cast and dx_out is None
             else 0,
-            "dw_acc": (V if plan.dw_rows is None else plan.dw_rows) * H * 4
+            "dw_acc": (plan.dw_acc_rows(0)[1] - plan.dw_acc_rows(0)[0]) * H * 4
             if plan.need_dw and plan.dw_acc_needed and dw_acc is None
             else 0,
+            "dw_acc_hi": (V - plan.dw_split) * H * 4
+            if plan.need_dw and plan.dw_split is not None
+            else 0,
             "dw_out": V * H * (4 if f32 else 2)
-            if plan.need_dw and plan.dw_rows is None and dw_out is None
+            if plan.need_dw
+            and plan.dw_rows is None
+            and plan.dw_split is None
+            and dw_out is None
             else 0,
         }
         alias = {name: n for name, n in sizes.items() if n}
         arena = torch.empty(
-            max([layout["total"] if workspace_buffer is None else 0, *alias.values()]),
+            max([carved["total"] if workspace_buffer is None else 0, *alias.values()]),
             dtype=torch.uint8,
             device=device,
         )
@@ -2477,10 +2653,15 @@ def prepare_lm_head_det_loss(
             layout["total"], dtype=torch.uint8, device=device
         )
     flat = workspace_buffer.view(-1).view(torch.uint8)
-    if flat.numel() < layout["total"]:
+    if flat.numel() < carved["total"]:
         raise ValueError(
-            f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
+            f"workspace_buffer needs {carved['total']} bytes, got {flat.numel()}"
         )
+
+    def carve(name, dtype, shape):
+        if _chunk_views is not None and name in CHUNK_VIEW_REGIONS:
+            return _chunk_view(_chunk_views, name, shape)
+        return _carve(flat, carved, name, dtype, shape)
 
     def output(given, name, shape, dtype):
         _check_output(given, name, shape, dtype)
@@ -2498,12 +2679,12 @@ def prepare_lm_head_det_loss(
         labels=_prepare_labels(labels, geometry, row_index),
     )
     rows = layout["logits"][1] // (V * 2)
-    t["logits"] = _carve(flat, layout, "logits", torch.bfloat16, (rows, V))
-    t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
-    t["d"] = _carve(flat, layout, "d", torch.float32, (rows,))
-    t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
-    t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
-    t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
+    t["logits"] = carve("logits", torch.bfloat16, (rows, V))
+    t["stats"] = carve("stats", torch.float32, (rows, plan.num_tiles, 2))
+    t["d"] = carve("d", torch.float32, (rows,))
+    t["term"] = carve("term", torch.float32, (rows,))
+    t["loss_acc"] = carve("loss_acc", torch.float64, (1,))
+    t["grad_scale"] = carve("grad_scale", torch.float32, (1,))
     t["unit_scale"] = torch.ones(
         (1,), dtype=torch.float32, device=device
     )  # the log-probability entry's cast scale
@@ -2511,13 +2692,11 @@ def prepare_lm_head_det_loss(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = _carve(
-            flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
-        )
+        t["dx_ws"] = carve("dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
     if plan.compact:
         t["row_index"] = row_index
-        t["x_c"] = _carve(
-            flat, layout, "x_c", torch.bfloat16, (rows, H)
+        t["x_c"] = carve(
+            "x_c", torch.bfloat16, (rows, H)
         )  # the chunk's valid X rows, gathered per chunk
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
@@ -2551,15 +2730,16 @@ def prepare_lm_head_det_loss(
             t["dx_out"] = output(dx_out, "dx_out", (rows_loop, H), torch.bfloat16)
     if plan.need_dw:
         if plan.dw_acc_needed:
-            t["dw_acc"] = output(
-                dw_acc,
-                "dw_acc",
-                (V if plan.dw_rows is None else plan.dw_rows, H),
-                torch.float32,
+            v0, v1 = plan.dw_acc_rows(0)
+            t["dw_acc"] = output(dw_acc, "dw_acc", (v1 - v0, H), torch.float32)
+        if plan.dw_split is not None:
+            # the split accumulator's upper rows (a template's view aliases the arena like the other buffers)
+            t["dw_acc_hi"] = output(
+                None, "dw_acc_hi", (V - plan.dw_split, H), torch.float32
             )
         if (
-            plan.dw_rows is None
-        ):  # a ``dw_rows`` plan leaves its accumulator to the caller
+            plan.dw_rows is None and plan.dw_split is None
+        ):  # a ``dw_rows`` / ``dw_split`` plan leaves its accumulator(s) to the caller
             t["dw_out"] = output(
                 dw_out,
                 "dw_out",
@@ -2571,13 +2751,9 @@ def prepare_lm_head_det_loss(
     if plan.keep_row_grad:
         t["d_rows"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
     if layout.get("workspace"):
-        t["workspace"] = _carve(
-            flat, layout, "workspace", torch.uint8, (layout["workspace"][1],)
-        )
+        t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
     if layout.get("tma_descriptor_workspace"):
-        t["tma_descriptor_workspace"] = _carve(
-            flat,
-            layout,
+        t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",
             torch.uint8,
             (layout["tma_descriptor_workspace"][1],),
@@ -3150,7 +3326,8 @@ def forward_binding_key(
     ``hidden_count`` whether chunk 0's gather and logits GEMM ran before the plan
     (the remembered sequence starts at chunk 0's row kernels); ``logprob_lbl``
     the resolved log-probability forward's logits form (:func:`logprob_lbl_default`).
-    A budget form of :func:`memory_plan` appends its plan options ``(dw_rows, keep_row_grad)``."""
+    A budget form of :func:`memory_plan` appends its plan options ``(dw_rows, keep_row_grad)``, the form
+    ``"fused_ip"`` ``("dw_split", dw_split)``."""
     return (
         "fwd",
         entry,
@@ -3420,7 +3597,7 @@ class _Binding:
                 launch.prepare(*arguments)
             launch.entry(*arguments)
 
-        _run_keys(self.plan, self.device_index, keys, run_key, dw_stream)
+        _run_split_keys(self.plan, self.device_index, keys, run_key, dw_stream)
 
     def forward(
         self,
@@ -3499,12 +3676,18 @@ class _Binding:
                     (T, H), dtype=torch.float32, device=self.device
                 )
             if plan.dw_acc_needed:
-                dw_shape = (V if plan.dw_rows is None else plan.dw_rows, H)
+                v0, v1 = plan.dw_acc_rows(0)
+                dw_shape = (v1 - v0, H)
                 t["dw_acc"] = (
                     dw_acc
                     if dw_acc is not None and tuple(dw_acc.shape) == dw_shape
                     else torch.empty(dw_shape, dtype=torch.float32, device=self.device)
                 )
+                if plan.dw_split is not None:
+                    # the split accumulator's upper rows: an allocation of its own (:func:`_dw_cast_split`)
+                    t["dw_acc_hi"] = torch.empty(
+                        (V - plan.dw_split, H), dtype=torch.float32, device=self.device
+                    )
             if plan.keep_row_grad:
                 t["d_rows"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         self._launch(self.forward_late if early else self.forward_order, t, dw_stream)
@@ -3518,6 +3701,9 @@ class _Binding:
                 t.get("dw_acc"),
                 _deferred_operands(plan, t),
                 (t["lse"], t["d_rows"], t["labels"]) if plan.keep_row_grad else None,
+                t.get(
+                    "dw_acc_hi"
+                ),  # the split accumulator's upper rows (:attr:`Plan.dw_split`)
             )
         return t["logp"], t["lse"]
 
@@ -4001,6 +4187,9 @@ class _BudgetResultState:
     row_state: Optional[tuple] = None
     plan: Optional[Plan] = None
     inputs: Optional[tuple] = None
+    # the form ``"fused_ip"``: the FP32 ``[V - a, H]`` upper rows of the split accumulator (``dw_acc`` the lower
+    # ``[a, H]``, :attr:`Plan.dw_split`)
+    dw_acc_hi: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -4072,6 +4261,38 @@ class ForwardResult(_BudgetResultState, _main._TemperatureResultState):
                 plan=self.plan,
                 dw_rows=self.memory_plan.dw_rows,
                 block_rows=self.memory_plan.block_rows,
+                gemm_tuning=self.gemm_tuning,
+            )
+            return dx, dw
+        if self.dw_acc_hi is not None and self.dz_last is not None:
+            # the form ``"fused_ip"``: the split accumulator, read, never written (a repeatable backward)
+            if grad_weight_dtype != torch.bfloat16:
+                raise ValueError(
+                    "memory_mode='budget' produces a BF16 weight gradient (grad_weight_dtype=torch.bfloat16)"
+                )
+            dx = (
+                None
+                if self.dx_acc is None
+                else finalize_dx(
+                    self.dx_acc,
+                    grad,
+                    self.row_index,
+                    self.row_valid,
+                    self.num_rows,
+                    backend=self.backend if backend is None else backend,
+                )
+            )
+            x_last = (
+                self.x_last
+                if self.x_last is not None
+                else torch.index_select(self.x_src, 0, self.x_idx)
+            )
+            dw = _dw_cast_split(
+                self.dz_last,
+                x_last,
+                [self.dw_acc, self.dw_acc_hi],
+                grad,
+                in_place=False,
                 gemm_tuning=self.gemm_tuning,
             )
             return dx, dw
@@ -4328,9 +4549,10 @@ def forward_loss(
     where it fits that budget with its own buffer lifetimes, else the budget form that fits (:func:`auto_memory_plan`;
     none fits: the fast form, ``memory_plan`` ``None``), on the valid rows of the count formed here or the caller's --
     an uncompacted call without the caller's count keeps the fast form, it never counts on the host.  It keeps the
-    hidden valid-row count where the count's chunk-0 buffers, with the chunk workspace a binding cache miss allocates
-    beside them, fit the budget of any valid-row count (:func:`_hidden_count_fits`; checked on every pass of a step
-    whose ``W`` requires a gradient, a checkpointed step's gradient-free first pass included), plans a budget form
+    hidden valid-row count where the count's chunk-0 buffers fit the budget of any valid-row count
+    (:func:`_hidden_count_fits`; checked on every pass of a step whose ``W`` requires a gradient, a checkpointed
+    step's gradient-free first pass included) -- a call that misses the binding cache prepares its binding on views
+    of those buffers (``_chunk_views`` of :func:`prepare_lm_head_det_loss`) --, plans a budget form
     with those chunk-sized buffers and drops the count's queued chunk-0 work only when that plan does not fit and the
     plan without the count does.
 
@@ -4425,8 +4647,8 @@ def forward_loss(
         )
         # ``"budget"``: no hidden valid-row count -- its chunk-0 buffers take ``min(chunk, T)`` rows before the count
         # is known, which can exceed the budget of a call with fewer valid rows than a chunk; the automatic form keeps
-        # it where those buffers, and the chunk workspace a cache miss allocates beside them, fit the budget of any
-        # valid-row count (:func:`_hidden_count_fits`)
+        # it where those buffers fit the budget of any valid-row count (:func:`_hidden_count_fits`; a cache miss
+        # prepares its binding on views of them)
         count = False if budget else _resolve_hidden_count(hidden_count)
         if count and count_checked:
             count = bool(
@@ -4709,8 +4931,21 @@ def forward_loss(
                 dx_slices_cap=dx_cap,
             )
         )
-        fuse = mplan.form == "fused"
-        if mplan.recompute:
+        fuse = mplan.form in ("fused", "fused_ip")
+        if (
+            mplan.form == "fused_ip"
+            and need_dw
+            and -(-(T if valid_count is None else valid_count) // int(problem.chunk))
+            > 1
+        ):
+            # the split FP32 accumulator (:attr:`Plan.dw_split`): the backward writes ``dW`` into its lower part (a
+            # one-chunk call has no accumulator: the fused form)
+            options = dict(
+                dw_split=dw_split_rows(
+                    problem.vocab, Geometry.from_record(record_for(X.device)[1])
+                )
+            )
+        elif mplan.recompute:
             options = dict(dw_rows=mplan.dw_rows or None, keep_row_grad=True)
             if not mplan.dw_rows:
                 common["need_dw"] = False
@@ -4732,7 +4967,9 @@ def forward_loss(
             hidden_count=hc is not None,
             **common,
         )
-        if options is not None:
+        if options is not None and "dw_split" in options:
+            key += ("dw_split", int(options["dw_split"]))  # the split accumulator's row
+        elif options is not None:
             key += (options["dw_rows"], True)  # a recompute form's plan options
         if dx_cap is not None:
             key += ("dx_slices_cap", int(dx_cap))  # the split's capped dX slice counts
@@ -4755,6 +4992,7 @@ def forward_loss(
             dw_stream=stream_mode,
             _template_only=backend == "cake",
             dx_slices_cap=dx_cap,
+            _chunk_views=hc if backend == "cake" else None,
             **common,
             **(options or {}),
         )
@@ -4823,6 +5061,7 @@ def forward_loss(
             dw_stream=stream_mode,
             _template_only=backend == "cake",
             dx_slices_cap=dx_cap,
+            _chunk_views=hc if backend == "cake" else None,
             **common,
             **(options or {}),
         )
@@ -4842,6 +5081,7 @@ def forward_loss(
                 _keep_runner_terms(runner)
             loss, logp = runner.forward()
             dx_acc, dw_acc = runner.dx_acc, runner.dw_acc
+            dw_acc_hi = runner.tensors.get("dw_acc_hi")
             deferred = _deferred_operands(runner.plan, runner.tensors)
             row_state = _row_state(runner.plan, runner.tensors)
             memory, plan = runner.memory, runner.plan
@@ -4852,7 +5092,7 @@ def forward_loss(
                 )
             del runner
     if binding is not None:
-        loss, logp, dx_acc, dw_acc, deferred, row_state = binding.forward(
+        loss, logp, dx_acc, dw_acc, deferred, row_state, dw_acc_hi = binding.forward(
             X,
             W,
             labels,
@@ -4894,7 +5134,7 @@ def forward_loss(
         gemm_tuning=tuning,
     )
     if mplan is not None:
-        _budget_result(result, mplan, row_state, plan, X, W)
+        _budget_result(result, mplan, row_state, plan, X, W, dw_acc_hi)
     return _with_zero_weight_rows(
         result,
         zero_index,
@@ -4917,13 +5157,22 @@ def _keep_runner_terms(runner: LmHeadDetLossRunner) -> None:
 
 
 def _budget_result(
-    result: ForwardResult, mplan: MemoryPlan, row_state, plan: Plan, X, W
+    result: ForwardResult,
+    mplan: MemoryPlan,
+    row_state,
+    plan: Plan,
+    X,
+    W,
+    dw_acc_hi: Optional[torch.Tensor] = None,
 ) -> None:
     """Record a ``memory_mode="budget"`` forward's form on its result; a recompute form also keeps the row statistics,
-    plan and inputs the backward's vocabulary-block recompute reads."""
+    plan and inputs the backward's vocabulary-block recompute reads, the form ``"fused_ip"`` the split accumulator's
+    upper rows ``dw_acc_hi`` (``dw_acc`` holds the lower ones)."""
     result.memory_plan = mplan
     if mplan.recompute:
         result.row_state, result.plan, result.inputs = row_state, plan, (X, W)
+    if mplan.form == "fused_ip":
+        result.dw_acc_hi = dw_acc_hi
 
 
 def _check_budget_call(backend: str, grad_weight_dtype) -> None:
@@ -5194,24 +5443,19 @@ def _hidden_count_shape_fits(
     chunk: int,
     need_dx: bool,
     geometry: Geometry = DEFAULT_GEOMETRY,
-    dx_ws_slabs: int = 0,
-    tma_workspace_bytes: int = 0,
-    scratch_bytes: int = 0,
 ) -> bool:
-    """Whether the hidden valid-row count's chunk-0 work stays within :func:`memory_plan`'s budget for a call of this
-    shape whatever its valid rows ``T_v`` (pure host arithmetic; ``True`` for a call the count does not serve, fewer
-    than :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks).
+    """Whether the hidden valid-row count's work before the count is known stays within :func:`memory_plan`'s budget
+    for a call of this shape whatever its valid rows ``T_v`` (pure host arithmetic; ``True`` for a call the count does
+    not serve, fewer than :data:`HIDDEN_COUNT_MIN_CHUNKS` chunks).
 
     Before the count is known its chunk-0 buffers take ``chunk`` rows (logits, statistics, gather buffer) beside the
-    call's ``O(T)`` vectors (``chunk0``).  A call that misses the binding cache -- a new valid-row count, every new
-    batch -- then allocates the chunk workspace of ``min(chunk, rows)`` rows while they are alive: the loss entry's
-    templated binding, the log-probability forward's runner (:func:`.cake_backend.workspace_layout`: logits,
-    statistics, row terms, gather buffer, ``dx_ws_slabs`` K-slice slabs -- at most the program's dX slice count less
-    one, the largest any chunk of any call can take -- and the record's TMA descriptor and scratch bytes).  Below one
-    chunk that phase grows faster with ``T_v`` than the budget (a workspace row takes more than ``2 V`` bytes, the
-    budget ``0.98 * 2 V``), above it the workspace stops growing, so the worst case is ``T_v = chunk``:
-    ``chunk0 + workspace(chunk) <= (1 - margin) * (2 * chunk * V + 2 * V * H + 2 * T * H)`` (the last term without
-    ``dX``) bounds every valid-row count, the call without a valid row (``chunk0`` alone, no chunk loop) included."""
+    call's ``O(T)`` vectors (``chunk0``).  That phase does not depend on ``T_v`` and the budget grows with it, so the
+    budget of a call without a valid row bounds it for every count: ``chunk0 <= (1 - margin) * (2 * V * H + 2 * T *
+    H)`` (the last term without ``dX``).  After the count, a call that misses the binding cache -- a new valid-row
+    count, every new batch -- prepares its binding on views of those buffers (``_chunk_views`` of
+    :func:`prepare_lm_head_det_loss`, of :func:`.cake_backend.prepare_lm_head_det_loss` for the log-probability
+    forward), so no second chunk buffer exists beside them: that phase is :func:`memory_plan`'s ``miss`` phase, never
+    above its forward phase."""
     T, H, V, C = int(num_rows), int(hidden), int(vocab), int(chunk)
     if T <= 0 or C <= 0 or -(-T // C) < HIDDEN_COUNT_MIN_CHUNKS:
         return True
@@ -5224,20 +5468,9 @@ def _hidden_count_shape_fits(
         + live(4 * T, 4)
         + live(4 * T, 8)
     )
-    workspace = workspace_layout(
-        C,
-        V,
-        C,
-        stats_tile=tile,
-        tma_workspace_bytes=int(tma_workspace_bytes),
-        scratch_bytes=int(scratch_bytes),
-        dx_ws_slabs=int(dx_ws_slabs),
-        hidden=H,
-        compact=True,
-    )["total"]
-    head = 2 * C * V + 2 * V * H + (2 * T * H if need_dx else 0)
+    head = 2 * V * H + (2 * T * H if need_dx else 0)
     budget = head - int(math.ceil(head * float(MEMORY_BUDGET_MARGIN)))
-    return chunk0 + live(workspace) <= budget
+    return chunk0 <= budget
 
 
 def _hidden_count_fits(
@@ -5250,18 +5483,16 @@ def _hidden_count_fits(
     need_dx: bool,
     entry: str = "loss",
 ) -> bool:
-    """:func:`_hidden_count_shape_fits` of a default call of ``entry`` on ``device``'s registered program: its
-    geometry, its TMA descriptor and scratch bytes and, for the loss entry with ``dX`` (whose forward runs the dX GEMM),
-    the program's largest dX slice count less one as the K-slice slabs (the log-probability forward has none).  A
-    default call whose count fails it runs without the hidden count (the shipped :func:`valid_rows` path, bitwise the
-    same outputs), so the count's chunk-0 work -- the call that misses the binding cache included -- never exceeds the
-    budget of a call that a budget form fits."""
+    """:func:`_hidden_count_shape_fits` of a default call of ``entry`` on ``device``'s registered program (its
+    geometry).  A default call whose count fails it runs without the hidden count (the shipped :func:`valid_rows`
+    path, bitwise the same outputs), so the count's chunk-0 work never exceeds the budget of a call that a budget form
+    fits.  ``entry``: the loss or log-probability entry (the same rule: the work before the count is the same)."""
+    if entry not in ENTRIES:
+        raise ValueError(f"entry must be one of {ENTRIES}")
     T, C = int(num_rows), int(chunk)
     if T <= 0 or C <= 0 or -(-T // C) < HIDDEN_COUNT_MIN_CHUNKS:
         return True
-    module_name, record = record_for(device)
-    stages = registered_stages(module_name)
-    slabs = dx_max_slices(stages) - 1 if (entry == "loss" and need_dx) else 0
+    _, record = record_for(device)
     return _hidden_count_shape_fits(
         num_rows=T,
         hidden=hidden,
@@ -5269,9 +5500,6 @@ def _hidden_count_fits(
         chunk=C,
         need_dx=need_dx,
         geometry=Geometry.from_record(record),
-        dx_ws_slabs=slabs,
-        tma_workspace_bytes=_record_tma_bytes(record, stages),
-        scratch_bytes=_record_scratch_bytes(record, stages),
     )
 
 
@@ -5371,8 +5599,8 @@ def _auto_loss_plan(
         if kept.fits:
             return kept, True
         if shared == C and compact:
-            # the same plan without the count's phases, whose cache-miss phase the count's check keeps within the
-            # budget (:func:`_hidden_count_fits`): none fits
+            # the same plan without the count's phases: its cache-miss phase (the template on views of the count's
+            # buffers) never exceeds its forward phase, so that plan does not fit either -- none fits
             return None, True
     elif _fast_fits("loss", device, compact=compact, buffer_rows=shared, **common):
         return None, True
@@ -5725,76 +5953,236 @@ def dw_cast(
         acc = product if dw_acc is None else dw_acc + product
         out.copy_(acc * g)
         return out
-    module_name, record = record_for(device)
-    record_abi(record)
-    # the last chunk's form and scalars: the raster / block rules of the record's architecture on this chunk's rows, or
-    # the explicit knobs (the block rule and knob apply to the fp32 cast only; the bf16 cast keeps the 1-D raster)
-    fp32 = out_dtype == torch.float32
-    dw_tuning = _resolve_gemm_tuning(gemm_tuning).get("dw", {})
-    raster = raster_variant(H, int(rows), record["arch"])
-    group_m = (
-        dw_tuning["group_m"]
-        if "group_m" in dw_tuning
-        else (raster[1] if raster else None)
+    form = _DwCastForm.of(
+        device,
+        int(rows),
+        H,
+        fp32=out_dtype == torch.float32,
+        multi=dw_acc is not None,
+        gemm_tuning=gemm_tuning,
     )
-    group_n = None
-    if fp32:
-        group_n = (
-            dw_tuning["group_n"]
-            if "group_n" in dw_tuning
-            else dw_block_variant(int(rows), H, record["arch"])
-        )
-        group_n = None if group_n in (None, 0) else int(group_n)
-    stage = stage_variant(
-        "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
-        blocked=group_n is not None,
-        epi_store="tma"
-        if (
-            not fp32
-            and dw_acc is not None
-            and "epi_store" not in dw_tuning
-            and dw_cast_tma_rule(2, int(rows), record["arch"])
-        )
-        else None,
-    )
-    if stage not in registered_stages(module_name):
-        raise NotImplementedError(
-            f"the registered program {module_name!r} lacks the stage {stage!r} (fuse_dw_cast)"
-        )
-    geometry = Geometry.from_record(record)
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
-    values.update({name: 0 for name in COMMON_SCALARS})
-    values.update(
-        A=dz_last,
-        B=x_rows,
-        C=out,
-        STATS_OUT=g,
-        WS=dw_acc if dw_acc is not None else _device_constants(int(index))["f32_dummy"],
-        rows_c=int(rows),
-        T=int(rows),
-        H=H,
-        V=int(V),
-        loss_div=1.0,
-        **gemm_scalars(
-            stage,
-            geometry,
-            hidden=H,
-            vocab=int(V),
-            rows_c=int(rows),
-            group_m=group_m,
-            group_n=group_n,
-            first_chunk=int(dw_acc is None),
-        ),
-    )
-    launch, arguments = _eager_launch(
-        record, module_name, stage, values, device, geometry
-    )
-    with _ffi_stream_context(int(index)):
-        if launch.prepare is not None:
-            launch.prepare(*arguments)
-        launch.entry(*arguments)
+    form.launch(dz_last, x_rows, dw_acc, out, g)
     return out
+
+
+@dataclass(frozen=True)
+class _DwCastForm:
+    """The fused scale + cast GEMM of a deferred last chunk (:func:`dw_cast`, :func:`_dw_cast_split`) on one device:
+    the record, its stage and launch scalars -- the raster / block rules of the record's architecture on the chunk's
+    rows, or the explicit knobs (the block rule and knob apply to the fp32 cast only; the bf16 cast keeps the 1-D
+    raster; the TMA store rule to a multi-chunk bf16 cast without an explicit ``epi_store``)."""
+
+    module_name: str
+    record: Any
+    geometry: Geometry
+    stage: str
+    group_m: Optional[int]
+    group_n: Optional[int]
+    device: torch.device
+    index: int
+
+    @classmethod
+    def of(
+        cls,
+        device: torch.device,
+        rows: int,
+        hidden: int,
+        *,
+        fp32: bool,
+        multi: bool,
+        gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> "_DwCastForm":
+        module_name, record = record_for(device)
+        record_abi(record)
+        dw_tuning = _resolve_gemm_tuning(gemm_tuning).get("dw", {})
+        raster = raster_variant(int(hidden), int(rows), record["arch"])
+        group_m = (
+            dw_tuning["group_m"]
+            if "group_m" in dw_tuning
+            else (raster[1] if raster else None)
+        )
+        group_n = None
+        if fp32:
+            group_n = (
+                dw_tuning["group_n"]
+                if "group_n" in dw_tuning
+                else dw_block_variant(int(rows), int(hidden), record["arch"])
+            )
+            group_n = None if group_n in (None, 0) else int(group_n)
+        stage = stage_variant(
+            "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
+            blocked=group_n is not None,
+            epi_store="tma"
+            if (
+                not fp32
+                and multi
+                and "epi_store" not in dw_tuning
+                and dw_cast_tma_rule(2, int(rows), record["arch"])
+            )
+            else None,
+        )
+        if stage not in registered_stages(module_name):
+            raise NotImplementedError(
+                f"the registered program {module_name!r} lacks the stage {stage!r} (fuse_dw_cast)"
+            )
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        return cls(
+            module_name,
+            record,
+            Geometry.from_record(record),
+            stage,
+            group_m,
+            group_n,
+            device,
+            int(index),
+        )
+
+    def launch(
+        self,
+        dz: torch.Tensor,
+        x_rows: torch.Tensor,
+        acc: Optional[torch.Tensor],
+        out: torch.Tensor,
+        g: torch.Tensor,
+    ) -> None:
+        """One launch over the vocabulary rows of ``dz`` (BF16 ``[rows, m]``, a column block of the chunk's ``dz``):
+        ``out`` = ``cast(g * (acc + dz^T @ x_rows))`` (``[m, H]``; ``acc`` ``None``: ``cast(g * dz^T @ x_rows)``)."""
+        rows, m = (int(n) for n in dz.shape)
+        H = int(x_rows.shape[1])
+        values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
+        values.update({name: 0 for name in COMMON_SCALARS})
+        values.update(
+            A=dz,
+            B=x_rows,
+            C=out,
+            STATS_OUT=g,
+            WS=acc if acc is not None else _device_constants(self.index)["f32_dummy"],
+            rows_c=rows,
+            T=rows,
+            H=H,
+            V=m,
+            loss_div=1.0,
+            **gemm_scalars(
+                self.stage,
+                self.geometry,
+                hidden=H,
+                vocab=m,
+                rows_c=rows,
+                group_m=self.group_m,
+                group_n=self.group_n,
+                first_chunk=int(acc is None),
+            ),
+        )
+        launch, arguments = _eager_launch(
+            self.record,
+            self.module_name,
+            self.stage,
+            values,
+            self.device,
+            self.geometry,
+        )
+        with _ffi_stream_context(self.index):
+            if launch.prepare is not None:
+                launch.prepare(*arguments)
+            launch.entry(*arguments)
+
+
+def _dw_cast_split(
+    dz_last: torch.Tensor,
+    x_rows: torch.Tensor,
+    acc: list,
+    grad: Optional[torch.Tensor],
+    *,
+    in_place: bool,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+) -> torch.Tensor:
+    """The BF16 ``dW`` of the budget form ``"fused_ip"`` (:attr:`Plan.dw_split`): :func:`dw_cast` of the deferred last
+    chunk over the split accumulator ``acc`` = ``[lower, upper]`` -- the FP32 ``[a, H]`` and ``[V - a, H]`` sums of
+    the vocabulary rows ``[0, a)`` and ``[a, V)`` of the chunks before it -- as one fused GEMM per vocabulary row piece
+    with the form, raster and store of the full launch (:class:`_DwCastForm`): each element sees the same FP32
+    operations, so ``dW`` is bitwise :func:`dw_cast`'s.
+
+    ``in_place`` (a backward that frees its graph): both tensors are taken out of ``acc`` and ``dW`` is written into
+    the lower accumulator's storage (``4 a H >= 2 V H`` bytes; :func:`dw_split_rows`) -- the rows ``[0, a)`` in the
+    pieces of :func:`_dw_split_pieces` in order, the first through a temporary copied into place after it, then the
+    rows ``[a, V)`` from the upper accumulator, which is released after it -- and returned as a BF16 ``[V, H]`` tensor
+    on that storage (autograd takes it as ``W.grad`` without a copy): the step holds no ``[V, H]`` output beside the
+    accumulators, which this consumes.  Otherwise (a retained graph, :meth:`ForwardResult.backward`) the accumulators
+    are read, never written, and ``dW`` is a new tensor (two launches)."""
+    if len(acc) != 2:
+        raise ValueError("the split accumulator's cast needs [lower, upper]")
+    lower, upper = acc
+    if in_place:
+        acc.clear()  # the caller's list: dropped here, so this function holds the last references
+    if (
+        dz_last.dtype != torch.bfloat16
+        or dz_last.ndim != 2
+        or not dz_last.is_contiguous()
+    ):
+        raise ValueError("dz_last must be a contiguous BF16 [rows, V] tensor")
+    rows, V = (int(n) for n in dz_last.shape)
+    if (
+        x_rows.dtype != torch.bfloat16
+        or x_rows.ndim != 2
+        or x_rows.shape[0] != rows
+        or x_rows.stride(1) != 1
+    ):
+        raise ValueError("x_rows must be a BF16 [rows, H] tensor with contiguous rows")
+    if x_rows.stride(0) % 8 or x_rows.data_ptr() % 16:
+        x_rows = x_rows.contiguous()
+    H = int(x_rows.shape[1])
+    a = int(lower.shape[0])
+    if (
+        lower.dtype != torch.float32
+        or upper.dtype != torch.float32
+        or not (lower.is_contiguous() and upper.is_contiguous())
+        or tuple(lower.shape) != (a, H)
+        or tuple(upper.shape) != (V - a, H)
+        or not V <= 2 * a < 2 * V
+        or rows == 0
+    ):
+        raise ValueError(
+            "the split accumulator is the contiguous FP32 [a, H] and [V - a, H] sums of a multi-chunk call, "
+            "V / 2 <= a < V"
+        )
+    device = dz_last.device
+    g = (
+        _unit_scale(device)
+        if grad is None
+        else grad.detach().reshape(1).to(device=device, dtype=torch.float32)
+    )
+    form = _DwCastForm.of(
+        device, rows, H, fp32=False, multi=True, gemm_tuning=gemm_tuning
+    )
+    if not in_place:
+        dw = torch.empty((V, H), dtype=torch.bfloat16, device=device)
+        form.launch(dz_last[:, :a], x_rows, lower, dw[:a], g)
+        form.launch(dz_last[:, a:], x_rows, upper, dw[a:], g)
+        return dw
+    storage = lower.untyped_storage()
+    if lower.storage_offset() or storage.nbytes() < 2 * V * H:
+        raise ValueError(
+            "the lower accumulator must own the start of a storage of at least 2 V H bytes"
+        )
+    dw = torch.empty(0, dtype=torch.bfloat16, device=device).set_(
+        storage, 0, (V, H), (H, 1)
+    )
+    for k, (m0, m1) in enumerate(_dw_split_pieces(a, dw_block_step(form.geometry))):
+        if k == 0:
+            # the first piece's BF16 rows would overwrite FP32 rows it still reads: through a temporary, copied into
+            # place behind the launch (stream order)
+            first = torch.empty((m1, H), dtype=torch.bfloat16, device=device)
+            form.launch(dz_last[:, :m1], x_rows, lower[:m1], first, g)
+            dw[:m1].copy_(first)
+            del first
+        else:
+            form.launch(dz_last[:, m0:m1], x_rows, lower[m0:m1], dw[m0:m1], g)
+    del lower  # its storage is dW's from here on
+    form.launch(dz_last[:, a:], x_rows, upper, dw[a:], g)
+    del upper
+    return dw
 
 
 # a block-shifted label outside the recompute block (:func:`_dw_vocab_blocks`): equal to no column, and not negative
@@ -7415,6 +7803,8 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
             result.dw_acc,
         )  # saved state, never mutated
         ctx.memory_plan = mplan = result.memory_plan
+        # the form ``"fused_ip"``: the split accumulator's upper rows (``dw_acc`` the lower ones)
+        ctx.dw_acc_hi = result.dw_acc_hi
         if ctx.auto_release:
             # the automatic form: the early release of the budget form its forward picked (none: the fast form)
             ctx.early_release = mplan is not None
@@ -7434,7 +7824,7 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
 
     @staticmethod
     def _release(ctx) -> None:
-        ctx.dx_acc = ctx.dw_acc = None
+        ctx.dx_acc = ctx.dw_acc = ctx.dw_acc_hi = None
         ctx.row_state = ctx.plan = None
         ctx.row_index = ctx.row_valid = None
         ctx.released = True
@@ -7530,15 +7920,31 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
                 x_last = torch.index_select(
                     x_src, 0, x_idx
                 )  # the compacted chunk's rows, gathered again
-            dw = dw_cast(
-                dz_last,
-                x_last,
-                ctx.dw_acc,
-                grad_loss,
-                ctx.grad_weight_dtype,
-                backend=ctx.backend,
-                gemm_tuning=ctx.gemm_tuning,
-            )
+            if ctx.dw_acc_hi is not None:
+                # the form ``"fused_ip"``: a backward that frees the graph writes ``dW`` into the lower accumulator's
+                # storage (the accumulators released from the context first, so ``dW`` is the storage's only holder)
+                acc = [ctx.dw_acc, ctx.dw_acc_hi]
+                if not keep:
+                    ctx.dw_acc = ctx.dw_acc_hi = None
+                dw = _dw_cast_split(
+                    dz_last,
+                    x_last,
+                    acc,
+                    grad_loss,
+                    in_place=not keep,
+                    gemm_tuning=ctx.gemm_tuning,
+                )
+                del acc
+            else:
+                dw = dw_cast(
+                    dz_last,
+                    x_last,
+                    ctx.dw_acc,
+                    grad_loss,
+                    ctx.grad_weight_dtype,
+                    backend=ctx.backend,
+                    gemm_tuning=ctx.gemm_tuning,
+                )
         elif ctx.dw_acc is not None:
             dw = scale_cast(
                 ctx.dw_acc, grad_loss, ctx.grad_weight_dtype, backend=ctx.backend

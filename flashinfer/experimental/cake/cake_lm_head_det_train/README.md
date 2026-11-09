@@ -403,6 +403,17 @@ keyword.
   weight-gradient form whose predicted peak stays within `B` less a 2 % margin
   (`cake_backend_opt_in.memory_plan`, which returns the form and both byte counts;
   `ForwardResult.memory_plan` carries it): `"fused"` (the fast form),
+  `"fused_ip"` (loss entry, two or more chunks: the fast form's kernels with
+  the FP32 accumulator split at the vocabulary row `a =
+  cake_backend_opt_in.dw_split_rows(V)`, half the vocabulary rounded up to
+  the weight-gradient block, so each chunk runs the accumulate GEMM on rows
+  `[0, a)` and `[a, V)`; a backward that frees the graph casts `dW` in place:
+  the deferred last chunk's fused scale + cast GEMM writes the BF16 rows of
+  `[0, a)` into the first part's own storage, in pieces that each start at
+  most twice as far in as the previous one ends (the first one, `a / 16`
+  rows rounded up to the block, through a temporary), then the rows `[a,
+  V)`, so no `[V, H]` BF16 output is held beside the accumulator; a backward
+  that keeps the graph, and `ForwardResult.backward`, cast out of place),
   `"unfused"` (every chunk accumulated, one flat cast after `dX` is written),
   `"partial"` (the chunk loop accumulates the vocabulary rows `[0, dw_rows)`
   only) or `"recompute"` (none).  The last two recompute the other rows of
@@ -470,23 +481,36 @@ keyword.
   15-35 % of the step.  A two-chunk call holds the FP32 `[V, H]`
   accumulator beside a small `B` (measured 1.67-1.71 `B` at `T = 8117`)
   and runs a budget form.  Below
-  the threshold the budget forms run slower: the measured steps of the issue's
-  shapes (`T = 16384`, a third of the labels ignored, `C = 4096`) went from
-  6.971 to 5.020 GiB at `H = 6144` and from 5.041 to 3.888 GiB at
-  `H = 4096`, 1-3 % slower; a short call that recomputes most of the
-  vocabulary costs more.  The margin above was measured for the `"budget"`
+  the threshold the cost depends on the form the call gets (B200, step
+  medians of the default and `"fast"` calls in one process, `C = 4096`):
+  at the issue's shapes (`T = 16384`, a third of the labels ignored) the
+  step peak went from 6.971 to 5.020 GiB at `H = 6144` (`"partial"`, 42.5
+  against 40.3 ms, about 5 % slower) and from 5.041 to 3.838 GiB at
+  `H = 4096` (`"fused_ip"`, 27.3 against 27.2 ms, within the noise); with
+  5 % of the labels ignored, at `H = 6144`, from 7.081 to 5.430 GiB
+  (`"fused_ip"`, 57.0 against 56.9 ms, within the noise; a checkpointed step
+  about 2 % slower); at `T = 8117` (two chunks, `H = 6144`, `"partial"`)
+  from 6.811 to 4.005 GiB, 33.5 against 28.9 ms (about 15 % slower); a
+  short call that recomputes most of the vocabulary costs more.  The margin above was measured for the `"budget"`
   form; the fast form's own-lifetime model is checked against measured peaks
   of the issue's shapes.  The hidden valid-row count allocates a whole
-  chunk's buffers before the count is known, and a call that misses the
-  binding cache (a new valid-row count: usually every training batch)
-  allocates the chunk workspace for its binding beside them.  A default call
-  whose step forms a BF16 `dW` -- every pass of it, a checkpointed step's
-  gradient-free first pass included -- keeps the count only where those
-  chunk-0 buffers plus that workspace fit `B` less the margin for every
-  valid-row count (the worst case is `T_v = chunk_size`, with the most dX
-  K-slice slabs the program can take); otherwise it runs without the count,
-  on the host count's path.  Its outputs are the same bits: the loss entry's
-  zero-weight row split is still decided as for the call with the count.  A
+  chunk's buffers before the count is known.  A call that misses the binding
+  cache (a new valid-row count: usually every training batch) prepares its
+  binding on views of those buffers (the template's logits, statistics and
+  gather regions; the rest of the chunk workspace and the aliased
+  accumulators in one allocation), so no second chunk buffer exists beside
+  them and that phase never exceeds the forward's.  A default call whose step
+  forms a BF16 `dW` -- every pass of it, a checkpointed step's gradient-free
+  first pass included -- keeps the count only where those chunk-0 buffers
+  and the call's `O(T)` vectors fit the budget of a call without a valid
+  row, `2 * V * H + 2 * T * H` less the margin, which bounds that phase for
+  every valid-row count (at `V = 154880`, `C = 4096`: from `T = 10264` at
+  `H = 4096`, from `T = 33418` at `H = 3584`); otherwise it runs without
+  the count, on the host count's path.  Its outputs are the same bits: the
+  loss entry's zero-weight row split is still decided as for the call with
+  the count.  A call of fewer valid rows than a chunk that keeps the count
+  holds the count's `chunk_size`-row buffers (a one-chunk call, whose step
+  peak is not bounded by `B`, above).  A
   call that keeps the count plans its budget form with the count's chunk-0
   buffers (`chunk_size` rows, the gather buffer included) and that
   cache-miss phase, and keeps the count when that plan fits; else, when the
