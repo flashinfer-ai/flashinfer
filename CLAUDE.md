@@ -461,6 +461,14 @@ pre-commit install
 
 ## Opening a Pull Request
 
+The static API documentation checker treats imports in implementation modules
+as dependencies unless explicitly exported by a literal `__all__`. Package
+facades still expose imported APIs, including through chains of internal
+aliases. Dynamic export lists retain imported names conservatively.
+Undocumented public definitions and re-exports remain findings.
+Run its CPU-only regression tests with
+`python3 -m unittest discover -s scripts/tests -p 'test_check*.py'`.
+
 Follow [`CONTRIBUTING.md`](CONTRIBUTING.md) when opening a PR. The two requirements most often
 missed:
 

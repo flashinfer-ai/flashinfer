@@ -223,8 +223,11 @@ def collect_module_alias_exports(
     A `.rst` file may document ``flashinfer.comm.vllm_all_reduce`` whose
     actual definition lives in ``flashinfer.comm.vllm_ar`` as ``def all_reduce``
     (decorated with ``@flashinfer_api``). We follow ``ast.ImportFrom`` chains
-    inside any ``__init__.py`` (and other modules) to surface the *aliased*
-    name under the *importing* module's dotted path.
+    inside package ``__init__.py`` files to surface the *aliased* name under
+    the importing module. Ordinary implementation modules without ``__all__``
+    treat imports as dependencies; a literal ``__all__`` selects re-exports.
+    Dynamic declarations retain imports conservatively. Internal imports
+    still participate in resolving public re-export chains.
 
     Returns ``{importing_module_dotted: set(alias_name, ...)}`` containing
     aliases that ultimately resolve to a ``@decorator``-decorated top-level
@@ -271,6 +274,49 @@ def collect_module_alias_exports(
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
             return
 
+    def explicit_module_exports(tree: ast.Module) -> set[str] | None:
+        """Read literal __all__; retain imports if a declaration is dynamic."""
+        exports: set[str] = set()
+        for node in tree.body:
+            value: ast.expr | None = None
+            if (
+                (
+                    isinstance(node, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name) and target.id == "__all__"
+                        for target in node.targets
+                    )
+                )
+                or (
+                    isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Name)
+                    and node.target.id == "__all__"
+                )
+                or (
+                    isinstance(node, ast.AugAssign)
+                    and isinstance(node.target, ast.Name)
+                    and node.target.id == "__all__"
+                    and isinstance(node.op, ast.Add)
+                )
+            ):
+                value = node.value
+            else:
+                continue
+            if not isinstance(value, (ast.List, ast.Tuple, ast.Set)) or not all(
+                isinstance(item, ast.Constant) and isinstance(item.value, str)
+                for item in value.elts
+            ):
+                return None
+            names = {item.value for item in value.elts}
+            if isinstance(node, ast.AugAssign):
+                exports.update(names)
+            else:
+                exports = names
+        return exports
+
+    # None means a package facade or an unresolved dynamic export list.
+    public_names: dict[str, set[str] | None] = {}
+
     for py_file in sorted(pkg_root.rglob("*.py")):
         try:
             tree = ast.parse(
@@ -281,6 +327,9 @@ def collect_module_alias_exports(
         importer_mod = module_name(py_file, pkg_root)
         importer_parts = importer_mod.split(".")
         is_package = py_file.name == "__init__.py"
+        public_names[importer_mod] = (
+            None if is_package else explicit_module_exports(tree)
+        )
         visitor = ModuleScopeImportFromVisitor()
         visitor.visit(tree)
         for node in visitor.imports:
@@ -316,7 +365,9 @@ def collect_module_alias_exports(
                 if surfaced in target_names:
                     continue
                 target_names.add(surfaced)
-                aliases.setdefault(importer_mod, set()).add(surfaced)
+                exported = public_names[importer_mod]
+                if exported is None or surfaced in exported:
+                    aliases.setdefault(importer_mod, set()).add(surfaced)
                 changed = True
     return aliases
 
