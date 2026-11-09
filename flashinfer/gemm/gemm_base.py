@@ -11970,8 +11970,9 @@ def group_deepgemm_fp8_nt_groupwise(
         ``torch.float32`` scale is converted by keeping only its exponent, i.e.
         to ``2 ** floor(log2(scale))``, so a scale that is not a power of two is
         applied up to 2x too small, without an error. Pass power-of-two scales
-        (for example ``2 ** ceil(log2(amax / 448))``, as ``per_token_cast_to_fp8``
-        and ``per_block_cast_to_fp8`` in ``flashinfer.testing.utils`` produce).
+        (for example ``2 ** ceil(log2(amax.clamp(min=1e-4) / 448))``, as
+        ``per_token_cast_to_fp8`` and ``per_block_cast_to_fp8`` in
+        ``flashinfer.testing.utils`` produce).
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
@@ -12405,8 +12406,11 @@ def batch_deepgemm_fp8_nt_groupwise(
         ``torch.float32`` scale is converted by keeping only its exponent, i.e.
         to ``2 ** floor(log2(scale))``, so a scale that is not a power of two is
         applied up to 2x too small, without an error. Pass power-of-two scales
-        (for example ``2 ** ceil(log2(amax / 448))``, as ``per_token_cast_to_fp8``
-        and ``per_block_cast_to_fp8`` in ``flashinfer.testing.utils`` produce).
+        (for example ``2 ** ceil(log2(amax.clamp(min=1e-4) / 448))``, as
+        ``per_token_cast_to_fp8`` and ``per_block_cast_to_fp8`` in
+        ``flashinfer.testing.utils`` produce).
+        ``backend="cake"`` has the same requirement: its block-scaled routes truncate the
+        scales the same way.
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
@@ -12479,7 +12483,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     >>> b_fp8 = torch.empty_like(b, device="cuda", dtype=torch.float8_e4m3fn)
     >>> b_scale = torch.empty(
     ...    (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
-    >>> )
+    ... )
     >>> for i in range(group_size):
     ...    a_fp8[i], a_scale[i] = per_token_cast_to_fp8(a[i])
     ...    b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b[i])
