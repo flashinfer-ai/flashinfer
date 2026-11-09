@@ -1090,6 +1090,17 @@ def gen_all_modules(
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
 
+    # Cake tinygemm2 kernels of tinygemm_bf16 and of the mm_bf16 TinyGEMM tactic:
+    # exact-target builds, one module per (kernel, target).
+    if has_sm90:
+        jit_specs.extend(gen_cake_tinygemm2_wgmma_aot_modules("sm_90a"))
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_103a"))
+    if has_sm107a_exact:
+        jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_107a"))
+
     if add_comm:
         from .jit.comm import (
             gen_dcp_alltoall_module,
@@ -1159,16 +1170,6 @@ def gen_all_modules(
             jit_specs.extend(gen_cake_fp4_allreduce_aot_modules("sm_103a"))
         if has_sm107a_exact:
             jit_specs.extend(gen_cake_fp4_allreduce_aot_modules("sm_107a"))
-        # Cake tinygemm2 kernels of tinygemm_bf16 and of the mm_bf16 TinyGEMM tactic:
-        # exact-target builds, one module per (kernel, target).
-        if has_sm90:
-            jit_specs.extend(gen_cake_tinygemm2_wgmma_aot_modules("sm_90a"))
-        if has_sm100a_exact:
-            jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_100a"))
-        if has_sm103a_exact:
-            jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_103a"))
-        if has_sm107a_exact:
-            jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_107a"))
         # NVLink one-sided MoE all-to-all behind flashinfer.moe_ep. The fence path
         # needs SM90+; the CFT path compiles only for SM100+ and traps elsewhere.
         if has_sm90 or has_sm100 or has_sm100f or has_sm103 or has_sm107:
