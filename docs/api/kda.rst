@@ -892,3 +892,30 @@ are reset before each invocation. The fixed route joins its private chain
 stream back to the caller's stream, so the caller observes completion of both
 kernels. Independent persistent launches must be serialized: their producer/
 consumer schedules rely on the full grid being resident.
+
+.. _apikda_exact_decode:
+
+flashinfer.kda_exact_decode
+---------------------------
+
+Prefill-decode bitwise invariant KDA decode for SM100 and SM103. Token ``p`` of
+a decoded request is the row a one-shot ``recurrent_kda(backend="cute-dsl")``
+prefill of the whole sequence would produce, by keeping the fp32 state at the
+last 16-token chunk boundary plus the raw inputs since it and replaying that
+partial chunk through the kernel's pinned ``engine`` route
+(``flashinfer.kda_prefill_cute.force_route``). Requires bf16 activations, an
+fp32 state, head dimension 128, ``HV == H`` and the finite gate lower bound the
+kernel is compiled for.
+
+.. currentmodule:: flashinfer.kda_exact_decode
+
+.. autosummary::
+    :toctree: ../generated
+
+    KdaLayerParams
+    KdaExactDecodeState
+    KdaExactDecodePool
+    kda_exact_decode
+    kda_exact_prefill
+    kda_exact_verify
+    kda_exact_accept
