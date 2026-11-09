@@ -9,6 +9,7 @@ from typing import Any, List, Literal, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 import cutlass.pipeline as pipeline
 from cutlass.cutlass_dsl import (
     Boolean,
@@ -35,6 +36,28 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
     mbarrier_arrive_expect_tx_on_peer,
     store_i32_to_peer_cluster_smem_async,
 )
+
+
+@cute.jit
+def _cluster_pipeline_consumer_wait_acquire_cluster(
+    cluster_pipeline, consumer_state
+) -> None:
+    """``consumer_wait`` with ``.acquire.cluster`` semantics.
+
+    The leader CTA completes every peer's copy of the full barrier with
+    ``st.async ... mbarrier::complete_tx``, a release at cluster scope; the
+    pipeline's default ``.acquire.cta`` wait does not synchronize with it.
+    ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
+    Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``, which
+    lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
+    """
+    full_barrier_ptr = cluster_pipeline.sync_object_full.get_barrier(
+        consumer_state.index
+    )
+    while not prims.mbarrier_try_wait_parity(
+        full_barrier_ptr, consumer_state.phase, scope=prims.MBarrierScope.CLUSTER
+    ):
+        pass
 
 
 # =============================================================================
@@ -646,7 +669,11 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         ds.producer_state.advance()
 
         # --- Consumer side (all CTAs sched warp threads) ---
-        cluster_pipeline.consumer_wait(ds.consumer_state)
+        # The leader's st.async complete-tx releases at cluster scope: acquire
+        # at cluster scope before the broadcast slot is read.
+        _cluster_pipeline_consumer_wait_acquire_cluster(
+            cluster_pipeline, ds.consumer_state
+        )
         cluster_idx = broadcast_tensor[0]
         cute.arch.fence_acq_rel_cta()
         cluster_pipeline.sync_object_empty.arrive(ds.consumer_state.index, Int32(0))

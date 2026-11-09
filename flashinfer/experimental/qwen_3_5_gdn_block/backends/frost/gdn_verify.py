@@ -41,6 +41,7 @@ from typing import Any
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 import cutlass.memory
 import torch
 from cutlass._mlir.dialects import llvm
@@ -110,6 +111,24 @@ def push_peer_f32(
         loc=loc,
         ip=ip,
     )
+
+
+@cute.jit
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: cute.Pointer, phase: cutlass.Int32
+) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
+    Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``, which
+    lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
+    ):
+        pass
 
 
 @dsl_user_op
@@ -1228,7 +1247,9 @@ def kernel(
                 )
             if tid == 0:
                 cute.arch.mbarrier_arrive_and_expect_tx(xbar.iterator, TMAX * 4)
-            cute.arch.mbarrier_wait(xbar.iterator, 0)
+            # The peer's push_peer_f32 complete-tx releases at cluster scope:
+            # acquire at cluster scope before recv is read.
+            _mbarrier_wait_acquire_cluster(xbar.iterator, cutlass.Int32(0))
             if tid < TMAX:
                 tot2[tid] = tot[tid] + recv[tid]
             cute.arch.barrier()
