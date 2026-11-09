@@ -655,10 +655,10 @@ DX_SPLIT_LONG_RING_ARCHES = (
 #    sm_107a only an explicit ``stages`` pin selects the ring)
 DX_SPLIT_WHOLE_ARCHES: tuple[str, ...] = (
     "sm_103a",
-    "sm_107a",
 )  # whole-tile chunks below RASTER_RULE_MIN_HIDDEN split in every call
 DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES: tuple[str, ...] = (
     "sm_100a",
+    "sm_107a",
 )  # ... only in a call of fewer than DW_STREAM_MIN_CHUNKS chunks
 DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
 # Swapped dX tile (``_swab``): dX^T = W^T dz^T, W's 128 hidden columns of a CTA on the MMA's M and the chunk's

@@ -1766,8 +1766,8 @@ def test_instance_rules_mirror_the_launchers():
     assert cake_backend.DX_WIDE_MIN_EFF == {"sm_100a": 0.83}
     assert cake_backend.DX_SPLIT_ARCHES == ("sm_100a", "sm_103a", "sm_107a")
     assert cake_backend.DX_SPLIT_LONG_RING_ARCHES == ("sm_103a", "sm_107a")
-    assert cake_backend.DX_SPLIT_WHOLE_ARCHES == ("sm_103a", "sm_107a")
-    assert cake_backend.DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES == ("sm_100a",)
+    assert cake_backend.DX_SPLIT_WHOLE_ARCHES == ("sm_103a",)
+    assert cake_backend.DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES == ("sm_100a", "sm_107a")
     g_glm = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     g_wide = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
     assert cake_backend.dx_tile_rule(3591, 6144, 148, 1, g_glm, "sm_100a") == 256
@@ -2284,16 +2284,16 @@ def test_dx_split_eligible_whole_chunks_by_architecture_and_call_length():
     assert cake_backend.dx_split_eligible(3943, 6144, "sm_100a", 512, 4)
     assert cake_backend.dx_split_eligible(3943, 6144, "sm_103a", 512, 4)
     assert cake_backend.dx_split_eligible(3943, 6144, "sm_107a", 512, 4)
-    # a whole 4096-token chunk below H 7168: every call on sm_103a / sm_107a; on sm_100a only a call of fewer than
+    # a whole 4096-token chunk below H 7168: every call on sm_103a; on sm_100a / sm_107a only a call of fewer than
     # DW_STREAM_MIN_CHUNKS chunks, whose dW accumulate shares the dX stream (an unknown chunk count: no)
     assert cake_backend.DW_STREAM_MIN_CHUNKS == 3
     for n in (1, 2, 3, 16, None):
         assert cake_backend.dx_split_eligible(4096, 6144, "sm_103a", 512, n)
-        assert cake_backend.dx_split_eligible(4096, 6144, "sm_107a", 512, n)
-    assert cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 1)
-    assert cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 2)
-    assert not cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 3)
-    assert not cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, None)
+    for arch in ("sm_100a", "sm_107a"):
+        assert cake_backend.dx_split_eligible(4096, 6144, arch, 512, 1)
+        assert cake_backend.dx_split_eligible(4096, 6144, arch, 512, 2)
+        assert not cake_backend.dx_split_eligible(4096, 6144, arch, 512, 3)
+        assert not cake_backend.dx_split_eligible(4096, 6144, arch, 512, None)
     # from H 7168 on a whole chunk keeps its full items on every architecture
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
         assert not cake_backend.dx_split_eligible(4096, 7168, arch, 512, 1)

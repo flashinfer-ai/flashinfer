@@ -11,11 +11,12 @@ The public module `flashinfer.cake_lm_head_det_train` is a stable API
 experimental, with no compatibility guarantee for its internal modules.
 SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
-built for `sm_107a`, under SM103's dispatch rules except the logits rasters and
-the long-chunk `dX` ring).  The feature does not participate in
-automatic backend selection, autotuning or trace-apply.  Its libraries are
-loaded prebuilt from `aot/` when the package ships them and JIT-built by
-FlashInfer from `build.json` otherwise (see "Layout of this package").
+built for `sm_107a`, under SM103's dispatch rules except the logits rasters,
+the long-chunk `dX` ring and the whole-chunk `dX` split).  The feature does
+not participate in automatic backend selection, autotuning or trace-apply.
+Its libraries are loaded prebuilt from `aot/` when the package ships them and
+JIT-built by FlashInfer from `build.json` otherwise (see "Layout of this
+package").
 
 ## Public entry points (`flashinfer/cake_lm_head_det_train.py`)
 
@@ -1149,9 +1150,9 @@ a record serves every admissible geometry and the host never selects by shape:
   items in the same launch (the grid carries `W + r` clusters; the split count
   is the launch scalar `dx_split`).  Taken on every architecture for chunks
   that are not a whole number of 512-token tiles; for chunks of whole
-  512-token tiles below `H` 7168 on sm_103a and sm_107a in every call
-  (`DX_SPLIT_WHOLE_ARCHES`) and on sm_100a in calls of fewer than three
-  chunks, whose dW accumulate shares the dX stream
+  512-token tiles below `H` 7168 on sm_103a in every call
+  (`DX_SPLIT_WHOLE_ARCHES`) and on sm_100a and sm_107a in calls of fewer
+  than three chunks, whose dW accumulate shares the dX stream
   (`DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES`, `DW_STREAM_MIN_CHUNKS`); on the
   long-chunk ring (`_st3_split`) on sm_103a only
   (`cake_backend.dx_split_rule`, `cake_backend.dx_split_eligible`,
@@ -1308,9 +1309,10 @@ combine kernels in their BF16 and FP32-accumulate modes), exported from the
 kernel snapshot named in the pull request.  The `sm_107a` record registers
 every stage of the `sm_103a` record; its rule tables take the `sm_103a`
 entries except the logits rasters (`LOGITS_LONG_RASTER_GROUPS`; the logits slot
-of `RASTER_WIDE_GROUPS` keeps the record's 32) and the long-chunk `dX` ring
-(`DX_LONG_CHUNK_STAGES`), so its rules reach twelve of the sixteen forms (all
-but the four `_st3` forms).
+of `RASTER_WIDE_GROUPS` keeps the record's 32), the long-chunk `dX` ring
+(`DX_LONG_CHUNK_STAGES`) and the whole-chunk `dX` split, which follows
+`sm_100a` (`DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES`), so its rules reach twelve of
+the sixteen forms (all but the four `_st3` forms).
 `tests/experimental/test_cake_lm_head_det_train_support.py` tests the candidate-support
 entries (host rules and the reference backend on any device, the cake backend
 on a registered device).
