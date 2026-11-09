@@ -14175,23 +14175,25 @@ def test_k1_dgrad_rules_by_sm():
                 plan.template,
             )
             assert int(plan.sk_units) == 0, what
-            # exact keys: the other output dtype, the token counts next to it, other parts
+            # exact keys: the other output dtype, the token counts next to it, other parts (the promotion of a
+            # range of K1_DGRAD_PROMO_RANGES_BY_SM where one holds the key)
             other = dict(arch=arch, K=K, N=N)
+
+            def promo_of(t, out_f32, sms=sms):
+                promo = cake_backend.k1_dgrad_promo(
+                    sm_count=sms, T=t, out_f32=out_f32, **other
+                )
+                return (("promo", promo),) if promo else ()
+
             if (K, N, T, "bf16" if f32 else "f32") not in rows:
-                assert (
-                    cake_backend.k1_dgrad_knobs(
-                        sm_count=sms, T=T, out_f32=not f32, **other
-                    )
-                    == ()
-                ), what
+                assert cake_backend.k1_dgrad_knobs(
+                    sm_count=sms, T=T, out_f32=not f32, **other
+                ) == promo_of(T, not f32), what
             for t in (T - 1, T + 1):
                 if (K, N, t, dt) not in rows:
-                    assert (
-                        cake_backend.k1_dgrad_knobs(
-                            sm_count=sms, T=t, out_f32=f32, **other
-                        )
-                        == ()
-                    ), what
+                    assert cake_backend.k1_dgrad_knobs(
+                        sm_count=sms, T=t, out_f32=f32, **other
+                    ) == promo_of(t, f32), what
             for s in (sms - 1, sms + 1, 160, 216):
                 assert (
                     cake_backend.k1_dgrad_knobs(sm_count=s, T=T, out_f32=f32, **other)
