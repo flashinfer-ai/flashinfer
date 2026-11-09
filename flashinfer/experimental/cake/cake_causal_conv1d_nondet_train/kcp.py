@@ -52,7 +52,9 @@ With more than one rank the head program(s), the multi call's concatenation of
 the send rows and the exchange issue run on the device's high-priority side
 stream (:func:`_side_stream`), forked from the caller's stream; the main
 program(s) launch on the caller's stream at once (they read no head row), and
-the caller's stream joins the side stream after them, before the wait.  After
+the caller's stream joins the side stream after them, before the wait.  The
+buffers the side stream fills are allocated on the caller's stream before the
+fork, so the join orders their reuse (no ``record_stream``).  After
 the wait, the tail-row programs of a multi call whose tensors share one width
 read their rows in place in the received pool and run concurrently
 (:func:`_halos_in_place`).  The same programs read the same inputs, so no bit
@@ -105,10 +107,13 @@ context and the shapes of the call, never a tensor's contents; it holds at most
 ``HOST_CACHE_MAX = 64`` contexts (the oldest dropped) and
 :func:`cake_causal_conv1d_nondet_train_kcp_host_cache_clear` empties it; ``_FFI_DEVICES`` caches the FFI device per
 device index.  The operand checks, the gather, the exchange, its wait and the
-kernel launches run as before with the same arguments on the same stream, so
-no bit changes; a replayed graph (``graph="replay"``) contains no host work.
-``_set_test_knobs({"host_trim": 0})`` (a private test hook; the backend reads no environment variable) selects
-the previous host path for the A/B record.
+kernel launches run as before with the same arguments, so no bit changes; a
+replayed graph (``graph="replay"``) contains no host work.  The trimmed path
+and the multi path issue an overlapped backward's head programs and exchange
+from the side stream (above); the previous host path keeps every launch on the
+caller's stream.  ``_set_test_knobs({"host_trim": 0})`` (a private test hook;
+the backend reads no environment variable) selects the previous host path for
+the A/B record.
 
 Backward grid beside a concurrent kernel (FlashInfer issue #8365): the main
 backward launches :func:`_bwd_grid`, ``ctas_per_sm x SM count`` CTAs less
@@ -256,9 +261,11 @@ def _exchange(
     recv_splits: tuple[int, ...],
     ctx: Any,
     agree: tuple[str, tuple[int, ...], bool],
+    recv: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[Any]]:
-    """One ``all_to_all_single`` of ``send`` (rows in destination-rank order) into a fresh ``[recv_rows, C]`` tensor,
-    issued asynchronously on the current stream; with one rank the send buffer is the received pool (no collective).
+    """One ``all_to_all_single`` of ``send`` (rows in destination-rank order) into ``recv`` (a ``[recv_rows, C]``
+    tensor; ``None`` = a fresh one), issued asynchronously on the current stream; with one rank the send buffer is
+    the received pool (no collective).
     ``agree`` = ``(phase, channels, multi)`` of the call: the first exchange of a (context, phase) runs the
     rank-agreement check first (:func:`_agree`).  Returns ``(recv, work)``; the caller waits ``work`` at the first
     consumer."""
@@ -266,7 +273,10 @@ def _exchange(
     if int(ctx.world_size) == 1:
         return send, None
     _agree(ctx, *agree, device=send.device)
-    recv = torch.empty((recv_rows, send.shape[1]), dtype=send.dtype, device=send.device)
+    if recv is None:
+        recv = torch.empty(
+            (recv_rows, send.shape[1]), dtype=send.dtype, device=send.device
+        )
     work = dist.all_to_all_single(
         recv,
         send,
@@ -716,14 +726,19 @@ def cake_causal_conv1d_nondet_train_kcp_host_cache_clear() -> int:
 def _side_stream(
     ctx: Any, device: torch.device, overlapped: bool
 ) -> Optional[torch.cuda.Stream]:
-    """The stream of an overlapped backward's head programs and exchange issue, forked from the current stream:
-    the device's high-priority side stream when the call exchanges (``world_size > 1``) and runs the overlapped pair,
-    else ``None`` (the current stream)."""
+    """The stream of an overlapped backward's head programs and exchange issue: the device's high-priority side
+    stream when the call exchanges (``world_size > 1``) and runs the overlapped pair, else ``None`` (the current
+    stream).  The caller allocates the buffers the side stream fills on the current stream, then forks
+    (:func:`_fork`)."""
     if not (_BWD_STREAMS and overlapped and int(ctx.world_size) > 1):
         return None
-    side = _device_stream(device, 0)
-    side.wait_stream(torch.cuda.current_stream(device))
-    return side
+    return _device_stream(device, 0)
+
+
+def _fork(side: Optional[torch.cuda.Stream], device: torch.device) -> None:
+    """The side stream waits for the current stream (after the side stream's buffers were allocated on it)."""
+    if side is not None:
+        side.wait_stream(torch.cuda.current_stream(device))
 
 
 def _device_stream(device: torch.device, slot: int) -> torch.cuda.Stream:
@@ -737,14 +752,20 @@ def _device_stream(device: torch.device, slot: int) -> torch.cuda.Stream:
     return stream
 
 
-def _join_side(side: Optional[torch.cuda.Stream], recv: torch.Tensor) -> None:
-    """After the main program(s): the current stream waits for the side stream (inside a capture this joins it), and
-    the received pool, allocated on the side stream, is recorded on the current stream that reads it."""
-    if side is None:
-        return
-    current = torch.cuda.current_stream(recv.device)
-    current.wait_stream(side)
-    recv.record_stream(current)
+def _rejoin(side: Optional[torch.cuda.Stream], device: torch.device) -> None:
+    """The current stream waits for the side stream, so that a call raising after the fork (e.g. the rank-agreement
+    check inside a capture) leaves no unjoined stream behind."""
+    if side is not None:
+        torch.cuda.current_stream(device).wait_stream(side)
+
+
+def _join_side(side: Optional[torch.cuda.Stream], device: torch.device) -> None:
+    """After the main program(s): the current stream waits for the side stream (inside a capture this joins it).
+    The head pools, the send rows and the received pool were allocated on the current stream before the fork and
+    live until after this join and the exchange's wait, so the allocator reuses them only after the side stream's
+    and the collective's work (no ``record_stream``, whose blocks the allocator frees only at a later allocation)."""
+    if side is not None:
+        torch.cuda.current_stream(device).wait_stream(side)
 
 
 def _ffi_device(device_index: int) -> Any:
@@ -1189,6 +1210,9 @@ def _graph_run(
         else:
             g.replay()
             entry.graph, entry.result = g, result
+            # the graph holds the addresses of the context's cached host-path tensors (tail tables): keep them alive
+            # past a host-cache clear or eviction (pins[0] is the context)
+            entry.pins += (_HOST_CACHE.get(id(entry.pins[0])),)
             entry.seen += 1
             GRAPH_STATS["capture"] += 1
             LAST_CALL[kind] = {
@@ -1910,10 +1934,12 @@ def _bwd_head(
     S: int,
     C: int,
     device: torch.device,
+    dpre_head: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """The head program of the backward (when the rank has head rows): the fresh FP32 ``dpre_head`` pool (at least one
-    row) whose first ``n_head`` rows are the backward exchange's send rows."""
-    dpre_head = _pool(e["n_head"], C, dtype=torch.float32, device=device)
+    """The head program of the backward (when the rank has head rows): the FP32 ``dpre_head`` pool (at least one
+    row; ``None`` = a fresh one) whose first ``n_head`` rows are the backward exchange's send rows."""
+    if dpre_head is None:
+        dpre_head = _pool(e["n_head"], C, dtype=torch.float32, device=device)
     if e["head"] is not None:
         info, hist_row_off, head_row_off = e["head"]
         _launch_trim(
@@ -2032,7 +2058,7 @@ def _bwd_overlap(
     then the tail-row program."""
     args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx_out, S=S, C=C)
     _launch_dyn(e["dyn"], dw_out=dw_out, spare=dpre_head, S=S, device=device, **args)
-    _join_side(side, dpre_tail)
+    _join_side(side, device)
     if work is not None:
         work.wait()
     _launch_halo(e["dyn"], tail_row_off=e["tail_row_off"], dpre_tail=dpre_tail, **args)
@@ -2051,7 +2077,8 @@ def _kcp_backward_trim(
     reserve: int = RESERVE_DEFAULT,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Trimmed host path: :func:`_kcp_backward` with the context-derived host work cached (:func:`_bwd_host`); the
-    operand checks, allocations, exchange, wait and launches are the untrimmed call's."""
+    operand checks, allocations, exchange, wait and launches are the untrimmed call's, except that an overlapped call
+    with more than one rank issues the head program and the exchange from the side stream (:func:`_side_stream`)."""
 
     S, C, x_flat, w, dy_flat, hist_t, dx_out, dw_out, e = _bwd_host(
         x,
@@ -2065,16 +2092,28 @@ def _kcp_backward_trim(
         reserve=reserve,
     )
     side = _side_stream(ctx, device, S > 0 and e["dyn"] is not None)
-    with torch.cuda.stream(side):
-        dpre_head = _bwd_head(e, x_flat, w, dy_flat, hist_t, S=S, C=C, device=device)
-        dpre_tail, work = _exchange(
-            dpre_head[: e["n_head"]],
-            recv_rows=e["tail_rows"],
-            send_splits=e["send_splits"],
-            recv_splits=e["recv_splits"],
-            ctx=ctx,
-            agree=("bwd", (C,), False),
-        )
+    pool = recv = None
+    if side is not None:
+        pool = _pool(e["n_head"], C, dtype=torch.float32, device=device)
+        recv = torch.empty((e["tail_rows"], C), dtype=torch.float32, device=device)
+    _fork(side, device)
+    try:
+        with torch.cuda.stream(side):
+            dpre_head = _bwd_head(
+                e, x_flat, w, dy_flat, hist_t, S=S, C=C, device=device, dpre_head=pool
+            )
+            dpre_tail, work = _exchange(
+                dpre_head[: e["n_head"]],
+                recv_rows=e["tail_rows"],
+                send_splits=e["send_splits"],
+                recv_splits=e["recv_splits"],
+                ctx=ctx,
+                agree=("bwd", (C,), False),
+                recv=recv,
+            )
+    except BaseException:
+        _rejoin(side, device)
+        raise
     if S == 0:
         if work is not None:
             work.wait()
@@ -2319,9 +2358,11 @@ def _kcp_given(
 # ``all_to_all_single`` instead of one per tensor.  The send rows of the tensors are packed side by side
 # (``[n_rows, sum C_i]``, the context's splits unchanged), and after the wait each tensor's rows are copied out into
 # a fresh contiguous pool -- the forward's ``hist`` ``[n_hist_rows, C_i]`` (the saved tensor) and the backward's
-# ``dpre_tail`` ``[n_tail_rows, C_i]`` -- before that tensor's kernels launch with the single call's arguments.  The
-# exchange and the unpacking are copies, and each tensor keeps its own kernels and accumulator launch, so every output
-# and ``dx`` is bitwise that of one single call per tensor (``dweight`` is each tensor's own unordered partial).
+# ``dpre_tail`` ``[n_tail_rows, C_i]`` -- before that tensor's kernels launch with the single call's arguments; an
+# overlapped backward whose tensors share one width lets each tail-row program read its rows in place in the received
+# pool instead (:func:`_halos_in_place`).  The exchange and the unpacking move the same values, and each tensor keeps
+# its own kernels and accumulator launch, so every output and ``dx`` is bitwise that of one single call per tensor
+# (``dweight`` is each tensor's own unordered partial).
 # One rank (no collective): the per-tensor send rows are the pools, exactly as in the single call.
 
 
@@ -2371,25 +2412,36 @@ def _halos_in_place(
     Row ``r`` of tensor ``i`` sits at element ``(r * n + i) * C`` of the packed receive pool, so tensor ``i`` reads
     the pool from element ``i * C`` with its tail-row table scaled by ``n`` (no copy; the program addresses
     ``dpre_tail + row * C`` and needs a contiguous pool).  The scaled tables are made on the current stream once per
-    host-cache entry; then the first program runs on the current stream and the others on the device's streams
-    1 .. n - 1, forked from it and joined back."""
+    host-cache entry, with an event that a later call from another stream waits for (inside a CUDA-graph capture
+    they are made for the call only: a captured table holds its values only after a replay; a capture starts after
+    a device synchronization).  Then the first program runs on the current stream and the others on the device's
+    streams 1 .. n - 1, forked from it and joined back (the pool, allocated on the current stream, outlives the
+    join)."""
     n = len(calls)
+    capturing = torch.cuda.is_current_stream_capturing()
+    current = torch.cuda.current_stream(device)
     tables = []
     for call in calls:
         e = call[8]
         key = f"tail_row_off_x{n}"
-        table = e.get(key)
-        if table is None:
+        hit = e.get(key)
+        if hit is None:
             t = e["tail_row_off"]
-            table = e[key] = torch.where(t >= 0, t * n, t)
+            table = torch.where(t >= 0, t * n, t)
+            if not capturing:
+                made = torch.cuda.Event()
+                made.record(current)
+                e[key] = (table, made, current.cuda_stream)
+        else:
+            table, made, stream_ptr = hit
+            if not capturing and stream_ptr != current.cuda_stream:
+                current.wait_event(made)
         tables.append(table)
-    current = torch.cuda.current_stream(device)
     streams = [current] + [_device_stream(device, i) for i in range(1, n)]
     for stream in streams[1:]:
         stream.wait_stream(current)
-        recv.record_stream(stream)
     flat = recv.view(-1)
-    for i, ((S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), table, stream) in enumerate(
+    for i, ((S, C, x_flat, w, dy_flat, hist_t, dx, _dw, e), table, stream) in enumerate(
         zip(calls, tables, streams, strict=True)
     ):
         with torch.cuda.stream(stream):
@@ -2500,8 +2552,10 @@ def cake_causal_conv1d_nondet_train_kcp_multi_backward(
     ``cake_causal_conv1d_nondet_train_kcp_backward(xs[i], weights[i], ctx, dys[i], hists[i])`` per tensor (``dxs``
     bitwise; each ``dweights[i]`` an unordered FP32 partial of the same budget).
 
-    The head programs of every tensor run first, their send rows travel packed in one exchange, and after the wait
-    each tensor's received rows are copied out and folded by that tensor's main backward program (one ordinary
+    The head programs of every tensor run first, their send rows travel packed in one exchange, and each tensor's
+    received rows are folded into its ``dx`` by that tensor's programs: on the overlapped route its main program runs
+    while the exchange is in flight and its tail-row program after the wait (reading the rows in place when every
+    tensor has the same width, else from a copy); otherwise its one-program backward runs after the wait (one ordinary
     launch per tensor on the stream's accumulator workspace).  ``hists`` are the forward's pools.  Every rank calls
     this function once per layer, in the same order.  ``graph`` as in
     :func:`cake_causal_conv1d_nondet_train_kcp_backward`.  Under torch's deterministic mode the call alerts like the
@@ -2646,27 +2700,57 @@ def _kcp_backward_multi(
     n_head = e0["n_head"]
     work = None
     recv = None
-    with torch.cuda.stream(side):
-        heads = [
-            _bwd_head(c[8], c[2], c[3], c[4], c[5], S=c[0], C=c[1], device=device)
+    pools: list[Optional[torch.Tensor]] = [None] * len(calls)
+    send = None
+    if side is not None:
+        widths = [c[1] for c in calls]
+        pools = [
+            _pool(c[8]["n_head"], c[1], dtype=torch.float32, device=device)
             for c in calls
         ]
-        if int(ctx.world_size) == 1:
-            tails = [h[:n_head] for h in heads]
-        else:
-            send = (
-                torch.cat([h[:n_head] for h in heads], dim=1)
-                if len(heads) > 1
-                else heads[0][:n_head]
+        if len(calls) > 1:
+            send = torch.empty(
+                (n_head, sum(widths)), dtype=torch.float32, device=device
             )
-            recv, work = _exchange(
-                send,
-                recv_rows=e0["tail_rows"],
-                send_splits=e0["send_splits"],
-                recv_splits=e0["recv_splits"],
-                ctx=ctx,
-                agree=("bwd", tuple(c[1] for c in calls), True),
-            )
+        recv = torch.empty(
+            (e0["tail_rows"], sum(widths)), dtype=torch.float32, device=device
+        )
+    _fork(side, device)
+    try:
+        with torch.cuda.stream(side):
+            heads = [
+                _bwd_head(
+                    c[8],
+                    c[2],
+                    c[3],
+                    c[4],
+                    c[5],
+                    S=c[0],
+                    C=c[1],
+                    device=device,
+                    dpre_head=pool,
+                )
+                for c, pool in zip(calls, pools, strict=True)
+            ]
+            if int(ctx.world_size) == 1:
+                tails = [h[:n_head] for h in heads]
+            else:
+                if len(heads) == 1:
+                    send = heads[0][:n_head]
+                else:
+                    send = torch.cat([h[:n_head] for h in heads], dim=1, out=send)
+                recv, work = _exchange(
+                    send,
+                    recv_rows=e0["tail_rows"],
+                    send_splits=e0["send_splits"],
+                    recv_splits=e0["recv_splits"],
+                    ctx=ctx,
+                    agree=("bwd", tuple(c[1] for c in calls), True),
+                    recv=recv,
+                )
+    except BaseException:
+        _rejoin(side, device)
+        raise
     dx_out = tuple(c[6] for c in calls)
     dw_out = tuple(c[7] for c in calls)
     if calls[0][0] == 0:
@@ -2682,8 +2766,7 @@ def _kcp_backward_multi(
         if e["dyn"] is not None:
             args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx, S=S, C=C)
             _launch_dyn(e["dyn"], dw_out=dw, spare=head, S=S, device=device, **args)
-    if recv is not None:
-        _join_side(side, recv)
+    _join_side(side, device)
     if work is not None:
         work.wait()
     if side is not None and len(calls) > 1 and len({c[1] for c in calls}) == 1:

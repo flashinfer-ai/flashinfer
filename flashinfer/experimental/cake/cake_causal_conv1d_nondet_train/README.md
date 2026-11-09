@@ -129,12 +129,15 @@ With more than one rank, the head program, the concatenation of a multi
 call's send rows and the exchange issue run on a high-priority side stream of
 the device. The main program starts on the caller's stream at once, because it
 reads no head row. The caller's stream joins the side stream before the wait.
-The programs and their inputs are the same, so no bit changes.
+The buffers that the side stream fills are allocated on the caller's stream
+before the fork. The programs and their inputs are the same, so no bit changes.
 
 The main program splits each lane into units of `M` tokens. `M` is the
-multiple of 8 from 64 to 128 with the least lane cost: the lane's tokens plus
-3.2 tokens per unit (`kcp_jit.dyn_plan`). On a 148-SM B200 this gives 104 for
-one 10240-channel tensor of 32768 tokens and 112 for 8192 channels of 16384
+multiple of 8 from 64 to 128 with the least lane cost: the lane bound
+`NL x M` tokens (`NL` units per lane) plus 3.2 tokens per unit, plus
+0.3 x `M` tokens for the last unit, which the other CTAs finish when an SM is
+busy (`kcp_jit.dyn_plan`). On a 148-SM B200 this gives 104 for one
+10240-channel tensor of 32768 tokens and 64 for 8192 channels of 16384
 tokens.
 
 Under any of these conditions, the one-program backward (`kcp_bwd`) runs after the wait instead:
@@ -271,6 +274,6 @@ tensors that share the context, such as a layer's q, k and v. It uses one halo e
 direction instead of `n`.
 
 - Inputs: each `xs[i]` is BF16 `[T_r, C_i]` and each `weights[i]` is FP32 `[C_i, 4]`. Each `C_i` is a multiple of 8, and they may differ.
-- Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, when every tensor has the same width, each tensor's tail-row program reads its rows in place in the received pool, and the programs run concurrently on separate streams. Otherwise the rows are copied into each tensor's own pool.
+- Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, when the call uses the side stream (more than one rank, every tensor on the overlapped pair) and every tensor has the same width, each tensor's tail-row program reads its rows in place in the received pool, and the programs run concurrently on separate streams. Otherwise the rows are copied into each tensor's own pool.
 - Programs: each tensor then runs the single call's programs. Outputs and `dx` are bitwise one single call per tensor. Each `dweight` is that tensor's own unordered partial.
 - Keywords: one `bwd_reserve_sms` value applies to every tensor. One recompute handle covers the whole call; its `"conv"` entry holds the `n` history pools.

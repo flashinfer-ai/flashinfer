@@ -90,7 +90,7 @@ kernel module key.
 from __future__ import annotations
 
 import functools
-from typing import Any, Optional, Sequence
+from typing import Any, Sequence
 
 import tvm_ffi
 
@@ -792,15 +792,20 @@ LOGICAL_TENSORS = (
 LOGICAL_SCALARS = (*_zero_history.LOGICAL_SCALARS, "M", "NL", "P", "L", "n_ctas")
 # The overlapped main program's channel tile (eight compute warps of 256
 # channels), its words per tile (one per warp), its most lanes and channels,
-# the smallest unit of tokens its plan considers, and a unit's fixed cost in
+# the smallest unit of tokens its plan considers, a unit's fixed cost in
 # tenths of a lane token (start, claim and run switch: about 0.69 us per unit
-# against 0.215 us per token of a lane, measured on B200).
+# against 0.215 us per token of a lane, measured on B200), and the tail's cost
+# in tenths of a token per token of a unit: a lane's last unit is the granule
+# at which the other CTAs finish a lane whose SM is busy (a held SM or another
+# stream's kernel); on B200, 112-token units of 3 x 8192 channels lose 2-6%
+# against 64-token units with 16 or 32 SMs held.
 DYN_TILE = 2048
 DYN_TILE_WORDS = 8
 DYN_MAX_LANES = 256
 DYN_MAX_CHANNELS = 32 * DYN_TILE
 DYN_UNIT = 64
 DYN_UNIT_COST_TENTHS = 32
+DYN_TAIL_COST_TENTHS = 3
 
 
 def route_applies(*, device_capability: Sequence[int], kind: str) -> bool:
@@ -970,7 +975,8 @@ def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
     :data:`DYN_MAX_LANES` lanes in all), each of ``NL`` units of ``M`` tokens, ``L`` lanes, ``n_ctas = max(L, sms)``
     CTAs (the grid) and ``n_tiles``.  ``M`` is the multiple of 8 from :data:`DYN_UNIT` to twice it whose plan fits
     the lanes' 16-bit claim counts at the least lane cost ``NL * M`` tokens plus ``NL`` units of
-    :data:`DYN_UNIT_COST_TENTHS` (the smaller ``M`` on a tie); when none fits, ``M`` doubles from ``4 * DYN_UNIT``
+    :data:`DYN_UNIT_COST_TENTHS` plus the tail's ``M`` tokens of :data:`DYN_TAIL_COST_TENTHS` (the smaller ``M``
+    on a tie); when none fits, ``M`` doubles from ``4 * DYN_UNIT``
     until a plan fits.  A pure function of ``(S, C, sms)``; ``dx`` does not depend on it."""
 
     S, C, sms = int(S), int(C), int(sms)
@@ -980,7 +986,7 @@ def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
         )
     n_tiles = -(-C // DYN_TILE)
 
-    def plan(M: int) -> Optional[dict[str, int]]:
+    def plan_for(M: int) -> dict[str, int] | None:
         P = max(1, min(sms // n_tiles, -(-S // M), DYN_MAX_LANES // n_tiles))
         per_lane = -(-S // P)
         NL = -(-per_lane // M)
@@ -990,17 +996,23 @@ def dyn_plan(S: int, C: int, sms: int) -> dict[str, int]:
             return None
         return {"M": M, "NL": NL, "P": P, "L": L, "n_ctas": n_ctas, "n_tiles": n_tiles}
 
-    fits = [p for p in map(plan, range(DYN_UNIT, 2 * DYN_UNIT + 1, 8)) if p is not None]
+    fits = [
+        p for p in map(plan_for, range(DYN_UNIT, 2 * DYN_UNIT + 1, 8)) if p is not None
+    ]
     if fits:
         return min(
             fits,
-            key=lambda p: (p["NL"] * (10 * p["M"] + DYN_UNIT_COST_TENTHS), p["M"]),
+            key=lambda p: (
+                p["NL"] * (10 * p["M"] + DYN_UNIT_COST_TENTHS)
+                + DYN_TAIL_COST_TENTHS * p["M"],
+                p["M"],
+            ),
         )
     M = 4 * DYN_UNIT
-    p = plan(M)
+    p = plan_for(M)
     while p is None:
         M *= 2
-        p = plan(M)
+        p = plan_for(M)
     return p
 
 
@@ -1117,6 +1129,7 @@ __all__ = [
     "DYN_TILE",
     "DYN_TILE_WORDS",
     "DYN_UNIT",
+    "DYN_TAIL_COST_TENTHS",
     "DYN_UNIT_COST_TENTHS",
     "HALO",
     "HALO_KIND",
