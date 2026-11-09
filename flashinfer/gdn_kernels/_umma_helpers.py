@@ -789,3 +789,72 @@ def sdesc_mn_sw128(lbo: int, sbo: int):
     operand stored row-major [K rows][MN] in 128 B swizzled rows (8-row atoms): SBO = byte
     stride between 8-row K atoms; LBO = stride between 64-element MN atoms (unused for N=64)."""
     return Uint64(((lbo >> 4) << 16) | ((sbo >> 4) << 32) | (1 << 46) | (2 << 61))
+
+
+@dsl_user_op
+def sts_u32(addr: Int32, w: Uint32, *, loc=None, ip=None) -> None:
+    """st.shared.b32."""
+    llvm.inline_asm(
+        None,
+        [Int32(addr).ir_value(loc=loc, ip=ip), Uint32(w).ir_value(loc=loc, ip=ip)],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def bulk_s2g(
+    dst_gmem: Int64, src_smem: Int32, nbytes: int, *, loc=None, ip=None
+) -> None:
+    """cp.async.bulk shared -> global (1-D, bulk_group completion); 16-B aligned, nbytes % 16 == 0."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(dst_gmem).ir_value(loc=loc, ip=ip),
+            Int32(src_smem).ir_value(loc=loc, ip=ip),
+        ],
+        f"cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], {nbytes};",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def prefetch_l2(src_gmem: Int64, nbytes: int, *, loc=None, ip=None) -> None:
+    """cp.async.bulk.prefetch.L2.global: pull ``nbytes`` (multiple of 16) at ``src_gmem`` into L2.
+    Fire-and-forget (no completion mechanism); raises the bytes in flight without any SMEM."""
+    llvm.inline_asm(
+        None,
+        [Int64(src_gmem).ir_value(loc=loc, ip=ip)],
+        f"cp.async.bulk.prefetch.L2.global [$0], {int(nbytes)};",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def prefetch_l1_line_if(pred: Int32, src_gmem: Int64, *, loc=None, ip=None) -> None:
+    """Predicated prefetch.global.L1 of the 128 B line holding ``src_gmem`` (no register result)."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(pred).ir_value(loc=loc, ip=ip),
+            Int64(src_gmem).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $0, 0;\n\t@p prefetch.global.L1 [$1];\n\t}",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )

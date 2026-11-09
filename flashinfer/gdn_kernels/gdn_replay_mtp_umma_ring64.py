@@ -73,12 +73,12 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint32, Uint64
 from cutlass.cute.nvgpu import cpasync
 
 try:
-    from . import _umma_helpers_ring64 as U
+    from . import _umma_helpers as U
     from .device_target import gdn_compile_options
 except (
     ImportError
 ):  # tests and benchmarks may load this file by path, outside the package
-    from flashinfer.gdn_kernels import _umma_helpers_ring64 as U
+    from flashinfer.gdn_kernels import _umma_helpers as U
     from flashinfer.gdn_kernels.device_target import gdn_compile_options
 
 RING_SLOTS = 64  # physical ring per request (a power of two: indices use & RING_MASK)
