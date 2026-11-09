@@ -106,7 +106,7 @@ kernel_cake_dsa_h64_det_train_93ad63698c318aab988f(__nv_bfloat16* __restrict__ d
         float b_lat = 0.0f;
         float a_rope = 0.0f;
         float b_rope = 0.0f;
-        #pragma unroll 2
+        #pragma unroll 8
         for (int i = 0; i < 8; i++) {
             int head = i * 8 + warp_1;
             int row = token * 64 + head;

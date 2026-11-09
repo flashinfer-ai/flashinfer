@@ -194,11 +194,20 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if DKV_NATURAL == 1
+#if __CUDA_ARCH__ == 1030
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#else
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#endif
+#else
 #if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
 #else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 #endif
 
     const int mbar_base = smem;
@@ -351,14 +360,10 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
 
     // ---- Role: gather ----
     if (warp <= 3) {
-#if DKV_NATURAL == 1
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
-#else
 #if __CUDA_ARCH__ == 1070
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
 #else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
-#endif
 #endif
         { // gather_main
             int pw = warp;
@@ -1832,7 +1837,19 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
     }
     // ---- Warpgroup: 4 ----
     if (warp >= 16 && warp <= 19) {
+#if DKV_NATURAL == 1
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 104;");
+#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
+#endif
+#else
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 120;");
+#else
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
+#endif
+#endif
         // ---- Role: mma ----
         if (warp == 16) {
             { // mma_main

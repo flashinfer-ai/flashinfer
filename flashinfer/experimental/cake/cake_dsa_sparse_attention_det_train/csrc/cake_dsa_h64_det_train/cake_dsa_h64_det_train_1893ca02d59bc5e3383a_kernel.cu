@@ -180,12 +180,7 @@ kernel_cake_dsa_h64_det_train_1893ca02d59bc5e3383a(const __grid_constant__ CUten
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int mbar_base = smem;
     #define qdo_full_addr (mbar_base + 0)
@@ -337,7 +332,11 @@ kernel_cake_dsa_h64_det_train_1893ca02d59bc5e3383a(const __grid_constant__ CUten
 
     // ---- Role: gather ----
     if (warp <= 3) {
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
+#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
+#endif
         { // gather_main
             int pw = warp;
             int ntok = 1;
@@ -4731,7 +4730,11 @@ kernel_cake_dsa_h64_det_train_1893ca02d59bc5e3383a(const __grid_constant__ CUten
     }
     // ---- Warpgroup: 4 ----
     if (warp >= 16 && warp <= 19) {
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 104;");
+#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
+#endif
         // ---- Role: mma ----
         if (warp == 16) {
             { // mma_main
