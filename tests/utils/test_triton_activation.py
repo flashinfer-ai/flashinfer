@@ -6,7 +6,7 @@ from flashinfer.triton.activation import silu_and_mul
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dim", [31, 512, 1025])
+@pytest.mark.parametrize("dim", [1, 31, 512, 1025])
 @pytest.mark.parametrize("column_stride", [0, 1, 2])
 @pytest.mark.parametrize("scaled", [False, True])
 def test_silu_and_mul_strided_input(dtype, dim, column_stride, scaled):

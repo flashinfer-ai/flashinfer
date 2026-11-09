@@ -49,11 +49,9 @@ def silu_and_mul_kernel(
     offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < d
 
-    x_offsets = offsets.to(tl.int64) * x_inner_stride
-    a = tl.load(x_row_ptr + x_offsets, mask=mask).to(tl.float32)
-    b = tl.load(x_row_ptr + x_offsets + d.to(tl.int64) * x_inner_stride, mask=mask).to(
-        tl.float32
-    )
+    x_offsets = offsets.to(tl.int64)
+    a = tl.load(x_row_ptr + x_offsets * x_inner_stride, mask=mask).to(tl.float32)
+    b = tl.load(x_row_ptr + (x_offsets + d) * x_inner_stride, mask=mask).to(tl.float32)
 
     if HAS_X_SCALE:
         x_scale = tl.load(x_scale_ptr)
