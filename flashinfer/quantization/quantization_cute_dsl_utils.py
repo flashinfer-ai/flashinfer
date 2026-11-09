@@ -212,7 +212,7 @@ def ue8m0_to_inv_scale_fast(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
 
     Constructs a float32 with exponent = (254 - ue8m0) and zero mantissa,
     which is exactly 2^(127 - ue8m0). No SFU dependency.
-    Returns 0 for ue8m0 == 0.
+    Byte zero encodes 2^-127, so its inverse must remain 2^127.
     """
     return Float32(
         llvm.inline_asm(
@@ -222,14 +222,11 @@ def ue8m0_to_inv_scale_fast(ue8m0_val: Uint32, *, loc=None, ip=None) -> Float32:
             {
                 .reg .s32 new_exp;
                 .reg .b32 float_bits;
-                .reg .pred p_zero;
 
-                setp.eq.u32 p_zero, $1, 0;
                 sub.s32 new_exp, 254, $1;
                 max.s32 new_exp, new_exp, 0;
                 shl.b32 float_bits, new_exp, 23;
                 mov.b32 $0, float_bits;
-                @p_zero mov.b32 $0, 0;
             }
             """,
             "=f,r",

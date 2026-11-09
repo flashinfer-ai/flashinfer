@@ -271,8 +271,8 @@ __device__ __forceinline__ float mx_quantize_mul(float a, float b) {
 }
 
 __device__ __forceinline__ float ue8m0_inverse_scale(uint8_t exp) {
-  // Same power-of-two construction and byte-zero sentinel as CuTe DSL.
-  return exp == 0 ? 0.0f : __uint_as_float(uint32_t(max(254 - int(exp), 0)) << 23);
+  // Byte zero encodes 2^-127, so its inverse must remain 2^127.
+  return __uint_as_float(uint32_t(max(254 - int(exp), 0)) << 23);
 }
 
 __device__ __forceinline__ float e2m1_code_to_float(uint8_t code) {
@@ -825,23 +825,24 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
   // TODO: use half as compute data type.
   float SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
   float SFValueNarrow;
+  float outputScale;
   // 8 bits representation of the SF.
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
   if constexpr (UE8M0_SF) {
     __nv_fp8_e8m0 tmp;
     tmp.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-    SFValueNarrow = static_cast<float>(tmp);
     fp8SFVal = tmp.__x;
+    outputScale = vecMax != 0.0f ? SFScaleVal * ue8m0_inverse_scale(fp8SFVal) : 0.0f;
   } else {
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValueNarrow = static_cast<float>(tmp);
+    // Get the output scale.
+    // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
+    outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValueNarrow) : 0.0f;
   }
-  // Get the output scale.
-  // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
-  float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValueNarrow) : 0.0f;
 
   if (SFout) {
     // Write the SF to global memory (STG.8).
