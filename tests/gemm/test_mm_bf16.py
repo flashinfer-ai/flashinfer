@@ -13,7 +13,8 @@ from flashinfer import autotune, mm_bf16
 from flashinfer.autotune_cache import MeasurementPolicy, ReplayCoverage, autotune_v2
 from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
-from flashinfer.gemm import is_cuda_tile_available
+from flashinfer.gemm import gemm_base, is_cuda_tile_available
+from flashinfer.gemm.routergemm import _tinygemm2_cake
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 
@@ -587,3 +588,125 @@ def test_mm_bf16_cute_dsl_low_m_only(monkeypatch, pdl):
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+# (m, n, k) candidates: the first one a window admits is the test shape.
+_CANDIDATES = [(6, 4096, 2048), (64, 4096, 2048), (16, 6784, 4096), (8, 4096, 4096)]
+# A shape no Cake window admits (N=96, K=5120, M=16 on SM100).
+_PLAIN = (16, 96, 5120)
+
+
+def _tensors(m, n, k, seed=0):
+    torch.manual_seed(seed)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
+    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+    return a, w, out
+
+
+def _admitted_shape():
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] not in (9, 10):
+        pytest.skip("The Cake TinyGEMM kernels exist for SM90 and SM100/SM103/SM107.")
+    for m, n, k in _CANDIDATES:
+        a, w, out = _tensors(m, n, k)
+        if _tinygemm2_cake(a, w, out, False, False) is not None:
+            return m, n, k
+    pytest.skip("No candidate shape is admitted by a Cake window on this GPU.")
+
+
+def _runner_inputs(a, w, out, pdl=False):
+    return [a, w.T, None, pdl, out, None]
+
+
+@pytest.fixture
+def cake_launches(monkeypatch):
+    launched = []
+    launch = gemm_base._tinygemm_bf16_cake
+
+    def record(program, *args, **kwargs):
+        launched.append(program)
+        return launch(program, *args, **kwargs)
+
+    monkeypatch.setattr(gemm_base, "_tinygemm_bf16_cake", record)
+    return launched
+
+
+def test_cake_tactic_is_offered_only_where_a_window_admits_the_shape():
+    m, n, k = _admitted_shape()
+    runner = gemm_base._tinygemm_bf16_gemm_runner()
+    a, w, out = _tensors(m, n, k)
+    assert runner.get_valid_tactics(_runner_inputs(a, w, out), None) == [0, 1]
+    a, w, out = _tensors(*_PLAIN)
+    assert runner.get_valid_tactics(_runner_inputs(a, w, out), None) == [0]
+
+
+def test_cake_tactic_matches_the_reference_bit_for_bit(cake_launches):
+    m, n, k = _admitted_shape()
+    runner = gemm_base._tinygemm_bf16_gemm_runner()
+    a, w, out = _tensors(m, n, k)
+    inputs = _runner_inputs(a, w, out)
+    reference = runner(inputs, tactic=0).clone()
+    assert not cake_launches
+    cake = runner(inputs, tactic=1).clone()
+    assert len(cake_launches) == 1
+    assert torch.equal(cake, reference)
+    torch.testing.assert_close(
+        reference, (a.float() @ w.float().T).to(torch.bfloat16), rtol=2e-2, atol=5e-2
+    )
+
+
+def test_cake_tactic_falls_back_to_the_reference_outside_every_window(cake_launches):
+    runner = gemm_base._tinygemm_bf16_gemm_runner()
+    a, w, out = _tensors(*_PLAIN)
+    inputs = _runner_inputs(a, w, out)
+    reference = runner(inputs, tactic=0).clone()
+    assert torch.equal(runner(inputs, tactic=1), reference)
+    assert not cake_launches
+
+
+@pytest.mark.parametrize("cake_wins", [False, True])
+def test_mm_bf16_tinygemm_autotune_launches_the_faster_tactic(
+    monkeypatch, cake_launches, cake_wins
+):
+    m, n, k = _admitted_shape()
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    profiled = []
+
+    def fake_profile(self, runner, inputs, tactic, *args, **kwargs):
+        profiled.append(tactic)
+        return 1.0 if (tactic == 1) == cake_wins else 2.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    a, w, _ = _tensors(m, n, k)
+    with autotune(True, tuning_buckets=[m]):
+        mm_bf16(a, w.T, backend="tinygemm")
+    assert sorted(profiled) == [0, 1]
+
+    cake_launches.clear()
+    out = mm_bf16(a, w.T, backend="tinygemm")
+    assert bool(cake_launches) == cake_wins
+    torch.testing.assert_close(
+        out, (a.float() @ w.float().T).to(torch.bfloat16), rtol=2e-2, atol=5e-2
+    )
+
+
+def test_cake_only_runner_offers_only_the_cake_tactic(cake_launches):
+    m, n, k = _admitted_shape()
+    runner = gemm_base._tinygemm_bf16_gemm_runner(cake_only=True)
+    assert runner is not gemm_base._tinygemm_bf16_gemm_runner()
+    assert runner.cake_only and not gemm_base._tinygemm_bf16_gemm_runner().cake_only
+    a, w, out = _tensors(m, n, k)
+    inputs = _runner_inputs(a, w, out)
+    assert runner.get_valid_tactics(inputs, None) == [1]
+    # The tuned entries of the default runner and of the cake-only one never share a key.
+    default_extras = gemm_base._tinygemm_bf16_gemm_runner().get_cache_key_extras(inputs)
+    assert runner.get_cache_key_extras(inputs) != default_extras
+
+    # A shape no window admits has no tactic, and an untuned call still runs the reference.
+    a, w, out = _tensors(*_PLAIN)
+    inputs = _runner_inputs(a, w, out)
+    assert runner.get_valid_tactics(inputs, None) == []
+    reference = gemm_base._tinygemm_bf16_gemm_runner()(inputs, tactic=0).clone()
+    assert torch.equal(runner(inputs, tactic=-1), reference)
+    assert not cake_launches

@@ -202,6 +202,12 @@ from .jit.cake_grouped_mxfp8_quantize import (
 from .jit.cake_bf16_bmm_swap_ab import (
     aot_specs as gen_cake_bf16_bmm_swap_ab_aot_modules,
 )
+from .jit.cake_tinygemm2_tcgen05 import (
+    aot_specs as gen_cake_tinygemm2_tcgen05_aot_modules,
+)
+from .jit.cake_tinygemm2_wgmma import (
+    aot_specs as gen_cake_tinygemm2_wgmma_aot_modules,
+)
 from .jit.cake_vsa_sm120 import (
     aot_specs as gen_cake_vsa_sm120_aot_modules,
 )
@@ -1083,6 +1089,17 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
         if has_sm120f:
             jit_specs.append(gen_fp4_quantization_sm120f_module())
+
+    # Cake tinygemm2 kernels of tinygemm_bf16 and of the mm_bf16 TinyGEMM tactic:
+    # exact-target builds, one module per (kernel, target).
+    if has_sm90:
+        jit_specs.extend(gen_cake_tinygemm2_wgmma_aot_modules("sm_90a"))
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_103a"))
+    if has_sm107a_exact:
+        jit_specs.extend(gen_cake_tinygemm2_tcgen05_aot_modules("sm_107a"))
 
     if add_comm:
         from .jit.comm import (

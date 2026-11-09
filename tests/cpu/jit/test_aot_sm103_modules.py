@@ -57,7 +57,7 @@ SM103_ONLY_MODULES = {
 }
 
 
-def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
+def _registered_generators(monkeypatch, sm_capabilities, overrides=None, add_comm=True):
     """Run gen_all_modules with every module generator stubbed to its own name."""
     from flashinfer import aot
     from flashinfer.jit import comm as jit_comm
@@ -88,7 +88,7 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
         [False],  # XQA iterates over the sliding-window options.
         [],
         sm_capabilities,
-        True,
+        add_comm,
         False,
         False,
         True,
@@ -133,6 +133,51 @@ def test_combined_build_registers_both_variants(monkeypatch):
     )
 
     assert registered >= SM103_SHARED_MODULES | SM100_ONLY_MODULES | SM103_ONLY_MODULES
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("add_comm", [True, False])
+@pytest.mark.parametrize(
+    ("sm_capabilities", "tcgen05_targets", "wgmma_targets"),
+    [
+        ({"sm90": True}, [], ["sm_90a"]),
+        ({"sm100": True, "sm100a_exact": True}, ["sm_100a"], []),
+        ({"sm103": True, "sm103a_exact": True}, ["sm_103a"], []),
+        ({"sm107": True, "sm107a_exact": True}, ["sm_107a"], []),
+        (
+            {"sm100a_exact": True, "sm103a_exact": True, "sm107a_exact": True},
+            ["sm_100a", "sm_103a", "sm_107a"],
+            [],
+        ),
+        ({"sm120": True}, [], []),
+    ],
+    ids=["sm90a", "sm100a", "sm103a", "sm107a", "sm10x", "sm120"],
+)
+def test_cake_tinygemm2_kernels_are_prebuilt_for_each_exact_target(
+    monkeypatch, sm_capabilities, tcgen05_targets, wgmma_targets, add_comm
+):
+    tcgen05, wgmma = [], []
+
+    def gen_tcgen05(target):
+        tcgen05.append(target)
+        return [SimpleNamespace(name=f"cake_tinygemm2_tcgen05_{target}")]
+
+    def gen_wgmma(target):
+        wgmma.append(target)
+        return [SimpleNamespace(name=f"cake_tinygemm2_wgmma_{target}")]
+
+    _registered_generators(
+        monkeypatch,
+        sm_capabilities,
+        {
+            "gen_cake_tinygemm2_tcgen05_aot_modules": gen_tcgen05,
+            "gen_cake_tinygemm2_wgmma_aot_modules": gen_wgmma,
+        },
+        add_comm=add_comm,
+    )
+
+    assert tcgen05 == tcgen05_targets
+    assert wgmma == wgmma_targets
 
 
 @pytest.mark.cpu_only
