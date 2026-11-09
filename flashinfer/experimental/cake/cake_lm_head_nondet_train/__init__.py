@@ -17,8 +17,8 @@ limitations under the License.
 # Experimental Cake backend of ``flashinfer.cake_lm_head_nondet_train``:
 # chunked large-vocabulary LM-head projection + log-sum-exp / cross-entropy /
 # policy-gradient loss with a memory-bounded backward for training on
-# SM100 / SM103 / SM107, whose dX GEMM combines its K-slice partials in an unordered
-# FP32 reduction.  The public entry points are the module's
+# SM100 / SM103 / SM107, whose dX GEMM stores its K-slice partials into an FP32 slab
+# that a slab sum adds in slice order.  The public entry points are the module's
 # ``cake_lm_head_nondet_train_loss``, ``cake_lm_head_nondet_train_logprob``,
 # ``cake_lm_head_nondet_train_preload`` and the candidate-support entries
 # ``cake_lm_head_nondet_train_support_logprob`` /

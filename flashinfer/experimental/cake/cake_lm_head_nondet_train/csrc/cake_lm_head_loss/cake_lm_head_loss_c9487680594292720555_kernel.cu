@@ -135,6 +135,15 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
 
 
 
+__device__ __forceinline__ void tma_store_2d(
+    const void *tmap, int x, int y, unsigned smem_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+        " [%0, {%1, %2}], [%3];"
+        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
+}
+
+
 __device__ __forceinline__ void tma_reduce_add_2d(
     const void* tmap, int x, int y, unsigned smem_addr) {
     asm volatile(
@@ -162,7 +171,7 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(224) void
-kernel_cake_lm_head_loss_8fac37f18451d7ab7f8c(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int M, int m_tiles, int k_iters, int ldc, int k_slices, int k_slice_iters, int group_m)
+kernel_cake_lm_head_loss_c9487680594292720555(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int M, int m_tiles, int k_iters, int ldc, int k_slices, int k_slice_iters, int group_m, const __grid_constant__ CUtensorMap SLAB, int* __restrict__ CNT)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -314,6 +323,9 @@ kernel_cake_lm_head_loss_8fac37f18451d7ab7f8c(const __grid_constant__ CUtensorMa
                     int ld_pairs = (int)cluster_size >> 1;
                     int ld_k_base = it_slice * k_slice_iters;
                     int ld_k_count = ((it_slice < k_slices - 1) ? k_slice_iters : k_iters - (k_slices - 1) * k_slice_iters);
+                    int live_rows = CNT[0];
+                    int live = (((bid_m >> 1) * 256 < live_rows) ? ld_k_count : 0);
+                    ld_k_count = live;
                     #pragma unroll 1
                     for (int ld_k = 0; ld_k < ld_k_count; ld_k++) {
                         mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
@@ -426,6 +438,9 @@ kernel_cake_lm_head_loss_8fac37f18451d7ab7f8c(const __grid_constant__ CUtensorMa
                     int bid_m_1 = first_m_1 + local_1 % group_size_1;
                     int bid_n_1 = local_1 / group_size_1;
                     int mm_k_last = ((it_slice_1 < k_slices - 1) ? k_slice_iters : k_iters - (k_slices - 1) * k_slice_iters);
+                    int live_rows_1 = CNT[0];
+                    int live_1 = (((bid_m_1 >> 1) * 256 < live_rows_1) ? mm_k_last : 0);
+                    mm_k_last = live_1;
                     mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
                     #pragma unroll 1
                     for (int mm_k = 0; mm_k < mm_k_last; mm_k++) {
@@ -590,8 +605,11 @@ kernel_cake_lm_head_loss_8fac37f18451d7ab7f8c(const __grid_constant__ CUtensorMa
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int ep_lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + epi_stage * 256;
                 int ep_off_n = (bid_n_2 * 2 + it_sub_2) * 256;
+                int live_rows_2 = CNT[0];
+                int live_2 = (((bid_m_2 >> 1) * 256 < live_rows_2) ? 8 : 0);
+                int ep_nbox = live_2;
                 #pragma unroll 1
-                for (int boxx = 0; boxx < 8; boxx++) {
+                for (int boxx = 0; boxx < ep_nbox; boxx++) {
                     int stage_row = box_stage * 128 + (unsigned int)local_row;
                     int staging = smem_epi_addr + box_stage * 16384;
                     if (warp == 2) {
@@ -618,7 +636,11 @@ kernel_cake_lm_head_loss_8fac37f18451d7ab7f8c(const __grid_constant__ CUtensorMa
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (warp == 2) {
                         if (elect_sync()) {
-                            tma_reduce_add_2d((&C), ep_off_n + boxx * 32, bid_m_2 * 128, staging);
+                            if (k_slices > 1) {
+                                tma_store_2d((&SLAB), ep_off_n + boxx * 32, it_slice_2 * (m_tiles * 128) + bid_m_2 * 128, staging);
+                            } else {
+                                tma_reduce_add_2d((&C), ep_off_n + boxx * 32, it_slice_2 * (m_tiles * 128) + bid_m_2 * 128, staging);
+                            }
                             asm volatile("cp.async.bulk.commit_group;");
                         }
                     }

@@ -130,6 +130,15 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
 
 
 
+__device__ __forceinline__ void tma_store_2d(
+    const void *tmap, int x, int y, unsigned smem_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+        " [%0, {%1, %2}], [%3];"
+        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
+}
+
+
 __device__ __forceinline__ void tma_reduce_add_2d(
     const void* tmap, int x, int y, unsigned smem_addr) {
     asm volatile(
@@ -157,7 +166,7 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(224) __cluster_dims__(2,1,1) void
-kernel_cake_lm_head_loss_215e839696749bfb9433(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int M, int m_tiles, int k_iters, int ldc, int k_slices, int k_slice_iters, int group_m, int* __restrict__ CNT)
+kernel_cake_lm_head_loss_ad0993452ea5a81f182e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, int M, int m_tiles, int k_iters, int ldc, int k_slices, int k_slice_iters, int group_m, const __grid_constant__ CUtensorMap SLAB, int* __restrict__ CNT)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -174,13 +183,13 @@ kernel_cake_lm_head_loss_215e839696749bfb9433(const __grid_constant__ CUtensorMa
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
-    #define mma_done_addr (mbar_base + 24)
-    #define mainloop_done_addr (mbar_base + 48)
-    #define epilogue_done_addr (mbar_base + 56)
-    #define clc_full_addr (mbar_base + 64)
-    #define clc_empty_addr (mbar_base + 80)
-    #define thr_full_addr (mbar_base + 96)
-    #define thr_empty_addr (mbar_base + 112)
+    #define mma_done_addr (mbar_base + 32)
+    #define mainloop_done_addr (mbar_base + 64)
+    #define epilogue_done_addr (mbar_base + 72)
+    #define clc_full_addr (mbar_base + 80)
+    #define clc_empty_addr (mbar_base + 96)
+    #define thr_full_addr (mbar_base + 112)
+    #define thr_empty_addr (mbar_base + 128)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -198,44 +207,46 @@ kernel_cake_lm_head_loss_215e839696749bfb9433(const __grid_constant__ CUtensorMa
     const int ring_mn_addr = smem + 17408;
     __nv_bfloat16* ring_mn_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
     const int ring_mn_addr_0 = smem + 33792;
-    float* smem_epi = reinterpret_cast<float*>(smem_raw + 148480);
-    const int smem_epi_addr = smem + 148480;
-    unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 181248);
-    const int clc_resp_addr = smem + 181248;
+    float* smem_epi = reinterpret_cast<float*>(smem_raw + 197632);
+    const int smem_epi_addr = smem + 197632;
+    unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 230400);
+    const int clc_resp_addr = smem + 230400;
 
-    // Mbarrier init (16 barriers at smem_raw[0..128))
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // tma_full: 3 barriers, init_count=2
+            // tma_full: 4 barriers, init_count=2
             mbarrier_init(smem + 0, 2);
             mbarrier_init(smem + 8, 2);
             mbarrier_init(smem + 16, 2);
-            // mma_done: 3 barriers, init_count=1
-            mbarrier_init(smem + 24, 1);
+            mbarrier_init(smem + 24, 2);
+            // mma_done: 4 barriers, init_count=1
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 40, 1);
+            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 56, 1);
             // --- pipeline 'mainloop_pipe' ---
             // mainloop_done: 1 barriers, init_count=1
-            mbarrier_init(smem + 48, 1);
+            mbarrier_init(smem + 64, 1);
             // epilogue_done: 1 barriers, init_count=8
-            mbarrier_init(smem + 56, 8);
+            mbarrier_init(smem + 72, 8);
             // --- pipeline 'clc_pipe' ---
             // clc_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 64, 1);
-            mbarrier_init(smem + 72, 1);
+            mbarrier_init(smem + 80, 1);
+            mbarrier_init(smem + 88, 1);
             // clc_empty: 2 barriers, init_count=416
-            mbarrier_init(smem + 80, 416);
-            mbarrier_init(smem + 88, 416);
+            mbarrier_init(smem + 96, 416);
+            mbarrier_init(smem + 104, 416);
             // --- pipeline 'thr_pipe' ---
             // thr_full: 2 barriers, init_count=32
-            mbarrier_init(smem + 96, 32);
-            mbarrier_init(smem + 104, 32);
-            // thr_empty: 2 barriers, init_count=32
             mbarrier_init(smem + 112, 32);
             mbarrier_init(smem + 120, 32);
+            // thr_empty: 2 barriers, init_count=32
+            mbarrier_init(smem + 128, 32);
+            mbarrier_init(smem + 136, 32);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -245,9 +256,9 @@ kernel_cake_lm_head_loss_215e839696749bfb9433(const __grid_constant__ CUtensorMa
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 128);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 144);
     if (warp == 0) {
-        int _tmem_hold = smem + 128;
+        int _tmem_hold = smem + 144;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -320,7 +331,7 @@ kernel_cake_lm_head_loss_215e839696749bfb9433(const __grid_constant__ CUtensorMa
                                 :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                         }
                         load_stage += 1;
-                        if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
+                        if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
                     }
                 }
                 mbarrier_wait(clc_full_addr + (load_clc_stage) * 8, _phase_clc_full);
@@ -365,10 +376,10 @@ kernel_cake_lm_head_loss_215e839696749bfb9433(const __grid_constant__ CUtensorMa
             }
             if (elect_sync()) {
                 #pragma unroll 1
-                for (int _ = 0; _ < 3; _++) {
+                for (int _ = 0; _ < 4; _++) {
                     mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                     load_stage += 1;
-                    if (load_stage == 3) { load_stage = 0; _phase_mma_done ^= 1; }
+                    if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
                 }
             }
         }
@@ -494,7 +505,7 @@ kernel_cake_lm_head_loss_215e839696749bfb9433(const __grid_constant__ CUtensorMa
                         }
                         elect_commit_cg2_multicast(mma_done_addr + (mma_tma_stage) * 8, (uint16_t)(3));
                         mma_tma_stage += 1;
-                        if (mma_tma_stage == 3) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
+                        if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                     }
                     elect_commit_cg2_multicast(mainloop_done_addr, (uint16_t)(3));
                     _phase_epilogue_done ^= 1;
@@ -639,7 +650,11 @@ kernel_cake_lm_head_loss_215e839696749bfb9433(const __grid_constant__ CUtensorMa
                     asm volatile("barrier.sync 8, 128;" ::: "memory");
                     if (warp == 2) {
                         if (elect_sync()) {
-                            tma_reduce_add_2d((&C), ep_off_n + boxx * 32, bid_m_2 * 128, staging);
+                            if (k_slices > 1) {
+                                tma_store_2d((&SLAB), ep_off_n + boxx * 32, it_slice_2 * (m_tiles * 128) + bid_m_2 * 128, staging);
+                            } else {
+                                tma_reduce_add_2d((&C), ep_off_n + boxx * 32, it_slice_2 * (m_tiles * 128) + bid_m_2 * 128, staging);
+                            }
                             asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
