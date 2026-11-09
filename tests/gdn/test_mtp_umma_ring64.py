@@ -29,9 +29,7 @@ import torch.nn.functional as F
 
 DEV = "cuda"
 H, HV, K, V = 16, 64, 128, 128
-W = int(
-    os.environ.get("GDN_MTP_UMMA_W_RING", "32")
-)  # window capacity class of the build under test (32 / 48 / 64)
+W = 32  # window capacity (W_RING) of the kernel under test
 RING = (
     64  # RING_SLOTS = 64 ring; see flashinfer/gdn_kernels/gdn_replay_mtp_umma_ring64.py
 )
@@ -59,20 +57,6 @@ def _default_fm(T):
 def _p_max(T):
     """Deepest live window a call may see: nu = min(W, RING - T) (= W at W < RING)."""
     return min(W, RING - T)
-
-
-def _umma_imports():
-    from flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 import W_RING, W_CHUNK
-
-    return W_RING, W_CHUNK
-
-
-def _skip_if_vf_unsupported():
-    w_ring, w_chunk = _umma_imports()
-    if w_ring > w_chunk:
-        pytest.skip(
-            f"unf_vf (vf=True) is not implemented for W_RING ({w_ring}) > W_CHUNK ({w_chunk})"
-        )
 
 
 SCALE = 1.0 / math.sqrt(K)
@@ -405,9 +389,8 @@ def test_heads_per_cta(T, hpc):
 
 @pytest.mark.parametrize("T", [4, 8])
 def test_launch_policy_is_bit_identical(T):
-    """heads_per_cta (grid split) and min_blocks_per_mp (register cap) only change how the
-    kernel is launched: outputs, committed state and every ring must stay bit-identical to
-    the default launch."""
+    """heads_per_cta (grid split) only changes how the kernel is launched: outputs, committed
+    state and every ring must stay bit-identical to the default launch."""
     _skip_if_not_sm100()
     import functools
 
@@ -425,11 +408,9 @@ def test_launch_policy_is_bit_identical(T):
 
     ref = run()
     for kw in (
-        dict(min_blocks_per_mp=3),
-        dict(min_blocks_per_mp=4),
-        dict(heads_per_cta=2, min_blocks_per_mp=4),
         dict(heads_per_cta=1),
-        dict(heads_per_cta=4, min_blocks_per_mp=4),
+        dict(heads_per_cta=2),
+        dict(heads_per_cta=4),
     ):
         for name, x, y_ in zip(
             ("y", "state", "k", "u", "g"), ref, run(**kw), strict=False
@@ -441,54 +422,23 @@ def test_launch_policy_is_bit_identical(T):
             ), (kw, name)
 
 
-@pytest.mark.parametrize("minb", [1, 2, 5])
-def test_min_blocks_per_mp_rejects_out_of_range(minb):
-    """5: TMEM holds at most 4 CTAs per SM. 1 and 2: the two warpgroups re-split a launch cap of 64 (4 CTAs/SM)
-    or 80 (3) registers per thread with setmaxnreg, so a larger cap would have the consumers "increase" to
-    96 registers below their launch count."""
-    _skip_if_not_sm100()
-    import functools
-
-    with pytest.raises(AssertionError):
-        _run(
-            functools.partial(_umma(), min_blocks_per_mp=minb),
-            _make_case(2, 4, [0, 1], 1, [0, 0]),
-            _fm_max(4),
-        )
-
-
 def test_auto_heads_per_cta_policy(monkeypatch):
-    """The W=16 policy (4 CTAs/SM, 8 waves) is unchanged; the module's own policy follows the
-    CTAs/SM its shared memory allows (4 at W_RING = 32 after the smem diet) and its measured
-    crossovers."""
+    """The policy follows the 4 CTAs/SM the shared memory allows and its measured crossovers
+    (3 waves of the hpc = 2 grid); a 16-row-window build (8 waves) keeps its own table."""
     import flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 as m
 
-    monkeypatch.setattr(m, "_CTA_SLOTS_PER_SM", 4)
+    assert m._SMEM_CTAS_PER_SM == 4
+    for T in (4, 8):
+        assert [
+            m.auto_heads_per_cta(b, 16, 148, T)
+            for b in (1, 9, 10, 55, 56, 64, 74, 128, 512)
+        ] == [1, 1, 2, 2, 4, 4, 4, 4, 4]
+    assert m.auto_heads_per_cta(100, 16, 148) == m.auto_heads_per_cta(100, 16, 148, 4)
     monkeypatch.setattr(m, "_HPC2_MAX_WAVES", 8)
-    monkeypatch.setattr(m, "_HPC2_MAX_WAVES_T8", 8)
     for T in (1, 4, 8):
         assert [
             m.auto_heads_per_cta(b, 16, 148, T) for b in (1, 9, 10, 148, 149, 512)
         ] == [1, 1, 2, 2, 4, 4]
-    monkeypatch.undo()
-    assert m._SMEM_CTAS_PER_SM == (4 if m.W_RING <= 32 else 3)
-    assert m._MINB == int(os.environ.get("GDN_MTP_UMMA_MINB", m._SMEM_CTAS_PER_SM))
-    if m.W_RING == 32:
-        for T in (4, 8):
-            assert [
-                m.auto_heads_per_cta(b, 16, 148, T)
-                for b in (1, 9, 10, 55, 56, 64, 74, 128, 512)
-            ] == [1, 1, 2, 2, 4, 4, 4, 4, 4]
-        assert m.auto_heads_per_cta(100, 16, 148) == m.auto_heads_per_cta(
-            100, 16, 148, 4
-        )
-    if m.W_RING > 32:
-        # 3 CTAs/SM (66.8 KB of shared memory at W_RING = 48, 74.8 KB at 64): 444 CTA slots on 148 SMs; hpc = 1 while
-        # B * 64 <= 444 (B <= 6), hpc = 2 while B * 32 <= 3 * 444 (B <= 41), else 4 (the W = 32 waves rule, unmeasured here)
-        for T in (4, 8):
-            assert [
-                m.auto_heads_per_cta(b, 16, 148, T) for b in (1, 6, 7, 41, 42, 64, 512)
-            ] == [1, 1, 2, 2, 4, 4, 4]
 
 
 def test_full_window_flush_P16_and_T1():
@@ -846,259 +796,6 @@ def test_multistep_partial_acceptance_wraps_the_ring(T):
     )
 
 
-@pytest.mark.parametrize("T", [4, 8])
-def test_parity_with_flashinfer_fp16_state(T):
-    """Same inputs through FlashInfer's gated_delta_rule_mtp_ucache_flush (fp16_state arm)."""
-    _skip_if_not_sm100()
-    w_ring, _ = _umma_imports()
-    from flashinfer.gdn_kernels.gdn_decode_bf16_wy_ucache_flush import (
-        W_RING as _HMMA_W_RING,
-    )
-
-    if w_ring != _HMMA_W_RING:
-        pytest.skip(
-            f"UMMA W_RING ({w_ring}) != HMMA reference W_RING ({_HMMA_W_RING}); "
-            "the two kernels no longer implement the same window contract"
-        )
-    fi = _flashinfer_fp16_state().gated_delta_rule_mtp_ucache_flush
-    fm = _fm_max(T)
-    hist = [fm - 1, fm, fm, 3, 0, fm - 1, fm, 1]
-    bases = [0, 28, 5, 30, 17, 31, 2, 9]
-    c1 = _make_case(8, T, hist, seed=21, bases=bases, poison=False)
-    c2 = [x.clone() for x in c1]
-    y1 = _run(_umma(), c1, fm)
-    y2 = _run(fi, c2, fm)
-    torch.cuda.synchronize()
-    dy = (y1.float() - y2.float()).abs().max().item()
-    dS = (c1[7].float() - c2[7].float()).abs().max().item()
-    du = (c1[9].float() - c2[9].float()).abs().max().item()
-    dg = (c1[10] - c2[10]).abs().max().item()
-    assert dy < Y_TOL and dS < STATE_TOL and du < 2 * U_TOL and dg < 1e-4, (
-        dy,
-        dS,
-        du,
-        dg,
-    )
-
-
-# ---------------------------------------------------------------------------
-# unf_vf: the flush re-solves the window's corrections from the v / beta rings against S0.
-# Its inputs must be CONSISTENT: rings produced by actually running the P history tokens
-# through the recurrence from the checkpoint (then stored u == re-solved u up to rounding).
-# ---------------------------------------------------------------------------
-def _make_consistent_case(B, T, hist_lens, seed, bases):
-    f = torch.float32
-    g = torch.Generator(device=DEV).manual_seed(seed)
-    case = list(_make_case(B, T, [0] * B, seed, bases, poison=True))
-    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
-    vc = torch.full((B, HV, RING, V), float("nan"), dtype=torch.bfloat16, device=DEV)
-    bc = torch.full((B, HV, RING), float("nan"), dtype=f, device=DEV)
-    grp = HV // H
-    for r in range(B):
-        P = hist_lens[r]
-        S = pool[r].to(f).clone()
-        gam = torch.zeros(HV, dtype=f, device=DEV)
-        for j in range(P):
-            slot = (bases[r] + j) % RING
-            kj = F.normalize(
-                torch.randn(H, K, generator=g, device=DEV), dim=-1
-            ).bfloat16()
-            vj = (torch.randn(HV, V, generator=g, device=DEV) * 0.5).bfloat16()
-            aj = (torch.randn(HV, generator=g, device=DEV) * 0.5).bfloat16()
-            bj = torch.randn(HV, generator=g, device=DEV).bfloat16()
-            la = -torch.exp(A_log.to(f)) * F.softplus(aj.to(f) + dt_bias.to(f))
-            beta = torch.sigmoid(bj.to(f))
-            k_hv = kj.to(f).repeat_interleave(grp, dim=0)
-            S = S * torch.exp(la)[:, None, None]
-            u = (vj.to(f) - torch.einsum("hvk,hk->hv", S, k_hv)) * beta[:, None]
-            S = S + u[:, :, None] * k_hv[:, None, :]
-            gam = gam + la
-            kc[r, :, slot] = kj
-            uc[r, :, slot] = u.bfloat16()
-            gc[r, :, slot] = gam
-            vc[r, :, slot] = vj
-            bc[r, :, slot] = beta
-        hl[r] = P
-    return case, vc, bc
-
-
-@pytest.mark.parametrize("T", [1, 4, 8])
-@pytest.mark.parametrize("poison_u", [False, True])
-def test_vf_matches_reference_and_ignores_u_on_flush(T, poison_u):
-    """unf_vf against the fp32 oracle on consistent histories; with poison_u the u-ring
-    windows of the FLUSH rows are NaN — the re-solve must not read them."""
-    _skip_if_not_sm100()
-    _skip_if_vf_unsupported()
-    fn = _umma()
-    fm = _fm_max(T)
-    hist = [fm, fm - 1, W, 2, fm, 0, fm - 1, min(W, fm + 1)]
-    bases = [28, 5, 30, 17, 0, 9, 31, 20]
-    B = len(hist)
-    case, vc, bc = _make_consistent_case(B, T, hist, seed=40 + T, bases=bases)
-    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
-    pool0, kc0, uc0, gc0 = pool.clone(), kc.clone(), uc.clone(), gc.clone()
-    if poison_u:
-        for r in range(B):
-            if hist[r] >= fm:
-                for j in range(hist[r]):
-                    uc[r, :, (bases[r] + j) % RING] = float("nan")
-    y = fn(
-        A_log,
-        a,
-        dt_bias,
-        q=q,
-        k=k,
-        v=v,
-        b=b,
-        initial_state_source=pool,
-        initial_state_indices=idx,
-        k_cache=kc,
-        u_cache=uc,
-        g_cache=gc,
-        hist_len=hl,
-        cache_base=cb,
-        scale=SCALE,
-        flush_min=fm,
-        restart_hist_on_flush=False,
-        v_cache=vc,
-        beta_cache=bc,
-    )
-    torch.cuda.synchronize()
-    ey = es = 0.0
-    for r in range(B):
-        P = hist[r]
-        kc_l, uc_l, gc_l = _logical(kc0[r], uc0[r], gc0[r], bases[r])
-        y_ref, S_ref, _, _, gam = _ref_fp32(
-            q[r], k[r], v[r], a[r], b[r], A_log, dt_bias, pool0[r], kc_l, uc_l, gc_l, P
-        )
-        ey = max(ey, (y[r].float() - y_ref).abs().max().item())
-        if P >= fm:
-            es = max(es, (pool[r].float() - S_ref).abs().max().item())
-        app = [(bases[r] + P + s) % RING for s in range(T)]
-        # v / beta ring appends
-        assert torch.equal(vc[r][:, app], v[r].transpose(0, 1)), f"row {r}: v append"
-        beta = torch.sigmoid(b[r].float()).transpose(0, 1)
-        assert (bc[r][:, app] - beta).abs().max().item() < 1e-5, f"row {r}: beta append"
-    assert ey < Y_TOL and es < STATE_TOL, (ey, es)
-
-
-@pytest.mark.parametrize("T", [4, 8])
-def test_uf_vf_agree_on_consistent_histories(T):
-    _skip_if_not_sm100()
-    _skip_if_vf_unsupported()
-    fn = _umma()
-    fm = _fm_max(T)
-    hist = [fm, fm - 1, W, fm, 3, fm + 1 if fm < W else W]
-    bases = [3, 30, 12, 27, 0, 22]
-    outs = {}
-    for mode in ("uf", "vf"):
-        case, vc, bc = _make_consistent_case(len(hist), T, hist, seed=77, bases=bases)
-        q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
-        extra = dict(v_cache=vc, beta_cache=bc) if mode == "vf" else {}
-        y = fn(
-            A_log,
-            a,
-            dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            initial_state_source=pool,
-            initial_state_indices=idx,
-            k_cache=kc,
-            u_cache=uc,
-            g_cache=gc,
-            hist_len=hl,
-            cache_base=cb,
-            scale=SCALE,
-            flush_min=fm,
-            restart_hist_on_flush=False,
-            **extra,
-        )
-        torch.cuda.synchronize()
-        outs[mode] = (y.float(), pool.float())
-    dy = (outs["uf"][0] - outs["vf"][0]).abs().max().item()
-    dS = (outs["uf"][1] - outs["vf"][1]).abs().max().item()
-    assert dy < Y_TOL and dS < STATE_TOL, (dy, dS)
-
-
-@pytest.mark.parametrize("T", [4, 8])
-def test_vf_multistep_horizon_with_commits(T):
-    """24 steps of unf_vf with cursor commits against a token-by-token fp32 recurrence:
-    every flush re-solves from the v / beta rings the kernel itself appended."""
-    _skip_if_not_sm100()
-    _skip_if_vf_unsupported()
-    fn = _umma()
-    B = 4
-    fm = _fm_max(T)
-    g = torch.Generator(device=DEV).manual_seed(6)
-    case = _make_case(B, T, [0] * B, seed=6, bases=[0, 9, 30, 17])
-    _, _, _, _, _, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
-    vc = torch.zeros(B, HV, RING, V, dtype=torch.bfloat16, device=DEV)
-    bc = torch.zeros(B, HV, RING, dtype=torch.float32, device=DEV)
-    S_true = pool.float().clone()
-    worst = 0.0
-    for _step in range(24):
-        q = torch.randn(B, T, H, K, generator=g, device=DEV).bfloat16()
-        k = torch.randn(B, T, H, K, generator=g, device=DEV).bfloat16()
-        v = (torch.randn(B, T, HV, V, generator=g, device=DEV) * 0.5).bfloat16()
-        a = (torch.randn(B, T, HV, generator=g, device=DEV) * 0.5).bfloat16()
-        b = torch.randn(B, T, HV, generator=g, device=DEV).bfloat16()
-        y = fn(
-            A_log,
-            a,
-            dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            b=b,
-            initial_state_source=pool,
-            initial_state_indices=idx,
-            k_cache=kc,
-            u_cache=uc,
-            g_cache=gc,
-            hist_len=hl,
-            cache_base=cb,
-            scale=SCALE,
-            flush_min=fm,
-            restart_hist_on_flush=True,
-            v_cache=vc,
-            beta_cache=bc,
-        )
-        hl.add_(T)
-        torch.cuda.synchronize()
-        for r in range(B):
-            ref_y, _, _, _, _ = _ref_fp32(
-                q[r],
-                k[r],
-                v[r],
-                a[r],
-                b[r],
-                A_log,
-                dt_bias,
-                S_true[r],
-                kc[r],
-                uc[r],
-                gc[r],
-                0,
-            )
-            assert torch.isfinite(y[r].float()).all(), f"row {r}: non-finite y"
-            worst = max(worst, (y[r].float() - ref_y).abs().max().item())
-            khat = F.normalize(k[r].float(), dim=-1)
-            for t in range(T):
-                la = -torch.exp(A_log.float()) * F.softplus(
-                    a[r, t].float() + dt_bias.float()
-                )
-                beta = torch.sigmoid(b[r, t].float())
-                k_hv = khat[t].repeat_interleave(HV // H, dim=0)
-                S = S_true[r] * torch.exp(la)[:, None, None]
-                u = (v[r, t].float() - torch.einsum("hvk,hk->hv", S, k_hv)) * beta[
-                    :, None
-                ]
-                S_true[r] = S + u[:, :, None] * k_hv[:, None, :]
-    assert worst < 2 * Y_TOL, f"vf multi-step |y - fp32 truth| = {worst:.2e}"
-
-
 # --------------------------------------------------------------------------- stochastic rounding
 _PHILOX = (
     0xD2511F53,
@@ -1177,7 +874,7 @@ def _lcg_noise13(seed, sidx):
     return torch.from_numpy(pairs.reshape(HV, V, K).astype(np.int32))
 
 
-def _sr_case(T, vf, seed):
+def _sr_case(T, seed):
     fm = _fm_max(T)
     hist = [
         fm,
@@ -1188,19 +885,13 @@ def _sr_case(T, vf, seed):
         fm,
     ]  # fm is the per-call-safe max P (not W: P + T <= RING)
     bases = [28 * RS, 5 * RS, 30 * RS, 17 * RS, 9 * RS, 0]
-    if vf:
-        case, vc, bc = _make_consistent_case(len(hist), T, hist, seed=seed, bases=bases)
-        extra = dict(v_cache=vc, beta_cache=bc)
-    else:
-        case, extra = _make_case(len(hist), T, hist, seed, bases), {}
-    return case, extra, hist, fm
+    return _make_case(len(hist), T, hist, seed, bases), hist, fm
 
 
-def _sr_call(case, extra, fm, **kw):
+def _sr_call(case, fm, **kw):
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = [
         x.clone() if isinstance(x, torch.Tensor) else x for x in case
     ]
-    ex = {n: t.clone() for n, t in extra.items()}
     y = _umma()(
         A_log,
         a,
@@ -1219,18 +910,16 @@ def _sr_call(case, extra, fm, **kw):
         scale=SCALE,
         flush_min=fm,
         restart_hist_on_flush=False,
-        **ex,
         **kw,
     )
     torch.cuda.synchronize()
-    return y, pool, (kc, uc, gc, *ex.values())
+    return y, pool, (kc, uc, gc)
 
 
 @pytest.mark.parametrize("T", [1, 4, 8])
-@pytest.mark.parametrize("vf", [False, True])
 @pytest.mark.parametrize("mode", ["philox10", "philox5", "lcg"])
 @pytest.mark.parametrize("hpc", [1, 4])
-def test_stochastic_rounding_matches_reference_bits(T, vf, mode, hpc):
+def test_stochastic_rounding_matches_reference_bits(T, mode, hpc):
     """SR only changes how the flushed fp16 state is rounded: outputs and rings are
     bit-identical to round-to-nearest, verify rows keep their state, every flushed element
     is RN or its neighbour, and each rounding direction agrees with the reference noise
@@ -1240,9 +929,7 @@ def test_stochastic_rounding_matches_reference_bits(T, vf, mode, hpc):
     violate that, which proves the check can fail. hpc 1 and 4 cover both RMW group sizes
     (16 / 32 TMEM columns)."""
     _skip_if_not_sm100()
-    if vf:
-        _skip_if_vf_unsupported()
-    case, extra, hist, fm = _sr_case(T, vf, seed=70 + T)
+    case, hist, fm = _sr_case(T, seed=70 + T)
     seed = 0x1234_5678_9ABC_DEF1 + T
     if mode == "lcg":
         kw = dict(stochastic_rounding="lcg")
@@ -1255,10 +942,9 @@ def test_stochastic_rounding_matches_reference_bits(T, vf, mode, hpc):
             return _philox_noise13(sd, sidx, rounds)
 
     pool0 = case[7].clone()
-    y_rn, s_rn, rings_rn = _sr_call(case, extra, fm, heads_per_cta=hpc)
+    y_rn, s_rn, rings_rn = _sr_call(case, fm, heads_per_cta=hpc)
     y_sr, s_sr, rings_sr = _sr_call(
         case,
-        extra,
         fm,
         heads_per_cta=hpc,
         **kw,
@@ -1314,19 +1000,18 @@ def test_stochastic_rounding_seed_and_graph():
     device, so an in-place update reaches a captured CUDA graph; default is RN."""
     _skip_if_not_sm100()
     T = 4
-    case, extra, hist, fm = _sr_case(T, False, seed=91)
+    case, hist, fm = _sr_case(T, seed=91)
     seed_t = torch.tensor([7], dtype=torch.int64, device=DEV)
     sr = dict(stochastic_rounding="philox")
-    _, a1, _ = _sr_call(case, extra, fm, rand_seed=seed_t, **sr)
-    _, a2, _ = _sr_call(case, extra, fm, rand_seed=seed_t, **sr)
+    _, a1, _ = _sr_call(case, fm, rand_seed=seed_t, **sr)
+    _, a2, _ = _sr_call(case, fm, rand_seed=seed_t, **sr)
     _, b1, _ = _sr_call(
         case,
-        extra,
         fm,
         rand_seed=torch.tensor([8], dtype=torch.int64, device=DEV),
         **sr,
     )
-    _, rn, _ = _sr_call(case, extra, fm)
+    _, rn, _ = _sr_call(case, fm)
     assert torch.equal(a1, a2)
     assert not torch.equal(a1, b1) and not torch.equal(a1, rn)
 
@@ -1366,25 +1051,21 @@ def test_stochastic_rounding_seed_and_graph():
         assert torch.equal(pool, want), f"graph replay with seed {want_seed}"
 
 
-@pytest.mark.parametrize("vf", [False, True])
-def test_lcg_unseeded_uses_clock(vf):
+def test_lcg_unseeded_uses_clock():
     """stochastic_rounding="lcg" without a seed: %clock-seeded, so two runs differ, while each
     stays RN or its neighbour with the expected ~1/4 of elements rounded the other way;
     "none" (and the default without rand_seed) is round-to-nearest."""
     _skip_if_not_sm100()
-    if vf:
-        _skip_if_vf_unsupported()
-    case, extra, hist, fm = _sr_case(4, vf, seed=12)
-    _, rn, _ = _sr_call(case, extra, fm)
+    case, hist, fm = _sr_case(4, seed=12)
+    _, rn, _ = _sr_call(case, fm)
     _, rn2, _ = _sr_call(
         case,
-        extra,
         fm,
         stochastic_rounding="none",
         rand_seed=torch.tensor([3], dtype=torch.int64, device=DEV),
     )
-    _, c1, _ = _sr_call(case, extra, fm, stochastic_rounding="lcg")
-    _, c2, _ = _sr_call(case, extra, fm, stochastic_rounding="lcg")
+    _, c1, _ = _sr_call(case, fm, stochastic_rounding="lcg")
+    _, c2, _ = _sr_call(case, fm, stochastic_rounding="lcg")
     assert torch.equal(rn, rn2)
     assert not torch.equal(c1, c2)
     rows = [r for r, h in enumerate(hist) if h >= fm]
@@ -1400,39 +1081,38 @@ def test_rand_seed_alone_does_not_enable_stochastic_rounding():
     """stochastic_rounding=None with a rand_seed is round-to-nearest, bit-identical to "none" (matches
     backend='umma' and the facade docstring: off unless set)."""
     _skip_if_not_sm100()
-    case, extra, _, fm = _sr_case(4, False, seed=33)
+    case, _, fm = _sr_case(4, seed=33)
     seed_t = torch.tensor([5], dtype=torch.int64, device=DEV)
-    _, rn, _ = _sr_call(case, extra, fm)
-    _, seeded, _ = _sr_call(case, extra, fm, rand_seed=seed_t)
-    _, none, _ = _sr_call(case, extra, fm, rand_seed=seed_t, stochastic_rounding="none")
-    _, sr, _ = _sr_call(case, extra, fm, rand_seed=seed_t, stochastic_rounding="philox")
+    _, rn, _ = _sr_call(case, fm)
+    _, seeded, _ = _sr_call(case, fm, rand_seed=seed_t)
+    _, none, _ = _sr_call(case, fm, rand_seed=seed_t, stochastic_rounding="none")
+    _, sr, _ = _sr_call(case, fm, rand_seed=seed_t, stochastic_rounding="philox")
     assert torch.equal(rn, seeded) and torch.equal(rn, none)
     assert not torch.equal(rn, sr)
 
 
 def test_stochastic_rounding_rejects_bad_seed():
     _skip_if_not_sm100()
-    case, extra, _, fm = _sr_case(4, False, seed=5)
+    case, _, fm = _sr_case(4, seed=5)
     for bad in (
         torch.tensor([1, 2], dtype=torch.int64, device=DEV),
         torch.tensor([1], dtype=torch.int32, device=DEV),
         torch.tensor([1], dtype=torch.int64),
     ):
         with pytest.raises(ValueError):
-            _sr_call(case, extra, fm, rand_seed=bad, stochastic_rounding="philox")
+            _sr_call(case, fm, rand_seed=bad, stochastic_rounding="philox")
     with pytest.raises(ValueError):
         _sr_call(
             case,
-            extra,
             fm,
             rand_seed=torch.tensor([1], dtype=torch.int64, device=DEV),
             stochastic_rounding="philox",
             philox_rounds=0,
         )
     with pytest.raises(ValueError):
-        _sr_call(case, extra, fm, stochastic_rounding="philox")  # philox needs a seed
+        _sr_call(case, fm, stochastic_rounding="philox")  # philox needs a seed
     with pytest.raises(ValueError):
-        _sr_call(case, extra, fm, stochastic_rounding="pcg")
+        _sr_call(case, fm, stochastic_rounding="pcg")
 
 
 # ---------------------------------------------------------------------------
@@ -1561,40 +1241,6 @@ def test_chunk_boundary_depths_with_padded_rows(fm_kind):
 
 def _bits(t):
     return t.contiguous().view({2: torch.int16, 4: torch.int32}[t.element_size()])
-
-
-@pytest.mark.parametrize("T", [4, 8])
-@pytest.mark.parametrize("hpc", [2, 4])
-@pytest.mark.parametrize("depth", [1, 2, 3])
-def test_l2pf_prefetch_is_a_pure_hint(monkeypatch, T, hpc, depth):
-    """GDN_MTP_UMMA_L2PF = N only adds cp.async.bulk.prefetch.L2 hints: outputs, state and rings must be bit-identical
-    to the default build (its entry loop used to rebind the mbarrier phase parity of the producer warp, which only
-    shows with more than one value head per CTA)."""
-    _skip_if_not_sm100()
-    import functools
-
-    import flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 as m
-
-    fm = _fm_max(T)
-    hist = [0, 3, fm - 1, fm, 20, 7, 11, 16]
-    bases = [0, 5 * RS, 31 * RS, 17 * RS, 9 * RS, 30 * RS, 2 * RS, 24 * RS]
-    fn = functools.partial(
-        m.gated_delta_rule_mtp_ucache_flush_umma_ring64, heads_per_cta=hpc
-    )
-    res = {}
-    for pf in (0, depth):
-        monkeypatch.setattr(m, "_L2PF", pf)
-        case = _make_case(len(hist), T, hist, 11, bases)
-        c = tuple(x.clone() for x in case)
-        out = _run(fn, c, fm)
-        torch.cuda.synchronize()
-        res[pf] = (out, c[7], c[8], c[9], c[10])
-    for name, x, y in zip(
-        ("out", "pool", "k ring", "u ring", "g ring"), res[0], res[depth], strict=False
-    ):
-        assert torch.equal(_bits(x), _bits(y)), (
-            f"{name} differs with L2PF={depth} (T={T}, hpc={hpc})"
-        )
 
 
 @pytest.mark.parametrize("T", [4, 5, 6, 7, 8])

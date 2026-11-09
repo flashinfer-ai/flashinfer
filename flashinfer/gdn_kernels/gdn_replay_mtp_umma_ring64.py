@@ -19,13 +19,6 @@ T = 8: 25) and 16 at T = 1. The ring contents are not interchangeable with the 3
   pairs. "lcg": one LCG step per pair (s ^ (s >> 16) dither, the ameyn/gdn-ucache-sr recipe)
   from a hashed per-row seed (``rand_seed`` or %clock).
 
-Two flush flavours (compile-time):
-* unf_uf — fold the STORED corrections u_j of the window (FlashInfer semantics);
-* unf_vf (only built at W_RING == 16) — extra v ring [pool, HV, 64, V] bf16 and beta ring [pool, HV, 64] f32, appended
-  every step; flush rows re-solve the window from S0 in fp32,
-      ũ_j = beta_j (w_j v_j - e^{G_P} S0 k̂_j - sum_{i<j} (k̂_i . k̂_j) ũ_i)   (= w_j u_j),
-  and fold ũ (never reading the u ring), the basis for a two-precision state.
-
 Math per (request, value head) with ``X = [k̂_0..k̂_{T-1}; s q̂_0..s q̂_{T-1}]``:
 
     S_h x = e^{G_P} S0 x + sum_j (w_j u_j)(k̂_j . x)                  (x in X)
@@ -37,7 +30,7 @@ fastest); 4 CTAs / SM (SMEM ~57 KB, 64 registers per thread at launch, 128 TMEM 
   warps 0-3 (consumer warpgroup, 96 registers after setmaxnreg): 128 lanes = 128 V rows (TMEM lane = row,
              row = lane quadrant ^ 64); prologue + per-row math.
   warp 4   : TMA producer — each value head's fp16 state as two 16 KB 128B-swizzled K halves
-             through two stages; per-head u windows (vf flush rows: v windows) bulk-copied
+             through two stages; per-head u windows bulk-copied
              into a two-head SMEM double buffer; flush rows TMA-store the folded halves.
   warp 5   : allocates TMEM at CTA entry (the next CTA on the SM is not launched before the
              allocation permit is relinquished), only UMMA issuer.
@@ -45,13 +38,12 @@ fastest); 4 CTAs / SM (SMEM ~57 KB, 64 registers per thread at launch, 128 TMEM 
   warp 7   : idle (the producer warpgroup gives its registers up: 32 per thread after setmaxnreg).
 UMMAs (kind::f16, fp32 accumulate in TMEM):
   readout  R = S0 . X^T            M128 N16 K128  A: state stage   B: X tile (K-major)
-  vf only  KH = S0 . K_hist^T      M128 N16 K128  A: state stage   B: K_hist tile (K-major)
   history  Y = D . C^T             M128 N16 K16   A: D (TMEM)      B: C tile
   fold     F = D . K_hist (halves) M128 N64 K16   A: D (TMEM)      B: K_hist tile, MN-major
-  with D[v, j] = w_j u_j[v] (vf flush: ũ_j[v]), C[x, j] = k̂_j . x, K_hist[j] = k̂_j (j < P).
-The per-CTA Gram [k̂_ring; X] . X^T (all dots + the norms; vf: + k̂_ring . k̂_ring) runs on
+  with D[v, j] = w_j u_j[v], C[x, j] = k̂_j . x, K_hist[j] = k̂_j (j < P).
+The per-CTA Gram [k̂_ring; X] . X^T (all dots + the norms) runs on
 mma.sync with fragments loaded straight from global memory.  The intra-step causal solve is
-a T-step forward substitution per V row on CUDA cores.  unf_uf flush rows issue fold half 0
+a T-step forward substitution per V row on CUDA cores.  Flush rows issue fold half 0
 before the state lands, so each half's RMW follows its readout and the epilogue overlaps the
 next head's state load.
 
@@ -61,7 +53,6 @@ Specialised for K == V == 128, HV % H == 0, HV // H == 4 (Qwen3.5 GDN geometry).
 from __future__ import annotations
 
 import math
-import os as _os
 import warnings
 from functools import cache
 from typing import Optional
@@ -83,10 +74,9 @@ except (
 
 RING_SLOTS = 64  # physical ring per request (a power of two: indices use & RING_MASK)
 RING_MASK = RING_SLOTS - 1
-# window capacity class in rows (<= RING_SLOTS): sizes the window tiles (W_CHUNKS tiles of W_CHUNK rows), the D columns in TMEM and
-# the coefficient block. GDN_MTP_UMMA_W_RING = 32 (2 chunks, default; 4 CTAs/SM), 48 / 64 (3 / 4 chunks; 3 CTAs/SM). The u window in
-# shared memory holds nu <= W_RING rows, a compile-time depth the wrapper derives from flush_min (P <= flush_min - 1 + T).
-W_RING = int(_os.environ.get("GDN_MTP_UMMA_W_RING", "32"))
+# window capacity in rows (<= RING_SLOTS): sizes the window tiles (W_CHUNKS tiles of W_CHUNK rows), the D columns in TMEM and
+# the coefficient block. The u window in shared memory holds nu <= W_RING rows, a compile-time depth that window_rows may reduce.
+W_RING = 32
 W_CHUNK = 16  # history/fold/Gram window tiles: W_CHUNKS independent W_CHUNK-row tiles
 W_CHUNKS = W_RING // W_CHUNK
 assert (
@@ -104,11 +94,8 @@ _TMEM_COLS = 128
 # instead of as 8 x 8 tables (see _a_off / _bq_off): 156 words per head instead of 192
 _CO_A, _CO_BQ, _CO_BETA, _CO_BG, _CO_EG, _CO_GAM, _CO_W = 0, 40, 88, 96, 104, 112, 120
 _CO_EGP = _CO_W + W_RING  # e^{G_P}
-_CO_BW = _CO_EGP + 1  # unf_vf: window beta_j, also W_RING wide
-# the beta window exists only where unf_vf can run (W_RING == W_CHUNK); dropping it at W_RING > W_CHUNK
-# frees 4 x W_RING x 4 B of shared memory
 _COEF = (
-    _CO_BW + (W_RING if W_RING == W_CHUNK else 0) + 3
+    _CO_EGP + 1 + 3
 ) & ~3  # fp32 coefficient words per head (see _CO_*): a multiple of 4,
 #                                                         so every head's block is 16 B aligned (vector loads at a runtime head)
 _RN_OFF = (
@@ -116,70 +103,19 @@ _RN_OFF = (
 ) * 16  # s_rn (16 fp32) sits right after s_gram inside the aliased block
 # CTAs per SM the shared-memory budget allows (233,472 B per SM, 1,024 B reserved per CTA). The dynamic shared memory of a CTA is
 # _SMEM_FIXED + 256 B per u-window row nu: state 32 KB, X tile 4 KB, Gram / K_hist block and C tile (W_RING rows), the coefficient
-# block, barriers. W_RING = 32: 57,256 B at nu = 32 (the 8 x 8 coefficient tables would need 57,832 B) against the per-CTA budget of
-# 4 CTAs/SM of 57,344 B; W_RING = 48 / 64 are above it at every window depth they serve (nu > 32): 3 CTAs/SM (76,800 B). The default
-# launch bound (min_blocks_per_mp) follows it: asking ptxas for more resident CTAs than shared memory can hold only caps the
-# registers (64 at 4 CTAs/SM of 256 threads, 80 at 3; setmaxnreg then moves them between the warpgroups: _NREG_CONS /
-# _NREG_OTHER, which assume a launch cap of at most 96 registers per thread).
-_SMEM_FIXED = 32_768 + 4_096 + W_RING * (256 + 32) + 4 * _COEF * 4 + 488
+# block, barriers. 57,248 B at nu = 32 (the 8 x 8 coefficient tables would need 57,824 B) against the per-CTA budget of
+# 4 CTAs/SM of 57,344 B. The launch bound (min_blocks_per_mp) follows it: asking ptxas for more resident CTAs than shared
+# memory can hold only caps the registers (64 at 4 CTAs/SM of 256 threads; setmaxnreg then moves them between the warpgroups:
+# _NREG_CONS / _NREG_OTHER, which assume a launch cap of at most 96 registers per thread).
+_SMEM_FIXED = 32_768 + 4_096 + W_RING * (256 + 32) + 4 * _COEF * 4 + 480
 _SMEM_PER_SM = 233_472
 _SMEM_RESERVED_PER_CTA = 1_024
-_SMEM_CTAS_PER_SM = 4 if W_RING <= 32 else 3
-_MINB = int(_os.environ.get("GDN_MTP_UMMA_MINB", str(_SMEM_CTAS_PER_SM)))
+_SMEM_CTAS_PER_SM = 4
+_MIN_BLOCKS_PER_SM = _SMEM_CTAS_PER_SM
 # registers per thread of the consumer / the other warpgroup after setmaxnreg (a 256-thread CTA at 4 CTAs per SM
 # launches with 64 each; the two warpgroups together keep that budget)
 _NREG_CONS = 96
 _NREG_OTHER = 128 - _NREG_CONS
-# IKET in-kernel phase markers (profiling only): GDN_MTP_UMMA_IKET=1 at import emits
-# cute.experimental.iket ranges / marks per warp role (docs/mtp_iket_sol.md); they are lowered
-# only when the profiler (run-iket, or pic-c with CUTE_DSL_COMPILER_OPT=iket) asks for it.
-_IKET_MODE = _os.environ.get("GDN_MTP_UMMA_IKET", "")  # "" | "1"/"full" | "2"/"simple"
-# Experiments (docs/mtp_sol_iket.html section 10), all off by default:
-#  GDN_MTP_UMMA_L2PF=N      the producer warp also issues cp.async.bulk.prefetch.L2 of the state of the head
-#                           N heads ahead (32 KB) whenever it issues a head's half 0, and of heads
-#                           1..N at CTA entry -> more bytes in flight without SMEM.  Bit-exact; slower
-#                           (B = 512, T = 4, actual flush mix: +2 % at N = 1, +4-5 % at N = 2, +7-10 % at
-#                           N = 3, at B = 128 and 512, T = 4 and 8): the memory system is already saturated.
-#                           (Its entry loop used to be `for ph in range(...)`, which rebinds the item's
-#                           mbarrier phase parity `ph` for the warp and made every later wait of that warp use a
-#                           wrong parity: wrong state, non-finite outputs, hangs.)
-#  GDN_MTP_UMMA_STAGGER_NS  first-wave CTAs (linear id < GDN_MTP_UMMA_FIRST_WAVE, default 592)
-#                           sleep (id mod 4) x this many ns at entry to break the lockstep wave
-_L2PF = int(_os.environ.get("GDN_MTP_UMMA_L2PF", "0"))
-#  GDN_MTP_UMMA_PERSIST=1   persistent CTAs: grid = min(items, SMs x GDN_MTP_UMMA_MINB), each CTA
-#                           loops over items (TMEM / SMEM set up once, barriers re-armed per item)
-_PERSIST = int(_os.environ.get("GDN_MTP_UMMA_PERSIST", "0"))
-#  GDN_MTP_UMMA_EARLY=1     start-up reorder: cursors loaded with the state index (one round trip),
-#                           all barriers initialised while it is in flight, head 0's halves and the
-#                           u windows issued before the gate loads, the Gram's ring rows pre-issued
-#                           before the prologue sync
-_EARLY = int(_os.environ.get("GDN_MTP_UMMA_EARLY", "0"))
-#  GDN_MTP_UMMA_DSTORE=1    flush rows: the RMW writes the updated half to the state pool directly
-#                           (st.global from registers) instead of SMEM + TMA store
-_DSTORE = int(_os.environ.get("GDN_MTP_UMMA_DSTORE", "0"))
-#  GDN_MTP_UMMA_PERSIST_PAD=0  caller guarantees no padded rows (state index >= 0 everywhere): skip the
-#                           per-call valid-rows-first ordering (keeps the launch to a single kernel)
-_PERSIST_PAD = int(_os.environ.get("GDN_MTP_UMMA_PERSIST_PAD", "1"))
-_STAGGER_NS = int(_os.environ.get("GDN_MTP_UMMA_STAGGER_NS", "0"))
-_FIRST_WAVE = int(_os.environ.get("GDN_MTP_UMMA_FIRST_WAVE", "592"))
-PROF_COLS = 80
-# %globaltimer stamp columns of the profiling variant (prof_buf[cta, col]); read by
-# benchmarks/timeline_mtp_umma.py
-PF_START, PF_SMID, PF_GRAM, PF_XREADY, PF_COEF, PF_W1END, PF_CEND = 0, 1, 2, 3, 4, 5, 6
-PF_ST_LAND = 8  # + slot: the issuer warp saw the state half land
-PF_DREADY = 16  # + head: D staged
-PF_MDONE = 20  # + head: readout + history done (seen by consumers)
-PF_EPI = 24  # + head: outputs stored
-PF_RMW0 = 28  # + head: fold half 0 written back
-PF_RMW1 = 32  # + head: fold half 1 written back
-PF_TMA = 40  # + slot: the producer warp issued the state load
-PF_HIST = 48  # + head: the issuer warp issued the history MMA (D . C^T)
-PF_F0 = 52  # + head: the issuer warp issued fold half 0 (flush)
-PF_F1 = 56  # + head: the issuer warp issued fold half 1 (flush)
-PF_STORE = 60  # + slot: the producer warp issued the TMA store of a folded half (flush)
-PF_USEEN = 68  # + head: consumers saw the u window land
-PF_TMRD = 72  # + head: consumers finished their R / Y TMEM reads
-PF_UISS = 76  # the producer warp issued head 0's u-window copy
 
 
 class _MbArr:
@@ -227,14 +163,9 @@ class GdnReplayMtpUmma:
         hv: int,
         u_bf16: bool = True,
         use_row_order: bool = False,
-        prof: bool = False,
-        vf: bool = False,
         hpc: int = HPK,
         sr: str = "",
         sr_rounds: int = 0,
-        slots: int = 0,
-        minb: int = _MINB,
-        l2pf: int = _L2PF,
         pmax: int = 0,
     ):
         assert 1 <= T <= 8
@@ -249,34 +180,6 @@ class GdnReplayMtpUmma:
         self.hv = hv
         self.u_bf16 = u_bf16
         self.use_row_order = use_row_order
-        self.prof = prof
-        self.vf = vf
-        if vf:
-            # _head_vf_flush's window K.K' re-solve needs a full W_RING x W_RING Gram, which
-            # s_gram (row stride 16) cannot hold at W_RING > W_CHUNK -- unf_vf is not extended
-            # to the wider window in this pass.
-            assert W_RING == W_CHUNK, (
-                "unf_vf (vf=True) is not implemented for W_RING > W_CHUNK (16); the window "
-                "K.K' Gram re-solve needs a W_RING x W_RING matrix this s_gram layout can't hold."
-            )
-        self.early = (
-            _EARLY > 0 and slots == 0
-        )  # not combined with the persistent kernel
-        # The early-start entry loads (wo / wr1_e, gp_*_e) were removed with the 256-thread restructure, so the build cannot be traced.
-        assert not self.early, (
-            "GDN_MTP_UMMA_EARLY=1 is not supported by the 256-thread UMMA kernel (its early-start entry loads were removed)"
-        )
-        self.dstore = _DSTORE > 0
-        self.persist = (
-            slots > 0
-        )  # persistent CTAs (GDN_MTP_UMMA_PERSIST): grid = min(items, slots)
-        self.slots = slots
-        self.minb = minb  # launch bound min_blocks_per_mp (caps registers per thread)
-        # the single-buffered u window (below) re-arms u_free once per head and aliases s_gram into
-        # s_kt; neither is re-timed for persistent CTAs (items re-use the same smem back to back)
-        assert not (self.persist and W_RING > W_CHUNK), (
-            "GDN_MTP_UMMA_PERSIST=1 is not implemented for W_RING > W_CHUNK (16)"
-        )
         # window rows that can ever be live: P <= W_RING (the window tiles hold W_RING rows) and P <= RING_SLOTS - T
         # (the T appends of the call land at slots P..P+T-1 of the ring), so rows >= nu are never read and are not even
         # copied. pmax (compile-time, the wrapper's flush_min - 1 + T) is the deepest window the caller will present:
@@ -290,15 +193,6 @@ class GdnReplayMtpUmma:
         ), (
             f"{_SMEM_FIXED + 256 * self.nu} B of shared memory per CTA do not fit {_SMEM_CTAS_PER_SM} CTAs/SM"
         )
-        # persistent mode: barriers are initialised once and reused through phase parity. Every
-        # barrier completes exactly once per item (dummy arrivals cover the other item type), except
-        # u_free[b] (once per head using buffer b) and the epi_done of the last head of each TMEM
-        # column class, which receive one dummy completion before the loop so that item 0 has a
-        # "previous item" to wait for.
-        self.u_cnt = [len([h for h in range(hpc) if h % 2 == b]) for b in range(2)]
-        self.dummy_epi = (
-            ({hpc - 1} | ({hpc - 2} if hpc >= 2 else set())) if self.persist else set()
-        )
         # stochastic rounding of the flush store: "" (round-to-nearest), "philox" (sr_rounds
         # rounds), "lcg" (seeded by rand_seed) or "lcg_clock" (seeded by %clock)
         assert sr in ("", "philox", "lcg", "lcg_clock")
@@ -307,55 +201,12 @@ class GdnReplayMtpUmma:
         self.sr_lcg = sr in ("lcg", "lcg_clock")
         # consumer head loop: a runtime loop over the CTA's 4 heads instead of 4 unrolled copies of the body (a
         # quarter of the consumer head code: it stays in the instruction cache while the CTAs of an SM run
-        # different heads and flush / verify rows). hpc < 4 bodies are short and stay unrolled.
-        self.hloop = hpc == HPK and not (vf or self.persist or self.early)
-        self.gloop = not (vf or self.persist or self.early)
-        # producer / issuer: the same runtime head loop (their per-head code was ~25% of the kernel's SASS unrolled)
-        self.hloop_o = self.hloop
+        # different heads and flush / verify rows). hpc < 4 bodies are short and stay unrolled. The producer / issuer
+        # use the same runtime head loop (their per-head code was ~25% of the kernel's SASS unrolled).
+        self.hloop = hpc == HPK
         self.num_threads = 256  # warps 0-3 consumers, 4 producer, 5 issuer, 6 window copies, 7 idle (register donor)
-        self.iket = _IKET_MODE != ""
-        self.iket_simple = _IKET_MODE in ("2", "simple")
-        self.l2pf = l2pf
         # T >= 5: the D builds' v loads sit on the epilogue-bound chain; below that they hide behind the readout wait
         self.pfv = T >= 5
-        self.stagger_ns = _STAGGER_NS
-        self.first_wave = _FIRST_WAVE
-
-    # IKET helpers: warp-uniform call sites only (never inside elect_one); no-ops unless
-    # GDN_MTP_UMMA_IKET is set. The "simple" set = markers flagged simple (prologue, c_gram,
-    # w0_load, w1_wait_x) plus the only_simple c_head ranges; the full set = all unflagged ones.
-    def _ep(self, idx, ph):
-        """Parity for an in-item wait on epi_done[idx] (dummy-completed barriers are one phase ahead)."""
-        return (1 - ph) if idx in self.dummy_epi else ph
-
-    def _last_head(self, cls):
-        """Last head (< hpc) whose TMEM columns belong to class cls (verify: hh % 2)."""
-        return max(h for h in range(self.hpc) if h % 2 == cls)
-
-    def _ik_on(self, simple, only_simple):
-        if not self.iket:
-            return False
-        if self.iket_simple:
-            return simple or only_simple
-        return not only_simple
-
-    def _ik_push(self, name, payload=None, simple=False, only_simple=False):
-        if self._ik_on(simple, only_simple):
-            if payload is None:
-                cute.experimental.iket.range_push(name)
-            else:
-                cute.experimental.iket.range_push(name, payload)
-
-    def _ik_pop(self, simple=False, only_simple=False):
-        if self._ik_on(simple, only_simple):
-            cute.experimental.iket.range_pop()
-
-    def _ik_mark(self, name, payload=None, simple=False, only_simple=False):
-        if self._ik_on(simple, only_simple):
-            if payload is None:
-                cute.experimental.iket.mark(name)
-            else:
-                cute.experimental.iket.mark(name, payload)
 
     @cute.jit
     def _make_state_tma(self, state: cute.Tensor, op):
@@ -390,26 +241,18 @@ class GdnReplayMtpUmma:
         k_cache,
         u_cache,
         g_cache,
-        v_cache,
-        beta_cache,
         hist_len,
         cache_base,
         row_order,
         out,
-        prof_buf,
         rand_seed,
-        n_valid,
         scale: Float32,
         flush_min: Int32,
         stream,
     ):
         tma_ld = self._make_state_tma(state, cpasync.CopyBulkTensorTileG2SOp())
         tma_st = self._make_state_tma(state, cpasync.CopyBulkTensorTileS2GOp())
-        if cutlass.const_expr(self.persist):
-            # items = valid rows (row_order puts them first; n_valid[0] is read in the kernel)
-            grid = (self.slots, 1, 1)
-        else:
-            grid = (self.h * self.nsub, q.shape[0], 1)
+        grid = (self.h * self.nsub, q.shape[0], 1)
         self.kernel(
             q,
             k,
@@ -423,23 +266,19 @@ class GdnReplayMtpUmma:
             k_cache,
             u_cache,
             g_cache,
-            v_cache,
-            beta_cache,
             hist_len,
             cache_base,
             row_order,
             out,
-            prof_buf,
             rand_seed,
             scale,
             flush_min,
-            n_valid,
             tma_ld,
             tma_st,
         ).launch(
             grid=grid,
             block=(self.num_threads, 1, 1),
-            min_blocks_per_mp=self.minb,
+            min_blocks_per_mp=_MIN_BLOCKS_PER_SM,
             stream=stream,
         )
 
@@ -458,17 +297,13 @@ class GdnReplayMtpUmma:
         k_cache: cute.Tensor,
         u_cache: cute.Tensor,
         g_cache: cute.Tensor,
-        v_cache: cute.Tensor,
-        beta_cache: cute.Tensor,
         hist_len: cute.Tensor,
         cache_base: cute.Tensor,
         row_order: cute.Tensor,
         out: cute.Tensor,
-        prof_buf: cute.Tensor,
         rand_seed: cute.Tensor,
         scale: Float32,
         flush_min: Int32,
-        n_valid: cute.Tensor,
         tma_ld: cpasync.TmaInfo,
         tma_st: cpasync.TmaInfo,
     ):
@@ -531,7 +366,6 @@ class GdnReplayMtpUmma:
         f_gdone = _MbArr(smem.allocate_array(cutlass.Int64, 2 * HPK))
         x_ready = smem.allocate_array(cutlass.Int64, 1)
         tmem_done = smem.allocate_array(cutlass.Int64, 1)
-        k_ready = smem.allocate_array(cutlass.Int64, 1)  # unf_vf: K_hist tile staged
         tmem_addr = smem.allocate(Int32, 4)
         sink = smem.allocate(
             Int32, 4
@@ -550,7 +384,6 @@ class GdnReplayMtpUmma:
         c_addr = s_c.iterator.toint()
         uw_addr = s_uwin.iterator.toint()
         u_g = u_cache.iterator.toint()
-        st_g = state.iterator.toint()  # state pool [pool, HV, V, K] fp16 (L2 prefetch)
         S = dict(
             s_state=s_state,
             s_x=s_x,
@@ -574,7 +407,6 @@ class GdnReplayMtpUmma:
             f_gdone=f_gdone,
             x_ready=x_ready,
             tmem_done=tmem_done,
-            k_ready=k_ready,
             tmem_addr=tmem_addr,
             sink=sink,
             st_addr=st_addr,
@@ -583,7 +415,6 @@ class GdnReplayMtpUmma:
             c_addr=c_addr,
             uw_addr=uw_addr,
             u_g=u_g,
-            st_g=st_g,
         )
 
         self._item(
@@ -605,13 +436,10 @@ class GdnReplayMtpUmma:
             k_cache,
             u_cache,
             g_cache,
-            v_cache,
-            beta_cache,
             hist_len,
             cache_base,
             row_order,
             out,
-            prof_buf,
             rand_seed,
             scale,
             flush_min,
@@ -640,13 +468,10 @@ class GdnReplayMtpUmma:
         k_cache,
         u_cache,
         g_cache,
-        v_cache,
-        beta_cache,
         hist_len,
         cache_base,
         row_order,
         out,
-        prof_buf,
         rand_seed,
         scale,
         flush_min,
@@ -658,15 +483,11 @@ class GdnReplayMtpUmma:
         # the loop-carried item index must be provably warp-uniform, otherwise everything derived
         # from it (row, state index, head base, addresses) leaves the uniform register file
         item = cute.arch.make_warp_uniform(item)
-        _phu = (
-            1 if self.persist else 0
-        )  # mid-item u_free wait: 2nd completion of the item (dummy shifts it)
         HPC = self.hpc
         T = self.T
         T2 = 2 * T
         RB = self.u_bf16
         _ring_t = BFloat16 if RB else Float16
-        HPC = self.hpc
         s_state = S["s_state"]
         _s_x = S["s_x"]
         _s_kt = S["s_kt"]
@@ -689,7 +510,6 @@ class GdnReplayMtpUmma:
         f_gdone = S["f_gdone"]
         x_ready = S["x_ready"]
         tmem_done = S["tmem_done"]
-        k_ready = S["k_ready"]
         tmem_addr = S["tmem_addr"]
         sink = S["sink"]
         st_addr = S["st_addr"]
@@ -698,7 +518,6 @@ class GdnReplayMtpUmma:
         c_addr = S["c_addr"]
         uw_addr = S["uw_addr"]
         u_g = S["u_g"]
-        st_g = S["st_g"]
         nblk = self.h * self.nsub
         blk_row = item // nblk
         bx = item % nblk
@@ -707,22 +526,11 @@ class GdnReplayMtpUmma:
         sub = bx & (self.nsub - 1)  # which hpc-head group of it
         warp = cute.arch.make_warp_uniform(tid // 32)
         lane = tid % 32
-        # IKET: every warp, entry -> CTA barrier (TMEM alloc, entry loads, barrier inits)
-        self._ik_mark("cta", item)
-        self._ik_push("prologue", simple=True)
         if cutlass.const_expr(self.use_row_order):
             brow = Int32(row_order[blk_row])
         else:
             brow = blk_row
         hv0 = kh * HPK + sub * HPC
-        cta_lin = item
-        PROF = self.prof
-        pb_g = prof_buf.iterator.toint() + Int64(cta_lin * PROF_COLS) * 8
-        if cutlass.const_expr(PROF):
-            if tid == 0:
-                prof_buf[cta_lin, PF_START] = U.globaltimer()
-                prof_buf[cta_lin, PF_SMID] = Int64(U.smid())
-
         if warp < 4:
             # ======================================================== consumer warpgroup (warps 0-3)
             cute.arch.warpgroup_reg_alloc(_NREG_CONS)
@@ -768,7 +576,6 @@ class GdnReplayMtpUmma:
             gp_g = Float32(g_cache[sidx, hv0 + ghc, (base + P - 1) & RING_MASK])
             gp_w = Float32(g_cache[sidx, hv0 + whc, (base + P - 1) & RING_MASK])
             gj_w = Float32(g_cache[sidx, hv0 + whc, (base + wj) & RING_MASK])
-            bw_w = Float32(0.0)
             # window rows [P, nu) are never copied: zero them once (this CTA's SMEM holds another CTA's
             # data) so the D build needs no per-row masks (its weights are 0 there)
             for r in cutlass.range_constexpr((self.nu * 16 + 127) // 128):
@@ -782,9 +589,7 @@ class GdnReplayMtpUmma:
                             Uint32(0),
                             Uint32(0),
                         )
-            self._ik_mark("pre_sync", simple=True)
             cute.arch.sync_threads()
-            self._ik_pop(simple=True)  # prologue
             # ============================================================ consumers
             cw = warp ^ 2
             ct = cw * 32 + lane  # TMEM lane address / k index for staging
@@ -793,9 +598,6 @@ class GdnReplayMtpUmma:
             c4 = lane & 3
 
             kc_g = k_cache.iterator.toint()
-            if cutlass.const_expr(self.early):
-                self._ik_pop(simple=True)  # prologue (init barrier synced at first use)
-            self._ik_push("c_gram", simple=True)
 
             # -------- Gram on mma.sync: rows [k̂_ring(16); X(16)] x cols X(16), K = 128.
             # Fragments come straight from global memory: per 32-wide k block a lane loads 16 B
@@ -830,38 +632,6 @@ class GdnReplayMtpUmma:
                 s_gram[(W_RING + 8 + grp) * 16 + gc] = accx[2]
                 s_gram[(W_RING + 8 + grp) * 16 + gc + 1] = accx[3]
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
-                if cutlass.const_expr(self.early):
-                    # X tile (fp16, SW128) and x_ready from these warps' own rows: they hold
-                    # the same rows as warps 2/3 and have nothing in flight, so the readout
-                    # can start once the X x X Gram is done instead of after the ring rows
-                    rn_x = cute.math.rsqrt(
-                        s_gram[(W_RING + xr_b) * 16 + xr_b] + Float32(_EPS)
-                    )
-                    rn_x = _sel(xr_b >= self.T, rn_x * scale, rn_x, Float32)
-                    for p in cutlass.range_constexpr(4):
-                        kc = 4 * p + c4
-                        xw = []
-                        for i in cutlass.range_constexpr(4):
-                            xw.append(
-                                U.pack_f16x2(
-                                    U.bf16x2_lo_f32(wb[p][i]) * rn_x,
-                                    U.bf16x2_hi_f32(wb[p][i]) * rn_x,
-                                )
-                            )
-                        xb = (
-                            (kc // 8) * 2048
-                            + xr_b * 128
-                            + (((kc % 8) ^ (xr_b % 8)) * 16)
-                        )
-                        U.sts_v4(x_addr + xb, xw[0], xw[1], xw[2], xw[3])
-                    self._ik_mark("pre_sync", simple=True)
-                    cute.arch.barrier(
-                        barrier_id=4, number_of_threads=96
-                    )  # warp 0's inits
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.mbarrier_arrive(x_ready)
-                    if cutlass.const_expr(PROF):
-                        U.stamp_if(Int32(ct == 64), pb_g + PF_XREADY * 8)
                 # Everything below needs only the X x X Gram and the gate inputs (one round
                 # trip), so it overlaps warps mt == 0 waiting for the ring rows.
                 cl = ct - 64
@@ -934,86 +704,51 @@ class GdnReplayMtpUmma:
                             )
                             s_coef[cb + _bq_off(t, s)] = dec * qk
             else:
-                if cutlass.const_expr(self.early):
-                    wr0 = wo  # issued when the cursors landed
-                    wr1 = wr1_e  # noqa: F821 (unreachable: GDN_MTP_UMMA_EARLY is rejected in __init__)
-                else:
-                    # ring rows j >= P are dead (their Gram rows are dropped by the C-tile
-                    # fill, MMA rows are independent): predicate their loads off, so a row
-                    # beyond the live window costs no DRAM traffic
-                    # Dead rows are redirected to the last live row (a duplicate address inside the
-                    # CTA: L1/L2 hit, no new DRAM bytes) instead of predicated off, which keeps the
-                    # loads plain and straight-line like the full-window kernel's (predicated asm
-                    # with undefined outputs cost spills at the 80-register cap).
-                    _wlim = _sel(P > 0, P - 1, Int32(0), Int32)
-                    # Ring rows of chunk 0 are loaded here (dead rows j >= P are redirected to the last
-                    # live row: a duplicate address inside the CTA, an L1/L2 hit with no new DRAM bytes,
-                    # which keeps the loads plain; predicated asm with undefined outputs spilled at the
-                    # 80-register cap). Chunks >= 1 are loaded and multiplied only while the live window
-                    # reaches them (CTA-uniform branch, after chunk 0 so the registers are never live
-                    # together): a shallow row (P <= 16) does no chunk-1 Gram work at all.
-                    wr0c0, wr1c0 = self._ring_k_loads(
-                        0, kc_g, k_cache, sidx, kh, base, P, grp, c4
-                    )
+                # ring rows j >= P are dead (their Gram rows are dropped by the C-tile
+                # fill, MMA rows are independent): predicate their loads off, so a row
+                # beyond the live window costs no DRAM traffic
+                # Dead rows are redirected to the last live row (a duplicate address inside the
+                # CTA: L1/L2 hit, no new DRAM bytes) instead of predicated off, which keeps the
+                # loads plain and straight-line like the full-window kernel's (predicated asm
+                # with undefined outputs cost spills at the 80-register cap).
+                _wlim = _sel(P > 0, P - 1, Int32(0), Int32)
+                # Ring rows of chunk 0 are loaded here (dead rows j >= P are redirected to the last
+                # live row: a duplicate address inside the CTA, an L1/L2 hit with no new DRAM bytes,
+                # which keeps the loads plain; predicated asm with undefined outputs spilled at the
+                # 80-register cap). Chunks >= 1 are loaded and multiplied only while the live window
+                # reaches them (CTA-uniform branch, after chunk 0 so the registers are never live
+                # together): a shallow row (P <= 16) does no chunk-1 Gram work at all.
+                wr0c0, wr1c0 = self._ring_k_loads(
+                    0, kc_g, k_cache, sidx, kh, base, P, grp, c4
+                )
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
-                if cutlass.const_expr(PROF):
-                    U.stamp_if(Int32(ct == 0), pb_g + PF_GRAM * 8)
                 # X tile (fp16, SW128) from the B fragments: lane = row xr_b, 4 x 16 B of k
                 rn_b = cute.math.rsqrt(
                     s_gram[(W_RING + xr_b) * 16 + xr_b] + Float32(_EPS)
                 )
                 rn_b = _sel(xr_b >= T, rn_b * scale, rn_b, Float32)
-                if cutlass.const_expr(not self.early):
-                    for p in cutlass.range_constexpr(4):
-                        kc = 4 * p + c4
-                        xw = []
-                        for i in cutlass.range_constexpr(4):
-                            xw.append(
-                                U.pack_f16x2(
-                                    U.bf16x2_lo_f32(wb[p][i]) * rn_b,
-                                    U.bf16x2_hi_f32(wb[p][i]) * rn_b,
-                                )
+                for p in cutlass.range_constexpr(4):
+                    kc = 4 * p + c4
+                    xw = []
+                    for i in cutlass.range_constexpr(4):
+                        xw.append(
+                            U.pack_f16x2(
+                                U.bf16x2_lo_f32(wb[p][i]) * rn_b,
+                                U.bf16x2_hi_f32(wb[p][i]) * rn_b,
                             )
-                        xb = (
-                            (kc // 8) * 2048
-                            + xr_b * 128
-                            + (((kc % 8) ^ (xr_b % 8)) * 16)
                         )
-                        U.sts_v4(x_addr + xb, xw[0], xw[1], xw[2], xw[3])
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.mbarrier_arrive(x_ready)
-                    if cutlass.const_expr(PROF):
-                        U.stamp_if(Int32(ct == 0), pb_g + PF_XREADY * 8)
+                    xb = (kc // 8) * 2048 + xr_b * 128 + (((kc % 8) ^ (xr_b % 8)) * 16)
+                    U.sts_v4(x_addr + xb, xw[0], xw[1], xw[2], xw[3])
+                cute.arch.fence_view_async_shared()
+                cute.arch.mbarrier_arrive(x_ready)
                 # ring x X tiles
-                if cutlass.const_expr(self.early):
-                    accr = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    for p in cutlass.range_constexpr(4):
-                        for hs in cutlass.range_constexpr(2):
-                            accr = U.mma_bf16_16816(
-                                wr0[p][2 * hs],
-                                wr1[p][2 * hs],
-                                wr0[p][2 * hs + 1],
-                                wr1[p][2 * hs + 1],
-                                wb[p][2 * hs],
-                                wb[p][2 * hs + 1],
-                                accr,
-                            )
-                    s_gram[grp * 16 + gc] = accr[0]
-                    s_gram[grp * 16 + gc + 1] = accr[1]
-                    s_gram[(grp + 8) * 16 + gc] = accr[2]
-                    s_gram[(grp + 8) * 16 + gc + 1] = accr[3]
-                else:
-                    self._gram_chunk(0, wr0c0, wr1c0, wb, s_gram, grp, gc)
-                    for wc in cutlass.range_constexpr(1, W_CHUNKS):
-                        if P > wc * W_CHUNK:
-                            wr0c, wr1c = self._ring_k_loads(
-                                wc, kc_g, k_cache, sidx, kh, base, P, grp, c4
-                            )
-                            self._gram_chunk(wc, wr0c, wr1c, wb, s_gram, grp, gc)
-                if cutlass.const_expr(self.early):
-                    # warp 0's inits, before this role's first mbarrier use (coefficients)
-                    self._ik_mark("pre_sync", simple=True)
-                    cute.arch.barrier(barrier_id=5, number_of_threads=96)
+                self._gram_chunk(0, wr0c0, wr1c0, wb, s_gram, grp, gc)
+                for wc in cutlass.range_constexpr(1, W_CHUNKS):
+                    if P > wc * W_CHUNK:
+                        wr0c, wr1c = self._ring_k_loads(
+                            wc, kc_g, k_cache, sidx, kh, base, P, grp, c4
+                        )
+                        self._gram_chunk(wc, wr0c, wr1c, wb, s_gram, grp, gc)
                 # k̂ ring appends (bf16, 16 B per lane) after the proxy fence above (it lowers
                 # to MEMBAR.ALL.CTA, which would wait for these stores to be acknowledged)
                 if xr_b < T:
@@ -1045,8 +780,6 @@ class GdnReplayMtpUmma:
                                 kw4[3],
                             )
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
-            self._ik_pop(simple=True)  # c_gram
-            self._ik_push("c_coef")
 
             # -------- after the ring tiles: C tile (warps mt == 1), window weights, g-ring
             # appends, Kt (flush rows)
@@ -1132,10 +865,6 @@ class GdnReplayMtpUmma:
             # C / Kt are read by the history / fold UMMAs, which the issuer warp issues only after
             # d_ready, arrived by these same threads after this fence
             cute.arch.fence_view_async_shared()
-            if cutlass.const_expr(self.vf):
-                if is_flush:
-                    cute.arch.mbarrier_arrive(k_ready)  # KH readout reads K_hist
-
             if ct >= 64:
                 if ct < 96:
                     # g appends of the gate lanes (G_P needs the cursors: second round trip)
@@ -1146,34 +875,23 @@ class GdnReplayMtpUmma:
                                 if P > 0:
                                     gnew = gnew + gp_g
                             g_cache[sidx, hv0 + gh, (base + P + gt) & RING_MASK] = gnew
-                            if cutlass.const_expr(self.vf):
-                                beta_cache[
-                                    sidx, hv0 + gh, (base + P + gt) & RING_MASK
-                                ] = s_coef[gh * _COEF + _CO_BETA + gt]
             if ct >= 32:
                 if ct < 96:
                     # window weights w_j = e^{G_P - g_j}, j < P. 64 threads (4 heads x 16
                     # rows) cover one W_CHUNK; W_CHUNKS passes over the same threads cover
                     # the full W_RING window (second+ passes fetch g_j at wj + wc*W_CHUNK
-                    # directly -- not through the self.early prefetch, which only ever
-                    # staged chunk 0 and is disabled for W_RING > W_CHUNK).
+                    # directly).
                     gpw = gp_w
                     for wc in cutlass.range_constexpr(W_CHUNKS):
                         wjg = wj + wc * W_CHUNK
                         if cutlass.const_expr(wc == 0):
                             gjw = gj_w
-                            bww = bw_w
                             w = Float32(0.0)
                             if wjg < P:
                                 w = cute.math.exp(gpw - gjw, fastmath=True)
                             s_coef[wh * _COEF + _CO_W + wjg] = w
-                            if cutlass.const_expr(self.vf):
-                                bwv = Float32(0.0)
-                                if wjg < P:
-                                    bwv = bww
-                                s_coef[wh * _COEF + _CO_BW + wjg] = bwv
                         else:
-                            # chunk wc >= 1: the g (and beta) ring rows are read only for live
+                            # chunk wc >= 1: the g ring rows are read only for live
                             # rows, and the whole pass is skipped while P stays inside chunk 0
                             if P > wc * W_CHUNK:
                                 w = Float32(0.0)
@@ -1185,79 +903,15 @@ class GdnReplayMtpUmma:
                                     )
                                     w = cute.math.exp(gpw - gjw, fastmath=True)
                                 s_coef[wh * _COEF + _CO_W + wjg] = w
-                                if cutlass.const_expr(self.vf):
-                                    bwv = Float32(0.0)
-                                    if wjg < P:
-                                        bwv = Float32(
-                                            beta_cache[
-                                                sidx,
-                                                hv0 + whc,
-                                                (base + wjg) & RING_MASK,
-                                            ]
-                                        )
-                                    s_coef[wh * _COEF + _CO_BW + wjg] = bwv
                     if wj == 0:
                         egp = Float32(1.0)
                         if P > 0:
                             egp = cute.math.exp(gpw, fastmath=True)
                         s_coef[wh * _COEF + _CO_EGP] = egp
             cute.arch.barrier(barrier_id=1, number_of_threads=128)
-            self._ik_pop()  # c_coef
 
-            if cutlass.const_expr(self.vf):
-                if is_flush:
-                    # window Gram KK[i][j] = k̂_i . k̂_j (re-solve coefficients) into the
-                    # now-dead ring x X rows of s_gram; ring rows reloaded (L1 hits)
-                    if mt == 0:
-                        rb0 = (
-                            kc_g
-                            + Int64(
-                                cute.crd2idx(
-                                    (sidx, kh, (base + grp) & RING_MASK, 0),
-                                    k_cache.layout,
-                                )
-                            )
-                            * 2
-                        )
-                        rb1 = (
-                            kc_g
-                            + Int64(
-                                cute.crd2idx(
-                                    (sidx, kh, (base + grp + 8) & RING_MASK, 0),
-                                    k_cache.layout,
-                                )
-                            )
-                            * 2
-                        )
-                        accw = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                        for p in cutlass.range_constexpr(4):
-                            koff = Int64((32 * p + 8 * c4) * 2)
-                            g0 = U.ldg_v4(rb0 + koff)
-                            g1 = U.ldg_v4(rb1 + koff)
-                            for hs in cutlass.range_constexpr(2):
-                                bb0 = _sel(nt == 0, g0[2 * hs], g1[2 * hs], Uint32)
-                                bb1 = _sel(
-                                    nt == 0, g0[2 * hs + 1], g1[2 * hs + 1], Uint32
-                                )
-                                accw = U.mma_bf16_16816(
-                                    g0[2 * hs],
-                                    g1[2 * hs],
-                                    g0[2 * hs + 1],
-                                    g1[2 * hs + 1],
-                                    bb0,
-                                    bb1,
-                                    accw,
-                                )
-                        s_gram[grp * 16 + gc] = accw[0]
-                        s_gram[grp * 16 + gc + 1] = accw[1]
-                        s_gram[(grp + 8) * 16 + gc] = accw[2]
-                        s_gram[(grp + 8) * 16 + gc + 1] = accw[3]
-                    cute.arch.barrier(barrier_id=1, number_of_threads=128)
-            if cutlass.const_expr(PROF):
-                U.stamp_if(Int32(ct == 0), pb_g + PF_COEF * 8)
             tbase = tmem_addr[0]
             ctx = dict(
-                pb_g=pb_g,
                 sidx=sidx,
                 base=base,
                 P=P,
@@ -1265,7 +919,6 @@ class GdnReplayMtpUmma:
                 hv0=hv0,
                 ct=ct,
                 row=row,
-                st_g=st_g,
                 tbase=tbase,
                 st_addr=st_addr,
                 u_cache=u_cache,
@@ -1284,8 +937,6 @@ class GdnReplayMtpUmma:
                 f_epi_a=f_epi_a,
                 f_gdone=f_gdone,
                 rd0=rd0,
-                v_cache=v_cache,
-                s_gram=s_gram,
                 ph=ph,
                 is_flush=is_flush,
             )
@@ -1300,9 +951,6 @@ class GdnReplayMtpUmma:
                     self._head_u(hh, ctx)
             U.fence_before_sync()
             cute.arch.mbarrier_arrive(tmem_done)
-            if cutlass.const_expr(PROF):
-                U.stamp_if(Int32(ct == 0), pb_g + PF_CEND * 8)
-
         else:
             # ================================================= producer / issuer warpgroup (warps 4-7)
             cute.arch.warpgroup_reg_dealloc(_NREG_OTHER)
@@ -1338,35 +986,13 @@ class GdnReplayMtpUmma:
                         U.prefetch_l1_line_if(_sel(is_flush, Int32(0), pv, Int32), va)
             if warp == 4:
                 # first two state halves before the bulk of the barrier inits
-                if cutlass.const_expr(not self.persist and not self.early):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_init(st_full[0], 1)
-                        cute.arch.mbarrier_init(st_full[1], 1)
-                        cute.arch.mbarrier_init(u_full[0], 1)
-                        cute.arch.mbarrier_init(u_full[1], 1)
-                        cute.arch.mbarrier_init_fence()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(st_full[0], 1)
+                    cute.arch.mbarrier_init(st_full[1], 1)
+                    cute.arch.mbarrier_init(u_full[0], 1)
+                    cute.arch.mbarrier_init(u_full[1], 1)
+                    cute.arch.mbarrier_init_fence()
                 cpasync.prefetch_descriptor(tma_ld.atom)
-                if cutlass.const_expr(self.early):
-                    # the two u windows (4 KB) ahead of the two state halves (32 KB): head 0's D
-                    # build needs its window long before the readout needs the state
-                    for hh in cutlass.range_constexpr(min(2, HPC)):
-                        with cute.arch.elect_one():
-                            self._u_window_copy(
-                                u_cache,
-                                v_cache,
-                                u_g,
-                                uw_addr,
-                                u_full[hh],
-                                sidx,
-                                hv0 + hh,
-                                base,
-                                hh,
-                                is_flush,
-                                v,
-                                brow,
-                                P,
-                            )
-                    self._ik_mark("w0_uwin", simple=True)
                 for g in cutlass.range_constexpr(2):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive_and_expect_tx(st_full[g], 16384)
@@ -1376,67 +1002,36 @@ class GdnReplayMtpUmma:
                         s_state[None, (None, g)],
                         st_full[g],
                     )
-                    self._ik_mark("w0_load", g, simple=True)
-                if cutlass.const_expr(self.l2pf > 0):
-                    for pfh in cutlass.range_constexpr(1, min(HPC, 1 + self.l2pf)):
-                        with cute.arch.elect_one():
-                            pf = st_g + (Int64(sidx) * self.hv + Int64(hv0 + pfh)) * (
-                                V_DIM * K_DIM * 2
-                            )
-                            U.prefetch_l2(pf, 16384)
-                            U.prefetch_l2(pf + Int64(16384), 16384)
-                if cutlass.const_expr(not self.early):
-                    # single-buffered window: head 0 here (producer warp), head h + 1 by warp 6 once every
-                    # consumer has read head h's window (_window_warp)
-                    with cute.arch.elect_one():
-                        self._u_window_copy(
-                            u_cache,
-                            v_cache,
-                            u_g,
-                            uw_addr,
-                            u_full[0],
-                            sidx,
-                            hv0,
-                            base,
-                            0,
-                            is_flush,
-                            v,
-                            brow,
-                            P,
-                        )
-                    if cutlass.const_expr(PROF):
-                        U.stamp_if(Int32(lane == 0), pb_g + PF_UISS * 8)
-                    self._ik_mark("w0_uwin", simple=True)
-                if cutlass.const_expr(self.early):
-                    self._ik_pop(simple=True)  # prologue (warp 0: everything issued)
-                if cutlass.const_expr(not self.persist and not self.early):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_init(u_full[2], 1)
-                        cute.arch.mbarrier_init(u_full[3], 1)
-                        cute.arch.mbarrier_init(u_free[0], 128)
-                        for s in cutlass.range_constexpr(2, 2 * HPK):
-                            cute.arch.mbarrier_init(st_full[s], 1)
-                        for s in cutlass.range_constexpr(2 * HPK):
-                            cute.arch.mbarrier_init(mma_slot[s], 1)
+                # single-buffered window: head 0 here (producer warp), head h + 1 by warp 6 once every
+                # consumer has read head h's window (_window_warp)
+                with cute.arch.elect_one():
+                    self._u_window_copy(
+                        u_cache, u_g, uw_addr, u_full[0], sidx, hv0, base, P
+                    )
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(u_full[2], 1)
+                    cute.arch.mbarrier_init(u_full[3], 1)
+                    cute.arch.mbarrier_init(u_free[0], 128)
+                    for s in cutlass.range_constexpr(2, 2 * HPK):
+                        cute.arch.mbarrier_init(st_full[s], 1)
+                    for s in cutlass.range_constexpr(2 * HPK):
+                        cute.arch.mbarrier_init(mma_slot[s], 1)
+                    for i in cutlass.range_constexpr(HPK):
+                        cute.arch.mbarrier_init(mma_done[i], 1)
+                        cute.arch.mbarrier_init(d_ready[i], 128)
+                        cute.arch.mbarrier_init(epi_done[i], 128)
+                    cute.arch.mbarrier_init(x_ready, 64)
+                    cute.arch.mbarrier_init(tmem_done, 128)
+                    if is_flush:
                         for i in cutlass.range_constexpr(HPK):
-                            cute.arch.mbarrier_init(mma_done[i], 1)
-                            cute.arch.mbarrier_init(d_ready[i], 128)
-                            cute.arch.mbarrier_init(epi_done[i], 128)
-                        cute.arch.mbarrier_init(x_ready, 64)
-                        cute.arch.mbarrier_init(tmem_done, 128)
-                        if is_flush:
-                            for i in cutlass.range_constexpr(HPK):
-                                cute.arch.mbarrier_init(f_mma_a[i], 1)
-                                cute.arch.mbarrier_init(f_mma_b[i], 1)
-                                cute.arch.mbarrier_init(f_epi_a[i], 128)
-                                cute.arch.mbarrier_init(rd0[i], 1)
-                            cute.arch.mbarrier_init(k_ready, 128)
-                            for s in cutlass.range_constexpr(2 * HPK):
-                                cute.arch.mbarrier_init(f_gdone[s], 128)
-                        cute.arch.mbarrier_init_fence()
-            self._ik_mark("pre_sync", simple=True)
+                            cute.arch.mbarrier_init(f_mma_a[i], 1)
+                            cute.arch.mbarrier_init(f_mma_b[i], 1)
+                            cute.arch.mbarrier_init(f_epi_a[i], 128)
+                            cute.arch.mbarrier_init(rd0[i], 1)
+                        for s in cutlass.range_constexpr(2 * HPK):
+                            cute.arch.mbarrier_init(f_gdone[s], 128)
+                    cute.arch.mbarrier_init_fence()
             cute.arch.sync_threads()
-            self._ik_pop(simple=True)  # prologue
 
             if warp == 4:
                 # ============================================================ producer
@@ -1449,38 +1044,27 @@ class GdnReplayMtpUmma:
                         sidx=sidx,
                         hv0=hv0,
                         ph=ph,
-                        lane=lane,
-                        pb_g=pb_g,
                         f_gdone=f_gdone,
                         st_full=st_full,
                         mma_slot=mma_slot,
                     )
-                    if cutlass.const_expr(self.hloop_o):
+                    if cutlass.const_expr(self.hloop):
                         for hh in cutlass.range(1, HPC, unroll=1):
                             self._produce_flush(hh, pc)
                     else:
                         for hh in cutlass.range_constexpr(1, HPC):
                             self._produce_flush(hh, pc)
                     for prev in cutlass.range_constexpr(2 * HPC - 2, 2 * HPC):
-                        self._ik_push("w0_wait_fold", prev)
                         cute.arch.mbarrier_wait(f_gdone[prev], ph)
-                        self._ik_pop()
-                        if cutlass.const_expr(not self.dstore):
-                            U.simple_tma_copy(
-                                tma_st.atom,
-                                s_state[None, (None, prev % 2)],
-                                tma_st.tma_tensor[
-                                    sidx, hv0 + prev // 2, None, (None, prev % 2)
-                                ],
-                            )
-                            cute.arch.cp_async_bulk_commit_group()
-                            if cutlass.const_expr(PROF):
-                                U.stamp_if(
-                                    Int32(lane == 0), pb_g + (PF_STORE + prev) * 8
-                                )
-                    self._ik_push("w0_store_drain", simple=True)
+                        U.simple_tma_copy(
+                            tma_st.atom,
+                            s_state[None, (None, prev % 2)],
+                            tma_st.tma_tensor[
+                                sidx, hv0 + prev // 2, None, (None, prev % 2)
+                            ],
+                        )
+                        cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0)
-                    self._ik_pop(simple=True)
                 else:
                     pc = dict(
                         tma_ld=tma_ld,
@@ -1489,29 +1073,16 @@ class GdnReplayMtpUmma:
                         sidx=sidx,
                         hv0=hv0,
                         ph=ph,
-                        lane=lane,
-                        pb_g=pb_g,
                         f_gdone=f_gdone,
                         st_full=st_full,
                         mma_slot=mma_slot,
                     )
-                    if cutlass.const_expr(self.hloop_o):
+                    if cutlass.const_expr(self.hloop):
                         for hh in cutlass.range(1, HPC, unroll=1):
                             self._produce_verify(hh, pc)
                     else:
                         for hh in cutlass.range_constexpr(1, HPC):
                             self._produce_verify(hh, pc)
-                    if cutlass.const_expr(self.vf):
-                        for hh in cutlass.range_constexpr(max(0, HPC - 2), HPC):
-                            cute.arch.mbarrier_wait(u_full[hh], ph)
-                            self._v_append_bulk(
-                                v_cache, uw_addr, sidx, hv0 + hh, base, P, hh % 2
-                            )
-                        cute.arch.cp_async_bulk_wait_group(0)
-                    if cutlass.const_expr(self.persist):
-                        # both pads must have been read before the next item's first halves are issued
-                        for s_ in cutlass.range_constexpr(2 * HPC - 2, 2 * HPC):
-                            cute.arch.mbarrier_wait(mma_slot[s_], ph)
             elif warp == 5:
                 # ============================================================ UMMA issuer
                 tbase = tmem_addr[0]
@@ -1540,91 +1111,9 @@ class GdnReplayMtpUmma:
                 )  # total D width (all chunks); verify-path parity stride
                 idesc16 = U.f16_idesc(128, 16)
                 idesc64mn = U.f16_idesc(128, 64, b_mn_major=True)
-                if cutlass.const_expr(self.early):
-                    self._ik_mark("pre_sync", simple=True)
-                    cute.arch.barrier(
-                        barrier_id=3, number_of_threads=64
-                    )  # warp 0's inits
-                    self._ik_pop(simple=True)  # prologue
-                self._ik_push("w1_wait_x", simple=True)
                 cute.arch.mbarrier_wait(x_ready, ph)
-                self._ik_pop(simple=True)
                 U.fence_after_sync()
-                kh_base = sd | Uint64(
-                    kt_addr >> 4
-                )  # K_hist tile as K-major B (vf KH readout)
-                if self.vf and is_flush:
-                    # unf_vf flush rows: readout R and KH = S0 . k̂_j (both halves) -> rd0; the
-                    # consumers re-solve the window into D -> history + fold half 0 -> fold half 1
-                    cute.arch.mbarrier_wait(k_ready, ph)
-                    if cutlass.const_expr(self.persist):
-                        with cute.arch.elect_one():
-                            for s_ in cutlass.range_constexpr(2 * HPK):
-                                cute.arch.mbarrier_arrive(
-                                    mma_slot[s_]
-                                )  # not used by flush items
-                    for hh in cutlass.range_constexpr(HPC):
-                        if cutlass.const_expr(hh > 0):
-                            cute.arch.mbarrier_wait(
-                                epi_done[hh - 1], self._ep(hh - 1, ph)
-                            )
-                        if cutlass.const_expr(hh == 0 and self.persist):
-                            cute.arch.mbarrier_wait(
-                                epi_done[HPC - 1], ph
-                            )  # previous item's last epilogue
-                        U.fence_after_sync()
-                        for g in cutlass.range_constexpr(2):
-                            slot = 2 * hh + g
-                            cute.arch.mbarrier_wait(st_full[slot], ph)
-                            U.fence_after_sync()
-                            for ka in cutlass.range_constexpr(4):
-                                U.umma_ss(
-                                    tbase + 0,
-                                    stage_base[g] | Uint64((ka * 32) >> 4),
-                                    x_base | Uint64((g * 2048 + ka * 32) >> 4),
-                                    idesc16,
-                                    (g > 0) or (ka > 0),
-                                )
-                                U.umma_ss(
-                                    tbase + 40,
-                                    stage_base[g] | Uint64((ka * 32) >> 4),
-                                    kh_base | Uint64((g * 2048 + ka * 32) >> 4),
-                                    idesc16,
-                                    (g > 0) or (ka > 0),
-                                )
-                        U.umma_commit(rd0[hh])
-                        cute.arch.mbarrier_wait(d_ready[hh], ph)
-                        U.fence_after_sync()
-                        for ka in cutlass.range_constexpr(W_CHUNKS):
-                            U.umma_ts(
-                                tbase + 16,
-                                tbase + 32 + ka * d_step,
-                                c_desc[ka],
-                                idesc16,
-                                ka > 0,
-                            )
-                        U.umma_commit(mma_done[hh])
-                        for ka in cutlass.range_constexpr(W_CHUNKS):
-                            U.umma_ts(
-                                tbase + 64,
-                                tbase + 32 + ka * d_step,
-                                kt_desc[ka],
-                                idesc64mn,
-                                ka > 0,
-                            )
-                        U.umma_commit(f_mma_a[hh])
-                        cute.arch.mbarrier_wait(f_epi_a[hh], ph)
-                        U.fence_after_sync()
-                        for ka in cutlass.range_constexpr(W_CHUNKS):
-                            U.umma_ts(
-                                tbase + 64,
-                                tbase + 32 + ka * d_step,
-                                kt_desc[ka] + Uint64(2048 >> 4),
-                                idesc64mn,
-                                ka > 0,
-                            )
-                        U.umma_commit(f_mma_b[hh])
-                elif is_flush:
+                if is_flush:
                     # per head: fold half 0 (needs only D, Kt) -> readout half 0 (rd0: the
                     # consumers' RMW of stage 0 may start) -> readout half 1 + history
                     # (mma_done) -> fold half 1 once the RMW has read fold half 0 (f_epi_a).
@@ -1641,8 +1130,6 @@ class GdnReplayMtpUmma:
                         d_width=d_width,
                         P=P,
                         ph=ph,
-                        lane=lane,
-                        pb_g=pb_g,
                         mma_slot=mma_slot,
                         st_full=st_full,
                         d_ready=d_ready,
@@ -1653,23 +1140,13 @@ class GdnReplayMtpUmma:
                         f_epi_a=f_epi_a,
                         rd0=rd0,
                     )
-                    if cutlass.const_expr(self.hloop_o):
+                    if cutlass.const_expr(self.hloop):
                         for hh in cutlass.range(HPC, unroll=1):
                             self._issue_flush_head(hh, ic)
                     else:
                         for hh in cutlass.range_constexpr(HPC):
                             self._issue_flush_head(hh, ic)
                 else:
-                    if cutlass.const_expr(self.persist):
-                        with cute.arch.elect_one():
-                            for i in cutlass.range_constexpr(HPK):
-                                cute.arch.mbarrier_arrive(
-                                    f_mma_a[i]
-                                )  # flush-only barriers: one dummy
-                                cute.arch.mbarrier_arrive(
-                                    f_mma_b[i]
-                                )  # completion per verify item
-                                cute.arch.mbarrier_arrive(rd0[i])
                     ic = dict(
                         tbase=tbase,
                         stage_base=stage_base,
@@ -1682,8 +1159,6 @@ class GdnReplayMtpUmma:
                         d_width=d_width,
                         P=P,
                         ph=ph,
-                        lane=lane,
-                        pb_g=pb_g,
                         mma_slot=mma_slot,
                         st_full=st_full,
                         d_ready=d_ready,
@@ -1694,20 +1169,15 @@ class GdnReplayMtpUmma:
                         f_epi_a=f_epi_a,
                         rd0=rd0,
                     )
-                    if cutlass.const_expr(self.hloop_o):
+                    if cutlass.const_expr(self.hloop):
                         for hh in cutlass.range(HPC, unroll=1):
                             self._issue_verify_head(hh, ic)
                     else:
                         for hh in cutlass.range_constexpr(HPC):
                             self._issue_verify_head(hh, ic)
-                self._ik_push("w1_wait_end")
                 cute.arch.mbarrier_wait(tmem_done, ph)
-                self._ik_pop()
                 U.fence_after_sync()
-                if cutlass.const_expr(not self.persist):
-                    U.tmem_dealloc(tbase, _TMEM_COLS)
-                if cutlass.const_expr(PROF):
-                    U.stamp_if(Int32(lane == 0), pb_g + PF_W1END * 8)
+                U.tmem_dealloc(tbase, _TMEM_COLS)
             elif warp == 6:
                 # ============================================================ next-head window copies
                 if cutlass.const_expr(HPC > 1):
@@ -1729,7 +1199,6 @@ class GdnReplayMtpUmma:
     def _produce_flush(self, hh, c):
         """Producer warp, flush row: both halves of head hh - 1 are folded: store each, then load the same stage with the
         same half of head hh."""
-        PROF = self.prof
         tma_ld, tma_st, s_state, sidx, hv0, ph = (
             c["tma_ld"],
             c["tma_st"],
@@ -1741,21 +1210,14 @@ class GdnReplayMtpUmma:
         for g in cutlass.range_constexpr(2):
             prev = 2 * (hh - 1) + g
             slot = 2 * hh + g
-            self._ik_push("w0_wait_fold", prev)
             cute.arch.mbarrier_wait(c["f_gdone"][prev], ph)
-            self._ik_pop()
-            if cutlass.const_expr(not self.dstore):
-                self._ik_push("w0_store", prev)
-                U.simple_tma_copy(
-                    tma_st.atom,
-                    s_state[None, (None, g)],
-                    tma_st.tma_tensor[sidx, hv0 + hh - 1, None, (None, g)],
-                )
-                cute.arch.cp_async_bulk_commit_group()
-                if cutlass.const_expr(PROF):
-                    U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_STORE + prev) * 8)
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                self._ik_pop()
+            U.simple_tma_copy(
+                tma_st.atom,
+                s_state[None, (None, g)],
+                tma_st.tma_tensor[sidx, hv0 + hh - 1, None, (None, g)],
+            )
+            cute.arch.cp_async_bulk_commit_group()
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(c["st_full"][slot], 16384)
             U.simple_tma_copy(
@@ -1764,14 +1226,10 @@ class GdnReplayMtpUmma:
                 s_state[None, (None, g)],
                 c["st_full"][slot],
             )
-            self._ik_mark("w0_load", slot, simple=True)
-            if cutlass.const_expr(PROF):
-                U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_TMA + slot) * 8)
 
     @cute.jit
     def _produce_verify(self, hh, c):
         """Producer warp, verify row: head hh's two halves, each into the stage the readout of head hh - 1 has freed."""
-        PROF = self.prof
         tma_ld, s_state, sidx, hv0, ph = (
             c["tma_ld"],
             c["s_state"],
@@ -1781,9 +1239,7 @@ class GdnReplayMtpUmma:
         )
         for g in cutlass.range_constexpr(2):
             slot = 2 * hh + g
-            self._ik_push("w0_wait_slot", slot)
             cute.arch.mbarrier_wait(c["mma_slot"][slot - 2], ph)
-            self._ik_pop()
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(c["st_full"][slot], 16384)
             U.simple_tma_copy(
@@ -1792,9 +1248,6 @@ class GdnReplayMtpUmma:
                 s_state[None, (None, g)],
                 c["st_full"][slot],
             )
-            self._ik_mark("w0_load", slot, simple=True)
-            if cutlass.const_expr(PROF):
-                U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_TMA + slot) * 8)
 
     @cute.jit
     def _issue_verify_head(self, hh, c):
@@ -1808,21 +1261,14 @@ class GdnReplayMtpUmma:
             c["c_desc"],
         )
         d_step, d_width, P, ph = c["d_step"], c["d_width"], c["P"], c["ph"]
-        PROF = self.prof
         rcol = (hh & 1) * 32
         if hh >= 2:
-            self._ik_push("w1_wait_epi", hh)
             cute.arch.mbarrier_wait(c["epi_done"][hh - 2], ph)
-            self._ik_pop()
             U.fence_after_sync()
         for g in cutlass.range_constexpr(2):
             slot = 2 * hh + g
-            self._ik_push("w1_wait_state", slot)
             cute.arch.mbarrier_wait(c["st_full"][slot], ph)
-            self._ik_pop()
             U.fence_after_sync()
-            if cutlass.const_expr(PROF):
-                U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_ST_LAND + slot) * 8)
             for ka in cutlass.range_constexpr(4):
                 U.umma_ss(
                     tbase + rcol,
@@ -1832,9 +1278,7 @@ class GdnReplayMtpUmma:
                     (g > 0) or (ka > 0),
                 )
             U.umma_commit(c["mma_slot"][slot])
-        self._ik_push("w1_wait_d", hh)
         cute.arch.mbarrier_wait(c["d_ready"][hh], ph)
-        self._ik_pop()
         U.fence_after_sync()
         for ka in cutlass.range_constexpr(W_CHUNKS):
             if P > (-1 if ka == 0 else ka * W_CHUNK):
@@ -1846,8 +1290,6 @@ class GdnReplayMtpUmma:
                     ka > 0,
                 )
         U.umma_commit(c["mma_done"][hh])
-        if cutlass.const_expr(PROF):
-            U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_HIST + hh) * 8)
 
     @cute.jit
     def _issue_flush_head(self, hh, c):
@@ -1867,14 +1309,9 @@ class GdnReplayMtpUmma:
             c["P"],
             c["ph"],
         )
-        PROF = self.prof
-        self._ik_push("w1_wait_d", hh)
         cute.arch.mbarrier_wait(c["d_ready"][hh], ph)
-        self._ik_pop()
         if hh > 0:
-            self._ik_push("w1_wait_epi", hh)
             cute.arch.mbarrier_wait(c["epi_done"][hh - 1], ph)
-            self._ik_pop()
         U.fence_after_sync()
         for ka in cutlass.range_constexpr(W_CHUNKS):
             # window chunk ka holds rows j in [ka*W_CHUNK, (ka+1)*W_CHUNK): when P
@@ -1884,16 +1321,10 @@ class GdnReplayMtpUmma:
                     tbase + 64, tbase + 32 + ka * d_step, kt_desc[ka], idesc64mn, ka > 0
                 )
         U.umma_commit(c["f_mma_a"][hh])
-        if cutlass.const_expr(PROF):
-            U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_F0 + hh) * 8)
         for g in cutlass.range_constexpr(2):
             slot = 2 * hh + g
-            self._ik_push("w1_wait_state", slot)
             cute.arch.mbarrier_wait(c["st_full"][slot], ph)
-            self._ik_pop()
             U.fence_after_sync()
-            if cutlass.const_expr(PROF):
-                U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_ST_LAND + slot) * 8)
             for ka in cutlass.range_constexpr(4):
                 U.umma_ss(
                     tbase + 0,
@@ -1910,11 +1341,7 @@ class GdnReplayMtpUmma:
                     tbase + 16, tbase + 32 + ka * d_step, c_desc[ka], idesc16, ka > 0
                 )
         U.umma_commit(c["mma_done"][hh])
-        if cutlass.const_expr(PROF):
-            U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_HIST + hh) * 8)
-        self._ik_push("w1_wait_rmw", hh)
         cute.arch.mbarrier_wait(c["f_epi_a"][hh], ph)
-        self._ik_pop()
         U.fence_after_sync()
         for ka in cutlass.range_constexpr(W_CHUNKS):
             if P > (-1 if ka == 0 else ka * W_CHUNK):
@@ -1926,8 +1353,6 @@ class GdnReplayMtpUmma:
                     ka > 0,
                 )
         U.umma_commit(c["f_mma_b"][hh])
-        if cutlass.const_expr(PROF):
-            U.stamp_if(Int32(c["lane"] == 0), c["pb_g"] + (PF_F1 + hh) * 8)
 
     def _x_row_addr(self, k, q, k_g, q_g, brow, kh, r):
         """Global byte address of X row r (k_t, then q_t; rows >= 2T -> k_0, never read)."""
@@ -2024,83 +1449,20 @@ class GdnReplayMtpUmma:
         )
         return Int32(t < self.T), va
 
-    def _u_window_copy(
-        self,
-        u_cache,
-        v_cache,
-        u_g,
-        uw_addr,
-        mbar,
-        sidx,
-        hv,
-        base,
-        buf,
-        is_flush,
-        v=None,
-        brow=None,
-        P=None,
-    ):
+    def _u_window_copy(self, u_cache, u_g, uw_addr, mbar, sidx, hv, base, P):
         """Bulk-copy the live logical window slots j = 0..min(P, nu)-1 (physical (base + j) & RING_MASK)
-        of one value head's u ring (unf_vf flush rows: its v ring) into the single window buffer
-        as [j][V]. Rows j >= P are not copied (they are zero-filled once per CTA, and their weights are +0).
-        Call under elect_one."""
-        rowb = V_DIM * 2
-        if not self.vf and not self.early:
-            # at most two contiguous copies (the window wraps the ring at most once) instead of one per row
-            src_head = u_g + Int64(cute.crd2idx((sidx, hv, 0, 0), u_cache.layout)) * 2
-            dst = uw_addr
-            self._window_copy_pair(
-                ctx_P=P, base=base, src_head=src_head, dst=dst, rowb=rowb, mbar=mbar
-            )
-            return
-        if self.early and not self.vf:
-            # the window's 16 ring slots (base + j) & RING_MASK wrap at most once: two contiguous
-            # copies instead of sixteen single-row ones (saves ~0.5 us of warp 0's serial issue
-            # per head pair). Without a wrap the second copy re-copies row 15 (same bytes), so
-            # the transaction count stays expression-only.
-            src_head = u_g + Int64(cute.crd2idx((sidx, hv, 0, 0), u_cache.layout)) * 2
-            dst = uw_addr + buf * (W_RING * rowb)
-            n1 = _sel(
-                base + W_RING <= RING_SLOTS,
-                Int32(W_RING),
-                Int32(RING_SLOTS) - base,
-                Int32,
-            )
-            n2 = _sel(n1 < W_RING, Int32(W_RING) - n1, Int32(1), Int32)
-            d2 = _sel(n1 < W_RING, n1, Int32(W_RING - 1), Int32)
-            s2 = _sel(
-                n1 < W_RING, Int32(0), (base + Int32(W_RING - 1)) & RING_MASK, Int32
-            )
-            cute.arch.mbarrier_arrive_and_expect_tx(mbar, (n1 + n2) * rowb)
-            U.bulk_g2s(dst, src_head + Int64(base * rowb), n1 * rowb, mbar.toint())
-            U.bulk_g2s(
-                dst + d2 * rowb, src_head + Int64(s2 * rowb), n2 * rowb, mbar.toint()
-            )
-            return
-        cute.arch.mbarrier_arrive_and_expect_tx(mbar, self.nu * rowb)
+        of one value head's u ring into the single window buffer as [j][V]. Rows j >= P are not copied (they are
+        zero-filled once per CTA, and their weights are +0). Call under elect_one."""
+        # at most two contiguous copies (the window wraps the ring at most once) instead of one per row
         src_head = u_g + Int64(cute.crd2idx((sidx, hv, 0, 0), u_cache.layout)) * 2
-        if self.vf:
-            v_head = (
-                v_cache.iterator.toint()
-                + Int64(cute.crd2idx((sidx, hv, 0, 0), v_cache.layout)) * 2
-            )
-            src_head = _sel(is_flush, v_head, src_head, Int64)
-        T = self.T
-        if self.vf:
-            v_row0 = (
-                v.iterator.toint() + Int64(cute.crd2idx((brow, 0, hv, 0), v.layout)) * 2
-            )
-            v_tstr = cute.crd2idx((0, 1, 0, 0), v.layout) * 2
-        for j in range(self.nu):
-            slot = (base + j) & RING_MASK
-            src = src_head + Int64(slot * rowb)
-            if self.vf and j >= W_RING - T:
-                # unf_vf verify rows (P <= 16 - T): rows 16-T..15 carry the T current v rows,
-                # which warp 0 bulk-stores into the v ring (the append) and consumers read
-                src = _sel(
-                    is_flush, src, v_row0 + Int64(v_tstr * (j - (W_RING - T))), Int64
-                )
-            U.bulk_g2s(uw_addr + j * rowb, src, Int32(rowb), mbar.toint())
+        self._window_copy_pair(
+            ctx_P=P,
+            base=base,
+            src_head=src_head,
+            dst=uw_addr,
+            rowb=V_DIM * 2,
+            mbar=mbar,
+        )
 
     @cute.jit
     def _window_bulk(self, nn0, dst, src_head, base, n1, n2, d2, s2, rowb, mbar):
@@ -2164,37 +1526,6 @@ class GdnReplayMtpUmma:
             with cute.arch.elect_one():
                 self._window_copy_pair(P, base, src_head, c["uw_addr"], rowb, mbar)
 
-    def _v_append_bulk(self, v_cache, uw_addr, sidx, hv, base, P, buf):
-        """unf_vf verify rows (warp 0): the T current v rows sit in window rows 16-T..15 of
-        buffer ``buf``; bulk-store them to the v ring at (base + P + t) & RING_MASK, then wait until
-        the copies have read the buffer (it is reused for the next window)."""
-        T = self.T
-        rowb = V_DIM * 2
-        v_head = (
-            v_cache.iterator.toint()
-            + Int64(cute.crd2idx((sidx, hv, 0, 0), v_cache.layout)) * 2
-        )
-        with cute.arch.elect_one():
-            for t in range(T):
-                U.bulk_s2g(
-                    v_head + Int64(((base + P + t) & RING_MASK) * rowb),
-                    uw_addr + buf * (W_RING * rowb) + (W_RING - T + t) * rowb,
-                    rowb,
-                )
-            cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
-
-    def _stamp(self, ctx, col):
-        """Profiling variant only: consumer thread 0 stores %globaltimer (one predicated STG)."""
-        if self.prof:
-            U.stamp_if(Int32(ctx["ct"] == 0), ctx["pb_g"] + col * 8)
-
-    def _rnorm(self, s_gram, r, scale):
-        rn = cute.math.rsqrt(s_gram[(W_RING + r) * 16 + r] + Float32(_EPS))
-        if r >= self.T:
-            rn = rn * scale
-        return rn
-
     @cute.jit
     def _d_chunks_deep(self, hh, dcol, ctx, ub):
         """D words of the window chunks >= 1 (rows j >= W_CHUNK) of head hh into TMEM columns
@@ -2229,41 +1560,18 @@ class GdnReplayMtpUmma:
                     words.append(U.pack_f16x2(lo, hi))
                 U.tmem_st_u32(ct, tbase + dcol + wc * (W_CHUNK // 2), words)
 
-    def _d_build(self, hh, dcol, ctx, flush):
+    def _d_build(self, hh, dcol, ctx):
         """D row w_j u_j (j < P, fp16 pairs) of head hh into TMEM columns dcol..dcol+W_RING/2-1;
         arrives d_ready[hh].  Also returns this row's raw v values of head hh (issued first
         so their latency overlaps the D build and the readout wait)."""
         T = self.T
-        _P, row, ct, tbase, s_coef = (
-            ctx["P"],
-            ctx["row"],
-            ctx["ct"],
-            ctx["tbase"],
-            ctx["s_coef"],
-        )
+        row, ct, tbase, s_coef = (ctx["row"], ctx["ct"], ctx["tbase"], ctx["s_coef"])
         v = ctx["v"]
         cb = hh * _COEF
-        vv = []
-        if not self.vf or flush:
-            for t in range(T):
-                vv.append(v[ctx["brow"], t, ctx["hv0"] + hh, row])
-        self._ik_push("c_wait_u", hh)
+        vv = [v[ctx["brow"], t, ctx["hv0"] + hh, row] for t in range(T)]
         cute.arch.mbarrier_wait(ctx["u_full"][hh], ctx["ph"])
-        self._ik_pop()
-        self._ik_push("c_dbuild", hh)
-        self._stamp(ctx, PF_USEEN + hh)
         ub = ctx["uw_addr"] + row * 2
         uv = [U.lds_u16(ub + j * (V_DIM * 2)) for j in range(W_CHUNK)]
-        if self.vf and not flush:
-            # unf_vf verify rows: the current v rows ride in window rows 16-T..15
-            for t in range(T):
-                vv.append(
-                    BFloat16(
-                        U.u16_as_f32(
-                            U.lds_u16(ub + (W_RING - T + t) * (V_DIM * 2)), True
-                        )
-                    )
-                )
         self._d_chunks_deep(
             hh, dcol, ctx, ub
         )  # chunks >= 1: loads, words and TMEM store
@@ -2282,15 +1590,12 @@ class GdnReplayMtpUmma:
         U.tmem_wait_st()
         U.fence_before_sync()
         cute.arch.mbarrier_arrive(ctx["d_ready"][hh])
-        self._ik_pop()  # c_dbuild
-        self._stamp(ctx, PF_DREADY + hh)
         return vv
 
-    def _epilogue(self, hh, rcol, ctx, vv, early_release):
+    def _epilogue(self, hh, rcol, ctx, vv):
         """Outputs and u appends of head hh from the readout R (cols rcol..) and history Y
         (cols rcol + 16..) TMEM columns; arrives epi_done[hh] once its TMEM reads are done."""
         T = self.T
-        ring_t = BFloat16 if self.u_bf16 else Float16
         sidx, base, P, brow, hv0 = (
             ctx["sidx"],
             ctx["base"],
@@ -2307,22 +1612,16 @@ class GdnReplayMtpUmma:
         yk = U.tmem_ld(ct, tbase + rcol + 16, nld)
         U.tmem_wait_ld()
         egp = s_coef[cb + _CO_EGP]
-        if early_release:
-            # verify rows: all four column groups first, then release the head buffer
-            # (the readout two heads ahead waits on it)
-            hks = [egp * rk[t] + yk[t] for t in range(T)]
-            rq = U.tmem_ld(ct, tbase + rcol + T, nld)
-            yq = U.tmem_ld(ct, tbase + rcol + 16 + T, nld)
-            U.tmem_wait_ld()
-            U.fence_before_sync()
-            cute.arch.mbarrier_arrive(ctx["epi_done"][hh])
-            self._stamp(ctx, PF_TMRD + hh)
+        # all four column groups first, then release the head buffer (the readout two heads ahead waits on it)
+        hks = [egp * rk[t] + yk[t] for t in range(T)]
+        rq = U.tmem_ld(ct, tbase + rcol + T, nld)
+        yq = U.tmem_ld(ct, tbase + rcol + 16 + T, nld)
+        U.tmem_wait_ld()
+        U.fence_before_sync()
+        cute.arch.mbarrier_arrive(ctx["epi_done"][hh])
         uu = []
         for t in range(T):
-            if early_release:
-                hk = hks[t]
-            else:
-                hk = egp * rk[t] + yk[t]
+            hk = hks[t]
             acc = (
                 s_coef[cb + _CO_BETA + t] * Float32(vv[t])
                 - s_coef[cb + _CO_BG + t] * hk
@@ -2330,38 +1629,15 @@ class GdnReplayMtpUmma:
             for s_ in range(t):
                 acc = acc - s_coef[cb + _a_off(t, s_)] * uu[s_]
             uu.append(acc)
-        if not early_release:
-            # flush rows (register-bound): the u solve runs before the q columns are read,
-            # so the k-side (hk, v) and q-side (rq, yq) values are never live together
-            rq = U.tmem_ld(ct, tbase + rcol + T, nld)
-            yq = U.tmem_ld(ct, tbase + rcol + 16 + T, nld)
-            U.tmem_wait_ld()
-            U.fence_before_sync()
-            cute.arch.mbarrier_arrive(ctx["epi_done"][hh])
-            self._stamp(ctx, PF_TMRD + hh)
 
-        # u appends at (base + P + t) & RING_MASK wrap at most once: two base rows (s0, s0 - RING_SLOTS)
-        # plus immediate offsets address all T appends
-        s0 = (base + P) & RING_MASK
-        u_a = (
-            u_cache.iterator.toint()
-            + Int64(cute.crd2idx((sidx, hv, s0, row), u_cache.layout)) * 2
-        )
-        u_b = u_a - Int64(RING_SLOTS * V_DIM * 2)
+        ring_t = BFloat16 if self.u_bf16 else Float16
         for t in range(T):
             hq = egp * rq[t] + yq[t]
             y = s_coef[cb + _CO_EG + t] * hq
             for s_ in range(t + 1):
                 y = y + s_coef[cb + _bq_off(t, s_)] * uu[s_]
             out[brow, t, hv, row] = BFloat16(y)
-            if early_release:
-                u_cache[sidx, hv, (base + P + t) & RING_MASK, row] = ring_t(uu[t])
-            else:
-                ua = _sel(s0 + t < RING_SLOTS, u_a, u_b, Int64)
-                U.stg_u16(ua + Int64(t * V_DIM * 2), U.f32_to_u16(uu[t], self.u_bf16))
-            if self.vf and not early_release:  # flush rows (verify: warp 0 bulk copies)
-                ctx["v_cache"][sidx, hv, (base + P + t) & RING_MASK, row] = vv[t]
-        self._stamp(ctx, PF_EPI + hh)
+            u_cache[sidx, hv, (base + P + t) & RING_MASK, row] = ring_t(uu[t])
 
     def _load_seed(self, ctx, rand_seed):
         """SR variants, flush rows only: the Philox key / LCG mixing key (verify rows never
@@ -2387,27 +1663,19 @@ class GdnReplayMtpUmma:
 
     @cute.jit
     def _flush_halves(self, hh, ctx):
-        if cutlass.const_expr(self.gloop):
-            for g in cutlass.range(2, unroll=1):
-                self._flush_half(hh, g, ctx)
-        else:
-            for g in cutlass.range_constexpr(2):
-                self._flush_half(hh, g, ctx)
+        for g in cutlass.range(2, unroll=1):
+            self._flush_half(hh, g, ctx)
 
     @cute.jit
     def _flush_half(self, hh, g, ctx):
         """Wait for half g of head hh (g = 0: fold half 0 and the half-0 readout; g = 1: fold half 1 and the
         history), then fold it into the resident stage."""
         if g == 0:
-            self._ik_push("c_wait_rd0", hh)
             cute.arch.mbarrier_wait(ctx["f_mma_a"][hh], ctx["ph"])
             cute.arch.mbarrier_wait(ctx["rd0"][hh], ctx["ph"])
-            self._ik_pop()
         else:
-            self._ik_push("c_wait_mma", hh)
             cute.arch.mbarrier_wait(ctx["f_mma_b"][hh], ctx["ph"])
             cute.arch.mbarrier_wait(ctx["mma_done"][hh], ctx["ph"])
-            self._ik_pop()
         U.fence_after_sync()
         self._rmw(hh, g, ctx)
 
@@ -2417,20 +1685,6 @@ class GdnReplayMtpUmma:
         ct, row, tbase, s_coef = ctx["ct"], ctx["row"], ctx["tbase"], ctx["s_coef"]
         egp = s_coef[hh * _COEF + _CO_EGP]
         srow = ctx["st_addr"] + g * 16384 + row * 128
-        if self.dstore:
-            # this thread's row of half g in the state pool [pool, HV, V, K] fp16: 128 B, linear
-            grow = (
-                ctx["st_g"]
-                + (
-                    (
-                        (Int64(ctx["sidx"]) * self.hv + Int64(ctx["hv0"] + hh)) * V_DIM
-                        + Int64(row)
-                    )
-                    * K_DIM
-                    + g * 64
-                )
-                * 2
-            )
         if self.sr_rounds > 0:
             # flat element offset of S[sidx, hv, row, 64 g] in the [pool, HV, V, K] state pool
             # (FlashInfer Mamba's Philox counter: state offset + row * K + column)
@@ -2504,92 +1758,24 @@ class GdnReplayMtpUmma:
                         nw.append(U.pack_f16x2_rs(lo, hi, rw[i]))
                     else:
                         nw.append(U.pack_f16x2(lo, hi))
-                if self.dstore:
-                    U.stg_v4(grow + Int64(chunk * 16), nw[0], nw[1], nw[2], nw[3])
-                else:
-                    U.sts_v4(sa, nw[0], nw[1], nw[2], nw[3])
-        if not self.dstore:
-            cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(
-            ctx["f_gdone"][2 * hh + g]
-        )  # dstore: the pad has been read
-        self._stamp(ctx, PF_RMW0 + 4 * g + hh)
-
-    def _head_vf_flush(self, hh, ctx):
-        """unf_vf flush row, head hh: re-solve the window's corrections from S0 in fp32,
-            ũ_j = β_j (w_j v_j - e^{G_P} S0 k̂_j - sum_{i<j} (k̂_i . k̂_j) ũ_i)   (= w_j u_j),
-        and use them as D for the history readout and the fold."""
-        T = self.T
-        P, row, ct, tbase, s_coef = (
-            ctx["P"],
-            ctx["row"],
-            ctx["ct"],
-            ctx["tbase"],
-            ctx["s_coef"],
-        )
-        s_gram = ctx["s_gram"]
-        v = ctx["v"]
-        cb = hh * _COEF
-        # current-token v first: loads still in flight at RMW0's proxy fence (MEMBAR) would
-        # stall it, so they must have landed by then
-        vv = []
-        for t in range(T):
-            vv.append(v[ctx["brow"], t, ctx["hv0"] + hh, row])
-        cute.arch.mbarrier_wait(
-            ctx["u_full"][hh], ctx["ph"]
-        )  # v-ring window of this head
-        ub = ctx["uw_addr"] + (hh % 2) * (W_RING * V_DIM * 2) + row * 2
-        vw = [U.lds_u16(ub + j * (V_DIM * 2)) for j in range(W_RING)]
-        if hh < 2 or self.persist:
-            cute.arch.mbarrier_arrive(ctx["u_free"][0])
-        cute.arch.mbarrier_wait(ctx["rd0"][hh], ctx["ph"])  # R and KH of both halves
-        U.fence_after_sync()
-        khv = U.tmem_ld(ct, tbase + 40, W_RING)
-        U.tmem_wait_ld()
-        egp = s_coef[cb + _CO_EGP]
-        ut = []
-        for j in range(W_RING):
-            acc = s_coef[cb + _CO_W + j] * U.u16_as_f32(vw[j], True) - egp * khv[j]
-            for i in range(j):
-                acc = acc - s_gram[j * 16 + i] * ut[i]
-            ut.append(_sel(j < P, acc * s_coef[cb + _CO_BW + j], 0.0, Float32))
-        words = [U.pack_f16x2(ut[2 * c], ut[2 * c + 1]) for c in range(W_RING // 2)]
-        U.tmem_st_u32(ct, tbase + 32, words)
-        U.tmem_wait_st()
-        U.fence_before_sync()
-        cute.arch.mbarrier_arrive(ctx["d_ready"][hh])
-        self._stamp(ctx, PF_DREADY + hh)
-        cute.arch.mbarrier_wait(ctx["f_mma_a"][hh], ctx["ph"])
-        U.fence_after_sync()
-        self._rmw(hh, 0, ctx)
-        cute.arch.mbarrier_wait(ctx["f_mma_b"][hh], ctx["ph"])
-        cute.arch.mbarrier_wait(ctx["mma_done"][hh], ctx["ph"])
-        U.fence_after_sync()
-        self._stamp(ctx, PF_MDONE + hh)
-        self._rmw(hh, 1, ctx)
-        self._epilogue(hh, 0, ctx, vv, False)
+                U.sts_v4(sa, nw[0], nw[1], nw[2], nw[3])
+        cute.arch.fence_view_async_shared()
+        cute.arch.mbarrier_arrive(ctx["f_gdone"][2 * hh + g])
 
     @cute.jit
     def _head_u(self, hh, ctx):
         """Head hh of a flush or a verify row (runtime is_flush): D build, then the flush row's two RMW halves or the
         verify row's wait for the history, then the epilogue with the early TMEM release for both."""
         is_flush = ctx["is_flush"]
-        self._ik_push("c_head", hh, only_simple=True)
         dcol = _sel(is_flush, Int32(32), 64 + (hh & 1) * (W_RING // 2), Int32)
         rcol = _sel(is_flush, Int32(0), (hh & 1) * 32, Int32)
-        vv = self._d_build(hh, dcol, ctx, False)
+        vv = self._d_build(hh, dcol, ctx)
         if is_flush:
             self._flush_halves(hh, ctx)
         else:
-            self._ik_push("c_wait_mma", hh)
             cute.arch.mbarrier_wait(ctx["mma_done"][hh], ctx["ph"])
-            self._ik_pop()
             U.fence_after_sync()
-            self._stamp(ctx, PF_MDONE + hh)
-        self._ik_push("c_epi", hh)
-        self._epilogue(hh, rcol, ctx, vv, True)
-        self._ik_pop()
-        self._ik_pop(only_simple=True)  # c_head
+        self._epilogue(hh, rcol, ctx, vv)
 
     # ------------------------------------------------------------------ compile
     @cache
@@ -2601,14 +1787,9 @@ class GdnReplayMtpUmma:
         hv: int,
         u_bf16: bool,
         use_row_order: bool,
-        prof: bool = False,
-        vf: bool = False,
         hpc: int = HPK,
         sr: str = "",
         sr_rounds: int = 0,
-        slots: int = 0,
-        minb: int = _MINB,
-        l2pf: int = _L2PF,
         pmax: int = 0,
     ):
         batch = cute.sym_int()
@@ -2628,16 +1809,11 @@ class GdnReplayMtpUmma:
             ft(BFloat16, (pool, h, RING_SLOTS, K_DIM), 8),  # k ring (bf16)
             ft(uring, (pool, hv, RING_SLOTS, V_DIM), 8),  # u ring (bf16 / fp16)
             ft(Float32, (pool, hv, RING_SLOTS), 1),  # g ring
-            # v ring (unf_vf); an unread placeholder (the u ring itself) otherwise, so it has the u ring's dtype
-            ft(BFloat16 if vf else uring, (pool, hv, RING_SLOTS, V_DIM), 8),
-            ft(Float32, (pool, hv, RING_SLOTS), 1),  # beta ring (unf_vf)
             ft(Int32, (batch,), 1),  # hist_len
             ft(Int32, (batch,), 1),  # cache_base
             ft(Int32, (batch,), 1),  # row order
             ft(BFloat16, (batch, T, hv, V_DIM), 8),  # out
-            ft(Int64, (cute.sym_int(), PROF_COLS), 1),  # prof_buf (stamps when prof)
             ft(Int64, (1,), 1),  # rand_seed (read by "philox" / "lcg")
-            ft(Int32, (1,), 1),  # n_valid (persistent: number of valid rows)
         ]
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile[gdn_compile_options(device, cute.EnableTVMFFI(True))](
@@ -2647,14 +1823,9 @@ class GdnReplayMtpUmma:
                 hv,
                 u_bf16,
                 use_row_order,
-                prof,
-                vf,
                 hpc,
                 sr,
                 sr_rounds,
-                slots,
-                minb,
-                l2pf,
                 pmax,
             ),
             *args,
@@ -2692,32 +1863,27 @@ _CVT_RS_CC = (
 _CTA_SLOTS_PER_SM = (
     _SMEM_CTAS_PER_SM  # 128 of 512 TMEM columns; SMEM per CTA decides the rest
 )
-# hpc = 2 up to this many waves of the hpc = 2 grid (see auto_heads_per_cta). W_RING = 16: 8 for every T.
-# W_RING = 32 (4 CTAs/SM, but the per-key-head prologue that hpc = 2 repeats is twice as long): measured
-# B200 crossovers (cold L2, fold 0-40 %, T = 4 and 8, verify-first consumer dispatch): hpc = 2 up to
-# B ~ 52-54, hpc = 4 beyond (3 waves of the hpc = 2 grid = B <= 55 at 148 SMs).
-_HPC2_MAX_WAVES = 8 if W_RING <= 16 else 3  # T <= 4
-_HPC2_MAX_WAVES_T8 = 8 if W_RING <= 16 else 3  # T > 4
+# hpc = 2 up to this many waves of the hpc = 2 grid (see auto_heads_per_cta). Measured B200 crossovers (cold L2,
+# fold 0-40 %, T = 4 and 8, verify-first consumer dispatch): hpc = 2 up to B ~ 52-54, hpc = 4 beyond (3 waves of the
+# hpc = 2 grid = B <= 55 at 148 SMs).
+_HPC2_MAX_WAVES = 3
 _NUM_SMS: dict = {}
 
 
 def auto_heads_per_cta(batch: int, n_key_heads: int, num_sms: int, T: int = 4) -> int:
     """Heads per CTA for a batch: 1 while the hpc = 1 grid fits in one wave of CTA slots,
-    2 while the hpc = 2 grid fits in a few waves (``_HPC2_MAX_WAVES``, per T), else 4.
+    2 while the hpc = 2 grid fits in a few waves (``_HPC2_MAX_WAVES``), else 4.
 
     One CTA runs its value heads one after another, so splitting a key head over 2 or 4
     CTAs (each repeating the small per-key-head prologue) shortens the per-CTA chain and
     gives the scheduler finer-grained work. hpc = 1 only pays off while everything runs in
-    one wave; hpc = 2 keeps winning over hpc = 4 well past one wave. W_RING = 16 (4 CTAs/SM):
-    5-25% at B = 16..128, cold clean L2, the repeated prologue catching up around B = 160-192;
-    B200 (148 SMs): 1 for B <= 9, 2 for B <= 148, else 4 (measured crossovers:
-    docs/mtp_umma_report.md). W_RING = 32 (4 CTAs/SM, doubled prologue): 1 for B <= 9, 2 for
-    B <= 55 (3 waves of the hpc = 2 grid), else 4, for every T."""
+    one wave; hpc = 2 keeps winning over hpc = 4 well past one wave. B200 (148 SMs, 4 CTAs/SM,
+    the prologue is twice as long as the 16-row-window kernel's): 1 for B <= 9, 2 for B <= 55
+    (3 waves of the hpc = 2 grid), else 4, for every T."""
     slots = _CTA_SLOTS_PER_SM * num_sms
     if batch * n_key_heads * HPK <= slots:
         return 1
-    waves = _HPC2_MAX_WAVES_T8 if T > 4 else _HPC2_MAX_WAVES
-    if batch * n_key_heads * (HPK // 2) <= waves * slots:
+    if batch * n_key_heads * (HPK // 2) <= _HPC2_MAX_WAVES * slots:
         return 2
     return HPK
 
@@ -2759,14 +1925,10 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
     flush_min: Optional[int] = None,
     restart_hist_on_flush: bool = True,
     row_order: Optional[torch.Tensor] = None,
-    prof_buf: Optional[torch.Tensor] = None,
-    v_cache: Optional[torch.Tensor] = None,
-    beta_cache: Optional[torch.Tensor] = None,
     heads_per_cta: Optional[int] = None,
     stochastic_rounding: Optional[str] = None,
     rand_seed: Optional[torch.Tensor] = None,
     philox_rounds: int = 10,
-    min_blocks_per_mp: Optional[int] = None,
     window_rows: Optional[int] = None,
 ) -> torch.Tensor:
     """UMMA drop-in for ``gated_delta_rule_mtp_ucache_flush`` (fp16-state arm), 1 <= T <= 8.
@@ -2797,9 +1959,6 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
     ``rand_seed`` is a single-element int64 CUDA tensor read on device, so a captured CUDA
     graph picks up updates; advance it every step (and use a different seed per layer), or
     repeated flushes of a slot reuse the same random bits.
-
-    ``prof_buf`` (int64 [B * H * 4 / heads_per_cta, PROF_COLS]) selects a variant that records %globaltimer
-    stamps per CTA (``PF_*`` columns); leave it None in production.
 
     ``flush_min`` (default: the largest value that is safe for any acceptance pattern,
     ``nu - T + 1`` with ``nu = min(W_RING, RING_SLOTS - T)``, i.e. ``min(W_RING - T + 1, RING_SLOTS - 2 T + 1)``:
@@ -2904,29 +2063,6 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         else int(heads_per_cta)
     )
     assert hpc in (1, 2, 4)
-    prof = prof_buf is not None
-    if not prof:
-        prof_key = ("prof", str(q.device))
-        prof_buf = _ROW_ID.get(prof_key)
-        if prof_buf is None:
-            prof_buf = torch.zeros(1, PROF_COLS, dtype=torch.int64, device=q.device)
-            _ROW_ID[prof_key] = prof_buf
-    else:
-        assert (
-            prof_buf.shape == (B * H * (HPK // hpc), PROF_COLS)
-            and prof_buf.dtype == torch.int64
-        )
-    vf = v_cache is not None
-    if vf:
-        assert beta_cache is not None
-        assert v_cache.dtype == torch.bfloat16 and tuple(v_cache.shape) == tuple(
-            u_cache.shape
-        )
-        assert beta_cache.dtype == torch.float32 and tuple(beta_cache.shape) == tuple(
-            g_cache.shape
-        )
-    else:
-        v_cache, beta_cache = u_cache, g_cache  # unused placeholders (unf_uf)
     mode = stochastic_rounding
     if mode is None:
         mode = "none"
@@ -2965,42 +2101,6 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
                 1, dtype=torch.int64, device=q.device
             )  # unread placeholder
             _ROW_ID[seed_key] = rand_seed
-    minb = _MINB if min_blocks_per_mp is None else int(min_blocks_per_mp)
-    assert 3 <= minb <= 4, (
-        f"min_blocks_per_mp={minb}: the warpgroups re-split a launch cap of 64 (4 CTAs/SM) or 80 "
-        f"(3) registers per thread with setmaxnreg, and TMEM allows at most 4 CTAs/SM"
-    )
-    slots = _num_sms(q.device) * minb if _PERSIST else 0
-    if _PERSIST and not _PERSIST_PAD:
-        # caller guarantees no padded rows: every row is an item, no per-call ordering work
-        nv_key = ("nvalid", B, str(q.device))
-        n_valid = _ROW_ID.get(nv_key)
-        if n_valid is None:
-            n_valid = torch.full((1,), B, dtype=torch.int32, device=q.device)
-            _ROW_ID[nv_key] = n_valid
-    elif _PERSIST:
-        # persistent CTAs stream items; padded rows (state index < 0) must not be items, so the
-        # row order puts valid rows first (keeping the caller's order among them) and the kernel
-        # reads the valid-row count from a device tensor (no host sync, graph-capturable)
-        valid = initial_state_indices >= 0
-        if use_ro:
-            ro_l = row_order.long()
-            row_order = row_order[
-                torch.argsort((~valid[ro_l]).to(torch.int8), stable=True)
-            ]
-        else:
-            row_order = torch.argsort((~valid).to(torch.int8), stable=True)
-        row_order = row_order.to(torch.int32).contiguous()
-        use_ro = True
-        n_valid = valid.sum().to(torch.int32).reshape(1)
-    else:
-        nv_key2 = ("nvalid", str(q.device))
-        n_valid = _ROW_ID.get(nv_key2)
-        if n_valid is None:
-            n_valid = torch.ones(
-                1, dtype=torch.int32, device=q.device
-            )  # unread placeholder
-            _ROW_ID[nv_key2] = n_valid
     fn = GdnReplayMtpUmma.compile(
         q.device,
         T,
@@ -3008,14 +2108,9 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         HV,
         u_cache.dtype == torch.bfloat16,
         use_ro,
-        prof,
-        vf,
         hpc,
         sr,
         sr_rounds,
-        slots,
-        minb,
-        _L2PF,
         pmax,
     )
     fn(
@@ -3031,15 +2126,11 @@ def gated_delta_rule_mtp_ucache_flush_umma_ring64(
         k_cache,
         u_cache,
         g_cache,
-        v_cache,
-        beta_cache,
         hist_len,
         cache_base,
         row_order,
         output,
-        prof_buf,
         rand_seed,
-        n_valid,
         float(scale),
         int(flush_min),
     )
