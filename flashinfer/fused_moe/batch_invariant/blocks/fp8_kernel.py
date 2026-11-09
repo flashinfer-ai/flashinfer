@@ -30,6 +30,7 @@ from ....gemm.batch_invariant.blocks.operands import (
     TmaSetup,
 )
 from ....gemm.batch_invariant.generator import Knobs, MainloopBlock
+from .epilogue import BAR_EPI_JOIN
 from .fp8_epilogue import (
     Fp8Chain,
     grouped_epilogue_loop_fp8,
@@ -220,6 +221,9 @@ class ScaledGroupedBlockGemmFp8:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=BAR_TMEM_ALLOC, num_threads=32 * (len(EPILOGUE_WARPS) + 1)
         )
+        epi_join = pipeline.NamedBarrier(
+            barrier_id=BAR_EPI_JOIN, num_threads=32 * len(EPILOGUE_WARPS)
+        )
         tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -405,4 +409,7 @@ class ScaledGroupedBlockGemmFp8:
                 cta_v=mma_tile_coord_v,
             )
             tmem.relinquish_alloc_permit()
+            # the allocator warp alone frees the columns: every epilogue warpgroup joins here after its last TMEM load (the
+            # staged store's barriers join one group only)
+            epi_join.arrive_and_wait()
             tmem.free(tmem_ptr)
