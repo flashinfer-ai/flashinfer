@@ -503,8 +503,11 @@ rank = int(os.environ["RANK"])
 case = os.environ["CACHE_CASE"]
 world_size = int(os.environ["WORLD_SIZE"])
 root = Path(os.environ["CASE_ROOT"])
+tactic_revision = 0
 
 class RunnerA(TunableRunner):
+    def get_tactic_cache_key(self, inputs):
+        return (tactic_revision,) if case == "partial_tactic_coverage" else None
     def get_cache_key_extras(self, inputs):
         return (0 if case in ("concurrent_publish", "all_hit_stale_memory") else rank,)
     def get_valid_tactics(self, inputs, profile):
@@ -546,7 +549,7 @@ try:
                                    runners[0].get_cache_key_extras(inputs))
         policy = tuner._profiling_policy(config)
         store = tuner._active_managed_store
-        all_hit = case in ("all_hit", "all_hit_different_tactics", "all_hit_different_runners", "all_hit_stale_memory")
+        all_hit = case in ("all_hit", "all_hit_different_tactics", "all_hit_different_runners", "all_hit_stale_memory", "partial_tactic_coverage")
         if all_hit or (rank == 0 and case not in ("all_miss", "concurrent_publish")):
             if case == "partial_memory":
                 tuner._winner_cache()[key] = (0, None)
@@ -561,6 +564,9 @@ try:
                 cached_tactic = rank if case == "all_hit_different_tactics" else 0
                 store.publish(key.file_key, key.runner_class_name, cached_tactic, key_fields=key.key_fields,
                               profiling_policy=policy, candidate_keys=candidates.file_keys)
+        if case == "partial_tactic_coverage" and rank == 0:
+            # Only one rank rejects its cached comparison's tactic signature.
+            tactic_revision = 1
         dist.barrier()
         if case == "all_hit_stale_memory":
             # The shared artifact is identical, but process-local memoized
@@ -578,6 +584,8 @@ try:
             if case != "concurrent_publish":
                 result = search(*args, **kwargs)
                 expected_hit = all_hit or (rank == 0 and case != "all_miss")
+                if case == "partial_tactic_coverage":
+                    expected_hit = rank != 0
                 assert result[0] == expected_hit, (rank, case, result)
                 return result
             if rank == 0:
@@ -836,6 +844,7 @@ finally:
         "partial_memory",
         "partial_file",
         "partial_managed",
+        "partial_tactic_coverage",
         "concurrent_publish",
         "failed_profile",
         "final_incomplete_disagreement",

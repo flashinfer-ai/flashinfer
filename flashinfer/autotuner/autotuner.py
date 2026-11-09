@@ -845,6 +845,23 @@ class TunableRunner(ABC):
         """
         return ()
 
+    def get_tactic_cache_key(
+        self, inputs: list[torch.Tensor]
+    ) -> tuple[Any, ...] | None:
+        """Optionally identify the tactic pool for tuning-cache reuse.
+
+        Return a cheap, hashable, cross-process-stable signature that changes
+        when tactics become available under the same runner identity. Like
+        cache-key extras, it must be invariant under input synthesis. Do not
+        build plans, profile, or enumerate tactics here: this runs before
+        preparation, including on warm tuning hits. Serving never calls it.
+
+        ``None`` preserves the existing assumption that the runner identity
+        determines its tactic pool. A changed signature requires retuning,
+        including for a single runner, without invalidating serving lookups.
+        """
+        return None
+
     def precompile_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -1457,19 +1474,26 @@ class ProfilingCacheKey:
 
 @dataclass(frozen=True)
 class _ProfilingCandidates:
-    runtime_keys: frozenset[tuple[str, int, tuple[Any, ...]]] | None
+    runtime_keys: (
+        frozenset[tuple[str, int, tuple[Any, ...], tuple[Any, ...] | None]] | None
+    )
     file_keys: tuple[str, ...] | None
 
     @classmethod
     def from_runners(
         cls, runners: list[TunableRunner], inputs: list[torch.Tensor]
     ) -> "_ProfilingCandidates | None":
-        if len(runners) == 1:
+        tactic_keys = [r.get_tactic_cache_key(inputs) for r in runners]
+        if len(runners) == 1 and tactic_keys[0] is None:
             return None
         runtime_keys = frozenset(
-            (type(r).__name__, hash(r), r.get_cache_key_extras(inputs)) for r in runners
+            (type(r).__name__, hash(r), r.get_cache_key_extras(inputs), tactic_key)
+            for r, tactic_key in zip(runners, tactic_keys, strict=True)
         )
-        file_keys = {str((name, extras)) for name, _, extras in runtime_keys}
+        file_keys = {
+            str((name, extras) if tactic_key is None else (name, extras, tactic_key))
+            for name, _, extras, tactic_key in runtime_keys
+        }
         # Persisted keys omit runtime hashes, so collisions make coverage ambiguous.
         return cls(
             runtime_keys,

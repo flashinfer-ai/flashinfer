@@ -200,6 +200,22 @@ result with coverage. The SM107 MXFP8 low-M CuTe-DSL runner uses a distinct
 entry from the regular CuTe-DSL runner, so its first tune can miss an older
 entry.
 
+A runner whose tactic pool can change without changing its identity may
+override ``TunableRunner.get_tactic_cache_key(inputs)``. Return a cheap,
+hashable, cross-process-stable tuple, such as a catalog revision. It must
+change when newly available tactics need comparison, and must be invariant
+under profiling-input synthesis. Computing it must not build plans, enumerate
+tactics, or invoke nested tuning.
+
+``choose_one()`` checks this signature only during tuning, including for a
+single runner. A changed or previously unrecorded signature triggers a new
+comparison; an unchanged signature permits warm reuse without enumeration or
+profiling. The signature is stored in the existing candidate-coverage metadata
+in both JSON and managed caches. Bare serving and capture remain lookup-only
+and can use an older valid winner until retuning. Runners returning ``None``
+(the default) retain their existing behavior; this does not detect undeclared
+tactic-pool changes or change ``rank_tactics(k > 1)`` shortlist reuse.
+
 Caching in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
