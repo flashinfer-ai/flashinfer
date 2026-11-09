@@ -228,8 +228,8 @@ A one-thread side kernel on GB200 (sm_100a, 152 SMs) barely changes the time:
 
 | Side kernel on another stream | shape A next-to / alone | shape B next-to / alone |
 | --- | --- | --- |
-| one thread, 2 ms | 1.000 | 1.002 |
-| one thread, 4 ms | 0.999 | 1.006 |
+| one thread, 2 ms | 0.999 | 0.999 |
+| one thread, 4 ms | 0.998 | 1.000 |
 
 The next table shows a resident kernel on another stream that holds `k` SMs. `N` is the SM count. The
 ratio columns give the time next to the resident kernel divided by the time alone. The `k = 0` rows give the
@@ -237,15 +237,15 @@ unloaded backward time. The previous non-deterministic backward ran as one progr
 
 | GPU | `k` | ideal `N / (N - k)` | shape A | shape B | previous backward, A / B |
 | --- | --- | --- | --- | --- | --- |
-| GB200 (sm_100a, 152 SMs) | 0 | 1 | 365.0 us | 493.1 us | 395.0 us / 560.5 us |
-| GB200 | 16 | 1.118 | 1.087 (396.7 us) | 1.175 (579.5 us) | 667.5 us / 921.1 us |
-| GB200 | 32 | 1.267 | 1.208 (440.8 us) | 1.286 (634.2 us) | 687.8 us / 914.1 us |
-| B200 (sm_100a, 148 SMs) | 0 | 1 | 384.3 us | 519.2 us | 423.9 us / 583.7 us |
-| B200 | 16 | 1.121 | 1.114 (428.0 us) | 1.190 (618.0 us) | 738.0 us / 973.8 us |
-| B200 | 32 | 1.276 | 1.258 (483.3 us) | 1.295 (672.6 us) | 743.4 us / 975.9 us |
+| GB200 (sm_100a, 152 SMs) | 0 | 1 | 360.1 us | 466.0 us | 395.0 us / 560.5 us |
+| GB200 | 16 | 1.118 | 1.091 (392.9 us) | 1.183 (551.1 us) | 667.5 us / 921.1 us |
+| GB200 | 32 | 1.267 | 1.210 (435.6 us) | 1.284 (598.2 us) | 687.8 us / 914.1 us |
+| B200 (sm_100a, 148 SMs) | 0 | 1 | 370.1 us | 486.4 us | 423.9 us / 583.7 us |
+| B200 | 16 | 1.121 | 1.159 (428.9 us) | 1.190 (578.6 us) | 738.0 us / 973.8 us |
+| B200 | 32 | 1.276 | 1.289 (477.1 us) | 1.320 (642.2 us) | 743.4 us / 975.9 us |
 
-For shape A, the slowdown closely follows the share of SMs the resident kernel holds and stays at or below the ideal ratio. For
-shape B it is above the ideal ratio.
+The slowdown follows the share of SMs the resident kernel holds. For shape A on GB200 it stays below the ideal
+ratio. For shape A on B200 and for shape B on both GPUs it is at most 0.07 above the ideal ratio.
 
 `bwd_reserve_sms=K` is an opt-in alternative (SM100 / SM103 only). It runs the one-program backward
 after the exchange with a grid `K x ctas_per_sm` CTAs short. A kernel holding up
