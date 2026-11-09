@@ -32,9 +32,11 @@ contract (the route reads ``group``, ``world_size``, ``cu_seqlens_local``,
 ``T_r``, ``conv_kernel_size`` and ``wait_ready()``; the numerical mode is
 never stored in the context), FP32 taps only, no bias, the legacy channel tile
 rule ``cake_jit.plan(..., legacy=True)``, the same forward and head programs
-(this package's copies of the det programs) and the same exchanges, recompute
-handle, graph replay and multi-tensor calls.  The difference is the backward
-after the head program, which overlaps the halo exchange (:func:`_bwd_overlap`):
+(this package's copies of the det programs: the KCP forward, its history-row
+program and the head program), the same two-launch forward (below) and the
+same exchanges, recompute handle, graph replay and multi-tensor calls.  The
+difference is the backward after the head program, which overlaps the halo
+exchange (:func:`_bwd_overlap`):
 
 1. the exchange is issued;
 2. the main program (registry ``kcp_jit``, kind ``kcp_bwd_dyn``) runs before
@@ -84,6 +86,28 @@ shared by the capture's backward calls on that stream, with another fill node
 when a call needs a larger buffer, and kept alive after its graph is freed
 until a later capture on that stream replaces it; with capture id 0, also
 without ``cuda.bindings``, each captured call zeroes a buffer of its own).
+
+Two-launch forward (the deterministic KCP package's forward, FlashInfer #9225): the forward can run as a main
+program that reads no received row and the ``kcp_fwd_halo`` history-row program.  The main program writes every row,
+a continuing fragment's first rows as at a document start: either this package's zero-history registry's single-rank
+``fwd`` route program (``cake_jit.selected_modules(arch, "fwd", C=C, S=S)``, the program the single-rank forward
+runs) on the rank's fragments, each a document of its own (``cu = ctx.cu_seqlens_local``, ``num_docs = n_frag``; the
+record's full co-resident grid and token-chunk counters as in the single-rank forward), or, in the overlapped form
+only, the ``kcp_fwd`` program with every ``hist_row_off`` entry ``-1``.  The history-row program then writes ``y`` of
+the first ``min(3, len)`` rows of every fragment with a history row again from the received pool, with the
+``kcp_fwd`` program's instructions, so ``y`` is bitwise the one-launch forward's; it runs only when the rank receives
+history rows.  With an exchange in flight (more than one rank) the overlapped form launches the main program before
+the exchange's wait and the history-row program after it.  The waiting form launches after the wait: the single-rank
+main program and the history-row program, or, with the ``kcp_fwd`` program as main, the one-launch forward (the
+``kcp_fwd`` program with the context's table, no history-row program).  ``FWD_MAIN_ARCHS`` names the architectures
+whose forward runs the single-rank main program (else the ``kcp_fwd`` program), ``FWD_OVERLAP_ARCHS`` those whose
+forward overlaps; ``MULTI_FWD_MAIN_ARCHS`` and ``MULTI_FWD_OVERLAP_ARCHS`` are the multi entry's, which overlaps its
+first tensor only (the other tensors take the waiting form after the wait).  The sets are the deterministic
+package's (the same programs; their comment): every architecture's single call runs the single-rank main program
+after the wait, and so does the multi entry on sm_100a and sm_103a; on sm_107a the multi entry overlaps.  The
+exchange, its wait and the collectives are the same in every form.  The private test knobs ``fwd_main`` and
+``fwd_overlap`` (``None`` shipped = the architecture sets, ``0`` = off, ``1`` = on) select the forms for the A/B
+record, and ``LAST_CALL["fwd"]`` / ``LAST_CALL["fwd_multi"]`` record the form a call took (:func:`_fwd_record`).
 
 Numerics: ``y`` and ``hist`` are the det KCP forward's bits; ``dx`` is the det
 KCP backward's bits on both backward forms (same per-thread FP32 steps, same
@@ -148,7 +172,8 @@ Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
 ``entries`` dict) the original forward exchanges as always and stores
 its history pool ``hist`` (the saved set's own tensor, key ``"conv"``) in the
 handle; torch's recompute of that forward inside the backward binds it and
-launches the same forward kernel on it -- no gather, no collective, no wait --
+launches the same forward programs on it (the two-launch forward in its waiting form) -- no gather, no collective,
+no wait --
 so ``y`` and the saved set ``(x_local, weight, hist)`` are bitwise those of the
 exchanging recompute.  The backward is unchanged (it still exchanges the head
 rows).  The forward exchange is a collective: every rank of ``ctx.group`` passes
@@ -185,12 +210,14 @@ from . import (
     _device_arch,
     _device_index,
     _dweight_aligned,
+    _forward_work,
     _output,
     _require_tensor,
     _scalars,
     _tokens,
     _weight,
 )
+from . import cake_jit as _zero_history
 from . import kcp_jit as _loader
 from .cake_jit import WIDTH, launch_grid, plan
 from .kcp_jit import (
@@ -212,11 +239,18 @@ KCP_BWD = "kcp_bwd"
 KCP_BWD_HEAD = "kcp_bwd_head"
 KCP_BWD_DYN = "kcp_bwd_dyn"
 KCP_BWD_HALO = "kcp_bwd_halo"
-# SMs of co-resident CTAs the forward (``kcp_fwd``, the deterministic KCP forward program) leaves free, per
+KCP_FWD_HALO = "kcp_fwd_halo"
+# The zero-history registry's forward route of FP32 taps and no bias (the KCP contract): the single-rank main program
+# of the two-launch forward (the module docstring).
+FWD_MAIN_ROUTE = "fwd"
+# SMs of co-resident CTAs the ``kcp_fwd`` program (the deterministic KCP forward program) leaves free, per
 # architecture (:func:`_forward_grid`).  sm_107a launches the deterministic KCP forward's grid, one SM short: unloaded it
 # measured about 0.3% faster there than the full co-resident grid (R200, 212 SMs, world 4, 16384 tokens x 8192
 # channels x 3 tensors per rank; within noise at 32768 x 10240).  sm_100a and sm_103a keep the full grid, which
-# measured faster than the reserved one there.  ``y`` does not depend on the grid.
+# measured faster than the reserved one there.  The single-rank main program of the two-launch forward
+# (``FWD_MAIN_ARCHS``) is the zero-history registry's record and launches its full co-resident grid, as the
+# single-rank forward does; the history-row program launches the head program's grid.  ``y`` does not depend on the
+# grid.
 FWD_RESERVE_SMS = {"sm_107a": 1}
 GRAPH_MODES = (
     "off",
@@ -685,10 +719,31 @@ HOST_TRIM_DEFAULT = (
 # exchange's wait for every call, via ``_set_test_knobs({"bwd_route": "single"})`` only.
 BWD_ROUTES = ("overlap", "single")
 BWD_ROUTE_DEFAULT = "overlap"
+# The two-launch forward (the module docstring's "Two-launch forward"): the knob values of ``fwd_main`` (the main
+# program: 1 = the single-rank ``fwd`` route program, 0 = the ``kcp_fwd`` program) and ``fwd_overlap`` (1 = the main
+# program before the exchange's wait, 0 = after it); ``None``, shipped, = the architecture sets below.
+FWD_MAINS = (None, 0, 1)
+FWD_MAIN_DEFAULT = None
+FWD_OVERLAPS = (None, 0, 1)
+FWD_OVERLAP_DEFAULT = None
+# The architectures whose single call runs the single-rank main program (``FWD_MAIN_ARCHS``) and launches its main
+# program before the exchange's wait (``FWD_OVERLAP_ARCHS``), and the multi entry's (``MULTI_*``).  The deterministic
+# KCP package's sets (FlashInfer #9225): this package runs the same forward programs (the zero-history registry's
+# ``fwd`` route records carry the deterministic records' build identity digits; the ``kcp_fwd`` and ``kcp_fwd_halo``
+# programs are copies of the deterministic ones), so each entry takes the form the deterministic package measured
+# faster than the one-launch forward on every forward, forward + backward and checkpointed step row of B200, GB300 and
+# R200: the single call waits and runs the single-rank main program on every architecture; the multi entry waits on
+# sm_100a and sm_103a and overlaps its first tensor on sm_107a.
+FWD_MAIN_ARCHS = frozenset(("sm_100a", "sm_103a", "sm_107a"))
+FWD_OVERLAP_ARCHS: frozenset[str] = frozenset()
+MULTI_FWD_MAIN_ARCHS = frozenset(("sm_100a", "sm_103a", "sm_107a"))
+MULTI_FWD_OVERLAP_ARCHS = frozenset(("sm_107a",))
 _TEST_KNOBS: dict[str, Any] = {
     "graph": "off",
     "host_trim": HOST_TRIM_DEFAULT,
     "bwd_route": BWD_ROUTE_DEFAULT,
+    "fwd_main": FWD_MAIN_DEFAULT,
+    "fwd_overlap": FWD_OVERLAP_DEFAULT,
 }
 # The opt-in SM reserve of the main backward (keyword ``bwd_reserve_sms``): 0 = the grid of :func:`_bwd_grid`.
 RESERVE_DEFAULT = 0
@@ -697,7 +752,8 @@ GRAPH_CACHE_MAX = 64
 LAST_CALL: dict[str, dict[str, Any]] = {}
 
 # -- the trimmed host path (host_trim=1): the per-context host state of the eager halo calls.  ``_HOST_CACHE[id(ctx)]`` holds the
-# context (pinned, so its id cannot be reused) and one entry per ``(kind, S, C, device, cu_seqlens_local_cpu)``: the
+# context (pinned, so its id cannot be reused) and one entry per ``(kind, S, C, device, cu_seqlens_local_cpu)`` (the
+# forward's also per effective ``(sr, overlap)`` of :func:`_fwd_form`): the
 # validated context tables and tensors (``cu``, ``hist_row_off``, ...), the plan scalars, the record names, the loaded
 # modules with their positional argument plans and grids.  Everything in an entry derives from host integers of the
 # context and the shapes of the call; no tensor content is read.  At most HOST_CACHE_MAX contexts (the oldest dropped).
@@ -881,6 +937,29 @@ def _overlapped(C: int, S: int, reserve: int) -> bool:
     >= 1`` keeps the ``kcp_bwd`` program's reserved grid, so it and a wider ``C`` run that program after the wait
     (as does the ``bwd_route`` test knob ``"single"``)."""
     return _TEST_KNOBS["bwd_route"] == "overlap" and not reserve and dyn_applies(C, S)
+
+
+def _fwd_form(arch: str, *, multi: bool = False) -> tuple[bool, bool]:
+    """``(sr, overlap)`` of the forward on ``arch`` (the module docstring's "Two-launch forward"): whether its main
+    program is the single-rank ``fwd`` route program (else the ``kcp_fwd`` program), and whether it launches the main
+    program before the exchange's wait when an exchange is in flight.  Each is its test knob (``fwd_main`` /
+    ``fwd_overlap``) when the knob is ``0`` or ``1``, else (``None``, shipped) whether ``arch`` is in the entry's set:
+    ``FWD_MAIN_ARCHS`` / ``FWD_OVERLAP_ARCHS``, or ``MULTI_FWD_MAIN_ARCHS`` / ``MULTI_FWD_OVERLAP_ARCHS`` for the multi
+    entry (``multi``)."""
+
+    main, overlap = _TEST_KNOBS["fwd_main"], _TEST_KNOBS["fwd_overlap"]
+    if main is None:
+        main = arch in (MULTI_FWD_MAIN_ARCHS if multi else FWD_MAIN_ARCHS)
+    if overlap is None:
+        overlap = arch in (MULTI_FWD_OVERLAP_ARCHS if multi else FWD_OVERLAP_ARCHS)
+    return bool(main), bool(overlap)
+
+
+def _fwd_variant(x: Any, *, multi: bool = False) -> tuple[bool, bool]:
+    """The forward's graph-key value: :func:`_fwd_form` on the device of ``x`` (the effective form, so a changed knob
+    or architecture set is another key)."""
+
+    return _fwd_form(_device_arch(_require_tensor(x, "x_local").device), multi=multi)
 
 
 def _dyn_host(
@@ -1076,7 +1155,8 @@ def _reserve_fits(reserve: int, x: Any, entry: str) -> None:
 def _set_test_knobs(knobs: Optional[dict]) -> dict:
     """Set the module's private test knobs (``graph``: ``"off"`` shipped | ``"replay"``; ``host_trim``: ``1`` shipped =
     the trimmed host path of the eager call | ``0`` the previous host path; ``bwd_route``: ``"overlap"`` shipped |
-    ``"single"`` the one backward program after the exchange's wait); a knob
+    ``"single"`` the one backward program after the exchange's wait; ``fwd_main`` / ``fwd_overlap``: ``None`` shipped
+    = the architecture sets of the two-launch forward | ``0`` off | ``1`` on, :func:`_fwd_form`); a knob
     the dict does not name keeps its shipped default; ``None`` restores the defaults.  A private test hook: tests call
     it directly and restore the defaults afterwards; the backend reads no environment variable.  Returns the active
     knobs."""
@@ -1084,13 +1164,18 @@ def _set_test_knobs(knobs: Optional[dict]) -> dict:
         _TEST_KNOBS["graph"] = "off"
         _TEST_KNOBS["host_trim"] = HOST_TRIM_DEFAULT
         _TEST_KNOBS["bwd_route"] = BWD_ROUTE_DEFAULT
+        _TEST_KNOBS["fwd_main"] = FWD_MAIN_DEFAULT
+        _TEST_KNOBS["fwd_overlap"] = FWD_OVERLAP_DEFAULT
         return dict(_TEST_KNOBS)
     if not isinstance(knobs, dict):
         raise TypeError(f"_set_test_knobs expects a dict, got {type(knobs).__name__}")
-    unknown = sorted(set(knobs) - {"graph", "host_trim", "bwd_route"})
+    unknown = sorted(
+        set(knobs) - {"graph", "host_trim", "bwd_route", "fwd_main", "fwd_overlap"}
+    )
     if unknown:
         raise ValueError(
-            f"_set_test_knobs: unknown knob(s) {unknown}; known: ['bwd_route', 'graph', 'host_trim']"
+            f"_set_test_knobs: unknown knob(s) {unknown}; known: ['bwd_route', 'fwd_main', 'fwd_overlap', 'graph', "
+            "'host_trim']"
         )
     graph = str(knobs.get("graph", "off"))
     if graph not in GRAPH_MODES:
@@ -1107,9 +1192,21 @@ def _set_test_knobs(knobs: Optional[dict]) -> dict:
         raise ValueError(
             f"_set_test_knobs: bwd_route must be one of {BWD_ROUTES}, got {bwd_route!r}"
         )
+    fwd_main = knobs.get("fwd_main", FWD_MAIN_DEFAULT)
+    if isinstance(fwd_main, bool) or fwd_main not in FWD_MAINS:
+        raise ValueError(
+            f"_set_test_knobs: fwd_main must be one of {FWD_MAINS}, got {fwd_main!r}"
+        )
+    fwd_overlap = knobs.get("fwd_overlap", FWD_OVERLAP_DEFAULT)
+    if isinstance(fwd_overlap, bool) or fwd_overlap not in FWD_OVERLAPS:
+        raise ValueError(
+            f"_set_test_knobs: fwd_overlap must be one of {FWD_OVERLAPS}, got {fwd_overlap!r}"
+        )
     _TEST_KNOBS["graph"] = graph
     _TEST_KNOBS["host_trim"] = int(host_trim)
     _TEST_KNOBS["bwd_route"] = str(bwd_route)
+    _TEST_KNOBS["fwd_main"] = None if fwd_main is None else int(fwd_main)
+    _TEST_KNOBS["fwd_overlap"] = None if fwd_overlap is None else int(fwd_overlap)
     return dict(_TEST_KNOBS)
 
 
@@ -1132,7 +1229,16 @@ def _graph_mode(graph: Optional[str]) -> str:
 class _GraphEntry:
     """One validity key: its graph (after the capture) and the static results."""
 
-    __slots__ = ("key", "pins", "seen", "graph", "result", "disabled", "digest")
+    __slots__ = (
+        "key",
+        "pins",
+        "seen",
+        "graph",
+        "result",
+        "record",
+        "disabled",
+        "digest",
+    )
 
     def __init__(self, key: tuple, pins: tuple) -> None:
         self.key, self.pins = (
@@ -1142,6 +1248,8 @@ class _GraphEntry:
         self.seen = 0
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.result: Optional[tuple] = None
+        # what the captured call recorded in LAST_CALL[kind] (the forward's launch form), repeated by every replay
+        self.record: dict[str, Any] = {}
         self.disabled: Optional[str] = None
         self.digest = f"{key[0]}:{hash(key) & 0xFFFFFFFFFFFF:012x}"
 
@@ -1166,8 +1274,8 @@ def _graph_entry(
 ) -> Optional[_GraphEntry]:
     """The cache entry of this call's validity key, or ``None`` when the call is never captured (mode off, no tokens);
     ``mode`` = the effective graph mode (:func:`_graph_mode`), ``None`` = the knob; ``extra`` = further host values
-    of the key (the backward's ``bwd_reserve_sms`` when not the default; a backward key also holds the
-    ``bwd_route`` test knob when not the default)."""
+    of the key (the backward's ``bwd_reserve_sms`` when not the default, the forward's :func:`_fwd_form`; a backward
+    key also holds the ``bwd_route`` test knob when not the default)."""
     if (
         (_TEST_KNOBS["graph"] if mode is None else mode) == "off"
         or int(getattr(ctx, "T_r", 0)) == 0
@@ -1203,17 +1311,21 @@ def _graph_run(
     kind: str, entry: Optional[_GraphEntry], body: Any, mode: Optional[str] = None
 ) -> tuple:
     """Run ``body()`` under the graph mode (keyword or knob): replay the key's graph, or capture this call (the key's second), or run eagerly
-    (the key's first call, a key whose capture failed, or a call that is never captured).  Returns the results."""
+    (the key's first call, a key whose capture failed, or a call that is never captured).  Returns the results.
+    ``LAST_CALL[kind]`` holds what the body recorded (the forward's launch form; a replay repeats the captured call's)
+    and the graph event."""
     if entry is not None and entry.graph is not None:
         entry.graph.replay()
         GRAPH_STATS["replay"] += 1
         LAST_CALL[kind] = {
+            **entry.record,
             "graph": "replay",
             "graph_event": "replay",
             "graph_key": entry.digest,
             "graph_fallback": None,
         }
         return entry.result
+    LAST_CALL.pop(kind, None)  # the body records afresh
     if entry is not None and entry.seen > 0 and entry.disabled is None:
         g = torch.cuda.CUDAGraph()
         try:
@@ -1225,12 +1337,14 @@ def _graph_run(
         else:
             g.replay()
             entry.graph, entry.result = g, result
+            entry.record = LAST_CALL.pop(kind, {})
             # the graph holds the addresses of the context's cached host-path tensors (tail tables): keep them alive
             # past a host-cache clear or eviction (pins[0] is the context)
             entry.pins += (_HOST_CACHE.get(id(entry.pins[0])),)
             entry.seen += 1
             GRAPH_STATS["capture"] += 1
             LAST_CALL[kind] = {
+                **entry.record,
                 "graph": "replay",
                 "graph_event": "capture",
                 "graph_key": entry.digest,
@@ -1242,6 +1356,7 @@ def _graph_run(
     if entry is not None:
         entry.seen += 1
     LAST_CALL[kind] = {
+        **LAST_CALL.get(kind, {}),
         "graph": _TEST_KNOBS["graph"] if mode is None else mode,
         "graph_event": "eager",
         "graph_key": None if entry is None else entry.digest,
@@ -1275,7 +1390,13 @@ def cake_causal_conv1d_nondet_train_kcp_forward(
     mode = _graph_mode(graph)
     if mode == "off":
         return _kcp_forward(x_local, weight, ctx, out=out)
-    entry = _graph_entry("fwd", ctx, (x_local, weight, out), mode)
+    entry = _graph_entry(
+        "fwd",
+        ctx,
+        (x_local, weight, out),
+        mode,
+        extra=(("fwd_form", _fwd_variant(x_local)),),
+    )
     y, hist = _graph_run(
         "fwd", entry, lambda: _kcp_forward(x_local, weight, ctx, out=out), mode
     )
@@ -1285,9 +1406,10 @@ def cake_causal_conv1d_nondet_train_kcp_forward(
 def _forward_grid(
     record: dict[str, Any], *, arch: str, device_index: int, C: int, n_ch_tiles: int
 ) -> tuple[int, int, int]:
-    """The forward's launch grid: the record's co-resident grid (:func:`launch_grid`) less :data:`FWD_RESERVE_SMS`
-    SMs of CTAs for ``arch`` when that shorter grid still holds all ``n_ch_tiles`` channel tiles, else the full grid;
-    a ``ValueError`` when not even the full grid holds them.  ``y`` does not depend on the grid."""
+    """The ``kcp_fwd`` program's launch grid: the record's co-resident grid (:func:`launch_grid`) less
+    :data:`FWD_RESERVE_SMS` SMs of CTAs for ``arch`` when that shorter grid still holds all ``n_ch_tiles`` channel
+    tiles, else the full grid; a ``ValueError`` when not even the full grid holds them.  ``y`` does not depend on the
+    grid."""
 
     full = launch_grid(record, device_index=device_index)
     if n_ch_tiles > full[0]:
@@ -1300,6 +1422,38 @@ def _forward_grid(
     return full
 
 
+def _sr_main(
+    arch: str, *, S: int, C: int, n_frag: int, device_index: int
+) -> tuple[str, dict[str, int], tuple[int, int, int], int]:
+    """The two-launch forward's single-rank main program of a call: ``(record name, plan scalars, grid, counter
+    words)`` of the zero-history registry's ``fwd`` route record ``cake_jit.selected_modules`` picks for ``C`` and
+    ``S`` -- the single-rank forward's plan (its role, route and architecture) over the rank's ``n_frag`` fragments as
+    documents, its record's full co-resident grid and its token-chunk counter words; a ``ValueError`` when ``C`` spans
+    more channel tiles than that grid holds."""
+    (name,) = _zero_history.selected_modules(arch, FWD_MAIN_ROUTE, C=C, S=S)
+    record = _zero_history.MODULES[name]
+    scalars = plan(
+        S,
+        C,
+        n_frag,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
+        route=_zero_history.record_route(record, arch),
+        arch=arch,
+    )
+    grid = launch_grid(record, device_index=device_index, C=C, S=S)
+    if scalars["n_ch_tiles"] > grid[0]:
+        raise ValueError(
+            f"C={C} spans more channel tiles than the forward's grid on this device holds"
+        )
+    return (
+        name,
+        scalars,
+        grid,
+        _zero_history.counter_words(record, scalars["n_ch_tiles"]),
+    )
+
+
 def _kcp_forward(
     x_local: torch.Tensor,
     weight: torch.Tensor,
@@ -1310,7 +1464,8 @@ def _kcp_forward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The forward's host flow (eagerly or inside a capture): see
     :func:`cake_causal_conv1d_nondet_train_kcp_forward`.  ``_hist``: the history pool a recompute handle stored
-    (checked by :func:`_handle_hist`): no gather, no exchange, no wait; the kernel launch is the same."""
+    (checked by :func:`_handle_hist`): no gather, no exchange, no wait; the programs are the same, launched in the
+    waiting form."""
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
@@ -1347,36 +1502,81 @@ def _kcp_forward(
     if S == 0:
         if work is not None:
             work.wait()
+        _fwd_record("fwd", None, False, False)
         return y, hist
     hist_row_off = _table(
         ctx, "hist_row_off", shape=(n_frag, HALO), dtype=torch.int32, device=device
     )
-    (name,) = route_modules(arch, KCP_FWD)
     device_index = _device_index(device)
-    record = _loader.MODULES[name]
-    scalars = plan(S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True)
-    grid = _forward_grid(
-        record,
-        arch=arch,
-        device_index=device_index,
-        C=C,
-        n_ch_tiles=scalars["n_ch_tiles"],
-    )
-    values: dict[str, Any] = {
-        "x": x_flat,
-        "w": w,
-        "cu": cu,
-        "y": y.view(S, C),
-        "hist": hist
-        if hist.shape[0]
-        else _pool(0, C, dtype=torch.bfloat16, device=device),
-        "hist_row_off": hist_row_off,
-        **_scalars(scalars),
-    }
-    if work is not None:
+    sr, overlap = _fwd_form(arch)
+    overlap = overlap and work is not None
+    values: dict[str, Any] = {"x": x_flat, "w": w, "cu": cu, "y": y.view(S, C)}
+    if sr:
+        # the single-rank fwd route program on the fragments (each a document of its own): the single-rank forward's
+        # plan, full co-resident grid and token-chunk counters
+        name, scalars, grid, words = _sr_main(
+            arch, S=S, C=C, n_frag=n_frag, device_index=device_index
+        )
+        counters = _forward_work(None, words, device=device, device_index=device_index)
+        if counters is not None:
+            values["work"] = counters
+    else:
+        (name,) = route_modules(arch, KCP_FWD)
+        record = _loader.MODULES[name]
+        scalars = plan(
+            S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
+        )
+        grid = _forward_grid(
+            record,
+            arch=arch,
+            device_index=device_index,
+            C=C,
+            n_ch_tiles=scalars["n_ch_tiles"],
+        )
+        if overlap:
+            # the overlapped forward: the main program reads no received row while the exchange is in flight
+            # (``x`` stands for the pool: a valid pointer no -1 entry names)
+            values["hist"] = x_flat
+            values["hist_row_off"] = torch.full(
+                (n_frag, HALO), -1, dtype=torch.int32, device=device
+            )
+        else:
+            values["hist"] = (
+                hist
+                if hist.shape[0]
+                else _pool(0, C, dtype=torch.bfloat16, device=device)
+            )
+            values["hist_row_off"] = hist_row_off
+    values.update(_scalars(scalars))
+    if work is not None and not overlap:
         work.wait()
-    # the grid of :func:`_forward_grid`, as on the trimmed host path
-    run_module(name, values, device_index=device_index, grid=grid)
+    # the grid of :func:`_forward_grid` (the kcp_fwd program) or the record's (the single-rank program), as on the
+    # trimmed host path
+    if sr:
+        _launch_trim(_zero_history_plan(name, grid, device_index), values, device_index)
+    else:
+        run_module(name, values, device_index=device_index, grid=grid)
+    if overlap:
+        work.wait()
+    repair = (sr or overlap) and int(halo.n_hist_rows) > 0
+    if repair:
+        (halo_name,) = route_modules(arch, KCP_FWD_HALO)
+        _launch_with_grid(
+            halo_name,
+            {
+                "x": x_flat,
+                "w": w,
+                "cu": cu,
+                "y": y.view(S, C),
+                "hist": hist,
+                "hist_row_off": hist_row_off,
+                "C": C,
+                "num_docs": n_frag,
+            },
+            grid=head_grid(_loader.MODULES[halo_name], n_frag=n_frag, C=C),
+            device_index=device_index,
+        )
+    _fwd_record("fwd", sr, overlap, repair)
     return y, hist
 
 
@@ -1387,23 +1587,28 @@ def _fwd_host(
     *,
     out: Optional[torch.Tensor],
     device: torch.device,
+    multi: bool = False,
 ) -> tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     """The trimmed forward's operand checks, output and host-cache entry: ``(S, C, x_flat, w, y, entry)``.  The entry
-    is cached per ``(ctx, S, C, device, cu_seqlens_local_cpu)``: the validated ``cu`` / ``hist_index`` /
-    ``hist_row_off`` tables, the halo splits, the record, its plan scalars and grid, the loaded module with its
-    argument plan."""
+    is cached per ``(ctx, S, C, device, cu_seqlens_local_cpu, sr, overlap)`` (:func:`_fwd_form` of the device's
+    architecture, of the multi entry's sets with ``multi``; both kept in the entry): the validated ``cu`` /
+    ``hist_index`` / ``hist_row_off`` tables, the halo splits, the main program's record, its plan scalars, grid and
+    counter words, the loaded module with its argument plan."""
 
     S, C, x_flat = _tokens(x, "x_local", device=device)
     w = _weight(weight, C, device=device)
     y = _output(out, "out", shape=tuple(x.shape), dtype=torch.bfloat16, device=device)
+    arch = _device_arch(device)
+    sr, overlap = _fwd_form(arch, multi=multi)
     e = _host_cache_entry(
-        ctx, ("fwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu))
+        ctx,
+        ("fwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu), sr, overlap),
     )
     if not e:
-        arch = _device_arch(device)
         cu, n_frag = _context(ctx, device=device, T_r=S)
         halo = ctx.halo
-        e.update(
+        # filled into the entry at the end, so a call that raises below (C too wide for the grid) leaves it empty
+        fresh: dict[str, Any] = dict(
             cu=cu,
             n_frag=n_frag,
             hist_index=_require_tensor(
@@ -1412,31 +1617,43 @@ def _fwd_host(
             recv_rows=int(halo.n_hist_rows),
             send_splits=tuple(halo.fwd_send_rows),
             recv_splits=tuple(halo.fwd_recv_rows),
+            sr=sr,
+            overlap=overlap,
         )
         if S != 0:
-            e["hist_row_off"] = _table(
+            fresh["hist_row_off"] = _table(
                 ctx,
                 "hist_row_off",
                 shape=(n_frag, HALO),
                 dtype=torch.int32,
                 device=device,
             )
-            (name,) = route_modules(arch, KCP_FWD)
             device_index = _device_index(device)
-            record = _loader.MODULES[name]
-            scalars = plan(
-                S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
-            )
-            grid = _forward_grid(
-                record,
-                arch=arch,
-                device_index=device_index,
-                C=C,
-                n_ch_tiles=scalars["n_ch_tiles"],
-            )
-            e["scalars"] = _scalars(scalars)
-            e["device_index"] = device_index
-            e["launch"] = _launch_plan(name, grid, device_index)
+            if sr:
+                # the single-rank fwd route program: the single-rank forward's plan, full co-resident grid and counters
+                name, scalars, grid, words = _sr_main(
+                    arch, S=S, C=C, n_frag=n_frag, device_index=device_index
+                )
+                fresh["words"] = words
+                fresh["launch"] = _zero_history_plan(name, grid, device_index)
+            else:
+                (name,) = route_modules(arch, KCP_FWD)
+                record = _loader.MODULES[name]
+                scalars = plan(
+                    S, C, n_frag, geometry=record["grid_rule"]["geometry"], legacy=True
+                )
+                grid = _forward_grid(
+                    record,
+                    arch=arch,
+                    device_index=device_index,
+                    C=C,
+                    n_ch_tiles=scalars["n_ch_tiles"],
+                )
+                fresh["words"] = 0
+                fresh["launch"] = _launch_plan(name, grid, device_index)
+            fresh["scalars"] = _scalars(scalars)
+            fresh["device_index"] = device_index
+        e.update(fresh)
     return S, C, x_flat, w, y, e
 
 
@@ -1450,6 +1667,119 @@ def _fwd_gather(x_flat: torch.Tensor, C: int, e: dict[str, Any]) -> torch.Tensor
     )
 
 
+def _zero_history_plan(
+    name: str, grid: tuple[int, int, int], device_index: int
+) -> tuple[Any, str, tuple[tuple[str | None, int], ...]]:
+    """:func:`_launch_plan` of record ``name`` of the zero-history registry (``cake_jit``: the two-launch forward's
+    single-rank main program), loaded through that registry."""
+    record = _zero_history.MODULES[name]
+    logical = record["logical"]
+    grid_values = {
+        "grid_x": int(grid[0]),
+        "grid_y": int(grid[1]),
+        "grid_z": int(grid[2]),
+    }
+    plan_: list[tuple[str | None, int]] = []
+    for kind, key in record["arg_plan"]:
+        if kind == "grid":
+            plan_.append((None, grid_values[key]))
+        else:
+            plan_.append((logical[key], 0))
+    module = _zero_history.load(name, _loader.device_arch(device_index))
+    return module, record["ffi_entry"], tuple(plan_)
+
+
+def _no_hist(e: dict[str, Any], device: torch.device) -> torch.Tensor:
+    """The overlapped forward's all ``-1`` ``hist_row_off`` of the ``kcp_fwd`` main program (int32 ``[n_frag, 3]``),
+    made at the host-cache entry's first overlapped ``kcp_fwd`` call, then reused (a captured graph pins the entry, so
+    the table outlives a host-cache clear)."""
+    table = e.get("no_hist")
+    if table is None:
+        table = e["no_hist"] = torch.full(
+            (e["n_frag"], HALO), -1, dtype=torch.int32, device=device
+        )
+    return table
+
+
+def _fwd_main(
+    e: dict[str, Any],
+    x_flat: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+    hist: Optional[torch.Tensor],
+    counters: Optional[torch.Tensor],
+    *,
+    S: int,
+    C: int,
+    device: torch.device,
+    deferred: bool = False,
+) -> None:
+    """Launch the main forward program of a call with ``S > 0`` (no wait).  The single-rank ``fwd`` route program
+    (``e["sr"]``) reads no history row: it writes every fragment as a document of its own, taking its token chunks
+    from ``counters``.  The ``kcp_fwd`` program reads ``hist`` through the context's ``hist_row_off``; ``deferred``
+    (the overlapped forward's main launch, before the exchange's wait): every ``hist_row_off`` entry ``-1`` and ``x``
+    as the (unread) pool, so it reads no received row and writes a continuing fragment's first rows as at a document
+    start (:func:`_fwd_repair` writes them again after the wait); ``hist`` is then not used."""
+    values: dict[str, Any] = {
+        "x": x_flat,
+        "w": w,
+        "cu": e["cu"],
+        "y": y.view(S, C),
+        **e["scalars"],
+    }
+    if e["sr"]:
+        if counters is not None:
+            values["work"] = counters
+    elif deferred:
+        values["hist"] = x_flat
+        values["hist_row_off"] = _no_hist(e, device)
+    else:
+        values["hist"] = (
+            hist if hist.shape[0] else _pool(0, C, dtype=torch.bfloat16, device=device)
+        )
+        values["hist_row_off"] = e["hist_row_off"]
+    _launch_trim(e["launch"], values, e["device_index"])
+
+
+def _fwd_repair(
+    e: dict[str, Any],
+    x_flat: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+    hist: torch.Tensor,
+    *,
+    S: int,
+    C: int,
+    device: torch.device,
+) -> bool:
+    """The two-launch forward's history-row program (route ``kcp_fwd_halo``), after the main program and the
+    exchange's wait: ``y`` of the first ``min(3, len)`` rows of every fragment with a history row, written again from
+    the received ``hist`` with the ``kcp_fwd`` program's instructions (nothing when the rank receives no history
+    row).  Its launch plan is made at the entry's first such call, then reused.  Returns whether it ran."""
+    if e["recv_rows"] == 0:
+        return False
+    info = e.get("repair_launch")
+    if info is None:
+        (name,) = route_modules(_device_arch(device), KCP_FWD_HALO)
+        grid = head_grid(_loader.MODULES[name], n_frag=e["n_frag"], C=C)
+        info = e["repair_launch"] = _launch_plan(name, grid, e["device_index"])
+    _launch_trim(
+        info,
+        {
+            "x": x_flat,
+            "w": w,
+            "cu": e["cu"],
+            "y": y.view(S, C),
+            "hist": hist,
+            "hist_row_off": e["hist_row_off"],
+            "C": C,
+            "num_docs": e["n_frag"],
+        },
+        e["device_index"],
+    )
+    return True
+
+
 def _fwd_launch(
     e: dict[str, Any],
     x_flat: torch.Tensor,
@@ -1461,22 +1791,27 @@ def _fwd_launch(
     S: int,
     C: int,
     device: torch.device,
-) -> None:
-    """Wait ``work`` (when given) and launch the forward kernel of a call with ``S > 0`` on ``hist``."""
-    values: dict[str, Any] = {
-        "x": x_flat,
-        "w": w,
-        "cu": e["cu"],
-        "y": y.view(S, C),
-        "hist": hist
-        if hist.shape[0]
-        else _pool(0, C, dtype=torch.bfloat16, device=device),
-        "hist_row_off": e["hist_row_off"],
-        **e["scalars"],
-    }
+    counters: Optional[torch.Tensor] = None,
+) -> bool:
+    """The waiting form: wait ``work`` (when given) and launch the forward of a call with ``S > 0`` on ``hist``: its
+    main program (:func:`_fwd_main`) and, after the single-rank main program, the history-row program
+    (:func:`_fwd_repair`).  Returns whether the history-row program ran."""
     if work is not None:
         work.wait()
-    _launch_trim(e["launch"], values, e["device_index"])
+    _fwd_main(e, x_flat, w, y, hist, counters, S=S, C=C, device=device)
+    return e["sr"] and _fwd_repair(e, x_flat, w, y, hist, S=S, C=C, device=device)
+
+
+def _fwd_record(kind: str, sr: Optional[bool], pair: bool, repair: bool) -> None:
+    """Record the launch form of the forward call ``kind`` (``"fwd"`` / ``"fwd_multi"``) in ``LAST_CALL[kind]``:
+    ``main`` -- ``"sr"`` (the single-rank ``fwd`` route program), ``"f"`` (the ``kcp_fwd`` program) or ``None`` (a rank
+    without tokens: no launch); ``form`` -- ``"pair"`` (a main program before the exchange's wait) or ``"wait"``;
+    ``repair`` -- whether a history-row program ran.  :func:`_graph_run` adds the graph event."""
+    LAST_CALL[kind] = {
+        "main": None if sr is None else ("sr" if sr else "f"),
+        "form": "pair" if pair else "wait",
+        "repair": bool(repair),
+    }
 
 
 def _kcp_forward_trim(
@@ -1489,8 +1824,8 @@ def _kcp_forward_trim(
     _hist: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Trimmed host path: :func:`_kcp_forward` with the context-derived host work cached per ``(ctx, S, C, device,
-    cu_seqlens_local_cpu)`` (:func:`_fwd_host`).  The operand checks, the gather, the exchange, the wait and the
-    kernel launch are the untrimmed call's, in the same order on the same stream."""
+    cu_seqlens_local_cpu, sr, overlap)`` (:func:`_fwd_host`).  The operand checks, the gather, the exchange, the wait
+    and the launches are the untrimmed call's, in the same order on the same stream."""
 
     S, C, x_flat, w, y, e = _fwd_host(x, weight, ctx, out=out, device=device)
     if _hist is None:
@@ -1507,8 +1842,26 @@ def _kcp_forward_trim(
     if S == 0:
         if work is not None:
             work.wait()
+        _fwd_record("fwd", None, False, False)
         return y, hist
-    _fwd_launch(e, x_flat, w, y, hist, work, S=S, C=C, device=device)
+    counters = (
+        _forward_work(None, e["words"], device=device, device_index=e["device_index"])
+        if e["words"]
+        else None
+    )
+    if work is not None and e["overlap"]:
+        # the overlapped forward: the main program reads no received row while the exchange is in flight
+        _fwd_main(
+            e, x_flat, w, y, None, counters, S=S, C=C, device=device, deferred=True
+        )
+        work.wait()
+        repair = _fwd_repair(e, x_flat, w, y, hist, S=S, C=C, device=device)
+        _fwd_record("fwd", e["sr"], True, repair)
+    else:
+        repair = _fwd_launch(
+            e, x_flat, w, y, hist, work, S=S, C=C, device=device, counters=counters
+        )
+        _fwd_record("fwd", e["sr"], False, repair)
     return y, hist
 
 
@@ -2525,7 +2878,13 @@ def cake_causal_conv1d_nondet_train_kcp_multi_forward(
     mode = _graph_mode(graph)
     if mode == "off":
         return _kcp_forward_multi(xs, weights, ctx, outs=outs)
-    entry = _graph_entry("fwd_multi", ctx, (*xs, *weights, *outs), mode)
+    entry = _graph_entry(
+        "fwd_multi",
+        ctx,
+        (*xs, *weights, *outs),
+        mode,
+        extra=(("fwd_form", _fwd_variant(xs[0], multi=True)),),
+    )
     ys, hists = _graph_run(
         "fwd_multi",
         entry,
@@ -2547,18 +2906,32 @@ def _kcp_forward_multi(
     _hists: Optional[tuple[torch.Tensor, ...]] = None,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """The multi forward's host flow (eagerly or inside a capture): per-tensor operand checks, the packed gather, one
-    exchange, one wait, the per-tensor unpack copies and the single call's forward kernel per tensor.  ``_hists``:
-    the pools a recompute handle stored (checked by :func:`_handle_hists`): no gather, no exchange, no wait."""
+    exchange, one wait, the per-tensor unpack copies and the single call's forward programs per tensor in the waiting
+    form; in the overlapped forward (``MULTI_FWD_OVERLAP_ARCHS`` or the ``fwd_overlap`` knob, an exchange in flight)
+    the first tensor's main program runs before the wait and its history-row program after it.  ``_hists``: the pools
+    a recompute handle stored (checked by :func:`_handle_hists`): no gather, no exchange, no wait."""
 
     device = _require_tensor(xs[0], "xs[0]").device
     _wait_ready(ctx)
     calls = [
-        _fwd_host(x, w, ctx, out=o, device=device)
+        _fwd_host(x, w, ctx, out=o, device=device, multi=True)
         for x, w, o in zip(xs, weights, outs, strict=True)
     ]
     S = calls[0][0]
     widths = [c[1] for c in calls]
+    # one counter buffer for every tensor's single-rank main program (launched in stream order), sized once
+    counters = (
+        _forward_work(
+            None,
+            max(c[5]["words"] for c in calls),
+            device=device,
+            device_index=calls[0][5]["device_index"],
+        )
+        if S > 0
+        else None
+    )
     work = None
+    overlap = False
     if _hists is not None:
         hists = list(_hists)
     elif int(ctx.world_size) == 1:
@@ -2576,14 +2949,42 @@ def _kcp_forward_multi(
             ctx=ctx,
             agree=("fwd", tuple(c[1] for c in calls), True),
         )
+        overlap = S > 0 and work is not None and e0["overlap"]
+        if overlap:
+            # the first tensor's main program while the exchange is in flight; the others wait, so that the call adds
+            # the history-row program of one tensor, not of every tensor
+            S0, C0, x0, w0, y0, _ = calls[0]
+            _fwd_main(
+                e0, x0, w0, y0, None, counters, S=S0, C=C0, device=device, deferred=True
+            )
         if work is not None:
             work.wait()
         hists = _unpack(recv, widths) if len(calls) > 1 else [recv]
     ys = tuple(c[4] for c in calls)
     if S == 0:
+        _fwd_record("fwd_multi", None, False, False)
         return ys, tuple(hists)
-    for (S_i, C, x_flat, w, y, e), hist in zip(calls, hists, strict=True):
-        _fwd_launch(e, x_flat, w, y, hist, None, S=S_i, C=C, device=device)
+    repair = False
+    for i, ((S_i, C, x_flat, w, y, e), hist) in enumerate(
+        zip(calls, hists, strict=True)
+    ):
+        if overlap and i == 0:
+            ran = _fwd_repair(e, x_flat, w, y, hist, S=S_i, C=C, device=device)
+        else:
+            ran = _fwd_launch(
+                e,
+                x_flat,
+                w,
+                y,
+                hist,
+                None,
+                S=S_i,
+                C=C,
+                device=device,
+                counters=counters,
+            )
+        repair = repair or ran
+    _fwd_record("fwd_multi", calls[0][5]["sr"], overlap, repair)
     return ys, tuple(hists)
 
 

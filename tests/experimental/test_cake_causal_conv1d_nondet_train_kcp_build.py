@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 The KCP registry (``kcp_jit``) of the non-deterministic causal convolution training package against the
-deterministic package's: the forward and head programs are the deterministic ones (only their names differ); the
-main backward programs keep the deterministic route positions, selection rule, build geometry and arguments, with
+deterministic package's: the forward, history-row and head programs are the deterministic ones (only their names
+differ; the history-row program, route ``kcp_fwd_halo`` of the two-launch forward, is a route of its own outside
+``KINDS``, and the forward's single-rank main program is the zero-history registry's ``fwd`` route); the main backward
+programs keep the deterministic route positions, selection rule, build geometry and arguments, with
 the ``partial`` rows replaced by zeroed FP32 accumulators (kernel parameter ``dw_acc``, logical ``acc``) and uint32
 ``work`` ticket counters, an ordinary occupancy-sized
 launch (no cooperative attribute, no grid barrier) and the workspace size of the legacy channel-tile rule the KCP
@@ -106,7 +108,14 @@ def test_routes_mirror_the_deterministic_kcp_registry() -> None:
         assert record["kernel_symbol"] == f"kernel_{name}"
         assert record["grid_rule"]["cooperative"] is False, name
         assert record["launch"]["cooperative"] is False, name
-    assert (*kcp_jit.KINDS, "kcp_bwd_dyn", "kcp_bwd_halo") == kcp_jit.ROUTE_KINDS
+    assert (
+        *kcp_jit.KINDS,
+        "kcp_bwd_dyn",
+        "kcp_bwd_halo",
+        "kcp_fwd_halo",
+    ) == kcp_jit.ROUTE_KINDS
+    assert kcp_jit.FWD_HALO_KIND == "kcp_fwd_halo"
+    assert kcp_jit.FWD_HALO_KIND not in kcp_jit.KINDS
     for arch in ARCHES:
         assert set(kcp_jit.ROUTES[arch]) == set(kcp_jit.ROUTE_KINDS), arch
 
@@ -119,6 +128,75 @@ def test_forward_and_head_records_are_the_deterministic_ones() -> None:
         assert _strip(kcp_jit.MODULES[name], *NAME_FIELDS) == _strip(
             det_kcp_jit.MODULES[det_name], *NAME_FIELDS
         ), (arch, kind, name)
+
+
+@pytest.mark.cpu_only
+def test_history_row_record_is_the_deterministic_one() -> None:
+    """The two-launch forward's history-row program (route ``kcp_fwd_halo``, one record on every architecture): the
+    det package's record of that route under this package's prefix (the same twenty hex digits), with the head
+    program's grid rule."""
+
+    for arch in ARCHES:
+        (name,) = kcp_jit.route_modules(arch, kcp_jit.FWD_HALO_KIND)
+        (det_name,) = det_kcp_jit.route_modules(arch, "kcp_fwd_halo")
+        assert name == det_name.replace(
+            "cake_causal_conv1d_det_train_", "cake_causal_conv1d_train_"
+        ), (arch, name, det_name)
+        assert _strip(kcp_jit.MODULES[name], *NAME_FIELDS) == _strip(
+            det_kcp_jit.MODULES[det_name], *NAME_FIELDS
+        ), (arch, name)
+        assert kcp_jit.selected_modules(arch, kcp_jit.FWD_HALO_KIND, C=8192) == (name,)
+        (head,) = kcp_jit.route_modules(arch, "kcp_bwd_head")
+        for n_frag in (0, 1, 3, 17):
+            for C in CHANNELS:
+                assert kcp_jit.head_grid(
+                    kcp_jit.MODULES[name], n_frag=n_frag, C=C
+                ) == kcp_jit.head_grid(kcp_jit.MODULES[head], n_frag=n_frag, C=C)
+
+
+@pytest.mark.cpu_only
+def test_two_launch_forward_programs() -> None:
+    """The two-launch forward's programs (``kcp`` module docstring): the history-row program is the ``kcp_fwd_halo``
+    route's one record and takes the arguments the host passes (``kcp._fwd_repair``); the single-rank main program is
+    a record of this package's zero-history registry's ``fwd`` route (``kcp.FWD_MAIN_ROUTE``) on every architecture,
+    the det package's zero-history record of the same route position, each record of that route takes only ``x``,
+    ``w``, ``cu``, ``y``, its ``work`` counters (``tile_counters``) and the plan scalars (``kcp._fwd_main``), and
+    launches the co-resident grid (no reserved SM), so the host can launch whichever record
+    ``cake_jit.selected_modules`` picks for the call's ``C`` and token count."""
+
+    kcp = cake_package(KEY, "kcp")
+    det_cake_jit = cake_package("cake_causal_conv1d_det_train", "cake_jit")
+    assert kcp.KCP_FWD_HALO == "kcp_fwd_halo" and kcp.FWD_MAIN_ROUTE == "fwd"
+    passed = {"x", "w", "cu", "y", "hist", "hist_row_off", "C", "num_docs"}
+    for arch in ARCHES:
+        (repair,) = kcp_jit.route_modules(arch, kcp.KCP_FWD_HALO)
+        assert set(kcp_jit.MODULES[repair]["logical"].values()) == passed
+    main_values = {"x", "w", "cu", "y", "work", *cake_jit.PLAN_SCALARS}
+    for arch in ARCHES:
+        names = cake_jit.route_modules(arch, kcp.FWD_MAIN_ROUTE)
+        assert names, arch
+        for name in names:
+            record = cake_jit.MODULES[name]
+            assert record["role"] == "fwd" and arch in record["arches"], (arch, name)
+            assert set(record["logical"].values()) <= main_values, (arch, name)
+            assert record["workspace_rule"]["kind"] == "tile_counters", (arch, name)
+            assert record["grid_rule"]["kind"] == "co_resident", (arch, name)
+            assert "reserve_sms" not in record["grid_rule"], (arch, name)
+            assert not record["grid_rule"]["cooperative"], (arch, name)
+        for C, S in ((256, 1), (256, 65536), (2048, 1), (8192, 32768), (10240, 32768)):
+            (name,) = cake_jit.selected_modules(arch, kcp.FWD_MAIN_ROUTE, C=C, S=S)
+            assert name in names, (arch, C, S)
+            # the det package's single-rank main program for the same call: the same program (twenty hex digits)
+            (det_name,) = det_cake_jit.selected_modules(
+                arch, kcp.FWD_MAIN_ROUTE, C=C, S=S
+            )
+            assert name.rsplit("_", 1)[-1] == det_name.rsplit("_", 1)[-1], (
+                arch,
+                C,
+                S,
+                name,
+                det_name,
+            )
 
 
 @pytest.mark.cpu_only

@@ -27,6 +27,9 @@ per-document one).  Per row and rank, for every tensor:
   partial sum within the package budget of the global FP64 ``dweight``;
 - the collective counts per phase of the deterministic suite: multi 1/0/1 direct, 1/1/1 plain checkpoint, 1/0/1
   with a handle; single calls n/0/n;
+- the two-launch forward (knobs ``fwd_main`` x ``fwd_overlap``, the same on every rank): ``LAST_CALL["fwd_multi"]``
+  names the form the rank ran and every tensor's ``y`` / ``hist`` are bitwise the one-launch single call's
+  (``fwd_main`` 0, ``fwd_overlap`` 0: the previous forward) and the deterministic multi forward's;
 - ``graph="replay"`` of the multi forward / backward: ``y`` / ``hist`` / ``dx`` bitwise the eager single calls on
   every call, ``dweight`` within budget, the deterministic suite's event sequence; and of the single backward of the
   first tensor (its head program and exchange issue on the side stream inside the capture): ``dx`` bitwise the eager
@@ -338,6 +341,64 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
         and cm_nest_out["calls"] == table(1, 0, 1)
         and cm_nest_in["calls"] == table(1, 1, 1)
     )
+    # The two-launch forward: every (fwd_main, fwd_overlap) form, the same on every rank, records its form in
+    # LAST_CALL["fwd_multi"] (the first tensor's main program before the exchange's wait on a rank with tokens; the
+    # history-row program when the rank receives history rows and the form has two launches) and gives every
+    # tensor's y / hist bitwise the one-launch single call's and the deterministic multi forward's.
+    from tests.test_helpers.cake_package import cake_package
+
+    det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
+    n_hist = int(ctx.halo.n_hist_rows)
+    det_ys, det_hists = det_kcp.cake_causal_conv1d_det_train_kcp_multi_forward(
+        xs, ws, ctx
+    )
+    conv_kcp._set_test_knobs({"fwd_main": 0, "fwd_overlap": 0})
+    try:
+        refs = [
+            conv_kcp.cake_causal_conv1d_nondet_train_kcp_forward(x, w, ctx)
+            for x, w in zip(xs, ws, strict=True)
+        ]
+        torch.cuda.synchronize(device)
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+    fwd_bitwise = all(
+        _same(y, det_ys[i]) and _same(hist, det_hists[i])
+        for i, (y, hist) in enumerate(refs)
+    )
+    fwd_recorded = True
+    for fwd_main in (0, 1):
+        for fwd_overlap in (0, 1):
+            conv_kcp._set_test_knobs({"fwd_main": fwd_main, "fwd_overlap": fwd_overlap})
+            try:
+                for _ in range(2):
+                    ys, hists = (
+                        conv_kcp.cake_causal_conv1d_nondet_train_kcp_multi_forward(
+                            xs, ws, ctx
+                        )
+                    )
+                    torch.cuda.synchronize(device)
+                    want = (
+                        {
+                            "main": "sr" if fwd_main else "f",
+                            "form": "pair" if fwd_overlap else "wait",
+                            "repair": bool(fwd_main or fwd_overlap) and n_hist > 0,
+                        }
+                        if xs[0].shape[0]
+                        else {"main": None, "form": "wait", "repair": False}
+                    )
+                    fwd_recorded = (
+                        fwd_recorded and conv_kcp.LAST_CALL["fwd_multi"] == want
+                    )
+                    fwd_bitwise = fwd_bitwise and all(
+                        _same(ys[i], y) and _same(hists[i], hist)
+                        for i, (y, hist) in enumerate(refs)
+                    )
+            finally:
+                conv_kcp._set_test_knobs(None)
+                conv_kcp.cake_causal_conv1d_nondet_train_kcp_host_cache_clear()
+    flags["fwd_forms_bitwise"] = fwd_bitwise
+    flags["fwd_forms_recorded"] = fwd_recorded
     return _report(W, row, flags, info, result_dir, rank, "nondet-multi")
 
 

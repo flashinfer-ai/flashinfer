@@ -25,16 +25,15 @@ rounding per output, and the SiLU derivative taken at the FP32 preactivation.
 The following parts are the deterministic KCP package's:
 
 - the context contract
-- the forward and head programs (this package's copies of the deterministic programs)
+- the two-launch forward (FlashInfer PR #9225; see The forward)
+- the forward, history-row and head programs (this package's copies of the deterministic programs)
 - the halo exchanges
 - the recompute handle
 - graph replay
 - the multi-tensor calls
 
 Of the programs, only the backward after the head program differs: it overlaps the halo exchange, and its `dweight`
-sum is unordered. The forward program is the same, but its launch grid follows the architecture
-(`kcp.FWD_RESERVE_SMS`). On sm_107a it is the deterministic route's grid, one SM short of the co-resident CTA count.
-On sm_100a and sm_103a it is the full co-resident grid, which measured faster there. `y` does not depend on the grid.
+sum is unordered.
 
 - **Halo exchange:** one `all_to_all_single` per direction and call. The
   forward delivers the history rows into the history pool `hist`
@@ -103,6 +102,42 @@ deterministic mode" means `torch.use_deterministic_algorithms(True)`.
 - `cooperative=True` raises `ValueError`. The cooperative launch form belongs
   to the deterministic KCP package (`cake_causal_conv1d_det_kcp(...,
   cooperative=True)`).
+
+### The forward
+
+The forward runs two programs:
+
+1. The main program reads no received history row. It writes every row, and it writes the first rows of a
+   continuing fragment as at a document start. It is the single-rank `fwd` route program: the program that this
+   package's single-rank forward runs for the call's `C` and token count. It takes each of the rank's fragments as a
+   document of its own, launches its record's full co-resident grid and takes its token chunks from zeroed counters,
+   as the single-rank forward does.
+2. The history-row program (`kcp_fwd_halo`) runs after the exchange's wait. It writes `y` of the first
+   `min(3, len)` rows of every fragment with a history row again, from the received pool, with the `kcp_fwd`
+   program's instructions. `y` therefore keeps the bits of the one-launch forward (the `kcp_fwd` program with the
+   context's history table). The program runs only when the rank receives history rows.
+
+The order depends on the entry and the architecture:
+
+- Single call: on every architecture, both programs run after the exchange's wait (`kcp.FWD_OVERLAP_ARCHS` is
+  empty).
+- Multi call on sm_107a (`kcp.MULTI_FWD_OVERLAP_ARCHS`) with more than one rank: the first tensor's main program runs
+  while the exchange is in flight, and its history-row program runs after the wait. The other tensors run both
+  programs after the wait.
+- Multi call on sm_100a and sm_103a: every tensor runs both programs after the wait.
+
+The sets are the deterministic package's (`kcp.FWD_MAIN_ARCHS`, `kcp.MULTI_FWD_MAIN_ARCHS`, `kcp.FWD_OVERLAP_ARCHS`
+and `kcp.MULTI_FWD_OVERLAP_ARCHS`), measured there against the one-launch forward. The exchange, its wait and the
+collectives are the same in every form. Every forward launch is on the caller's stream. With one rank no collective
+is issued.
+
+Outside `kcp.FWD_MAIN_ARCHS` (for the multi entry, `kcp.MULTI_FWD_MAIN_ARCHS`) the main program would be the
+`kcp_fwd` program: after the wait, the one-launch forward with the context's history table and no history-row
+program; before the wait, with every `hist_row_off` entry `-1`, followed by the history-row program. Every supported
+architecture is in both sets, so the shipped forward does not launch the `kcp_fwd` program. Its launch grid follows
+the architecture (`kcp.FWD_RESERVE_SMS`): on sm_107a it is one SM short of the co-resident CTA count when that grid
+holds every channel tile, and on sm_100a and sm_103a it is the full co-resident grid. `y` does not depend on any
+grid.
 
 ### The backward
 
@@ -272,7 +307,7 @@ With `recompute_handle=CakeCausalConv1dNondetKcpRecomputeHandle()`, the checkpoi
 recompute of a call issues no collective:
 
 1. The original forward exchanges as always and stores `hist` in the handle (key `"conv"`). The handle retains `n_hist_rows x C x 2` bytes per tensor.
-2. Torch's recompute of that forward inside the backward binds `hist` and launches the forward program on it, with no gather, no collective and no wait.
+2. Torch's recompute of that forward inside the backward binds `hist` and launches the forward programs on it (both after the binding, as in the waiting form), with no gather, no collective and no wait.
 3. The backward still exchanges once.
 
 The handle has these rules:
@@ -290,5 +325,5 @@ direction instead of `n`.
 
 - Inputs: each `xs[i]` is BF16 `[T_r, C_i]` and each `weights[i]` is FP32 `[C_i, 4]`. Each `C_i` is a multiple of 8, and they may differ.
 - Exchange: the tensors' send rows travel side by side in one `all_to_all_single`. After the wait, when the call uses the side stream (more than one rank, every tensor on the overlapped pair) and every tensor has the same width, each tensor's tail-row program reads its rows in place in the received pool, and the programs run concurrently on the side stream and streams forked from it. Otherwise the rows are copied into each tensor's own pool.
-- Programs: each tensor then runs the single call's programs. Outputs and `dx` are bitwise one single call per tensor. Each `dweight` is that tensor's own unordered partial.
+- Programs: each tensor then runs the single call's programs. In the forward on sm_107a, the first tensor's main program runs before the wait (see The forward). Outputs and `dx` are bitwise one single call per tensor. Each `dweight` is that tensor's own unordered partial.
 - Keywords: one `bwd_reserve_sms` value applies to every tensor. One recompute handle covers the whole call; its `"conv"` entry holds the `n` history pools.

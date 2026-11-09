@@ -73,6 +73,18 @@ words are the tiles' warp words ``tile_tk`` (``DYN_TILE_WORDS`` per tile of
 and the departure word ``departs`` (one), all zero before and after every
 launch (:func:`dyn_workspace_layout`).
 
+One more route carries the two-launch forward's history-row program
+(:data:`FWD_HALO_KIND`, ``kcp_fwd_halo``: this package's copy of the det
+program of the det package's route of that name).  The host can run the
+forward as a main program that reads no history row -- the zero-history
+registry's single-rank forward program on the rank's fragments, or the
+``kcp_fwd`` program with every ``hist_row_off`` entry ``-1`` -- launched before
+or after the forward halo exchange is waited; after the wait this program
+writes ``y`` of the first ``min(3, len)`` rows of every fragment with a history
+row again from the received ``hist`` rows, with the ``kcp_fwd`` program's
+instructions in its order, so ``y`` is the one-launch forward's bits.  Its grid
+is the head program's rule, :func:`head_grid`.
+
 The host plan reuses :mod:`.cake_jit`'s functions over a record (:func:`plan`,
 :func:`launch_grid`, :func:`accumulator_layout`, :func:`channel_split`)
 unchanged; the functions bound to the tables (:func:`route_modules`,
@@ -86,9 +98,9 @@ tables ``hist``, ``hist_row_off``, ``dpre_tail``, ``tail_row_off``,
 scalars are :mod:`.cake_jit`'s.
 
 The program names are ``cake_causal_conv1d_train_<20 hex>_kcp``: the copies of
-the det forward and head programs take the det programs' identity digits under
-this package's prefix, the backward programs the identity digests of their own
-kernel module key.
+the det forward, history-row and head programs take the det programs' identity
+digits under this package's prefix, the backward programs the identity digests
+of their own kernel module key.
 """
 
 from __future__ import annotations
@@ -687,13 +699,75 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "kcp_bwd_halo",
         "workspace_rule": None,
     },
+    # Route ``kcp_fwd_halo``: this package's copy of the det program
+    # ``cake_causal_conv1d_det_train_138311f76132280b1e94_kcp`` (the same kernel module key under this package's
+    # prefix; no cross-CTA reduction, so its outputs are bitwise the det program's): the history-row program of the
+    # two-launch forward.  ``y`` of the first ``min(3, len)`` rows of every fragment with a history row
+    # (``hist_row_off``, ``-1`` = none), written again from the received ``hist`` rows after a main program that read
+    # no history row (the zero-history registry's ``fwd`` route program on the fragments, or the ``kcp_fwd`` program
+    # with every ``hist_row_off`` entry ``-1``), with the ``kcp_fwd`` program's instructions in its order, so ``y`` is
+    # the one-launch forward's bits.  One CTA per (fragment, block of ``threads x vec`` channels) work item, the head
+    # program's rule (:func:`head_grid`).
+    "cake_causal_conv1d_train_138311f76132280b1e94_kcp": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "y"],
+            ["buffer", "hist"],
+            ["buffer", "hist_row_off"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 5,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_train_138311f76132280b1e94_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_138311f76132280b1e94_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_138311f76132280b1e94_kcp",
+        "logical": {
+            "C": "C",
+            "cu": "cu",
+            "hist": "hist",
+            "hist_row_off": "hist_row_off",
+            "num_docs": "num_docs",
+            "w": "w",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "kcp_fwd_halo",
+        "workspace_rule": None,
+    },
 }
 
 # architecture -> KCP kind -> the records the route may launch, in launch
 # order.  The forward and the head route carry one program; the backward
 # route carries the architecture's fallback program first and the
 # big-channel ``_st8`` program second (:func:`selected_modules` launches one);
-# the overlapped backward's two routes carry one program each.
+# the overlapped backward's two routes and the two-launch forward's
+# history-row route carry one program each.
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "kcp_bwd": [
@@ -711,6 +785,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "kcp_fwd": [
             "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
+        ],
+        "kcp_fwd_halo": [
+            "cake_causal_conv1d_train_138311f76132280b1e94_kcp",
         ],
     },
     "sm_103a": {
@@ -730,6 +807,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "kcp_fwd": [
             "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
         ],
+        "kcp_fwd_halo": [
+            "cake_causal_conv1d_train_138311f76132280b1e94_kcp",
+        ],
     },
     "sm_107a": {
         "kcp_bwd": [
@@ -748,6 +828,9 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "kcp_fwd": [
             "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp",
         ],
+        "kcp_fwd_halo": [
+            "cake_causal_conv1d_train_138311f76132280b1e94_kcp",
+        ],
     },
 }
 
@@ -757,8 +840,12 @@ KINDS = ("kcp_fwd", "kcp_bwd", "kcp_bwd_head")
 # The overlapped backward's routes: its main program and its tail-row program.
 DYN_KIND = "kcp_bwd_dyn"
 HALO_KIND = "kcp_bwd_halo"
+# The route of the two-launch forward's history-row program: after a main
+# program that read no history row, it writes the first rows of every fragment
+# with a history row again (module docstring).
+FWD_HALO_KIND = "kcp_fwd_halo"
 # Every route of ``ROUTES[arch]``.
-ROUTE_KINDS = (*KINDS, DYN_KIND, HALO_KIND)
+ROUTE_KINDS = (*KINDS, DYN_KIND, HALO_KIND, FWD_HALO_KIND)
 # The history / halo rows every fragment carries (the convolution width minus one).
 HALO = WIDTH - 1
 # Logical argument names the KCP host flow binds: the zero-history vocabulary
@@ -1044,8 +1131,8 @@ def dyn_workspace_layout(
 
 
 def head_grid(record: dict[str, Any], *, n_frag: int, C: int) -> tuple[int, int, int]:
-    """The grid of the head program and of the tail-row program: ``max(1, n_frag x ceil(C / (threads x vec)))`` work
-    items over the record's geometry."""
+    """The grid of the head program, of the tail-row program and of the history-row program: ``max(1, n_frag x ceil(C
+    / (threads x vec)))`` work items over the record's geometry."""
 
     geometry = record["grid_rule"]["geometry"]
     channels_per_cta = int(geometry["threads"]) * int(geometry["vec"])
@@ -1166,6 +1253,7 @@ __all__ = [
     "dyn_applies",
     "dyn_plan",
     "dyn_workspace_layout",
+    "FWD_HALO_KIND",
     "head_grid",
     "launch_grid",
     "library_name",
