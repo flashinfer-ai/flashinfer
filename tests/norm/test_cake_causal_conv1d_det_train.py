@@ -2183,9 +2183,11 @@ def test_narrow_tiles_launch_and_keep_y_and_dx_bits(kind, monkeypatch) -> None:
             floor = FWD_NARROW_FLOORS.get(arch, {}).get(C // 8)
             if role == "fwd" and narrow and floor is not None and floor <= S:
                 want = FWD_WIDE_SPLIT_TABLE[C]
-            if role == "bwd" and route == "bwd" and _bwd_selection_of_record(
-                arch, S, C
-            ) == BWD_SM_CTA.get(arch):
+            if (
+                role == "bwd"
+                and route == "bwd"
+                and _bwd_selection_of_record(arch, S, C) == BWD_SM_CTA.get(arch)
+            ):
                 # The SM-wide row-group program's band: one channel tile of the
                 # whole width, as many row groups as its threads fold.
                 threads = loader.MODULES[BWD_SM_CTA[arch]]["grid_rule"]["geometry"][
@@ -2452,7 +2454,9 @@ def test_workspace_bytes_and_layout() -> None:
         if sm_cta is not None:
             counted = sm_cta in counted_owners
             assert counted == _sm_cta_band(arch, C), C
-            assert [owner for owner in counted_owners if owner is not sm_cta] == shared, C
+            assert [
+                owner for owner in counted_owners if owner is not sm_cta
+            ] == shared, C
             if counted:
                 layout = loader.workspace_layout(sm_cta, C, device_index=device.index)
                 assert layout["total_bytes"] <= capacity, C
