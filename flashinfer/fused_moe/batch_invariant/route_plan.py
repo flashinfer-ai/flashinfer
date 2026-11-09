@@ -234,6 +234,8 @@ class RoutePlanKernel:
         # form's host bound hold -1, which the gather skips
         for r in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
             mSrc[r] = Int32(-1)
+            if cutlass.const_expr(self.dual):
+                mPosPad[r] = Int32(-1)
         pdl.trigger_one_wave()
 
 
