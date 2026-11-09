@@ -7942,7 +7942,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "K5_FORM_BANDS": {
             "sm_100a": ((0, None, "t160"),),
             "sm_103a": ((0, None, "t160"),),
-            "sm_107a": ((0, 8192, "t160"),),
+            "sm_107a": ((0, None, "t160"),),
         },
         "K5_FORM_ROWS": {"production": 2, "t160": 1},
         "FWD_FINISH_PROGRAM": {"sm_100a": "w2", "sm_103a": "w2", "sm_107a": "w1"},
@@ -7993,7 +7993,7 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "K5_FORM_BANDS": {
             "sm_100a": ((0, None, "t224"),),
             "sm_103a": ((0, None, "t224"),),
-            "sm_107a": ((0, 8192, "t224"),),
+            "sm_107a": ((0, None, "t224"),),
         },
         "K5_FORM_ROWS": {"production": 2, "t224": 1},
         "FWD_FINISH_PROGRAM": {"sm_100a": "w2", "sm_103a": "w2", "sm_107a": "w1"},
