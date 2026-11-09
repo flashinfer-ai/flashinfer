@@ -52,8 +52,11 @@ With more than one rank the head program(s), the multi call's concatenation of
 the send rows and the exchange issue run on the device's high-priority side
 stream (:func:`_side_stream`), forked from the caller's stream; the main
 program(s) launch on the caller's stream at once (they read no head row), and
-the caller's stream joins the side stream after them, before the wait.  The
-same programs read the same inputs, so no bit changes.
+the caller's stream joins the side stream after them, before the wait.  After
+the wait, the tail-row programs of a multi call whose tensors share one width
+read their rows in place in the received pool and run concurrently
+(:func:`_halos_in_place`).  The same programs read the same inputs, so no bit
+changes.
 
 The plan of the main program is :func:`kcp_jit.dyn_plan` (units of ``M``
 tokens, ``P`` lanes per 2048-channel tile, one CTA per SM).  A call that
@@ -141,10 +144,11 @@ level (no check is made; a mismatch hangs or corrupts data).
 
 Several convolutions of one layer (FlashInfer issue #7815): ``cake_causal_conv1d_nondet_kcp_multi(xs, weights, ctx)``
 runs the convolutions of ``n`` tensors that share the context (a layer's q, k and v) with one halo exchange per
-direction instead of ``n``: the tensors' send rows travel side by side in one ``all_to_all_single`` and are copied
-out into each tensor's own contiguous pool after the wait, and each tensor then runs the single call's kernels with
-the single call's arguments, so outputs and ``dx`` are bitwise one single call per tensor (``dweight`` is each
-tensor's own unordered partial).
+direction instead of ``n``: the tensors' send rows travel side by side in one ``all_to_all_single``; after the wait,
+the tail-row programs of tensors of one width read them in place in the received pool, and other widths copy them out
+into each tensor's own contiguous pool; each tensor then runs the single call's kernels with the single call's
+arguments (the tail-row program with its rows' offsets in the pool), so outputs and ``dx`` are bitwise one single
+call per tensor (``dweight`` is each tensor's own unordered partial).
 One recompute handle serves the whole call (its ``"conv"`` entry holds the ``n`` pools).  The multi path always
 uses the trimmed host path's per-context cache (the ``host_trim`` test knob selects the single call's path only).
 """
@@ -681,10 +685,12 @@ LAST_CALL: dict[str, dict[str, Any]] = {}
 HOST_CACHE_MAX = 64
 _HOST_CACHE: dict[int, tuple[Any, dict[tuple, dict[str, Any]]]] = {}
 _FFI_DEVICES: dict[int, Any] = {}
-# The overlapped backward's side stream per device (:func:`_side_stream`); ``_BWD_SIDE_STREAM = False`` keeps the
-# head programs and the exchange issue on the caller's stream (the previous order, for the A/B record).
-_BWD_SIDE_STREAM = True
-_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
+# The overlapped backward's extra streams per device: slot 0 the high-priority side stream of the head programs and
+# the exchange issue (:func:`_side_stream`), slots 1.. the multi call's tail-row programs (:func:`_halos_in_place`).
+# ``_BWD_STREAMS = False`` keeps every launch on the caller's stream and copies a multi call's received rows (the
+# previous order, for the A/B record).
+_BWD_STREAMS = True
+_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
 
 
 def _host_cache_entry(ctx: Any, key: tuple) -> dict[str, Any]:
@@ -713,14 +719,22 @@ def _side_stream(
     """The stream of an overlapped backward's head programs and exchange issue, forked from the current stream:
     the device's high-priority side stream when the call exchanges (``world_size > 1``) and runs the overlapped pair,
     else ``None`` (the current stream)."""
-    if not (_BWD_SIDE_STREAM and overlapped and int(ctx.world_size) > 1):
+    if not (_BWD_STREAMS and overlapped and int(ctx.world_size) > 1):
         return None
-    index = _device_index(device)
-    side = _SIDE_STREAMS.get(index)
-    if side is None:
-        side = _SIDE_STREAMS[index] = torch.cuda.Stream(device=device, priority=-1)
+    side = _device_stream(device, 0)
     side.wait_stream(torch.cuda.current_stream(device))
     return side
+
+
+def _device_stream(device: torch.device, slot: int) -> torch.cuda.Stream:
+    """The device's extra stream ``slot`` (created once): slot 0 at high priority, the others at the default."""
+    key = (_device_index(device), slot)
+    stream = _STREAMS.get(key)
+    if stream is None:
+        stream = _STREAMS[key] = torch.cuda.Stream(
+            device=device, priority=-1 if slot == 0 else 0
+        )
+    return stream
 
 
 def _join_side(side: Optional[torch.cuda.Stream], recv: torch.Tensor) -> None:
@@ -2350,6 +2364,41 @@ def _unpack(recv: torch.Tensor, widths: list[int]) -> list[torch.Tensor]:
     return blocks
 
 
+def _halos_in_place(
+    calls: list[tuple], recv: torch.Tensor, device: torch.device
+) -> None:
+    """The tail-row programs of an overlapped multi call whose ``n`` tensors share one width ``C``, after the wait.
+    Row ``r`` of tensor ``i`` sits at element ``(r * n + i) * C`` of the packed receive pool, so tensor ``i`` reads
+    the pool from element ``i * C`` with its tail-row table scaled by ``n`` (no copy; the program addresses
+    ``dpre_tail + row * C`` and needs a contiguous pool).  The scaled tables are made on the current stream once per
+    host-cache entry; then the first program runs on the current stream and the others on the device's streams
+    1 .. n - 1, forked from it and joined back."""
+    n = len(calls)
+    tables = []
+    for call in calls:
+        e = call[8]
+        key = f"tail_row_off_x{n}"
+        table = e.get(key)
+        if table is None:
+            t = e["tail_row_off"]
+            table = e[key] = torch.where(t >= 0, t * n, t)
+        tables.append(table)
+    current = torch.cuda.current_stream(device)
+    streams = [current] + [_device_stream(device, i) for i in range(1, n)]
+    for stream in streams[1:]:
+        stream.wait_stream(current)
+        recv.record_stream(stream)
+    flat = recv.view(-1)
+    for i, ((S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), table, stream) in enumerate(
+        zip(calls, tables, streams, strict=True)
+    ):
+        with torch.cuda.stream(stream):
+            args = _bwd_args(e, x_flat, w, dy_flat, hist_t, dx, S=S, C=C)
+            _launch_halo(e["dyn"], tail_row_off=table, dpre_tail=flat[i * C :], **args)
+    for stream in streams[1:]:
+        current.wait_stream(stream)
+
+
 def cake_causal_conv1d_nondet_train_kcp_multi_forward(
     xs: Any,
     weights: Any,
@@ -2637,6 +2686,9 @@ def _kcp_backward_multi(
         _join_side(side, recv)
     if work is not None:
         work.wait()
+    if side is not None and len(calls) > 1 and len({c[1] for c in calls}) == 1:
+        _halos_in_place(calls, recv, device)
+        return dx_out, dw_out
     if recv is not None:
         tails = _unpack(recv, [c[1] for c in calls]) if len(calls) > 1 else [recv]
     for (S, C, x_flat, w, dy_flat, hist_t, dx, dw, e), tail in zip(
