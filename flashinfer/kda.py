@@ -288,8 +288,9 @@ def recurrent_kda(
             a state pool ``[N_pool, H, 128, 128]`` whose inner slots are
             contiguous; padding between pool slots is allowed. The small-BH
             pool must be bfloat16.
-            Indexed batched ``T=1`` CuTe DSL decode gathers and scatters
-            the selected rows. See :ref:`kda-indexed-single-token-decode`
+            State-updating indexed batched ``T=1`` CuTe DSL decode gathers
+            and scatters the selected rows; frozen decode
+            (``disable_state_update=True``) reads them directly. See :ref:`kda-indexed-single-token-decode`
             for a packed layout that accesses the pool directly.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.

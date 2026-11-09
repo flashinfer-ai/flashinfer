@@ -344,14 +344,19 @@ small ``B * HV * T``. Requires SM90+ for the WY path and ``K = V = 128``;
 Indexed single-token decode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For ``recurrent_kda`` with ``backend="cute-dsl"``, ``T=1`` and
-``ssm_state_indices``, the batched ``[B, 1, ...]`` form without ``cu_seqlens``
+For state-updating ``recurrent_kda`` calls with ``backend="cute-dsl"``, ``T=1``
+and ``ssm_state_indices``, the batched ``[B, 1, ...]`` form without ``cu_seqlens``
 gathers the selected state-pool rows into a temporary and scatters them back
 following decode. In-place updates therefore do not imply that the call avoids
 state copies. Each gather and scatter moves the full selected state: at
 ``HV=64`` and ``K=V=128``, that is 2 MiB of BF16 state per sequence.
 This also applies when ``auto`` falls back to this CuTe DSL path; Cake paths
 that directly index the pool do not have this gather/scatter cost.
+
+Frozen decode (``disable_state_update=True``) is different: the batched indexed
+form reads the selected pool rows directly and writes no state back, so it
+needs no layout change. In frozen mode the packed ``cu_seqlens`` form below
+requires ``correction_cache`` and ``kg_cache`` and raises without them.
 
 For a serving pool, use the packed ``[1, B, ...]`` form with one token per
 sequence and ``cu_seqlens = [0, 1, ..., B]`` to let the decode kernel access the
