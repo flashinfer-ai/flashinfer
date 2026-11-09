@@ -2370,7 +2370,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._batch_invariant.refuse(
                 window_right=window_right, seq_lens=seq_lens, block_tables=block_tables
             )
-            bi_causal = (
+            causal = (
                 True if q_len_per_req <= 1 or is_causal is None else bool(is_causal)
             )
             self._batch_invariant.plan(
@@ -2383,7 +2383,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim_qk=head_dim,
                 head_dim_vo=None,
                 page_size=page_size,
-                causal=bi_causal,
+                causal=causal,
                 window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 pos_encoding_mode=pos_encoding_mode,
