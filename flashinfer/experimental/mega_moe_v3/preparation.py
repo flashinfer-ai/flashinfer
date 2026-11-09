@@ -588,7 +588,10 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     w2_dense_k / pack]`` copy of ``w2``'s bytes (zero codes past
     ``w2_logical_k``, then one zero row) and ``K2`` as ``w2_dense_k``; any
     other call binds the padded ``B2`` with ``K2`` the physical width.
-    ``SFB2`` is the padded one on both. Without metadata (the original routes)
+    ``SFB2`` is the padded one on both. ``num_ctas`` (stated by a route whose
+    persistent grid is smaller than the device, ``runtime.route_num_ctas``) is
+    the grid the bindings launch, ``(num_ctas, 1, 1)``; without it the grid is
+    one CTA per SM, ``(num_sms, 1, 1)``. Without metadata (the original routes)
     the host uses the original heuristics.
     """
     import torch
@@ -812,9 +815,16 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     meta_token = control("meta_token")
     meta_slot = control("meta_slot")
     num_sms = int(num_sms)
-    # The source schedule runs one CTA per SM (NUM_CTAS) however few tiles
-    # the routes fill, e.g. when -1 slots leave fewer routed tokens.
-    persistent_grid = num_sms
+    # The source schedule runs its persistent grid (NUM_CTAS) however few tiles
+    # the routes fill, e.g. when -1 slots leave fewer routed tokens: one CTA per
+    # SM, or the smaller count the route states. Workspace sizing and the SFB1
+    # view stay keyed on the device's SM count.
+    persistent_grid = int(metadata.get("num_ctas", num_sms))
+    if not 0 < persistent_grid <= num_sms:
+        raise ValueError(
+            f"route metadata 'num_ctas' must be a persistent grid of 1 to "
+            f"{num_sms} CTAs on this device; got {metadata.get('num_ctas')!r}"
+        )
     grid = (persistent_grid, 1, 1)
     reset_storage = control("reset_storage")
     expert_counts = reset_storage[:E].view(torch.int32)
