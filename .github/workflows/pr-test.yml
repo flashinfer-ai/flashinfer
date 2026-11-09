@@ -1,6 +1,6 @@
 # CI workflow using AWS self-hosted runners.
-# Runs AOT build tests and GPU unit tests on PRs to main, and on main itself on
-# a schedule.
+# Runs AOT build tests, GPU unit tests and the CPU-only tests/cpu suite on PRs
+# to main, and on main itself on a schedule.
 # Uses ci/bash.sh for Docker execution (same as Jenkins).
 #
 # Permission Control:
@@ -316,6 +316,26 @@ jobs:
               done
             fi
 
+            # tests/cpu runs on every run, whatever scope was requested. Its
+            # tests check contracts across modules (package parity, stub
+            # configs, wrapper attributes), so a change in one directory breaks
+            # a CPU test that a scope naming that directory would not select.
+            # It needs no GPU and takes about 5 minutes on a CPU runner, and
+            # through fail-fast it stops the GPU lanes early when it fails.
+            # Bare runs also cover it on H100; the duplicate is cheap.
+            if [ "$SKIP_GPU" != "true" ]; then
+              jq -nc '{
+                name: "CPU Unittest",
+                kind: "cpu",
+                gpu_name: "CPU",
+                runner: ["self-hosted", "linux", "x64", "cpu", "on-demand"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: "tests/cpu",
+                timeout: 60
+              }'
+            fi
+
             if [ "$SKIP_GPU" != "true" ] && [ -z "${REQUESTED_TEST_PATH}" ]; then
               for shard in 1 2 3 4 5; do
                 jq -nc --arg shard "$shard" '{
@@ -456,7 +476,8 @@ jobs:
       # which turns it off for A/B timing without a code change. The `|| '1'`
       # matters: an unset variable is null, and `null != '0'` is false because
       # mismatched types are compared as numbers (null and '0' both become 0).
-      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
+      # The CPU lane compiles nothing, so it skips sccache too.
+      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && matrix.kind != 'cpu' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -553,7 +574,7 @@ jobs:
             --no-gpu "./scripts/${TEST_SCRIPT}"
 
       - name: Configure compile cache
-        if: matrix.kind != 'aot'
+        if: matrix.kind != 'aot' && matrix.kind != 'cpu'
         env:
           S3_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
           S3_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
@@ -625,6 +646,20 @@ jobs:
           TEST_RUNNER_ARGS=()
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
+          elif [ "${MATRIX_KIND}" = "cpu" ]; then
+            # No GPU in the container. ci/bash.sh forwards the lane identity
+            # only for GPU containers, so pass it here for summary.py.
+            # tests/cpu peaks near 4 GiB host RSS per file on H100, so 16
+            # workers fit the CPU runners the AOT lanes use (the arm64 one has
+            # 64 vCPU and ~500 GiB). More would not help: the slowest file,
+            # about 250 s, sets the floor.
+            DOCKER_ARGS+=(
+              --no-gpu
+              -e CI_GPU_NAME "${CI_GPU_NAME}"
+              -e CI_TEST_SCRIPT "${TEST_SCRIPT}"
+              -e CI_MATRIX_CUDA "${MATRIX_CUDA}"
+            )
+            TEST_RUNNER_ARGS+=(--workers 16)
           fi
           # Per-build compile times, summarized by the "Summarize JIT build times"
           # step. Appended: DOCKER_ARGS already carries the sccache settings.
@@ -751,7 +786,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           # Non-H100 names add the runner SM: A10G and T4 rows can run the same script.
-          name: junit-${{ matrix.kind == 'h100' && 'h100' || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: junit-${{ (matrix.kind == 'h100' || matrix.kind == 'cpu') && matrix.kind || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit/**/*.xml
             junit/**/*.telemetry.json
@@ -957,6 +992,15 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
+      - name: Download CPU JUnit artifacts
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-cpu-*
+          path: junit-cpu
+          merge-multiple: true
+        continue-on-error: true
+
       - name: Download shard JUnit artifacts (A10G/T4)
         if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
         uses: actions/download-artifact@v4
@@ -976,6 +1020,10 @@ jobs:
           SUMMARY_ARGS=""
           if [ -f junit-h100/run-summary.json ]; then
             SUMMARY_ARGS="--summary junit-h100/run-summary.json"
+          fi
+          # The CPU lane runs the same sharded runner, so it has a run summary.
+          if [ -f junit-cpu/run-summary.json ]; then
+            SUMMARY_ARGS="$SUMMARY_ARGS --summary junit-cpu/run-summary.json --junit-dir junit-cpu"
           fi
 
           # A10G/T4 shard lanes produce raw JUnit XML (no run-summary.json).
@@ -1178,7 +1226,7 @@ jobs:
 
           if [ -n "${TEST_SCOPE:-}" ]; then
             echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
-            echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
+            echo "> Tested only: \`${TEST_SCOPE}\`, plus \`tests/cpu\` on the CPU lane" >> $GITHUB_STEP_SUMMARY
             echo "> Comment \`@flashinfer-bot run all\` for full coverage." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi

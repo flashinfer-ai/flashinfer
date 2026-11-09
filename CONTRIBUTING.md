@@ -130,6 +130,9 @@ FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVID
 
 Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardware on AWS self-hosted runners.
 
+Every public CI run, targeted or full, also runs all of `tests/cpu` in a "CPU Unittest" lane on a CPU runner,
+whatever paths you named. Tests under `tests/cpu` must therefore run without a GPU.
+
 The commands below are the user-facing reference. The design behind them -- why there are two CI systems, how a run is narrowed to specific tests, and the constraints that follow -- is recorded in [`docs/design_docs/ci_bot_and_targeted_testing.md`](docs/design_docs/ci_bot_and_targeted_testing.md).
 
 Public CI does not start on its own for any PR. An explicit `@flashinfer-bot run <paths>` or `@flashinfer-bot run all` starts it, and works for anyone who can label the PR as well as for members of the `ci-users` team. Adding the `run-ci` label by hand does the same, for anyone whose permissions let them label a PR. This applies to everyone, including maintainers.
