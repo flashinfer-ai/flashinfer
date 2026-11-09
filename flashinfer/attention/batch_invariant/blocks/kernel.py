@@ -10,6 +10,10 @@ arriver runs the group's chunk-order fold (``fixup.fold_row``) and writes the ou
 
 Every floating-point op outside the two MMAs and ``ex2`` goes through ``CuteF32``; the reduction
 trees come from ``canon`` plans; the arithmetic functions are ``spec.py``'s.
+
+The fp8-KV kernels (``kv_fmt`` ``"e4m3"`` / ``"e5m2"``) differ in one role: the load warp and the two empty warps form the
+conversion stage (``convert.py``) that fills the bf16 ring from the fp8 cache instead of the TMA, through a thread-to-UMMA ring
+pipeline; the epilogue takes the value scale ``vs`` (``fixup.finish``). Every other role is the bf16 kernel's code.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from ..plan import (
     F_TILE_HI,
     F_TILE_LO,
 )
+from .convert import convert_unit, load_q_unit
 from .correction import correction_loop, correction_loop_q2, fold_group
 from .mma import mma_loop, mma_loop_q2
 from .operands import (
@@ -102,6 +107,7 @@ class AttentionKernel:
         n_wg: int = 1,
         q2: bool = False,
         ragged: bool = False,
+        kv_fmt: str = "bf16",
     ):
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
@@ -112,6 +118,7 @@ class AttentionKernel:
             q2,
             ragged,
         )
+        self.kv_fmt = kv_fmt
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -130,6 +137,7 @@ class AttentionKernel:
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
+        vs: Float32,
         window_left: Int32,
         num_units: Int32,
         grid: Int32,
@@ -137,9 +145,18 @@ class AttentionKernel:
     ):
         """``grid`` CTAs walk the ``num_units`` work units persistently (unit ``u`` on CTA ``u % grid``): a launch
         parameter, never a quantity that reaches the bits (I10). ``mScratch`` is the per-CTA ``O_m`` scratch (``grid x 128 x D``
-        fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor."""
+        fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor. ``vs`` is the fp8-KV classes' value scale
+        (the epilogue's one ``mul.rn``; unused by the bf16 kernel, which passes 1.0). ``mK`` / ``mV`` are the bf16 caches, or the
+        fp8 caches viewed as bytes for the fp8-KV kernels."""
         st = StaticPlan(
-            self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged
+            self.D,
+            self.g,
+            self.page,
+            self.kv_slots,
+            self.n_wg,
+            self.q2,
+            self.ragged,
+            self.kv_fmt,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)
@@ -196,6 +213,7 @@ class AttentionKernel:
             mKvIndices,
             c,
             nc,
+            vs,
             window_left,
             num_units,
             st.qk_tiled_mma,
@@ -238,6 +256,7 @@ class AttentionKernel:
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
+        vs: Float32,
         window_left: Int32,
         num_units: Int32,
         qk_tiled_mma: cute.TiledMma,
@@ -260,8 +279,9 @@ class AttentionKernel:
         if warp_idx == R.load_warp:
             cpasync.prefetch_descriptor(atom_q)
             cpasync.prefetch_descriptor(atom_q_rep)
-            cpasync.prefetch_descriptor(atom_k)
-            cpasync.prefetch_descriptor(atom_v)
+            if cutlass.const_expr(not st.lowbit):
+                cpasync.prefetch_descriptor(atom_k)
+                cpasync.prefetch_descriptor(atom_v)
         Hq = tK.shape[2] * st.g  # heads of Q = kv heads x group
 
         # ---- scaffolding
@@ -275,14 +295,24 @@ class AttentionKernel:
             tx_count=st.q_bytes,
             defer_sync=True,
         ).make_participants()
-        kv_prod, kv_cons = pipeline.PipelineTmaUmma.create(
-            barrier_storage=storage.kv_mbar.data_ptr(),
-            num_stages=st.n_slots,
-            producer_group=_thread_group(1),
-            consumer_group=_thread_group(1),
-            tx_count=st.kv_slot_bytes,
-            defer_sync=True,
-        ).make_participants()
+        if cutlass.const_expr(st.lowbit):
+            # the ring is filled by the conversion stage's threads (one arrival each after its fence), consumed by the UMMA
+            kv_prod, kv_cons = pipeline.PipelineAsyncUmma.create(
+                barrier_storage=storage.kv_mbar.data_ptr(),
+                num_stages=st.n_slots,
+                producer_group=_thread_group(R.convert_threads),
+                consumer_group=_thread_group(1),
+                defer_sync=True,
+            ).make_participants()
+        else:
+            kv_prod, kv_cons = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.kv_mbar.data_ptr(),
+                num_stages=st.n_slots,
+                producer_group=_thread_group(1),
+                consumer_group=_thread_group(1),
+                tx_count=st.kv_slot_bytes,
+                defer_sync=True,
+            ).make_participants()
         n_stage = (
             128 if st.q2 else n_soft
         )  # threads on a tile's stage: one warpgroup under ping-pong / pairing, all otherwise
@@ -355,6 +385,10 @@ class AttentionKernel:
         sKV_flat = storage.sKV.get_tensor(
             cute.make_layout((st.n_slots * st.kv_slot_elems,))
         )
+        sKV_u32 = cute.make_tensor(
+            cute.recast_ptr(sKV_flat.iterator, dtype=cutlass.Uint32),
+            cute.make_layout((st.n_slots * st.kv_slot_elems // 2,)),
+        )  # the ring as 32-bit words (the conversion stage's store view)
         s_alpha = storage.s_alpha.get_tensor(
             cute.make_layout((st.stats_slots, Q_ROWS))
         )  # softmax -> correction: alpha (early)
@@ -384,69 +418,126 @@ class AttentionKernel:
         # while the persistent walk still needed them: slower at every multi-wave fold.
 
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
-        if warp_idx == R.load_warp:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
-            if cutlass.const_expr(st.q2):
+        if cutlass.const_expr(st.lowbit):
+            # the conversion stage: the load warp (Q by TMA, then its share of the K / V conversion) and the two other warps (their
+            # share of the conversion); every thread of the stage runs the same ring-slot sequence
+            if warp_idx == R.load_warp:
+                cute.arch.setmaxregister_decrease(R.regs_other)
+                tidx, _, _ = cute.arch.thread_idx()
+                ctid = tidx - 32 * R.load_warp
                 for u in range(bidx, num_units, grid_size):
-                    ua = 2 * u
-                    ub = ua + 1
-                    q_prod, kv_prod = load_loop_q2(
+                    q_prod = load_q_unit(
                         st,
                         atom_q,
                         tQ,
                         atom_q_rep,
                         tQr,
-                        atom_k,
-                        tK,
-                        atom_v,
-                        tV,
                         sQ_view,
                         sQ_rep_view,
-                        sKV_view,
                         q_prod,
-                        kv_prod,
-                        mKvIndptr,
-                        mKvIndices,
-                        mDesc[(ua, F_REQ)],
-                        mDesc[(ua, F_KVHEAD)],
-                        mDesc[(ua, F_QBASE)] + mDesc[(ua, F_QTOK0)],
-                        mDesc[(ua, F_ROWS)],
-                        mDesc[(ua, F_TILE_LO)],
-                        mDesc[(ua, F_TILE_HI)],
-                        mDesc[(ub, F_QBASE)] + mDesc[(ub, F_QTOK0)],
-                        mDesc[(ub, F_ROWS)],
-                        mDesc[(ub, F_TILE_LO)],
-                        mDesc[(ub, F_TILE_HI)],
-                    )
-            if cutlass.const_expr(not st.q2):
-                for u in range(bidx, num_units, grid_size):
-                    q_prod, kv_prod = load_loop(
-                        st,
-                        atom_q,
-                        tQ,
-                        atom_q_rep,
-                        tQr,
-                        atom_k,
-                        tK,
-                        atom_v,
-                        tV,
-                        sQ_view,
-                        sQ_rep_view,
-                        sKV_view,
-                        q_prod,
-                        kv_prod,
-                        mKvIndptr,
-                        mKvIndices,
-                        mDesc[(u, F_REQ)],
                         mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
                         mDesc[(u, F_KVHEAD)],
                         mDesc[(u, F_ROWS)],
+                    )
+                    kv_prod = convert_unit(
+                        st,
+                        kv_prod,
+                        tK,
+                        tV,
+                        sKV_u32,
+                        mKvIndptr,
+                        mKvIndices,
+                        mDesc[(u, F_REQ)],
+                        mDesc[(u, F_KVHEAD)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
+                        ctid,
                     )
-            cute.arch.griddepcontrol_launch_dependents()
+                cute.arch.griddepcontrol_launch_dependents()
+            if warp_idx >= R.empty_warps[0]:
+                cute.arch.setmaxregister_decrease(R.regs_other)
+                tidx, _, _ = cute.arch.thread_idx()
+                ctid = tidx - 32 * R.load_warp
+                for u in range(bidx, num_units, grid_size):
+                    kv_prod = convert_unit(
+                        st,
+                        kv_prod,
+                        tK,
+                        tV,
+                        sKV_u32,
+                        mKvIndptr,
+                        mKvIndices,
+                        mDesc[(u, F_REQ)],
+                        mDesc[(u, F_KVHEAD)],
+                        mDesc[(u, F_TILE_LO)],
+                        mDesc[(u, F_TILE_HI)],
+                        ctid,
+                    )
+                cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not st.lowbit):
+            if warp_idx == R.load_warp:
+                cute.arch.setmaxregister_decrease(REGS_OTHER)
+                if cutlass.const_expr(st.q2):
+                    for u in range(bidx, num_units, grid_size):
+                        ua = 2 * u
+                        ub = ua + 1
+                        q_prod, kv_prod = load_loop_q2(
+                            st,
+                            atom_q,
+                            tQ,
+                            atom_q_rep,
+                            tQr,
+                            atom_k,
+                            tK,
+                            atom_v,
+                            tV,
+                            sQ_view,
+                            sQ_rep_view,
+                            sKV_view,
+                            q_prod,
+                            kv_prod,
+                            mKvIndptr,
+                            mKvIndices,
+                            mDesc[(ua, F_REQ)],
+                            mDesc[(ua, F_KVHEAD)],
+                            mDesc[(ua, F_QBASE)] + mDesc[(ua, F_QTOK0)],
+                            mDesc[(ua, F_ROWS)],
+                            mDesc[(ua, F_TILE_LO)],
+                            mDesc[(ua, F_TILE_HI)],
+                            mDesc[(ub, F_QBASE)] + mDesc[(ub, F_QTOK0)],
+                            mDesc[(ub, F_ROWS)],
+                            mDesc[(ub, F_TILE_LO)],
+                            mDesc[(ub, F_TILE_HI)],
+                        )
+                if cutlass.const_expr(not st.q2):
+                    for u in range(bidx, num_units, grid_size):
+                        q_prod, kv_prod = load_loop(
+                            st,
+                            atom_q,
+                            tQ,
+                            atom_q_rep,
+                            tQr,
+                            atom_k,
+                            tK,
+                            atom_v,
+                            tV,
+                            sQ_view,
+                            sQ_rep_view,
+                            sKV_view,
+                            q_prod,
+                            kv_prod,
+                            mKvIndptr,
+                            mKvIndices,
+                            mDesc[(u, F_REQ)],
+                            mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
+                            mDesc[(u, F_KVHEAD)],
+                            mDesc[(u, F_ROWS)],
+                            mDesc[(u, F_TILE_LO)],
+                            mDesc[(u, F_TILE_HI)],
+                        )
+                cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
+            cute.arch.setmaxregister_decrease(R.regs_other)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tStS, tOtOc, tOtOm, tOrP = tmem_views(
@@ -651,6 +742,7 @@ class AttentionKernel:
                         mWs,
                         c,
                         nc,
+                        vs,
                         Hq,
                         mDesc[(ua, F_QBASE)],
                         mDesc[(ua, F_KVHEAD)],
@@ -681,6 +773,7 @@ class AttentionKernel:
                         mDesc[(ua, F_GROUP)],
                         c,
                         nc,
+                        vs,
                         window_left,
                         Hq,
                     )
@@ -695,6 +788,7 @@ class AttentionKernel:
                             mDesc[(ub, F_GROUP)],
                             c,
                             nc,
+                            vs,
                             window_left,
                             Hq,
                         )
@@ -716,6 +810,7 @@ class AttentionKernel:
                         bidx,
                         c,
                         nc,
+                        vs,
                         mDesc[(u, F_ROWS)],
                         mDesc[(u, F_QBASE)],
                         mDesc[(u, F_QTOK0)],
@@ -738,6 +833,7 @@ class AttentionKernel:
                         mDesc[(u, F_GROUP)],
                         c,
                         nc,
+                        vs,
                         window_left,
                         Hq,
                     )
@@ -747,5 +843,6 @@ class AttentionKernel:
                 barrier_id=BAR_CORRECTION, num_threads=128
             ).arrive_and_wait()
             tmem.free(tmem_ptr)
-        if warp_idx >= R.empty_warps[0]:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
+        if cutlass.const_expr(not st.lowbit):
+            if warp_idx >= R.empty_warps[0]:
+                cute.arch.setmaxregister_decrease(REGS_OTHER)

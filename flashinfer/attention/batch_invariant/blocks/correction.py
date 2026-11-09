@@ -34,7 +34,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import tcgen05
 
 from ....batch_invariant.fp_interface.cute import CuteF32
-from ..fixup import VEC, fold_row
+from ..fixup import VEC, finish, fold_row
 from ..plan import (
     G_CHUNK_LO,
     G_KVHEAD,
@@ -212,6 +212,8 @@ def merge_global_pipelined(
     CT: cutlass.Constexpr,
     to_output: cutlass.Constexpr,
     D: cutlass.Constexpr,
+    vs: Float32,
+    scaled: cutlass.Constexpr,
 ):
     """The chunk merge with ``O_m`` in the global scratch, software-pipelined ``len(rMs)`` deep: the ``O_m`` pieces ``i + 1 .. i + depth - 1``
     are in flight (one register buffer each) while piece ``i`` is merged -- ``fma(O_c, a2, mul(O_m, a1))`` per element, exactly
@@ -228,9 +230,7 @@ def merge_global_pipelined(
                 rMa[e] = CuteF32.fma(rO[e], a2, Float32(0.0))
             if cutlass.const_expr(to_output):
                 for e in cutlass.range_constexpr(cute.size(rO)):
-                    rOut[e] = CuteF32.add(CuteF32.mul(rMa[e], inv), Float32(0.0)).to(
-                        IN_DTYPE
-                    )
+                    rOut[e] = finish(rMa[e], inv, vs, scaled).to(IN_DTYPE)
                 if row_valid:
                     cute.autovec_copy(
                         rOut,
@@ -259,9 +259,7 @@ def merge_global_pipelined(
                 cur[e] = CuteF32.fma(rO[e], a2, CuteF32.mul(cur[e], a1))
             if cutlass.const_expr(to_output):
                 for e in cutlass.range_constexpr(cute.size(rO)):
-                    rOut[e] = CuteF32.add(CuteF32.mul(cur[e], inv), Float32(0.0)).to(
-                        IN_DTYPE
-                    )
+                    rOut[e] = finish(cur[e], inv, vs, scaled).to(IN_DTYPE)
                 if row_valid:
                     cute.autovec_copy(
                         rOut,
@@ -327,6 +325,8 @@ def merge_chunk(
                 CT,
                 False,
                 1,
+                Float32(1.0),
+                False,
             )
     cute.arch.fence_view_async_tmem_load()
     oh.release()
@@ -364,7 +364,10 @@ def epilogue(
     CT: cutlass.Constexpr,
     om_tmem: cutlass.Constexpr,
     WS: cutlass.Constexpr,
+    vs: Float32,
+    scaled: cutlass.Constexpr,
 ):
+    """``vs`` / ``scaled``: the fp8-KV classes' value scale in the epilogue chain (``fixup.finish``)."""
     oh = (
         o_cons.wait_and_advance()
     )  # the unit's last PV complete; held until the reads below are done
@@ -390,6 +393,8 @@ def epilogue(
                         CT,
                         True,
                         D,
+                        vs,
+                        scaled,
                     )
                 else:
                     for i in cutlass.range_constexpr(n_pieces):
@@ -399,9 +404,7 @@ def epilogue(
                             rO,
                         )
                         for e in cutlass.range_constexpr(cute.size(rO)):
-                            rOut[e] = CuteF32.add(
-                                CuteF32.mul(rO[e], inv), Float32(0.0)
-                            ).to(IN_DTYPE)
+                            rOut[e] = finish(rO[e], inv, vs, scaled).to(IN_DTYPE)
                         if row_valid:
                             cute.autovec_copy(
                                 rOut,
@@ -438,9 +441,7 @@ def epilogue(
                         for e in cutlass.range_constexpr(cute.size(rO)):
                             rM[e] = rO[e]
                     for e in cutlass.range_constexpr(cute.size(rO)):
-                        rOut[e] = CuteF32.add(CuteF32.mul(rM[e], inv), Float32(0.0)).to(
-                            IN_DTYPE
-                        )
+                        rOut[e] = finish(rM[e], inv, vs, scaled).to(IN_DTYPE)
                     if row_valid:
                         cute.autovec_copy(
                             rOut,
@@ -492,6 +493,7 @@ def correction_loop(
     cta: Int32,
     c: Float32,
     nc: Float32,
+    vs: Float32,
     rows_valid: Int32,
     q_base: Int32,
     q_tok0: Int32,
@@ -668,6 +670,8 @@ def correction_loop(
         CT,
         om_tmem,
         WS,
+        vs,
+        st.lowbit,
     )
     return o_cons, stats_cons
 
@@ -683,6 +687,7 @@ def fold_group(
     grp: Int32,
     c: Float32,
     nc: Float32,
+    vs: Float32,
     window_left: Int32,
     Hq: Int32,
 ):
@@ -744,6 +749,8 @@ def fold_group(
                         chunk_len(st.D),
                         8 if st.n_wg == 1 else 4,
                         st.ws_row,
+                        vs,
+                        st.lowbit,
                     )
             if thread_idx == 0:
                 mCounters[grp] = Int32(
@@ -869,6 +876,7 @@ def correction_loop_q2(
     mWs: cute.Tensor,
     c: Float32,
     nc: Float32,
+    vs: Float32,
     Hq: Int32,
     q_base: Int32,
     kv_head: Int32,
@@ -1075,6 +1083,8 @@ def correction_loop_q2(
             CT,
             st.om_tmem,
             WS,
+            vs,
+            st.lowbit,
         )
     if has_b:
         inv_b = CuteF32.div(Float32(1.0), lr_b)
@@ -1109,5 +1119,7 @@ def correction_loop_q2(
             CT,
             st.om_tmem,
             WS,
+            vs,
+            st.lowbit,
         )
     return o_cons_a, o_cons_b, stats_cons_a, stats_cons_b
