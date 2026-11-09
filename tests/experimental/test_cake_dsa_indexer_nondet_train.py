@@ -823,7 +823,11 @@ def test_policy_selects_registered_programs_on_a_dense_geometry_grid():
                         assert list(choice.keys) == selected
                         # without a registry the plan names the :lsf copy wherever the record asks for it; the backend
                         # passes the registry, which runs the program itself where its copy is not registered (sm_107a)
-                        if scan_keys is None and arch == "sm_107a" and choice.scan_key not in keys:
+                        if (
+                            scan_keys is None
+                            and arch == "sm_107a"
+                            and choice.scan_key not in keys
+                        ):
                             selected[0] = choice.scan_key.removesuffix(":lsf")
                         for key in selected:
                             assert key in keys, (
@@ -1111,18 +1115,18 @@ def test_lsf_copy_runs_where_the_registry_has_it_and_never_changes_the_plan():
                 assert base.scan_key in keys, where
                 copy = base.scan_key + ":lsf"
                 if copy in keys:
-                    assert got == dataclasses.replace(
-                        base, lsf=True, scan_key=copy
-                    ), where
+                    assert got == dataclasses.replace(base, lsf=True, scan_key=copy), (
+                        where
+                    )
                     reached.add(copy)
                 else:
                     assert got == base, where
                     kept += 1
                 # equal key segments (num_keys == S x max_seqlen_k): the program itself
                 bounded = dict(call, max_seqlen_k=Tkv // S)
-                assert select_program(p, **bounded) == select_program(
-                    off, **bounded
-                ), where
+                assert select_program(p, **bounded) == select_program(off, **bounded), (
+                    where
+                )
             if arch == "sm_107a":
                 assert reached == keys & _SM107_LSF_COPIES and kept, arch
             else:
@@ -2918,12 +2922,18 @@ def test_sm107_longest_first_copy_runs_on_a_poisoned_caller_workspace(geometry):
     device = torch.device("cuda", torch.cuda.current_device())
     arch = arch_for(device)
     if arch != "sm_107a":
-        pytest.skip(f"the longest-first copies of the TicketWord programs ship on sm_107a, not {arch}")
-    assert _SM107_LSF_COPIES <= set(cake_jit.PROGRAM_KEYS[arch])
+        pytest.skip(
+            f"the longest-first copies of the TicketWord programs ship on sm_107a, not {arch}"
+        )
+    assert set(cake_jit.PROGRAM_KEYS[arch]) >= _SM107_LSF_COPIES
     seg_q, seg_k, top_k, key = _SM107_LSF_GEOMETRIES[geometry]
-    inputs = ref.make_random_inputs(seg_q, seg_k, top_k=top_k, seed=88 + geometry, device="cuda")
+    inputs = ref.make_random_inputs(
+        seg_q, seg_k, top_k=top_k, seed=88 + geometry, device="cuda"
+    )
     own = _prepare(inputs)
-    assert own.choice.scan_key in (_SM107_LSF_COPIES if key is None else {key}), own.choice.scan_key
+    assert own.choice.scan_key in (_SM107_LSF_COPIES if key is None else {key}), (
+        own.choice.scan_key
+    )
     expected = _cloned(own())
     torch.cuda.synchronize()
     _judge_ok(expected, ref.select_reference(inputs))
@@ -2932,7 +2942,10 @@ def test_sm107_longest_first_copy_runs_on_a_poisoned_caller_workspace(geometry):
     )
     workspace.fill_(0xFF)
     runner = _prepare(inputs, workspace_buffer=workspace)
-    assert runner.choice.scan_key == own.choice.scan_key and runner.ticket_block is not None
+    assert (
+        runner.choice.scan_key == own.choice.scan_key
+        and runner.ticket_block is not None
+    )
     assert cake_backend.reads_ticket_word(runner.programs["scan"], runner.arch)
     generator = torch.Generator(device=device).manual_seed(89)
     for step in range(4):
