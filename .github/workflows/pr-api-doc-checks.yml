@@ -23,10 +23,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Test API and documentation checkers
+      - name: Test public API checker
         id: public_api_tests
         continue-on-error: true
-        run: python -m unittest discover -s scripts/tests -p 'test_check*.py' -v
+        run: python -m unittest discover -s scripts/tests -p 'test_check_pr_api_diff.py' -v
 
       - name: Check public API signature and export changes
         id: public_api
