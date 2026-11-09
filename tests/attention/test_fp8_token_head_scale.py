@@ -133,8 +133,6 @@ def _check(
     """Two-part validation:
     - correctness: ``o_fp8`` (token-head-scale kernel) vs ``o_ref`` (16-bit on dequant)
     - quantization: ``o_orig`` (16-bit on original) vs ``o_fp8`` > 0.995
-
-    ``correctness_thresh`` is relaxed for asymmetric head_dim (192).
     """
     cos_correct = _cos(o_fp8, o_ref)
     assert cos_correct > correctness_thresh, (
@@ -685,12 +683,11 @@ def test_single_prefill_token_head_scale_logits_soft_cap(q_dtype):
 
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_single_prefill_token_head_scale_asym_head_dim(q_dtype):
-    # head_dim_qk=192, head_dim_vo=128: K and V carry different head dims, and
-    # head_dim_qk is a 16-multiple outside {64,128,256}.
+    # head_dim_qk=256, head_dim_vo=128: K and V carry different head dims.
     _skip_bf16_on_sm75(q_dtype)
     torch.manual_seed(42)
     dev = "cuda:0"
-    head_dim_qk, head_dim_vo = 192, 128
+    head_dim_qk, head_dim_vo = 256, 128
     qo_len = kv_len = 32
     num_qo_heads = num_kv_heads = 4
 
@@ -706,7 +703,28 @@ def test_single_prefill_token_head_scale_asym_head_dim(q_dtype):
         q, k_fp8, v_fp8, backend="fa2", kv_cache_sf=(k_sf, v_sf)
     )
     assert o_fp8.shape == (qo_len, num_qo_heads, head_dim_vo), o_fp8.shape
-    _check(o_fp8, o_ref, o_orig, "asym_head_dim", correctness_thresh=0.998)
+    _check(o_fp8, o_ref, o_orig, "asym_head_dim")
+
+
+def test_single_prefill_token_head_scale_refuses_head_dim_qk_192():
+    # The FA2 kernels load FP8 K rows in 128-element blocks, so a 192-element row
+    # is only partly loaded (NaN or wrong output); the module refuses it.
+    dev = "cuda:0"
+    q = torch.randn(32, 4, 192, dtype=torch.float16, device=dev)
+    k_fp8, k_sf, _ = quantize_token_head(
+        torch.randn(32, 4, 192, dtype=torch.float16, device=dev),
+        torch.float8_e4m3fn,
+        192,
+    )
+    v_fp8, v_sf, _ = quantize_token_head(
+        torch.randn(32, 4, 128, dtype=torch.float16, device=dev),
+        torch.float8_e4m3fn,
+        128,
+    )
+    with pytest.raises(ValueError, match="head_dim_qk=192"):
+        flashinfer.single_prefill_with_kv_cache(
+            q, k_fp8, v_fp8, backend="fa2", kv_cache_sf=(k_sf, v_sf)
+        )
 
 
 # ---------------------------------------------------------------------------
