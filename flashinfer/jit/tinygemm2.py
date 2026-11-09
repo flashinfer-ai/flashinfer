@@ -30,7 +30,11 @@ def gen_tinygemm2_sm100_module() -> JitSpec:
         "tinygemm2_sm100",
         [jit_env.FLASHINFER_CSRC_DIR / "tinygemm2_sm100.cu"],
         extra_cuda_cflags=sm100a_nvcc_flags
-        + ["-gencode=arch=compute_103a,code=sm_103a"]
+        + (
+            ["-gencode=arch=compute_103a,code=sm_103a"]
+            if is_cuda_version_at_least("12.9")
+            else []
+        )
         + (
             ["-gencode=arch=compute_107a,code=sm_107a"]
             if is_cuda_version_at_least("13.4")

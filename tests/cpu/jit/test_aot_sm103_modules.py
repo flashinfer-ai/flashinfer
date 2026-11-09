@@ -57,7 +57,7 @@ SM103_ONLY_MODULES = {
 }
 
 
-def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
+def _registered_generators(monkeypatch, sm_capabilities, overrides=None, add_moe=True):
     """Run gen_all_modules with every module generator stubbed to its own name."""
     from flashinfer import aot
     from flashinfer.jit import comm as jit_comm
@@ -91,7 +91,7 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
         True,
         False,
         False,
-        True,
+        add_moe,
         False,
         True,
         True,
@@ -215,6 +215,13 @@ def test_tinygemm2_is_prebuilt_for_every_arch_that_loads_it(monkeypatch, arch):
 
 
 @pytest.mark.cpu_only
+def test_tinygemm2_is_prebuilt_without_moe(monkeypatch):
+    registered = _registered_generators(monkeypatch, {"sm100": True}, add_moe=False)
+
+    assert {"gen_tinygemm2_module", "gen_tinygemm2_sm100_module"} <= registered
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("arch", "expected"),
     [
@@ -233,3 +240,22 @@ def test_tinygemm2_sm100_variant_is_prebuilt_only_for_sm10x(
     registered = _registered_generators(monkeypatch, {arch: True})
 
     assert ("gen_tinygemm2_sm100_module" in registered) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("cuda", "sm103a", "sm107a"),
+    [("12.8", False, False), ("12.9", True, False), ("13.4", True, True)],
+)
+def test_tinygemm2_sm100_targets_follow_the_cuda_version(
+    monkeypatch, cuda, sm103a, sm107a
+):
+    from flashinfer.jit import tinygemm2
+
+    monkeypatch.setattr(
+        tinygemm2, "is_cuda_version_at_least", lambda v: Version(cuda) >= Version(v)
+    )
+    flags = tinygemm2.gen_tinygemm2_sm100_module().extra_cuda_cflags
+
+    assert ("-gencode=arch=compute_103a,code=sm_103a" in flags) == sm103a
+    assert ("-gencode=arch=compute_107a,code=sm_107a" in flags) == sm107a
