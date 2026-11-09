@@ -2185,13 +2185,15 @@ def _run_split_keys(
     keys: tuple,
     run_key: Callable[[Any], None],
     dw_stream: Optional[Union[bool, str]] = None,
-    run_keys: Callable[..., None] = _run_keys,
+    run_keys: Optional[Callable[..., None]] = None,
 ) -> None:
-    """``run_keys`` (:func:`.cake_backend._run_keys`, or ``_run_keys_temperature`` for a plan with the temperature
-    forms) of a plan with a split weight-gradient accumulator (:attr:`Plan.dw_split`; any other plan: that function).
-    Each chunk's second accumulate (its :class:`_UpperRows` key) runs right behind the first, on the same stream -- the
-    dW side stream where the placement of :func:`side_stream_schedule` puts the chunk's accumulate -- so that placement
-    sees one accumulate per chunk, as without the split."""
+    """``run_keys`` (default :func:`.cake_backend._run_keys`, looked up at the call; ``_run_keys_temperature`` for a plan
+    with the temperature forms) of a plan with a split weight-gradient accumulator (:attr:`Plan.dw_split`; any other
+    plan: that function).  Each chunk's second accumulate (its :class:`_UpperRows` key) runs right behind the first, on
+    the same stream -- the dW side stream where the placement of :func:`side_stream_schedule` puts the chunk's
+    accumulate -- so that placement sees one accumulate per chunk, as without the split."""
+    if run_keys is None:
+        run_keys = _run_keys
     if plan.dw_split is None:
         run_keys(plan, device_index, keys, run_key, dw_stream)
         return
