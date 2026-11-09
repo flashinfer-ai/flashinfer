@@ -1269,10 +1269,11 @@ def test_deterministic_dw_is_bitwise_reproducible(hidden: int, rows: int) -> Non
     assert torch.isfinite(results[0][1]).all()
 
 
-def _taper_rows(record: dict, sms: int, limit: int) -> list[int]:
+def _taper_rows(record: dict, limit: int) -> list[int]:
     """Row counts of the record's window where its taper cuts another chunk
-    table than the module constants would: the first, a middle and the last
-    within ``limit`` (none for a program at the default taper)."""
+    table than the module constants would on device 0 (the host's slot count
+    of the record, ``slot_count``): the first, a middle and the last within
+    ``limit`` (none for a program at the default taper)."""
 
     rule = record["grid_rule"]
     taper = loader.chunk_taper(rule)
@@ -1282,7 +1283,8 @@ def _taper_rows(record: dict, sms: int, limit: int) -> list[int]:
     above = 0 if select is None else int(select["above"])
     at_most = None if select is None else select["at_most"]
     last = limit if at_most is None else min(limit, int(at_most))
-    slots, rpi = int(rule["ctas_per_sm"]) * sms, int(rule["rows_per_issue"])
+    slots = loader.slot_count(rule, device_index=0)
+    rpi = int(rule["rows_per_issue"])
     differing = [
         rows
         for rows in range(above + 1, last + 1)
@@ -1314,7 +1316,6 @@ def test_backward_reuses_a_poisoned_workspace_across_row_counts(
     ):
         pytest.skip(f"hidden={hidden} has no exported residual backward route")
     arch = loader.arch_for_capability(_capability())
-    sms = loader.sm_count(0)
     limit = 32768
     rows_set = {
         rows for rows in _switch_rows(arch, hidden, "bwd", residual) if rows <= limit
@@ -1322,7 +1323,7 @@ def test_backward_reuses_a_poisoned_workspace_across_row_counts(
     for name in loader.route_modules(arch, hidden, "bwd", residual):
         record = loader.MODULES[name]
         if record.get("workspace_rule") is not None:
-            rows_set.update(_taper_rows(record, sms, limit))
+            rows_set.update(_taper_rows(record, limit))
     descending = sorted(rows_set, reverse=True)
     order = descending + descending[-2::-1]
     eps = EPS[hidden]
