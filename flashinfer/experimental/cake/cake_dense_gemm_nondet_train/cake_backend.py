@@ -1845,8 +1845,11 @@ _DGRAD_N = "dense_proj_gemm_dgrad_kn_n256_f32_ef"
 _DGRAD_N_TMA = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma"
 _DGRAD_N_TMA_LEAN_FREE = "dense_proj_gemm_dgrad_kn_n256_f32_tma_lean_free"
 _DGRAD_N_EF_TMA_LEAN_FREE_R9 = "dense_proj_gemm_dgrad_kn_n256_f32_ef_tma_lean_free_r9"
-#: The token counts of the 148-SM ``sm_100a`` input-gradient windows of :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`.
+#: The token counts of the 148-SM ``sm_100a`` and 152-SM ``sm_103a`` input-gradient windows of
+#: :data:`K1_DGRAD_PROGRAM_RULES_BY_SM`.
 _DGRAD_WINDOW_TOKENS = range(16172, 16385)
+#: The token counts of the 148-SM ``sm_100a`` forward window of :data:`K1_FORWARD_PROGRAM_RULES_BY_SM` (``5120 -> 1024``).
+_FORWARD_WINDOW_TOKENS = range(16231, 16385)
 
 #: The K1 forward rows that run a program of this package instead of the deterministic package's,
 #: ``(arch, sm_count) -> {(K, N, T): template}``: on a part of exactly ``sm_count`` SMs,
@@ -1867,14 +1870,18 @@ _DGRAD_WINDOW_TOKENS = range(16172, 16385)
 #: same program without the prefetch and the token halves took 1.007 to 1.040 times its time on a B200 part, 1.018 to
 #: 1.055 times on a GB200 part and 1.012 to 1.026 times on a GB300 part, slower in 0 of 5 groups on every row; at 1024
 #: features the deterministic plan's program took 1.032 to 1.057 times its time on a GB200 part and 1.010 to 1.033
-#: times on a GB300 part, slower in at most 1 of 5 groups.  The other 1024-feature rows and parts keep the
-#: deterministic plan.
+#: times on a GB300 part, slower in at most 1 of 5 groups.  On 148-SM ``sm_100a`` parts ``5120 -> 1024`` runs it at
+#: every token count from 16231 to 16384 (:data:`_FORWARD_WINDOW_TOKENS`): on one B200 part, 17 paired groups in eager
+#: launches and in CUDA graph replays each, at 16231 and 16384 tokens, it took 0.994 to 0.995 times the time of the
+#: deterministic plan (the median of the paired ratios; faster in 12 to 17 of 17 groups), with that plan's bits on 20
+#: repeats.  The other 1024-feature rows and parts keep the deterministic plan.
 # fmt: off
 K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int], str]] = {
     ("sm_100a", 148): {
         (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
         (4096, 512, 16384): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16172): _WAVE_LEAN_N224_PF2_ST,
         (5120, 512, 16231): _WAVE_LEAN_N224_PF2_ST, (5120, 512, 16384): _WAVE_LEAN_N224_PF2_ST,
+        **{(5120, 1024, T): _WAVE_LEAN_N224_PF2_ST for T in _FORWARD_WINDOW_TOKENS},
     },
     ("sm_100a", 152): {
         (4096, 512, 16172): _WAVE_LEAN_N224_PF2_ST, (4096, 512, 16231): _WAVE_LEAN_N224_PF2_ST,
@@ -1912,7 +1919,11 @@ K1_FORWARD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int],
 #: replays each, the same bits as the deterministic plan and on 20 repeats: at 16172 and 16384 tokens the 512-feature
 #: rows took 0.95 to 0.97 times the time of the evict-first TMA form they ran before and ``6144 -> 576`` 0.94 to 0.96
 #: times that of the deterministic plan; at 16231 tokens the form without the hint took 0.93 to 0.95 times the time of
-#: the evict-first TMA form in 5 of 5 paired groups.
+#: the evict-first TMA form in 5 of 5 paired groups.  On 152-SM ``sm_103a`` parts ``4096 -> 512``, ``5120 -> 512`` and
+#: ``6144 -> 576`` run the program without the evict-first hint at every token count of the same window.  On one GB300
+#: part, two GPUs, 17 paired groups in eager launches and in CUDA graph replays each, at 16172, 16231 and 16384 tokens,
+#: the same bits as the deterministic plan and on 20 repeats: the 512-feature rows took 0.95 to 0.96 times the time of
+#: the evict-first TMA form they ran before and ``6144 -> 576`` 0.94 to 0.95 times that of the deterministic plan.
 # fmt: off
 K1_DGRAD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, str], str]] = {
     ("sm_100a", 148): {
@@ -1932,9 +1943,8 @@ K1_DGRAD_PROGRAM_RULES_BY_SM: dict[tuple[str, int], dict[tuple[int, int, int, st
     ("sm_103a", 152): {
         (4096, 1024, 16172, "f32"): _DGRAD_N, (4096, 1024, 16231, "f32"): _DGRAD_N, (4096, 1024, 16384, "f32"): _DGRAD_N,
         (5120, 1024, 16172, "f32"): _DGRAD_N, (5120, 1024, 16231, "f32"): _DGRAD_N, (5120, 1024, 16384, "f32"): _DGRAD_N,
-        (4096, 512, 16172, "f32"): _DGRAD_N_TMA, (4096, 512, 16231, "f32"): _DGRAD_N_TMA,
-        (4096, 512, 16384, "f32"): _DGRAD_N_TMA, (5120, 512, 16172, "f32"): _DGRAD_N_TMA,
-        (5120, 512, 16231, "f32"): _DGRAD_N_TMA, (5120, 512, 16384, "f32"): _DGRAD_N_TMA,
+        **{(K, N, T, "f32"): _DGRAD_N_TMA_LEAN_FREE for K, N in ((4096, 512), (5120, 512), (6144, 576))
+           for T in _DGRAD_WINDOW_TOKENS},
     },
 }
 # fmt: on
