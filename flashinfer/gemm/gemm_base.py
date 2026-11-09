@@ -429,7 +429,12 @@ def _cutlass_mm_bf16_requirement(
         raise ValueError(
             "You cannot use the CUTLASS backend with a bias. Use the TGV backend instead."
         )
-    # No PDL launch: pdl=True runs it without PDL.
+    if pdl and backend != "auto":
+        # No PDL launch: backend="auto" keeps CUTLASS as a pdl=True candidate
+        # that runs without PDL, but naming it with pdl=True is an error.
+        raise ValueError(
+            "The CUTLASS backend does not support PDL. Use the TGV backend instead."
+        )
     _require_contiguous_a_column_major_b(a, b, "CUTLASS")
 
     _validate_bf16_output_dtype(out_dtype)
@@ -463,7 +468,12 @@ def _cublaslt_mm_bf16_requirement(
             raise ValueError("cuBLASLt bias must be on the same CUDA device as A.")
         if not bias.is_contiguous():
             raise ValueError("cuBLASLt bias must be contiguous.")
-    # No PDL launch: pdl=True runs it without PDL.
+    if pdl and backend != "auto":
+        # No PDL launch: backend="auto" keeps cuBLASLt as a pdl=True candidate
+        # that runs without PDL, but naming it with pdl=True is an error.
+        raise ValueError(
+            "The cuBLASLt backend does not support PDL. Use the TGV backend instead."
+        )
     _require_contiguous_a_column_major_b(a, b, "cuBLASLt")
     _validate_bf16_output_dtype(out_dtype)
 
@@ -705,7 +715,9 @@ def _heuristic_func_mm_bf16(
     ] = "cudnn",
     batch_invariant: bool = False,
 ):
-    # pdl does not narrow the candidates: backends without PDL ignore it.
+    # pdl does not narrow the candidates: cuDNN, cuBLASLt and CUTLASS have no
+    # PDL launch and run without it here (CUTLASS and cuBLASLt reject
+    # pdl=True only when named explicitly).
     heuristic_backends = []
     if bias is not None:
         # CUTLASS has no bias epilogue.
@@ -760,7 +772,7 @@ def mm_bf16(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    pdl: bool = False,
+    pdl: Optional[bool] = False,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal[
@@ -791,15 +803,19 @@ def mm_bf16(
         CuTeDSL backends; cuBLASLt supports bias with BF16 output. Defaults to
         ``None``.
 
-    pdl: bool
-        Whether to use Programmatic Dependent Launch. Enabled for TGV,
-        TinyGEMM, and CuTeDSL backends, which then run only with PDL; the
-        other backends ignore it, so ``backend="auto"`` still considers all of
-        them. Tuning entries for ``pdl=True`` use the op name
-        ``"bf16_gemm_pdl"``, while ``skip_ops={"bf16_gemm"}`` still skips such
-        calls. PDL kernels may read ``b`` and ``bias`` before waiting for the
-        preceding kernel, so pass ``pdl=False`` if a kernel that may still be
-        running writes them. Defaults to ``False``.
+    pdl: Optional[bool]
+        Whether to use Programmatic Dependent Launch. TGV, TinyGEMM, and
+        CuTeDSL launch with PDL. The other backends have no PDL launch: naming
+        CUTLASS, cuBLASLt, or cuTile with ``pdl=True`` raises ``ValueError``,
+        and cuDNN runs without PDL. ``backend="auto"`` keeps the same
+        candidates under ``pdl=True``: TGV, TinyGEMM, and CuTeDSL launch with
+        PDL, while cuDNN, cuBLASLt, and CUTLASS compete without it. Tuning
+        entries for ``pdl=True`` use the op name ``"bf16_gemm_pdl"``, while
+        ``skip_ops={"bf16_gemm"}`` still skips such calls. PDL kernels may read
+        ``b`` and ``bias`` before waiting for the preceding kernel, so pass
+        ``pdl=False`` if a kernel that may still be running writes them.
+        Defaults to ``False``. ``None`` is accepted as ``False`` for backward
+        compatibility with 0.7.4rc1.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
@@ -819,8 +835,8 @@ def mm_bf16(
         search and an optional fused BF16 bias epilogue for BF16 output.
         ``"tinygemm"`` uses the TinyGEMM backend for small-M BF16 GEMM.
         ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
-            persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
-            ``bias`` / ``pdl``. Requires SM >= 90.
+            persistent-scheduled GEMM with per-shape exhaustive autotune; rejects
+            ``bias`` and ``pdl=True``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M kernels (direct,
         cluster Split-K and warp Split-K) and supports M <= 32 only; use
         ``"auto"`` or ``"cublaslt"`` for larger M. Without autotuning, the
@@ -891,6 +907,10 @@ def mm_bf16(
     torch.bfloat16
     """
 
+    # None (accepted since #8032, shipped in 0.7.4rc1) behaves as False. The
+    # requirement checkers already ran and treat None as falsy, like False.
+    pdl = bool(pdl)
+
     if batch_invariant:
         from .batch_invariant.tuning import mm_bf16_batch_invariant_auto
 
@@ -905,7 +925,7 @@ def mm_bf16(
 
     # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
     # Handled before the SM100 dispatch table because it does not consume
-    # `workspace_buffer` and ignores `bias` / `pdl`.
+    # `workspace_buffer`; its checker rejects `bias` and `pdl=True`.
     if backend == "cutile":
         from .kernels.cutile.mm_bf16_cutile import mm_bf16_cutile
 
@@ -2546,9 +2566,9 @@ def _tinygemm_bf16_gemm_runner():
             a, b, bias, pdl, out, _ = inputs
             weight = b.transpose(-2, -1)
             if bias is None:
-                module.tinygemm2_nobias_op(a, weight, out, pdl)
+                module.tinygemm2_nobias_op(a, weight, out, bool(pdl))
             else:
-                module.tinygemm2_op(a, weight, bias, out, pdl)
+                module.tinygemm2_op(a, weight, bias, out, bool(pdl))
             return out
 
     return TinyGemmBf16GemmRunner()
