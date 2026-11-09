@@ -628,6 +628,86 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
+    ("context_bf16", "RUNTIME_PACK1_SINK_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_33dc9c46c95d308f026f",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2_SINK_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_c8ee4df85b4478b5cc7f",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4_SINK_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_bd379ba1e19a94494056",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5_SINK_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_01d2dcb2e9c3bcc2d0e6",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6_SINK_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_a8e4f9470fb696be4246",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7_SINK_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_e124cfe4d3609e987f03",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8_SINK_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_097f936e2ae96a771e97",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12_SINK_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_1b8e45773f26db7aaa3c",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK1_LSE_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_f830493c5d628354ce1e",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2_LSE_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_f4e29d546225e9728953",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4_LSE_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_0356530db188eb569c53",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5_LSE_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_2877961b650239d3821e",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6_LSE_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_5e6775d4538ca8de016d",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7_LSE_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_9fb2ae574a87a3cca205",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8_LSE_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_cf498c5791a9c1294ddc",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12_LSE_SEQ_TAIL"): (
+        "cake_fmha_context_bf16_ef6955e1a812ecf793c1",
+        None,
+        False,
+    ),
     ("context_bf16", "RUNTIME_PACK1_NONCAUSAL"): (
         "cake_fmha_context_bf16_b85606b52eadf25563c1",
         None,
@@ -1957,6 +2037,60 @@ _CONTEXT_BF16_RUNTIME_LSE_ROUTES: dict[str, dict[tuple[int, int | None], str]] =
         (1, None): "RUNTIME_PACK1_LSE",
     },
 }
+# The causal sink and LSE forms again, built without tail-order code: their
+# tail units always run one after another and ``full_sections`` is the plain
+# section count.  A launch of those forms whose tail order is the plain one
+# (:func:`_context_bf16_tail_interleave` false) runs the program of the same
+# pack and page size here; an interleaved launch runs the program of its form's
+# table.  The tiles and so the output bits are the same.  sm100a (B200) ships
+# them for the packs whose plain-order launches of at most
+# :data:`_CONTEXT_BF16_SEQ_TAIL_MAX_KV_LEN` keys ran faster than the form's
+# program: sinks at packs 1, 5, 6, 8 and 12, LSE at packs 1, 8 and 12 (at 2048
+# and more keys they ran no faster); its other packs run the form's program.
+# sm103a (GB300) ships them for every pack but 16, whose launches of at most
+# its bound were not measured; pack 16 runs the form's program.
+# causal, attention sinks, no tail-order code
+_CONTEXT_BF16_RUNTIME_SINK_SEQ_TAIL_ROUTES: dict[
+    str, dict[tuple[int, int | None], str]
+] = {
+    "sm100a": {
+        (12, None): "RUNTIME_PACK12_SINK_SEQ_TAIL",
+        (8, None): "RUNTIME_PACK8_SINK_SEQ_TAIL",
+        (6, None): "RUNTIME_PACK6_SINK_SEQ_TAIL",
+        (5, None): "RUNTIME_PACK5_SINK_SEQ_TAIL",
+        (1, None): "RUNTIME_PACK1_SINK_SEQ_TAIL",
+    },
+    "sm103a": {
+        (12, None): "RUNTIME_PACK12_SINK_SEQ_TAIL",
+        (8, None): "RUNTIME_PACK8_SINK_SEQ_TAIL",
+        (7, None): "RUNTIME_PACK7_SINK_SEQ_TAIL",
+        (6, None): "RUNTIME_PACK6_SINK_SEQ_TAIL",
+        (5, None): "RUNTIME_PACK5_SINK_SEQ_TAIL",
+        (4, None): "RUNTIME_PACK4_SINK_SEQ_TAIL",
+        (2, None): "RUNTIME_PACK2_SINK_SEQ_TAIL",
+        (1, None): "RUNTIME_PACK1_SINK_SEQ_TAIL",
+    },
+}
+# causal, LSE output, no tail-order code
+_CONTEXT_BF16_RUNTIME_LSE_SEQ_TAIL_ROUTES: dict[
+    str, dict[tuple[int, int | None], str]
+] = {
+    "sm100a": {
+        (12, None): "RUNTIME_PACK12_LSE_SEQ_TAIL",
+        (8, None): "RUNTIME_PACK8_LSE_SEQ_TAIL",
+        (1, None): "RUNTIME_PACK1_LSE_SEQ_TAIL",
+    },
+    "sm103a": {
+        (12, None): "RUNTIME_PACK12_LSE_SEQ_TAIL",
+        (8, None): "RUNTIME_PACK8_LSE_SEQ_TAIL",
+        (7, None): "RUNTIME_PACK7_LSE_SEQ_TAIL",
+        (6, None): "RUNTIME_PACK6_LSE_SEQ_TAIL",
+        (5, None): "RUNTIME_PACK5_LSE_SEQ_TAIL",
+        (4, None): "RUNTIME_PACK4_LSE_SEQ_TAIL",
+        (2, None): "RUNTIME_PACK2_LSE_SEQ_TAIL",
+        (1, None): "RUNTIME_PACK1_LSE_SEQ_TAIL",
+    },
+}
 # not causal
 _CONTEXT_BF16_RUNTIME_NONCAUSAL_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     "sm100a": {
@@ -2053,6 +2187,37 @@ _CONTEXT_RUNTIME_FLAG_ROUTES: dict[
         (False, False, True): _CONTEXT_BF16_RUNTIME_NONCAUSAL_SINK_ROUTES,
         (False, True, False): _CONTEXT_BF16_RUNTIME_NONCAUSAL_LSE_ROUTES,
     },
+}
+# The BF16 flag forms ``(is_causal, return_lse, enable_sink)`` whose runtime-size
+# programs also ship without tail-order code, and those programs' tables.
+_CONTEXT_BF16_RUNTIME_SEQ_TAIL_ROUTES: dict[
+    tuple[bool, bool, bool], dict[str, dict[tuple[int, int | None], str]]
+] = {
+    (True, False, True): _CONTEXT_BF16_RUNTIME_SINK_SEQ_TAIL_ROUTES,
+    (True, True, False): _CONTEXT_BF16_RUNTIME_LSE_SEQ_TAIL_ROUTES,
+}
+# Per target, a runtime-size BF16 program of those forms -> the program of the
+# same pack and page size without tail-order code, which its plain-order
+# launches run.
+_CONTEXT_BF16_SEQ_TAIL_PROGRAMS: dict[str, dict[str, str]] = {
+    target: {
+        identifier: seq_tail[target][key]
+        for form, seq_tail in _CONTEXT_BF16_RUNTIME_SEQ_TAIL_ROUTES.items()
+        for key, identifier in _CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"][form][
+            target
+        ].items()
+        if key in seq_tail[target]
+    }
+    for target in _CONTEXT_BF16_RUNTIME_SINK_SEQ_TAIL_ROUTES
+}
+# Per target, the most cache keys (``max_kv_len``) of a plain-order launch that
+# runs the program without tail-order code (``None``: no bound); a launch of
+# more keys runs its form's program.  sm103a (GB300): at 6144 and more keys
+# the pack-1 sink program ran slower than the form's program, at 4096 keys no
+# program did.
+_CONTEXT_BF16_SEQ_TAIL_MAX_KV_LEN: dict[str, int | None] = {
+    "sm100a": 1024,
+    "sm103a": 4096,
 }
 # Per target, ``(queries, keys)``: a causal BF16 call without LSE or sink at a
 # JIT pack above 1 whose ``max_q_len`` is a power of two of at least
@@ -9118,13 +9283,25 @@ class CakeFmhaContextProgramModule:
     """One loaded generated context program behind the context FFI ABI
     (``cake_paged_attention_context``, the arguments ``trtllm_batch_context_
     with_kv_cache`` passes): the route it serves, the ``CakeProgram`` record,
-    its exact target and the binding's ``run`` entry."""
+    its exact target and the binding's ``run`` entry; for a runtime-size BF16
+    program of :data:`_CONTEXT_BF16_SEQ_TAIL_PROGRAMS`, also the entry of its
+    program without tail-order code, which the launches of the plain tail
+    order of at most ``seq_tail_max_kv_len`` keys (``None``: any) run."""
 
-    def __init__(self, route: CakeFmhaContextRoute, program: Any, target: str):
+    def __init__(
+        self,
+        route: CakeFmhaContextRoute,
+        program: Any,
+        target: str,
+        seq_tail: Any = None,
+        seq_tail_max_kv_len: int | None = None,
+    ):
         self.route = route
         self.program = program
         self.target = target
         self.entry = program.entry(target)
+        self.seq_tail_entry = None if seq_tail is None else seq_tail.entry(target)
+        self.seq_tail_max_kv_len = seq_tail_max_kv_len
         self.units_per_batch = route.num_q_heads // route.pack_g
         self.quantized = route.component != "context_bf16"
         _, self.num_m_blocks, self.one_tile = _context_program_facts(program.name)
@@ -9340,6 +9517,7 @@ class CakeFmhaContextProgramModule:
             softmax_scale_log2 = float(bmm1_scale) * log2e
             output_scale, bmm1_is_log2 = float(bmm2_scale), 0
             bmm1_ptr = bmm2_ptr = unread_f32
+        entry = self.entry
         # The arguments in the binding's order: ``_CONTEXT_HOST_PARAMS`` of the
         # component (LSE_ptr and sinks unread unless the program's flag form
         # takes them, seq_lens_q unread; a runtime-size program's sizes after
@@ -9364,23 +9542,29 @@ class CakeFmhaContextProgramModule:
                 counter,
             )
             if self.runtime:
+                interleave = is_causal and _context_bf16_tail_interleave(
+                    int(batch_size),
+                    int(max_q_len),
+                    int(max_kv_len),
+                    units_per_batch,
+                    self.m_block_tokens,
+                    num_ctas,
+                )
+                if (
+                    not interleave
+                    and self.seq_tail_entry is not None
+                    and (
+                        self.seq_tail_max_kv_len is None
+                        or max_kv_len <= self.seq_tail_max_kv_len
+                    )
+                ):
+                    # the plain tail order: the program without tail-order code
+                    entry = self.seq_tail_entry
                 arguments = (
                     *arguments,
                     num_m_blocks,
                     total_bh // 8
-                    | (
-                        _CONTEXT_BF16_TAIL_INTERLEAVE
-                        if is_causal
-                        and _context_bf16_tail_interleave(
-                            int(batch_size),
-                            int(max_q_len),
-                            int(max_kv_len),
-                            units_per_batch,
-                            self.m_block_tokens,
-                            num_ctas,
-                        )
-                        else 0
-                    ),
+                    | (_CONTEXT_BF16_TAIL_INTERLEAVE if interleave else 0),
                     units_per_batch,
                     num_q_heads,
                     num_q_heads // key_cache.shape[1],
@@ -9491,10 +9675,10 @@ class CakeFmhaContextProgramModule:
                 1,
             )
         if _ffi_call_takes_the_torch_stream():
-            self.entry(*arguments)
+            entry(*arguments)
         else:
             with _torch_stream_context(device):
-                self.entry(*arguments)
+                entry(*arguments)
 
 
 @functools.cache
@@ -9595,6 +9779,43 @@ def context_nvfp4_programs_unavailable() -> str | None:
     )
 
 
+def _context_program_record(
+    loader: Any,
+    component: str,
+    identifier: str,
+    pinned: tuple[str, int | None, bool],
+    target: str,
+) -> Any:
+    """The generated loader's ``CakeProgram`` of ``identifier``, held to the
+    host's pinned record ``pinned``: its name, a ``target`` build and its
+    binding's arguments."""
+
+    from .jit.cake_program import GRID_ARGS, CakeProgram
+
+    loader_name = f"cake_fmha_{component}"
+    program = getattr(loader, identifier, None)
+    if not isinstance(program, CakeProgram):
+        raise RuntimeError(
+            f"flashinfer.jit.{loader_name} publishes no CakeProgram {identifier!r}"
+        )
+    if program.name != pinned[0]:
+        raise RuntimeError(
+            f"flashinfer.jit.{loader_name}.{identifier} is {program.name}; "
+            f"this module pins {pinned[0]}"
+        )
+    if target not in program.targets:
+        raise RuntimeError(
+            f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
+        )
+    params = _context_program_params(component, pinned[1], identifier)
+    if tuple(program.args) != (*params, *GRID_ARGS):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {[*params, *GRID_ARGS]}"
+        )
+    return program
+
+
 _CONTEXT_PROGRAM_MODULES: dict[tuple[str, str, str], CakeFmhaContextProgramModule] = {}
 
 
@@ -9616,8 +9837,6 @@ def _load_cake_fmha_context_program(
         return module
     import importlib
 
-    from .jit.cake_program import GRID_ARGS, CakeProgram
-
     pinned = _CONTEXT_PROGRAMS.get((route.component, route.program))
     if pinned is None:
         raise RuntimeError(
@@ -9629,28 +9848,28 @@ def _load_cake_fmha_context_program(
             raise RuntimeError(f"Cake FMHA cannot build {pinned[0]}: {unavailable}")
     loader_name = f"cake_fmha_{route.component}"
     loader = importlib.import_module(f".jit.{loader_name}", __package__)
-    program = getattr(loader, route.program, None)
-    if not isinstance(program, CakeProgram):
-        raise RuntimeError(
-            f"flashinfer.jit.{loader_name} publishes no CakeProgram {route.program!r}"
-        )
-    if program.name != pinned[0]:
-        raise RuntimeError(
-            f"flashinfer.jit.{loader_name}.{route.program} is {program.name}; "
-            f"this module pins {pinned[0]}"
-        )
     target = _ALIGNED_PROGRAM_TARGET[route.target]
-    if target not in program.targets:
-        raise RuntimeError(
-            f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
+    program = _context_program_record(
+        loader, route.component, route.program, pinned, target
+    )
+    seq_tail = None
+    seq_tail_programs = _CONTEXT_BF16_SEQ_TAIL_PROGRAMS.get(route.target, {})
+    if route.component == "context_bf16" and route.program in seq_tail_programs:
+        identifier = seq_tail_programs[route.program]
+        seq_tail = _context_program_record(
+            loader,
+            route.component,
+            identifier,
+            _CONTEXT_PROGRAMS[(route.component, identifier)],
+            target,
         )
-    params = _context_program_params(route.component, pinned[1], route.program)
-    if tuple(program.args) != (*params, *GRID_ARGS):
-        raise RuntimeError(
-            f"the generated {program.name} binding takes {list(program.args)}; "
-            f"the host spells {[*params, *GRID_ARGS]}"
-        )
-    module = CakeFmhaContextProgramModule(route, program, target)
+    module = CakeFmhaContextProgramModule(
+        route,
+        program,
+        target,
+        seq_tail,
+        _CONTEXT_BF16_SEQ_TAIL_MAX_KV_LEN.get(route.target),
+    )
     _CONTEXT_PROGRAM_MODULES[key] = module
     return module
 

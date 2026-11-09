@@ -213,7 +213,10 @@ _RUNTIME_PACK |= {
 # BF16 runtime-size program identifier (every flag form) -> its pack
 _BF16_RUNTIME_PACK = {
     identifier: pack
-    for tables in cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].values()
+    for tables in (
+        *cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].values(),
+        *cake_api._CONTEXT_BF16_RUNTIME_SEQ_TAIL_ROUTES.values(),
+    )
     for routes in tables.values()
     for (pack, _), identifier in routes.items()
 }
@@ -321,7 +324,10 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
                 served.setdefault(("context_fp8", identifier), set()).add(
                     _TARGET_ARCH[target]
                 )
-    for table in cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].values():
+    for table in (
+        *cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"].values(),
+        *cake_api._CONTEXT_BF16_RUNTIME_SEQ_TAIL_ROUTES.values(),
+    ):
         for target, routes in table.items():
             for identifier in routes.values():
                 served.setdefault(("context_bf16", identifier), set()).add(
@@ -3465,6 +3471,155 @@ def test_cake_context_bf16_flag_form_tail_order_follows_causality(
         assert full_sections(flag, max_q_len, **flags) == want
 
 
+# Per target and form, the packs whose sink and LSE programs also ship without
+# tail-order code.
+_BF16_SEQ_TAIL_PACKS = {
+    "sm100a": {(True, False, True): {1, 5, 6, 8, 12}, (True, True, False): {1, 8, 12}},
+    "sm103a": {
+        (True, False, True): {1, 2, 4, 5, 6, 7, 8, 12},
+        (True, True, False): {1, 2, 4, 5, 6, 7, 8, 12},
+    },
+}
+
+
+def test_cake_context_bf16_seq_tail_tables_mirror_their_form_tables() -> None:
+    """The causal sink and LSE forms ship their runtime-size programs again
+    without tail-order code: per target the packs of
+    ``_BF16_SEQ_TAIL_PACKS``, the program of the form's table with the suffix
+    ``_SEQ_TAIL``.  Route selection never names them (no form table holds
+    them); the module of a form program loads its one."""
+
+    assert set(cake_api._CONTEXT_BF16_RUNTIME_SEQ_TAIL_ROUTES) == {
+        (True, False, True),
+        (True, True, False),
+    }
+    forms = cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"]
+    pairs = {}
+    for form, table in cake_api._CONTEXT_BF16_RUNTIME_SEQ_TAIL_ROUTES.items():
+        assert table is getattr(
+            cake_api, f"_CONTEXT_BF16_RUNTIME_{_BF16_FLAG_FORMS[form]}_SEQ_TAIL_ROUTES"
+        )
+        assert set(table) == set(forms[form]) == set(_BF16_SEQ_TAIL_PACKS)
+        for target, routes in table.items():
+            assert routes == {
+                (pack, page): f"{identifier}_SEQ_TAIL"
+                for (pack, page), identifier in forms[form][target].items()
+                if pack in _BF16_SEQ_TAIL_PACKS[target][form]
+            }, (form, target)
+            for key, seq_tail in routes.items():
+                pairs.setdefault(target, {})[forms[form][target][key]] = seq_tail
+    assert pairs == cake_api._CONTEXT_BF16_SEQ_TAIL_PROGRAMS
+    assert cake_api._CONTEXT_BF16_SEQ_TAIL_MAX_KV_LEN == {
+        "sm100a": 1024,
+        "sm103a": 4096,
+    }
+    routed = {
+        identifier
+        for table in forms.values()
+        for routes in table.values()
+        for identifier in routes.values()
+    }
+    assert not routed & {
+        seq_tail for programs in pairs.values() for seq_tail in programs.values()
+    }
+
+
+@pytest.mark.parametrize("form", [(True, False, True), (True, True, False)])
+def test_cake_context_bf16_flag_form_plain_tail_order_runs_the_seq_tail_program(
+    monkeypatch, form
+) -> None:
+    """A causal sink or LSE launch of the interleaved tail order runs its
+    form's program with bit 31 of ``full_sections`` set, as before; a launch
+    of the plain order runs the program without tail-order code with the
+    plain section count."""
+
+    is_causal, return_lse, enable_sink = form
+    identifier = f"RUNTIME_PACK8_{_BF16_FLAG_FORMS[form]}"
+    tables = torch.arange(1024, dtype=torch.int32).view(1, 1024)
+    flag = _stand_in_module("context_bf16", identifier, form=form)
+    seq_tail = []
+
+    def seq_tail_entry(*values):
+        flag.calls.append(values)
+        seq_tail.append(len(flag.calls))
+
+    flag.seq_tail_entry = seq_tail_entry
+
+    def launch(max_q_len, batch=1, block_tables=tables):
+        return _launch_values(
+            monkeypatch,
+            block_tables,
+            shared=True,
+            module=flag,
+            batch=batch,
+            max_q_len=max_q_len,
+            max_kv_len=16384,
+            is_causal=is_causal,
+            lse=torch.zeros((batch * 64, 32)) if return_lse else None,
+            lse_stride_tokens=32 if return_lse else 0,
+            lse_stride_heads=1 if return_lse else 0,
+            attention_sinks=torch.zeros(32) if enable_sink else None,
+        )
+
+    assert launch(8192)["full_sections"] == cake_api._CONTEXT_BF16_TAIL_INTERLEAVE
+    assert seq_tail == []
+    assert launch(8320)["full_sections"] == 0
+    assert seq_tail == [2]
+    # 3 requests of 4 units: one whole section, 4 tail units
+    assert (
+        launch(64, batch=3, block_tables=tables[:, :4].repeat(3, 1))["full_sections"]
+        == 1
+    )
+    assert seq_tail == [2, 3]
+
+
+@pytest.mark.parametrize("form", [(True, False, True), (True, True, False)])
+def test_cake_context_bf16_seq_tail_max_kv_len_bounds_the_plain_order(
+    monkeypatch, form
+) -> None:
+    """Under a key bound (sm100a's), a plain-order launch of at most that many
+    keys runs the program without tail-order code, one of more keys its
+    form's program; both with the plain section count."""
+
+    is_causal, return_lse, enable_sink = form
+    bound = cake_api._CONTEXT_BF16_SEQ_TAIL_MAX_KV_LEN["sm100a"]
+    flag = _stand_in_module(
+        "context_bf16", f"RUNTIME_PACK8_{_BF16_FLAG_FORMS[form]}", form=form
+    )
+    seq_tail = []
+
+    def seq_tail_entry(*values):
+        flag.calls.append(values)
+        seq_tail.append(len(flag.calls))
+
+    flag.seq_tail_entry = seq_tail_entry
+    flag.seq_tail_max_kv_len = bound
+    tables = torch.arange(1024, dtype=torch.int32).view(1, 1024)[:, :4].repeat(3, 1)
+
+    def launch(max_kv_len):
+        return _launch_values(
+            monkeypatch,
+            tables,
+            shared=True,
+            module=flag,
+            batch=3,
+            max_q_len=64,
+            max_kv_len=max_kv_len,
+            is_causal=is_causal,
+            lse=torch.zeros((3 * 64, 32)) if return_lse else None,
+            lse_stride_tokens=32 if return_lse else 0,
+            lse_stride_heads=1 if return_lse else 0,
+            attention_sinks=torch.zeros(32) if enable_sink else None,
+        )
+
+    # 3 requests of 4 units: one whole section, 4 tail units, the plain order
+    assert launch(bound)["full_sections"] == 1
+    assert seq_tail == [1]
+    assert launch(bound + 1)["full_sections"] == 1
+    assert seq_tail == [1]
+    assert len(flag.calls) == 2
+
+
 def test_cake_context_one_stage_program_takes_one_stage_m_blocks(
     monkeypatch,
 ) -> None:
@@ -4329,6 +4484,69 @@ def test_cake_context_bf16_runtime_tail_orders_are_bitwise_the_same(
     assert len(served_programs) == served
     assert torch.equal(_bits(outs[1]), _bits(outs[0]))
     assert torch.equal(_bits(outs[0]), _bits(jit_out))
+
+
+@_GPU
+@pytest.mark.parametrize("form", [(True, False, True), (True, True, False)])
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size"),
+    [
+        # one request, 4 units of pack 8: every unit a tail unit
+        ((32, 4), (1000,), (1333,), 16),
+        # ragged requests of 2 units each: 6 tail units over 3 requests
+        ((16, 2), (700, 300, 511), (900, 1500, 511), 64),
+        # 3 requests of 4 units: one whole section and 4 tail units
+        ((32, 4), (513, 257, 1000), (513, 2000, 1000), 16),
+        # the same within sm100a's key bound (at most 1024 keys)
+        ((32, 4), (513, 257, 1000), (513, 1000, 1024), 16),
+    ],
+)
+def test_cake_context_bf16_flag_form_tail_orders_are_bitwise_the_same(
+    monkeypatch, served_programs, form, heads, q_lens, kv_lens, page_size
+) -> None:
+    """The causal sink or LSE runtime-size program of the batch's JIT pack
+    writes the output and LSE bytes of the JIT route of its form with the tail
+    units interleaved (its form's program) and one after another (the program
+    without tail-order code)."""
+
+    is_causal, return_lse, enable_sink = form
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    pack = cake_api._context_pack_g(max(q_lens), max(kv_lens), *heads)
+    table = cake_api._CONTEXT_RUNTIME_FLAG_ROUTES["context_bf16"][form][target]
+    program = table.get((pack, None))
+    if program is None:
+        pytest.skip(f"no {form} runtime-size program of pack {pack} on {target}")
+    case = _bf16_batch(heads, q_lens, kv_lens, page_size)
+    sinks = None
+    if enable_sink:
+        generator = torch.Generator(device="cpu").manual_seed(20261109)
+        sinks = (torch.rand(heads[0], generator=generator) * 5).to("cuda")
+    run = dict(return_lse=return_lse, sinks=sinks, causal=is_causal)
+    outs = []
+    for interleaved in (False, True):
+        monkeypatch.setattr(
+            cake_api,
+            "_context_bf16_tail_interleave",
+            lambda *sizes, interleaved=interleaved: interleaved,
+        )
+        outs.append(_run_bf16_batch(case, **run))
+        assert served_programs[-1] == program
+    module = cake_api._CONTEXT_PROGRAM_MODULES[(target, "context_bf16", program)]
+    assert (module.seq_tail_entry is not None) == (
+        program in cake_api._CONTEXT_BF16_SEQ_TAIL_PROGRAMS[target]
+    )
+    assert (
+        module.seq_tail_max_kv_len
+        == (cake_api._CONTEXT_BF16_SEQ_TAIL_MAX_KV_LEN[target])
+    )
+    served = len(served_programs)
+    monkeypatch.setattr(cake_api, "_CONTEXT_RUNTIME_FLAG_ROUTES", {})
+    jit_out, jit_lse = _run_bf16_batch(case, **run)
+    assert len(served_programs) == served
+    for out, lse in outs:
+        assert torch.equal(_bits(out), _bits(jit_out))
+        if return_lse:
+            assert torch.equal(lse.view(torch.int32), jit_lse.view(torch.int32))
 
 
 @_GPU
