@@ -26,7 +26,9 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
     LamportPeerStoreConfig,
+    bind_peer_store_args,
     make_lamport_peer_store_config,
+    split_peer_store_config,
     store_tile_to_peers,
 )
 
@@ -554,9 +556,10 @@ class SplitKDenseGemmKernel:
         c: cute.Tensor,
         bias: cute.Tensor,
         stream: _cuda.CUstream,
+        peer_args=None,
     ):
         # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, peer_args).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
@@ -576,6 +579,7 @@ class SplitKDenseGemmKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
+        peer_args,
     ):
         """Allocate storage and dispatch the specialized warps."""
         stages = self.num_ab_stage
@@ -675,7 +679,7 @@ class SplitKDenseGemmKernel:
         # None compiles the peer-store epilogue out.
         peer_store_operands = None
         if cutlass.const_expr(self.peer_store is not None):
-            peer_store_operands = (sA, mC, bidx, n_idx)
+            peer_store_operands = (sA, mC, bidx, n_idx, peer_args)
 
         if warp_idx == 0:
             with cute.arch.elect_one():
@@ -1022,10 +1026,10 @@ class SplitKDenseGemmKernel:
                 # Preserve TMEM coordinates; the copy predicates output tails.
                 cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
             else:
-                sA, mC, bidx, n_idx = peer_store_operands
+                sA, mC, bidx, n_idx, peer_args = peer_store_operands
                 assert self.cta_n <= self.cta_k  # the tile fits in one A stage
                 store_tile_to_peers(
-                    self.peer_store,
+                    bind_peer_store_args(self.peer_store, peer_args),
                     rD,
                     tiled_copy_t2r,
                     epi_tid,
@@ -1045,6 +1049,8 @@ class SplitKDenseGemmKernel:
 import torch as _torch
 
 _SUPPORTED_TORCH_DTYPES = (_torch.bfloat16, _torch.float16)
+# Peer-store kernels keyed without addresses; functools.cache would key on the launch arguments.
+_PEER_STORE_KERNELS: dict = {}
 
 
 @cute.experimental.jit
@@ -1054,6 +1060,7 @@ def _bmm_no_bias(
     b: cute.Tensor,
     c: cute.Tensor,
     stream: _cuda.CUstream,
+    peer_args=None,
 ):
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     gemm_op(
@@ -1062,6 +1069,7 @@ def _bmm_no_bias(
         c,
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
         stream,
+        peer_args,
     )
 
 
@@ -1169,7 +1177,6 @@ def _get_compiled_splitk_kernel(
     use_pdl: bool,
     has_bias: bool,
     leading_dims: tuple[int, int, int],
-    peer_store: LamportPeerStoreConfig | None = None,
 ):
     if dtype not in _SUPPORTED_TORCH_DTYPES:
         raise ValueError(
@@ -1185,7 +1192,6 @@ def _get_compiled_splitk_kernel(
                 use_pdl=use_pdl,
                 has_bias=has_bias,
                 arch=_arch(device_index),
-                peer_store=peer_store,
             ),
             *(compile_tensors if has_bias else compile_tensors[:3]),
             _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
@@ -1303,18 +1309,19 @@ def run_splitk_dense_peer_store(
         m=m,
         n=n,
     )
+    peer_store, peer_args = split_peer_store_config(peer_store)
     with _torch.cuda.device(a.device):
         tensors = _to_cute_swap(a, b, out, None)
-        compiled = _get_compiled_splitk_kernel(
-            device_index=a.get_device(),
-            dtype=a.dtype,
-            tactic=tactic,
-            use_pdl=pdl,
-            has_bias=False,
-            leading_dims=tensors[4],
-            peer_store=peer_store,
-        )
-        compiled(
-            *tensors[:3],
-            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
-        )
+        stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+        args = (*tensors[:3], stream, peer_args)
+        key = (a.get_device(), tactic, pdl, tensors[4], peer_store)
+        if key not in _PEER_STORE_KERNELS:
+            kernel = SplitKDenseGemmKernel(
+                tactic=tactic,
+                use_pdl=pdl,
+                has_bias=False,
+                arch=_arch(a.get_device()),
+                peer_store=peer_store,
+            )
+            _PEER_STORE_KERNELS[key] = cute_ext.compile(_bmm_no_bias, kernel, *args)
+        _PEER_STORE_KERNELS[key](*args)

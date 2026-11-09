@@ -116,7 +116,9 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 
 from .dense_bf16_gemm_warp_splitk import (
     LamportPeerStoreConfig,
+    bind_peer_store_args,
     make_lamport_peer_store_config,
+    split_peer_store_config,
     store_tile_to_peers,
 )
 
@@ -287,6 +289,7 @@ class TgvGemmCuteExtKernel:
         c: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         bias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
         stream: cuda.CUstream,
+        peer_args=None,
     ):
         # Each CTA processes one (CTA_M, CTA_N) output tile, no persistence.
         # Round the (M, N) tile counts up to a full cluster so 2-CTA launches
@@ -301,7 +304,7 @@ class TgvGemmCuteExtKernel:
             ),
             self.cluster_shape,
         )
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, peer_args).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
@@ -317,6 +320,7 @@ class TgvGemmCuteExtKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
+        peer_args,
     ):
         """
         Device-side dispatcher: build MMA descriptor, allocate SMEM/TMEM/
@@ -596,6 +600,7 @@ class TgvGemmCuteExtKernel:
                     mC,
                     work_tile_info.M_idx,
                     work_tile_info.N_idx,
+                    peer_args,
                 )
             # Epilog tid is 128..255 in the CTA; offset to 0..127 for partition.
             epi_tid = tidx - 128
@@ -905,7 +910,7 @@ class TgvGemmCuteExtKernel:
         epi_tid: cutlass.Int32,  # 0..127 within the 4 EPILOG warps
         c_dtype: cutlass.Constexpr,
         d_layout: cutlass.Constexpr,
-        peer_store_operands=None,  # (sA, mC, M_idx, N_idx) for the peer-store epilogue
+        peer_store_operands=None,  # (sA, mC, M_idx, N_idx, peer_args) for the peer-store epilogue
     ):
         # Sync with MMA's alloc_tmem (phase 0 of bar_tmem_alloc): 128 arrivals
         # from this warp + 32 from MMA = 160. tmem_base_ptr is uninitialized
@@ -1076,13 +1081,13 @@ class TgvGemmCuteExtKernel:
         else:
             assert self.cta_n <= self.cta_k  # the tile fits in one A stage
             store_tile_to_peers(
-                self.peer_store,
+                bind_peer_store_args(self.peer_store, peer_store_operands[4]),
                 rD,
                 tiled_copy_t2r,
                 epi_tid,
                 d_layout,
                 self.acc_dtype,
-                *peer_store_operands,
+                *peer_store_operands[:4],
                 self.cta_m,
                 self.cta_n,
             )
@@ -1100,13 +1105,14 @@ def _bmm_no_bias(
     b: cute.Tensor,  # (L, K, N) from PyTorch (permuted)
     c: cute.Tensor,  # (L, M, N) from PyTorch (permuted)
     stream: cuda.CUstream,
+    peer_args=None,
 ):
     a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
     b = cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0]))
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     # Dummy bias aliasing C — never dereferenced when has_bias=False.
     bias = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2]))
-    gemm_op(a, b, c, bias, stream)
+    gemm_op(a, b, c, bias, stream, peer_args)
 
 
 @cute.experimental.jit
@@ -1227,6 +1233,7 @@ def _get_compiled_cute_ext_kernel(
     c_leading: int,
     arch: str = "sm_100",
     peer_store: Optional[LamportPeerStoreConfig] = None,
+    peer_args=None,  # traced only, not part of the cache key
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
@@ -1284,7 +1291,8 @@ def _get_compiled_cute_ext_kernel(
     if has_bias:
         compiled = cute_ext.compile(_bmm_bias, gemm, a_, b_, c_, bias_, fake_stream)
     else:
-        compiled = cute_ext.compile(_bmm_no_bias, gemm, a_, b_, c_, fake_stream)
+        extra = () if peer_store is None else (peer_args,)
+        compiled = cute_ext.compile(_bmm_no_bias, gemm, a_, b_, c_, fake_stream, *extra)
 
     _TGV_CUTE_EXT_COMPILE_CACHE[key] = compiled
     return compiled
@@ -1412,6 +1420,7 @@ def run_tgv_cute_ext(
     """
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
+    peer_args = None
     if peer_store is not None:
         if has_bias:
             raise ValueError("peer_store needs no bias")
@@ -1421,6 +1430,7 @@ def run_tgv_cute_ext(
             raise ValueError(
                 f"slot_bytes={peer_store.slot_bytes} is below {m * n * 2} for M={m}, N={n}"
             )
+        peer_store, peer_args = split_peer_store_config(peer_store)
     if tactic >= _TGV_CUTE_EXT_FIRST_SM107_TACTIC and not _is_sm107(a.device):
         raise ValueError(f"TGV cute_ext tactic {tactic} needs SM107 SMEM.")
 
@@ -1447,6 +1457,7 @@ def run_tgv_cute_ext(
         c_leading=c_leading,
         arch="sm_107" if tactic >= _TGV_CUTE_EXT_FIRST_SM107_TACTIC else "sm_100",
         peer_store=peer_store,
+        peer_args=peer_args,
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
@@ -1454,7 +1465,7 @@ def run_tgv_cute_ext(
     if has_bias:
         compiled(a_, b_, c_, bias_, stream)
     else:
-        compiled(a_, b_, c_, stream)
+        compiled(a_, b_, c_, stream, *([] if peer_args is None else [peer_args]))
     return out
 
 

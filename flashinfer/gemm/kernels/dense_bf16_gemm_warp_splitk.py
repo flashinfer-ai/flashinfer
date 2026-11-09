@@ -44,6 +44,8 @@ _CTA_RESERVED_SMEM = 1024
 _SM_SMEM_BYTES = _SMEM_CAPACITY + _CTA_RESERVED_SMEM
 _MAILBOX_GROUP_VALUES = 32
 _MAILBOX_PADDED_GROUP_VALUES = 34
+# Peer-store kernels keyed without addresses; functools.cache would key on the launch arguments.
+_PEER_STORE_KERNELS: dict = {}
 
 
 # Pad each mailbox group by two FP32 words to reduce bank conflicts.
@@ -548,7 +550,8 @@ def _make_smem_layout(dtype, rows: int, cols: int, stages: int):
 
 @dataclasses.dataclass(frozen=True)
 class LamportPeerStoreConfig:
-    """Destinations of a Lamport peer-store epilogue, compiled into the kernel.
+    """Destinations of a Lamport peer-store epilogue. The addresses are kernel
+    arguments, the rest is compiled in (see ``split_peer_store_config``).
 
     Lamport protocol: consumers pre-fill the slots with zero, which the producer
     never stores, and poll until every 32-bit word is nonzero; no flag or barrier.
@@ -604,6 +607,28 @@ def make_lamport_peer_store_config(
     return LamportPeerStoreConfig(
         layout, world_size, rank, slot_bytes, int(epoch_ptr), peer_ptrs, multicast_ptr
     )
+
+
+def split_peer_store_config(config: LamportPeerStoreConfig):
+    """Split ``config`` into its compiled part (addresses zeroed; the compile key) and
+    the kernel arguments: ``epoch_ptr``, then the destination addresses."""
+    unicast = config.multicast_ptr is None
+    ptrs = config.peer_ptrs if unicast else (config.multicast_ptr,)
+    compiled = dataclasses.replace(
+        config,
+        epoch_ptr=0,
+        peer_ptrs=(0,) * len(ptrs) if unicast else None,
+        multicast_ptr=None if unicast else 0,
+    )
+    # Int64: plain Python ints would be passed as Int32.
+    return compiled, tuple(cutlass.Int64(ptr) for ptr in (config.epoch_ptr, *ptrs))
+
+
+def bind_peer_store_args(config: LamportPeerStoreConfig, args):
+    """In the kernel: ``config`` with the arguments of ``split_peer_store_config``."""
+    if config.multicast_ptr is not None:
+        return dataclasses.replace(config, epoch_ptr=args[0], multicast_ptr=args[1])
+    return dataclasses.replace(config, epoch_ptr=args[0], peer_ptrs=args[1:])
 
 
 def load_peer_epoch_parity(config: LamportPeerStoreConfig):
@@ -758,7 +783,9 @@ class CpAsyncWarpSplitKKernel:
         self.smem_bytes = _smem_bytes(tactic)
 
     @cute.experimental.jit
-    def __call__(self, weight, activation, bias, output, stream: _cuda.CUstream):
+    def __call__(
+        self, weight, activation, bias, output, stream: _cuda.CUstream, peer_args=None
+    ):
         sA_layout = _make_smem_layout(
             weight.element_type, self.output_tile, self.k_tile, self.stages
         )
@@ -771,7 +798,7 @@ class CpAsyncWarpSplitKKernel:
             permutation_mnk=(self.output_tile, self.token_tile, self.k_tile),
         )
         self.kernel(
-            weight, activation, bias, output, sA_layout, sB_layout, tiled_mma
+            weight, activation, bias, output, sA_layout, sB_layout, tiled_mma, peer_args
         ).launch(
             grid=(
                 cute.ceil_div(weight.shape[0], self.output_tile),
@@ -794,6 +821,7 @@ class CpAsyncWarpSplitKKernel:
         sA_layout: cute.ComposedLayout,
         sB_layout: cute.ComposedLayout,
         tiled_mma: cute.TiledMma,
+        peer_args,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         output_tile_idx, token_tile_idx, _ = cute.arch.block_idx()
@@ -1084,7 +1112,7 @@ class CpAsyncWarpSplitKKernel:
                         value
                     ].to(output.element_type)
             if const_expr(self.peer_store is not None):
-                peer_store = self.peer_store
+                peer_store = bind_peer_store_args(self.peer_store, peer_args)
                 # Ordered after the B loader's grid-dependency wait by the mainloop barriers.
                 parity = load_peer_epoch_parity(peer_store)
                 m = cute.size(activation, mode=[0])
@@ -1154,11 +1182,10 @@ def _compile(
     tactic: WarpSplitKTactic,
     use_pdl: bool,
     has_bias: bool,
-    peer_store: LamportPeerStoreConfig | None = None,
 ):
     with _torch.cuda.device(device_index):
         return cute_ext.compile(
-            CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias, peer_store),
+            CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias),
             *(
                 _from_dlpack(
                     _torch.empty(shape, device="cuda", dtype=dtype),
@@ -1223,27 +1250,35 @@ def run_warp_splitk_dense_peer_store(
         m=m,
         n=n,
     )
+    peer_store, peer_args = split_peer_store_config(peer_store)
     device_index = a.device.index
     assert device_index is not None
+    key = (device_index, a.dtype, n, k, tactic, pdl, peer_store)
     with _torch.cuda.device(a.device):
-        compiled = _compile(device_index, a.dtype, n, k, tactic, pdl, False, peer_store)
-        compiled(
+        args = (
             _from_dlpack(b.T),
             _from_dlpack(a, dynamic_m=True),
             _from_dlpack(out[0]),
             _from_dlpack(out, dynamic_m=True),
             _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
+            peer_args,
         )
+        if key not in _PEER_STORE_KERNELS:
+            kernel = CpAsyncWarpSplitKKernel(tactic, pdl, False, peer_store)
+            _PEER_STORE_KERNELS[key] = cute_ext.compile(kernel, *args)
+        _PEER_STORE_KERNELS[key](*args)
 
 
 __all__ = [
     "LamportPeerStoreConfig",
     "WarpSplitKTactic",
     "autotune_tactics",
+    "bind_peer_store_args",
     "default_tactic",
     "make_lamport_peer_store_config",
     "run_warp_splitk_dense",
     "run_warp_splitk_dense_peer_store",
+    "split_peer_store_config",
     "store_tile_to_peers",
     "validate_inputs",
 ]

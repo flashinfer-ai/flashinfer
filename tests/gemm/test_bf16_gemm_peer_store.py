@@ -165,6 +165,43 @@ def test_peer_store_partial_feature_tile(kernel):
         torch.testing.assert_close(buffer, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("kernel", ["warp", "cluster", "tgv"])
+def test_peer_store_compiles_once_for_new_buffers(kernel, monkeypatch):
+    """The addresses are kernel arguments: new peer buffers reuse the kernel."""
+    _require_splitk()
+    from cutlass.cute import experimental as cute_ext
+    from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as cluster
+    from flashinfer.gemm.kernels import dense_bf16_gemm_warp_splitk as warp
+    from flashinfer.gemm.kernels import tgv_gemm_cute_ext as tgv
+
+    m, n, k, slot_bytes = 8, 1536, 2048, 8 * 1536 * 2
+    a = torch.randn((m, k), device="cuda").bfloat16()
+    w = (torch.randn((n, k), device="cuda") / k**0.5).bfloat16()
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    ref = (a.float() @ w.float().T).expand(2, m, n)
+    run, tactic = {
+        "warp": (warp.run_warp_splitk_dense_peer_store, warp.default_tactic),
+        "cluster": (cluster.run_splitk_dense_peer_store, cluster.default_tactic),
+        "tgv": (tgv.run_tgv_cute_ext_peer_store, lambda *_: 18),  # 2-CTA 64 x 16 tile
+    }[kernel]
+    count, fn = [], cute_ext.compile
+    monkeypatch.setattr(cute_ext, "compile", lambda *x: count.append(x) or fn(*x))
+    epoch = torch.zeros(1, dtype=torch.int32, device="cuda")
+    rank = 1
+    dest = dict(epoch_ptr=epoch.data_ptr(), slot_bytes=slot_bytes, world_size=2)
+    counts = []
+    for _ in range(2):  # a new allocation (two peers) for each launch
+        bufs = torch.zeros(2, 4 * slot_bytes, dtype=torch.uint8, device="cuda")
+        ptrs = [buf.data_ptr() for buf in bufs]
+        run(a, w.T, out, tactic(m, n, k), peer_ptrs=ptrs, rank=rank, **dest)
+        tiles = bufs[:, rank * slot_bytes : (rank + 1) * slot_bytes]
+        got = tiles.view(torch.bfloat16).reshape(2, m, n).float()
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+        counts.append(len(count))
+    # The first launch compiles at most once (none if cached); the second never.
+    assert counts[0] <= 1 and counts[1] == counts[0], counts
+
+
 def test_peer_store_rejects_bad_arguments():
     _require_splitk()
     from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as cluster
