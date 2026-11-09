@@ -748,7 +748,7 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
     small_token_max: int,
 ) -> None:
     """At world size 2, a top_k 4 batch the large-token program takes (above
-    kLargeTokenMinTokens = 512 tokens, kLargeTokenMinTokensSharedExpert = 1280 with a
+    kLargeTokenMinTokens = 512 tokens, kLargeTokenMinTokensSharedExpert = 895 with a
     shared expert) runs the large-token program that also prefetches the shared-expert row
     (_lts) on a rank with a shared expert and the large-token program (_lt) on a rank
     without one; the shared form runs the same exchange, so the ranks of one call may mix
@@ -764,7 +764,7 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
         )
     }
     assert constants["kLargeTokenMinTokens"] == 512
-    assert constants["kLargeTokenMinTokensSharedExpert"] == 1280
+    assert constants["kLargeTokenMinTokensSharedExpert"] == 895
     large = re.search(
         r"\} else if \((large_token != nullptr &&.*?)\) \{\s*kernel = (.*?);",
         binding,
@@ -820,8 +820,8 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
         for quantize in (False, True):
             for use_shared in (False, True):
                 case = (use_shared, quantize, dtype)
-                large_min = 1280 if use_shared else 512
-                for tokens in (512, 513, 1280, 1281, 2048, 4096):
+                large_min = 895 if use_shared else 512
+                for tokens in (512, 513, 895, 896, 1280, 1281, 2048, 4096):
                     expected = (
                         ("_lts" if use_shared else "_lt")
                         if tokens > large_min
@@ -838,7 +838,7 @@ def test_world_size_2_shared_expert_runs_the_large_token_shared_program(
                         ), (world_size, tokens, *case)
             # Mixed shared-expert presence among the two ranks of one call.
             for present in ({0}, {1}):
-                for tokens in (1281, 2048):
+                for tokens in (896, 1281, 2048):
                     programs = [
                         program(2, tokens, 4, rank in present, quantize, dtype)
                         for rank in range(2)

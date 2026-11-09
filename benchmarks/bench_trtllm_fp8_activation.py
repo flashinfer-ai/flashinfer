@@ -12,8 +12,9 @@ Run in an environment with this source checkout installed:
     uv run benchmarks/bench_trtllm_fp8_activation.py \
         --num-tokens 16384 --intermediate-size 512 --top-k 8 --num-experts 288
 
-The one-byte-offset output selects the original scalar kernel. Timings use
-warm-cache CUDA graphs and exclude routing, GEMMs, and buffer allocation.
+The one-byte-offset output selects the scalar kernel. Check-only mode also checks
+32-channel scale blocks at the 1,024-token vector threshold. Timings use 128-channel
+scale blocks and warm-cache CUDA graphs. They exclude routing, GEMMs, and buffer allocation.
 The staged activation can run on SM120; this does not validate the full MoE path.
 """
 
@@ -27,12 +28,12 @@ from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 from flashinfer.testing import bench_gpu_time
 
 
-def run_case(module, args, num_tokens, intermediate_size):
+def run_case(module, args, num_tokens, intermediate_size, sf_block_size):
     expanded_rows = num_tokens * args.top_k
     rows_per_expert = (expanded_rows + args.num_experts - 1) // args.num_experts
     padded_rows_per_expert = (rows_per_expert + 127) // 128 * 128
     padded_rows = padded_rows_per_expert * args.num_experts
-    blocks = intermediate_size // 128
+    blocks = intermediate_size // sf_block_size
     row = torch.arange(expanded_rows, device="cuda", dtype=torch.int32)
     mapping = row % args.num_experts * padded_rows_per_expert + row // args.num_experts
     mapping[row % 17 == 0] = -1
@@ -49,11 +50,12 @@ def run_case(module, args, num_tokens, intermediate_size):
         inputs[used_rows[0]] = 0
     input_scales = torch.rand(blocks * 2, padded_rows, device="cuda") * 0.25 + 0.01
     total = torch.tensor([padded_rows], device="cuda", dtype=torch.int32)
+    fp8_nan = 0x7F
     output = torch.full(
-        (padded_rows, intermediate_size), 0x55, device="cuda", dtype=torch.uint8
+        (padded_rows, intermediate_size), fp8_nan, device="cuda", dtype=torch.uint8
     )
     scalar_storage = torch.full(
-        (output.numel() + 1,), 0x55, device="cuda", dtype=torch.uint8
+        (output.numel() + 1,), fp8_nan, device="cuda", dtype=torch.uint8
     )
     scalar_output = scalar_storage[1:].view_as(output)
     scales = torch.full((blocks, padded_rows), -1.0, device="cuda")
@@ -72,25 +74,31 @@ def run_case(module, args, num_tokens, intermediate_size):
             intermediate_size,
             int(ActivationType.Swiglu),
             args.enable_pdl,
+            sf_block_size,
         )
 
     launch(scalar_output, scalar_scales)
     launch(output, scales)
     assert torch.equal(output, scalar_output), "FP8 output differs from scalar fallback"
     assert torch.equal(scales, scalar_scales), "Scales differ from scalar fallback"
-    assert torch.all(output[~active] == 0x55), "Inactive output rows were written"
+    assert torch.all((output[active] & 0x7F) != fp8_nan), (
+        "Missing or NaN active FP8 output"
+    )
+    assert torch.all(scales[:, active] > 0), "Missing or invalid active scale blocks"
+    assert torch.all(output[~active] == fp8_nan), "Inactive output rows were written"
     assert torch.all(scales[:, ~active] == -1), "Inactive scale rows were written"
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch(output, scales)
-    output.fill_(0x55)
+    output.fill_(fp8_nan)
     scales.fill_(-1)
     graph.replay()
     assert torch.equal(output, scalar_output), "CUDA graph output differs"
     assert torch.equal(scales, scalar_scales), "CUDA graph scales differ"
     label = (
-        f"tokens={num_tokens} intermediate={intermediate_size} pdl={args.enable_pdl}"
+        f"tokens={num_tokens} intermediate={intermediate_size} "
+        f"sf_block_size={sf_block_size} pdl={args.enable_pdl}"
     )
     if args.check_only:
         print(f"{label}: bitwise parity, inactive rows, and graph replay passed")
@@ -138,7 +146,9 @@ def main():
     module = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
     for num_tokens in args.num_tokens:
         for intermediate_size in args.intermediate_size:
-            run_case(module, args, num_tokens, intermediate_size)
+            run_case(module, args, num_tokens, intermediate_size, sf_block_size=128)
+    if args.check_only:
+        run_case(module, args, num_tokens=1024, intermediate_size=128, sf_block_size=32)
 
 
 if __name__ == "__main__":

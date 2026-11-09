@@ -161,6 +161,13 @@ NVFP4_DEFAULT_TACTICS_BY_TOKENS = {
     for tokens, (seed, replicas, overlap) in _DEFAULTS.items()
 }
 
+# Each default's lockstep-scale (sf0) core. The scale ring fits only N64
+# tiles, so wider token tiles of a scale-ring default are built on this core.
+NVFP4_SF0_DEFAULT_CORES_BY_TOKENS = {
+    tokens: dict(NVFP4_SF0_CANDIDATE_SEEDS[seed])
+    for tokens, (seed, _, _) in _DEFAULTS.items()
+}
+
 # Measured scale-ring choices. Admission depends on geometry, not GPU name,
 # live-token count, clamp, or overlap; construction checks actual resources.
 NVFP4_SF2_CANDIDATE_SEEDS = tuple(

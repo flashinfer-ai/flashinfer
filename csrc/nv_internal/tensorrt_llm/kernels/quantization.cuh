@@ -334,27 +334,9 @@ quantize_with_block_size(
     } else {
       // Normal path: This row contains actual data
       for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
-        for (int colBase = threadIdx.x; colBase < numColThreadsForSf;
-             colBase += blockDim.x * LOADS_IN_FLIGHT) {
-          PackedVecT in_vecs[LOADS_IN_FLIGHT];
-          if constexpr (LOADS_IN_FLIGHT > 1) {
-#pragma unroll
-            for (int u = 0; u < LOADS_IN_FLIGHT; ++u) {
-              int const colIdx = colBase + u * blockDim.x;
-              if (colIdx < numColThreads) {
-                loadPackedVec(
-                    in_vecs[u],
-                    reinterpret_cast<PackedVecT const*>(in) +
-                        static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx);
-              }
-            }
-          }
-#pragma unroll
-          for (int u = 0; u < LOADS_IN_FLIGHT; ++u) {
-            int const colIdx = colBase + u * blockDim.x;
-            if (colIdx >= numColThreadsForSf) {
-              break;
-            }
+        if constexpr (LOADS_IN_FLIGHT == 1) {
+          // Original one-load schedule, kept verbatim so it compiles to main's SASS.
+          for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
             std::optional<int> optionalBatchIdx = batchIdx;
             std::optional<int> optionalNumRows = numRows;
 
@@ -388,13 +370,9 @@ quantize_with_block_size(
                 sf_out[0] = 0x00;
               }
             } else {
+              // Load the input vector.
               PackedVecT in_vec;
-              if constexpr (LOADS_IN_FLIGHT == 1) {
-                // Load the input vector.
-                loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
-              } else {
-                in_vec = in_vecs[u];
-              }
+              loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
 
               // Dispatch the quantization kernel.
               if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
@@ -411,7 +389,78 @@ quantize_with_block_size(
                     cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(in_vec, sf_out);
               }
             }
-          }  // u
+          }
+        } else {
+          for (int colBase = threadIdx.x; colBase < numColThreadsForSf;
+               colBase += blockDim.x * LOADS_IN_FLIGHT) {
+            PackedVecT in_vecs[LOADS_IN_FLIGHT];
+#pragma unroll
+            for (int u = 0; u < LOADS_IN_FLIGHT; ++u) {
+              int const colIdx = colBase + u * blockDim.x;
+              if (colIdx < numColThreads) {
+                loadPackedVec(
+                    in_vecs[u],
+                    reinterpret_cast<PackedVecT const*>(in) +
+                        static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx);
+              }
+            }
+#pragma unroll
+            for (int u = 0; u < LOADS_IN_FLIGHT; ++u) {
+              int const colIdx = colBase + u * blockDim.x;
+              if (colIdx >= numColThreadsForSf) {
+                break;
+              }
+              std::optional<int> optionalBatchIdx = batchIdx;
+              std::optional<int> optionalNumRows = numRows;
+
+              // The SF output pointer.
+              auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                  optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numColsForSf / SF_VEC_SIZE,
+                  SFout, layout);
+
+              int64_t outOffset =
+                  static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+
+              // Set the values to 0 of those are padded columns.
+              if (colIdx >= numColThreads && colIdx < numPaddedColThreads) {
+                // Dispatch the quantization kernel.
+                if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+                  reinterpret_cast<FP4OutT*>(out)[outOffset] = FP4OutT{0};
+                } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
+                  reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+                } else if constexpr (quantization_type ==
+                                     BlockScaleQuantizationType::FP16_TO_MXFP8) {
+                  reinterpret_cast<MxFp8OutT*>(out)[outOffset] = MxFp8OutT{};
+                }
+              }
+
+              // Process actual data or padding
+              if (colIdx >= numColThreads) {
+                // Column padding: Set the SF padding to 0.
+                if (sf_out != nullptr) {
+                  sf_out[0] = 0x00;
+                }
+              } else {
+                PackedVecT in_vec = in_vecs[u];
+
+                // Dispatch the quantization kernel.
+                if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+                  reinterpret_cast<FP4OutT*>(out)[outOffset] =
+                      cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
+                                           DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
+                          in_vec, SFScaleVal, sf_out);
+                } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
+                  reinterpret_cast<uint64_t*>(out)[outOffset] =
+                      cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
+                          in_vec, SFScaleVal, sf_out);
+                } else if constexpr (quantization_type ==
+                                     BlockScaleQuantizationType::FP16_TO_MXFP8) {
+                  reinterpret_cast<MxFp8OutT*>(out)[outOffset] =
+                      cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(in_vec, sf_out);
+                }
+              }
+            }  // u
+          }
         }
       }
     }

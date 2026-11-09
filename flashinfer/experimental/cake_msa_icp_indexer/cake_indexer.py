@@ -39,6 +39,7 @@ launch can stall behind a peer's spinning merge).
 from __future__ import annotations
 
 import collections
+import dataclasses
 from typing import Any, Callable, Hashable, Optional, Sequence
 
 import torch
@@ -204,6 +205,11 @@ class MSAIcpIndexerPlan:
         self.comm_layout = cb.comm_layout(
             world_size, self.heads_per_rank, max_decode_tokens
         )
+        # The caller's optional prefill publish storage (the prefill exchange
+        # as a peer publish; :class:`MSAIcpPrefillPublish`).
+        self.prefill_publish_layout = cb.prefill_publish_layout(
+            world_size, self.heads_per_rank, max_num_batched_tokens
+        )
         self.decode_score_columns = cb.decode_score_columns(max_model_len, page_size)
         # The smallest chunk any step can use (the longest sequence) bounds the
         # number of query windows of one step.
@@ -366,6 +372,54 @@ class MSAIcpIndexerPlan:
         entry = self._checked_comms.get(id(comm))
         if entry is None or entry[0] is not comm or not _same_comm(comm, entry[1]):
             self.check_comm(comm)
+
+    def check_prefill_publish(self, publish: "MSAIcpPrefillPublish") -> None:
+        """Validate the caller's prefill publish storage against
+        :attr:`prefill_publish_layout`."""
+        layout = self.prefill_publish_layout
+        want = {
+            "rows": (torch.int64, layout["rows_shape"]),
+            "generations": (torch.int32, layout["generations_shape"]),
+            "expected": (torch.int32, layout["expected_shape"]),
+        }
+        peers = tuple(getattr(publish, "peer_rows", ()))
+        if len(peers) != self.world_size:
+            raise ValueError(
+                f"publish.peer_rows must hold {self.world_size} tensors (one per rank)"
+            )
+        checks = [(f, getattr(publish, f, None), *w) for f, w in want.items()]
+        checks += [
+            (f"peer_rows[{p}]", t, torch.int64, layout["rows_shape"])
+            for p, t in enumerate(peers)
+        ]
+        for field, t, dtype, shape in checks:
+            if (
+                not isinstance(t, torch.Tensor)
+                or t.device != self.device
+                or t.dtype != dtype
+                or tuple(t.shape) != tuple(shape)
+                or not t.is_contiguous()
+            ):
+                raise ValueError(
+                    f"publish.{field} must be contiguous {dtype} {list(shape)} on {self.device}"
+                )
+
+    def prefill_window_fused(
+        self, tokens: int, window_plan: cb.MSAIcpScorePlan, pool: Optional[torch.Tensor]
+    ) -> bool:
+        """Whether :meth:`prefill_local` runs the fused path (the list scorer
+        and the list merge) for a window of ``tokens`` query tokens: with a
+        pool, unless the window is short and its plan's columns fit the
+        model's pitch."""
+        return pool is not None and (
+            tokens > self.prefill_short_tokens
+            or (
+                (window_plan.columns + 1) // 2
+                if self.page_size == 256
+                else window_plan.columns
+            )
+            > self.prefill_score_columns
+        )
 
     # ----------------------------------------------------------------- decode
 
@@ -587,9 +641,10 @@ class MSAIcpIndexerPlan:
         window_plan: cb.MSAIcpScorePlan,
         score_scratch: Optional[torch.Tensor],
         num_valid_pages: torch.Tensor,
-        carrier_view: torch.Tensor,
+        carrier_view: Optional[torch.Tensor],
         *,
         pool: Optional[torch.Tensor] = None,
+        publish: Optional[dict[str, Any]] = None,
     ) -> None:
         """Score one query chunk into ``score_scratch[:T]`` and write its
         per-(head, token) Top16 rows into ``carrier_view`` (int32 ``[H, T, 33]``,
@@ -604,17 +659,20 @@ class MSAIcpIndexerPlan:
         at most :attr:`prefill_short_tokens` tokens (whose plan's columns fit
         the model's pitch) runs the score rows and the Top16 select in the
         facade's own scratch even with a pool: the same carrier rows, decided
-        on the host from the chunk's size."""
+        on the host from the chunk's size.
+
+        ``publish`` (the fused path only; :meth:`MSAIcpPrefillStep` passes
+        it): instead of ``carrier_view``, the rows go to the owners' receive
+        rows of a :class:`MSAIcpPrefillPublish` (keys ``peer_rows``,
+        ``generations``, ``slot``, ``t_base``, ``capacity`` of
+        :func:`~.cake_backend.prefill_score_select`)."""
         t = query.shape[0]
-        if pool is not None and (
-            t > self.prefill_short_tokens
-            or (
-                (window_plan.columns + 1) // 2
-                if self.page_size == 256
-                else window_plan.columns
+        fused = self.prefill_window_fused(t, window_plan, pool)
+        if publish is not None and not fused:
+            raise ValueError(
+                "a prefill publish needs the fused path (a pool and a long window)"
             )
-            > self.prefill_score_columns
-        ):
+        if fused:
             cb.prefill_score_select(
                 query,
                 index_k,
@@ -628,6 +686,7 @@ class MSAIcpIndexerPlan:
                 compact=self.page_size == 256,
                 force_begin_blocks=self.init_blocks,
                 force_end_blocks=self.local_blocks,
+                publish=publish,
             )
             return
         if pool is not None:
@@ -663,9 +722,14 @@ class MSAIcpIndexerPlan:
         received: torch.Tensor,
         num_valid_pages: torch.Tensor,
         output: torch.Tensor,
+        expected: Optional[torch.Tensor] = None,
     ) -> None:
         """Merge the exchanged carrier rows ``received`` (int32
-        ``[W, hpr, T, 33]``) of the heads this rank owns into ``output``."""
+        ``[W, hpr, T, 33]``) of the heads this rank owns into ``output``; with
+        ``expected`` (int32 ``[hpr, capacity]``, one slot of a
+        :class:`MSAIcpPrefillPublish`) ``received`` is that slot's published
+        tagged rows (int64 ``[W, hpr, capacity, 32]``), waited for by
+        generation."""
         cb.merge_candidates(
             received,
             num_valid_pages,
@@ -674,6 +738,7 @@ class MSAIcpIndexerPlan:
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
             prefill=True,
+            expected_generations=expected,
         )
 
     # ----------------------------------------------------------------- step prepare
@@ -688,6 +753,7 @@ class MSAIcpIndexerPlan:
         output: torch.Tensor,
         *,
         debug: bool = False,
+        publish: Optional["MSAIcpPrefillPublish"] = None,
         **local_kwargs: Any,
     ) -> "MSAIcpPrefillStep":
         """The prefill side of one step, prepared once for all its layers.
@@ -703,7 +769,26 @@ class MSAIcpIndexerPlan:
         runs for every window, and :meth:`MSAIcpPrefillStep.merge` what
         ``prefill_merge(received, num_valid_pages, output)`` runs: the same
         launches with the same arguments, checked once per step.  See
-        :class:`MSAIcpPrefillStep`."""
+        :class:`MSAIcpPrefillStep`.
+
+        With ``publish`` (a :class:`MSAIcpPrefillPublish` this indexer
+        validates) and a ``pool``, a step whose every window takes the fused
+        path publishes its rows to the owners instead
+        (:attr:`MSAIcpPrefillStep.publishes`): per layer ``local(...,
+        slot=)`` and ``merge(slot=)`` and no caller exchange; any other step
+        keeps ``send -> received`` (decided here, on the host)."""
+        if publish is not None:
+            self.check_prefill_publish(publish)
+            if output.shape[0] > self.max_num_batched_tokens:
+                raise ValueError(
+                    "a published step holds at most max_num_batched_tokens tokens"
+                )
+            pool = local_kwargs.get("pool")
+            if not all(
+                self.prefill_window_fused(int(end) - int(start), plan, pool)
+                for start, end, _, plan in windows
+            ):
+                publish = None
         return MSAIcpPrefillStep(
             self,
             windows,
@@ -714,6 +799,7 @@ class MSAIcpIndexerPlan:
             output,
             debug=debug,
             local_kwargs=local_kwargs,
+            publish=publish,
         )
 
     def prepare_decode_step(
@@ -875,12 +961,33 @@ class _StepBase:
         return [p.call for p in prepared]
 
 
+@dataclasses.dataclass(eq=False)
+class MSAIcpPrefillPublish:
+    """The caller's prefill publish storage (laid out by
+    :func:`~.cake_backend.prefill_publish_layout`; all zeroed once on every
+    rank, never reset): ``rows`` this rank's local view of its symmetric
+    receive rows (int64 ``[3, W, hpr, capacity, 32]``), ``peer_rows`` every
+    rank's rows as a tensor on this device (``W`` of them in rank order: the
+    symmetric allocation's peer views, entry ``rank`` this rank's own rows),
+    ``generations`` the publisher's counters (int32 ``[3, H, capacity]``) and
+    ``expected`` the merge's (int32 ``[3, hpr, capacity]``).  The caller keeps the symmetric
+    allocation alive while any step uses it."""
+
+    rows: torch.Tensor
+    peer_rows: tuple[torch.Tensor, ...]
+    generations: torch.Tensor
+    expected: torch.Tensor
+
+
 class MSAIcpPrefillStep(_StepBase):
     """The prefill side of one step (:meth:`MSAIcpIndexerPlan.prepare_prefill_step`).
 
     Per layer: :meth:`local` (score and local Top16 of every window into
     ``send``), the caller's one exchange ``send -> received``, then
-    :meth:`merge`.  The launches and their arguments are exactly those of the
+    :meth:`merge`.  A step that :attr:`publishes` writes every window's rows
+    into the owners' receive rows of the layer's slot instead
+    (``local(..., slot=)``) and merges them (``merge(slot=)``): the layer's
+    one exchange without the caller's.  The launches and their arguments are exactly those of the
     facade's ``prefill_local`` per window and ``prefill_merge``; only the host
     work differs (see :class:`_StepBase`).  CUDA Graph safe like the facade.
     """
@@ -897,6 +1004,7 @@ class MSAIcpPrefillStep(_StepBase):
         *,
         debug: bool,
         local_kwargs: dict,
+        publish: Optional[MSAIcpPrefillPublish] = None,
     ) -> None:
         super().__init__(indexer, debug)
         self.windows = tuple(
@@ -918,14 +1026,47 @@ class MSAIcpPrefillStep(_StepBase):
         self.received = received
         self.output = output
         self.local_kwargs = dict(local_kwargs)
-        self._local: Optional[list[_PreparedLaunch]] = None
+        self.publish = publish
+        # Prepared window launches and merge launches, by slot (``None``: the
+        # carrier exchange, whose launches do not depend on the slot).
+        self._local: dict[Optional[int], list[_PreparedLaunch]] = {}
         self._sig: tuple = ()
-        self._merge: Optional[list[cj.RecordedLaunch]] = None
+        self._merge: dict[Optional[int], list[cj.RecordedLaunch]] = {}
 
-    def _per_call_local(self, index_q: torch.Tensor, index_k: torch.Tensor):
+    @property
+    def publishes(self) -> bool:
+        """Whether the step publishes its rows (no caller exchange)."""
+        return self.publish is not None
+
+    def _slot(self, slot: Optional[int]) -> Optional[int]:
+        if not self.publishes:
+            return None
+        if slot not in _SLOTS:
+            raise ValueError(
+                "a publishing prefill step needs the layer's slot (0, 1 or 2)"
+            )
+        return int(slot)
+
+    def _per_call_local(
+        self, index_q: torch.Tensor, index_k: torch.Tensor, slot: Optional[int]
+    ):
         """(window rows, launches) of the facade's per-window prefill_local."""
         out = []
+        pub = self.publish
         for start, end, block_table, plan in self.windows:
+            extra = (
+                {}
+                if pub is None
+                else {
+                    "publish": {
+                        "peer_rows": pub.peer_rows,
+                        "generations": pub.generations,
+                        "slot": slot,
+                        "t_base": start,
+                        "capacity": pub.rows.shape[3],
+                    }
+                }
+            )
             calls = self._record(
                 self.indexer.prefill_local,
                 index_q[start:end],
@@ -934,72 +1075,101 @@ class MSAIcpPrefillStep(_StepBase):
                 plan,
                 self.score_scratch,
                 self.num_valid_pages[start:end],
-                self.send[:, start:end],
+                None if pub is not None else self.send[:, start:end],
                 **self.local_kwargs,
+                **extra,
             )
             out.append(((start, end), calls))
         return out
 
     def _prepare_local(
-        self, index_q: torch.Tensor, index_k: torch.Tensor
+        self, index_q: torch.Tensor, index_k: torch.Tensor, slot: Optional[int]
     ) -> list[_PreparedLaunch]:
         full = (0, index_q.shape[0])
         prepared = []
-        for rows, calls in self._per_call_local(index_q, index_k):
+        for rows, calls in self._per_call_local(index_q, index_k, slot):
             for call in calls:
                 prepared.append(_PreparedLaunch(call, None if rows == full else rows))
-        self._local = prepared
+        self._local[slot] = prepared
         self._sig = (_signature(index_q), _signature(index_k))
         return prepared
 
-    def local(self, index_q: torch.Tensor, index_k: torch.Tensor) -> None:
+    def local(
+        self,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        slot: Optional[int] = None,
+    ) -> None:
         """Score and select every window of this layer: ``index_q`` holds the
         step's ``T`` prefill query tokens ``[T, H, 128]``, ``index_k`` this
-        layer's K shard."""
-        if self._local is None:
-            prepared = self._prepare_local(index_q, index_k)
+        layer's K shard; ``slot`` the layer's slot set (a publishing step)."""
+        slot = self._slot(slot)
+        prepared = self._local.get(slot)
+        if prepared is None:
+            if self._local:
+                self._check_layer(self._sig, index_q, index_k)
+            prepared = self._prepare_local(index_q, index_k, slot)
             cj.launch_recorded([p.call for p in prepared], self.device_index)
             return
         self._check_layer(self._sig, index_q, index_k)
-        calls = self._replay(self._local, index_q, index_k)
+        calls = self._replay(prepared, index_q, index_k)
         if self.debug:
-            got = [c for _, cs in self._per_call_local(index_q, index_k) for c in cs]
+            got = [
+                c for _, cs in self._per_call_local(index_q, index_k, slot) for c in cs
+            ]
             _check_same_launches(calls, got, "prefill step local")
         cj.launch_recorded(calls, self.device_index)
 
-    def merge(self) -> None:
-        """Merge the exchanged ``received`` rows of this layer into ``output``."""
-        calls = self._merge
-        if calls is None or self.debug:
-            got = self._record(
+    def _merge_calls(self, slot: Optional[int]) -> list[cj.RecordedLaunch]:
+        pub = self.publish
+        if pub is None:
+            return self._record(
                 self.indexer.prefill_merge,
                 self.received,
                 self.num_valid_pages,
                 self.output,
             )
+        return self._record(
+            self.indexer.prefill_merge,
+            pub.rows[slot],
+            self.num_valid_pages,
+            self.output,
+            pub.expected[slot],
+        )
+
+    def merge(self, *, slot: Optional[int] = None) -> None:
+        """Merge the exchanged ``received`` rows of this layer into ``output``
+        (a publishing step: the rows published into slot ``slot``)."""
+        slot = self._slot(slot)
+        calls = self._merge.get(slot)
+        if calls is None or self.debug:
+            got = self._merge_calls(slot)
             if calls is None:
-                calls = self._merge = got
+                calls = self._merge[slot] = got
             else:
                 _check_same_launches(calls, got, "prefill step merge")
         cj.launch_recorded(calls, self.device_index)
 
     def record(
-        self, index_q: torch.Tensor, index_k: torch.Tensor
+        self,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        slot: Optional[int] = None,
     ) -> list[cj.RecordedLaunch]:
         """Prepare the step without launching (the first layer's host checks)
         and return its launches: every window's, then the merge's."""
-        if self._local is None:
-            self._prepare_local(index_q, index_k)
+        slot = self._slot(slot)
+        if slot not in self._local:
+            if self._local:
+                self._check_layer(self._sig, index_q, index_k)
+            self._prepare_local(index_q, index_k, slot)
         else:
             self._check_layer(self._sig, index_q, index_k)
-        if self._merge is None:
-            self._merge = self._record(
-                self.indexer.prefill_merge,
-                self.received,
-                self.num_valid_pages,
-                self.output,
-            )
-        return [p.call for p in self._local] + list(self._merge)
+        if slot not in self._merge:
+            self._merge[slot] = self._merge_calls(slot)
+        return [p.call for p in self._local[slot]] + list(self._merge[slot])
 
 
 class MSAIcpDecodeStep(_StepBase):
@@ -1286,9 +1456,13 @@ class MSAIcpGraphStep:
         if self.decode is not None:
             self.decode.run(q_d, index_k, slot=slot)
         if self.prefill is not None:
-            self.prefill.local(q_p, index_k)
-            self.exchange()
-            self.prefill.merge()
+            if self.prefill.publishes:
+                self.prefill.local(q_p, index_k, slot=slot)
+                self.prefill.merge(slot=slot)
+            else:
+                self.prefill.local(q_p, index_k)
+                self.exchange()
+                self.prefill.merge()
 
     def run(
         self, layer: int, index_q: torch.Tensor, index_k: torch.Tensor, *, slot: int = 0
@@ -1302,7 +1476,14 @@ class MSAIcpGraphStep:
             # windows and merge, and the decode chain of every slot set.
             q_d, q_p = self._parts(index_q)
             prefill_key = (
-                _launch_key(self.prefill.record(q_p, index_k))
+                (
+                    tuple(
+                        _launch_key(self.prefill.record(q_p, index_k, slot=s))
+                        for s in _SLOTS
+                    )
+                    if self.prefill.publishes
+                    else _launch_key(self.prefill.record(q_p, index_k))
+                )
                 if self.prefill is not None
                 else None
             )

@@ -136,6 +136,54 @@ def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
     )
 
 
+@pytest.mark.parametrize(("num_tokens", "intermediate_size"), [(128, 160), (1024, 128)])
+def test_prims_ts_deepseek_fp8_block32_smoke(
+    cache_permute_indices, num_tokens, intermediate_size
+):
+    """Check [32,32] DeepSeek scales through FC2 and the final comparison.
+
+    ``intermediate_size=160`` is the TP4 shard of a 640-wide expert: FC1 has
+    320 rows (a partial 128-row weight tile) and FC2 reduces over K=160 (a
+    partial 128-wide K tile). At 1,024 tokens and 128 intermediate channels,
+    only the scale block size rules out the vector activation kernel.
+    """
+    if get_compute_capability(torch.device(device="cuda")) == (10, 7):
+        pytest.skip("DeepSeek FP8 32x32 scale blocks are not validated on SM107 yet")
+    run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=512,
+        intermediate_size=intermediate_size,
+        moe_impl=FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK,
+            block_size=32,
+        ),
+        routing_config={
+            "num_experts": 64,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_intermediate_size": [intermediate_size],
+            "compatible_activation_types": [ActivationType.Swiglu],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+
+
 def test_prims_ts_deepseek_fp8_accepts_fp32_logits(cache_permute_indices):
     run_moe_test(
         num_tokens=32,
