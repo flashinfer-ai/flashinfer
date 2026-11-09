@@ -1791,3 +1791,29 @@ def test_cuda_core_decode_refuses_head_dim_not_a_multiple_of_vec_size():
     k = torch.randn(64, 2, 72, device="cuda:0").to(torch.float8_e4m3fn)
     with pytest.raises(ValueError, match="head_dim 72"):
         flashinfer.decode.single_decode_with_kv_cache(q, k, k, use_tensor_cores=False)
+
+
+def test_cuda_core_decode_refuses_split_merge_layout_of_an_fp8_output():
+    """With KV split the partial outputs are merged with vec_size = 16 elements of
+    an fp8 output per lane, which does not divide head_dim 88."""
+    device = "cuda:0"
+    kv_indptr = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(2, dtype=torch.int32, device=device)
+    kv_last_page_len = torch.tensor([16], dtype=torch.int32, device=device)
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "NHD", use_tensor_cores=False
+    )
+    with pytest.raises(ValueError, match="head_dim 88"):
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            8,
+            2,
+            88,
+            16,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.float8_e4m3fn,
+        )
