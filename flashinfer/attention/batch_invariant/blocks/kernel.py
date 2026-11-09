@@ -127,6 +127,8 @@ class AttentionKernel:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mKsf: cute.Tensor,
+        mVsf: cute.Tensor,
         mO: cute.Tensor,
         mWs: cute.Tensor,
         mScratch: cute.Tensor,
@@ -147,7 +149,8 @@ class AttentionKernel:
         parameter, never a quantity that reaches the bits (I10). ``mScratch`` is the per-CTA ``O_m`` scratch (``grid x 128 x D``
         fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor. ``vs`` is the fp8-KV classes' value scale
         (the epilogue's one ``mul.rn``; unused by the bf16 kernel, which passes 1.0). ``mK`` / ``mV`` are the bf16 caches, or the
-        fp8 caches viewed as bytes for the fp8-KV kernels."""
+        fp8 caches viewed as bytes for the fp8-KV kernels, or the packed NVFP4 caches with their block scales ``mKsf`` / ``mVsf``
+        (``(D / 16, page, Hkv, num_pages)`` bytes; any one-element tensor for the other kernels)."""
         st = StaticPlan(
             self.D,
             self.g,
@@ -203,6 +206,8 @@ class AttentionKernel:
             tma.tensor_k,
             tma.atom_v,
             tma.tensor_v,
+            mKsf,
+            mVsf,
             mO,
             mWs,
             mScratch,
@@ -246,6 +251,8 @@ class AttentionKernel:
         tK: cute.Tensor,
         atom_v: cute.CopyAtom,
         tV: cute.Tensor,
+        tKsf: cute.Tensor,
+        tVsf: cute.Tensor,
         mO: cute.Tensor,
         mWs: cute.Tensor,
         mScratch: cute.Tensor,
@@ -444,6 +451,8 @@ class AttentionKernel:
                         kv_prod,
                         tK,
                         tV,
+                        tKsf,
+                        tVsf,
                         sKV_u32,
                         mKvIndptr,
                         mKvIndices,
@@ -464,6 +473,8 @@ class AttentionKernel:
                         kv_prod,
                         tK,
                         tV,
+                        tKsf,
+                        tVsf,
                         sKV_u32,
                         mKvIndptr,
                         mKvIndices,

@@ -61,10 +61,14 @@ def get_compiled_attention(
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
         lowbit = kv_fmt != "bf16"
+        fp4 = kv_fmt == "nvfp4"
         kv_dtype = cutlass.Uint8 if lowbit else bf16
         kv_div = (
             16 if lowbit else 8
         )  # outer strides: 16-byte multiples in either element size
+        kv_d = (
+            D // 2 if fp4 else D
+        )  # the cache row: D bf16 or fp8 elements, or D / 2 packed bytes
         s_hq, s_tq, s_npages, s_nunits, s_hkv = (cute.sym_int(32) for _ in range(5))
         s_ws = (
             cute.sym_int64()
@@ -81,7 +85,7 @@ def get_compiled_attention(
         )  # the ragged pool: one page of total_kv (dynamic) tokens
         k_fake = cute.runtime.make_fake_tensor(
             kv_dtype,
-            (D, kv_tok, s_hkv, s_npages),
+            (kv_d, kv_tok, s_hkv, s_npages),
             (
                 1,
                 cute.sym_int64(divisibility=kv_div),
@@ -92,7 +96,7 @@ def get_compiled_attention(
         )
         v_fake = cute.runtime.make_fake_tensor(
             kv_dtype,
-            (D, kv_tok, s_hkv, s_npages),
+            (kv_d, kv_tok, s_hkv, s_npages),
             (
                 1,
                 cute.sym_int64(divisibility=kv_div),
@@ -101,6 +105,27 @@ def get_compiled_attention(
             ),
             assumed_align=16,
         )
+        if fp4:
+            # the NVFP4 block scales: one byte per 16 elements, the cache's geometry, byte loads (no stride constraint)
+            ksf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                (D // 16, kv_tok, s_hkv, s_npages),
+                (1, cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=1,
+            )
+            vsf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                (D // 16, kv_tok, s_hkv, s_npages),
+                (1, cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=1,
+            )
+        else:
+            ksf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8, (cute.sym_int(32),), (1,), assumed_align=1
+            )
+            vsf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8, (cute.sym_int(32),), (1,), assumed_align=1
+            )
         o_fake = cute.runtime.make_fake_tensor(
             bf16,
             (cute.sym_int(32), D),
@@ -133,6 +158,8 @@ def get_compiled_attention(
             q_fake,
             k_fake,
             v_fake,
+            ksf_fake,
+            vsf_fake,
             o_fake,
             ws_fake,
             scratch_fake,

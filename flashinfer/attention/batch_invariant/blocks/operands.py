@@ -164,9 +164,12 @@ class StaticPlan:
         # from global memory, widens them to bf16 exactly and writes the SAME ring bytes the TMA would have written for a bf16 cache
         # holding those values -- the MMAs, the softmax and the correction are the bf16 body's, untouched. One softmax warpgroup, no
         # pairing (the conversion stage takes the second warpgroup's register budget).
+        # "nvfp4": the cache is packed e2m1 nibbles ((D / 2, page, Hkv, num_pages) bytes) with one e4m3 block scale per 16 elements
+        # ((D / 16, page, Hkv, num_pages) bytes); the conversion stage forms the exact products in bf16
         assert kv_fmt in KV_FMTS, kv_fmt
         self.kv_fmt = kv_fmt
         self.lowbit = kv_fmt != "bf16"
+        self.fp4 = kv_fmt == "nvfp4"
         assert not self.lowbit or (n_wg == 1 and not q2), (kv_fmt, n_wg, q2)
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
