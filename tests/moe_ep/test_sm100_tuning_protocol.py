@@ -59,7 +59,8 @@ def test_reference_row_sampling_under_model_default_dtype(
         situ_beta=None,
         situ_linear_beta=None,
     )
-    x = torch.arange(num_tokens * 2, dtype=torch.int64).to(torch.uint8).view(-1, 2)
+    row_ids = torch.arange(num_tokens, dtype=torch.int64)
+    x = torch.stack((row_ids % 256, row_ids // 256), dim=1).to(torch.uint8)
     workspace = SimpleNamespace(
         config=config,
         x=x,
@@ -87,6 +88,11 @@ def test_reference_row_sampling_under_model_default_dtype(
         assert int(indices[0]) == 0
         assert int(indices[-1]) == (num_tokens - 1 if len(indices) > 1 else 0)
         assert bool((indices[1:] > indices[:-1]).all())
+        if len(indices) > 1:
+            # Each index rounds its ideal position down by less than one row.
+            steps = len(indices) - 1
+            for sample, row in enumerate(indices.tolist()):
+                assert row * steps <= sample * (num_tokens - 1) < (row + 1) * steps
     torch.testing.assert_close(expected, x[indices].bfloat16())
 
 
