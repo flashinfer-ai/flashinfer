@@ -325,7 +325,9 @@ def _collect_metadata() -> dict[str, str]:
 
         * ``flashinfer_version``  -- our own bucketing / ordering changes
         * ``cuda_version``        -- CUDA driver/runtime ABI
-        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN
+        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN,
+                                     and the cuBLASLt algorithm descriptors
+                                     the cuBLAS runners use as tactics
         * ``cudnn_version``       -- cuDNN **backend** version
         * ``cudnn_frontend_version`` -- cuDNN-frontend Python wrapper
                                         version (independent of backend);
@@ -911,6 +913,7 @@ def autotune(
     round_up: bool | None = None,
     skip_ops: str | set[str] | None = None,
     cuda_graph_profile_replays: int | None = None,
+    tie_tolerance: float | None = None,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -983,10 +986,20 @@ def autotune(
             operations configured with ``use_cold_l2_cache=True`` flush L2
             before every replay. ``None`` inherits the enclosing context or
             each operation's ``TuningConfig`` value.
+        tie_tolerance: Relative time difference, in ``[0, 1)``, within which
+            tactics count as tied with the fastest. ``0`` (the default) keeps
+            the fastest measured tactic, which can differ from process to
+            process when several measure within timing noise. A positive value
+            re-times the tied tactics enumerated before the fastest (at most
+            four) and keeps the first that stays within the tolerance, so
+            separate processes pick the same tactic more often; the kept
+            tactic can measure up to ``tie_tolerance`` slower. ``None``
+            inherits the enclosing context. Not part of the cache identity.
 
     Raises:
         ValueError: If ``tuning_buckets`` is provided but empty.
         ValueError: If ``cuda_graph_profile_replays`` is less than one.
+        ValueError: If ``tie_tolerance`` is negative or at least one.
 
     .. rubric:: Edge-case behaviour
 
@@ -1048,6 +1061,10 @@ def autotune(
         # Measure every tactic under sustained CUDA graph execution
         with autotune(True, cuda_graph_profile_replays=20):
             model(inputs)
+
+        # Re-time tactics within 0.5% of the fastest so processes agree more often
+        with autotune(True, cache="my_configs.json", tie_tolerance=0.005):
+            model(inputs)
     """
     tuner = AutoTuner.get()
 
@@ -1058,6 +1075,8 @@ def autotune(
         )
     if cuda_graph_profile_replays is not None and cuda_graph_profile_replays < 1:
         raise ValueError("cuda_graph_profile_replays must be at least one")
+    if tie_tolerance is not None and not 0 <= tie_tolerance < 1:
+        raise ValueError("tie_tolerance must be at least 0 and less than 1")
 
     # Load configs from cache file on entry (if it exists).  A file with
     # mismatched metadata is ignored here; whether it may be overwritten on
@@ -1067,6 +1086,7 @@ def autotune(
         with tuner._lock:
             tuner._file_configs.clear()
             tuner._file_config_policies.clear()
+            tuner._file_config_selections.clear()
             tuner._namespaced_records.clear()
             tuner._dirty_namespaces.clear()
             tuner._logged_file_hits.clear()
@@ -1089,6 +1109,7 @@ def autotune(
     current_buckets = override_stack[-1][0] if override_stack else None
     current_round_up = override_stack[-1][1] if override_stack else False
     current_profile_replays = override_stack[-1][2] if override_stack else None
+    current_tie_tolerance = override_stack[-1][3] if override_stack else None
     new_buckets = (
         tuple(sorted(set(tuning_buckets)))
         if tuning_buckets is not None
@@ -1100,13 +1121,19 @@ def autotune(
         if cuda_graph_profile_replays is not None
         else current_profile_replays
     )
+    new_tie_tolerance = (
+        tie_tolerance if tie_tolerance is not None else current_tie_tolerance
+    )
     pushed = (
         tuning_buckets is not None
         or round_up is not None
         or cuda_graph_profile_replays is not None
+        or tie_tolerance is not None
     )
     if pushed:
-        override_stack.append((new_buckets, new_round_up, new_profile_replays))
+        override_stack.append(
+            (new_buckets, new_round_up, new_profile_replays, new_tie_tolerance)
+        )
 
     scope_token = _tuning_scope.set(object())
 
@@ -1727,8 +1754,9 @@ def load_from_file(file_key: str) -> tuple[bool, int, Any, None]:
 # override stack.  First element is the sorted tuple of tuning bucket values
 # (None means "inherit from enclosing context / use default"), second element
 # is the round_up flag that controls whether runtime shapes are rounded up to
-# the nearest bucket, and the third is the optional CUDA graph replay count.
-Override: TypeAlias = tuple[tuple[int, ...] | None, bool, int | None]
+# the nearest bucket, the third is the optional CUDA graph replay count, and
+# the fourth the optional near-tie tolerance, which leaves TuningConfig alone.
+Override: TypeAlias = tuple[tuple[int, ...] | None, bool, int | None, float | None]
 
 # Per-thread stack of Override entries.  The top of the stack (index -1) is
 # the currently active override; inner autotune() contexts push, outer ones pop.
@@ -1784,6 +1812,9 @@ class AutoTuner:
 
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _COLD_CHAIN_SAMPLE_BUDGET_MS = 10.0
+    # Near-tie settling (autotune(tie_tolerance=...)); see _settle_near_ties.
+    _TIE_MAX_CONTENDERS = 4
+    _TIE_CONFIRM_ROUNDS = 2
     _instance = None
     _class_lock = threading.Lock()
 
@@ -1809,6 +1840,8 @@ class AutoTuner:
         # This lets a different profiling policy retune the same workload while
         # keeping the selected tactic reachable after autotune() exits.
         self._profiling_cache_policies: dict[tuple, tuple | None] = {}
+        # How each profiled winner was chosen, keyed and saved like its policy.
+        self._profiling_cache_selections: dict[tuple, dict[str, Any]] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
         # Set after a CUPTI infrastructure failure (e.g. another profiler
@@ -1843,6 +1876,7 @@ class AutoTuner:
         # User-loaded configs from JSON files (populated by load_configs or autotune(cache=))
         self._file_configs: dict[str, tuple[str, Any]] = {}
         self._file_config_policies: dict[str, tuple[Any, ...]] = {}
+        self._file_config_selections: dict[str, dict[str, Any]] = {}
         # Keep disk merges from reviving superseded runners, including when
         # exporting the same cache to more than one path. Reset by clear_cache.
         self._invalidated_file_keys: set[str] = set()
@@ -2026,7 +2060,14 @@ class AutoTuner:
         return new_config
 
     def _tactic_still_valid(
-        self, runner: TunableRunner, inputs, tactic: Any, custom_op: str, source: str
+        self,
+        runner: TunableRunner,
+        inputs,
+        tactic: Any,
+        custom_op: str,
+        source: str,
+        *,
+        validation_profile: OptimizationProfile | None = None,
     ) -> bool:
         """Runner-contract revalidation of a cached (on-disk) tactic.
 
@@ -2035,13 +2076,27 @@ class AutoTuner:
         ``isValidConfig`` pattern).  A tactic that fails it is treated as a
         loud cache miss instead of becoming a silent different kernel or an
         execute-time crash (the "plan rejected at execute, server dead"
-        class).  Runners without the method are trusted as before.
+        class). Runners without a validator are trusted as before.
+
+        During profile reuse, shape-aware runners may instead expose
+        ``validate_tactic_for_profile(inputs, tactic, profile)``. This avoids
+        checking a bucket's tactic against the original caller's row count.
+        Other validators continue receiving the original inputs unchanged.
         """
+        validate_profile = (
+            getattr(runner, "validate_tactic_for_profile", None)
+            if validation_profile is not None
+            else None
+        )
         validate = getattr(runner, "validate_tactic", None)
-        if validate is None:
+        if validate_profile is None and validate is None:
             return True
         try:
-            ok = bool(validate(inputs, tactic))
+            ok = bool(
+                validate_profile(inputs, tactic, validation_profile)
+                if validate_profile is not None
+                else validate(inputs, tactic)
+            )
         except Exception:
             ok = False
         if not ok:
@@ -2166,6 +2221,12 @@ class AutoTuner:
             return stack[-1][2]
         return None
 
+    @property
+    def _tie_tolerance(self) -> float:
+        """Active ``autotune(tie_tolerance=...)``; ``0`` keeps the fastest."""
+        stack = self._get_override_stack()
+        return (stack[-1][3] or 0.0) if stack else 0.0
+
     @classmethod
     def get(cls):
         # Double-checked locking for thread-safe singleton creation
@@ -2220,6 +2281,7 @@ class AutoTuner:
         inputs: list[torch.Tensor] | None = None,
         *,
         require_profiling_policy: bool = False,
+        validation_profile: OptimizationProfile | None = None,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search for cached profiling results matching the current configuration.
 
@@ -2244,20 +2306,20 @@ class AutoTuner:
                 when choose_one can profile and when selecting its resulting winner.
                 Lookup-only callers leave this False, even inside tuning contexts.
                 Legacy v1 policy checks are unchanged.
+            validation_profile: Bucket being reused during profiling. Enables
+                an optional profile-aware validator without synthesizing tensors;
+                runtime lookups leave this unset.
 
         Returns:
             A tuple containing:
             [is_cache_hit, runner_id, tactic, stored_profile]
 
         Note:
-            input_shapes and inputs feed orthogonal paths inside
-            this method: input_shapes flows only into
-            _find_nearest_profile (bucket matching) and inputs
-            flows only into r.get_cache_key_extras(inputs).  Callers
-            may therefore pass them describing different tensor sets
-            (e.g. a profile's opt_shapes alongside the caller's real
-            inputs) so long as get_cache_key_extras is
-            synthesis-invariant; see: TunableRunner.get_cache_key_extras.
+            A profiling lookup may combine a bucket's input_shapes with the
+            caller's original inputs. Cache extras must be synthesis-invariant;
+            see TunableRunner.get_cache_key_extras. validation_profile lets
+            shape-aware validators use the bucket's dimensions while retaining
+            the original tensors for other properties such as workspace capacity.
         """
         with self._lock:
             result = self._search_cache_impl(
@@ -2267,6 +2329,7 @@ class AutoTuner:
                 tuning_config,
                 inputs,
                 require_profiling_policy=require_profiling_policy,
+                validation_profile=validation_profile,
             )
             # In tuning mode a miss means "profile this bucket", so only
             # lookup-only searches fall back to the top tuned bucket. Replay
@@ -2291,6 +2354,7 @@ class AutoTuner:
                 tuning_config,
                 inputs,
                 nearest_profile=top_profile,
+                validation_profile=validation_profile,
             )
             if not top_result[0]:
                 return result
@@ -2317,6 +2381,7 @@ class AutoTuner:
         *,
         require_profiling_policy: bool = False,
         nearest_profile: tuple[tuple[int, ...], ...] | None = None,
+        validation_profile: OptimizationProfile | None = None,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search sources 1-4 of :meth:`search_cache` for one profile.
 
@@ -2361,7 +2426,12 @@ class AutoTuner:
                         continue
                     tactic, stored_profile = winners[cache_key]
                     if not self._tactic_still_valid(
-                        r, inputs, tactic, custom_op, "memory"
+                        r,
+                        inputs,
+                        tactic,
+                        custom_op,
+                        "memory",
+                        validation_profile=validation_profile,
                     ):
                         if (
                             rejections is not None
@@ -2409,7 +2479,12 @@ class AutoTuner:
                                 rejections.append("runner_mismatch")
                             continue
                         if not self._tactic_still_valid(
-                            runners[r_id], inputs, tactic, custom_op, "config file"
+                            runners[r_id],
+                            inputs,
+                            tactic,
+                            custom_op,
+                            "config file",
+                            validation_profile=validation_profile,
                         ):
                             if (
                                 rejections is not None
@@ -2481,7 +2556,12 @@ class AutoTuner:
                             rejections.append("runner_mismatch")
                         continue
                     if not self._tactic_still_valid(
-                        runners[r_id], inputs, tactic, custom_op, "managed cache"
+                        runners[r_id],
+                        inputs,
+                        tactic,
+                        custom_op,
+                        "managed cache",
+                        validation_profile=validation_profile,
                     ):
                         if (
                             rejections is not None
@@ -2530,6 +2610,20 @@ class AutoTuner:
                         continue
                     is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
                     if is_hit:
+                        if not self._tactic_still_valid(
+                            runners[r_id],
+                            inputs,
+                            file_tactic,
+                            custom_op,
+                            "bundled config",
+                            validation_profile=validation_profile,
+                        ):
+                            if (
+                                rejections is not None
+                                and "invalid_tactic" not in rejections
+                            ):
+                                rejections.append("invalid_tactic")
+                            continue
                         if report is not None:
                             report._record(
                                 custom_op,
@@ -3091,6 +3185,7 @@ class AutoTuner:
                         tuning_config,
                         inputs=inputs,
                         require_profiling_policy=True,
+                        validation_profile=p,
                     )
                     selection = (
                         (runner_id, type(runners[runner_id]).__name__, tactic)
@@ -3173,6 +3268,9 @@ class AutoTuner:
                                 leave=True,
                             )
                         min_time = float("inf")
+                        # (time, runner_id, tactic) per candidate in enumeration
+                        # order, for near-tie settling and the selection record.
+                        measured: list[tuple[float, int, Any]] = []
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         runner_id, tactic = None, None
                         skipped_count = 0
@@ -3329,6 +3427,7 @@ class AutoTuner:
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
                                     # or some runtime error occurs during profiling.
                                     time_measured = float("inf")
+                                measured.append((time_measured, r_id, tac))
                                 if time_measured < min_time:
                                     min_time = time_measured
                                     runner_id, tactic = r_id, tac
@@ -3341,6 +3440,19 @@ class AutoTuner:
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
+                            winner = self._settle_near_ties(
+                                measured,
+                                functools.partial(
+                                    self._retime_candidate,
+                                    runners,
+                                    tensors,
+                                    tuning_config,
+                                    prepared_input_batches,
+                                    kwargs,
+                                ),
+                                self._tie_tolerance,
+                            )
+                            _, runner_id, tactic = measured[winner]
                             cache_key = self._get_cache_key(
                                 custom_op,
                                 runners[runner_id],
@@ -3359,7 +3471,13 @@ class AutoTuner:
                                     republish_key=cache_key.file_key,
                                 )
                             self._cache_profile_result(
-                                cache_key, p, tuning_config, tactic
+                                cache_key,
+                                p,
+                                tuning_config,
+                                tactic,
+                                self._selection_record(
+                                    [t for t, _, _ in measured], winner
+                                ),
                             )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
@@ -3433,9 +3551,11 @@ class AutoTuner:
                 winners.pop(key, None)
                 ranked.pop(key, None)
                 self._profiling_cache_policies.pop((identity, key), None)
+                self._profiling_cache_selections.pop((identity, key), None)
                 if identity is None:
                     self._file_configs.pop(key.file_key, None)
                     self._file_config_policies.pop(key.file_key, None)
+                    self._file_config_selections.pop(key.file_key, None)
                     self._invalidated_file_keys.add(key.file_key)
                 else:
                     self._excluded_file_keys.setdefault(identity, set()).add(
@@ -3453,13 +3573,107 @@ class AutoTuner:
             self._dirty = True
             self._dirty_seq += 1
 
+    @staticmethod
+    def _selection_record(times: list[float], winner: int) -> dict[str, Any]:
+        """How the tactic at ``times[winner]`` was chosen, saved with its entry.
+
+        ``runner_up_ms`` is the fastest other candidate's time and ``margin``
+        is ``runner_up_ms / time_ms - 1``, both from the first measurement.
+        When ``tie_tolerance`` kept an earlier-enumerated tactic over a faster
+        one, ``runner_up_ms`` is below ``time_ms`` and ``margin`` is negative.
+        """
+        others = [t for i, t in enumerate(times) if i != winner and t < float("inf")]
+        time_ms = times[winner]
+        runner_up_ms = min(others, default=None)
+        return {
+            "time_ms": round(time_ms, 6),
+            "runner_up_ms": None if runner_up_ms is None else round(runner_up_ms, 6),
+            "margin": (
+                round(runner_up_ms / time_ms - 1.0, 6)
+                if runner_up_ms is not None and time_ms > 0
+                else None
+            ),
+            "candidates": len(others) + 1,
+        }
+
+    def _settle_near_ties(
+        self,
+        measured: list[tuple[float, int, Any]],
+        retime: Callable[[int, Any], float],
+        tolerance: float,
+    ) -> int:
+        """Return the index in ``measured`` of the tactic to keep (#7884).
+
+        ``measured`` holds ``(time_ms, runner_id, tactic)`` per candidate in
+        enumeration order. The candidates within ``tolerance`` of the fastest
+        and enumerated before it (at most ``_TIE_MAX_CONTENDERS``) are re-timed
+        against it in that order, alternating over ``_TIE_CONFIRM_ROUNDS``
+        rounds; the first whose mean stays within ``tolerance`` is kept, else
+        the fastest. Unlike measured order, enumeration order is the same in
+        every process, and all ranks see the same group-reduced times.
+        """
+        inf = float("inf")
+        finite = [i for i, (t, _, _) in enumerate(measured) if t < inf]
+        # min() keeps the first of equal times, as the strict argmin does.
+        fastest = min(finite, key=lambda i: measured[i][0])
+        limit = measured[fastest][0] * (1.0 + tolerance)
+        contenders = [i for i in finite if i < fastest and measured[i][0] <= limit]
+        for i in contenders[: self._TIE_MAX_CONTENDERS]:
+            own: list[float] = []
+            ref: list[float] = []
+            for round_idx in range(self._TIE_CONFIRM_ROUNDS):
+                pair = ((i, own), (fastest, ref))
+                # Alternate the order so drift favours neither of the two.
+                for j, out in pair if round_idx % 2 == 0 else pair[::-1]:
+                    _, runner_id, tactic = measured[j]
+                    out.append(retime(runner_id, tactic))
+            # A failed re-timing is inf, so that contender is not kept.
+            if max(own + ref) < inf and statistics.fmean(own) <= statistics.fmean(
+                ref
+            ) * (1.0 + tolerance):
+                return i
+        return fastest
+
+    def _retime_candidate(
+        self,
+        runners: list[TunableRunner],
+        inputs: list[Any],
+        tuning_config: TuningConfig,
+        input_tensor_batches: list[list[Any]] | None,
+        kwargs: dict[str, Any],
+        runner_id: int,
+        tactic: Any,
+    ) -> float:
+        """Re-time a near-tied candidate; any failure, OOM included, is inf."""
+        try:
+            return self._profile_single_kernel(
+                runners[runner_id],
+                inputs,
+                tactic,
+                tuning_config,
+                input_tensor_batches=input_tensor_batches,
+                **kwargs,
+            )
+        except Exception as e:
+            logger.debug(
+                f"[Autotuner]: Not keeping tactic {runners[runner_id]} {tactic}, "
+                f"which failed while being re-timed: {e}"
+            )
+            with contextlib.suppress(Exception):
+                torch.cuda.synchronize()
+            with contextlib.suppress(Exception):
+                torch.cuda.cudart().cudaGetLastError()
+            return float("inf")
+
     def _cache_profile_result(
-        self, key: ProfilingCacheKey, profile, tuning_config, tactic
+        self, key: ProfilingCacheKey, profile, tuning_config, tactic, selection
     ) -> None:
         """Publish a winner and its provenance through one ownership path."""
         policy = self._profiling_policy(tuning_config)
+        identity = self._winner_cache_identity()
         self._winner_cache()[key] = (tactic, profile)
-        self._profiling_cache_policies[(self._winner_cache_identity(), key)] = policy
+        self._profiling_cache_policies[(identity, key)] = policy
+        self._profiling_cache_selections[(identity, key)] = selection
         self._dirty = True
         self._dirty_seq += 1
         store = self._active_managed_store
@@ -3491,7 +3705,8 @@ class AutoTuner:
         ``k > 1``, every valid tactic is profiled once; the winner is cached
         under the same key as ``choose_one``, and the top ``k`` by measured
         time are returned for callers that need a shortlist (e.g. multi-stage
-        compound-tactic refinement).
+        compound-tactic refinement). With ``k > 1``, ``tie_tolerance`` does not
+        apply: the fastest measured tactic is cached.
         """
         if self.is_tuning_mode and _tune_process_group is not None:
             _check_tuning_group_phase(
@@ -3736,7 +3951,13 @@ class AutoTuner:
                     profile_inputs=tensors,
                     republish_key=cache_key.file_key,
                 )
-            self._cache_profile_result(cache_key, profile, tuning_config, ranked[0])
+            self._cache_profile_result(
+                cache_key,
+                profile,
+                tuning_config,
+                ranked[0],
+                self._selection_record([t for t, _ in scored], 0),
+            )
             ranked_cache[cache_key] = (policy, tuple(ranked))
 
             return ranked[:k]
@@ -4633,6 +4854,8 @@ class AutoTuner:
                 configs[file_key] = [runner_name, _tactic_to_json(tactic)]
                 if file_key in self._file_config_policies:
                     configs[file_key].append(self._file_config_policies[file_key])
+                    if file_key in self._file_config_selections:
+                        configs[file_key].append(self._file_config_selections[file_key])
 
             num_previous = len(configs)
 
@@ -4650,6 +4873,11 @@ class AutoTuner:
                 policy = self._profiling_cache_policies.get((None, cache_key))
                 if policy is not None:
                     configs[file_key].append(policy)
+                    # How the winner was chosen follows its policy, so that
+                    # loaders reading only [runner, tactic, policy] still work.
+                    selection = self._profiling_cache_selections.get((None, cache_key))
+                    if selection is not None:
+                        configs[file_key].append(selection)
 
         current_meta = _collect_metadata()
 
@@ -4908,8 +5136,12 @@ class AutoTuner:
                 # Older records contain only runner and tactic. Do not inherit
                 # provenance from a previously loaded record for the same key.
                 self._file_config_policies.pop(key, None)
+                self._file_config_selections.pop(key, None)
                 if len(value) > 2:
                     self._file_config_policies[key] = tuple(value[2])
+                # Kept only to be saved back; selection never reads it.
+                if len(value) > 3 and isinstance(value[3], dict):
+                    self._file_config_selections[key] = dict(value[3])
 
         if skipped_legacy_cudnn_tactics:
             logger.warning(
@@ -5103,8 +5335,10 @@ class AutoTuner:
             self._ranked_tactics_cache.clear()
             self._ranked_tactics_partitions.clear()
             self._profiling_cache_policies.clear()
+            self._profiling_cache_selections.clear()
             self._file_configs.clear()
             self._file_config_policies.clear()
+            self._file_config_selections.clear()
             self._invalidated_file_keys.clear()
             self._excluded_file_keys.clear()
             self._namespaced_records.clear()

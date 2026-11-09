@@ -1,6 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The Lean coupling of the classes ``gemm.bf16`` and ``gemm.e4m3`` / ``gemm.e5m2`` (``flashinfer/batch_invariant/lean/``).
+"""The Lean coupling of the classes ``gemm.bf16``, ``gemm.e4m3`` / ``gemm.e5m2`` and ``gemm.mxfp8`` (both instructions'
+classes) (``flashinfer/batch_invariant/lean/``).
 
 Device-free (every CI job): the committed ``Cases.lean`` is byte for byte what the Python spec and engine emit, so a
 change to the dataflow, the lowering, a knob constraint or the chunk rule that was not propagated to the Lean cases
@@ -38,7 +39,7 @@ def test_generated_cases_are_current():
         assert f"theorem {name} " in committed
     with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean")) as f:
         axioms = f.read()
-    for name in lean_cases.DECIDED_THEOREMS:
+    for name in lean_cases.DECIDED_THEOREMS + lean_cases.MODULE_DECIDED_THEOREMS:
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
 
 
@@ -109,41 +110,68 @@ def test_lean_model_matches_python_engine_and_spec():
     assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
+    kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
+    for F in lean_cases.FORMATS:
+        kinds[F.tag] = "spec"
+        kinds[F.tag + "loop"] = "loop"
+        kinds[F.tag + "out"] = "out"
+        if F.table is not None:
+            kinds[F.chunk_tag] = "chunks"
     lean = {}
     for line in r.stdout.splitlines():
         tag = line.split(" ", 1)[0]
-        if tag in ("gemm", "gemm32"):
+        kind = kinds.get(tag)
+        if kind == "spec":
             _, steps, C, sx = line.split(" ", 3)
             lean[(tag, int(steps), int(C))] = sx
-        elif tag in ("gemmloop", "gemm32loop"):
+        elif kind == "loop":
             _, nblk, sx = line.split(" ", 2)
             lean[(tag, int(nblk))] = sx
-        elif tag in ("gemmout", "gemm32out"):
+        elif kind == "out":
             _, steps, fmt, sx = line.split(" ", 3)
             lean[(tag, int(steps), fmt)] = sx
-        elif tag in ("chunks", "chunks32"):
+        elif kind == "chunks":
             _, N, K, C = line.split(" ")
             lean[(tag, int(N), int(K))] = int(C)
+        elif kind == "fp4class":
+            _, N, K, b = line.split(" ")
+            lean[("fp4class", int(N), int(K))] = bool(int(b))
+        elif kind == "attn":
+            _, name, sx = line.split(" ", 2)
+            lean[("attn", name)] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
-    # the bf16 class at the mma16 step and the fp8 classes at the mma32 step (one Lean step for e4m3 and e5m2)
-    for in_fmt, p in (("bf16", ""), (lean_cases.FP8_FMT, "32")):
-        mk = MMA_K_OF[in_fmt]
+    # the bf16 class at the mma16 step, the fp8 classes at the mma32 step (one Lean step for e4m3 and e5m2), the MXFP8
+    # classes at the mma32mx / mma64mx8 steps (one chunk rule for both, printed once)
+    for F in lean_cases.FORMATS:
+        in_fmt, mk = F.in_fmt, MMA_K_OF[F.in_fmt]
         for K, C, sx in lean_cases.spec_cases(in_fmt):
-            assert lean[(f"gemm{p}", K // mk, C)] == sx, (in_fmt, K, C)
+            assert lean[(F.tag, K // mk, C)] == sx, (in_fmt, K, C)
             checked += 1
         for nblk, sx in lean_cases.loop_cases(in_fmt)[1]:
-            assert lean[(f"gemm{p}loop", nblk)] == sx, (in_fmt, nblk)
+            assert lean[(F.tag + "loop", nblk)] == sx, (in_fmt, nblk)
             checked += 1
         for K, fmt, sx in lean_cases.out_cases(in_fmt):
-            assert lean[(f"gemm{p}out", K // mk, fmt)] == sx, (in_fmt, K, fmt)
+            assert lean[(F.tag + "out", K // mk, fmt)] == sx, (in_fmt, K, fmt)
             checked += 1
         for N, K, C in lean_cases.chunk_table(in_fmt):
-            assert lean[(f"chunks{p}", N, K)] == C, (in_fmt, N, K)
-            checked += 1
+            assert lean[(F.chunk_tag, N, K)] == C, (in_fmt, N, K)
+            if F.table is not None:
+                checked += 1
+    # the sm_107 NVFP4 class rule
+    for N, K, b in lean_cases.class_table():
+        assert lean[("fp4class", N, K)] == b, (N, K)
+        checked += 1
+    # the biased chain of the bf16 classes
+    for K, C, sx in lean_cases.bias_cases():
+        assert lean[("gemmbias", K // MMA_K, C)] == sx, (K, C)
+        checked += 1
+    for name, *_, sx in lean_cases.attn_cases():
+        assert lean[("attn", name)] == sx, name
+        checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
-    assert checked == len(lean) >= 40
+    assert checked == len(lean) >= 80
 
 
 @needs_lake
@@ -151,6 +179,7 @@ def test_axioms_policy():
     r = _lake("exe", "axioms", timeout=600)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-3000:]
     assert "0 with sorry, 0 violations" in r.stdout, r.stdout
-    assert f"{len(lean_cases.DECIDED_THEOREMS)} named table theorems" in r.stdout, (
-        r.stdout
+    n_decided = len(lean_cases.DECIDED_THEOREMS) + len(
+        lean_cases.MODULE_DECIDED_THEOREMS
     )
+    assert f"{n_decided} named table theorems" in r.stdout, r.stdout

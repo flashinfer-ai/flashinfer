@@ -18,6 +18,7 @@ import functools
 from collections import Counter, OrderedDict
 import logging
 import os
+import struct
 import threading
 import warnings
 import weakref
@@ -204,13 +205,123 @@ def _gemm_workspace_at_least(workspace: torch.Tensor, size: int) -> torch.Tensor
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
 _CUBLASLT_ALGO_BYTES = 64
-# Counts launches where a tuned cuBLASLt tactic did not survive the exact shape and
-# the heuristic default was substituted.  A non-zero count means "reported as tuned,
-# executed untuned" -- benchmarks and tests read it to tell a real tuned hit from a
-# rematerialization.  Keyed by (N, K, compute dtype).
+_CUBLASLT_MAX_ALGOS = 100
+# Counts launches where cuBLASLt rejected the tuned descriptor for the actual
+# problem and the heuristic default ran instead.  A non-zero count means
+# "reported as tuned, executed untuned" -- benchmarks and tests read it to tell
+# a real tuned hit from a rematerialization.  Keyed by descriptor.
 _CUBLASLT_TACTIC_REMATERIALIZED: "Counter[tuple]" = Counter()
 _CUBLASLT_REMATERIALIZE_WARNED: set = set()
-_CUBLASLT_MAX_ALGOS = 100
+_CUBLASLT_ALGO_FORMAT = "8Q"
+_CUBLASLT_ALGO_CACHE_MAX = 256
+
+
+class _CublasltAlgoCache:
+    """Candidate descriptors per bucketed problem, shared by a runner class.
+
+    The runner factories are memoized, so the cache is process-lived: it is
+    bounded (a serving process walks many problems) and locked (runners are
+    shared across threads; a lookup must not race an eviction). Enumeration
+    itself stays outside the lock.
+    """
+
+    def __init__(self, max_entries: int = _CUBLASLT_ALGO_CACHE_MAX):
+        self._entries: "OrderedDict[tuple, List[tuple]]" = OrderedDict()
+        self._lock = threading.Lock()
+        self._max_entries = max_entries
+
+    def get(self, key: tuple) -> Optional[List[tuple]]:
+        with self._lock:
+            cached = self._entries.get(key)
+            if cached is not None:
+                self._entries.move_to_end(key)
+            return cached
+
+    def put(self, key: tuple, tactics: List[tuple]) -> None:
+        with self._lock:
+            self._entries[key] = tactics
+            if len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+def _cublaslt_device_key(device: torch.device) -> tuple:
+    """Device identity for the algo cache: the index and the architecture,
+    so a descriptor enumerated on one GPU is never offered on another."""
+    major, minor = get_compute_capability(device)
+    return (device.index, major, minor)
+
+
+def _cublaslt_algos_to_tactics(algo_buf: torch.Tensor, count: int) -> List[tuple]:
+    """Split ``count`` serialized ``cublasLtMatmulAlgo_t`` into tactics.
+
+    A cuBLASLt tactic is the algorithm descriptor itself, as a tuple of its
+    eight uint64 words. Unlike a position in the heuristic's list, which is
+    ranked per problem, it names the same algorithm at every M and survives
+    the JSON round-trip of the autotune caches.
+    """
+    raw = algo_buf[: count * _CUBLASLT_ALGO_BYTES].numpy().tobytes()
+    return list(struct.iter_unpack(_CUBLASLT_ALGO_FORMAT, raw))
+
+
+def _is_cublaslt_algo_tactic(tactic) -> bool:
+    return (
+        isinstance(tactic, tuple)
+        and len(tactic) == 8
+        and all(isinstance(word, int) and 0 <= word < 1 << 64 for word in tactic)
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _cublaslt_algo_tensor(tactic: tuple) -> torch.Tensor:
+    """The CPU byte buffer the cuBLASLt ``run_with_descriptor`` entry points take."""
+    return torch.frombuffer(
+        bytearray(struct.pack(_CUBLASLT_ALGO_FORMAT, *tactic)), dtype=torch.uint8
+    )
+
+
+def _cublaslt_algo_arg(tactic) -> Optional[torch.Tensor]:
+    """Map a cuBLASLt tactic to the descriptor argument; ``None`` runs the heuristic default."""
+    if tactic == -1:
+        return None
+    if not _is_cublaslt_algo_tactic(tactic):
+        raise ValueError(
+            "cuBLASLt tactics are -1 or a cublasLtMatmulAlgo_t descriptor "
+            f"(a tuple of eight uint64 words), got {tactic!r}."
+        )
+    return _cublaslt_algo_tensor(tactic)
+
+
+def _check_cublaslt_descriptor_ran(used_descriptor: int, tactic) -> None:
+    """Account for a descriptor that did not apply to the problem it was run on.
+
+    During profiling the descriptor is disqualified: raising makes the
+    autotuner record ``inf`` for it instead of timing the heuristic default
+    under its name.  Outside profiling the heuristic default has already run
+    (e.g. the descriptor was tuned at another M of the bucket, or persisted by
+    another cuBLASLt); the launch is counted in
+    ``_CUBLASLT_TACTIC_REMATERIALIZED`` and warned about once per descriptor,
+    so a launch reported as tuned but executed untuned leaves a trace.
+
+    The heuristic default itself (``tactic == -1``) is never a rejected
+    descriptor: the autotuner times it as a candidate of its own (the default
+    races the tuned tactics in ``autotune_v2`` contexts).
+    """
+    if tactic == -1 or used_descriptor:
+        return
+    if is_in_profile_measurement():
+        raise RuntimeError(
+            f"cuBLASLt algorithm {tactic!r} does not apply to the profiled problem."
+        )
+    _CUBLASLT_TACTIC_REMATERIALIZED[tactic] += 1
+    if tactic not in _CUBLASLT_REMATERIALIZE_WARNED:
+        _CUBLASLT_REMATERIALIZE_WARNED.add(tactic)
+        warnings.warn(
+            f"cuBLASLt rejected the tuned algorithm {tactic!r} for this problem; "
+            "the heuristic default ran instead, so this launch is NOT running "
+            "the tuned algorithm.  Tune this shape, or narrow the tuning buckets.",
+            stacklevel=3,
+        )
+
 
 # Error messages
 CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR = "cudnn FP4 GEMM with mxfp4 quantization is not supported on SM120/SM121 with cuDNN backend version < 9.14.0."
@@ -226,54 +337,42 @@ def _match_sm_version(device: torch.device, sm_version: list[str]):
 def get_gemm_module():
     module = gen_gemm_module().build_and_load()
 
+    # Shared by every CublasFp8GemmRunner instance: candidate descriptors per
+    # bucketed problem.
+    algo_cache = _CublasltAlgoCache()
+
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
-            # Same contract as the BF16 cuBLASLt runner: the instance is memoized
-            # (process-lived), so the algo cache is keyed on the exact launch,
-            # device included, bounded, and locked.
-            _ALGO_CACHE_MAX = 256
-
-            def __init__(self):
-                self._algo_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
-                self._algo_cache_lock = threading.Lock()
-
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-                # Must be synthesis-invariant: including a.shape (dynamic M)
-                # makes the runtime key miss the bucketed profile key, so the
-                # tuned tactic is dropped for tactic=-1. Shapes are already in
-                # the autotuner's input_shapes; add only dtypes.
+                # Must be synthesis-invariant: shapes are already in the
+                # autotuner's input_shapes, with M bucketed; add only dtypes.
                 a, b, _, _, out, _ = inputs
                 return (a.dtype, b.dtype, out.dtype)
 
-            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
-                # The algo list is enumerated per exact problem descriptor and
-                # filtered by the workspace size, so a smaller buffer re-queries.
-                a, b, _, _, out, workspace = inputs
-                dev = a.device
-                major, minor = get_compute_capability(dev)
-                return (
-                    dev.index,
-                    major,
-                    minor,
-                    tuple(a.shape),
-                    tuple(b.shape),
-                    tuple(a.stride()),
-                    tuple(b.stride()),
-                    tuple(out.stride()),
+            def validate_tactic(self, inputs: List[torch.Tensor], tactic) -> bool:
+                return tactic == -1 or _is_cublaslt_algo_tactic(tactic)
+
+            def _get_algos(self, inputs) -> List[tuple]:
+                # Enumerate at the bucketed M that keys the tuned tactic, so the
+                # candidates are the same for every M of the bucket.
+                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                bucket_m = AutoTuner.get().get_effective_map_to_tuning_buckets(
+                    _FP8_GEMM_SM100_TUNING_CONFIG
+                )(a.shape[-2])
+                key = (
+                    _cublaslt_device_key(a.device),
+                    a.shape[0],
+                    bucket_m,
+                    b.shape[-1],
+                    a.shape[-1],
                     a.dtype,
                     b.dtype,
                     out.dtype,
-                    workspace.numel() * workspace.element_size(),
+                    workspace_buffer.numel() * workspace_buffer.element_size(),
                 )
-
-            def _get_algos(self, inputs):
-                a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                key = self._algo_cache_key(inputs)
-                with self._algo_cache_lock:
-                    cached = self._algo_cache.get(key)
-                    if cached is not None:
-                        self._algo_cache.move_to_end(key)
-                        return cached
+                cached = algo_cache.get(key)
+                if cached is not None:
+                    return cached
                 algo_buf = torch.empty(
                     _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
                     dtype=torch.uint8,
@@ -287,49 +386,40 @@ def get_gemm_module():
                     scale_b,
                     workspace_buffer,
                     algo_buf,
+                    bucket_m,
                 )
-                result = (algo_buf, count)
-                with self._algo_cache_lock:
-                    self._algo_cache[key] = result
-                    if len(self._algo_cache) > self._ALGO_CACHE_MAX:
-                        self._algo_cache.popitem(last=False)
-                return result
+                tactics = _cublaslt_algos_to_tactics(algo_buf, count)
+                algo_cache.put(key, tactics)
+                return tactics
 
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
-            ) -> List[int]:
-                _, count = self._get_algos(inputs)
-                return list(range(count))
+            ) -> List[tuple]:
+                return self._get_algos(inputs)
 
             def forward(
                 self,
                 inputs: List[torch.Tensor],
-                tactic: int = -1,
+                tactic=-1,
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                # The cuBLASLt algo list is enumerated per-shape, so a tactic
-                # tuned at a different (bucketed) M may be out of range here.
-                # Fall back to the heuristic default (the tactic==-1 path) on an
-                # out-of-range or empty algo list rather than raising.
-                if tactic >= 0:
-                    algo_buf, count = self._get_algos(inputs)
-                    if 0 <= tactic < count:
-                        module.bmm_fp8_run_with_algo(
-                            a,
-                            b,
-                            out,
-                            scale_a,
-                            scale_b,
-                            workspace_buffer,
-                            algo_buf,
-                            tactic,
-                        )
-                        return out
-                module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
+                if tactic == -1:
+                    module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
+                    return out
+                used_descriptor = module.bmm_fp8_run_with_descriptor(
+                    a,
+                    b,
+                    out,
+                    scale_a,
+                    scale_b,
+                    workspace_buffer,
+                    _cublaslt_algo_arg(tactic),
+                )
+                _check_cublaslt_descriptor_ran(used_descriptor, tactic)
                 return out
 
         return CublasFp8GemmRunner()
@@ -739,6 +829,13 @@ def _heuristic_func_mm_bf16(
     return heuristic_backends
 
 
+def _batch_invariant_requested(*args, **kwargs) -> bool:
+    # ``batch_invariant`` is keyword-only in every GEMM API that has it. The batch-invariant class replaces the backends
+    # (it never runs one) and validates every input itself with typed errors, so the backend checks and the auto
+    # heuristic are skipped for it.
+    return bool(kwargs.get("batch_invariant", False))
+
+
 @backend_requirement(
     {
         "cudnn": _cudnn_mm_bf16_requirement,
@@ -751,6 +848,7 @@ def _heuristic_func_mm_bf16(
     },
     common_check=_check_mm_bf16_problem_size,
     heuristic_func=_heuristic_func_mm_bf16,
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_bf16_trace)
 def mm_bf16(
@@ -836,13 +934,17 @@ def mm_bf16(
 
     batch_invariant: bool
         ``True`` runs the batch-invariant bf16 GEMM class in place of the
-        backends (requires ``backend="auto"``, bf16 output and no bias): a
+        backends (requires ``backend="auto"`` and bf16 output): a
         row of the output is bit-identical whatever the number of rows, the
         row's position in the batch or the configuration chosen, and the
         result is deterministic. Under autotuning the class's top
         configurations for the shape are profiled; all of them compute the
         same bits. ``b`` may be the row-major ``(k, n)`` tensor or the
-        transpose of a row-major ``(n, k)`` weight. Unsupported inputs raise
+        transpose of a row-major ``(n, k)`` weight. A bf16 ``bias`` of shape
+        ``(n,)`` is added once, in fp32, to the fully reduced accumulator
+        before the single rounding to bf16 (a biased call is a different
+        specification: ``flashinfer.batch_invariant.fingerprint("mm_bf16", N=,
+        K=, bias=True)``). Unsupported inputs raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
@@ -2276,66 +2378,31 @@ def get_gemm_sm100_module_cutlass_bf16():
 def get_mm_bf16_cublaslt_module():
     module = gen_mm_bf16_cublaslt_module().build_and_load()
 
+    # Shared by every CublasltBf16GemmRunner instance: candidate descriptors
+    # per bucketed problem.
+    algo_cache = _CublasltAlgoCache()
+
     def cublaslt_bf16_gemm_runner():
         class CublasltBf16GemmRunner(TunableRunner):
-            # The algo list cuBLASLt hands back is enumerated per *exact* problem
-            # descriptor, so the artifact cache below is keyed on the exact launch
-            # signature -- device, layout and shapes included.  The AutoTuner key
-            # (get_cache_key_extras) is the semantic one and must stay
-            # synthesis-invariant.  Conflating the two is what made tuned entries
-            # unreachable (#3868) and, once the runner became long-lived, let two
-            # devices share one algo buffer.
-            _ALGO_CACHE_MAX = 256
-
-            def __init__(self):
-                self._algo_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
-                # The memoized runner is shared across threads; a lookup must not
-                # race an eviction.  Enumeration itself stays outside the lock.
-                self._algo_cache_lock = threading.Lock()
-
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
                 # Semantic key: synthesis-invariant.  M/N/K already live in the
-                # AutoTuner's input_shapes; repeating the raw (dynamic) M here
-                # made a bucket-tuned entry unreachable at runtime M, silently
-                # discarding the tuning.  Layout is part of the semantics because
-                # a different stride class is a different problem.
-                a, b, _, _, out, _ = inputs
+                # AutoTuner's input_shapes with M bucketed; repeating the raw
+                # (dynamic) M here made a bucket-tuned entry unreachable at
+                # runtime M, silently discarding the tuning.  Layout is part of
+                # the semantics because a different stride class is a different
+                # problem, and so is the bias alignment class.
+                a, b, bias, _, out, _ = inputs
                 return (
                     a.dtype,
                     b.dtype,
                     self._compute_dtype(out.dtype),
                     a.stride(-1) == 1,
                     b.stride(-2) == 1,
-                )
-
-            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
-                """Exact launch signature for the cuBLASLt algo artifact.
-
-                Device identity is in the key because the runner is memoized and
-                therefore process-lived: without it, an algo enumerated on one
-                GPU would be replayed on another with a different architecture.
-                The workspace size is in it because the heuristic filters algos by
-                it: an algo listed for a larger buffer must not run on a smaller one.
-                """
-                a, b, bias, _, out, workspace = inputs
-                dev = a.device
-                major, minor = get_compute_capability(dev)
-                return (
-                    dev.index,
-                    major,
-                    minor,
-                    tuple(a.shape),
-                    tuple(b.shape),
-                    tuple(a.stride()),
-                    tuple(b.stride()),
-                    tuple(out.stride()),
-                    a.dtype,
-                    b.dtype,
-                    out.dtype,
-                    self._compute_dtype(out.dtype),
                     self._pointer_alignment(bias),
-                    workspace.numel() * workspace.element_size(),
                 )
+
+            def validate_tactic(self, inputs: List[torch.Tensor], tactic) -> bool:
+                return tactic == -1 or _is_cublaslt_algo_tactic(tactic)
 
             @staticmethod
             def _pointer_alignment(tensor):
@@ -2353,15 +2420,26 @@ def get_mm_bf16_cublaslt_module():
                     return torch.float32
                 return out_dtype
 
-            def _get_algos(self, inputs):
+            def _get_algos(self, inputs) -> List[tuple]:
+                # Enumerate at the bucketed M that keys the tuned tactic, so the
+                # candidates are the same for every M of the bucket.
                 a, b, bias, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
-                key = self._algo_cache_key(inputs)
-                with self._algo_cache_lock:
-                    cached = self._algo_cache.get(key)
-                    if cached is not None:
-                        self._algo_cache.move_to_end(key)
-                        return cached
+                bucket_m = AutoTuner.get().get_effective_map_to_tuning_buckets(
+                    _BF16_GEMM_SM100_TUNING_CONFIG
+                )(a.shape[0])
+                key = (
+                    _cublaslt_device_key(a.device),
+                    bucket_m,
+                    b.shape[1],
+                    a.shape[1],
+                    compute_dt,
+                    self._pointer_alignment(bias),
+                    workspace_buffer.numel() * workspace_buffer.element_size(),
+                )
+                cached = algo_cache.get(key)
+                if cached is not None:
+                    return cached
                 algo_buf = torch.empty(
                     _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
                     dtype=torch.uint8,
@@ -2382,33 +2460,28 @@ def get_mm_bf16_cublaslt_module():
                     workspace_buffer,
                     cublas_handle,
                     algo_buf,
+                    bucket_m,
                 )
-                result = (algo_buf, count)
-                with self._algo_cache_lock:
-                    self._algo_cache[key] = result
-                    # Bounded: the runner is process-lived now, and a serving
-                    # process walks many exact M values.  The outer factory
-                    # lru_cache bounds the number of runners, not this.
-                    if len(self._algo_cache) > self._ALGO_CACHE_MAX:
-                        self._algo_cache.popitem(last=False)
-                return result
+                tactics = _cublaslt_algos_to_tactics(algo_buf, count)
+                algo_cache.put(key, tactics)
+                return tactics
 
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
-            ) -> List[int]:
-                _, count = self._get_algos(inputs)
-                return list(range(count))
+            ) -> List[tuple]:
+                return self._get_algos(inputs)
 
             def forward(
                 self,
                 inputs: List[torch.Tensor],
-                tactic: int = -1,
+                tactic=-1,
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, bias, _, out, workspace_buffer = inputs
+                algo_desc = _cublaslt_algo_arg(tactic)
                 with torch.cuda.device(a.device):
                     cublas_handle = torch.cuda.current_blas_handle()
                 b_t = b.transpose(-2, -1)
@@ -2420,48 +2493,16 @@ def get_mm_bf16_cublaslt_module():
                 else:
                     compute_out = out
 
-                algo_buf, count = self._get_algos(inputs)
-                if count == 0:
-                    raise RuntimeError(
-                        "cuBLASLt heuristic returned zero algorithms for "
-                        f"M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
-                        f"dtype={compute_out.dtype}. "
-                        "This shape/dtype combination may not be supported."
-                    )
-                if tactic >= count:
-                    # cuBLASLt enumerates its algo list per *exact* problem, so a
-                    # tactic tuned at a bucketed M can fall off the end here.
-                    # Raising would break serving; silently taking position 0 would
-                    # report an untuned heuristic launch as a tuned hit.  Take the
-                    # heuristic default, but count and warn so the two are
-                    # distinguishable in a profile or a test.
-                    kind = (b.shape[1], a.shape[1], compute_out.dtype)
-                    _CUBLASLT_TACTIC_REMATERIALIZED[kind] += 1
-                    if kind not in _CUBLASLT_REMATERIALIZE_WARNED:
-                        _CUBLASLT_REMATERIALIZE_WARNED.add(kind)
-                        warnings.warn(
-                            f"cuBLASLt tactic {tactic} is out of range at M="
-                            f"{a.shape[0]} (N={b.shape[1]}, K={a.shape[1]}, "
-                            f"dtype={compute_out.dtype}): only {count} algorithms "
-                            "are enumerated for this exact shape.  Falling back to "
-                            "the heuristic default -- this launch is NOT running "
-                            "the tuned algorithm.  Tune this M, or narrow the "
-                            "tuning buckets.",
-                            stacklevel=2,
-                        )
-                    tactic = 0
-                if tactic < 0:
-                    tactic = 0
-                module.mm_bf16_cublaslt_run_with_algo(
+                used_descriptor = module.mm_bf16_cublaslt_run_with_descriptor(
                     a,
                     b_t,
                     bias,
                     compute_out,
                     workspace_buffer,
                     cublas_handle,
-                    algo_buf,
-                    tactic,
+                    algo_desc,
                 )
+                _check_cublaslt_descriptor_ran(used_descriptor, tactic)
                 if need_cast:
                     out.copy_(compute_out)
                 return out
@@ -6648,6 +6689,7 @@ def _check_mm_mxfp8_problem_size(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
+    batch_invariant: bool = False,
 ) -> bool:
     # Generic checks
     ## pre-check the input tensors and block scale tensors
@@ -6767,6 +6809,7 @@ def _cutlass_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",
+    batch_invariant: bool = False,
 ):
     # CUTLASS reads scales as 1D 128x4-swizzled atoms only; all other layouts raise ValueError.
     if is_sm12x_supported(a.device):
@@ -6797,6 +6840,7 @@ def _trtllm_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["trtllm", "auto"] = "auto",
+    batch_invariant: bool = False,
 ):
     if out_dtype != torch.bfloat16:
         return False
@@ -6825,6 +6869,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = True,  # unused
     backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    batch_invariant: bool = False,
 ):
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
     # in F8_128x4 layout for both A and B.
@@ -6847,6 +6892,7 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = False,
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
+    batch_invariant: bool = False,
 ):
     if use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
         if backend != "cutedsl_low_latency":
@@ -6878,6 +6924,7 @@ def _cudnn_mm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cudnn", "auto"] = "cudnn",
+    batch_invariant: bool = False,
 ):
     # The cuDNN MXFP8 GEMM graph consumes block scales reordered in the
     # F8_128x4 swizzled layout, so it requires 1D swizzled (128x4) scales and
@@ -7803,7 +7850,11 @@ def _heuristic_func_mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "auto"] = "auto",
+    batch_invariant: bool = False,
 ) -> List[str]:
+    if batch_invariant:
+        # the batch-invariant class runs in place of the backends: their availability does not decide the call
+        return ["batch_invariant"]
     # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
         order = ["b12x", "cutlass"] + (["cudnn"] if CUDNN_AVAILABLE else [])
@@ -7831,6 +7882,7 @@ def _heuristic_func_mm_mxfp8(
     },
     common_check=_check_mm_mxfp8_problem_size,
     heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_mxfp8_trace)
 def mm_mxfp8(
@@ -7844,6 +7896,8 @@ def mm_mxfp8(
     backend: Literal[
         "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
     ] = "auto",
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
 
@@ -7904,6 +7958,23 @@ def mm_mxfp8(
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
 
+    batch_invariant: bool
+        ``True`` runs the batch-invariant MXFP8 GEMM class in place of the
+        backends (requires ``backend="auto"``, the 128x4 swizzled scale layout
+        and bf16 / fp16 output): a row of the output is bit-identical whatever
+        the number of rows, the row's position in the batch or the
+        configuration chosen, and the result is deterministic. Under autotuning
+        the class's top configurations for the shape are profiled; all of them
+        compute the same bits. ``b`` must be the transpose of a row-major
+        ``(n, k)`` weight (the block-scaled instruction takes K-major operands
+        only). The class is the architecture's (the SM107 instruction folds 64
+        elements per step, the SM100 / SM103 one 32), so the specification is
+        ``flashinfer.batch_invariant.fingerprint("mm_mxfp8", N=, K=, out_dtype=,
+        arch=)``. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
+        Defaults to ``False``.
+
     Returns
     -------
     out: torch.Tensor
@@ -7927,6 +7998,13 @@ def mm_mxfp8(
     >>> out.shape
     torch.Size([512, 256])
     """
+
+    if batch_invariant:
+        from .batch_invariant.tuning import mm_mxfp8_batch_invariant_auto
+
+        return mm_mxfp8_batch_invariant_auto(
+            a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout, backend
+        )
 
     assert a.ndim == 2, f"mm_mxfp8: a must be 2D, got {a.ndim}D with shape {a.shape}"
     assert b.ndim == 2, f"mm_mxfp8: b must be 2D, got {b.ndim}D with shape {b.shape}"
@@ -8318,6 +8396,7 @@ def _check_mm_fp4_problem_size(
     ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     # Generic checks
     ## pre-check the input tensor, block scale tensor and alpha tensor
@@ -8387,6 +8466,7 @@ def _cudnn_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
@@ -8429,6 +8509,7 @@ def _trtllm_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if not use_nvfp4:
         raise ValueError("Only cudnn and auto FP4 GEMM supports mxfp4 quantization.")
@@ -8456,6 +8537,7 @@ def _cutlass_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if use_8x4_sf_layout:
         raise ValueError("Only TRTLLM FP4 GEMM supports 8x4 scale factor layout.")
@@ -8482,6 +8564,7 @@ def _cute_dsl_gemm_fp4_requirement(
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if _match_sm_version(a.device, ["120", "121"]):
         if backend == "auto":
@@ -8541,6 +8624,7 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     if use_8x4_sf_layout:
         if backend != "cutedsl_low_latency":
@@ -8580,6 +8664,7 @@ def _b12x_gemm_fp4_requirement(
     ] = "auto",  # unused
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,  # unused
 ):
     cuda_version = get_cuda_version()
     min_cuda_version = _MIN_B12X_CUDA_VERSION if use_nvfp4 else Version("13.0")
@@ -9826,6 +9911,7 @@ def _heuristic_func_mm_fp4(
     ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
+    batch_invariant: bool = False,
 ):
     r"""
     Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
@@ -9846,6 +9932,9 @@ def _heuristic_func_mm_fp4(
     backend has one too, but it is explicit opt-in only (``backend="cake"``) and
     never auto-selected.
     """
+    if batch_invariant:
+        # the batch-invariant class runs in place of the backends: their availability does not decide the call
+        return ["batch_invariant"]
     if _is_per_token_alpha(alpha):
         return [c for c in ("cute-dsl",) if c in suitable_backends]
 
@@ -10040,6 +10129,7 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     },
     common_check=_check_mm_fp4_problem_size,
     heuristic_func=_heuristic_func_mm_fp4,  # result stored in mm_fp4.suitable_auto_backends
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_fp4_trace)
 def mm_fp4(
@@ -10064,6 +10154,8 @@ def mm_fp4(
     ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -10133,6 +10225,18 @@ def mm_fp4(
         The SM120/SM121 ``"cute-dsl"`` implementation uses ordinary
         stream-ordered launches for either value. This parameter is ignored
         by other backends.
+    batch_invariant: bool
+        ``True`` runs the batch-invariant NVFP4 (``use_nvfp4=True``) or MXFP4
+        GEMM class in place of the backends (requires ``backend="auto"``, the
+        128x4 swizzled scale layout, a scalar ``alpha`` and bf16 / fp16
+        output): a row of the output is bit-identical whatever the number of
+        rows, the row's position in the batch or the configuration chosen, and
+        the result is deterministic. Under autotuning the class is profiled
+        like a backend; any tactic computes the class. The receipt of the
+        specification: ``flashinfer.batch_invariant.fingerprint("mm_fp4", N=,
+        K=, out_dtype=, use_nvfp4=, arch=)``. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
 
     Notes
     -----
@@ -10161,6 +10265,22 @@ def mm_fp4(
     >>> out.shape
     torch.Size([48, 256])
     """
+    if batch_invariant:
+        from .batch_invariant.tuning import mm_fp4_batch_invariant_auto
+
+        return mm_fp4_batch_invariant_auto(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            alpha,
+            out_dtype,
+            out,
+            block_size,
+            use_8x4_sf_layout,
+            backend,
+            use_nvfp4,
+        )
 
     # allocate the output tensor if not provided
     if out is None:
@@ -10443,6 +10563,7 @@ def _heuristic_func_bmm_fp8(
     },
     common_check=_check_bmm_fp8_problem_size,
     heuristic_func=_heuristic_func_bmm_fp8,
+    bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=bmm_fp8_trace)
 def bmm_fp8(
@@ -12348,8 +12469,8 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
 ) -> bool:
     """Admission of the generated Cake programs: exactly the band the Cake dispatcher owns.
 
-    SM100a / SM103a devices with an exported SM count, the eight inventory
-    ``(N, K)`` geometries, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
+    SM100a / SM103a / SM107a devices with an exported SM count, the ``(N, K)``
+    geometries the architecture's route chain owns, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
     operands with float32 ``(1, 128, 128)`` scales (or the native MN-major packed
     UE8M0 int32 scales of the serving routes), int32 ``masked_m`` and a bfloat16
     output.  Every other problem raises through ``backend_requirement``.
@@ -12480,13 +12601,14 @@ def batch_deepgemm_fp8_nt_groupwise(
         (SM100a / SM103a; ``(n, k)`` in ``{(128, 512), (512, 128),
         (4096, 7168), (7168, 2048), (6144, 7168), (7168, 3072), (4096, 4096),
         (4096, 2048)}``; SM107a: the masked BLOCK_N programs, ``(n, k)`` in
-        ``{(128, 512), (512, 128), (4096, 7168), (7168, 2048)}`` with float32
-        scales; bfloat16 output; FP32 accumulation with the same
+        ``{(128, 512), (512, 128), (4096, 7168), (7168, 2048)}``; bfloat16 output; FP32 accumulation with the same
         ordered block-scale application as DeepGEMM) and raises for every other
         problem.  With ``backend="cake"`` the scales may also be the native
         MN-major packed UE8M0 ``torch.int32`` tensors of the serving routes
         (``a_scale`` of shape ``(batch_size, m, k // 512)``, ``b_scale`` of
-        shape ``(batch_size, n, k // 512)``), consumed without conversion.
+        shape ``(batch_size, n, k // 512)``) for ``(n, k)`` in
+        ``{(4096, 7168), (7168, 2048)}`` and ``batch_size`` 32 or 64 on
+        SM100a, SM103a and SM107a, consumed without conversion.
         Every launch of the Cake backend, including the first, may be captured
         into a CUDA graph; see
         :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.prepare_batch_deepgemm_fp8_nt_groupwise`

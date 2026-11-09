@@ -51,12 +51,13 @@ SHIPPED_SLABS = (4, 16, 32, 64)
 # (``test_rows_cover_every_backward_window_edge``) and the training shapes.
 ROWS = (
     1, 2, 3, 4, 5, 6, 7, 8, 20, 21, 25, 26, 31, 32, 33, 63, 64, 65, 87, 88, 109, 110, 121, 122, 127, 128, 129, 152, 153,
-    171, 172, 203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 576, 577, 768, 769, 960, 961, 1023, 1024, 1025,
-    1280, 1281, 1664, 1665, 1680, 1681, 2048, 2049, 3072, 3073, 4096, 4097, 5120, 5121, 6144, 6145, 12288, 12289, 14928,
-    14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968, 19969, 20480, 20481, 24064, 24065, 32768,
-    32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 44032, 44033, 45056, 45057, 48640, 48641, 50688,
-    50689, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921, 99840,
-    99841, 114688, 114689, 139264, 139265, 720896, 720897, 1179648, 1179649, 1572864, 1572865,
+    171, 172, 203, 204, 214, 215, 227, 228, 255, 256, 257, 288, 289, 368, 369, 576, 577, 767, 768, 769, 960, 961, 1023,
+    1024, 1025, 1152, 1153, 1216, 1217, 1280, 1281, 1664, 1665, 1680, 1681, 2047, 2048, 2049, 3072, 3073, 4096, 4097,
+    5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968,
+    19969, 20480, 20481, 22528, 22529, 24064, 24065, 24576, 24577, 32768, 32769, 36352, 36353, 40448, 40449, 40960,
+    40961, 42496, 42497, 44032, 44033, 45056, 45057, 48640, 48641, 50176, 50177, 50688, 50689, 51200, 51201, 52736,
+    52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688,
+    114689, 139264, 139265, 720896, 720897, 1179648, 1179649, 1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -471,6 +472,11 @@ RECUT_FP32_ROUTES: dict[
         (49152, None),
     ),
     ("sm_107a", 5120, "fwd", False): ((49152, None),),
+    # the backward windows where the BF16 route runs a pipelined program that has no FP32-weight build: the
+    # FP32-weight route keeps the programs of its earlier windows there, each with the dw reduce of its window
+    ("sm_100a", 2048, "bwd", False): ((288, 1024), (1024, 16384), (16384, 58880)),
+    ("sm_100a", 6144, "bwd", False): ((256, 4096),),
+    ("sm_103a", 6144, "bwd", False): ((20, 4096),),
 }
 
 
@@ -510,8 +516,8 @@ def _recut_windows(
 def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
     """Every FP32-weight route (``_w32``) is the twin of the BF16 route of its width, kind and residual form: the
     same windows, companions and host plans, the owners' roles carrying ``_w32`` before ``_residual`` -- except the
-    windows ``RECUT_FP32_ROUTES`` names, where the route runs another FP32-weight kernel under its own record; and
-    the BF16 routes alone decide ``supported_hidden_sizes``."""
+    windows ``RECUT_FP32_ROUTES`` names, where the route runs another FP32-weight kernel under its own record (a
+    backward route with the dw reduce of that window); and the BF16 routes alone decide ``supported_hidden_sizes``."""
     routes = loader.ROUTES[arch]
     twins = [route for route in routes if _route_parts(route)[3] == "f32"]
     if not twins:
@@ -537,12 +543,27 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
         base_owners = [
             n for n in routes[base] if loader.MODULES[n]["role"] != REDUCE_ROLE
         ]
-        assert [
-            n for n in routes[route] if loader.MODULES[n]["role"] == REDUCE_ROLE
-        ] == [n for n in routes[base] if loader.MODULES[n]["role"] == REDUCE_ROLE], (
-            arch,
-            route,
-        )
+        reduces = [n for n in routes[route] if loader.MODULES[n]["role"] == REDUCE_ROLE]
+        base_reduces = [
+            n for n in routes[base] if loader.MODULES[n]["role"] == REDUCE_ROLE
+        ]
+        if kind == "bwd" and recut:
+            # every pair window of a re-cut backward route has the dw reduce of that window, the base route's
+            # outside the re-cut windows
+            pairs = [
+                n
+                for n in owners
+                if (loader.MODULES[n].get("workspace_rule") or {}).get("kind")
+                == PAIR_WORKSPACE
+            ]
+            assert [_window(loader.MODULES[n]) for n in reduces] == [
+                _window(loader.MODULES[n]) for n in pairs
+            ], (arch, route)
+            for name in reduces:
+                if _window(loader.MODULES[name]) not in recut:
+                    assert name in base_reduces, (arch, route, name)
+        else:
+            assert reduces == base_reduces, (arch, route)
         base_windows = [_window(loader.MODULES[n]) for n in base_owners]
         assert [_window(loader.MODULES[n]) for n in owners] == _recut_windows(
             base_windows, recut
@@ -588,7 +609,8 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
                 assert twin["role"] == expected_role, (arch, route, mine_name)
                 continue
             # a window of a re-cut route: the twin route's own record, for this architecture alone, with the
-            # BF16 owner's hidden size and workspace and a rows_per_cta grid rule of its own
+            # BF16 owner's hidden size and workspace and a grid rule of its own (rows_per_cta for a forward,
+            # claimed chunks for a backward)
             assert window in recut, (arch, route, mine_name)
             owner = loader.MODULES[
                 next(
@@ -606,7 +628,9 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
                 owner["hidden"],
                 owner["workspace_rule"],
             ), (arch, route, mine_name)
-            assert twin["grid_rule"]["kind"] == "rows_per_cta", (arch, route, mine_name)
+            assert twin["grid_rule"]["kind"] == (
+                "rows_per_cta" if kind == "fwd" else "claimed_chunks"
+            ), (arch, route, mine_name)
             assert twin["role"].startswith(kind) and "_w32" in twin["role"], (
                 arch,
                 route,
@@ -623,8 +647,9 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
 # The SM counts of devices per architecture at or above the guard's: the measured boards (B200 148, GB300 152,
 # R200 212 and 216) and a device of the same architecture with more SMs (GB200 152, a 160-SM GB300).
 BOARD_SMS = {"sm_100a": (148, 152), "sm_103a": (152, 160), "sm_107a": (212, 216)}
-# The accuracy edges: the plain programs of H = 1536 / 2048 / 4096 / 5120 / 6144 -> their block-compensated forms,
-# the H = 256 ring -> the compensated-dot ring (0 on sm_107a: its H = 256 route runs compensated programs only).
+# The accuracy edges: the plain programs of H = 1536 / 2048 / 4096 / 5120 / 6144 and of the residual H = 6144 ->
+# their block-compensated forms, the H = 256 ring -> the compensated-dot ring (0 on sm_107a: its H = 256 route runs
+# compensated programs only).
 ACCURACY_EDGES = {
     "sm_100a": {
         "h1536": 36352,
@@ -633,6 +658,7 @@ ACCURACY_EDGES = {
         "h4096": 44032,
         "h5120": 6144,
         "h6144": 42496,
+        "residual_h6144": 42496,
     },
     "sm_103a": {
         "h1536": 40448,
@@ -641,6 +667,7 @@ ACCURACY_EDGES = {
         "h4096": 48640,
         "h5120": 5120,
         "h6144": 48640,
+        "residual_h6144": 48640,
     },
     "sm_107a": {
         "h1536": 45056,
@@ -649,6 +676,7 @@ ACCURACY_EDGES = {
         "h4096": 24064,
         "h5120": 19968,
         "h6144": 19456,
+        "residual_h6144": 19456,
     },
 }
 
@@ -671,8 +699,8 @@ def _launched_library(arch: str, route: str, rows: int) -> str:
 
 def test_accuracy_guard_names_the_measured_sm_counts_and_edges() -> None:
     """The guard's tables: the smallest measured SM count per architecture and, for the BF16 and FP32-weight
-    backward routes with a compensated program (every one but H = 512 and the residual H = 6144), the edge where the
-    route's compensated programs start."""
+    backward routes with a compensated program (every one but H = 512), the edge where the route's compensated
+    programs start."""
     assert windows.ACCURACY_MIN_SMS == {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}
     assert set(windows.ACCURACY_EDGES) == set(loader.ROUTES)
     for arch, edges in ACCURACY_EDGES.items():
@@ -991,14 +1019,13 @@ def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) 
     else:
         assert sizes[0] > loader.COUNTERS_BYTES
     assert sizes[-1] > loader.COUNTERS_BYTES
-    sms = loader.sm_count(0)
     for name in loader.route_modules(arch, hidden, "bwd", False):
         record = loader.MODULES[name]
         if record.get("workspace_rule") is None:
             continue
         for rows in (1, 129, 16384, 65536):
             layout = loader.workspace_layout(record, rows, device_index=0)
-            slots = int(record["grid_rule"]["ctas_per_sm"]) * sms
+            slots = loader.slot_count(record["grid_rule"], device_index=0)
             assert (
                 layout["counters_offset"] == 0
                 and layout["partial_offset"] == loader.COUNTERS_BYTES

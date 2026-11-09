@@ -617,6 +617,21 @@ def test_trace_apply_does_not_replace_the_class():
 
 
 @needs_device
+def test_public_api_skips_backend_selection(monkeypatch):
+    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
+    for it (host cost only): a selecting call rewrites `bmm_fp8.suitable_auto_backends`, a bypassed one leaves it."""
+    A, B = adv_fp8(2, 16, 4096, seed=131), weights(2, 4096, 4096, 132)
+    sa, sb = scales()
+    sentinel = ["sentinel"]
+    # the wrapper creates the attribute at its first auto selection, so it may not exist yet
+    monkeypatch.setattr(
+        flashinfer.bmm_fp8, "suitable_auto_backends", sentinel, raising=False
+    )
+    bi_bmm(A, B, sa, sb)
+    assert flashinfer.bmm_fp8.suitable_auto_backends is sentinel
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     A, B = adv_fp8(2, 16, 4096, seed=121), weights(2, 4096, 4096, 122)
     sa, sb = scales()
@@ -638,9 +653,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bi_bmm(A, weights(3, 4096, 4096, 126), sa, sb)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="3-D operands"):
         bmm_fp8_batch_invariant(A[0], B[0], sa, sb, torch.bfloat16)
-    with pytest.raises(
-        ValueError
-    ):  # FlashInfer's own output-dtype contract, checked before the flag path
+    # the public API hands batch-invariant calls to the class without running the backend checks: the class's typed
+    # error (a ValueError, as before)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16 output"):
         bi_bmm(A, B, sa, sb, torch.float32)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="out"):
         bi_bmm(
@@ -669,6 +684,15 @@ def test_chunk_count_and_workspace_checks():
     )  # N = 128: the chunk rule splits; b = 3: one workspace reused per element
     A, B = adv_fp8(b, M, K, seed=131), weights(b, N, K, 132)
     sa, sb = scales()
+    # a caller-forced configuration the kernel cannot implement: the 16-wide tile of the 2-CTA pair needs a K-major weight
+    # on kind::f8f6f4 (the only guard is the launch path's, for the unsplit class the batched launch's)
+    A1, B1 = adv_fp8(1, 16, 4096, seed=141), weights(1, 4096, 4096, 142)
+    forced = Knobs((256, 16), (2, 1), True, True, "m", 1)
+    assert not can_implement(forced, 16, 4096, 4096, "n", 1, "e4m3")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
+        bmm_fp8_batch_invariant(
+            A1, B1.contiguous(), sa, sb, torch.bfloat16, config=forced
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
         bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, chunks=0)
     C = chunks_for(N, K, "e4m3")
@@ -722,6 +746,18 @@ def test_chunk_count_and_workspace_checks():
         bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
     ):
         bmm_fp8_batch_invariant(A, B, ws[:1], sb, torch.bfloat16, workspace=ws)
+    big = torch.empty(
+        b * 16 * K // 4, dtype=torch.float32, device="cuda"
+    )  # a workspace holding the (b, 16, K) operand below
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="A overlapping"):
+        bmm_fp8_batch_invariant(
+            big.view(torch.float8_e4m3fn).view(b, 16, K),
+            B,
+            sa,
+            sb,
+            torch.bfloat16,
+            workspace=big,
+        )
     out = ws.view(torch.bfloat16)[: b * M * N].view(b, M, N)
     with pytest.raises(
         bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
