@@ -205,64 +205,68 @@ def moe_cases() -> List[Tuple[str, str, str, bool]]:
         chain(name, s_.gemm1(), f"MoE.actElemT {_UACT[act]} {ul}")
     # the fp8 per-tensor classes (`spec_fp8.py` vs `MoEFp8.lean`): the per-tile alpha from the multipliers, GEMM1's fused
     # e4m3 quantization of every gated and ungated chain, GEMM2's scaled chain, the input quantization
-    alpha1 = 'MoE.alphaOfT (.sym "m_x") (.leaf "mw1" [0])'
+    alpha1 = 'MoEFp8.alphaOfT (.sym "m_x") (.leaf "mw1" [0])'
     for name, act, params in GLU_CASES:
         s_ = M8.Fp8MoESpec(64, 32, 2, 8, act=act, params=params, alg=alg)
         chain(
             f"w8a8_gemm1_{name}",
             s_.gemm1(),
-            f'MoE.gluQuantE4m3T {lean_gact(act, params)} {gl} {ul} ({alpha1}) (.sym "m_inter")',
+            f'MoEFp8.gluQuantE4m3T {lean_gact(act, params)} {gl} {ul} ({alpha1}) (.sym "m_inter")',
         )
     for name, act in (("act_relu2", "relu2"),) + tuple(ACT_CASES):
         s_ = M8.Fp8MoESpec(64, 32, 2, 8, act=act, gated=False, alg=alg)
         chain(
             f"w8a8_gemm1_{name}",
             s_.gemm1(),
-            f'MoE.actQuantE4m3T {_UACT[act]} {ul} ({alpha1}) (.sym "m_inter")',
+            f'MoEFp8.actQuantE4m3T {_UACT[act]} {ul} ({alpha1}) (.sym "m_inter")',
         )
     s8 = M8.Fp8MoESpec(64, 32, 2, 8, alg=alg)
     chain(
         "w8a8_gemm2",
         s8.gemm2(),
-        'MoE.scaledOutT (.leaf "acc2" [0, 0]) (MoE.alphaOfT (.sym "m_inter") (.leaf "mw2" [0]))',
+        'MoEFp8.scaledOutT (.leaf "acc2" [0, 0]) (MoEFp8.alphaOfT (.sym "m_inter") (.leaf "mw2" [0]))',
     )
-    chain("x_quant_e4m3", s8.x_quant(), 'MoE.quantE4m3T (.leaf "x" [0]) (.sym "m_x")')
+    chain(
+        "x_quant_e4m3", s8.x_quant(), 'MoEFp8.quantE4m3T (.leaf "x" [0]) (.sym "m_x")'
+    )
     # the per-token fp8 classes (`spec_fp8.py: pertoken_*` vs `MoEFp8.lean`): the multiplier with the select, the quantization and the
     # scale on it, GEMM1 under the (token x channel) scales of the gate and the up columns for every gated chain and under one scale for
     # the ungated ones, GEMM2 under the (row x channel) scale
     chain(
         "pt_mult",
         M8.pertoken_mult(alg, alg.sym("amax")),
-        'MoE.pertokenMultT (.sym "amax")',
+        'MoEFp8.pertokenMultT (.sym "amax")',
     )
     chain(
         "pt_quant",
         M8.pertoken_quant_elem(alg, x, M8.pertoken_mult(alg, alg.sym("amax"))),
-        'MoE.quantE4m3T (.leaf "x" [0]) (MoE.pertokenMultT (.sym "amax"))',
+        'MoEFp8.quantE4m3T (.leaf "x" [0]) (MoEFp8.pertokenMultT (.sym "amax"))',
     )
     chain(
         "pt_scale",
         M8.pertoken_scale(alg, alg.sym("m")),
-        'MoE.pertokenScaleT (.sym "m")',
+        'MoEFp8.pertokenScaleT (.sym "m")',
     )
     sg_, su_ = (
-        '(MoE.pertokenElemScaleT (.sym "s_x") (.leaf "sw1" [0, 1]))',
-        '(MoE.pertokenElemScaleT (.sym "s_x") (.leaf "sw1" [0, 0]))',
+        '(MoEFp8.pertokenElemScaleT (.sym "s_x") (.leaf "sw1" [0, 1]))',
+        '(MoEFp8.pertokenElemScaleT (.sym "s_x") (.leaf "sw1" [0, 0]))',
     )
     for name, act, params in GLU_CASES:
         s_ = M8.Fp8PerTokenMoESpec(64, 32, 2, 8, act=act, params=params, alg=alg)
         chain(
             f"pt_gemm1_{name}",
             s_.gemm1(),
-            f"MoE.gluScaled2T {lean_gact(act, params)} {gl} {ul} {sg_} {su_}",
+            f"MoEFp8.gluScaled2T {lean_gact(act, params)} {gl} {ul} {sg_} {su_}",
         )
     for name, act in (("act_relu2", "relu2"),) + tuple(ACT_CASES):
         s_ = M8.Fp8PerTokenMoESpec(64, 32, 2, 8, act=act, gated=False, alg=alg)
-        chain(f"pt_gemm1_{name}", s_.gemm1(), f"MoE.actScaledT {_UACT[act]} {ul} {su_}")
+        chain(
+            f"pt_gemm1_{name}", s_.gemm1(), f"MoEFp8.actScaledT {_UACT[act]} {ul} {su_}"
+        )
     chain(
         "pt_gemm2",
         M8.Fp8PerTokenMoESpec(64, 32, 2, 8, alg=alg).gemm2(),
-        'MoE.scaledOutT (.leaf "acc2" [0, 0]) (MoE.pertokenElemScaleT (.leaf "pts2" [0]) (.leaf "sw2" [0, 0]))',
+        'MoEFp8.scaledOutT (.leaf "acc2" [0, 0]) (MoEFp8.pertokenElemScaleT (.leaf "pts2" [0]) (.leaf "sw2" [0, 0]))',
     )
     # the routing weights
     for meth, E, sel in ROUTING_CASES:

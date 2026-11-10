@@ -20,7 +20,9 @@ GEMM folds are the dense fp8 class's (`kfold` at the fp8 step). This module stat
 The theorems state that the fused epilogues are the standalone quantization term applied to the activation value (the fusion
 moves no arithmetic), and that the chains are the bf16 classes' activation terms on alpha-scaled accumulators.
 -/
-namespace BIK.MoE
+namespace BIK.MoEFp8
+
+open BIK.MoE
 
 /-- `spec_fp8.w8a8_alpha`: `alpha_e = mul(s_a, s_w[e])`, the fp8 dense class's alpha, formed on the device per tile. -/
 def w8a8Alpha (sa sw : MTerm) : MTerm := .mul sa sw
@@ -118,7 +120,7 @@ theorem gluScaled2T_same_scale (a : GAct) (g u s : MTerm) : gluScaled2T a g u s 
 /-- GEMM2 of the per-token classes: `cvt_bf16(mul(acc, mul(s_row, s_col)))`. -/
 theorem pertoken_gemm2 (acc sr sc : MTerm) : scaledOutT acc (pertokenElemScaleT sr sc) = .cvt "bf16" (.mul acc (.mul sr sc)) := rfl
 
-end BIK.MoE
+end BIK.MoEFp8
 
 /-! ## The swapped records of the fp8 per-tensor classes
 
@@ -131,7 +133,9 @@ accumulator): the swapped records are placements, and the dispatcher ranks them 
 TMEM layout gives a thread the rows `r` and `r + 8` (the interleaved weight's up / gate pair) instead of lane `+8`: which register
 holds the gate, never the term. The predicate mirrors `blocks/fp8_swap_kernel.is_swapped_record`; the space is the four records. -/
 
-namespace BIK.MoE
+namespace BIK.MoEFp8
+
+open BIK.MoE
 
 /-- A swapped record of the fp8 classes: the swapped 1-CTA record at 128 or 64 weight rows and a token tile of 16 or 32, no cluster,
 swizzle 1, no in-cluster split, no in-CTA chunk fold. -/
@@ -165,7 +169,7 @@ theorem swapped_fp8_space_invariant : ∀ c₁ ∈ swappedSpaceFp8, ∀ c₂ ∈
     GEMM.tileResult c₁ S₁ p a b kb nblk = GEMM.tileResult c₂ S₂ q a b kb nblk :=
   GEMM.space_invariant swappedSpaceFp8
 
-end BIK.MoE
+end BIK.MoEFp8
 
 
 /-! ## The per-token quantizer's row amax (`spec_fp8.pertoken_row_reduction` vs this section)
