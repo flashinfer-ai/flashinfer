@@ -3190,6 +3190,64 @@ def test_sm12x_nvfp4_reads_the_shared_cutile_view(activation):
     _assert_w4a4_close(runner.forward(inputs), reference(act))
 
 
+@pytest.mark.parametrize("num_tokens", (8, 257))
+def test_sm12x_nvfp4_native_layer_on_noncurrent_device(monkeypatch, num_tokens):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    device = torch.device("cuda:1")
+    activation = SwiGLU(limit=7.0)
+    with torch.cuda.device(device):
+        if not _sm12x_nvfp4_bf16_is_supported():
+            pytest.skip("requires an SM12x input device, CUDA 13 and CuTe DSL")
+        view, make_activations, reference = _make_sm12x_nvfp4_case(
+            activation,
+            num_tokens=num_tokens,
+            hidden_size=512,
+            intermediate_size=512,
+            num_experts=4,
+            top_k=2,
+        )
+        weights = MoEWeightPack()
+        weights.prepare_for(SM12xNvfp4Runner.backend_key, view)
+        layer = MoELayer(
+            _sm12x_nvfp4_config(
+                activation,
+                num_experts=4,
+                top_k=2,
+                intermediate_size=512,
+                max_num_tokens=num_tokens,
+            ),
+            device,
+        )
+        act = make_activations(0)
+        expected = reference(act)
+        runner = next(r for r in layer.runners if isinstance(r, SM12xNvfp4Runner))
+        assert runner._requires_native()
+        monkeypatch.setattr(runner._fc1_module, "_COMPILED", {})
+        monkeypatch.setattr(runner._fc2_module, "_COMPILED", {})
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+    other_stream = torch.cuda.Stream(device=0)
+    with torch.cuda.stream(stream), torch.cuda.stream(other_stream):
+        for _ in range(2):
+            assert torch.cuda.current_device() == 0
+            actual = layer(act, weights).clone()
+            assert torch.cuda.current_device() == 0
+            stream.synchronize()
+            _assert_w4a4_close(actual, expected)
+    assert layer.winner_backend == SM12xNvfp4Runner.backend_key
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), torch.cuda.stream(other_stream):
+        actual = layer(act, weights)
+        assert torch.cuda.current_device() == 0
+    with torch.cuda.stream(stream), torch.cuda.stream(other_stream):
+        graph.replay()
+        assert torch.cuda.current_device() == 0
+    stream.synchronize()
+    _assert_w4a4_close(actual, expected)
+
+
 _SM12X_NVFP4_GEOMETRIES = (
     # (case, num_tokens, hidden, intermediate, experts, top_k, activation)
     ("qwen3.8_flash_next_t1", 1, 2560, 640, 512, 10, SwiGLU()),

@@ -2504,8 +2504,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1Decode:
             cute.arch.griddepcontrol_launch_dependents()
 
 
-def _stream():
-    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+def _stream(device):
+    return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
 def make_args(
@@ -2555,7 +2555,7 @@ def make_args(
         from_dlpack(weight_global_scale).mark_layout_dynamic(),
         from_dlpack(input_global_scale).mark_layout_dynamic(),
         from_dlpack(global_scale).mark_layout_dynamic(),
-        _stream(),
+        _stream(a_q.device),
         (
             from_dlpack(token_map, assumed_align=4).mark_layout_dynamic()
             if token_map is not None

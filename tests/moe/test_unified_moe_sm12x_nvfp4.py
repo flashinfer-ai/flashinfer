@@ -3,6 +3,7 @@
 """Native SM12x NVFP4 chain correctness and shared route consumers."""
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -46,6 +47,133 @@ def test_nvfp4_torch_oracle_rounding_and_limit():
     )
     torch.testing.assert_close(actual, expected)
     assert not torch.equal(actual, torch.nn.functional.silu(gate) * linear)
+
+
+@pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")
+@pytest.mark.parametrize("op", ["fc1_act_q1", "fc2_finalize"])
+def test_nvfp4_stream_uses_input_device(monkeypatch, op):
+    module = importlib.import_module(
+        f"flashinfer.fused_moe.cute_dsl.blackwell_sm12x.kernel_moe_fp4_{op}"
+    )
+    requested = []
+
+    def current_stream(device=None):
+        requested.append(device)
+        return SimpleNamespace(cuda_stream=123)
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    monkeypatch.setattr(module.cuda, "CUstream", lambda handle: handle)
+    device = torch.device("cuda:1")
+    assert module._stream(device) == 123
+    assert requested == [device]
+
+
+@pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")
+@pytest.mark.parametrize("gather", [False, True])
+@pytest.mark.parametrize("explicit_tactic", [False, True])
+def test_nvfp4_fc1_tuning_reuses_public_entry(monkeypatch, gather, explicit_tactic):
+    module = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_fp4_fc1_act_q1"
+    )
+    calls = []
+
+    def launch(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(module, "cute_dsl_sm12x_fc1_act_q1_nvfp4", launch)
+    runner = module._Fc1ActQ1Runner(
+        torch.uint8, ActivationType.Swiglu, True, 7.0, 1.5, 0.5
+    )
+    inputs = [object() for _ in range(9 if gather else 8)]
+    out = (object(), object())
+    epi = module.EpiMethod.WG_S2R_QUANT
+    tactic = (64, 128, epi) if explicit_tactic else None
+    assert runner.launch(inputs, out, tactic) is None
+    assert calls == [
+        (
+            tuple(inputs[:8]),
+            dict(
+                out_dtype=torch.uint8,
+                tile=(64, 128, module.PLAIN_TILE_K) if explicit_tactic else None,
+                epi=epi if explicit_tactic else None,
+                tune=False,
+                enable_pdl=True,
+                activation=ActivationType.Swiglu,
+                swiglu_limit=7.0,
+                situ_beta=1.5,
+                situ_linear_beta=0.5,
+                out_q=out[0],
+                out_sf=out[1],
+                token_map=inputs[8] if gather else None,
+            ),
+        )
+    ]
+
+
+@pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")
+@pytest.mark.parametrize("explicit_tactic", [False, True])
+def test_nvfp4_fc2_tuning_reuses_public_entry(monkeypatch, explicit_tactic):
+    module = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_fp4_fc2_finalize"
+    )
+    calls = []
+
+    def launch(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(module, "cute_dsl_sm12x_fc2_finalize_nvfp4", launch)
+    runner = module._Fc2FinalizeRunner(enable_pdl=True)
+    inputs = [object() for _ in range(10)]
+    out = object()
+    tactic = (64, 128, module.DEFAULT_EPI) if explicit_tactic else None
+    assert runner.launch(inputs, out, tactic) is None
+    assert calls == [
+        (
+            tuple(inputs),
+            dict(
+                tile=(64, 128, module.BK) if explicit_tactic else None,
+                epi=module.DEFAULT_EPI,
+                tune=False,
+                enable_pdl=True,
+                out=out,
+            ),
+        )
+    ]
+
+
+@pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")
+@pytest.mark.parametrize("tokens", [8, 257])
+def test_sm12x_nvfp4_native_chain_on_noncurrent_device(monkeypatch, tokens):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    device = torch.device("cuda:1")
+    if not is_sm120a_supported(device):
+        pytest.skip("requires an SM120a input device")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    with torch.cuda.device(device):
+        data = Fixture("qwen30b", tokens, shape_override=(512, 512, 4, 2))
+        monkeypatch.setattr(data.fc1, "_COMPILED", {})
+        monkeypatch.setattr(data.fc2, "_COMPILED", {})
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+    other_stream = torch.cuda.Stream(device=0)
+    with torch.cuda.stream(stream), torch.cuda.stream(other_stream):
+        for _ in range(2):
+            assert torch.cuda.current_device() == 0
+            output = data.native().clone()
+            assert torch.cuda.current_device() == 0
+            stream.synchronize()
+            data.check(output)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream), torch.cuda.stream(other_stream):
+        output = data.native()
+        assert torch.cuda.current_device() == 0
+    with torch.cuda.stream(stream), torch.cuda.stream(other_stream):
+        graph.replay()
+        assert torch.cuda.current_device() == 0
+    stream.synchronize()
+    data.check(output)
 
 
 @pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available")

@@ -285,76 +285,80 @@ def cute_dsl_sm12x_fc2_finalize_nvfp4(
         input_global_scale,
         num_tokens,
     )
-    n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
-    props = torch.cuda.get_device_properties(a_q.device)
-    num_sms, sm_version = props.multi_processor_count, f"sm_{props.major}{props.minor}"
-    inputs = (
-        a_q,
-        a_scale,
-        b_q,
-        b_scale,
-        m_indptr,
-        src_token,
-        pair_scales,
-        weight_global_scale,
-        input_global_scale,
-        num_tokens,
-    )
-    if tile is None and tune is not False:
-        chosen = None
-        if MOE_AUTOTUNE_ENABLED():
-            with autotune():
-                _, tactic = AutoTuner.get().choose_one(
-                    "cute_dsl_sm12x_fc2_finalize_nvfp4",
-                    [_Fc2FinalizeRunner(enable_pdl)],
-                    TuningConfig(),
-                    list(inputs),
-                )
-            if tactic != -1:
-                chosen = tactic
-        if chosen is not None:
-            tile, epi = split_tactic(chosen)
-    if tile is None:
-        tile = select_tile(
-            total_rows=int(a_q.shape[0]),
-            n=n,
-            k=k,
-            num_experts=int(b_q.shape[0]),
-            num_sms=num_sms,
+    with torch.cuda.device(a_q.device):
+        n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
+        props = torch.cuda.get_device_properties(a_q.device)
+        num_sms, sm_version = (
+            props.multi_processor_count,
+            f"sm_{props.major}{props.minor}",
         )
-    op = CuteDslSm120GroupedNvfp4Fc2FinalizeOp(n, k, tuple(tile), epi, enable_pdl)
-    grid_x = op.get_grid_size(int(a_q.shape[0]), int(b_q.shape[0]), num_sms)
-    if out is None:
-        out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
-    if (
-        out.shape != (num_tokens, n)
-        or out.dtype is not torch.bfloat16
-        or out.device != a_q.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError("out does not match the FC2 output contract")
-    offsets = m_indptr.to(torch.int32)
-    worklist, workcount = _prepare_worklist(
-        op, inputs[:-1], out, offsets, worklist, workcount
-    )
-    args = make_args(
-        a_q,
-        a_scale,
-        b_q,
-        b_scale,
-        out,
-        src_token.to(torch.int32),
-        pair_scales.to(torch.float32),
-        offsets,
-        weight_global_scale,
-        input_global_scale,
-        op.cfg.epi,
-        op.cfg.TILE,
-        worklist=worklist,
-        workcount=workcount,
-    )
-    compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
-    return out
+        inputs = (
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            m_indptr,
+            src_token,
+            pair_scales,
+            weight_global_scale,
+            input_global_scale,
+            num_tokens,
+        )
+        if tile is None and tune is not False:
+            chosen = None
+            if MOE_AUTOTUNE_ENABLED():
+                with autotune():
+                    _, tactic = AutoTuner.get().choose_one(
+                        "cute_dsl_sm12x_fc2_finalize_nvfp4",
+                        [_Fc2FinalizeRunner(enable_pdl)],
+                        TuningConfig(),
+                        list(inputs),
+                    )
+                if tactic != -1:
+                    chosen = tactic
+            if chosen is not None:
+                tile, epi = split_tactic(chosen)
+        if tile is None:
+            tile = select_tile(
+                total_rows=int(a_q.shape[0]),
+                n=n,
+                k=k,
+                num_experts=int(b_q.shape[0]),
+                num_sms=num_sms,
+            )
+        op = CuteDslSm120GroupedNvfp4Fc2FinalizeOp(n, k, tuple(tile), epi, enable_pdl)
+        grid_x = op.get_grid_size(int(a_q.shape[0]), int(b_q.shape[0]), num_sms)
+        if out is None:
+            out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
+        if (
+            out.shape != (num_tokens, n)
+            or out.dtype is not torch.bfloat16
+            or out.device != a_q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError("out does not match the FC2 output contract")
+        offsets = m_indptr.to(torch.int32)
+        worklist, workcount = _prepare_worklist(
+            op, inputs[:-1], out, offsets, worklist, workcount
+        )
+        args = make_args(
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            out,
+            src_token.to(torch.int32),
+            pair_scales.to(torch.float32),
+            offsets,
+            weight_global_scale,
+            input_global_scale,
+            op.cfg.epi,
+            op.cfg.TILE,
+            worklist=worklist,
+            workcount=workcount,
+        )
+        compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
+        return out
 
 
 class _Fc2FinalizeRunner(TunableRunner):
@@ -416,58 +420,15 @@ class _Fc2FinalizeRunner(TunableRunner):
         return torch.zeros(num_tokens, n, dtype=self.out_dtype, device=a_q.device)
 
     def launch(self, inputs, out, tactic):
-        (
-            a_q,
-            a_scale,
-            b_q,
-            b_scale,
-            m_indptr,
-            src_token,
-            pair_scales,
-            weight_global_scale,
-            input_global_scale,
-            num_tokens,
-        ) = inputs
-        n, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
-        props = torch.cuda.get_device_properties(a_q.device)
-        num_sms = props.multi_processor_count
-        if tactic is None:
-            tile, epi = (
-                select_tile(
-                    total_rows=int(a_q.shape[0]),
-                    n=n,
-                    k=k,
-                    num_experts=int(b_q.shape[0]),
-                    num_sms=num_sms,
-                ),
-                DEFAULT_EPI,
-            )
-        else:
-            tile, epi = split_tactic(tactic)
-        op = CuteDslSm120GroupedNvfp4Fc2FinalizeOp(
-            n, k, tuple(tile), epi, self.enable_pdl
+        tile, epi = (None, DEFAULT_EPI) if tactic is None else split_tactic(tactic)
+        cute_dsl_sm12x_fc2_finalize_nvfp4(
+            *inputs,
+            tile=tile,
+            epi=epi,
+            tune=False,
+            enable_pdl=self.enable_pdl,
+            out=out,
         )
-        grid_x = op.get_grid_size(int(a_q.shape[0]), int(b_q.shape[0]), num_sms)
-        offsets = m_indptr.to(torch.int32)
-        worklist, workcount = _prepare_worklist(op, inputs[:-1], out, offsets)
-        args = make_args(
-            a_q,
-            a_scale,
-            b_q,
-            b_scale,
-            out,
-            src_token.to(torch.int32),
-            pair_scales.to(torch.float32),
-            offsets,
-            weight_global_scale,
-            input_global_scale,
-            op.cfg.epi,
-            op.cfg.TILE,
-            worklist=worklist,
-            workcount=workcount,
-        )
-        sm_version = "sm_{}{}".format(props.major, props.minor)
-        compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
 
     def get_cache_key_extras(self, inputs):
         (
@@ -489,7 +450,7 @@ class _Fc2FinalizeRunner(TunableRunner):
             int(b_q.shape[2]) * 2,
             int(num_tokens),
             self.enable_pdl,
-            torch.cuda.get_device_capability(),
+            torch.cuda.get_device_capability(a_q.device),
         )
 
 

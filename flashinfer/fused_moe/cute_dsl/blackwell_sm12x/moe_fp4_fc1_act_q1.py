@@ -539,124 +539,127 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
         activation,
         token_map,
     )
-    swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
-    n, k = (
-        int(b_q.shape[1]) // (1 if activation is ActivationType.Relu2 else 2),
-        int(b_q.shape[2]) * 2,
-    )
-    gather = token_map is not None
-    total_rows = token_map.numel() if gather else int(a_q.shape[0])
-    assert not enable_pdl or (out_q is not None and out_sf is not None), (
-        "PDL requires caller-owned out_q and out_sf"
-    )
-    props = torch.cuda.get_device_properties(a_q.device)
-    grid_x = props.multi_processor_count
-    sm_version = f"sm_{props.major}{props.minor}"
-    inputs = (
-        a_q,
-        a_scale,
-        b_q,
-        b_scale,
-        m_indptr,
-        weight_global_scale,
-        input_global_scale,
-        global_scale,
-    )
-    if gather:
-        inputs += (token_map,)
-    if tile is None and tune is not False:
-        chosen = None
-        if MOE_AUTOTUNE_ENABLED():
-            with autotune():
-                _, tactic = AutoTuner.get().choose_one(
-                    "cute_dsl_sm12x_fc1_act_q1_nvfp4",
-                    [
-                        _Fc1ActQ1Runner(
-                            out_dtype,
-                            activation,
-                            enable_pdl,
-                            swiglu_limit,
-                            situ_beta,
-                            situ_linear_beta,
-                        )
-                    ],
-                    TuningConfig(),
-                    list(inputs),
-                )
-            if tactic != -1:
-                chosen = tactic
-        if chosen is not None:
-            tile, epi = split_tactic(chosen)
-    if tile is None:
-        tile = select_tile(
-            total_rows=total_rows,
-            n=n,
-            k=k,
-            num_experts=int(b_q.shape[0]),
-            num_sms=grid_x,
-            activation=activation,
+    with torch.cuda.device(a_q.device):
+        swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
+        n, k = (
+            int(b_q.shape[1]) // (1 if activation is ActivationType.Relu2 else 2),
+            int(b_q.shape[2]) * 2,
         )
-    op = _op(
-        n,
-        k,
-        tuple(tile),
-        out_dtype,
-        activation,
-        epi,
-        enable_pdl,
-        swiglu_limit,
-        situ_beta,
-        situ_linear_beta,
-        gather=gather,
-    )
-    sf_shape = out_sf_shape(total_rows, n, int(b_q.shape[0]))
-    q = (
-        torch.empty(total_rows, n // 2, dtype=torch.uint8, device=a_q.device)
-        if out_q is None
-        else out_q
-    )
-    sf = (
-        torch.zeros(sf_shape, dtype=torch.uint8, device=a_q.device)
-        if out_sf is None
-        else out_sf
-    )
-    if (
-        q.shape != (total_rows, n // 2)
-        or q.dtype != torch.uint8
-        or q.device != a_q.device
-        or not q.is_contiguous()
-    ):
-        raise ValueError("out_q does not match the NVFP4 Q1 output contract")
-    if (
-        sf.shape != sf_shape
-        or sf.dtype != torch.uint8
-        or sf.device != a_q.device
-        or not sf.is_contiguous()
-    ):
-        raise ValueError("out_sf does not match the NVFP4 Q1 scale contract")
-    if q.data_ptr() % 16 != 0 or sf.data_ptr() % 16 != 0:
-        raise ValueError("out_q and out_sf must be 16-byte aligned")
-    worklist, workcount = _prepare_worklist(op, inputs, (q, sf), worklist, workcount)
-    args = make_args(
-        a_q,
-        a_scale,
-        b_q,
-        b_scale,
-        q,
-        sf,
-        m_indptr,
-        weight_global_scale,
-        input_global_scale,
-        global_scale,
-        op.cfg.epi,
-        op.cfg.TILE,
-        token_map=token_map,
-        worklist=worklist,
-        workcount=workcount,
-    )
-    grid_x = op.get_grid_size(total_rows, int(b_q.shape[0]), grid_x)
-    compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
-    return q, sf
+        gather = token_map is not None
+        total_rows = token_map.numel() if gather else int(a_q.shape[0])
+        assert not enable_pdl or (out_q is not None and out_sf is not None), (
+            "PDL requires caller-owned out_q and out_sf"
+        )
+        props = torch.cuda.get_device_properties(a_q.device)
+        grid_x = props.multi_processor_count
+        sm_version = f"sm_{props.major}{props.minor}"
+        inputs = (
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            m_indptr,
+            weight_global_scale,
+            input_global_scale,
+            global_scale,
+        )
+        if gather:
+            inputs += (token_map,)
+        if tile is None and tune is not False:
+            chosen = None
+            if MOE_AUTOTUNE_ENABLED():
+                with autotune():
+                    _, tactic = AutoTuner.get().choose_one(
+                        "cute_dsl_sm12x_fc1_act_q1_nvfp4",
+                        [
+                            _Fc1ActQ1Runner(
+                                out_dtype,
+                                activation,
+                                enable_pdl,
+                                swiglu_limit,
+                                situ_beta,
+                                situ_linear_beta,
+                            )
+                        ],
+                        TuningConfig(),
+                        list(inputs),
+                    )
+                if tactic != -1:
+                    chosen = tactic
+            if chosen is not None:
+                tile, epi = split_tactic(chosen)
+        if tile is None:
+            tile = select_tile(
+                total_rows=total_rows,
+                n=n,
+                k=k,
+                num_experts=int(b_q.shape[0]),
+                num_sms=grid_x,
+                activation=activation,
+            )
+        op = _op(
+            n,
+            k,
+            tuple(tile),
+            out_dtype,
+            activation,
+            epi,
+            enable_pdl,
+            swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
+            gather=gather,
+        )
+        sf_shape = out_sf_shape(total_rows, n, int(b_q.shape[0]))
+        q = (
+            torch.empty(total_rows, n // 2, dtype=torch.uint8, device=a_q.device)
+            if out_q is None
+            else out_q
+        )
+        sf = (
+            torch.zeros(sf_shape, dtype=torch.uint8, device=a_q.device)
+            if out_sf is None
+            else out_sf
+        )
+        if (
+            q.shape != (total_rows, n // 2)
+            or q.dtype != torch.uint8
+            or q.device != a_q.device
+            or not q.is_contiguous()
+        ):
+            raise ValueError("out_q does not match the NVFP4 Q1 output contract")
+        if (
+            sf.shape != sf_shape
+            or sf.dtype != torch.uint8
+            or sf.device != a_q.device
+            or not sf.is_contiguous()
+        ):
+            raise ValueError("out_sf does not match the NVFP4 Q1 scale contract")
+        if q.data_ptr() % 16 != 0 or sf.data_ptr() % 16 != 0:
+            raise ValueError("out_q and out_sf must be 16-byte aligned")
+        worklist, workcount = _prepare_worklist(
+            op, inputs, (q, sf), worklist, workcount
+        )
+        args = make_args(
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            q,
+            sf,
+            m_indptr,
+            weight_global_scale,
+            input_global_scale,
+            global_scale,
+            op.cfg.epi,
+            op.cfg.TILE,
+            token_map=token_map,
+            worklist=worklist,
+            workcount=workcount,
+        )
+        grid_x = op.get_grid_size(total_rows, int(b_q.shape[0]), grid_x)
+        compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
+        return q, sf
 
 
 def cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
@@ -687,139 +690,142 @@ def cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
         raise TypeError("b_q must be 3D uint8-packed FP4")
     experts = int(b_q.shape[0])
     route._validate(x, topk_ids, topk_weights, experts, input_global_scale)
-    if topk_ids.numel() == 0:
-        raise ValueError("topk_ids must contain at least one route")
-    n2, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
-    if int(x.shape[1]) != k:
-        raise ValueError("x and b_q K extents must match")
-    if activation is not ActivationType.Relu2 and n2 % 2:
-        raise ValueError("b_q projection extent must be even")
-    n = n2 // (1 if activation is ActivationType.Relu2 else 2)
-    swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
-    if tile is None:
-        props = torch.cuda.get_device_properties(x.device)
-        tile, gather = select_tactic(
-            total_rows=topk_ids.numel(),
-            n=n,
-            k=k,
-            num_experts=experts,
-            num_sms=props.multi_processor_count,
-            activation=activation,
-        )
-    else:
-        tile = tuple(tile)
-        gather = tile[0] != 128
-    _op(
-        n,
-        k,
-        tuple(tile),
-        torch.uint8,
-        activation,
-        epi,
-        enable_pdl,
-        swiglu_limit,
-        situ_beta,
-        situ_linear_beta,
-        gather=gather,
-    )
-    decode = is_swapab(tile)
-    if enable_pdl and (out_q is None or out_sf is None):
-        raise ValueError("PDL requires caller-owned out_q and out_sf")
-    if workspace is None:
-        if decode:
-            workspace = route.make_nvfp4_route_meta_workspace(
-                topk_ids, experts, tile_m=tile[0]
-            )
-        elif gather:
-            workspace = route.make_nvfp4_route_meta_workspace(topk_ids, experts)
-        else:
-            workspace = route.make_nvfp4_q0_route_workspace(x, topk_ids, experts)
-    if decode and not isinstance(workspace, route.Nvfp4DecodeRouteMetaWorkspace):
-        raise TypeError(
-            "standard-grid FC1 decode requires a worklist metadata workspace"
-        )
-    if gather:
-        if not isinstance(workspace, route.Nvfp4RouteMetaWorkspace) or isinstance(
-            workspace, route.Nvfp4Q0RouteWorkspace
-        ):
-            raise TypeError("gather requires a metadata-only workspace")
-    elif not isinstance(workspace, route.Nvfp4Q0RouteWorkspace):
-        raise TypeError("TMA requires a Q0 route workspace")
-    sources = (
-        x,
-        topk_ids,
-        topk_weights,
-        b_q,
-        b_scale,
-        input_global_scale,
-        weight_global_scale,
-        global_scale,
-        out_q,
-        out_sf,
-    )
-    if any(
-        route._overlaps(value, source)
-        for value in vars(workspace).values()
-        for source in sources
-        if source is not None
-    ):
-        raise ValueError("workspace must not alias an input or Q1 output")
-    if gather:
-        x = x.contiguous()
-        if decode:
-            offsets, token_map, token_weights = route.nvfp4_route_meta_triton(
-                topk_ids, topk_weights, experts, workspace=workspace, tile_m=tile[0]
+    with torch.cuda.device(x.device):
+        if topk_ids.numel() == 0:
+            raise ValueError("topk_ids must contain at least one route")
+        n2, k = int(b_q.shape[1]), int(b_q.shape[2]) * 2
+        if int(x.shape[1]) != k:
+            raise ValueError("x and b_q K extents must match")
+        if activation is not ActivationType.Relu2 and n2 % 2:
+            raise ValueError("b_q projection extent must be even")
+        n = n2 // (1 if activation is ActivationType.Relu2 else 2)
+        swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
+        if tile is None:
+            props = torch.cuda.get_device_properties(x.device)
+            tile, gather = select_tactic(
+                total_rows=topk_ids.numel(),
+                n=n,
+                k=k,
+                num_experts=experts,
+                num_sms=props.multi_processor_count,
+                activation=activation,
             )
         else:
-            offsets, token_map, token_weights = route.nvfp4_route_meta_triton(
-                topk_ids, topk_weights, experts, workspace=workspace
-            )
-        a_q, a_scale = fp4_quantize(
-            x,
-            input_global_scale,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=False,
-            is_sf_8x4_layout=False,
-            is_global_scale_inversed=False,
-            enable_pdl=enable_pdl,
-            backend="cuda",
-            nvfp4_4over6=None,
+            tile = tuple(tile)
+            gather = tile[0] != 128
+        _op(
+            n,
+            k,
+            tuple(tile),
+            torch.uint8,
+            activation,
+            epi,
+            enable_pdl,
+            swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
+            gather=gather,
         )
-    else:
-        offsets, token_map, token_weights, a_q, a_scale = route.nvfp4_q0_route_triton(
+        decode = is_swapab(tile)
+        if enable_pdl and (out_q is None or out_sf is None):
+            raise ValueError("PDL requires caller-owned out_q and out_sf")
+        if workspace is None:
+            if decode:
+                workspace = route.make_nvfp4_route_meta_workspace(
+                    topk_ids, experts, tile_m=tile[0]
+                )
+            elif gather:
+                workspace = route.make_nvfp4_route_meta_workspace(topk_ids, experts)
+            else:
+                workspace = route.make_nvfp4_q0_route_workspace(x, topk_ids, experts)
+        if decode and not isinstance(workspace, route.Nvfp4DecodeRouteMetaWorkspace):
+            raise TypeError(
+                "standard-grid FC1 decode requires a worklist metadata workspace"
+            )
+        if gather:
+            if not isinstance(workspace, route.Nvfp4RouteMetaWorkspace) or isinstance(
+                workspace, route.Nvfp4Q0RouteWorkspace
+            ):
+                raise TypeError("gather requires a metadata-only workspace")
+        elif not isinstance(workspace, route.Nvfp4Q0RouteWorkspace):
+            raise TypeError("TMA requires a Q0 route workspace")
+        sources = (
             x,
             topk_ids,
             topk_weights,
-            experts,
+            b_q,
+            b_scale,
             input_global_scale,
-            workspace=workspace,
-            enable_pdl=enable_pdl,
+            weight_global_scale,
+            global_scale,
+            out_q,
+            out_sf,
         )
-    q, sf = cute_dsl_sm12x_fc1_act_q1_nvfp4(
-        a_q,
-        a_scale,
-        b_q,
-        b_scale,
-        offsets,
-        weight_global_scale,
-        input_global_scale,
-        global_scale,
-        tile=tile,
-        epi=epi,
-        activation=activation,
-        tune=False,
-        enable_pdl=enable_pdl,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        out_q=out_q,
-        out_sf=out_sf,
-        token_map=token_map if gather else None,
-        worklist=workspace.worklist if decode else None,
-        workcount=workspace.workcount if decode else None,
-    )
-    return offsets, token_map, token_weights, q, sf
+        if any(
+            route._overlaps(value, source)
+            for value in vars(workspace).values()
+            for source in sources
+            if source is not None
+        ):
+            raise ValueError("workspace must not alias an input or Q1 output")
+        if gather:
+            x = x.contiguous()
+            if decode:
+                offsets, token_map, token_weights = route.nvfp4_route_meta_triton(
+                    topk_ids, topk_weights, experts, workspace=workspace, tile_m=tile[0]
+                )
+            else:
+                offsets, token_map, token_weights = route.nvfp4_route_meta_triton(
+                    topk_ids, topk_weights, experts, workspace=workspace
+                )
+            a_q, a_scale = fp4_quantize(
+                x,
+                input_global_scale,
+                sf_vec_size=16,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=False,
+                is_sf_8x4_layout=False,
+                is_global_scale_inversed=False,
+                enable_pdl=enable_pdl,
+                backend="cuda",
+                nvfp4_4over6=None,
+            )
+        else:
+            offsets, token_map, token_weights, a_q, a_scale = (
+                route.nvfp4_q0_route_triton(
+                    x,
+                    topk_ids,
+                    topk_weights,
+                    experts,
+                    input_global_scale,
+                    workspace=workspace,
+                    enable_pdl=enable_pdl,
+                )
+            )
+        q, sf = cute_dsl_sm12x_fc1_act_q1_nvfp4(
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            offsets,
+            weight_global_scale,
+            input_global_scale,
+            global_scale,
+            tile=tile,
+            epi=epi,
+            activation=activation,
+            tune=False,
+            enable_pdl=enable_pdl,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            out_q=out_q,
+            out_sf=out_sf,
+            token_map=token_map if gather else None,
+            worklist=workspace.worklist if decode else None,
+            workcount=workspace.workcount if decode else None,
+        )
+        return offsets, token_map, token_weights, q, sf
 
 
 class _Fc1ActQ1Runner(TunableRunner):
@@ -890,72 +896,22 @@ class _Fc1ActQ1Runner(TunableRunner):
         )
 
     def launch(self, inputs, out, tactic):
-        (
-            a_q,
-            a_scale,
-            b_q,
-            b_scale,
-            m_indptr,
-            weight_global_scale,
-            input_global_scale,
-            global_scale,
-        ) = inputs[:8]
-        token_map = inputs[8] if len(inputs) == 9 else None
-        gather = token_map is not None
-        total_rows = token_map.numel() if gather else int(a_q.shape[0])
-        q, sf = out
-        n, k = (
-            int(b_q.shape[1]) // (1 if self.activation is ActivationType.Relu2 else 2),
-            int(b_q.shape[2]) * 2,
+        tile, epi = (None, None) if tactic is None else split_tactic(tactic)
+        cute_dsl_sm12x_fc1_act_q1_nvfp4(
+            *inputs[:8],
+            out_dtype=self.out_dtype,
+            tile=tile,
+            epi=epi,
+            tune=False,
+            enable_pdl=self.enable_pdl,
+            activation=self.activation,
+            swiglu_limit=self.swiglu_limit,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
+            out_q=out[0],
+            out_sf=out[1],
+            token_map=inputs[8] if len(inputs) == 9 else None,
         )
-        props = torch.cuda.get_device_properties(a_q.device)
-        grid_x = props.multi_processor_count
-        epi = None
-        if tactic is None:
-            tile = select_tile(
-                total_rows=total_rows,
-                n=n,
-                k=k,
-                num_experts=int(b_q.shape[0]),
-                num_sms=grid_x,
-                activation=self.activation,
-            )
-        else:
-            tile, epi = split_tactic(tactic)
-        op = _op(
-            n,
-            k,
-            tuple(tile),
-            self.out_dtype,
-            self.activation,
-            epi,
-            self.enable_pdl,
-            self.swiglu_limit,
-            self.situ_beta,
-            self.situ_linear_beta,
-            gather=gather,
-        )
-        worklist, workcount = _prepare_worklist(op, inputs, out)
-        args = make_args(
-            a_q,
-            a_scale,
-            b_q,
-            b_scale,
-            q,
-            sf,
-            m_indptr,
-            weight_global_scale,
-            input_global_scale,
-            global_scale,
-            op.cfg.epi,
-            op.cfg.TILE,
-            token_map=token_map,
-            worklist=worklist,
-            workcount=workcount,
-        )
-        sm_version = f"sm_{props.major}{props.minor}"
-        grid_x = op.get_grid_size(total_rows, int(b_q.shape[0]), grid_x)
-        compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
 
     def get_cache_key_extras(self, inputs):
         a_q, _, b_q, _, _, _, _, _ = inputs[:8]
@@ -973,7 +929,7 @@ class _Fc1ActQ1Runner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
-            torch.cuda.get_device_capability(),
+            torch.cuda.get_device_capability(a_q.device),
         )
 
 

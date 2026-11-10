@@ -9150,56 +9150,57 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
 
     def _forward_native(self, inputs: List[torch.Tensor]) -> None:
         out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2 = inputs
-        workspace, q, sf, fc1_tile, fc2_tile, work = self._native_workspace(x, ids)
-        enable_pdl = self.config.execution.enable_pdl is not False
-        out.zero_()
-        offsets, token_map, route_weights, q, sf = (
-            self._fc1_module.cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
-                x,
-                ids,
-                topk_weights,
-                w1,
-                s1,
-                a1,
-                g1,
-                a2,
-                tile=fc1_tile,
-                workspace=workspace,
-                enable_pdl=enable_pdl,
-                out_q=q,
-                out_sf=sf,
-                **_sm12x_nvfp4_activation_kwargs(self.config.activation),
-            )
-        )
-        work_args = {}
-        if work is not None:
-            worklist, workcount = work
-            if worklist is not getattr(workspace, "worklist", None):
-                self._route_module.build_nvfp4_worklist(
-                    offsets,
-                    worklist,
-                    workcount,
-                    fc2_tile[0],
-                    total_rows=ids.numel(),
+        with torch.cuda.device(x.device):
+            workspace, q, sf, fc1_tile, fc2_tile, work = self._native_workspace(x, ids)
+            enable_pdl = self.config.execution.enable_pdl is not False
+            out.zero_()
+            offsets, token_map, route_weights, q, sf = (
+                self._fc1_module.cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
+                    x,
+                    ids,
+                    topk_weights,
+                    w1,
+                    s1,
+                    a1,
+                    g1,
+                    a2,
+                    tile=fc1_tile,
+                    workspace=workspace,
+                    enable_pdl=enable_pdl,
+                    out_q=q,
+                    out_sf=sf,
+                    **_sm12x_nvfp4_activation_kwargs(self.config.activation),
                 )
-            work_args = dict(worklist=worklist, workcount=workcount)
-        self._fc2_module.cute_dsl_sm12x_fc2_finalize_nvfp4(
-            q,
-            sf,
-            w2,
-            s2,
-            offsets,
-            token_map,
-            route_weights,
-            g2,
-            a2,
-            x.shape[0],
-            tile=fc2_tile,
-            tune=False,
-            enable_pdl=enable_pdl,
-            out=out,
-            **work_args,
-        )
+            )
+            work_args = {}
+            if work is not None:
+                worklist, workcount = work
+                if worklist is not getattr(workspace, "worklist", None):
+                    self._route_module.build_nvfp4_worklist(
+                        offsets,
+                        worklist,
+                        workcount,
+                        fc2_tile[0],
+                        total_rows=ids.numel(),
+                    )
+                work_args = dict(worklist=worklist, workcount=workcount)
+            self._fc2_module.cute_dsl_sm12x_fc2_finalize_nvfp4(
+                q,
+                sf,
+                w2,
+                s2,
+                offsets,
+                token_map,
+                route_weights,
+                g2,
+                a2,
+                x.shape[0],
+                tile=fc2_tile,
+                tune=False,
+                enable_pdl=enable_pdl,
+                out=out,
+                **work_args,
+            )
 
     def _activation_global_scale(
         self, view: dict[str, torch.Tensor], key: str

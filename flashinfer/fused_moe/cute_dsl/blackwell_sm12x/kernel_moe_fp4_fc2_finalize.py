@@ -1240,8 +1240,8 @@ class CuteDslSm120MoeNvfp4Fc2FinalizeDecode:
             )
 
 
-def _stream():
-    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+def _stream(device):
+    return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
 def make_args(
@@ -1287,7 +1287,7 @@ def make_args(
         from_dlpack(m_indptr).mark_layout_dynamic(),
         from_dlpack(weight_global_scale).mark_layout_dynamic(),
         from_dlpack(input_global_scale).mark_layout_dynamic(),
-        _stream(),
+        _stream(a_q.device),
     )
     if worklist is not None:
         args += (
