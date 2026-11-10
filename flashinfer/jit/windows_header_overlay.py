@@ -37,7 +37,7 @@ def get_windows_header_overlay(
     )
     for header in headers:
         source = source_root / header
-        content = source.read_text()
+        content = source.read_bytes().decode("utf-8")
         if header == _PATCHED_HEADER:
             old_count = content.count(_OLD_DECLARATION)
             new_count = content.count(_NEW_DECLARATION)

@@ -390,15 +390,18 @@ def build_common_cuda_flags(common_cflags: List[str]) -> List[str]:
     """Common flags for nvcc; on Windows the MSVC host compiler needs its own set."""
     if not is_windows:
         return list(common_cflags)
-    # The first common flag (Py_LIMITED_API) is dropped for nvcc on Windows, as in the
-    # Windows port; the MSVC conformance switches are passed through -Xcompiler.
+    # The Py_LIMITED_API define is dropped for nvcc on Windows, as in the Windows
+    # port. The filter matches the flag by value: build_common_cflags emits the
+    # define only when Py_GIL_DISABLED is unset, so on a free-threaded Python the
+    # first entry is an include flag that nvcc must keep. The MSVC conformance
+    # switches are passed through -Xcompiler.
     return [
         "-DTORCH_EXTENSION_NAME=$name",
         "--std=c++20",
         "-Xcompiler /Zc:__cplusplus",
         "-Xcompiler /Zc:preprocessor",
         "-Xcompiler=/bigobj",
-    ] + list(common_cflags[1:])
+    ] + [flag for flag in common_cflags if not flag.startswith("-DPy_LIMITED_API")]
 
 
 def build_cuda_cflags(
