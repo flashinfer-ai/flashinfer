@@ -518,6 +518,13 @@ LOG_COEFFS = (
 LOG_LN2_HI = 0.693359375
 LOG_LN2_LO = -2.12194440e-4
 HUGE = 1.2676506002282294e30  # 2^100: scales a sign or a positive part into a clamp's saturation range (exact)
+# The declared log's subnormal step: a positive x below the smallest normal is scaled by 2^24 (exact) before the bit split
+# and the exponent takes the 24 back; the select is the same clamp form as the recentring, applied twice to reach 1.
+LOG_MIN_NORMAL = 2.0**-126
+LOG_SUB_SCALE = (
+    2.0**24 - 1.0
+)  # add(1, mul(sub, .)) is 2^24 for a subnormal x and 1 otherwise, both exact
+LOG_SUB_EXP = -24.0
 
 #: The gated chains on the (gate, up) accumulator pair and the ungated chains on one accumulator; FlashInfer's
 #: ``ActivationConfig`` scalars are the ``params`` of a chain (binary32 constants of the term: class dimensions).
@@ -576,11 +583,24 @@ def gelu_term(fp: Any, x: Any) -> Any:
 def log_term(fp: Any, x: Any) -> Any:
     """The declared natural log of a positive ``x`` (Cephes logf): ``x = m 2^e`` with ``m`` in [1/2, 1) (``frexpm`` /
     ``frexpe``, exact bit operations), recentred by the exact select ``lt = clamp((sqrt(1/2) - m) 2^100, 0, 1)`` into
-    ``z = m + lt m - 1``, ``e' = e - lt``; ``z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi``. On a positive subnormal
-    ``x`` the split is the raw fields (``frexpm`` / ``frexpe`` do not renormalise), so the chain's value there is the
-    declared term's, not the natural log's; the PowLU chain clamps it by ``gp 2^100``."""
-    m = fp.frexpm(x)
-    ex = fp.frexpe(x)
+    ``z = m + lt m - 1``, ``e' = e - lt``; ``z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi``. ``frexpm`` / ``frexpe``
+    read the raw fields, so a positive subnormal ``x`` is first scaled into the normal range by the exact select
+    ``sub = clamp((2^-126 - x) 2^100 2^100, 0, 1)``: ``x' = mul(x, add(1, mul(sub, 2^24 - 1)))`` (``x 2^24``, exact)
+    and the exponent takes ``mul(sub, -24)`` back; the split is then the normalised mantissa and exponent of every
+    positive ``x`` (at ``x = 0`` the PowLU chain's clamp ``gp 2^100`` zeroes the branch whatever the log's value)."""
+    sub = fp.fmax(
+        fp.fmin(
+            fp.mul(
+                fp.mul(fp.add(fp.const(LOG_MIN_NORMAL), fp.neg(x)), fp.const(HUGE)),
+                fp.const(HUGE),
+            ),
+            fp.const(1.0),
+        ),
+        fp.const(0.0),
+    )
+    xn = fp.mul(x, fp.add(fp.const(1.0), fp.mul(sub, fp.const(LOG_SUB_SCALE))))
+    m = fp.frexpm(xn)
+    ex = fp.add(fp.frexpe(xn), fp.mul(sub, fp.const(LOG_SUB_EXP)))
     lt = fp.fmax(
         fp.fmin(
             fp.mul(fp.add(fp.const(LOG_SQRTHF), fp.neg(m)), fp.const(HUGE)),

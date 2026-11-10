@@ -166,12 +166,16 @@ def logCoeffsTail : List String :=
 range. -/
 def hugeC : String := "1.2676506002282294e+30"
 
-/-- The declared natural log of a positive `x` (`spec.log_term`, Cephes logf): `x = m 2^e` through the exact `frexpm` /
-`frexpe`, the exact select `lt = clamp((sqrt(1/2) - m) 2^100, 0, 1)` recentres `m` into `z = m + lt m - 1` and
-`e' = e - lt`; `z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi`. -/
+/-- The declared natural log of a positive `x` (`spec.log_term`, Cephes logf): a positive subnormal `x` is first scaled
+into the normal range by the exact select `sub = clamp((2^-126 - x) 2^100 2^100, 0, 1)` (`x' = mul(x, add(1, mul(sub,
+2^24 - 1)))`, the exponent takes `mul(sub, -24)` back), then `x' = m 2^e` through the exact `frexpm` / `frexpe`, the
+exact select `lt = clamp((sqrt(1/2) - m) 2^100, 0, 1)` recentres `m` into `z = m + lt m - 1` and `e' = e - lt`;
+`z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi`. -/
 def logT (x : MTerm) : MTerm :=
-  let m := MTerm.frexpm x
-  let ex := MTerm.frexpe x
+  let sub := MTerm.fmax (.fmin (.mul (.mul (.add (c "1.1754943508222875e-38") (.neg x)) (c hugeC)) (c hugeC)) (c "1.0")) (c "0.0")
+  let xn := MTerm.mul x (.add (c "1.0") (.mul sub (c "16777215.0")))
+  let m := MTerm.frexpm xn
+  let ex := MTerm.add (.frexpe xn) (.mul sub (c "-24.0"))
   let lt := MTerm.fmax (.fmin (.mul (.add (c "0.7071067690849304") (.neg m)) (c hugeC)) (c "1.0")) (c "0.0")
   let z := MTerm.add (.add m (.mul lt m)) (c "-1.0")
   let ex := MTerm.add ex (.neg lt)
