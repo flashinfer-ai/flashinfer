@@ -833,6 +833,63 @@ def test_routing_method_map_matches_the_spec():
     ] == S.SIGMOID_BIAS_RENORM_SCALED.with_groups(4, 2)
 
 
+def test_launch_tile_bound_dominates_the_scheduler_total():
+    """The persistent grid's clip: the static bound on a launch's cluster tiles is at least the scheduler's total -- the sum
+    over experts of ceil(count / cluster rows), times the N tiles -- for every record of both spaces over random count vectors
+    (empty experts, one-row experts, one expert holding everything), and it is tight at one row per active expert."""
+    import random
+
+    from flashinfer.fused_moe.batch_invariant.schedule import (
+        grouped_knobs,
+        launch_tile_bound,
+        swapped_knobs,
+    )
+
+    rng = random.Random(3)
+    records = grouped_knobs() + swapped_knobs()
+    for E, Tk, N in [
+        (8, 2, 4096),
+        (128, 8, 1536),
+        (128, 128, 1536),
+        (256, 2048, 7168),
+        (64, 64, 512),
+        (1024, 4096, 768),
+    ]:
+        vectors = [[Tk] + [0] * (E - 1), [1] * min(E, Tk) + [0] * max(0, E - Tk)]
+        if Tk >= E:
+            vectors[1] = [Tk // E + (1 if i < Tk % E else 0) for i in range(E)]
+        for _ in range(6):
+            cuts = sorted(rng.randrange(Tk + 1) for _ in range(E - 1))
+            vectors.append([b - a for a, b in zip([0] + cuts, cuts + [Tk])])
+        for cfg in records:
+            if cfg.swap_ab:
+                cluster_rows, tn, cn = cfg.tile_n, cfg.mma_tiler_mn[0], 1
+            else:
+                cta_m = cfg.mma_tiler_mn[0] // (2 if cfg.use_2cta_instrs else 1)
+                cluster_rows, tn, cn = (
+                    cta_m * cfg.cluster_shape_mn[0],
+                    cfg.mma_tiler_mn[1],
+                    cfg.cluster_shape_mn[1],
+                )
+            n_tiles = -(-N // (tn * cn))
+            bound = launch_tile_bound(cfg, Tk, E, N)
+            for counts in vectors:
+                assert sum(counts) == Tk
+                total = sum(-(-c // cluster_rows) for c in counts) * n_tiles
+                assert total <= bound, (
+                    cfg.describe(),
+                    E,
+                    Tk,
+                    N,
+                    counts[:8],
+                    total,
+                    bound,
+                )
+            if Tk <= E:
+                assert bound == Tk * n_tiles, (cfg.describe(), E, Tk, N, bound)
+        assert launch_tile_bound(records[0], 0, E, N) == 1
+
+
 @pytest.mark.parametrize(
     "family,sm_count",
     [("sm_107", 212), ("sm_107", 204), ("sm_100", 148), ("sm_103", 152)],

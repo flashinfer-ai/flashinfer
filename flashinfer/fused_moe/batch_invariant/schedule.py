@@ -47,6 +47,26 @@ def active_experts(T: int, k: int, E: int) -> int:
     return max(1, min(E, T * k))
 
 
+def launch_tile_bound(config: Knobs, Tk: int, E: int, N: int) -> int:
+    """An upper bound on a grouped launch's cluster tiles from the static sizes alone (no device read, so a graph node's
+    grid): every active expert contributes at least one row tile and the rows past one per expert add at most one tile per
+    cluster rows -- ``min(E, Tk) + (Tk - min(E, Tk)) // cluster_rows`` row tiles, times the N tiles. The persistent grid is
+    clipped to it: which CTA computes a tile, never the bits (the scheduler strides by the grid); a swapped record's cluster
+    rows are its token tile, its N tiles the weight tiles."""
+    if config.swap_ab:
+        cluster_rows, tn, cn = config.tile_n, config.mma_tiler_mn[0], 1
+    else:
+        cta_m = config.mma_tiler_mn[0] // (2 if config.use_2cta_instrs else 1)
+        cluster_rows, tn, cn = (
+            cta_m * config.cluster_shape_mn[0],
+            config.mma_tiler_mn[1],
+            config.cluster_shape_mn[1],
+        )
+    act = min(E, Tk)
+    row_tiles = act + (Tk - act) // cluster_rows
+    return max(1, row_tiles * -(-N // (tn * cn)))
+
+
 def rows_per_expert(T: int, k: int, E: int) -> int:
     """The dispatcher's size proxy: average rows per active expert."""
     return max(1, -(-(T * k) // active_experts(T, k, E)))

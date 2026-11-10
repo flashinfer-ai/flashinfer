@@ -192,6 +192,7 @@ def grouped_gemm(
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     Tk: Optional[int] = None,
+    grid: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` for the expert segments ``counts`` (int32 ``[E]``, group order = expert order;
     rows ``[off_e, off_e + counts[e])`` of ``a`` belong to expert ``e``). ``a [R >= Tk, K]`` bf16 row-major, ``w [E, N, K]``
@@ -203,6 +204,7 @@ def grouped_gemm(
     swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
     launch argument: the device's co-resident cluster capacity for the record's cluster size."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .schedule import launch_tile_bound
 
     if (
         a.dtype != torch.bfloat16
@@ -265,12 +267,17 @@ def grouped_gemm(
         a = a[
             :Tk
         ]  # the grouped body's A has the output's rows (one symbol); the swapped body's R is free
+    if grid is None:
+        # the persistent grid clipped to the launch's tile bound (a placement: which CTA computes a tile)
+        grid = min(
+            persistent_clusters(a.device, config), launch_tile_bound(config, Tk, E, N)
+        )
     kernel(
         a.unsqueeze(-1),
         w.permute(1, 2, 0),
         out,
         counts,
-        persistent_clusters(a.device, config),
+        grid,
     )
     return out
 
@@ -286,6 +293,7 @@ def grouped_gemm_gather(
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     Tk: Optional[int] = None,
+    grid: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(x[src[p] // k_div] @ w[e(p)].T)`` for the expert segments ``counts``: :func:`grouped_gemm` on a
     swapped record with the rows gathered by the kernel (the TMA's gather4 mode) from the unpermuted ``x [T, K]`` bf16 -- no
@@ -293,6 +301,7 @@ def grouped_gemm_gather(
     as :func:`grouped_gemm` on the materialised permutation (the stage holds the same bytes, the fold is the same). The
     gather form belongs to the swapped records (a dense record raises)."""
     from .blocks.compile import get_compiled_swapped
+    from .schedule import launch_tile_bound
 
     if (
         x.dtype != torch.bfloat16
@@ -357,6 +366,10 @@ def grouped_gemm_gather(
     kernel = get_compiled_swapped(config, chain, gather=True)
     if Tk == 0:
         return out
+    if grid is None:
+        grid = min(
+            persistent_clusters(x.device, config), launch_tile_bound(config, Tk, E, N)
+        )
     kernel(
         x,
         src,
@@ -364,7 +377,7 @@ def grouped_gemm_gather(
         w.permute(1, 2, 0),
         out,
         counts,
-        persistent_clusters(x.device, config),
+        grid,
     )
     return out
 
@@ -598,6 +611,7 @@ def fused_moe(
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     finalize: bool = True,
     gather: Optional[bool] = None,
+    grid_clip: bool = True,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
@@ -609,7 +623,8 @@ def fused_moe(
     the rows are the class's own intermediates, a function of the token, its expert and the routing alone). ``gather``:
     whether GEMM1 gathers the tokens' rows itself (the swapped body's gather form: no gather launch, no permuted tensor;
     ``x_perm`` of the intermediates is then None) -- by default exactly when GEMM1's record is a swapped one, a placement
-    with the same bits either way; ``True`` on a dense record raises."""
+    with the same bits either way; ``True`` on a dense record raises. ``grid_clip``: the GEMMs' persistent grids clipped to
+    the launch's tile bound (the default), or the device's capacity (a placement either way)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
@@ -658,13 +673,15 @@ def fused_moe(
     pad1 = config1.tile_n if config1.swap_ab else 0
     pad2 = config2.tile_n if config2.swap_ab else 0
     a_buf = torch.empty(Tk + pad2, I, dtype=torch.bfloat16, device=x.device)
+    g1 = None if grid_clip else persistent_clusters(x.device, config1)
+    g2 = None if grid_clip else persistent_clusters(x.device, config2)
     if gather is None:
         gather = bool(config1.swap_ab)
     if gather:
         # the swapped GEMM1 gathers the tokens' rows itself through the plan's slots: no gather launch, no permuted tensor
         x_perm = None
         a = grouped_gemm_gather(
-            x, src, k, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk
+            x, src, k, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
         )  # [Tk, I] bf16
     else:
         x_buf = torch.empty(Tk + pad1, H, dtype=torch.bfloat16, device=x.device)
@@ -674,10 +691,10 @@ def fused_moe(
                 k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
             )(x, src, x_perm, Tk, H)
         a = grouped_gemm(
-            x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk
+            x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
         )  # [Tk, I] bf16
     y = grouped_gemm(
-        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk
+        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk, grid=g2
     )  # [Tk, H] bf16
     if finalize and T:
         get_compiled_combine(
