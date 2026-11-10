@@ -283,20 +283,21 @@ its split tail became ordered.
 Features by architecture
 ------------------------
 
-================================================== =============== =============== ===============
-feature                                            sm_100a         sm_103a         sm_107a
-================================================== =============== =============== ===============
-``fwd`` / ``dgrad`` 256- and 512-column tiles      domain schedule domain schedule static schedule
-``fwd`` evict-first / 3-3 head-tail twin           yes / --        yes / yes       yes / --
-``dgrad`` evict-first / 3-3 head-tail twin         yes / --        -- / yes        yes / --
-``dgrad`` probed queue split                       yes             yes             --
-``wgrad`` 256-wide k tile, two-launch tail reduce  yes             yes             yes
-``wgrad`` 512-wide k tile, ordered one-launch tail yes             yes             yes
-``wgrad`` 512 wave-synchronised builds             yes             yes             --
-``wgrad`` 512 half-release builds                  planned, slack  planned, slack  planned, slack
-``wgrad`` 512 k256-tail twin                       --              --              slack tail
-``wgrad`` output dtypes                            bf16, fp32      bf16, fp32      bf16, fp32
-``wgrad`` accumulate, fused, fp32 ``out``          planned, wave   planned, wave   planned, k256t
-CUDA toolkit floor                                 12.8            12.9            13.4
-CUDA toolkit floor, fp32 accumulate builds         13.4            13.4            13.4
-================================================== =============== =============== ===============
+================================================== ====================== ====================== ======================
+feature                                            sm_100a                sm_103a                sm_107a
+================================================== ====================== ====================== ======================
+``fwd`` / ``dgrad`` 256- and 512-column tiles      domain schedule        domain schedule        static schedule
+``fwd`` evict-first / 3-3 head-tail twin           yes / --               yes / yes              yes / --
+``dgrad`` evict-first / 3-3 head-tail twin         yes / --               -- / yes               yes / --
+``dgrad`` probed queue split                       yes                    yes                    --
+``wgrad`` 256-wide k tile, two-launch tail reduce  yes                    yes                    yes
+``wgrad`` 512-wide k tile, ordered one-launch tail yes                    yes                    yes
+``wgrad`` 512 wave-synchronised builds             yes                    yes                    --
+``wgrad`` 512 half-release builds                  planned, slack         planned, slack         planned, slack
+``wgrad`` 512 k256-tail twin                       --                     --                     slack tail
+``wgrad`` 512 queue-walk builds                    planned tail           planned tail           --
+``wgrad`` output dtypes                            bf16, fp32             bf16, fp32             bf16, fp32
+``wgrad`` accumulate, fused, fp32 ``out``          planned, wave, queue   planned, wave, queue   planned, k256t
+CUDA toolkit floor                                 12.8                   12.9                   13.4
+CUDA toolkit floor, fp32 accumulate builds         13.4                   13.4                   13.4
+================================================== ====================== ====================== ======================

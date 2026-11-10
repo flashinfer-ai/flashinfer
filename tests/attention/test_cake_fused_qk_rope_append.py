@@ -21,7 +21,7 @@ Cake BF16 standard: Q/K ``atol = rtol = 1e-2``, V bit-exact, every cache /
 output element outside the appended rows and the cleared range untouched.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_fused_qk_rope_append`` facade is covered by
@@ -38,7 +38,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_fused_qk_rope_append")
 cake_build = cake_package("cake_fused_qk_rope_append", "cake_build")

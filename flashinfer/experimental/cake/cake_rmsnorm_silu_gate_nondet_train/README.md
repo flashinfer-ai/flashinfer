@@ -50,8 +50,15 @@ the fused backward's schedule and row arithmetic, the CTAs claiming the
 blocks in chunks whose rows the row count and the grid fix, each chunk's
 weight-gradient terms added exactly into fixed-point digits, so its `dx`,
 `dz` and `dw` are the deterministic package's bits in this tree, the same
-for the rows and the SM count.  The cuts live in one place,
-`cake_jit.BACKWARD_BANDS`.  The row-claims programs
+for the rows and the SM count.  Packed rows of the repeatable band (`dy`,
+`x` and `z` each with head stride 128 and token stride `H * 128`) run its
+long program instead, `bwd_bf16_rep_long`, from 2560 rows per SM on
+`sm_100a` and `sm_103a` and from 1536 on `sm_107a`: the deterministic
+package's look-ahead program (its build `{"lookahead": True, "math": "ax",
+"min_blocks": 4, "out": "bf16", "prefetch_share": None, "threads": 256}`),
+the same grid, workspace and bits.  The cuts live in one place,
+`cake_jit.BACKWARD_BANDS` (the long program's in
+`cake_jit.LONG_BACKWARD_ROWS_PER_SM`).  The row-claims programs
 (`bwd_bf16_rc`, `bwd_bf16_rc_mid`; `sm_100a`, `sm_103a`), whose `dw` may vary
 from run to run as well, and the BF16 static and claimed programs ship
 routed, but no band runs them.
@@ -228,6 +235,7 @@ each program repeats `y` bit for bit for the same inputs on the same device.
 | `bwd_bf16_t512` (`sm_100a`, `sm_107a`), `bwd_f32_t512` | exact tiny backward: one cluster of 16 CTAs of 4 teams of 128 threads, the chunk partials of the deterministic backward at FlashInfer 2e989556 summed on chip in its reduction order, no workspace | the rows of its band (at most 512) |
 | `bwd_bf16_fused` | fused backward (a BF16 weight gradient; every architecture): the deterministic package's fused backward's schedule and row arithmetic (the approximate gate and `rstd`, the next-block L2 prefetch up to the architecture's share of blocks a CTA): 256 threads, 16 lanes a row, 16-row blocks, at most 4 CTAs per SM, which claim the blocks in chunks when there are more blocks than CTAs (`dx` and `dz` the deterministic package's bits at any grid); each thread's FP32 runs of at most 16 rows folded into FP32 two-sum pairs, each CTA's column sums added to 4 FP64 accumulator copies with atomics, the CTA that arrives last rounding the sum once | its backward band, up to 1000 rows per SM (`sm_107a`: past 64, up to 256 rows per SM) |
 | `bwd_bf16_rep` | repeatable backward (a BF16 weight gradient; every architecture): the deterministic package's backward program (its build `{"math": "ax", "min_blocks": 4, "out": "bf16", "prefetch_share": None, "threads": 256}`) under this package's name: 256 threads, 16 lanes a row, 16-row blocks, at most 4 CTAs per SM claiming the blocks in chunks whose rows are fixed by the row count and the grid; each chunk's weight-gradient terms added exactly into fixed-point digits in the workspace, the CTA that arrives last rounding the sum once (the deterministic package's `dx`, `dz` and `dw` bits, the same for the rows and the SM count) | its backward bands, past 1000 rows per SM (`sm_107a`: past 512 rows, up to 64 rows per SM, and past 256 rows per SM) |
+| `bwd_bf16_rep_long` | the repeatable backward's long program (every architecture): the deterministic package's look-ahead program (its build `{"lookahead": True, "math": "ax", "min_blocks": 4, "out": "bf16", "prefetch_share": None, "threads": 256}`) under this package's name: the repeatable backward in a loop that loads a block's rows while the previous block's row math runs, with its grid, block schedule, FP32 operations in the same order and workspace, so its bits | packed rows of the last repeatable band from `LONG_BACKWARD_ROWS_PER_SM` rows per SM (2560 on `sm_100a` and `sm_103a`, 1536 on `sm_107a`) |
 | `bwd_f32` (every architecture), `bwd_bf16` (`sm_107a`) | static backward: 128 threads, 8-row blocks, CTA `b` runs chunks `b`, `b + grid`, ... (the same bits at any grid); on `sm_100a` and `sm_103a` 4 copies of the weight-gradient windows and no prefetch, the CTA that arrives last reading each window by an atomic exchange with 0, on `sm_107a` 4 copies plus occupancy words (the last CTA reads only the windows some CTA added into) | its FP32 backward band (no BF16 band runs `bwd_bf16`; the call role `bwd_bf16` has no program on `sm_100a` and `sm_103a`) |
 | `bwd_bf16_rc` | row-claims backward (a BF16 weight gradient; `sm_100a`, `sm_103a`): 256 threads, 16 lanes a row, 16-row blocks, the CTAs past one wave claiming blocks from the claim counter; each thread's FP32 run of rows added to 4 FP64 accumulator copies with atomics, the CTA that arrives last rounding the sum | no band |
 | `bwd_bf16_rc_mid` | row-claims mid backward (`sm_100a`, `sm_103a`): the row-claims backward with 5 CTAs per SM, thread 0 warming the next block of packed `dy`, `x` and `z` in L2 with one bulk prefetch per tensor; the runs and the CTA's column sums kept as FP32 two-sum pairs and added once as FP64 (a column whose pair sum is not finite takes the sum alone) | no band |
@@ -250,6 +258,7 @@ the 20 hex digits shown):
 | `bwd_bf16_t512` | `f6a3420d9aaa20a99e8d` | (none) | `f6a3420d9aaa20a99e8d` |
 | `bwd_bf16_fused` | `1d4b7311041b9046e379` | `1d4b7311041b9046e379` | `1d4b7311041b9046e379` |
 | `bwd_bf16_rep` | `8a6cb16beff15b6ffbfe` | `8a6cb16beff15b6ffbfe` | `8a6cb16beff15b6ffbfe` |
+| `bwd_bf16_rep_long` | `fef9d1cc2cc267219992` | `fef9d1cc2cc267219992` | `fef9d1cc2cc267219992` |
 | `bwd_bf16` | (none) | (none) | `6d7cf79fb3d679d07410` |
 | `bwd_bf16_rc` | `615c6fae07a6a89f3a45` | `615c6fae07a6a89f3a45` | (none) |
 | `bwd_bf16_rc_mid` | `f14663d91454a0e833f7` | `f14663d91454a0e833f7` | (none) |
@@ -298,7 +307,11 @@ step only past 64 and up to 256 rows per SM (both cuts on the repeatable
 backward's waves of 64 rows per SM), the repeatable backward runs past the
 small-row bands up to 64 rows per SM, the fused backward up to 256 and the
 repeatable backward past it
-(`SM107A_BF16_REP_LAST`, `SM107A_BF16_FUSED_LAST`); for an FP32 weight
+(`SM107A_BF16_REP_LAST`, `SM107A_BF16_FUSED_LAST`), and packed rows of its
+last band from `LONG_BACKWARD_ROWS_PER_SM` rows per SM (2560 on `sm_100a`
+and `sm_103a`, 1536 on `sm_107a`; only the last repeatable band reaches
+them) run the repeatable backward's long program `bwd_bf16_rep_long` in its
+place; for an FP32 weight
 gradient a static backward runs at
 most 4 row blocks a CTA of its one-wave grid (256 rows per SM; on `sm_107a`
 one wave at most) and the claimed backward runs past it:
@@ -328,10 +341,10 @@ The fused backward cuts the rows into 16-row blocks and launches
 `min(blocks, 4 * SMs)` CTAs of 256 threads (20736 bytes of dynamic shared
 memory each), which claim the blocks in chunks when there are more blocks
 than CTAs; the bits of `dx` and `dz` do not depend on which CTA runs a block.
-The repeatable backward launches the same grid of 256-thread CTAs (26368
-bytes of dynamic shared memory each), which claim the blocks in chunks whose
-rows are fixed by the row count and the grid, so its bits do not depend on
-which CTA runs a chunk.
+The repeatable backward and its long program launch the same grid of
+256-thread CTAs (26368 bytes of dynamic shared memory each), which claim the
+blocks in chunks whose rows are fixed by the row count and the grid, so
+their bits do not depend on which CTA runs a chunk.
 A small-row backward launches one cluster of 16 CTAs whatever the rows: 512
 threads each for the exact tiny backward (19584 bytes of dynamic shared
 memory each), 256 threads each for the short backward (6144 bytes each).
@@ -390,7 +403,7 @@ package's layout):
 | `bwd_bf16_t512` | none (`sm_100a`; no program on `sm_103a`) | none |
 | `bwd_f32_t512` | none | none |
 | `bwd_bf16_fused` | `dw_sums` and `dw_done`, 4104 bytes | `dw_sums` and `dw_done`, 4104 bytes |
-| `bwd_bf16_rep` | `acc`, `flags` and `done`, 18952 bytes | `acc`, `flags` and `done`, 18952 bytes |
+| `bwd_bf16_rep`, `bwd_bf16_rep_long` | `acc`, `flags` and `done`, 18952 bytes | `acc`, `flags` and `done`, 18952 bytes |
 | `bwd_bf16` | (no program) | 5 slots (4 window copies, then the occupancy words), 36360 bytes |
 | `bwd_f32` | 4 slots, 29192 bytes | 5 slots (4 window copies, then the occupancy words), 36360 bytes |
 | `bwd_bf16_rc` | `dw_sums` and `dw_done`, 4104 bytes | (no program) |
@@ -411,7 +424,7 @@ backward.  The deterministic package's FP32 workspace is refused with a
 Calls without a workspace use one per device, stream and backward program
 that takes one (of the size above: 29192 bytes on `sm_100a` and `sm_103a`,
 36360 on `sm_107a`; on each stream at most one per such program the
-architecture routes: the static, the fused `_fused`, the repeatable `_rep`, the row-claims `_rc` and
+architecture routes: the static, the fused `_fused`, the repeatable `_rep` and `_rep_long`, the row-claims `_rc` and
 `_rc_mid` and the claimed `_mid` backwards), kept for the process.  Eager calls without a
 workspace also keep a reserve per device for CUDA Graph captures: 64
 zero-filled workspaces in one allocation (with 256-byte alignment, 29440 bytes

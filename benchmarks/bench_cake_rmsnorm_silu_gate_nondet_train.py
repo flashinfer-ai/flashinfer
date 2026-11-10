@@ -51,7 +51,10 @@ SM100 and SM103, it runs the fused backward (256-thread CTAs of 16-row blocks,
 at most 4 per SM) up to 1000 rows per SM and the repeatable backward (its copy
 of the deterministic package's backward, the same grid; its ``dw`` repeats its
 bits) past it; on SM107 the repeatable backward up to 64 rows per SM, the
-fused backward up to 256 and the repeatable backward past it.
+fused backward up to 256 and the repeatable backward past it.  From 2560 rows
+per SM on SM100 and SM103 and 1536 on SM107 packed rows run the repeatable
+backward's long program (its copy of the deterministic package's look-ahead
+program, the same bits; ``cake_jit.LONG_BACKWARD_ROWS_PER_SM``).
 An FP32 weight gradient runs the exact tiny backward up to 512 rows, the
 static backward up to 256 rows per SM on SM100 and SM103 (64 on SM107) and the
 claimed backward past that.  At ``--heads 48`` the default token counts reach
@@ -123,13 +126,14 @@ STAGES = ("fwd", "bwd", "ckpt")
 # The issue's token counts and a spread around them, then small and irregular ones.
 # The BF16 backward each reaches at 48 heads (``cake_jit.BACKWARD_BANDS``):
 # - 148-SM B200 (sm_100a): 1 and 5 tokens the short backward; 7 the exact tiny
-#   backward; 16 to 2048 the fused backward; 4097 and more the repeatable
-#   backward.
+#   backward; 16 to 2048 the fused backward; 4097 the repeatable backward;
+#   30000 and more its long program.
 # - 152-SM GB300 (sm_103a): 1 and 5 tokens the short backward; 7 to 2048 the
-#   fused backward; 4097 and more the repeatable backward.
+#   fused backward; 4097 the repeatable backward; 30000 and more its long
+#   program.
 # - 212-SM R200 (sm_107a): 1 and 5 tokens the short backward; 7 the exact tiny
 #   backward; 16 and 129 the repeatable backward; 1031 the fused backward;
-#   2048 and more the repeatable backward.
+#   2048 and 4097 the repeatable backward; 30000 and more its long program.
 TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 5, 7, 16, 129, 1031, 2048, 4097)
 
 

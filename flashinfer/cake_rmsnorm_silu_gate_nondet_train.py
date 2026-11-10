@@ -133,7 +133,10 @@ the repeatable backward.  The kernels are those of the standalone package
   the same for the rows and the SM count: ``dx`` and ``dz`` within the bound
   above, the weight gradient not the sum of the chunk partials of the
   deterministic backward at FlashInfer 2e989556 (within that package's
-  budget).
+  budget).  Packed rows (``grad_out``, ``x`` and ``z`` each with head stride
+  128 and token stride ``H * 128``) run its copy of the deterministic
+  package's look-ahead program, the same build, from 2560 rows per SM on
+  SM100 and SM103 and from 1536 on SM107, with the same bits.
 
 Mode and dispatch rules:
 
@@ -490,7 +493,9 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
     package's backward, adds each chunk's weight-gradient terms
     exactly into fixed-point digits in the workspace: ``dx``, ``dz`` and
     ``dw`` the deterministic package's bits, the same for the rows and the SM
-    count.  Every other output repeats bit for bit, whatever the order in
+    count (packed rows from 2560 rows per SM on SM100 and SM103 and from 1536
+    on SM107 run its look-ahead program, with the same bits).  Every other
+    output repeats bit for bit, whatever the order in
     which CTAs run and, but in the repeatable band, whatever the grid.
     The deterministic backward is
     :func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`.

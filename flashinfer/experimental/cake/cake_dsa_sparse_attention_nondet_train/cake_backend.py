@@ -1662,6 +1662,31 @@ def _main_accumulator_constants(
     return dict(dkv_stride=D_LATENT, dkr_stride=D_ROPE, dkr_col0=0, dkv_has_map=0)
 
 
+#: The (plan, architecture) pairs whose main launches walk the tokens in descending order (``token_base = T - 1``,
+#: ``token_step = -1``) when the backward runs a single key pass: those where no measured row of the plan is slower
+#: with it.  Every other pair and every multi-pass backward keep ascending order.
+#: The forward and dQ keep their bits; dK / dV (atomic adds) stay within the unchanged budget.
+DESCENDING_TOKEN_PLANS = frozenset(
+    {
+        ("rope", "sm_103a"),
+        ("rope", "sm_107a"),
+        ("nope", "sm_103a"),
+        ("nope", "sm_107a"),
+    }
+)
+
+
+def token_order(
+    num_queries: int, arch: str, single_pass: bool, plan: str
+) -> dict[str, int]:
+    """``token_base`` / ``token_step`` of the main launches of ``plan`` (``"rope"`` or ``"nope"``; ``token =
+    token_base + token_step * (blockIdx.x + k * gridDim.x)``): descending for a single key pass where
+    :data:`DESCENDING_TOKEN_PLANS` names (plan, arch), ascending otherwise."""
+    if single_pass and (plan, arch) in DESCENDING_TOKEN_PLANS:
+        return dict(token_base=int(num_queries) - 1, token_step=-1)
+    return dict(token_base=0, token_step=1)
+
+
 def _plan(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
@@ -1829,8 +1854,7 @@ def _plan(
         # main-stage accumulator geometry: the private permuted accumulators unless the binding accumulates
         # directly (the caller's packed row stride, rope column 512, the map flag)
         **_main_accumulator_constants(direct, dst_row_stride, dkv_dst_map is not None),
-        token_base=0,  # one CTA per token, token = blockIdx.x
-        token_step=1,
+        **token_order(T, arch, passes == 1, "rope"),  # the main launches' token order
         num_tokens=T,  # bwd_compact: the whole row; a multi-pass backward overrides it per token chunk
     )
     # per (token chunk, key-range pass) overrides of a multi-pass backward: the key range, ``dq_mode``,
@@ -3741,8 +3765,7 @@ def _plan_nope(
             dst_row_stride if accumulate else D_LATENT,
             dkv_dst_map is not None,
         ),
-        token_base=0,  # token = token_base + token_step * (blockIdx.x + k * gridDim.x): the persistent loop
-        token_step=1,
+        **token_order(T, arch, passes == 1, "nope"),  # the persistent loop's order
         num_tokens=T,  # compaction: the whole row; a multi-pass backward overrides it per token chunk
     )
     pass_overrides: tuple[tuple[dict[str, int], ...], ...] = ()

@@ -545,7 +545,7 @@ kernel_cake_lm_head_loss_755db75b43d51ae3662f(const __grid_constant__ CUtensorMa
                 long long rin_lbl = labels[rin_t];
                 float dz_lse = lse[rin_t];
                 float dz_d = dlogp[d_off + rin_r];
-                int dz_skip = ((rin_lbl < 0) ? 1 : 0);
+                int dz_skip = ((rin_lbl < 0ll) ? 1 : 0);
                 int dz_col = (int)rin_lbl - ep_off_n;
                 int live_rows_2 = CNT[0];
                 int live_2 = (((bid_m_2 >> 1) * 256 < live_rows_2) ? k_iters : 0);
