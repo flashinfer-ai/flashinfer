@@ -48,12 +48,22 @@ FlashInfer provides three packages:
 .. code-block:: bash
 
     pip install flashinfer-python
-    # cubin package
-    pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
-    # JIT cache package (replace cu129 with your CUDA version: cu129, cu130, or cu134)
-    pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu129
+    flashinfer download-kernels
 
 This eliminates compilation and downloading overhead at runtime.
+``flashinfer download-kernels`` installs the ``flashinfer-cubin`` and
+``flashinfer-jit-cache`` wheels that match the installed ``flashinfer-python``
+version and the CUDA version of the installed PyTorch. By default it installs
+pre-built kernels for every supported GPU architecture (several GB); pass
+``--sm`` (for example ``--sm sm90a``, repeatable) to install the jit-cache
+provider only for your GPUs. The kernel wheels must match ``flashinfer-python``
+exactly, so re-run the command after upgrading. See :doc:`cli` for all options.
+
+.. note::
+   The ``flashinfer-cubin`` package on PyPI is no longer updated and does not
+   match current ``flashinfer-python`` releases; FlashInfer ignores a mismatched
+   wheel with a warning. Use ``flashinfer download-kernels``, which installs
+   from https://flashinfer.ai/whl, instead of ``pip install flashinfer-cubin``.
 
 
 .. _install-from-source:
@@ -133,12 +143,9 @@ Nightly builds are available for testing the latest features:
 
 .. code-block:: bash
 
-    # Core and cubin packages
     pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps # Install the nightly package from custom index, without installing dependencies
     pip install flashinfer-python  # Install flashinfer-python's dependencies from PyPI
-    pip install -U --pre flashinfer-cubin --index-url https://flashinfer.ai/whl/nightly/
-    # JIT cache package (replace cu129 with your CUDA version: cu129, cu130, or cu134)
-    pip install -U --pre flashinfer-jit-cache --index-url https://flashinfer.ai/whl/nightly/cu129
+    flashinfer download-kernels --nightly  # Optional: matching nightly flashinfer-cubin and flashinfer-jit-cache wheels
 
 Verify Installation
 ^^^^^^^^^^^^^^^^^^^

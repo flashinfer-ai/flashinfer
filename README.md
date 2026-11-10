@@ -102,9 +102,10 @@ pip install flashinfer-python
 
 ```bash
 pip install flashinfer-python
-flashinfer install-cubin-wheel
-flashinfer install-jit-cache-wheel
+flashinfer download-kernels
 ```
+
+`flashinfer download-kernels` installs the `flashinfer-cubin` and `flashinfer-jit-cache` wheels that match the installed `flashinfer-python` and CUDA versions. By default it installs pre-built kernels for every supported GPU architecture (several GB); pass `--sm` (e.g. `--sm sm90a`, repeatable) to install the jit-cache provider only for your GPUs. Re-run it after upgrading `flashinfer-python`.
 
 **For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
 
@@ -184,8 +185,7 @@ For more details, see the [Install from Source documentation](https://docs.flash
 ```bash
 pip install -U --pre flashinfer-python --index-url https://flashinfer.ai/whl/nightly/ --no-deps
 pip install flashinfer-python  # Install dependencies from PyPI
-flashinfer install-cubin-wheel --nightly
-flashinfer install-jit-cache-wheel --nightly
+flashinfer download-kernels --nightly
 ```
 
 ### CLI Tools
@@ -201,10 +201,10 @@ flashinfer list-modules
 flashinfer module-status
 
 # Manage artifacts and cache
-flashinfer download-cubin
+flashinfer download-kernels      # flashinfer-cubin + flashinfer-jit-cache wheels
 flashinfer install-cubin-wheel
 flashinfer install-jit-cache-wheel
-flashinfer download-kernels
+flashinfer download-cubin
 flashinfer clear-cache
 
 # For developers: generate compile_commands.json for IDE integration
