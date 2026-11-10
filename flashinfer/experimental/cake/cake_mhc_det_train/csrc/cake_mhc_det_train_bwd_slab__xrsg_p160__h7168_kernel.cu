@@ -40,8 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define LAUNCH_MIN_BLOCKS 1
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -179,8 +177,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void
-kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap dY, const __grid_constant__ CUtensorMap dU, const __grid_constant__ CUtensorMap dzp, const __grid_constant__ CUtensorMap fnTp, const __grid_constant__ CUtensorMap dX, float* __restrict__ tokp, float* __restrict__ dfn_part, int T, int P, int rpc)
+__global__ void
+kernel_cake_mhc_det_train_bwd_slab__xrsg_p160__h7168(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap dY, const __grid_constant__ CUtensorMap dU, const __grid_constant__ CUtensorMap dzp, const __grid_constant__ CUtensorMap fnTp, const __grid_constant__ CUtensorMap dX, float* __restrict__ tokp, float* __restrict__ dfn_part, int T, int P, int rpc)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -339,7 +337,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
 
     // Kernel post-init ops
     if (warp >= 0 && warp <= 3) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 72;");
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
 
     // ---- Role: load ----
@@ -352,7 +350,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
             if (elect_sync()) {
                 const int bid_0 = (int)bid;
                 const int grid = (int)num_bids;
-                const int n_mine = (64 * P - bid_0 + grid - 1) / grid;
+                const int n_mine = (112 * P - bid_0 + grid - 1) / grid;
                 unsigned int ld_stage = 0;
                 int first_ld = 1;
                 int tcl = 0;
@@ -376,12 +374,12 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                             if (n_tiles > 0) {
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0)), "r"((int)(row0)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0)), "r"((int)(row0)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 4096)), "r"((int)(row0)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 4096)), "r"((int)(row0)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 8192)), "r"((int)(row0)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 8192)), "r"((int)(row0)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 12288)), "r"((int)(row0)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 12288)), "r"((int)(row0)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 7168)), "r"((int)(row0)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 7168)), "r"((int)(row0)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 14336)), "r"((int)(row0)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 14336)), "r"((int)(row0)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 21504)), "r"((int)(row0)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 21504)), "r"((int)(row0)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dU))), "r"((int)(k0)), "r"((int)(row0)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dzp))), "r"((int)(0)), "r"((int)(row0)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dzp))), "r"((int)(32)), "r"((int)(row0)) : "memory");
@@ -390,17 +388,17 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         }
                         mbarrier_wait(fn_empty_addr, _phase_fn_empty);
                         tma_3d_gmem2smem(fn0_0_addr_1_0, (&fnTp), 0, k0, 0, fn_full_addr);
-                        tma_3d_gmem2smem(fn0_0_addr_1_0 + 4096, (&fnTp), 0, k0 + 4096, 0, fn_full_addr);
-                        tma_3d_gmem2smem(fn0_0_addr_1_1, (&fnTp), 0, k0 + 8192, 0, fn_full_addr);
-                        tma_3d_gmem2smem(fn0_0_addr_1_1 + 4096, (&fnTp), 0, k0 + 12288, 0, fn_full_addr);
+                        tma_3d_gmem2smem(fn0_0_addr_1_0 + 4096, (&fnTp), 0, k0 + 7168, 0, fn_full_addr);
+                        tma_3d_gmem2smem(fn0_0_addr_1_1, (&fnTp), 0, k0 + 14336, 0, fn_full_addr);
+                        tma_3d_gmem2smem(fn0_0_addr_1_1 + 4096, (&fnTp), 0, k0 + 21504, 0, fn_full_addr);
                         tma_3d_gmem2smem(fn1_0_addr_1_0, (&fnTp), 0, k0, 1, fn_full_addr);
-                        tma_3d_gmem2smem(fn1_0_addr_1_0 + 4096, (&fnTp), 0, k0 + 4096, 1, fn_full_addr);
-                        tma_3d_gmem2smem(fn1_0_addr_1_1, (&fnTp), 0, k0 + 8192, 1, fn_full_addr);
-                        tma_3d_gmem2smem(fn1_0_addr_1_1 + 4096, (&fnTp), 0, k0 + 12288, 1, fn_full_addr);
+                        tma_3d_gmem2smem(fn1_0_addr_1_0 + 4096, (&fnTp), 0, k0 + 7168, 1, fn_full_addr);
+                        tma_3d_gmem2smem(fn1_0_addr_1_1, (&fnTp), 0, k0 + 14336, 1, fn_full_addr);
+                        tma_3d_gmem2smem(fn1_0_addr_1_1 + 4096, (&fnTp), 0, k0 + 21504, 1, fn_full_addr);
                         tma_3d_gmem2smem(fn2_0_addr_1_0, (&fnTp), 0, k0, 2, fn_full_addr);
-                        tma_3d_gmem2smem(fn2_0_addr_1_0 + 4096, (&fnTp), 0, k0 + 4096, 2, fn_full_addr);
-                        tma_3d_gmem2smem(fn2_0_addr_1_1, (&fnTp), 0, k0 + 8192, 2, fn_full_addr);
-                        tma_3d_gmem2smem(fn2_0_addr_1_1 + 4096, (&fnTp), 0, k0 + 12288, 2, fn_full_addr);
+                        tma_3d_gmem2smem(fn2_0_addr_1_0 + 4096, (&fnTp), 0, k0 + 7168, 2, fn_full_addr);
+                        tma_3d_gmem2smem(fn2_0_addr_1_1, (&fnTp), 0, k0 + 14336, 2, fn_full_addr);
+                        tma_3d_gmem2smem(fn2_0_addr_1_1 + 4096, (&fnTp), 0, k0 + 21504, 2, fn_full_addr);
                         mbarrier_arrive_expect_tx(fn_full_addr, 49152);
                         _phase_fn_empty ^= 1;
                         #pragma unroll 1
@@ -413,26 +411,26 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                             mbarrier_arrive_expect_tx(stage_full_z_addr + (ld_stage) * 8, 12288);
                             tma_2d_gmem2smem(dus_addr + ld_stage * 86016, (&dU), k0, t0, stage_full_addr + (ld_stage) * 8);
                             tma_2d_gmem2smem(dy0_addr_1_0 + ld_stage * 86016, (&dY), k0, t0, stage_full_addr + (ld_stage) * 8);
-                            tma_2d_gmem2smem(dy0_addr_1_1 + ld_stage * 86016, (&dY), k0 + 4096, t0, stage_full_addr + (ld_stage) * 8);
-                            tma_2d_gmem2smem(dy0_addr_1_2 + ld_stage * 86016, (&dY), k0 + 8192, t0, stage_full_addr + (ld_stage) * 8);
-                            tma_2d_gmem2smem(dy0_addr_1_3 + ld_stage * 86016, (&dY), k0 + 12288, t0, stage_full_addr + (ld_stage) * 8);
+                            tma_2d_gmem2smem(dy0_addr_1_1 + ld_stage * 86016, (&dY), k0 + 7168, t0, stage_full_addr + (ld_stage) * 8);
+                            tma_2d_gmem2smem(dy0_addr_1_2 + ld_stage * 86016, (&dY), k0 + 14336, t0, stage_full_addr + (ld_stage) * 8);
+                            tma_2d_gmem2smem(dy0_addr_1_3 + ld_stage * 86016, (&dY), k0 + 21504, t0, stage_full_addr + (ld_stage) * 8);
                             mbarrier_arrive_expect_tx(stage_full_addr + (ld_stage) * 8, 40960);
                             mbarrier_wait(stage_empty_addr + (ld_stage) * 8, _phase_stage_empty_e);
                             tma_2d_gmem2smem(x0_addr_1_0 + ld_stage * 86016, (&X), k0, t0, stage_full_x_addr + (ld_stage) * 8);
-                            tma_2d_gmem2smem(x0_addr_1_1 + ld_stage * 86016, (&X), k0 + 4096, t0, stage_full_x_addr + (ld_stage) * 8);
-                            tma_2d_gmem2smem(x0_addr_1_2 + ld_stage * 86016, (&X), k0 + 8192, t0, stage_full_x_addr + (ld_stage) * 8);
-                            tma_2d_gmem2smem(x0_addr_1_3 + ld_stage * 86016, (&X), k0 + 12288, t0, stage_full_x_addr + (ld_stage) * 8);
+                            tma_2d_gmem2smem(x0_addr_1_1 + ld_stage * 86016, (&X), k0 + 7168, t0, stage_full_x_addr + (ld_stage) * 8);
+                            tma_2d_gmem2smem(x0_addr_1_2 + ld_stage * 86016, (&X), k0 + 14336, t0, stage_full_x_addr + (ld_stage) * 8);
+                            tma_2d_gmem2smem(x0_addr_1_3 + ld_stage * 86016, (&X), k0 + 21504, t0, stage_full_x_addr + (ld_stage) * 8);
                             mbarrier_arrive_expect_tx(stage_full_x_addr + (ld_stage) * 8, 32768);
                             int nt = tile + 1;
                             if (nt < n_tiles) {
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0)), "r"((int)(row0 + nt * 64)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0)), "r"((int)(row0 + nt * 64)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 4096)), "r"((int)(row0 + nt * 64)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 4096)), "r"((int)(row0 + nt * 64)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 8192)), "r"((int)(row0 + nt * 64)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 8192)), "r"((int)(row0 + nt * 64)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 12288)), "r"((int)(row0 + nt * 64)) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 12288)), "r"((int)(row0 + nt * 64)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 7168)), "r"((int)(row0 + nt * 64)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 7168)), "r"((int)(row0 + nt * 64)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 14336)), "r"((int)(row0 + nt * 64)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 14336)), "r"((int)(row0 + nt * 64)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(k0 + 21504)), "r"((int)(row0 + nt * 64)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(k0 + 21504)), "r"((int)(row0 + nt * 64)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dU))), "r"((int)(k0)), "r"((int)(row0 + nt * 64)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dzp))), "r"((int)(0)), "r"((int)(row0 + nt * 64)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dzp))), "r"((int)(32)), "r"((int)(row0 + nt * 64)) : "memory");
@@ -456,12 +454,12 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                                     if (tt < n_tiles_0) {
                                         asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(s_0 * 64)), "r"((int)(row0_0 + tt * 64)) : "memory");
                                         asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(s_0 * 64)), "r"((int)(row0_0 + tt * 64)) : "memory");
-                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(s_0 * 64 + 4096)), "r"((int)(row0_0 + tt * 64)) : "memory");
-                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(s_0 * 64 + 4096)), "r"((int)(row0_0 + tt * 64)) : "memory");
-                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(s_0 * 64 + 8192)), "r"((int)(row0_0 + tt * 64)) : "memory");
-                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(s_0 * 64 + 8192)), "r"((int)(row0_0 + tt * 64)) : "memory");
-                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(s_0 * 64 + 12288)), "r"((int)(row0_0 + tt * 64)) : "memory");
-                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(s_0 * 64 + 12288)), "r"((int)(row0_0 + tt * 64)) : "memory");
+                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(s_0 * 64 + 7168)), "r"((int)(row0_0 + tt * 64)) : "memory");
+                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(s_0 * 64 + 7168)), "r"((int)(row0_0 + tt * 64)) : "memory");
+                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(s_0 * 64 + 14336)), "r"((int)(row0_0 + tt * 64)) : "memory");
+                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(s_0 * 64 + 14336)), "r"((int)(row0_0 + tt * 64)) : "memory");
+                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&X))), "r"((int)(s_0 * 64 + 21504)), "r"((int)(row0_0 + tt * 64)) : "memory");
+                                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dY))), "r"((int)(s_0 * 64 + 21504)), "r"((int)(row0_0 + tt * 64)) : "memory");
                                         asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dU))), "r"((int)(s_0 * 64)), "r"((int)(row0_0 + tt * 64)) : "memory");
                                         asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dzp))), "r"((int)(0)), "r"((int)(row0_0 + tt * 64)) : "memory");
                                         asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&dzp))), "r"((int)(32)), "r"((int)(row0_0 + tt * 64)) : "memory");
@@ -483,7 +481,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
             asm volatile("griddepcontrol.wait;" ::: "memory");
             const int bid_0_1 = (int)bid;
             const int grid_1 = (int)num_bids;
-            const int n_mine_1 = (64 * P - bid_0_1 + grid_1 - 1) / grid_1;
+            const int n_mine_1 = (112 * P - bid_0_1 + grid_1 - 1) / grid_1;
             unsigned int mm_stage = 0;
             unsigned int acc_mm = 0;
             unsigned int grp_mm = 0;
@@ -512,8 +510,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         mbarrier_wait(acc_empty_addr + (acc_mm) * 8, _phase_acc_empty);
                         mbarrier_wait(stage_full_z_addr + (mm_stage) * 8, _phase_stage_full_z);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x7FFF);
+                        int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x3FFF);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -538,8 +536,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accw + (acc_mm * 128))), "r"(0) : "memory");
-                        int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_1_2) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1) >> 4) & 0x7FFF);
+                        int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_1_2) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1) >> 4) & 0x3FFF);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -564,8 +562,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
-                        int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x7FFF);
+                        int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x3FFF);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -590,7 +588,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
-                        int _mma_a_lo_3 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_a_lo_3 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -615,7 +613,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_2), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
-                        int _mma_a_lo_4 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_a_lo_4 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -640,7 +638,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
-                        int _mma_a_lo_5 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_a_lo_5 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -671,8 +669,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         int in_grp = tile_1 % 16;
                         int small_init = ((in_grp == 0) ? 1 : 0);
                         unsigned int sbuf = grp_mm % 2;
-                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -707,8 +705,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_3), "r"((tmem_dfb0 + (acc_mm * 32))), "r"(0) : "memory");
-                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -743,8 +741,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_4), "r"((tmem_dfs0 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
-                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -779,8 +777,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_5), "r"((tmem_dfs0 + (sbuf * 32))), "r"(1) : "memory");
-                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -815,8 +813,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_9), "r"(_mma_b_lo_6), "r"((tmem_dfb1 + (acc_mm * 32))), "r"(0) : "memory");
-                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -851,8 +849,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_7), "r"((tmem_dfs1 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
-                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -920,7 +918,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
             asm volatile("griddepcontrol.wait;" ::: "memory");
             const int bid_0_2 = (int)bid;
             const int grid_2 = (int)num_bids;
-            const int n_mine_2 = (64 * P - bid_0_2 + grid_2 - 1) / grid_2;
+            const int n_mine_2 = (112 * P - bid_0_2 + grid_2 - 1) / grid_2;
             unsigned int ep_stage = 0;
             const int ew = warp - 4;
             int tce = 0;
@@ -964,7 +962,9 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
             const unsigned long long fq = (unsigned long long)(fp * 8);
             const unsigned int fdst = (unsigned int)(fr * 112 + (fr >> 3 & 1) * 16);
             const int tokbase = q % 2 * 32 + mt * 16;
-            const unsigned int wtab = wtv_addr + (unsigned int)(ew * 1280);
+            const unsigned int wtab = wtv_addr + (unsigned int)(mt * 4352 + q * 1024 + q / 3 * 128);
+            const unsigned int wl_base = wtab + (unsigned int)(48 + i0 / 2 * 976);
+            const int wl_str = 64 - i0 / 2 * 56;
             const unsigned int wpre_off = (unsigned int)(8 + 4 * i0);
             const unsigned int wc_off = (unsigned int)(24 + 8 * i0);
             const unsigned int wrow_bytes = (unsigned int)(tokbase * 128);
@@ -1019,36 +1019,27 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             __syncwarp();
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            if (i0 == 0) {
-                                #pragma unroll
-                                for (int kq_2 = 0; kq_2 < 2; kq_2++) {
-                                    int rowa = t0_1 + tokbase + wq_r4[kq_2];
-                                    if (rowa >= T) {
-                                        rowa = T - 1;
-                                    }
-                                    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                        :: "r"(wtab + (unsigned int)(wq_r4[kq_2] * 80 + wq_q4[kq_2] * 16)), "l"(tokp + ((unsigned long long)rowa * 24ull + (unsigned long long)(wq_q4[kq_2] * 4))));
+                            #pragma unroll
+                            for (int kq_2 = 0; kq_2 < 2; kq_2++) {
+                                int rowa = t0_1 + tokbase + wq_r4[kq_2];
+                                if (rowa >= T) {
+                                    rowa = T - 1;
                                 }
-                            } else {
-                                #pragma unroll
-                                for (int kq_3 = 0; kq_3 < 3; kq_3++) {
-                                    int rowa_1 = t0_1 + tokbase + wq_r5[kq_3];
-                                    if (rowa_1 >= T) {
-                                        rowa_1 = T - 1;
-                                    }
-                                    if (kq_3 == 2) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .pred p;\n\t"
-                                            "setp.ne.b32 p, %0, 0;\n\t"
-                                            "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
-                                            "}"
-                                            :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_3] * 80 + wq_s5[kq_3] * 16)), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)(wq_q5[kq_3] * 4))));
-                                    } else {
-                                        asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                            :: "r"(wtab + (unsigned int)(wq_r5[kq_3] * 80 + wq_s5[kq_3] * 16)), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)(wq_q5[kq_3] * 4))));
-                                    }
+                                asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
+                                    :: "r"(wtab + (unsigned int)(wq_r4[kq_2] * 64 + wq_q4[kq_2] * 16)), "l"(tokp + ((unsigned long long)rowa * 24ull + (unsigned long long)((wq_q4[kq_2] + i0 / 2 * (wq_q4[kq_2] / 2)) * 4))));
+                            }
+                            if (i0 != 0) {
+                                int rowc = t0_1 + tokbase + lane_1;
+                                if (rowc >= T) {
+                                    rowc = T - 1;
                                 }
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .pred p;\n\t"
+                                    "setp.ne.b32 p, %0, 0;\n\t"
+                                    "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
+                                    "}"
+                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(1024 + lane_1 * 8)), "l"(tokp + ((unsigned long long)rowc * 24ull + 20ull)));
                             }
                             asm volatile("cp.async.commit_group;");
                         }
@@ -1079,7 +1070,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     unsigned int sbase = x0_addr_1_0 + ep_stage * 86016;
                     unsigned int tv[24];
                     unsigned int wpp[2];
-                    unsigned int wrow = wtab + (unsigned int)(tq * 80);
+                    unsigned int wrow = wtab + (unsigned int)(tq * 64);
                     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tv[0])) : "r"(wrow + 4));
                     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tv[6])) : "r"(wrow + 4));
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
@@ -1098,8 +1089,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         : "r"(wrow + wc_off + 16));
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&tv[10])), "=r"(*reinterpret_cast<uint32_t*>(&tv[(10) + 1]))
-                        : "r"(wrow + wc_off + 24));
-                    unsigned int wrow_0 = wtab + (unsigned int)((tq + 8) * 80);
+                        : "r"(wl_base + (unsigned int)(tq * wl_str)));
+                    unsigned int wrow_0 = wtab + (unsigned int)((tq + 8) * 64);
                     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tv[12])) : "r"(wrow_0 + 4));
                     asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tv[18])) : "r"(wrow_0 + 4));
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
@@ -1118,7 +1109,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         : "r"(wrow_0 + wc_off + 16));
                     asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&tv[22])), "=r"(*reinterpret_cast<uint32_t*>(&tv[(22) + 1]))
-                        : "r"(wrow_0 + wc_off + 24));
+                        : "r"(wl_base + (unsigned int)((tq + 8) * wl_str)));
                     float nct[2];
                     nct[0] = -__uint_as_float(tv[0]);
                     nct[1] = -__uint_as_float(tv[12]);
@@ -2476,36 +2467,27 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (i0 == 0) {
-                            #pragma unroll
-                            for (int kq_4 = 0; kq_4 < 2; kq_4++) {
-                                int rowa_2 = t0_1 + 64 + tokbase + wq_r4[kq_4];
-                                if (rowa_2 >= T) {
-                                    rowa_2 = T - 1;
-                                }
-                                asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                    :: "r"(wtab + (unsigned int)(wq_r4[kq_4] * 80 + wq_q4[kq_4] * 16)), "l"(tokp + ((unsigned long long)rowa_2 * 24ull + (unsigned long long)(wq_q4[kq_4] * 4))));
+                        #pragma unroll
+                        for (int kq_3 = 0; kq_3 < 2; kq_3++) {
+                            int rowa_1 = t0_1 + 64 + tokbase + wq_r4[kq_3];
+                            if (rowa_1 >= T) {
+                                rowa_1 = T - 1;
                             }
-                        } else {
-                            #pragma unroll
-                            for (int kq_5 = 0; kq_5 < 3; kq_5++) {
-                                int rowa_3 = t0_1 + 64 + tokbase + wq_r5[kq_5];
-                                if (rowa_3 >= T) {
-                                    rowa_3 = T - 1;
-                                }
-                                if (kq_5 == 2) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .pred p;\n\t"
-                                        "setp.ne.b32 p, %0, 0;\n\t"
-                                        "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
-                                        "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_5] * 80 + wq_s5[kq_5] * 16)), "l"(tokp + ((unsigned long long)rowa_3 * 24ull + (unsigned long long)(wq_q5[kq_5] * 4))));
-                                } else {
-                                    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                        :: "r"(wtab + (unsigned int)(wq_r5[kq_5] * 80 + wq_s5[kq_5] * 16)), "l"(tokp + ((unsigned long long)rowa_3 * 24ull + (unsigned long long)(wq_q5[kq_5] * 4))));
-                                }
+                            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
+                                :: "r"(wtab + (unsigned int)(wq_r4[kq_3] * 64 + wq_q4[kq_3] * 16)), "l"(tokp + ((unsigned long long)rowa_1 * 24ull + (unsigned long long)((wq_q4[kq_3] + i0 / 2 * (wq_q4[kq_3] / 2)) * 4))));
+                        }
+                        if (i0 != 0) {
+                            int rowc_1 = t0_1 + 64 + tokbase + lane_1;
+                            if (rowc_1 >= T) {
+                                rowc_1 = T - 1;
                             }
+                            asm volatile(
+                                "{\n\t"
+                                ".reg .pred p;\n\t"
+                                "setp.ne.b32 p, %0, 0;\n\t"
+                                "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
+                                "}"
+                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(1024 + lane_1 * 8)), "l"(tokp + ((unsigned long long)rowc_1 * 24ull + 20ull)));
                         }
                         asm volatile("cp.async.commit_group;");
                     } else {
@@ -2527,36 +2509,27 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                                 asm volatile("tcgen05.fence::before_thread_sync;");
                                 __syncwarp();
                                 asm volatile("tcgen05.fence::after_thread_sync;");
-                                if (i0 == 0) {
-                                    #pragma unroll
-                                    for (int kq_6 = 0; kq_6 < 2; kq_6++) {
-                                        int rowa_4 = row0_1_1 + tokbase + wq_r4[kq_6];
-                                        if (rowa_4 >= T) {
-                                            rowa_4 = T - 1;
-                                        }
-                                        asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                            :: "r"(wtab + (unsigned int)(wq_r4[kq_6] * 80 + wq_q4[kq_6] * 16)), "l"(tokp + ((unsigned long long)rowa_4 * 24ull + (unsigned long long)(wq_q4[kq_6] * 4))));
+                                #pragma unroll
+                                for (int kq_4 = 0; kq_4 < 2; kq_4++) {
+                                    int rowa_2 = row0_1_1 + tokbase + wq_r4[kq_4];
+                                    if (rowa_2 >= T) {
+                                        rowa_2 = T - 1;
                                     }
-                                } else {
-                                    #pragma unroll
-                                    for (int kq_7 = 0; kq_7 < 3; kq_7++) {
-                                        int rowa_5 = row0_1_1 + tokbase + wq_r5[kq_7];
-                                        if (rowa_5 >= T) {
-                                            rowa_5 = T - 1;
-                                        }
-                                        if (kq_7 == 2) {
-                                            asm volatile(
-                                                "{\n\t"
-                                                ".reg .pred p;\n\t"
-                                                "setp.ne.b32 p, %0, 0;\n\t"
-                                                "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
-                                                "}"
-                                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(wq_r5[kq_7] * 80 + wq_s5[kq_7] * 16)), "l"(tokp + ((unsigned long long)rowa_5 * 24ull + (unsigned long long)(wq_q5[kq_7] * 4))));
-                                        } else {
-                                            asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
-                                                :: "r"(wtab + (unsigned int)(wq_r5[kq_7] * 80 + wq_s5[kq_7] * 16)), "l"(tokp + ((unsigned long long)rowa_5 * 24ull + (unsigned long long)(wq_q5[kq_7] * 4))));
-                                        }
+                                    asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;"
+                                        :: "r"(wtab + (unsigned int)(wq_r4[kq_4] * 64 + wq_q4[kq_4] * 16)), "l"(tokp + ((unsigned long long)rowa_2 * 24ull + (unsigned long long)((wq_q4[kq_4] + i0 / 2 * (wq_q4[kq_4] / 2)) * 4))));
+                                }
+                                if (i0 != 0) {
+                                    int rowc_2 = row0_1_1 + tokbase + lane_1;
+                                    if (rowc_2 >= T) {
+                                        rowc_2 = T - 1;
                                     }
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .pred p;\n\t"
+                                        "setp.ne.b32 p, %0, 0;\n\t"
+                                        "@p cp.async.ca.shared::cta.global [%1], [%2], 8;\n\t"
+                                        "}"
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(1024 + lane_1 * 8)), "l"(tokp + ((unsigned long long)rowc_2 * 24ull + 20ull)));
                                 }
                                 asm volatile("cp.async.commit_group;");
                                 qa_pre = 1;
@@ -2631,8 +2604,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     __syncwarp();
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     if (elect_sync()) {
-                        tma_store_2d((&dX), s_2 * 64 + i0 * 4096, t0_1 + wcoord_t, sbase + xoff0 + wrow_bytes);
-                        tma_store_2d((&dX), s_2 * 64 + (i0 + 1) * 4096, t0_1 + wcoord_t, sbase + xoff0 + 8192 + wrow_bytes);
+                        tma_store_2d((&dX), s_2 * 64 + i0 * 7168, t0_1 + wcoord_t, sbase + xoff0 + wrow_bytes);
+                        tma_store_2d((&dX), s_2 * 64 + (i0 + 1) * 7168, t0_1 + wcoord_t, sbase + xoff0 + 8192 + wrow_bytes);
                         asm volatile("cp.async.bulk.commit_group;");
                         asm volatile("cp.async.bulk.wait_group.read 0;");
                         mbarrier_arrive(stage_empty_addr + (ep_stage) * 8);
@@ -2640,13 +2613,13 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     ep_stage += 1;
                     if (ep_stage == 2) { ep_stage = 0; _phase_stage_full_x ^= 1; }
                 }
-                unsigned long long kcol = (unsigned long long)(i_str * 4096 + s_2 * 64 + dl);
-                unsigned long long pbase = (unsigned long long)p_2 * 393216ull;
+                unsigned long long kcol = (unsigned long long)(i_str * 7168 + s_2 * 64 + dl);
+                unsigned long long pbase = (unsigned long long)p_2 * 688128ull;
                 #pragma unroll
                 for (int n_3 = 0; n_3 < 24; n_3++) {
                     float _sub_4;
                     asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_4) : "f"(acc[n_3]), "f"(comp[n_3]));
-                    dfn_part[pbase + (unsigned long long)(n_3 * 16384) + kcol] = _sub_4;
+                    dfn_part[pbase + (unsigned long long)(n_3 * 28672) + kcol] = _sub_4;
                 }
             }
         }
