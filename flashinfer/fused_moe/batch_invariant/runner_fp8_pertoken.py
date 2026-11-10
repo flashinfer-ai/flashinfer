@@ -113,11 +113,19 @@ class BatchInvariantFp8PerTokenRunner(BatchInvariantFp8PerTensorRunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
+            # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
+            # meaning in this module (with pre-routed ids the group structure never enters the computation)
+            if getattr(self, "_grouped_other", False):
+                raise unsupported(
+                    CLASS,
+                    f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
+                    "the groups with DeepSeekV3, or pre-routed ids",
+                )
             if self._method is None:
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",
-                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm or DeepSeekV3 with n_group <= 1",
+                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm, TopK, Llama4, TopKSigmoid or DeepSeekV3",
                 )
             bias = act.routing_bias
             if (bias is not None) != self._method.bias:

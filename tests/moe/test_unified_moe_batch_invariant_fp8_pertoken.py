@@ -305,6 +305,27 @@ def test_fingerprint_dimensions_terms_and_pins():
         )
         != fp
     )
+    g84 = bi.fingerprint(
+        "fused_moe_fp8_pertoken",
+        method=RoutingMethodType.DeepSeekV3,
+        n_group=8,
+        topk_group=4,
+        **dims,
+    )  # DeepSeekV3's groups are parameters of its routing term: the group shape is a dimension
+    assert g84 != bi.fingerprint(
+        "fused_moe_fp8_pertoken", method=RoutingMethodType.DeepSeekV3, **dims
+    )
+    assert g84 == bi.fingerprint(
+        "fused_moe_fp8_pertoken", method="sigmoid_renorm_bias_scaled_g8x4", **dims
+    )
+    with pytest.raises(ValueError):
+        bi.fingerprint(
+            "fused_moe_fp8_pertoken",
+            method=RoutingMethodType.TopK,
+            n_group=8,
+            topk_group=4,
+            **dims,
+        )
     fps = {bi.fingerprint("fused_moe_fp8_pertoken", act=a, **dims) for a in ACTIVATIONS}
     assert len(fps) == len(ACTIVATIONS) and fp in fps
     for cfg in ACTIVATIONS:
@@ -722,6 +743,72 @@ def test_three_routing_modes_agree_and_runs_are_deterministic():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out_g), bits(out_l))
+
+
+@needs_device
+def test_grouped_deepseekv3_from_logits_matches_the_pre_routed_path():
+    """DeepSeekV3's group-limited selection from logits (the groups are parameters of the routing term, derived by the
+    per-tensor runner's shared function): the layer's bits equal the pre-routed path on the exact CPU model's ids and
+    weights, and repeat; expert groups with another method are refused from logits and never consulted with pre-routed
+    ids (the bits of the ungrouped layer on the same ids and weights)."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, H, I, E = 64, 4, 512, 256, 32
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=7, adversarial=True)
+    bias = (
+        (torch.randn(E, generator=torch.Generator().manual_seed(8)) * 0.1)
+        .float()
+        .cuda()
+    )
+    W = _weights(w1, w2)
+
+    def grouped_layer(method, n_group, topk_group, **kw):
+        return MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(
+                    num_experts=E,
+                    top_k=k,
+                    method=method,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    **kw,
+                ),
+                quant=QuantConfig(
+                    weight=QuantFormat.FP8PerChannel,
+                    activation=QuantFormat.FP8PerToken,
+                ),
+                experts=ExpertConfig(intermediate_size=I),
+                activation=_SWIGLU,
+                backend=BackendOptions((BatchInvariantFp8PerTokenConfig(),)),
+                execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=T),
+            ),
+            device=torch.device("cuda"),
+        )
+
+    for groups in ((8, 4), (4, 1)):
+        rm = S.METHOD_OF_FLASHINFER[RoutingMethodType.DeepSeekV3].with_groups(*groups)
+        layer = grouped_layer(
+            RoutingMethodType.DeepSeekV3, *groups, routed_scaling_factor=1.75
+        )
+        out = layer(_logits_pack(x, logits, bias=bias), W)
+        ex, w = R.route_cpu(logits.cpu(), k, rm, bias.cpu(), 1.75)
+        assert torch.equal(
+            bits(out), bits(layer(_routed_pack(x, ex.cuda(), w.cuda()), W))
+        ), groups
+        assert torch.equal(
+            bits(layer(_logits_pack(x, logits, bias=bias), W)), bits(out)
+        ), groups
+    grouped = grouped_layer(RoutingMethodType.Renormalize, 2, 1)
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+        grouped(_logits_pack(x, logits), W)
+    assert "n_group" in str(excinfo.value)
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    plain = _layer(k, E, I, tune_max=T)
+    assert torch.equal(
+        bits(grouped(_routed_pack(x, ids.cuda(), wts.cuda()), W)),
+        bits(plain(_routed_pack(x, ids.cuda(), wts.cuda()), W)),
+    )
 
 
 @needs_device
