@@ -2789,6 +2789,38 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def uses_guarded_grouped_swaps_output_rows(self) -> bool:
+        """Whether inactive wide NVFP4 Swaps rows skip score masking.
+
+        As with grouped Keeps, every SwapsMmaAb Q row is an independent score
+        column: its max/sum scratch slot, P column, O column and correction
+        scale belong to that row alone, and direct output, split scratch and
+        reduction publication already guard row validity. Inactive grouped
+        rows load zero-filled (or another request's finite) Q, so they cannot
+        perturb a valid row. Masking them cost 48 selects per score tile on
+        the D128 Q48 softmax, its bottleneck (GB300 B128/KV128K/sQ6: 1.18 ->
+        1.03 ms, bitwise-identical output). D512 keeps the mask: its
+        instruction-cache-bound Q64 schedule measured 1.5% slower without it.
+        Narrow profiles retain their existing masks: changing their softmax
+        predication can reduce throughput even when no rows are inactive.
+        """
+        return (
+            self.headdim <= 256
+            and self.uses_large_q_swaps_tile
+            and self.use_transform_kv
+            and self.use_nvfp4_kv
+            and self.use_fp8_q
+            and self.use_paged_kv
+            and self.groups_tokens_heads_q
+            and (
+                not self.use_variable_seqlens_q
+                or (self.uniform_query_offsets and not self.use_sage_attention)
+            )
+            and not self.use_block_sparse
+            and not self.use_cluster_smem_reduction
+        )
+
+    @property
     def has_static_dense_full_kv_tiles(self) -> bool:
         """Whether static dense KV avoids masking and runtime tile remapping."""
         return (
@@ -2889,6 +2921,7 @@ class FmhaDecodeConfig:
         return (
             self.q_tiles_need_row_mask
             and not self.uses_guarded_grouped_keeps_output_rows
+            and not self.uses_guarded_grouped_swaps_output_rows
         )
 
     @property
