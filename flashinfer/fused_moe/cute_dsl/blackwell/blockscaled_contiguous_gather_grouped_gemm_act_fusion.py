@@ -3359,19 +3359,31 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                 acc_scale1 = ue8m0_to_inv_scale_fast(
                                     tCrSFC[vi + 1].to(cutlass.Uint32)
                                 )
+                                vec0 = tTR_rAcc_frg[None, vi]
+                                vec1 = tTR_rAcc_frg[None, vi + 1]
                                 if cutlass.const_expr(self.fold_clamped_relu2_l2):
                                     # norm_const is L ** 2 here (1.0 otherwise). For a
                                     # block with a tiny amax (small E8M0 code),
-                                    # 2 ** (127 - code) * L ** 2 overflows fp32, and
-                                    # inf * 0 gives NaN: clamp as the NVFP4 path does.
-                                    acc_scale0, acc_scale1 = cute.arch.mul_packed_f32x2(
+                                    # 2 ** (127 - code) * L ** 2 overflows fp32: apply
+                                    # L ** 2 to that block's values first instead.
+                                    folded0, folded1 = cute.arch.mul_packed_f32x2(
                                         (acc_scale0, acc_scale1),
                                         (norm_const, norm_const),
                                     )
-                                    acc_scale0 = fmin(acc_scale0, fp32_max, nan=True)
-                                    acc_scale1 = fmin(acc_scale1, fp32_max, nan=True)
-                                vec0 = tTR_rAcc_frg[None, vi]
-                                vec1 = tTR_rAcc_frg[None, vi + 1]
+                                    if folded0 > fp32_max:
+                                        for ei in cutlass.range_constexpr(
+                                            self.sf_vec_size
+                                        ):
+                                            vec0[ei] = vec0[ei] * norm_const
+                                    else:
+                                        acc_scale0 = folded0
+                                    if folded1 > fp32_max:
+                                        for ei in cutlass.range_constexpr(
+                                            self.sf_vec_size
+                                        ):
+                                            vec1[ei] = vec1[ei] * norm_const
+                                    else:
+                                        acc_scale1 = folded1
                                 for ei in cutlass.range_constexpr(self.sf_vec_size):
                                     vec0[ei], vec1[ei] = cute.arch.mul_packed_f32x2(
                                         (vec0[ei], vec1[ei]),
