@@ -105,7 +105,7 @@ pip install flashinfer-python
 flashinfer download-kernels
 ```
 
-`flashinfer download-kernels` installs the `flashinfer-cubin` and `flashinfer-jit-cache` wheels that match the installed `flashinfer-python` and CUDA versions. By default it installs pre-built kernels for every supported GPU architecture (several GB); pass `--sm` (e.g. `--sm sm90a`, repeatable) to install the jit-cache provider only for your GPUs. Re-run it after upgrading `flashinfer-python`.
+`flashinfer download-kernels` installs the `flashinfer-cubin` and `flashinfer-jit-cache` wheels that match the installed `flashinfer-python` and CUDA versions. By default it installs pre-built kernels for every supported GPU architecture (several GB); pass `--mode minimal` to install the jit-cache provider only for the visible GPUs, or `--sm` (e.g. `--sm sm90a`, repeatable) to choose architectures explicitly. Re-run it after upgrading `flashinfer-python`.
 
 **For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
 

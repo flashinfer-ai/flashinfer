@@ -948,6 +948,67 @@ def test_download_kernels_cmd_sm_installs_only_compatible_provider(monkeypatch):
     ]
 
 
+def test_download_kernels_cmd_minimal_detects_visible_sm(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "12.9")
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr(
+        flashinfer_main.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(9, "0a")},
+    )
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm80", "sm90a")
+
+    out = _test_cmd_helper(["download-kernels", "--mode", "minimal", "--dry-run"])
+
+    _assert_output_contains_all(
+        out,
+        "flashinfer-cubin==0.4.1",
+        "Install mode: minimal",
+        "Providers: sm90a",
+        "flashinfer-jit-cache-sm90a==0.4.1+cu129",
+    )
+    assert "flashinfer-jit-cache-sm80" not in out
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (
+            ["--mode", "all", "--sm", "sm90a"],
+            "--sm cannot be combined with --mode all.",
+        ),
+        (["--sm", "hopper"], "Invalid SM architecture 'hopper'."),
+    ],
+)
+def test_download_kernels_cmd_rejects_invalid_selection_before_install(
+    monkeypatch, args, message
+):
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+
+    def fail_run(*_args, **_kwargs):
+        pytest.fail("Invalid options must not install any wheel")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    result = CliRunner().invoke(
+        cli,
+        ["download-kernels", "--cuda-version", "12.9", "--flashinfer-version", "0.4.1"]
+        + args,
+    )
+
+    assert result.exit_code != 0
+    assert message in result.output
+    assert "=== Cubin Wheel Install ===" not in result.output
+
+
 def test_download_kernels_cmd_allows_local_flashinfer_version(monkeypatch):
     def fail_run(*_args, **_kwargs):
         raise AssertionError("subprocess.run should not be called for dry-run")

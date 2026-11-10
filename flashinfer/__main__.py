@@ -487,7 +487,17 @@ def _install_kernel_wheels(
     nightly: bool,
     dry_run: bool,
     sm_architectures: tuple[str, ...] = (),
+    mode: str | None = None,
 ) -> None:
+    # Reject invalid jit-cache selections before installing the cubin wheel, so a
+    # bad flag does not first spend a multi-GB download and then fail.
+    if mode is None:
+        mode = "minimal" if sm_architectures else "all"
+    elif sm_architectures and mode != "minimal":
+        raise click.ClickException("--sm cannot be combined with --mode all.")
+    for architecture in sm_architectures:
+        _normalize_jit_cache_provider_tag(architecture)
+
     failures = []
     installers = [
         (
@@ -504,7 +514,7 @@ def _install_kernel_wheels(
                 jit_cache_index_url,
                 nightly,
                 dry_run,
-                mode="minimal" if sm_architectures else "all",
+                mode=mode,
                 sm_architectures=sm_architectures,
             ),
         ),
@@ -823,12 +833,24 @@ cli.add_command(download_jit_cache_cmd, "download-jit-cache")
     help="Explicit flashinfer-jit-cache wheel index URL.",
 )
 @click.option(
+    "--mode",
+    type=click.Choice(("all", "minimal")),
+    default=None,
+    help=(
+        "jit-cache providers to install: all providers declared by the shim, "
+        "or only those selected by --sm or the visible GPUs. Defaults to "
+        "minimal when --sm is given, otherwise all. The flashinfer-cubin "
+        "wheel is shared by all architectures and is always installed in full."
+    ),
+)
+@click.option(
     "--sm",
     "sm_architectures",
     multiple=True,
     help=(
         "Install only the jit-cache provider compatible with this CUDA "
-        "architecture, such as sm80, sm90a, or sm120f. May be repeated."
+        "architecture, such as sm80, sm90a, or sm120f. Implies --mode "
+        "minimal. May be repeated."
     ),
 )
 @click.option(
@@ -846,6 +868,7 @@ def download_kernels_cmd(
     flashinfer_version,
     cubin_index_url,
     jit_cache_index_url,
+    mode,
     sm_architectures,
     nightly,
     dry_run,
@@ -859,6 +882,7 @@ def download_kernels_cmd(
         nightly,
         dry_run,
         sm_architectures,
+        mode,
     )
 
 

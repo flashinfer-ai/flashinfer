@@ -55,8 +55,9 @@ This eliminates compilation and downloading overhead at runtime.
 ``flashinfer-jit-cache`` wheels that match the installed ``flashinfer-python``
 version and the CUDA version of the installed PyTorch. By default it installs
 pre-built kernels for every supported GPU architecture (several GB); pass
-``--sm`` (for example ``--sm sm90a``, repeatable) to install the jit-cache
-provider only for your GPUs. The kernel wheels must match ``flashinfer-python``
+``--mode minimal`` to install the jit-cache provider only for the visible GPUs,
+or ``--sm`` (for example ``--sm sm90a``, repeatable) to choose architectures
+explicitly. The kernel wheels must match ``flashinfer-python``
 exactly, so re-run the command after upgrading. See :doc:`cli` for all options.
 
 .. note::
