@@ -1049,9 +1049,13 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "ActivationType::SwigluStep with MxFp8.";
 }
 
+// Tile_N candidates around the tile covering num_tokens * top_k / num_local_experts. Under expert
+// parallelism a caller may pass every row it received, with global expert ids, so when
+// num_experts > num_local_experts the tile covering num_tokens * top_k / num_experts is also
+// offered if it is below every candidate: at most one extra, smaller tile.
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                                        int64_t const num_tokens, int64_t const top_k,
-                                       int64_t const num_local_experts,
+                                       int64_t const num_local_experts, int64_t const num_experts,
                                        int const num_smaller_tile_candidates = 2) {
   TVM_FFI_ICHECK(!ascending_supported_tile_sizes.empty())
       << "ascending_supported_tile_sizes must not be empty.";
@@ -1070,10 +1074,12 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_sup
   // - Here we map derived avg_tokens_per_expert to the first supported tile that covers it.
   // Because they bucket different quantities, cache bucket and runtime tile candidates can
   // diverge; launcher-side tactic resolution handles that mismatch.
-  auto it = std::lower_bound(
-      ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end(),
-      avg_tokens_per_expert,
-      [](int32_t tile, double average) { return static_cast<double>(tile) < average; });
+  auto const tile_below = [](int32_t tile, double average) {
+    return static_cast<double>(tile) < average;
+  };
+  auto it =
+      std::lower_bound(ascending_supported_tile_sizes.begin(), ascending_supported_tile_sizes.end(),
+                       avg_tokens_per_expert, tile_below);
   if (it == ascending_supported_tile_sizes.end()) {
     it = std::prev(ascending_supported_tile_sizes.end());
   }
@@ -1101,14 +1107,24 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_sup
     selected_tile_nums.insert(*down);
   }
 
+  if (num_experts > num_local_experts) {
+    double const global_avg_tokens_per_expert =
+        static_cast<double>(num_tokens) * static_cast<double>(top_k) / num_experts;
+    // The global estimate is at most the local one, so its covering tile is at or below *it.
+    int32_t const global_tile = *std::lower_bound(ascending_supported_tile_sizes.begin(), it,
+                                                  global_avg_tokens_per_expert, tile_below);
+    if (global_tile < *selected_tile_nums.begin()) {
+      selected_tile_nums.insert(global_tile);
+    }
+  }
   return selected_tile_nums;
 }
 
 int64_t selectDefaultTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
                            int64_t const num_tokens, int64_t const top_k,
                            int64_t const num_local_experts) {
-  auto selected =
-      computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts, 1);
+  auto selected = computeSelectedTileN(ascending_supported_tile_sizes, num_tokens, top_k,
+                                       num_local_experts, /*num_experts=*/num_local_experts, 1);
   TVM_FFI_ICHECK(!selected.empty()) << "No selected tile_N candidates for current MoE input.";
   return *selected.begin();
 }
@@ -2094,15 +2110,16 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
                                                int64_t hidden_size_output,
                                                int64_t intermediate_size, int64_t num_local_experts,
-                                               int64_t num_tokens, int64_t act_type,
-                                               bool use_shuffled_weight, int64_t weight_layout,
+                                               int64_t num_experts, int64_t num_tokens,
+                                               int64_t act_type, bool use_shuffled_weight,
+                                               int64_t weight_layout,
                                                batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-    std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+    std::set<int32_t> selected_tile_nums = computeSelectedTileN(
+        supported_tile_nums, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
@@ -2704,6 +2721,17 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
         routing_logits_dtype == dl_float32 ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
   }
 
+  // DeepSeek FP8 scale block implied by hidden_states_scale [hidden_size / block, num_tokens]:
+  // 128 (checkpoint layout) or 32 (vLLM's re-blocked TP shards). check_moe() rejects anything
+  // else; MxFp8 keeps the 128-element divisibility rule.
+  int64_t deepseek_sf_block_size() const {
+    if (quantization_type != Fp8QuantizationType::DeepSeekFp8 || hidden_states_scale.ndim() != 2 ||
+        hidden_states_scale.size(0) == 0 || args->hidden_size % hidden_states_scale.size(0) != 0) {
+      return 128;
+    }
+    return args->hidden_size / hidden_states_scale.size(0);
+  }
+
   void check_moe() const override {
     FusedMoeLauncher::check_moe_common();
     TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn)
@@ -2720,10 +2748,12 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
     TVM_FFI_ICHECK(weight_layout == batchedGemm::gemm::MatrixLayout::MajorK ||
                    weight_layout == batchedGemm::gemm::MatrixLayout::BlockMajorK)
         << "Staged FP8 block-scale MoE: weight_layout must be MajorK or BlockMajorK.";
-    TVM_FFI_ICHECK_EQ(args->hidden_size % 128, 0)
-        << "Staged FP8 block-scale MoE: hidden_size must be a multiple of 128.";
-    TVM_FFI_ICHECK_EQ(args->intermediate_size % 128, 0)
-        << "Staged FP8 block-scale MoE: intermediate_size must be a multiple of 128.";
+    int64_t const sf_block = deepseek_sf_block_size();
+    TVM_FFI_ICHECK_EQ(args->hidden_size % sf_block, 0)
+        << "Staged FP8 block-scale MoE: hidden_size must be a multiple of " << sf_block << ".";
+    TVM_FFI_ICHECK_EQ(args->intermediate_size % sf_block, 0)
+        << "Staged FP8 block-scale MoE: intermediate_size must be a multiple of " << sf_block
+        << ".";
     if (gemm1_weights.has_value() && gemm2_weights.has_value()) {
       TensorView const gemm1 = gemm1_weights.value();
       TensorView const gemm2 = gemm2_weights.value();
@@ -2772,8 +2802,11 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
           << "Staged DeepSeek FP8 MoE: hidden_states_scale must be float32.";
       TVM_FFI_ICHECK_EQ(hidden_states_scale.ndim(), 2)
           << "Staged DeepSeek FP8 MoE: hidden_states_scale must be 2D.";
-      TVM_FFI_ICHECK_EQ(hidden_states_scale.size(0), args->hidden_size / 128)
-          << "Staged DeepSeek FP8 MoE: hidden_states_scale dim0 must be hidden_size / 128.";
+      TVM_FFI_ICHECK((sf_block == 128 || sf_block == 32) &&
+                     hidden_states_scale.size(0) * sf_block == args->hidden_size)
+          << "Staged DeepSeek FP8 MoE: hidden_states_scale dim0 must be hidden_size / 128 or "
+             "hidden_size / 32, got "
+          << hidden_states_scale.size(0) << " for hidden_size " << args->hidden_size << ".";
       TVM_FFI_ICHECK_EQ(hidden_states_scale.size(1), args->num_tokens)
           << "Staged DeepSeek FP8 MoE: hidden_states_scale dim1 must be num_tokens.";
       if (gemm1_weights_scale.has_value() && gemm2_weights_scale.has_value()) {
@@ -2792,13 +2825,13 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
         TVM_FFI_ICHECK_EQ(gemm2_scale.size(0), totalLocalExperts)
             << "Staged DeepSeek FP8 MoE: gemm2_weights_scale dim0 is incorrect.";
         TVM_FFI_ICHECK_EQ(gemm1_scale.size(1),
-                          intermediate_size_factor * args->intermediate_size / 128)
+                          intermediate_size_factor * args->intermediate_size / sf_block)
             << "Staged DeepSeek FP8 MoE: gemm1_weights_scale dim1 is incorrect.";
-        TVM_FFI_ICHECK_EQ(gemm1_scale.size(2), args->hidden_size / 128)
+        TVM_FFI_ICHECK_EQ(gemm1_scale.size(2), args->hidden_size / sf_block)
             << "Staged DeepSeek FP8 MoE: gemm1_weights_scale dim2 is incorrect.";
-        TVM_FFI_ICHECK_EQ(gemm2_scale.size(1), args->hidden_size / 128)
+        TVM_FFI_ICHECK_EQ(gemm2_scale.size(1), args->hidden_size / sf_block)
             << "Staged DeepSeek FP8 MoE: gemm2_weights_scale dim1 is incorrect.";
-        TVM_FFI_ICHECK_EQ(gemm2_scale.size(2), args->intermediate_size / 128)
+        TVM_FFI_ICHECK_EQ(gemm2_scale.size(2), args->intermediate_size / sf_block)
             << "Staged DeepSeek FP8 MoE: gemm2_weights_scale dim2 is incorrect.";
       }
     } else if (quantization_type == Fp8QuantizationType::MxFp8) {
@@ -2837,14 +2870,16 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
       // inherit the wider FC1 minimum and write past gemm2_output.
       auto const staged_padded_tokens =
           std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
+      int64_t const sf_block = deepseek_sf_block_size();
       gemm1_output = alloc_tensor({staged_padded_tokens, gemm1_output_hidden}, dl_uint8,
                                   hidden_states.device());
-      gemm1_output_scale = alloc_tensor({gemm1_output_hidden / 128, staged_padded_tokens},
+      gemm1_output_scale = alloc_tensor({gemm1_output_hidden / sf_block, staged_padded_tokens},
                                         dl_float32, hidden_states.device());
       activation_output = alloc_tensor({staged_padded_tokens, args->intermediate_size}, dl_uint8,
                                        hidden_states.device());
-      activation_output_scale = alloc_tensor({args->intermediate_size / 128, staged_padded_tokens},
-                                             dl_float32, hidden_states.device());
+      activation_output_scale =
+          alloc_tensor({args->intermediate_size / sf_block, staged_padded_tokens}, dl_float32,
+                       hidden_states.device());
       gemm2_output = alloc_tensor({staged_padded_tokens, args->hidden_size}, dl_bfloat16,
                                   hidden_states.device());
     } else {
@@ -3378,13 +3413,15 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
                           gemm2_output2);
 }
 
-void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView gemm1_output_scale,
-                                            TensorView activation_output,
-                                            TensorView activation_output_scale,
-                                            TensorView expanded_idx_to_permuted_idx,
-                                            TensorView total_num_padded_tokens, int64_t num_tokens,
-                                            int64_t top_k, int64_t intermediate_size,
-                                            int64_t activation_type, bool enable_pdl) {
+void trtllm_moe_run_deepseek_fp8_activation(
+    TensorView gemm1_output, TensorView gemm1_output_scale, TensorView activation_output,
+    TensorView activation_output_scale, TensorView expanded_idx_to_permuted_idx,
+    TensorView total_num_padded_tokens, int64_t num_tokens, int64_t top_k,
+    int64_t intermediate_size, int64_t activation_type, bool enable_pdl, int64_t sf_block_size) {
+  TVM_FFI_ICHECK(sf_block_size == 128 || sf_block_size == 32)
+      << "DeepSeek FP8 activation: sf_block_size must be 128 or 32.";
+  TVM_FFI_ICHECK_EQ(intermediate_size % sf_block_size, 0)
+      << "DeepSeek FP8 activation: intermediate_size must be a multiple of sf_block_size.";
   TVM_FFI_ICHECK_EQ(gemm1_output.dtype(), dl_uint8)
       << "DeepSeek FP8 activation: gemm1_output must be uint8 FP8 storage.";
   TVM_FFI_ICHECK_EQ(gemm1_output_scale.dtype(), dl_float32)
@@ -3399,10 +3436,23 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView 
       << "DeepSeek FP8 activation: total_num_padded_tokens must be int32.";
 
   auto const activation = validateAndCastActivationType(activation_type);
+  // Both scale buffers are [row_blocks, padded_tokens] and the kernel indexes them by
+  // sf_block_size, so their leading dims must match the block the caller named.
+  int64_t const gemm1_cols = intermediate_size * (isGatedActivation(activation) ? 2 : 1);
+  TVM_FFI_ICHECK(gemm1_output_scale.ndim() == 2 &&
+                 gemm1_output_scale.size(0) == gemm1_cols / sf_block_size)
+      << "DeepSeek FP8 activation: gemm1_output_scale must be [" << gemm1_cols / sf_block_size
+      << ", padded_tokens] for sf_block_size " << sf_block_size << ".";
+  TVM_FFI_ICHECK(activation_output_scale.ndim() == 2 &&
+                 activation_output_scale.size(0) == intermediate_size / sf_block_size &&
+                 activation_output_scale.size(1) == gemm1_output_scale.size(1))
+      << "DeepSeek FP8 activation: activation_output_scale must be ["
+      << intermediate_size / sf_block_size << ", " << gemm1_output_scale.size(1) << "].";
   moe::dev::activation::Data activationData;
   activationData.mDtypeElt = btg::Dtype::E4m3;
   activationData.mUsePdl = enable_pdl;
   activationData.mUseDeepSeekFp8 = true;
+  activationData.mDeepSeekSfBlockSize = static_cast<int32_t>(sf_block_size);
   activationData.inPtr = const_cast<void*>(gemm1_output.data_ptr());
   activationData.outPtr = activation_output.data_ptr();
   activationData.inDqSfsPtr = static_cast<float*>(const_cast<void*>(gemm1_output_scale.data_ptr()));
@@ -3980,19 +4030,17 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
   Tensor routing_scales;
 
  public:
-  static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
-                                               int64_t hidden_size_output,
-                                               int64_t intermediate_size, int64_t num_local_experts,
-                                               int64_t num_tokens, int64_t act_type,
-                                               bool use_shuffled_weight, int64_t weight_layout,
-                                               btg::Dtype dtype_act, btg::Dtype dtype_weights,
-                                               bool use_routing_scales_on_input) {
+  static Array<Array<int64_t>> getValidConfigs(
+      int64_t top_k, int64_t hidden_size, int64_t hidden_size_output, int64_t intermediate_size,
+      int64_t num_local_experts, int64_t num_experts, int64_t num_tokens, int64_t act_type,
+      bool use_shuffled_weight, int64_t weight_layout, btg::Dtype dtype_act,
+      btg::Dtype dtype_weights, bool use_routing_scales_on_input) {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-    std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+    std::set<int32_t> selected_tile_nums = computeSelectedTileN(
+        supported_tile_nums, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
@@ -4252,15 +4300,16 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
                                                int64_t hidden_size_output,
                                                int64_t intermediate_size, int64_t num_local_experts,
-                                               int64_t num_tokens, int64_t act_type,
-                                               bool use_shuffled_weight, int64_t weight_layout,
-                                               btg::Dtype dtype_act, btg::Dtype dtype_weights) {
+                                               int64_t num_experts, int64_t num_tokens,
+                                               int64_t act_type, bool use_shuffled_weight,
+                                               int64_t weight_layout, btg::Dtype dtype_act,
+                                               btg::Dtype dtype_weights) {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> supported_tile_nums(mSupportedTileNums.begin(), mSupportedTileNums.end());
-    std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+    std::set<int32_t> selected_tile_nums = computeSelectedTileN(
+        supported_tile_nums, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
@@ -4831,7 +4880,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
 
   static Array<Array<int64_t>> getValidConfigs(
       int64_t top_k, int64_t hidden_size, int64_t hidden_size_output, int64_t intermediate_size,
-      int64_t num_local_experts, int64_t num_tokens, bool use_shuffled_weight,
+      int64_t num_local_experts, int64_t num_experts, int64_t num_tokens, bool use_shuffled_weight,
       int64_t weight_layout, btg::Dtype dtype_act, btg::Dtype dtype_weights,
       Fp8QuantizationType quantization_type, int64_t act_type,
       batchedGemm::gemm::BiasType gemm1_bias_type) {
@@ -4840,8 +4889,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     auto activation_type = validateAndCastActivationType(act_type);
 
     auto supported_tile_nums = getSupportedTileNums(quantization_type);
-    std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(supported_tile_nums, num_tokens, top_k, num_local_experts);
+    std::set<int32_t> selected_tile_nums = computeSelectedTileN(
+        supported_tile_nums, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
       std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
@@ -5089,14 +5138,14 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
                                                int64_t hidden_size_output,
                                                int64_t intermediate_size, int64_t num_local_experts,
-                                               int64_t num_tokens,
+                                               int64_t num_experts, int64_t num_tokens,
                                                batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> tile_sizes(mSupportedTileNums.begin(), mSupportedTileNums.end());
     std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
+        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
@@ -5532,16 +5581,16 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
                                                int64_t hidden_size_output,
                                                int64_t intermediate_size, int64_t num_local_experts,
-                                               int64_t num_tokens, int64_t act_type,
-                                               btg::Dtype dtype_act, btg::Dtype dtype_weights,
-                                               bool use_per_token_scaling,
+                                               int64_t num_experts, int64_t num_tokens,
+                                               int64_t act_type, btg::Dtype dtype_act,
+                                               btg::Dtype dtype_weights, bool use_per_token_scaling,
                                                batchedGemm::gemm::BiasType gemm1_bias_type) {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
     std::vector<int32_t> tile_sizes = getSupportedTileNums(dtype_act, dtype_weights);
     std::set<int32_t> selected_tile_nums =
-        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
+        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts, num_experts);
 
     for (int32_t tile_N : selected_tile_nums) {
       auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
@@ -6570,9 +6619,9 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     int64_t const dtype_act_, int64_t const dtype_weights_,
     Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
     int64_t const hidden_size_output, int64_t const intermediate_size,
-    int64_t const num_local_experts, int64_t const act_type, bool const use_shuffled_weight,
-    int64_t const weight_layout, bool const use_per_token_scaling, int64_t const num_tokens,
-    bool has_gemm1_lora_delta) {
+    int64_t const num_local_experts, int64_t const num_experts, int64_t const act_type,
+    bool const use_shuffled_weight, int64_t const weight_layout, bool const use_per_token_scaling,
+    int64_t const num_tokens, bool has_gemm1_lora_delta) {
   auto activation_type = validateAndCastActivationType(act_type);
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
@@ -6583,13 +6632,13 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     // MxInt4 MoE
     return MxInt4BlockScaleLauncher::getValidConfigs(top_k, hidden_size, hidden_size_output,
                                                      intermediate_size, num_local_experts,
-                                                     num_tokens, gemm1_bias_type_enum);
+                                                     num_experts, num_tokens, gemm1_bias_type_enum);
   }
   if (dtype_act == btg::Dtype::Bfloat16 && dtype_weights == btg::Dtype::Bfloat16) {
     // BF16 MoE
     return Bf16MoeLauncher::getValidConfigs(
-        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
-        act_type, use_shuffled_weight, weight_layout, gemm1_bias_type_enum);
+        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_experts,
+        num_tokens, act_type, use_shuffled_weight, weight_layout, gemm1_bias_type_enum);
 
   } else if (fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
@@ -6600,22 +6649,22 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     }
     // FP8 block scale (DeepSeek)
     return Fp8BlockScaleLauncher::getValidConfigs(
-        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
-        use_shuffled_weight, weight_layout, dtype_act, dtype_weights, fp8_quantization_type,
-        act_type, gemm1_bias_type_enum);
+        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_experts,
+        num_tokens, use_shuffled_weight, weight_layout, dtype_act, dtype_weights,
+        fp8_quantization_type, act_type, gemm1_bias_type_enum);
   } else if (fp8_quantization_type == Fp8QuantizationType::PerChannelFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
     // FP8 per-channel scale
     return Fp8PerChannelLauncher::getValidConfigs(
-        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
-        act_type, use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
+        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_experts,
+        num_tokens, act_type, use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
   } else if (fp8_quantization_type == Fp8QuantizationType::MxFp8 &&
              dtype_act == btg::Dtype::MxE4m3 && dtype_weights == btg::Dtype::MxE4m3) {
     // FP8 block scale (MxFp8)
     return Fp8BlockScaleLauncher::getValidConfigs(
-        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
-        use_shuffled_weight, weight_layout, dtype_act, dtype_weights, fp8_quantization_type,
-        act_type, gemm1_bias_type_enum);
+        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_experts,
+        num_tokens, use_shuffled_weight, weight_layout, dtype_act, dtype_weights,
+        fp8_quantization_type, act_type, gemm1_bias_type_enum);
   } else if ((fp8_quantization_type == Fp8QuantizationType::PerTensorFp8 ||
               fp8_quantization_type == Fp8QuantizationType::NoneFp8) &&
              dtype_weights == btg::Dtype::E4m3) {
@@ -6628,15 +6677,16 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
           << "FP8 per-tensor currently supports gated activations only, "
           << "got act_type=" << act_type << ".";
     }
-    return Fp8PerTensorLauncher::getValidConfigs(top_k, hidden_size, hidden_size_output,
-                                                 intermediate_size, num_local_experts, num_tokens,
-                                                 act_type, use_shuffled_weight, weight_layout,
-                                                 dtype_act, dtype_weights, use_per_token_scaling);
+    return Fp8PerTensorLauncher::getValidConfigs(
+        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_experts,
+        num_tokens, act_type, use_shuffled_weight, weight_layout, dtype_act, dtype_weights,
+        use_per_token_scaling);
   } else if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
     // FP4 block scale
-    return FP4BlockScaleLauncher::getValidConfigs(
-        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
-        act_type, dtype_act, dtype_weights, use_per_token_scaling, gemm1_bias_type_enum);
+    return FP4BlockScaleLauncher::getValidConfigs(top_k, hidden_size, hidden_size_output,
+                                                  intermediate_size, num_local_experts, num_experts,
+                                                  num_tokens, act_type, dtype_act, dtype_weights,
+                                                  use_per_token_scaling, gemm1_bias_type_enum);
   }
 
   TVM_FFI_LOG_AND_THROW(NotImplementedError)
@@ -6654,14 +6704,14 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
     int64_t const dtype_act_, int64_t const dtype_weights_,
     Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
     int64_t const hidden_size_output, int64_t const intermediate_size,
-    int64_t const num_local_experts, int64_t const act_type, bool const use_shuffled_weight,
-    int64_t const weight_layout, bool const use_per_token_scaling, int64_t const num_tokens,
-    bool has_gemm1_lora_delta) {
+    int64_t const num_local_experts, int64_t const num_experts, int64_t const act_type,
+    bool const use_shuffled_weight, int64_t const weight_layout, bool const use_per_token_scaling,
+    int64_t const num_tokens, bool has_gemm1_lora_delta) {
   // Start from complete valid tactics so every factorized coordinate remains executable.
   auto const completeTactics = trtllm_get_valid_moe_configs(
       dtype_act_, dtype_weights_, fp8_quantization_type, top_k, hidden_size, hidden_size_output,
-      intermediate_size, num_local_experts, act_type, use_shuffled_weight, weight_layout,
-      use_per_token_scaling, num_tokens, has_gemm1_lora_delta);
+      intermediate_size, num_local_experts, num_experts, act_type, use_shuffled_weight,
+      weight_layout, use_per_token_scaling, num_tokens, has_gemm1_lora_delta);
   auto const dtypeAct = static_cast<btg::Dtype>(dtype_act_);
   auto const dtypeWeights = static_cast<btg::Dtype>(dtype_weights_);
   auto const activationType = validateAndCastActivationType(act_type);

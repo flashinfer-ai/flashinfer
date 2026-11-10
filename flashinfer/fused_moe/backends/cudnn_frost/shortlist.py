@@ -3,7 +3,9 @@
 
 Tables contain artifact identities, not hardware timings or compiled objects.
 An unmeasured token count uses the next measured count (the largest above the
-table's range). Geometry, activation and top-k must match exactly.
+table's range). Geometry, activation and top-k must match exactly. Entries with
+``complete: true`` include fusion/routing choices and fix the entire stage pool;
+legacy entries can still gain heuristic fusion candidates.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
+from typing import NamedTuple
 
 from .manifest import MANIFEST_FILENAME, read_manifest
 
@@ -20,6 +23,13 @@ _FILENAME = "moe_shortlists.json"
 _TableKey = tuple[str, str, int, int, int, int]
 _ProfileChoices = tuple[tuple[str, ...], tuple[str, ...]]
 _ProfileMap = Mapping[int, _ProfileChoices]
+
+
+class CompleteChoices(NamedTuple):
+    """Final stage choices already compared across routing and fusion modes."""
+
+    fc1: tuple[str, ...]
+    fc2: tuple[str, ...]
 
 
 @functools.lru_cache(maxsize=8)
@@ -76,7 +86,11 @@ def _read(roots: tuple[Path, ...]) -> dict:
             profiles = tables.setdefault(key, {})
             if tokens in profiles:
                 raise ValueError("duplicate Frost MoE shortlist profile")
-            profiles[tokens] = (tuple(entry["fc1"]), tuple(entry["fc2"]))
+            complete = entry.get("complete", False)
+            if not isinstance(complete, bool):
+                raise ValueError("Frost shortlist 'complete' must be boolean")
+            choices = (tuple(entry["fc1"]), tuple(entry["fc2"]))
+            profiles[tokens] = CompleteChoices(*choices) if complete else choices
     return tables
 
 
@@ -86,8 +100,12 @@ def capture_profiles(roots: tuple[Path, ...]) -> Mapping[_TableKey, _ProfileMap]
     for key, profiles in _read(tuple(roots)).items():
         tables[key] = MappingProxyType(
             {
-                tokens: (tuple(first), tuple(second))
-                for tokens, (first, second) in profiles.items()
+                tokens: (
+                    CompleteChoices(tuple(choices[0]), tuple(choices[1]))
+                    if isinstance(choices, CompleteChoices)
+                    else (tuple(choices[0]), tuple(choices[1]))
+                )
+                for tokens, choices in profiles.items()
             }
         )
     return MappingProxyType(tables)

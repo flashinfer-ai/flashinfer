@@ -491,8 +491,9 @@ class CuteDslSm120MoeMxfp8Mxfp4Grouped:
         gW = cute.make_tensor(
             gB_e.iterator, cute.make_layout((N, K, E), stride=(K, 1, N * K))
         )
-        m_padded_sf = cute.size(gSFA_u8, mode=[1])
         sf_dtype = cfg.load_sf.sf_dtype
+        # Size the packed scale extent in the TMA operand's element units.
+        m_padded_sf = cute.size(cute.recast_tensor(gSFA_u8, sf_dtype), mode=[1])
         if cutlass.const_expr(cfg.mma.swap_ab):
             t_a, t_b = gW, gA
             gSFA = cute.make_tensor(

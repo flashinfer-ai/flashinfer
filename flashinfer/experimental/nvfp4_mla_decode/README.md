@@ -92,10 +92,13 @@ stage's are `decode_qk_ahead` (SM100), for long balanced plans, `decode_xv`
 `decode_short`, for plans whose work units are all short, and
 `decode_short_epi_warp`, which takes the place of `decode_short` when every
 request ends in a CTA of at least 32 valid query rows, and
-`decode_short_spec_uh` (SM100) and `decode_short_epi_warp_spec_uh`, which load
+`decode_short_spec_uh` and `decode_short_epi_warp_spec_uh`, which load
 the first item of their work unit in the kernel setup and take the place of
-either when every work unit holds one item pair; the combine's is
-`reduce_general`, for plans of more than two splits per row. Each record
+either when every work unit holds one item pair; the combine's are
+`reduce_general`, for plans of more than two splits per row, and
+`reduce_two_splits`, which skips the per-row split-count load and runs
+short plans whose rows of two splits form one contiguous range, launched over
+that range alone. Each record
 carries the host plan: the
 architectures it is delivered for, its launch record, the argument plan of its
 `run` entry, the grid rule a launch follows, the kernel-parameter to

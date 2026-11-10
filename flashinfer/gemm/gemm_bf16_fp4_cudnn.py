@@ -15,12 +15,13 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    is_in_profile_measurement,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..utils import _get_cache_buf, get_native_fp4_dtype
+from ..utils import _get_stream_cache_buf, get_native_fp4_dtype
 
 from .gemm_base import (
     CUDNN_AVAILABLE,
@@ -511,6 +512,11 @@ def _cudnn_bf16_fp4_runner(tuning_config):
             except CudnnCaptureUnsafeError:
                 raise
             except Exception as exc:
+                # During autotuner profiling, report the failed tactic as
+                # unsupported (marked inf) instead of silently timing
+                # tactic=-1 -- see the note in gemm_base.py (#3707 review).
+                if is_in_profile_measurement():
+                    raise
                 warnings.warn(
                     "cuDNN bf16-fp4 GEMM tactic failed; falling back to default "
                     f"tactic=-1. ({exc})",
@@ -594,7 +600,7 @@ def _compute_cudnn(
         if out.dtype != out_dtype:
             raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "mm_bf16_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 

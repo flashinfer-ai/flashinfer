@@ -116,7 +116,7 @@ def test_staged_routing_ffi_signatures_take_optional_weights(name, expected_para
     )
     assert source_path.exists(), f"JIT MoE source does not exist: {source_path}"
     source = source_path.read_text()
-    begin = source.index(f"Array<Tensor> {name}(")
+    begin = source.index(f" {name}(")
     signature = source[source.index("(", begin) + 1 : source.index(")", begin)]
     params = [param.strip() for param in signature.split(",")]
     names = [param.split()[-1] for param in params]
@@ -504,6 +504,7 @@ def _partition_geometry_runner(
         has_output_block_scaling = False
         preferred_cluster_shape = (1, 1, 1)
         umma_cta_count = 1
+        use_deepseek_fp8 = 0
 
         def __init__(self, tile_m):
             self.tile_m = tile_m
@@ -571,6 +572,7 @@ def test_unpartitioned_geometry_filters_incomplete_wider_cga(monkeypatch):
         is_swap_ab = True
         tile_m = 128
         umma_cta_count = 2
+        use_deepseek_fp8 = 0
 
         def __init__(self, cluster_dim_x):
             self.preferred_cluster_shape = (cluster_dim_x, 1, 1)

@@ -24,10 +24,15 @@ negative ``dt_bias`` so most gates sit in ``(-0.5, 0]``, wide beta logits up to
 sigmoid ~0.99, nonzero initial state) and checks both the ``recurrent_kda``
 facade (BF16 state pool) and the prepared BF16 export (FP32 state pool) against
 an FP64 token-by-token recurrence.  Non-finite output is a hard failure.
-The last section runs the prepared export at the head counts of other TP
+A later section runs the prepared export at the head counts of other TP
 ranks (24, 64, 96) and on plain state pools without ``state_indices``.
+
+The last section checks the BT16 prepare/chain route, which a compact BF16
+state and an indexed FP32 state pool take, under these statistics and under a
+slow isotropic decay.
 """
 
+import importlib
 import math
 
 import pytest
@@ -36,7 +41,10 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import prepare_bf16_kda_prefill
+from flashinfer.jit.flash_kda import _GeneratedFlashKDASelectorNotFoundError
 from flashinfer.kda import recurrent_kda
+
+kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -359,26 +367,37 @@ def test_prepared_bf16_export_matches_fp64_recurrence(
 # round 7).  The round-9 body accumulates the BF16 decay correction onto the
 # FP32 state instead of re-deriving it (delta decay; FP32 chunk
 # carrier); these rows fail on the round-7 split body and pass on the fixed one.
-# Long rows whose 2-CTA clusters fit one wave take the pair-share build of the
-# same split (schedule suffix ``_pair_share``, the same bits) where the part's
-# pair-share row allows it: one sequence of 12 tasks is in the first row of
-# both parts (32 tasks, 1024 tokens); four 1024-token sequences (long-task load
-# 48) need 2048 tokens on both parts and keep the routed program.
+# Long rows of the same split take its M64 owner/helper build (suffix
+# ``_owner2helper``, the same bits) where the loader names one: one sequence of
+# 12 tasks of at least 1024 tokens is within the rule of both parts (36 tasks,
+# 1024 tokens); a loader without the build takes the pair-share build (suffix
+# ``_pair_share``) there, its 2-CTA clusters fitting one wave in the first
+# pair-share row of both parts (32 tasks, 1024 tokens).  Four 1024-token
+# sequences (48 tasks, long-task load 48) are beyond the owner/helper rule,
+# need 2048 tokens for the pair-share build on both parts and keep the routed
+# program.
 LONG_CASES = [
-    pytest.param((2048,), 12, 4411, True, id="bs1_t2048"),
-    pytest.param((2241,), 12, 4412, True, id="bs1_t2241"),
-    pytest.param((1024,) * 4, 12, 4413, False, id="bs4_t1024"),
+    pytest.param((2048,), 12, 4411, "_owner2helper", id="bs1_t2048"),
+    pytest.param((2241,), 12, 4412, "_owner2helper", id="bs1_t2241"),
+    pytest.param((1024,) * 4, 12, 4413, "", id="bs4_t1024"),
 ]
 
 
-@pytest.mark.parametrize(("lengths", "heads", "seed", "pair_share"), LONG_CASES)
+@pytest.mark.parametrize(("lengths", "heads", "seed", "suffix"), LONG_CASES)
 def test_prepared_bf16_export_long_bounded_rows_keep_fp32_state_carrier(
-    lengths, heads, seed, pair_share
+    lengths, heads, seed, suffix
 ):
+    from flashinfer.jit import cake_kda_tf32 as registry
+
+    if (
+        suffix == "_owner2helper"
+        and not registry._RENDERED_M64_OWNER_HELPER_ROUTES[registry.device_arch()]
+    ):
+        suffix = "_pair_share"
     call = _run_prepared_bf16_export(lengths, heads, seed, checkpoints=True)
     schedule = str(call.schedule)
     expected = "fused_m64_independent_dvsplit_fp32_state"
-    assert schedule == expected + ("_pair_share" if pair_share else ""), schedule
+    assert schedule == expected + suffix, schedule
 
 
 # ---------------------------------------------------------------------------
@@ -632,3 +651,207 @@ def test_prepared_bf16_export_without_state_indices_matches_indexed_call(
         assert torch.equal(plain.view(torch.uint8), indexed.view(torch.uint8)), (
             f"{name} differs between the plain and the indexed call"
         )
+
+
+def slow_decay_inputs(*, lengths, heads, seed, device="cuda"):
+    """Isotropic operands whose gates decay ~0.17% per token, from a zero state."""
+    gen = torch.Generator(device=device).manual_seed(seed)
+    shape = (1, sum(lengths), heads, HEAD_DIM)
+    q, k, v, g = (
+        torch.randn(shape, generator=gen, device=device).bfloat16() for _ in range(4)
+    )
+    offsets = [0]
+    for n in lengths:
+        offsets.append(offsets[-1] + n)
+    return dict(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=torch.randn(shape[:3], generator=gen, device=device).bfloat16(),
+        A_log=torch.zeros(heads, device=device),
+        dt_bias=torch.full((heads, HEAD_DIM), -8.0, device=device),
+        state=torch.zeros(len(lengths), heads, HEAD_DIM, HEAD_DIM, device=device),
+        offsets=offsets,
+    )
+
+
+# A compact BF16 state (no ``ssm_state_indices``) with few sequences takes the
+# BT16 prepare/chain route.  Its prepare kernel folds beta * T^T, the transposed
+# chunk inverse, into the chain's factors.  The fold's cross-block terms only
+# matter when the decay inside a 16-token chunk is slow, and the off-diagonal
+# block of T needs the complete 8x8 diagonal inverses once keys share a
+# direction and beta is near 1.  ``generated`` runs the generated prepare
+# body; ``static`` makes the generated selector miss so that the hand-written
+# ``bt16_prepare`` kernel runs instead.
+BT16_CASES = [
+    pytest.param(slow_decay_inputs, (512,), 0, id="slow_decay_bs1_t512"),
+    pytest.param(trained_gate_inputs, (512,), 4414, id="trained_bs1_t512"),
+    pytest.param(trained_gate_inputs, (700, 1300), 4415, id="trained_bs2_varlen"),
+]
+
+
+@pytest.mark.parametrize(("make_inputs", "lengths", "seed"), BT16_CASES)
+@pytest.mark.parametrize("kernels", ["generated", "static"])
+def test_bt16_compact_bf16_state_matches_fp64_recurrence(
+    make_inputs, lengths, seed, kernels, monkeypatch
+):
+    inp = make_inputs(lengths=lengths, heads=12, seed=seed)
+    expected_out, expected_final = fp64_reference(inp)
+    launches = []
+
+    def record(name, launch):
+        def run(*args, **kwargs):
+            launches.append(name)
+            return launch(*args, **kwargs)
+
+        return run
+
+    def miss_generated_selector(**kwargs):
+        launches.append("generated")
+        raise _GeneratedFlashKDASelectorNotFoundError("hand-written BT16 kernels")
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_generated_bt16_prepare_chain",
+        miss_generated_selector
+        if kernels == "static"
+        else record("generated", kda_prefill_api._run_generated_bt16_prepare_chain),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_bt16_prepare_chain",
+        record("static", kda_prefill_api._run_bt16_prepare_chain),
+    )
+    out, final_state = recurrent_kda(
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"],
+        g=inp["g"],
+        beta=inp["beta"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        scale=None,
+        initial_state=inp["state"].bfloat16(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=LOWER_BOUND,
+        cu_seqlens=(
+            torch.tensor(inp["offsets"], device="cuda", dtype=torch.int64)
+            if len(lengths) > 1
+            else None
+        ),
+        beta_is_logit=True,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+    assert launches == (
+        ["generated"] if kernels == "generated" else ["generated", "static"]
+    )
+    _check("output", out, expected_out)
+    _check("final_state", final_state, expected_final)
+
+
+def test_bt16_indexed_fp32_state_matches_fp64_recurrence(monkeypatch):
+    """An indexed FP32 state pool takes the same BT16 prepare with the FP32 chain."""
+    lengths, heads = (512,), 12
+    inp = trained_gate_inputs(lengths=lengths, heads=heads, seed=4416)
+    expected_out, expected_final = fp64_reference(inp)
+    launches = []
+    launch = kda_prefill_api._run_generated_bt16_prepare_chain
+
+    def record(*args, **kwargs):
+        launches.append(kwargs["state_dtype_is_fp32"])
+        return launch(*args, **kwargs)
+
+    monkeypatch.setattr(kda_prefill_api, "_run_generated_bt16_prepare_chain", record)
+    pool = torch.zeros(
+        (len(lengths) + 2, heads, HEAD_DIM, HEAD_DIM),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    indices = torch.arange(len(lengths), device="cuda", dtype=torch.int32) + 1
+    pool[indices.long()] = inp["state"]
+    out, _ = recurrent_kda(
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"],
+        g=inp["g"],
+        beta=inp["beta"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        scale=None,
+        initial_state=pool,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=LOWER_BOUND,
+        ssm_state_indices=indices,
+        beta_is_logit=True,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+    assert launches == [True]
+    _check("output", out, expected_out)
+    _check("final_state", pool[indices.long()], expected_final)
+
+
+# The hand-written ``bt16_prepare_beta_tma`` body serves the dense wavefront
+# (one fixed-layout sequence, 60-64 heads with whole 8-head beta boxes, at least
+# 4096 tokens) when the generated selector misses.  The route policy sends that
+# H64 shape to the one-wave M64 split, so the route is forced to BT16 here, and
+# the generated selector is made to miss as in the ``static`` cases above.
+BT16_BETA_TMA_CASES = [
+    pytest.param(slow_decay_inputs, 4417, id="slow_decay_h64_t4096"),
+    pytest.param(trained_gate_inputs, 4418, id="trained_h64_t4096"),
+]
+
+
+@pytest.mark.parametrize(("make_inputs", "seed"), BT16_BETA_TMA_CASES)
+def test_bt16_prepare_beta_tma_dense_wavefront_matches_fp64_recurrence(
+    make_inputs, seed, monkeypatch
+):
+    inp = make_inputs(lengths=(4096,), heads=64, seed=seed)
+    expected_out, expected_final = fp64_reference(inp)
+    launches = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def record_module(variant, target):
+        launches.append(variant)
+        return get_module(variant, target)
+
+    def miss_generated_selector(**kwargs):
+        launches.append("generated")
+        raise _GeneratedFlashKDASelectorNotFoundError("hand-written BT16 kernels")
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "select_bf16_schedule_route",
+        lambda **kwargs: kda_prefill_api._FLASH_KDA_ROUTE_BT16_M64,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_run_generated_bt16_prepare_chain", miss_generated_selector
+    )
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", record_module)
+    out, final_state = recurrent_kda(
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"],
+        g=inp["g"],
+        beta=inp["beta"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        scale=None,
+        initial_state=inp["state"].bfloat16(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=LOWER_BOUND,
+        beta_is_logit=True,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+    assert launches == ["generated", "bt16_prepare_beta_tma", "bt16_chain_m64_s9"]
+    _check("output", out, expected_out)
+    _check("final_state", final_state, expected_final)

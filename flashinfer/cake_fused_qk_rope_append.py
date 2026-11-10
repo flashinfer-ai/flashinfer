@@ -48,7 +48,10 @@ and the problem shape with the Cake stage policy mirrored in
 writes bit-identical outputs.  The call is CUDA-graph capturable: every launch
 argument is a by-value scalar or a tensor pointer, no host synchronisation or
 workspace is involved; the selected build depends only on shapes, so a captured
-graph replays the same build.
+graph replays the same build.  With ``enable_pdl=True`` the call launches a
+build that waits for the preceding kernel on the stream (programmatic
+dependent launch) where the backend's ``PDL_POLICY`` admits it; see the
+``enable_pdl`` parameter for what the caller must guarantee.
 """
 
 from __future__ import annotations
@@ -90,6 +93,7 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
     out_k: Optional[torch.Tensor] = None,
     out_v: Optional[torch.Tensor] = None,
     clear_unused_last_page_rows: bool = True,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     r"""Fused Q/K RMSNorm + NeoX RoPE + BF16 Q output + paged K/V append in one launch.
 
@@ -124,6 +128,17 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
     clear_unused_last_page_rows : bool
         Zero rows ``[(seq_lens[b] - 1) % page_size + 1, page_size)`` of every request's
         last page in both caches (all kv heads).
+    enable_pdl : bool
+        Launch with programmatic dependent launch (PDL), so the kernel may start
+        while the immediately preceding kernel on the stream is still running.
+        The kernel then waits for that kernel to complete before it reads ``qkv``
+        and before any store, so ``qkv`` may be written by that kernel.
+        ``q_indptr``, ``seq_lens``, ``page_indices``, ``cos_sin`` and the norm
+        weights are read before that wait: no kernel that may still be running
+        when this kernel launches may write them.  PDL is used only on SM100 /
+        SM103 and only where it was measured to help (``PDL_POLICY`` of the
+        backend package); every other call launches plainly.  The outputs are
+        bitwise identical either way.  Default ``False``.
 
     Returns
     -------
@@ -149,6 +164,7 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
         out_k=out_k,
         out_v=out_v,
         clear_unused_last_page_rows=clear_unused_last_page_rows,
+        enable_pdl=enable_pdl,
     )
 
 

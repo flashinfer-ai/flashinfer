@@ -61,8 +61,10 @@ def _decode_inputs(
     device="cuda",
     seed=0,
     packed=True,
+    seqlen_q=1,
 ):
-    """One decode token per sequence against a paged, block-sparse fp8 KV cache.
+    """``seqlen_q`` decode tokens per sequence (one by default) against a paged,
+    block-sparse fp8 KV cache.
 
     Mirrors the shapes the SM90 decode schedule is built for: q is bf16, the KV
     cache is fp8 e4m3 with K and V interleaved in one buffer, and q2k_indices are
@@ -71,7 +73,7 @@ def _decode_inputs(
     """
     torch.manual_seed(seed)
     npages = max_k_tiles * batch
-    total_q = batch
+    total_q = batch * seqlen_q
     base = (
         torch.randn(npages, num_kv_heads, BLK_KV, 2 * HEAD_DIM, device=device) / 4
     ).to(torch.float8_e4m3fn)
@@ -263,6 +265,70 @@ def test_sparse_decode_paged_matches_reference(num_qo_heads, num_kv_heads):
 
 
 @sm90_only
+@pytest.mark.parametrize(
+    "batch,seqlen_q,num_qo_heads,num_kv_heads,max_k_tiles,route_at_132_sms",
+    [
+        pytest.param(
+            67, 1, 64, 4, 16, "decode_v5:nc16:s2:st2:evict_first:main", id="q1-s2"
+        ),
+        pytest.param(
+            42, 2, 64, 4, 65, "decode_v5:nc16:s1:st2:evict_first:main", id="q2-s1"
+        ),
+    ],
+)
+def test_sparse_decode_serves_the_nc16_bands_planned_at_three_stages(
+    batch, seqlen_q, num_qo_heads, num_kv_heads, max_k_tiles, route_at_132_sms
+):
+    """#7222: on 132-SM parts the decode cost model picks three ring stages for
+    these GQA-16 bands (265-330 items at q-len 1 with 11+ pages, 332-396 items
+    at q-len 2 with 65+ pages; items = batch * seqlen_q * KV heads), and the
+    export delivered those nc16 coordinates at two stages only, so
+    ``route_program`` raised ``KeyError`` from ``_decode_template``.  The
+    planner now serves the band with the two-stage ring of the same split
+    count; this checks that output against the FP32 oracle.  On other SM counts
+    the model picks a delivered route and this is an ordinary reference check.
+    """
+    from flashinfer.jit.cake_hopper_msa import ROUTES
+    from flashinfer.msa_ops import cake_hopper_sm90 as ch
+
+    total_q = batch * seqlen_q
+    num_sms = ch._num_sms(0)
+    plan = ch.plan_sparse_decode(
+        total_q=total_q,
+        num_q_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        num_sms=num_sms,
+        seqlen_q=seqlen_q,
+        max_pages=max_k_tiles,
+    )
+    assert plan.route in ROUTES, plan.route
+    if num_sms == 132 and route_at_132_sms.replace(":st2:", ":st3:") not in ROUTES:
+        # the model's three-stage pick is still undelivered: the band runs on the fallback
+        assert plan.route == route_at_132_sms
+
+    q, k, v, idx, page_table, seqused_k = _decode_inputs(
+        batch=batch,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        max_k_tiles=max_k_tiles,
+        seqlen_q=seqlen_q,
+    )
+    out = msa_sparse_decode_attention(
+        q,
+        k,
+        v,
+        idx,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        seqlen_q=seqlen_q,
+        softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+    )
+    cu_q = torch.arange(0, total_q + 1, seqlen_q, dtype=torch.int32, device="cuda")
+    ref = _prefill_reference(q, k, v, idx, cu_q, page_table, seqused_k)
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+
+@sm90_only
 def test_topk_select_shape_and_dtype():
     """top-k select is the only width SM90 supports (16) and must emit int32."""
     torch.manual_seed(0)
@@ -449,6 +515,194 @@ def test_topk_select_matches_reference_from_inf_validity():
         scores[:, int(valid[t]) :, t] = float("-inf")
     out = msa_topk_select(scores, TOPK)
     assert torch.equal(out, _topk_reference(scores, None, 0, 0))
+
+
+def _ragged_proxy_inputs(reqs, width, hq=1, seed=0):
+    """One-head fp8 index cache for ``reqs`` = [(q_len, seqused_k)], queries at
+    the end of each sequence, permuted pages, a page table ``width`` columns wide
+    (a CUDA graph captures vLLM's at max_model_len)."""
+    torch.manual_seed(seed)
+    need = [-(-s // BLK_KV) for _, s in reqs]
+    npages = sum(need) + 4
+    perm = torch.randperm(npages, device="cuda").to(torch.int32)
+    page_table = torch.zeros(len(reqs), width, dtype=torch.int32, device="cuda")
+    o = 0
+    for r, n in enumerate(need):
+        page_table[r, :n] = perm[o : o + n]
+        o += n
+    q_lens = torch.tensor([ql for ql, _ in reqs], device="cuda")
+    cu_q = torch.zeros(len(reqs) + 1, dtype=torch.int32, device="cuda")
+    cu_q[1:] = q_lens.cumsum(0)
+    seqused_k = torch.tensor([s for _, s in reqs], dtype=torch.int32, device="cuda")
+    total_q = int(cu_q[-1])
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 3).to(torch.float8_e4m3fn)
+    k = (torch.randn(npages, 1, BLK_KV, HEAD_DIM, device="cuda") / 3).to(
+        torch.float8_e4m3fn
+    )
+    return q, k, cu_q, page_table, seqused_k, max(need)
+
+
+@sm90_only
+@pytest.mark.parametrize("wide", [False, True], ids=["own-width", "8192-wide"])
+@pytest.mark.parametrize("hq,sq", [(1, 2), (1, 4), (2, 4), (4, 4)])
+def test_proxy_decode_masks_queries_straddling_a_tile_boundary(hq, sq, wide):
+    """MTP decode whose queries straddle a page boundary (seqused_k % 128 < q_len):
+    the earlier queries must not see the later keys of the second-to-last page.
+    The 8192-wide buffer is what a CUDA-graph replay hands the kernel; every
+    column past a sequence's pages must still be -inf."""
+    lens = [129, 2 * BLK_KV + sq - 1, 130, 5000, sq]
+    reqs = [(sq, s) for s in lens]
+    q, k, cu_q, page_table, seqused_k, pages = _ragged_proxy_inputs(reqs, 8192, hq=hq)
+    # Positive queries and large keys at every position some query of the
+    # sequence must not see, so a key leaking past the causal limit becomes
+    # its page's maximum instead of hiding under a larger visible one.
+    q = q.float().abs().to(torch.float8_e4m3fn)
+    kf = k.float()
+    for b, s in enumerate(lens):
+        for p in range(s - sq + 1, s):
+            kf[int(page_table[b, p // BLK_KV]), 0, p % BLK_KV] = 2.0
+    k = kf.to(torch.float8_e4m3fn)
+    width = 8192 if wide else pages
+    out = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=sq,
+        max_k_tiles=width,
+    )
+    ref = _proxy_prefill_reference(q, k, cu_q, page_table, seqused_k, pages)
+    own = out[:, :pages]
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(own), finite)
+    torch.testing.assert_close(own[finite], ref[finite], atol=1e-2, rtol=1e-2)
+    assert bool(torch.isneginf(out[:, pages:]).all())
+
+
+@sm90_only
+@pytest.mark.parametrize("use_fp32_acc", [True, False], ids=["fp32", "f16"])
+def test_proxy_score_mixed_decode_and_prefill_batch(use_fp32_acc):
+    """One scoring call over decodes beside a prefill chunk (a mixed serving step):
+    each sequence scores its own query rows, however short against
+    max_seqlen_q."""
+    reqs = [(4, 129), (4, 3000), (1, 700), (300, 300 + 1100), (4, 9000)]
+    q, k, cu_q, page_table, seqused_k, pages = _ragged_proxy_inputs(reqs, 96)
+    out = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=300,
+        max_k_tiles=pages,
+        use_fp32_acc=use_fp32_acc,
+    )
+    ref = _proxy_prefill_reference(q, k, cu_q, page_table, seqused_k, pages)
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(out), finite)
+    torch.testing.assert_close(out[finite], ref[finite], atol=1e-2, rtol=1e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("batch", [4, 48])
+def test_topk_select_wide_score_buffer_matches_reference(batch):
+    """Top-k over a max_model_len-wide score buffer whose columns past each
+    token's num_valid_pages are -inf (a CUDA-graph replay): the result is the
+    exact top-k of the token's own extent."""
+    reqs = [(4, 8 * 1024 - 37 * (r % 3)) for r in range(batch)]
+    q, k, cu_q, page_table, seqused_k, pages = _ragged_proxy_inputs(reqs, 8192)
+    scores = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=4,
+        max_k_tiles=8192,
+    )
+    pos = torch.cat([torch.arange(s - ql, s, device="cuda") for ql, s in reqs])
+    nvp = (pos // BLK_KV + 1).to(torch.int32)
+    out = msa_topk_select(
+        scores, TOPK, num_valid_pages=nvp, force_begin_blocks=0, force_end_blocks=1
+    )
+    assert torch.equal(out, _topk_reference(scores[:, :pages], nvp, 0, 1))
+
+
+@sm90_only
+@pytest.mark.parametrize("hq,sq", [(1, 4), (2, 4), (4, 1)])
+def test_proxy_decode_wide_buffer_tail_is_neg_inf(hq, sq):
+    """Every column past a sequence's last tile is -inf in that sequence's
+    rows of a max_model_len-wide buffer (the grid fills them across
+    sequences), and every column inside it is a real score."""
+    seqs = (1, 129, 5000, 300, 8191 * 128, 64 * 128 + 7)
+    reqs = [(sq, s) for s in seqs]
+    q, k, cu_q, page_table, seqused_k, _ = _ragged_proxy_inputs(reqs, 8192, hq=hq)
+    scores = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=sq,
+        max_k_tiles=8192,
+    )
+    for r, s in enumerate(seqs):
+        rows = scores[:, :, r * sq : (r + 1) * sq]
+        n = -(-s // BLK_KV)
+        assert bool(torch.isneginf(rows[:, n:]).all()), (r, s)
+        assert bool(torch.isfinite(rows[:, : n - 1]).all()), (r, s)
+
+
+@sm90_only
+@pytest.mark.parametrize("prefix", [642539, 642560])
+def test_topk_select_long_chunk_unaligned_prefix(sm90_regression_backend, prefix):
+    """A chunked-prefill step whose prefix is not page-aligned: 32 adjacent
+    tokens straddle a page boundary, so a CTA's columns disagree on
+    num_valid_pages.  The CuTe threshold compactor used to hang on it, since
+    its per-group vote needs a warp-uniform trip count.  The aligned prefix
+    is the control."""
+    nq = 8124
+    tiles = -(-(prefix + nq) // BLK_KV)
+    g = torch.Generator(device="cuda").manual_seed(prefix)
+    pos = torch.arange(prefix, prefix + nq, device="cuda")
+    nvp = (pos // BLK_KV + 1).to(torch.int32)
+    valid = torch.arange(tiles, device="cuda")[:, None] < nvp[None, :]
+    scores = torch.randn(1, tiles, nq, generator=g, device="cuda")
+    scores = scores.masked_fill(~valid[None], float("-inf"))
+    out = msa_topk_select(
+        scores, TOPK, num_valid_pages=nvp, force_begin_blocks=0, force_end_blocks=1
+    )
+    # Every token has thousands of valid pages, so the reference is the
+    # forced last page plus the top 15 of the rest, ascending.
+    ref = scores[0].T.clone()
+    ref[torch.arange(nq, device="cuda"), nvp.long() - 1] = float("inf")
+    ref = torch.topk(ref, TOPK, dim=1).indices.sort(dim=1).values.to(torch.int32)
+    assert torch.equal(out[:, 0], ref)
+
+
+@sm90_only
+@pytest.mark.parametrize("batch", [1, 24, 64])
+def test_topk_select_decode_width_with_long_extents(sm90_regression_backend, batch):
+    """A decode batch on a CUDA-graph-wide score buffer is planned for a
+    narrower width than the buffer (its extents are only known per token);
+    extents up to the full width must still select exactly."""
+    width, nq = 8192, 4 * batch
+    g = torch.Generator(device="cuda").manual_seed(batch)
+    ext = torch.randint(17, width + 1, (batch,), generator=g, device="cuda")
+    ext[0] = width
+    nvp = (ext[:, None] - torch.arange(3, -1, -1, device="cuda")).reshape(-1)
+    nvp = nvp.to(torch.int32)
+    valid = torch.arange(width, device="cuda")[:, None] < nvp[None, :]
+    scores = torch.randn(1, width, nq, generator=g, device="cuda")
+    scores = scores.masked_fill(~valid[None], float("-inf"))
+    out = msa_topk_select(
+        scores, TOPK, num_valid_pages=nvp, force_begin_blocks=0, force_end_blocks=1
+    )
+    ref = scores[0].T.clone()
+    ref[torch.arange(nq, device="cuda"), nvp.long() - 1] = float("inf")
+    ref = torch.topk(ref, TOPK, dim=1).indices.sort(dim=1).values.to(torch.int32)
+    assert torch.equal(out[:, 0], ref)
 
 
 @sm90_only
@@ -817,6 +1071,26 @@ def test_program_first_needed_under_capture_raises_instead_of_building(monkeypat
 
 
 @sm90_only
+def test_topk_preload_covers_serving_plans(monkeypatch):
+    """The CuTe top-k preload builds the kernels that decode at a CUDA-graph
+    width and eager steps of any width and token count pick, so none of them
+    compiles mid-serving."""
+    from flashinfer.msa_ops.cute_dsl import topk_select_sm90 as ts
+
+    built = set()
+    monkeypatch.setattr(ts, "_cache", {})
+    monkeypatch.setattr(ts, "_compile", lambda key, *args: built.add(key) or key)
+    assert ts.preload() == len(built)
+    served = {ts._select_plan(1, 8192, 4 * b, True) for b in (1, 8, 24, 48, 64, 512)}
+    served |= {
+        ts._plan(1, t, n)
+        for t in range(17, 8193, 61)
+        for n in (1, 64, 1000, 4096, 5084, 8124)
+    }
+    assert {p + (True, torch.float32) for p in served} <= built
+
+
+@sm90_only
 def test_preload_loads_every_program_of_a_kind_outside_capture():
     """The explicit opt-in loads every delivered program of the named kinds,
     reports what it loaded, and refuses unknown kinds and capture."""
@@ -1179,8 +1453,9 @@ def sm90_regression_backend(request, monkeypatch):
         ):
             monkeypatch.setattr(cake_hopper_sm90, route, lambda **kwargs: False)
     else:
-        # sparse prefill now prefers the CuTe schedules, so the Cake arm has to
-        # turn that preference off or this fixture would run CuTe on both arms.
+        # proxy-score decode and long-chunk sparse prefill prefer the CuTe
+        # schedules, so the Cake arm has to turn those preferences off or this
+        # fixture would run CuTe on both arms.
         for pref in ("_cute_prefill_preferred", "_cute_proxy_decode_preferred"):
             monkeypatch.setattr(_sm90_dispatch, pref, lambda *a, **k: False)
     return request.param
@@ -1279,6 +1554,318 @@ def test_sparse_prefill_runs_both_backends(sm90_regression_backend, max_k_tiles)
         lambda r: (0, prefix + r),
     )
     torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("hq", [8, 16])
+@pytest.mark.parametrize(
+    "batch, qlen, prefix_pages",
+    [
+        (1, 2048, 256),  # union (CuTe arm), <= _MPG_UNION_MAX pages
+        (1, 2048, 1024),  # single-token, fp8 PV body
+        (1, 256, 4100),  # single-token, f16 PV body, > 4096 pages (no Cake)
+        (1, 2048, 4100),  # single-token, fp8 PV body, > 4096 pages
+        (20, 64, 4100),  # > 16 sequences and > 4096 pages
+        (1, 8192, 64),  # union, the CuTe-preferred long chunk
+    ],
+)
+@pytest.mark.parametrize("v_mode", ["random", "channel_mean"])
+def test_sparse_prefill_fp32_accuracy(
+    sm90_regression_backend, hq, batch, qlen, prefix_pages, v_mode
+):
+    """Relative L2 against an fp32 reference built from the fp8 cache bytes.
+
+    MiniMax-M3 geometry: one KV head, GQA 8 / 16, a chunk over a cached prefix,
+    every query selecting its own block plus 15 random older ones. Single fp8
+    operands for Q and P measured ~3e-2 here (and a register relabel of P in
+    the single-token fp8 body ~2) while the elementwise tolerances of the other
+    tests still passed; the bf16 output floor is ~1.7e-3.
+
+    ``channel_mean`` gives every key the same positive V row, so the exact
+    output is that row. Random V hides a one-signed accumulation bias: fp8
+    WGMMA chained across blocks into one accumulator returned it ~0.8% low.
+    """
+    torch.manual_seed(hq + batch + prefix_pages)
+    hkv = 1
+    seq = prefix_pages * BLK_KV + qlen
+    width = -(-seq // BLK_KV)
+    npages = batch * width + 4
+    page_table = (
+        torch.randperm(npages, device="cuda")[: batch * width]
+        .to(torch.int32)
+        .view(batch, width)
+    )
+    kv = (torch.randn(npages, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    if v_mode == "channel_mean":
+        kv[..., HEAD_DIM:] = (1.0 + 0.5 * torch.rand(HEAD_DIM, device="cuda")).to(
+            torch.float8_e4m3fn
+        )
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    total_q = batch * qlen
+    q = torch.randn(total_q, hq, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device="cuda") * qlen
+    seqused_k = torch.full((batch,), seq, dtype=torch.int32, device="cuda")
+    pos = torch.arange(seq - qlen, seq, device="cuda").repeat(batch)
+    own = pos // BLK_KV
+    # own block + 15 random older blocks, ascending
+    score = torch.rand(total_q, width, device="cuda")
+    score[torch.arange(width, device="cuda")[None, :] >= own[:, None]] = -1.0
+    older = score.topk(TOPK - 1, dim=-1).indices
+    idx = torch.cat([older, own[:, None]], dim=-1).sort(dim=-1).values
+    idx = idx.to(torch.int32)[None].expand(hkv, total_q, TOPK).contiguous()
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    rows = torch.linspace(0, total_q - 1, 48).long().unique().tolist()
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        scale,
+        rows,
+        lambda r: (r // qlen, seq - qlen + r % qlen),
+    )
+    err = (out[rows].float() - ref).norm() / ref.norm()
+    assert err < 3e-3, f"rel-L2 {err:.2e} vs fp32 reference"
+
+
+@sm90_only
+@pytest.mark.parametrize("hq", [8, 16])
+@pytest.mark.parametrize("qlen", [64, 2048])  # f16 PV body, fp8 PV body
+@pytest.mark.parametrize("nvalid", [1, 5])
+def test_single_token_prefill_short_block_lists(hq, qlen, nvalid):
+    """The one-token-per-CTA schedule with -1 padded block lists.
+
+    Both PV bodies run their last selected block inside the block loop with the
+    next-block refills predicated off (#7915), so a list of one block runs the
+    loop once and refills nothing. 4100 pages has no Cake program, so this
+    reaches the CuTe DSL schedule on either backend.
+    """
+    torch.manual_seed(hq + qlen + nvalid)
+    hkv, prefix_pages = 1, 4100
+    seq = prefix_pages * BLK_KV + qlen
+    width = -(-seq // BLK_KV)
+    page_table = torch.randperm(width, device="cuda").to(torch.int32).view(1, width)
+    kv = (torch.randn(width, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    q = torch.randn(qlen, hq, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    seqused_k = torch.tensor([seq], dtype=torch.int32, device="cuda")
+    own = torch.arange(seq - qlen, seq, device="cuda") // BLK_KV
+    # own block + (nvalid - 1) random older ones, ascending, then -1 padding
+    score = torch.rand(qlen, width, device="cuda")
+    score[torch.arange(width, device="cuda")[None, :] >= own[:, None]] = -1.0
+    older = score.topk(nvalid - 1, dim=-1).indices
+    sel = torch.cat([older, own[:, None]], dim=-1).sort(dim=-1).values
+    idx = torch.full((qlen, TOPK), -1, dtype=torch.int32, device="cuda")
+    idx[:, :nvalid] = sel.to(torch.int32)
+    idx = idx[None].contiguous()
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    rows = torch.linspace(0, qlen - 1, 32).long().unique().tolist()
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        scale,
+        rows,
+        lambda r: (0, seq - qlen + r),
+    )
+    err = (out[rows].float() - ref).norm() / ref.norm()
+    assert err < 3e-3, f"rel-L2 {err:.2e} vs fp32 reference"
+
+
+@sm90_only
+@pytest.mark.parametrize(
+    "prefix_pages, q_lens",
+    [
+        (40, (1024, 768)),  # union schedule (page table <= 800 wide)
+        (900, (512,)),  # single-token schedule, fp8 PV body (transposes V)
+    ],
+)
+def test_cute_prefill_transposes_only_referenced_pages(
+    monkeypatch, prefix_pages, q_lens
+):
+    """The CuTe prefill's V transpose covers the pages the batch's extents
+    reference, not the whole KV pool: a pool four times larger, with NaN in
+    every page no sequence references, two sequences sharing their first
+    pages, and a second call after the referenced pages change (a page the
+    transpose skipped would keep the first call's V)."""
+    from flashinfer.msa_ops import cake_hopper_sm90
+
+    monkeypatch.setattr(
+        cake_hopper_sm90, "prefill_route_available", lambda **kwargs: False
+    )
+    torch.manual_seed(prefix_pages)
+    hq, hkv, nb = 8, 1, len(q_lens)
+    seqs = [prefix_pages * BLK_KV + ql for ql in q_lens]
+    width = max(-(-s // BLK_KV) for s in seqs)
+    npg = 4 * nb * width
+    perm = torch.randperm(npg, device="cuda").to(torch.int32)
+    page_table = perm[: nb * width].view(nb, width).clone()
+    page_table[:, :4] = page_table[0, :4].clone()  # a shared prefix
+    referenced = torch.zeros(npg, dtype=torch.bool, device="cuda")
+    for b, s in enumerate(seqs):
+        referenced[page_table[b, : -(-s // BLK_KV)].long()] = True
+    kv = torch.full((npg, hkv, BLK_KV, 2 * HEAD_DIM), float("nan"), device="cuda")
+    kv = kv.to(torch.float8_e4m3fn)
+    q = torch.randn(sum(q_lens), hq, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    cu_q = torch.tensor([0, *q_lens], device="cuda").cumsum(0).to(torch.int32)
+    seqused_k = torch.tensor(seqs, dtype=torch.int32, device="cuda")
+    # Each query selects its own block and 15 random older ones.
+    qpos = torch.cat(
+        [
+            torch.arange(s - ql, s, device="cuda")
+            for s, ql in zip(seqs, q_lens, strict=True)
+        ]
+    )
+    own = qpos // BLK_KV
+    score = torch.rand(len(qpos), width, device="cuda")
+    score[torch.arange(width, device="cuda")[None, :] >= own[:, None]] = -1.0
+    sel = torch.cat([score.topk(TOPK - 1, dim=-1).indices, own[:, None]], dim=-1)
+    idx = sel.sort(dim=-1).values.to(torch.int32)[None].contiguous()
+    starts = [sum(q_lens[:b]) for b in range(nb)]
+    rows = [
+        s + o
+        for s, ql in zip(starts, q_lens, strict=True)
+        for o in (0, ql // 2, ql - 1)
+    ]
+
+    def seq_of(row):
+        b = max(i for i, s in enumerate(starts) if s <= row)
+        return b, int(qpos[row])
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    for _ in range(2):
+        fresh = torch.randn(npg, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") * 0.5
+        kv[referenced] = fresh.to(torch.float8_e4m3fn)[referenced]
+        k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+        out = msa_sparse_attention(
+            q,
+            k,
+            v,
+            idx,
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            causal=True,
+            softmax_scale=scale,
+        )
+        assert torch.isfinite(out.float()).all()
+        ref = _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, seq_of)
+        err = (out[rows].float() - ref).norm() / ref.norm()
+        assert err < 3e-3, f"rel-L2 {err:.2e} vs fp32 reference"
+
+
+@sm90_only
+def test_cute_prefill_single_masks_blocks_past_the_extent(monkeypatch):
+    """A selected block at or past the sequence's extent (prefix plus its
+    queries) is causally masked in full, as on every other schedule.  The
+    fp8 single-token schedule transposes V only below that extent, so such a
+    block must not read its never-written transpose page: the transpose's
+    memory is poisoned with fp8 NaN here, which 0 * NaN would carry through
+    the causal mask into the output.  A token left with no live block must
+    skip the mainloop rather than run it on block -1."""
+    from flashinfer.msa_ops import cake_hopper_sm90
+
+    monkeypatch.setattr(
+        cake_hopper_sm90, "prefill_route_available", lambda **kwargs: False
+    )
+    torch.manual_seed(0)
+    hq, hkv, ql, extra = 8, 1, 512, 4
+    seq = 900 * BLK_KV + ql  # single-token schedule, fp8 PV body
+    own_pages = -(-seq // BLK_KV)
+    width = own_pages + extra  # page-table columns past the extent
+    npg = 2 * width
+    page_table = torch.randperm(npg, device="cuda").to(torch.int32)[:width][None]
+    kv = torch.randn(npg, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") * 0.5
+    kv = kv.to(torch.float8_e4m3fn)
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    q = torch.randn(ql, hq, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    cu_q = torch.tensor([0, ql], dtype=torch.int32, device="cuda")
+    seqused_k = torch.tensor([seq], dtype=torch.int32, device="cuda")
+    qpos = torch.arange(seq - ql, seq, device="cuda")
+    own = qpos // BLK_KV
+    # 13 older blocks, the query's own, and two past the extent (ascending).
+    score = torch.rand(ql, own_pages, device="cuda")
+    score[torch.arange(own_pages, device="cuda")[None, :] >= own[:, None]] = -1.0
+    past = torch.tensor([own_pages, own_pages + extra - 1], device="cuda")
+    sel = torch.cat(
+        [score.topk(TOPK - 3, dim=-1).indices, own[:, None], past.expand(ql, 2)], -1
+    )
+    idx = sel.sort(dim=-1).values.to(torch.int32)[None].contiguous()
+    # The past-extent blocks sort last: the same selection without them.
+    clean = idx.clone()
+    clean[..., -2:] = -1
+
+    empty = torch.empty
+
+    def nan_empty(*args, **kwargs):
+        # The op's only fp8 allocation is the V transpose: fill it with fp8
+        # NaN (0xFF), standing in for whatever memory it is handed.
+        t = empty(*args, **kwargs)
+        if t.dtype == torch.float8_e4m3fn:
+            t.view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(torch, "empty", nan_empty)
+
+    def run(indices):
+        return msa_sparse_attention(
+            q,
+            k,
+            v,
+            indices.contiguous(),
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            causal=True,
+            softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+        )
+
+    out = run(idx)
+    assert torch.isfinite(out.float()).all(), "an untransposed V page reached the PV"
+    assert torch.equal(out, run(clean))
+
+    # A token left with no live block -- every entry -1, or only blocks past
+    # the extent -- attends nothing: its output is zero, the others unchanged.
+    none = idx.clone()
+    none[0, :16] = -1
+    none[0, 8:16, :2] = past.to(torch.int32)
+    out_none = run(none)
+    assert torch.isfinite(out_none.float()).all()
+    assert not out_none[:16].any()
+    assert torch.equal(out_none[16:], out[16:])
 
 
 @sm90_only
@@ -1961,3 +2548,157 @@ def test_sparse_decode_cute_fallback_matches_reference(monkeypatch, mult):
         lambda r: (r, int(seqused_k[r]) - 1),
     )
     torch.testing.assert_close(out[rows].float(), ref, atol=3e-2, rtol=3e-2)
+
+
+_FLOOR = -(2.0**127)  # scores at or below this rank as this value
+_FLOOR_CLASS = (float("nan"), -3.0e38, -torch.finfo(torch.float32).max, _FLOOR)
+
+
+def _place(g, column_len, n, exclude=()):
+    """n distinct random positions in [0, column_len) avoiding ``exclude``."""
+    pool = [i for i in range(column_len) if i not in set(exclude)]
+    perm = torch.randperm(len(pool), generator=g).tolist()
+    return sorted(pool[i] for i in perm[:n])
+
+
+@sm90_only
+@pytest.mark.parametrize("hq,tiles,total_q", [(1, 48, 37), (4, 300, 64), (1, 2048, 32)])
+def test_topk_select_keeps_floor_and_nan_scores_and_drops_neg_inf(hq, tiles, total_q):
+    """NaN and finite scores at or below -2**127 stay selectable (they rank as
+    -2**127); a raw -inf block is invalid. With at most 16 non -inf blocks the
+    selection is exactly those blocks, -1 padded; with more, the cut falls above
+    the floor and only the 16 largest ordinary scores are kept."""
+    g = torch.Generator().manual_seed(hq * 7919 + tiles)
+    scores = torch.full((hq, tiles, total_q), float("-inf"), dtype=torch.float32)
+    expect = torch.full((total_q, hq, TOPK), -1, dtype=torch.int32)
+    for t in range(total_q):
+        for h in range(hq):
+            if t % 2 == 0:  # at most 16 candidates, several in the floor class
+                n = 1 + (t * 5 + h) % TOPK
+                pos = _place(g, tiles, n)
+                floors = min(n, 1 + (t + h) % 4)
+                for j, p in enumerate(pos):
+                    if j < floors:
+                        scores[h, p, t] = _FLOOR_CLASS[(t + h + j) % 4]
+                    else:
+                        scores[h, p, t] = float(torch.randn(1, generator=g))
+                expect[t, h, :n] = torch.tensor(pos, dtype=torch.int32)
+            else:  # 20 ordinary scores outrank 3 floor-class blocks
+                pos = _place(g, tiles, 23)
+                highs = pos[:20]
+                vals = torch.randperm(1000, generator=g)[:20].float() / 8 - 59.9375
+                for p, v in zip(highs, vals.tolist(), strict=True):
+                    scores[h, p, t] = v
+                for j, p in enumerate(pos[20:]):
+                    scores[h, p, t] = _FLOOR_CLASS[(t + j) % 4]
+                keep = sorted(highs[i] for i in torch.topk(vals, TOPK).indices.tolist())
+                expect[t, h] = torch.tensor(keep, dtype=torch.int32)
+    out = msa_topk_select(scores.cuda(), TOPK)
+    assert torch.equal(out.cpu(), expect)
+
+
+@sm90_only
+def test_topk_select_floor_and_nan_with_valid_pages_and_forced_blocks():
+    """The same rule inside a per-token extent: forced sink / window blocks are
+    kept even at -inf, floor-class and NaN blocks inside the extent are kept,
+    finite decoys past num_valid_pages are not."""
+    g = torch.Generator().manual_seed(1088)
+    hq, tiles, total_q = 2, 64, 53
+    scores = torch.full((hq, tiles, total_q), float("-inf"), dtype=torch.float32)
+    nvp = torch.randint(20, tiles + 1, (total_q,), generator=g, dtype=torch.int32)
+    expect = torch.full((total_q, hq, TOPK), -1, dtype=torch.int32)
+    for t in range(total_q):
+        v = int(nvp[t])
+        scores[:, v:, t] = 1.0e3  # decoys outside the extent
+        forced = [0, v - 1]
+        for h in range(hq):
+            n = 1 + (t + 3 * h) % (TOPK - 2)
+            pos = _place(g, v, n, exclude=forced)
+            for j, p in enumerate(pos):
+                if j % 3 == 0:
+                    scores[h, p, t] = _FLOOR_CLASS[(t + j) % 4]
+                else:
+                    scores[h, p, t] = float(torch.randn(1, generator=g))
+            chosen = sorted(set(pos) | set(forced))
+            expect[t, h, : len(chosen)] = torch.tensor(chosen, dtype=torch.int32)
+    out = msa_topk_select(
+        scores.cuda(),
+        TOPK,
+        num_valid_pages=nvp.cuda(),
+        force_begin_blocks=1,
+        force_end_blocks=1,
+    )
+    assert torch.equal(out.cpu(), expect)
+
+
+_TINY = torch.finfo(torch.float32).tiny  # smallest normal; below it are denormals
+# zero / denormal scores, largest first: every one is a distinct finite candidate
+_ZERO_CLASS = (_TINY / 2, _TINY / 2**10, 0.0, -0.0, -_TINY / 2**10, -_TINY / 2)
+
+
+@sm90_only
+@pytest.mark.parametrize("hq,tiles,total_q", [(1, 48, 37), (4, 300, 64), (1, 2048, 32)])
+def test_topk_select_keeps_zero_and_denormal_scores(hq, tiles, total_q):
+    """+0.0, -0.0 and denormal scores are ordinary finite candidates. With at most
+    16 finite blocks the selection is exactly those blocks, -1 padded; with more,
+    the cut falls strictly between two distinct values, so the kept set is unique:
+    the denormals above the cut stay and the zeros and denormals below it go."""
+    g = torch.Generator().manual_seed(hq * 104729 + tiles)
+    scores = torch.full((hq, tiles, total_q), float("-inf"), dtype=torch.float32)
+    expect = torch.full((total_q, hq, TOPK), -1, dtype=torch.int32)
+    for t in range(total_q):
+        for h in range(hq):
+            if t % 2 == 0:  # at most 16 candidates, at least one zero / denormal
+                n = 1 + (t * 3 + h) % TOPK
+                pos = _place(g, tiles, n)
+                zeros = min(n, 1 + (t + h) % len(_ZERO_CLASS))
+                for j, p in enumerate(pos):
+                    if j < zeros:
+                        scores[h, p, t] = _ZERO_CLASS[(t + h + j) % len(_ZERO_CLASS)]
+                    else:
+                        scores[h, p, t] = float(torch.randn(1, generator=g))
+                expect[t, h, :n] = torch.tensor(pos, dtype=torch.int32)
+            else:  # 14 ordinary positives + the 6 zero / denormal scores
+                pos = _place(g, tiles, 20)
+                perm = torch.randperm(20, generator=g).tolist()
+                highs = [pos[i] for i in perm[:14]]
+                lows = [pos[i] for i in perm[14:]]
+                for p in highs:
+                    scores[h, p, t] = 1.0 + float(torch.rand(1, generator=g))
+                for p, v in zip(lows, _ZERO_CLASS, strict=True):
+                    scores[h, p, t] = v
+                # the 16 kept: the 14 positives and the 2 positive denormals
+                keep = sorted(highs + lows[:2])
+                expect[t, h] = torch.tensor(keep, dtype=torch.int32)
+    out = msa_topk_select(scores.cuda(), TOPK)
+    assert torch.equal(out.cpu(), expect)
+
+
+@sm90_only
+def test_topk_select_zero_and_denormal_scores_with_valid_pages_and_forced_blocks():
+    """The same inside a per-token extent with forced sink / window blocks: every
+    zero / denormal block inside the extent is kept, decoys past it are not."""
+    g = torch.Generator().manual_seed(9243)
+    hq, tiles, total_q = 2, 64, 53
+    scores = torch.full((hq, tiles, total_q), float("-inf"), dtype=torch.float32)
+    nvp = torch.randint(20, tiles + 1, (total_q,), generator=g, dtype=torch.int32)
+    expect = torch.full((total_q, hq, TOPK), -1, dtype=torch.int32)
+    for t in range(total_q):
+        v = int(nvp[t])
+        scores[:, v:, t] = 1.0e3  # decoys outside the extent
+        forced = [0, v - 1]
+        for h in range(hq):
+            n = 1 + (t + 5 * h) % (TOPK - 2)
+            pos = _place(g, v, n, exclude=forced)
+            for j, p in enumerate(pos):
+                scores[h, p, t] = _ZERO_CLASS[(t + h + j) % len(_ZERO_CLASS)]
+            chosen = sorted(set(pos) | set(forced))
+            expect[t, h, : len(chosen)] = torch.tensor(chosen, dtype=torch.int32)
+    out = msa_topk_select(
+        scores.cuda(),
+        TOPK,
+        num_valid_pages=nvp.cuda(),
+        force_begin_blocks=1,
+        force_end_blocks=1,
+    )
+    assert torch.equal(out.cpu(), expect)

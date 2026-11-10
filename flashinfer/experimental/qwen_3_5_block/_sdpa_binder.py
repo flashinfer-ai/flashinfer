@@ -210,6 +210,12 @@ class SdpaDenseBinder:
     # with a sink altogether (``supports_combine_q_lens`` above; the block declares no sink), so False here and in the shim, and the
     # vendored ``prepared.py`` / ``api_dsl.py`` decline such a plan by name.
     supports_quantized_split_sink = False
+    # The 4c8e24355 pin's two new dense flags: the mixed-precision (fp8) KV pools under a bf16 Q (``supports_mixed_fp8_kv``) and the per-batch
+    # ragged Q lengths of the padded decode leg (``supports_ragged_q_lens``; the extension appends the ``[B + 1]`` Q-length address to the
+    # frame).  Neither is bound here (the blocks declare bf16 pools and uniform steps), so both read False here and in the shim
+    # (``PYTHON_BINDER_FLAGS``) and the vendored ``api_dsl.py`` / ``prepared.py`` / ``engines.py`` decline such a plan by name.
+    supports_mixed_fp8_kv = False
+    supports_ragged_q_lens = False
 
     def __init__(self, spec):
         _half_plan_only(spec, "SdpaDenseBinder")
@@ -295,6 +301,13 @@ class SdpaThdBinder:
     # ``engines.py`` / ``api_dsl.py`` decline such a plan by name, as the dense binder's ``supports_native_d576`` does.
     supports_native_d576 = False
     supports_native_d576_packed_split = False
+    # The 4c8e24355 pin's three new THD flags: the mixed-precision (fp8) KV pools under a bf16 Q, the non-paged d128 split form's physical
+    # origins and the per-role origin CAPS frame slot (``thd_origin_caps``, read when ``origin_specs`` is set).  This binder gathers the native
+    # THD roles only and the blocks' packed declarations carry no origins and no fp8 pools, so every one reads False here and in the shim
+    # (``PYTHON_BINDER_FLAGS``) and the vendored ``prepared.py`` / ``engines.py`` / ``api_dsl.py`` decline such a plan by name.
+    supports_mixed_fp8_kv = False
+    supports_nonpaged_d128_split_physical_origins = False
+    supports_physical_origin_caps = False
 
     def __init__(self, spec):
         _half_plan_only(spec, "SdpaThdBinder")

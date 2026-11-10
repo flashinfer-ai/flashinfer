@@ -155,6 +155,21 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(backend: Literal['a'] = 'a') -> None",
                 "def api(backend: Literal['a', 'b'] = 'a') -> None",
             ),
+            (
+                "general union widening",
+                "def api(value: int) -> None",
+                "def api(value: int | str) -> None",
+            ),
+            (
+                "keyword-only insertion after varargs",
+                "def api(value: int, *args: object, last: int = 2) -> None",
+                "def api(value: int, *args: object, added: str = 'x', last: int = 2) -> None",
+            ),
+            (
+                "variadic tuple input widens",
+                "def api(value: tuple[int, ...]) -> None",
+                "def api(value: tuple[int | str, ...]) -> None",
+            ),
         )
 
         for name, before, after in cases:
@@ -224,11 +239,6 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: int = 0) -> None",
             ),
             (
-                "general union widening",
-                "def api(value: int) -> None",
-                "def api(value: int | str) -> None",
-            ),
-            (
                 "unrelated Optional attribute",
                 "def api(value: Tensor) -> None",
                 "def api(value: custom.Optional[Tensor] = None) -> None",
@@ -249,9 +259,39 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: int, added: str = 'x', **kwargs: object) -> None",
             ),
             (
+                "new keyword-only parameter before kwargs",
+                "def api(value: int, **kwargs: object) -> None",
+                "def api(value: int, *, added: str = 'x', **kwargs: object) -> None",
+            ),
+            (
                 "return annotation changed",
                 "def api(value: int) -> int",
                 "def api(value: int) -> str",
+            ),
+            (
+                "return union narrowed",
+                "def api(value: int) -> int | str",
+                "def api(value: int) -> int",
+            ),
+            (
+                "return union widened without an opt-in input",
+                "def api(value: int) -> int",
+                "def api(value: int) -> int | str",
+            ),
+            (
+                "return union widened with an opt-in input",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
+            ),
+            (
+                "return tuple member widens",
+                "def api(value: int) -> tuple[int, str]",
+                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
+            ),
+            (
+                "fixed return tuple widens to variadic",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
             ),
             (
                 "function became async",
@@ -268,6 +308,88 @@ class SignatureCompatibilityTest(unittest.TestCase):
                         api_function(after),
                     )
                 )
+
+
+class TypeAliasCompatibilityTest(unittest.TestCase):
+    def test_module_local_alias_can_preserve_or_widen_an_annotation(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(
+                    backend: Literal["first", "second"] = "first",
+                ) -> OldPlan:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Backend = Literal["first", "second", "third"]
+
+                @flashinfer_api
+                def api(backend: Backend = "first") -> OldPlan:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_module_local_alias_cannot_hide_narrowing(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(backend: Literal["first", "second"] = "first") -> None:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Backend = Literal["first"]
+
+                @flashinfer_api
+                def api(backend: Backend = "first") -> None:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(
+            tuple(finding.check for finding in compare_snapshots(base, head)),
+            ("public_api_signature_changed",),
+        )
+
+    def test_module_local_alias_cannot_hide_return_widening(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(value: int) -> OldPlan:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Plan = Union[OldPlan, NewPlan]
+
+                @flashinfer_api
+                def api(value: int, fallback: bool = False) -> Plan:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(
+            tuple(finding.check for finding in compare_snapshots(base, head)),
+            ("public_api_signature_changed",),
+        )
 
 
 class ClassReexportIntegrationTest(unittest.TestCase):
@@ -510,6 +632,88 @@ class ExperimentalTrackExclusionTest(unittest.TestCase):
                 {"flashinfer/core.py": self.stable},
             ),
             [],
+        )
+
+
+class LazyExportTableTest(unittest.TestCase):
+    """Rows of ``_LAZY_EXPORTS`` in flashinfer/__init__.py are top-level exports."""
+
+    eager = textwrap.dedent(
+        """
+        from . import facade
+        from .impl import api
+        """
+    )
+    lazy = textwrap.dedent(
+        """
+        _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
+            **{name: (".runtime", name) for name in sorted(_RUNTIME_NAMES)},
+            "facade": (".facade", None),
+            "api": (".impl", "api"),
+            "renamed": ("flashinfer.impl", "api"),
+            "outside": ("torch", "api"),
+        }
+        """
+    )
+
+    def test_rows_resolve_like_imports(self) -> None:
+        self.assertEqual(
+            api_diff.exported_names(self.lazy),
+            {
+                "facade": "flashinfer",
+                "api": "flashinfer.impl",
+                "renamed": "flashinfer.impl",
+            },
+        )
+
+    def test_relative_and_absolute_spellings_agree(self) -> None:
+        relative = (
+            '_LAZY_EXPORTS = {"a": (".impl", "api"), "m": (".pkg.mod", None),'
+            ' "up": ("..x", None)}'
+        )
+        absolute = (
+            '_LAZY_EXPORTS = {"a": ("flashinfer.impl", "api"),'
+            ' "m": ("flashinfer.pkg.mod", None)}'
+        )
+        self.assertEqual(
+            api_diff.exported_names(relative), api_diff.exported_names(absolute)
+        )
+        self.assertEqual(
+            api_diff.exported_names('_LAZY_EXPORTS = {"m": (".", None)}'),
+            api_diff.exported_names('_LAZY_EXPORTS = {"m": ("flashinfer", None)}'),
+        )
+
+    def test_moving_names_into_rows_is_not_a_removal(self) -> None:
+        impl = "@flashinfer_api\ndef api(value: int) -> None:\n    pass\n"
+        base = {
+            "flashinfer/__init__.py": self.eager,
+            "flashinfer/impl.py": impl,
+            "flashinfer/facade.py": "",
+        }
+        head = dict(base, **{"flashinfer/__init__.py": self.lazy})
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_dropping_a_row_is_a_removal(self) -> None:
+        base = {"flashinfer/__init__.py": self.lazy, "flashinfer/facade.py": ""}
+        head = {
+            "flashinfer/__init__.py": self.lazy.replace(
+                '    "facade": (".facade", None),\n', ""
+            ),
+            "flashinfer/facade.py": "",
+        }
+        findings = compare_snapshots(base, head)
+        self.assertEqual(
+            [
+                (f.check, f.message)
+                for f in findings
+                if f.check == "public_export_removed"
+            ],
+            [
+                (
+                    "public_export_removed",
+                    "Public top-level export `facade` was removed.",
+                )
+            ],
         )
 
 

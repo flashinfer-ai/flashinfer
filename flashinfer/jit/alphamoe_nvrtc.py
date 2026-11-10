@@ -53,13 +53,15 @@ _CAKE_ENTRIES = {
     "cake_medium_routed_split_e256": "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs8",
     "cake_medium_routed_split_e288": "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs9",
     "cake_medium_routed_split_e384": "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs12",
-    "cake_cluster_routed_c16_w16": "kernel_alpha_moe_fused_router_cluster_c16_w16_threshold_acq",
+    "cake_cluster_routed_c16_w16": "kernel_alpha_moe_fused_router_cluster_c16_w16_threshold_acq_half_read",
     "cake_large_routed_e512_ot": "kernel_alpha_moe_fused_router_e512_threshold_one_token",
     "cake_medium_routed_e512_bm4": "kernel_alpha_moe_fused_router_medium_e512_threshold_bm4",
     "cake_medium_routed_e512_bm5": "kernel_alpha_moe_fused_router_medium_e512_threshold_bm5",
-    "cake_large_routed_e512_cps": "kernel_alpha_moe_fused_router_e512_threshold_cta_per_sm",
+    "cake_large_routed_e512_cps": "kernel_alpha_moe_fused_router_e512_threshold_cta_per_sm_entry_prefetch",
     "cake_large_routed_e512_rb_cps": "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm",
     "cake_large_tail_e512": "kernel_alpha_moe_fused_router_large_tail_e512_idle_padding",
+    "cake_small_routed_e512_c16_hr": "kernel_alpha_moe_fused_router_cluster_c16_w8_threshold_half_read",
+    "cake_large_routed_e512_rb_os_cps_pf": "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_prefetch",
 }
 _CAKE_IMAGES = "cake_alphamoe_router_images.h"
 

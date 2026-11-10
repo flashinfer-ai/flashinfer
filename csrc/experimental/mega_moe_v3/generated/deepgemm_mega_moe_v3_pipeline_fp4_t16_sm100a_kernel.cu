@@ -1480,6 +1480,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a(int* __restrict__ topk_idx_i
                     }
                     mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
                     if (elect_sync()) {
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
                         if (task[0] == 1) {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 1024, (&A), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                             tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF1), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
@@ -2849,6 +2850,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a(int* __restrict__ topk_idx_i
             }
             asm volatile("barrier.sync 15, 256;" ::: "memory");
             asm volatile("barrier.sync 1, 384;" ::: "memory");
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             unsigned int epi_warp_2 = warp - 8;
             unsigned int phase_1 = 0;
             unsigned int values[4];

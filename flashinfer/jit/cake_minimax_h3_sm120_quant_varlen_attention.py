@@ -16,10 +16,12 @@ statistics with their per-segment fold into the K means and V scales (KV_STATS),
 E4M3 quantizer (QUANTIZE) and the attention launch in the unit-scaled block-scale MMA
 form (ATTENTION), and the overlapped form of the plans in the overlap band, launched in
 this order: the head-major pre-processing producers (PREPROCESS_HEAD_MAJOR, a plain
-launch), the lead attention launch (ATTENTION_LEAD) and the tail attention launch
-(ATTENTION_TAIL), each a programmatic dependent of the launch before it; each shipped
-for sm_120a. An overlapped CTA waits only on CTAs of the launches before it in its call,
-so a lazy module load of any of the three only delays the call. The host module
+launch, or on a part of 188 SMs for a plan of overlap width 32 their burst build
+PREPROCESS_HEAD_MAJOR_BURST on every SM), the lead attention launch (ATTENTION_LEAD) and
+the tail attention launch (ATTENTION_TAIL), each a programmatic dependent of the launch
+before it; each shipped for sm_120a. An overlapped CTA waits only on CTAs of the
+launches before it in its call, so a lazy module load of any of the three only delays
+the call. The host module
 ``flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention`` selects the
 form, computes the grids and launches the programs behind
 ``minimax_h3_sm120_varlen_attention_fp8``.
@@ -133,12 +135,12 @@ QUANTIZE = cake_program.CakeProgram(
 )
 
 ATTENTION = cake_program.CakeProgram(
-    name="cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b",
+    name="cake_minimax_h3_sm120_quant_varlen_attention_ded4b175c17b3fa37452",
     operator_dir="cake_minimax_h3_sm120_quant_varlen_attention",
-    kernel="kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b",
+    kernel="kernel_cake_minimax_h3_sm120_quant_varlen_attention_ded4b175c17b3fa37452",
     sources=(
-        "cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b_kernel.cu",
-        "cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b_binding.cu",
+        "cake_minimax_h3_sm120_quant_varlen_attention_ded4b175c17b3fa37452_kernel.cu",
+        "cake_minimax_h3_sm120_quant_varlen_attention_ded4b175c17b3fa37452_binding.cu",
     ),
     targets=("sm_120a",),
     compile_options=(("sm_120a", ()),),
@@ -182,12 +184,79 @@ ATTENTION = cake_program.CakeProgram(
 )
 
 PREPROCESS_HEAD_MAJOR = cake_program.CakeProgram(
-    name="cake_minimax_h3_sm120_quant_varlen_attention_bffafaaa13fe97200512",
+    name="cake_minimax_h3_sm120_quant_varlen_attention_e6053d42d0acd4a8c404",
     operator_dir="cake_minimax_h3_sm120_quant_varlen_attention",
-    kernel="kernel_cake_minimax_h3_sm120_quant_varlen_attention_bffafaaa13fe97200512",
+    kernel="kernel_cake_minimax_h3_sm120_quant_varlen_attention_e6053d42d0acd4a8c404",
     sources=(
-        "cake_minimax_h3_sm120_quant_varlen_attention_bffafaaa13fe97200512_kernel.cu",
-        "cake_minimax_h3_sm120_quant_varlen_attention_bffafaaa13fe97200512_binding.cu",
+        "cake_minimax_h3_sm120_quant_varlen_attention_e6053d42d0acd4a8c404_kernel.cu",
+        "cake_minimax_h3_sm120_quant_varlen_attention_e6053d42d0acd4a8c404_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "tile_table",
+        "seg_begin",
+        "seg_len",
+        "seg_tile_begin",
+        "cu_seqlens",
+        "partials",
+        "counters",
+        "mean_k",
+        "v_scale",
+        "q8",
+        "k8",
+        "vt8",
+        "q_scale",
+        "k_scale",
+        "hctr",
+        "num_tiles",
+        "total_tokens",
+        "total_padded",
+        "num_segments",
+        "num_heads",
+        "num_kblocks",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "tile_table",
+        "seg_begin",
+        "seg_len",
+        "seg_tile_begin",
+        "cu_seqlens",
+        "partials",
+        "counters",
+        "mean_k",
+        "v_scale",
+        "q8",
+        "k8",
+        "vt8",
+        "q_scale",
+        "k_scale",
+        "hctr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=33024,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+PREPROCESS_HEAD_MAJOR_BURST = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_quant_varlen_attention_e916e39b115ab99e495b",
+    operator_dir="cake_minimax_h3_sm120_quant_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_quant_varlen_attention_e916e39b115ab99e495b",
+    sources=(
+        "cake_minimax_h3_sm120_quant_varlen_attention_e916e39b115ab99e495b_kernel.cu",
+        "cake_minimax_h3_sm120_quant_varlen_attention_e916e39b115ab99e495b_binding.cu",
     ),
     targets=("sm_120a",),
     compile_options=(("sm_120a", ()),),
@@ -359,6 +428,7 @@ PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     QUANTIZE,
     ATTENTION,
     PREPROCESS_HEAD_MAJOR,
+    PREPROCESS_HEAD_MAJOR_BURST,
     ATTENTION_LEAD,
     ATTENTION_TAIL,
 )
@@ -374,6 +444,7 @@ __all__ = [
     "QUANTIZE",
     "ATTENTION",
     "PREPROCESS_HEAD_MAJOR",
+    "PREPROCESS_HEAD_MAJOR_BURST",
     "ATTENTION_LEAD",
     "ATTENTION_TAIL",
     "PROGRAMS",

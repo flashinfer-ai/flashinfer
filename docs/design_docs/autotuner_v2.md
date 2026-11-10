@@ -397,12 +397,22 @@ Persistence and orchestration stay separate responsibilities.
   nested shortlist preparation. It does not recover sticky CUDA errors or
   failures inside arbitrary runner collectives. Delegated protocols still own
   their distributed coordination.
+- **Sticky CUDA errors**: a failed tactic is skipped only while the CUDA context
+  stays usable. After an illegal memory access or a device-side assert, tuning
+  stops with an error naming the op, runner, tactic and input shapes, instead of
+  failing later in an unrelated runner. A tuning-group member stops the same
+  way, since it cannot rejoin the per-tactic reduces on a dead context; its
+  peers then fail at their next collective or the process-group timeout.
 - **Cache agreement**: each profile reduces its hit flag and a digest of the
   cached runner/tactic. Only an all-hit group with matching selections skips
   profiling; any miss or disagreement makes all ranks discard that profile's
   winner/shortlist and re-profile. Malformed persisted selections remain cache
   misses. Warm tuning still performs startup gates; serving with tuning disabled
   adds no collective. Distributed tuning must run outside CUDA Graph capture.
+- **Timer fallback**: CUPTI availability and initialization are checked across the tuning
+  group before candidate warmup or graph capture. If tracing fails on any rank, all ranks
+  fall back to CUDA events. Candidate exceptions still disqualify the tactic rather than
+  retrying it with another timer.
 - **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
   tactic shortlists. Independent tuning without a process group can still diverge until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process

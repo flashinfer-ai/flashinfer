@@ -1,12 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FROST kernels of the gated attention block -- a FLAT package, Rubin (``sm_107a``) only.
+"""FROST kernels of the gated attention block -- a FLAT package, written for Rubin (``sm_107a``).
 
-The block targets one arch, so there is no arch sub-package here: arch is the
-ONLY axis that earns a directory (engine contract § 8) and a single arch earns
-none.  Every other axis -- stage, dtype family -- stays in the filename.  By
-stage of the pipeline in ``api.py``::
+The block was built for one arch, so there is no arch sub-package here: arch is
+the ONLY axis that earns a directory (engine contract § 8) and a single arch
+earns none.  Every other axis -- stage, dtype family -- stays in the filename.
+Since 2026-10-29 the block's dense bf16 / f16 inference forms also run on cc
+10.0 (``api.DENSE_SERVING_CCS``) through the kernels here that carry no arch pin
+(``proj_gemm`` over the sm100 GEMM family, the two norm + RoPE kernels,
+``cache_write``, ``elementwise``) and the shared SM100 SDPA kernels; the fused
+projection forks (``--gpu-arch sm_107a``), the quantize / indexer / sparse
+kernels stay Rubin-only and are declined by name there.  By stage of the
+pipeline in ``api.py``::
 
     proj_gemm.py                stages (1) and (6): plan records + runners over the
                                 RENDERED FROST GEMM template (writes no kernel)
@@ -27,8 +33,20 @@ stage of the pipeline in ``api.py``::
                                 the e4m3 store arm of the query and compress outputs under the e4m3 indexer cache)
     qsa_compress.py             (4i) the in-block indexer's key side: the raw indexer keys mean-pooled per 4-token block, RMSNormed
                                 and rotated at the block start (the prefill form), the same body at pool 1 for the indexer
-                                queries, and the step form (the raw-key ring + the incremental compress of the compressed-key cache);
-                                the e4m3 store arm (the e4m3 cast of the bf16 row) on the pool-1 and the step outputs
+                                queries, and the step form (the raw-key ring + the incremental compress of the compressed-key cache)
+                                with its ring read-only CHUNK form (``ring_write=False``: a prefill chunk behind a cached prefix
+                                compresses the blocks it completes, the straddling one from the ring, and writes no ring row);
+                                the e4m3 store arm (the e4m3 cast of the bf16 row) on the pool-1 and the step outputs; the
+                                ``rounding`` attribute ("single" / "hf") of every compress chain
+    qsa_kbar_gather.py          (4i, the extend step) the dense kbar gather: the paged compressed-key cache through the main block
+                                table into a contiguous ``[B, n_blocks_max, 128]`` scorer operand (a 16-byte-granule bit copy, bf16 or
+                                e4m3; zero rows for a dead / short sequence and for an unassigned page), plus the extend step's device
+                                metadata -- the per-piece clamped first position ``q_pos0`` (the memory guard of the compact-logits
+                                scratch), the per-row visible counts, the per-sequence report; no SMEM, no mbarrier
+    qsa_canonical_list.py       (4i, the extend step; the prefill form too) the canonical row order of a selected block list in one
+                                launch: one warp per row, the row's ids sorted DESCENDING by an in-register bitonic network over
+                                ``shfl.sync.bfly``, ``-1`` past the position rule's count (a dead row all ``-1``), the per-row list
+                                length; in place legal; no SMEM, no mbarrier
     sigmoid_gate_bwd.py         BACKWARD of stage (5): dO, dG into the GATE band, optional O_gated
     qk_norm_rope_bwd.py         BACKWARD of stages (2)+(3): exact RoPE adjoint + RMSNorm backward into
                                 the Q / K bands, dW_norm partials + fixed-order reduce, the V band copy

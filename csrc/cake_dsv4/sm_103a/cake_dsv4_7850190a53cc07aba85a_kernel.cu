@@ -338,6 +338,16 @@ kernel_cake_dsv4_7850190a53cc07aba85a(const __grid_constant__ CUtensorMap tmap_q
     const int smem_indices_addr = smem + 197888;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_swa_kv))) : "memory");
+    int prologue_row = -1;
+    if (warp >= 8 && warp <= 11) {
+        int prologue_rank = warp - 8;
+        int prologue_query = blockIdx.x >> 2;
+        int* prologue_row_ptr = swa_indices + (prologue_query * swa_index_stride);
+        int prologue_offset = prologue_rank * 16 + lane % 16 + lane / 16 * 64;
+        if (prologue_offset < sparse_topk) {
+            prologue_row = prologue_row_ptr[prologue_offset];
+        }
+    }
 
     // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 16 barriers)
     // Mbarriers at smem_raw[0..128)
@@ -1316,7 +1326,7 @@ kernel_cake_dsv4_7850190a53cc07aba85a(const __grid_constant__ CUtensorMap tmap_q
             int index_offset = load_warp_rank * 16 + lane % 16 + lane / 16 * 64;
             int sparse_row = -1;
             if (index_offset < sparse_topk) {
-                sparse_row = row_ptr[index_offset];
+                sparse_row = prologue_row;
             }
             if (load_warp_rank == 0) {
                 if (elect_sync()) {

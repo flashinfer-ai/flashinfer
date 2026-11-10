@@ -347,6 +347,8 @@ class MoEEpSplitLayer(nn.Module):
         weights: MoEWeightPack,
         fleet_knobs: Sequence[AlgoKnob] = (),
         backend: Union[str, SplitConfig, object] = "nccl_ep",
+        *,
+        _prepared_weights=None,
     ) -> None:
         """Validate the EP config and hand ``weights`` to the inner kernel.
 
@@ -384,11 +386,23 @@ class MoEEpSplitLayer(nn.Module):
                 split_comm_runtime_requirements(self._comm_backend_name()),
             )
 
-        self._validate_at_init()
-        self._kernel.validate_init(bootstrap, fleet_params)
+        try:
+            self._validate_at_init(validate_weights=_prepared_weights is None)
+            self._kernel.validate_init(bootstrap, fleet_params)
 
-        if type(self._kernel).requires_weights():
-            self._kernel.preprocess_weights(self._weights, fleet_params)
+            if _prepared_weights is not None:
+                self._kernel._transformed_weights = _prepared_weights
+            elif type(self._kernel).requires_weights():
+                self._kernel.preprocess_weights(self._weights, fleet_params)
+        except Exception:
+            try:
+                self._kernel.destroy()
+            finally:
+                if self._runtime is not None:
+                    finalize_moe_ep_runtime(self._runtime)
+                    self._runtime = None
+                self._destroyed = True
+            raise
         # Source pack is only needed for init-time validation and kernel
         # preprocessing; the kernel retains what it needs. Release it so the
         # layer does not pin a per-layer weight copy for the model lifetime
@@ -455,11 +469,12 @@ class MoEEpSplitLayer(nn.Module):
             )
         return on_communication
 
-    def _validate_at_init(self) -> None:
+    def _validate_at_init(self, *, validate_weights=True) -> None:
         validate_bootstrap_world_size(self._bootstrap)
-        validate_fleet_weights(
-            self._weights, self._fleet_params, self._bootstrap.world_size
-        )
+        if validate_weights:
+            validate_fleet_weights(
+                self._weights, self._fleet_params, self._bootstrap.world_size
+            )
         if self._uses_communication():
             self._validate_communication_config()
         else:
@@ -578,11 +593,13 @@ class MoEEpSplitLayer(nn.Module):
         )
         runtime_max = t.runtime_max_tokens_per_rank
         if runtime_max is not None and not (
-            t.num_tokens <= runtime_max <= self._fleet_params.max_tokens_per_rank
+            max(t.num_tokens, 1)
+            <= runtime_max
+            <= self._fleet_params.max_tokens_per_rank
         ):
             raise MoEEpConfigError(
                 f"runtime_max_tokens_per_rank={runtime_max} must lie in "
-                f"[num_tokens={t.num_tokens}, "
+                f"[max(num_tokens, 1)={max(t.num_tokens, 1)}, "
                 f"max_tokens_per_rank={self._fleet_params.max_tokens_per_rank}]"
             )
 
@@ -635,6 +652,38 @@ class MoEEpSplitLayer(nn.Module):
             self._warmed = True
         return out
 
+    def _forward_prepared(self, t, state, *, compute=None, output=None):
+        """Execute on persistent transport storage owned by an EP selection plan."""
+        if self._destroyed or state.destroyed:
+            raise MoEEpConfigError("The prepared split workspace has been destroyed")
+        validate_split_forward_inputs(
+            t.hidden_states, t.topk_ids, t.topk_weights, self._fleet_params
+        )
+        if t.runtime_max_tokens_per_rank != state._runtime_max_tokens_per_rank:
+            raise ValueError(
+                "runtime_max_tokens_per_rank changed; prepare another plan"
+            )
+        output = state.out if output is None else output
+        if self._uses_communication():
+            out = self._communication_dispatch_compute_combine(
+                t, output, compute=compute
+            )
+        else:
+            # Fleet handles bind weights at creation; refresh their contents
+            # when eager callers provide a different routing buffer.
+            if t.topk_weights.data_ptr() != state._topk_weights.data_ptr():
+                state._topk_weights.copy_(t.topk_weights)
+            handle = state._handle
+            handle.update(HandleParams(topk_ids=t.topk_ids))
+            try:
+                out = self._fleet_dispatch_compute_combine(
+                    handle, t, output, out_is_stable=True, compute=compute
+                )
+            finally:
+                handle.complete()
+        self._warmed = True
+        return out
+
     def destroy(self) -> None:
         """Tear down graph state, then the transport, then comm runtime.
 
@@ -656,6 +705,9 @@ class MoEEpSplitLayer(nn.Module):
         # when that raises, or the bootstrap ref_count leaks and the layer keeps
         # serving forward() on a half-destroyed transport.
         try:
+            # Before the transport: the kernel's per-forward state may still
+            # reference its receive buffers.
+            self._kernel.destroy()
             if self._communication is not None:
                 self._communication.destroy()
                 self._communication = None
@@ -824,6 +876,7 @@ class MoEEpSplitLayer(nn.Module):
         out: torch.Tensor,
         *,
         out_is_stable: bool = False,
+        compute=None,
     ) -> torch.Tensor:
         """Dispatch, run the inner kernel and combine on a bound handle."""
         timings: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
@@ -832,7 +885,9 @@ class MoEEpSplitLayer(nn.Module):
         with self._stage(timings, "dispatch"):
             dispatched = handle.dispatch(DispatchInputParams(x=[payload]))
         with self._stage(timings, "compute"):
-            expert_out = self._kernel.compute(self._fleet_kernel_context(dispatched))
+            expert_out = (compute or self._kernel.compute)(
+                self._fleet_kernel_context(dispatched)
+            )
         with self._stage(timings, "combine"):
             combined = handle.combine(
                 CombineInputParams(x=[expert_out], out=out, out_is_stable=out_is_stable)
@@ -925,7 +980,7 @@ class MoEEpSplitLayer(nn.Module):
         )
 
     def _communication_dispatch_compute_combine(
-        self, t: "MoEEpTensors", out: torch.Tensor
+        self, t: "MoEEpTensors", out: torch.Tensor, *, compute=None
     ) -> torch.Tensor:
         """Dispatch, run the inner kernel and combine over the communication."""
         comm = self._ensure_communication(t.topk_ids.shape[1])
@@ -952,7 +1007,7 @@ class MoEEpSplitLayer(nn.Module):
             )
         with self._stage(timings, "compute"):
             ctx = self._communication_kernel_context(comm, received)
-            expert_out = self._kernel.compute(ctx)
+            expert_out = (compute or self._kernel.compute)(ctx)
         with self._stage(timings, "combine"):
             combined = comm.combine(expert_out.reshape(ctx.num_tokens, -1), output=out)
         self._publish_timings(timings)
@@ -961,20 +1016,16 @@ class MoEEpSplitLayer(nn.Module):
     def _communication_kernel_context(
         self, comm: MoEEpCommunication, received: MoEEpDispatchResult
     ) -> SplitKernelContext:
-        # The inner kernels take RANK_MAJOR routing as ids local to this rank,
-        # with -1 for picks this rank does not own.
-        first_local = comm.ep_rank * comm.num_local_experts
-        ids = received.topk_ids
-        is_local = (ids >= first_local) & (ids < first_local + comm.num_local_experts)
+        # The received routing goes to the inner kernel as GLOBAL ids; it
+        # evaluates only the picks in this rank's local expert range.
         return SplitKernelContext(
             expert_tensors=received.hidden_states.view(
                 comm.ep_size, received.tokens_per_rank, -1
             ),
             num_tokens=comm.ep_size * received.tokens_per_rank,
             fleet_params=self._fleet_params,
-            recv_topk_idx=torch.where(
-                is_local, ids - first_local, torch.full_like(ids, -1)
-            ),
+            recv_topk_idx=received.topk_ids,
             recv_topk_weights=received.topk_weights,
+            recv_topk_idx_global=True,
             expert_tensors_scale=received.hidden_states_scale,
         )

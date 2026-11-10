@@ -1331,11 +1331,12 @@ __global__ void checkpointing_ssu_kernel(CheckpointingSsuParams params) {
 
   // ── Ring head (oldest live cache row) ──
   auto const* __restrict__ ring_start_ptr = reinterpret_cast<int32_t const*>(params.ring_start);
-  int const ring_start = __ldg(&ring_start_ptr[cache_slot]);
+  int const ring_start =
+      __ldg(&ring_start_ptr[tracker_offset(cache_slot, params.ring_start_stride)]);
 
   // ── prev_num_accepted_tokens ──
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
-  int const prev_k = prev_ptr[cache_slot];
+  int const prev_k = prev_ptr[tracker_offset(cache_slot, params.prev_num_accepted_stride)];
 
   // ── Varlen vs non-varlen prologue.  See checkpointing_ssu_kernel_8bit for
   // the rationale: `seq_len` flows downstream as a constexpr-foldable

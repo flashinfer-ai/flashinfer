@@ -47,9 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
 #define QUANT_UNITS 2
 #define SF_TILE_BYTES 512
 
@@ -116,7 +113,7 @@ kernel_cake_kimi_k3_fp8_projection_76532340e38f7479bbf6(__nv_bfloat16* __restric
     unsigned long long row_base = (unsigned long long)row_c * (unsigned long long)K;
     int m_tile = row_c / sf_rows;
     int row_in_tile = row_c - m_tile * sf_rows;
-    unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4;
+    unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16ull + (unsigned long long)(row_in_tile >> 5) * 4ull;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     float staged[16];
     #pragma unroll
@@ -167,14 +164,14 @@ kernel_cake_kimi_k3_fp8_projection_76532340e38f7479bbf6(__nv_bfloat16* __restric
         for (int _lr = 1; _lr < 8; _lr++) {
             absmax = max_noftz(absmax, mags[_lr]);
         }
-        float o1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
-        absmax = fmaxf(absmax, o1);
-        float o2 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
-        absmax = fmaxf(absmax, o2);
-        float o4 = __shfl_xor_sync(0xFFFFFFFF, absmax, 4);
-        absmax = fmaxf(absmax, o4);
-        float o8 = __shfl_xor_sync(0xFFFFFFFF, absmax, 8);
-        absmax = fmaxf(absmax, o8);
+        float other_0 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
+        absmax = fmaxf(absmax, other_0);
+        float other_1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
+        absmax = fmaxf(absmax, other_1);
+        float other_2 = __shfl_xor_sync(0xFFFFFFFF, absmax, 4);
+        absmax = fmaxf(absmax, other_2);
+        float other_3 = __shfl_xor_sync(0xFFFFFFFF, absmax, 8);
+        absmax = fmaxf(absmax, other_3);
         absmax = fmaxf(absmax, 1e-04f);
         float scale = absmax / 448.0f;
         unsigned int scale_bits = __as_u32(scale);

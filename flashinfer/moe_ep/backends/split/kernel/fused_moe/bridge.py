@@ -22,7 +22,8 @@ For the LL **RANK_MAJOR** layout the recv buffer is instead
 ``[world, max_tokens_per_rank, hidden]`` (tokens grouped by source rank, each
 carrying its received ``topk_idx`` / ``topk_weights``), and
 :func:`build_activation_pack_rank_major` drives the runner at the real ``top_k``
-with the received routing masked to this rank's local experts — see its docstring.
+with the received routing restricted to this rank's local experts — see its
+docstring.
 """
 
 from __future__ import annotations
@@ -32,7 +33,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
-    from flashinfer.fused_moe.api import MoEActivationPack, QuantConfig
+    from flashinfer.fused_moe.api import (
+        MoEActivationPack,
+        QuantConfig,
+        RoutingInputMode,
+    )
 
 
 _NCCL_EP_LL_BF16_WIDTHS = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
@@ -206,33 +211,44 @@ def build_activation_pack_rank_major(
     mxfp8_dispatch: bool = False,
     hidden_size: Optional[int] = None,
     recv_scale: Optional[torch.Tensor] = None,
+    global_ids: bool = False,
+    routing_input_mode: Optional["RoutingInputMode"] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D RANK_MAJOR dispatch output into a token-major pack.
 
     The RANK_MAJOR recv buffer is ``[world, max_tokens_per_rank, hidden]`` — tokens
     grouped by *source rank*, received once each, **carrying their received
-    ``topk_idx`` / ``topk_weights``**.  The library returns ``topk_idx`` as
-    **LOCAL expert indices** (0-based within this rank's experts), with ``-1``
-    marking a pick routed to a NON-local expert (handled by another rank).  Each
-    received token must run through whichever of *this rank's* local experts appear
-    in its top-k, weighted and summed (the "pre-reduce across local experts" the
-    layout contract calls for).
+    ``topk_idx`` / ``topk_weights``**.  Each received token must run through
+    whichever of *this rank's* local experts appear in its top-k, weighted and
+    summed (the "pre-reduce across local experts" the layout contract calls
+    for). The runner applies the real ``top_k`` weights and sums local
+    contributions; ``combine`` sums across ranks.
 
-    The runner applies the real ``top_k`` weights and sums local contributions;
-    ``combine`` sums across ranks. Masked picks use a valid remote expert ID
-    when ``num_experts`` provides a remote shard, so the runner excludes them
-    from expert compute. Otherwise they use a local ID with zero weight.
+    With ``global_ids`` (the MoEEpCommunication transports), ``topk_idx`` holds
+    **GLOBAL expert ids** and reaches the runner unchanged, together with the
+    weights. The routing kernels behind the pre-routed runners map global ids
+    to local experts through ``local_expert_offset`` and skip every id outside
+    this rank's range, so picks owned by another rank and ``invalid_expert_id``
+    rows never reach the expert computation.
+
+    Otherwise (the Fleet/Handle transports) ``topk_idx`` holds **LOCAL expert
+    indices** (0-based within this rank's experts), with ``-1`` marking a pick
+    routed to a NON-local expert, and is translated to global ids here.
+    Masked picks use a valid remote expert ID when ``num_experts`` provides a
+    remote shard, so the runner excludes them from expert compute. Otherwise
+    they use a local ID with zero weight.
 
     Parameters
     ----------
     recv_tensors : torch.Tensor
         Dispatch output, shape ``[world, max_tokens_per_rank, hidden]`` (bf16).
     recv_topk_idx : torch.Tensor
-        Received per-token LOCAL expert indices, ``[M, top_k]`` (``M = world *
-        max_tokens_per_rank``); ``-1`` marks a non-local pick.
+        Received per-token expert ids, ``[M, top_k]`` (``M = world *
+        max_tokens_per_rank``): GLOBAL int32 ids with ``global_ids``, LOCAL
+        indices with ``-1`` for a non-local pick otherwise.
     recv_topk_weights : torch.Tensor
-        Received per-token routing weights, ``[M, top_k]`` fp32 (same per-pick order
-        as ``recv_topk_idx``).
+        Received per-token routing weights, ``[M, top_k]`` (same per-pick order
+        as ``recv_topk_idx``); fp32, or bf16 with ``global_ids``.
     num_local_experts : int
         Number of experts this rank owns (carried for API symmetry / validation).
     local_expert_offset : int
@@ -246,6 +262,12 @@ def build_activation_pack_rank_major(
         ``[M, *]`` received scale factors when the tokens were quantized by
         :func:`quantize_for_dispatch` before dispatch; ``recv_tensors`` then
         holds the quantized values and is not quantized again.
+    global_ids : bool
+        ``recv_topk_idx`` holds global expert ids (see above).
+    routing_input_mode : RoutingInputMode, optional
+        Pre-routed mode of the pack; ``PackedPrecomputed`` when omitted.
+        ``UnpackedPrecomputed`` hands the ids and weights to the routing
+        kernel as they are, without packing them into one tensor.
     """
     if recv_tensors.dim() != 3:
         raise ValueError(
@@ -258,28 +280,38 @@ def build_activation_pack_rank_major(
     m = flat.shape[0]
 
     idx = recv_topk_idx
-    if idx.dtype != torch.int64:
-        idx = idx.to(torch.int64)
     weights = recv_topk_weights
-    if weights.dtype != torch.float32:
-        weights = weights.to(torch.float32)
-    if idx.shape != weights.shape or idx.shape[0] != m:
+    if idx.shape != weights.shape or idx.dim() != 2 or idx.shape[0] != m:
         raise ValueError(
             f"recv_topk_idx/weights must share shape [M={m}, top_k]; got "
             f"{tuple(idx.shape)} / {tuple(weights.shape)}."
         )
 
-    # Zero weight alone does not skip GEMMs; a remote ID excludes the route.
-    masked_expert = local_expert_offset
-    if num_experts is not None and num_local_experts < num_experts:
-        masked_expert = (local_expert_offset + num_local_experts) % num_experts
-    is_local = (idx >= 0) & (idx < num_local_experts)
-    selected_experts = torch.where(
-        is_local,
-        idx + local_expert_offset,
-        torch.full_like(idx, masked_expert),
-    ).to(torch.int32)
-    final_scales = torch.where(is_local, weights, torch.zeros_like(weights))
+    if global_ids:
+        if idx.dtype != torch.int32:
+            raise TypeError(f"global recv_topk_idx must be int32, got {idx.dtype}")
+        if weights.dtype not in (torch.float32, torch.bfloat16):
+            raise TypeError(
+                f"recv_topk_weights must be float32 or bfloat16, got {weights.dtype}"
+            )
+        selected_experts = idx
+        final_scales = weights
+    else:
+        if idx.dtype != torch.int64:
+            idx = idx.to(torch.int64)
+        if weights.dtype != torch.float32:
+            weights = weights.to(torch.float32)
+        # Zero weight alone does not skip GEMMs; a remote ID excludes the route.
+        masked_expert = local_expert_offset
+        if num_experts is not None and num_local_experts < num_experts:
+            masked_expert = (local_expert_offset + num_local_experts) % num_experts
+        is_local = (idx >= 0) & (idx < num_local_experts)
+        selected_experts = torch.where(
+            is_local,
+            idx + local_expert_offset,
+            torch.full_like(idx, masked_expert),
+        ).to(torch.int32)
+        final_scales = torch.where(is_local, weights, torch.zeros_like(weights))
 
     return _quantize_and_pack(
         flat,
@@ -291,6 +323,7 @@ def build_activation_pack_rank_major(
         mxfp8_dispatch=mxfp8_dispatch,
         hidden_size=hidden_size,
         flat_scale=recv_scale,
+        routing_input_mode=routing_input_mode,
     )
 
 
@@ -354,6 +387,7 @@ def _quantize_and_pack(
     mxfp8_dispatch: bool,
     hidden_size: Optional[int],
     flat_scale: Optional[torch.Tensor] = None,
+    routing_input_mode: Optional["RoutingInputMode"] = None,
 ) -> "MoEActivationPack":
     """Prepare ``flat`` for the configured activation path and assemble the pack.
 
@@ -362,7 +396,7 @@ def _quantize_and_pack(
     ``flat_scale``, ``flat`` already holds the values
     :func:`quantize_for_dispatch` produced and is only reinterpreted.
     """
-    from flashinfer.fused_moe.api import MoEActivationPack
+    from flashinfer.fused_moe.api import MoEActivationPack, RoutingInputMode
 
     if flat_scale is None:
         hidden_states_q, hidden_states_scale, per_token_scale = _quantize_activations(
@@ -385,6 +419,7 @@ def _quantize_and_pack(
         topk_ids=selected_experts,
         topk_weights=final_scales,
         per_token_scale=per_token_scale,
+        routing_input_mode=routing_input_mode or RoutingInputMode.PackedPrecomputed,
     )
 
 

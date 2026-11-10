@@ -298,6 +298,95 @@ def test_split_bf16_masked_routes_cuda_graph(offset, num_tokens):
 
 
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize("mode", ["PackedPrecomputed", "UnpackedPrecomputed"])
+@pytest.mark.parametrize("offset", [0, 12])
+@pytest.mark.parametrize("num_tokens", [8, 512])
+def test_split_bf16_global_routes_cuda_graph(mode, offset, num_tokens):
+    """Received global ids reach the kernel unchanged: picks of other ranks'
+    experts and the invalid id are skipped while graph inputs change."""
+    _require_backend(TrtllmBf16Config)
+
+    from dataclasses import replace
+
+    import torch
+
+    from flashinfer.fused_moe.api import RoutingInputMode
+    from flashinfer.fused_moe.layer import MoELayer
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.bridge import (
+        build_activation_pack_rank_major,
+    )
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
+    )
+
+    x, w13, w2, _, weights = _make_problem()
+    repeats = (num_tokens + NUM_TOKENS - 1) // NUM_TOKENS
+    x = x.repeat(repeats, 1)[:num_tokens]
+    weights = weights.repeat(repeats, 1)[:num_tokens].contiguous()
+    cfg = _build_moe_config("bf16")
+    cfg = replace(
+        cfg,
+        experts=replace(cfg.experts, local_expert_offset=offset, local_num_experts=4),
+        execution=replace(cfg.execution, tune_max_num_tokens=num_tokens),
+    )
+    wp = materialize_fused_moe_weights(
+        MoEWeightPack(w13=w13[offset : offset + 4], w2=w2[offset : offset + 4]), cfg
+    )
+    layer = MoELayer(cfg)
+    routes = torch.arange(num_tokens * TOP_K, device="cuda").reshape(-1, TOP_K)
+    # Every global id plus the invalid id -1; row 0 is a padding row.
+    initial = (routes % (NUM_EXPERTS + 1) - 1).to(torch.int32)
+    initial[0] = -1
+    idx = initial.clone()
+
+    def forward():
+        pack = build_activation_pack_rank_major(
+            x.reshape(1, num_tokens, HIDDEN),
+            idx,
+            weights,
+            num_local_experts=4,
+            local_expert_offset=offset,
+            num_experts=NUM_EXPERTS,
+            quant=cfg.quant,
+            global_ids=True,
+            routing_input_mode=RoutingInputMode[mode],
+        )
+        return layer(pack, wp)
+
+    def check(output):
+        local = (idx >= offset) & (idx < offset + 4)
+        reference = _dense_moe_reference(
+            x.float(),
+            w13.float(),
+            w2.float(),
+            torch.where(local, idx, -1),
+            weights,
+            act_roundtrip=lambda a: a.to(torch.bfloat16).float(),
+        )
+        torch.testing.assert_close(output.float(), reference, rtol=3e-2, atol=3e-2)
+        assert torch.count_nonzero(output[~local.any(dim=1)]).item() == 0
+
+    for _ in range(3):
+        output = forward()
+    check(output)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+    other_ranks = (offset + 4 + routes % (NUM_EXPERTS - 4)) % NUM_EXPERTS
+    for new_idx in (
+        initial,
+        torch.full_like(idx, -1),
+        (routes % 4 + offset).to(torch.int32),
+        other_ranks.to(torch.int32),
+    ):
+        idx.copy_(new_idx)
+        graph.replay()
+        check(output)
+
+
+@pytest.mark.arch_blackwell
 def test_split_nvfp4_kernel_matches_torch_reference():
     """``trtllm_fp4_routed`` (all experts local) matches the dequant torch oracle."""
     _require_backend(TrtllmFp4Config)
@@ -430,6 +519,85 @@ def test_split_w4a8_kernel_matches_direct_runner(compute_backend):
     ref_cfg = replace(cfg, routing=replace(cfg.routing, top_k=1))
     expected = fm.MoELayer(ref_cfg)(act, weights)
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("compute_backend", ["cute", "trtllm"])
+def test_split_w4a8_global_routing_matches_local_routing(compute_backend):
+    """Rank-major compute on received global ids equals compute on the same
+    routing translated to local ids, for the second of two EP ranks."""
+    import torch
+
+    import flashinfer.fused_moe as fm
+    import flashinfer.moe_ep as ep
+
+    config_cls = fm.CuteDslConfig if compute_backend == "cute" else fm.TrtllmFp4Config
+    _require_backend(config_cls)
+    if compute_backend == "cute" and torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("CuTe-DSL W4A8 is not supported on SM107")
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if compute_backend == "cute" and not is_cute_dsl_available():
+        pytest.skip("CuTeDSL is not available")
+
+    from dataclasses import replace
+
+    from flashinfer.fused_moe.api import RoutingInputMode
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
+        FusedMoeSplitKernelBackend,
+    )
+
+    world, local_experts = 2, NUM_EXPERTS // 2
+    offset = local_experts  # rank 1 owns experts [8, 16)
+    x, w13, w2, topk_ids, topk_weights = _make_problem()
+    cfg = _build_moe_config("w4a8")
+    cfg = replace(
+        cfg,
+        backend=fm.BackendOptions(candidates=(config_cls(),)),
+        experts=replace(
+            cfg.experts, local_expert_offset=offset, local_num_experts=local_experts
+        ),
+    )
+    fleet = ep.FleetParams(
+        num_experts=NUM_EXPERTS,
+        max_tokens_per_rank=NUM_TOKENS // world,
+        token_hidden_size=HIDDEN,
+        layout=ep.EpLayout.RANK_MAJOR,
+    )
+    backend = FusedMoeSplitKernelBackend(ep.FusedMoeKernelConfig(moe_config=cfg))
+    backend.validate_init(ep.BootstrapConfig(world_size=world, rank=1), fleet)
+    backend.preprocess_weights(
+        ep.MoEWeightPack(w13=w13[offset:], w2=w2[offset:]), fleet
+    )
+
+    # The last rows of each source rank are padding rows with the invalid id.
+    global_ids = topk_ids.to(torch.int32).contiguous()
+    global_ids.view(world, -1, TOP_K)[:, -3:] = -1
+    local = (global_ids >= offset) & (global_ids < offset + local_experts)
+    recv = x.view(world, NUM_TOKENS // world, HIDDEN)
+
+    def run(ids, ids_global):
+        return backend.compute(
+            ep.SplitKernelContext(
+                expert_tensors=recv,
+                num_tokens=NUM_TOKENS,
+                fleet_params=fleet,
+                recv_topk_idx=ids,
+                recv_topk_weights=topk_weights,
+                recv_topk_idx_global=ids_global,
+            )
+        ).reshape(NUM_TOKENS, HIDDEN)
+
+    actual = run(global_ids, True)
+    expected = run(torch.where(local, global_ids - offset, -1), False)
+    expected_mode = (
+        RoutingInputMode.PackedPrecomputed
+        if compute_backend == "cute"
+        else RoutingInputMode.UnpackedPrecomputed
+    )
+    assert backend._global_routing_mode is expected_mode
+    # Unpacked routing keeps the FP32 weights the packed path rounds to BF16.
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    assert torch.count_nonzero(actual[~local.any(dim=1)]).item() == 0
 
 
 @pytest.mark.parametrize(

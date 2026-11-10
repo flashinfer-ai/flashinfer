@@ -30,6 +30,9 @@ from .weights import (
 )
 
 if TYPE_CHECKING:
+    from ..mxfp4_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
     from ......tensors import MoEEpTensors
     from ......kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
         Sm107BlockScaledSymmBuffer,
@@ -41,7 +44,8 @@ if TYPE_CHECKING:
 
 def _resolve_gate_up_clamp(
     config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-    | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
 ) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
@@ -59,10 +63,42 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def __init__(
         self,
         config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     ) -> None:
         super().__init__(config)
         self._kernel_config = config
+
+    def ep_weight_pack(self, weights):
+        from ..automatic import ep_weight_pack
+
+        return ep_weight_pack(self, weights)
+
+    def ep_selected_config(self, workspace):
+        from ..automatic import ep_selected_config
+
+        return ep_selected_config(self, workspace)
+
+    def ep_prepare_fixed(self, workspace, weights):
+        workspace.prepare(*weights)
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        from ..automatic import ep_force_tune
+
+        ep_force_tune(self, workspace, tensors, weights, output)
+
+    def ep_tuning_contract(self, fleet_params):
+        from ..automatic import ep_tuning_contract
+
+        return ep_tuning_contract(self, fleet_params)
+
+    @classmethod
+    def create(cls, config):
+        if config.kernel_variant == "auto":
+            from ..variant_selection import RubinVariantBackend
+
+            return RubinVariantBackend(config, cls)
+        return cls(config)
 
     def coordinate_workspace_replacement(
         self, workspace: Sm107BlockScaledSymmBuffer
@@ -239,12 +275,13 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
-        validate_routing_values(
-            t.topk_ids,
-            t.topk_weights,
-            workspace.config.num_total_experts,
-            workspace=workspace,
-        )
+        """Stage validated MXFP8 activations and routes, masking unused rows.
+
+        BF16 inputs may fuse validation with quantization; prequantized inputs
+        are validated before copying their payload and logical scale columns.
+        """
+        if self._kernel_config.knobs == "auto":
+            workspace._tuning_inputs = (t, quantize_input)
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
@@ -255,9 +292,18 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 kind=self._kernel_config.kind,
+                num_experts=workspace.config.num_total_experts,
+                workspace=workspace,
             )
             workspace.note_staged_tokens(staged)
             return
+
+        validate_routing_values(
+            t.topk_ids,
+            t.topk_weights,
+            workspace.config.num_total_experts,
+            workspace=workspace,
+        )
 
         num_tokens = t.hidden_states.shape[0]
         capacity = workspace.x.shape[0]
