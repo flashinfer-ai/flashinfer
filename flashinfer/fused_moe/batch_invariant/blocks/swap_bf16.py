@@ -310,9 +310,9 @@ class SwappedGroupedGemm:
         # programmatic dependent launch: the wait for the predecessor grid sits in each warp before its first read of the
         # predecessor's output (the token rows); the weight loads and the group tables (the plan: complete before this grid
         # launched, as no kernel of the chain triggers before its own wait) do not wait, so the weight ring fills during the
-        # launch; the trigger placement is the chain's (``pdl.TRIGGER``). The counts read below, before the wait, is the
-        # box form's reliance on that rule (``pdl.BOX_FORM_TRIGGERS``, asserted at the builder); the gather form, whose
-        # predecessor is the plan itself, waits first.
+        # launch; the trigger placement is the chain's (``pdl.TRIGGER``). Reading the counts below, before the wait, relies
+        # on that rule (``pdl.BOX_FORM_TRIGGERS``, asserted at the builder); the gather form, whose predecessor is the plan
+        # itself, waits first.
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
