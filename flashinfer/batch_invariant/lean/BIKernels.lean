@@ -18,3 +18,5 @@ import BIKernels.MoE
 import BIKernels.MoECases
 import BIKernels.MegaMoE
 import BIKernels.MegaMoECases
+import BIKernels.Gdn
+import BIKernels.GdnCases

@@ -22,6 +22,9 @@ lean_exe samplingconformance where
 lean_exe megamoeconformance where
   root := `MegaMoEMain
 
+lean_exe gdnconformance where
+  root := `GdnMain
+
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true
