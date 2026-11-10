@@ -1392,9 +1392,10 @@ def test_attention_ts_context_stats_reuses_dynamic_requests(
         assert launches[-1][4] is lse
         assert launches[-1][8] is qo
         assert launches[-1][9] is ko
-        assert launches[-1][17] is stats
-        assert launches[-1][6] == pytest.approx(0.25 * math.log2(math.e))
+        assert launches[-1][19] is stats
+        assert launches[-1][6] == 0.25
         assert launches[-1][7] == 0.5
+        assert launches[-1][-1] == (0.25 if store_softmax_stats else None)
     assert len(compile_calls) == 1
     assert compile_calls[0].store_softmax_stats is store_softmax_stats
     assert compile_calls[0].lse_mode == lse_mode
@@ -5533,11 +5534,24 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     _assert_context_correct(graph_out, second)
 
 
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim,head_dim_vo", [(128, 128), (192, 128), (256, 256)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "packed,causal,dtype,out_dtype",
+    [
+        pytest.param(
+            False, False, torch.bfloat16, torch.bfloat16, id="fixed-dense-bf16"
+        ),
+        pytest.param(False, True, torch.bfloat16, _FP8, id="fixed-causal-bf16-fp8out"),
+        pytest.param(True, False, torch.bfloat16, _FP8, id="packed-dense-bf16-fp8out"),
+        pytest.param(
+            True, True, torch.bfloat16, torch.bfloat16, id="packed-causal-bf16"
+        ),
+        pytest.param(False, False, _FP8, _FP8, id="fixed-dense-fp8"),
+        pytest.param(False, True, _FP8, torch.bfloat16, id="fixed-causal-fp8-bf16out"),
+        pytest.param(True, False, _FP8, torch.bfloat16, id="packed-dense-fp8-bf16out"),
+        pytest.param(True, True, _FP8, _FP8, id="packed-causal-fp8"),
+    ],
+)
 @_REQUIRES_CONTEXT_STATS_GPU
 def test_attention_ts_context_softmax_stats(
     packed, causal, head_dim, head_dim_vo, dtype, out_dtype

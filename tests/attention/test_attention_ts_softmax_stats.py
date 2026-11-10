@@ -14,7 +14,7 @@
 
 """The shared max/denominator export contract across PrimTS attention paths."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import inspect
 import math
 from types import SimpleNamespace
@@ -876,7 +876,9 @@ def test_attention_ts_paged_softmax_stats_merge_kv_partitions(kind):
     _assert_result(merged, torch.stack((maximum, denominator), -1), case)
 
 
-def _force_decode_topology(monkeypatch, case, family, reduction, *, tile_kv=128):
+def _force_decode_topology(
+    monkeypatch, case, family, reduction, *, tile_kv=128, requested_splits=None
+):
     import cutlass
     from flashinfer.attention.prims_ts import decode
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
@@ -949,6 +951,10 @@ def _force_decode_topology(monkeypatch, case, family, reduction, *, tile_kv=128)
     assert config.use_separate_reduction_kernel == (reduction in ("serial", "parallel"))
     if config.use_separate_reduction_kernel:
         assert config.use_parallel_separate_reduction == (reduction == "parallel")
+    if requested_splits is not None:
+        config = replace(config, runtime_split_kv=True)
+        assert config.uses_compact_split_grid
+        assert requested_splits < config.max_splits_kv
     spec = decode._decode_launch_spec_from_config(
         config,
         batch_size=case.block_tables.shape[0],
@@ -959,7 +965,10 @@ def _force_decode_topology(monkeypatch, case, family, reduction, *, tile_kv=128)
         max_active_clusters=fmha_decode_config.get_max_active_clusters_for_cluster_size(
             1
         ),
+        requested_splits=requested_splits,
     )
+    if requested_splits is not None:
+        spec = replace(spec, requested_splits=requested_splits)
     monkeypatch.setattr(
         decode, "_resolve_decode_launch_spec", lambda *_args, **_kwargs: spec
     )
@@ -987,13 +996,36 @@ def test_attention_ts_decode_softmax_stats_forced_reduction(
         max_q=1,
         mask_type="dense",
     )
-    compile_cache = _force_decode_topology(monkeypatch, case, family, reduction)
+    requested_splits = 2 if reduction in ("serial", "parallel") else None
+    compile_cache = _force_decode_topology(
+        monkeypatch, case, family, reduction, requested_splits=requested_splits
+    )
     compile_cache.cache_clear()
     try:
         wrapper = case.plan()
+        if requested_splits is not None:
+            state = wrapper._plan_state
+            logical_rows = case.block_tables.shape[0] * case.k.shape[1]
+            assert logical_rows > 1
+            assert state.config.uses_compact_split_grid
+            assert (
+                state.requested_splits == requested_splits < state.config.max_splits_kv
+            )
+            assert (
+                state.workspace.partial_stats.shape[0]
+                == logical_rows * requested_splits
+            )
         stats = torch.full((*case.q.shape[:-1], 2), torch.nan, device="cuda")
         output = case.run(wrapper, stats)
         _assert_result(output, stats, case)
+        if requested_splits is not None:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                case.run(wrapper, stats, out=output, validate=False)
+            output.fill_(torch.nan)
+            stats.fill_(torch.nan)
+            graph.replay()
+            _assert_result(output, stats, case)
     finally:
         # The serial test temporarily overrides derived configuration properties.
         compile_cache.cache_clear()

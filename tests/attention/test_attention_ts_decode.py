@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -2877,6 +2878,8 @@ def test_attention_ts_decode_softmax_stats_flattened_launch_abi(
         v_page_stride=15,
         v_head_stride=16,
         v_token_stride=17,
+        k_sf_page_stride=18,
+        v_sf_page_stride=19,
         softmax_scale=0.125,
         output_scale=0.75,
     )
@@ -2898,15 +2901,17 @@ def test_attention_ts_decode_softmax_stats_flattened_launch_abi(
     assert result is out
     assert len(calls) == 2
     rows = math.prod(query_shape[:-2])
-    for args, lse_position in ((calls[0], 6), (calls[1], 1)):
+    for args, lse_position, stats_position in ((calls[0], 6, -1), (calls[1], 1, -2)):
         assert args[lse_position].shape == (rows, 8)
         assert args[lse_position].data_ptr() == lse.data_ptr()
-        assert args[-5:-1] == (5, 3, (), 4097)
+        assert args[stats_position - 4 : stats_position] == (5, 3, (), 4097)
         if stats_enabled:
-            assert args[-1].shape == (rows, 8, 2)
-            assert args[-1].data_ptr() == stats.data_ptr()
+            assert args[stats_position].shape == (rows, 8, 2)
+            assert args[stats_position].data_ptr() == stats.data_ptr()
         else:
-            assert args[-1] is None
+            assert args[stats_position] is None
+    assert calls[0][22:26] == (18, 19, 0.125, 0.75)
+    assert calls[1][-1] == (runtime.softmax_scale if stats_enabled else None)
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
@@ -10396,7 +10401,8 @@ def test_attention_ts_decode_fp8_speculative_runtime_reduction(out_dtype):
 
 
 @_REQUIRES_PRIMTS_GPU
-def test_decode_global_scales_graph_and_prepared(monkeypatch):
+@pytest.mark.parametrize("store_stats", (False, True), ids=("output-only", "stats"))
+def test_decode_global_scales_graph_and_prepared(monkeypatch, store_stats):
     """Device scales stay live through the standalone reducer and prepared API."""
     original = fmha_decode_config.make_decode_config
 
@@ -10431,6 +10437,11 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
         lengths = torch.tensor([2048], dtype=torch.int32, device="cuda")
         table = torch.arange(128, dtype=torch.int32, device="cuda").view(1, -1)
         out = torch.empty(q.shape, dtype=torch.bfloat16, device="cuda")
+        stats = (
+            torch.full((*q.shape[:-1], 2), torch.nan, device="cuda")
+            if store_stats
+            else None
+        )
         scales = dict(
             softmax_scale=torch.tensor(0.125, device="cuda"),
             output_scale=torch.tensor(0.75, device="cuda"),
@@ -10448,6 +10459,7 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
             k_dtype=dtype,
             v_dtype=dtype,
             out_dtype=out.dtype,
+            store_softmax_stats=store_stats,
             **scales,
         )
         assert wrapper._plan_state.config.use_separate_reduction_kernel
@@ -10459,12 +10471,19 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
                 None
             ]
             torch.testing.assert_close(out.float(), expected, atol=0.02, rtol=0.05)
+            if stats is not None:
+                maximum = scores.amax(-1)
+                denominator = (scores - maximum[:, None]).exp().sum(-1)
+                expected_stats = torch.stack((maximum, denominator), -1)[None]
+                torch.testing.assert_close(
+                    stats, expected_stats, atol=0.002, rtol=0.002
+                )
 
-        wrapper.run(*args, out=out)
+        wrapper.run(*args, out=out, softmax_stats=stats)
         check(0.125, 0.75)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            wrapper.run(*args, out=out, validate=False)
+            wrapper.run(*args, out=out, softmax_stats=stats, validate=False)
         for scale in scales.values():
             scale.mul_(1.5)
         graph.replay()
@@ -10479,6 +10498,8 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
             out=out,
             workspace_buffer=workspace,
             validate=False,
+            store_softmax_stats=store_stats,
+            softmax_stats=stats,
             **scales,
         )
         check(0.1875, 1.125)
@@ -10490,11 +10511,12 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch):
             lengths,
             2048,
             out=out,
+            store_softmax_stats=store_stats,
             **scales,
         )
         prepared_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(prepared_graph):
-            prepared.run(q, out=out, validate=False)
+            prepared.run(q, out=out, softmax_stats=stats, validate=False)
         for scale in scales.values():
             scale.mul_(0.5)
         prepared_graph.replay()

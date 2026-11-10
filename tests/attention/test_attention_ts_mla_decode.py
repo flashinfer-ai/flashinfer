@@ -4126,7 +4126,8 @@ def test_attention_ts_mla_decode_2cta_runtime_small_split_reduction(seq_len_q, k
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("family", ("1cta", "2cta"))
-def test_dense_mla_global_scales_graph_replay(family):
+@pytest.mark.parametrize("store_stats", (False, True), ids=("output-only", "stats"))
+def test_dense_mla_global_scales_graph_replay(family, store_stats):
     from tests.utils.test_helpers.pdl import late_store
 
     case = replace(
@@ -4145,18 +4146,19 @@ def test_dense_mla_global_scales_graph_replay(family):
         case, offsets = _pack_mla_case(case, [1] * 8)
     sm_scale = (
         torch.tensor(case.softmax_scale, device="cuda")
-        if family == "1cta"
+        if family == "1cta" or store_stats
         else case.softmax_scale
     )
     output_scale = torch.tensor(case.output_scale, device="cuda")
-    name = "softmax_scale" if family == "1cta" else "output_scale"
-    scale = sm_scale if family == "1cta" else output_scale
+    name = "softmax_scale" if family == "1cta" or store_stats else "output_scale"
+    scale = sm_scale if name == "softmax_scale" else output_scale
     wrapper = _plan_case(
         case,
         qo_indptr=offsets,
         max_q_len=1,
         softmax_scale=sm_scale,
         output_scale=output_scale,
+        store_softmax_stats=store_stats,
     )
     policy = _policy_dict(wrapper)
     assert policy["kernel"] == (
@@ -4167,6 +4169,31 @@ def test_dense_mla_global_scales_graph_replay(family):
     out = torch.empty(
         (*case.query.shape[:-1], 512), device="cuda", dtype=torch.bfloat16
     )
+    stats = (
+        torch.full((*case.query.shape[:-1], 2), torch.nan, device="cuda")
+        if store_stats
+        else None
+    )
+
+    def check(expected):
+        _assert_case_correct(out, expected, policy, qo_indptr=offsets)
+        if stats is None:
+            return
+        statistics = []
+        for batch_idx in range(expected.block_tables.shape[0]):
+            query = expected.query[batch_idx].reshape(1, expected.query.shape[-2], -1)
+            cache = _gather_request_cache(expected, batch_idx)
+            scores = (
+                torch.einsum("qhd,kd->qhk", query.float(), cache)
+                * expected.softmax_scale
+            )
+            maximum = scores.amax(-1)
+            denominator = (scores - maximum[..., None]).exp().sum(-1)
+            statistics.append(torch.stack((maximum, denominator), -1))
+        expected_stats = (
+            torch.cat(statistics) if offsets is not None else torch.stack(statistics)
+        )
+        torch.testing.assert_close(stats, expected_stats, atol=0.002, rtol=0.002)
 
     def run():
         wrapper.run(
@@ -4176,11 +4203,12 @@ def test_dense_mla_global_scales_graph_replay(family):
             case.seq_lens_kv,
             qo_indptr=offsets,
             out=out,
+            softmax_stats=stats,
             validate=False,
         )
 
     run()
-    _assert_case_correct(out, case, policy, qo_indptr=offsets)
+    check(case)
     changed_value = getattr(case, name) * 1.5
     changed = replace(case, **{name: changed_value})
     late_store(scale, changed_value)
@@ -4192,4 +4220,4 @@ def test_dense_mla_global_scales_graph_replay(family):
     for _ in range(2):
         scale.fill_(getattr(case, name))
         graph.replay()
-        _assert_case_correct(out, changed, policy, qo_indptr=offsets)
+        check(changed)

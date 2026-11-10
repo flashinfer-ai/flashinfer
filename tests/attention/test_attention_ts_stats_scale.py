@@ -172,10 +172,8 @@ def test_attention_ts_statistics_scale_reaches_every_decode_branch():
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("paged", (False, True), ids=("contiguous", "paged"))
-@pytest.mark.parametrize(
-    "runtime_override", (False, True), ids=("plan_scale", "runtime_scale")
-)
-def test_attention_ts_context_mla_partition_original_scale(paged, runtime_override):
+@pytest.mark.parametrize("scale_mode", ("plan", "runtime", "device"))
+def test_attention_ts_context_mla_partition_original_scale(paged, scale_mode):
     """Merge context and dense MLA whose large maxima differ by half an FP32 unit."""
     from flashinfer.attention.prims_ts import (
         BatchMLADecodePagedTSWrapper,
@@ -184,6 +182,16 @@ def test_attention_ts_context_mla_partition_original_scale(paged, runtime_overri
     )
 
     scale, heads, length = 0.37, 8, 128
+    runtime_scale = (
+        torch.tensor(scale, device="cuda") if scale_mode == "device" else scale
+    )
+    plan_scale = (
+        torch.tensor(0.19, device="cuda")
+        if scale_mode == "device"
+        else 0.19
+        if scale_mode == "runtime"
+        else scale
+    )
     q = torch.zeros((1, 1, heads, 128), device="cuda", dtype=torch.bfloat16)
     q[..., 0], q[..., 1] = 4096, 1
     key = torch.zeros((1, length, heads, 128), device="cuda", dtype=q.dtype)
@@ -210,14 +218,14 @@ def test_attention_ts_context_mla_partition_original_scale(paged, runtime_overri
         q_dtype=q.dtype,
         k_dtype=key.dtype,
         mask_type="dense",
-        softmax_scale=0.19 if runtime_override else scale,
+        softmax_scale=plan_scale,
         store_softmax_stats=True,
         **({"page_size": length} if paged else {"packed_query": False}),
     )
     args = (q, key, value, offsets, pages, lengths) if paged else (q, key, value)
     runtime_kwargs = {}
-    if runtime_override:
-        runtime_kwargs = {"softmax_scale": scale}
+    if scale_mode != "plan":
+        runtime_kwargs = {"softmax_scale": runtime_scale}
     output = wrapper.run(*args, softmax_stats=stats, **runtime_kwargs)
     mla_q = torch.zeros((1, 1, heads, 576), device="cuda", dtype=q.dtype)
     mla_q[..., :128] = q.reshape(1, 1, heads, 128)
@@ -239,10 +247,16 @@ def test_attention_ts_context_mla_partition_original_scale(paged, runtime_overri
         out_dtype=q.dtype,
         mask_type="dense",
         store_softmax_stats=True,
+        softmax_scale=runtime_scale,
     )
     mla_stats = torch.empty((1, 1, heads, 2), device="cuda", dtype=torch.float32)
     mla_output = mla.run(
-        mla_q, cache, pages, lengths, softmax_scale=scale, softmax_stats=mla_stats
+        mla_q,
+        cache,
+        pages,
+        lengths,
+        softmax_scale=runtime_scale,
+        softmax_stats=mla_stats,
     )
     maxima = (
         torch.tensor([2**24, 2**24 + 2], device="cuda", dtype=torch.float32) * scale
@@ -271,15 +285,48 @@ def test_attention_ts_context_mla_partition_original_scale(paged, runtime_overri
         wrapper.run(
             *args, softmax_stats=stats, out=output, validate=False, **runtime_kwargs
         )
+        mla.run(
+            mla_q,
+            cache,
+            pages,
+            lengths,
+            out=mla_output,
+            softmax_stats=mla_stats,
+            validate=False,
+        )
     stats.fill_(torch.nan)
+    mla_stats.fill_(torch.nan)
+    if scale_mode == "device":
+        runtime_scale.fill_(0.23)
+        maxima = (
+            torch.tensor([2**24, 2**24 + 2], device="cuda", dtype=torch.float32) * 0.23
+        )
     graph.replay()
-    torch.testing.assert_close(
-        stats[..., 0], maxima[0].expand_as(stats[..., 0]), rtol=0, atol=0
+    for result, maximum in ((stats, maxima[0]), (mla_stats, maxima[1])):
+        torch.testing.assert_close(
+            result[..., 0], maximum.expand_as(result[..., 0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            result[..., 1],
+            torch.full_like(result[..., 1], length),
+            rtol=1e-6,
+            atol=1e-4,
+        )
+    _GRAPH_OWNERS.append(
+        (
+            graph,
+            wrapper,
+            args,
+            output,
+            stats,
+            runtime_kwargs,
+            mla,
+            mla_q,
+            cache,
+            mla_output,
+            mla_stats,
+        )
     )
-    torch.testing.assert_close(
-        stats[..., 1], torch.full_like(stats[..., 1], length), rtol=1e-6, atol=1e-4
-    )
-    _GRAPH_OWNERS.append((graph, wrapper, args, output, stats, runtime_kwargs))
 
 
 @_REQUIRES_PRIMTS_GPU

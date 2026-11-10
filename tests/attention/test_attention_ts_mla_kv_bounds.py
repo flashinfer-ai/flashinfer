@@ -916,7 +916,11 @@ def test_attention_ts_mla_kv_bounds_cpu_presence_contract(
 
     wrapper = BatchMLADecodePagedTSWrapper()
     wrapper._plan_state = SimpleNamespace(
-        use_kv_bounds=use_kv_bounds, store_softmax_stats=False
+        use_kv_bounds=use_kv_bounds,
+        store_softmax_stats=False,
+        softmax_scale=1.0,
+        output_scale=1.0,
+        device=torch.device("cpu"),
     )
 
     def fail_prepare(*args: object, **kwargs: object) -> None:
