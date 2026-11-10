@@ -218,6 +218,10 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
     permuted row ``r``; the token permute is fused into the A load (never
     materialized).
 
+    ``x``, ``w1_weight`` and ``out`` must be 16-byte aligned (checked on every
+    call); the int32 routing metadata must be 4-byte aligned (not checked per
+    call).
+
     Args:
         x: Unpermuted activations ``[num_tokens, k]``, row-major bf16/fp16.
         w1_weight: Expert weights, k contiguous. Gated:

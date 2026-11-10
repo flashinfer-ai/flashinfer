@@ -909,7 +909,7 @@ def test_cute_dsl_bf16_moe_bad_inputs():
     x_off = torch.empty(t * k + 1, device="cuda", dtype=torch.bfloat16)[1:].view(t, k)
     with pytest.raises(ValueError, match="16-byte aligned"):
         sm90_contiguous_gather_grouped_gemm_act_fusion(x_off, w1, *args, **kw)
-    # The fused pipeline checks the routing-weight dtype before moe_sort reads it.
+    # The fused pipeline rejects non-float32 routing weights before any launch.
     w2 = torch.randn(e, k, 64, device="cuda", dtype=torch.bfloat16)
     ids = torch.zeros(t, 1, device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match="token_final_scales must be float32"):

@@ -142,7 +142,7 @@ def _moe_core_impl(
             f"cute_dsl_fused_moe_bf16 requires SM90 (Hopper). Got SM{major}{minor}."
         )
     if token_final_scales.dtype != torch.float32:
-        # moe_sort reads the scales as float32.
+        # GEMM2's finalize reads the scales as float32; fail before any launch.
         raise ValueError("token_final_scales must be float32")
 
     num_tokens, hidden = x.shape
@@ -401,8 +401,8 @@ def cute_dsl_fused_moe_bf16(
         swiglu_alpha=float(swiglu_alpha),
         swiglu_beta=float(swiglu_beta),
         swiglu_limit=float(swiglu_limit),
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
+        situ_beta=None if situ_beta is None else float(situ_beta),
+        situ_linear_beta=None if situ_linear_beta is None else float(situ_linear_beta),
     )
 
     num_tokens, hidden = x.shape

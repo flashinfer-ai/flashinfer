@@ -149,6 +149,10 @@ def sm90_contiguous_grouped_gemm_finalize_fusion(
     the caller must pass a zero-initialized ``out [num_tokens, hidden]``.
     Deterministic mode scatters to ``out [num_tokens * topk, hidden]`` and
     leaves the routing-weight reduction to the host pipeline.
+
+    ``a``, ``w2_weight`` and ``out`` must be 16-byte aligned (checked on every
+    call); the int32 routing metadata and ``token_final_scales`` must be 4-byte
+    aligned (not checked per call).
     """
     major, minor = get_compute_capability(a.device)
     if major != 9:
