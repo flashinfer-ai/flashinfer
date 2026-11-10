@@ -1772,8 +1772,12 @@ def test_swapped_records_equal_the_grouped_records():
     rows): at every token tile its rows are a grouped record's rows bit for bit -- the fp32 and bf16 outputs, the gated and
     the ungated chain -- with groups of 1 .. 70 rows (several token tiles), empty groups, E = 256, a weight width that is
     not a multiple of the 128-row weight tile, and the dense buffer with and without the token tile's pad rows past the live
-    ones (the last tiles' boxes then read the pad, or are zero-filled past the buffer: never stored)."""
-    from flashinfer.fused_moe.batch_invariant.api import grouped_gemm
+    ones (the last tiles' boxes then read the pad, or are zero-filled past the buffer: never stored); the gather form (the
+    token box gathered by the TMA from the unpermuted rows through the plan's slots, k_div 1 and 3) gives the same rows."""
+    from flashinfer.fused_moe.batch_invariant.api import (
+        grouped_gemm,
+        grouped_gemm_gather,
+    )
     from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
     from flashinfer.gemm.batch_invariant.generator import Knobs
 
@@ -1805,6 +1809,15 @@ def test_swapped_records_equal_the_grouped_records():
                     ("relu2", torch.bfloat16),
                 )
             }
+            perm = (
+                torch.randperm(Tk, generator=torch.Generator().manual_seed(Tk + pad))
+                .to(torch.int32)
+                .cuda()
+            )
+            x_src = torch.empty(Tk, K, dtype=torch.bfloat16, device="cuda")
+            x_src[perm.long()] = a_buf[
+                :Tk
+            ]  # row p of the packing is x_src[perm[p]] = x_src[src[p] // k_div]
             for cfg in swapped_knobs():
                 for (ch, dt), ref in refs.items():
                     got = grouped_gemm(a_buf, w, cnt, cfg, ch, dt, Tk=Tk)
@@ -1817,6 +1830,72 @@ def test_swapped_records_equal_the_grouped_records():
                         K,
                         pad,
                     )
+                    for k_div in (1, 3):
+                        got = grouped_gemm_gather(
+                            x_src, perm * k_div, k_div, w, cnt, cfg, ch, dt, Tk=Tk
+                        )
+                        assert torch.equal(bits(got.cpu()), bits(ref.cpu())), (
+                            cfg.describe(),
+                            ch,
+                            dt,
+                            counts[:4],
+                            N,
+                            K,
+                            pad,
+                            "gather",
+                            k_div,
+                        )
+            with pytest.raises(ValueError):
+                grouped_gemm_gather(x_src, perm, 1, w, cnt, dense, "plain", Tk=Tk)
+
+
+@needs_device
+def test_gather_form_of_the_op_equals_the_materialised_path():
+    """The op with a swapped GEMM1 gathers the tokens' rows itself (the default for a swapped record: no gather launch, no
+    permuted tensor) and gives the bits of the materialised path on the same records and of the dense records, at decode
+    grid shapes with empty experts and one-token experts; ``gather=True`` on a dense record raises."""
+    from flashinfer.fused_moe.batch_invariant.api import MoEWeights, fused_moe, route
+    from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    g = torch.Generator(device="cuda").manual_seed(5)
+    dense = Knobs((64, 64), (1, 1), False, True, "m", 1)
+    for T, k, H, I, E in [
+        (1, 8, 2048, 768, 128),
+        (4, 6, 1024, 512, 64),
+        (16, 8, 1024, 256, 256),
+        (64, 2, 512, 1024, 8),
+    ]:
+        x = (torch.randn(T, H, device="cuda", generator=g) * 0.5).to(torch.bfloat16)
+        fc1 = (torch.randn(E, 2 * I, H, device="cuda", generator=g) * 0.02).to(
+            torch.bfloat16
+        )
+        fc2 = (torch.randn(E, H, I, device="cuda", generator=g) * 0.02).to(
+            torch.bfloat16
+        )
+        W = MoEWeights.prepare(fc1, fc2)
+        ids, wts = route(torch.randn(T, E, device="cuda", generator=g), k)
+        ref = bits(fused_moe(x, ids, wts, W, config1=dense, config2=dense).cpu())
+        for sw in swapped_knobs():
+            for gather in (None, False, True):
+                out, im = fused_moe(
+                    x,
+                    ids,
+                    wts,
+                    W,
+                    config1=sw,
+                    config2=sw,
+                    return_intermediates=True,
+                    gather=gather,
+                )
+                assert (im["x_perm"] is None) == (gather is not False), (
+                    T,
+                    sw.describe(),
+                    gather,
+                )
+                assert torch.equal(bits(out.cpu()), ref), (T, sw.describe(), gather)
+        with pytest.raises(ValueError):
+            fused_moe(x, ids, wts, W, config1=dense, config2=dense, gather=True)
 
 
 @needs_device
