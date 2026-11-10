@@ -317,6 +317,34 @@ void TrtllmGenBatchedGemmRunner::run(
   auto const& config = configs[configIndex];
   // printf("running config %d: %s\n", configIndex, config.mFunctionName);
 
+  if (enable_pdl) {
+    // The fused MoE's glue kernels (the DeepSeek FP8 activation after GEMM1, the finalize after
+    // GEMM2) read routing outputs before their own griddepcontrol.wait. That is sound only if
+    // every CTA of the GEMM they depend on waits on its primary before it triggers the dependent
+    // launch or exits, so that routing is complete by the time a glue kernel can start. trtllm-gen
+    // builds its kernels that way; this rules out, for the kernel actually selected, the option
+    // combinations that would allow a trigger or an exit before the wait. A kernel with no wait
+    // at all is launched without the PDL attribute by BatchedGemmInterface (plain stream order),
+    // which keeps the chain intact as well.
+    auto const& opts = config.mOptions;
+    bool const waitsOnPrimary = opts.mGridWaitForPrimaryRouting ||
+                                opts.mGridWaitForPrimaryEarlyExit || opts.mGridWaitForPrimaryA ||
+                                opts.mGridWaitForPrimaryB;
+    // The same condition under which BatchedGemmInterface launches the kernel with the PDL
+    // attribute: a kernel with none of these is launched in plain stream order and needs no check.
+    bool const launchedWithPdl =
+        waitsOnPrimary || opts.mFineGrainedConsumerA || opts.mFineGrainedConsumerB;
+    bool const exitingCtasWait = !(opts.mEnablesEarlyExit || opts.mEnablesDelayedEarlyExit) ||
+                                 opts.mGridWaitForPrimaryEarlyExit;
+    FLASHINFER_CHECK(
+        !launchedWithPdl || (waitsOnPrimary && exitingCtasWait &&
+                             (!opts.mGridTriggerSecondaryA || opts.mGridWaitForPrimaryA) &&
+                             (!opts.mGridTriggerSecondaryB || opts.mGridWaitForPrimaryB)),
+        "Batched GEMM kernel ", config.mFunctionName,
+        " may trigger its dependent launch or exit before waiting on its primary; "
+        "the MoE glue kernels rely on the wait coming first.");
+  }
+
   FLASHINFER_CHECK(numBatches > 0, "Batched GEMM requires numBatches > 0");
   if (!mOptions.staticBatch) {
     FLASHINFER_CHECK(totalNumPaddedTokens,
