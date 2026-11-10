@@ -2148,7 +2148,9 @@ class UnifiedPrefillMGKernel:
         head_offset=0,
         valid_hpb=None,
         pack_hilo_rows=False,
+        lse_natural=False,
     ):
+        self.lse_natural = bool(lse_natural)
         self.traits = traits
         self.layout = layout
         self.page_block_size = int(page_block_size)
@@ -2273,7 +2275,7 @@ class UnifiedPrefillMGKernel:
         topk_length: cute.Tensor,  # (T,) int32 per-token MAIN valid length
         attn_sink: cute.Tensor,  # (heads,) f32 (dummy 1-elem when no sink)
         output: cute.Tensor,  # (T, heads, D_V) bf16
-        out_lse: cute.Tensor,  # (T, heads) f32 base-2 LSE
+        out_lse: cute.Tensor,  # (T, heads) f32 LSE in the selected output units
         sm_scale_log2: Float32,
         latent_scale: Float32,
         stride_kv_block: Int64,  # MAIN per-block byte stride
@@ -3839,6 +3841,7 @@ class UnifiedPrefillMGKernel:
                 valid_hpb=self.valid_hpb,
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
+                lse_natural=self.lse_natural,
                 epilogue_mode=EPILOGUE_FINAL_BF16,
                 has_attn_sink=self.has_sink,
                 attn_sink=attn_sink,
@@ -3903,6 +3906,7 @@ class UnifiedPrefillMGKernel:
                     valid_hpb=t.hpb,
                     nt_per_warp_xv=t.nt_per_warp_xv,
                     v_has_rope=t.v_has_rope,
+                    lse_natural=self.lse_natural,
                     epilogue_mode=EPILOGUE_FINAL_BF16,
                     has_attn_sink=self.has_sink,
                     attn_sink=attn_sink,
@@ -3953,6 +3957,7 @@ def _sparse_mla_prefill_mg_flat_launch(
     latent_scale_per_token: bool = False,
     fp8_internal: bool = False,
     prepared: object | None = None,
+    lse_scale: str = "base2",
 ) -> None:
     traits = make_unified_traits(
         int(model_type),
@@ -4029,6 +4034,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         head_offset=head_offset,
         valid_hpb=valid_hpb,
         pack_hilo_rows=pack_hilo_rows,
+        lse_natural=lse_scale == "natural",
     )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     base_args = (
@@ -4093,6 +4099,8 @@ def _sparse_mla_prefill_mg_flat_launch(
             "out_lse", lse_out, dims=(DimKey.dynamic(), DimKey.exact(total_heads))
         ),
     ]
+    if lse_scale == "natural":
+        spec_fields.append(key_field("lse_natural", 1))
     if active_heads != total_heads or head_offset != 0:
         spec_fields.extend(
             [
@@ -4356,7 +4364,10 @@ def run_unified_prefill_mg(
     head_offset: int = 0,
     traits_override: UnifiedMLATraits | None = None,
     prepared: object | None = None,
+    lse_scale: str = "base2",
 ):
+    if lse_scale not in ("base2", "natural"):
+        raise ValueError(f"invalid lse_scale: {lse_scale!r}")
     if traits_override is not None:
         model_type = int(traits_override.model_type)
     else:
@@ -4517,6 +4528,7 @@ def run_unified_prefill_mg(
             and active_heads == total_heads
             and head_offset == 0
             and not traits.fp8_internal
+            and lse_scale == "base2"
             and prepared is None
             and not compile_only_launches_enabled()
         ):
@@ -4582,6 +4594,7 @@ def run_unified_prefill_mg(
                 head_offset=head_offset,
                 fp8_internal=bool(traits.fp8_internal),
                 prepared=prepared,
+                lse_scale=lse_scale,
             )
             if compile_only_launches_enabled():
                 return result
@@ -4592,6 +4605,7 @@ def run_unified_prefill_mg(
         and active_heads == total_heads
         and head_offset == 0
         and not traits.fp8_internal
+        and lse_scale == "base2"
         and prepared is None
         and not compile_only_launches_enabled()
     ):
@@ -4652,6 +4666,7 @@ def run_unified_prefill_mg(
             latent_scale_per_token=bool(latent_scale_per_token),
             fp8_internal=bool(traits.fp8_internal),
             prepared=prepared,
+            lse_scale=lse_scale,
         )
         if compile_only_launches_enabled():
             return result
