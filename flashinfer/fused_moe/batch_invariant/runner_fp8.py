@@ -25,6 +25,7 @@ from .runner import (
     BatchInvariantMoeRunner,
     _configs_from_tactic,
     _tactic,
+    routing_term,
 )
 
 CLASS = "moe.e4m3"
@@ -44,7 +45,6 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
     # ---- support ---------------------------------------------------------------------------------------------------
     def _check_support(self) -> None:
         from ..runners import MoERunner
-        from .spec import METHOD_OF_FLASHINFER
 
         MoERunner._check_support(self)
         cfg = self.config
@@ -79,15 +79,7 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        if routing.n_group not in (None, 0, 1) or routing.topk_group not in (
-            None,
-            0,
-            1,
-        ):
-            raise unsupported(
-                CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
-            )
-        self._method = METHOD_OF_FLASHINFER.get(routing.method)
+        self._method, self._grouped_other = routing_term(routing, CLASS)
         if experts.local_expert_offset or (
             experts.local_num_experts not in (None, 0, routing.num_experts)
         ):
@@ -161,11 +153,19 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
         mode = act.routing_input_mode
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
+            # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
+            # meaning in this module (with pre-routed ids the group structure never enters the computation)
+            if getattr(self, "_grouped_other", False):
+                raise unsupported(
+                    CLASS,
+                    f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
+                    "the groups with DeepSeekV3, or pre-routed ids",
+                )
             if self._method is None:
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",
-                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm or DeepSeekV3 with n_group <= 1",
+                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm, TopK, Llama4, TopKSigmoid or DeepSeekV3",
                 )
             bias = act.routing_bias
             if (bias is not None) != self._method.bias:

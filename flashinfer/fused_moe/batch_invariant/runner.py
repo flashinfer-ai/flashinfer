@@ -93,6 +93,53 @@ def _configs_from_tactic(t: tuple):
     return one(t[:_TACTIC_FIELDS]), one(t[_TACTIC_FIELDS : 2 * _TACTIC_FIELDS])
 
 
+def routing_term(routing: Any, cls: str) -> Tuple[Optional[Any], bool]:
+    """The routing term of a ``RoutingConfig`` for a class runner of this module: the method of ``METHOD_OF_FLASHINFER`` (``None``
+    for a method this module has no term for: the pre-routed modes never consult it, the logits mode refuses it at the call)
+    with DeepSeekV3's expert groups attached (``with_groups``: the group-limited selection is a term of that method, its shape
+    rule here) and the Llama4 top-1 rule; the flag: expert groups given with another method (no meaning in this module; the
+    logits mode refuses them at the call). ``cls``: the class name of the errors. Every class runner derives its term here."""
+    from .spec import MAX_GROUPS, METHOD_OF_FLASHINFER
+
+    if routing.method not in METHOD_OF_FLASHINFER:
+        # the pre-routed modes never consult the method; the logits mode does (pack_inputs raises there too)
+        return None, False
+    else:
+        method = METHOD_OF_FLASHINFER[routing.method]
+        grouped_other = False
+        grouped = (routing.n_group or 0) > 1 or (routing.topk_group or 0) > 1
+        if grouped and routing.method is RoutingMethodType.DeepSeekV3:
+            # the group-limited selection: a term of the class with the groups as parameters (its shape rule here;
+            # the pre-routed modes never consult it)
+            n_group, topk_group = (
+                int(routing.n_group or 0),
+                int(routing.topk_group or 0),
+            )
+            E = routing.num_experts
+            if not (
+                1 <= topk_group <= n_group <= MAX_GROUPS
+                and E % n_group == 0
+                and E // n_group >= 2
+                and routing.top_k <= topk_group * (E // n_group)
+            ):
+                raise unsupported(
+                    cls,
+                    f"n_group {n_group}, topk_group {topk_group} over {E} experts for top_k {routing.top_k}",
+                    f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at "
+                    "least two experts, top_k <= topk_group * (num_experts / n_group)",
+                )
+            method = method.with_groups(n_group, topk_group)
+        elif grouped:
+            grouped_other = True
+        if routing.method is RoutingMethodType.Llama4 and routing.top_k != 1:
+            raise unsupported(
+                cls,
+                f"Llama4 routing with top_k {routing.top_k}",
+                "top_k = 1 (the method is the top-1 of the logits with its sigmoid as the weight; TopKSigmoid for other k)",
+            )
+    return method, grouped_other
+
+
 class _PackedInputs(list):
     """The packed inputs with the mode's weight dtype attached (the dtype the unfinalized form returns the weights in; the
     autotuner's profiling lists carry no attribute and read as fp32, the class's own weight dtype)."""
@@ -159,10 +206,7 @@ class BatchInvariantMoeRunner(MoERunner):
 
     def _check_support(self) -> None:
         super()._check_support()
-        from .spec import MAX_GROUPS, METHOD_OF_FLASHINFER
-
         cfg = self.config
-        self._grouped_other = False
         check_device(self.device, CLASS, MOE_BF16_ARCHS)
         try:
             self._activation()
@@ -203,41 +247,7 @@ class BatchInvariantMoeRunner(MoERunner):
             raise unsupported(
                 CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
             )
-        if routing.method not in METHOD_OF_FLASHINFER:
-            # the pre-routed modes never consult the method; the logits mode does (pack_inputs raises there too)
-            self._method = None
-        else:
-            self._method = METHOD_OF_FLASHINFER[routing.method]
-            grouped = (routing.n_group or 0) > 1 or (routing.topk_group or 0) > 1
-            if grouped and routing.method is RoutingMethodType.DeepSeekV3:
-                # the group-limited selection: a term of the class with the groups as parameters (its shape rule here;
-                # the pre-routed modes never consult it)
-                n_group, topk_group = (
-                    int(routing.n_group or 0),
-                    int(routing.topk_group or 0),
-                )
-                E = routing.num_experts
-                if not (
-                    1 <= topk_group <= n_group <= MAX_GROUPS
-                    and E % n_group == 0
-                    and E // n_group >= 2
-                    and routing.top_k <= topk_group * (E // n_group)
-                ):
-                    raise unsupported(
-                        CLASS,
-                        f"n_group {n_group}, topk_group {topk_group} over {E} experts for top_k {routing.top_k}",
-                        f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at "
-                        "least two experts, top_k <= topk_group * (num_experts / n_group)",
-                    )
-                self._method = self._method.with_groups(n_group, topk_group)
-            elif grouped:
-                self._grouped_other = True
-            if routing.method is RoutingMethodType.Llama4 and routing.top_k != 1:
-                raise unsupported(
-                    CLASS,
-                    f"Llama4 routing with top_k {routing.top_k}",
-                    "top_k = 1 (the method is the top-1 of the logits with its sigmoid as the weight; TopKSigmoid for other k)",
-                )
+        self._method, self._grouped_other = routing_term(routing, CLASS)
 
     def _build(self) -> None:
         from ...gemm.batch_invariant.api import part_of
