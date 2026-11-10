@@ -782,6 +782,10 @@ def main():
         FLUSH_MIN = W - T + 1
     if args.flush_min is not None:
         FLUSH_MIN = args.flush_min
+    if args.arm in ("umma_ring64", "umma_ring64_u16") and RING == 32:
+        assert FLUSH_MIN <= 17 - T, (
+            f"32-slot rings need flush_min <= 17 - T = {17 - T} (got {FLUSH_MIN})"
+        )
     P_VERIFY = {"full": FLUSH_MIN - 1, "mid": (FLUSH_MIN - 1) // 2, "zero": 0}[
         args.hist
     ]
@@ -853,6 +857,7 @@ def main():
                 folded_rows=0 if r == 0 else max(1, round(B * r / 100)),
                 hist=args.hist,
                 flush_min=FLUSH_MIN,
+                ring=RING,
                 p_verify=P_VERIFY,
                 row_order=args.row_order,
                 localized=args.localized,
@@ -877,6 +882,7 @@ def main():
             d["no_commit"],
             d.get("hist", "full"),
             d.get("flush_min"),
+            d.get("ring"),
             d.get("localized", False),
             d.get("ugpu", False),
             d.get("persistent", "auto"),
