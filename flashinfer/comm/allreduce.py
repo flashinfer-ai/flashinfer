@@ -345,7 +345,7 @@ def _workspace_creation_heuristic(
     # Single-node scenarios
     # From benchmarking data, we can see that MNNVL is either on par (smaller problem sizes) or significantly faster than TRTLLM (larger problem sizes such as hidden_dim=8192, token_num=64 for TP=4), for single-node scenarios.
     # TRTLLM still has the larger specialized-fusion surface, such as MoE
-    # patterns and packed group FP8 quantization.
+    # patterns.
     if "mnnvl" in suitable_backends:
         return ["mnnvl"]
     else:
@@ -900,17 +900,17 @@ def allreduce_fusion(
         * ``kARResidualRMSNormOutFP4Quant = 5``
         * ``kMoEReductionARResidualRMSNorm = 6`` (TRT-LLM only)
         * ``kMoEFinalizeARResidualRMSNorm = 7``
-        * ``kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8`` (TRT-LLM only)
-        * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9`` (TRT-LLM only)
+        * ``kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8``
+        * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9``
         * ``kARResidualRMSNormDynamicFP8Quant = 10``
         * ``kARResidualRMSNormOutDynamicFP8Quant = 11``
         * ``kMoEFinalizeARResidualRMSNormFP8Quant = 12`` (MNNVL CuTe DSL only)
         * ``kARResidualRMSNormMXFP8Quant = 13``
         * ``kARResidualRMSNormOutMXFP8Quant = 14``
 
-        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5), dynamic
-        FP8 patterns (10-11) and MXFP8 patterns (13-14). Packed group quant
-        patterns remain TRT-LLM only.
+        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5), packed
+        per-token-group FP8 patterns (8-9), dynamic FP8 patterns (10-11),
+        and MXFP8 patterns (13-14).
 
         ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM,
         Cake on a TRT-LLM workspace, and the explicit MNNVL CuTe DSL backend.
@@ -959,6 +959,9 @@ def allreduce_fusion(
         layout selected by ``layout_code`` and sized as ``mxfp8_quantize``
         returns it (rows padded to 128 and scale columns to 4 for
         ``SWIZZLED_128x4``); the scales of the padding rows are not written.
+        Packed per-token-group FP8
+        uses shape ``[token_num, ceil(groups_per_row / 4)]``, dtype
+        ``torch.int32``, and stride ``(1, ceil(token_num / 4) * 4)``.
         Per-tensor FP8 does not use ``scale_out``.
     residual_in : Optional[torch.Tensor]
         Residual tensor to add, shape ``[token_num, hidden_dim]``.
@@ -1009,8 +1012,10 @@ def allreduce_fusion(
         Optional shared-expert output to add, shape
         ``[token_num, hidden_dim]``.
     block_quant_group_size : Optional[int]
-        Group size for per-token-group FP8 packed quantization patterns
-        (TRT-LLM only).
+        Group size for per-token-group FP8 packed quantization patterns. The
+        MNNVL backend requires an exact row partition in which each CTA owns an
+        integral number of groups; unsupported ``(hidden_dim, group_size)``
+        pairs raise ``ValueError`` before launch.
     weight_bias : float
         Bias added to ``rms_gamma`` before scaling.
 
@@ -1020,7 +1025,7 @@ def allreduce_fusion(
           (``out = (1 + gamma) * x * rsqrt(...)``).
 
         Supported by both TRT-LLM and MNNVL backends for standard RMSNorm
-        and quant patterns (1-5), and by TRT-LLM for MoE RMSNorm
+        and quant patterns (1-5, 8-11), and by TRT-LLM for MoE RMSNorm
         variants. Ignored for ``kAllReduce``.
     moe_finalize_backend : {"trtllm", "cake"}
         Implementation for ``kMoEFinalizeARResidualRMSNorm`` on a TRT-LLM
@@ -1433,6 +1438,14 @@ def allreduce_fusion(
                 MNNVLQuantType.NVFP4,
                 True,
             ),
+            AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant: (
+                MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+                False,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant: (
+                MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+                True,
+            ),
             AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant: (
                 MNNVLQuantType.DYNAMIC_FP8,
                 False,
@@ -1524,7 +1537,10 @@ def allreduce_fusion(
                 )
 
             quant_type, has_norm_out = mnnvl_quant_patterns[pattern]
-            is_dynamic_fp8 = quant_type == MNNVLQuantType.DYNAMIC_FP8
+            requires_preallocated_outputs = quant_type in (
+                MNNVLQuantType.DYNAMIC_FP8,
+                MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+            )
             if quant_type == MNNVLQuantType.MXFP8:
                 _check_mxfp8_fusion_args(
                     pattern,
@@ -1537,22 +1553,22 @@ def allreduce_fusion(
                     norm_out,
                     mnnvl_layout_code,
                 )
-            elif is_dynamic_fp8:
+            elif requires_preallocated_outputs:
                 if residual_out is None:
                     raise ValueError(
-                        "residual_out is required for MNNVL dynamic FP8 patterns"
+                        "residual_out is required for MNNVL preallocated quantization patterns"
                     )
                 if quant_out is None:
                     raise ValueError(
-                        "quant_out is required for MNNVL dynamic FP8 patterns"
+                        "quant_out is required for MNNVL preallocated quantization patterns"
                     )
                 if scale_out is None:
                     raise ValueError(
-                        "scale_out is required for MNNVL dynamic FP8 patterns"
+                        "scale_out is required for MNNVL preallocated quantization patterns"
                     )
                 if has_norm_out and norm_out is None:
                     raise ValueError(
-                        "norm_out is required for MNNVL dynamic FP8 norm-out pattern"
+                        "norm_out is required for MNNVL preallocated quantization norm-out patterns"
                     )
             elif has_norm_out and norm_out is None:
                 norm_out = torch.empty_like(input)
@@ -1575,6 +1591,7 @@ def allreduce_fusion(
                 launch_with_pdl=launch_with_pdl,
                 strategy=strategy,
                 weight_bias=weight_bias,
+                block_quant_group_size=block_quant_group_size,
             )
             return quant_result
 
