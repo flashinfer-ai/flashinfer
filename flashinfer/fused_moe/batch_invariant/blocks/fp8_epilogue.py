@@ -25,12 +25,13 @@ from typing import Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Boolean, Int32, Uint8
+from cutlass import Boolean, Float32, Int32, Uint8
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from ....batch_invariant.fp_interface.exact import f32_bits
+from ....batch_invariant.quantization.cute_ext import select_f32
 from ....batch_invariant.quantization.cvt_fp8 import cvt_f32x2_to_fp8x2
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
 from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS
@@ -44,6 +45,10 @@ from .epilogue import (
     staging_layout,
     store_plan,
 )
+
+#: The accumulator a dead row (past the group's end, never stored) runs the chain on: a normal operand, where a dead row's zero or
+#: arbitrary accumulators take the slow sequences of the chain's exact division and the quantization's reciprocal.
+DEAD_ACC = 1.0
 
 __all__ = [
     "Fp8Chain",
@@ -317,8 +322,23 @@ def grouped_epilogue_loop_fp8(
             if warp_active:
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
                 cC_sub = tRG_cC[(None, None, None, s)]
+                # the lane's rows that are live rows of the group: a dead row (padding, another group's rows, stale bytes) is never
+                # stored, and its accumulators are replaced by a benign constant before the chain -- the divisions of the chain and
+                # of the quantization take the hardware's slow path on zero / garbage operands and would stall the warp; a select
+                # per register keeps the fragment's chains interleaved, where a region per register does not (a placement: the live
+                # rows' arithmetic is unchanged)
+                crd_live = cC_sub[((0, 0), 0, 0)]
+                live = {
+                    m: (crd_live[0] - Int32(offs[0][0]) + Int32(m)) < rows_left
+                    for m in rows_in_frag
+                }
+                for v in cutlass.range_constexpr(nv):
+                    tTR_rAcc[v] = select_f32(
+                        live[offs[v][0]], tTR_rAcc[v], Float32(DEAD_ACC)
+                    )
                 if cutlass.const_expr(e4m3_out):
-                    # two outputs per cvt.rn.satfinite.e4m3x2.f32 (any two output positions: each byte goes to its own register)
+                    # two outputs per cvt.rn.satfinite.e4m3x2.f32 (any two output positions, in any two rows: each byte goes to its
+                    # own register and is stored under its own row's predicate)
                     outs = [v for v in range(nv) if is_out[v]]
                     assert len(outs) % 2 == 0, offs
                     for q in cutlass.range_constexpr(0, len(outs), 2):
