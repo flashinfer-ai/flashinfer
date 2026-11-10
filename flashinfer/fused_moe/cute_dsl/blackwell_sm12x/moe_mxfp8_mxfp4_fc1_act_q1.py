@@ -21,6 +21,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.common import DSLUserCodeError
+from cutlass.cute.runtime import from_dlpack
 
 from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from ....tllm_enums import (
@@ -34,6 +35,7 @@ from ....tllm_enums import (
 )
 from ....utils import ceil_div
 from ._moe_utils.heuristic import select_fc1_act_tile
+from ._moe_utils.moe_activation import make_gated_activation
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
 from ._moe_utils.sm12x_blockscaled_layout import (
@@ -47,6 +49,8 @@ from .kernel_moe_mxfp8_mxfp4_fc1_act_q1 import (
     GRANK_B,
     QUANT_EPIS,
     CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1,
+    CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1SplitK,
+    _stream,
     is_swapab,
     make_args,
     make_cfg,
@@ -214,6 +218,176 @@ def _op(
 _COMPILED: dict = {}
 
 
+_COMPILED_SPLIT_K = {}
+
+
+def _allocate_outputs(a_q, rows, n, num_experts, out_dtype, out_q, out_sf):
+    q = (
+        torch.empty(rows, n, dtype=out_dtype, device=a_q.device)
+        if out_q is None
+        else out_q
+    )
+    sf = (
+        torch.zeros(
+            out_sf_shape(rows, n, num_experts), dtype=torch.int32, device=a_q.device
+        )
+        if out_sf is None
+        else out_sf
+    )
+    if (
+        q.shape != (rows, n)
+        or q.dtype is not out_dtype
+        or q.device != a_q.device
+        or not q.is_contiguous()
+    ):
+        raise ValueError("out_q does not match the Q1 output contract")
+    if (
+        sf.shape != out_sf_shape(rows, n, num_experts)
+        or sf.dtype is not torch.int32
+        or sf.device != a_q.device
+        or not sf.is_contiguous()
+    ):
+        raise ValueError("out_sf does not match the Q1 scale output contract")
+    return q, sf
+
+
+def _check_split_k_inputs(a_q, a_scale, b_q, b_scale, m_indptr, token_map, out_dtype):
+    if token_map is None:
+        raise ValueError("SplitK2 requires token_map gather inputs")
+    tensors = a_q, a_scale, b_q, b_scale, m_indptr, token_map
+    if any(
+        not value.is_cuda or value.device != a_q.device or not value.is_contiguous()
+        for value in tensors
+    ):
+        raise ValueError("SplitK2 inputs must be contiguous on the same CUDA device")
+    if a_q.ndim != 2 or b_q.ndim != 3:
+        raise ValueError("SplitK2 expects rank-2 tokens and rank-3 weights")
+    num_experts, channels, packed_k = b_q.shape
+    n, k, rows = channels // 2, packed_k * 2, token_map.numel()
+    if (
+        channels % 256
+        or n <= 0
+        or k <= 0
+        or k % 128
+        or num_experts <= 0
+        or a_q.shape[1] != k
+        or (rows > 0 and a_q.shape[0] == 0)
+    ):
+        raise ValueError(
+            "SplitK2 requires positive N/K aligned to 128 and compatible tokens"
+        )
+    if (
+        a_q.dtype is not torch.float8_e4m3fn
+        or b_q.dtype is not torch.uint8
+        or out_dtype is not torch.float8_e4m3fn
+    ):
+        raise ValueError("SplitK2 requires E4M3 tokens/output and packed uint8 weights")
+    if (
+        a_scale.dtype is not torch.int32
+        or a_scale.shape != (ceil_div(k, 512), a_q.shape[0])
+        or b_scale.dtype not in (torch.uint8, torch.int32)
+        or b_scale.ndim != 3
+    ):
+        raise ValueError("SplitK2 scale layout does not match the operand contract")
+    if (
+        m_indptr.dtype is not torch.int32
+        or m_indptr.shape != (num_experts + 1,)
+        or token_map.dtype is not torch.int32
+        or token_map.ndim != 1
+    ):
+        raise ValueError("SplitK2 requires int32 expert offsets and a rank-1 token_map")
+    sf_columns = channels * (4 if b_scale.dtype is torch.uint8 else 1)
+    if b_scale.shape != (num_experts, ceil_div(k, 128), sf_columns):
+        raise ValueError(
+            "SplitK2 weight scale layout does not match the operand contract"
+        )
+    if any(
+        value.data_ptr() % (4 if index in (4, 5) else 16)
+        for index, value in enumerate(tensors)
+    ):
+        raise ValueError(
+            "SplitK2 operand base alignment does not match the copy contract"
+        )
+    return num_experts, n, k, rows
+
+
+def _run_split_k(
+    a_q,
+    a_scale,
+    b_q,
+    b_scale,
+    m_indptr,
+    *,
+    token_map,
+    activation,
+    swiglu_limit,
+    situ_beta,
+    situ_linear_beta,
+    out_dtype,
+    out_q,
+    out_sf,
+):
+    num_experts, n, k, rows = _check_split_k_inputs(
+        a_q, a_scale, b_q, b_scale, m_indptr, token_map, out_dtype
+    )
+    weight_sf = b_scale.view(torch.int32)
+    swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
+    activation_op = make_gated_activation(
+        activation,
+        swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+    q, sf = _allocate_outputs(a_q, rows, n, num_experts, out_dtype, out_q, out_sf)
+    if rows == 0:
+        return q, sf
+    props = torch.cuda.get_device_properties(a_q.device)
+    if props.major != 12:
+        raise NotImplementedError("SplitK2 requires an SM12x device")
+    partial = torch.empty((2, 2, rows, n), dtype=torch.float32, device=a_q.device)
+    tensors = (
+        a_q,
+        b_q,
+        a_scale,
+        weight_sf,
+        q,
+        sf.view(torch.uint8),
+        m_indptr,
+        token_map,
+        partial,
+    )
+    if any(
+        value.data_ptr() % (4 if index in (6, 7) else 16)
+        for index, value in enumerate(tensors)
+    ):
+        raise ValueError(
+            "SplitK2 operand/output base alignment does not match the copy contract"
+        )
+    params = (
+        (swiglu_limit,)
+        if activation is ActivationType.Swiglu
+        else (situ_beta, situ_linear_beta)
+    )
+    key = activation, params, props.major, props.minor
+    with torch.cuda.device(a_q.device):
+        args = tuple(
+            from_dlpack(
+                value, assumed_align=4 if index in (6, 7) else 16
+            ).mark_layout_dynamic(
+                leading_dim=value.ndim - 1 if value.numel() == 1 else None
+            )
+            for index, value in enumerate(tensors)
+        ) + (_stream(),)
+        compiled = _COMPILED_SPLIT_K.get(key)
+        if compiled is None:
+            compiled = cute.compile(
+                CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1SplitK(activation_op), *args
+            )
+            _COMPILED_SPLIT_K[key] = compiled
+        compiled(*args)
+    return q, sf
+
+
 def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
     # Scale recasts are specialized to the input tensor element types.
     scale_dtypes = tuple(arg.element_type for arg in sample_args[2:4])
@@ -249,6 +423,22 @@ def select_tile(*, total_rows: int, n: int, k: int, num_experts: int, num_sms: i
         tiles=CuteDslSm120GroupedMxfp8Mxfp4Fc1ActQ1Op.TILES,
         gran_k=BK,
     )
+
+
+def select_split_k(*, tile, total_rows: int, n: int, k: int, num_sms: int) -> int:
+    if (
+        tile[0] != 8
+        or total_rows <= 0
+        or n <= 0
+        or n % 128
+        or k < 4 * BK
+        or k % BK
+        or num_sms <= 0
+    ):
+        return 1
+    task_upper = total_rows * ceil_div(n, 128)
+    partial_tasks = 2 * total_rows * ceil_div(n, 32)
+    return 2 if task_upper < num_sms <= partial_tasks else 1
 
 
 def _check_a_scale_granularity(a_scale, k: int) -> None:
@@ -295,6 +485,7 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
     out_q: torch.Tensor | None = None,
     out_sf: torch.Tensor | None = None,
     token_map: torch.Tensor | None = None,
+    split_k: int | None = None,
 ):
     """Compute gated FC1, activation and MXFP8 Q1.
 
@@ -302,7 +493,39 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
     and packed int32 ``a_scale``. Its consumed entries must index valid input
     tokens. The output capacity is ``token_map.numel()``; ``m_indptr`` bounds
     valid routed rows. Q1 and SF1 retain the grouped routed output layout.
+
+    ``split_k=None`` selects SplitK2 for supported low-parallelism gather calls.
+    ``1`` retains the original kernel and ``2`` forces SplitK2. Explicit tiles
+    and selected tuning tactics take precedence over automatic selection.
     """
+    if split_k is not None and (type(split_k) is not int or split_k not in (1, 2)):
+        raise ValueError("split_k must be None, 1 or 2")
+    if split_k == 2:
+        if (
+            token_map is None
+            or tile is not None
+            or enable_pdl
+            or tune not in (None, False)
+            or epi not in (DEFAULT_EPI, EpiMethod.WG_QUANT_SWAP)
+        ):
+            raise ValueError(
+                "SplitK2 requires gather, no explicit tile/PDL/tuning, and a compatible epilogue"
+            )
+        return _run_split_k(
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            m_indptr,
+            token_map=token_map,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            out_dtype=out_dtype,
+            out_q=out_q,
+            out_sf=out_sf,
+        )
     swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
     m, n, k = int(a_q.shape[0]), int(b_q.shape[1]) // 2, int(b_q.shape[2]) * 2
     if token_map is not None:
@@ -355,6 +578,7 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
                             swiglu_limit,
                             situ_beta,
                             situ_linear_beta,
+                            split_k=split_k,
                         )
                     ],
                     TuningConfig(),
@@ -368,6 +592,36 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
         tile = select_tile(
             total_rows=m, n=n, k=k, num_experts=num_experts, num_sms=grid_x
         )
+        if (
+            split_k is None
+            and token_map is not None
+            and not enable_pdl
+            and props.major == 12
+            and epi in (DEFAULT_EPI, EpiMethod.WG_QUANT_SWAP)
+            and select_split_k(tile=tile, total_rows=m, n=n, k=k, num_sms=grid_x) == 2
+        ):
+            try:
+                _check_split_k_inputs(
+                    a_q, a_scale, b_q, b_scale, m_indptr, token_map, out_dtype
+                )
+            except ValueError:
+                pass
+            else:
+                return _run_split_k(
+                    a_q,
+                    a_scale,
+                    b_q,
+                    b_scale,
+                    m_indptr,
+                    token_map=token_map,
+                    activation=activation,
+                    swiglu_limit=swiglu_limit,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                    out_dtype=out_dtype,
+                    out_q=out_q,
+                    out_sf=out_sf,
+                )
         if epi not in epi_tactics(tile):
             epi = epi_tactics(tile)[0]
     op = _op(
@@ -382,32 +636,7 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
         situ_beta,
         situ_linear_beta,
     )
-    q = (
-        torch.empty(m, n, dtype=out_dtype, device=a_q.device)
-        if out_q is None
-        else out_q
-    )
-    sf = (
-        torch.zeros(
-            out_sf_shape(m, n, num_experts), dtype=torch.int32, device=a_q.device
-        )
-        if out_sf is None
-        else out_sf
-    )
-    if (
-        q.shape != (m, n)
-        or q.dtype is not out_dtype
-        or q.device != a_q.device
-        or not q.is_contiguous()
-    ):
-        raise ValueError("out_q does not match the Q1 output contract")
-    if (
-        sf.shape != out_sf_shape(m, n, num_experts)
-        or sf.dtype is not torch.int32
-        or sf.device != a_q.device
-        or not sf.is_contiguous()
-    ):
-        raise ValueError("out_sf does not match the Q1 scale output contract")
+    q, sf = _allocate_outputs(a_q, m, n, num_experts, out_dtype, out_q, out_sf)
     args = make_args(
         a_q,
         a_scale,
@@ -433,8 +662,11 @@ class _Fc1ActQ1Runner(TunableRunner):
         swiglu_limit=None,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
+        *,
+        split_k=None,
     ):
         self.out_dtype = out_dtype
+        self.split_k = split_k
         self._out = None
         self.activation, self.enable_pdl = activation, enable_pdl
         self.swiglu_limit = swiglu_limit
@@ -485,25 +717,30 @@ class _Fc1ActQ1Runner(TunableRunner):
     def launch(self, inputs, out, tactic):
         a_q, a_scale, b_q, b_scale, m_indptr, token_map = _unpack_inputs(inputs)
         q, sf = out
+        if tactic is None:
+            cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
+                a_q,
+                a_scale,
+                b_q,
+                b_scale,
+                m_indptr,
+                self.out_dtype,
+                tune=False,
+                enable_pdl=self.enable_pdl,
+                activation=self.activation,
+                swiglu_limit=self.swiglu_limit,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
+                out_q=q,
+                out_sf=sf,
+                token_map=token_map,
+                split_k=self.split_k,
+            )
+            return
         n, k = int(b_q.shape[1]) // 2, int(b_q.shape[2]) * 2
         props = torch.cuda.get_device_properties(a_q.device)
         grid_x = props.multi_processor_count
-        if tactic is None:
-            m = int(a_q.shape[0]) if token_map is None else token_map.numel()
-            tile, epi = (
-                select_tile(
-                    total_rows=m,
-                    n=n,
-                    k=k,
-                    num_experts=int(b_q.shape[0]),
-                    num_sms=grid_x,
-                ),
-                DEFAULT_EPI,
-            )
-            if epi not in epi_tactics(tile):
-                epi = epi_tactics(tile)[0]
-        else:
-            tile, epi = split_tactic(tactic)
+        tile, epi = split_tactic(tactic)
         op = _op(
             n,
             k,
@@ -548,6 +785,7 @@ class _Fc1ActQ1Runner(TunableRunner):
             torch.cuda.get_device_capability(),
             token_map is not None,
             m,
+            self.split_k,
         )
 
 

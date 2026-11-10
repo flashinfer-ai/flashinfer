@@ -19,7 +19,7 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.warp.mma as warp_mma
 import cutlass.utils
 import torch
-from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack
 
 from ....tllm_enums import (
@@ -36,6 +36,8 @@ from ._moe_utils.moe_epilogue import (
     QuantConst,
     QuantPoint,
     WgQuantSwapEpiConfig,
+    epi_swap_quant_stg,
+    sf_ctx_of,
     store_wg_q1_after_s2r,
     store_wg_q1_before_r2s,
 )
@@ -1564,6 +1566,647 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                     tile = next_tile
                 else:
                     tile = cons.get_next_tile(sWork, sfull, sempty)
+
+
+class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1SplitK:
+    def __init__(self, activation):
+        self.activation = activation
+        self.TILE = (32, 8, 128)
+        self.epi_tile = (128, 8, 128)
+        self.ab_stage, self.split_k = 2, 2
+        self.num_warp_m, self.num_warp_k = 2, 4
+        self.threads = 32 * self.num_warp_m * self.num_warp_k
+        self.swizzle_a, self.swizzle_b = (2, 4, 3), (3, 4, 3)
+        self.copy_bits_a, self.copy_bits_b, self.copy_bits_sf = 128, 32, 32
+        self.a_copy_threads = ceil_div(
+            self.TILE[0] * (self.TILE[2] >> 1), self.copy_bits_a >> 3
+        )
+        store_threads = WgQuantSwapEpiConfig.store_threads_for(
+            cutlass.BFloat16, self.epi_tile
+        )
+        self.epi = WgQuantSwapEpiConfig(
+            cutlass.BFloat16, self.threads, store_threads=store_threads
+        )
+        self.qcfg = QuantConst()
+
+    def make_tiled_mma(self):
+        op = warp.MmaMXF8F6F4Op(
+            cutlass.Float4E2M1FN,
+            cutlass.Float8E4M3FN,
+            cutlass.Float32,
+            cutlass.Float8E8M0FNU,
+        )
+        warp_layout = cute.make_ordered_layout(
+            (self.num_warp_m, 1, self.num_warp_k), order=(0, 1, 2)
+        )
+        return cute.make_tiled_mma(op, warp_layout, permutation_mnk=self.TILE)
+
+    def make_smem_layouts(self):
+        bm, bn, bk = self.TILE
+        packed_k = bk >> 1
+        a_smem = cute.make_composed_layout(
+            cute.make_swizzle(*self.swizzle_a),
+            0,
+            cute.make_layout(
+                (bm, packed_k, self.ab_stage), stride=(packed_k, 1, bm * packed_k)
+            ),
+        )
+        b_smem = cute.make_composed_layout(
+            cute.make_swizzle(*self.swizzle_b),
+            0,
+            cute.make_layout((bn, bk, self.ab_stage), stride=(bk, 1, bn * bk)),
+        )
+        sfa_smem = cute.make_layout((bm, 1, self.ab_stage))
+        sfb_smem = cute.make_layout((bn, self.ab_stage))
+        partial_smem = cute.make_layout((bm, self.num_warp_k, 2))
+        assert cute.size_in_bytes(cutlass.Float32, partial_smem) <= cute.size_in_bytes(
+            cutlass.Uint8, a_smem.outer
+        )
+        return a_smem, b_smem, sfa_smem, sfb_smem, partial_smem
+
+    @cute.jit
+    def __call__(
+        self,
+        gA: cute.Tensor,
+        gB_u8: cute.Tensor,
+        gSFA: cute.Tensor,
+        gSFB: cute.Tensor,
+        gD: cute.Tensor,
+        gSFQ: cute.Tensor,
+        offsets: cute.Tensor,
+        gMap: cute.Tensor,
+        gP: cute.Tensor,
+        stream,
+    ):
+        a_smem, b_smem, sfa_smem, sfb_smem, partial_smem = self.make_smem_layouts()
+        epi_smem = self.epi.make_smem_layout(self.epi_tile)
+
+        @cute.struct
+        class PartialStorage:
+            sU: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, cute.cosize(a_smem.outer)], 128
+            ]
+            sG: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint8, cute.cosize(a_smem.outer)], 128
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float8E4M3FN, cute.cosize(b_smem.outer)],
+                128,
+            ]
+            sSFU: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, cute.cosize(sfa_smem)], 128
+            ]
+            sSFG: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, cute.cosize(sfa_smem)], 128
+            ]
+            sSFB: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, cute.cosize(sfb_smem)], 128
+            ]
+
+        @cute.struct
+        class ReductionStorage:
+            sC: cute.struct.Align[
+                cute.struct.MemRange[cutlass.BFloat16, cute.cosize(epi_smem)], 128
+            ]
+
+        self.storage, self.reduction_storage = PartialStorage, ReductionStorage
+        tiledmma = self.make_tiled_mma()
+        tiled_s2r = self.epi.make_tiled_s2r(self.epi_tile)
+        R, N = cute.size(gD, mode=[0]), cute.size(gD, mode=[1])
+        self.splitK(
+            gB_u8,
+            gA,
+            gSFB,
+            gSFA,
+            offsets,
+            gMap,
+            gP,
+            tiledmma,
+            a_smem,
+            b_smem,
+            sfa_smem,
+            sfb_smem,
+            partial_smem,
+        ).launch(
+            grid=(R * ceil_div(N, self.TILE[0]) * self.split_k, 1, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+        self.reduceK(gP, gD, gSFQ, offsets, tiled_s2r, epi_smem).launch(
+            grid=(R * ceil_div(N, self.epi_tile[0]), 1, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def make_smem_view(self, base, layout, dtype: cutlass.Constexpr):
+        view = cute.recast_tensor(cute.make_tensor(base, layout.outer), dtype)
+        return cute.make_tensor(
+            cute.recast_ptr(view.iterator, swizzle_=layout.inner), view.layout
+        )
+
+    @cute.jit
+    def unpack(self, packed):
+        nibbles = cute.recast_tensor(packed, cutlass.Int4)
+        expanded = cute.make_rmem_tensor_like(nibbles, cutlass.Uint8)
+        expanded.store(
+            (nibbles.load().to(cutlass.Uint8) & cutlass.Uint8(15)) * cutlass.Uint8(4)
+        )
+        return expanded
+
+    @cute.jit
+    def find_expert(self, offsets, route):
+        lo, hi = cutlass.Int32(0), cutlass.Int32(cute.size(offsets, mode=[0]))
+        while lo < hi:
+            middle = (lo + hi) >> 1
+            if offsets[middle] <= route:
+                lo = middle + 1
+            else:
+                hi = middle
+        return lo - 1
+
+    @cute.jit
+    def gmem_to_smem(
+        self,
+        gA_u8,
+        gB,
+        gSFA,
+        gSFB,
+        sU,
+        sG,
+        sB,
+        sSFU,
+        sSFG,
+        sSFB,
+        copy_a,
+        copy_b,
+        copy_sf,
+        tidx,
+        stage,
+        k_tile,
+        valid,
+    ):
+        bm, bn, bk = self.TILE
+        K, N2 = cute.size(gB, mode=[1]), cute.size(gA_u8, mode=[0])
+        packed_k = bk >> 1
+        vec_a, vec_b = self.copy_bits_a >> 3, self.copy_bits_b >> 3
+        # Keep Boolean storage conversion local to this staged copy region.
+        valid = cutlass.Boolean(valid)
+        p_copy = cute.make_rmem_tensor(1, cutlass.Boolean)
+        p_copy[0] = valid
+        a_pred = cute.make_tensor(p_copy.iterator, cute.make_layout(vec_a, stride=0))
+        if tidx < self.a_copy_threads:
+            byte = tidx * vec_a
+            row, col = byte >> 6, byte & (packed_k - 1)
+            up_addr = (
+                gA_u8.iterator + cutlass.Int64(row) * (K >> 1) + k_tile * packed_k + col
+            )
+            gate_addr = (
+                gA_u8.iterator
+                + cutlass.Int64(row + (N2 >> 1)) * (K >> 1)
+                + k_tile * packed_k
+                + col
+            )
+            up_ptr = cute.make_ptr(
+                cutlass.Uint8,
+                up_addr.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=vec_a,
+            )
+            gate_ptr = cute.make_ptr(
+                cutlass.Uint8,
+                gate_addr.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=vec_a,
+            )
+            up_dst = sU.iterator + cute.crd2idx((row, col, stage), sU.layout)
+            gate_dst = sG.iterator + cute.crd2idx((row, col, stage), sG.layout)
+            up_dst_ptr = cute.make_ptr(
+                cutlass.Uint8,
+                up_dst.toint(),
+                cute.AddressSpace.smem,
+                assumed_align=vec_a,
+                swizzle_=cute.make_swizzle(*self.swizzle_a),
+            )
+            gate_dst_ptr = cute.make_ptr(
+                cutlass.Uint8,
+                gate_dst.toint(),
+                cute.AddressSpace.smem,
+                assumed_align=vec_a,
+                swizzle_=cute.make_swizzle(*self.swizzle_a),
+            )
+            cute.copy(
+                copy_a,
+                cute.make_tensor(up_ptr, cute.make_layout(vec_a)),
+                cute.make_tensor(up_dst_ptr, cute.make_layout(vec_a)),
+                pred=a_pred,
+            )
+            cute.copy(
+                copy_a,
+                cute.make_tensor(gate_ptr, cute.make_layout(vec_a)),
+                cute.make_tensor(gate_dst_ptr, cute.make_layout(vec_a)),
+                pred=a_pred,
+            )
+        byte = tidx * vec_b
+        row, col = byte >> 7, byte & (bk - 1)
+        src = cute.make_ptr(
+            cutlass.Float8E4M3FN,
+            (gB.iterator + k_tile * bk + col).toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=vec_b,
+        )
+        dst = cute.make_ptr(
+            cutlass.Float8E4M3FN,
+            (sB.iterator + cute.crd2idx((row, col, stage), sB.layout)).toint(),
+            cute.AddressSpace.smem,
+            assumed_align=vec_b,
+            swizzle_=cute.make_swizzle(*self.swizzle_b),
+        )
+        p_copy[0] = valid & (row == 0)
+        row_pred = cute.make_tensor(p_copy.iterator, cute.make_layout(vec_b, stride=0))
+        cute.copy(
+            copy_b,
+            cute.make_tensor(src, cute.make_layout(vec_b)),
+            cute.make_tensor(dst, cute.make_layout(vec_b)),
+            pred=row_pred,
+        )
+        p_copy[0] = valid
+        if tidx < bm:
+            source = gSFA.iterator + cutlass.Int64(k_tile) * N2 + tidx
+            cute.copy(
+                copy_sf,
+                cute.make_tensor(source, cute.make_layout(1)),
+                cute.make_tensor(
+                    sSFU.iterator + stage * bm + tidx, cute.make_layout(1)
+                ),
+                pred=p_copy,
+            )
+            cute.copy(
+                copy_sf,
+                cute.make_tensor(source + (N2 >> 1), cute.make_layout(1)),
+                cute.make_tensor(
+                    sSFG.iterator + stage * bm + tidx, cute.make_layout(1)
+                ),
+                pred=p_copy,
+            )
+        if tidx < bn:
+            source = gSFB.iterator + cutlass.Int64(k_tile >> 2) * cute.size(
+                gSFB, mode=[1]
+            )
+            p_copy[0] = valid & (tidx == 0)
+            cute.copy(
+                copy_sf,
+                cute.make_tensor(source, cute.make_layout(1)),
+                cute.make_tensor(
+                    sSFB.iterator + stage * bn + tidx, cute.make_layout(1)
+                ),
+                pred=p_copy,
+            )
+        cute.arch.cp_async_commit_group()
+
+    @cute.jit
+    def reduce_k_slices(self, acc_u, acc_g, sPartial, tCrC_coords, tidx):
+        for vi in cutlass.range_constexpr(cute.size(acc_u)):
+            coord = tCrC_coords[vi]
+            if coord[1] == 0:
+                sPartial[coord[0], tidx >> 6, 0] = acc_u[vi]
+                sPartial[coord[0], tidx >> 6, 1] = acc_g[vi]
+        cute.arch.barrier()
+        acc = cute.make_rmem_tensor(2, cutlass.Float32)
+        acc.fill(0.0)
+        if tidx < self.TILE[0]:
+            acc[0] = sPartial[tidx, 0, 0]
+            acc[1] = sPartial[tidx, 0, 1]
+            for k_slice in cutlass.range_constexpr(1, self.num_warp_k):
+                acc[0] += sPartial[tidx, k_slice, 0]
+                acc[1] += sPartial[tidx, k_slice, 1]
+        return acc
+
+    @cute.jit
+    def rmem_to_gmem(self, acc, gP, split, route, n_block, tidx):
+        if tidx < self.TILE[0]:
+            channel = n_block * self.TILE[0] + tidx
+            gP[0, split, route, channel] = acc[0]
+            gP[1, split, route, channel] = acc[1]
+
+    @cute.kernel
+    def splitK(
+        self,
+        gA_u8: cute.Tensor,
+        gB: cute.Tensor,
+        gSFA: cute.Tensor,
+        gSFB: cute.Tensor,
+        offsets: cute.Tensor,
+        gMap: cute.Tensor,
+        gP: cute.Tensor,
+        tiledmma,
+        a_smem,
+        b_smem,
+        sfa_smem,
+        sfb_smem,
+        partial_smem,
+    ):
+        tidx, bidx = cute.arch.thread_idx()[0], cute.arch.block_idx()[0]
+        N, R = cute.size(gP, mode=[3]), cute.size(gP, mode=[2])
+        num_n_tiles = ceil_div(N, self.TILE[0])
+        num_tasks = R * num_n_tiles
+        split, task = bidx // num_tasks, bidx % num_tasks
+        route, n_block = task // num_n_tiles, task % num_n_tiles
+        valid_rows = offsets[cute.size(offsets, mode=[0]) - 1]
+        valid = route < valid_rows
+        bm, _, bk = self.TILE
+        K, T = cute.size(gB, mode=[1]), cute.size(gB, mode=[0])
+        expert, token = cutlass.Int32(0), cutlass.Int32(0)
+        if valid:
+            expert, token = self.find_expert(offsets, route), gMap[route]
+        num_k_tiles = ceil_div(K, bk)
+        k_begin = (num_k_tiles * split) >> 1
+        k_end = (num_k_tiles * (split + 1)) >> 1
+        gB_tile = cute.make_tensor(
+            gB.iterator + cutlass.Int64(token) * K,
+            cute.make_layout((1, K), stride=(K, 1)),
+        )
+        gA_tile_u8 = cute.make_tensor(
+            gA_u8.iterator
+            + (cutlass.Int64(expert) * (2 * N) + n_block * bm) * (K >> 1),
+            cute.make_layout((2 * N, K >> 1), stride=(K >> 1, 1)),
+        )
+        gSFA_tile = cute.make_tensor(
+            gSFA.iterator
+            + cutlass.Int64(expert) * ceil_div(K, bk) * (2 * N)
+            + n_block * bm,
+            cute.make_layout((ceil_div(K, bk), 2 * N), stride=(2 * N, 1)),
+        )
+        gSFB_tile = cute.make_tensor(
+            gSFB.iterator + token,
+            cute.make_layout((ceil_div(K, bk * UE8M0_PACK_NUM), T), stride=(T, 1)),
+        )
+        storage = cutlass.utils.SmemAllocator().allocate(self.storage)
+        acc_u, acc_g, tCrC_coords = self.mma(
+            tiledmma,
+            gA_tile_u8,
+            gB_tile,
+            gSFA_tile,
+            gSFB_tile,
+            storage,
+            a_smem,
+            b_smem,
+            sfa_smem,
+            sfb_smem,
+            tidx,
+            k_begin,
+            k_end - k_begin,
+            valid,
+        )
+        sPartial = cute.make_tensor(
+            cute.recast_ptr(storage.sU.data_ptr(), dtype=cutlass.Float32), partial_smem
+        )
+        acc = self.reduce_k_slices(acc_u, acc_g, sPartial, tCrC_coords, tidx)
+        if valid:
+            self.rmem_to_gmem(acc, gP, split, route, n_block, tidx)
+
+    @cute.jit
+    def mma(
+        self,
+        tiledmma,
+        gA_u8,
+        gB,
+        gSFA,
+        gSFB,
+        storage,
+        a_smem,
+        b_smem,
+        sfa_smem,
+        sfb_smem,
+        tidx,
+        k_begin,
+        num_k_tiles,
+        valid,
+    ):
+        bm, bn, bk = self.TILE
+        sU = self.make_smem_view(storage.sU.data_ptr(), a_smem, cutlass.Uint8)
+        sG = self.make_smem_view(storage.sG.data_ptr(), a_smem, cutlass.Uint8)
+        sB = self.make_smem_view(storage.sB.data_ptr(), b_smem, cutlass.Float8E4M3FN)
+        sU16 = self.make_smem_view(storage.sU.data_ptr(), a_smem, cutlass.Uint16)
+        sG16 = self.make_smem_view(storage.sG.data_ptr(), a_smem, cutlass.Uint16)
+        sB32 = self.make_smem_view(storage.sB.data_ptr(), b_smem, cutlass.Uint32)
+        sSFU = storage.sSFU.get_tensor(sfa_smem)
+        sSFG = storage.sSFG.get_tensor(sfa_smem)
+        sSFB = storage.sSFB.get_tensor(sfb_smem)
+        copy_a = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), cutlass.Uint8, num_bits_per_copy=self.copy_bits_a
+        )
+        copy_b = cute.make_copy_atom(
+            cpasync.CopyG2SOp(),
+            cutlass.Float8E4M3FN,
+            num_bits_per_copy=self.copy_bits_b,
+        )
+        copy_sf = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), cutlass.Int32, num_bits_per_copy=self.copy_bits_sf
+        )
+        thr = tiledmma.get_slice(tidx)
+        tCrA_coords = thr.partition_A(cute.make_identity_tensor((bm, bk)))
+        tCrB_coords = thr.partition_B(cute.make_identity_tensor((bn, bk)))
+        tCrC_coords = thr.partition_C(cute.make_identity_tensor((bm, bn)))
+        proxy_a = cute.make_tensor(storage.sU.data_ptr(), cute.make_layout((bm, bk)))
+        proxy_b = cute.make_tensor(storage.sB.data_ptr(), cute.make_layout((bn, bk)))
+        tCrU = tiledmma.make_fragment_A(thr.partition_A(proxy_a))
+        tCrG = tiledmma.make_fragment_A(thr.partition_A(proxy_a))
+        tCrB = tiledmma.make_fragment_B(thr.partition_B(proxy_b))
+        tCrU_u8, tCrG_u8 = (
+            cute.recast_tensor(tCrU, cutlass.Uint8),
+            cute.recast_tensor(tCrG, cutlass.Uint8),
+        )
+        tCrB_u32 = cute.recast_tensor(tCrB, cutlass.Uint32)
+        packed_u = cute.make_rmem_tensor((4, 1), cutlass.Uint16)
+        packed_g = cute.make_rmem_tensor((4, 1), cutlass.Uint16)
+        tCrSFU, tCrSFG, tCrSFB = (
+            cute.make_rmem_tensor(1, cutlass.Uint8),
+            cute.make_rmem_tensor(1, cutlass.Uint8),
+            cute.make_rmem_tensor(1, cutlass.Uint8),
+        )
+        sf_layout = cute.make_layout(32, stride=0)
+        tCrSFU_frg = cute.make_tensor(
+            cute.recast_ptr(tCrSFU.iterator, dtype=cutlass.Float8E8M0FNU), sf_layout
+        )
+        tCrSFG_frg = cute.make_tensor(
+            cute.recast_ptr(tCrSFG.iterator, dtype=cutlass.Float8E8M0FNU), sf_layout
+        )
+        tCrSFB_frg = cute.make_tensor(
+            cute.recast_ptr(tCrSFB.iterator, dtype=cutlass.Float8E8M0FNU), sf_layout
+        )
+        acc_u = cute.make_rmem_tensor(
+            tiledmma.partition_shape_C((bm, bn)), cutlass.Float32
+        )
+        acc_g = cute.make_rmem_tensor_like(acc_u)
+        acc_u.fill(0.0)
+        acc_g.fill(0.0)
+        for stage in cutlass.range_constexpr(self.ab_stage):
+            if stage < num_k_tiles:
+                self.gmem_to_smem(
+                    gA_u8,
+                    gB,
+                    gSFA,
+                    gSFB,
+                    sU,
+                    sG,
+                    sB,
+                    sSFU,
+                    sSFG,
+                    sSFB,
+                    copy_a,
+                    copy_b,
+                    copy_sf,
+                    tidx,
+                    stage,
+                    k_begin + stage,
+                    valid,
+                )
+        for k_tile in cutlass.range(num_k_tiles):
+            if k_tile + self.ab_stage <= num_k_tiles:
+                cute.arch.cp_async_wait_group(self.ab_stage - 1)
+            else:
+                cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            stage = k_tile & (self.ab_stage - 1)
+            for word in cutlass.range_constexpr(2):
+                coord = tCrB_coords[word * 4, 0, 0]
+                tCrB_u32[word, 0, 0] = sB32[coord[0], coord[1] >> 2, stage]
+            global_k = (k_begin + k_tile) * bk + tCrB_coords[0, 0, 0][1]
+            shift_b = (((global_k >> 7) & 3) << 3).to(cutlass.Uint32)
+            tCrSFB[0] = (
+                sSFB[(tidx >> 2) & 7, stage].bitcast(cutlass.Uint32) >> shift_b
+            ).to(cutlass.Uint8)
+            for group in cutlass.range_constexpr(4):
+                coord = tCrA_coords[group * 4, 0, 0]
+                packed_u[group, 0] = sU16[coord[0], coord[1] >> 2, stage]
+                packed_g[group, 0] = sG16[coord[0], coord[1] >> 2, stage]
+            expanded_u, expanded_g = self.unpack(packed_u), self.unpack(packed_g)
+            for vi in cutlass.range_constexpr(16):
+                tCrU_u8[vi, 0, 0] = expanded_u[vi, 0]
+                tCrG_u8[vi, 0, 0] = expanded_g[vi, 0]
+            coord = tCrA_coords[0, 0, 0]
+            sf_row = coord[0] + ((tidx & 1) << 3)
+            global_k = (k_begin + k_tile) * bk + coord[1]
+            shift_a = (((global_k >> 5) & 3) << 3).to(cutlass.Uint32)
+            tCrSFU[0] = (sSFU[sf_row, 0, stage].bitcast(cutlass.Uint32) >> shift_a).to(
+                cutlass.Uint8
+            )
+            tCrSFG[0] = (sSFG[sf_row, 0, stage].bitcast(cutlass.Uint32) >> shift_a).to(
+                cutlass.Uint8
+            )
+            cute.gemm(
+                tiledmma,
+                acc_u[None, 0, 0],
+                [tCrU[None, 0, 0], tCrSFU_frg],
+                [tCrB[None, 0, 0], tCrSFB_frg],
+                acc_u[None, 0, 0],
+            )
+            cute.gemm(
+                tiledmma,
+                acc_g[None, 0, 0],
+                [tCrG[None, 0, 0], tCrSFG_frg],
+                [tCrB[None, 0, 0], tCrSFB_frg],
+                acc_g[None, 0, 0],
+            )
+            # Release operand reads before refill or scratch reuse.
+            cute.arch.barrier()
+            if k_tile + self.ab_stage < num_k_tiles:
+                self.gmem_to_smem(
+                    gA_u8,
+                    gB,
+                    gSFA,
+                    gSFB,
+                    sU,
+                    sG,
+                    sB,
+                    sSFU,
+                    sSFG,
+                    sSFB,
+                    copy_a,
+                    copy_b,
+                    copy_sf,
+                    tidx,
+                    stage,
+                    k_begin + k_tile + self.ab_stage,
+                    valid,
+                )
+        cute.arch.cp_async_wait_group(0)
+        return acc_u, acc_g, tCrC_coords
+
+    @cute.kernel
+    def reduceK(
+        self,
+        gP: cute.Tensor,
+        gD: cute.Tensor,
+        gSFQ: cute.Tensor,
+        offsets: cute.Tensor,
+        tiled_s2r,
+        epi_smem,
+    ):
+        tidx, bidx = cute.arch.thread_idx()[0], cute.arch.block_idx()[0]
+        N = cute.size(gD, mode=[1])
+        bm, bn, _ = self.epi_tile
+        route, n_block = bidx // ceil_div(N, bm), bidx % ceil_div(N, bm)
+        valid_rows = offsets[cute.size(offsets, mode=[0]) - 1]
+        if route < valid_rows:
+            expert = self.find_expert(offsets, route)
+            storage = cutlass.utils.SmemAllocator().allocate(self.reduction_storage)
+            sC = cute.slice_(storage.sC.get_tensor(epi_smem), (None, None, 0))
+            for part in cutlass.range_constexpr(ceil_div(bm * bn, self.threads)):
+                index = tidx + part * self.threads
+                sC[index >> 3, index & (bn - 1)] = cutlass.BFloat16(0)
+            cute.arch.barrier()
+            if tidx < bm:
+                acc_u = cute.make_rmem_tensor(1, cutlass.Float32)
+                acc_g = cute.make_rmem_tensor(1, cutlass.Float32)
+                acc_u[0], acc_g[0] = cutlass.Float32(0), cutlass.Float32(0)
+                for split in cutlass.range_constexpr(self.split_k):
+                    acc_u[0] += gP[0, split, route, n_block * bm + tidx]
+                    acc_g[0] += gP[1, split, route, n_block * bm + tidx]
+                self.activation(acc_u, acc_g)
+                sC[tidx, 0] = acc_u[0].to(cutlass.BFloat16)
+            cute.arch.barrier()
+            self.store_q1(
+                tiled_s2r, sC, gD, gSFQ, offsets, expert, route, n_block, tidx
+            )
+            cute.arch.barrier()
+
+    @cute.jit
+    def store_q1(self, tiled_s2r, sC, gD, gSFQ, offsets, expert, route, n_block, tidx):
+        N = cute.size(gD, mode=[1])
+        bm, bn, _ = self.epi_tile
+        gQt = cute.make_tensor(
+            gD.iterator, cute.make_layout((N, cute.size(gD, mode=[0])), stride=(1, N))
+        )
+        gQ_tile = cute.local_tile(
+            cute.domain_offset((0, route), gQt), (bm, bn), (n_block, 0)
+        )
+        sf_rows = cute.size(gSFQ, mode=[1]) >> 2
+        gSF = cute.make_tensor(
+            gSFQ.iterator,
+            cute.make_layout(
+                (cute.size(gSFQ, mode=[0]), sf_rows, UE8M0_PACK_NUM),
+                stride=(UE8M0_PACK_NUM * sf_rows, UE8M0_PACK_NUM, 1),
+            ),
+        )
+        base = offsets[expert]
+        sf_col = ((base + expert * (SF_M_ALIGN - 1)) & -SF_M_ALIGN) + route - base
+        ctx = sf_ctx_of(sf_col, n_block, UE8M0_PACK_NUM, self.qcfg)
+        epi_swap_quant_stg(
+            tiled_s2r.get_slice(tidx),
+            sC,
+            gQ_tile,
+            gSF,
+            ctx,
+            self.qcfg,
+            (bm, bn),
+            route,
+            route + 1,
+            tidx,
+            self.epi.s2g_threads_n(self.epi_tile),
+            self.epi.num_store_threads,
+        )
 
 
 def _stream():
