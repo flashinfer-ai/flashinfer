@@ -28,6 +28,9 @@ config = get_provider_build_config()
 os.environ["FLASHINFER_CUDA_ARCH_LIST"] = config.cuda_architecture
 
 PROVIDER_PLATFORM_TAG_ENV = "FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG"
+# JSON module selection (flashinfer.aot.ModuleSelection) for a custom provider
+# that ships only part of the default module set; see scripts/custom_jit_cache.py.
+PROVIDER_SELECTION_ENV = "FLASHINFER_JIT_CACHE_PROVIDER_SELECTION"
 
 
 def _write_build_metadata() -> None:
@@ -74,7 +77,7 @@ def _ensure_build_inputs() -> None:
     main_build_backend._create_data_dir(use_symlinks=True)
 
 
-def _write_provider_manifest(jit_cache_dir: Path) -> None:
+def _write_provider_manifest(jit_cache_dir: Path, selection_name=None) -> None:
     modules = sorted(
         module_dir.name
         for module_dir in jit_cache_dir.iterdir()
@@ -91,6 +94,8 @@ def _write_provider_manifest(jit_cache_dir: Path) -> None:
         "cuda_architectures": [config.provider_tag],
         "modules": modules,
     }
+    if selection_name is not None:
+        manifest["selection"] = selection_name
     (PROVIDER_SOURCE_DIR / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -101,17 +106,29 @@ def _build_aot_modules(verbose: bool = True) -> None:
 
     from flashinfer import aot
 
+    selection = None
+    aot_config = None
+    selection_path = os.environ.get(PROVIDER_SELECTION_ENV, "").strip()
+    if selection_path:
+        selection = aot.ModuleSelection.from_dict(
+            json.loads(Path(selection_path).read_text())
+        )
+        aot_config = aot.parse_aot_config_overrides(selection.aot_config)
+
     jit_cache_dir = PROVIDER_SOURCE_DIR / "jit_cache"
     build_dir = PROJECT_ROOT / "build" / "aot-providers" / config.provider_tag
     aot.compile_and_package_modules(
         out_dir=jit_cache_dir,
         build_dir=build_dir,
         project_root=PROJECT_ROOT,
-        config=None,
+        config=aot_config,
         verbose=verbose,
         skip_prebuilt=False,
+        selection=selection,
     )
-    _write_provider_manifest(jit_cache_dir)
+    _write_provider_manifest(
+        jit_cache_dir, selection.name if selection is not None else None
+    )
 
 
 def _provider_platform_tag(default_platform_tag: str) -> str:
