@@ -23,6 +23,86 @@
 namespace flashinfer {
 namespace sampling {
 
+// Exclude both the compensated helper and its reduction storage by default:
+// that variant regresses sampling performance even on untied rows.
+#ifndef FLASHINFER_SAMPLING_USE_COMPENSATED_MASS
+#define FLASHINFER_SAMPLING_USE_COMPENSATED_MASS 0
+#endif
+
+#if FLASHINFER_SAMPLING_USE_COMPENSATED_MASS
+struct SamplingBoundaryMass {
+  double above;
+  uint32_t equal_count;
+  uint32_t inexact;
+
+  __device__ SamplingBoundaryMass operator+(const SamplingBoundaryMass& rhs) const {
+    return {above + rhs.above, equal_count + rhs.equal_count, inexact | rhs.inexact};
+  }
+};
+
+// Explicit IEEE operations preserve compensation under --use_fast_math,
+// including subnormal residuals (no FTZ or reassociation).
+__device__ __forceinline__ float SamplingMassAdd(float a, float b) {
+  float result;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+  return result;
+}
+
+__device__ __forceinline__ float SamplingMassSub(float a, float b) {
+  float result;
+  asm("sub.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+  return result;
+}
+
+__device__ __forceinline__ float SamplingMassTwoSum(float a, float b, float& error) {
+  const float sum = SamplingMassAdd(a, b);
+  const float b_virtual = SamplingMassSub(sum, a);
+  error = SamplingMassAdd(SamplingMassSub(a, SamplingMassSub(sum, b_virtual)),
+                          SamplingMassSub(b, b_virtual));
+  return sum;
+}
+
+// Float subtraction can turn an integral boundary quota into n + one ulp.
+// Recheck tied boundaries in double, leaving unique-pivot scans unchanged.
+template <uint32_t BLOCK_THREADS, typename DType>
+__device__ __forceinline__ SamplingBoundaryMass GetSamplingBoundaryMass(const DType* row,
+                                                                        uint32_t size,
+                                                                        float boundary) {
+  using Reduce = cub::BlockReduce<SamplingBoundaryMass, BLOCK_THREADS>;
+  __shared__ typename Reduce::TempStorage temporary;
+  __shared__ SamplingBoundaryMass result;
+  SamplingBoundaryMass local{0, 0, 0};
+  float sum = 0, correction = 0;
+  for (uint32_t i = threadIdx.x; i < size; i += BLOCK_THREADS) {
+    const float value = row[i];
+    float error, lost;
+    sum = SamplingMassTwoSum(sum, value > boundary ? value : 0.f, error);
+    correction = SamplingMassTwoSum(correction, error, lost);
+    local.inexact |= (__float_as_uint(lost) & 0x7fffffffu) != 0;
+    local.equal_count += value == boundary;
+  }
+  double correction_double;
+  asm("cvt.f64.f32 %0, %1;" : "=d"(correction_double) : "f"(correction));
+  local.above = double(sum) + correction_double;
+  const auto reduced = Reduce(temporary).Sum(local);
+  if (threadIdx.x == 0) result = reduced;
+  __syncthreads();
+  // A two-float expansion is exact until its residual itself loses bits.
+  // Rare wide-dynamic-range rows retain the original double-scan accuracy.
+  if (result.inexact) {
+    local.above = 0;
+    for (uint32_t i = threadIdx.x; i < size; i += BLOCK_THREADS) {
+      const float value = row[i];
+      local.above += value > boundary ? double(value) : 0;
+    }
+    const auto exact = Reduce(temporary).Sum(local);
+    if (threadIdx.x == 0) result = exact;
+    __syncthreads();
+  }
+  return result;
+}
+
+#else
 struct SamplingBoundaryMass {
   double above;
   uint32_t equal_count;
@@ -52,6 +132,8 @@ __device__ __forceinline__ SamplingBoundaryMass GetSamplingBoundaryMass(const DT
   __syncthreads();
   return result;
 }
+
+#endif
 
 // Conservative error allowance for a nonnegative float sum: at most one
 // sequential addition per lane item, plus the block reduction and comparison.

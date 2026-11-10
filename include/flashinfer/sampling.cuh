@@ -1575,6 +1575,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   // counted. Four independent accumulators per lane keep the dependency chains short.
   auto threshold_pass = [&](float thr0, float thr1) {
     float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
+    float ge[4] = {0.f, 0.f, 0.f, 0.f};
     int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
 #pragma unroll 2
     for (uint32_t i = warp_begin + lane * 4; i < warp_end; i += 128) {
@@ -1582,6 +1583,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
       const float v[4] = {v4.x, v4.y, v4.z, v4.w};
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
+        if constexpr (!TOP_K) ge[j] += v[j] >= thr0 ? v[j] : 0.f;
         s0[j] += v[j] > thr0 ? v[j] : 0.f;
         s1[j] += v[j] > thr1 ? v[j] : 0.f;
         if constexpr (MODE != SplitRowSamplingMode::kTopP) {
@@ -1594,6 +1596,13 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
     ValueCount<float> t1{(s1[0] + s1[1]) + (s1[2] + s1[3]), (c1[0] + c1[1]) + (c1[2] + c1[3])};
     t0 = WarpReduceValueCount(t0);
     t1 = WarpReduceValueCount(t1);
+    if constexpr (!TOP_K) {
+      // Pure top-p has no count predicate; reuse slot 0's count storage for
+      // mass >= pivot, without another DSM exchange or cluster barrier.
+      const float mass_ge =
+          WarpReduceValueCount(ValueCount<float>{(ge[0] + ge[1]) + (ge[2] + ge[3]), 0}).value;
+      t0.count = __float_as_int(mass_ge);
+    }
     if (lane < cluster_size) {
       *cluster.map_shared_rank(&temp_storage.part[0][rank * NUM_WARPS + warp_id], lane) = t0;
       *cluster.map_shared_rank(&temp_storage.part[1][rank * NUM_WARPS + warp_id], lane) = t1;
@@ -1644,15 +1653,28 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
     threshold_pass(pivot_0, pivot_1);
     // Row totals: lane r sums rank r over its warps, then one fixed shuffle tree over ranks.
     ValueCount<float> r0{0.f, 0}, r1{0.f, 0};
+    float local_ge = 0;
     if (lane < cluster_size) {
 #pragma unroll
       for (uint32_t w = 0; w < NUM_WARPS; ++w) {
-        r0 += temp_storage.part[0][lane * NUM_WARPS + w];
+        const auto part0 = temp_storage.part[0][lane * NUM_WARPS + w];
+        if constexpr (!TOP_K) {
+          r0.value += part0.value;
+          local_ge += __int_as_float(part0.count);
+        } else {
+          r0 += part0;
+        }
         r1 += temp_storage.part[1][lane * NUM_WARPS + w];
       }
     }
     const ValueCount<float> agg0 = WarpReduceValueCount(r0);
     const ValueCount<float> agg1 = WarpReduceValueCount(r1);
+    if constexpr (!TOP_K) {
+      const float mass_ge = WarpReduceValueCount(ValueCount<float>{local_ge, 0}).value;
+      // The whole equality group is legal when its upper mass bound is below p.
+      // Keep crossing groups and numerically uncertain comparisons on the exact path.
+      if (mass_ge + SamplingMassError<BLOCK_THREADS>(mass_ge, d) < p) break;
+    }
     const bool accept_0 = (!TOP_K || agg0.count < k) && (!TOP_P || p >= 1.f || agg0.value < p);
     const bool accept_1 =
         (!TOP_K || agg1.count < k) &&

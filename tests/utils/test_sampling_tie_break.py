@@ -483,3 +483,29 @@ def test_fast_path_ties_created_by_softmax_use_original_indices(
             probs, k, 0.3, **kwargs
         )
     assert (samples == 1).all()
+
+
+@pytest.mark.parametrize("vocab_size", [4096, 131072])
+@pytest.mark.parametrize("direction", [-1, 0, 1])
+def test_top_p_mass_at_cumulative_boundary(vocab_size, direction):
+    # Small terms following a large value can disappear in naive per-thread
+    # float sums. The target lands on, or one float ulp beside, a tied prefix.
+    probs = torch.full((1, vocab_size), 2**-27, device="cuda")
+    probs[0, : vocab_size // 2] = 2**-26
+    probs[0, 0] = 0.5
+    probs[0, -1] = 1.0 - probs[0, :-1].double().sum()
+    boundary = 2**-27
+    above = probs.double().masked_fill(probs <= boundary, 0).sum()
+    p = (above + 128 * boundary).float()
+    if direction:
+        p = torch.nextafter(p, torch.full_like(p, float(direction)))
+    expected = _renorm_reference(probs, p=p)
+    actual = flashinfer.sampling.top_p_renorm_probs(probs, p.item())
+    assert torch.equal(actual > 0, expected > 0)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-8)
+    indices = torch.zeros(256, device="cuda", dtype=torch.int64)
+    samples, valid = flashinfer.sampling.top_p_sampling_from_probs(
+        probs, p.item(), indices=indices, seed=42, return_valid=True
+    )
+    assert valid.all()
+    assert (expected[0, samples.long()] > 0).all()

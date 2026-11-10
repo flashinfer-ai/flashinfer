@@ -14,16 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
 
 
 def gen_sampling_module() -> JitSpec:
+    compensated_mass = os.environ.get("FLASHINFER_SAMPLING_USE_COMPENSATED_MASS", "0")
+    if compensated_mass not in ("0", "1"):
+        raise ValueError("FLASHINFER_SAMPLING_USE_COMPENSATED_MASS must be 0 or 1")
+    # Separate modules prevent the opt-in build from reusing the default AOT/JIT binary.
+    enabled = compensated_mass == "1"
     return gen_jit_spec(
-        "sampling",
+        "sampling_compensated_mass" if enabled else "sampling",
         [
             jit_env.FLASHINFER_CSRC_DIR / "sampling.cu",
             jit_env.FLASHINFER_CSRC_DIR / "renorm.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_sampling_binding.cu",
         ],
+        extra_cuda_cflags=(
+            ["-DFLASHINFER_SAMPLING_USE_COMPENSATED_MASS=1"] if enabled else None
+        ),
     )

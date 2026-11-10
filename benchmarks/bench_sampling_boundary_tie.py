@@ -22,6 +22,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import statistics
 import subprocess
 import warnings
@@ -91,6 +92,7 @@ def main():
         "include/flashinfer/air_top_p.cuh",
         "include/flashinfer/sampling_tie_break.cuh",
         "flashinfer/sampling.py",
+        "flashinfer/jit/sampling.py",
     ]
     metadata = {
         "label": args.label,
@@ -98,6 +100,9 @@ def main():
         "source": str(source),
         "top_k": args.top_k,
         "top_p": args.top_p,
+        "requested_compensated_mass": os.environ.get(
+            "FLASHINFER_SAMPLING_USE_COMPENSATED_MASS", "0"
+        ),
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -171,6 +176,7 @@ def main():
                     )
                     binary = spec.get_library_path()
                     metadata["sampling_binary"] = {
+                        "module": spec.name,
                         "path": str(binary),
                         "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                     }
