@@ -670,13 +670,26 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         (512, 256, 64, 6),
         (1024, 512, 64, 8),
     ]
+    from flashinfer.fused_moe.batch_invariant.schedule import (
+        all_valid_configs_bf16,
+        all_valid_configs_swapped,
+        swapped_knobs,
+    )
+
+    sw = swapped_knobs()
+    assert [c.tile_n for c in sw] == [8, 16, 32] and all(
+        c.swap_ab and c.tile_m == 128 and c.cluster_shape_mn == (1, 1) for c in sw
+    )
     for H, I, E, k in geoms:
         s1, s1u, s2 = (
-            set(all_valid_configs(2 * I, H, E, "swiglu")),
-            set(all_valid_configs(I, H, E, "relu2")),
-            set(all_valid_configs(H, I, E, "plain")),
+            set(all_valid_configs_bf16(2 * I, H, E, "swiglu")),
+            set(all_valid_configs_bf16(I, H, E, "relu2")),
+            set(all_valid_configs_bf16(H, I, E, "plain")),
         )
+        # the two record spaces are disjoint (the swapped flag) and the swapped one has every tile at these shapes
         assert s1 and s1u and s2
+        assert not (set(all_valid_configs(H, I, E, "plain")) & set(sw))
+        assert set(all_valid_configs_swapped(H, I, E, "plain")) == set(sw)
         for T in (1, 7, 64, 300, 800, 4096, 16384):
             c1, c2 = default_configs(
                 T, k, H, I, E, sm_count, family, True, nominal=True
@@ -711,6 +724,14 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                 and len(set(ranked)) == len(ranked)
                 and all(c in s2 for c in ranked)
             )
+            a1, a2 = default_configs(
+                T, k, H, I, E, sm_count, family, True, nominal=True, swap=True
+            )
+            assert a1.swap_ab and a2.swap_ab and a1 in s1 and a2 in s2
+            n1, n2 = default_configs(
+                T, k, H, I, E, sm_count, family, True, nominal=True, swap=False
+            )
+            assert not n1.swap_ab and not n2.swap_ab
 
 
 def test_unsupported_device_raises_before_any_kernel():
@@ -1002,6 +1023,24 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
     for t in tactics:
         out = runner.forward(runner.pack_inputs(pack, W), tactic=t)
         assert torch.equal(bits(out), ref), t
+    # a decode-sized batch: the ranked tactics include the swapped records (the swapped body) and every tactic gives the bits
+    # of the dense records; a tactic round-trips its swapped flag
+    from flashinfer.fused_moe.batch_invariant.runner import (
+        _configs_from_tactic,
+        _tactic,
+    )
+
+    xd, ld, _, _ = _problem(3, k, H, I, E, seed=8, adversarial=True)
+    packd = _logits_pack(xd, ld)
+    refd = bits(layer(packd, W))
+    inputs = runner.pack_inputs(packd, W)
+    tactics_d = runner.get_valid_tactics(inputs, None)
+    assert any(_configs_from_tactic(t)[0].swap_ab for t in tactics_d), tactics_d
+    for t in tactics_d:
+        c1, c2 = _configs_from_tactic(t)
+        assert _tactic(c1, c2) == t
+        out = runner.forward(runner.pack_inputs(packd, W), tactic=t)
+        assert torch.equal(bits(out), refd), t
     failed_before = (
         len(AutoTuner.get().stats.failed_tactics)
         if hasattr(AutoTuner.get(), "stats")
@@ -1195,6 +1234,59 @@ def _poison_allocator(byte: int):
 
 
 @needs_device
+def test_swapped_records_equal_the_grouped_records():
+    """The swapped body (the weights on the MMA's M side, the group's rows a TMA box of 8 / 16 / 32 tokens from the dense
+    rows): at every token tile its rows are a grouped record's rows bit for bit -- the fp32 and bf16 outputs, the gated and
+    the ungated chain -- with groups of 1 .. 70 rows (several token tiles), empty groups, E = 256, a weight width that is
+    not a multiple of the 128-row weight tile, and the dense buffer with and without the token tile's pad rows past the live
+    ones (the last tiles' boxes then read the pad, or are zero-filled past the buffer: never stored)."""
+    from flashinfer.fused_moe.batch_invariant.api import grouped_gemm
+    from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    g = torch.Generator().manual_seed(11)
+
+    def rnd(*shape, span=2.0):
+        return (
+            ((torch.rand(*shape, generator=g) * 2 - 1) * span).to(torch.bfloat16).cuda()
+        )
+
+    dense = Knobs((64, 64), (1, 1), False, True, "m", 1)
+    for counts, N, K in [
+        ([5, 0, 70, 1, 33, 64, 0, 3], 256, 512),
+        ([1] * 16, 192, 1024),
+        ([0] * 200 + [40] + [0] * 55, 320, 256),
+        ([3, 7, 11, 13] * 16, 1024, 128),
+    ]:
+        E, Tk = len(counts), sum(counts)
+        cnt = torch.tensor(counts, dtype=torch.int32, device="cuda")
+        w = rnd(E, N, K)
+        for pad in (0, 32):
+            a_buf = rnd(Tk + pad, K)
+            refs = {
+                (ch, dt): grouped_gemm(a_buf, w, cnt, dense, ch, dt, Tk=Tk)
+                for ch, dt in (
+                    ("plain", torch.float32),
+                    ("plain", torch.bfloat16),
+                    ("swiglu", torch.bfloat16),
+                    ("relu2", torch.bfloat16),
+                )
+            }
+            for cfg in swapped_knobs():
+                for (ch, dt), ref in refs.items():
+                    got = grouped_gemm(a_buf, w, cnt, cfg, ch, dt, Tk=Tk)
+                    assert torch.equal(bits(got.cpu()), bits(ref.cpu())), (
+                        cfg.describe(),
+                        ch,
+                        dt,
+                        counts[:4],
+                        N,
+                        K,
+                        pad,
+                    )
+
+
+@needs_device
 @pytest.mark.parametrize("act", [_SWIGLU, ReLU2()], ids=["gated", "ungated"])
 def test_poisoned_intermediates_do_not_reach_the_bits(act):
     """Unspecified bytes and timing never reach the output: the op's intermediates (the permuted rows, GEMM1's output, GEMM2's
@@ -1210,6 +1302,16 @@ def test_poisoned_intermediates_do_not_reach_the_bits(act):
     )
     layer, pack = _layer(k, E, I, act), _weights(w1, w2, act)
     ref = bits(layer(_logits_pack(x, logits), pack).cpu())
+    # the swapped records on the pre-routed op: their pad rows past the live ones come from torch.empty too
+    from flashinfer.fused_moe.batch_invariant.api import MoEWeights, fused_moe, route
+    from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
+
+    w = MoEWeights.from_view(pack.get_view(BatchInvariantMoeRunner.backend_key))
+    ids, wts = route(logits, k)
+    sw = swapped_knobs()[0]
+    assert torch.equal(
+        bits(fused_moe(x, ids, wts, w, config1=sw, config2=sw).cpu()), ref
+    )
     side = torch.cuda.Stream()
     junk = torch.empty(256 << 20, dtype=torch.uint8, device="cuda")
     for i in range(int(os.environ.get("RLK_STRESS_ITERS", "20"))):
@@ -1220,6 +1322,9 @@ def test_poisoned_intermediates_do_not_reach_the_bits(act):
                     junk.add_(1)
             out = layer(_logits_pack(x, logits), pack)
             assert torch.equal(bits(out.cpu()), ref), (i, hex(byte))
+            _poison_allocator(byte)
+            out = fused_moe(x, ids, wts, w, config1=sw, config2=sw)
+            assert torch.equal(bits(out.cpu()), ref), (i, hex(byte), "swapped")
     torch.cuda.synchronize()
 
 
