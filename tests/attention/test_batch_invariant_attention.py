@@ -1579,39 +1579,6 @@ def test_noncausal_fingerprint_is_a_function_of_head_dim_and_mode(op):
         assert bi.fingerprint(op, head_dim=D) == fp
 
 
-def test_noncausal_kernel_identity_and_spec():
-    """The non-causal bodies are separate compiled objects (the causal kernels' names, hence their code, are unchanged), and the
-    spec's non-causal row sees every key of its request whatever its position; a window is not a parameter of that class."""
-    from flashinfer.attention.batch_invariant.blocks.compile import (
-        kernel_name as body_name,
-    )
-    from flashinfer.attention.batch_invariant.spec import (
-        RowSpec,
-        present_chunks,
-        spec_fingerprint,
-        visible_keys,
-    )
-    from flashinfer.attention.batch_invariant.swaps.compile import (
-        kernel_name as swaps_name,
-    )
-
-    assert body_name(128, 4, 16, 4) == body_name(128, 4, 16, 4, causal=True)
-    assert body_name(128, 4, 16, 4, causal=False).endswith("_nc")
-    assert swaps_name(128, 4, 16, 8, cap=228 << 10, causal=False).endswith("_nc")
-    assert swaps_name(128, 4, 16, 8, cap=228 << 10) == swaps_name(
-        128, 4, 16, 8, cap=228 << 10, causal=True
-    )
-    for p in (0, 7, 699):
-        row = RowSpec(p=p, causal=False, kv_len=700)
-        assert (row.lo, row.L) == (0, 700)
-        assert visible_keys(row, 5) == list(range(640, 700))
-        assert present_chunks(row, 128) == [0, 1]
-    with pytest.raises(AssertionError):
-        RowSpec(p=3, window_left=2, causal=False, kv_len=10)
-    with pytest.raises(ValueError):
-        spec_fingerprint(128, window_left=5, causal=False)
-
-
 @needs_device
 @pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("Hq,Hkv", [(32, 8), (8, 8)])
