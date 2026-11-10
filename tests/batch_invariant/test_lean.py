@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The Lean coupling of the classes ``gemm.bf16``, ``gemm.e4m3`` / ``gemm.e5m2`` and ``gemm.mxfp8`` (both instructions'
-classes) (``flashinfer/batch_invariant/lean/``).
+"""The Lean coupling of the classes ``gemm.bf16``, ``gemm.e4m3`` / ``gemm.e5m2``, ``gemm.e4m3.kblock128`` (the block-scale
+fp8 class) and ``gemm.mxfp8`` (both instructions' classes) (``flashinfer/batch_invariant/lean/``).
 
 Device-free (every CI job): the committed ``Cases.lean`` is byte for byte what the Python spec and engine emit, so a
 change to the dataflow, the lowering, a knob constraint or the chunk rule that was not propagated to the Lean cases
@@ -111,6 +111,8 @@ def test_lean_model_matches_python_engine_and_spec():
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
     kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
+    # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
+    kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
     for F in lean_cases.FORMATS:
         kinds[F.tag] = "spec"
         kinds[F.tag + "loop"] = "loop"
@@ -166,6 +168,15 @@ def test_lean_model_matches_python_engine_and_spec():
     # the biased chain of the bf16 classes
     for K, C, sx in lean_cases.bias_cases():
         assert lean[("gemmbias", K // MMA_K, C)] == sx, (K, C)
+        checked += 1
+    # the block-scale fp8 class: the spec's output at (0, 0) and at (3, 129) node for node, and the kernel's promotion loop
+    # against the engine's per-block traces folded by the block digit
+    for KB, fmt, sx0, sx1 in lean_cases.fp8bs_cases():
+        assert lean[("gemmfp8bs", KB, fmt)] == sx0, ("e4m3_bs", KB, fmt)
+        assert lean[("gemmfp8bs2", KB, fmt)] == sx1, ("e4m3_bs (3, 129)", KB, fmt)
+        checked += 2
+    for KB, sx in lean_cases.fp8bs_loop_cases():
+        assert lean[("gemmfp8bsloop", KB)] == sx, ("e4m3_bs loop", KB)
         checked += 1
     for name, *_, sx in lean_cases.attn_cases():
         assert lean[("attn", name)] == sx, name

@@ -53,15 +53,15 @@ def _get_compiled_gather_kernel(
     n: int,
     k: int,
     num_experts: int,
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    tile_idx_ptr,
-    mn_limit_ptr,
-    token_id_ptr,
-    num_tiles_ptr,
+    a_ptr: int,
+    b_ptr: int,
+    c_ptr: int,
+    tile_idx_ptr: int,
+    mn_limit_ptr: int,
+    token_id_ptr: int,
+    num_tiles_ptr: int,
     max_active_clusters: int,
-    stream,
+    stream: int,
     ab_dtype: type,
     c_dtype: type,
     tile_shape_mn: Tuple[int, int],
@@ -84,6 +84,11 @@ def _get_compiled_gather_kernel(
     (tile_size/cluster_shape_mn/swizzle_size/raster_along_m tactics, ``topk``,
     ``max_active_clusters``, ``enable_pdl``, the activation type and its
     constants) form the process-local compile key.
+
+    The kernel is compiled as a TVM-FFI function so that a launch takes the
+    raw device addresses, the dimensions and the stream handle directly (a
+    few microseconds of host time); pointer objects are built only here, as
+    compile-time examples of the pointer types.
     """
     cache_key = (
         ab_dtype,
@@ -121,22 +126,27 @@ def _get_compiled_gather_kernel(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
+
+    def ptr(dtype: type, address: int, align: int):
+        return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=align)
+
     compiled = cute.compile(
         gemm.wrapper,
-        a_ptr,
-        b_ptr,
-        c_ptr,
-        tile_idx_ptr,
-        mn_limit_ptr,
-        token_id_ptr,
-        num_tiles_ptr,
+        ptr(ab_dtype, a_ptr, 16),
+        ptr(ab_dtype, b_ptr, 16),
+        ptr(c_dtype, c_ptr, 16),
+        ptr(cutlass.Int32, tile_idx_ptr, 4),
+        ptr(cutlass.Int32, mn_limit_ptr, 4),
+        ptr(cutlass.Int32, token_id_ptr, 4),
+        ptr(cutlass.Int32, num_tiles_ptr, 4),
         orig_m,
         permuted_m,
         n,
         k,
         num_experts,
         max_active_clusters=max_active_clusters,
-        stream=stream,
+        stream=cuda.CUstream(stream),
+        options="--enable-tvm-ffi",
     )
     _gather_kernel_cache[cache_key] = compiled
     return compiled
@@ -207,6 +217,10 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
     ``h = x[token(r)] @ w1_weight[expert(r)].T``. Both hold for every valid
     permuted row ``r``; the token permute is fused into the A load (never
     materialized).
+
+    ``x``, ``w1_weight`` and ``out`` must be 16-byte aligned (checked on every
+    call); the int32 routing metadata must be 4-byte aligned (not checked per
+    call).
 
     Args:
         x: Unpermuted activations ``[num_tokens, k]``, row-major bf16/fp16.
@@ -314,36 +328,16 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
 
-    a_ptr = make_ptr(ab_dtype, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    b_ptr = make_ptr(
-        ab_dtype, w1_weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-    )
-    c_ptr = make_ptr(c_dtype, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    tile_idx_ptr = make_ptr(
-        cutlass.Int32,
-        tile_idx_to_expert_idx.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    mn_limit_ptr = make_ptr(
-        cutlass.Int32,
-        tile_idx_to_mn_limit.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    token_id_ptr = make_ptr(
-        cutlass.Int32,
-        token_id_mapping.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    num_tiles_ptr = make_ptr(
-        cutlass.Int32,
-        num_non_exiting_tiles.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=4,
-    )
-    stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
+    a_ptr = x.data_ptr()
+    b_ptr = w1_weight.data_ptr()
+    c_ptr = out.data_ptr()
+    tile_idx_ptr = tile_idx_to_expert_idx.data_ptr()
+    mn_limit_ptr = tile_idx_to_mn_limit.data_ptr()
+    token_id_ptr = token_id_mapping.data_ptr()
+    num_tiles_ptr = num_non_exiting_tiles.data_ptr()
+    if (a_ptr | b_ptr | c_ptr) % 16:
+        raise ValueError("x, w1_weight and out must be 16-byte aligned")
+    stream = torch.cuda.current_stream(x.device).cuda_stream
 
     compiled = _get_compiled_gather_kernel(
         orig_m=orig_m,
@@ -389,6 +383,6 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         n,
         k,
         num_local_experts,
-        stream=stream,
+        stream,
     )
     return out

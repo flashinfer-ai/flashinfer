@@ -136,12 +136,12 @@ def _run(code: str) -> subprocess.CompletedProcess:
 
 
 def test_the_shared_mode_name_checks():
-    """The shared #8928 checks (tests/test_helpers/cake_mode_names.py): mode word and stem, no ``deterministic``
+    """The shared #8928 checks (tests/cake/test_helpers/cake_mode_names.py): mode word and stem, no ``deterministic``
     keyword, one name per object across the module, the backend modules and the flashinfer top level, and the
     former paths and names failing at import in a fresh interpreter."""
     import flashinfer
 
-    from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+    from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
 
     module = importlib.import_module(MODULE)
     assert_cake_mode_module(

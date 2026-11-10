@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     GRAD_NAMES,
     LOWER_BOUND,
     RAW_GRAD_NAMES,
@@ -36,7 +36,7 @@ from tests.test_helpers.cake_kda_det_train_reference import (
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 # The backend suite names its package once, through the shared alias helper, and imports nothing else from
 # flashinfer: a build that vendors the package under another import path runs it unchanged after pointing the

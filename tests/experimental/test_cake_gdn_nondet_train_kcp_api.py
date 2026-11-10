@@ -69,7 +69,7 @@ def _few_cpu_threads():
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry when it lists the package, else directly."""
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_nondet_train_kcp", sub)
     except (ImportError, KeyError):
@@ -634,7 +634,7 @@ PACKAGE_NAMES = (set(FACADE_FUNCTIONS) - {"is_cake_gdn_nondet_train_kcp_supporte
 def _det(sub: str | None = None):
     """The deterministic package (or one of its modules) through the test-helper registry: a stale entry fails here
     and never skips."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_det_train_kcp", sub)
 

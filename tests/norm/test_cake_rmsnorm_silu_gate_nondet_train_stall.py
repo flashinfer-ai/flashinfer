@@ -246,7 +246,7 @@ import statistics
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_silu_gate_nondet_train")
 loader = cake_package("cake_rmsnorm_silu_gate_nondet_train", "cake_jit")

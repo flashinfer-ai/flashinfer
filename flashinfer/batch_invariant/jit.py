@@ -52,6 +52,10 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm_blockscaled": (
         "gemm/batch_invariant/blocks/compile_blockscaled.py",
     ),
+    # the block-scale fp8 kernels (the DeepSeek-style class behind gemm_fp8_nt_groupwise): their own module
+    "batch_invariant_gemm_fp8_blockscale": (
+        "gemm/batch_invariant/blocks/compile_fp8bs.py",
+    ),
     # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
     "batch_invariant_attention": (
         "attention/batch_invariant/blocks/compile.py",
@@ -78,6 +82,9 @@ MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm_blockscaled": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
+    "batch_invariant_gemm_fp8_blockscale": (
+        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
 }
 
 #: Sources within the mode's directories that the closure walk reaches but that no kernel binary depends on (host-side
@@ -94,6 +101,10 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
     ),
     # the grouped kernels compose the dense GEMM blocks, whose closure reaches the GEMM dispatcher files
     "batch_invariant_moe": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_gemm_fp8_blockscale": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),
