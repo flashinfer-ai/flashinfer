@@ -53,9 +53,11 @@ def pack_scale(linear, packed, mid, stream):
 @cute.kernel
 def combine_kernel(
     routes: cute.Tensor,
+    ids: cute.Tensor,
     weights: cute.Tensor,
     output: cute.Tensor,
     top_k: cutlass.Constexpr,
+    num_experts: cutlass.Constexpr,
     narrow_weights: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
@@ -64,20 +66,33 @@ def combine_kernel(
     if col < output.shape[1]:
         value = cutlass.Float32(0)
         for slot in cutlass.range_constexpr(top_k):
-            weight = weights[token, slot]
-            if cutlass.const_expr(narrow_weights):
-                weight = weight.to(cutlass.BFloat16)
-            value = _fma(
-                routes[token * top_k + slot, col].to(cutlass.Float32),
-                weight.to(cutlass.Float32),
-                value,
-            )
+            expert = ids[token, slot]
+            # A zero partial alone cannot mask a NaN/Inf padding score.
+            if expert >= 0 and expert < num_experts:
+                weight = weights[token, slot]
+                if cutlass.const_expr(narrow_weights):
+                    weight = weight.to(cutlass.BFloat16)
+                value = _fma(
+                    routes[token * top_k + slot, col].to(cutlass.Float32),
+                    weight.to(cutlass.Float32),
+                    value,
+                )
         output[token, col] = value.to(cutlass.BFloat16)
 
 
 @cute.jit
-def combine(routes, weights, output, narrow_weights: cutlass.Constexpr, stream):
-    combine_kernel(routes, weights, output, weights.shape[1], narrow_weights).launch(
+def combine(
+    routes,
+    ids,
+    weights,
+    output,
+    num_experts: cutlass.Constexpr,
+    narrow_weights: cutlass.Constexpr,
+    stream,
+):
+    combine_kernel(
+        routes, ids, weights, output, weights.shape[1], num_experts, narrow_weights
+    ).launch(
         grid=(cute.ceil_div(output.shape[1], 256), output.shape[0], 1),
         block=(256, 1, 1),
         stream=stream,

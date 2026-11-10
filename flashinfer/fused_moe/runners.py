@@ -99,6 +99,7 @@ from .api import (
     SwiGLUStep,
     # Unified config and pack types
     ActivationType,
+    CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -852,10 +853,7 @@ class MoERunner(TunableRunner):
             resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
         )
 
-    # Anything the profiled tensor shapes cannot reveal has to be listed here.
-    # One stable tuple feeds both __hash__ (in-memory) and the persisted key,
-    # which excludes runner_hash. Shapes already in the profile are omitted.
-
+    # Persisted key (no runner_hash), so rank-invariant; __hash__ adds the EP offset.
     def _cache_key_extras(self) -> tuple:
         """Return stable tactic inputs absent from profiled tensor shapes."""
         routing = self.config.routing
@@ -874,7 +872,6 @@ class MoERunner(TunableRunner):
             int(routing.top_k),
             int(routing.num_experts),
             int(local_num_experts),
-            int(experts.local_expert_offset),
             int(experts.intermediate_size),
             # S changes tactic enumeration but not profiled tensor shapes.
             int(experts.num_fused_shared_experts),
@@ -894,7 +891,10 @@ class MoERunner(TunableRunner):
         )
 
     def __hash__(self) -> int:
-        return hash(self._cache_key_extras())
+        # In-memory only: EP ranks must share persisted entries (#6082).
+        return hash(
+            (self._cache_key_extras(), int(self.config.experts.local_expert_offset))
+        )
 
     def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         """Optional tactic-pool identity, stable for packed and profiling inputs."""
@@ -4968,16 +4968,42 @@ class CuteDslRunner(MoERunner):
     supported_quant_variants = (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.NVFP4, QuantFormat.BF16),
     )
-    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        (QuantFormat.NVFP4, QuantFormat.BF16): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+    }
     # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
     # takes the recipe as an argument; _check_support() below narrows this to
     # the per-token path, the only one that runs that quantizer.
     supports_nvfp4_4over6 = True
 
+    @property
+    def swap_ab(self) -> bool:
+        candidates = [
+            backend
+            for backend in self.config.backend
+            if isinstance(backend, CuteDslConfig)
+        ]
+        if not candidates:
+            # Direct legacy runner construction has no backend-specific options.
+            return False
+        if len(candidates) != 1:
+            raise ValueError("CuteDslRunner requires one bound CuteDslConfig")
+        return candidates[0].swap_ab
+
     def _check_support(self) -> None:
         super()._check_support()
+        if self.swap_ab and hasattr(self, "device"):
+            from .prepare import _cute_dsl_gated_weight_group_size
+
+            _cute_dsl_gated_weight_group_size(self.device, self.swap_ab)
         if self.config.quant.swizzled_scale_factors is True:
             raise NotImplementedError(
                 f"{type(self).__name__} consumes only the linear activation "
@@ -5003,16 +5029,27 @@ class CuteDslRunner(MoERunner):
                 f"{self.config.quant.weight.name}×{self.config.quant.activation.name} "
                 "activation scales."
             )
-        mxfp4_mxfp8 = self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-        if mxfp4_mxfp8 and isinstance(self.config.activation, SiTU):
-            raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
-        if mxfp4_mxfp8 and not self.config.finalize.use_fused_finalize:
-            raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
-        if mxfp4_mxfp8 and hasattr(self, "device"):
+        # W4A8 (MXFP4 weights) and MXFP8 (MXFP8 weights) share the MXFP8
+        # activation path and its limits.
+        mxfp8_act = self.config.quant.pair in (
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        )
+        mode = (
+            "MXFP8"
+            if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
+            else "W4A8"
+        )
+        if mxfp8_act and not self.swap_ab:
+            if isinstance(self.config.activation, SiTU):
+                raise NotImplementedError(f"CuTe-DSL {mode} does not support SiTU.")
+            if not self.config.finalize.use_fused_finalize:
+                raise NotImplementedError(f"CuTe-DSL {mode} requires fused finalize.")
+        if mxfp8_act and hasattr(self, "device"):
             from ..utils import get_compute_capability
 
             if get_compute_capability(self.device) == (10, 7):
-                raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+                raise NotImplementedError(f"CuTe-DSL {mode} does not support SM107.")
         if (
             isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
             and not self.config.quant.per_token_scale
@@ -5116,6 +5153,7 @@ class CuteDslRunner(MoERunner):
         if self.config.quant.pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
             (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
         ):
             self._inner = CuteDslFusedMoERunner(
                 forward_impl=_cute_dsl_fused_moe_impl,
@@ -5126,11 +5164,12 @@ class CuteDslRunner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
-                quant_mode=(
-                    "w4a8"
-                    if self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-                    else "w4a4"
-                ),
+                quant_mode={
+                    (QuantFormat.NVFP4, QuantFormat.NVFP4): "w4a4",
+                    (QuantFormat.MXFP4, QuantFormat.MXFP8): "w4a8",
+                    (QuantFormat.MXFP8, QuantFormat.MXFP8): "mxfp8",
+                }[self.config.quant.pair],
+                swap_ab=self.swap_ab,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -5141,6 +5180,7 @@ class CuteDslRunner(MoERunner):
                 local_expert_offset=experts.local_expert_offset,
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
+                swap_ab=self.swap_ab,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         else:
@@ -5165,10 +5205,13 @@ class CuteDslRunner(MoERunner):
         return self._inner.get_valid_tactics(inputs, profile)
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + (
+        extras = super()._cache_key_extras() + (
             bool(self._inner.use_fused_finalize),
             bool(self._inner.enable_pdl),
         )
+        if self.swap_ab:
+            extras += ("swap_ab",)
+        return extras
 
     def forward(
         self,
@@ -5218,6 +5261,16 @@ class CuteDslRunner(MoERunner):
                 f"{type(self.config.activation).__name__}; prepare the view with "
                 "the same typed activation."
             )
+        if self.config.activation.is_gated:
+            expected_group_size = 16 if self.swap_ab else 64
+            # Unannotated manual views use the original 64-row API contract.
+            group_size = v.get("gated_weight_group_size", 64)
+            if group_size != expected_group_size:
+                raise ValueError(
+                    f"CuteDslRunner: gated_weight_group_size={group_size} does "
+                    f"not match swap_ab={self.swap_ab}; prepare the weight view "
+                    "with the same swap_ab option."
+                )
 
         pair = self.config.quant.pair
         use_per_token_activation = bool(self.config.quant.per_token_scale)
@@ -5226,13 +5279,16 @@ class CuteDslRunner(MoERunner):
             in (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
                 (QuantFormat.MXFP4, QuantFormat.MXFP8),
+                (QuantFormat.MXFP8, QuantFormat.MXFP8),
             )
             and not use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is None
         ):
-            is_mxfp4 = pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-            hidden_size = act.hidden_states_q.shape[1] * (1 if is_mxfp4 else 2)
+            # MXFP8 activations (W4A8 and MXFP8): one E4M3 byte per element and
+            # row-major E8M0 scales, no GEMM2 input scale.
+            mxfp8_act = pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
+            hidden_size = act.hidden_states_q.shape[1] * (1 if mxfp8_act else 2)
             moe_output = act.hidden_states_q.new_empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
             )
@@ -5240,15 +5296,15 @@ class CuteDslRunner(MoERunner):
                 act.hidden_states_q,
                 (
                     act.hidden_states_scale
-                    if is_mxfp4
+                    if mxfp8_act
                     else act.hidden_states_scale.unsqueeze(-1)
-                ).view(torch.uint8 if is_mxfp4 else act.hidden_states_scale.dtype),
+                ).view(torch.uint8 if mxfp8_act else act.hidden_states_scale.dtype),
                 act.topk_ids,
                 act.topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
-                None if is_mxfp4 else v["fc2_input_scale"],
+                None if mxfp8_act else v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
@@ -7393,13 +7449,34 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
-        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+            SwiGLU,
+            GeGLU,
+            SiTU,
+            ReLU2,
+            SiLU,
+        ),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (
+            SwiGLU,
+            GeGLU,
+            SiTU,
+            ReLU2,
+            SiLU,
+        ),
         (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
-        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2),
-        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): (SwiGLU, ReLU2),
+        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2, SiLU),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): (
+            SwiGLU,
+            ReLU2,
+            SiLU,
+        ),
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (
+            SwiGLU,
+            GeGLU,
+            ReLU2,
+            SiLU,
+        ),
     }
 
     def _check_support(self) -> None:
@@ -7746,22 +7823,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         per_token_scale = None
         if is_fp4:
+            # MXFP4xMXFP8 keeps the compact TRT-LLM UE8M0 row here;
+            # PrimsTsMxfp4Mxfp8MoERunner pads it to the GEMM's row stride.
             hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
-            if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
-                # TRT-LLM stores a compact linear UE8M0 row. The Prims-TS
-                # MXFP8 activation GEMM reads K-blocks rounded up to 16.
-                # Padding happens on every pack_inputs, including the hot
-                # forward path: one allocation, fill, and copy per call, so
-                # the public activation pack can stay the shared TRT-LLM layout.
-                from flashinfer.prims_ts.moe.runner import (
-                    _pad_mxfp8_linear_scale_for_prims,
-                )
-
-                hidden_states_scale = _pad_mxfp8_linear_scale_for_prims(
-                    hidden_states_scale,
-                    num_tokens=num_tokens,
-                    hidden_size=hidden_size,
-                ).view(torch.float8_e4m3fn)
             if is_nvfp4:
                 if self._per_token and act.per_token_scale is None:
                     raise RuntimeError(
@@ -9453,9 +9517,10 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
 
     Every expert segment is padded to ``_segment_alignment`` rows; padding rows
     are computed but never read back. Stage buffers hold the token bucket's
-    worst-case row count and every stage covers all of it: cuDNN's grouped GEMM
-    takes segment starts only, so the last expert's segment runs to the end of
-    the buffer.
+    worst-case row count and every stage covers all of it: the cuDNN grouped
+    GEMM offsets (``_cudnn_moe_first_token_offset``: segment starts, or explicit
+    boundaries ending at the buffer's row count) run the last expert's segment
+    to the end of the buffer.
     """
 
     supported_routing_modes = (
@@ -10645,7 +10710,7 @@ class _GroupedGemmStageRunner(TunableRunner):
         return (*self.parent._cache_key_extras(), "stage", self.stage)
 
     def __hash__(self) -> int:
-        return hash(self.get_cache_key_extras([]))
+        return hash((hash(self.parent), "stage", self.stage))
 
 
 def __getattr__(name: str):

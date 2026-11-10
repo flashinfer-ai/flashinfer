@@ -66,6 +66,8 @@ if [ "$pcie_ipc_gpus" -lt 2 ]; then
 else
   NPROC_MULTIRANK=$(( pcie_ipc_gpus < 4 ? pcie_ipc_gpus : 4 )) bash tests/moe_ep/run_tests.sh comm
 fi
+# ulysses backend selection (pure-CPU decision layer, no GPU collectives)
+pytest -s tests/comm/test_ulysses_topology.py
 # nvshmem ar
 pytest -s tests/comm/test_nvshmem.py
 pytest -s tests/comm/test_nvshmem_allreduce.py

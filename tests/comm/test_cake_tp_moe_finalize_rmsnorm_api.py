@@ -21,6 +21,8 @@ from flashinfer.cake_tp_moe_finalize_rmsnorm_backend import cake_jit as loader
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DIR = Path(pkg.__file__).parent
 BLACKWELL = ("sm_100a", "sm_103a")
+R200 = ("sm_107a",)
+EVERY = BLACKWELL + R200
 KINDS = ("onehop", "rsag", "tokown", "token1", "eo")
 DATA = (
     "gemm2",
@@ -57,18 +59,19 @@ KIND_SLOTS = {
     ("sm_100a", "tp2"): {"eo": 32, "rsag": 33, "token1": 148},
     ("sm_100a", "tp8"): {"eo": 7, "token1": 144},
     ("sm_103a", "tp2"): {"onehop": 17, "token1": 148, "rsag": 33, "eo": 64},
-    ("sm_103a", "tp4"): {"onehop": 8, "eo": 24, "token1": 152},
+    ("sm_103a", "tp4"): {"onehop": 8, "token1": 152},
+    ("sm_107a", "tp4"): {"onehop": 8, "eo": 24, "token1": 212},
 }
 
 
 def test_route_and_architecture_helpers():
-    assert tuple(loader.WORLDS) == (2, 4, 8) and tuple(loader.ARCHES) == BLACKWELL
+    assert tuple(loader.WORLDS) == (2, 4, 8) and tuple(loader.ARCHES) == EVERY
     assert [loader.route_key(world) for world in loader.WORLDS] == ["tp2", "tp4", "tp8"]
     with pytest.raises(ValueError, match="world size 3"):
         loader.route_key(3)
     assert loader.arch_for_capability((10, 0)) == "sm_100a"
     assert loader.arch_for_capability([10, 3]) == "sm_103a"
-    assert loader.arch_for_capability((10, 7)) is None
+    assert loader.arch_for_capability((10, 7)) == "sm_107a"
     assert loader.arch_for_capability((9, 0)) is None
     assert loader.arch_for_capability((10,)) is None
     assert set(loader.ARCH_BY_CAPABILITY.values()) == set(loader.ARCHES)
@@ -83,7 +86,7 @@ def test_registry_records_reference_the_build_manifest():
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert manifest["package"] == pkg.__name__
-    assert set(manifest["arch_flags"]) >= set(BLACKWELL)
+    assert set(manifest["arch_flags"]) >= set(EVERY)
     assert manifest["common"]["requires"]["cuda_toolkit"]["min"]
     libraries = cake_build.libraries_by_name()
     assert (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file()
@@ -101,16 +104,22 @@ def test_registry_records_reference_the_build_manifest():
         assert kind in KINDS and world in loader.WORLDS, name
         assert record["route"] == loader.route_key(world)
         arches = tuple(record["arches"])
-        assert arches and set(arches) <= set(BLACKWELL), name
+        assert arches and set(arches) <= set(EVERY), name
         build = record["build"]
         split = int(build.get("split", 1))
         launch = record["launch"]
         block = tuple(launch["block"])
         assert block[0] > 0 and block[1:] == (1, 1), name
+        # the token-owner cluster-pair build: one slot is a cluster of two CTAs
+        pair = kind == "tokown" and build.get("cpair", False) is True
         expected_cluster = (
-            (split, 1, 1) if kind in ("eo", "onehop", "token1") else (1, 1, 1)
+            (split, 1, 1)
+            if kind in ("eo", "onehop", "token1")
+            else ((2, 1, 1) if pair else (1, 1, 1))
         )
         assert tuple(launch["cluster"]) == expected_cluster, name
+        if kind == "tokown":
+            assert block[0] * expected_cluster[0] == 512, name
         assert launch["cooperative"] is (kind == "tokown")
         assert launch["use_pdl"] is False and build.get("pdl", False) is False
         assert (
@@ -179,7 +188,7 @@ def test_registry_records_reference_the_build_manifest():
 def test_routes_partition_the_token_counts():
     seen = set()
     for arch, routes in loader.ROUTES.items():
-        assert arch in BLACKWELL
+        assert arch in EVERY
         for route, names in routes.items():
             seen.add((arch, route))
             assert len(names) == len(set(names))
@@ -217,9 +226,13 @@ def test_routes_partition_the_token_counts():
         ("sm_100a", "tp8"),
         ("sm_103a", "tp2"),
         ("sm_103a", "tp4"),
+        ("sm_107a", "tp4"),
     }
     assert not loader.route_available("sm_100a", "tp4") and not loader.route_available(
         "sm_103a", "tp8"
+    )
+    assert not loader.route_available("sm_107a", "tp2") and not loader.route_available(
+        "sm_107a", "tp8"
     )
     assert loader.route_modules("sm_100a", "tp4") == ()
     with pytest.raises(NotImplementedError, match="no exported program"):
@@ -240,6 +253,7 @@ def test_kind_slots_are_the_largest_window_edges():
     for (arch, route), expected in KIND_SLOTS.items():
         assert pkg.kind_slots(arch, route) == expected, (arch, route)
     assert pkg.kind_slots("sm_100a", "tp4") == {}
+    assert pkg.kind_slots("sm_107a", "tp2") == {}
 
 
 def test_launch_grid_follows_the_record_and_the_agreed_capacity(monkeypatch):
@@ -286,6 +300,26 @@ def test_launch_grid_follows_the_record_and_the_agreed_capacity(monkeypatch):
             1,
             1,
         )
+    # a cluster-pair record's grid counts slots, held as for one CTA per slot (its module launches two CTAs per slot)
+    pairs = [
+        record
+        for record in loader.MODULES.values()
+        if record["program"] == "tokown" and record["launch"]["cluster"][0] == 2
+    ]
+    assert sorted((record["world"], tuple(record["arches"])) for record in pairs) == [
+        (4, ("sm_103a",)),
+        (8, ("sm_100a",)),
+    ]
+    for record in pairs:
+        world = int(record["world"])
+        for n_tok, capacity in ((145, 148), (153, 74), (288, 148), (224, 200)):
+            assert loader.launch_grid(
+                record,
+                n_tok,
+                device_index=0,
+                values={"max_ctas": 160},
+                capacity=capacity,
+            ) == (loader.tokown_grid(n_tok, min(capacity, 160), world), 1, 1)
     with pytest.raises(ValueError, match="positive token count"):
         loader.launch_grid(eo, 0, device_index=0, capacity=1)
     monkeypatch.setattr(loader, "cluster_capacity", lambda *args: 12)
@@ -302,6 +336,114 @@ def test_launch_grid_follows_the_record_and_the_agreed_capacity(monkeypatch):
         )
     with pytest.raises(RuntimeError, match="not delivered for sm_107a"):
         loader.library_name(eo["library"], "sm_107a")
+
+
+def test_load_launches_a_cluster_record_at_its_cluster_per_slot(monkeypatch):
+    """``load`` gives a cluster-pair record's module behind its slot grid: the entry launches ``launch.cluster[0]``
+    CTAs per slot of ``launch_grid`` and every other attribute is the library's; every other record's module is the
+    library itself."""
+    calls = []
+
+    class Library:
+        def __getattr__(self, attr):
+            return lambda *args: calls.append((attr, args))
+
+    library = Library()
+    monkeypatch.setattr(cake_build, "load_library", lambda name: library)
+    pairs = 0
+    for name, record in loader.MODULES.items():
+        module = loader.load.__wrapped__(name, record["arches"][0])
+        ctas = record["launch"]["cluster"][0]
+        if record["program"] != "tokown" or ctas == 1:
+            assert module is library, name
+            continue
+        pairs += 1
+        assert ctas == 2, name
+        grid = (loader.tokown_grid(145, 148, int(record["world"])), 1, 1)
+        axes = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
+        args = tuple(
+            axes[key] if kind == "grid" else f"{kind}:{key}"
+            for kind, key in record["arg_plan"]
+        )
+        getattr(module, record["ffi_entry"])(*args)
+        launched = tuple(
+            ctas * value if (kind, key) == ("grid", "grid_x") else value
+            for (kind, key), value in zip(record["arg_plan"], args, strict=True)
+        )
+        assert calls[-1] == (record["ffi_entry"], launched), name
+        assert launched.count(2 * grid[0]) == 1, name
+        getattr(module, record["occupancy_entry"])(0, 256, 1, 1, 2, 1, 1, 1024)
+        assert calls[-1] == (record["occupancy_entry"], (0, 256, 1, 1, 2, 1, 1, 1024))
+    assert pairs == 2
+
+
+def test_selection_table_picks_the_record_of_the_route_scan():
+    """``selected_module`` reads the route's selection table; for every token count it picks the first record of
+    the route whose window admits it (the record the scan over the route picks)."""
+    for arch, routes in loader.ROUTES.items():
+        for route, names in routes.items():
+            assert loader._SELECTION[(arch, route)] is not None, (arch, route)
+            edges = {
+                int(edge)
+                for name in names
+                for window in loader.MODULES[name]["select_rule"]["windows"].get(
+                    arch, ()
+                )
+                for edge in window
+                if edge is not None
+            }
+            counts = set(range(1, 2049)) | {
+                edge + step for edge in edges for step in (-1, 0, 1, 2)
+            }
+            for n_tok in sorted(n for n in counts | {65536, 10**6} if n > 0):
+                scan = next(
+                    name
+                    for name in names
+                    if loader.admits(loader.MODULES[name]["select_rule"], n_tok, arch)
+                )
+                assert loader.selected_module(arch, route, n_tok) == scan, (
+                    arch,
+                    route,
+                    n_tok,
+                )
+
+
+def test_tokown_slots_are_agreed_over_the_one_cta_records():
+    """The slots of the persistent program: min(TOKOWN_MAX_CTAS, capacities of its one-CTA-per-slot records); a
+    cluster-pair record is held to the slots and to its own cluster capacity and never lowers the others'."""
+    for arch, routes in loader.ROUTES.items():
+        for route, names in routes.items():
+            tokown = [n for n in names if loader.MODULES[n]["program"] == "tokown"]
+            single = [
+                n for n in tokown if loader.MODULES[n]["launch"]["cluster"][0] == 1
+            ]
+            pair = [n for n in tokown if n not in single]
+            assert single, (arch, route)
+            assert len(pair) == (
+                1 if (arch, route) in (("sm_100a", "tp8"), ("sm_103a", "tp4")) else 0
+            )
+            for one, two in (
+                (148, 148),
+                (148, 150),
+                (148, 74),
+                (152, 76),
+                (200, 300),
+                (200, 90),
+            ):
+                capacity = {n: (two if n in pair else one) for n in tokown}
+                slots, agreed = cake_backend.tokown_slots(capacity)
+                assert slots == min(160, one)
+                assert {n: agreed[n] for n in single} == dict.fromkeys(single, slots)
+                assert {n: agreed[n] for n in pair} == dict.fromkeys(
+                    pair, min(slots, two)
+                )
+                if not pair or two >= one:
+                    # the rule before the cluster records: every record at min(160, every capacity)
+                    assert agreed == dict.fromkeys(tokown, min(160, *capacity.values()))
+            # one-CTA records of unequal capacities: the smallest
+            capacity = {n: 150 + i for i, n in enumerate(tokown)}
+            slots, agreed = cake_backend.tokown_slots(capacity)
+            assert slots == min(160, *(capacity[n] for n in single))
 
 
 def test_workspace_layout_fill_and_binding_follow_the_rules():

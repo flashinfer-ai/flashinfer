@@ -4,7 +4,6 @@
 from typing import NamedTuple, Optional
 
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.thd import THD_WORK_PREFIX_OFF, THD_WORK_META_WORDS, THD_REMAP_OFF
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.config_sm100 import thd_work_prefix_enabled
 import cutlass
 import cutlass.cute as cute
 from cutlass.base_dsl.typing import Pointer
@@ -64,6 +63,31 @@ def sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv):
             word.store((word.load(alignment=4) & keep_mask) | fill_mask, alignment=4)
         nvvm.fence_proxy("async.shared", space="cta")
         nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
+def sanitize_mxfp8_v_sf_padding_pair(sv_sf, kv_tile_idx, seqlen_kv, peer_cta_id, cta_group: cutlass.Constexpr[int]):
+    """Replace the fully padded V scale blocks in this CTA's slab and, under ``cta_group`` 2, in the peer CTA's slab at
+    the same offset through cluster-mapped loads and stores.
+
+    Called by the leader's MMA warp after its ``mb_v_full`` wait and before the ``tcgen05.cp`` that reads each CTA's
+    slab into that CTA's tensor memory; the peer runs no MMA warp of its own.
+    """
+    sanitize_mxfp8_thd_v_sf_padding(sv_sf, kv_tile_idx, seqlen_kv)
+    if cutlass.const_expr(cta_group == 2):
+        remaining = seqlen_kv - kv_tile_idx * cutlass.Int32(128)
+        valid_blocks = (remaining + cutlass.Int32(31)) // cutlass.Int32(32)
+        if valid_blocks < cutlass.Int32(4):
+            lane = cute.arch.thread_idx()[0] % cutlass.Int32(32)
+            keep_mask = (cutlass.Int32(1) << (valid_blocks * cutlass.Int32(8))) - cutlass.Int32(1)
+            fill_mask = cutlass.Int32(0x7F7F7F7F) & ~keep_mask
+            for row_group in cutlass.range_constexpr(4):
+                byte_offset = lane * cutlass.Int32(16) + cutlass.Int32(row_group * 4)
+                peer_word = nvvm.mapa(sv_sf.base.subview(byte_offset), peer_cta_id).ir_value()
+                old = nvvm.inline_ptx("ld.shared::cluster.b32 $0, [$1];", write_only_types=[cutlass.Int32], read_only_args=[peer_word])
+                nvvm.inline_ptx("st.shared::cluster.b32 [$0], $1;", read_only_args=[peer_word, (old & keep_mask) | fill_mask])
+            nvvm.inline_ptx("fence.proxy.async.shared::cluster;")
+            nvvm.bar_warp_sync(cute.arch.FULL_MASK)
 
 
 class Bars(NamedTuple):
@@ -391,8 +415,13 @@ def make_classic_bars(
     bias_resident: bool = False,
     bias_ring_stages: int = 0,
     bias_ring_empty_arrivers: Optional[int] = None,
+    stages_k: Optional[int] = None,
+    stages_v: Optional[int] = None,
 ) -> Bars:
     """The classic pipeline's barrier set.
+
+    ``stages_k`` / ``stages_v``: the K and V ring depths when a kernel runs them at different depths (the d192
+    half-input cga1 tile: one K stage, two V stages); None (every other caller) = ``CFG.STAGES_KV`` for both.
 
     ``s_stages`` is the S/P TMEM slot ring depth the BMM1-done / BMM2-ready
     handshakes run over: one stage per Q sub-tile on the classic pipeline
@@ -444,6 +473,8 @@ def make_classic_bars(
     KV_EMPTY_ARRIVERS = (CFG.CGA_M // CFG.CTA_MMA) + CFG.CGA_N - 1
     N_BMM2_CHUNKS = CFG.N_BMM2_CHUNKS
     N_S = CFG.TILES_Q if s_stages is None else int(s_stages)
+    STAGES_K = CFG.STAGES_KV if stages_k is None else int(stages_k)
+    STAGES_V = CFG.STAGES_KV if stages_v is None else int(stages_v)
 
     def _alloc(n):
         return cutlass.Array(cutlass.Int64, n, alignment=16, space=cutlass.AddressSpace.smem)
@@ -452,11 +483,11 @@ def make_classic_bars(
         # q_full_arrivers > 1: besides the leader's expect_tx arrive, each peer CTA's TMA-LDG warp arrives once
         # after filling its own SF_Q tile by hand (the MXFP8 PackGQA gather, sm100/prefill_d128_mxfp8.py).
         mb_q_full=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE + q_full_arrivers - 1, producer=Producer.TMA_LOAD),
-        mb_k_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
-        mb_v_full=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_k_full=MBarrier(_alloc(STAGES_K), stages=STAGES_K, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
+        mb_v_full=MBarrier(_alloc(STAGES_V), stages=STAGES_V, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_q_empty=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        mb_k_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
-        mb_v_empty=MBarrier(_alloc(CFG.STAGES_KV), stages=CFG.STAGES_KV, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_k_empty=MBarrier(_alloc(STAGES_K), stages=STAGES_K, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
+        mb_v_empty=MBarrier(_alloc(STAGES_V), stages=STAGES_V, init_count=KV_EMPTY_ARRIVERS, producer=Producer.MMA_COMMIT),
         mb_bmm1_done=MBarrier(_alloc(N_S), stages=N_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_done=MBarrier(_alloc(CFG.TILES_Q), stages=CFG.TILES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_bmm2_ready=MBarrier(
@@ -995,8 +1026,15 @@ def make_sdpa_helpers(
     lpt_head_group: int = 1,
     lpt_q_tiles: int = 0,
     kv_shared_cluster: bool = False,
+    bounded_thd_decode: bool = False,
 ) -> SdpaHelpers:
     """Decode / bounds / THD closures for a flavor.
+
+    ``bounded_thd_decode`` uses the device-sorted batch remap to locate a live
+    THD work item without scanning later sequences. Equal endpoint tile counts
+    admit direct indexing, including unequal lengths in the same tile bucket.
+    Callers opt in after qualifying their geometry; other flavors keep the
+    original decoder. Neither path reads sequence lengths on the host.
 
     ``kv_shared_cluster`` (default False = every existing kernel's trace, byte for byte): the
     CLUSTER-UNION geometry of the d512 2x2-datapath kernel, whose CGA_M CTAs each own their
@@ -1251,22 +1289,39 @@ def make_sdpa_helpers(
             q_len = cutlass.Int32(meta[n_batch + b + 1]) - cutlass.Int32(meta[n_batch + b])
             cb = (q_len + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
             if local < cb * n_qh:
+                # Policies reorder the SAME live THD work list; they never decode
+                # the padded rectangular cache-shape envelope. NATURAL retains
+                # head-major ascending rows. LPT visits the heavier causal rows
+                # across all heads first; LPT_L2 keeps a KV-sharing head group
+                # together while reversing its rows. Other flavors retain their
+                # head-major THD order until their policy contracts are validated.
                 head = local // cb
                 row = local % cb
-                if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
-                    head = local % n_qh
-                    row = cb - 1 - local // n_qh
-                elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
-                    group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
-                    head = (local // (cb * group)) * group + local % group
-                    row = cb - 1 - (local // group) % cb
+                if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (64, 128, 256)):
+                    if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
+                        head = local % n_qh
+                        row = cb - 1 - local // n_qh
+                    elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
+                        group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
+                        head = (local // (cb * group)) * group + local % group
+                        row = cb - 1 - (local // group) % cb
                 f_batch, f_head, f_qc = b, head, row
         return f_qc * cutlass.Int32(_q_supers_per_cluster) + cta_in_pair, f_head, f_batch + split * n_batch
 
     @cute.jit
     def _thd_decode(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
-        if cutlass.const_expr(thd_work_prefix_enabled(CFG)):
-            return _thd_decode_prefix(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+        """Unit id -> (q_super, head, batch [+ split * n_batch]) for every THD flavor.
+
+        Through the remap-ordered work prefix the setup launch publishes
+        (``write_thd_work_prefix``; ``THD_WORK_PREFIX_OFF``): a binary search over
+        B + 1 words. Dead units (uid past the live total) keep
+        ``batch == n_batch``: in-bounds metadata reads make every downstream
+        consumer a no-op (empty KV range, no O/LSE writes).
+        """
+        return _thd_decode_prefix(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+
+    @cute.jit
+    def _thd_decode_bounded(linear_cta, seq_kv_lens_t, n_batch, n_qh, cta_in_pair):
         u = linear_cta // cutlass.Int32(CFG.CGA_M)
         split = cutlass.Int32(0)
         if cutlass.const_expr(getattr(CFG, "SPLIT_KV", 1) > 1):
@@ -1287,50 +1342,69 @@ def make_sdpa_helpers(
         f_batch = n_batch
         f_head = cutlass.Int32(0)
         f_qc = cutlass.Int32(0)
+        found_cb = cutlass.Int32(1)
+        found_local = cutlass.Int32(0)
         done = cutlass.Int32(0)
-        # Sequences are visited LONGEST FIRST through batch_remap (built by the
-        # THD setup launch), so the ragged tail of the grid is short sequences.
         remap0 = cutlass.Int32(3) * n_batch + cutlass.Int32(2)
-        for i in cutlass.range(0, n_batch, 1, unroll=1):
+        search = cutlass.Int32(1)
+        # batch_remap is sorted by decreasing Q length. Rounding length to
+        # tile count is monotone, so equal endpoint counts prove that EVERY
+        # batch has the same count, including unequal lengths in one bucket.
+        # All observations are current device metadata; no host promise.
+        if n_batch > cutlass.Int32(0):
+            first_b = cutlass.Int32(cu[remap0])
+            last_b = cutlass.Int32(cu[remap0 + n_batch - cutlass.Int32(1)])
+            first_s = cutlass.Int32(cu[cuq0 + first_b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + first_b])
+            last_s = cutlass.Int32(cu[cuq0 + last_b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + last_b])
+            first_cb = (first_s + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            last_cb = (last_s + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
+            if first_cb == last_cb:
+                search = cutlass.Int32(0)
+                if first_cb > cutlass.Int32(0):
+                    per_batch = first_cb * n_qh
+                    ordinal = u // per_batch
+                    if ordinal < n_batch:
+                        f_batch = cutlass.Int32(cu[remap0 + ordinal])
+                        found_cb = first_cb
+                        found_local = u % per_batch
+                        done = cutlass.Int32(1)
+        i = cutlass.Int32(0)
+        # Preserve longest-first remapping and the DEAD-unit sentinel. Empty
+        # batches consume zero work. No host knowledge of lengths is needed.
+        while (i < n_batch) & (done == cutlass.Int32(0)) & (search != cutlass.Int32(0)):
             b = cutlass.Int32(cu[remap0 + i])
             s_i = cutlass.Int32(cu[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(cu[cuq0 + b])
             cb = (s_i + cutlass.Int32(thd_token_tile_m - 1)) // cutlass.Int32(thd_token_tile_m)
             units_b = cb * n_qh
-            # A zero-length sequence gives cb == 0, and units_b == 0 with it, so
-            # in_rng is false and the quotient is discarded — but arith.select
-            # evaluates BOTH arms, so divide by a clamped copy to keep the dead
-            # arm defined. units_b keeps the true cb (thd_decode_unit's tb_nz).
-            cb_nz = cute.math.max(cb, cutlass.Int32(1))
-            in_rng = (done == cutlass.Int32(0)) & (u < acc + units_b)
-            local = u - acc
-            # Policies reorder the SAME live THD work list; they never decode
-            # the padded rectangular cache-shape envelope. NATURAL retains
-            # head-major ascending rows. LPT visits the heavier causal rows
-            # across all heads first; LPT_L2 keeps a KV-sharing head group
-            # together while reversing its rows. Other flavors retain their
-            # existing THD order until their policy contracts are validated.
-            head = local // cb_nz
-            row = local % cb_nz
+            if u < acc + units_b:
+                f_batch = b
+                found_cb = cb
+                found_local = u - acc
+                done = cutlass.Int32(1)
+            acc = acc + units_b
+            i = i + cutlass.Int32(1)
+        # Quotient/remainder decoding is needed only for the matching batch.
+        # cb is positive here; keep head/row zero for an unclaimed work unit.
+        if done != cutlass.Int32(0):
+            f_head = found_local // found_cb
+            f_qc = found_local % found_cb
             if cutlass.const_expr(CFG.DTYPE_QKV in (2, 3) and CFG.TILE_K in (64, 128, 256)):
                 if cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT):
-                    head = local % n_qh
-                    row = cb - cutlass.Int32(1) - local // n_qh
+                    f_head = found_local % n_qh
+                    f_qc = found_cb - cutlass.Int32(1) - found_local // n_qh
                 elif cutlass.const_expr(CFG.SCHEDULER_POLICY == SCHED_LPT_L2):
                     group = cutlass.Int32(_packed_heads_per_kv if CFG.PACK_GQA else CFG.QH_PER_KH)
-                    head = (local // (cb_nz * group)) * group + local % group
-                    row = cb - cutlass.Int32(1) - (local // group) % cb_nz
-            f_batch = cutlass.Int32(arith.select(in_rng.ir_value(), b.ir_value(), f_batch.ir_value()))
-            f_head = cutlass.Int32(arith.select(in_rng.ir_value(), head.ir_value(), f_head.ir_value()))
-            f_qc = cutlass.Int32(arith.select(in_rng.ir_value(), row.ir_value(), f_qc.ir_value()))
-            done = cutlass.Int32(arith.select(in_rng.ir_value(), cutlass.Int32(1).ir_value(), done.ir_value()))
-            acc = acc + units_b
+                    f_head = (found_local // (found_cb * group)) * group + found_local % group
+                    f_qc = found_cb - cutlass.Int32(1) - (found_local // group) % found_cb
         q_super = f_qc * cutlass.Int32(_q_supers_per_cluster) + cta_in_pair
         return q_super, f_head, f_batch + split * n_batch
+
+    _thd_decode_impl = _thd_decode_bounded if bounded_thd_decode else _thd_decode
 
     @cute.jit
     def _dispatch_decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
-            return _thd_decode(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+            return _thd_decode_impl(bidx, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         if cutlass.const_expr(CFG.PACK_GQA):
             qh_per_kh = cutlass.Int32(_packed_heads_per_kv)
         return _decode_initial(bidx, bidy, bidz, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
@@ -1338,7 +1412,7 @@ def make_sdpa_helpers(
     @cute.jit
     def _dispatch_decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, seq_kv_lens_t, qh_per_kh=None, seqlen_kv=None):
         if cutlass.const_expr(_thd_on):
-            return _thd_decode(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
+            return _thd_decode_impl(t0, seq_kv_lens_t, n_batch, n_qh, cta_in_pair)
         if cutlass.const_expr(CFG.PACK_GQA):
             qh_per_kh = cutlass.Int32(_packed_heads_per_kv)
         return _decode_payload(t0, t1, cta_in_pair, n_q_supers, n_qh, n_batch, qh_per_kh, seqlen_kv)
@@ -1375,7 +1449,7 @@ def make_sdpa_helpers(
         bounds_for_tile_qtrim=_bounds_for_tile_qtrim,
         resolve_seqlen_kv=_resolve_seqlen_kv,
         resolve_seqlen_q=_resolve_seqlen_q,
-        thd_decode=_thd_decode,
+        thd_decode=_thd_decode_impl,
         dispatch_decode_initial=_dispatch_decode_initial,
         dispatch_decode_payload=_dispatch_decode_payload,
         thd_tma_offsets=_thd_tma_offsets,
@@ -1657,7 +1731,6 @@ def sdpa_operand_tensors(
     n_pages=0,
     o_pack=1,
     table_v_strides=None,
-    work_prefix=False,
 ) -> SdpaOperandTensors:
     """Pointer + stride prologue shared by every SM100 / SM107 prefill host (called while the
     host traces, so the branches below are static).
@@ -1691,8 +1764,8 @@ def sdpa_operand_tensors(
         lse = cute.make_tensor(lse_ptr, cute.make_layout((split_kv if packed_split else B * split_kv, QH, SQ), stride=(l0, l1, l2)))
     sinks = _vec(sinks_ptr, QH)
     if thd:
-        # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr] and (B + 3) O/K/V descriptor slots
-        meta = _vec(meta_ptr, THD_WORK_META_WORDS(B) if work_prefix else 4 * B + 4)
+        # [seq_kv(B) | cu_q(B+1) | cu_k(B+1) | remap(B) | live | ctr | unit prefix(B+1)] and (B + 3) O/K/V descriptor slots
+        meta = _vec(meta_ptr, THD_WORK_META_WORDS(B))
         o_desc = _vec(o_desc_ptr, (B + 3) * tensor_map_qwords)
         q_lens = None if thd_q_lens_ptr is None else _vec(thd_q_lens_ptr, B + (thd_lens_form & 1))
         kv_lens = None if thd_kv_lens_ptr is None else _vec(thd_kv_lens_ptr, B + ((thd_lens_form >> 1) & 1))

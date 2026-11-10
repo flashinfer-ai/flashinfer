@@ -40,8 +40,8 @@ def _supported_device():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
-    if major not in (9, 10, 12):
-        pytest.skip("GDN prefill requires SM90, SM100, or SM12x")
+    if major not in (8, 9, 10, 12):
+        pytest.skip("GDN prefill requires SM8x, SM90, SM100, or SM12x")
     if major == 10 and int(torch.version.cuda.split(".")[0]) < 13:
         pytest.skip("SM100 GDN prefill requires CUDA 13+")
     if not is_cute_dsl_arch_supported(major, minor):
@@ -58,7 +58,7 @@ def _normalize_reference(x):
 @pytest.mark.parametrize(
     "capability,cuda_version,dsl_available",
     [
-        pytest.param((8, 0), "13.0", True, id="unsupported-gdn-arch"),
+        pytest.param((7, 5), "13.0", True, id="unsupported-gdn-arch"),
         pytest.param((10, 0), "12.8", True, id="unsupported-cuda-version"),
         pytest.param((9, 0), "13.0", False, id="unavailable-cute-dsl"),
     ],

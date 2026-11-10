@@ -588,7 +588,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
-                                :: "r"(clc_empty_addr + load_clc_stage * 8), "r"(0) : "memory");
+                                :: "r"(clc_empty_addr + (load_clc_stage) * 8), "r"(0) : "memory");
                             load_clc_stage += 1;
                             if (load_clc_stage == 2) { load_clc_stage = 0; _phase_clc_full ^= 1; }
                             load_valid = _clc_valid_1;
@@ -700,7 +700,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
-                                :: "r"(clc_empty_addr + load_clc_stage * 8), "r"(0) : "memory");
+                                :: "r"(clc_empty_addr + (load_clc_stage) * 8), "r"(0) : "memory");
                             load_clc_stage += 1;
                             if (load_clc_stage == 2) { load_clc_stage = 0; _phase_clc_full ^= 1; }
                             load_valid = _clc_valid_2;
@@ -906,7 +906,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
-                                :: "r"(clc_empty_addr + mma_clc_stage * 8), "r"(0) : "memory");
+                                :: "r"(clc_empty_addr + (mma_clc_stage) * 8), "r"(0) : "memory");
                             mma_clc_stage += 1;
                             if (mma_clc_stage == 2) { mma_clc_stage = 0; _phase_clc_full_1 ^= 1; }
                             mma_valid = _clc_valid_3;
@@ -916,7 +916,8 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                     last_stage = mma_stage;
                     if (cta_rank == 0) {
                         elect_commit_cg2_local(klast_done_addr);
-                        mbarrier_wait(klast_done_addr, completed & 1);
+                        int _parity_klast_done = (int)((unsigned int)(int)completed % 2);
+                        mbarrier_wait(klast_done_addr, _parity_klast_done);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
                     #pragma unroll 1
@@ -1078,7 +1079,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             if (hs_1 >= 5) {
                                 hs_1 = hs_1 - 5;
                             }
-                            elect_commit_cg2_multicast(tma_empty_addr + (hs_1) * 8, (uint16_t)(3));
+                            elect_commit_cg2_multicast(tma_empty_addr + (((mma_stage + (4 + rank_chunk_4) >= 5) ? mma_stage + (4 + rank_chunk_4) - 5 : mma_stage + (4 + rank_chunk_4))) * 8, (uint16_t)(3));
                         }
                     }
                 } else {
@@ -1211,7 +1212,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
-                                :: "r"(clc_empty_addr + mma_clc_stage * 8), "r"(0) : "memory");
+                                :: "r"(clc_empty_addr + (mma_clc_stage) * 8), "r"(0) : "memory");
                             mma_clc_stage += 1;
                             if (mma_clc_stage == 2) { mma_clc_stage = 0; _phase_clc_full_1 ^= 1; }
                             mma_valid = _clc_valid_4;
@@ -1221,7 +1222,8 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                     last_stage = mma_stage;
                     if (cta_rank == 0) {
                         elect_commit_cg2_local(klast_done_addr);
-                        mbarrier_wait(klast_done_addr, completed & 1);
+                        int _parity_klast_done_1 = (int)((unsigned int)(int)completed % 2);
+                        mbarrier_wait(klast_done_addr, _parity_klast_done_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
                     #pragma unroll 1
@@ -1383,14 +1385,14 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             if (hs_3 >= 5) {
                                 hs_3 = hs_3 - 5;
                             }
-                            elect_commit_cg2_multicast(tma_empty_addr + (hs_3) * 8, (uint16_t)(3));
+                            elect_commit_cg2_multicast(tma_empty_addr + (((mma_stage + (4 + rank_chunk_7) >= 5) ? mma_stage + (4 + rank_chunk_7) - 5 : mma_stage + (4 + rank_chunk_7))) * 8, (uint16_t)(3));
                         }
                     }
                 }
                 _phase_acc_empty ^= 1;
                 accf_stage += 1;
                 if (accf_stage == 2) { accf_stage = 0; }
-                completed = completed + 1;
+                completed += 1;
                 if (mma_valid == 0) {
                     break;
                 }
@@ -1452,7 +1454,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(clc_full_addr + sched_clc_stage * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(clc_full_addr + (sched_clc_stage) * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
                     }
                     if (elect_sync()) {
                         asm volatile(
@@ -1483,7 +1485,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(clc_empty_addr + sched_clc_stage * 8), "r"(0) : "memory");
+                        :: "r"(clc_empty_addr + (sched_clc_stage) * 8), "r"(0) : "memory");
                     sched_clc_stage += 1;
                     if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_2 ^= 1; }
                     if (_clc_valid_0 == 0) {
@@ -1556,7 +1558,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + epi_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (epi_clc_stage) * 8), "r"(0) : "memory");
                 epi_clc_stage += 1;
                 if (epi_clc_stage == 2) { epi_clc_stage = 0; _phase_clc_full_3 ^= 1; }
                 int unit_i_2 = (int)unit_e;
@@ -1684,15 +1686,35 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             if (v8_col < N) {
                                 int v8_idx = v8_row * N + v8_col;
                                 if (out_hinted != 0) {
-                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx + (0)), "r"(result_bf16[(0) + 0]), "r"(result_bf16[(0) + 1]), "r"(result_bf16[(0) + 2]), "r"(result_bf16[(0) + 3]), "r"(result_bf16[(0) + 4]), "r"(result_bf16[(0) + 5]), "r"(result_bf16[(0) + 6]), "r"(result_bf16[(0) + 7]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 16) + (0)), "r"(result_bf16[(8) + 0]), "r"(result_bf16[(8) + 1]), "r"(result_bf16[(8) + 2]), "r"(result_bf16[(8) + 3]), "r"(result_bf16[(8) + 4]), "r"(result_bf16[(8) + 5]), "r"(result_bf16[(8) + 6]), "r"(result_bf16[(8) + 7]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 32) + (0)), "r"(result_bf16[(16) + 0]), "r"(result_bf16[(16) + 1]), "r"(result_bf16[(16) + 2]), "r"(result_bf16[(16) + 3]), "r"(result_bf16[(16) + 4]), "r"(result_bf16[(16) + 5]), "r"(result_bf16[(16) + 6]), "r"(result_bf16[(16) + 7]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 48) + (0)), "r"(result_bf16[(24) + 0]), "r"(result_bf16[(24) + 1]), "r"(result_bf16[(24) + 2]), "r"(result_bf16[(24) + 3]), "r"(result_bf16[(24) + 4]), "r"(result_bf16[(24) + 5]), "r"(result_bf16[(24) + 6]), "r"(result_bf16[(24) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx), "r"(result_bf16[(0) + 0]), "r"(result_bf16[(0) + 1]), "r"(result_bf16[(0) + 2]), "r"(result_bf16[(0) + 3]), "r"(result_bf16[(0) + 4]), "r"(result_bf16[(0) + 5]), "r"(result_bf16[(0) + 6]), "r"(result_bf16[(0) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 16)), "r"(result_bf16[(8) + 0]), "r"(result_bf16[(8) + 1]), "r"(result_bf16[(8) + 2]), "r"(result_bf16[(8) + 3]), "r"(result_bf16[(8) + 4]), "r"(result_bf16[(8) + 5]), "r"(result_bf16[(8) + 6]), "r"(result_bf16[(8) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 32)), "r"(result_bf16[(16) + 0]), "r"(result_bf16[(16) + 1]), "r"(result_bf16[(16) + 2]), "r"(result_bf16[(16) + 3]), "r"(result_bf16[(16) + 4]), "r"(result_bf16[(16) + 5]), "r"(result_bf16[(16) + 6]), "r"(result_bf16[(16) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 48)), "r"(result_bf16[(24) + 0]), "r"(result_bf16[(24) + 1]), "r"(result_bf16[(24) + 2]), "r"(result_bf16[(24) + 3]), "r"(result_bf16[(24) + 4]), "r"(result_bf16[(24) + 5]), "r"(result_bf16[(24) + 6]), "r"(result_bf16[(24) + 7]) : "memory");
                                 } else {
-                                    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx + (0)), "r"(result_bf16[(0) + 0]), "r"(result_bf16[(0) + 1]), "r"(result_bf16[(0) + 2]), "r"(result_bf16[(0) + 3]), "r"(result_bf16[(0) + 4]), "r"(result_bf16[(0) + 5]), "r"(result_bf16[(0) + 6]), "r"(result_bf16[(0) + 7]) : "memory");
-                                    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 16) + (0)), "r"(result_bf16[(8) + 0]), "r"(result_bf16[(8) + 1]), "r"(result_bf16[(8) + 2]), "r"(result_bf16[(8) + 3]), "r"(result_bf16[(8) + 4]), "r"(result_bf16[(8) + 5]), "r"(result_bf16[(8) + 6]), "r"(result_bf16[(8) + 7]) : "memory");
-                                    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 32) + (0)), "r"(result_bf16[(16) + 0]), "r"(result_bf16[(16) + 1]), "r"(result_bf16[(16) + 2]), "r"(result_bf16[(16) + 3]), "r"(result_bf16[(16) + 4]), "r"(result_bf16[(16) + 5]), "r"(result_bf16[(16) + 6]), "r"(result_bf16[(16) + 7]) : "memory");
-                                    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx + 48) + (0)), "r"(result_bf16[(24) + 0]), "r"(result_bf16[(24) + 1]), "r"(result_bf16[(24) + 2]), "r"(result_bf16[(24) + 3]), "r"(result_bf16[(24) + 4]), "r"(result_bf16[(24) + 5]), "r"(result_bf16[(24) + 6]), "r"(result_bf16[(24) + 7]) : "memory");
+                                    {
+                                        const unsigned* _raw_stv8_2 = reinterpret_cast<const unsigned*>(result_bf16);
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(out_ptr + v8_idx)), "r"(_raw_stv8_2[0]), "r"(_raw_stv8_2[1]), "r"(_raw_stv8_2[2]), "r"(_raw_stv8_2[3]), "r"(_raw_stv8_2[4]), "r"(_raw_stv8_2[5]), "r"(_raw_stv8_2[6]), "r"(_raw_stv8_2[7]) : "memory");
+                                    }
+                                    {
+                                        const unsigned* _raw_stv8_3 = reinterpret_cast<const unsigned*>(result_bf16 + (8));
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(out_ptr + (v8_idx + 16))), "r"(_raw_stv8_3[0]), "r"(_raw_stv8_3[1]), "r"(_raw_stv8_3[2]), "r"(_raw_stv8_3[3]), "r"(_raw_stv8_3[4]), "r"(_raw_stv8_3[5]), "r"(_raw_stv8_3[6]), "r"(_raw_stv8_3[7]) : "memory");
+                                    }
+                                    {
+                                        const unsigned* _raw_stv8_4 = reinterpret_cast<const unsigned*>(result_bf16 + (16));
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(out_ptr + (v8_idx + 32))), "r"(_raw_stv8_4[0]), "r"(_raw_stv8_4[1]), "r"(_raw_stv8_4[2]), "r"(_raw_stv8_4[3]), "r"(_raw_stv8_4[4]), "r"(_raw_stv8_4[5]), "r"(_raw_stv8_4[6]), "r"(_raw_stv8_4[7]) : "memory");
+                                    }
+                                    {
+                                        const unsigned* _raw_stv8_5 = reinterpret_cast<const unsigned*>(result_bf16 + (24));
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(out_ptr + (v8_idx + 48))), "r"(_raw_stv8_5[0]), "r"(_raw_stv8_5[1]), "r"(_raw_stv8_5[2]), "r"(_raw_stv8_5[3]), "r"(_raw_stv8_5[4]), "r"(_raw_stv8_5[5]), "r"(_raw_stv8_5[6]), "r"(_raw_stv8_5[7]) : "memory");
+                                    }
                                 }
                             }
                         }
@@ -1748,8 +1770,8 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                     int w_idx_3 = u_tile_2 / (unsigned int)tok_tiles;
                     int tok_idx_4 = u_tile_2 - (unsigned int)(w_idx_3 * tok_tiles);
                     if (raster_group != 0) {
-                        int _min_2_2 = ((raster_group) < (tok_tiles - (int)(u_tile_2 / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(u_tile_2 / (unsigned int)(raster_group * w_tiles)) * raster_group));
-                        w_idx_3 = (u_tile_2 - u_tile_2 / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_2_2;
+                        int _min_6 = ((raster_group) < (tok_tiles - (int)(u_tile_2 / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(u_tile_2 / (unsigned int)(raster_group * w_tiles)) * raster_group));
+                        w_idx_3 = (u_tile_2 - u_tile_2 / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_6;
                         int _min_5 = ((raster_group) < (tok_tiles - (int)(u_tile_2 / (unsigned int)(raster_group * w_tiles)) * raster_group) ? (raster_group) : (tok_tiles - (int)(u_tile_2 / (unsigned int)(raster_group * w_tiles)) * raster_group));
                         tok_idx_4 = u_tile_2 / (unsigned int)(raster_group * w_tiles) * (unsigned int)raster_group + (u_tile_2 - u_tile_2 / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) - (u_tile_2 - u_tile_2 / (unsigned int)(raster_group * w_tiles) * (unsigned int)(raster_group * w_tiles)) / (unsigned int)_min_5 * (unsigned int)_min_5;
                     }
@@ -1764,9 +1786,9 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             if (bias_col_1 < N) {
                                 unsigned int _vec_load_1[2];
                                 {
-                                    uint32_t _bf16x2_bits_3;
-                                    _bf16x2_bits_3 = *reinterpret_cast<const uint32_t*>(bias + bias_col_1);
-                                    _vec_load_1[0] = _bf16x2_bits_3;
+                                    uint32_t _bf16x2_bits_7;
+                                    _bf16x2_bits_7 = *reinterpret_cast<const uint32_t*>(bias + bias_col_1);
+                                    _vec_load_1[0] = _bf16x2_bits_7;
                                 }
                                 staged_bias_pair_1 = _vec_load_1[0];
                             }
@@ -1858,15 +1880,35 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             if (v8_col_1 < N) {
                                 int v8_idx_1 = v8_row_1 * N + v8_col_1;
                                 if (out_hinted != 0) {
-                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx_1 + (0)), "r"(result_bf16_1[(0) + 0]), "r"(result_bf16_1[(0) + 1]), "r"(result_bf16_1[(0) + 2]), "r"(result_bf16_1[(0) + 3]), "r"(result_bf16_1[(0) + 4]), "r"(result_bf16_1[(0) + 5]), "r"(result_bf16_1[(0) + 6]), "r"(result_bf16_1[(0) + 7]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 16) + (0)), "r"(result_bf16_1[(8) + 0]), "r"(result_bf16_1[(8) + 1]), "r"(result_bf16_1[(8) + 2]), "r"(result_bf16_1[(8) + 3]), "r"(result_bf16_1[(8) + 4]), "r"(result_bf16_1[(8) + 5]), "r"(result_bf16_1[(8) + 6]), "r"(result_bf16_1[(8) + 7]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 32) + (0)), "r"(result_bf16_1[(16) + 0]), "r"(result_bf16_1[(16) + 1]), "r"(result_bf16_1[(16) + 2]), "r"(result_bf16_1[(16) + 3]), "r"(result_bf16_1[(16) + 4]), "r"(result_bf16_1[(16) + 5]), "r"(result_bf16_1[(16) + 6]), "r"(result_bf16_1[(16) + 7]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 48) + (0)), "r"(result_bf16_1[(24) + 0]), "r"(result_bf16_1[(24) + 1]), "r"(result_bf16_1[(24) + 2]), "r"(result_bf16_1[(24) + 3]), "r"(result_bf16_1[(24) + 4]), "r"(result_bf16_1[(24) + 5]), "r"(result_bf16_1[(24) + 6]), "r"(result_bf16_1[(24) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx_1), "r"(result_bf16_1[(0) + 0]), "r"(result_bf16_1[(0) + 1]), "r"(result_bf16_1[(0) + 2]), "r"(result_bf16_1[(0) + 3]), "r"(result_bf16_1[(0) + 4]), "r"(result_bf16_1[(0) + 5]), "r"(result_bf16_1[(0) + 6]), "r"(result_bf16_1[(0) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 16)), "r"(result_bf16_1[(8) + 0]), "r"(result_bf16_1[(8) + 1]), "r"(result_bf16_1[(8) + 2]), "r"(result_bf16_1[(8) + 3]), "r"(result_bf16_1[(8) + 4]), "r"(result_bf16_1[(8) + 5]), "r"(result_bf16_1[(8) + 6]), "r"(result_bf16_1[(8) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 32)), "r"(result_bf16_1[(16) + 0]), "r"(result_bf16_1[(16) + 1]), "r"(result_bf16_1[(16) + 2]), "r"(result_bf16_1[(16) + 3]), "r"(result_bf16_1[(16) + 4]), "r"(result_bf16_1[(16) + 5]), "r"(result_bf16_1[(16) + 6]), "r"(result_bf16_1[(16) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 48)), "r"(result_bf16_1[(24) + 0]), "r"(result_bf16_1[(24) + 1]), "r"(result_bf16_1[(24) + 2]), "r"(result_bf16_1[(24) + 3]), "r"(result_bf16_1[(24) + 4]), "r"(result_bf16_1[(24) + 5]), "r"(result_bf16_1[(24) + 6]), "r"(result_bf16_1[(24) + 7]) : "memory");
                                 } else {
-                                    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + v8_idx_1 + (0)), "r"(result_bf16_1[(0) + 0]), "r"(result_bf16_1[(0) + 1]), "r"(result_bf16_1[(0) + 2]), "r"(result_bf16_1[(0) + 3]), "r"(result_bf16_1[(0) + 4]), "r"(result_bf16_1[(0) + 5]), "r"(result_bf16_1[(0) + 6]), "r"(result_bf16_1[(0) + 7]) : "memory");
-                                    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 16) + (0)), "r"(result_bf16_1[(8) + 0]), "r"(result_bf16_1[(8) + 1]), "r"(result_bf16_1[(8) + 2]), "r"(result_bf16_1[(8) + 3]), "r"(result_bf16_1[(8) + 4]), "r"(result_bf16_1[(8) + 5]), "r"(result_bf16_1[(8) + 6]), "r"(result_bf16_1[(8) + 7]) : "memory");
-                                    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 32) + (0)), "r"(result_bf16_1[(16) + 0]), "r"(result_bf16_1[(16) + 1]), "r"(result_bf16_1[(16) + 2]), "r"(result_bf16_1[(16) + 3]), "r"(result_bf16_1[(16) + 4]), "r"(result_bf16_1[(16) + 5]), "r"(result_bf16_1[(16) + 6]), "r"(result_bf16_1[(16) + 7]) : "memory");
-                                    asm volatile("st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(out_ptr + (v8_idx_1 + 48) + (0)), "r"(result_bf16_1[(24) + 0]), "r"(result_bf16_1[(24) + 1]), "r"(result_bf16_1[(24) + 2]), "r"(result_bf16_1[(24) + 3]), "r"(result_bf16_1[(24) + 4]), "r"(result_bf16_1[(24) + 5]), "r"(result_bf16_1[(24) + 6]), "r"(result_bf16_1[(24) + 7]) : "memory");
+                                    {
+                                        const unsigned* _raw_stv8_8 = reinterpret_cast<const unsigned*>(result_bf16_1);
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(out_ptr + v8_idx_1)), "r"(_raw_stv8_8[0]), "r"(_raw_stv8_8[1]), "r"(_raw_stv8_8[2]), "r"(_raw_stv8_8[3]), "r"(_raw_stv8_8[4]), "r"(_raw_stv8_8[5]), "r"(_raw_stv8_8[6]), "r"(_raw_stv8_8[7]) : "memory");
+                                    }
+                                    {
+                                        const unsigned* _raw_stv8_9 = reinterpret_cast<const unsigned*>(result_bf16_1 + (8));
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(out_ptr + (v8_idx_1 + 16))), "r"(_raw_stv8_9[0]), "r"(_raw_stv8_9[1]), "r"(_raw_stv8_9[2]), "r"(_raw_stv8_9[3]), "r"(_raw_stv8_9[4]), "r"(_raw_stv8_9[5]), "r"(_raw_stv8_9[6]), "r"(_raw_stv8_9[7]) : "memory");
+                                    }
+                                    {
+                                        const unsigned* _raw_stv8_10 = reinterpret_cast<const unsigned*>(result_bf16_1 + (16));
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(out_ptr + (v8_idx_1 + 32))), "r"(_raw_stv8_10[0]), "r"(_raw_stv8_10[1]), "r"(_raw_stv8_10[2]), "r"(_raw_stv8_10[3]), "r"(_raw_stv8_10[4]), "r"(_raw_stv8_10[5]), "r"(_raw_stv8_10[6]), "r"(_raw_stv8_10[7]) : "memory");
+                                    }
+                                    {
+                                        const unsigned* _raw_stv8_11 = reinterpret_cast<const unsigned*>(result_bf16_1 + (24));
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(out_ptr + (v8_idx_1 + 48))), "r"(_raw_stv8_11[0]), "r"(_raw_stv8_11[1]), "r"(_raw_stv8_11[2]), "r"(_raw_stv8_11[3]), "r"(_raw_stv8_11[4]), "r"(_raw_stv8_11[5]), "r"(_raw_stv8_11[6]), "r"(_raw_stv8_11[7]) : "memory");
+                                    }
                                 }
                             }
                         }

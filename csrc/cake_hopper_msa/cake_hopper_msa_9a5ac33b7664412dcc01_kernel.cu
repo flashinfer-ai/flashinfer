@@ -14,37 +14,19 @@
  * limitations under the License.
  */
 
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long uint64_t;
+#include "cake_hopper_msa_device.h"
+
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags set the knob values below (a knob without a -D flag is a compile error) and name
+// the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel).
+//   CAKE_GROUP  query heads per KV head (the route's g<G>); selects the literal table below
+#ifndef CAKE_GROUP
+#error "CAKE_GROUP must come from the record's compile_flags"
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int int32_t;
-typedef short int int16_t;
-struct __align__(64) CakeTensorMap64 {
-  uint64_t opaque[16];
-};
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
-#include <cuda.h>
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL (the program's kernel symbol) must come from the record's compile_flags"
 #endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_KV8_OFF 1024
 #define SMEM_KV8_STAGE_BYTES 16384
@@ -71,6 +53,13 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_HDR_STAGE_BYTES 32
 #define SMEM_HDR_STRIDE 32
 #define SMEM_META_PG_OFF 140864
+#if CAKE_GROUP == 16
+#define CAKE_WG_TOKENS_M1 3
+#define CAKE_LOG2_GROUP 4
+#define CAKE_WG_TOKENS 4
+#define CAKE_TILE_TOKENS 8
+#define CAKE_WG_MASK 15
+#define CAKE_META_ENTRIES 128
 #define SMEM_META_PG_STAGE_BYTES 512
 #define SMEM_META_PG_STRIDE 512
 #define SMEM_META_BLK_OFF 141376
@@ -80,95 +69,31 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_META_MASK_STAGE_BYTES 1024
 #define SMEM_META_MASK_STRIDE 1024
 #define SMEM_TOTAL 142976
+#elif CAKE_GROUP == 8
+#define CAKE_WG_TOKENS_M1 7
+#define CAKE_LOG2_GROUP 3
+#define CAKE_WG_TOKENS 8
+#define CAKE_TILE_TOKENS 16
+#define CAKE_WG_MASK 255
+#define CAKE_META_ENTRIES 256
+#define SMEM_META_PG_STAGE_BYTES 1024
+#define SMEM_META_PG_STRIDE 1024
+#define SMEM_META_BLK_OFF 141888
+#define SMEM_META_BLK_STAGE_BYTES 1024
+#define SMEM_META_BLK_STRIDE 1024
+#define SMEM_META_MASK_OFF 142912
+#define SMEM_META_MASK_STAGE_BYTES 2048
+#define SMEM_META_MASK_STRIDE 2048
+#define SMEM_TOTAL 145024
+#else
+#error "unsupported CAKE_GROUP"
+#endif
 #define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-  uint32_t pred = 0;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred %%px;\n\t"
-      "elect.sync _|%%px, %1;\n\t"
-      "@%%px mov.s32 %0, 1;\n\t"
-      "}\n"
-      : "+r"(pred)
-      : "r"(0xFFFFFFFF));
-  return pred;
-}
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count) : "memory");
-}
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
-      "@P1 bra.uni DONE;\n\t"
-      "bra.uni LAB_WAIT;\n\t"
-      "DONE:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::"r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-  asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(mbar_addr),
-      "r"(bytes)
-      : "memory");
-}
-
-__device__ __forceinline__ float approx_exp2(float x) {
-  float y;
-  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
-
-__device__ __forceinline__ float approx_rcp(float x) {
-  float y;
-  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-  float c;
-  asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-  return c;
-}
-
-__device__ __forceinline__ void tma_3d_gmem2smem(int dst, const void* tmap_ptr, int x, int y, int z,
-                                                 int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.3d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr)
-      : "memory");
-}
-
-__device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
-  uint32_t result;
-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=r"(result) : "r"(val));
-  return result;
-}
-
 extern "C" {
 
-__global__
-__launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b7664412dcc01(
+__global__ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void CAKE_PROGRAM_KERNEL(
     unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K,
     const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O,
     int* __restrict__ q2k_indices, int* __restrict__ cu_seqlens_q, int* __restrict__ page_table,
@@ -211,10 +136,10 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
   const int hdr_addr = smem + 140832;
   int* meta_pg = reinterpret_cast<int*>(smem_raw + 140864);
   const int meta_pg_addr = smem + 140864;
-  int* meta_blk = reinterpret_cast<int*>(smem_raw + 141376);
-  const int meta_blk_addr = smem + 141376;
-  unsigned int* meta_mask = reinterpret_cast<unsigned int*>(smem_raw + 141888);
-  const int meta_mask_addr = smem + 141888;
+  int* meta_blk = reinterpret_cast<int*>(smem_raw + SMEM_META_BLK_OFF);
+  const int meta_blk_addr = smem + SMEM_META_BLK_OFF;
+  unsigned int* meta_mask = reinterpret_cast<unsigned int*>(smem_raw + SMEM_META_MASK_OFF);
+  const int meta_mask_addr = smem + SMEM_META_MASK_OFF;
 
   // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 8 barriers)
   // Mbarriers at smem_raw[0..64)
@@ -273,7 +198,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
             if (bb < batch) {
               cu_lo = cu_seqlens_q[bb];
               cu_hi = cu_seqlens_q[bb + 1];
-              cnt_b = (cu_hi - cu_lo + 8 - 1) / 8;
+              cnt_b = (cu_hi - cu_lo + CAKE_TILE_TOKENS - 1) / CAKE_TILE_TOKENS;
             }
             int incl = cnt_b;
             int up = __shfl_up_sync(0xFFFFFFFF, incl, 1, 32);
@@ -317,11 +242,11 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
               int cnt_s = __shfl_sync(0xFFFFFFFF, cnt_b, src_l);
               int lg = gi - base_g - ex_s;
               lg = cnt_s - 1 - lg;
-              sel_tok0 = lg * 8;
+              sel_tok0 = lg * CAKE_TILE_TOKENS;
               sel_qlen = hi_s - sel_cu;
               sel_ntok = sel_qlen - sel_tok0;
-              if (sel_ntok > 8) {
-                sel_ntok = 8;
+              if (sel_ntok > CAKE_TILE_TOKENS) {
+                sel_ntok = CAKE_TILE_TOKENS;
               }
               found = 1;
             }
@@ -421,7 +346,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
       int blk_e[1];
       int e = tid_1;
       blk_e[0] = -1;
-      if (e < 128) {
+      if (e < CAKE_META_ENTRIES) {
         int tl_e = e / 16;
         int k_e = e - tl_e * 16;
         if (tl_e < n_tok_u) {
@@ -1653,7 +1578,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
             if (bb_1 < batch) {
               cu_lo_1 = cu_seqlens_q[bb_1];
               cu_hi_1 = cu_seqlens_q[bb_1 + 1];
-              cnt_b_1 = (cu_hi_1 - cu_lo_1 + 8 - 1) / 8;
+              cnt_b_1 = (cu_hi_1 - cu_lo_1 + CAKE_TILE_TOKENS - 1) / CAKE_TILE_TOKENS;
             }
             int incl_1 = cnt_b_1;
             int up_4 = __shfl_up_sync(0xFFFFFFFF, incl_1, 1, 32);
@@ -1697,11 +1622,11 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
               int cnt_s_1 = __shfl_sync(0xFFFFFFFF, cnt_b_1, src_l_1);
               int lg_1 = gi_c - base_g_1 - ex_s_1;
               lg_1 = cnt_s_1 - 1 - lg_1;
-              sel_tok0_1 = lg_1 * 8;
+              sel_tok0_1 = lg_1 * CAKE_TILE_TOKENS;
               sel_qlen_1 = hi_s_1 - sel_cu_1;
               sel_ntok_1 = sel_qlen_1 - sel_tok0_1;
-              if (sel_ntok_1 > 8) {
-                sel_ntok_1 = 8;
+              if (sel_ntok_1 > CAKE_TILE_TOKENS) {
+                sel_ntok_1 = CAKE_TILE_TOKENS;
               }
               found_1 = 1;
             }
@@ -1802,7 +1727,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
       int blk_e_1[1];
       int e_1 = tid_c;
       blk_e_1[0] = -1;
-      if (e_1 < 128) {
+      if (e_1 < CAKE_META_ENTRIES) {
         int tl_e_1 = e_1 / 16;
         int k_e_1 = e_1 - tl_e_1 * 16;
         if (tl_e_1 < n_tok_u_1) {
@@ -2457,22 +2382,22 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
       int cq = lane_c - g * 4;
       int r0 = wgi * 64 + wi * 16 + g;
       int r1 = r0 + 8;
-      int tl0 = r0 >> 4;
-      int tl1 = r1 >> 4;
-      int hg0 = r0 - (tl0 << 4);
-      int hg1 = r1 - (tl1 << 4);
+      int tl0 = r0 >> CAKE_LOG2_GROUP;
+      int tl1 = r1 >> CAKE_LOG2_GROUP;
+      int hg0 = r0 - (tl0 << CAKE_LOG2_GROUP);
+      int hg1 = r1 - (tl1 << CAKE_LOG2_GROUP);
       int mw0 = tl0 >> 5;
       unsigned int ms0 = (unsigned int)(tl0 & 31);
       int mw1 = tl1 >> 5;
       unsigned int ms1 = (unsigned int)(tl1 & 31);
-      int tokbase = wgi * 4;
+      int tokbase = wgi * CAKE_WG_TOKENS;
       int wword = tokbase >> 5;
       unsigned int wshift = (unsigned int)(tokbase & 31);
-      int tokhi = tokbase + 3;
+      int tokhi = tokbase + CAKE_WG_TOKENS_M1;
       int kcol = 2 * cq;
       unsigned int qf[32] = {0};
       if (tl0 < n_tok) {
-        int qrow0 = (cu_b + tok0 + tl0) * num_q_heads + kv_head_c * 16 + hg0;
+        int qrow0 = (cu_b + tok0 + tl0) * num_q_heads + kv_head_c * CAKE_GROUP + hg0;
         int qb0 = qrow0 * 64 + cq;
         qf[0] = Q32[qb0];
         qf[2] = Q32[qb0 + 4];
@@ -2492,7 +2417,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
         qf[30] = Q32[qb0 + 56 + 4];
       }
       if (tl1 < n_tok) {
-        int qrow1 = (cu_b + tok0 + tl1) * num_q_heads + kv_head_c * 16 + hg1;
+        int qrow1 = (cu_b + tok0 + tl1) * num_q_heads + kv_head_c * CAKE_GROUP + hg1;
         int qb1 = qrow1 * 64 + cq;
         qf[1] = Q32[qb1];
         qf[3] = Q32[qb1 + 4];
@@ -2691,7 +2616,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
         unsigned int mb0 = meta_mask[2 * u + mw0];
         unsigned int mb1 = meta_mask[2 * u + mw1];
         int live = 0;
-        if ((mwd >> wshift & 15) != 0) {
+        if ((mwd >> wshift & CAKE_WG_MASK) != 0) {
           if (qpos1 + tokhi - pbase > 0) {
             live = 1;
           }
@@ -3886,7 +3811,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
       d_o[62] = d_o[62] * inv1;
       d_o[63] = d_o[63] * inv1;
       if (tl0 < n_tok) {
-        int orow0 = (cu_b + tok0 + tl0) * num_q_heads + kv_head_c * 16 + hg0;
+        int orow0 = (cu_b + tok0 + tl0) * num_q_heads + kv_head_c * CAKE_GROUP + hg0;
         int ob0 = orow0 * 128 + kcol;
         {
           __nv_bfloat162 _pk = __floats2bfloat162_rn(d_o[0 + 0], d_o[0 + 1]);
@@ -3954,7 +3879,7 @@ __launch_bounds__(384, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_9a5ac33b76
         }
       }
       if (tl1 < n_tok) {
-        int orow1 = (cu_b + tok0 + tl1) * num_q_heads + kv_head_c * 16 + hg1;
+        int orow1 = (cu_b + tok0 + tl1) * num_q_heads + kv_head_c * CAKE_GROUP + hg1;
         int ob1 = orow1 * 128 + kcol;
         {
           __nv_bfloat162 _pk = __floats2bfloat162_rn(d_o[2 + 0], d_o[2 + 1]);

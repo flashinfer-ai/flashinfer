@@ -41,7 +41,7 @@ Quantized-base GEMM with runtime BF16 LoRA (SM90, SM100, SM103)
 BF16 LoRA factors consumed as given (Cake generated programs). ``lora_scale=None`` disables the
 adapter even if ``d`` / ``lora_b`` are passed; pass a device scalar to apply it.  The NVFP4
 operator also takes a prepared adapter (``lora_adapter=prepare_nvfp4_lora_adapter(lora_b,
-lora_scale, alpha)``: the adapter folded once at the switch, SVDQuant-equivalent numerics).
+lora_scale, alpha)``: the adapter is folded once at the switch, with SVDQuant-equivalent numerics).
 
 .. autosummary::
     :toctree: ../generated

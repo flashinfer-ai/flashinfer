@@ -445,6 +445,18 @@ __global__ __launch_bounds__(THREADS)
           }
         }
       }
+#pragma unroll 1
+      for (int _ = 0; _ < 6; _++) {
+        uint32_t _mbar_token_tail = mbarrier_try_wait(mma_done_addr + (load_stage) * 8, load_phase);
+        mbarrier_wait_token(mma_done_addr + (load_stage) * 8, load_phase, _mbar_token_tail);
+        load_stage += 1;
+        if (load_stage == 6) {
+          load_stage = 0;
+        }
+        if (load_stage == 0) {
+          load_phase = load_phase ^ 1;
+        }
+      }
     }
   }
   // ---- Role: mma ----

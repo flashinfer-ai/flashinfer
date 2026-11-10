@@ -23,6 +23,7 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantFormat,
+    PowLU,
     ReLU,
     ReLU2,
     RoutingConfig,
@@ -37,7 +38,6 @@ from flashinfer.fused_moe.api import RoutingInputMode
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
 from tests.moe.test_frost_low_latency import _assert_near, _require_gpu
 
-
 ACTIVATIONS = [
     SwiGLU(),
     SwiGLU(alpha=1.702, beta=1.0, limit=3.0),
@@ -51,10 +51,22 @@ ACTIVATIONS = [
     ReLU2(),
     SiLU(),
     Identity(),
+    PowLU(),
+    PowLU(m=1.5, limit=2.0),
+    PowLU(m=0.125),
+    PowLU(m=3.0, limit=1.0),
 ]
 
 
 def _activation(up, gate, activation):
+    if isinstance(activation, PowLU):
+        from tests.moe.utils import powlu_ref
+
+        activated = powlu_ref(gate, activation.m)
+        if activation.limit is not None:
+            activated = activated.clamp_max(activation.limit)
+            up = up.clamp(-activation.limit, activation.limit)
+        return activated * up
     if isinstance(activation, SwiGLU):
         gate = gate.clamp_max(activation.limit)
         up = up.clamp(-activation.limit, activation.limit)
@@ -81,7 +93,7 @@ def _activation(up, gate, activation):
     return up
 
 
-def _reference(x, w1, w2, ids, scores, activation, packed):
+def _reference(x, w1, w2, ids, scores, activation, packed, output_dtype=torch.bfloat16):
     rows = []
     for token in range(ids.shape[0]):
         for expert in ids[token].tolist():
@@ -90,29 +102,38 @@ def _reference(x, w1, w2, ids, scores, activation, packed):
                 up, gate = value.chunk(2)
             else:
                 up, gate = value, torch.zeros_like(value)
-            mid = _activation(up, gate, activation).bfloat16()
-            rows.append((w2[expert].double() @ mid.double()).bfloat16())
+            mid = _activation(up, gate, activation).to(x.dtype)
+            rows.append((w2[expert].double() @ mid.double()).to(output_dtype))
     raw = torch.stack(rows)
     effective_scores = scores.bfloat16().float() if packed else scores.float()
     result = torch.zeros_like(x, dtype=torch.float32)
     for slot in range(ids.shape[1]):
         weighted = raw[slot :: ids.shape[1]].float() * effective_scores[:, slot, None]
         result = result + weighted  # Separate FP32 multiply/add, slot order.
-    return raw, result.bfloat16(), effective_scores
+    return raw, result.to(output_dtype), effective_scores
 
 
-def _inputs(activation, tokens=2, hidden=256, intermediate=96, topk=3, experts=None):
-    _require_gpu()
+def _inputs(
+    activation,
+    tokens=2,
+    hidden=256,
+    intermediate=96,
+    topk=3,
+    experts=None,
+    dtype=torch.bfloat16,
+    output_dtype=torch.bfloat16,
+):
+    _require_gpu(allow_sm120=True, allow_sm90=True, allow_sm80=True)
     torch.manual_seed(5103 + tokens)
     e = max(5, topk) if experts is None else experts
-    x = torch.randn(tokens, hidden, device="cuda").bfloat16()
+    x = torch.randn(tokens, hidden, device="cuda").to(dtype)
     w1 = (
         torch.randn(
             e, (2 if activation.is_gated else 1) * intermediate, hidden, device="cuda"
         )
         * 0.08
-    ).bfloat16()
-    w2 = (torch.randn(e, hidden, intermediate, device="cuda") * 0.08).bfloat16()
+    ).to(dtype)
+    w2 = (torch.randn(e, hidden, intermediate, device="cuda") * 0.08).to(dtype)
     ids = (
         torch.arange(tokens * topk, device="cuda", dtype=torch.int32).reshape(
             tokens, topk
@@ -122,13 +143,26 @@ def _inputs(activation, tokens=2, hidden=256, intermediate=96, topk=3, experts=N
     ids[:, -1] = ids[:, 0]  # Repeated experts are legal, scores can be signed.
     scores = torch.randn(tokens, topk, device="cuda") * 0.3
     pack = MoEWeightPack()
+    prepare = (
+        FrostLowLatencyConfig.prepare_bf16_weights
+        if dtype == torch.bfloat16
+        else FrostLowLatencyConfig.prepare_fp16_weights
+    )
     pack.prepare_for(
         "frost_low_latency",
-        FrostLowLatencyConfig.prepare_bf16_weights(w1, w2, activation=activation),
+        prepare(w1, w2, activation=activation),
     )
     cfg = MoEConfig(
         RoutingConfig(e, topk),
-        QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+        QuantConfig(
+            weight=QuantFormat.BF16 if dtype == torch.bfloat16 else QuantFormat.FP16,
+            activation=(
+                QuantFormat.BF16 if dtype == torch.bfloat16 else QuantFormat.FP16
+            ),
+            output=(
+                QuantFormat.BF16 if output_dtype == torch.bfloat16 else QuantFormat.FP16
+            ),
+        ),
         ExpertConfig(intermediate),
         activation=activation,
         backend=BackendOptions((FrostLowLatencyConfig(max_num_tokens=8),)),
@@ -250,6 +284,7 @@ def test_bf16_public_layer_and_metadata_rejections():
 
 
 def test_bf16_real_autotuning_and_larger_input_fallback():
+    _require_gpu()  # This test's TRT-LLM fallback is SM100-family-only.
     cfg, x, w1, w2, ids, scores, pack = _inputs(
         SwiGLU(), tokens=1, hidden=2048, intermediate=1408, topk=6, experts=64
     )

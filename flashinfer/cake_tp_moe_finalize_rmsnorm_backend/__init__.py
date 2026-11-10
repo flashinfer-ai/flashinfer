@@ -17,7 +17,8 @@ Backend of the Cake TP MoE finalize + RMSNorm kernels as one self-contained
 package: the host (:mod:`.cake_backend`), the ``cake_jit`` registry and loader
 glue and the generated CUDA sources under ``csrc/``, behind
 ``flashinfer.comm.tp_moe_finalize_rmsnorm(..., backend="cake")`` (hidden size
-4096, top-k 8, tensor-parallel world sizes 2, 4 and 8 on SM100 / SM103).  The
+4096, top-k 8; tensor-parallel world sizes 2, 4 and 8 on SM100 / SM103 and
+world size 4 on SM107).  The
 stable, ``@flashinfer_api``-decorated entry points and the user-facing
 documentation live in :mod:`flashinfer.comm`; import them.
 """

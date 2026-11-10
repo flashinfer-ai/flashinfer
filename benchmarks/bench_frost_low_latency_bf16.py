@@ -36,6 +36,7 @@ from flashinfer.fused_moe import (
     MoEConfig,
     MoELayer,
     MoEWeightPack,
+    PowLU,
     PrimsTsConfig,
     QuantConfig,
     QuantFormat,
@@ -55,6 +56,7 @@ ACTIVATIONS = {
     "geglu": GeGLU,
     "geglu_tanh": GeGLUTanh,
     "swiglu_step": SwiGLUStep,
+    "powlu": PowLU,
     "gelu": GELU,
     "relu": ReLU,
     "relu2": ReLU2,
@@ -64,6 +66,15 @@ ACTIVATIONS = {
 
 
 def activate(up, gate, name):
+    if name == "powlu":
+        positive = gate > 0
+        safe = torch.where(positive, gate, torch.ones_like(gate))
+        exponent = PowLU().m / (safe.sqrt() + 1.0)
+        return up * torch.where(
+            positive,
+            safe.pow(exponent) * torch.sigmoid(safe),
+            torch.nn.functional.silu(gate),
+        )
     if name == "swiglu":
         return up * torch.nn.functional.silu(gate)
     if name == "situ":
@@ -111,6 +122,9 @@ def main():
     p.add_argument("--experts", type=int, default=512)
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument("--activation", choices=tuple(ACTIVATIONS), default="swiglu")
+    p.add_argument(
+        "--timer", choices=("cuda-event", "globaltimer"), default="cuda-event"
+    )
     p.add_argument("--cache-mode", choices=("warm", "cold"), default="warm")
     p.add_argument("--expert-reuse", choices=("disjoint", "shared"), default="disjoint")
     p.add_argument(
@@ -212,6 +226,19 @@ def main():
     def capture(fn):
         fn()
         graph = torch.cuda.CUDAGraph()
+        if a.timer == "globaltimer":
+            times = torch.empty((16, 2), device="cuda", dtype=torch.int64)
+            starts = [times[j, :1] for j in range(16)]
+            ends = [times[j, 1:] for j in range(16)]
+            stamp(starts[0])
+            with torch.cuda.graph(graph):
+                for start, end in zip(starts, ends, strict=True):
+                    if flush is not None:
+                        flush.add_(1)
+                    stamp(start)
+                    output = fn()
+                    stamp(end)
+            return graph, times, output
         events = [
             (
                 torch.cuda.Event(enable_timing=True, external=True),
@@ -231,8 +258,22 @@ def main():
     def sample(record):
         graph, events, _ = record
         graph.replay()
+        if a.timer == "globaltimer":
+            torch.cuda.synchronize()
+            intervals = ((events[:, 1] - events[:, 0]).double() / 1000).cpu().tolist()
+            assert min(intervals) > 0, intervals
+            return median(intervals)
         events[-1][1].synchronize()
-        return median(start.elapsed_time(end) * 1000 for start, end in events)
+        intervals = [start.elapsed_time(end) * 1000 for start, end in events]
+        assert min(intervals) > 0, intervals
+        return median(intervals)
+
+    if a.timer == "globaltimer":
+        from flashinfer.utils import get_globaltimer_kernel
+
+        stamp = get_globaltimer_kernel()
+        if stamp is None:
+            raise RuntimeError("globaltimer is unavailable")
 
     configs = {
         "frost": (FrostLowLatencyConfig(max_num_tokens=8), "frost_low_latency"),
@@ -252,7 +293,7 @@ def main():
         cache_tuning={},
         excluded={},
         checks=[],
-        scope="BF16 public routed-MoE event-delimited individual-call GPU time; includes adapters/combine, excludes host enqueue, preparation, cache eviction, routing selection, shared experts, communication and serving.",
+        scope=f"BF16 public routed-MoE {a.timer}-delimited individual-call GPU time; includes adapters/combine, excludes host enqueue, preparation, cache eviction, routing selection, shared experts, communication and serving.",
         numerical_contract="BF16 intermediate/expert output, packed BF16 routing scores, FP32 combine; cross-backend checks use 1% relative L2 / 3% normalized maximum, not bitwise equivalence.",
         cache_eviction_bytes=flush.numel() if flush is not None else 0,
     )
@@ -260,6 +301,13 @@ def main():
 
     def save():
         a.output.write_text(json.dumps(result, indent=2) + "\n")
+
+    if a.timer == "globaltimer":
+        empty = capture(lambda: None)
+        for _ in range(3):
+            sample(empty)
+        result["empty_interval_us"] = [sample(empty) for _ in range(20)]
+        del empty
 
     calls = {}
     ref = reference()

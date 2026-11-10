@@ -450,7 +450,11 @@ def dcp_balanced_program(
     multiprocessor and every (request, KV head) pair at least one chunk ticket)
     the idle-CTA eight-slice fold of split tiles can never be taken, so the
     launch runs the program without that fold body (``at_or_above_grid``;
-    identical plan and fold order).  Below the grid, a launch whose page-table
+    identical plan and fold order).  Below the grid, a launch of at least
+    ``near_grid_regime.min_q_len`` query rows whose ``num_kv_heads * (batch_size
+    + min_chunks - 1 + reduce_tickets_per_tile)`` exceeds the grid runs that
+    program too: no request can split there, so the planner never folds.  Below
+    the grid otherwise, a launch whose page-table
     width (``max_pages_per_seq``, the ``block_tables`` width) bounds every pair
     to ``n_max >= min_chunks`` chunks of ``chunk_tokens`` and whose
     ``batch_size * num_kv_heads * (n_max + reduce_tickets_per_tile)`` tickets
@@ -516,6 +520,23 @@ def dcp_balanced_program(
     tiles = int(batch_size) * int(num_kv_heads) * q_tiles
     if tiles >= int(sm_count):
         return int(variants["at_or_above_grid"])
+    near_grid = variants.get("near_grid_regime")
+    if (
+        near_grid is not None
+        and q_len is not None
+        and int(q_len) >= int(near_grid["min_q_len"])
+    ):
+        # No request can split: a split request takes at least ``min_chunks``
+        # chunk tickets and ``reduce_tickets_per_tile`` reduce tickets per KV head
+        # beside one chunk ticket for every other (request, KV head), which
+        # overflows the grid, so the planner's fold clauses never fire and the
+        # program without the idle-CTA fold body has the same plan and fold order.
+        split = variants["static_one_wave_regime"]
+        split_tickets = (
+            int(split["min_chunks"]) - 1 + int(split["reduce_tickets_per_tile"])
+        )
+        if int(num_kv_heads) * (int(batch_size) + split_tickets) > int(sm_count):
+            return int(variants["at_or_above_grid"])
     regime = variants["static_one_wave_regime"]
     if regime.get("form", "split_chunks") == "whole_tiles":
         # The whole-tile form (the BF16 head_dim-128 family): one request whose

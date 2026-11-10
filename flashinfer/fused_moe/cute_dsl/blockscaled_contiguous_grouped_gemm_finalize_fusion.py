@@ -271,18 +271,6 @@ def _get_compiled_finalize_kernel(
                     "GEMM kernel yet: its wrapper has no "
                     "a_per_token_scale_ptr parameter."
                 )
-            if not use_fused_finalize:
-                # The Rubin kernel takes no use_fused_finalize parameter: it
-                # always does the atomic scatter-add into token rows.  The
-                # caller allocates `out` with torch.empty (not torch.zeros)
-                # and shape (seq_len * topk, n) in the unfused case, so
-                # silently ignoring this would accumulate into uninitialized
-                # memory at the wrong shape.
-                raise NotImplementedError(
-                    "use_fused_finalize=False is not supported by the Rubin "
-                    "(SM107) finalize grouped GEMM kernel: it always performs "
-                    "the fused atomic scatter-add."
-                )
             if final_scale_dtype is not cutlass.Float32:
                 # The Rubin kernel hardcodes self.final_scale_dtype =
                 # cutlass.Float32; its can_implement never sees this dtype.
@@ -299,6 +287,7 @@ def _get_compiled_finalize_kernel(
                 raster_along_m=raster_along_m,
                 topK=topk,
                 enable_pdl=enable_pdl,
+                use_fused_finalize=use_fused_finalize,
             )
             wrapper_fn = gemm_rubin.wrapper  # type: ignore[attr-defined]
         else:

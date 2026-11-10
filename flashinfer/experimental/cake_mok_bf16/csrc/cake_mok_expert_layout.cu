@@ -60,38 +60,76 @@ kernel_cake_mok_expert_layout(int* __restrict__ counts, int* __restrict__ schedu
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
-    if (tid == 0) {
-        int offset = 0;
+    // === Task calls (declaration order) ===
+    int lane_1 = tid % 32;
+    int warp_1 = tid / 32;
+    if (warp_1 == 0) {
+        int carry = 0;
         #pragma unroll 1
-        for (int expert = 0; expert < experts; expert++) {
-            int count = counts[expert];
-            layout[expert] = count;
-            layout[experts + expert] = offset;
-            offset = offset + count;
+        for (int chunk = 0; chunk < experts; chunk += 64) {
+            int lo_e = chunk + lane_1;
+            int hi_e = chunk + 32 + lane_1;
+            int lo_c = 0;
+            int hi_c = 0;
+            if (lo_e < experts) {
+                lo_c = counts[lo_e];
+            }
+            if (hi_e < experts) {
+                hi_c = counts[hi_e];
+            }
+            uint32_t _warp_scan_sum_0 = (unsigned int)lo_c;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_0) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_0) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_0) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_0) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_0) : "r"(16));
+            int lo_s = (int)_warp_scan_sum_0;
+            uint32_t _warp_scan_sum_1 = (unsigned int)hi_c;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_1) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_1) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_1) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_1) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_1) : "r"(16));
+            int hi_s = (int)_warp_scan_sum_1;
+            int lo_t = __shfl_sync(0xFFFFFFFF, lo_s, 31);
+            int hi_t = __shfl_sync(0xFFFFFFFF, hi_s, 31);
+            if (lo_e < experts) {
+                layout[experts + lo_e] = carry + lo_s - lo_c;
+            }
+            if (hi_e < experts) {
+                layout[experts + hi_e] = carry + lo_t + hi_s - hi_c;
+            }
+            carry = carry + lo_t + hi_t;
+        }
+    }
+    __syncthreads();
+    #pragma unroll 1
+    for (int expert = tid; expert < experts; expert += 256) {
+        int start = layout[experts + expert];
+        int padded = counts[expert];
+        int real = 0;
+        if (padded > 0) {
+            int low = padded - 256;
+            int high = padded;
+            #pragma unroll
+            for (int _ = 0; _ < 8; _++) {
+                int mid = (low + high) / 2;
+                int probe = schedule_rank[start + mid];
+                low = ((probe >= 0) ? mid : low);
+                high = ((probe >= 0) ? high : mid);
+            }
+            real = high;
+        }
+        layout[2 * experts + expert] = real;
+        #pragma unroll 1
+        for (int block = start / 256; block < (start + padded) / 256; block++) {
+            layout[3 * experts + block] = expert;
         }
     }
     __syncthreads();
     #pragma unroll 1
     for (int expert_1 = tid; expert_1 < experts; expert_1 += 256) {
-        int start = layout[experts + expert_1];
-        int real = layout[expert_1];
-        #pragma unroll 1
-        for (int _ = 0; _ < 256; _++) {
-            if (real == 0) {
-                break;
-            }
-            int last_peer = schedule_rank[start + real - 1];
-            if (last_peer >= 0) {
-                break;
-            }
-            real = real - 1;
-        }
-        layout[2 * experts + expert_1] = real;
-        #pragma unroll 1
-        for (int block = start / 256; block < (start + layout[expert_1]) / 256; block++) {
-            layout[3 * experts + block] = expert_1;
-        }
+        layout[expert_1] = counts[expert_1];
     }
 }
 

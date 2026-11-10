@@ -24,6 +24,17 @@ _THREADS = 128
 _MERGE_THREADS = 256
 _LOG2E = 1.4426950408889634
 _NEG = -3.0e38
+# P is stored in pdt (fp16), so the exponent has to stay inside fp16 range, not
+# fp32 range: the offset is one tile lagged, so sv can exceed mnew and a 120.0
+# cap would store inf (fp16 max is 65504 ~ 2^16) and poison the PV matmul with
+# NaN. 2^15 leaves a margin. Capping saturates one tile whose logit jumped more
+# than 2^15 above the previous tile's max; the next tile's offset correction
+# rescales, whereas an inf never recovers.
+_PMAX_LOG2 = 15.0
+
+_F8_LO = -448.0  # e4m3 finite range; clamping maps a NaN page byte into it
+_F8_HI = 448.0
+
 
 # H100: 132 SMs, 228 KiB of shared memory per SM.
 _NUM_SM = 132
@@ -39,10 +50,18 @@ _SPLITS = (1, 2, 4, 8, 16)
 
 
 class MsaSparseDecode:
-    def __init__(self, topk, nsplit, stages, nc, d, page, wide_addr):
+    def __init__(
+        self, topk, nsplit, stages, nc, d, page, wide_addr, softmax_scale=None
+    ):
         # Partials are read in batches whose fragment array stays inside 32
         # registers, so the fused combine never raises the mainloop's
         # allocation.  Eight fp16 per access is one 16-byte vector.
+        """Record the split, ring depth and tile geometry this body is built for."""
+        # softmax_scale is a compile-time constant, as in the prefill schedules:
+        # vLLM uses one scale per model, so this costs one extra compile rather
+        # than a per-call q prescale and its allocation.
+        scale = 1.0 / (d**0.5) if softmax_scale is None else float(softmax_scale)
+        self.scale_log2 = scale * _LOG2E
         self.mgs = max(1, min(nsplit, 8))
         self.topk = topk
         self.nsplit = nsplit
@@ -74,6 +93,7 @@ class MsaSparseDecode:
         ntok: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """Launch the decode grid for one call."""
         st = self.stages
         nc = self.nc
         D = self.d
@@ -225,6 +245,7 @@ class MsaSparseDecode:
         hkv: cutlass.Int32,
         tx_bytes: cutlass.Int32,
     ):
+        """One CTA per (split, query tile): gather selected blocks and reduce."""
         st = self.stages
         tk = self.topk
         ns = self.nsplit
@@ -489,7 +510,7 @@ class MsaSparseDecode:
         lp = cute.make_rmem_tensor(cute.make_layout(NS), self.acc_dtype)
         lp.fill(0.0)
         mrun = cutlass.Float32(0.0)
-        scale2 = cutlass.Float32(_LOG2E / (D**0.5))
+        scale2 = cutlass.Float32(self.scale_log2)
         lg = tidx // LANES
 
         sVb_one = sVb[None, None, 0]
@@ -594,7 +615,13 @@ class MsaSparseDecode:
 
             vbf = cute.make_rmem_tensor(cute.make_layout(VW), pdt)
             for c in cutlass.range_constexpr(NCV):
-                vbf.store(vf8[(None, c)].load().to(pdt))
+                # Rows of the final page past seqused_k are uninitialised in
+                # vLLM. The score mask only sanitises scores, and 0 * NaN = NaN
+                # in the PV gemm, so a NaN V byte reaches the output. Clamping
+                # into the e4m3 range clears it: fmax(NaN, x) returns x.
+                for e in cutlass.range_constexpr(VW):
+                    xv = cutlass.Float32(vf8[e, c])
+                    vbf[e] = cute.arch.fmin(cute.arch.fmax(xv, _F8_LO), _F8_HI).to(pdt)
                 cute.autovec_copy(vbf, dst[None, c, 0])
 
             # Online softmax with a one-tile-lagged offset: the running max is
@@ -623,7 +650,7 @@ class MsaSparseDecode:
                 for e in cutlass.range_constexpr(NS):
                     sv = accS[e] * scale2
                     tmax = cute.arch.fmax(tmax, sv)
-                    pv = cute.arch.exp2(cute.arch.fmin(sv - mnew, 120.0))
+                    pv = cute.arch.exp2(cute.arch.fmin(sv - mnew, _PMAX_LOG2))
                     sP_kg[tScS[e]] = pv.to(pdt)
                     lp[e] = lp[e] + pv
             else:
@@ -634,7 +661,7 @@ class MsaSparseDecode:
                         else cutlass.Float32(_NEG)
                     )
                     tmax = cute.arch.fmax(tmax, sv)
-                    pv = cute.arch.exp2(cute.arch.fmin(sv - mnew, 120.0))
+                    pv = cute.arch.exp2(cute.arch.fmin(sv - mnew, _PMAX_LOG2))
                     sP_kg[tScS[e]] = pv.to(pdt)
                     lp[e] = lp[e] + pv
             # A single integer redux replaces five dependent shuffle/fmax
@@ -846,10 +873,15 @@ _WS: dict = {}  # scratch buffers (memory only, never carries results across cal
 _WS_RETIRED = []
 
 
-def _scratch(n, nc, d, device):
+def _scratch(n, nc, d, device, stream):
     """Split-K partial buffers.  Pure scratch: written before it is read on
-    every call, never carries a result from one call to the next."""
-    key = (device, nc, d)
+    every call, never carries a result from one call to the next.
+
+    Keyed by stream as well as device: the buffers are live for the duration of
+    a launch, so two streams running decode concurrently would otherwise share
+    one set of partials and overwrite each other's splits.  Torch reuses stream
+    handles from its pool, so the key set stays small."""
+    key = (device, stream, nc, d)
     buf = _WS.get(key)
     if buf is None or buf[0].shape[0] < n * nc * d:
         if buf is not None:
@@ -942,7 +974,8 @@ def _plan(nc, d, grid, tiles_per_cta):
     return max(2, min(_MAX_STAGES, stages, max(2, tiles_per_cta)) - 1)
 
 
-def run(q, kv, q2k_indices, page_table, seqused_k, out):
+def run(q, kv, q2k_indices, page_table, seqused_k, out, softmax_scale=None):
+    """Run MSA sparse decode attention. Writes ``out``."""
     total_q, Hq, D = q.shape
     num_pages, Hkv, page_size, two_d = kv.shape
     B = seqused_k.numel()
@@ -983,9 +1016,12 @@ def run(q, kv, q2k_indices, page_table, seqused_k, out):
     mPT = _pack32(page_table, 1)
     mSeq = _pack32(seqused_k, 0)
 
-    wO, wL, wM, wC = _scratch(base * nsplit if nsplit > 1 else 1, nc, D, q.device)
+    cu_stream = torch.cuda.current_stream().cuda_stream
+    wO, wL, wM, wC = _scratch(
+        base * nsplit if nsplit > 1 else 1, nc, D, q.device, cu_stream
+    )
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(cu_stream)
     args = (
         mQ,
         mKV,
@@ -1006,11 +1042,14 @@ def run(q, kv, q2k_indices, page_table, seqused_k, out):
     )
 
     wide_addr = not safe32_q
-    key = (topk, nsplit, stages, nc, D, page_size, wide_addr)
+    key = (topk, nsplit, stages, nc, D, page_size, wide_addr, softmax_scale)
     fn = _COMPILED.get(key)
     if fn is None:
         fn = cute.compile(
-            MsaSparseDecode(topk, nsplit, stages, nc, D, page_size, wide_addr), *args
+            MsaSparseDecode(
+                topk, nsplit, stages, nc, D, page_size, wide_addr, softmax_scale
+            ),
+            *args,
         )
         _COMPILED[key] = fn
     fn(*args)

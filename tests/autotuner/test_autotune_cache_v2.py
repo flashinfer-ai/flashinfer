@@ -23,9 +23,11 @@ from flashinfer.autotune_cache import (
 )
 from flashinfer.autotuner import (
     AutoTuner,
+    DynamicTensorSpec,
     TuningConfig,
     autotune,
 )
+from flashinfer.utils import next_positive_power_of_2
 
 from .utils import DummyRunner, reset_autotuner
 
@@ -56,13 +58,17 @@ def cache_root(tmp_path, monkeypatch):
 
 def _install_fake_profile(monkeypatch, times, record_configs=None):
     """Replace GPU profiling with a lookup table; returns the call log.
-    Pass a list as *record_configs* to also capture each TuningConfig."""
+    Pass a list as *record_configs* to also capture each TuningConfig.
+    *times* is a ``{tactic: time}`` table, or a ``(inputs, tactic) -> time``
+    callable when the winner must depend on the profiled shape."""
     calls = []
 
     def fake_profile(self, runner, inputs, tactic, tuning_config, **kwargs):
         calls.append(tactic)
         if record_configs is not None:
             record_configs.append(tuning_config)
+        if callable(times):
+            return float(times(inputs, tactic))
         return float(times[tactic])
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
@@ -345,6 +351,51 @@ def test_hydrate_only_context_enables_reuse(cache_root, monkeypatch):
         pass  # attach only; no calls inside
     _, tactic = AutoTuner.get().choose_one(
         _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+    )
+    assert tactic == 1
+    assert calls == []
+
+
+def test_serving_above_top_tuned_bucket_uses_largest_entry(cache_root, monkeypatch):
+    """A serving lookup whose bucket lies above every bucket in the store is
+    served from the largest hydrated entry instead of the fallback."""
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4, 8),
+                map_to_tuning_buckets=next_positive_power_of_2,
+            ),
+        ),
+    )
+
+    # Bucket 4 is won by tactic 0 and bucket 8 by tactic 1, so the served
+    # tactic shows which entry the lookup used.
+    def times_by_bucket(inputs, tactic):
+        return {
+            4: {0: 1.0, 1: 3.0, 2: 2.0},
+            8: {0: 3.0, 1: 1.0, 2: 2.0},
+        }[inputs[0].shape[0]][tactic]
+
+    _install_fake_profile(monkeypatch, times=times_by_bucket)
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner()], config, [torch.zeros(8, 16)])
+    assert len(_entry_files(cache_root)) == 2
+
+    _fresh_process()
+    calls = _install_fake_profile(monkeypatch, times=times_by_bucket)
+    with autotune_v2(mode="replay"):
+        pass  # hydrate the entries for buckets 4 and 8
+    # A malformed key must not break the scan for the top tuned bucket.
+    store = AutoTuner.get()._active_managed_store
+    for bad_key in (("too", "short"), (_OP, "DummyRunner", None, ())):
+        AutoTuner.get()._managed_decoded[(str(store.root), store.env_hash, bad_key)] = (
+            object()
+        )
+    # 12 maps to bucket 16, above both tuned buckets.
+    _, tactic = AutoTuner.get().choose_one(
+        _OP, [DummyRunner()], config, [torch.zeros(12, 16)]
     )
     assert tactic == 1
     assert calls == []
@@ -1239,8 +1290,101 @@ def test_pcie_lookup_without_tune_group_reuses_managed_entry(
     assert calls == []
 
 
+@pytest.mark.parametrize("hydrate", ["preload", "lazy", "reload"])
+@pytest.mark.parametrize("initial_individual", [False, True])
+def test_graph_timing_disk_transition(
+    cache_root, monkeypatch, hydrate, initial_individual
+):
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.zeros(1)]
+    seen = []
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        mode = tuning_config.use_cuda_graph_individual_timing
+        seen.append((mode, tactic))
+        return 1.0 if tactic == int(mode) else 2.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    before = TuningConfig(
+        use_cuda_graph=True, use_cuda_graph_individual_timing=initial_individual
+    )
+    after = replace(before, use_cuda_graph_individual_timing=not initial_individual)
+    with autotune_v2():
+        assert AutoTuner.get().choose_one("review_policy", [runner], before, inputs)[
+            1
+        ] == int(initial_individual)
+    if hydrate == "lazy":
+        (entry_file,) = _entry_files(cache_root)
+        entry = json.loads(entry_file.read_text())
+        del entry["key_fields"]
+        entry_file.write_text(json.dumps(entry))
+    tuner = _fresh_process()
+    with autotune_v2(mode="replay"):
+        pass
+    if hydrate == "reload":
+        autotune_v2_reload()
+    seen.clear()
+    with autotune_v2():
+        assert tuner.choose_one("review_policy", [runner], after, inputs)[1] == int(
+            not initial_individual
+        )
+        assert seen
+        seen.clear()
+        assert tuner.choose_one("review_policy", [runner], after, inputs)[1] == int(
+            not initial_individual
+        )
+        assert not seen
+    tuner = _fresh_process()
+    with autotune_v2():
+        assert tuner.choose_one("review_policy", [runner], after, inputs)[1] == int(
+            not initial_individual
+        )
+        assert not seen
+
+
+def test_graph_timing_policy_namespace_and_replay(cache_root, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert MeasurementPolicy().manifest_fields() == {}
+    config = TuningConfig(use_cuda_graph=True)
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.ones(1)]
+    calls = []
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        calls.append(tactic)
+        return (
+            1.0
+            if tactic == int(tuning_config.use_cuda_graph_individual_timing)
+            else 2.0
+        )
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    policies = [
+        MeasurementPolicy(graph_timing=mode) for mode in ("amortized", "individual")
+    ]
+    for winner, policy in enumerate(policies):
+        with autotune_v2(measurement_policy=policy):
+            assert (
+                AutoTuner.get().choose_one(_OP, [runner], config, inputs)[1] == winner
+            )
+    assert len(_entry_files(cache_root)) == 2
+    calls.clear()
+    for winner, policy in enumerate(policies):
+        tuner = _fresh_process()
+        with autotune_v2(mode="replay", measurement_policy=policy):
+            assert tuner.choose_one(_OP, [runner], config, inputs)[1] == winner
+        assert tuner.choose_one(_OP, [runner], config, inputs)[1] == winner
+    assert not calls
+
+
 @pytest.mark.parametrize("storage", ["legacy", "managed"])
-def test_retuned_runner_survives_serving_and_restart(cache_root, monkeypatch, storage):
+@pytest.mark.parametrize("objective", ["replays", "individual"])
+def test_retuned_runner_survives_serving_and_restart(
+    cache_root, monkeypatch, storage, objective
+):
     from contextlib import nullcontext
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -1258,10 +1402,18 @@ def test_retuned_runner_survives_serving_and_restart(cache_root, monkeypatch, st
     runners = [RunnerA((0,)), RunnerB((0,))]
     inputs = [torch.ones(1)]
     before = TuningConfig(use_cuda_graph=True)
-    after = replace(before, cuda_graph_profile_replays=2)
+    after = (
+        replace(before, cuda_graph_profile_replays=2)
+        if objective == "replays"
+        else replace(before, use_cuda_graph_individual_timing=True)
+    )
 
     def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
-        want_b = tuning_config.cuda_graph_profile_replays == 2
+        want_b = (
+            tuning_config.cuda_graph_profile_replays == 2
+            if objective == "replays"
+            else tuning_config.use_cuda_graph_individual_timing
+        )
         return 1.0 if isinstance(runner, RunnerB) == want_b else 2.0
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)

@@ -24,7 +24,7 @@ MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py"
 # These tests create their own distributed workers with torch.multiprocessing.spawn.
 # Running them under mpirun would start multiple pytest parents and can collide on
 # TCPStore ports.
-SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py tests/comm/test_trtllm_allreduce_fusion_pdl.py"
+SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py tests/comm/test_trtllm_allreduce_fusion_pdl.py tests/comm/test_ulysses_a2a.py tests/comm/test_ulysses_communicator.py"
 
 # Tests that require torchrun instead of mpirun
 TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py tests/comm/test_mnnvl_cutedsl_numerical_contract.py tests/comm/test_mnnvl_cutedsl_no_rms_norm.py tests/comm/test_mnnvl_cutedsl_h7168.py tests/comm/test_mnnvl_cutedsl_static_fp8.py tests/comm/test_mnnvl_cutedsl_dynamic_fp8.py tests/comm/test_mnnvl_cutedsl_allreduce_api.py"
@@ -95,17 +95,34 @@ main() {
             local -a TEST_STATUS_PYTEST_COMMAND
             test_status_pytest_command "${receipt}" torchrun
             rm -f "$junit_file"
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
             if ${TORCHRUN_PREFIX} "${TEST_STATUS_PYTEST_COMMAND[@]}" "${test_file}" -v --junitxml="${junit_file}"; then
-                echo "PASSED: $test_file"
+                if [ -f "$junit_file" ]; then
+                    echo "PASSED: $test_file"
+                    PASSED_TESTS=$((PASSED_TESTS + 1))
+                else
+                    echo "NO RESULT: $test_file (missing JUnit XML: $junit_file)"
+                    record_no_result_test "$test_file"
+                fi
             else
                 pytest_status=$?
-                echo "FAILED: $test_file"
-                EXIT_CODE=1
+                if [ -f "$junit_file" ]; then
+                    echo "FAILED: $test_file"
+                    record_failed_test "$test_file"
+                else
+                    echo "NO RESULT: $test_file (missing JUnit XML: $junit_file)"
+                    record_no_result_test "$test_file"
+                fi
             fi
             test_status_finish "${receipt}" "${pytest_status}"
         fi
         echo ""
     done
+
+    # Counters are cumulative across all groups, so this is the overall summary.
+    if [ "$DRY_RUN" != "true" ] && [ -n "$TORCHRUN_TEST_FILES" ]; then
+        print_execution_summary
+    fi
 
     test_status_complete "$EXIT_CODE"
     exit "$EXIT_CODE"

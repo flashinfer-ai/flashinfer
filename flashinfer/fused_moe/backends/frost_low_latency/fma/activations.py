@@ -31,6 +31,31 @@ def _tanh(x):
 
 
 @cute.jit
+def _select(condition, x, y):
+    if cutlass.const_expr(isinstance(condition, cute.TensorSSA)):
+        return cute.where(condition, x, y)
+    else:
+        value = y
+        if condition:
+            value = x
+        return value
+
+
+@cute.jit
+def _powlu(gate, m: cutlass.Constexpr):
+    # Avoid evaluating log/sqrt on the non-positive branch. Positive infinity
+    # has exponent zero, so its power is one (the same as pow(inf, 0)).
+    positive = gate > 0.0
+    finite_positive = positive & (gate < cutlass.Float32(float("inf")))
+    safe = _select(finite_positive, gate, cutlass.Float32(1.0))
+    exponent = m / (cute.math.sqrt(safe, fastmath=False) + 1.0)
+    power = cute.math.exp2(
+        cute.math.log2(safe, fastmath=False) * exponent, fastmath=False
+    )
+    return _select(positive, power, gate) * _sigmoid(gate)
+
+
+@cute.jit
 def apply_activation(
     up,
     gate,
@@ -38,7 +63,15 @@ def apply_activation(
     approximate_swiglu: cutlass.Constexpr = False,
     parameters: cutlass.Constexpr = None,
 ):
-    if cutlass.const_expr(parameters is not None and activation == "swiglu"):
+    if cutlass.const_expr(activation == "powlu"):
+        m, limit = parameters
+        activated = _powlu(gate, m)
+        if cutlass.const_expr(limit is not None):
+            activated = _select(activated > limit, cutlass.Float32(limit), activated)
+            up = _select(up > limit, cutlass.Float32(limit), up)
+            up = _select(up < -limit, cutlass.Float32(-limit), up)
+        value = activated * up
+    elif cutlass.const_expr(parameters is not None and activation == "swiglu"):
         alpha, beta, limit = parameters
         gate = cutlass.min(gate, cutlass.Float32(limit))
         up = cutlass.max(

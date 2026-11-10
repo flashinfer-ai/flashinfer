@@ -54,7 +54,7 @@ def reference(x, w1, s1, w2, s2, ids, scores, activation, packed=True):
 @pytest.mark.parametrize("weight_format", [QuantFormat.MXFP4, QuantFormat.MXFP8])
 @pytest.mark.parametrize("index,activation", list(enumerate(ACTIVATIONS)))
 def test_mx_activation_tactics_graph_and_padding(weight_format, index, activation):
-    _require_gpu()
+    _require_gpu(allow_sm120=True)
     torch.manual_seed(6100 + index)
     t, h, i, e, k = (1, 2, 4, 8)[index % 4], 256, 96, 5, 3
     device = torch.device("cuda", torch.cuda.current_device())

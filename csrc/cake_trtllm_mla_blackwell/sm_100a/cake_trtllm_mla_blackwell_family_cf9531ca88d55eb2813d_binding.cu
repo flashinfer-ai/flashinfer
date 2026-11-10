@@ -46,7 +46,7 @@
 #define CAKE_STR_(x) #x
 #define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_79e49e216298d59fce33(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap V_map, int* __restrict__ page_table, int* __restrict__ seq_lens, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_stats, __nv_bfloat16* __restrict__ O, unsigned int* __restrict__ completion, int q_len, int page_table_stride, int max_num_ctas_q, int max_num_ctas_kv, float bmm1_scale_log2, float bmm2_scale);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_5e0f8dc7a9ea5462743e(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap V_map, int* __restrict__ page_table, int* __restrict__ seq_lens, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_stats, __nv_bfloat16* __restrict__ O, unsigned int* __restrict__ completion, int q_len, int page_table_stride, int max_num_ctas_q, int max_num_ctas_kv, float bmm1_scale_log2, float bmm2_scale);
 
 namespace CAKE_PROGRAM_SHIM {
 
@@ -284,15 +284,15 @@ void Run(TensorView arg_Q_map, TensorView arg_K_map, TensorView arg_V_map, Tenso
   void* kargs[] = {&p_Q_map, &p_K_map, &p_V_map, &p_page_table, &p_seq_lens, &p_partial_O, &p_partial_stats, &p_O, &p_completion, &v_q_len, &v_page_table_stride, &v_max_num_ctas_q, &v_max_num_ctas_kv, &v_bmm1_scale_log2, &v_bmm2_scale};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_79e49e216298d59fce33), 178560);
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_5e0f8dc7a9ea5462743e), 227712);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(512u, 1u, 1u);
 
   cudaError_t launch_status = cudaLaunchKernel(
-      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_79e49e216298d59fce33), grid, block, kargs, 178560u, stream);
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_5e0f8dc7a9ea5462743e), grid, block, kargs, 227712u, stream);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernel for kernel_cake_trtllm_mla_blackwell_79e49e216298d59fce33 failed: "
+      << "cudaLaunchKernel for kernel_cake_trtllm_mla_blackwell_5e0f8dc7a9ea5462743e failed: "
       << cudaGetErrorString(launch_status);
 }
 }  // namespace CAKE_VARIANT_NS

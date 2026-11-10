@@ -243,14 +243,14 @@ def build_arms(group, device, rank, world_size, hidden, rows, args):
     )
     comm_in = UlyssesCommunicator(
         group,
-        max_elems=rows * 3 * hidden,
+        max_bytes=rows * 3 * hidden * torch.bfloat16.itemsize,
         dtype=torch.bfloat16,
         backend=args.ulysses_backend,
         device=device,
     )
     comm_ops = UlyssesCommunicator(
         group,
-        max_elems=rows * hidden,
+        max_bytes=rows * hidden * torch.bfloat16.itemsize,
         dtype=torch.bfloat16,
         backend=args.ulysses_backend,
         device=device,

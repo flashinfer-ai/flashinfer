@@ -46,7 +46,7 @@
 #define CAKE_STR_(x) #x
 #define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k_nope, const __grid_constant__ CUtensorMap tmap_k_rope, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ O, int* __restrict__ seq_lens_kv, int* __restrict__ page_table, float* __restrict__ sinks, float softmax_scale_log2, float bmm2_scale, int total_work_items, int value_split_count, int max_pages_per_seq, int enable_sink);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_72eef3a2482bf37faaf5(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k_nope, const __grid_constant__ CUtensorMap tmap_k_rope, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ O, int* __restrict__ seq_lens_kv, int* __restrict__ page_table, float* __restrict__ sinks, float softmax_scale_log2, float bmm2_scale, int total_work_items, int value_split_count, int max_pages_per_seq, int enable_sink);
 
 namespace CAKE_PROGRAM_SHIM {
 
@@ -386,7 +386,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   void* kargs[] = {&p_tmap_q, &p_tmap_k_nope, &p_tmap_k_rope, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3), 231424);
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_72eef3a2482bf37faaf5), 231424);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(384u, 1u, 1u);
@@ -410,9 +410,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_72eef3a2482bf37faaf5), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_6a2644cd7c80243f7cc3 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_72eef3a2482bf37faaf5 failed: "
       << cudaGetErrorString(launch_status);
 }
 }  // namespace CAKE_VARIANT_NS

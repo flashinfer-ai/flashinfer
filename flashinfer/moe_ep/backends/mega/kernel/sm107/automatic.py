@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, TypeAlias
 
+from .....core.tuning_state import prepared_for_serving, record_prepared
+
 if TYPE_CHECKING:
     import torch
 
@@ -72,6 +74,8 @@ def coordinate_workspace_replacement(
                 "or measurement policy, before CUDA graph capture."
             )
         return False
+    if prepared_for_serving(state, context):
+        return False
     replace = (
         state.graph_captured
         and needs_selection(workspace, context)
@@ -115,7 +119,12 @@ def prepare_auto_configuration(
     """
     if backend._kernel_config.knobs != "auto":
         return
+    inputs = getattr(workspace, "_tuning_inputs", None)
+    workspace._tuning_inputs = None
     context = tuning_context()
+    state = workspace._tuning_state
+    if prepared_for_serving(state, context):
+        return
     select = needs_selection(workspace, context)
     import torch
 
@@ -132,15 +141,14 @@ def prepare_auto_configuration(
             raise ValueError("EP ranks disagree on whether MegaMoE tuning is enabled")
         select = any(pending for _, pending in decisions)
     if not select:
+        record_prepared(state, context)
         return
     from .....kernel_src.sm107.next_cutedsl_megamoe import (
         KNOB_KEYS,
-        autotune_sm107_block_scaled_mega_moe,
         sm107_candidates,
     )
 
     cfg = workspace.config
-    state = workspace._tuning_state
     if state.initial_knobs is None:
         state.initial_knobs = {name: getattr(cfg, name) for name in KNOB_KEYS}
     candidates = sm107_candidates(
@@ -149,8 +157,15 @@ def prepare_auto_configuration(
         allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
         and cfg.combine_dtype == "bf16",
     )
-    winner = autotune_sm107_block_scaled_mega_moe(
-        output,
+    from .forward_tuning import ForwardExecution
+
+    if inputs is None:
+        raise RuntimeError("Stage inputs before automatic Rubin tuning")
+    tensors, quantize_input = inputs
+    execution = ForwardExecution(
+        backend, tensors, quantize_input=quantize_input, output=output
+    )
+    winner = execution.tune(
         weights[0],
         weights[1],
         workspace,
@@ -163,6 +178,7 @@ def prepare_auto_configuration(
     )
     if winner is None and state.graph_captured:
         # Captured explicit handles retain their prepared configuration.
+        record_prepared(state, context)
         return
     if winner is None and state.winner is not None:
         from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
@@ -183,4 +199,87 @@ def prepare_auto_configuration(
         tuning_identity(context)
         if winner is not None and context.tuning_enabled
         else None,
+    )
+    record_prepared(state, context)
+
+
+def ep_tuning_contract(backend, fleet_params):
+    from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+
+    cfg = backend._resolved_config(fleet_params)
+    return {
+        "revision": knob_cache.BACKEND_REVISION,
+        "quantization": cfg.quant_kind,
+        "intermediate": cfg.intermediate,
+        "top_k": cfg.num_topk,
+        "activation": cfg.activation,
+        "gate_up_clamp": cfg.gate_up_clamp,
+        "situ_beta": cfg.situ_beta,
+        "situ_linear_beta": cfg.situ_linear_beta,
+        "per_token_activation": False,
+        "nvfp4_4over6": None,
+        "apply_routing_weights_before_fc2": cfg.apply_routing_weights_before_fc2,
+        "combine_dtype": cfg.combine_dtype,
+    }
+
+
+def ep_selected_config(backend, workspace):
+    import dataclasses
+    from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+
+    return dataclasses.replace(
+        backend._kernel_config,
+        kernel_variant=workspace.config.kernel_variant,
+        knobs={name: getattr(workspace.config, name) for name in KNOB_KEYS},
+    )
+
+
+def ep_force_tune(backend, workspace, tensors, weights, output):
+    from flashinfer.autotuner import AutoTuner
+    from .forward_tuning import ForwardExecution
+    from .....kernel_src.sm107.next_cutedsl_megamoe import sm107_candidates
+    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        NAMESPACE,
+        RubinTuningProtocol,
+    )
+
+    execution = ForwardExecution(backend, tensors, quantize_input=True, output=output)
+    cfg = workspace.config
+    backend.stage_inputs(tensors, workspace, quantize_input=True)
+    AutoTuner.get().choose_with_protocol(
+        NAMESPACE,
+        RubinTuningProtocol(
+            output,
+            weights[0],
+            weights[1],
+            workspace,
+            num_tokens=tensors.num_tokens,
+            candidates=sm107_candidates(
+                cfg.quant_kind,
+                kernel_variant=cfg.kernel_variant,
+                allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
+                and cfg.combine_dtype == "bf16",
+            ),
+            process_group=backend.ep_comm_group if backend.ep_world_size > 1 else None,
+            install_winner=True,
+            allow_nondeterministic=backend._kernel_config.in_kernel_fc2_reduce,
+            make_trial=execution.make_trial,
+            execution_contract=execution.contract(),
+        ),
+        force_tune=True,
+    )
+
+
+def ep_weight_pack(backend, weights):
+    import torch
+    from .....weights import MoEWeightPack
+
+    intermediate = backend._kernel_config.intermediate_size
+    if weights.w13.shape[1] != 2 * intermediate:
+        raise ValueError("Gated EP weights must have 2 * intermediate_size FC1 rows")
+    return MoEWeightPack(
+        torch.cat(
+            (weights.w13[:, intermediate:], weights.w13[:, :intermediate]), dim=1
+        ),
+        weights.w2,
     )

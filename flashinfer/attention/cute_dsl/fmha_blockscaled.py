@@ -79,6 +79,7 @@ def _get_variant_name(
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
     use_pdl: bool = False,
+    p_exp_mode: str = "exp2",
 ) -> str:
     """Generate the block-scaled variant name used by the artifact compiler."""
     pv_str = _dtype_to_str(pv_dtype)
@@ -91,7 +92,8 @@ def _get_variant_name(
     sink_str = "_sink" if enable_sink else ""
     pdl_str = "_pdl" if use_pdl else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return f"cute_dsl_fmha_blockscaled_{qk_mode}_{pv_str}_{out_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{ffi_str}"
+    exp_str = "" if p_exp_mode == "exp2" else f"_{p_exp_mode}"
+    return f"cute_dsl_fmha_blockscaled_{qk_mode}_{pv_str}_{out_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{exp_str}{ffi_str}"
 
 
 @functools.cache
@@ -109,6 +111,7 @@ def get_cute_dsl_fmha_blockscaled_kernel(
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
     use_pdl: bool = False,
+    p_exp_mode: str = "exp2",
 ):
     """Load a compiled block-scaled FMHA kernel from local or remote artifacts."""
     if qk_mode not in _BLOCKSCALED_MODES:
@@ -129,6 +132,7 @@ def get_cute_dsl_fmha_blockscaled_kernel(
         enable_skip_softmax=enable_skip_softmax,
         enable_sink=enable_sink,
         use_pdl=use_pdl,
+        p_exp_mode=p_exp_mode,
     )
 
     # Check for local .so directory (development mode)
@@ -165,6 +169,7 @@ def cute_dsl_fmha_blockscaled_prefill(
     scale_o: float | torch.Tensor = 1.0,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     enable_pdl: bool = False,
+    p_exp_mode: str = "exp2",
 ) -> None:
     """Batched (non-varlen) block-scaled prefill via the trtllm kernel.
 
@@ -173,6 +178,13 @@ def cute_dsl_fmha_blockscaled_prefill(
     - k (b, s_k, H_k, D), k_sf (quantized block-scaled format)
     - v/o: (b, s, H, D_v)
 
+    ``p_exp_mode="expcast"`` opts into a direct approximate exponential-to-E4M3
+    mapping with fixed beta=-0.35. It requires E4M3 V and uses the generated
+    FP8 weights for PV, with FP16 partial sums reduced into the FP32 denominator
+    (including approximate LSE), using the shared Prims-TS encoding helpers.
+    Each mode uses a distinct artifact name, with JIT fallback when no matching
+    artifact is available. Existing exp2 artifact names are unchanged.
+
     The per-tensor scales accept a Python float or a 0-d tensor (as returned by the
     quantizer); tensors are converted to floats here at the eager boundary.
     """
@@ -180,6 +192,10 @@ def cute_dsl_fmha_blockscaled_prefill(
         raise ValueError(
             f"qk_mode must be one of {tuple(_BLOCKSCALED_MODES)}, got {qk_mode!r}"
         )
+    if p_exp_mode not in ("exp2", "expcast"):
+        raise ValueError(f"Unsupported p_exp_mode: {p_exp_mode!r}")
+    if p_exp_mode == "expcast" and v.dtype != torch.float8_e4m3fn:
+        raise ValueError("expcast requires E4M3 PV")
     batch_size, s_q, H_q, D = q.shape
     _, s_k, H_k, _ = k.shape
     D_v = v.shape[-1]
@@ -192,6 +208,7 @@ def cute_dsl_fmha_blockscaled_prefill(
         skip_softmax_threshold_scale_factor is not None
         and skip_softmax_threshold_scale_factor > 0
     )
+    kernel_fn = None
     try:
         if window_left != -1 or window_right != -1:
             # The artifact name has no window axis, so only its traced
@@ -211,11 +228,14 @@ def cute_dsl_fmha_blockscaled_prefill(
             with_lse=lse is not None,
             enable_skip_softmax=use_skip_softmax,
             use_pdl=enable_pdl,
+            p_exp_mode=p_exp_mode,
         )
     except (RuntimeError, FileNotFoundError) as e:
         logger.info(
             f"Block-scaled DSL FMHA cubin unavailable ({e}); JIT-compiling the kernel."
         )
+        kernel_fn = None
+    if kernel_fn is None:
         kernel_fn = compile_cute_dsl_fmha_blockscaled_kernel(
             qk_mode,
             v.dtype,
@@ -228,6 +248,7 @@ def cute_dsl_fmha_blockscaled_prefill(
             use_skip_softmax,
             enable_pdl,
             q.device,
+            p_exp_mode=p_exp_mode,
             has_window_left=window_left != -1,
             has_window_right=is_causal or window_right != -1,
         )

@@ -30,7 +30,7 @@ INT32_SCORE_SEED_TILE_LBO = 128
 INT32_SCORE_SEED_TILE_SBO = 256
 
 
-def score_seed_tile_bytes(mma_m: int, mma_n: int) -> int:
+def sage_score_seed_tile_bytes(mma_m: int, mma_n: int) -> int:
     """Return the byte size of the seed MMA's operand tile.
 
     A reads the first M rows and B the first N rows of the same tile.
@@ -39,7 +39,7 @@ def score_seed_tile_bytes(mma_m: int, mma_n: int) -> int:
 
 
 @cute.jit
-def score_seed_words(smem_base, offset: int, num_bytes: int) -> cutlass.Array:
+def sage_score_seed_words(smem_base, offset: int, num_bytes: int) -> cutlass.Array:
     """Return the seed MMA's operand tile as a 32-bit SMEM array."""
     return cutlass.Array(
         smem_base.data_ptr() + offset,
@@ -50,7 +50,7 @@ def score_seed_words(smem_base, offset: int, num_bytes: int) -> cutlass.Array:
 
 
 @cute.jit
-def fill_score_seed_tile(
+def fill_sage_score_seed_tile(
     words: cutlass.Array, num_words: int, thread_idx: Int32, num_threads: int
 ) -> None:
     """Fill the seed tile with ``num_threads`` threads, one word pair each per round.
@@ -70,7 +70,7 @@ def fill_score_seed_tile(
 
 
 @cute.jit
-def issue_score_seed_mma(
+def issue_sage_score_seed_mma(
     tmem_s,
     words: cutlass.Array,
     mma_m: int,

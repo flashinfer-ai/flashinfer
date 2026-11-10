@@ -783,8 +783,8 @@ and the per-process source/command records.
 ### Paired output stores and zero-count updates (2026-09-18)
 
 Paired BF16 output stores reuse row-address calculations and write adjacent
-values together. The MXFP4 path requires M256/N64/K256, complete channel
-clusters (`H % (256 * cluster_m) == 0`), epilogue token-back, BF16 combine,
+values together. The MXFP4 path requires M256 with N64, N72 or N80 and K128
+or K256 (K128 joined in October 2026), complete channel clusters (`H % (256 * cluster_m) == 0`), epilogue token-back, BF16 combine,
 and neither dispatch deduplication nor in-kernel top-k reduction. Other
 layouts use scalar stores. Zero-count elision skips zero local count updates
 when dispatch deduplication is disabled; grid rendezvous, empty-expert/rank
@@ -890,14 +890,70 @@ CGA1x1x1 group-330 candidate with two dispatch warps and FC1 store offload,
 folded N64 CGA1x1x1 candidates with groups 264 and 132, and a folded N64
 CGA1x2x1 group-132 tail-pair candidate. All five use one scheduler stage;
 the folded candidates use one dispatch warp, early FC1 publication and
-direct FC1 stores. For this shape, the complete eligible union grows from
-three to eight candidates without changing the heuristic defaults.
+direct FC1 stores. For this shape, the complete eligible union grew from
+three to eight candidates; since October 2026 the shape also has its own
+per-bucket default table, whose entries and N72/N80 tilings join the union
+(see below).
 For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 28;
 three large-token configurations and 12 distinct tail-pair neighbors bring
 the total to 43. Every model considers the same bounded extension catalog,
 then filters candidates through tile alignment and strategy eligibility.
-Other shapes can therefore have fewer than 43 candidates. Token capacity
-changes ordering, not the union; the untuned heuristic buckets are unchanged.
+Other shapes can therefore have fewer than 43 candidates. Tuning skips the
+candidates with dispatch-side token-back (`reuse_dispatch_warps`, two of the
+43): that path can give intermittent run-to-run output differences whose
+cause is open. An explicit `token_back_mode` still selects it, and the untuned
+defaults of the published-exact routing profile still use it above 512
+tokens per rank. Token capacity
+changes the ordering of this union; the per-bucket defaults and their N72/N80
+tilings described below then add table- and capacity-dependent members.
+
+The pull-buffer fields are tactic fields. `compact_pull_buffer` sizes the
+pull buffer for the active dispatch warps. `dispatch_pull_batch` keeps 1-4
+rows in flight per active dispatch warp in the idle slots of the full buffer
+(`dispatch_pull_batch * active_dispatch_warps <= 4`, `epi_warps` token-back,
+neither dedup nor grouped token-back); with a batch above 1, `flag_batch` has
+no effect. `dispatch_pull_rotate` rotates the rows a warp takes on each pass
+and is not combined with dispatch-side token-back. Explicit values override a
+cached or default tactic: an explicit compact buffer or dispatch-side
+`token_back_mode` drops the tactic's batch to 1 (a dispatch-side mode also its
+rotation), and an explicit batch above 1 drops the tactic's compact buffer.
+
+Untuned launches use per-bucket defaults measured on H200 with
+block-permutation routing in October 2026
+(`shim/mxfp4_optimization.py::_FUSED_DEFAULTS`). They cover the FP8
+heuristic's 13 buckets (8 to 32768 tokens per rank) and store complete
+tactics, including the strategy and pull-buffer fields. Each table serves
+only the shape it was measured on: the K256 table H7168/I3072/E384/top-6/EP4
+and the K128 table H2560/I640/E512/top-10/EP2. Other shapes and the
+published-exact profile keep the legacy 8-bucket heuristic. A folded M256 N64
+default then takes the token-tile width of 64, 72 or 80 that needs the
+fewest tiles for the balanced rows per expert,
+`max_tokens * top_k * EP / experts`; ties keep N64. One N72 or N80 task holds
+an expert's 65-72 or 65-80 rows where N64 needs a second, nearly empty tile.
+On H200, H2560/I640/E512/top-10/EP2 at 2048 tokens (80 rows per expert) runs
+N80 at 0.85x the N64 time and at 1792 tokens N72 at 0.79x. Fewer tiles do not
+always win: at 8192 tokens (320 rows per expert) N80 measured 1.006x. Equal
+tile counts measured 3-15% slower.
+Routing that spreads rows across a tile boundary can favor N72 even at equal
+balanced tile counts (H7168/I3072/E384/top-6/EP4 at 1024 and 2048 tokens:
+0.88x and 0.93x), so the N72 and N80 tilings of the capacity's bucket default
+join the candidates together with the selected table's tactics; tuning
+therefore always measures the default. NV candidates and NV cache provenance
+exclude these MXFP4 defaults. NV instead adds the N72/N80 tilings of its
+reference default for the capacity bucket (NV tuning version v3) when that
+default is a folded N64 tile; other shapes keep them only where they are
+legal. A scale-ring default is tiled on its lockstep (sf0) core: the
+two-slot ring needs four AB stages, which N72/N80 tiles do not fit, so
+H7168/I3072/E384/EP4 NV tuning gains these tilings above 256 tokens. There
+the sf0 N72 tiling measured 0.89x the scale-ring default
+at 1024 tokens and 0.92x the NV default at 2048 tokens. The NV reference
+defaults without the scale ring (every bucket but 512 and 1024 tokens) take
+the same row rule as MXFP4. Against their N64 tiles that measured 0.61x at
+1152 tokens (N72), 0.87x at 1280 (N80), 0.75x at 2304 (N72), 0.94x at 2560
+(N80), 0.87x at 4608 (N72), 0.95x at 5120 (N80), and 0.98x, 0.94x and 0.94x
+at 8192, 16384 and 32768 tokens (N80); capacities with equal tile counts,
+such as 2048 and 4096 tokens, keep N64. The tail-pair candidates are still
+derived from the legacy table.
 
 Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
 `hopper_mxfp4_candidates` list. The default public scorer takes
@@ -1093,3 +1149,12 @@ tactics. Do not treat one cache-or-heuristic run as that full campaign.
 For controlled comparisons, hold shape, routing, data, timed regions and
 complete tactics fixed, then run the six formal processes independently of
 selection. Record source identity and actual clocks with the samples.
+
+
+## NVFP4
+
+The K16/E4M3 NVFP4 specialization lives under `shim/`, with a
+separate backend and compilation identity. Its implementation, numerical
+contract and validation commands are documented in
+[moe_ep_sm90_nvfp4.md](../../../../../docs/design_docs/moe_ep_sm90_nvfp4.md).
+Current MXFP4 measurements in this document are not NVFP4 measurements.

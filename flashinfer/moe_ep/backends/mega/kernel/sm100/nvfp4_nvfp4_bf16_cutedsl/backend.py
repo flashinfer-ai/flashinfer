@@ -18,6 +18,7 @@ from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import nvfp4_cutedsl_runtime_requirements
 from ......core.validation.common import (
+    MoEEpConfigError,
     validate_mega_arch,
     validate_mega_fleet_params,
 )
@@ -46,6 +47,20 @@ def _resolve_gate_up_clamp(
     return config.activation_clamp
 
 
+def _cake_reducer_supported(k, fleet_params: FleetParams) -> bool:
+    from flashinfer.jit.cake_megamoe_topk_reduce import supports_device
+
+    return (
+        fleet_params.max_tokens_per_rank in (256, 4096)
+        and fleet_params.token_hidden_size == 4096
+        and k.top_k == 6
+        and not k.enable_in_kernel_fc2_reduce
+        and k.combine_dtype == "bf16"
+        and k.apply_routing_weights_before_fc2
+        and supports_device()
+    )
+
+
 @register_mega_kernel(
     "sm100_nvfp4_nvfp4_bf16_cutedsl", deprecated_aliases=("nvfp4_cutedsl",)
 )
@@ -53,7 +68,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
 
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        """Initialize legacy inference state and reject next-only GenPhase."""
         super().__init__(config)
+        if config.kernel_variant != "inference":
+            raise MoEEpConfigError(
+                "NVFP4 GenPhase requires kernel_name='sm100_nvfp4_nvfp4_bf16_cutedsl_next'."
+            )
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._thunk_states: dict[tuple, tuple] = {}
@@ -217,23 +237,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         return self._finalize_mode(fleet_params) is FinalizeMode.CAKE
 
     def _cake_reducer_supported(self, fleet_params: FleetParams) -> bool:
-        """Whether this exact workspace can use the frozen Cake reducer.
-
-        The reducer is published for the datacenter-Blackwell targets that
-        also run this CuTeDSL megakernel (sm_100a on B200, sm_103a on B300).
-        """
-        from flashinfer.jit.cake_megamoe_topk_reduce import supports_device
-
-        k = self._kernel_config
-        return (
-            supports_device()
-            and fleet_params.max_tokens_per_rank in (256, 4096)
-            and fleet_params.token_hidden_size == 4096
-            and k.top_k == 6
-            and not k.enable_in_kernel_fc2_reduce
-            and k.combine_dtype == "bf16"
-            and k.apply_routing_weights_before_fc2
-        )
+        return _cake_reducer_supported(self._kernel_config, fleet_params)
 
     def validate_forward(
         self,

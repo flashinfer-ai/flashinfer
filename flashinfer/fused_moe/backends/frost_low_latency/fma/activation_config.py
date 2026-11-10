@@ -7,6 +7,7 @@ from ....api import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -21,6 +22,7 @@ ACTIVATIONS = {
     GeGLU: "geglu",
     GeGLUTanh: "geglu_tanh",
     SwiGLUStep: "swiglu_step",
+    PowLU: "powlu",
     GELU: "gelu",
     ReLU: "relu",
     ReLU2: "relu2",
@@ -34,6 +36,8 @@ def lower_activation(activation):
         name = ACTIVATIONS[type(activation)]
     except KeyError:
         raise NotImplementedError(f"Frost does not support {activation!r}") from None
+    if isinstance(activation, PowLU):
+        return name, (activation.m, activation.limit)
     if activation == type(activation)():
         # Keep the exact legacy device specialization for default semantics.
         return name, None

@@ -227,6 +227,9 @@ class MoERunner(TunableRunner):
             self.hidden_size_output,
             self.intermediate_size,
             self.num_local_experts + nfse,
+            # Global expert count: lets the launcher also offer the tiles that fit
+            # expert-parallel inputs whose rows carry global expert ids.
+            self.num_experts + nfse,
             self.activation_type,
             self.use_shuffled_weight,
             self.weight_layout,
@@ -267,6 +270,7 @@ class MoERunner(TunableRunner):
             self.hidden_size_output,
             self.intermediate_size,
             self.num_local_experts + self.num_fused_shared_experts,
+            self.num_experts + self.num_fused_shared_experts,
             self.activation_type,
             self.use_shuffled_weight,
             self.weight_layout,

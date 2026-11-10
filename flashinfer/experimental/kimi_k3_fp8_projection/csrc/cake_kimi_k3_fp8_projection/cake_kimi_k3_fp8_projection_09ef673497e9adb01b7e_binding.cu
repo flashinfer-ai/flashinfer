@@ -38,6 +38,67 @@
 #ifndef CAKE_PROGRAM_SHIM
 #define CAKE_PROGRAM_SHIM cake_host_shim_21a850b2e1b93a85
 #endif
+// Launch constants.  Programs that share this launcher pass their TMA box dims, dynamic shared
+// memory, block dims and cluster dims as plain integers on the compile line (-DCAKE_BOX_<T>_<i>,
+// -DCAKE_DYN_SMEM, -DCAKE_BLOCK_X, -DCAKE_CLUSTER_X/Y/Z); the defaults
+// are the values of the program this file was exported for.
+#ifndef CAKE_BOX_A_0
+#define CAKE_BOX_A_0 128
+#endif
+#ifndef CAKE_BOX_A_1
+#define CAKE_BOX_A_1 128
+#endif
+#ifndef CAKE_BOX_A_2
+#define CAKE_BOX_A_2 1
+#endif
+#ifndef CAKE_BOX_B_0
+#define CAKE_BOX_B_0 128
+#endif
+#ifndef CAKE_BOX_B_1
+#define CAKE_BOX_B_1 32
+#endif
+#ifndef CAKE_BOX_B_2
+#define CAKE_BOX_B_2 1
+#endif
+#ifndef CAKE_BOX_SFA_0
+#define CAKE_BOX_SFA_0 128
+#endif
+#ifndef CAKE_BOX_SFA_1
+#define CAKE_BOX_SFA_1 4
+#endif
+#ifndef CAKE_BOX_SFA_2
+#define CAKE_BOX_SFA_2 1
+#endif
+#ifndef CAKE_BOX_SFB_0
+#define CAKE_BOX_SFB_0 128
+#endif
+#ifndef CAKE_BOX_SFB_1
+#define CAKE_BOX_SFB_1 8
+#endif
+#ifndef CAKE_BOX_SFB_2
+#define CAKE_BOX_SFB_2 1
+#endif
+#ifndef CAKE_BOX_OUT_0
+#define CAKE_BOX_OUT_0 32
+#endif
+#ifndef CAKE_BOX_OUT_1
+#define CAKE_BOX_OUT_1 128
+#endif
+#ifndef CAKE_DYN_SMEM
+#define CAKE_DYN_SMEM 199680
+#endif
+#ifndef CAKE_BLOCK_X
+#define CAKE_BLOCK_X 320
+#endif
+#ifndef CAKE_CLUSTER_X
+#define CAKE_CLUSTER_X 2
+#endif
+#ifndef CAKE_CLUSTER_Y
+#define CAKE_CLUSTER_Y 1
+#endif
+#ifndef CAKE_CLUSTER_Z
+#define CAKE_CLUSTER_Z 1
+#endif
 
 extern "C" __global__ void CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K, float* __restrict__ sk_partials, unsigned int* __restrict__ sk_flags, int sk_pairs, int sk_rem, int sk_ksplit, int sk_dp);
 
@@ -68,7 +129,7 @@ inline CUtensorMap EncodeTma_A(const TensorView& t) {
   uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(outer1), (uint64_t)((d1 / 128))};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'A' resolved a non-positive global dim";
-  uint32_t box_dim[3] = {128u, 128u, 1u};
+  uint32_t box_dim[3] = {CAKE_U(CAKE_BOX_A_0), CAKE_U(CAKE_BOX_A_1), CAKE_U(CAKE_BOX_A_2)};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ") exceeds resolved global dims for 'A'";
   int64_t carrier_stride_0 = s2;
@@ -116,7 +177,7 @@ inline CUtensorMap EncodeTma_B(const TensorView& t) {
   uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(outer2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'B' resolved a non-positive global dim";
-  uint32_t box_dim[3] = {128u, 32u, 1u};
+  uint32_t box_dim[3] = {CAKE_U(CAKE_BOX_B_0), CAKE_U(CAKE_BOX_B_1), CAKE_U(CAKE_BOX_B_2)};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ") exceeds resolved global dims for 'B'";
   int64_t carrier_stride_0 = d1;
@@ -164,7 +225,7 @@ inline CUtensorMap EncodeTma_SFA(const TensorView& t) {
   uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(outer2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'SFA' resolved a non-positive global dim";
-  uint32_t box_dim[3] = {128u, 4u, 1u};
+  uint32_t box_dim[3] = {CAKE_U(CAKE_BOX_SFA_0), CAKE_U(CAKE_BOX_SFA_1), CAKE_U(CAKE_BOX_SFA_2)};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ") exceeds resolved global dims for 'SFA'";
   int64_t carrier_stride_0 = d1;
@@ -212,7 +273,7 @@ inline CUtensorMap EncodeTma_SFB(const TensorView& t) {
   uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(outer2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'SFB' resolved a non-positive global dim";
-  uint32_t box_dim[3] = {128u, 8u, 1u};
+  uint32_t box_dim[3] = {CAKE_U(CAKE_BOX_SFB_0), CAKE_U(CAKE_BOX_SFB_1), CAKE_U(CAKE_BOX_SFB_2)};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ") exceeds resolved global dims for 'SFB'";
   int64_t carrier_stride_0 = d1;
@@ -263,7 +324,7 @@ inline CUtensorMap EncodeTma_OUT(const TensorView& t) {
   uint64_t global_dim[2] = {(uint64_t)(d1), (uint64_t)(outer1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
       << "TMA descriptor for 'OUT' resolved a non-positive global dim";
-  uint32_t box_dim[2] = {32u, 128u};
+  uint32_t box_dim[2] = {CAKE_U(CAKE_BOX_OUT_0), CAKE_U(CAKE_BOX_OUT_1)};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ") exceeds resolved global dims for 'OUT'";
   int64_t carrier_stride_0 = s2;
@@ -374,9 +435,12 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_SFA, TensorView arg_
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
-  TVM_FFI_CHECK(grid_x % 2 == 0 && grid_y % 1 == 0 && grid_z % 1 == 0, ValueError)
+#if CAKE_CLUSTER_X * CAKE_CLUSTER_Y * CAKE_CLUSTER_Z != 1
+  CAKE_CHECK_EXPANDED(grid_x % CAKE_CLUSTER_X == 0 && grid_y % CAKE_CLUSTER_Y == 0 && grid_z % CAKE_CLUSTER_Z == 0, ValueError)
       << "launch grid (" << grid_x << ", " << grid_y << ", " << grid_z
-      << ") must be divisible by cluster dims (2, 1, 1)";
+      << ") must be divisible by cluster dims (" CAKE_STRINGIZE(CAKE_CLUSTER_X) ", " CAKE_STRINGIZE(CAKE_CLUSTER_Y) ", "
+         CAKE_STRINGIZE(CAKE_CLUSTER_Z) ")";
+#endif
 
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
   CUtensorMap p_A = EncodeTma_A(arg_A);
@@ -404,18 +468,18 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_SFA, TensorView arg_
   void* kargs[] = {&p_A, &p_B, &p_SFA, &p_SFB, &p_out, &p_OUT, &v_M, &v_m_tiles, &v_n_tiles, &v_n_valid, &v_ldo, &v_store_vec, &v_num_k_iters, &v_sf_k_tiles, &p_x, &v_K, &p_sk_partials, &p_sk_flags, &v_sk_pairs, &v_sk_rem, &v_sk_ksplit, &v_sk_dp};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 199680);
+      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), CAKE_DYN_SMEM);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
-  dim3 block(320u, 1u, 1u);
+  dim3 block(CAKE_U(CAKE_BLOCK_X), 1u, 1u);
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
   cudaLaunchAttribute attrs[3]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeClusterDimension;
-  attrs[n].val.clusterDim.x = 2u;
-  attrs[n].val.clusterDim.y = 1u;
-  attrs[n].val.clusterDim.z = 1u;
+  attrs[n].val.clusterDim.x = CAKE_U(CAKE_CLUSTER_X);
+  attrs[n].val.clusterDim.y = CAKE_U(CAKE_CLUSTER_Y);
+  attrs[n].val.clusterDim.z = CAKE_U(CAKE_CLUSTER_Z);
   ++n;
   attrs[n].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[n].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
@@ -426,7 +490,7 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_SFA, TensorView arg_
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 199680u;
+  config.dynamicSmemBytes = CAKE_U(CAKE_DYN_SMEM);
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
@@ -533,18 +597,18 @@ inline void RebindReceiptSlot(void** kargs, int64_t slot, const TensorView& t) {
 // The launch of a planned receipt on ``stream``: the module's own launch text with the receipt's grid.
 inline void IssueReceipt(const LaunchReceipt* header, void** kargs, cudaStream_t stream) {
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 199680);
+      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), CAKE_DYN_SMEM);
   (void)smem_ready;
   dim3 grid(header->chain.grid[0], header->chain.grid[1], header->chain.grid[2]);
-  dim3 block(320u, 1u, 1u);
+  dim3 block(CAKE_U(CAKE_BLOCK_X), 1u, 1u);
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
   cudaLaunchAttribute attrs[3]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeClusterDimension;
-  attrs[n].val.clusterDim.x = 2u;
-  attrs[n].val.clusterDim.y = 1u;
-  attrs[n].val.clusterDim.z = 1u;
+  attrs[n].val.clusterDim.x = CAKE_U(CAKE_CLUSTER_X);
+  attrs[n].val.clusterDim.y = CAKE_U(CAKE_CLUSTER_Y);
+  attrs[n].val.clusterDim.z = CAKE_U(CAKE_CLUSTER_Z);
   ++n;
   attrs[n].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[n].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
@@ -555,7 +619,7 @@ inline void IssueReceipt(const LaunchReceipt* header, void** kargs, cudaStream_t
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 199680u;
+  config.dynamicSmemBytes = CAKE_U(CAKE_DYN_SMEM);
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
@@ -683,9 +747,12 @@ int64_t Plan(TensorView receipt, TensorView arg_A, TensorView arg_B, TensorView 
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
-  TVM_FFI_CHECK(grid_x % 2 == 0 && grid_y % 1 == 0 && grid_z % 1 == 0, ValueError)
+#if CAKE_CLUSTER_X * CAKE_CLUSTER_Y * CAKE_CLUSTER_Z != 1
+  CAKE_CHECK_EXPANDED(grid_x % CAKE_CLUSTER_X == 0 && grid_y % CAKE_CLUSTER_Y == 0 && grid_z % CAKE_CLUSTER_Z == 0, ValueError)
       << "launch grid (" << grid_x << ", " << grid_y << ", " << grid_z
-      << ") must be divisible by cluster dims (2, 1, 1)";
+      << ") must be divisible by cluster dims (" CAKE_STRINGIZE(CAKE_CLUSTER_X) ", " CAKE_STRINGIZE(CAKE_CLUSTER_Y) ", "
+         CAKE_STRINGIZE(CAKE_CLUSTER_Z) ")";
+#endif
 
   CUtensorMap p_A = EncodeTma_A(arg_A);
   CUtensorMap p_B = EncodeTma_B(arg_B);
@@ -712,7 +779,7 @@ int64_t Plan(TensorView receipt, TensorView arg_A, TensorView arg_B, TensorView 
   void* kargs[] = {&p_A, &p_B, &p_SFA, &p_SFB, &p_out, &p_OUT, &v_M, &v_m_tiles, &v_n_tiles, &v_n_valid, &v_ldo, &v_store_vec, &v_num_k_iters, &v_sf_k_tiles, &p_x, &v_K, &p_sk_partials, &p_sk_flags, &v_sk_pairs, &v_sk_rem, &v_sk_ksplit, &v_sk_dp};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 199680);
+      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), CAKE_DYN_SMEM);
   (void)smem_ready;
   const size_t sizes[22] = {sizeof(p_A), sizeof(p_B), sizeof(p_SFA), sizeof(p_SFB), sizeof(p_out), sizeof(p_OUT), sizeof(v_M), sizeof(v_m_tiles), sizeof(v_n_tiles), sizeof(v_n_valid), sizeof(v_ldo), sizeof(v_store_vec), sizeof(v_num_k_iters), sizeof(v_sf_k_tiles), sizeof(p_x), sizeof(v_K), sizeof(p_sk_partials), sizeof(p_sk_flags), sizeof(v_sk_pairs), sizeof(v_sk_rem), sizeof(v_sk_ksplit), sizeof(v_sk_dp)};
   size_t offset = kReceiptStorageOffset;
