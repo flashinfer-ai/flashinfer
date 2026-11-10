@@ -3,6 +3,7 @@ import torch
 
 import flashinfer
 
+
 @pytest.mark.parametrize("metadata_device", ["cpu", "cuda:1"])
 def test_fast_decode_plan_rejects_metadata_off_wrapper_device(metadata_device):
     # fast_decode_plan adopts indptr/indices/last_page_len as the wrapper's
