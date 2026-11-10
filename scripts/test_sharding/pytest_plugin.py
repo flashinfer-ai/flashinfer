@@ -45,6 +45,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     with contextlib.suppress(argparse.ArgumentError):
         group.addoption(
             "--full",
+            # tests/infra/test_helpers/parametrize.py also registers --full; pytest>=9.2
+            # rejects a second option mapping to the same dest unless it is explicit.
+            dest="full",
             action="store_true",
             default=False,
             help="run full parameter matrices instead of regular subsets",

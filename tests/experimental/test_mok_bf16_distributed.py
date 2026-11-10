@@ -11,7 +11,7 @@ import pytest
 pytest_plugins = ["tests.experimental._mok_bf16_test_utils"]
 
 
-def test_complete_training_graph(monkeypatch, mok_distributed_group):
+def test_complete_training_graph(cuda_matmul_flags, mok_distributed_group):
     if "RANK" not in os.environ or int(os.environ.get("WORLD_SIZE", "0")) not in (
         1,
         4,
@@ -30,10 +30,7 @@ def test_complete_training_graph(monkeypatch, mok_distributed_group):
     ):
         pytest.skip("Requires an SM100a, SM103a or SM107a CUDA device")
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    monkeypatch.setattr(
-        torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", False
-    )
+    cuda_matmul_flags(allow_tf32=False, allow_bf16_reduced_precision_reduction=False)
     path = Path(__file__).resolve().parents[2] / "examples" / "mok_bf16_toy.py"
     spec = importlib.util.spec_from_file_location("mok_bf16_toy", path)
     module = importlib.util.module_from_spec(spec)

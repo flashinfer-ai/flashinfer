@@ -262,11 +262,8 @@ def _check_fused_training(
 
 
 @pytest.fixture(autouse=True)
-def _exact_matmul(monkeypatch):
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    monkeypatch.setattr(
-        torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", False
-    )
+def _exact_matmul(cuda_matmul_flags):
+    cuda_matmul_flags(allow_tf32=False, allow_bf16_reduced_precision_reduction=False)
 
 
 def test_fused_training():

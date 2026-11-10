@@ -1201,7 +1201,8 @@ def test_selection_refuses_a_column_slab_the_route_lacks(monkeypatch) -> None:
 def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
     """``PDL_EDGES`` = the deterministic edges without ``K7->K8``, the column slab's stem
     ``cake_mhc_train_bwd_slab_fold`` on ``K6->K7`` (every form and size); ``PDL_OFF_BANDS`` = the deterministic
-    bands without ``K7->K8`` (one table for every hidden size, as in the deterministic package).  On every path and
+    bands of every hidden size without ``K7->K8`` (one table: the deterministic package's per-size tables differ only
+    in their K7->K8 cells; test_host_rules_are_copies_of_the_deterministic_ones).  On every path and
     token count (the counts of record and every band boundary) the ``enable_pdl`` without an SM count of the
     column-slab records of each hidden size reads the bands of :func:`_pdl_cell` without an SM count: every
     deterministic column-slab record's value of the route of that size where no ``(arch, None, hidden)`` cell holds
@@ -1878,10 +1879,19 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
     for name in _SHARED_TABLES:
         assert getattr(nd, name) == getattr(det, name), name
     # The hidden sizes: the deterministic ones; the per-size table names are the deterministic ones without the
-    # column-slab and reduction tables (BWD_ROW_BANDS kept), and the tables of each size other than 4096 the
-    # deterministic tables of those names (the tables of record above are the H 4096 ones).
+    # column-slab and reduction tables (BWD_ROW_BANDS kept) and without PDL_OFF_BANDS, and the tables of each size
+    # other than 4096 the deterministic tables of those names (the tables of record above are the H 4096 ones).
+    # The deterministic PDL_OFF_BANDS of every size (4096 included) is this package's one table plus the K7->K8
+    # cells, an edge this package does not have.
     assert tuple(nd.HIDDEN_SIZES) == tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
-    kept = tuple(name for name in det.H_TABLE_NAMES if name not in _DROPPED_RULES)
+    dropped = (*_DROPPED_RULES, "PDL_OFF_BANDS")
+    kept = tuple(name for name in det.H_TABLE_NAMES if name not in dropped)
+    for hidden in HIDDEN_SIZES:
+        without_k7_k8 = {
+            a: {edge: bands for edge, bands in edges.items() if edge != "K7->K8"}
+            for a, edges in det._tab("PDL_OFF_BANDS", hidden).items()
+        }
+        assert without_k7_k8 == nd.PDL_OFF_BANDS, hidden
     assert "BWD_ROW_BANDS" in kept
     assert kept == nd.H_TABLE_NAMES
     assert HIDDEN not in det.H_TABLES and set(det.H_TABLES) == set(NEW_HIDDEN_SIZES)
@@ -3086,7 +3096,8 @@ def test_route_plan_binds_the_parameter_rows(monkeypatch, arch: str, sm: int) ->
             )
             assert [name for name, _ in plan] == list(selection), (what, plan)
             (token,) = [n for n in selection if nd.MODULES[n]["role"] == "bwd_token"]
-            assert token.endswith(GROUP_ROWS) == group_rows, (what, token)
+            stem = token.removesuffix(f"__h{hidden}")
+            assert stem.endswith(GROUP_ROWS) == group_rows, (what, token)
             (bound,) = [b for n, b in plan if nd.MODULES[n]["role"] == "bwd_slab"]
             want = _fold_plan(det.host_plan(T, sm, arch, hidden))
             assert bound["prow"] == want["prow"] == int(group_rows), (what, bound)
