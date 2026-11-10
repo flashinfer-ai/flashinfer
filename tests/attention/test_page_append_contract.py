@@ -41,7 +41,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 import flashinfer
 
