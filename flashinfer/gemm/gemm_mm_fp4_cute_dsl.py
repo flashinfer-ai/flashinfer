@@ -490,18 +490,31 @@ def _get_mm_fp4_cute_dsl_compile_workers() -> int:
 
 
 def _run_mm_fp4_precompile_pool(payloads) -> None:
-    """Compile mm_fp4 tactics into the on-disk cache with a subprocess pool.
+    """Compile mm_fp4 tactics with workers shared by the autotune context.
 
-    Each subprocess runs _mm_fp4_precompile_worker.
+    Workers are initialized lazily and released when the outermost tuning-enabled
+    context exits. Calls outside such a context use a temporary pool.
     """
     from multiprocessing import get_context
+
+    from ..autotuner._resources import get_tuning_resource
 
     num_workers = min(_get_mm_fp4_cute_dsl_compile_workers(), len(payloads))
     logger.info(
         f"[mm_fp4 cute-dsl] precompiling {len(payloads)} tactics "
         f"with {num_workers} workers"
     )
-    with get_context("spawn").Pool(num_workers) as pool:
+
+    def make_pool():
+        return get_context("spawn").Pool(num_workers)
+
+    # Keep CUDA device contexts separate and preserve per-batch worker sizing.
+    key = ("mm_fp4_compile_pool", payloads[0]["device_index"], num_workers)
+    pool = get_tuning_resource(key, make_pool)
+    if pool is None:
+        with make_pool() as pool:
+            results = pool.map(_mm_fp4_precompile_worker, payloads)
+    else:
         results = pool.map(_mm_fp4_precompile_worker, payloads)
     for kernel_name, err in results:
         if err is not None:
