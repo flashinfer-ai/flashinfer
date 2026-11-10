@@ -104,7 +104,8 @@ def _swapped_knobs() -> Tuple[Knobs, ...]:
 
 def swapped_knobs() -> List[Knobs]:
     """The swapped record space of the bf16 classes (:mod:`.blocks.swap_bf16`): the swapped 1-CTA records at the narrow token
-    tiles (128 weight rows x 8 / 16 / 32 tokens), one per tile, no cluster, swizzle 1. Disjoint from the grouped space (the
+    tiles (a 128-row weight tile x 8 / 16 / 32 tokens, a 64-row one x 16 / 32), one per (weight tile, token tile), no cluster,
+    swizzle 1. Disjoint from the grouped space (the
     swapped flag); the body reads the same dense rows through a TMA box."""
     return list(_swapped_knobs())
 

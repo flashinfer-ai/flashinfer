@@ -3299,14 +3299,18 @@ class BatchInvariantBf16Config:
     slot-order fp32 fold of the class; ``MoEFinalizeConfig(do_finalize=False)`` leaves it to the caller and returns the
     layer's triple ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``: GEMM2's bf16 rows grouped by expert
     in expert order and, inside a group, in token-slot order (a function of the routing alone, so the rows are
-    reproducible; rows past the valid ones are not written), the weights as the combine folds them (fp32 from logits
-    and for fp32 pre-routed weights; the mode's bf16 for packed and bf16 pre-routed weights, whose exact widening the
-    fold uses) and the flat ``[num_tokens * top_k]`` int32 map, ``-1`` for a dropped slot. The class's slot-order fold
-    over the triple is the finalized output bit for bit. ``use_fused_finalize`` is ignored (the combine is never an
-    atomic finalize).
+    reproducible; rows past the valid ones are not written), the weights as the combine folds them (fp32 from logits,
+    where the other backends return bf16: the fold widens a bf16 weight exactly, so a receiver that needs bf16 rounds
+    them itself; fp32 for fp32 pre-routed weights; the mode's bf16 for packed and bf16 pre-routed weights) and the flat
+    ``[num_tokens * top_k]`` int32 map, ``-1`` for a dropped slot. The class's slot-order fold over the triple is the
+    finalized output bit for bit: ``flashinfer.fused_moe.batch_invariant.api.combine_unfinalized(*triple)`` computes it
+    with the combine kernel of the finalized forward. ``use_fused_finalize`` is ignored (the combine is never an atomic
+    finalize).
     All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
     ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm``, ``TopK``, ``Llama4`` (``top_k = 1``), ``TopKSigmoid`` and
-    ``DeepSeekV3`` with or without expert groups), the pre-routed modes take the caller's ids and weights. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
+    ``DeepSeekV3`` with or without expert groups), the pre-routed modes take the caller's ids and weights under any
+    ``RoutingConfig``: a routing term the from-logits mode has no class for (the group shape rule, ``Llama4`` with
+    ``top_k > 1``, ``MiniMax2``) is refused at a from-logits call, never at construction. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
     its argument below, so a masked expert keeps a positive score of the smallest magnitudes; while ``top_k`` unmasked
     experts exist it is never selected and the weights are exactly those of the row without it, otherwise masked experts
     fill the remaining slots (in index order; by their bias for the biased methods) with such weights, and a fully masked
@@ -3320,7 +3324,8 @@ class BatchInvariantBf16Config:
     Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls
     back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout). The layer's own
     checks come first: ``MoELayer`` runs every candidate's support check at construction (this backend refuses
-    ``top_k`` / ``num_experts`` beyond its bounds, fused shared experts and a local expert range outside the experts) and
+    ``top_k`` / ``num_experts`` beyond its bounds, fused shared experts and a local expert range outside the experts;
+    the routing term is checked at the from-logits call) and
     reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
     filter admits only a bf16 ``[num_tokens, H]`` activation (an fp16 one is its ``NotImplementedError``: no usable
     backend); what reaches the runner (an unimplemented method from logits, a bias or expert groups against the method,

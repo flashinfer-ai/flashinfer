@@ -176,8 +176,8 @@ def can_implement_swapped(
     chain: Union[str, GroupedChain] = "plain",
     out_fmt: str = "bf16",
 ) -> bool:
-    """Acceptance of the swapped body (:mod:`.swap_bf16`): a swapped record of the bf16 classes (128 weight rows x 8 / 16 / 32
-    tokens, 1-CTA) under the grouped body's operand rules (16-byte-aligned K and N, whole ``2 x GROUP`` column blocks for the
+    """Acceptance of the swapped body (:mod:`.swap_bf16`): a swapped record of the bf16 classes (a 128-row weight tile x 8 /
+    16 / 32 tokens or a 64-row one x 16 / 32, 1-CTA) under the grouped body's operand rules (16-byte-aligned K and N, whole ``2 x GROUP`` column blocks for the
     gated chain, at most ``MAX_E`` experts); every chain of the classes."""
     if isinstance(chain, str):
         if chain not in CHAINS or out_fmt not in OUT_DT:
