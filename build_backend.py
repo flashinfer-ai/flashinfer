@@ -1220,10 +1220,7 @@ def build_sdist(sdist_directory, config_settings=None):
 # _EXPERIMENTAL_SOURCES_KEEP.
 # Experimental features are JIT-only and intended for main-branch users
 # (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
-# 100 MB. The Cake training backends one level deeper,
-# flashinfer/experimental/cake/<pkg>/csrc/**, are not matched and ship in every
-# wheel: they back the stable flashinfer.cake_<op>_<det|nondet>_train[_kcp]
-# facades (#8928). Python modules, build.json manifests and route catalogs stay,
+# 100 MB. Python modules, build.json manifests and route catalogs stay,
 # so `import flashinfer` is unchanged. Loads requiring omitted sources fail on
 # first use; the marker file below explains how to obtain those sources.
 _EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"
