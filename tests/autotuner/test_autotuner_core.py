@@ -2619,6 +2619,44 @@ def test_search_cache_top_bucket_ignores_unservable_file_configs(monkeypatch):
     assert lookup() == (False, 0, -1, None)  # no file config is served
 
 
+def test_single_process_tuning_does_not_block_top_bucket_fallback(monkeypatch):
+    """Single-process tuning invalidates stale disk winners without marking
+    the bucket group-rejected for later top-bucket fallback."""
+    tuner = reset_autotuner()
+
+    class OtherRunner(DummyRunner):
+        pass
+
+    class UnseenRunner(DummyRunner):
+        pass
+
+    runner_a, runner_b, runner_c = (
+        DummyRunner([0]),
+        OtherRunner([1]),
+        UnseenRunner([2]),
+    )
+    config = _pow2_bucket_config()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner, inputs, tactic, tuning_config, **kwargs: (
+            1.0
+            if (type(runner) is DummyRunner and inputs[0].shape[0] <= 128)
+            or (isinstance(runner, OtherRunner) and inputs[0].shape[0] > 128)
+            else 2.0
+        ),
+    )
+    with autotune(True):
+        assert tuner.choose_one(
+            "top_bucket_sp", [runner_a, runner_b], config, [torch.empty((512, 16))]
+        ) == (runner_b, 1)
+
+    assert tuner.choose_one(
+        "top_bucket_sp", [runner_a, runner_c], config, [torch.empty((512, 16))]
+    ) == (runner_a, 0)
+
+
 # ---------------------------------------------------------------------------
 # Tests for value-aware profiling usage
 # ---------------------------------------------------------------------------

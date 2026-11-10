@@ -1930,6 +1930,9 @@ class AutoTuner:
         # Reject legacy entries within one managed/policy identity without
         # deleting the user's global v1 configs. Keep these across v2 reload.
         self._excluded_file_keys: dict[tuple, set[str]] = {}
+        # Group-rejected buckets must not borrow another bucket's winner while
+        # serving, until a later tune publishes or agrees on that bucket.
+        self._rejected_file_keys: dict[tuple | None, set[str]] = {}
         # AMBIENT managed store attached by autotune_v2 (ManagedAutotuneCache).
         # Design doc: docs/design_docs/autotuner_v2.md §2.1 -- process-lifetime
         # attach is forced by both consumers serving OUTSIDE any context; a
@@ -2392,6 +2395,20 @@ class AutoTuner:
                 or self._v2_local.replay_report is not None
                 or self._v2_local.strict_replay
             ):
+                return result
+            rejected_keys = self._rejected_file_keys.get(self._winner_cache_identity())
+            if rejected_keys and any(
+                self._get_cache_key(
+                    custom_op,
+                    runner,
+                    input_shapes,
+                    tuning_config,
+                    runner.get_cache_key_extras(inputs) if inputs is not None else (),
+                ).file_key
+                in rejected_keys
+                for runner in runners
+            ):
+                # Do not borrow another bucket's winner for a rejected bucket.
                 return result
             top_profile = self._top_tuned_profile(
                 custom_op, runners, input_shapes, tuning_config, inputs
@@ -3612,6 +3629,14 @@ class AutoTuner:
                                 ),
                                 profiling_candidates=profiling_candidates,
                             )
+                            if _tune_process_group is None:
+                                self._clear_rejected_profile(
+                                    custom_op,
+                                    runners,
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    inputs,
+                                )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
                                 + 1
@@ -3662,8 +3687,42 @@ class AutoTuner:
                 if not _all_ranks_hit_cache(
                     has_selection, selection, phase=("final_selection", custom_op)
                 ):
+                    # Serving does not consult the tuning group.
+                    self._discard_profile_cache(
+                        custom_op,
+                        runners,
+                        input_shapes,
+                        tuning_config,
+                        inputs,
+                        record_group_rejection=True,
+                    )
                     return runners[0], -1
+                self._clear_rejected_profile(
+                    custom_op, runners, input_shapes, tuning_config, inputs
+                )
             return runners[runner_id], tactic
+
+    def _clear_rejected_profile(
+        self,
+        custom_op,
+        runners,
+        input_shapes,
+        tuning_config,
+        inputs,
+    ) -> None:
+        rejected = self._rejected_file_keys.get(self._winner_cache_identity())
+        if not rejected:
+            return
+        for runner in runners:
+            rejected.discard(
+                self._get_cache_key(
+                    custom_op,
+                    runner,
+                    input_shapes,
+                    tuning_config,
+                    runner.get_cache_key_extras(inputs) if inputs is not None else (),
+                ).file_key
+            )
 
     def _discard_profile_cache(
         self,
@@ -3675,6 +3734,7 @@ class AutoTuner:
         *,
         profile_inputs=None,
         republish_key: str | None = None,
+        record_group_rejection: bool = False,
     ) -> None:
         """Retire old winners and shortlists within the active identity.
 
@@ -3712,6 +3772,10 @@ class AutoTuner:
                     self._invalidated_file_keys.add(key.file_key)
                 else:
                     self._excluded_file_keys.setdefault(identity, set()).add(
+                        key.file_key
+                    )
+                if record_group_rejection:
+                    self._rejected_file_keys.setdefault(identity, set()).add(
                         key.file_key
                     )
                 if store is not None:
@@ -3833,6 +3897,15 @@ class AutoTuner:
         identity = self._winner_cache_identity()
         self._winner_cache()[key] = (tactic, profile)
         self._profiling_cache_policies[(identity, key)] = policy
+        if identity is None:
+            self._invalidated_file_keys.discard(key.file_key)
+        else:
+            excluded = self._excluded_file_keys.get(identity)
+            if excluded is not None:
+                excluded.discard(key.file_key)
+        rejected = self._rejected_file_keys.get(identity)
+        if rejected is not None:
+            rejected.discard(key.file_key)
         candidate_keys = None
         if profiling_candidates is not None:
             self._profiling_cache_candidates[(identity, key)] = profiling_candidates
@@ -5504,6 +5577,7 @@ class AutoTuner:
             self._file_config_selections.clear()
             self._invalidated_file_keys.clear()
             self._excluded_file_keys.clear()
+            self._rejected_file_keys.clear()
             self._namespaced_records.clear()
             self._dirty_namespaces.clear()
             self._observed_cache_generations.clear()
