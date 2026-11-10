@@ -1,5 +1,8 @@
 name: Nightly Release
 
+env:
+  NIGHTLY_RELEASE_REPOSITORY: flashinfer-ai/whl
+
 on:
   schedule:
     # Run at 00:00 UTC every day
@@ -10,6 +13,20 @@ on:
         description: 'Date suffix for dev version (YYYYMMDD, leave empty for today)'
         required: false
         type: string
+
+concurrency:
+  # One run at a time per ref. Runs on main recreate date-tagged releases and
+  # rewrite the shared wheel index; if two overlapped, an older run could write
+  # its index rows last, with hashes for assets a newer run has since replaced.
+  # update-wheel-index also runs when tests fail, so a slow failing run reaches
+  # that step too. Other refs are dry runs and only queue behind their own
+  # branch. `queue: max` keeps every pending run (up to GitHub's limit of 100)
+  # instead of the default single slot, where a newly queued run cancels the
+  # pending one: a scheduled run waiting behind a manual dispatch would
+  # otherwise be dropped by the next dispatch, and its date never published.
+  group: nightly-release-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   setup:
@@ -24,209 +41,98 @@ jobs:
 
       - name: Set date suffix and release tag
         id: set-suffix
+        env:
+          INPUT_DATE_SUFFIX: ${{ inputs.date_suffix }}
         run: |
           # Read version from version.txt
           VERSION=$(cat version.txt | tr -d '[:space:]')
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?$ ]]; then
+            echo "Error: version.txt contains an invalid version: ${VERSION}"
+            exit 1
+          fi
 
           # Set date suffix
-          if [ -n "${{ inputs.date_suffix }}" ]; then
-            DEV_SUFFIX="${{ inputs.date_suffix }}"
+          if [ -n "${INPUT_DATE_SUFFIX}" ]; then
+            DEV_SUFFIX="${INPUT_DATE_SUFFIX}"
           else
             DEV_SUFFIX=$(date -u +%Y%m%d)
+          fi
+          if [[ ! "${DEV_SUFFIX}" =~ ^[0-9]{8}$ ]]; then
+            echo "Error: date suffix must use YYYYMMDD format: ${DEV_SUFFIX}"
+            exit 1
           fi
 
           # Create release tag with version
           RELEASE_TAG="nightly-v${VERSION}-${DEV_SUFFIX}"
+          if [[ ! "${RELEASE_TAG}" =~ ^nightly-v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?-[0-9]{8}$ ]]; then
+            echo "Error: generated an invalid nightly release tag: ${RELEASE_TAG}"
+            exit 1
+          fi
 
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "dev_suffix=${DEV_SUFFIX}" >> $GITHUB_OUTPUT
-          echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+          {
+            echo "version=${VERSION}"
+            echo "dev_suffix=${DEV_SUFFIX}"
+            echo "release_tag=${RELEASE_TAG}"
+          } >> "$GITHUB_OUTPUT"
           echo "Base version: ${VERSION}"
           echo "Using dev suffix: ${DEV_SUFFIX}"
           echo "Release tag: ${RELEASE_TAG}"
 
-  build-flashinfer-python:
+  build:
     needs: setup
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build wheel
-
-      - name: Build flashinfer-python wheel and sdist
-        env:
-          FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
-        run: |
-          echo "Building flashinfer-python with dev suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
-          echo "Git commit: $(git rev-parse HEAD)"
-          python -m build
-          ls -lh dist/
-
-      - name: Upload flashinfer-python artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flashinfer-python-dist
-          path: dist/*
-          retention-days: 7
-
-  build-flashinfer-cubin:
-    needs: setup
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine wheel
-
-      - name: Build flashinfer-cubin wheel
-        env:
-          FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
-        run: |
-          echo "Building flashinfer-cubin with dev suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
-          echo "Git commit: $(git rev-parse HEAD)"
-          cd flashinfer-cubin
-          rm -rf dist build *.egg-info
-          python -m build --wheel
-          ls -lh dist/
-          mkdir -p ../dist
-          cp dist/*.whl ../dist/
-
-      - name: Upload flashinfer-cubin artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flashinfer-cubin-wheel
-          path: dist/*.whl
-          retention-days: 7
-
-  build-flashinfer-jit-cache:
-    needs: setup
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda: ["12.8", "12.9", "13.0"]
-        arch: ['x86_64', 'aarch64']
-
-    runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
-
-    steps:
-      - name: Cleanup
-        run: |
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          docker system prune -f || true
-
-      - name: Display Machine Information
-        run: |
-          echo "CPU: $(nproc) cores, $(lscpu | grep 'Model name' | cut -d':' -f2 | xargs)"
-          echo "RAM: $(free -h | awk '/^Mem:/ {print $7 " available out of " $2}')"
-          echo "Disk: $(df -h / | awk 'NR==2 {print $4 " available out of " $2}')"
-          echo "Architecture: $(uname -m)"
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Build wheel in container
-        env:
-          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
-          FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
-        run: |
-          # Extract CUDA major and minor versions
-          CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
-          CUDA_MINOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f2)
-          export CUDA_MAJOR
-          export CUDA_MINOR
-          export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
-
-          mkdir -p ${{ github.workspace }}/ci-cache
-
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -v ${{ github.workspace }}/ci-cache:/ci-cache \
-            -e FLASHINFER_CI_CACHE=/ci-cache \
-            -e CUDA_VERSION="${{ matrix.cuda }}" \
-            -e CUDA_MAJOR="$CUDA_MAJOR" \
-            -e CUDA_MINOR="$CUDA_MINOR" \
-            -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
-            -e FLASHINFER_DEV_RELEASE_SUFFIX="${FLASHINFER_DEV_RELEASE_SUFFIX}" \
-            -e ARCH="${{ matrix.arch }}" \
-            -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
-            -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-}" \
-            -e SCCACHE_BUCKET="${{ vars.SCCACHE_BUCKET }}" \
-            -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
-            -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
-            -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
-            -w /workspace \
-            ${{ env.DOCKER_IMAGE }} \
-            bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
-        timeout-minutes: 360
-
-      - name: Display wheel size
-        run: du -h flashinfer-jit-cache/dist/*
-
-      - name: Create artifact name
-        id: artifact-name
-        run: |
-          CUDA_NO_DOT=$(echo "${{ matrix.cuda }}" | tr -d '.')
-          echo "name=jit-cache-cu${CUDA_NO_DOT}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
-
-      - name: Upload flashinfer-jit-cache artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.artifact-name.outputs.name }}
-          path: flashinfer-jit-cache/dist/*.whl
-          retention-days: 7
+    uses: ./.github/workflows/release-build.yml
+    with:
+      dev_suffix: ${{ needs.setup.outputs.dev_suffix }}
+      wheel_version: ${{ needs.setup.outputs.version }}.dev${{ needs.setup.outputs.dev_suffix }}
+      clean_self_hosted_runners: true
+      cubin_retry_window_seconds: '86400'
+    secrets:
+      SCCACHE_AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+      SCCACHE_AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
 
   create-release:
-    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
+    needs: [setup, build]
+    # Publish only from main: a workflow_dispatch on any other branch runs the
+    # builds and tests as a dry run without touching the nightly release/index.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      actions: read
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create GitHub Release (empty first)
+      - name: Create nightly release in wheel repository (empty first)
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Requires contents: write access to NIGHTLY_RELEASE_REPOSITORY.
+          GH_TOKEN: ${{ secrets.WHL_TOKEN }}
+          RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.setup.outputs.version }}
+          SOURCE_COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          TAG="${{ needs.setup.outputs.release_tag }}"
-
           # Delete existing release and tag if they exist
-          if gh release view "$TAG" &>/dev/null; then
-            echo "Deleting existing release: $TAG"
-            gh release delete "$TAG" --yes --cleanup-tag
+          if gh release view "${RELEASE_TAG}" --repo "${NIGHTLY_RELEASE_REPOSITORY}" &>/dev/null; then
+            echo "Deleting existing release: ${RELEASE_TAG}"
+            gh release delete "${RELEASE_TAG}" \
+              --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+              --yes \
+              --cleanup-tag
           fi
 
           # Create new release without assets first
-          gh release create "$TAG" \
-            --title "Nightly Release v${{ needs.setup.outputs.version }}-${{ needs.setup.outputs.dev_suffix }}" \
-            --notes "Automated nightly build for version ${{ needs.setup.outputs.version }} (dev${{ needs.setup.outputs.dev_suffix }})" \
+          printf -v RELEASE_NOTES \
+            'Automated nightly build for version %s (dev%s)\n\nSource commit: [%s](%s)' \
+            "${RELEASE_VERSION}" \
+            "${RELEASE_SUFFIX}" \
+            "${SOURCE_SHA}" \
+            "${SOURCE_COMMIT_URL}"
+          gh release create "${RELEASE_TAG}" \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+            --title "Nightly Release v${RELEASE_VERSION}-${RELEASE_SUFFIX}" \
+            --notes "${RELEASE_NOTES}" \
             --prerelease
 
       - name: Download flashinfer-python artifact
@@ -235,11 +141,14 @@ jobs:
           name: flashinfer-python-dist
           path: dist-python/
 
-      - name: Upload flashinfer-python to release
+      - name: Upload flashinfer-python to wheel release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.WHL_TOKEN }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* --clobber
+          gh release upload "${RELEASE_TAG}" dist-python/* \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+            --clobber
 
       - name: Download flashinfer-cubin artifact
         uses: actions/download-artifact@v4
@@ -247,48 +156,47 @@ jobs:
           name: flashinfer-cubin-wheel
           path: dist-cubin/
 
-      - name: Upload flashinfer-cubin to release
+      - name: Upload flashinfer-cubin to wheel release
+        env:
+          GH_TOKEN: ${{ secrets.WHL_TOKEN }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" dist-cubin/* \
+            --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+            --clobber
+
+      - name: Upload provider and shim wheels to wheel release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* --clobber
-
-      - name: Upload flashinfer-jit-cache wheels to release (one at a time to avoid OOM)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Upload jit-cache wheels one at a time to avoid OOM
-          # Each wheel can be several GB, so we download, upload, delete, repeat
-          mkdir -p dist-jit-cache
-
-          for cuda in 128 129 130; do
+          mapfile -t CUDA_LABELS < <(jq -r '.jit_cache[].label' ci/cuda-versions.json)
+          for cuda_label in "${CUDA_LABELS[@]}"; do
             for arch in x86_64 aarch64; do
-              ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}"
-              echo "Processing ${ARTIFACT_NAME}..."
+              rm -rf dist-jit-cache
+              mkdir -p dist-jit-cache
+              gh run download "${GITHUB_RUN_ID}" \
+                --pattern "jit-cache-provider-${cuda_label}-${arch}-*" \
+                --dir dist-jit-cache
+              gh run download "${GITHUB_RUN_ID}" \
+                --name "jit-cache-shim-${cuda_label}-${arch}" \
+                --dir dist-jit-cache
 
-              # Download this specific artifact
-              gh run download ${{ github.run_id }} -n "${ARTIFACT_NAME}" -D dist-jit-cache/ || {
-                echo "Warning: Failed to download ${ARTIFACT_NAME}, skipping..."
-                continue
-              }
-
-              # Upload to release
-              if [ -n "$(ls -A dist-jit-cache/)" ]; then
-                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
-                echo "✅ Uploaded ${ARTIFACT_NAME}"
-              fi
-
-              # Clean up to save disk space before next iteration
-              rm -rf dist-jit-cache/*
+              while IFS= read -r wheel; do
+                GH_TOKEN="${WHL_TOKEN}" gh release upload "${RELEASE_TAG}" "${wheel}" \
+                  --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
+                  --clobber
+              done < <(find dist-jit-cache -type f -name '*.whl' -print)
             done
           done
 
   test-nightly-build:
-    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
+    needs: [setup, build]
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["12.9", "13.0"]
+        cuda: ${{ fromJSON(needs.build.outputs.runtime_cuda_matrix) }}
         test-shard: [1, 2, 3, 4, 5]
     runs-on: [self-hosted, linux, x64, gpu, sm86, on-demand]
 
@@ -325,36 +233,47 @@ jobs:
           name: flashinfer-cubin-wheel
           path: dist-cubin/
 
-      - name: Download flashinfer-jit-cache artifact
+      - name: Download flashinfer-jit-cache provider artifacts
         uses: actions/download-artifact@v4
         with:
-          name: jit-cache-cu${{ matrix.cuda == '12.9' && '129' || '130' }}-x86_64
+          pattern: jit-cache-provider-${{ matrix.cuda.label }}-x86_64-*
+          path: dist-jit-cache/
+          merge-multiple: true
+
+      - name: Download flashinfer-jit-cache shim artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jit-cache-shim-${{ matrix.cuda.label }}-x86_64
           path: dist-jit-cache/
 
       - name: Get Docker image tag
         id: docker-tag
+        env:
+          CUDA_LABEL: ${{ matrix.cuda.label }}
         run: |
-          CUDA_VERSION="cu${{ matrix.cuda == '12.9' && '129' || '130' }}"
-          DOCKER_TAG=$(grep "flashinfer/flashinfer-ci-${CUDA_VERSION}" ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
-          echo "cuda_version=${CUDA_VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=${DOCKER_TAG}" >> $GITHUB_OUTPUT
+          DOCKER_TAG=$(grep "flashinfer/flashinfer-ci-${CUDA_LABEL}" ci/docker-tags.yml | cut -d':' -f2 | tr -d ' ')
+          echo "cuda_version=${CUDA_LABEL}" >> "$GITHUB_OUTPUT"
+          echo "tag=${DOCKER_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Run nightly build tests in Docker (shard ${{ matrix.test-shard }})
         env:
+          CUDA_VERSION: ${{ matrix.cuda.version }}
           CUDA_VISIBLE_DEVICES: 0
+          DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ steps.docker-tag.outputs.cuda_version }}:${{ steps.docker-tag.outputs.tag }}
+          TEST_SHARD: ${{ matrix.test-shard }}
         run: |
-          DOCKER_IMAGE="flashinfer/flashinfer-ci-${{ steps.docker-tag.outputs.cuda_version }}:${{ steps.docker-tag.outputs.tag }}"
-          bash ci/bash.sh ${DOCKER_IMAGE} \
-            -e TEST_SHARD ${{ matrix.test-shard }} \
-            -e FLASHINFER_JIT_CACHE_REPORT_FILE /workspace/jit_cache_report_shard${{ matrix.test-shard }}_cuda${{ matrix.cuda }}.json \
+          REPORT_FILE="/workspace/jit_cache_report_shard${TEST_SHARD}_cuda${CUDA_VERSION}.json"
+          bash ci/bash.sh "${DOCKER_IMAGE}" \
+            -e TEST_SHARD "${TEST_SHARD}" \
+            -e FLASHINFER_JIT_CACHE_REPORT_FILE "${REPORT_FILE}" \
             ./scripts/task_test_nightly_build.sh
 
       - name: Upload JIT cache report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jit-cache-report-shard${{ matrix.test-shard }}-cuda${{ matrix.cuda }}
-          path: jit_cache_report_shard${{ matrix.test-shard }}_cuda${{ matrix.cuda }}.json
+          name: jit-cache-report-shard${{ matrix.test-shard }}-cuda${{ matrix.cuda.version }}
+          path: jit_cache_report_shard${{ matrix.test-shard }}_cuda${{ matrix.cuda.version }}.json
           if-no-files-found: ignore
           retention-days: 7
 
@@ -369,7 +288,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Download all JIT cache reports
         uses: actions/download-artifact@v4
@@ -392,7 +311,17 @@ jobs:
           fi
 
   update-wheel-index:
+    # test-nightly-build stays in `needs` only so that its result is readable
+    # below. A failing test suite no longer withholds the wheels; it marks them
+    # untested in the index instead. Producing a complete set of artifacts every
+    # day is the nightly's contract, so the test outcome is reported, not gated
+    # on. create-release must still have succeeded: without it the release
+    # assets the index links to do not exist.
     needs: [setup, create-release, test-nightly-build]
+    if: >-
+      !cancelled()
+      && github.ref == 'refs/heads/main'
+      && needs.create-release.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flashinfer repo
@@ -418,21 +347,38 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version-file: '.python-version'
 
       - name: Update wheel index
+        env:
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          TESTS_PASSED: ${{ needs.test-nightly-build.result == 'success' }}
         run: |
+          UNTESTED_ARGS=()
+          if [ "${TESTS_PASSED}" != "true" ]; then
+            echo "::warning::Nightly tests did not pass; publishing this build with its index entries marked untested."
+            UNTESTED_ARGS=(--untested)
+          fi
           python3 scripts/update_whl_index.py \
             --dist-dir dist \
             --output-dir flashinfer-whl \
-            --release-tag "${{ needs.setup.outputs.release_tag }}" \
-            --nightly
+            --base-url "https://github.com/${NIGHTLY_RELEASE_REPOSITORY}/releases/download" \
+            --release-tag "${RELEASE_TAG}" \
+            --nightly \
+            "${UNTESTED_ARGS[@]}"
 
       - name: Push wheel index
+        env:
+          RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
+          TESTS_PASSED: ${{ needs.test-nightly-build.result == 'success' }}
         run: |
           cd flashinfer-whl
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          COMMIT_MSG="update whl for nightly ${RELEASE_SUFFIX}"
+          if [ "${TESTS_PASSED}" != "true" ]; then
+            COMMIT_MSG="${COMMIT_MSG} (untested)"
+          fi
           git add -A
-          git commit -m "update whl for nightly ${{ needs.setup.outputs.dev_suffix }}"
+          git commit -m "${COMMIT_MSG}"
           git push

@@ -32,7 +32,7 @@ from .mainloop_spec import (
     make_mla_mainloop_spec,
     make_mla_fp8_mainloop_spec,
 )
-from .fusion.mask import MaskType
+from .fusion.mask import MaskSpec
 from .fusion.variant import (
     tanh_approx,
     AttentionVariant,
@@ -80,6 +80,7 @@ from .wrappers.batch_decode import (
     BatchDecodeCuteDSLWrapper,
     BatchDecodePagedCuteDSLWrapper,
 )
+from .wrappers.batch_hca import cute_dsl_hca_decode
 
 # MLA decode is reached via a dispatcher that picks the modular or monolithic
 # implementation based on the cute_dsl_impl= kwarg (default "auto" = pick

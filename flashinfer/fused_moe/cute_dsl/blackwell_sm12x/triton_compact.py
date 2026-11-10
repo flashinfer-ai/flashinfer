@@ -23,16 +23,19 @@ def _compact_topk_ids_kernel(
     pair_slots = tl.arange(0, BLOCK)
     valid = pair_slots < total_pairs
     ids = tl.load(topk_ids_ptr + pair_slots, mask=valid, other=-1).to(tl.int32)
+    # A negative id marks an unrouted pair: it keeps compact id -1 and does
+    # not count as an active expert.
+    routed = valid & (ids >= 0)
 
     row_slots = pair_slots[:, None]
     col_slots = pair_slots[None, :]
-    row_valid = valid[:, None]
-    col_valid = valid[None, :]
+    row_routed = routed[:, None]
+    col_routed = routed[None, :]
 
     same_id = ids[:, None] == ids[None, :]
-    prior_same = row_valid & col_valid & same_id & (col_slots < row_slots)
+    prior_same = row_routed & col_routed & same_id & (col_slots < row_slots)
 
-    first_flags = valid & (tl.sum(prior_same.to(tl.int32), axis=1) == 0)
+    first_flags = routed & (tl.sum(prior_same.to(tl.int32), axis=1) == 0)
     first_prefix = tl.cumsum(first_flags.to(tl.int32), axis=0)
 
     prior_slots = tl.where(prior_same, col_slots, BLOCK)
@@ -40,9 +43,10 @@ def _compact_topk_ids_kernel(
     first_slot = tl.where(first_match < BLOCK, first_match, pair_slots)
     first_slot_mask = col_slots == first_slot[:, None]
     compact_id = tl.sum(tl.where(first_slot_mask, first_prefix[None, :], 0), axis=1) - 1
+    compact_id = tl.where(routed, compact_id, -1)
 
     tl.store(compact_topk_ids_ptr + pair_slots, compact_id, mask=valid)
-    tl.store(weight_expert_ids_ptr + compact_id, ids, mask=valid & first_flags)
+    tl.store(weight_expert_ids_ptr + compact_id, ids, mask=first_flags)
 
     active_expert_count = tl.sum(first_flags.to(tl.int32), axis=0)
     tl.store(active_expert_count_ptr, active_expert_count)
@@ -57,10 +61,13 @@ def compact_topk_ids(
     """Remap global expert IDs to dense contiguous local indices.
 
     Args:
-        topk_ids: [total_pairs] int32 — flattened global expert IDs.
-        compact_topk_ids: [total_pairs] int32 — output: dense local indices.
+        topk_ids: [total_pairs] int32 — flattened global expert IDs.  A
+            negative id marks an unrouted pair.
+        compact_topk_ids: [total_pairs] int32 — output: dense local indices,
+            -1 for unrouted pairs.
         weight_expert_ids: [>=total_pairs] int32 — output: local->global map.
-        active_expert_count: [1] int32 — output: number of unique experts.
+        active_expert_count: [1] int32 — output: number of unique routed
+            experts.
     """
     total_pairs = topk_ids.numel()
     if total_pairs == 0:

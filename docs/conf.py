@@ -17,6 +17,7 @@ autodoc_mock_imports = [
     "triton",
     "flashinfer._build_meta",
     "cuda",
+    "quack",
     "numpy",
     "einops",
     "mpi4py",
@@ -74,7 +75,7 @@ todo_include_todos = False
 
 html_theme = "furo"  # "sphinx_rtd_theme"
 
-templates_path: List[Any] = []
+templates_path: List[Any] = ["_templates"]
 
 html_static_path = ["_static"]
 

@@ -10,6 +10,3 @@
 [submodule "3rdparty/nixl"]
 	path = 3rdparty/nixl
 	url = https://github.com/ai-dynamo/nixl.git
-[submodule "3rdparty/nccl"]
-	path = 3rdparty/nccl
-	url = https://github.com/NVIDIA/nccl.git

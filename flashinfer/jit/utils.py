@@ -81,6 +81,15 @@ filename_safe_dtype_map = {
 if hasattr(torch, "float4_e2m1fn_x2"):
     filename_safe_dtype_map[torch.float4_e2m1fn_x2] = "fp4_e2m1"
 
+
+def filename_safe_dtype_map_kv(dtype: torch.dtype) -> str:
+    """Return the cache-key dtype name for KV cache kernels."""
+
+    if dtype_map_kv[dtype] == "__nv_fp4x2_e2m1":
+        return "fp4x2_e2m1"
+    return filename_safe_dtype_map[dtype]
+
+
 pos_encoding_mode_literal = {
     0: "PosEncodingMode::kNone",
     1: "PosEncodingMode::kRoPELlama",

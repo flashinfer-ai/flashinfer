@@ -1,6 +1,9 @@
 # Bot command handler for CI permissions
-# Authorized users (ci-users team) can comment to control CI:
-#   @flashinfer-bot run          - Add run-ci label to trigger CI
+# Authorized users - anyone who can apply the run-ci label to a PR, plus the
+# ci-users team - can comment to control CI:
+#   @flashinfer-bot run          - AI scope recommendation; only full-suite advice starts CI
+#   @flashinfer-bot run all     - Full suite on the current commit
+#   @flashinfer-bot run <paths>  - Explicit pytest paths; needed again after new commits
 #   @flashinfer-bot rerun        - Cancel and rerun all workflows
 #   @flashinfer-bot rerun failed - Rerun failed and cancelled jobs
 #   @flashinfer-bot stop         - Cancel all in-progress workflows
@@ -14,27 +17,38 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  statuses: write # publishes the requested test scope (see "Handle @flashinfer-bot run")
   actions: write
 
 jobs:
   handle-command:
-    # Only run on PR comments mentioning @flashinfer-bot
+    # Cheap pre-filter only. Workflow expressions have no regex, so this cannot
+    # tell a command from prose that mentions one; `Parse command` below is the
+    # authoritative match and every handler step is gated on its output.
     if: |
       github.event.issue.pull_request &&
+      github.event.comment.user.login != 'flashinfer-bot' &&
       contains(github.event.comment.body, '@flashinfer-bot')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Check team membership
+      # Base-repo checkout only - never the PR head. This job holds a write token, so
+      # the validator it runs must be the trusted copy from the default branch.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check permission
         id: check-permission
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
           ORG: ${{ github.repository_owner }}
           TEAM: ci-users
           ACTOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "Checking if $ACTOR is a member of $ORG/$TEAM..."
-
           # Verify token is set
           if [[ -z "$GH_TOKEN" ]]; then
             echo "::error::FLASHINFER_GITHUB_TOKEN secret is not set"
@@ -42,8 +56,33 @@ jobs:
             exit 0
           fi
 
+          ROLE_ERROR="$RUNNER_TEMP/role-error"
+          if ! ROLE=$(timeout --kill-after=5s 15s gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${REPO}/collaborators/${ACTOR}/permission" \
+            --jq '.role_name' 2>"$ROLE_ERROR"); then
+            ROLE="none"
+
+            # 404 is the ordinary answer for someone who is not a collaborator.
+            # Anything else means the lookup is broken rather than the commenter
+            # unprivileged, and would otherwise deny a contributor who can label
+            # with nothing in the log to explain why.
+            if ! grep -q "HTTP 404" "$ROLE_ERROR"; then
+              echo "::warning::Could not read the repository role of $ACTOR, using team membership only: $(cat "$ROLE_ERROR")"
+            fi
+          fi
+
+          case "$ROLE" in
+            admin|maintain|write|triage)
+              echo "$ACTOR is authorized by repository role"
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
           # List team members and check if commenter is in the list
-          MEMBERS=$(gh api \
+          MEMBERS=$(timeout --kill-after=5s 15s gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             --paginate \
@@ -55,10 +94,10 @@ jobs:
           }
 
           if echo "$MEMBERS" | grep -qx "$ACTOR"; then
-            echo "$ACTOR is a member of $TEAM"
+            echo "$ACTOR is authorized by team membership"
             echo "authorized=true" >> "$GITHUB_OUTPUT"
           else
-            echo "$ACTOR is not a member of $TEAM"
+            echo "$ACTOR is not authorized"
             echo "authorized=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -67,14 +106,48 @@ jobs:
         env:
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          if echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot rerun failed"; then
+          # A command counts only when it STARTS a line that is not inside a
+          # fenced code block. These matches used to be unanchored, so merely
+          # writing about a command ran it: on #4880 four review/progress comments
+          # that quoted the phrase in prose, a table cell, an inline code span or
+          # a ``` block each re-applied `run-ci`, and under
+          # `cancel-in-progress` that cancelled and restarted a ~4.5h GPU run.
+          #
+          # Reduce the body to the first line that IS a command, then classify it.
+          # Leading whitespace is allowed (indented commands are common); anything
+          # to the left of the handle - `>` for a quoted reply, `|` for a table
+          # cell, a backtick for an inline code span, prose - is not.
+          # A fence closes only on the delimiter that opened it: a ``` block may
+          # legitimately contain a ~~~ line as content, and treating that as the
+          # close would let a command later in the same block through -- exactly
+          # the bug this change exists to prevent.
+          #
+          # `|| CMD=""` because grep exits 1 when nothing matches, which is the
+          # normal case for an ordinary comment. Today the runner shell is
+          # `bash -e` without pipefail, so only grep's status could propagate;
+          # adding `shell: bash` or a `defaults.run.shell` later would enable
+          # pipefail and abort the step before it writes any command= output.
+          CMD=$(printf '%s\n' "$COMMENT_BODY" | tr -d '\r' \
+            | awk '
+                /^[[:space:]]*```/ { if (!f) { f = 1; d = "b" } else if (d == "b") { f = 0 } ; next }
+                /^[[:space:]]*~~~/ { if (!f) { f = 1; d = "t" } else if (d == "t") { f = 0 } ; next }
+                !f
+              ' \
+            | grep -iEm1 '^[[:space:]]*@flashinfer-bot[[:space:]]+(run|rerun|stop)([[:space:]]|$)' \
+            | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') || CMD=""
+
+          # Same order as before: `rerun failed` must be tested before `rerun`.
+          # The trailing `([[:space:]]|$)` keeps `run` from matching `running`.
+          if echo "$CMD" | grep -qiE '^@flashinfer-bot[[:space:]]+rerun[[:space:]]+failed([[:space:]]|$)'; then
             echo "command=rerun-failed" >> "$GITHUB_OUTPUT"
-          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot rerun"; then
+          elif echo "$CMD" | grep -qiE '^@flashinfer-bot[[:space:]]+rerun([[:space:]]|$)'; then
             echo "command=rerun" >> "$GITHUB_OUTPUT"
-          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot stop"; then
+          elif echo "$CMD" | grep -qiE '^@flashinfer-bot[[:space:]]+stop([[:space:]]|$)'; then
             echo "command=stop" >> "$GITHUB_OUTPUT"
-          elif echo "$COMMENT_BODY" | grep -qi "@flashinfer-bot run"; then
+          elif echo "$CMD" | grep -qiE '^@flashinfer-bot[[:space:]]+run([[:space:]]|$)'; then
             echo "command=run" >> "$GITHUB_OUTPUT"
+            # Pass exactly this unfenced command, not a second scan of the body.
+            printf '%s' "$CMD" > "$RUNNER_TEMP/ci-bot-run-command.txt"
           else
             echo "command=unknown" >> "$GITHUB_OUTPUT"
           fi
@@ -83,21 +156,159 @@ jobs:
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'run'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
+          # Commit statuses are published with GITHUB_TOKEN, not the bot PAT. The
+          # `permissions:` block at the top of this file grants `statuses: write` to
+          # GITHUB_TOKEN only -- it does not apply to a PAT -- and the bot PAT has no
+          # commit-status permission, so publishing a scope with it fails:
+          #     gh: Resource not accessible by personal access token (HTTP 403)
+          # The PAT is still required for the label, because a `labeled` event raised by
+          # GITHUB_TOKEN does not trigger workflows. A status needs to trigger nothing;
+          # pr-test.yml reads it with GITHUB_TOKEN too. So splitting by purpose is safe
+          # and keeps the privileged token's blast radius smaller.
+          STATUS_TOKEN: ${{ github.token }}
+          # Only this authorized step receives the inference key. PR data is
+          # fetched as read-only evidence by trusted code, never executed here.
+          INFERENCE_API_KEY: ${{ secrets.INFERENCE_API_KEY }}
+          INFERENCE_BASE_URL: ${{ vars.INFERENCE_BASE_URL }}
+          CI_BOT_TARGET_MODEL: ${{ vars.CI_BOT_TARGET_MODEL }}
+          CI_BOT_TARGET_TIMEOUT_SECONDS: ${{ vars.CI_BOT_TARGET_TIMEOUT_SECONDS }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
         run: |
-          echo "Adding run-ci label to PR #${{ github.event.issue.number }}"
+          # Run only the trusted default-branch helper. It reads PR objects through the
+          # API and an isolated merge; selection never executes PR code.
+          # Bound GitHub operations so a stalled request leaves time for feedback.
+          bounded_gh() { timeout --kill-after=5s 15s gh "$@"; }
+          SCOPE_RESULT="$RUNNER_TEMP/ci-bot-scope.json"
+          SCOPE_NOTE="$RUNNER_TEMP/ci-bot-scope.md"
+          reject() {
+            if [ "$#" -gt 0 ]; then
+              printf '%s\n' "$1" > "$SCOPE_NOTE"
+            elif [ ! -s "$SCOPE_NOTE" ]; then
+              printf '%s\n' 'No CI pipeline was started because test targets could not be selected or validated. Review and specify paths with `run tests/<dir-or-file>` or use `run all` for the full suite.' > "$SCOPE_NOTE"
+            fi
+            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
+              || echo "warning: could not post rejection note"
+            bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+              -f content=confused > /dev/null || echo "warning: could not react"
+            echo "Scope rejected; run-ci not applied."
+            exit 0
+          }
 
-          # Add run-ci label
-          gh pr edit ${{ github.event.issue.number }} \
-            --repo ${{ github.repository }} \
-            --add-label "run-ci"
+          # Includes the initial PR lookup and cleanup around the 420-second
+          # selection cap; leave time within the ten-minute job for feedback.
+          if ! timeout --kill-after=5s 450s env GH_TOKEN="$STATUS_TOKEN" \
+              python3 scripts/pr_checks/ai_test_scope.py \
+              --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+              --command-file "$RUNNER_TEMP/ci-bot-run-command.txt" \
+              --output "$SCOPE_RESULT" --note "$SCOPE_NOTE"; then
+            # Preserve the helper's sanitized manual-validation explanation.
+            reject
+          fi
+          HEAD_SHA=$(jq -er '.head_sha' "$SCOPE_RESULT")
+          MODE=$(jq -er '.mode' "$SCOPE_RESULT")
+          if [ "$MODE" = advisory ]; then
+            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
+              || reject "The AI recommendation could not be posted. No CI pipeline was started; retry the command."
+            bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+              -f content='+1' > /dev/null || echo "warning: could not react"
+            echo "AI recommendation posted; no CI pipeline was started."
+            exit 0
+          fi
+          case "$MODE" in
+            automatic|manual|full) ;;
+            *) reject "No CI pipeline was started: invalid run mode." ;;
+          esac
+          RUN_LABEL=run-ci
+          SNAPSHOT_DESC=""
+          if [ "$MODE" = automatic ]; then
+            RUN_LABEL=run-ci-focused
+            if ! jq -e '.snapshot.head_sha == .head_sha' "$SCOPE_RESULT" > /dev/null; then
+              reject "No CI pipeline was started: the selected merge snapshot is invalid. Retry the command."
+            fi
+            if ! SNAPSHOT_DESC=$(jq -er '.snapshot | [.base_sha, .merge_sha, .tree_sha]
+                | if all(.[]; type == "string" and test("^[0-9a-f]{40}$"))
+                  then join(" ") else error("invalid merge snapshot") end' "$SCOPE_RESULT"); then
+              reject "No CI pipeline was started: the selected merge snapshot is invalid. Retry the command."
+            fi
+          fi
+          CHUNKED=$(jq -r '.chunks[]' "$SCOPE_RESULT")
+          CHUNKS=()
+          if [ -n "$CHUNKED" ]; then
+            mapfile -t CHUNKS <<< "$CHUNKED"
+          elif [ "$MODE" = manual ]; then
+            reject "No CI pipeline was started: a focused run requires at least one validated target."
+          fi
+          if [ "$MODE" = automatic ]; then
+            if [ "${#CHUNKS[@]}" -ne 0 ]; then
+              reject "No CI pipeline was started: focused AI suggestions require developer review."
+            fi
+            SCOPE_TEXT=$(IFS=' '; printf '%s' "${CHUNKS[*]}")
+            SCOPE_DIGEST=$(printf '%s' "$SCOPE_TEXT" | sha256sum | cut -c1-16)
+            SNAPSHOT_DESC="$SNAPSHOT_DESC $SCOPE_DIGEST"
+          fi
 
-          # React with thumbs up
-          gh api \
-            -X POST \
-            "/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
-            -f content='+1'
+          # Clear every previous trailing chunk. Failure must not resurrect stale targets
+          # or replace a requested scope with a full run, so publication is fail-closed.
+          if ! PREV_MAX=$(GH_TOKEN="$STATUS_TOKEN" bounded_gh api \
+              "/repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" \
+              --jq '[.statuses[].context | select(test("^ci/test-scope-[0-9]+$"))
+                | sub("^ci/test-scope-"; "") | tonumber] | max // 0'); then
+            reject "No CI pipeline was started: the previous scope could not be read. Retry the command."
+          fi
+          publish_status() {
+            GH_TOKEN="$STATUS_TOKEN" bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state=success -f context="$1" -f description="$2" \
+              -f target_url="$COMMENT_URL" > /dev/null
+          }
+          for i in "${!CHUNKS[@]}"; do
+            publish_status "ci/test-scope-$((i + 1))" "${CHUNKS[$i]}" \
+              || reject "No CI pipeline was started: the requested scope could not be published. Retry the command."
+          done
+          for ((i = ${#CHUNKS[@]} + 1; i <= PREV_MAX; i++)); do
+            publish_status "ci/test-scope-$i" "" \
+              || reject "No CI pipeline was started: the previous scope could not be cleared. Retry the command."
+          done
 
-          echo "Label added successfully"
+          # The final marker binds automatic scopes to a base, merge and tree.
+          # Explicit/full requests clear it so they retain their existing semantics.
+          publish_status "ci/test-snapshot" "$SNAPSHOT_DESC" \
+            || reject "No CI pipeline was started: the merge snapshot could not be published. Retry the command."
+
+          if ! CURRENT_SHA=$(bounded_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid); then
+            reject "No CI pipeline was started: the current PR head could not be verified. Retry the command."
+          fi
+          if [ "$CURRENT_SHA" != "$HEAD_SHA" ]; then
+            reject "The PR changed while its test scope was prepared. No CI pipeline was started; retry the command."
+          fi
+          if [ "$MODE" = automatic ]; then
+            if ! BASE_REF=$(bounded_gh api --method GET "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref | @uri') \
+                || ! CURRENT_BASE=$(bounded_gh api --method GET "/repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_REF" --jq .object.sha); then
+              reject "No CI pipeline was started: the current base branch could not be verified. Retry the command."
+            fi
+            read -r SELECTED_BASE SELECTED_MERGE SELECTED_TREE SELECTED_SCOPE <<< "$SNAPSHOT_DESC"
+            if [ "$CURRENT_BASE" != "$SELECTED_BASE" ]; then
+              reject "The PR base changed while its test scope was prepared. No CI pipeline was started; retry the command."
+            fi
+          fi
+          if ! HAS_RUN_CI=$(bounded_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json labels -q "[.labels[].name] | index(\"$RUN_LABEL\") != null"); then
+            reject "No CI pipeline was started: the current CI label could not be read. Retry the command."
+          fi
+          if [ "$HAS_RUN_CI" = true ]; then
+            bounded_gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label "$RUN_LABEL" \
+              || reject "No new CI pipeline was started: the previous CI label could not be removed. Retry the command."
+          fi
+          bounded_gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "$RUN_LABEL" \
+            || reject "The CI label request failed; check the PR's runs before retrying the command."
+          if [ "$MODE" = automatic ]; then
+            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
+              || echo "warning: could not post the selected-target explanation"
+          fi
+          bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -f content='+1' > /dev/null || echo "warning: could not react"
+          echo "CI started with $MODE scope on $HEAD_SHA"
 
       - name: Handle @flashinfer-bot rerun
         if: steps.check-permission.outputs.authorized == 'true' && steps.parse.outputs.command == 'rerun'
@@ -211,7 +422,8 @@ jobs:
           while read -r run_id; do
             if [ -n "$run_id" ]; then
               echo "Cancelling workflow $run_id..."
-              gh run cancel "$run_id" --repo ${{ github.repository }} || true
+              gh run cancel "$run_id" --repo ${{ github.repository }} \
+                || echo "::error::Cancel failed for $run_id"
               CANCEL_COUNT=$((CANCEL_COUNT + 1))
             fi
           done

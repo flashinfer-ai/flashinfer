@@ -43,275 +43,139 @@
 
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
-import ctypes
-import functools
-from typing import Union
+"""
+Blackwell (SM100) specific kernel utilities.
+
+Re-exports shared utilities from common/kernel_utils.py (pointer helpers, the
+f32 activation functions, fmin) and adds Blackwell-specific functions:
+blk_reduce_bf16, blk_reduce_fp32, blk_reduce_fp16.
+"""
 
 import cutlass
-import cutlass._mlir.dialects.cute as _cute_ir
-import cutlass.cute as cute
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm, nvvm
-from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import cute as _cute_ir
+from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.typing import AddressSpace
+from cutlass.cutlass_dsl import dsl_user_op
+
+# Re-export all shared utilities so existing imports continue to work
+from ..common.kernel_utils import (  # noqa: F401
+    _Pointer,
+    _nvvm_fmin_needs_res,
+    atomic_add_func,
+    f32_reciprocal,
+    fmin,
+    gelu_tanh_f32,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+    is_power_of_2,
+    make_ptr,
+    sigmoid_f32,
+    silu_f32,
+    situ_f32,
+    tanh_f32,
+    vectorized_atomic_add_bf16x8,
+    vectorized_atomic_add_fp32x2,
+)
 
 
-# WAR for CuTeDSL make_ptr implementation
-class _Pointer(Pointer):
-    """Represents a runtime pointer that can interoperate with various data structures,
-    including numpy arrays and device memory.
-
-    Args:
-        pointer (int or pointer-like object): The pointer to the data.
-        dtype (Type): Data type of the elements pointed to.
-        mem_space (_cute_ir.AddressSpace, optional): Memory space where the pointer resides. Defaults to generic.
-        assumed_align (int, optional): Alignment of the input pointer in bytes. Defaults to None.
-
-    Attributes:
-        _pointer: The underlying pointer.
-        _dtype: Data type of the elements.
-        _addr_space: Memory space of the pointer.
-        _assumed_align: Alignment of the pointer in bytes.
-        _desc: C-type descriptor for the pointer.
-        _c_pointer: C-compatible pointer representation.
-    """
-
-    def __init__(
-        self,
-        pointer,
-        dtype,
-        mem_space: _cute_ir.AddressSpace = _cute_ir.AddressSpace.generic,
-        assumed_align=None,
-    ):
-        self._pointer = pointer
-        self._dtype = dtype
-        self._addr_space = mem_space
-
-        if assumed_align is None:
-            self._assumed_align = dtype.width // 8
-        else:
-            self._assumed_align = assumed_align
-
-        self._desc = None
-        self._c_pointer = None
-        assert int(self._pointer) % self._assumed_align == 0, (
-            f"pointer must be {self._assumed_align} bytes aligned"
-        )
-
-    def size_in_bytes(self) -> int:
-        return ctypes.sizeof(ctypes.c_void_p(int(self._pointer)))
-
-    def __get_mlir_types__(self):
-        return [self.mlir_type]
-
-    def __c_pointers__(self):
-        if self._c_pointer is None:
-            self._desc = ctypes.c_void_p(int(self._pointer))
-            self._c_pointer = ctypes.addressof(self._desc)
-        return [self._c_pointer]
-
-    def __new_from_mlir_values__(self, values):
-        assert len(values) == 1
-        return values[0]
-
-    # Move mlir Type out of __init__ to decouple with mlir Context
-    @property
-    def mlir_type(self) -> ir.Type:
-        return _cute_ir.PtrType.get(
-            self._dtype.mlir_type, self._addr_space, self._assumed_align
-        )
-
-    @property
-    def dtype(self) -> Type[Numeric]:
-        return self._dtype
-
-    @property
-    def memspace(self):
-        return self._addr_space
-
-    def align(self, min_align: int, *, loc=None, ip=None) -> Pointer:
-        raise NotImplementedError("align is not supported in runtime")
-
-    def verify(self, expected_py_type):
-        if expected_py_type is Pointer or (
-            isinstance(expected_py_type, ir.Value) and expected_py_type.ty is Pointer
-        ):
-            return True
-
-        return False
-
-    def __str__(self) -> str:
-        return f"Ptr<0x{int(self._pointer):016x}@{self._addr_space}>"
-
-    def __repr__(self):
-        return self.__str__()
-
-
-def make_ptr(
-    dtype: Type[Numeric],
-    value: Union[int, ctypes._Pointer],
-    mem_space: AddressSpace = AddressSpace.generic,
-    assumed_align=None,
-) -> Pointer:
-    """Creates a pointer from a memory address.
-
-    Args:
-        dtype (Type[Numeric]): Data type of the pointer elements.
-        value (Union[int, ctypes._Pointer]): Memory address as an integer or ctypes pointer.
-        mem_space (AddressSpace, optional): Memory address space. Defaults to AddressSpace.generic.
-        assumed_align (int, optional): Alignment in bytes. Defaults to None.
-
-    Returns:
-        Pointer: A pointer object.
-
-    Example:
-        ```python
-        import numpy as np
-        import ctypes
-        from cutlass import Float32
-        from cutlass.cute.runtime import make_ptr
-
-        # Create a numpy array
-        a = np.random.randn(16, 32).astype(np.float32)
-        # Get pointer address as ctypes pointer
-        ptr_address = a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        # Create pointer from address
-        y = make_ptr(cutlass.Float32, ptr_address)
-        ```
-    """
-    # check if value is int or ctypes.POINTER
-    if isinstance(value, int):
-        address_value = value
-    elif isinstance(value, ctypes._Pointer):
-        # get address value
-        address_value = ctypes.cast(value, ctypes.c_void_p).value
-        assert address_value is not None, "Pointer address is None"
-    else:
-        raise TypeError(
-            f"Expect int or ctypes.POINTER for value but got {type(value)=}"
-        )
-
-    return _Pointer(address_value, dtype, mem_space, assumed_align=assumed_align)
-
-
-def is_power_of_2(x: int) -> bool:
-    return x > 0 and (x & (x - 1)) == 0
-
-
-@functools.lru_cache(maxsize=None)
-def _nvvm_fmin_needs_res():
-    import inspect
-
-    return "res" in inspect.signature(nvvm.fmin).parameters
+# ============================================================================
+# Blackwell-specific functions
+# ============================================================================
 
 
 @dsl_user_op
-def fmin(
-    a: Union[float, cutlass.Float32],
-    b: Union[float, cutlass.Float32],
-    *,
-    nan=False,
+def tma_gather4(
+    atom,
+    destination,
+    mbarrier,
+    k,
+    r0,
+    r1,
+    r2,
+    r3,
+    cta_group,
+    cache_policy=0,
+    mcast_mask=None,
     loc=None,
     ip=None,
-) -> cutlass.Float32:
-    a_val = cutlass.Float32(a).ir_value(loc=loc, ip=ip)
-    b_val = cutlass.Float32(b).ir_value(loc=loc, ip=ip)
-    if _nvvm_fmin_needs_res():
-        # CUDA 12: nvvm.fmin(res, a, b, ...)
-        result = nvvm.fmin(T.f32(), a_val, b_val, nan=nan, loc=loc, ip=ip)
-    else:
-        # CUDA 13: nvvm.fmin(a, b, ...)
-        result = nvvm.fmin(a_val, b_val, nan=nan, loc=loc, ip=ip)
-    return cutlass.Float32(result)
-
-
-def sigmoid_f32(
-    a: Union[float, cutlass.Float32], fastmath: bool = False
-) -> Union[float, cutlass.Float32]:
-    """
-    Compute the sigmoid of the input tensor.
-    """
-    return cute.arch.rcp_approx(1.0 + cute.math.exp(-a, fastmath=fastmath))
-
-
-def silu_f32(
-    a: Union[float, cutlass.Float32], fastmath: bool = False
-) -> Union[float, cutlass.Float32]:
-    """
-    Compute the silu of the input tensor.
-    """
-    return a * sigmoid_f32(a, fastmath=fastmath)
-
-
-# TODO(zhichenj): try to move these to NVVM wrapper or helper functions
-@dsl_user_op
-def vectorized_atomic_add_bf16x8(
-    rOut_epi_packed, scatter_out_offset, loc=None, ip=None
 ):
+    """Load four independently indexed rows into the native K-major layout."""
+    executable = _cute_nvgpu_ir.atom_make_exec_tma(atom._trait.value, loc=loc, ip=ip)
+    descriptor_type = _cute_ir.PtrType.get(
+        _cute_nvgpu_ir.TmaDescriptorTiledType.get(), AddressSpace.generic, 64
+    )
+    descriptor = _cute_nvgpu_ir.get_tma_desc_addr(
+        descriptor_type, executable, loc=loc, ip=ip
+    )
+    barrier = cutlass.Int32(mbarrier.toint())
+    if cta_group == 2:
+        # Both CTAs' completion bytes belong to the leader's barrier.
+        barrier = barrier & cutlass.Int32(-16777217)
+    elif cta_group != 1:
+        raise ValueError("Unsupported TMA CTA group")
+    operands = [
+        cutlass.Int32(destination.toint()).ir_value(loc=loc, ip=ip),
+        descriptor.toint().ir_value(loc=loc, ip=ip),
+        barrier.ir_value(loc=loc, ip=ip),
+        *[
+            cutlass.Int32(value).ir_value(loc=loc, ip=ip)
+            for value in (k, r0, r1, r2, r3)
+        ],
+    ]
+    constraints = "r,l,r,r,r,r,r,r"
+    scope = "cluster" if cta_group == 2 or mcast_mask is not None else "cta"
+    asm = (
+        f"cp.async.bulk.tensor.2d.shared::{scope}.global.tile::gather4."
+        "mbarrier::complete_tx::bytes"
+    )
+    arguments = "[$0], [$1, {$3, $4, $5, $6, $7}], [$2]"
+    if mcast_mask is not None:
+        asm += ".multicast::cluster"
+        arguments += f", ${len(operands)}"
+        operands.append(cutlass.Int16(mcast_mask).ir_value(loc=loc, ip=ip))
+        constraints += ",h"
+    asm += f".cta_group::{cta_group}.L2::cache_hint "
+    arguments += f", ${len(operands)};"
+    operands.append(cutlass.Int64(cache_policy).ir_value(loc=loc, ip=ip))
+    constraints += ",l"
+    asm += arguments
     llvm.inline_asm(
         None,
-        [
-            scatter_out_offset.iterator.llvm_ptr,
-            llvm.bitcast(T.i32(), rOut_epi_packed[0, None].load().ir_value()),
-            llvm.bitcast(T.i32(), rOut_epi_packed[1, None].load().ir_value()),
-            llvm.bitcast(T.i32(), rOut_epi_packed[2, None].load().ir_value()),
-            llvm.bitcast(T.i32(), rOut_epi_packed[3, None].load().ir_value()),
-        ],
-        "red.global.v4.bf16x2.add.noftz [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r",
+        operands,
+        asm,
+        constraints,
         has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )
 
 
 @dsl_user_op
-def vectorized_atomic_add_fp32x2(
-    rOut_epi_packed, scatter_out_offset, loc=None, ip=None
-):
-    llvm.inline_asm(
-        None,
-        [
-            scatter_out_offset.iterator.llvm_ptr,
-            rOut_epi_packed[0].ir_value(),
-            rOut_epi_packed[1].ir_value(),
-        ],
-        "red.global.v2.f32.add [$0], {$1, $2};",
-        "l,f,f",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
+def release_gpu(loc=None, ip=None):
+    """Publish completed writes before triggering the dependent grid."""
+    llvm.fence(llvm.AtomicOrdering.release, syncscope="device", loc=loc, ip=ip)
 
 
 @dsl_user_op
-def atomic_add_func(rOut_epi_packed, scatter_out_offset, loc=None, ip=None):
-    if cutlass.const_expr(rOut_epi_packed.dtype == cutlass.Float32):
-        llvm.inline_asm(
-            None,
-            [
-                scatter_out_offset.iterator.llvm_ptr,
-                rOut_epi_packed.ir_value(),
-            ],
-            "red.global.add.f32 [$0], $1;",
-            "l,f",
-            has_side_effects=True,
-            loc=loc,
-            ip=ip,
-        )
-    elif cutlass.const_expr(rOut_epi_packed.dtype == cutlass.BFloat16):
-        llvm.inline_asm(
-            None,
-            [
-                scatter_out_offset.iterator.llvm_ptr,
-                llvm.bitcast(T.i16(), rOut_epi_packed.ir_value()),
-            ],
-            "red.add.noftz.bf16 [$0], $1;",
-            "l,h",
-            has_side_effects=True,
-            loc=loc,
-            ip=ip,
-        )
+def blk_copy(dst_gemm, src_smem, size, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            src_smem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            size.ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -360,46 +224,6 @@ def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
         "cp.reduce.async.bulk.global.shared::cta.bulk_group.noftz.f16 [$0], [$1], $2;",
         "l,l,r",
         has_side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def griddepcontrol_wait(*, loc=None, ip=None) -> None:
-    """
-    This instruction is used to wait for the previous kernel's grid ending
-    (all blocks of the previous kernel have finished and memflushed), i.e.,
-    the instruction after this instruction will not be issued until the previous
-    grid has finished.
-    """
-    llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="griddepcontrol.wait;",
-        constraints="",
-        has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def griddepcontrol_launch_dependents(*, loc=None, ip=None) -> None:
-    """
-    Issuing the launch_dependents instruction hints a dependent kernel to launch earlier.
-    launch_dependents doesn't impact the functionality but the performance:
-    Launching a dependent kernel too early can compete with current kernels,
-    while launching too late can lead to a long latency.
-    """
-    llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="griddepcontrol.launch_dependents;",
-        constraints="",
-        has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
     )

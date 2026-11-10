@@ -106,24 +106,28 @@ def bind_namespace(
     return dict(bound.arguments)
 
 
-def build_extractor_maps(templates: list) -> list[dict[str, Callable]]:
-    """Pre-build each template's per-axis extractor callables (once, at install)."""
-    maps: list[dict[str, Callable]] = []
+def build_extractor_maps(
+    templates: list,
+) -> list[dict[str, Callable] | None]:
+    """Pre-build each template's axis extractors, preserving failed entries."""
+    maps: list[dict[str, Callable] | None] = []
     for tmpl in templates:
         try:
             maps.append(tmpl._build_axis_extractors())
         except Exception:  # noqa: BLE001 — a malformed template must not break others
-            continue
+            maps.append(None)
     return maps
 
 
 def extract_axes(
-    extractor_maps: list[dict[str, Callable]], namespace: dict[str, Any]
+    extractor_maps: list[dict[str, Callable] | None], namespace: dict[str, Any]
 ) -> dict[str, int]:
     """Run extractors over a (param → value) namespace → full concrete axis vector.
     Multiple templates merge: each axis is filled by the first that resolves it."""
     axes: dict[str, int] = {}
     for emap in extractor_maps:
+        if emap is None:
+            continue
         for axis_name, fn in emap.items():
             if axis_name in axes:
                 continue
@@ -171,11 +175,81 @@ def _reset_stats() -> None:
 _loaded_lock = Lock()
 _loaded: dict[tuple[str, str], Callable] = {}
 _loading_locks: dict[tuple[str, str], Lock] = {}
+#: Already-built callables registered by sealed-package loaders (trace_apply/packages).
+#: Consulted before the build path so sealed sources are never materialized
+#: into the on-disk solution cache.
+#: {(definition, solution name): (callable, Solution hash or None)}.
+_preloaded: dict[tuple[str, str], tuple[Callable, str | None]] = {}
+
+
+def register_preloaded(
+    definition: str, name: str, fn: Callable, *, solution_hash: str | None = None
+) -> None:
+    """Register an already-built callable for a (definition, solution-name) pair.
+
+    Sealed-package loaders use this to hand ``enable_apply`` their imported
+    entry point: the registered callable is returned by the loaded-solution
+    boundary instead of building through the loaders, so sealed sources never
+    reach the world-writable solution cache. ``reset_loaded`` does not clear
+    preloaded entries; they are the caller's to manage via ``clear_preloaded``.
+    ``solution_hash`` (``Solution.hash()``) binds the callable to the one
+    Solution it was built from: a different Solution enabled under the same
+    definition and name is refused at the boundary instead of being served the
+    callable of the first.
+    """
+    with _loaded_lock:
+        key = (str(definition), str(name))
+        _preloaded[key] = (fn, solution_hash)
+        # A callable the build path cached for this key before the
+        # registration is never served again.
+        _loaded.pop(key, None)
+
+
+def unregister_preloaded(definition: str, name: str) -> None:
+    """Drop the preloaded entry of one (definition, solution-name) pair, if any.
+
+    The release path of a sealed-package loader: the entries other loaders
+    registered stay."""
+    with _loaded_lock:
+        _preloaded.pop((str(definition), str(name)), None)
+
+
+def clear_preloaded() -> None:
+    """Drop every preloaded entry (the sealed-package kill path)."""
+    with _loaded_lock:
+        _preloaded.clear()
+
+
+def preloaded_entry(definition: str, name: str) -> Callable | None:
+    """The callable preloaded for a (definition, solution-name) pair, if any.
+
+    Read access for installers that verify their registration is still the
+    live one (a foreign ``register_preloaded`` for the same key replaces it).
+    """
+    with _loaded_lock:
+        entry = _preloaded.get((str(definition), str(name)))
+        return None if entry is None else entry[0]
+
+
+def _preloaded_for(entry: tuple[Callable, str | None], solution: Solution) -> Callable:
+    """Return the preloaded callable, refusing one bound to another Solution hash."""
+    fn, bound = entry
+    if bound is not None and bound != solution.hash():
+        raise RuntimeError(
+            f"Trace Apply: the callable preloaded for {solution.definition!r}/"
+            f"{solution.name!r} was built for another Solution ({bound[:12]}, not "
+            f"{solution.hash()[:12]}); disable it before enabling this one"
+        )
+    return fn
 
 
 def _get_loaded_solution(solution: Solution) -> Callable:
+    """Resolve a Solution's callable: a preloaded entry wins, else build it once."""
     key = (solution.definition, solution.name)
     with _loaded_lock:
+        preloaded = _preloaded.get(key)
+        if preloaded is not None:
+            return _preloaded_for(preloaded, solution)
         cached = _loaded.get(key)
         if cached is not None:
             return cached
@@ -186,11 +260,22 @@ def _get_loaded_solution(solution: Solution) -> Callable:
     # different solutions still build in parallel.
     with lock:
         with _loaded_lock:
+            # Asked again under the per-solution lock: a registration that
+            # landed while this caller waited for another caller's build wins
+            # over the callable that build cached.
+            preloaded = _preloaded.get(key)
+            if preloaded is not None:
+                return _preloaded_for(preloaded, solution)
             cached = _loaded.get(key)
             if cached is not None:
                 return cached
         fn = load_solution(solution)
         with _loaded_lock:
+            # A callable preloaded while this build ran wins: the build path
+            # never serves a Solution a sealed loader owns.
+            preloaded = _preloaded.get(key)
+            if preloaded is not None:
+                return _preloaded_for(preloaded, solution)
             _loaded[key] = fn
         return fn
 
@@ -236,27 +321,57 @@ def _make_wrapper(
     original: Callable,
     build_namespace: Callable[[tuple, dict], dict[str, Any]],
     extractor_maps: list,
-    template: Any,
-    dests: dict,
+    templates: list,
+    template_dispatch: Callable | None,
+    dests_by_template: list[dict],
     is_inplace: bool,
+    stateful_adapter: Any | None,
     solutions_by_name: dict[str, Any],
 ) -> Callable:
     """Wrapper that routes a call to a registered solution by *definition name*.
 
-    Per call: build the namespace, extract the const axes, compute this
-    template's definition name (``name_prefix`` + const-axis abbrevs — the same
-    logic the trace collector uses), and look it up in ``solutions_by_name``. The
-    per-name decision (resolved entry or miss) is cached, so later calls for the
-    same shape are a dict lookup. Inside CUDA-graph capture only the cached path
-    runs (eager warmup populates the cache before capture)."""
+    Per call: build the namespace, resolve the same template selected by
+    ``fi_trace``, extract its const axes, compute its definition name, and look
+    it up in ``solutions_by_name``.  The per-name decision (resolved entry or
+    miss) is cached, so later calls for the same shape are a dict lookup. Inside
+    CUDA-graph capture only the cached path runs (eager warmup populates the
+    cache before capture)."""
     cache_lock = Lock()
     by_name: dict[str, _Entry | None] = {}
+    template_indices = {id(template): idx for idx, template in enumerate(templates)}
 
     @functools.wraps(original)
     def wrapper(*args, **kwargs):
         try:
             namespace = build_namespace(args, kwargs)
-            axes = extract_axes(extractor_maps, namespace)
+            if namespace.get("batch_invariant"):
+                # The batch-invariant mode fixes the call's dataflow to its class; a registered solution is another
+                # kernel, so the original call stands.
+                bump_stat(fi_api, "fallback_batch_invariant")
+                return original(*args, **kwargs)
+            template = (
+                templates[0]
+                if template_dispatch is None
+                else template_dispatch(save_dir=None, name=None, **namespace)
+            )
+            # Apply only a canonical template published by this dispatcher.
+            # A dynamic or unknown template remains traceable but has no
+            # registered Apply binding, so preserve the original API call.
+            template_idx = template_indices.get(id(template))
+            if template_idx is None:
+                return original(*args, **kwargs)
+            extractor_map = extractor_maps[template_idx]
+            if extractor_map is None:
+                return original(*args, **kwargs)
+            if stateful_adapter is not None:
+                self_obj = args[0] if args else None
+                namespace = plan_capture.augment_namespace(
+                    stateful_adapter, template, namespace, self_obj
+                )
+            dests = dests_by_template[template_idx]
+            if is_inplace and not dests:
+                return original(*args, **kwargs)
+            axes = extract_axes([extractor_map], namespace)
             name = template.definition_name(axes)
         except Exception:  # noqa: BLE001 — never let extraction break the engine
             return original(*args, **kwargs)
@@ -482,21 +597,36 @@ def _registry_by_fi_api() -> dict[str, tuple[Callable, list]]:
     """fi_api -> (undecorated original, [templates]) from the live trace registry."""
     out: dict[str, tuple[Callable, list]] = {}
     try:
-        from flashinfer.api_logging import _TRACE_REGISTRY  # noqa: PLC0415
+        from flashinfer.api_logging import (  # noqa: PLC0415
+            _TRACE_FI_API_ALIASES,
+            _TRACE_REGISTRY,
+            _trace_fi_api_for,
+        )
     except Exception:  # noqa: BLE001
         return out
     for original, template, _label in _TRACE_REGISTRY:
         module = getattr(original, "__module__", "") or ""
         qualname = getattr(original, "__qualname__", "") or ""
-        fi_api = f"{module}.{qualname}" if module else qualname
-        if not fi_api:
-            continue
-        entry = out.get(fi_api)
-        if entry is None:
-            out[fi_api] = (original, [template])
-        else:
-            entry[1].append(template)
+        moved_fi_api = f"{module}.{qualname}" if module else qualname
+        fi_apis = [api for api in (_trace_fi_api_for(original), moved_fi_api) if api]
+        if moved_fi_api in _TRACE_FI_API_ALIASES:
+            fi_apis.append(moved_fi_api)
+        for fi_api in dict.fromkeys(fi_apis):
+            entry = out.get(fi_api)
+            if entry is None:
+                out[fi_api] = (original, [template])
+            else:
+                entry[1].append(template)
     return out
+
+
+def _trace_dispatcher_for(original: Callable) -> Callable | None:
+    """Return the trace-time runtime selector registered for ``original``."""
+    try:
+        from flashinfer.api_logging import _TRACE_DISPATCHERS  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    return _TRACE_DISPATCHERS.get(original)
 
 
 # ---------------------------------------------------------------------------
@@ -596,10 +726,11 @@ def enable_apply(solutions: dict[str, Any] | None = None) -> int:
         wrapped = 0
         matched_apis = 0
         for fi_api, (original, templates) in registry.items():
-            template0 = templates[0] if templates else None
-            if template0 is None:
+            if not templates:
                 continue
-            if not _template_matches_any(template0, sol_map):
+            if not any(
+                _template_matches_any(template, sol_map) for template in templates
+            ):
                 continue  # skip-wrap: no registered solution can target this API
             resolved = _resolve_target(fi_api)
             if resolved is None:
@@ -612,43 +743,40 @@ def enable_apply(solutions: dict[str, Any] | None = None) -> int:
 
             matched_apis += 1
             extractor_maps = build_extractor_maps(templates)
-            dests = _derive_output_dests(template0, original)
+            dests_by_template = [
+                _derive_output_dests(template, original) for template in templates
+            ]
             is_inplace = _is_inplace_api(original)
-            if is_inplace and not dests:
-                _log.warning(
-                    "Trace Apply: %s is in-place but has no output destination map; "
-                    "skipping to avoid silent corruption.",
-                    fi_api,
-                )
-                continue
-
+            stateful_adapter = None
+            build_ns = _stateless_namespace_builder(original)
             if plan_capture.is_stateful(fi_api):
-                adapter = plan_capture.adapter_for(fi_api)
-                build_ns = _stateful_namespace_builder(original, template0, adapter)
-                if hasattr(owner, adapter.plan_attr):
-                    plan_current = getattr(owner, adapter.plan_attr)
+                stateful_adapter = plan_capture.adapter_for(fi_api)
+                if hasattr(owner, stateful_adapter.plan_attr):
+                    plan_current = getattr(owner, stateful_adapter.plan_attr)
                     if not getattr(plan_current, "_trace_apply", False):
                         setattr(
-                            owner, adapter.plan_attr, _make_plan_wrapper(plan_current)
+                            owner,
+                            stateful_adapter.plan_attr,
+                            _make_plan_wrapper(plan_current),
                         )
                         _patches.append(
                             _Patch(
                                 owner=owner,
-                                attr=adapter.plan_attr,
+                                attr=stateful_adapter.plan_attr,
                                 original=plan_current,
                             )
                         )
-            else:
-                build_ns = _stateless_namespace_builder(original)
 
             wrapper = _make_wrapper(
                 fi_api=fi_api,
                 original=current,
                 build_namespace=build_ns,
                 extractor_maps=extractor_maps,
-                template=template0,
-                dests=dests,
+                templates=templates,
+                template_dispatch=_trace_dispatcher_for(original),
+                dests_by_template=dests_by_template,
                 is_inplace=is_inplace,
+                stateful_adapter=stateful_adapter,
                 solutions_by_name=sol_map,
             )
             # Patch the canonical target + module-level aliases for the same
@@ -682,6 +810,7 @@ def disable_apply() -> None:
 
 
 def _disable_locked() -> None:
+    """Revert each patch, warn about unfired Solutions, empty the mapping in place."""
     global _solutions, _unfired
     while _patches:
         p = _patches.pop()
@@ -701,6 +830,10 @@ def _disable_locked() -> None:
             len(never),
             never,
         )
+    # Emptied in place: every wrapper built on this mapping (one a caller kept
+    # before its first matching call included) routes nowhere from here on,
+    # instead of resolving a Solution that is no longer enabled.
+    _solutions.clear()
     _solutions = {}
     reset_loaded()
     _reset_stats()

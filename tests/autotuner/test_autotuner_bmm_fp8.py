@@ -6,12 +6,20 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import (
     _FP8_GEMM_SM100_TUNING_CONFIG,
     _cudnn_gemm_fp8_runner,
-    _get_cache_buf,
+    _get_stream_cache_buf,
     get_gemm_module,
     DEFAULT_WORKSPACE_SIZE,
 )
+from flashinfer.gemm import gemm_base
 from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
+
+
+def _assert_engine_knob_tactic(tactic):
+    """cuDNN tactics are stable (engine_id, knob_items) descriptors, not plan indices."""
+    engine_id, knob_items = tactic
+    assert isinstance(engine_id, int)
+    assert all(len(item) == 2 for item in knob_items)
 
 
 @pytest.mark.parametrize(
@@ -91,7 +99,7 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
     assert res.isfinite().all()
 
     # bmm_fp8 is tuned through fp8_gemm_sm100 and uses these inputs internally.
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, input_fp8.device
     )
     cache_inputs = [
@@ -120,10 +128,7 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
     assert is_cache_hit == expected_cache_hit
     if is_cache_hit:
         assert runner_id == 0
-        # cuDNN FP8 runner now enumerates multiple execution plans, so the
-        # autotuner can pick any valid plan index (>= 0). Tactic == -1 would
-        # mean the fallback path was chosen (no hit), which contradicts the hit.
-        assert tactic >= 0
+        _assert_engine_knob_tactic(tactic)
         assert stored_profile is not None
 
 
@@ -131,12 +136,10 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
 def test_autotuner_gemm_cross_bucket_m(backend):
     """Tune at one M bucket, then run inference at a non-bucket M.
 
-    The non-override cuDNN graph (and the cuBLASLt algo list) is enumerated at
-    the *real* shape, so a tactic tuned against a different (bucketed) M may be
-    out of range for the runtime plan/algo list. This must NOT raise (the
-    runner clamps an out-of-range index back to the heuristic default), and the
-    autotuner must still reuse the tuned bucket entry for the non-bucket M
-    (i.e. the workspace scratch size does not leak into the cache key).
+    Both backends' tactics are stable descriptors (cuBLASLt algorithms, cuDNN
+    engine/knobs) resolved against the runtime problem. Both paths must reuse
+    the tuned bucket entry for the non-bucket M (i.e. the workspace scratch
+    size does not leak into the cache key) and produce finite output.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     cc = compute_capability[0] * 10 + compute_capability[1]
@@ -169,8 +172,7 @@ def test_autotuner_gemm_cross_bucket_m(backend):
     with autotune(tune_mode=True):
         bmm_fp8(a8, b8, a_s, b_s, res_dtype, backend=backend)
 
-    # 2) Run at a non-bucket M. Must not raise (out-of-range tactic is clamped)
-    #    and must produce finite output.
+    # 2) Run at a non-bucket M. Must not raise and must produce finite output.
     a8, b8, a_s, b_s = make(run_m)
     res = bmm_fp8(a8, b8, a_s, b_s, res_dtype, backend=backend)
     assert res.isfinite().all()
@@ -181,7 +183,7 @@ def test_autotuner_gemm_cross_bucket_m(backend):
         if backend == "cudnn"
         else get_gemm_module().cublas_fp8_gemm_runner()
     )
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, a8.device
     )
     is_cache_hit, runner_id, tactic, stored_profile = autotuner.search_cache(
@@ -199,5 +201,47 @@ def test_autotuner_gemm_cross_bucket_m(backend):
         inputs=[a8, b8, a_s, b_s, res, workspace_buffer],
     )
     assert is_cache_hit
-    assert tactic >= 0
+    if backend == "cudnn":
+        _assert_engine_knob_tactic(tactic)
+    else:
+        assert gemm_base._is_cublaslt_algo_tactic(tactic)
     assert stored_profile is not None
+
+
+def test_bmm_fp8_heuristic_gates_cudnn_on_sm12x_without_override_shape(monkeypatch):
+    """On SM12x, cuDNN must be excluded from the ``auto`` candidate list when
+    ``override_shape`` is unavailable (cuDNN backend < 9.23.1): the cuDNN FP8
+    path pays an unbounded per-shape ``policy=ALL`` host-side graph build at
+    serving time and surfaces an async CUDA fault past the tactic-level
+    fallback (#3707 only catches synchronous exceptions). When
+    ``override_shape`` is available, M is bucketed and the build is amortized,
+    so cuDNN stays a candidate. See RFC #3920 (runner-contract rule 6).
+
+    The SM version and cuDNN availability are monkeypatched so this runs on
+    any host without SM12x hardware or a cuDNN install.
+    """
+    # _match_sm_version(device, versions) -> True only for the SM12x list,
+    # so is_sm_supported (SM10x) is False and is_sm120_supported is True.
+    monkeypatch.setattr(gemm_base, "_match_sm_version", lambda dev, vers: "120" in vers)
+
+    a = torch.empty(1, 16, 32, dtype=torch.bfloat16)
+    b = torch.empty(1, 64, 32, dtype=torch.bfloat16)
+
+    def call(override_shape_available):
+        monkeypatch.setattr(
+            gemm_base, "CUDNN_AVAILABLE", True
+        )  # exercise the cudnn branch
+        monkeypatch.setattr(
+            gemm_base,
+            "_is_cudnn_override_shape_available",
+            lambda: override_shape_available,
+        )
+        return gemm_base._heuristic_func_bmm_fp8(
+            ["cudnn", "cublas", "cutlass"], a, b, a, b, torch.bfloat16, None, "auto"
+        )
+
+    # override_shape unavailable -> cuDNN excluded on SM12x.
+    assert "cudnn" not in call(override_shape_available=False)
+
+    # override_shape available -> cuDNN retained.
+    assert "cudnn" in call(override_shape_available=True)

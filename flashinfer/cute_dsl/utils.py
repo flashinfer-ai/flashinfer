@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import ctypes
 import functools
-import importlib.util
 import warnings
-from typing import Union, Tuple
+from typing import Tuple, Union
 
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
@@ -28,31 +28,23 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
+from .availability import (  # noqa: F401
+    cute_dsl_compile_arch,
+    is_cute_dsl_arch_supported,
+    is_cute_dsl_available,
+    is_cute_dsl_experimental_available,
+    is_rubin_cute_dsl_available,
+    require_cute_dsl_arch,
+)
+
+if not hasattr(cute.nvgpu, "OperandMajorMode"):
+    with contextlib.suppress(AttributeError):
+        cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
+
 
 def ceil_div(a: int, b: int) -> int:
     """Ceiling division."""
     return (a + b - 1) // b
-
-
-def is_cute_dsl_available() -> bool:
-    r"""Return ``True`` when the optional CuTe DSL stack is importable.
-
-    Probes for ``cutlass`` and ``cutlass.cute`` via :func:`importlib.util.find_spec`.
-    Used by higher-level wrappers to decide whether to dispatch to a CuTe-DSL
-    backend (e.g. :func:`flashinfer.quantization.mxfp4_quantize`,
-    :class:`flashinfer.cute_dsl.attention.wrappers.BatchDecodeCuteDSLWrapper`)
-    or fall back to a plain-CUDA implementation.
-
-    Returns
-    -------
-    bool
-        ``True`` if both ``cutlass`` and ``cutlass.cute`` are importable in the
-        current Python environment.
-    """
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("cutlass.cute") is not None
-    )
 
 
 def get_cutlass_dtype(dtype: str) -> cutlass.dtype:
@@ -82,6 +74,21 @@ def torch_to_cutlass_dtype(dtype: torch.dtype) -> cutlass.dtype:
     return dtype_map[dtype]
 
 
+def _as_cute_dsl_workspace_i8(
+    workspace_buffer: torch.Tensor,
+    *,
+    name: str = "workspace_buffer",
+) -> torch.Tensor:
+    if workspace_buffer.dtype not in (torch.int8, torch.uint8):
+        raise ValueError(
+            f"{name} must be a torch.int8 or torch.uint8 byte tensor, "
+            f"got {workspace_buffer.dtype}"
+        )
+    if not workspace_buffer.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    return workspace_buffer.view(-1).view(torch.int8)
+
+
 def cutlass_to_torch_dtype(cutlass_dtype):
     """
     Return the corresponding torch.dtype per the given DSL type
@@ -104,6 +111,27 @@ def cutlass_to_torch_dtype(cutlass_dtype):
     if torch_dtype is None:
         raise TypeError(f"{cutlass_dtype} is not supported by torch")
     return torch_dtype
+
+
+def torch_dtype_to_cutlass(dtype: torch.dtype):
+    """Convert torch.dtype to corresponding cutlass dtype.
+
+    :param dtype: PyTorch data type
+    :type dtype: torch.dtype
+    :return: Corresponding CUTLASS data type
+    :rtype: cutlass.dtype
+    :raises TypeError: If the dtype is not supported
+    """
+    torch_to_cutlass_map = {
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
+    if dtype not in torch_to_cutlass_map:
+        raise TypeError(f"Unsupported torch dtype: {dtype}")
+    return torch_to_cutlass_map[dtype]
 
 
 @functools.cache
@@ -412,6 +440,47 @@ def convert_sf_to_mma_layout(
     return sf_6d  # Return strided view, NOT contiguous
 
 
+def convert_row_major_sf_to_mma_layout(
+    sf: torch.Tensor,
+    m: int,
+    k: int,
+    num_groups: int = 1,
+    sf_vec_size: int = 32,
+) -> torch.Tensor:
+    """Convert row-major (unswizzled) block scales to the 6D MMA layout.
+
+    Checkpoints store block scales row-major, one ``uint8`` (E8M0) per
+    ``sf_vec_size`` elements along K, e.g. ``[num_groups, m, k // sf_vec_size]`` for
+    stacked expert weights. This swizzles them (``block_scale_interleave``) and
+    returns the same view as :func:`convert_sf_to_mma_layout`, so it matches
+    ``mxfp8_quantize(..., is_sf_swizzled_layout=True)`` followed by that function.
+
+    Args:
+        sf: ``uint8`` (or ``float8_e8m0fnu``) scales of shape
+            ``(num_groups, m, ceil(k / sf_vec_size))``, or ``(m, ceil(k / sf_vec_size))``
+            when ``num_groups == 1``.
+        m: Rows of the quantized matrix.
+        k: Columns (the quantized dimension) of the matrix before block scaling.
+        num_groups: Number of stacked matrices (e.g. experts).
+        sf_vec_size: Elements per scale (32 for MXFP8).
+
+    Returns:
+        Scales in the 6D MMA layout ``(32, 4, m_tiles, 4, k_tiles, num_groups)``.
+    """
+    from ..quantization.fp4_quantization import block_scale_interleave
+
+    sf_k = ceil_div(k, sf_vec_size)
+    if sf.dtype != torch.uint8:
+        sf = sf.view(torch.uint8)
+    if tuple(sf.shape) not in ((num_groups, m, sf_k), (m, sf_k)):
+        raise ValueError(
+            f"Row-major scales must have shape ({num_groups}, {m}, {sf_k}), "
+            f"got {tuple(sf.shape)}"
+        )
+    swizzled = block_scale_interleave(sf.reshape(num_groups, m, sf_k).contiguous())
+    return convert_sf_to_mma_layout(swizzled, m, k, num_groups, sf_vec_size)
+
+
 def convert_sf_from_mma_layout(
     sf_6d: torch.Tensor,
     m: int,
@@ -510,8 +579,10 @@ def sm120_make_smem_layout_sfa(
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
-    assert tile_shape_mnk[0] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[0] must be divisible by 64"
+    # Sub-64-row M tiles appear only in the b12x dense GEMM path, whose SF
+    # fragment layouts handle them.
+    assert tile_shape_mnk[0] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[0] must be divisible by 16"
     )
 
     # Scale-factor tiles are quantized in 128-row blocks, so narrower MMA

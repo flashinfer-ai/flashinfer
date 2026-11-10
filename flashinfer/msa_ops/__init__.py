@@ -1,0 +1,92 @@
+"""Minimax Sparse Attention operations.
+
+Sparse prefill, sparse decode, and top-k selection support SM100, SM103, SM120,
+and SM121 Blackwell GPUs. Proxy scoring remains SM120/SM121-only.
+"""
+
+import torch
+
+from ..utils import get_compute_capability
+from ._blackwell_sm100 import MSASparseAttentionWorkspace
+from ._nvfp4_decode_sm100 import (
+    msa_decode_nvfp4_specialized_stats,
+    warm as msa_decode_nvfp4_specialized_warmup,
+)
+from ._nvfp4_prefill_sm100 import (
+    msa_prefill_nvfp4_specialized_stats,
+    warm as msa_prefill_nvfp4_specialized_warmup,
+)
+from .proxy_score import (
+    msa_proxy_score,
+    msa_proxy_score_fp4,
+)
+from .sparse_prefill import msa_sparse_attention
+from .sparse_decode import (
+    msa_sparse_decode_attention,
+    prepare_msa_nvfp4_sparse_decode,
+)
+from .cake_icp_indexer import (
+    msa_icp_comm_layout,
+    msa_icp_decode_index_score_sharded,
+    msa_icp_decode_pool_bytes,
+    msa_icp_decode_score_columns,
+    msa_icp_decode_score_publish,
+    msa_icp_index_score_columns,
+    msa_icp_index_score_plan_storage,
+    msa_icp_index_score_sharded,
+    msa_icp_index_score_sharded_plan,
+    msa_icp_index_score_sharded_plan_device,
+    msa_icp_merge_candidates,
+    msa_icp_prefill_pool_bytes,
+    msa_icp_prefill_score_select,
+    msa_icp_topk_select_prefill,
+    msa_icp_topk_select_publish,
+    prepare_msa_icp_indexer,
+)
+from .sparse_topk_select import msa_topk_select
+
+# Legacy aggregate capability flag retained for callers that only target
+# SM120/SM121. Mixed-architecture callers should query supports_packed_kv().
+SUPPORTS_PACKED_KV = True
+
+
+def supports_packed_kv(device: torch.device | str) -> bool:
+    """Return whether MSA accepts packed paged K/V views on ``device``."""
+
+    normalized_device = torch.device(device)
+    return normalized_device.type == "cuda" and get_compute_capability(
+        normalized_device
+    ) in {(12, 0), (12, 1)}
+
+
+__all__ = [
+    "MSASparseAttentionWorkspace",
+    "SUPPORTS_PACKED_KV",
+    "msa_decode_nvfp4_specialized_stats",
+    "msa_decode_nvfp4_specialized_warmup",
+    "msa_icp_comm_layout",
+    "msa_icp_decode_index_score_sharded",
+    "msa_icp_decode_pool_bytes",
+    "msa_icp_decode_score_columns",
+    "msa_icp_decode_score_publish",
+    "msa_icp_index_score_columns",
+    "msa_icp_index_score_plan_storage",
+    "msa_icp_index_score_sharded",
+    "msa_icp_index_score_sharded_plan",
+    "msa_icp_index_score_sharded_plan_device",
+    "msa_icp_merge_candidates",
+    "msa_icp_prefill_pool_bytes",
+    "msa_icp_prefill_score_select",
+    "msa_icp_topk_select_prefill",
+    "msa_icp_topk_select_publish",
+    "msa_prefill_nvfp4_specialized_stats",
+    "msa_prefill_nvfp4_specialized_warmup",
+    "msa_proxy_score",
+    "msa_proxy_score_fp4",
+    "msa_sparse_attention",
+    "msa_sparse_decode_attention",
+    "msa_topk_select",
+    "prepare_msa_icp_indexer",
+    "prepare_msa_nvfp4_sparse_decode",
+    "supports_packed_kv",
+]

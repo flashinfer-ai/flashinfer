@@ -268,6 +268,18 @@ top_k_top_p_sampling_trace = TraceTemplate(
 # ── Free-function sampling utilities ─────────────────────────────────────────
 
 
+def _scaled_fp32_logits(logits, temperature):
+    """The fp32 logits scaled by the temperature as the batch-invariant class scales them (``x / T``)."""
+    x = logits.to(torch.float32)
+    if temperature is not None:
+        if isinstance(temperature, torch.Tensor):
+            t = temperature.to(torch.float32).reshape(-1, 1)
+        else:
+            t = float(temperature)
+        x = x / t
+    return x
+
+
 @torch.no_grad()
 def _softmax_reference(logits, temperature=None, **_unused):
     """Online safe softmax with optional temperature scaling."""
@@ -311,6 +323,14 @@ softmax_trace = TraceTemplate(
             optional=True,
             description="Per-tensor or per-row temperature.",
         ),
+        "out_dtype": Scalar(
+            "dtype",
+            optional=True,
+            description=(
+                "batch_invariant=True only: None keeps the input dtype; torch.float32 returns the fp32 "
+                "probabilities (the softmax_f32 template)."
+            ),
+        ),
     },
     outputs={
         "output": Tensor(["batch_size", "vocab_size"], dtype_from="logits"),
@@ -318,6 +338,256 @@ softmax_trace = TraceTemplate(
     tags=["status:verified"],
     reference=_softmax_reference,
     init=_softmax_init,
+)
+
+
+@torch.no_grad()
+def _softmax_f32_reference(logits, temperature=None, **_unused):
+    """Softmax of the temperature-scaled row in fp32 (``softmax(batch_invariant=True, out_dtype=torch.float32)``)."""
+    return torch.softmax(_scaled_fp32_logits(logits, temperature), dim=-1)
+
+
+def _softmax_f32_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.softmax(..., batch_invariant=True, out_dtype=torch.float32)``."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(
+            batch_size, vocab_size, device=device, dtype=torch.bfloat16
+        ),
+        "temperature": 1.0,
+        "batch_invariant": True,
+        "out_dtype": torch.float32,
+    }
+
+
+softmax_f32_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="softmax_f32",
+    description=(
+        "Batch-invariant softmax with optional temperature scaling returning fp32 probabilities "
+        "(softmax(batch_invariant=True, out_dtype=torch.float32): the fp32 input's class for a 16-bit input)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+        "out_dtype": Scalar("dtype", description="torch.float32."),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "vocab_size"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_softmax_f32_reference,
+    init=_softmax_f32_init,
+)
+
+
+def softmax_trace_dispatch(**kwargs):
+    """``softmax`` returns the input dtype unless ``out_dtype=torch.float32`` (batch-invariant class only)."""
+    if kwargs.get("out_dtype") is torch.float32:
+        return softmax_f32_trace
+    return softmax_trace
+
+
+softmax_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    softmax_trace,
+    softmax_f32_trace,
+)
+
+
+@torch.no_grad()
+def _log_softmax_reference(logits, temperature=None, **_unused):
+    """fp32 log-softmax of the temperature-scaled row (``flashinfer.log_softmax``: the batch-invariant class)."""
+    return torch.log_softmax(_scaled_fp32_logits(logits, temperature), dim=-1)
+
+
+def _log_softmax_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.log_softmax``."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "temperature": 1.0,
+    }
+
+
+log_softmax_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="log_softmax",
+    description=(
+        "Batch-invariant fp32 log-softmax row with optional temperature scaling "
+        "(the class lse.row: one dataflow for every batch, position and SM count)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+    },
+    outputs={
+        "output": Tensor(["batch_size", "vocab_size"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_log_softmax_reference,
+    init=_log_softmax_init,
+)
+
+
+@torch.no_grad()
+def _log_probs_reference(logits, token_ids, temperature=None, **_unused):
+    """fp32 log-probability of ``token_ids`` under the temperature-scaled softmax: one id per row
+    (``token_ids.shape == logits.shape[:-1]``) or ``K`` ids per row (``logits.shape[:-1] + (K,)``)."""
+    logp = torch.log_softmax(_scaled_fp32_logits(logits, temperature), dim=-1)
+    ids = token_ids.to(torch.long)
+    if ids.dim() == logits.dim() - 1:
+        return logp.gather(-1, ids.unsqueeze(-1)).squeeze(-1)
+    return logp.gather(-1, ids)
+
+
+def _log_probs_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.log_probs`` with one token id per row."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "token_ids": torch.randint(
+            0, vocab_size, (batch_size,), dtype=torch.int64, device=device
+        ),
+        "temperature": 1.0,
+    }
+
+
+def _log_probs_k_ids_init(
+    *,
+    batch_size: int,
+    num_ids: int = 4,
+    vocab_size: int = 32000,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.log_probs`` with ``num_ids`` token ids per row."""
+    torch.manual_seed(seed)
+    return {
+        "logits": make_logits(batch_size, vocab_size, device=device),
+        "token_ids": torch.randint(
+            0, vocab_size, (batch_size, num_ids), dtype=torch.int64, device=device
+        ),
+        "temperature": 1.0,
+    }
+
+
+_log_probs_template = TraceTemplate(
+    op_type="sampling",
+    name_prefix="log_probs",
+    description=(
+        "Batch-invariant fp32 log-probability of one token id per row under the "
+        "temperature-scaled softmax (the class lse.row; the row log-softmax gathered)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "token_ids": Tensor(
+            ["batch_size"],
+            dtype="int64",
+            description="One token id per row (int32 or int64); an id outside the vocabulary gives NaN.",
+        ),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+    },
+    outputs={
+        "logp": Tensor(["batch_size"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_log_probs_reference,
+    init=_log_probs_init,
+)
+
+
+_log_probs_k_ids_template = TraceTemplate(
+    op_type="sampling",
+    name_prefix="log_probs_k_ids",
+    description=(
+        "Batch-invariant fp32 log-probabilities of K token ids per row under the "
+        "temperature-scaled softmax (the class lse.row; the sampled token with its top-k or requested alternatives)."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+        "num_ids": Var(description="Token ids per row."),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "token_ids": Tensor(
+            ["batch_size", "num_ids"],
+            dtype="int64",
+            description="K token ids per row (int32 or int64); an id outside the vocabulary gives NaN.",
+        ),
+        "temperature": Scalar(
+            "float32",
+            optional=True,
+            description="Per-tensor or per-row temperature.",
+        ),
+    },
+    outputs={
+        "logp": Tensor(["batch_size", "num_ids"], dtype="float32"),
+    },
+    tags=["status:verified"],
+    reference=_log_probs_reference,
+    init=_log_probs_k_ids_init,
+)
+
+
+def log_probs_trace(**kwargs):
+    """Select the ``log_probs`` template by the rank of ``token_ids``: one id per row or ``K`` ids per row."""
+    logits = kwargs.get("logits")
+    token_ids = kwargs.get("token_ids")
+    if (
+        isinstance(logits, torch.Tensor)
+        and isinstance(token_ids, torch.Tensor)
+        and token_ids.dim() == logits.dim()
+    ):
+        return _log_probs_k_ids_template
+    return _log_probs_template
+
+
+log_probs_trace.templates = (  # type: ignore[attr-defined]
+    _log_probs_template,
+    _log_probs_k_ids_template,
 )
 
 
@@ -891,6 +1161,7 @@ top_k_ragged_transform_trace = TraceTemplate(
 )
 
 
+@torch.no_grad()
 # ── DeepSeek-V3 fused expert routing (top-k) ─────────────────────────────────
 
 
@@ -1019,24 +1290,44 @@ def _top_k_page_table_transform_reference(
     tie_break: int = 0,
     dsa_graph_safe: bool = False,
     row_starts=None,
+    page_table_row_starts=None,
+    page_size: int = 1,
     **_unused,
 ) -> torch.Tensor:
     """Reference for top_k_page_table_transform: per-row top-k selection on
-    the leading ``lengths[i]`` valid entries, then translate the selected
-    indices through ``src_page_table[row_to_batch[i]]``. Used in sparse
-    attention's second stage to produce per-row page-id sequences.
+    the score window starting at ``row_starts[i]``, then translate the selected
+    local indices through compact pages from the page-table window starting at
+    ``page_table_row_starts[i]``. Used in sparse attention's second stage to
+    produce per-row physical slot indices.
     """
+    if page_size > 1 and row_starts is not None and page_table_row_starts is None:
+        raise ValueError(
+            "page_table_row_starts is required with page_size > 1 and row_starts"
+        )
     num_rows = input.shape[0]
-    out = torch.zeros(num_rows, int(k), dtype=torch.int32, device=input.device)
+    out = torch.full((num_rows, int(k)), -1, dtype=torch.int32, device=input.device)
     for i in range(num_rows):
         L = int(lengths[i].item())
         if L <= 0:
             continue
         b = int(row_to_batch[i].item()) if row_to_batch is not None else i
-        row = input[i, :L].to(torch.float32)
+        row_start = int(row_starts[i].item()) if row_starts is not None else 0
+        page_table_row_start = (
+            int(page_table_row_starts[i].item())
+            if page_table_row_starts is not None
+            else row_start
+        )
+        row = input[i, row_start : row_start + L].to(torch.float32)
         kk = min(int(k), L)
-        _, idx = torch.topk(row, kk, sorted=True)
-        out[i, :kk] = src_page_table[b, idx.to(torch.long)].to(torch.int32)
+        if int(k) >= L:
+            idx = torch.arange(kk, dtype=torch.int32, device=input.device)
+        else:
+            _, idx = torch.topk(row, kk, sorted=True)
+            idx = idx.to(torch.int32)
+        physical_pages = src_page_table[
+            b, page_table_row_start + idx.to(torch.long) // page_size
+        ]
+        out[i, :kk] = physical_pages * page_size + idx % page_size
     return out
 
 
@@ -1045,8 +1336,9 @@ def _top_k_page_table_transform_init(
     num_rows: int,
     max_len: int = 64,
     batch_size: int = 4,
-    max_pages_per_seq: int = 32,
+    max_pages_per_seq: int = 64,
     k: int = 8,
+    page_size: int = 1,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1062,17 +1354,32 @@ def _top_k_page_table_transform_init(
         "src_page_table": src_page_table,
         "lengths": lengths,
         "k": int(k),
+        "page_size": int(page_size),
     }
 
 
-top_k_page_table_transform_trace = TraceTemplate(
+class _TopKPageTableTransformTraceTemplate(TraceTemplate):
+    """Keep API-default extraction local to the compact-page transform."""
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def extract_page_size(kwargs):
+            page_size = kwargs.get("page_size", 1)
+            return 1 if page_size is None else int(page_size)
+
+        extractors["page_size"] = extract_page_size
+        return extractors
+
+
+top_k_page_table_transform_trace = _TopKPageTableTransformTraceTemplate(
     op_type="sampling",
     name_prefix="top_k_page_table_transform",
     description=(
         "Fused per-row top-k selection plus page-table translation. For "
-        "each row i: pick top-k indices over input[i, :lengths[i]] and "
-        "translate them via src_page_table[row_to_batch[i]] to produce "
-        "per-row page-id sequences for sparse attention."
+        "each row i: pick top-k indices from the score window starting at "
+        "row_starts[i] and translate them from the page-table window starting "
+        "at page_table_row_starts[i] to produce physical slot indices."
     ),
     axes={
         "num_rows": Var(),
@@ -1080,6 +1387,7 @@ top_k_page_table_transform_trace = TraceTemplate(
         "batch_size": Var(),
         "max_pages_per_seq": Var(),
         "k": Const(abbrev="k"),
+        "page_size": Const(abbrev="ps"),
     },
     inputs={
         "input": Tensor(["num_rows", "max_len"]),
@@ -1090,6 +1398,9 @@ top_k_page_table_transform_trace = TraceTemplate(
         "lengths": Tensor(["num_rows"], dtype="int32"),
         "k": Scalar("int32"),
         "row_to_batch": Tensor(["num_rows"], dtype="int32", optional=True),
+        "row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
+        "page_table_row_starts": Tensor(["num_rows"], dtype="int32", optional=True),
+        "page_size": Scalar("int32", optional=True),
     },
     outputs={
         "indices": Tensor(["num_rows", "k"], dtype="int32"),
@@ -1097,4 +1408,16 @@ top_k_page_table_transform_trace = TraceTemplate(
     tags=["status:verified", "sparse"],
     reference=_top_k_page_table_transform_reference,
     init=_top_k_page_table_transform_init,
+)
+
+
+def top_k_page_table_transform_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Trace the returned indices when no raw side-output is requested."""
+    if kwargs.get("out_raw_indices") is not None:
+        return None
+    return top_k_page_table_transform_trace
+
+
+top_k_page_table_transform_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    top_k_page_table_transform_trace,
 )

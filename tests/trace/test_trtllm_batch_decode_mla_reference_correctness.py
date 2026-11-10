@@ -26,7 +26,7 @@ from tests.trace.reference_utils import (
 def test_trtllm_batch_decode_mla_reference_correctness(shape_kwargs):
     """trtllm_batch_decode_with_kv_cache_mla kernel vs reference (SM100/103)."""
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
-    from flashinfer.trace.templates.attention import trtllm_batch_decode_mla_trace
+    from flashinfer.trace.templates.attention import trtllm_batch_decode_mla_dense_trace
 
     # TRT-LLM MLA kernel is only instantiated on SM100/SM103 (trtllm-gen).
     _skip_if_not_sm100_or_103()
@@ -67,7 +67,7 @@ def test_trtllm_batch_decode_mla_reference_correctness(shape_kwargs):
         )
     except Exception as exc:
         pytest.skip(f"trtllm_batch_decode_with_kv_cache_mla unavailable: {exc}")
-    ref_out = trtllm_batch_decode_mla_trace.reference(
+    ref_out = trtllm_batch_decode_mla_dense_trace.reference(
         query,
         kv_cache,
         workspace,
@@ -81,6 +81,12 @@ def test_trtllm_batch_decode_mla_reference_correctness(shape_kwargs):
         bmm2_scale=1.0,
     )
     # Matches tests/attention/test_cute_dsl_mla_decode.py element-wise tol.
-    _check(trtllm_batch_decode_mla_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)
+    _check(
+        trtllm_batch_decode_mla_dense_trace,
+        ref_out,
+        api_out,
+        atol=1e-2,
+        rtol=1e-2,
+    )
     if torch.cuda.is_available():
         torch.cuda.synchronize()

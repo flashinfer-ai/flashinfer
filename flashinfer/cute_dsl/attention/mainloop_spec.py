@@ -80,6 +80,7 @@ class MainloopSpec:
                 kv_stages=kv_stages,
                 mma_softmax_stages=self.mma_softmax_stage,
                 epi_stages=self.epi_stage,
+                load_pt_stages=self.config.load_pt_stages,
             )
         else:
             topology = make_prefill_topology(
@@ -90,6 +91,7 @@ class MainloopSpec:
                 softmax_corr_stages=self.softmax_corr_stage,
                 mma_corr_stages=self.mma_corr_stage,
                 epi_stages=self.epi_stage,
+                load_pt_stages=self.config.load_pt_stages,
             )
         return replace(self, kv_stages=kv_stages, pipeline_topology=topology)
 

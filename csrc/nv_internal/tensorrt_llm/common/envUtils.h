@@ -16,10 +16,14 @@
  */
 
 #pragma once
+#include <cuda_runtime_api.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 
+#include "flashinfer/exception.h"
 #include "tensorrt_llm/common/quantization.h"
 
 namespace tensorrt_llm::common {
@@ -114,5 +118,24 @@ bool getEnvNVFP44Over6ErrUseFastMath();
 
 // Use 256 instead of 448 for the NVFP4 4over6 E4M3 scaling convention.
 bool getEnvNVFP44Over6E4M3Use256();
+
+template <typename KernelFn, typename... Args>
+inline void launchWithPdlWhenEnabled(char const* name, bool enable_pdl, KernelFn kernelFn,
+                                     dim3 grid, dim3 block, size_t dynamicShmSize,
+                                     cudaStream_t stream, Args&&... args) {
+  cudaLaunchConfig_t kernelConfig;
+  kernelConfig.gridDim = grid;
+  kernelConfig.blockDim = block;
+  kernelConfig.dynamicSmemBytes = dynamicShmSize;
+  kernelConfig.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  kernelConfig.attrs = attrs;
+  kernelConfig.numAttrs = 1;
+  cudaError_t e = cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...);
+  FLASHINFER_CHECK(e == cudaSuccess, "cudaLaunchKernelEx (", name,
+                   ") failed: ", cudaGetErrorString(e));
+}
 
 }  // namespace tensorrt_llm::common

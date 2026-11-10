@@ -19,23 +19,158 @@
 set -e
 set -u
 
-pip3 install --upgrade "setuptools>=77" "pip>=24"
+# Pip caches wheels under ~/.cache/pip by default; in a Docker layer that would
+# roughly double the multi-GB CUDA wheels. Disable it for every pip call below.
+export PIP_NO_CACHE_DIR=1
 
-# Accept CUDA version as parameter (e.g., cu126, cu128, cu129)
-CUDA_VERSION=${1:-cu128}
+# Usage: install_python_packages.sh <pytorch-index> <cudnn-version> [stage]
+# Each stage is its own `RUN` in docker/Dockerfile.ci so that they form separate
+# image layers, ordered from least to most frequently changed:
+#   torch  torch + the CUDA wheels it pulls in (and pip/setuptools)
+#   deps   requirements.txt, test/build deps, cuda-python, nvshmem4py, CI pins
+#   cudnn  cuDNN override and the final version assertions
+#   all    every stage in order (default)
+STAGE=${3:-all}
+case "${STAGE}" in
+  torch|deps|cudnn|all) ;;
+  *)
+    echo "ERROR: invalid stage: ${STAGE} (expected torch, deps, cudnn or all)" >&2
+    exit 1
+    ;;
+esac
+want_stage() { [[ "${STAGE}" == "all" || "${STAGE}" == "$1" ]]; }
+
+# Accept a PyTorch wheel index path (e.g., cu129 or nightly/cu134).
+PYTORCH_INDEX=${1:-cu129}
+if [[ ! "${PYTORCH_INDEX}" =~ ^(nightly/)?cu[0-9]+$ ]]; then
+  echo "ERROR: invalid PyTorch index path: ${PYTORCH_INDEX}" >&2
+  exit 1
+fi
+# The torch stage must not depend on the cuDNN version (or on the files that
+# change with it), or a cuDNN bump would invalidate the torch layer.
+CUDNN_VERSION=${2:-}
+if [[ "${STAGE}" != "torch" ]]; then
+  if [[ ! "${CUDNN_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: invalid cuDNN package version: ${CUDNN_VERSION:-<empty>}" >&2
+    exit 1
+  fi
+fi
+
+CUDA_TAG="${PYTORCH_INDEX##*/}"  # nightly/cu134 -> cu134
+CUDA_MAJOR="${CUDA_TAG:2:2}"     # cu129 -> 12, cu134 -> 13
+CUDA_MINOR="${CUDA_TAG:4}"       # cu129 -> 9, cu134 -> 4
+PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${PYTORCH_INDEX}"
+CI_IMAGE_DEPENDENCIES=()
+CUDA_TILE_COMPILE_DEPENDENCIES=()
+if want_stage deps; then
+  CI_IMAGE_DEPENDENCY_OUTPUT="$(
+    PYTHONPATH=/install python3 -c \
+      'import sys; from build_utils import get_ci_image_dependency_requirements; print(*get_ci_image_dependency_requirements(sys.argv[1]), sep="\n")' \
+      "${CUDA_MAJOR}"
+  )"
+  if [[ -n "${CI_IMAGE_DEPENDENCY_OUTPUT}" ]]; then
+    mapfile -t CI_IMAGE_DEPENDENCIES <<< "${CI_IMAGE_DEPENDENCY_OUTPUT}"
+  fi
+  if [[ "${CUDA_MAJOR}" == "13" ]] && (( 10#${CUDA_MINOR} < 4 )); then
+    mapfile -t CUDA_TILE_COMPILE_DEPENDENCIES < <(
+      PYTHONPATH=/install python3 -c \
+        'from build_utils import get_cuda_tile_compile_dependency_requirements; print(*get_cuda_tile_compile_dependency_requirements(), sep="\n")'
+    )
+  fi
+fi
 
 # Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
 # This is to ensure that the torch version is compatible with the CUDA version.
-pip3 install --force-reinstall torch --index-url https://download.pytorch.org/whl/${CUDA_VERSION}
-pip3 install -r /install/requirements.txt
-pip3 install responses pytest scipy build cuda-python nvshmem4py-cu12
+if want_stage torch; then
+  pip3 install --upgrade "setuptools>=77" "pip>=24"
+  TORCH_INSTALL_ARGS=(--force-reinstall torch --index-url "${PYTORCH_INDEX_URL}")
+  if [[ "${PYTORCH_INDEX}" == nightly/* ]]; then
+    TORCH_INSTALL_ARGS=(--pre "${TORCH_INSTALL_ARGS[@]}")
+  fi
+  pip3 install "${TORCH_INSTALL_ARGS[@]}"
+  # Fail the (slow) first layer early if the index served a different CUDA.
+  python3 -c "
+import sys, torch
+torch_cuda = torch.version.cuda or ''
+if torch_cuda != '${CUDA_MAJOR}.${CUDA_MINOR}':
+    sys.exit(f'ERROR: torch targets CUDA {torch_cuda}, expected ${CUDA_MAJOR}.${CUDA_MINOR}')
+"
+fi
 
-# Install cudnn package based on CUDA version
-if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
-  pip3 install --upgrade cuda-python==13.0
-  pip3 install --upgrade nvidia-cudnn-cu13
-  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+# Each stage runs in its own layer, so read the torch version back from the image.
+
+# Pin the +cuXXX torch: it is unpinned in requirements.txt, so a dependency
+# conflict lets pip swap it for the PyPI build of a different CUDA major.
+# Strip the local +cuXXX tag so the constraint remains resolvable from PyPI.
+# mktemp, not /install: the .dev images run this as a non-root USER.
+# Not written in the torch stage: a random tempfile name would end up in that
+# layer and change its digest on every build.
+if [[ "${STAGE}" != "torch" ]]; then
+  TORCH_CONSTRAINT="$(mktemp)"
+  python3 -c 'import importlib.metadata as m; print("torch==" + m.version("torch").split("+", 1)[0])' \
+    > "$TORCH_CONSTRAINT"
+  export PIP_CONSTRAINT="$TORCH_CONSTRAINT"
+fi
+
+# Resolve the remaining direct dependencies once. Match cuda-python to the
+# image's CUDA major/minor; this also satisfies the matching nvshmem4py range.
+# CUDA 13.4 started at patch release 13.4.1, so there is no 13.4 distribution.
+if [[ "${CUDA_TAG}" == "cu134" ]]; then
+  CUDA_PYTHON="cuda-python==13.4.1"
 else
-  pip3 install --upgrade cuda-python==12.*
-  pip3 install --upgrade nvidia-cudnn-cu12
+  CUDA_PYTHON="cuda-python==${CUDA_MAJOR}.${CUDA_MINOR}"
+fi
+if [[ "${CUDA_TAG}" == cu13* ]]; then
+  NVSHMEM4PY="nvshmem4py-cu13"
+  CUDNN_PACKAGE="nvidia-cudnn-cu13"
+else
+  # nvshmem4py-cu12 declares <=12.9. PEP 440 treats 12.9.7 as newer than
+  # 12.9, so the former ==12.* constraint did not actually satisfy it. The
+  # exact ==12.9 constraint resolves to the compatible 12.9.0 release.
+  NVSHMEM4PY="nvshmem4py-cu12"
+  CUDNN_PACKAGE="nvidia-cudnn-cu12"
+fi
+
+if want_stage deps; then
+  # wheel is imported by flashinfer-jit-cache's build backend, which CI builds
+  # without isolation. Resolve the remaining image dependencies together once.
+  pip3 install \
+    -r /install/requirements.txt \
+    responses pytest scipy build wheel \
+    "${CUDA_PYTHON}" \
+    "${NVSHMEM4PY}" \
+    "${CI_IMAGE_DEPENDENCIES[@]}"
+
+  if (( ${#CUDA_TILE_COMPILE_DEPENDENCIES[@]} > 0 )); then
+    pip3 install --no-deps "${CUDA_TILE_COMPILE_DEPENDENCIES[@]}"
+  fi
+fi
+
+if want_stage cudnn; then
+  # Torch 2.13's cu129/cu130 wheels exact-pin cuDNN 9.20, but current FlashInfer
+  # uses cuDNN 9.21-9.24 APIs and 9.20 has a known incomplete sublibrary set.
+  # Override only the backend package, last, so no later resolver pass undoes it.
+  # docker/test_ci_image.py verifies the installed package and loaded backend.
+  pip3 install --upgrade --no-deps "${CUDNN_PACKAGE}==${CUDNN_VERSION}"
+
+  # Fail the build if torch or cuda-python drifts off the requested CUDA release.
+  python3 -c "
+import importlib.metadata as m, sys, torch
+import cudnn
+torch_cuda = torch.version.cuda or ''
+if torch_cuda != '${CUDA_MAJOR}.${CUDA_MINOR}':
+    sys.exit(f'ERROR: torch targets CUDA {torch_cuda}, expected ${CUDA_MAJOR}.${CUDA_MINOR}')
+cuda_python = m.version('cuda-python')
+if cuda_python.split('.')[:2] != ['${CUDA_MAJOR}', '${CUDA_MINOR}']:
+    sys.exit(f'ERROR: cuda-python targets CUDA {cuda_python}, expected ${CUDA_MAJOR}.${CUDA_MINOR}')
+cudnn_package_version = m.version('${CUDNN_PACKAGE}')
+if cudnn_package_version != '${CUDNN_VERSION}':
+    sys.exit(f'ERROR: ${CUDNN_PACKAGE} is {cudnn_package_version}, expected ${CUDNN_VERSION}')
+cudnn_parts = [int(part) for part in cudnn_package_version.split('.')[:3]]
+expected_backend = cudnn_parts[0] * 10000 + cudnn_parts[1] * 100 + cudnn_parts[2]
+if cudnn.backend_version() != expected_backend:
+    sys.exit(f'ERROR: cuDNN backend is {cudnn.backend_version()}, expected {expected_backend}')
+print('CUDA ${CUDA_MAJOR}.${CUDA_MINOR} check passed:', torch.__version__)
+print('${CUDNN_PACKAGE} check passed:', cudnn_package_version)
+"
 fi

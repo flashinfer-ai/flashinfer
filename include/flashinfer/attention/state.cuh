@@ -54,10 +54,13 @@ struct state_t {
                                         float other_d) {
     float m_prev = m, d_prev = d;
     m = max(m_prev, other_m);
-    d = d_prev * math::ptx_exp2(m_prev - m) + other_d * math::ptx_exp2(other_m - m);
+    // max() drops the NaN from merging two empty states ((-inf) - (-inf)).
+    float f1 = math::ptx_exp2(max(m_prev - m, -math::inf));
+    float f2 = math::ptx_exp2(max(other_m - m, -math::inf));
+    d = d_prev * f1 + other_d * f2;
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
-      o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(other_m - m);
+      o[i] = o[i] * f1 + other_o[i] * f2;
     }
   }
 
@@ -70,10 +73,12 @@ struct state_t {
   }
 
   __device__ __forceinline__ void normalize() {
-    // only normalize by d when not normalized on the fly
+    // only normalize by d when not normalized on the fly; empty states
+    // (d == 0) keep zero output instead of 0/0 = NaN
+    float d_rcp = (d > 0.f) ? __fdividef(1.f, d) : 0.f;
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
-      o[i] = __fdividef(o[i], d);
+      o[i] = o[i] * d_rcp;
     }
   }
 };

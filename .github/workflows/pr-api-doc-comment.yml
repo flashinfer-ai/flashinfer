@@ -1,0 +1,327 @@
+name: PR Documentation Summary
+
+on:
+  workflow_run:
+    workflows: ["PR Documentation Checks"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  comment:
+    concurrency:
+      group: pr-documentation-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'skipped'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve pull request number
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          CANDIDATE_PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          result-encoding: string
+          script: |
+            const candidate = String(process.env.CANDIDATE_PR || '').trim();
+            const { owner, repo } = context.repo;
+            const headSha = process.env.HEAD_SHA;
+            if (/^[1-9][0-9]*$/.test(candidate)) {
+              try {
+                const { data: candidatePr } = await github.rest.pulls.get({
+                  owner,
+                  repo,
+                  pull_number: Number(candidate),
+                });
+                if (candidatePr.state === 'open' && candidatePr.head.sha === headSha) {
+                  return candidate;
+                }
+                core.info(`Ignoring stale pull request candidate #${candidate}`);
+              } catch (error) {
+                core.warning(`Could not validate pull request #${candidate}: ${error.message}`);
+              }
+            }
+
+            const headRepository = process.env.HEAD_REPOSITORY || `${owner}/${repo}`;
+            const [headOwner, headRepo] = headRepository.split('/', 2);
+            let associated = [];
+            try {
+              const response = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner: headOwner,
+                repo: headRepo,
+                commit_sha: headSha,
+              });
+              associated = response.data;
+            } catch (error) {
+              core.warning(`Could not query associated PRs in ${headRepository}: ${error.message}`);
+            }
+            let matches = associated.filter((pr) =>
+              pr.state === 'open'
+              && pr.head.sha === headSha
+              && pr.base.repo.full_name === `${owner}/${repo}`
+            );
+            if (!matches.length) {
+              const openPullRequests = await github.paginate(github.rest.pulls.list, {
+                owner,
+                repo,
+                state: 'open',
+                per_page: 100,
+              });
+              matches = openPullRequests.filter((pr) => pr.head.sha === headSha);
+            }
+            const pullRequest = matches.find((pr) => pr.base.ref === 'main') || matches[0];
+            if (!pullRequest) {
+              core.warning(`No open pull request found for workflow head ${headSha}`);
+              return '';
+            }
+            return String(pullRequest.number);
+
+      - name: Download untrusted report data
+        if: steps.pr.outputs.result != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pr-documentation-report
+          path: reports
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Update PR documentation summary
+        if: steps.pr.outputs.result != ''
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.result }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- flashinfer-pr-documentation-summary -->';
+            const prNumber = Number(process.env.PR_NUMBER);
+            const runUrl = process.env.RUN_URL;
+            const { owner, repo } = context.repo;
+            const escape = (value) => String(value)
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/\r?\n/g, ' ')
+              .slice(0, 500);
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const previous = comments.find((comment) =>
+              comment.user?.login === 'github-actions[bot]'
+              && comment.body.includes(marker)
+            );
+            const publicApiFindings = [];
+            const documentationFindings = [];
+            const reportErrors = [];
+            const reportTargets = [
+              ['reports/public-api.json', publicApiFindings],
+              ['reports/static-documentation.json', documentationFindings],
+            ];
+            for (const [file, target] of reportTargets) {
+              if (!fs.existsSync(file)) {
+                reportErrors.push(`${file} is missing`);
+                continue;
+              }
+              try {
+                const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+                for (const finding of report.findings || []) target.push(finding);
+              } catch (error) {
+                core.warning(`Ignoring malformed report ${file}: ${error.message}`);
+                reportErrors.push(`${file} is malformed`);
+              }
+            }
+            let executionStatus = {};
+            if (fs.existsSync('reports/execution-status.json')) {
+              try {
+                executionStatus = JSON.parse(fs.readFileSync('reports/execution-status.json', 'utf8'));
+              } catch (error) {
+                reportErrors.push('execution-status.json is malformed');
+              }
+            } else {
+              reportErrors.push('execution-status.json is missing');
+            }
+            const failedChecks = Object.entries(executionStatus)
+              .filter(([, outcome]) => outcome !== 'success')
+              .map(([name]) => name);
+            const findings = [...publicApiFindings, ...documentationFindings];
+            const hasProblems = Boolean(
+              findings.length || failedChecks.length || reportErrors.length
+            );
+            if (!hasProblems) {
+              if (previous) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: previous.id,
+                });
+                core.info('Documentation findings resolved; removed the existing summary.');
+              } else {
+                core.info('Clean PR with no existing documentation summary; no comment needed.');
+              }
+              return;
+            }
+            const publicRows = publicApiFindings.slice(0, 20);
+            const documentationRows = documentationFindings.slice(0, 20);
+            const sections = [marker];
+            if (publicApiFindings.length) {
+              sections.push(
+                '# 🚨 POTENTIAL BREAKING PUBLIC API CHANGE DETECTED 🚨',
+                '',
+                '> [!CAUTION]',
+                '> **THIS PR APPEARS TO BREAK THE PUBLIC API. AUTHORS AND REVIEWERS: DO NOT MISS THIS.**',
+                '>',
+                '> This is an advisory warning and does not gate merging. Confirm compatibility and provide a deprecation or migration path, or track the fix in a follow-up PR.',
+                '',
+                `${publicApiFindings.length} public API finding(s):`,
+                '',
+                publicRows.map((f) => `- \`${escape(f.path)}:${Number(f.line) || 1}\` — ${escape(f.message)}`).join('\n'),
+              );
+            }
+            if (documentationFindings.length) {
+              sections.push(
+                '## Documentation checks ⚠️',
+                '',
+                `${documentationFindings.length} new documentation finding(s):`,
+                '',
+                documentationRows.map((f) => `- \`${escape(f.path)}:${Number(f.line) || 1}\` — ${escape(f.message)}`).join('\n'),
+              );
+            }
+            if (failedChecks.length || reportErrors.length) {
+              const problems = [
+                ...failedChecks.map((name) => `${name} did not complete`),
+                ...reportErrors,
+              ];
+              sections.push(
+                '# 🚨 ADVISORY CHECKER REPORT IS INCOMPLETE 🚨',
+                '',
+                '> [!WARNING]',
+                `> ${escape(problems.join('; '))}. The checker remains non-blocking, but this run must not be treated as a clean result.`,
+              );
+            }
+            sections.push('', `[View the full check run](${runUrl})`);
+            const body = sections.join('\n');
+            if (previous) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+            }
+
+      - name: Post inline documentation findings
+        if: steps.pr.outputs.result != ''
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.result }}
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const marker = 'flashinfer-pr-documentation-inline';
+            const prNumber = Number(process.env.PR_NUMBER);
+            const escape = (value) => String(value)
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/\r?\n/g, ' ')
+              .slice(0, 500);
+            const findings = [];
+            for (const [file, category] of [
+              ['reports/public-api.json', 'public_api'],
+              ['reports/static-documentation.json', 'documentation'],
+            ]) {
+              if (!fs.existsSync(file)) continue;
+              try {
+                const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+                findings.push(...(report.findings || []).map((finding) => ({
+                  ...finding,
+                  category,
+                })));
+              } catch (error) {
+                core.warning(`Ignoring malformed report ${file}: ${error.message}`);
+              }
+            }
+            const { owner, repo } = context.repo;
+            const [pr, changedFiles, existingComments] = await Promise.all([
+              github.rest.pulls.get({ owner, repo, pull_number: prNumber }),
+              github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: prNumber, per_page: 100 }),
+              github.paginate(github.rest.pulls.listReviewComments, { owner, repo, pull_number: prNumber, per_page: 100 }),
+            ]);
+            const changedPaths = new Set(changedFiles.map((file) => file.filename));
+            const existingKeys = new Set(
+              existingComments
+                .filter((comment) =>
+                  comment.user?.login === 'github-actions[bot]'
+                  && comment.body.includes(marker)
+                )
+                .map((comment) => comment.body.match(/<!-- key:(.*?) -->/)?.[1])
+                .filter(Boolean),
+            );
+            const candidates = [];
+            const candidateKeys = new Set();
+            for (const finding of findings) {
+              const path = String(finding.path || '');
+              const line = Number(finding.line);
+              const key = crypto.createHash('sha256')
+                .update(JSON.stringify([finding.check, path, finding.message]))
+                .digest('hex');
+              if (!path || !Number.isInteger(line) || line < 1 || !changedPaths.has(path)) continue;
+              if (!existingKeys.has(key) && !candidateKeys.has(key)) {
+                candidates.push({ finding, key, path, line });
+                candidateKeys.add(key);
+              }
+            }
+            const reviewComments = candidates.slice(0, 20).map(
+              ({ finding, key, path, line }) => ({
+                path,
+                line,
+                side: 'RIGHT',
+                body: finding.category === 'public_api'
+                  ? `<!-- ${marker} --><!-- key:${key} -->\n🚨🚨🚨 **POTENTIAL BREAKING PUBLIC API CHANGE:** ${escape(finding.message)}`
+                  : `<!-- ${marker} --><!-- key:${key} -->\n⚠️ **Documentation check:** ${escape(finding.message)}`,
+              })
+            );
+            if (!reviewComments.length) {
+              core.info('No new inline documentation findings to post.');
+              return;
+            }
+            try {
+              await github.rest.pulls.createReview({
+                owner,
+                repo,
+                pull_number: prNumber,
+                commit_id: pr.data.head.sha,
+                event: 'COMMENT',
+                body: `<!-- ${marker} -->\n${reviewComments.length} new documentation finding(s) generated from the static PR check.`,
+                comments: reviewComments,
+              });
+            } catch (error) {
+              core.warning(`Could not post inline documentation review: ${error.message}`);
+              // A line may no longer be commentable after a concurrent push.
+              // Retry individually so one stale location does not hide the rest.
+              for (const comment of reviewComments) {
+                try {
+                  await github.rest.pulls.createReview({
+                    owner,
+                    repo,
+                    pull_number: prNumber,
+                    commit_id: pr.data.head.sha,
+                    event: 'COMMENT',
+                    body: `<!-- ${marker} -->\nDocumentation finding generated from the static PR check.`,
+                    comments: [comment],
+                  });
+                } catch (commentError) {
+                  core.warning(
+                    `Could not post inline finding for ${comment.path}:${comment.line}: ${commentError.message}`
+                  );
+                }
+              }
+            }

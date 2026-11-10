@@ -17,39 +17,40 @@
 
 #include "batch_mla_sm90_config.inc"
 #include "tvm/ffi/container/array.h"
+#include "tvm/ffi/container/tuple.h"
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
 
 using tvm::ffi::Array;
+using tvm::ffi::Tuple;
 
-Array<int64_t> BatchMLAPagedAttentionSM90Plan(TensorView float_workspace_buffer,
-                                              TensorView int_workspace_buffer,
-                                              TensorView page_locked_int_workspace_buffer,
-                                              TensorView qo_indptr, TensorView kv_indptr,
-                                              TensorView kv_len, int64_t num_heads,
-                                              int64_t head_dim_o, bool causal) {
+Tuple<Array<int64_t>, int64_t> BatchMLAPagedAttentionSM90Plan(
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
+    TensorView kv_len, int64_t num_heads, int64_t head_dim_o, bool causal) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
 
   MLAPlanInfo plan_info;
+  size_t staged_int_workspace_bytes = 0;
 
   int batch_size = kv_len.size(0);
 
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
-  cudaError_t status =
-      MLAPlan(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
-              int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
-              int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
-              static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len.data_ptr()),
-              batch_size, num_heads, head_dim_o, causal, stream);
+  cudaError_t status = MLAPlan(
+      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+      int_workspace_size_in_bytes, plan_info, staged_int_workspace_bytes,
+      static_cast<IdType*>(qo_indptr.data_ptr()), static_cast<IdType*>(kv_indptr.data_ptr()),
+      static_cast<IdType*>(kv_len.data_ptr()), batch_size, num_heads, head_dim_o, causal, stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan MLA, error: " << cudaGetErrorString(status);
 
-  return Array(plan_info.ToVector());
+  return Tuple<Array<int64_t>, int64_t>(Array(plan_info.ToVector()), staged_int_workspace_bytes);
 }

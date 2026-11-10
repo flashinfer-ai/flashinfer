@@ -1,0 +1,16 @@
+#pragma once
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cstdint>
+
+using state_t = {{ state_dtype }};
+using input_t = {{ input_dtype }};
+using matrixA_t = {{ matrixA_dtype }};
+constexpr int DIM = {{ dim }};
+constexpr int DSTATE = {{ dstate }};
+constexpr int HEADS_PER_GROUP = {{ heads_per_group }};
+constexpr int MAX_WINDOW = {{ max_window }};
+constexpr int NPREDICTED = 1;
+constexpr int PHILOX_ROUNDS = {{ philox_rounds }};
+constexpr bool ENABLE_PDL = false;

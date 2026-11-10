@@ -1,16 +1,44 @@
+"""Benchmark TensorRT-LLM Gen and Prims-TS fused MoE implementations.
+
+Localized Prims-TS runs use FlashInfer's CUDAPluggableAllocator-based domain
+pools and locality-domain green-context streams. They require CUDA 13.4
+toolkit/driver support and a GPU exposing at least two locality domains.
+"""
+
 import argparse
-from typing import Optional, Literal
+from dataclasses import asdict, dataclass
+from functools import cache, partial
+import hashlib
+from importlib.metadata import PackageNotFoundError, version
+import json
+from pathlib import Path
+import platform
+import subprocess
+from typing import Any, Callable, Literal, Optional
 import torch
 import numpy as np
-from functools import partial
 from flashinfer import (
     RoutingMethodType,
     ActivationType,
     fp4_quantize,
     mxfp8_quantize,
 )
+from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     Fp8QuantizationType,
+    prims_ts_bf16_moe,
+    prims_ts_bf16_moe_partitioned,
+    prims_ts_bf16_routed_moe,
+    prims_ts_fp4_block_scale_moe,
+    prims_ts_fp4_block_scale_moe_partitioned,
+    prims_ts_fp4_block_scale_routed_moe,
+    prims_ts_fp8_block_scale_moe,
+    prims_ts_fp8_block_scale_moe_partitioned,
+    prims_ts_fp8_block_scale_routed_moe,
+    prims_ts_fp8_per_tensor_scale_moe,
+    prims_ts_fp8_per_tensor_scale_moe_partitioned,
+    trtllm_bf16_moe,
+    trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_mxint4_block_scale_moe,
@@ -19,7 +47,21 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_routed_moe,
     WeightLayout,
 )
+from flashinfer.fused_moe.core import (
+    _maybe_get_cached_w3_w1_permute_indices,
+    convert_to_block_layout,
+    get_w2_permute_indices_with_cache,
+)
 from flashinfer.autotuner import autotune, AutoTuner
+from flashinfer.prims_ts.moe.partition import (
+    MoePartitionResources,
+    MoeShardedWeights,
+    PartitionStrategy,
+    prepared_block_major_k_bytes,
+    prepared_weight_layouts,
+    shard_prepared_moe_weights,
+)
+from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import device_support_pdl
 from routines.flashinfer_benchmark_utils import enum_type
@@ -27,14 +69,328 @@ from flashinfer.fused_moe.utils import make_random_topk_ids
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0
+BACKENDS = ("trtllm", "prims_ts")
+LOCALIZATIONS = ("none", "tp_n_tp_n", "tp_n_tp_k")
+Localization = Literal["none", "tp_n_tp_n", "tp_n_tp_k"]
+LOCALITY_SM_SPLITS = ("backfill", "strict")
+LocalitySmSplit = Literal["backfill", "strict"]
+
+
+@dataclass(frozen=True)
+class MoeModelPreset:
+    quant_mode: str
+    num_tokens: tuple[int, ...]
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+    top_k: int
+    routed_scaling_factor: float
+    activation_type: ActivationType
+    swiglu_limit: Optional[float]
+
+
+# These presets benchmark the routed-expert fused kernel only. Routers and
+# shared experts are intentionally excluded so both backends receive identical
+# precomputed routing decisions and execute the same FC1/activation/FC2 workload.
+MODEL_PRESETS = {
+    "deepseek-v4-flash": MoeModelPreset(
+        quant_mode="MxFP4xMxFP8",
+        num_tokens=(1, 32, 256, 1024, 8192),
+        num_experts=256,
+        hidden_size=4096,
+        intermediate_size=2048,
+        top_k=6,
+        routed_scaling_factor=1.5,
+        activation_type=ActivationType.Swiglu,
+        swiglu_limit=10.0,
+    ),
+    "deepseek-v4.1-flash": MoeModelPreset(
+        quant_mode="MxFP4xMxFP8",
+        num_tokens=(1, 32, 256, 1024, 8192),
+        num_experts=384,
+        hidden_size=5120,
+        intermediate_size=2304,
+        top_k=6,
+        routed_scaling_factor=1.5,
+        activation_type=ActivationType.Swiglu,
+        swiglu_limit=10.0,
+    ),
+    "deepseek-v4-pro": MoeModelPreset(
+        quant_mode="MxFP4xMxFP8",
+        num_tokens=(1, 32, 256, 1024, 8192),
+        num_experts=384,
+        hidden_size=7168,
+        intermediate_size=3072,
+        top_k=6,
+        routed_scaling_factor=2.5,
+        activation_type=ActivationType.Swiglu,
+        swiglu_limit=10.0,
+    ),
+    "deepseek-v4-pro-nvfp4": MoeModelPreset(
+        quant_mode="NvFP4xNvFP4",
+        num_tokens=(1, 32, 256, 1024, 8192),
+        num_experts=384,
+        hidden_size=7168,
+        intermediate_size=3072,
+        top_k=6,
+        routed_scaling_factor=2.5,
+        activation_type=ActivationType.Swiglu,
+        swiglu_limit=10.0,
+    ),
+    "nemotron-ultra-v3-nvfp4": MoeModelPreset(
+        quant_mode="NvFP4xNvFP4",
+        num_tokens=(1, 8, 64, 256, 1024, 8192),
+        num_experts=512,
+        hidden_size=2048,
+        intermediate_size=1280,
+        top_k=22,
+        routed_scaling_factor=2.5,
+        activation_type=ActivationType.Relu2,
+        swiglu_limit=None,
+    ),
+}
+
+
+def _apply_model_preset(args: argparse.Namespace) -> None:
+    if args.model == "custom":
+        return
+
+    if args.model in ("kimi-k3", "kimi-k3-nvfp4"):
+        args.quant_mode = (
+            "NvFP4xNvFP4" if args.model == "kimi-k3-nvfp4" else "MxFP4xMxFP8"
+        )
+        if args.num_tokens is None:
+            args.num_tokens = [1024]
+        args.num_experts = 896
+        args.local_num_experts = 56
+        args.local_expert_offset = 0
+        args.hidden_size = 3584
+        args.intermediate_size = 3072
+        args.top_k = 16
+        args.activation_type = ActivationType.Situ
+        args.gemm1_alpha = 4.0
+        args.gemm1_beta = 25.0
+        args.use_bias = False
+        args.routed = True
+        args.routed_scaling_factor = None
+        args.swiglu_limit = None
+        return
+
+    preset = MODEL_PRESETS[args.model]
+    args.quant_mode = preset.quant_mode
+    if args.num_tokens is None:
+        args.num_tokens = list(preset.num_tokens)
+    args.num_experts = preset.num_experts
+    args.hidden_size = preset.hidden_size
+    args.intermediate_size = preset.intermediate_size
+    args.top_k = preset.top_k
+    args.use_bias = False
+    args.routed = True
+    args.activation_type = preset.activation_type
+    args.routed_scaling_factor = preset.routed_scaling_factor
+    args.swiglu_limit = preset.swiglu_limit
+
+
+@dataclass(frozen=True)
+class BenchmarkSetup:
+    batch_size: int
+    backend: str
+    fn: Callable
+    input_kwargs: dict
+    localization: Localization = "none"
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    batch_size: int
+    backend: str
+    no_autotune_ms: float
+    tuned_ms: float
+    localization: Localization = "none"
+
+
+@dataclass(frozen=True)
+class _LocalizedPartition:
+    resources: MoePartitionResources
+    alloc: Callable[[int, tuple[int, ...], torch.dtype], torch.Tensor]
+    pointer_domain: Callable[[torch.Tensor], int]
+    domain_count: int
+    sm_split: LocalitySmSplit
+    sm_counts: tuple[int, int]
+    remainder_sm_count: int
+    keepalive: tuple[Any, ...]
+
+
+@cache
+def _localized_partition(
+    device: torch.device, sm_split: LocalitySmSplit
+) -> _LocalizedPartition:
+    """Create matched compute and memory resources for two locality domains."""
+
+    from flashinfer.locality_domain import get_localized_domains
+
+    domains = get_localized_domains(device, sm_split=sm_split)
+
+    return _LocalizedPartition(
+        resources=MoePartitionResources(streams=domains.streams),
+        alloc=domains.empty,
+        pointer_domain=domains.pointer_domain,
+        domain_count=domains.domain_count,
+        sm_split=sm_split,
+        sm_counts=domains.sm_counts,
+        remainder_sm_count=domains.remainder_sm_count,
+        keepalive=(domains,),
+    )
+
+
+def _shard_for_partition(
+    *,
+    strategy: PartitionStrategy,
+    sm_split: LocalitySmSplit,
+    fc1_weight: torch.Tensor,
+    fc2_weight: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    weight_layout: int,
+    fc1_scale: Optional[torch.Tensor] = None,
+    fc2_scale: Optional[torch.Tensor] = None,
+    scale_k_group_size: Optional[int] = None,
+) -> MoeShardedWeights:
+    """Shard prepared weights directly into their matching locality domains."""
+
+    if scale_k_group_size is not None and (fc1_scale is None or fc2_scale is None):
+        raise ValueError("Block-scaled localization requires both weight scales")
+    if (
+        fc1_scale is not None
+        and fc2_scale is not None
+        and fc1_scale.dtype != fc2_scale.dtype
+    ):
+        raise ValueError("FC1 and FC2 scales must use the same dtype")
+    localized = _localized_partition(fc1_weight.device, sm_split)
+    # Return cached blocks held by the primary allocator before the localized
+    # pools reserve the materialized weight shards.
+    torch.cuda.empty_cache()
+    fc1_layout, fc2_layout = prepared_weight_layouts(
+        weight_dtype=fc1_weight.dtype,
+        weight_layout=weight_layout,
+        use_shuffled_weight=True,
+        scale_k_group_size=scale_k_group_size,
+        scale_dtype=(
+            fc1_scale.dtype
+            if scale_k_group_size is not None and fc1_scale is not None
+            else None
+        ),
+        fc1_block_major_k_bytes=prepared_block_major_k_bytes(fc1_weight, weight_layout),
+        fc2_block_major_k_bytes=prepared_block_major_k_bytes(fc2_weight, weight_layout),
+    )
+    shards = shard_prepared_moe_weights(
+        fc1_weight,
+        fc2_weight,
+        strategy=strategy,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        fc1_layout=fc1_layout,
+        fc2_layout=fc2_layout,
+        fc1_scale=fc1_scale,
+        fc2_scale=fc2_scale,
+        alloc=localized.alloc,
+    )
+    for partition_id in range(2):
+        tensors = [shards.fc1[partition_id], shards.fc2[partition_id]]
+        if shards.fc1_scale is not None:
+            tensors.append(shards.fc1_scale[partition_id])
+        if shards.fc2_scale is not None:
+            tensors.append(shards.fc2_scale[partition_id])
+        for tensor in tensors:
+            actual_domain = localized.pointer_domain(tensor)
+            if actual_domain != partition_id:
+                raise RuntimeError(
+                    f"partition {partition_id} tensor was allocated in locality "
+                    f"domain {actual_domain}"
+                )
+    return shards
+
+
+_LOCALIZED_OPS: dict[tuple[str, str], Callable] = {
+    ("prims_ts", "bf16"): prims_ts_bf16_moe_partitioned,
+    ("prims_ts", "fp4"): prims_ts_fp4_block_scale_moe_partitioned,
+    ("prims_ts", "fp8_per_tensor"): prims_ts_fp8_per_tensor_scale_moe_partitioned,
+    ("prims_ts", "fp8_block"): prims_ts_fp8_block_scale_moe_partitioned,
+}
+
+
+def _localized_setup(
+    *,
+    batch_size: int,
+    backend: str,
+    family: str,
+    strategy: PartitionStrategy,
+    sm_split: LocalitySmSplit,
+    common_fn_kwargs: dict,
+    input_kwargs: dict,
+    shards: MoeShardedWeights,
+) -> BenchmarkSetup:
+    """Build one localized setup without exposing shards to buffer rotation."""
+
+    try:
+        op = _LOCALIZED_OPS[(backend, family)]
+    except KeyError as exc:
+        raise ValueError(f"{backend} has no localized {family} MoE path yet") from exc
+
+    fn_kwargs = dict(common_fn_kwargs)
+    for name in (
+        "gemm1_bias",
+        "gemm2_bias",
+        "num_fused_shared_experts",
+    ):
+        fn_kwargs.pop(name, None)
+    fn_kwargs.setdefault("routing_logits", None)
+    fn_kwargs.setdefault("routing_bias", None)
+    fn_kwargs.setdefault("topk_ids", None)
+    if family == "fp4":
+        fn_kwargs.setdefault("topk_weights", None)
+    else:
+        fn_kwargs.setdefault("expert_weights", None)
+    fn_kwargs.update(
+        gemm1_weights=shards.fc1,
+        gemm2_weights=shards.fc2,
+        partition_resources=_localized_partition(
+            input_kwargs["hidden_states"].device, sm_split
+        ).resources,
+        partition_strategy=strategy,
+    )
+    if shards.fc1_scale is not None:
+        fn_kwargs["gemm1_weights_scale"] = shards.fc1_scale
+    if shards.fc2_scale is not None:
+        fn_kwargs["gemm2_weights_scale"] = shards.fc2_scale
+
+    activation_kwargs = {
+        name: input_kwargs[name]
+        for name in ("hidden_states", "hidden_states_scale")
+        if name in input_kwargs
+    }
+    return BenchmarkSetup(
+        batch_size=batch_size,
+        backend=backend,
+        fn=partial(op, **fn_kwargs),
+        input_kwargs=activation_kwargs,
+        localization=strategy,
+    )
 
 
 def _pack_topk(
-    num_tokens: int, top_k: int, num_experts: int, device: torch.device
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    device: torch.device,
+    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     topk_ids = make_random_topk_ids(num_experts, num_tokens, top_k, device)
     raw_w = torch.rand(num_tokens, top_k, device=device)
-    weights = (raw_w / raw_w.sum(-1, keepdim=True)).to(torch.bfloat16)
+    weights = raw_w / raw_w.sum(-1, keepdim=True)
+    if routed_scaling_factor is not None:
+        weights *= routed_scaling_factor
+    weights = weights.to(torch.bfloat16)
     return (topk_ids << 16) | weights.view(torch.int16).to(torch.int32)
 
 
@@ -64,17 +420,65 @@ def mxint4_quantize(
     ), scales.reshape(-1, sf_vec_size)
 
 
-def _print_table(results: list[tuple[int, float, float]], config_str: str):
+def _print_table(results: list[BenchmarkResult], config_str: str):
     print(f"\n{config_str}")
-    col0, col1, col2, col3 = 12, 18, 16, 9
-    header = f"  {'num_tokens':>{col0}}  {'no_autotune (ms)':>{col1}}  {'autotuned (ms)':>{col2}}  {'speedup':>{col3}}"
-    sep = f"  {'-' * col0}  {'-' * col1}  {'-' * col2}  {'-' * col3}"
+    col0, col1, col2, col3, col4, col5, col6, col7 = (
+        12,
+        10,
+        12,
+        18,
+        16,
+        9,
+        15,
+        16,
+    )
+    header = (
+        f"  {'num_tokens':>{col0}}  {'backend':>{col1}}"
+        f"  {'localization':>{col2}}"
+        f"  {'no_autotune (ms)':>{col3}}  {'autotuned (ms)':>{col4}}"
+        f"  {'speedup':>{col5}}  {'vs trtllm':>{col6}}"
+        f"  {'vs unlocalized':>{col7}}"
+    )
+    sep = (
+        f"  {'-' * col0}  {'-' * col1}  {'-' * col2}  {'-' * col3}"
+        f"  {'-' * col4}  {'-' * col5}  {'-' * col6}  {'-' * col7}"
+    )
     print(header)
     print(sep)
-    for num_tokens, ms, ms_tuned in results:
-        speedup = ms / ms_tuned
+    trtllm_tuned = {
+        result.batch_size: result.tuned_ms
+        for result in results
+        if result.backend == "trtllm" and result.localization == "none"
+    }
+    unlocalized_tuned = {
+        (result.batch_size, result.backend): result.tuned_ms
+        for result in results
+        if result.localization == "none"
+    }
+    for result in sorted(
+        results,
+        key=lambda item: (item.batch_size, item.backend, item.localization),
+    ):
+        speedup = result.no_autotune_ms / result.tuned_ms
+        baseline = trtllm_tuned.get(result.batch_size)
+        backend_ratio = baseline / result.tuned_ms if baseline is not None else None
+        backend_ratio_str = (
+            f"{backend_ratio:.2f}x" if backend_ratio is not None else "n/a"
+        )
+        unlocalized = unlocalized_tuned.get((result.batch_size, result.backend))
+        localization_ratio = (
+            unlocalized / result.tuned_ms if unlocalized is not None else None
+        )
+        localization_ratio_str = (
+            f"{localization_ratio:.2f}x" if localization_ratio is not None else "n/a"
+        )
         print(
-            f"  {num_tokens:>{col0}}  {ms:>{col1}.3f}  {ms_tuned:>{col2}.3f}  {speedup:>{col3}.2f}x"
+            f"  {result.batch_size:>{col0}}  {result.backend:>{col1}}"
+            f"  {result.localization:>{col2}}"
+            f"  {result.no_autotune_ms:>{col3}.6f}"
+            f"  {result.tuned_ms:>{col4}.6f}  {speedup:>{col5}.2f}x"
+            f"  {backend_ratio_str:>{col6}}"
+            f"  {localization_ratio_str:>{col7}}"
         )
 
 
@@ -92,30 +496,616 @@ def _measure(fn, input_kwargs, warmups, iterations):
 
 
 def _run_benchmark(
-    setups: list[tuple[int, callable, dict]],
+    setups: list[BenchmarkSetup],
     warmups: int,
     iterations: int,
     config_str: str,
+    tuning_buckets: Optional[list[int]] = None,
+    cuda_graph_profile_replays: int = 1,
 ):
     AutoTuner.get().clear_cache()
 
     measure = partial(_measure, warmups=warmups, iterations=iterations)
 
-    # measure untuned
-    ms_no_autotune = [measure(fn, kw) for _, fn, kw in setups]
+    # Tune before starting CUPTI activity tracing. Repeated CUPTI
+    # initialize/finalize cycles can destabilize later CuTe CUDA-graph tactic
+    # profiling in the same process. The timing order does not affect either
+    # reported value: autotuning and JIT stay outside every measured sample.
+    # The tuning config controls whether this covers
+    # all buckets up to tune_max or only the explicit user-requested buckets.
+    tuned_variants = set()
+    tuning_buckets_tuple = None if tuning_buckets is None else tuple(tuning_buckets)
+    for setup in setups:
+        variant = (setup.backend, setup.localization)
+        if variant in tuned_variants:
+            continue
+        with autotune(
+            True,
+            tuning_buckets=tuning_buckets_tuple,
+            cuda_graph_profile_replays=cuda_graph_profile_replays,
+        ):
+            setup.fn(**setup.input_kwargs)
+        tuned_variants.add(variant)
 
-    # tune once — covers all buckets up to tune_max
-    _, first_fn, first_kw = setups[0]
-    with autotune(True):
-        first_fn(**first_kw)
+    # The same override must remain active for lookup as for profiling.  Without
+    # it, explicit buckets are cached under one profile mapping and measured
+    # under the API's default mapping, which can silently fall back to tactic -1.
+    with autotune(
+        False,
+        tuning_buckets=tuning_buckets_tuple,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
+    ):
+        ms_tuned = [measure(setup.fn, setup.input_kwargs) for setup in setups]
 
-    # measure tuned
+    # Clear only selected tactics, then collect the heuristic controls. Kernel
+    # modules and generated input tensors remain unchanged.
+    AutoTuner.get().clear_cache()
+    ms_no_autotune = [measure(setup.fn, setup.input_kwargs) for setup in setups]
     results = [
-        (batch_size, ms, measure(fn, kw))
-        for (batch_size, fn, kw), ms in zip(setups, ms_no_autotune, strict=True)
+        BenchmarkResult(
+            batch_size=setup.batch_size,
+            backend=setup.backend,
+            no_autotune_ms=ms,
+            tuned_ms=tuned_ms,
+            localization=setup.localization,
+        )
+        for setup, ms, tuned_ms in zip(setups, ms_no_autotune, ms_tuned, strict=True)
     ]
 
     _print_table(results, config_str)
+    return results
+
+
+def _normalize_backends(backends: list[str], quant_mode: str) -> list[str]:
+    if "both" in backends:
+        resolved = list(BACKENDS)
+    else:
+        resolved = []
+        for backend in backends:
+            if backend not in resolved:
+                resolved.append(backend)
+
+    if "prims_ts" in resolved:
+        if quant_mode == "MxInt4xBf16":
+            raise ValueError("Prims-TS is not wired for MxInt4xBf16 in this benchmark")
+        if not is_prims_ts_available():
+            raise RuntimeError(
+                "Prims-TS backend requested but dependencies are unavailable"
+            )
+    return resolved
+
+
+def _normalize_localizations(localizations: list[str]) -> list[Localization]:
+    resolved: list[Localization] = []
+    for localization in localizations:
+        if localization not in LOCALIZATIONS:
+            raise ValueError(f"Unknown MoE localization mode: {localization}")
+        if localization not in resolved:
+            resolved.append(localization)
+    return resolved
+
+
+def _op_family(quant_mode: str) -> str:
+    if quant_mode == "BF16":
+        return "bf16"
+    if quant_mode in ("NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"):
+        return "fp4"
+    if quant_mode == "Fp8-Per-Tensor":
+        return "fp8_per_tensor"
+    if quant_mode == "Fp8-Block":
+        return "fp8_deepseek"
+    if quant_mode == "MxFP8xMxFP8":
+        return "fp8_block"
+    return quant_mode
+
+
+def _require_cupti_for_localization(
+    localizations: list[Localization],
+) -> None:
+    if all(localization == "none" for localization in localizations):
+        return
+    try:
+        cupti_version = version("cupti-python")
+    except PackageNotFoundError as exc:
+        raise RuntimeError(
+            "Localized MoE benchmarking requires cupti-python>=13; "
+            "CUDA-event fallback cannot preserve a fair cold-L2 comparison"
+        ) from exc
+    try:
+        from cupti import cupti as cupti_module
+    except Exception as exc:
+        raise RuntimeError(
+            "Localized MoE benchmarking requires a working cupti-python import; "
+            "CUDA-event fallback cannot preserve a fair cold-L2 comparison"
+        ) from exc
+    del cupti_module
+    if int(cupti_version.split(".", 1)[0]) < 13:
+        raise RuntimeError(
+            f"Localized MoE benchmarking requires cupti-python>=13, got {cupti_version}"
+        )
+
+
+def _validate_localization_support(
+    *,
+    backends: list[str],
+    quant_mode: str,
+    activation_type: int,
+    localizations: list[Localization],
+) -> None:
+    if all(localization == "none" for localization in localizations):
+        return
+    activation = ActivationType(activation_type)
+    if not activation.is_gated:
+        raise ValueError(
+            f"Localized MoE supports only gated activations; got {activation.name}"
+        )
+    family = _op_family(quant_mode)
+    if not any((backend, family) in _LOCALIZED_OPS for backend in backends):
+        if family == "fp8_deepseek":
+            raise ValueError(
+                "DeepSeek FP8 block-scale layout has no partitioned MoE path"
+            )
+        raise ValueError(
+            f"{quant_mode} has no localized MoE path for the selected backends: "
+            + ", ".join(backends)
+        )
+    _require_cupti_for_localization(localizations)
+
+
+def _report_skipped_localizations(
+    *,
+    backends: list[str],
+    quant_mode: str,
+    localizations: list[Localization],
+) -> None:
+    """Report backend/localization pairs omitted from a mixed benchmark."""
+
+    family = _op_family(quant_mode)
+    skipped = [
+        f"{backend}/{localization}"
+        for backend in backends
+        for localization in localizations
+        if localization != "none" and (backend, family) not in _LOCALIZED_OPS
+    ]
+    if skipped:
+        print(
+            "Skipping unsupported localized backend/mode pairs: " + ", ".join(skipped)
+        )
+
+
+def _fp4_ops(backend: str, routed: bool) -> Callable:
+    if backend == "trtllm":
+        return (
+            trtllm_fp4_block_scale_routed_moe if routed else trtllm_fp4_block_scale_moe
+        )
+    if backend == "prims_ts":
+        return (
+            prims_ts_fp4_block_scale_routed_moe
+            if routed
+            else prims_ts_fp4_block_scale_moe
+        )
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def _bf16_ops(backend: str, routed: bool) -> Callable:
+    if backend == "trtllm":
+        return trtllm_bf16_routed_moe if routed else trtllm_bf16_moe
+    if backend == "prims_ts":
+        return prims_ts_bf16_routed_moe if routed else prims_ts_bf16_moe
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def _fp8_per_tensor_op(backend: str) -> Callable:
+    if backend == "trtllm":
+        return trtllm_fp8_per_tensor_scale_moe
+    if backend == "prims_ts":
+        return prims_ts_fp8_per_tensor_scale_moe
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def _fp8_block_ops(backend: str, routed: bool) -> Callable:
+    if backend == "trtllm":
+        return (
+            trtllm_fp8_block_scale_routed_moe if routed else trtllm_fp8_block_scale_moe
+        )
+    if backend == "prims_ts":
+        return (
+            prims_ts_fp8_block_scale_routed_moe
+            if routed
+            else prims_ts_fp8_block_scale_moe
+        )
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def _shuffle_fp4_major_k(
+    gemm1_weights: torch.Tensor,
+    gemm1_scales: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_scales: torch.Tensor,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    num_local_experts: int,
+    sf_vec_size: int,
+    activation_type: int,
+    gemm1_bias: Optional[torch.Tensor] = None,
+    gemm2_bias: Optional[torch.Tensor] = None,
+) -> dict[str, Optional[torch.Tensor]]:
+    """Convert canonical FP4 expert tensors to the shuffled MajorK layout.
+
+    The FP4 MoE kernels benchmarked here consume the TRT-LLM/Prims-TS native
+    layout: FC1 and FC2 rows are epilogue-tile permuted, and their
+    block-scale tensors are interleaved to match the packed weight layout.
+    """
+    epilogue_tile_m = 128
+    is_gated = ActivationType(activation_type).is_gated
+    gemm1_rows = intermediate_size * (2 if is_gated else 1)
+    gemm1_weights = gemm1_weights.view(torch.uint8).reshape(
+        num_local_experts, gemm1_rows, hidden_size // 2
+    )
+    gemm1_scales = gemm1_scales.view(torch.float8_e4m3fn).reshape(
+        num_local_experts, gemm1_rows, hidden_size // sf_vec_size
+    )
+    gemm2_weights = gemm2_weights.view(torch.uint8).reshape(
+        num_local_experts, hidden_size, intermediate_size // 2
+    )
+    gemm2_scales = gemm2_scales.view(torch.float8_e4m3fn).reshape(
+        num_local_experts, hidden_size, intermediate_size // sf_vec_size
+    )
+
+    gemm1_weights_shuffled = []
+    gemm1_scales_shuffled = []
+    gemm2_weights_shuffled = []
+    gemm2_scales_shuffled = []
+    gemm1_bias_shuffled = [] if gemm1_bias is not None else None
+    gemm2_bias_shuffled = [] if gemm2_bias is not None else None
+    permute_cache = {}
+    for expert_idx in range(num_local_experts):
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            gemm1_weights[expert_idx],
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm1_weights_shuffled.append(
+            gemm1_weights[expert_idx][
+                permute_indices.to(gemm1_weights.device)
+            ].contiguous()
+        )
+
+        permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            gemm1_scales[expert_idx].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm1_scales_shuffled.append(
+            block_scale_interleave(
+                gemm1_scales[expert_idx]
+                .view(torch.uint8)[permute_sf_indices.to(gemm1_scales.device)]
+                .contiguous()
+            )
+        )
+
+        if gemm1_bias_shuffled is not None:
+            permute_bias_indices = _maybe_get_cached_w3_w1_permute_indices(
+                permute_cache,
+                gemm1_bias[expert_idx].reshape(-1, 1),
+                epilogue_tile_m,
+                is_gated_act_gemm=is_gated,
+            )
+            gemm1_bias_shuffled.append(
+                gemm1_bias[expert_idx]
+                .reshape(-1, 1)[permute_bias_indices.to(gemm1_bias.device)]
+                .contiguous()
+            )
+
+        permute_indices = get_w2_permute_indices_with_cache(
+            permute_cache,
+            gemm2_weights[expert_idx],
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm2_weights_shuffled.append(
+            gemm2_weights[expert_idx][
+                permute_indices.to(gemm2_weights.device)
+            ].contiguous()
+        )
+
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            permute_cache,
+            gemm2_scales[expert_idx].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm2_scales_shuffled.append(
+            block_scale_interleave(
+                gemm2_scales[expert_idx]
+                .view(torch.uint8)[permute_sf_indices.to(gemm2_scales.device)]
+                .contiguous()
+            )
+        )
+
+        if gemm2_bias_shuffled is not None:
+            permute_bias_indices = get_w2_permute_indices_with_cache(
+                permute_cache,
+                gemm2_bias[expert_idx].reshape(-1, 1),
+                epilogue_tile_m,
+                is_gated_act_gemm=is_gated,
+            )
+            gemm2_bias_shuffled.append(
+                gemm2_bias[expert_idx]
+                .reshape(-1, 1)[permute_bias_indices.to(gemm2_bias.device)]
+                .contiguous()
+            )
+
+    result = {
+        "gemm1_weights": torch.stack(gemm1_weights_shuffled),
+        "gemm1_weights_scale": torch.stack(gemm1_scales_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_local_experts, gemm1_rows, hidden_size // sf_vec_size),
+        "gemm2_weights": torch.stack(gemm2_weights_shuffled),
+        "gemm2_weights_scale": torch.stack(gemm2_scales_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_local_experts, hidden_size, intermediate_size // sf_vec_size),
+        "gemm1_bias": None,
+        "gemm2_bias": None,
+    }
+    if gemm1_bias_shuffled is not None:
+        result["gemm1_bias"] = torch.stack(gemm1_bias_shuffled).reshape(
+            num_local_experts, gemm1_rows
+        )
+    if gemm2_bias_shuffled is not None:
+        result["gemm2_bias"] = torch.stack(gemm2_bias_shuffled).reshape(
+            num_local_experts, hidden_size
+        )
+    return result
+
+
+def _shuffle_bf16_block_major_k(
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    *,
+    activation_type: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create the common shuffled BlockMajorK layout required by BF16 MoE."""
+    epilogue_tile_m = 128
+    is_gated = ActivationType(activation_type).is_gated
+    permute_cache = {}
+    gemm1_weights_shuffled = []
+    gemm2_weights_shuffled = []
+    for expert_idx in range(gemm1_weights.shape[0]):
+        gemm1_bytes = gemm1_weights[expert_idx].view(torch.uint8)
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            gemm1_bytes,
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm1_weights_shuffled.append(
+            convert_to_block_layout(
+                gemm1_bytes[permute_indices.to(gemm1_bytes.device)].contiguous(), 128
+            ).view(torch.bfloat16)
+        )
+
+        gemm2_bytes = gemm2_weights[expert_idx].view(torch.uint8)
+        permute_indices = get_w2_permute_indices_with_cache(
+            permute_cache,
+            gemm2_bytes,
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm2_weights_shuffled.append(
+            convert_to_block_layout(
+                gemm2_bytes[permute_indices.to(gemm2_bytes.device)].contiguous(), 128
+            ).view(torch.bfloat16)
+        )
+
+    return (
+        torch.stack(gemm1_weights_shuffled).contiguous(),
+        torch.stack(gemm2_weights_shuffled).contiguous(),
+    )
+
+
+def _shuffle_fp8_major_k(
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    *,
+    activation_type: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create the common shuffled MajorK weight layout for FP8 block scale."""
+    epilogue_tile_m = 128
+    is_gated = ActivationType(activation_type).is_gated
+    permute_cache = {}
+    gemm1_weights_shuffled = []
+    gemm2_weights_shuffled = []
+    for expert_idx in range(gemm1_weights.shape[0]):
+        gemm1_bytes = gemm1_weights[expert_idx].view(torch.uint8)
+        gemm1_permute = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            gemm1_bytes,
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm1_weights_shuffled.append(
+            gemm1_bytes[gemm1_permute.to(gemm1_bytes.device)].contiguous()
+        )
+
+        gemm2_bytes = gemm2_weights[expert_idx].view(torch.uint8)
+        gemm2_permute = get_w2_permute_indices_with_cache(
+            permute_cache,
+            gemm2_bytes,
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm2_weights_shuffled.append(
+            gemm2_bytes[gemm2_permute.to(gemm2_bytes.device)].contiguous()
+        )
+
+    return (
+        torch.stack(gemm1_weights_shuffled).view(gemm1_weights.dtype),
+        torch.stack(gemm2_weights_shuffled).view(gemm2_weights.dtype),
+    )
+
+
+def bench_trtllm_gen_fused_moe_autotuner_bf16(
+    tune_max_num_tokens: Optional[int],
+    num_tokens_list: list[int],
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    warmups: int,
+    iterations: int,
+    activation_type: int,
+    backends: list[str],
+    tuning_buckets: Optional[list[int]] = None,
+    routed: bool = False,
+    cuda_graph_profile_replays: int = 1,
+    localizations: Optional[list[Localization]] = None,
+    locality_sm_split: LocalitySmSplit = "backfill",
+    enable_pdl: Optional[bool] = None,
+):
+    device = torch.device("cuda:0")
+    resolved_localizations = localizations or ["none"]
+    _validate_localization_support(
+        backends=backends,
+        quant_mode="BF16",
+        activation_type=activation_type,
+        localizations=resolved_localizations,
+    )
+    _report_skipped_localizations(
+        backends=backends,
+        quant_mode="BF16",
+        localizations=resolved_localizations,
+    )
+    if any(localization != "none" for localization in resolved_localizations):
+        _localized_partition(device, locality_sm_split)
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(device)
+    tune_max = (
+        max(num_tokens_list) if tune_max_num_tokens is None else tune_max_num_tokens
+    )
+    is_gated = ActivationType(activation_type).is_gated
+    gemm1_rows = 2 * intermediate_size if is_gated else intermediate_size
+    gemm1_weights = torch.randn(
+        num_experts,
+        gemm1_rows,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.randn(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm1_weights, gemm2_weights = _shuffle_bf16_block_major_k(
+        gemm1_weights,
+        gemm2_weights,
+        activation_type=activation_type,
+    )
+    localized_shards = {
+        strategy: _shard_for_partition(
+            strategy=strategy,
+            sm_split=locality_sm_split,
+            fc1_weight=gemm1_weights,
+            fc2_weight=gemm2_weights,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            weight_layout=WeightLayout.BlockMajorK.value,
+        )
+        for strategy in resolved_localizations
+        if strategy != "none"
+    }
+
+    static_kwargs = dict(
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=(
+            RoutingMethodType.Renormalize.value
+            if routed
+            else RoutingMethodType.TopK.value
+        ),
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.BlockMajorK.value,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        tune_max_num_tokens=tune_max,
+        activation_type=activation_type,
+    )
+
+    setups = []
+    for batch_size in num_tokens_list:
+        hidden_states = torch.randn(
+            batch_size, hidden_size, device=device, dtype=torch.bfloat16
+        )
+        common_fn_kwargs = dict(static_kwargs)
+        if routed:
+            common_fn_kwargs["topk_ids"] = _pack_topk(
+                batch_size, top_k, num_experts, device
+            )
+        else:
+            common_fn_kwargs.update(
+                routing_logits=torch.rand(
+                    batch_size,
+                    num_experts,
+                    device=device,
+                    dtype=torch.bfloat16,
+                ),
+                routing_bias=None,
+                norm_topk_prob=True,
+            )
+        input_kwargs = {
+            "hidden_states": hidden_states,
+            "gemm1_weights": gemm1_weights,
+            "gemm2_weights": gemm2_weights,
+        }
+        for backend in backends:
+            for localization in resolved_localizations:
+                if localization == "none":
+                    setups.append(
+                        BenchmarkSetup(
+                            batch_size,
+                            backend,
+                            partial(_bf16_ops(backend, routed), **common_fn_kwargs),
+                            input_kwargs,
+                        )
+                    )
+                elif (backend, "bf16") in _LOCALIZED_OPS:
+                    setups.append(
+                        _localized_setup(
+                            batch_size=batch_size,
+                            backend=backend,
+                            family="bf16",
+                            strategy=localization,
+                            sm_split=locality_sm_split,
+                            common_fn_kwargs=common_fn_kwargs,
+                            input_kwargs=input_kwargs,
+                            shards=localized_shards[localization],
+                        )
+                    )
+
+    mode_str = "routed" if routed else "non_routed"
+    return _run_benchmark(
+        setups,
+        warmups,
+        iterations,
+        f"quant_mode=BF16  routing={mode_str}  experts={num_experts}"
+        f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        tuning_buckets=tuning_buckets,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
+    )
 
 
 def bench_trtllm_gen_fused_moe_autotuner_fp8(
@@ -129,20 +1119,79 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
     warmups: int,
     iterations: int,
     activation_type: int,
+    backends: list[str],
+    tuning_buckets: Optional[list[int]] = None,
     routed: bool = False,
+    cuda_graph_profile_replays: int = 1,
+    localizations: Optional[list[Localization]] = None,
+    locality_sm_split: LocalitySmSplit = "backfill",
+    enable_pdl: Optional[bool] = None,
 ):
     device = torch.device("cuda:0")
-    enable_pdl = device_support_pdl(device)
-    is_block_scale = quant_mode != "Fp8-Per-Tensor"
+    resolved_localizations = localizations or ["none"]
+    _validate_localization_support(
+        backends=backends,
+        quant_mode=quant_mode,
+        activation_type=activation_type,
+        localizations=resolved_localizations,
+    )
+    _report_skipped_localizations(
+        backends=backends,
+        quant_mode=quant_mode,
+        localizations=resolved_localizations,
+    )
+    if any(localization != "none" for localization in resolved_localizations):
+        _localized_partition(device, locality_sm_split)
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(device)
+    is_gated = ActivationType(activation_type).is_gated
+    if quant_mode == "Fp8-Per-Tensor" and not is_gated and "trtllm" in backends:
+        raise ValueError(
+            "TRT-LLM FP8 per-tensor MoE supports only gated activations; "
+            f"got {ActivationType(activation_type).name}. Use "
+            "'--backends prims_ts' for non-gated activations."
+        )
+    activation = ActivationType(activation_type)
+    if quant_mode == "Fp8-Block" and activation != ActivationType.Swiglu:
+        raise ValueError(
+            "DeepSeek FP8 block-scale MoE supports only Swiglu activation; "
+            f"got {activation.name}."
+        )
+    if quant_mode == "MxFP8xMxFP8":
+        supported_by_backend = {
+            "trtllm": {
+                ActivationType.Swiglu,
+                ActivationType.SwigluStep,
+                ActivationType.Geglu,
+                ActivationType.Relu2,
+            },
+            "prims_ts": {
+                ActivationType.Swiglu,
+                ActivationType.Geglu,
+                ActivationType.Relu2,
+                ActivationType.Silu,
+            },
+        }
+        unsupported = [
+            backend
+            for backend in backends
+            if activation not in supported_by_backend[backend]
+        ]
+        if unsupported:
+            raise ValueError(
+                f"MxFP8xMxFP8 activation {activation.name} is not supported by "
+                f"{', '.join(unsupported)}. Select a compatible backend."
+            )
     tune_max = (
         max(num_tokens_list) if tune_max_num_tokens is None else tune_max_num_tokens
     )
+    gemm1_rows = intermediate_size * (2 if is_gated else 1)
 
     # --- num_tokens-independent setup ---
     routing_bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16)
-    w13 = torch.randn(
-        num_experts, intermediate_size * 2, hidden_size, device=device
-    ).to(torch.bfloat16)
+    w13 = torch.randn(num_experts, gemm1_rows, hidden_size, device=device).to(
+        torch.bfloat16
+    )
     w2 = torch.randn(num_experts, hidden_size, intermediate_size, device=device).to(
         torch.bfloat16
     )
@@ -163,6 +1212,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
         )
         output2_scale_scalar = torch.tensor(
             [hidden_states_scale_scalar * w2_scale] * num_experts, device=device
+        )
+        localized_w13, localized_w2 = _shuffle_fp8_major_k(
+            w13, w2, activation_type=activation_type
         )
     elif quant_mode == "Fp8-Block":
         w13, w13_scalar = fp8_quantize(w13)
@@ -185,18 +1237,33 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             w2_scalar.item(),
             device=device,
         )
+        w13, w2 = _shuffle_fp8_major_k(w13, w2, activation_type=activation_type)
     else:  # MxFP8xMxFP8
         w13, w13_scale = mxfp8_quantize(w13, True)
         w2, w2_scale = mxfp8_quantize(w2, True)
-        w13_scale = w13_scale.view(torch.uint8).reshape(
-            num_experts, intermediate_size * 2, -1
-        )
+        w13_scale = w13_scale.view(torch.uint8).reshape(num_experts, gemm1_rows, -1)
         w2_scale = w2_scale.view(torch.uint8).reshape(num_experts, hidden_size, -1)
+        w13, w2 = _shuffle_fp8_major_k(w13, w2, activation_type=activation_type)
 
-    if is_block_scale:
-        assert activation_type == ActivationType.Swiglu.value, (
-            "Only Swiglu activation is supported for FP8 block scale MoE."
+    if quant_mode != "Fp8-Per-Tensor":
+        localized_w13, localized_w2 = w13, w2
+
+    localized_shards = {
+        strategy: _shard_for_partition(
+            strategy=strategy,
+            sm_split=locality_sm_split,
+            fc1_weight=localized_w13,
+            fc2_weight=localized_w2,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            weight_layout=WeightLayout.MajorK.value,
+            fc1_scale=w13_scale if quant_mode == "MxFP8xMxFP8" else None,
+            fc2_scale=w2_scale if quant_mode == "MxFP8xMxFP8" else None,
+            scale_k_group_size=32 if quant_mode == "MxFP8xMxFP8" else None,
         )
+        for strategy in resolved_localizations
+        if strategy != "none" and quant_mode != "Fp8-Block"
+    }
 
     setups = []
     for batch_size in num_tokens_list:
@@ -206,8 +1273,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
 
         if quant_mode == "Fp8-Per-Tensor":
             hidden_states, hs_scale = fp8_quantize(hidden_states_bf16)
-            fn = partial(
-                trtllm_fp8_per_tensor_scale_moe,
+            common_fn_kwargs = dict(
                 routing_logits=torch.rand(batch_size, num_experts, device=device).to(
                     torch.bfloat16
                 ),
@@ -229,11 +1295,37 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 tune_max_num_tokens=tune_max,
                 activation_type=activation_type,
             )
-            input_kwargs = {
-                "hidden_states": hidden_states,
-                "gemm1_weights": w13,
-                "gemm2_weights": w2,
-            }
+            for backend in backends:
+                input_kwargs = {
+                    "hidden_states": hidden_states,
+                    "gemm1_weights": localized_w13 if backend == "prims_ts" else w13,
+                    "gemm2_weights": localized_w2 if backend == "prims_ts" else w2,
+                }
+                for localization in resolved_localizations:
+                    if localization == "none":
+                        setups.append(
+                            BenchmarkSetup(
+                                batch_size,
+                                backend,
+                                partial(
+                                    _fp8_per_tensor_op(backend), **common_fn_kwargs
+                                ),
+                                input_kwargs,
+                            )
+                        )
+                    elif (backend, "fp8_per_tensor") in _LOCALIZED_OPS:
+                        setups.append(
+                            _localized_setup(
+                                batch_size=batch_size,
+                                backend=backend,
+                                family="fp8_per_tensor",
+                                strategy=localization,
+                                sm_split=locality_sm_split,
+                                common_fn_kwargs=common_fn_kwargs,
+                                input_kwargs=input_kwargs,
+                                shards=localized_shards[localization],
+                            )
+                        )
         else:
             if quant_mode == "Fp8-Block":
                 hidden_states, hs_scalar = fp8_quantize(hidden_states_bf16)
@@ -256,24 +1348,23 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 local_expert_offset=0,
                 local_num_experts=num_experts,
                 routed_scaling_factor=2.5,
-                use_shuffled_weight=quant_mode == "MxFP8xMxFP8",
+                use_shuffled_weight=True,
                 weight_layout=WeightLayout.MajorK.value,
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=tune_max,
                 fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8
                 if quant_mode == "Fp8-Block"
                 else Fp8QuantizationType.MxFp8,
+                activation_type=activation_type,
             )
             if routed:
-                fn = partial(
-                    trtllm_fp8_block_scale_routed_moe,
+                common_fn_kwargs = dict(
                     topk_ids=_pack_topk(batch_size, top_k, num_experts, device),
                     routing_method_type=RoutingMethodType.Renormalize.value,
                     **block_scale_kwargs,
                 )
             else:
-                fn = partial(
-                    trtllm_fp8_block_scale_moe,
+                common_fn_kwargs = dict(
                     routing_logits=torch.rand(
                         batch_size, num_experts, device=device
                     ).to(torch.float32),
@@ -288,15 +1379,46 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 "gemm2_weights": w2,
                 "gemm2_weights_scale": w2_scale,
             }
-        setups.append((batch_size, fn, input_kwargs))
+            for backend in backends:
+                for localization in resolved_localizations:
+                    if localization == "none":
+                        setups.append(
+                            BenchmarkSetup(
+                                batch_size,
+                                backend,
+                                partial(
+                                    _fp8_block_ops(backend, routed),
+                                    **common_fn_kwargs,
+                                ),
+                                input_kwargs,
+                            )
+                        )
+                    elif (
+                        quant_mode == "MxFP8xMxFP8"
+                        and (backend, "fp8_block") in _LOCALIZED_OPS
+                    ):
+                        setups.append(
+                            _localized_setup(
+                                batch_size=batch_size,
+                                backend=backend,
+                                family="fp8_block",
+                                strategy=localization,
+                                sm_split=locality_sm_split,
+                                common_fn_kwargs=common_fn_kwargs,
+                                input_kwargs=input_kwargs,
+                                shards=localized_shards[localization],
+                            )
+                        )
 
     mode_str = "routed" if routed else "non_routed"
-    _run_benchmark(
+    return _run_benchmark(
         setups,
         warmups,
         iterations,
         f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        tuning_buckets=tuning_buckets,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
@@ -305,29 +1427,77 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
     quant_mode: Literal["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"],
     num_tokens_list: list[int],
     num_experts: int,
+    local_num_experts: int,
+    local_expert_offset: int,
     hidden_size: int,
     intermediate_size: int,
     top_k: int,
     warmups: int,
     iterations: int,
     activation_type: int,
+    gemm1_alpha: Optional[float],
+    gemm1_beta: Optional[float],
+    gemm1_clamp_limit: Optional[float],
+    backends: list[str],
+    tuning_buckets: Optional[list[int]] = None,
+    use_bias: bool = True,
     routed: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
+    model: str = "custom",
+    cuda_graph_profile_replays: int = 1,
+    localizations: Optional[list[Localization]] = None,
+    locality_sm_split: LocalitySmSplit = "backfill",
+    enable_pdl: Optional[bool] = None,
 ):
     device = torch.device("cuda:0")
-    enable_pdl = device_support_pdl(device)
+    resolved_localizations = localizations or ["none"]
+    _validate_localization_support(
+        backends=backends,
+        quant_mode=quant_mode,
+        activation_type=activation_type,
+        localizations=resolved_localizations,
+    )
+    _report_skipped_localizations(
+        backends=backends,
+        quant_mode=quant_mode,
+        localizations=resolved_localizations,
+    )
+    if any(localization != "none" for localization in resolved_localizations):
+        _localized_partition(device, locality_sm_split)
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(device)
     tune_max = (
         max(num_tokens_list) if tune_max_num_tokens is None else tune_max_num_tokens
     )
+    if local_expert_offset < 0 or local_num_experts <= 0:
+        raise ValueError(
+            "local_expert_offset must be non-negative and local_num_experts positive"
+        )
+    if local_expert_offset + local_num_experts > num_experts:
+        raise ValueError(
+            "local_expert_offset + local_num_experts must be <= num_experts"
+        )
 
     # --- num_tokens-independent setup ---
-    w13 = torch.randn(
-        num_experts, intermediate_size * 2, hidden_size, device=device
-    ).to(torch.bfloat16)
-    w2 = torch.randn(num_experts, hidden_size, intermediate_size, device=device).to(
+    is_gated = ActivationType(activation_type).is_gated
+    gemm1_rows = intermediate_size * (2 if is_gated else 1)
+    w13 = torch.randn(local_num_experts, gemm1_rows, hidden_size, device=device).to(
         torch.bfloat16
     )
-    bias13 = torch.randn(num_experts, intermediate_size * 2, device=device) * 10
-    bias2 = torch.randn(num_experts, hidden_size, device=device) * 10
+    w2 = torch.randn(
+        local_num_experts, hidden_size, intermediate_size, device=device
+    ).to(torch.bfloat16)
+    bias13 = (
+        torch.randn(local_num_experts, gemm1_rows, device=device) * 10
+        if use_bias
+        else None
+    )
+    bias2 = (
+        torch.randn(local_num_experts, hidden_size, device=device) * 10
+        if use_bias
+        else None
+    )
 
     if quant_mode == "NvFP4xNvFP4":
         w13, w13_scale = fp4_quantize(
@@ -335,55 +1505,122 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
             torch.tensor([448.0 * 6.0], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
         )
         w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
-            num_experts, intermediate_size * 2, -1
+            local_num_experts, gemm1_rows, -1
         )
         w2, w2_scale = fp4_quantize(
             w2,
             torch.tensor([448.0 * 6.0], device=device),
             sf_vec_size=16,
             sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
         )
         w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(
-            num_experts, hidden_size, -1
+            local_num_experts, hidden_size, -1
         )
         w13_global_scale = w2_global_scale = 1.0 / 448.0 / 6.0
         hidden_states_global_scale = 1.0 / 448.0 / 6.0
+        sf_vec_size = 16
     else:
-        assert activation_type != ActivationType.Relu2.value, (
-            "Relu2 activation is supported for FP4 only with 'NvFP4xNvFP4' quant mode"
-        )
         w13, w13_scale = fp4_quantize(
-            w13, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True
+            w13,
+            torch.tensor([1.0], device=device),
+            sf_vec_size=32,
+            sf_use_ue8m0=True,
+            is_sf_swizzled_layout=False,
         )
         w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
-            num_experts, intermediate_size * 2, -1
+            local_num_experts, gemm1_rows, -1
         )
         w2, w2_scale = fp4_quantize(
-            w2, torch.tensor([1.0], device=device), sf_vec_size=32, sf_use_ue8m0=True
+            w2,
+            torch.tensor([1.0], device=device),
+            sf_vec_size=32,
+            sf_use_ue8m0=True,
+            is_sf_swizzled_layout=False,
         )
         w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(
-            num_experts, hidden_size, -1
+            local_num_experts, hidden_size, -1
         )
         w13_global_scale = w2_global_scale = 1.0
         hidden_states_global_scale = 1.0
+        sf_vec_size = 32
 
     output1_scale_scalar = torch.tensor(
-        [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
+        [hidden_states_global_scale * w13_global_scale] * local_num_experts,
+        device=device,
     )
     output1_scale_gate_scalar = torch.tensor(
-        [hidden_states_global_scale * w13_global_scale] * num_experts, device=device
+        [hidden_states_global_scale * w13_global_scale] * local_num_experts,
+        device=device,
     )
     output2_scale_scalar = torch.tensor(
-        [hidden_states_global_scale * w2_global_scale] * num_experts, device=device
+        [hidden_states_global_scale * w2_global_scale] * local_num_experts,
+        device=device,
     )
+    effective_clamp_limit = (
+        gemm1_clamp_limit if gemm1_clamp_limit is not None else swiglu_limit
+    )
+    gemm1_clamp_limit_tensor = (
+        torch.full(
+            (local_num_experts,),
+            effective_clamp_limit,
+            dtype=torch.float32,
+            device=device,
+        )
+        if effective_clamp_limit is not None
+        else None
+    )
+
+    shuffled = _shuffle_fp4_major_k(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_local_experts=local_num_experts,
+        sf_vec_size=sf_vec_size,
+        activation_type=activation_type,
+        gemm1_bias=bias13,
+        gemm2_bias=bias2,
+    )
+    localized_shards = {
+        strategy: _shard_for_partition(
+            strategy=strategy,
+            sm_split=locality_sm_split,
+            fc1_weight=shuffled["gemm1_weights"],
+            fc2_weight=shuffled["gemm2_weights"],
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            weight_layout=WeightLayout.MajorK.value,
+            fc1_scale=shuffled["gemm1_weights_scale"],
+            fc2_scale=shuffled["gemm2_weights_scale"],
+            scale_k_group_size=sf_vec_size,
+        )
+        for strategy in resolved_localizations
+        if strategy != "none"
+    }
 
     fp4_kwargs = dict(
         routing_bias=None,
-        gemm1_alpha=None,
-        gemm1_beta=None,
-        gemm1_clamp_limit=None,
+        gemm1_alpha=(
+            None
+            if gemm1_alpha is None
+            else torch.full(
+                (local_num_experts,), gemm1_alpha, dtype=torch.float32, device=device
+            )
+        ),
+        gemm1_beta=(
+            None
+            if gemm1_beta is None
+            else torch.full(
+                (local_num_experts,), gemm1_beta, dtype=torch.float32, device=device
+            )
+        ),
+        gemm1_clamp_limit=gemm1_clamp_limit_tensor,
         output1_scale_scalar=output1_scale_scalar,
         output1_scale_gate_scalar=output1_scale_gate_scalar,
         output2_scale_scalar=output2_scale_scalar,
@@ -392,9 +1629,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         n_group=None,
         topk_group=None,
         intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
         routing_method_type=RoutingMethodType.Renormalize.value,
         do_finalize=True,
         enable_pdl=enable_pdl,
@@ -429,14 +1666,18 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
             hidden_states_scale = None
 
         if routed:
-            fn = partial(
-                trtllm_fp4_block_scale_routed_moe,
-                topk_ids=_pack_topk(batch_size, top_k, num_experts, device),
+            common_fn_kwargs = dict(
+                topk_ids=_pack_topk(
+                    batch_size,
+                    top_k,
+                    num_experts,
+                    device,
+                    routed_scaling_factor,
+                ),
                 **fp4_kwargs,
             )
         else:
-            fn = partial(
-                trtllm_fp4_block_scale_moe,
+            common_fn_kwargs = dict(
                 routing_logits=torch.rand(batch_size, num_experts, device=device).to(
                     torch.bfloat16
                 ),
@@ -446,22 +1687,54 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
         input_kwargs = {
             "hidden_states": hidden_states,
             "hidden_states_scale": hidden_states_scale,
-            "gemm1_weights": w13,
-            "gemm1_weights_scale": w13_scale,
-            "gemm2_weights": w2,
-            "gemm2_weights_scale": w2_scale,
-            "gemm1_bias": bias13,
-            "gemm2_bias": bias2,
+            "gemm1_weights": shuffled["gemm1_weights"],
+            "gemm1_weights_scale": shuffled["gemm1_weights_scale"],
+            "gemm2_weights": shuffled["gemm2_weights"],
+            "gemm2_weights_scale": shuffled["gemm2_weights_scale"],
+            "gemm1_bias": shuffled["gemm1_bias"],
+            "gemm2_bias": shuffled["gemm2_bias"],
         }
-        setups.append((batch_size, fn, input_kwargs))
+        for backend in backends:
+            for localization in resolved_localizations:
+                if localization == "none":
+                    setups.append(
+                        BenchmarkSetup(
+                            batch_size,
+                            backend,
+                            partial(_fp4_ops(backend, routed), **common_fn_kwargs),
+                            input_kwargs,
+                        )
+                    )
+                elif (backend, "fp4") in _LOCALIZED_OPS:
+                    setups.append(
+                        _localized_setup(
+                            batch_size=batch_size,
+                            backend=backend,
+                            family="fp4",
+                            strategy=localization,
+                            sm_split=locality_sm_split,
+                            common_fn_kwargs=common_fn_kwargs,
+                            input_kwargs=input_kwargs,
+                            shards=localized_shards[localization],
+                        )
+                    )
 
     mode_str = "routed" if routed else "non_routed"
-    _run_benchmark(
+    return _run_benchmark(
         setups,
         warmups,
         iterations,
-        f"quant_mode={quant_mode}  routing={mode_str}  experts={num_experts}"
-        f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        f"model={model}  quant_mode={quant_mode}  routing={mode_str}"
+        f"  experts={num_experts}"
+        f"  local_experts={local_num_experts}  local_offset={local_expert_offset}"
+        f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}"
+        f"  bias={use_bias}  routed_scale={routed_scaling_factor}"
+        f"  swiglu_limit={swiglu_limit}"
+        f"  activation={ActivationType(activation_type).name}"
+        f"  gemm1_alpha={gemm1_alpha}  gemm1_beta={gemm1_beta}"
+        f"  gemm1_clamp_limit={gemm1_clamp_limit}",
+        tuning_buckets=tuning_buckets,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
@@ -476,6 +1749,7 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
     warmups: int,
     iterations: int,
     activation_type: int,
+    cuda_graph_profile_replays: int = 1,
 ):
     device = torch.device("cuda:0")
     enable_pdl = device_support_pdl(device)
@@ -536,24 +1810,38 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
             "gemm2_weights": w2,
             "gemm2_weights_scale": w2_scale,
         }
-        setups.append((batch_size, fn, input_kwargs))
+        setups.append(BenchmarkSetup(batch_size, "trtllm", fn, input_kwargs))
 
-    _run_benchmark(
+    return _run_benchmark(
         setups,
         warmups,
         iterations,
         f"quant_mode={quant_mode}  experts={num_experts}"
         f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--model",
+        type=str,
+        default="custom",
+        choices=["custom", *MODEL_PRESETS, "kimi-k3", "kimi-k3-nvfp4"],
+        help=(
+            "MoE model preset. DeepSeek-V4, Nemotron, and Kimi-K3 presets "
+            "select the routed-expert shape, quantization mode, Top-K, routing "
+            "scale/activation, and no-bias path. --num-tokens and TP remain "
+            "configurable."
+        ),
+    )
+    parser.add_argument(
         "--quant-mode",
         type=str,
         default="MxFP4xMxFP8",
         choices=[
+            "BF16",
             "NvFP4xNvFP4",
             "MxFP4xMxFP8",
             "MxFP4xBf16",
@@ -568,8 +1856,18 @@ if __name__ == "__main__":
         "--num-tokens",
         type=int,
         nargs="+",
-        default=[512],
+        default=None,
         help="Number of tokens (one or more)",
+    )
+    parser.add_argument(
+        "--tuning-buckets",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Explicit autotune measurement buckets. Defaults to the API bucket "
+            "generation when omitted."
+        ),
     )
     parser.add_argument(
         "--tune-max-num-tokens",
@@ -578,11 +1876,23 @@ if __name__ == "__main__":
         help="Maximum number of tokens for tuning (defaults to max of --num-tokens)",
     )
     parser.add_argument(
-        "--num-experts", type=int, default=128, help="Number of experts"
+        "--num-experts", type=int, default=None, help="Number of global experts"
     )
-    parser.add_argument("--hidden-size", type=int, default=3072, help="Hidden size")
     parser.add_argument(
-        "--intermediate-size", type=int, default=3072, help="Intermediate size"
+        "--local-num-experts",
+        type=int,
+        default=None,
+        help="Number of resident local experts",
+    )
+    parser.add_argument(
+        "--local-expert-offset",
+        type=int,
+        default=0,
+        help="Global expert id offset for the first local expert",
+    )
+    parser.add_argument("--hidden-size", type=int, default=None, help="Hidden size")
+    parser.add_argument(
+        "--intermediate-size", type=int, default=None, help="Intermediate size"
     )
     parser.add_argument(
         "--tp",
@@ -590,12 +1900,64 @@ if __name__ == "__main__":
         default=1,
         help="Tensor parallelism degree; divides intermediate-size",
     )
-    parser.add_argument("--top-k", type=int, default=4, help="Top-k experts per token")
+    parser.add_argument(
+        "--top-k", type=int, default=None, help="Top-k experts per token"
+    )
+    parser.add_argument(
+        "--backends",
+        type=str,
+        nargs="+",
+        default=["both"],
+        choices=["trtllm", "prims_ts", "both"],
+        help="Backends to benchmark. Use 'both' to compare TRT-LLM Gen and Prims-TS.",
+    )
+    parser.add_argument(
+        "--localization",
+        type=str,
+        nargs="+",
+        choices=LOCALIZATIONS,
+        default=["none"],
+        help=(
+            "MoE localization modes. 'none' uses the ordinary backend path; "
+            "tp_n_tp_n and tp_n_tp_k use two locality-domain green contexts "
+            "with weight shards allocated in their matching domain pools. "
+            "Requires CUDA 13.4 toolkit/driver support and a GPU with at least "
+            "two locality domains. Localization is currently implemented only "
+            "by Prims-TS; unsupported backends run only their 'none' baseline. "
+            "Localized execution rejects bias and DeepSeek Fp8-Block, but supports "
+            "FP4 SwiGLU clamp and SiTU alpha/beta."
+        ),
+    )
+    parser.add_argument(
+        "--locality-sm-split",
+        choices=LOCALITY_SM_SPLITS,
+        default="backfill",
+        help=(
+            "SM split for localized runs. 'backfill' (default) uses every SM "
+            "and may incur stitch traffic; 'strict' uses only domain-local SMs "
+            "and may leave remainder SMs idle."
+        ),
+    )
+    parser.add_argument(
+        "--use-bias",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Include FC1/FC2 bias tensors in FP4 benchmarks.",
+    )
     parser.add_argument(
         "--warmups", type=int, default=100, help="Number of warmup iterations"
     )
     parser.add_argument(
         "--iterations", type=int, default=100, help="Number of benchmark iterations"
+    )
+    parser.add_argument(
+        "--cuda-graph-profile-replays",
+        type=int,
+        default=1,
+        help=(
+            "Back-to-back CUDA graph warmup and timed replays used to profile "
+            "every autotuned config."
+        ),
     )
     parser.add_argument(
         "--activation-type",
@@ -606,13 +1968,94 @@ if __name__ == "__main__":
         help=f"Type of activation function: {[e.name for e in ActivationType]}",
     )
     parser.add_argument(
+        "--gemm1-alpha",
+        type=float,
+        default=None,
+        help="Per-local-expert gated activation alpha (Kimi K3 SiTU gate beta: 4.0).",
+    )
+    parser.add_argument(
+        "--gemm1-beta",
+        type=float,
+        default=None,
+        help="Per-local-expert gated activation beta (Kimi K3 SiTU linear beta: 25.0).",
+    )
+    parser.add_argument(
+        "--gemm1-clamp-limit",
+        type=float,
+        default=None,
+        help="Optional per-local-expert gated activation clamp limit.",
+    )
+    parser.add_argument(
         "--routed",
         action="store_true",
         default=False,
         help="Use pre-computed topk_ids (routed) path instead of routing_logits. "
         "Not supported for Fp8-Per-Tensor or MxInt4xBf16.",
     )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed used to create inputs"
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Write configuration, environment, and raw median results as JSON.",
+    )
+    parser.add_argument(
+        "--routed-scaling-factor",
+        type=float,
+        default=None,
+        help="Optional routing-weight scale applied by the fused MoE operation.",
+    )
+    parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=None,
+        help=(
+            "Optional per-expert SwiGLU clamp limit for FP4 MoE, including "
+            "localized Prims-TS runs."
+        ),
+    )
     args = parser.parse_args()
+
+    _apply_model_preset(args)
+    torch.manual_seed(args.seed)
+
+    if args.num_tokens is None:
+        args.num_tokens = [512]
+    if args.num_experts is None:
+        args.num_experts = 128
+    if args.hidden_size is None:
+        args.hidden_size = 3072
+    if args.intermediate_size is None:
+        args.intermediate_size = 3072
+    if args.top_k is None:
+        args.top_k = 4
+    localizations = _normalize_localizations(args.localization)
+    if args.use_bias is None:
+        args.use_bias = all(localization == "none" for localization in localizations)
+
+    if args.local_num_experts is None:
+        args.local_num_experts = args.num_experts
+
+    backends = _normalize_backends(args.backends, args.quant_mode)
+    has_localization = any(localization != "none" for localization in localizations)
+    if has_localization:
+        unsupported_options = [
+            name
+            for name, value in (("--use-bias", args.use_bias),)
+            if value not in (None, False)
+        ]
+        if unsupported_options:
+            raise ValueError(
+                "Localized MoE does not support " + ", ".join(unsupported_options)
+            )
+    _validate_localization_support(
+        backends=backends,
+        quant_mode=args.quant_mode,
+        activation_type=args.activation_type,
+        localizations=localizations,
+    )
     args.intermediate_size //= args.tp
 
     is_fp8 = args.quant_mode in ["Fp8-Per-Tensor", "Fp8-Block", "MxFP8xMxFP8"]
@@ -623,8 +2066,26 @@ if __name__ == "__main__":
     if args.routed and is_mxint4:
         raise ValueError("--routed is not supported for MxInt4xBf16.")
 
-    if is_fp8:
-        bench_trtllm_gen_fused_moe_autotuner_fp8(
+    if args.quant_mode == "BF16":
+        results = bench_trtllm_gen_fused_moe_autotuner_bf16(
+            args.tune_max_num_tokens,
+            args.num_tokens,
+            args.num_experts,
+            args.hidden_size,
+            args.intermediate_size,
+            args.top_k,
+            args.warmups,
+            args.iterations,
+            args.activation_type,
+            backends,
+            tuning_buckets=args.tuning_buckets,
+            routed=args.routed,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
+            localizations=localizations,
+            locality_sm_split=args.locality_sm_split,
+        )
+    elif is_fp8:
+        results = bench_trtllm_gen_fused_moe_autotuner_fp8(
             args.tune_max_num_tokens,
             args.quant_mode,
             args.num_tokens,
@@ -635,10 +2096,15 @@ if __name__ == "__main__":
             args.warmups,
             args.iterations,
             args.activation_type,
+            backends,
+            tuning_buckets=args.tuning_buckets,
             routed=args.routed,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
+            localizations=localizations,
+            locality_sm_split=args.locality_sm_split,
         )
     elif is_mxint4:
-        bench_trtllm_gen_fused_moe_autotuner_mxint4(
+        results = bench_trtllm_gen_fused_moe_autotuner_mxint4(
             args.tune_max_num_tokens,
             args.quant_mode,
             args.num_tokens,
@@ -649,18 +2115,153 @@ if __name__ == "__main__":
             args.warmups,
             args.iterations,
             args.activation_type,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
         )
     else:
-        bench_trtllm_gen_fused_moe_autotuner_fp4(
+        results = bench_trtllm_gen_fused_moe_autotuner_fp4(
             args.tune_max_num_tokens,
             args.quant_mode,
             args.num_tokens,
             args.num_experts,
+            args.local_num_experts,
+            args.local_expert_offset,
             args.hidden_size,
             args.intermediate_size,
             args.top_k,
             args.warmups,
             args.iterations,
             args.activation_type,
+            args.gemm1_alpha,
+            args.gemm1_beta,
+            args.gemm1_clamp_limit,
+            backends,
+            tuning_buckets=args.tuning_buckets,
+            use_bias=args.use_bias,
             routed=args.routed,
+            routed_scaling_factor=args.routed_scaling_factor,
+            swiglu_limit=args.swiglu_limit,
+            model=args.model,
+            cuda_graph_profile_replays=args.cuda_graph_profile_replays,
+            localizations=localizations,
+            locality_sm_split=args.locality_sm_split,
         )
+
+    if args.output_json is not None:
+
+        def package_version(name: str) -> Optional[str]:
+            try:
+                return version(name)
+            except PackageNotFoundError:
+                return None
+
+        def command_output(command: list[str]) -> Optional[str]:
+            try:
+                return subprocess.check_output(command, text=True).strip()
+            except (OSError, subprocess.CalledProcessError):
+                return None
+
+        device_properties = torch.cuda.get_device_properties(0)
+        cupti_version = package_version("cupti-python")
+        driver_output = command_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader",
+            ]
+        )
+        source_path = Path(__file__).resolve()
+        localized_partition = (
+            _localized_partition(
+                torch.device("cuda:0"),
+                args.locality_sm_split,
+            )
+            if has_localization
+            else None
+        )
+        timing_method = (
+            "CUPTI activity tracing of one CUDA-graph replay"
+            if cupti_version is not None and int(cupti_version.split(".")[0]) >= 13
+            else "CUDA events around 10-call CUDA-graph replays, divided by 10"
+        )
+        payload = {
+            "schema_version": 1,
+            "environment": {
+                "gpu": device_properties.name,
+                "compute_capability": list(torch.cuda.get_device_capability(0)),
+                "nvidia_driver": (
+                    driver_output.splitlines()[0] if driver_output else None
+                ),
+                "python": platform.python_version(),
+                "flashinfer": package_version("flashinfer-python"),
+                "flashinfer_cubin": package_version("flashinfer-cubin"),
+                "torch": torch.__version__,
+                "torch_cuda": torch.version.cuda,
+                "cudnn": torch.backends.cudnn.version(),
+                "numpy": np.__version__,
+                "nvidia_cutlass_dsl": package_version("nvidia-cutlass-dsl"),
+                "apache_tvm_ffi": package_version("apache-tvm-ffi"),
+                "cupti_python": cupti_version,
+                "git_commit": command_output(["git", "rev-parse", "HEAD"]),
+                "git_dirty": bool(command_output(["git", "status", "--porcelain"])),
+                "locality_domain_count": (
+                    localized_partition.domain_count
+                    if localized_partition is not None
+                    else None
+                ),
+                "locality_domain_sm_counts": (
+                    list(localized_partition.sm_counts)
+                    if localized_partition is not None
+                    else None
+                ),
+                "locality_remainder_sm_count": (
+                    localized_partition.remainder_sm_count
+                    if localized_partition is not None
+                    else None
+                ),
+                "benchmark_script_sha256": hashlib.sha256(
+                    source_path.read_bytes()
+                ).hexdigest(),
+            },
+            "configuration": {
+                "quant_mode": args.quant_mode,
+                "routing_input_mode": "precomputed" if args.routed else "logits",
+                "routing_method": (
+                    "Renormalize"
+                    if args.routed
+                    else (
+                        "DeepSeekV3"
+                        if args.quant_mode in ("Fp8-Block", "MxFP8xMxFP8")
+                        else "TopK"
+                    )
+                ),
+                "num_tokens": args.num_tokens,
+                "num_experts": args.num_experts,
+                "local_num_experts": args.local_num_experts,
+                "local_expert_offset": args.local_expert_offset,
+                "top_k": args.top_k,
+                "hidden_size": args.hidden_size,
+                "intermediate_size": args.intermediate_size,
+                "tp": args.tp,
+                "activation_type": int(args.activation_type),
+                "use_bias": args.use_bias if args.quant_mode != "BF16" else False,
+                "tune_max_num_tokens": args.tune_max_num_tokens,
+                "tuning_buckets": args.tuning_buckets,
+                "seed": args.seed,
+                "localizations": localizations,
+                "locality_sm_split": (
+                    args.locality_sm_split if has_localization else None
+                ),
+            },
+            "timing": {
+                "method": timing_method,
+                "cold_l2_cache": True,
+                "cuda_graph": True,
+                "warmup_replays": args.warmups,
+                "measured_replays": args.iterations,
+                "calls_per_replay": 1 if cupti_version is not None else 10,
+                "jit_compilation_in_steady_state_timing": False,
+            },
+            "results": [asdict(result) for result in results],
+        }
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(json.dumps(payload, indent=2) + "\n")
