@@ -152,14 +152,19 @@ def get_compiled_grouped(
 
 
 def swapped_kernel_name(
-    cfg: Knobs, chain: Union[str, GroupedChain], out_fmt: str = "bf16"
+    cfg: Knobs,
+    chain: Union[str, GroupedChain],
+    out_fmt: str = "bf16",
+    gather: bool = False,
 ) -> str:
-    """``swapped_bf16_<chain>_<record>``: the swapped record (its token tile) names the object beside the chain."""
+    """``swapped_bf16_<chain>_<record>[_gather]``: the swapped record (its token tile) names the object beside the chain; the
+    gather form (the token box gathered from the unpermuted rows) appends ``_gather``."""
     if isinstance(chain, str):
         chain = GroupedChain.legacy(chain, out_fmt)
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"swapped_bf16_{chain.describe()}_{knobs.describe()}"
+        + ("_gather" if gather else "")
     )
 
 
@@ -207,9 +212,13 @@ def can_implement(
     ) or can_implement_swapped(knobs, N, K, E, chain, out_fmt)
 
 
-def compile_swapped_fn(cfg: Knobs, chain: GroupedChain) -> Callable[[], Any]:
+def compile_swapped_fn(
+    cfg: Knobs, chain: GroupedChain, gather: bool = False
+) -> Callable[[], Any]:
     """The zero-argument compile closure of one swapped specialisation: ``kernel(rows3, w3, out2, counts, grid)`` -- ``rows
-    (R, K, 1)`` the dense permuted rows (``R >= Tk``), ``w (N, K, E)``, ``out (Tk, Nout)``."""
+    (R, K, 1)`` the dense permuted rows (``R >= Tk``), ``w (N, K, E)``, ``out (Tk, Nout)``; the gather form ``kernel(x2, src,
+    k_div, w3, out2, counts, grid)`` -- ``x (T, K)`` the unpermuted rows, ``src (>= Tk,)`` int32 the plan's slot of every
+    expanded row (row ``p`` reads ``x[src[p] // k_div]``)."""
     in_dt, al = IN_DT["bf16"], ALIGN["bf16"]
     out_dt, oal = OUT_DT[chain.out_fmt], ALIGN[chain.out_fmt]
 
@@ -222,12 +231,6 @@ def compile_swapped_fn(cfg: Knobs, chain: GroupedChain) -> Callable[[], Any]:
             cute.sym_int(32),
         )
         sym_no = cute.sym_int(32, divisibility=oal)
-        rows_fake = cute.runtime.make_fake_tensor(
-            in_dt,
-            (sym_r, sym_k, 1),
-            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
-            assumed_align=16,
-        )
         w_fake = cute.runtime.make_fake_tensor(
             in_dt,
             (sym_n, sym_k, sym_e),
@@ -243,8 +246,37 @@ def compile_swapped_fn(cfg: Knobs, chain: GroupedChain) -> Callable[[], Any]:
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
+        body = SwappedGroupedGemm(cfg, chain, gather=gather)
+        if gather:
+            x_fake = cute.runtime.make_fake_tensor(
+                in_dt,
+                (sym_r, sym_k),
+                (cute.sym_int64(divisibility=al), 1),
+                assumed_align=16,
+            )
+            src_fake = cute.runtime.make_fake_tensor(
+                Int32, (cute.sym_int(32),), (1,), assumed_align=16
+            )
+            return cute.compile(
+                body.gathered,
+                x_fake,
+                src_fake,
+                Int32(1),
+                w_fake,
+                o_fake,
+                c_fake,
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+        rows_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_r, sym_k, 1),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
         return cute.compile(
-            SwappedGroupedGemm(cfg, chain),
+            body,
             rows_fake,
             w_fake,
             o_fake,
@@ -259,11 +291,14 @@ def compile_swapped_fn(cfg: Knobs, chain: GroupedChain) -> Callable[[], Any]:
 
 @functools.cache
 def get_compiled_swapped(
-    cfg: Knobs, chain: Union[str, GroupedChain] = "plain", out_fmt: str = "bf16"
+    cfg: Knobs,
+    chain: Union[str, GroupedChain] = "plain",
+    out_fmt: str = "bf16",
+    gather: bool = False,
 ) -> Any:
     """``kernel(rows3, w3, out2, counts, grid)``: the swapped body for a swapped record (module ``batch_invariant_moe``):
     rows ``(R, K, 1)`` K-major bf16 (``R >= Tk``), w ``(N, K, E)`` K-major bf16, out ``(Tk, Nout)``, counts ``(E,)``, ``grid``
-    the persistent grid in CTAs."""
+    the persistent grid in CTAs; the gather form ``kernel(x2, src, k_div, w3, out2, counts, grid)``."""
     if isinstance(chain, str):
         assert chain in CHAINS and (chain == "plain" or out_fmt == "bf16"), (
             chain,
@@ -272,5 +307,7 @@ def get_compiled_swapped(
         chain = GroupedChain.legacy(chain, out_fmt)
     assert is_swapped_record(cfg), cfg
     return jit.build_and_load(
-        MODULE, swapped_kernel_name(cfg, chain), compile_swapped_fn(cfg, chain)
+        MODULE,
+        swapped_kernel_name(cfg, chain, gather=gather),
+        compile_swapped_fn(cfg, chain, gather),
     )

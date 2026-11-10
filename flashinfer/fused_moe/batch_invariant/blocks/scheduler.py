@@ -101,13 +101,17 @@ def build_group_tables(
     lane = cute.arch.lane_idx()
     loc_c = cute.make_rmem_tensor((PER_LANE,), Int32)
     loc_b = cute.make_rmem_tensor((PER_LANE,), Int32)
-    sum_c = Int32(0)
-    sum_b = Int32(0)
+    # the lane's counts first, all loads in flight together (one memory latency per CTA instead of one per entry), then the sums
     for i in cutlass.range_constexpr(PER_LANE):
         e = lane * PER_LANE + i
         c = Int32(0)
         if e < E:
             c = counts[e]
+        loc_c[i] = c
+    sum_c = Int32(0)
+    sum_b = Int32(0)
+    for i in cutlass.range_constexpr(PER_LANE):
+        c = loc_c[i]
         loc_c[i] = sum_c
         loc_b[i] = sum_b
         if cutlass.const_expr(align > 1):

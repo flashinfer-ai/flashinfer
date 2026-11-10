@@ -47,6 +47,26 @@ def active_experts(T: int, k: int, E: int) -> int:
     return max(1, min(E, T * k))
 
 
+def launch_tile_bound(config: Knobs, Tk: int, E: int, N: int) -> int:
+    """An upper bound on a grouped launch's cluster tiles from the static sizes alone (no device read, so a graph node's
+    grid): every active expert contributes at least one row tile and the rows past one per expert add at most one tile per
+    cluster rows -- ``min(E, Tk) + (Tk - min(E, Tk)) // cluster_rows`` row tiles, times the N tiles. The persistent grid is
+    clipped to it: which CTA computes a tile, never the bits (the scheduler strides by the grid); a swapped record's cluster
+    rows are its token tile, its N tiles the weight tiles."""
+    if config.swap_ab:
+        cluster_rows, tn, cn = config.tile_n, config.mma_tiler_mn[0], 1
+    else:
+        cta_m = config.mma_tiler_mn[0] // (2 if config.use_2cta_instrs else 1)
+        cluster_rows, tn, cn = (
+            cta_m * config.cluster_shape_mn[0],
+            config.mma_tiler_mn[1],
+            config.cluster_shape_mn[1],
+        )
+    act = min(E, Tk)
+    row_tiles = act + (Tk - act) // cluster_rows
+    return max(1, row_tiles * -(-N // (tn * cn)))
+
+
 def rows_per_expert(T: int, k: int, E: int) -> int:
     """The dispatcher's size proxy: average rows per active expert."""
     return max(1, -(-(T * k) // active_experts(T, k, E)))
@@ -180,17 +200,135 @@ def zero_fill_cycles(
 ) -> float:
     """The zero-fill of a CTA's token box rows past the group's rows over the K extent: the grouped body's token tile (its
     CTA rows; the box is multicast over the N-cluster, each CTA fills its share) less the live rows, the swapped body's
-    token tile less the live rows; at the family's fill rate (`ZERO_FILL_BYTES_PER_CLK`). Charged once per launch, not per
-    wave: a later wave's fill streams beside the other CTAs' loads; the first wave's is exposed."""
+    token box less the live rows; at the family's fill rate (`ZERO_FILL_BYTES_PER_CLK`), of which a swapped record's box
+    exposes only a share (`SWAPPED_FILL_EXPOSURE`: the box streams under the weight tile's stages). Charged once per launch,
+    not per wave: a later wave's fill streams beside the other CTAs' loads; the first wave's is exposed."""
     from ...gemm.batch_invariant.spec import ELEM_BITS_OF
 
     eb = ELEM_BITS_OF[in_fmt] / 8.0
+    rate = ZERO_FILL_BYTES_PER_CLK.get(family, ZERO_FILL_BYTES_PER_CLK["sm_107"])
     if cfg.swap_ab:
-        oob, share = max(0, cfg.tile_n - rows), 1.0
+        # the token box's fill streams largely under the weight tile's stages: the exposed share of its rate
+        oob, share, rate = max(0, cfg.tile_n - rows), 1.0, rate / SWAPPED_FILL_EXPOSURE
     else:
         oob, share = max(0, cfg.cta_tile_mn[0] - rows), float(cfg.cluster_n)
-    rate = ZERO_FILL_BYTES_PER_CLK.get(family, ZERO_FILL_BYTES_PER_CLK["sm_107"])
     return oob * K * eb / share / rate
+
+
+# The exposed share of a swapped record's token-box fill: the box streams largely under the weight tile's stages, so the wider box
+# costs only a share of its fill bytes at the family's fill rate (an empirical constant fitted on the token-tile ladder of the
+# 128-row records at one row per expert, one value for every family)
+SWAPPED_FILL_EXPOSURE = 0.4
+
+# A cluster record's per-step cost beyond its bytes at a few live rows per expert: every k-step waits on all of the
+# cluster's CTAs releasing their stages while the token operand they share is a row or two, so a two- or four-CTA
+# cluster's step runs longer than its bytes say (one declared empirical constant per extra CTA of the cluster, scaled
+# by the record's own step; nothing once the live rows fill the tile)
+CLUSTER_STEP = 0.2
+
+
+def estimate_overrides(cfg: Knobs, rows: int, in_fmt: str, family: str) -> dict:
+    """The dense estimate's constants as the MoE ranking applies them to a grouped launch at ``rows`` live rows per expert
+    (the dense dispatcher's own constants untouched): the cluster's multicast credit on the bytes the cluster actually
+    shares -- the live rows of the token tile, so one live row of a tile earns almost none and rows at the tile the whole
+    credit (the prefill ranking unchanged); the cluster's per-step cost beyond its bytes at those live rows
+    (`CLUSTER_STEP`, through the step floor); and the 64-row CTA tile's MMA penalty confined to the compute share of
+    the step (at one row per expert the swapped records are bytes-bound, so a 64-row weight tile is priced by its bytes
+    per CTA)."""
+    from ...gemm.batch_invariant.heuristic import CONSTANTS, PART_TABLE
+    from ...gemm.batch_invariant.spec import ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
+
+    p = dict(CONSTANTS)
+    part = PART_TABLE.get(family, PART_TABLE["sm_107"])
+    group = 2 if cfg.use_2cta_instrs else 1
+    cta_rows = (
+        cfg.mma_tiler_mn[0] // group
+    )  # the CTA's rows (a swapped record's weight rows)
+    tn = cfg.mma_tiler_mn[1]
+    cm, cn = cfg.cluster_shape_mn
+    live = min(max(1, rows), cta_rows)
+    if not cfg.swap_ab:
+        p["mcast_pow"] = CONSTANTS["mcast_pow"] * live / cta_rows
+    # the record's k-step as the estimate forms it: MMA cycles against operand bytes
+    eb = ELEM_BITS_OF[in_fmt] / 8.0
+    kk = MMA_K_OF[in_fmt]
+    rate = part.mma_flop_per_clk * MMA_RATE_OF[in_fmt]
+    wb = tn / group * max(eb, 1.0)
+    b_eff = (
+        1.0
+        if cfg.swap_ab
+        else p["eff16b"]
+        if wb <= 16
+        else p["eff32b"]
+        if wb <= 32
+        else p["eff64b"]
+        if wb <= 64
+        else 1.0
+    )
+    mma_raw = 2.0 * cta_rows * tn * kk / rate
+    a_bytes = cta_rows * kk * eb / (cn ** p["mcast_pow"])
+    b_bytes = tn * kk * eb / (cm ** p["mcast_pow"]) / b_eff
+    bytes_cycles = (a_bytes + b_bytes) / part.load_bytes_per_clk
+    if cta_rows < 128:
+        share = min(1.0, mma_raw / bytes_cycles)
+        p["rows64_eff"] = 1.0 - (1.0 - CONSTANTS["rows64_eff"]) * share
+    size = cm * cn
+    if not cfg.swap_ab and size > 1 and live < cta_rows:
+        mma_eff = 1.0 if cta_rows >= 128 else p["rows64_eff"]
+        step = max(mma_raw / mma_eff, bytes_cycles) + CONSTANTS["step_floor"]
+        dead = (cta_rows - live) / cta_rows
+        p["step_floor"] = (
+            CONSTANTS["step_floor"] + CLUSTER_STEP * (size - 1) * step * dead
+        )
+    return p
+
+
+def record_cost(
+    cfg: Knobs,
+    rows: int,
+    n_active: int,
+    N: int,
+    K: int,
+    nodes: int,
+    pair: bool,
+    family: str,
+    sm_count: Optional[int] = None,
+    in_fmt: str = "bf16",
+    nominal: bool = False,
+    overrides: Optional[dict] = None,
+) -> float:
+    """The shared contract's cost of one grouped record at the launch's shape ``(rows per expert, n_active x N, K)``, the key
+    every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
+    (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
+    dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
+    chain and the token box's exposed fill; in SM cycles (a launch's fixed cost is the same for both bodies on
+    every measured part, so it is no term)."""
+    import dataclasses
+
+    from ...gemm.batch_invariant.heuristic import estimate_cycles
+
+    constants = estimate_overrides(cfg, rows, in_fmt, family)
+    if overrides:
+        constants.update(overrides)
+    canon = dataclasses.replace(cfg, raster_along="m")
+    est = estimate_cycles(
+        canon,
+        rows,
+        n_active * N,
+        K,
+        1,
+        "k",
+        in_fmt,
+        family,
+        sm_count,
+        nominal=nominal,
+        c=constants,
+    )
+    return (
+        est * pair_term(cfg, rows) * tiles_term(cfg, rows)
+        + exposed_epilogue_cycles(cfg, rows, nodes, pair)
+        + zero_fill_cycles(cfg, rows, K, family, in_fmt)
+    )
 
 
 def raster_for(cfg: Knobs, rows: int) -> str:
@@ -222,6 +360,7 @@ def rank_grouped(
     nominal: bool = False,
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
+    in_fmt: str = "bf16",
 ) -> List[Knobs]:
     """The ranked records for one GEMM over both record spaces: the grouped records the grouped body accepts for the weight
     shape and the chain (at a decode-sized ``rows`` the dense dispatcher's structural guard, `heuristic.decode_sane`: 1-CTA
@@ -240,11 +379,10 @@ def rank_grouped(
     distinct records, at most ``k``, never empty for an implementable shape."""
     import dataclasses
 
-    from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
+    from ...gemm.batch_invariant.heuristic import decode_sane
     from .blocks.compile import can_implement_grouped, can_implement_swapped
 
     fam = family or "sm_107"
-    dense_n = (n_active or E) * N
     dense = (
         []
         if swap is True
@@ -258,18 +396,16 @@ def rank_grouped(
     space = dense + swapped
     guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
     nodes = chain_nodes(chain if not isinstance(chain, str) else chain)
+    from .blocks.epilogue import GroupedChain
+
+    pair = (
+        GroupedChain.legacy(chain, "bf16") if isinstance(chain, str) else chain
+    ).pair
 
     def key(i, c):
-        canon = dataclasses.replace(c, raster_along="m")
-        est = estimate_cycles(
-            canon, rows, dense_n, K, 1, "k", "bf16", fam, sm_count, nominal=nominal
-        )
-        # the grouped launch's own terms on the dense estimate: the cluster tile's dummy share (pair term), the swapped records'
-        # spill over their token tile under the load, the last tile's exposed epilogue chain, the token box's zero-fill
-        est = (
-            est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes, chain.pair)
-            + zero_fill_cycles(c, rows, K, fam)
+        # the shared contract's cost: the dense estimate under the MoE ranking's overrides and the grouped launch's own terms
+        est = record_cost(
+            c, rows, n_active or E, N, K, nodes, pair, fam, sm_count, in_fmt, nominal
         )
         # three significant digits: records the estimate cannot separate (at the HBM floor every token tile reads the same
         # weights) fall through to the structural raster and the enumeration order -- the grouped records before the swapped

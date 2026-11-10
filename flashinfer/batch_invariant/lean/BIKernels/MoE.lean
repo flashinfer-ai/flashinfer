@@ -304,16 +304,27 @@ def softmaxSum (E : Nat) : MTerm :=
 
 def softmaxP (E e : Nat) : MTerm := .div (softmaxZ E e) (softmaxSum E)
 
-/-- `spec.RoutingMethod`: `softmax` (weights = probabilities) or sigmoid (weights = the unbiased sigmoid; a selection
-bias never enters a weight term); renormalisation; scaling. -/
+/-- `spec.RoutingMethod`: `softmax` (weights = probabilities), sigmoid (weights = the unbiased sigmoid; a selection
+bias never enters a weight term) or `raw` (weights = the logits themselves: the `TopK` method; `topk_sigmoid` has the
+sigmoid weights with a selection on the logits); renormalisation; scaling. The selection-only features (what the k slots
+are chosen on; the group-limited stage) are not fields: they change `selected`, never a weight term
+(`routingWeights_selection_only`). -/
 structure Method where
   softmax : Bool := true
   renorm : Bool := true
   scaled : Bool := false
+  raw : Bool := false
   deriving Repr, DecidableEq
 
 def weightOf (m : Method) (E e : Nat) : MTerm :=
-  if m.softmax then softmaxP E e else sigmoidT (.leaf "l" [e])
+  if m.raw then .leaf "l" [e] else if m.softmax then softmaxP E e else sigmoidT (.leaf "l" [e])
+
+/-- `spec.biased_score_term`: the sigmoid methods' selection score with a bias, `add(sigmoid(l_e), b_e)`. -/
+def biasedScoreT (e : Nat) : MTerm := .add (sigmoidT (.leaf "l" [e])) (.leaf "b" [e])
+
+/-- `spec.group_score_term`: the group-limited stage's score of a group whose two largest biased scores are
+experts `a` and `b` -- one `add` (commutative in the printer: the order of the two is immaterial). -/
+def groupScoreT (a b : Nat) : MTerm := .add (biasedScoreT a) (biasedScoreT b)
 
 /-- `spec.slot_weights`: `S_k = fold_r add(acc, w_r)` from `+0` in slot order, `w_r / S_k`; then `w_r * scale`. -/
 def slotWeights (m : Method) (ws : List MTerm) : List MTerm :=
@@ -326,6 +337,12 @@ def slotWeights (m : Method) (ws : List MTerm) : List MTerm :=
 /-- The k routing weights of the selected experts (in slot order). -/
 def routingWeights (m : Method) (E : Nat) (selected : List Nat) : List MTerm :=
   slotWeights m (selected.map (weightOf m E))
+
+/-- The weight terms depend on the selected experts and the method's weight features only: a method that
+selects differently (on the logits instead of their sigmoid, or through the group-limited stage) with the
+same weight features has the same weight terms for the same `selected`. -/
+theorem routingWeights_selection_only (m : Method) (E : Nat) (selected : List Nat) :
+    routingWeights m E selected = slotWeights m (selected.map (weightOf m E)) := rfl
 
 /-! ## The combine (`spec.combine_reduction` / `combine_elem`) -/
 
@@ -413,23 +430,25 @@ theorem grouped_tile_reset (cfg : GEMM.Config) (S : Nat) (prev₁ prev₂ : GEMM
 /-! ## The swapped records: a second placement space of the grouped GEMM
 
 The swapped body (`fused_moe/batch_invariant/blocks/swap_bf16.py`) computes `Cᵀ` per expert: the expert's weight rows on the
-MMA's M side (128 rows per CTA) and the group's tokens on its N side as a narrow tile of 8 / 16 / 32 rows. The tcgen05 step
+MMA's M side (128 rows per CTA, or 64) and the group's tokens on its N side as a narrow tile of 8 / 16 / 32 rows. The tcgen05 step
 folds the same K sequence per output element whichever operand carries the token, so every output element is the dense
 class's `kfold` of the row's data and the expert's column: the swapped records are placements (`groupedRow` erases the
 orientation with the grouping), and the dispatcher ranks them with the grouped records. The predicate mirrors
-`blocks/swap_bf16.is_swapped_record`; the space is the three token tiles. -/
+`blocks/swap_bf16.is_swapped_record`; the space is the three token tiles of the 128-row weight tile and the two wider ones of
+the 64-row tile. -/
 
-/-- A swapped record of the bf16 classes: the swapped 1-CTA record at 128 weight rows and a narrow token tile (8 / 16 / 32),
-no cluster, swizzle 1, no in-cluster split, no in-CTA chunk fold. -/
+/-- A swapped record of the bf16 classes: the swapped 1-CTA record at 128 weight rows and a narrow token tile (8 / 16 / 32) or
+at 64 weight rows and a token tile of 16 / 32, no cluster, swizzle 1, no in-cluster split, no in-CTA chunk fold. -/
 def swappedOK (cfg : GEMM.Config) : Bool :=
-  cfg.swapAb && cfg.tm == 128 && (cfg.tn == 8 || cfg.tn == 16 || cfg.tn == 32) && cfg.clusterM == 1 && cfg.clusterN == 1 &&
-  !cfg.twoCta && cfg.swizzle == 1 && cfg.clusterK == 1 && !cfg.ctaChunks
+  cfg.swapAb && ((cfg.tm == 128 && (cfg.tn == 8 || cfg.tn == 16 || cfg.tn == 32)) || (cfg.tm == 64 && (cfg.tn == 16 || cfg.tn == 32))) &&
+  cfg.clusterM == 1 && cfg.clusterN == 1 && !cfg.twoCta && cfg.swizzle == 1 && cfg.clusterK == 1 && !cfg.ctaChunks
 
-/-- The swapped record space (`schedule.swapped_knobs`): one record per token tile, raster along the token tiles. -/
+/-- The swapped record space (`schedule.swapped_knobs`): one record per (weight tile, token tile), raster along the token tiles. -/
 def swappedSpace : List GEMM.Config :=
-  [⟨128, 8, 1, 1, false, true, 1, false, 1, true⟩, ⟨128, 16, 1, 1, false, true, 1, false, 1, true⟩, ⟨128, 32, 1, 1, false, true, 1, false, 1, true⟩]
+  [⟨128, 8, 1, 1, false, true, 1, false, 1, true⟩, ⟨128, 16, 1, 1, false, true, 1, false, 1, true⟩, ⟨128, 32, 1, 1, false, true, 1, false, 1, true⟩,
+   ⟨64, 16, 1, 1, false, true, 1, false, 1, true⟩, ⟨64, 32, 1, 1, false, true, 1, false, 1, true⟩]
 
-theorem swapped_space_size : swappedSpace.length = 3 := by decide
+theorem swapped_space_size : swappedSpace.length = 5 := by decide
 theorem swapped_space_ok : swappedSpace.all swappedOK = true := by decide
 
 /-- The swapped records are disjoint from the dense records (the swapped flag): no record is in both spaces. -/

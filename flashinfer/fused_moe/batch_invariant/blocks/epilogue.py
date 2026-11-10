@@ -35,6 +35,8 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass import Boolean, Float32, Int32
+from cutlass._mlir.dialects import arith
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
@@ -212,6 +214,20 @@ class MoeF32(CuteF32):
         """The biased exponent field of ``|a|`` minus 126, as a Float32 (exact)."""
         bits = bitcast_f32_to_i32(a) & Int32(0x7FFFFFFF)
         return (((bits >> 23) & Int32(0xFF)) - Int32(126)).to(Float32)
+
+
+@dsl_user_op
+def select_f32(cond: Boolean, a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """``a`` if ``cond`` else ``b`` (``arith.select`` on a Boolean: a choice between two values, no arithmetic)."""
+    return Float32(
+        arith.select(
+            Boolean(cond).ir_value(loc=loc, ip=ip),
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def _chain_elem(chain: GroupedChain, acc, acc_gate):
@@ -435,6 +451,19 @@ def grouped_epilogue_loop(
             if warp_active:
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
                 cC_sub = tRG_cC[(None, None, None, s)]
+                crd0 = cC_sub[((0, 0), 0, 0)]
+                # a dead row's accumulators (past the group's end) are replaced by a benign constant right after the TMEM
+                # load (a choice, no arithmetic): its lanes would otherwise run the division's slow path on the padded rows'
+                # zero or garbage operands, and its values are never stored, so the chain runs unconditionally on every lane
+                # (a per-lane region instead costs the compiler the interleaving of the chains)
+                live = {
+                    m: (crd0[0] - Int32(offs[0][0]) + Int32(m)) < rows_left
+                    for m in rows_in_frag
+                }
+                for v in cutlass.range_constexpr(nv):
+                    tTR_rAcc[v] = select_f32(
+                        live[offs[v][0]], tTR_rAcc[v], Float32(1.0)
+                    )
                 # the chain, in fp32, per element (pair)
                 for v in cutlass.range_constexpr(nv):
                     if cutlass.const_expr(is_out[v]):

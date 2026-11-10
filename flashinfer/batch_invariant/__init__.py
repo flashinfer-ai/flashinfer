@@ -149,12 +149,15 @@ def _moe_bf16_fingerprint(
     act: object = "swiglu",
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
 ) -> str:
     """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
-    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements; ``act`` an
-    ``ActivationConfig`` of the layer (its scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default
-    gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the
-    names in both tables)."""
+    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, with ``n_group`` /
+    ``topk_group`` for ``DeepSeekV3``'s group-limited selection (``RoutingConfig``'s values; the groups are a parameter of
+    the routing term); ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters), ``"swiglu"`` /
+    ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with
+    ``params`` (and ``gated`` for the names in both tables)."""
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
     from flashinfer.fused_moe.batch_invariant import spec
@@ -176,6 +179,12 @@ def _moe_bf16_fingerprint(
         raise TypeError(
             f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
         )
+    if (n_group or 0) > 1 or (topk_group or 0) > 1:
+        if rm is not spec.SIGMOID_BIAS_RENORM_SCALED:
+            raise ValueError(
+                "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
+            )
+        rm = rm.with_groups(int(n_group or 0), int(topk_group or 0))
     if not isinstance(act, str):
         a = spec.activation_of(act)
         name, params, gated = a.act, a.params, a.gated
@@ -251,7 +260,7 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.bf16",
         ("H", "I", "top_k", "num_experts"),
         _moe_bf16_fingerprint,
-        ("method", "act", "params", "gated"),
+        ("method", "act", "params", "gated", "n_group", "topk_group"),
     ),
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output

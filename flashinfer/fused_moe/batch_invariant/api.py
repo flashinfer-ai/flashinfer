@@ -192,6 +192,7 @@ def grouped_gemm(
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     Tk: Optional[int] = None,
+    grid: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` for the expert segments ``counts`` (int32 ``[E]``, group order = expert order;
     rows ``[off_e, off_e + counts[e])`` of ``a`` belong to expert ``e``). ``a [R >= Tk, K]`` bf16 row-major, ``w [E, N, K]``
@@ -203,6 +204,7 @@ def grouped_gemm(
     swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
     launch argument: the device's co-resident cluster capacity for the record's cluster size."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
+    from .schedule import launch_tile_bound
 
     if (
         a.dtype != torch.bfloat16
@@ -265,12 +267,117 @@ def grouped_gemm(
         a = a[
             :Tk
         ]  # the grouped body's A has the output's rows (one symbol); the swapped body's R is free
+    if grid is None:
+        # the persistent grid clipped to the launch's tile bound (a placement: which CTA computes a tile)
+        grid = min(
+            persistent_clusters(a.device, config), launch_tile_bound(config, Tk, E, N)
+        )
     kernel(
         a.unsqueeze(-1),
         w.permute(1, 2, 0),
         out,
         counts,
-        persistent_clusters(a.device, config),
+        grid,
+    )
+    return out
+
+
+def grouped_gemm_gather(
+    x: torch.Tensor,
+    src: torch.Tensor,
+    k_div: int,
+    w: torch.Tensor,
+    counts: torch.Tensor,
+    config: Knobs,
+    chain: Union[str, GroupedChain] = "plain",
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+    Tk: Optional[int] = None,
+    grid: Optional[int] = None,
+) -> torch.Tensor:
+    """``out[p] = chain(x[src[p] // k_div] @ w[e(p)].T)`` for the expert segments ``counts``: :func:`grouped_gemm` on a
+    swapped record with the rows gathered by the kernel (the TMA's gather4 mode) from the unpermuted ``x [T, K]`` bf16 -- no
+    permuted activation tensor, no gather launch; ``src [>= Tk]`` int32 the plan's slot of every expanded row. The same bits
+    as :func:`grouped_gemm` on the materialised permutation (the stage holds the same bytes, the fold is the same). The
+    gather form belongs to the swapped records (a dense record raises)."""
+    from .blocks.compile import get_compiled_swapped
+    from .schedule import launch_tile_bound
+
+    if (
+        x.dtype != torch.bfloat16
+        or w.dtype != torch.bfloat16
+        or x.dim() != 2
+        or w.dim() != 3
+    ):
+        raise TypeError("grouped_gemm_gather takes bf16 x [T, K] and w [E, N, K]")
+    if not config.swap_ab:
+        raise ValueError(
+            "grouped_gemm_gather: the gather form belongs to the swapped records"
+        )
+    T, K = x.shape
+    E, N, K2 = w.shape
+    src = src.reshape(-1)
+    if Tk is None:
+        Tk = out.shape[0] if out is not None else int(src.shape[0])
+    if (
+        K != K2
+        or x.stride(1) != 1
+        or w.stride(2) != 1
+        or w.stride(1) != K
+        or x.stride(0) % 8
+        or w.stride(0) % 8
+    ):
+        raise ValueError(
+            "grouped_gemm_gather: K-contiguous, 16-byte-aligned operands of one K "
+            f"(x {tuple(x.shape)} strides {tuple(x.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
+        )
+    if (
+        counts.dtype != torch.int32
+        or tuple(counts.shape) != (E,)
+        or not counts.is_contiguous()
+    ):
+        raise ValueError("grouped_gemm_gather: counts must be a contiguous int32 [E]")
+    if (
+        src.dtype != torch.int32
+        or not src.is_contiguous()
+        or src.shape[0] < Tk
+        or k_div < 1
+    ):
+        raise ValueError(
+            "grouped_gemm_gather: src must be a contiguous int32 [>= Tk] and k_div >= 1"
+        )
+    if isinstance(chain, str):
+        if chain not in ("plain", "swiglu", "relu2"):
+            raise ValueError(f"unknown chain {chain!r}")
+        chain = GroupedChain.legacy(chain, _OUT[out_dtype])
+    n_out = N // 2 if chain.pair else N
+    out_dtype = _DTYPE_OF[chain.out_fmt]
+    if out is None:
+        out = torch.empty(Tk, n_out, dtype=out_dtype, device=x.device)
+    if (
+        tuple(out.shape) != (Tk, n_out)
+        or out.dtype != out_dtype
+        or out.stride(1) != 1
+        or out.stride(0) % 8
+    ):
+        raise ValueError(
+            "grouped_gemm_gather: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
+        )
+    kernel = get_compiled_swapped(config, chain, gather=True)
+    if Tk == 0:
+        return out
+    if grid is None:
+        grid = min(
+            persistent_clusters(x.device, config), launch_tile_bound(config, Tk, E, N)
+        )
+    kernel(
+        x,
+        src,
+        int(k_div),
+        w.permute(1, 2, 0),
+        out,
+        counts,
+        grid,
     )
     return out
 
@@ -352,10 +459,14 @@ def route_plan(
     align: int = 1,
     dual: bool = False,
     pad_align: int = 128,
+    local: Optional[Tuple[int, int]] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """``route`` and ``permute_plan`` in one launch for small token counts: ``(experts [T, k] int32, weights [T, k] f32,
     counts [E] int32, dest [T, k] int32, src [T k] int32)``, the same bits and integers as the two calls (the routing is the
     route kernel's per-token code, the plan the two-launch plan's ranking); ``T k <= route_plan.ROUTE_PLAN_MAX_SLOTS``.
+    ``local = (offset, E_local)``: an expert-parallel shard -- the routing over the ``E`` global experts as given (global
+    ids in ``experts``), the plan over the local experts ``[offset, offset + E_local)`` by their local ids (``counts
+    [E_local]``), every other slot dropped (``dest -1``): the integers of ``permute_plan(experts - offset, E_local)``.
     ``align > 1``: the group offsets rounded up to ``align`` rows (the block-scaled classes' padded packing) and ``src`` of the
     padded bound's rows with ``-1`` in every padding slot, as the padded two-launch plan gives them. ``dual`` (with ``align = 1``):
     ``(..., dest_pad [T, k] int32, pos_pad [T k] int32)`` follow -- the positions with the groups padded to ``pad_align`` rows and
@@ -405,11 +516,16 @@ def route_plan(
         raise ValueError(
             "route_plan: the dual form takes align 1 and a padded alignment above 1"
         )
+    e_off, E_plan = (0, E) if local is None else (int(local[0]), int(local[1]))
+    if not (e_off >= 0 and E_plan >= 1 and e_off + E_plan <= E):
+        raise ValueError(
+            f"route_plan: local experts [{e_off}, {e_off + E_plan}) must lie in [0, {E})"
+        )
     n = T * top_k
-    n_src = n if align == 1 else -(-(n + (align - 1) * min(E, n)) // align) * align
+    n_src = n if align == 1 else -(-(n + (align - 1) * min(E_plan, n)) // align) * align
     experts = torch.empty(T, top_k, dtype=torch.int32, device=dev)
     weights = torch.empty(T, top_k, dtype=torch.float32, device=dev)
-    counts = torch.empty(E, dtype=torch.int32, device=dev)
+    counts = torch.empty(E_plan, dtype=torch.int32, device=dev)
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     src = torch.empty(n_src, dtype=torch.int32, device=dev)
     dest_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
@@ -417,7 +533,22 @@ def route_plan(
     if T:
         get_compiled_route_plan(
             expert_bucket(E), top_k, method, _IN[logits.dtype], align, dual, pad_align
-        )(logits, b, s, experts, weights, counts, dest, src, dest_pad, pos_pad, T, E)
+        )(
+            logits,
+            b,
+            s,
+            experts,
+            weights,
+            counts,
+            dest,
+            src,
+            dest_pad,
+            pos_pad,
+            T,
+            E,
+            E_plan,
+            e_off,
+        )
     else:
         counts.zero_()
     if dual:
@@ -468,6 +599,13 @@ def permute_plan(
     return counts, dest.view(T, k), src
 
 
+# The gather form's token tiles: the swapped GEMM1 gathers the tokens' rows itself (no gather launch) when its token tile is
+# at most this wide. The gather stage streams one swizzle atom of K at a time where the box form's stage streams two, and a
+# wide token tile exposes that slower stream; the narrow tiles of the decode regime hide it behind the launch they save
+# (declared empirical: the in-op A/B of the two forms per token tile).
+GATHER_TOKEN_TILE_MAX = 16
+
+
 def fused_moe(
     x: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -478,13 +616,25 @@ def fused_moe(
     config2: Optional[Knobs] = None,
     return_intermediates: bool = False,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    finalize: bool = True,
+    gather: Optional[bool] = None,
+    grid_clip: bool = True,
+    w_round: bool = False,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
     slot order in fp32 and converted once. An expert id outside ``[0, E)`` is a dropped slot: neither gathered nor
     computed, the term ``+0`` in its token's fold whatever its weight (a token whose slots are all dropped gives a zero
     row). ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space gives the same bits; the
-    dispatcher's pick by default)."""
+    dispatcher's pick by default). ``finalize=False`` skips the combine launch and leaves ``out`` as given: the per-slot
+    rows ``y`` and the positions ``dest`` of ``return_intermediates`` are then the unfinalized form of the op (a placement:
+    the rows are the class's own intermediates, a function of the token, its expert and the routing alone). ``gather``:
+    whether GEMM1 gathers the tokens' rows itself (the swapped body's gather form: no gather launch, no permuted tensor;
+    ``x_perm`` of the intermediates is then None) -- by default when GEMM1's record is a swapped one with a narrow token
+    tile (`GATHER_TOKEN_TILE_MAX`), a placement with the same bits either way; ``True`` on a dense record raises. ``grid_clip``: the GEMMs' persistent grids clipped to
+    the launch's tile bound (the default), or the device's capacity (a placement either way). ``w_round``: the f32 ``weights`` enter the fold as their bf16
+    rounding, done by the combine kernel (the pre-routed packed-word convention: the bits of rounding them on the host first,
+    without the host's passes over the slots)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
@@ -532,22 +682,33 @@ def fused_moe(
     # rows past the live ones, so the last tiles' boxes stay inside it (rows past the live ones are computed and never stored)
     pad1 = config1.tile_n if config1.swap_ab else 0
     pad2 = config2.tile_n if config2.swap_ab else 0
-    x_buf = torch.empty(Tk + pad1, H, dtype=torch.bfloat16, device=x.device)
-    x_perm = x_buf[:Tk]
-    if Tk:
-        get_compiled_gather(
-            k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
-        )(x, src, x_perm, Tk, H)
     a_buf = torch.empty(Tk + pad2, I, dtype=torch.bfloat16, device=x.device)
-    a = grouped_gemm(
-        x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk
-    )  # [Tk, I] bf16
+    g1 = None if grid_clip else persistent_clusters(x.device, config1)
+    g2 = None if grid_clip else persistent_clusters(x.device, config2)
+    if gather is None:
+        gather = bool(config1.swap_ab) and config1.tile_n <= GATHER_TOKEN_TILE_MAX
+    if gather:
+        # the swapped GEMM1 gathers the tokens' rows itself through the plan's slots: no gather launch, no permuted tensor
+        x_perm = None
+        a = grouped_gemm_gather(
+            x, src, k, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
+        )  # [Tk, I] bf16
+    else:
+        x_buf = torch.empty(Tk + pad1, H, dtype=torch.bfloat16, device=x.device)
+        x_perm = x_buf[:Tk]
+        if Tk:
+            get_compiled_gather(
+                k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
+            )(x, src, x_perm, Tk, H)
+        a = grouped_gemm(
+            x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk, grid=g1
+        )  # [Tk, I] bf16
     y = grouped_gemm(
-        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk
+        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk, grid=g2
     )  # [Tk, H] bf16
-    if T:
+    if finalize and T:
         get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device))
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device)), w_round
         )(y, dest, scales, out, T, H)
     if return_intermediates:
         return out, dict(

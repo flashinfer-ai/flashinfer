@@ -72,6 +72,8 @@ def test_generated_cases_are_current():
         "w8a8_gemm1_act_gelu",
         "w8a8_gemm2",
         "x_quant_e4m3",
+        "biased_score",
+        "group_score",
     }
     for name in theorems:
         assert f"theorem moe_{name} :" in committed
@@ -109,6 +111,10 @@ def test_generated_cases_are_current():
         "sigmoid",
         "sigmoid_renorm",
         "sigmoid_renorm_bias_scaled",
+        "topk",
+        "topk_sigmoid",
+        "sigmoid_renorm_bias_scaled_g4x2",
+        "sigmoid_renorm_bias_scaled_g8x4",
     }
     assert "sorry" not in committed and "native_decide" not in committed
 
