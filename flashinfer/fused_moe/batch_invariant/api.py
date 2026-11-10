@@ -352,10 +352,14 @@ def route_plan(
     align: int = 1,
     dual: bool = False,
     pad_align: int = 128,
+    local: Optional[Tuple[int, int]] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """``route`` and ``permute_plan`` in one launch for small token counts: ``(experts [T, k] int32, weights [T, k] f32,
     counts [E] int32, dest [T, k] int32, src [T k] int32)``, the same bits and integers as the two calls (the routing is the
     route kernel's per-token code, the plan the two-launch plan's ranking); ``T k <= route_plan.ROUTE_PLAN_MAX_SLOTS``.
+    ``local = (offset, E_local)``: an expert-parallel shard -- the routing over the ``E`` global experts as given (global
+    ids in ``experts``), the plan over the local experts ``[offset, offset + E_local)`` by their local ids (``counts
+    [E_local]``), every other slot dropped (``dest -1``): the integers of ``permute_plan(experts - offset, E_local)``.
     ``align > 1``: the group offsets rounded up to ``align`` rows (the block-scaled classes' padded packing) and ``src`` of the
     padded bound's rows with ``-1`` in every padding slot, as the padded two-launch plan gives them. ``dual`` (with ``align = 1``):
     ``(..., dest_pad [T, k] int32, pos_pad [T k] int32)`` follow -- the positions with the groups padded to ``pad_align`` rows and
@@ -405,11 +409,16 @@ def route_plan(
         raise ValueError(
             "route_plan: the dual form takes align 1 and a padded alignment above 1"
         )
+    e_off, E_plan = (0, E) if local is None else (int(local[0]), int(local[1]))
+    if not (e_off >= 0 and E_plan >= 1 and e_off + E_plan <= E):
+        raise ValueError(
+            f"route_plan: local experts [{e_off}, {e_off + E_plan}) must lie in [0, {E})"
+        )
     n = T * top_k
-    n_src = n if align == 1 else -(-(n + (align - 1) * min(E, n)) // align) * align
+    n_src = n if align == 1 else -(-(n + (align - 1) * min(E_plan, n)) // align) * align
     experts = torch.empty(T, top_k, dtype=torch.int32, device=dev)
     weights = torch.empty(T, top_k, dtype=torch.float32, device=dev)
-    counts = torch.empty(E, dtype=torch.int32, device=dev)
+    counts = torch.empty(E_plan, dtype=torch.int32, device=dev)
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     src = torch.empty(n_src, dtype=torch.int32, device=dev)
     dest_pad = torch.empty(n, dtype=torch.int32, device=dev) if dual else dest
@@ -417,7 +426,22 @@ def route_plan(
     if T:
         get_compiled_route_plan(
             expert_bucket(E), top_k, method, _IN[logits.dtype], align, dual, pad_align
-        )(logits, b, s, experts, weights, counts, dest, src, dest_pad, pos_pad, T, E)
+        )(
+            logits,
+            b,
+            s,
+            experts,
+            weights,
+            counts,
+            dest,
+            src,
+            dest_pad,
+            pos_pad,
+            T,
+            E,
+            E_plan,
+            e_off,
+        )
     else:
         counts.zero_()
     if dual:
@@ -478,13 +502,16 @@ def fused_moe(
     config2: Optional[Knobs] = None,
     return_intermediates: bool = False,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    finalize: bool = True,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
     slot order in fp32 and converted once. An expert id outside ``[0, E)`` is a dropped slot: neither gathered nor
     computed, the term ``+0`` in its token's fold whatever its weight (a token whose slots are all dropped gives a zero
     row). ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space gives the same bits; the
-    dispatcher's pick by default)."""
+    dispatcher's pick by default). ``finalize=False`` skips the combine launch and leaves ``out`` as given: the per-slot
+    rows ``y`` and the positions ``dest`` of ``return_intermediates`` are then the unfinalized form of the op (a placement:
+    the rows are the class's own intermediates, a function of the token, its expert and the routing alone)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
@@ -545,7 +572,7 @@ def fused_moe(
     y = grouped_gemm(
         a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk
     )  # [Tk, H] bf16
-    if T:
+    if finalize and T:
         get_compiled_combine(
             k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device))
         )(y, dest, scales, out, T, H)

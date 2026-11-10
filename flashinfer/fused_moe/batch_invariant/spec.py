@@ -27,6 +27,7 @@ identifier :func:`spec_fingerprint` is not: it hashes the dense GEMM class's ide
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -96,29 +97,70 @@ def swiglu_elem(fp: Any, g: Any, u: Any, out_fmt: str = "bf16") -> Any:
 
 @dataclass(frozen=True)
 class RoutingMethod:
-    """``score``: ``softmax`` (selection on the logits, weights = probabilities) or ``sigmoid``
-    (selection on ``sigmoid(l) + bias``, weights = the unbiased sigmoid). ``renormalize`` divides
-    the k weights by their slot-order sum; ``bias`` says a per-expert bias enters the selection
-    score; ``scaled`` multiplies the weights by a runtime scalar (DeepSeek's routed_scaling_factor)."""
+    """``score``: the selection score -- ``softmax`` (selection on the logits, weights = probabilities), ``sigmoid``
+    (selection on ``sigmoid(l) + bias``, weights = the unbiased sigmoid) or ``logit`` (selection on the logits with no
+    normalisation; the weights are the logits themselves, ``weight = "logit"``: FlashInfer ``TopK``, or their sigmoid,
+    ``weight = "sigmoid"``: FlashInfer ``Llama4`` at k = 1 and ``TopKSigmoid``). ``renormalize`` divides the k weights by
+    their slot-order sum; ``bias`` says a per-expert bias enters the selection score; ``scaled`` multiplies the weights by
+    a runtime scalar (DeepSeek's routed_scaling_factor). ``n_group > 1`` (the sigmoid score only): the group-limited
+    selection of DeepSeek-V3 -- the experts form ``n_group`` contiguous groups, a group's score is ``add`` of its two
+    largest selection scores, the ``topk_group`` best groups are kept and the k slots are selected among their experts
+    (docs/moe_scoping.md 3.1 and 12.3); the weight terms are those of the ungrouped method."""
 
     score: str = "softmax"
     renormalize: bool = True
     bias: bool = False
     scaled: bool = False
+    weight: Optional[str] = None
+    n_group: int = 0
+    topk_group: int = 0
 
     def __post_init__(self):
-        assert self.score in ("softmax", "sigmoid"), self.score
-        assert not (self.bias and self.score == "softmax"), (
+        assert self.score in ("softmax", "sigmoid", "logit"), self.score
+        assert not (self.bias and self.score != "sigmoid"), (
             "a selection bias is a sigmoid-routing feature"
         )
+        w = self.weight_kind
+        assert w == self.score or (self.score == "logit" and w == "sigmoid"), (
+            self.score,
+            w,
+        )
+        if self.n_group > 1:
+            assert self.score == "sigmoid", (
+                "the group-limited selection is a sigmoid-routing feature"
+            )
+            assert 1 <= self.topk_group <= self.n_group, (self.n_group, self.topk_group)
+        else:
+            assert self.n_group == 0 and self.topk_group == 0, (
+                self.n_group,
+                self.topk_group,
+            )
+
+    @property
+    def weight_kind(self) -> str:
+        """What the weights are: ``softmax`` (probabilities), ``sigmoid`` (the unbiased sigmoid) or ``logit`` (the logits)."""
+        return self.weight if self.weight is not None else self.score
+
+    @property
+    def grouped(self) -> bool:
+        return self.n_group > 1
+
+    def with_groups(self, n_group: int, topk_group: int) -> "RoutingMethod":
+        """The method with the group-limited selection stage (``n_group`` groups, ``topk_group`` of them kept)."""
+        return dataclasses.replace(self, n_group=n_group, topk_group=topk_group)
 
     @property
     def name(self) -> str:
+        if self.score == "logit":
+            base = "topk" if self.weight_kind == "logit" else "topk_sigmoid"
+        else:
+            base = self.score
         return (
-            self.score
+            base
             + ("_renorm" if self.renormalize else "")
             + ("_bias" if self.bias else "")
             + ("_scaled" if self.scaled else "")
+            + (f"_g{self.n_group}x{self.topk_group}" if self.grouped else "")
         )
 
 
@@ -131,26 +173,59 @@ SIGMOID_RENORM = RoutingMethod("sigmoid", renormalize=True)  # FlashInfer Sigmoi
 SIGMOID_BIAS_RENORM_SCALED = RoutingMethod(
     "sigmoid", True, True, True
 )  # DeepSeek-V3 (n_group <= 1), noaux
-METHODS: Dict[str, RoutingMethod] = {
-    m.name: m
-    for m in (
-        SOFTMAX,
-        SOFTMAX_RENORM,
-        SIGMOID,
-        SIGMOID_RENORM,
-        SIGMOID_BIAS_RENORM_SCALED,
-        RoutingMethod("sigmoid", True, True, False),
-        RoutingMethod("sigmoid", False, True, False),
-    )
-}
+TOPK = RoutingMethod(
+    "logit", renormalize=False
+)  # FlashInfer TopK: the logits as weights
+TOPK_SIGMOID = RoutingMethod(
+    "logit", renormalize=False, weight="sigmoid"
+)  # FlashInfer Llama4 (k = 1) and TopKSigmoid
+DEEPSEEK_V3_GROUPED = SIGMOID_BIAS_RENORM_SCALED.with_groups(
+    8, 4
+)  # DeepSeek-V3 with its group-limited selection
+#: The route kernels hold the group scores of at most this many groups per token.
+MAX_GROUPS = 16
+
+
+class _Methods(dict):
+    """The named methods; a grouped name ``<method>_g<n>x<t>`` not in the table resolves to the named method with the
+    group-limited stage (``RoutingMethod.with_groups``), so every grouped configuration has a name (the kernels' key)."""
+
+    def __missing__(self, name: str) -> RoutingMethod:
+        base, sep, grp = name.rpartition("_g")
+        if sep and "x" in grp and base in self:
+            n, t = grp.split("x", 1)
+            if n.isdigit() and t.isdigit():
+                return self[base].with_groups(int(n), int(t))
+        raise KeyError(name)
+
+
+METHODS: Dict[str, RoutingMethod] = _Methods(
+    {
+        m.name: m
+        for m in (
+            SOFTMAX,
+            SOFTMAX_RENORM,
+            SIGMOID,
+            SIGMOID_RENORM,
+            SIGMOID_BIAS_RENORM_SCALED,
+            RoutingMethod("sigmoid", True, True, False),
+            RoutingMethod("sigmoid", False, True, False),
+            TOPK,
+            TOPK_SIGMOID,
+            DEEPSEEK_V3_GROUPED,
+        )
+    }
+)
 
 #: The :class:`~flashinfer.tllm_enums.RoutingMethodType` values whose semantics (selection order, weight formula) are
 #: one of the methods above; the method's dataflow is this module's (docs/moe_scoping.md section 3.1). ``Default`` is
 #: softmax then top-k; ``Renormalize`` (FlashInfer's top-k then softmax over the survivors) and ``RenormalizeNaive``
 #: (softmax, top-k, divide by the top-k sum) are both the value softmax -> top-k -> renormalise; ``SigmoidRenorm`` and
-#: ``Sigmoid`` select on the sigmoid and weight by it, with and without the renormalisation; ``DeepSeekV3`` is the
-#: ``n_group <= 1`` case only (a grouped selection is another method, which the API refuses). The values absent here
-#: have no method in this module.
+#: ``Sigmoid`` select on the sigmoid and weight by it, with and without the renormalisation; ``TopK`` selects on the
+#: logits and weights by them; ``Llama4`` (the runner requires ``top_k = 1``, as TRTLLM-Gen's kernel) and ``TopKSigmoid``
+#: select on the logits and weight by their sigmoid; ``DeepSeekV3`` is the ``n_group <= 1`` method here, and the runner
+#: builds its grouped form from ``n_group`` / ``topk_group`` (``SIGMOID_BIAS_RENORM_SCALED.with_groups``). The values
+#: absent here (``MiniMax2``: its renormalisation adds an epsilon, another term) have no method in this module.
 METHOD_OF_FLASHINFER: Dict[RoutingMethodType, RoutingMethod] = {
     RoutingMethodType.Default: SOFTMAX,
     RoutingMethodType.Renormalize: SOFTMAX_RENORM,
@@ -158,6 +233,9 @@ METHOD_OF_FLASHINFER: Dict[RoutingMethodType, RoutingMethod] = {
     RoutingMethodType.SigmoidRenorm: SIGMOID_RENORM,
     RoutingMethodType.Sigmoid: SIGMOID,
     RoutingMethodType.DeepSeekV3: SIGMOID_BIAS_RENORM_SCALED,
+    RoutingMethodType.TopK: TOPK,
+    RoutingMethodType.Llama4: TOPK_SIGMOID,
+    RoutingMethodType.TopKSigmoid: TOPK_SIGMOID,
 }
 
 
@@ -202,12 +280,20 @@ def per_expert_scores(
 ) -> Tuple[List[Any], List[Any]]:
     """``(selection_score_e, weight_e)`` for every expert. softmax: selection on the logit itself,
     weight ``p_e = div(z_e, S)``; sigmoid: ``s_e = sigmoid(l_e)``, selection on ``add(s_e, bias_e)``
-    (or ``s_e``), weight ``s_e``."""
+    (or ``s_e``), weight ``s_e``; logit: selection on the logit itself, weight the logit (``TOPK``) or
+    ``sigmoid(l_e)`` (``TOPK_SIGMOID``)."""
     E = len(logits)
     if method.score == "softmax":
         z, S = softmax_terms(fp, logits, E)
         p = [fp.div(z_e, S) for z_e in z]
         return list(logits), p
+    if method.score == "logit":
+        w = (
+            list(logits)
+            if method.weight_kind == "logit"
+            else [sigmoid_term(fp, l) for l in logits]
+        )
+        return list(logits), w
     s = [sigmoid_term(fp, l) for l in logits]
     if method.bias:
         assert bias is not None and len(bias) == E
@@ -217,13 +303,84 @@ def per_expert_scores(
     return q, s
 
 
-def select_topk(scores: Sequence[float], k: int) -> List[int]:
+def biased_score_term(fp: Any, l: Any, b: Any) -> Any:
+    """The sigmoid methods' selection score with a bias: ``add(sigmoid(l_e), b_e)`` (the term the group stage sums)."""
+    return fp.add(sigmoid_term(fp, l), b)
+
+
+def group_score_term(fp: Any, q_a: Any, q_b: Any) -> Any:
+    """The group stage's score: ``add`` of a group's two largest selection scores (one rounding; ``add`` is commutative, so
+    the order of the two is immaterial to the bits)."""
+    return fp.add(q_a, q_b)
+
+
+def _selectable(scores: Sequence[float], candidates: Sequence[int]) -> List[int]:
+    """The candidates in the strict total order ``(score desc, index asc)``, those with a NaN score left out (no comparison
+    of the order holds for them)."""
+    return sorted(
+        (e for e in candidates if scores[e] == scores[e]),
+        key=lambda e: (-scores[e], e),
+    )
+
+
+def select_topk(
+    scores: Sequence[float], k: int, candidates: Optional[Sequence[int]] = None
+) -> List[int]:
     """The selection: experts in the strict total order ``(score desc, index asc)``; slot ``r``
     holds the expert of rank ``r``. Pure Python on exact binary32 values; ``-0 == +0`` is a tie
-    broken by the index, as the device's ``setp`` sees it."""
+    broken by the index, as the device's ``setp`` sees it. ``candidates`` restricts the order to a
+    subset (the group stage's kept groups; every expert by default). An expert whose score is NaN is
+    never selected; when fewer than ``k`` candidates have a non-NaN score, each remaining slot takes the
+    lowest index of ``range(len(scores))`` not yet taken (the device's rule: every id stays in range, the
+    slot's weight is NaN -- :func:`routing_weights`)."""
     assert 1 <= k <= len(scores)
-    order = sorted(range(len(scores)), key=lambda e: (-scores[e], e))
-    return order[:k]
+    order = _selectable(
+        scores, range(len(scores)) if candidates is None else candidates
+    )[:k]
+    if len(order) < k:
+        taken = set(order)
+        order += [e for e in range(len(scores)) if e not in taken][: k - len(order)]
+    return order
+
+
+def group_scores(fp: Any, q: Sequence[float], method: RoutingMethod) -> List[float]:
+    """The group stage (``method.n_group`` contiguous groups of ``E / n_group`` experts): per group the score
+    ``group_score_term(q_a, q_b)`` of its two largest selection scores in the strict order; NaN when fewer than two
+    of its scores are non-NaN (such a group is never kept while enough other groups are)."""
+    E, n = len(q), method.n_group
+    G = E // n
+    assert method.grouped and G * n == E and G >= 2, (E, n)
+    out = []
+    for j in range(n):
+        top = _selectable(q, range(j * G, (j + 1) * G))[:2]
+        out.append(
+            group_score_term(fp, q[top[0]], q[top[1]])
+            if len(top) == 2
+            else float("nan")
+        )
+    return out
+
+
+def select_topk_grouped(
+    fp: Any, q: Sequence[float], k: int, method: RoutingMethod
+) -> List[int]:
+    """The group-limited selection: the ``topk_group`` groups of the largest group scores (the strict order ``(score desc,
+    group index asc)``; a group with a NaN score is never kept while enough are selectable, else the lowest untaken group
+    indices fill), then :func:`select_topk` among the kept groups' experts (the fill rule over every expert)."""
+    gs = group_scores(fp, q, method)
+    kept = sorted(select_topk(gs, method.topk_group))
+    G = len(q) // method.n_group
+    return select_topk(q, k, [e for j in kept for e in range(j * G, (j + 1) * G)])
+
+
+def select_slots(
+    fp: Any, q: Sequence[float], k: int, method: RoutingMethod
+) -> List[int]:
+    """The method's selection on exact selection scores: the group-limited two-stage order for a grouped method, the
+    strict total order otherwise."""
+    return (
+        select_topk_grouped(fp, q, k, method) if method.grouped else select_topk(q, k)
+    )
 
 
 def slot_weights(
@@ -258,10 +415,12 @@ def routing_weights(
     selected: Optional[Sequence[int]] = None,
 ) -> Tuple[List[int], List[Any]]:
     """One token's routing: returns ``(selected, weights)``. ``selected`` may be given (symbolic
-    backends cannot compare terms); otherwise the scores are selected with :func:`select_topk`."""
+    backends cannot compare terms); otherwise the scores are selected with :func:`select_slots` (the method's
+    order), and a slot the fill rule took (its expert's selection score is NaN) has the weight NaN."""
     q, wgt = per_expert_scores(fp, logits, method, bias)
     if selected is None:
-        selected = select_topk(q, k)
+        selected = select_slots(fp, q, k, method)
+        wgt = [float("nan") if q[e] != q[e] else w for e, w in enumerate(wgt)]
     return list(selected), slot_weights(fp, wgt, selected, method, scale)
 
 
@@ -679,6 +838,14 @@ class MoESpec:
             scale,
             selected=sel,
         )
+
+    def biased_score(self, e: int) -> Term:
+        """The sigmoid methods' biased selection score of expert ``e`` (a selection term: it never enters a weight)."""
+        return biased_score_term(self.alg, self.logit(e), self.bias(e))
+
+    def group_score(self, a: int, b: int) -> Term:
+        """The group stage's score of a group whose two largest biased scores are experts ``a`` and ``b``."""
+        return group_score_term(self.alg, self.biased_score(a), self.biased_score(b))
 
     def swiglu(self, r: int = 0, j: int = 0) -> Term:
         return swiglu_elem(
