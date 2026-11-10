@@ -1961,6 +1961,103 @@ def test_top_k_sampling_with_variable_k(batch_size, vocab_size, k):
         ]
 
 
+def _sample_freq_single_row(sample_fn, row_probs, num_trials):
+    """Draw ``num_trials`` samples from a single probability row and return frequencies.
+
+    Uses the ``indices`` mechanism so every output samples from the same row but with
+    independent randomness (one block per output), mirroring ``test_sampling_freq``.
+    """
+    vocab_size = row_probs.numel()
+    probs = row_probs.view(1, vocab_size).contiguous()
+    indices = torch.zeros(num_trials, dtype=torch.int32, device=probs.device)
+    samples = sample_fn(probs, indices)
+    counter = torch.zeros(vocab_size, dtype=torch.int64, device=probs.device)
+    counter.scatter_add_(0, samples.long(), torch.ones_like(samples, dtype=torch.int64))
+    return counter, counter.float() / num_trials
+
+
+def test_top_k_sampling_boundary_tie():
+    """Tokens tied with the k-th token but outside top-k must not be over-accepted.
+
+    Distribution [0.4, 0.3, 0.3, 0.0] with k=2 has a tie at the boundary: tokens 1 and 2
+    both have probability 0.3 == p_min. The buggy value-only acceptance accepts all three of
+    {0, 1, 2}; the index tie-break must keep exactly 2 tokens and renormalize over mass 0.7.
+    """
+    torch.manual_seed(42)
+    row_probs = torch.tensor([0.4, 0.3, 0.3, 0.0], dtype=torch.float32, device="cuda:0")
+    k = 2
+    num_trials = 200000
+
+    counter, freq = _sample_freq_single_row(
+        lambda probs, indices: flashinfer.sampling.top_k_sampling_from_probs(
+            probs, k, indices=indices
+        ),
+        row_probs,
+        num_trials,
+    )
+
+    # Zero-probability token is never sampled.
+    assert counter[3].item() == 0
+    # Exactly k distinct tokens are accepted (no over-acceptance of the tied token).
+    assert int((counter > 0).sum().item()) == k
+    # The highest-probability token is always present, and the normalizer covers exactly the
+    # top-k mass (0.4 + 0.3 = 0.7), so its frequency is 0.4 / 0.7 rather than the buggy 0.4.
+    assert abs(freq[0].item() - 0.4 / 0.7) < 0.02, freq
+    # The single surviving tied token carries the remaining 0.3 / 0.7 mass.
+    # The lower original token index wins the boundary tie.
+    assert counter[2].item() == 0
+    tie_freq = freq[1].item() + freq[2].item()
+    assert abs(tie_freq - 0.3 / 0.7) < 0.02, freq
+
+
+def test_top_p_sampling_boundary_tie():
+    """Tokens tied at the top-p truncation boundary must not be over-accepted."""
+    torch.manual_seed(42)
+    row_probs = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float32, device="cuda:0")
+    p = 0.7
+    num_trials = 200000
+
+    counter, freq = _sample_freq_single_row(
+        lambda probs, indices: flashinfer.sampling.top_p_sampling_from_probs(
+            probs, p, indices=indices
+        ),
+        row_probs,
+        num_trials,
+    )
+
+    # Exactly 2 tokens survive: {0.5, one of the tied 0.25}; normalizer is 0.75.
+    assert int((counter > 0).sum().item()) == 2
+    assert abs(freq[0].item() - 0.5 / 0.75) < 0.02, freq
+    # The lower original token index wins the boundary tie.
+    assert counter[2].item() == 0
+    tie_freq = freq[1].item() + freq[2].item()
+    assert abs(tie_freq - 0.25 / 0.75) < 0.02, freq
+
+
+def test_top_k_top_p_sampling_boundary_tie():
+    """Joint top-k/top-p must also resolve boundary ties via the index tie-break."""
+    torch.manual_seed(42)
+    row_probs = torch.tensor([0.4, 0.3, 0.3, 0.0], dtype=torch.float32, device="cuda:0")
+    k, p = 2, 0.99
+    num_trials = 200000
+
+    counter, freq = _sample_freq_single_row(
+        lambda probs, indices: flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, k, p, indices=indices, filter_apply_order="joint"
+        ),
+        row_probs,
+        num_trials,
+    )
+
+    assert counter[3].item() == 0
+    assert int((counter > 0).sum().item()) == k
+    assert abs(freq[0].item() - 0.4 / 0.7) < 0.02, freq
+    # The lower original token index wins the boundary tie.
+    assert counter[2].item() == 0
+    tie_freq = freq[1].item() + freq[2].item()
+    assert abs(tie_freq - 0.3 / 0.7) < 0.02, freq
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
@@ -2495,36 +2592,9 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k, distribution, dtype):
     # Count non-zero elements in output
     nonzero_counts = (renorm_prob > 0).sum(dim=-1)
 
-    # Find the pivot value (k-th largest) and count ties
-    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
-    pivot = sorted_prob[:, k - 1]
-
-    # Count how many elements are strictly greater than pivot
-    num_greater = (normalized_prob > pivot.unsqueeze(-1)).sum(dim=-1)
-    # Count how many elements equal the pivot (ties)
-    num_ties = (normalized_prob == pivot.unsqueeze(-1)).sum(dim=-1)
-
-    # Valid range: [num_greater, num_greater + num_ties]
-    # The kernel must keep all elements > pivot, and may keep some/all/none of the ties
-    # But it must keep exactly k elements total (if there are enough)
     nonzero_input = (normalized_prob > 0).sum(dim=-1)
-    expected_k = torch.minimum(
-        torch.full_like(nonzero_input, k, dtype=torch.int64), nonzero_input
-    )
-
-    # Check: nonzero_counts should be in valid range considering ties
-    max_valid = num_greater + num_ties
-
-    # The actual count should be >= k (we keep at least k) and within tie range
-    # Due to floating point, allow small tolerance
-    assert torch.all(nonzero_counts >= torch.clamp(expected_k - 1, min=0)), (
-        f"Some rows have fewer non-zero elements than expected. "
-        f"nonzero_counts min: {nonzero_counts.min()}, expected_k min: {expected_k.min()}"
-    )
-    assert torch.all(nonzero_counts <= max_valid + 1), (
-        f"Some rows have more non-zero elements than allowed by ties. "
-        f"nonzero_counts max: {nonzero_counts.max()}, max_valid max: {max_valid.max()}"
-    )
+    expected_k = torch.minimum(torch.full_like(nonzero_input, k), nonzero_input)
+    assert torch.equal(nonzero_counts, expected_k)
 
 
 @pytest.mark.parametrize("top_k_arr", [True, False])
@@ -2644,29 +2714,8 @@ def test_top_k_renorm_probs_mixed_k_persistent_loop(dtype):
     # Verify non-zero count matches k for each row
     nonzero_counts = (renorm_probs > 0).sum(dim=-1)
 
-    # For rows with k >= vocab_size, all elements should be non-zero
-    # For rows with k < vocab_size, non-zero count should be >= k (may be more due to ties)
-    for i in range(batch_size):
-        k = k_values[i].item()
-        count = nonzero_counts[i].item()
-
-        if k >= vocab_size:
-            # All elements should be non-zero
-            assert count == vocab_size, (
-                f"Row {i}: k >= vocab_size but count={count} != {vocab_size}"
-            )
-        else:
-            # Count should be at least k (may be more due to ties at the threshold)
-            row_probs = probs[i].float()
-            topk_vals, _ = torch.topk(row_probs, k, sorted=True)
-            threshold = topk_vals[-1]
-            expected_ge_threshold = (row_probs >= threshold).sum().item()
-
-            # Allow small tolerance for floating point
-            assert count >= k - 1, f"Row {i}: k={k} but only {count} non-zero elements"
-            assert count <= expected_ge_threshold + 1, (
-                f"Row {i}: k={k}, expected at most {expected_ge_threshold} but got {count}"
-            )
+    # Boundary ties keep exactly k positions, including after an unfiltered row.
+    assert torch.equal(nonzero_counts, k_values.clamp(max=vocab_size))
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -2709,48 +2758,9 @@ def test_top_k_mask_logits(
     # Count finite elements in output
     finite_counts = torch.isfinite(masked_logits).sum(dim=-1)
 
-    # Find the pivot value (k-th largest among finite values) and count ties
-    # Replace -inf with a very small value for sorting
-    logits_for_sort = logits.clone()
-    logits_for_sort[~torch.isfinite(logits_for_sort)] = -float("inf")
-    sorted_logits, _ = torch.sort(logits_for_sort, descending=True)
-
-    # Count finite inputs per row
     finite_inputs = torch.isfinite(logits).sum(dim=-1)
-
-    # For each row, find the pivot (k-th largest if enough finite values)
-    effective_k = torch.minimum(
-        torch.full_like(finite_inputs, k, dtype=torch.int64), finite_inputs
-    )
-
-    # Get pivot for each row (handle case where effective_k might be 0)
-    pivot = torch.zeros(batch_size, dtype=dtype, device=logits.device)
-    for i in range(batch_size):
-        ek = effective_k[i].item()
-        if ek > 0:
-            pivot[i] = sorted_logits[i, ek - 1]
-        else:
-            pivot[i] = float("-inf")
-
-    # Count how many elements are strictly greater than pivot
-    num_greater = (logits > pivot.unsqueeze(-1)).sum(dim=-1)
-    # Count how many elements equal the pivot (ties) - only among finite values
-    num_ties = ((logits == pivot.unsqueeze(-1)) & torch.isfinite(logits)).sum(dim=-1)
-
-    # Valid range considering ties
-    max_valid = num_greater + num_ties
-
-    # Check: finite_counts should be >= effective_k (we keep at least k finite values)
-    # and <= max_valid (we don't keep more than all elements >= pivot)
-    # Allow small tolerance for floating point issues
-    assert torch.all(finite_counts >= torch.clamp(effective_k - 1, min=0)), (
-        f"Some rows have fewer finite elements than expected. "
-        f"finite_counts min: {finite_counts.min()}, effective_k min: {effective_k.min()}"
-    )
-    assert torch.all(finite_counts <= max_valid + 1), (
-        f"Some rows have more finite elements than allowed by ties. "
-        f"finite_counts max: {finite_counts.max()}, max_valid max: {max_valid.max()}"
-    )
+    effective_k = torch.minimum(torch.full_like(finite_inputs, k), finite_inputs)
+    assert torch.equal(finite_counts, effective_k)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -2792,27 +2802,7 @@ def test_top_k_mask_logits_mixed_k_persistent_loop(dtype):
     # Verify finite count matches k for each row
     finite_counts = torch.isfinite(masked_logits).sum(dim=-1)
 
-    for i in range(batch_size):
-        k = k_values[i].item()
-        count = finite_counts[i].item()
-
-        if k >= vocab_size:
-            # All elements should be finite
-            assert count == vocab_size, (
-                f"Row {i}: k >= vocab_size but finite count={count} != {vocab_size}"
-            )
-        else:
-            # Count should be at least k (may be more due to ties at the threshold)
-            row_logits = logits[i].float()
-            topk_vals, _ = torch.topk(row_logits, k, sorted=True)
-            threshold = topk_vals[-1]
-            expected_ge_threshold = (row_logits >= threshold).sum().item()
-
-            # Allow small tolerance for floating point
-            assert count >= k - 1, f"Row {i}: k={k} but only {count} finite elements"
-            assert count <= expected_ge_threshold + 1, (
-                f"Row {i}: k={k}, expected at most {expected_ge_threshold} but got {count}"
-            )
+    assert torch.equal(finite_counts, k_values.clamp(max=vocab_size))
 
 
 @pytest.mark.parametrize("initial_offset", [0, 12])

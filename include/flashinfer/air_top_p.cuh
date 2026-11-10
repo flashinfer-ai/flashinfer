@@ -27,6 +27,8 @@
 #include <cuda/std/limits>
 #include <type_traits>
 
+#include "sampling_tie_break.cuh"
+
 namespace flashinfer {
 namespace sampling {
 namespace air_top_p {
@@ -373,7 +375,6 @@ __global__ void AirTopPRenormRadixKernel(Counter<T>* counters, HisT<IsDeterminis
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     AccT* histPtr = IsDeterministic ? histValueSmem : reinterpret_cast<AccT*>(histogram);
     __shared__ AccT warpSum[WARP_COUNT];
-    __shared__ cuda::atomic<AccT, cuda::thread_scope_block> blockSum;
     if constexpr (BITS_PER_PASS != 11) {
       for (int i = threadIdx.x; i < NUM_BUCKETS; i += BLOCK_SIZE) warpSum[i] = 0;
       __syncthreads();
@@ -381,13 +382,7 @@ __global__ void AirTopPRenormRadixKernel(Counter<T>* counters, HisT<IsDeterminis
     for (int i = threadIdx.x; i < NUM_BUCKETS; i += BLOCK_SIZE)
       reduce_store_async(warp, warpSum + i / WARP_SIZE, histPtr[i], cg::plus<float>{});
     __syncthreads();
-    if (threadIdx.x < WARP_SIZE) {
-      reduce_store_async(warp, blockSum, warpSum[threadIdx.x], cg::plus<float>{});
-      if constexpr (BITS_PER_PASS == 11)
-        reduce_update_async(warp, blockSum, warpSum[threadIdx.x + WARP_SIZE], cg::plus<float>{});
-    }
-    __syncthreads();
-    if (pass == 0) currentSum = blockSum * counter->p;
+    if (pass == 0) currentSum = counter->p >= 1.f ? CUDART_INF_F : counter->p;
     if (threadIdx.x == 0) {
       AccT prev = 0;
       int targetStep = 0;
@@ -459,23 +454,50 @@ __global__ void AirTopPRenormApplyKernel(T const* probs, T* renormedProbs, Count
                                          int vocabSize) {
   int const batchId = blockIdx.x;
   int const tid = threadIdx.x;
-  T const threshold = twiddleOut<T>(counters[batchId].kthValueBits, false);
-  float threadSum = 0.0f;
-  for (int i = tid; i < vocabSize; i += blockDim.x) {
-    T val = probs[batchId * vocabSize + i];
-    if (val >= threshold) threadSum += static_cast<float>(val);
+  const bool unfiltered = counters[batchId].p >= 1.f;
+  T const threshold = unfiltered ? T(0) : twiddleOut<T>(counters[batchId].kthValueBits, false);
+  const uint32_t equal_count = unfiltered ? 1 : counters[batchId].len;
+  uint32_t tie_index_limit = UINT32_MAX;
+  double retained_mass = -1;
+  if (equal_count > 1) {
+    const auto mass =
+        GetSamplingBoundaryMass<1024>(probs + batchId * vocabSize, vocabSize, float(threshold));
+    const uint32_t take = SamplingBoundaryQuota(double(counters[batchId].p), mass.above,
+                                                double(threshold), mass.equal_count);
+    if (take < mass.equal_count) {
+      tie_index_limit = FindSamplingTieIndexLimit<1024, true>(
+          vocabSize, take, [probs, batchId, vocabSize, threshold](uint32_t i) {
+            return probs[batchId * vocabSize + i] == threshold;
+          });
+    }
+    retained_mass = mass.above + double(take) * double(threshold);
   }
-  typedef cub::BlockReduce<float, 1024> BlockReduce;
-  __shared__ typename BlockReduce::TempStorage temp;
-  float totalSum = BlockReduce(temp).Sum(threadSum);
+  float totalSum = 0;
+  // The exact pass already computed the retained mass. Do not scan the full
+  // row again merely to normalize it, especially on bf16-derived tied rows.
+  if (equal_count <= 1) {
+    float threadSum = 0.0f;
+    for (int i = tid; i < vocabSize; i += blockDim.x) {
+      T val = probs[batchId * vocabSize + i];
+      if (val >= threshold) threadSum += static_cast<float>(val);
+    }
+    typedef cub::BlockReduce<float, 1024> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp;
+    totalSum = BlockReduce(temp).Sum(threadSum);
+  }
   __shared__ float sharedNorm;
-  if (tid == 0) sharedNorm = (totalSum > 1e-8f) ? (1.0f / totalSum) : 1.0f;
+  if (tid == 0) {
+    const float selected_sum = retained_mass >= 0 ? float(retained_mass) : totalSum;
+    sharedNorm = (selected_sum > 1e-8f) ? (1.0f / selected_sum) : 1.0f;
+  }
   __syncthreads();
   float norm = sharedNorm;
   for (int i = tid; i < vocabSize; i += blockDim.x) {
     T val = probs[batchId * vocabSize + i];
     renormedProbs[batchId * vocabSize + i] =
-        (val >= threshold) ? static_cast<T>(static_cast<float>(val) * norm) : static_cast<T>(0);
+        (val > threshold || (val == threshold && uint32_t(i) < tie_index_limit))
+            ? static_cast<T>(static_cast<float>(val) * norm)
+            : static_cast<T>(0);
   }
 }
 

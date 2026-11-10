@@ -2,7 +2,8 @@
 
 Covers top-k, top-p and combined filtering, int32/int64 indices, per-request
 thresholds and RNG replay. An independent float64 reference bounds the legal
-support: top-k ties permit several answers; only top-p gets a float32 mass allowance.
+support uses probability-descending, original-index-ascending order; top-p gets a
+float32 mass allowance near cumulative boundaries.
 Seeded cases check support, output metadata and replay. Frozen distributions also
 check probability mass with a chi-square and effect-size gate; its false-positive
 budget is nominal, not a finite-sample guarantee.
@@ -79,48 +80,32 @@ def reference_top_k_pivot(probs_row: torch.Tensor, top_k: int) -> torch.Tensor:
 
 
 def reference_top_k_support(probs_row: torch.Tensor, top_k: int) -> torch.Tensor:
-    """Tie-inclusive top-k support, comparing stored values without tolerance."""
-    return probs_row >= reference_top_k_pivot(probs_row, top_k)
+    """Exactly k positions, with lower original indices winning equal values."""
+    if top_k < 1:
+        raise ValueError("top_k must be at least 1")
+    order = probs_row.argsort(descending=True, stable=True)
+    keep = torch.zeros_like(probs_row, dtype=torch.bool)
+    keep[order[:top_k]] = True
+    return keep
 
 
 def reference_top_k_bounds(
     probs_row: torch.Tensor, top_k: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(may_keep, must_keep)`` for a top-k filter.
-
-    ``may_keep`` is the tie-inclusive support. ``must_keep`` drops the classes tied
-    with the pivot when the implementation is free to choose among them: with ``g``
-    classes strictly above the pivot and ``t`` tied with it, any implementation that
-    keeps at least ``k`` classes must keep all of ``g`` and ``k - g`` of the ``t``,
-    so the tie is only forced when ``t <= k - g``.
-    """
-    pivot = reference_top_k_pivot(probs_row, top_k)
-    above = probs_row > pivot
-    may = probs_row >= pivot
-    tied = may & ~above
-    if int(tied.sum()) <= top_k - int(above.sum()):
-        return may, may
-    return may, above
+    keep = reference_top_k_support(probs_row, top_k)
+    return keep, keep
 
 
 def reference_top_p_support(
     probs_row: torch.Tensor, top_p: float, shift: float = 0.0
 ) -> torch.Tensor:
-    """Inclusive top-p nucleus: keep a class iff the mass strictly above it is < top_p.
-
-    Written over the strictly-greater mass so equal-valued classes are kept together.
-    ``shift`` loosens (or tightens) the cumulative-mass threshold for the fp32 boundary.
-    """
-    return _mass_strictly_above(probs_row) < top_p + shift
-
-
-def _mass_strictly_above(probs_row: torch.Tensor) -> torch.Tensor:
-    """For each class, the total mass of the classes strictly more likely than it."""
-    return torch.where(
-        probs_row.unsqueeze(0) > probs_row.unsqueeze(1),
-        probs_row.unsqueeze(0),
-        torch.zeros_like(probs_row).unsqueeze(0),
-    ).sum(dim=1)
+    """The shortest stable descending prefix reaching top_p (including crossing)."""
+    order = probs_row.argsort(descending=True, stable=True)
+    values = probs_row[order]
+    before = values.cumsum(0) - values
+    keep = torch.zeros_like(probs_row, dtype=torch.bool)
+    keep[order] = (before < top_p + shift) | (top_p >= 1)
+    return keep
 
 
 def _renorm_on(probs_row: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
@@ -134,22 +119,6 @@ def reference_top_k_filter(probs_row: torch.Tensor, top_k: int) -> torch.Tensor:
 
 def reference_top_p_filter(probs_row: torch.Tensor, top_p: float) -> torch.Tensor:
     return _renorm_on(probs_row, reference_top_p_support(probs_row, top_p))
-
-
-def reference_top_k_renorm_sums(
-    probs_row: torch.Tensor, top_k: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(smallest, largest)`` mass a legal top-k filter can leave to renormalize by.
-
-    In ``top_k_first``, retaining more tied classes widens the subsequent nucleus.
-    """
-    pivot = reference_top_k_pivot(probs_row, top_k)
-    above = probs_row > pivot
-    tied = (probs_row >= pivot) & ~above
-    n_tied_kept = min(int(tied.sum()), max(top_k - int(above.sum()), 0))
-    s_min = probs_row[above].sum() + n_tied_kept * pivot
-    s_max = probs_row[probs_row >= pivot].sum()
-    return s_min, s_max
 
 
 def reference_top_k_top_p_filter_joint(
@@ -179,7 +148,7 @@ def reference_support_bounds(
     """``(may_draw, must_draw)`` for one row.
 
     ``may_draw`` contains every legal support; ``must_draw`` is shared by all of
-    them. They differ at top-k ties and top-p boundaries within ``shift``.
+    them. They differ only at top-p boundaries within ``shift``.
     Zero-probability classes are always excluded.
     """
     positive = probs_row > 0
@@ -199,15 +168,10 @@ def reference_support_bounds(
             k_may & reference_top_p_support(probs_row, top_p, shift) & positive,
             k_must & reference_top_p_support(probs_row, top_p, -shift) & positive,
         )
-    # top_k_first: top-p runs on the row the top-k stage renormalized. Every class the
-    # top-k stage can keep is at least as likely as the pivot, so the mass strictly
-    # above it is the same whichever tied classes were dropped; only the renormalizing
-    # sum moves, and the two sums above bracket it.
-    s_min, s_max = reference_top_k_renorm_sums(probs_row, top_k)
-    greater = _mass_strictly_above(probs_row)
+    renorm_k = reference_top_k_filter(probs_row, top_k)
     return (
-        k_may & (greater / s_max < top_p + shift) & positive,
-        k_must & (greater / s_min < top_p - shift) & positive,
+        k_may & reference_top_p_support(renorm_k, top_p, shift) & positive,
+        k_must & reference_top_p_support(renorm_k, top_p, -shift) & positive,
     )
 
 
@@ -678,9 +642,7 @@ def _run_case(cfg: Cfg) -> None:
             category="row_threshold" if wrong_row_signature else "required_draw",
         )
 
-    # Individual must-draw classes do not encode the number of tied classes
-    # that a legal top-k implementation has to retain. Test that separately,
-    # without selecting which tied class should win.
+    # Also check the observed cardinality when the sampling budget is adequate.
     if cfg.api == "top_k":
         for d in range(nd):
             k = cfg.top_k[d if cfg.per_request else 0]
@@ -1467,11 +1429,10 @@ def test_reference_self_consistency():
     ]
     joint = reference_top_k_top_p_filter_joint(row, 2, 0.9)
     assert (joint > 0).tolist() == [True, True, False, False, False]
-    # Boundary ties may be kept together, and the choice is the implementation's.
+    # Boundary ties keep the first required original indices.
     tied = torch.tensor([0.3, 0.3, 0.3, 0.1], dtype=torch.float64)
     may, must = reference_top_k_bounds(tied, 1)
-    assert may.tolist() == [True, True, True, False]
-    assert must.tolist() == [False, False, False, False]
+    assert may.tolist() == must.tolist() == [True, False, False, False]
     # Two tied classes and room for exactly two: both are then required.
     may, must = reference_top_k_bounds(
         torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64), 3
@@ -1488,8 +1449,8 @@ def test_reference_self_consistency():
     [
         # A unique k-th class is required, however small the gap above it.
         ([0.5, 0.25, 0.125, 0.125], 2, [1, 1, 0, 0], [1, 1, 0, 0]),
-        # Two classes tied at the pivot with room for one: either may be kept.
-        ([0.5, 0.25, 0.125, 0.125], 3, [1, 1, 1, 1], [1, 1, 0, 0]),
+        # Two classes tied at the pivot with room for one: lower index wins.
+        ([0.5, 0.25, 0.125, 0.125], 3, [1, 1, 1, 0], [1, 1, 1, 0]),
         # ... and with room for both, both are required.
         ([0.5, 0.25, 0.125, 0.125], 4, [1, 1, 1, 1], [1, 1, 1, 1]),
     ],
@@ -1520,17 +1481,13 @@ def test_dropping_the_unique_kth_class_is_detected():
 
 
 def test_top_k_first_bounds_track_the_renormalized_row():
-    """top_k_first runs top-p on the renormalized row, so the tie choice moves it."""
-    # k=3 over [0.4, 0.3, 0.15, 0.15] keeps 0.4 and 0.3 plus one of the two 0.15s
-    # (mass 0.85) or both (mass 1.0). Class 1 then carries 0.4/1.0 or 0.4/0.85 of the
-    # mass above it, which straddles p=0.45: it is allowed but not required, purely
-    # because of which tied class the top-k stage kept.
+    """top_k_first applies top-p to the exactly-k renormalized row."""
+    # k=3 keeps mass 0.85, so the mass before class 1 is 0.4/0.85 > 0.45.
     row = reference_normalize(torch.tensor([0.4, 0.3, 0.15, 0.15], dtype=_DTYPE))
     may, must = reference_support_bounds(
         "top_k_top_p", row, 3, 0.45, "top_k_first", _fp32_mass_eps(row.numel())
     )
-    assert may.tolist() == [True, True, False, False]
-    assert must.tolist() == [True, False, False, False]
+    assert may.tolist() == must.tolist() == [True, False, False, False]
 
 
 def test_frozen_distribution_targets_are_unambiguous():
@@ -1703,7 +1660,7 @@ def test_gof_result_shapes_and_range():
 def reference_top_k_min_observed(probs_row, top_k, num_draws):
     """Minimum observed support size when the sampling budget makes it testable.
 
-    This does not choose a tie-break. If fewer than k classes are observed, all
+    If fewer than k classes are observed, all
     draws lie in some subset of k-1 allowed classes. Every such subset omits a
     class of probability at least pivot / allowed_mass. A union bound over those
     subsets gives C(m, k-1) * exp(-num_draws * pivot / allowed_mass).
@@ -1848,8 +1805,8 @@ def test_wrong_row_diagnosis_uses_the_observations():
 
 
 @pytest.mark.parametrize("support", [[0, 1], [0, 2], [0, 1, 2]])
-def test_top_k_cardinality_does_not_choose_a_tie_break(monkeypatch, support):
-    """Either legal tied choice, or retaining the whole tie, passes."""
+def test_top_k_cardinality_enforces_the_tie_break(monkeypatch, support):
+    """Only the lower-index tied choice passes the exact support check."""
     cfg = Cfg(0, "top_k", "-", ["test"], 3, top_k=[2])
     row = torch.tensor([[0.5, 0.25, 0.25]], dtype=torch.float32)
     samples = torch.tensor((support * 4096)[:4096], dtype=torch.int32)
@@ -1861,11 +1818,16 @@ def test_top_k_cardinality_does_not_choose_a_tie_break(monkeypatch, support):
     monkeypatch.setitem(globals(), "_build_probs", lambda *_: row)
     monkeypatch.setitem(globals(), "_draw_samples", draw)
     monkeypatch.setitem(globals(), "_describe", lambda _: "CPU cardinality fixture")
-    _run_case(cfg)
+    if support == [0, 1]:
+        _run_case(cfg)
+    else:
+        with pytest.raises(_CaseFailure) as err:
+            _run_case(cfg)
+        assert err.value.category == "support"
 
 
-def test_top_k_cardinality_detects_dropping_all_optional_ties(monkeypatch):
-    """The original may/must checks alone accept argmax-only for this k=2 row."""
+def test_top_k_cardinality_detects_dropping_required_tie(monkeypatch):
+    """A kernel dropping the required tied token is rejected."""
     cfg = Cfg(0, "top_k", "-", ["test"], 3, top_k=[2])
     row = torch.tensor([[0.5, 0.25, 0.25]], dtype=torch.float32)
 
@@ -1880,7 +1842,7 @@ def test_top_k_cardinality_detects_dropping_all_optional_ties(monkeypatch):
     monkeypatch.setitem(globals(), "_describe", lambda _: "CPU cardinality fixture")
     with pytest.raises(_CaseFailure) as err:
         _run_case(cfg)
-    assert err.value.category == "support_cardinality"
+    assert err.value.category == "required_draw"
 
 
 def test_top_k_cardinality_requires_an_adequate_sampling_budget():

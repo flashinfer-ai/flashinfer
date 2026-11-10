@@ -1112,6 +1112,35 @@ users should normally leave the batch-size policy at its defaults.
 | `FLASHINFER_PACKED_KDA_L2POL` | `0` | Override the experimental L2 cache-policy selector. |
 | `FLASHINFER_PACKED_KDA_MINBLOCKS` | `0` | Override the generated kernel's minimum-blocks-per-SM launch-bound hint. |
 
+## Sampling boundary order
+
+Sampling, top-k renormalization/masking, and top-p renormalization use descending
+value and ascending original token index. Keep exactly k positions for top-k and
+the shortest prefix reaching top-p. See `docs/api/sampling.rst` and
+`tests/utils/test_sampling_tie_break.py`. Preserve this order through top-k-first
+selection, including ties created by normalization inside the gathered top-p boundary. The rejection loop
+may terminate only after accepting a token or resolving the final boundary set.
+Use the absolute top-p threshold consistently in rejection, renorm search and
+boundary quotas, including AIR. Resolve ties only where the requested prefix
+cuts a group or a cumulative comparison is uncertain. Keep the three rejection
+kernels within the 1024-thread register budget on every compiled architecture;
+check compiler register/spill reports as well as real launches.
+On SM90 split-row sampling, keep equality counts out of the initial and proposal
+value passes. Pure top-p also carries mass >= pivot in the unused slot-0 count
+storage and skips verification only when the entire tie group is safely below p.
+Count equality on potentially accepted boundary groups or uncertain comparisons.
+Boundary mass uses double accumulation by default. For controlled performance
+comparisons, set `FLASHINFER_SAMPLING_USE_COMPENSATED_MASS=1` before starting Python
+to opt into per-thread compensated float sums promoted to double for block reduction,
+with the original double-scan fallback if compensation loses bits. This selects a
+separate `sampling_compensated_mass` JIT module; unset or `0` keeps `sampling`.
+The public sampling module is cached on first use, so use separate processes when
+comparing modes. Direct CUDA callers may define the same macro to `1` at compile time.
+The entire compensated helper and its reduction storage are compiled out by default:
+it improves some renorm cases but regresses SM90 sampling, including untied inputs.
+Resolve exact boundary mass and original-index quotas from the ranks' staged chunks,
+and preserve legal proposals before drawing from the final cluster-wide support.
+
 ## Development Workflow
 
 ### Typical Development Loop

@@ -34,6 +34,7 @@ struct RadixTopKTraits<float> {
 
   __device__ __forceinline__ static OrderedType ToOrdered(float val) {
     uint32_t bits = __float_as_uint(val);
+    if ((bits & 0x7fffffffu) == 0) bits = 0;  // Signed zeros share the same rank.
     // For descending order: flip all bits if negative, else flip sign bit
     return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
   }
@@ -60,6 +61,7 @@ struct RadixTopKTraits<half> {
 
   __device__ __forceinline__ static OrderedType ToOrdered(half val) {
     uint16_t bits = __half_as_ushort(val);
+    if ((bits & 0x7fffu) == 0) bits = 0;  // Signed zeros share the same rank.
     return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits ^ 0x8000);
   }
 
@@ -86,6 +88,7 @@ struct RadixTopKTraits<nv_bfloat16> {
 
   __device__ __forceinline__ static OrderedType ToOrdered(nv_bfloat16 val) {
     uint16_t bits = __bfloat16_as_ushort(val);
+    if ((bits & 0x7fffu) == 0) bits = 0;  // Signed zeros share the same rank.
     return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits ^ 0x8000);
   }
 

@@ -25,6 +25,7 @@
 #include <numeric>
 #include <type_traits>
 
+#include "sampling_tie_break.cuh"
 #include "topk_common.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
@@ -628,6 +629,13 @@ __device__ __forceinline__ OrderedType RadixSelectFromSharedMemory(
   }
 
   OrderedType ordered_pivot = static_cast<OrderedType>(prefix_cache);
+  // The last radix bucket contains exactly the boundary-value group.
+  // Preserve its row-wide size before suffix_sum is reused for local counts.
+  if (tx == 0) {
+    local_histogram[0] =
+        suffix_sum[found_bucket] - (found_bucket + 1 < RADIX ? suffix_sum[found_bucket + 1] : 0);
+  }
+  __syncthreads();
 
   // Count > pivot (and optionally == pivot) elements by scanning shared_ordered.
   // This is needed because suffix_sum only tracks elements matching the current prefix,
@@ -955,6 +963,7 @@ __device__ __forceinline__ void RadixCollectIndicesDeterministic(
   __shared__ DeterministicCollectScanTempStorage scan_temp_storage;
 
   if (cta_local_eq_emit_limit == 0) {  // gt-only collect
+    if (cta_local_gt_count == 0) return;
     DeterministicThreadStridedCollect<BLOCK_THREADS>(
         tx, actual_chunk_size, scan_temp_storage.scalar,
         [&](uint32_t i) { return shared_ordered[i] > ordered_pivot; }, cta_local_gt_emit_limit,
@@ -964,31 +973,91 @@ __device__ __forceinline__ void RadixCollectIndicesDeterministic(
     return;
   }
 
-  // Collect gt and eq elements
-  DeterministicCollectCountPair thread_local_counts = {0, 0};
-  for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-    const OrderedType ordered = shared_ordered[i];
-    thread_local_counts.gt += static_cast<uint32_t>(ordered > ordered_pivot);
-    thread_local_counts.eq += static_cast<uint32_t>(ordered == ordered_pivot);
+  // Only a partially retained boundary needs an index scan. The ordinary
+  // thread-strided collect is sufficient once the selected set is fixed.
+  uint32_t equal_limit = UINT32_MAX;
+  if (cta_local_eq_emit_limit < cta_local_eq_count) {
+    equal_limit = FindSamplingTieIndexLimit<BLOCK_THREADS>(
+        actual_chunk_size, cta_local_eq_emit_limit,
+        [shared_ordered, ordered_pivot](uint32_t i) { return shared_ordered[i] == ordered_pivot; });
   }
-
-  DeterministicCollectCountPair thread_local_prefix = {0, 0};
+  const uint32_t collect_size =
+      cta_local_gt_count == 0 ? min(actual_chunk_size, equal_limit) : actual_chunk_size;
+  DeterministicCollectCountPair thread_local_counts{0, 0};
+  for (uint32_t i = tx; i < collect_size; i += BLOCK_THREADS) {
+    const OrderedType ordered = shared_ordered[i];
+    thread_local_counts.gt += uint32_t(ordered > ordered_pivot);
+    thread_local_counts.eq += uint32_t(ordered == ordered_pivot && i < equal_limit);
+  }
+  DeterministicCollectCountPair thread_local_prefix{0, 0};
   PairBlockScan(scan_temp_storage.pair)
       .ExclusiveScan(thread_local_counts, thread_local_prefix, DeterministicCollectCountPair{0, 0},
                      DeterministicCollectCountPairSum{});
-
-  DeterministicCollectCountPair thread_local_pos = thread_local_prefix;
-  for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+  auto pos = thread_local_prefix;
+  for (uint32_t i = tx; i < collect_size; i += BLOCK_THREADS) {
     const OrderedType ordered = shared_ordered[i];
-    if (ordered > ordered_pivot && thread_local_pos.gt < cta_local_gt_emit_limit) {
-      output_func(chunk_start + i, ordered, cta_local_gt_output_base + thread_local_pos.gt);
-      ++thread_local_pos.gt;
-    } else if (ordered == ordered_pivot && thread_local_pos.eq < cta_local_eq_emit_limit) {
-      output_func(chunk_start + i, ordered, cta_local_eq_output_base + thread_local_pos.eq);
-      ++thread_local_pos.eq;
+    if (ordered > ordered_pivot && pos.gt < cta_local_gt_emit_limit) {
+      output_func(chunk_start + i, ordered, cta_local_gt_output_base + pos.gt++);
+    } else if (ordered == ordered_pivot && i < equal_limit && pos.eq < cta_local_eq_emit_limit) {
+      output_func(chunk_start + i, ordered, cta_local_eq_output_base + pos.eq++);
     }
   }
   __syncthreads();
+}
+
+// Keep exactly k entries, resolving only a partially retained boundary group.
+// Radix select already provides the row-wide tie quota and CTA-local equal counts.
+// Unique pivots use the original value-only epilogue without an index scan.
+template <uint32_t BLOCK_THREADS, bool SINGLE_CTA, typename OrderedType>
+__device__ __forceinline__ uint32_t
+RadixSamplingTieIndexLimit(const OrderedType* ordered, OrderedType pivot, uint32_t chunk_start,
+                           uint32_t chunk_size, uint32_t row_equal_count, uint32_t row_equal_take,
+                           uint32_t local_equal_count, RadixRowState* state, int& barrier_phase,
+                           uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t* scratch) {
+  __syncthreads();  // Load every lane's radix outputs before reusing histogram scratch.
+  if (row_equal_count <= row_equal_take) return UINT32_MAX;
+  uint32_t prefix = 0;
+  if constexpr (!SINGLE_CTA) {
+    // A peer may still be reading the final radix histogram after its last
+    // barrier. Finish those reads before reusing histogram[0] as tie scratch.
+    AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, threadIdx.x);
+    // Histogram storage is no longer needed until the next persistent row.
+    // Batch the counts so this also supports groups larger than 256 CTAs.
+    for (uint32_t base = 0; base < ctas_per_group; base += 256) {
+      const uint32_t count = min(256u, ctas_per_group - base);
+      if (threadIdx.x == 0 && cta_in_group >= base && cta_in_group < base + count) {
+        state->histogram[0][cta_in_group - base] = local_equal_count;
+      }
+      AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, threadIdx.x);
+      // Read peer counts in parallel instead of serializing every load in lane 0.
+      // Only the first warp participates; each CTA needs its own exclusive prefix.
+      if (threadIdx.x < 32) {
+        uint32_t batch_prefix = 0;
+        for (uint32_t c = threadIdx.x; c < count && base + c < cta_in_group; c += 32) {
+          batch_prefix += state->histogram[0][c];
+        }
+#pragma unroll
+        for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+          batch_prefix += __shfl_down_sync(0xffffffff, batch_prefix, offset);
+        }
+        if (threadIdx.x == 0) prefix += batch_prefix;
+      }
+      AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, threadIdx.x);
+    }
+    if (cta_in_group == 0) {
+      for (uint32_t i = threadIdx.x; i < 256; i += BLOCK_THREADS) state->histogram[0][i] = 0;
+    }
+  }
+  if (threadIdx.x == 0) scratch[0] = prefix;
+  __syncthreads();
+  prefix = scratch[0];
+  const uint32_t take =
+      row_equal_take > prefix ? min(local_equal_count, row_equal_take - prefix) : 0;
+  if (take >= local_equal_count) return UINT32_MAX;
+  if (local_equal_count == chunk_size) return chunk_start + take;
+  // Bisection avoids a block scan for every index tile before a sparse boundary tie.
+  return FindSamplingTieIndexLimit<BLOCK_THREADS, true>(
+      chunk_size, take, [ordered, pivot](uint32_t i) { return ordered[i] == pivot; }, chunk_start);
 }
 
 // ==================== Unified Radix Top-K Kernel with Epilogue Modes ====================
@@ -1490,14 +1559,20 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
 
     // Stage 1: Load the chunk into shared memory, then radix-select the pivot.
     uint32_t local_gt_count = 0;  // Not used in this kernel
-    uint32_t local_eq_count = 0;  // Not used in this kernel
+    uint32_t local_eq_count = 0;
     OrderedType ordered_pivot =
-        RadixSelectFindPivot<BLOCK_THREADS, VEC_SIZE, SINGLE_CTA, false, DType>(
+        RadixSelectFindPivot<BLOCK_THREADS, VEC_SIZE, SINGLE_CTA, true, DType>(
             logits + row_idx * vocab_size, shared_ordered, local_histogram, suffix_sum,
             shared_scalars, state, chunk_start, actual_chunk_size, k, barrier_phase, ctas_per_group,
             cta_in_group, tx, iter, local_gt_count, local_eq_count);
 
     pivot = Traits::FromOrdered(ordered_pivot);
+    const uint32_t row_equal_count = local_histogram[0];
+    const uint32_t row_equal_take = shared_scalars[1];
+    const uint32_t tie_index_limit = RadixSamplingTieIndexLimit<BLOCK_THREADS, SINGLE_CTA>(
+        shared_ordered, ordered_pivot, chunk_start, actual_chunk_size, row_equal_count,
+        row_equal_take, local_eq_count, state, barrier_phase, ctas_per_group, cta_in_group,
+        local_histogram);
 
     // Stage 2: Final masking pass
     const DType neg_inf = Traits::NegInf();
@@ -1509,7 +1584,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
       logits_vec.cast_load(logits + row_idx * vocab_size + chunk_start + i);
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        logits_vec[j] = (logits_vec[j] >= pivot) ? logits_vec[j] : neg_inf;
+        logits_vec[j] = (logits_vec[j] > pivot ||
+                         (logits_vec[j] == pivot && chunk_start + i + j < tie_index_limit))
+                            ? logits_vec[j]
+                            : neg_inf;
       }
       logits_vec.store(masked_logits + row_idx * vocab_size + chunk_start + i);
     }
@@ -1517,7 +1595,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
     // Handle tail
     for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
       DType val = logits[row_idx * vocab_size + chunk_start + i];
-      masked_logits[row_idx * vocab_size + chunk_start + i] = (val >= pivot) ? val : neg_inf;
+      masked_logits[row_idx * vocab_size + chunk_start + i] =
+          (val > pivot || (val == pivot && chunk_start + i < tie_index_limit)) ? val : neg_inf;
     }
   }
 
@@ -1774,14 +1853,20 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
 
     // ========== Stage 1: Find pivot ==========
     uint32_t local_gt_count = 0;  // Not used in this kernel
-    uint32_t local_eq_count = 0;  // Not used in this kernel
-    auto ordered_pivot = RadixSelectFindPivot<BLOCK_THREADS, VEC_SIZE, SINGLE_CTA, false, DType>(
+    uint32_t local_eq_count = 0;
+    auto ordered_pivot = RadixSelectFindPivot<BLOCK_THREADS, VEC_SIZE, SINGLE_CTA, true, DType>(
         probs + row_idx * vocab_size, shared_ordered, local_histogram, suffix_sum, shared_scalars,
         state, chunk_start, actual_chunk_size, k, barrier_phase, ctas_per_group, cta_in_group, tx,
         iter, local_gt_count, local_eq_count);
     pivot = Traits::FromOrdered(ordered_pivot);
+    const uint32_t row_equal_count = local_histogram[0];
+    const uint32_t row_equal_take = shared_scalars[1];
+    const uint32_t tie_index_limit = RadixSamplingTieIndexLimit<BLOCK_THREADS, SINGLE_CTA>(
+        shared_ordered, ordered_pivot, chunk_start, actual_chunk_size, row_equal_count,
+        row_equal_take, local_eq_count, state, barrier_phase, ctas_per_group, cta_in_group,
+        local_histogram);
 
-    // ========== Stage 2: Compute sum of elements >= pivot ==========
+    // ========== Stage 2: Compute the retained mass ==========
     float thread_sum = 0.0f;
     vec_t<DType, VEC_SIZE> data_vec;
     const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
@@ -1791,7 +1876,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
       data_vec.cast_load(probs + row_idx * vocab_size + chunk_start + i);
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        if (data_vec[j] >= pivot) {
+        if (data_vec[j] > pivot ||
+            (data_vec[j] == pivot && chunk_start + i + j < tie_index_limit)) {
           thread_sum += float(data_vec[j]);
         }
       }
@@ -1799,7 +1885,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     // Handle tail
     for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
       DType val = probs[row_idx * vocab_size + chunk_start + i];
-      if (val >= pivot) {
+      if (val > pivot || (val == pivot && chunk_start + i < tie_index_limit)) {
         thread_sum += float(val);
       }
     }
@@ -1859,7 +1945,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
       data_vec.cast_load(probs + row_idx * vocab_size + chunk_start + i);
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        data_vec[j] = (data_vec[j] >= pivot) ? DType(float(data_vec[j]) * normalizer) : DType(0);
+        data_vec[j] =
+            (data_vec[j] > pivot || (data_vec[j] == pivot && chunk_start + i + j < tie_index_limit))
+                ? DType(float(data_vec[j]) * normalizer)
+                : DType(0);
       }
       data_vec.store(renormed_prob + row_idx * vocab_size + chunk_start + i);
     }
@@ -1867,7 +1956,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
       DType val = probs[row_idx * vocab_size + chunk_start + i];
       renormed_prob[row_idx * vocab_size + chunk_start + i] =
-          (val >= pivot) ? DType(float(val) * normalizer) : DType(0);
+          (val > pivot || (val == pivot && chunk_start + i < tie_index_limit))
+              ? DType(float(val) * normalizer)
+              : DType(0);
     }
   }
 
@@ -2304,6 +2395,7 @@ struct FilteredTopKTraits<float> {
     // Convert to FP16 representation and extract high 8 bits
     __half h = __float2half_rn(x);
     uint16_t bits = __half_as_ushort(h);
+    if ((bits & 0x7fffu) == 0) bits = 0;
     uint16_t key =
         (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
     return static_cast<uint8_t>(key >> 8);
@@ -2311,6 +2403,7 @@ struct FilteredTopKTraits<float> {
 
   __device__ __forceinline__ static OrderedType ToOrdered(float x) {
     uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7fffffffu) == 0) bits = 0;  // Signed zeros share the same rank.
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
   }
 };
@@ -2326,6 +2419,7 @@ struct FilteredTopKTraits<half> {
 
   __device__ __forceinline__ static uint8_t ToCoarseKey(half x) {
     uint16_t bits = __half_as_ushort(x);
+    if ((bits & 0x7fffu) == 0) bits = 0;
     uint16_t key =
         (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
     return static_cast<uint8_t>(key >> 8);
@@ -2333,6 +2427,7 @@ struct FilteredTopKTraits<half> {
 
   __device__ __forceinline__ static OrderedType ToOrdered(half x) {
     uint16_t bits = __half_as_ushort(x);
+    if ((bits & 0x7fffu) == 0) bits = 0;  // Signed zeros share the same rank.
     return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
   }
 };
@@ -2346,6 +2441,7 @@ struct FilteredTopKTraits<nv_bfloat16> {
 
   __device__ __forceinline__ static uint8_t ToCoarseKey(nv_bfloat16 x) {
     uint16_t bits = __bfloat16_as_ushort(x);
+    if ((bits & 0x7fffu) == 0) bits = 0;
     uint16_t key =
         (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
     return static_cast<uint8_t>(key >> 8);
@@ -2353,6 +2449,7 @@ struct FilteredTopKTraits<nv_bfloat16> {
 
   __device__ __forceinline__ static OrderedType ToOrdered(nv_bfloat16 x) {
     uint16_t bits = __bfloat16_as_ushort(x);
+    if ((bits & 0x7fffu) == 0) bits = 0;  // Signed zeros share the same rank.
     return (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
   }
 };
@@ -3562,6 +3659,26 @@ cudaError_t TopKDispatch(DType* input, IdType* output_indices, DType* output_val
                          RadixRowState* row_states_buffer, bool sorted_output = false,
                          bool deterministic = false, TopKTieBreak tie_break = TopKTieBreak::None,
                          cudaStream_t stream = 0, bool dsa_graph_safe = false) {
+  // Sampling's explicit low-index convention must also work on devices
+  // without the 128 KiB shared-memory capacity required by FilteredTopK.
+  if (tie_break == TopKTieBreak::Small && !dsa_graph_safe && top_k_val <= FILTERED_TOPK_MAX_K &&
+      !CanImplementFilteredTopK()) {
+    FLASHINFER_CUDA_CALL(
+        (RadixTopKMultiCTA<DType, IdType>(input, output_indices, output_values, nullptr, num_rows,
+                                          top_k_val, max_len, row_states_buffer, true, stream)));
+    if (deterministic || sorted_output) {
+      // Restore original-index order among the k survivors before the stable
+      // value sort, including tied groups strictly above the k-th value.
+      FLASHINFER_CUDA_CALL((LaunchFinalizeTopKIndices<true, FilteredTopKMode::Plain, DType, IdType>(
+          output_indices, output_values, nullptr, 0, nullptr, nullptr, num_rows, top_k_val, max_len,
+          stream)));
+    }
+    if (sorted_output) {
+      FLASHINFER_CUDA_CALL((StableSortTopKByValue<DType, IdType>(
+          output_indices, output_values, num_rows, top_k_val, max_len, stream)));
+    }
+    return cudaSuccess;
+  }
   const bool require_filtered = dsa_graph_safe || tie_break != TopKTieBreak::None;
   if (require_filtered && (top_k_val > FILTERED_TOPK_MAX_K || !CanImplementFilteredTopK())) {
     return cudaErrorNotSupported;
