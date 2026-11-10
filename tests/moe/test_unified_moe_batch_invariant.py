@@ -860,7 +860,7 @@ def test_launch_tile_bound_dominates_the_scheduler_total():
             vectors[1] = [Tk // E + (1 if i < Tk % E else 0) for i in range(E)]
         for _ in range(6):
             cuts = sorted(rng.randrange(Tk + 1) for _ in range(E - 1))
-            vectors.append([b - a for a, b in zip([0] + cuts, cuts + [Tk])])
+            vectors.append([b - a for a, b in zip([0] + cuts, cuts + [Tk], strict=True)])
         for cfg in records:
             if cfg.swap_ab:
                 cluster_rows, tn, cn = cfg.tile_n, cfg.mma_tiler_mn[0], 1
