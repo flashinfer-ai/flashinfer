@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from .generator import Knobs, enumerate_space
-from .spec import ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
+from .spec import BLOCK_K, ELEM_BITS_OF, FP8_BLOCKSCALE_FMTS, MMA_K_OF, MMA_RATE_OF
 
 logger = logging.getLogger(__name__)
 
@@ -161,17 +161,28 @@ CONSTANTS: Dict[str, float] = dict(
     sw_gain=1.0,  # swizzle > 1 with many tiles in flight on both axes
     sw_partial=1.1,  # a swizzle that does not divide its axis (a partial last group)
     two_cta=0.9,  # the 2-CTA pair's shared B and halved per-CTA issue
+    promote_bytes_per_clk=256.0,  # the block-scale class's promotion pass: the CTA tile's fp32 partial through the promotion warps' TMEM
+    # loads and packed fmas, per block
+    promote_handoff_clk=256.0,  # the block-scale class's per-block hand-off: the dependent chain of the accumulator stage's mbarrier wake-up, the
+    # TMEM load round trip and the release the MMA warp observes; nominally two round trips of 128 cycles
+    promote_pair_clk=16.0,  # the 2-CTA pair's hand-off waits for the peer CTA's release across the cluster: the remote arrive's extra latency
 )
 
 DECODE_M = 64  # up to this many rows the candidates are the `decode_sane` subset
+TOKEN_BOX_ROWS = 128  # the rows of the token (A) TMA box: the CTA tile's M
 
 
-def decode_sane(k: Knobs, M: int, swapped: bool = False) -> bool:
+def decode_sane(
+    k: Knobs, M: int, swapped: bool = False, narrow_tiles: bool = False
+) -> bool:
     """The candidate guard at M <= DECODE_M (structural): 1-CTA tiles of N >= 32 in an N-cluster at swizzle 1; where the
     space has swapped decode records (``swapped``: the block-scaled classes), those records at swizzle 1 -- the narrow
     token tiles on the 1-CTA instruction, the 64-wide one on the 2-CTA pair once the tokens fill at least half of it --
-    and no dense record (one token tile holds every token, the weights stream through the 128-row operand). Records
-    outside the guard stay members of the space (the autotuner may still reach them)."""
+    and no dense record (one token tile holds every token, the weights stream through the 128-row operand). The dense
+    guard leaves out the 16-wide tile because its 16-byte B box wastes the TMA's transactions; ``narrow_tiles`` admits it
+    for the block-scale class, whose decode block is bounded by the per-block accumulator hand-off (`estimate_cycles`),
+    not by the box, so the narrowest tile that still fits the part in one wave streams the weight through the most CTAs.
+    Records outside the guard stay members of the space (the autotuner may still reach them)."""
     if M > DECODE_M:
         return True
     if swapped:
@@ -182,7 +193,7 @@ def decode_sane(k: Knobs, M: int, swapped: bool = False) -> bool:
         )
     return (
         (not k.use_2cta_instrs)
-        and k.tile_n >= 32
+        and k.tile_n >= (16 if narrow_tiles else 32)
         and k.cluster_m == 1
         and k.swizzle_size == 1
     )
@@ -318,6 +329,28 @@ def estimate_cycles(
     step = (
         max(mma_cycles, (a_bytes + b_bytes) / part.load_bytes_per_clk) + p["step_floor"]
     )
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        # the block-scale class promotes every accumulator element of the CTA tile once per K block (two promotion warpgroups:
+        # a TMEM read and a packed fma per element pair) and ends every block in an accumulator hand-off: the promotion warps
+        # wait for the stage, load it, fold, fence and release it before the MMA warp may reuse it. The pass is one more
+        # per-k-step term next to the MMA and the operand traffic: a fixed hand-off chain (its latency does not shrink with
+        # the tile, so at decode every tile of one wave costs the same per block and the narrowest one-wave tile wins) plus
+        # the tile's bytes at the pass rate. In the 2-CTA pair the stage is released by both CTAs' promotion warps and the
+        # leader's MMA waits for the peer's arrive across the cluster, so the pair's chain is longer by that remote arrive.
+        handoff = p["promote_handoff_clk"] + (
+            p["promote_pair_clk"] if k.use_2cta_instrs else 0.0
+        )
+        promote = (handoff + rows * tn * 4.0 / p["promote_bytes_per_clk"]) / (
+            BLOCK_K // kk
+        )
+        step = (
+            max(
+                mma_cycles,
+                (a_bytes + b_bytes) / part.load_bytes_per_clk,
+                promote,
+            )
+            + p["step_floor"]
+        )
     body = waves * ksteps * step
     active = ctas_m * n_tiles * items
     l2_total = (
@@ -384,7 +417,9 @@ def estimate_cycles(
             )
             if axis % sw:
                 t *= p["sw_partial"]
-    if k.use_2cta_instrs:
+    if k.use_2cta_instrs and in_fmt not in FP8_BLOCKSCALE_FMTS:
+        # the pair's halved per-CTA issue; not for the block-scale class, whose pair runs its promotion in lockstep (the
+        # accumulator hand-off above is pair-wide: the block cannot be shorter than either CTA's promotion pass)
         t *= p["two_cta"]
     return t
 
@@ -411,7 +446,21 @@ def rank(
     fam = family or "sm_107"
     space = enumerate_space(M, N, K, chunks=chunks, b_major=b_major, in_fmt=in_fmt)
     swapped = any(k.swap_ab for k in space)
-    guarded = [k for k in space if decode_sane(k, M, swapped)]
+    blockscale = in_fmt in FP8_BLOCKSCALE_FMTS
+    guarded = [k for k in space if decode_sane(k, M, swapped, blockscale)]
+    if blockscale and M <= TOKEN_BOX_ROWS // 4:
+        # the block-scale class at a few tokens: the 128-row token box is at least three quarters zero-fill, a TMA cost per
+        # block per CTA that the N-cluster's multicast issues once per cluster; the widest N-cluster shares it most, as long
+        # as its clusters still fit the part in one wave (the estimate's wave count would otherwise double)
+        cap4 = capacity_for(fam, sm_count, nominal).get(4) or max(
+            1, (sm_count or PART_TABLE[fam].sm_count) // 4
+        )
+        wide = [
+            k
+            for k in guarded
+            if k.cluster_n == 4 and ((N + k.tile_n - 1) // k.tile_n + 3) // 4 <= cap4
+        ]
+        guarded = wide or guarded
     space = guarded or space
     if not space:
         return ()

@@ -69,6 +69,7 @@ class Digit:
     identity_note: str = (
         ""  # why a kernel may substitute the identity for absent leaves
     )
+    indexed: bool = False  # fold: the step also takes the digit value, fn(fp, acc, x, i) (a per-index coefficient such as a block scale)
 
     def __post_init__(self):
         assert self.shape in ("pairwise", "fold"), self.shape
@@ -84,10 +85,15 @@ class Digit:
         """Reduce ``vals`` (ordered by digit value; None = absent)."""
         if self.shape == "fold":
             acc = None
-            for v in vals:
+            for i, v in enumerate(vals):
                 if v is None:
                     continue
-                acc = self.step(fp, self.init(fp) if acc is None else acc, v)
+                prev = self.init(fp) if acc is None else acc
+                acc = (
+                    self.step(fp, prev, v, i)
+                    if self.indexed
+                    else self.step(fp, prev, v)
+                )
             return acc
         return _pairwise(vals, lambda a, b: self.combine(fp, a, b))
 
@@ -586,7 +592,10 @@ class BlockedFold:
         acc = None
         for blk in range(n_blocks):
             for j in self.inner_steps():
-                x = red.leaf(fp, {**fixed, self.digit: self.step_index(blk, j)})
+                i = self.step_index(blk, j)
+                x = red.leaf(fp, {**fixed, self.digit: i})
                 assert x is not None, "blocked folds have no absent leaves"
-                acc = d.step(fp, acc if self.accumulate(blk, j) else d.init(fp), x)
+                prev = acc if self.accumulate(blk, j) else d.init(fp)
+                # an indexed digit's step takes the digit value as well (`Digit.reduce`)
+                acc = d.step(fp, prev, x, i) if d.indexed else d.step(fp, prev, x)
         return acc
