@@ -3360,11 +3360,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     tCrSFC[vi + 1].to(cutlass.Uint32)
                                 )
                                 if cutlass.const_expr(self.fold_clamped_relu2_l2):
-                                    # norm_const is L ** 2 here (1.0 otherwise).
+                                    # norm_const is L ** 2 here (1.0 otherwise). For a
+                                    # block with a tiny amax (small E8M0 code),
+                                    # 2 ** (127 - code) * L ** 2 overflows fp32, and
+                                    # inf * 0 gives NaN: clamp as the NVFP4 path does.
                                     acc_scale0, acc_scale1 = cute.arch.mul_packed_f32x2(
                                         (acc_scale0, acc_scale1),
                                         (norm_const, norm_const),
                                     )
+                                    acc_scale0 = fmin(acc_scale0, fp32_max, nan=True)
+                                    acc_scale1 = fmin(acc_scale1, fp32_max, nan=True)
                                 vec0 = tTR_rAcc_frg[None, vi]
                                 vec1 = tTR_rAcc_frg[None, vi + 1]
                                 for ei in cutlass.range_constexpr(self.sf_vec_size):

@@ -299,6 +299,29 @@ def test_mxfp8_clamped_relu2_huge_limit_is_relu2():
     torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
 
 
+@pytest.mark.parametrize("clamp_limit", [16.0, 1e20])
+def test_mxfp8_clamped_relu2_tiny_fc1_block(clamp_limit):
+    """FC1 blocks of 32 values with a tiny amax get a small E8M0 code. With L ** 2
+    folded into the output scale, 2 ** (127 - code) * L ** 2 must not overflow
+    to inf (inf * 0 = NaN)."""
+    num_tokens, hidden, inter, num_experts, top_k = 33, 896, 1152, 16, 4
+    x, w1, w2, topk_ids, topk_w = _make_case(
+        num_tokens, hidden, inter, num_experts, top_k
+    )
+    # FC1 outputs ~5e-18 overflow with L = 16; ~2e-9 overflow with the capped
+    # huge L (with that L, the ~5e-18 block underflows to zero instead).
+    w1[:, :32] *= 2.5e-18
+    w1[:, 32:64] *= 1e-9
+    out = _run_kernel(
+        x, w1, w2, topk_ids, topk_w, num_experts, clamp_limit=clamp_limit
+    ).float()
+    assert torch.isfinite(out).all()
+    ref_q = _reference(
+        x, w1, w2, topk_ids, topk_w, quantized=True, clamp_limit=clamp_limit
+    )
+    torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
+
+
 @pytest.mark.parametrize("swap_ab", [False, True])
 def test_mxfp8_clamped_relu2_limit_is_read_at_runtime(swap_ab):
     """Different limit values reuse one compiled GEMM1 kernel.
