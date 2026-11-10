@@ -34,8 +34,8 @@
                     int s3_dual_b0ccd7 = 0;
                     if (s3_off_6d8ec7 < world_size) {
                         int _max_4726d5 = ((owner_route_counts[s3_own_11b679]) > (0) ? (owner_route_counts[s3_own_11b679]) : (0));
-                        int _min_d1db25_3 = ((_max_4726d5) < (MOE_X_7830131351) ? (_max_4726d5) : (MOE_X_7830131351));
-                        int s3_rt_d397d2 = _min_d1db25_3;
+                        int _min_b5280by = ((_max_4726d5) < (MOE_X_7830131351) ? (_max_4726d5) : (MOE_X_7830131351));
+                        int s3_rt_d397d2 = _min_b5280by;
                         int s3_wq_0d1a6f = 128;
                         if (s3_rt_d397d2 >= 768 && s3_rt_d397d2 < 768 || s3_rt_d397d2 >= 8192) {
                             s3_wq_0d1a6f = 64;
@@ -50,100 +50,100 @@
                         int _min_0aae49 = ((s3_cnt_b0ffb8) < (MOE_X_9fc62c3487) ? (s3_cnt_b0ffb8) : (MOE_X_9fc62c3487));
                         s3_cnt_b0ffb8 = _min_0aae49;
                         int _max_ea4fd7 = ((source_route_counts[s3_own_11b679]) > (0) ? (source_route_counts[s3_own_11b679]) : (0));
-                        int _min_d1db25_4 = ((_max_ea4fd7) < (MOE_X_7830131351) ? (_max_ea4fd7) : (MOE_X_7830131351));
-                        s3_dual_b0ccd7 = (int)(s3_rt_d397d2 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || s3_rt_d397d2 * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_d1db25_4 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        int _min_aadd92y = ((_max_ea4fd7) < (MOE_X_7830131351) ? (_max_ea4fd7) : (MOE_X_7830131351));
+                        s3_dual_b0ccd7 = (int)(s3_rt_d397d2 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || s3_rt_d397d2 * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_aadd92y * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
                     }
                     int s3_k_996f2c = 1;
                     int s3_off_e0103d = warp - 8 + 4 + 1;
-                    int s3_own_11b679_1 = rank + s3_off_e0103d;
-                    if (s3_own_11b679_1 >= world_size) {
-                        s3_own_11b679_1 = s3_own_11b679_1 - world_size;
+                    int s3_own_06dfc3y = rank + s3_off_e0103d;
+                    if (s3_own_06dfc3y >= world_size) {
+                        s3_own_06dfc3y = s3_own_06dfc3y - world_size;
                     }
-                    int s3_cnt_b0ffb8_1 = 0;
-                    int s3_dual_b0ccd7_1 = 0;
+                    int s3_cnt_50f62cy = 0;
+                    int s3_dual_5eec72y = 0;
                     if (s3_off_e0103d < world_size) {
-                        int _max_4726d5_1 = ((owner_route_counts[s3_own_11b679_1]) > (0) ? (owner_route_counts[s3_own_11b679_1]) : (0));
-                        int _min_d1db25_5 = ((_max_4726d5_1) < (MOE_X_7830131351) ? (_max_4726d5_1) : (MOE_X_7830131351));
-                        int s3_rt_d397d2_1 = _min_d1db25_5;
-                        int s3_wq_0d1a6f_1 = 128;
-                        if (s3_rt_d397d2_1 >= 768 && s3_rt_d397d2_1 < 768 || s3_rt_d397d2_1 >= 8192) {
-                            s3_wq_0d1a6f_1 = 64;
+                        int _max_b6f76cy = ((owner_route_counts[s3_own_06dfc3y]) > (0) ? (owner_route_counts[s3_own_06dfc3y]) : (0));
+                        int _min_b5280by_1 = ((_max_b6f76cy) < (MOE_X_7830131351) ? (_max_b6f76cy) : (MOE_X_7830131351));
+                        int s3_rt_73cd02y = _min_b5280by_1;
+                        int s3_wq_28b1d4y = 128;
+                        if (s3_rt_73cd02y >= 768 && s3_rt_73cd02y < 768 || s3_rt_73cd02y >= 8192) {
+                            s3_wq_28b1d4y = 64;
                         }
-                        if (s3_rt_d397d2_1 < 768) {
-                            s3_wq_0d1a6f_1 = 32;
+                        if (s3_rt_73cd02y < 768) {
+                            s3_wq_28b1d4y = 32;
                         }
-                        int _max_3bd31e_1 = (((s3_rt_d397d2_1 + s3_wq_0d1a6f_1 - 1) / s3_wq_0d1a6f_1 - 1) > (0) ? ((s3_rt_d397d2_1 + s3_wq_0d1a6f_1 - 1) / s3_wq_0d1a6f_1 - 1) : (0));
-                        int s3_wfull_4cf789_1 = _max_3bd31e_1;
-                        int _max_28b6a8_1 = ((s3_wfull_4cf789_1 + (s3_rt_d397d2_1 - s3_wfull_4cf789_1 * s3_wq_0d1a6f_1 + 64 - 1) / 64) > (1) ? (s3_wfull_4cf789_1 + (s3_rt_d397d2_1 - s3_wfull_4cf789_1 * s3_wq_0d1a6f_1 + 64 - 1) / 64) : (1));
-                        s3_cnt_b0ffb8_1 = _max_28b6a8_1 + 1;
-                        int _min_0aae49_1 = ((s3_cnt_b0ffb8_1) < (MOE_X_9fc62c3487) ? (s3_cnt_b0ffb8_1) : (MOE_X_9fc62c3487));
-                        s3_cnt_b0ffb8_1 = _min_0aae49_1;
-                        int _max_ea4fd7_1 = ((source_route_counts[s3_own_11b679_1]) > (0) ? (source_route_counts[s3_own_11b679_1]) : (0));
-                        int _min_d1db25_6 = ((_max_ea4fd7_1) < (MOE_X_7830131351) ? (_max_ea4fd7_1) : (MOE_X_7830131351));
-                        s3_dual_b0ccd7_1 = (int)(s3_rt_d397d2_1 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || s3_rt_d397d2_1 * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_d1db25_6 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        int _max_146c9dy = (((s3_rt_73cd02y + s3_wq_28b1d4y - 1) / s3_wq_28b1d4y - 1) > (0) ? ((s3_rt_73cd02y + s3_wq_28b1d4y - 1) / s3_wq_28b1d4y - 1) : (0));
+                        int s3_wfull_8ad26cy = _max_146c9dy;
+                        int _max_54043ey = ((s3_wfull_8ad26cy + (s3_rt_73cd02y - s3_wfull_8ad26cy * s3_wq_28b1d4y + 64 - 1) / 64) > (1) ? (s3_wfull_8ad26cy + (s3_rt_73cd02y - s3_wfull_8ad26cy * s3_wq_28b1d4y + 64 - 1) / 64) : (1));
+                        s3_cnt_50f62cy = _max_54043ey + 1;
+                        int _min_f6e2f2y = ((s3_cnt_50f62cy) < (MOE_X_9fc62c3487) ? (s3_cnt_50f62cy) : (MOE_X_9fc62c3487));
+                        s3_cnt_50f62cy = _min_f6e2f2y;
+                        int _max_41ec01y = ((source_route_counts[s3_own_06dfc3y]) > (0) ? (source_route_counts[s3_own_06dfc3y]) : (0));
+                        int _min_aadd92y_1 = ((_max_41ec01y) < (MOE_X_7830131351) ? (_max_41ec01y) : (MOE_X_7830131351));
+                        s3_dual_5eec72y = (int)(s3_rt_73cd02y * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || s3_rt_73cd02y * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_aadd92y_1 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
                     }
-                    int s3_k_996f2c_1 = 1;
+                    int s3_k_aa4508y = 1;
                     int s3_off_c0c21e = warp - 8 + 8 + 1;
-                    int s3_own_11b679_2 = rank + s3_off_c0c21e;
-                    if (s3_own_11b679_2 >= world_size) {
-                        s3_own_11b679_2 = s3_own_11b679_2 - world_size;
+                    int s3_own_b6881fy = rank + s3_off_c0c21e;
+                    if (s3_own_b6881fy >= world_size) {
+                        s3_own_b6881fy = s3_own_b6881fy - world_size;
                     }
-                    int s3_cnt_b0ffb8_2 = 0;
-                    int s3_dual_b0ccd7_2 = 0;
+                    int s3_cnt_50f62cy_1 = 0;
+                    int s3_dual_5eec72y_1 = 0;
                     if (s3_off_c0c21e < world_size) {
-                        int _max_4726d5_2 = ((owner_route_counts[s3_own_11b679_2]) > (0) ? (owner_route_counts[s3_own_11b679_2]) : (0));
-                        int _min_d1db25_7 = ((_max_4726d5_2) < (MOE_X_7830131351) ? (_max_4726d5_2) : (MOE_X_7830131351));
-                        int s3_rt_d397d2_2 = _min_d1db25_7;
-                        int s3_wq_0d1a6f_2 = 128;
-                        if (s3_rt_d397d2_2 >= 768 && s3_rt_d397d2_2 < 768 || s3_rt_d397d2_2 >= 8192) {
-                            s3_wq_0d1a6f_2 = 64;
+                        int _max_b6f76cy_1 = ((owner_route_counts[s3_own_b6881fy]) > (0) ? (owner_route_counts[s3_own_b6881fy]) : (0));
+                        int _min_b5280by_2 = ((_max_b6f76cy_1) < (MOE_X_7830131351) ? (_max_b6f76cy_1) : (MOE_X_7830131351));
+                        int s3_rt_73cd02y_1 = _min_b5280by_2;
+                        int s3_wq_28b1d4y_1 = 128;
+                        if (s3_rt_73cd02y_1 >= 768 && s3_rt_73cd02y_1 < 768 || s3_rt_73cd02y_1 >= 8192) {
+                            s3_wq_28b1d4y_1 = 64;
                         }
-                        if (s3_rt_d397d2_2 < 768) {
-                            s3_wq_0d1a6f_2 = 32;
+                        if (s3_rt_73cd02y_1 < 768) {
+                            s3_wq_28b1d4y_1 = 32;
                         }
-                        int _max_3bd31e_2 = (((s3_rt_d397d2_2 + s3_wq_0d1a6f_2 - 1) / s3_wq_0d1a6f_2 - 1) > (0) ? ((s3_rt_d397d2_2 + s3_wq_0d1a6f_2 - 1) / s3_wq_0d1a6f_2 - 1) : (0));
-                        int s3_wfull_4cf789_2 = _max_3bd31e_2;
-                        int _max_28b6a8_2 = ((s3_wfull_4cf789_2 + (s3_rt_d397d2_2 - s3_wfull_4cf789_2 * s3_wq_0d1a6f_2 + 64 - 1) / 64) > (1) ? (s3_wfull_4cf789_2 + (s3_rt_d397d2_2 - s3_wfull_4cf789_2 * s3_wq_0d1a6f_2 + 64 - 1) / 64) : (1));
-                        s3_cnt_b0ffb8_2 = _max_28b6a8_2 + 1;
-                        int _min_0aae49_2 = ((s3_cnt_b0ffb8_2) < (MOE_X_9fc62c3487) ? (s3_cnt_b0ffb8_2) : (MOE_X_9fc62c3487));
-                        s3_cnt_b0ffb8_2 = _min_0aae49_2;
-                        int _max_ea4fd7_2 = ((source_route_counts[s3_own_11b679_2]) > (0) ? (source_route_counts[s3_own_11b679_2]) : (0));
-                        int _min_d1db25_8 = ((_max_ea4fd7_2) < (MOE_X_7830131351) ? (_max_ea4fd7_2) : (MOE_X_7830131351));
-                        s3_dual_b0ccd7_2 = (int)(s3_rt_d397d2_2 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || s3_rt_d397d2_2 * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_d1db25_8 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        int _max_146c9dy_1 = (((s3_rt_73cd02y_1 + s3_wq_28b1d4y_1 - 1) / s3_wq_28b1d4y_1 - 1) > (0) ? ((s3_rt_73cd02y_1 + s3_wq_28b1d4y_1 - 1) / s3_wq_28b1d4y_1 - 1) : (0));
+                        int s3_wfull_8ad26cy_1 = _max_146c9dy_1;
+                        int _max_54043ey_1 = ((s3_wfull_8ad26cy_1 + (s3_rt_73cd02y_1 - s3_wfull_8ad26cy_1 * s3_wq_28b1d4y_1 + 64 - 1) / 64) > (1) ? (s3_wfull_8ad26cy_1 + (s3_rt_73cd02y_1 - s3_wfull_8ad26cy_1 * s3_wq_28b1d4y_1 + 64 - 1) / 64) : (1));
+                        s3_cnt_50f62cy_1 = _max_54043ey_1 + 1;
+                        int _min_f6e2f2y_1 = ((s3_cnt_50f62cy_1) < (MOE_X_9fc62c3487) ? (s3_cnt_50f62cy_1) : (MOE_X_9fc62c3487));
+                        s3_cnt_50f62cy_1 = _min_f6e2f2y_1;
+                        int _max_41ec01y_1 = ((source_route_counts[s3_own_b6881fy]) > (0) ? (source_route_counts[s3_own_b6881fy]) : (0));
+                        int _min_aadd92y_2 = ((_max_41ec01y_1) < (MOE_X_7830131351) ? (_max_41ec01y_1) : (MOE_X_7830131351));
+                        s3_dual_5eec72y_1 = (int)(s3_rt_73cd02y_1 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || s3_rt_73cd02y_1 * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_aadd92y_2 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
                     }
-                    int s3_k_996f2c_2 = 1;
+                    int s3_k_aa4508y_1 = 1;
                     int s3_off_066fa4 = warp - 8 + 12 + 1;
-                    int s3_own_11b679_3 = rank + s3_off_066fa4;
-                    if (s3_own_11b679_3 >= world_size) {
-                        s3_own_11b679_3 = s3_own_11b679_3 - world_size;
+                    int s3_own_c0965dy = rank + s3_off_066fa4;
+                    if (s3_own_c0965dy >= world_size) {
+                        s3_own_c0965dy = s3_own_c0965dy - world_size;
                     }
-                    int s3_cnt_b0ffb8_3 = 0;
-                    int s3_dual_b0ccd7_3 = 0;
+                    int s3_cnt_50f62cy_2 = 0;
+                    int s3_dual_5eec72y_2 = 0;
                     if (s3_off_066fa4 < world_size) {
-                        int _max_4726d5_3 = ((owner_route_counts[s3_own_11b679_3]) > (0) ? (owner_route_counts[s3_own_11b679_3]) : (0));
-                        int _min_d1db25_9 = ((_max_4726d5_3) < (MOE_X_7830131351) ? (_max_4726d5_3) : (MOE_X_7830131351));
-                        int s3_rt_d397d2_3 = _min_d1db25_9;
-                        int s3_wq_0d1a6f_3 = 128;
-                        if (s3_rt_d397d2_3 >= 768 && s3_rt_d397d2_3 < 768 || s3_rt_d397d2_3 >= 8192) {
-                            s3_wq_0d1a6f_3 = 64;
+                        int _max_b6f76cy_2 = ((owner_route_counts[s3_own_c0965dy]) > (0) ? (owner_route_counts[s3_own_c0965dy]) : (0));
+                        int _min_b5280by_3 = ((_max_b6f76cy_2) < (MOE_X_7830131351) ? (_max_b6f76cy_2) : (MOE_X_7830131351));
+                        int s3_rt_73cd02y_2 = _min_b5280by_3;
+                        int s3_wq_28b1d4y_2 = 128;
+                        if (s3_rt_73cd02y_2 >= 768 && s3_rt_73cd02y_2 < 768 || s3_rt_73cd02y_2 >= 8192) {
+                            s3_wq_28b1d4y_2 = 64;
                         }
-                        if (s3_rt_d397d2_3 < 768) {
-                            s3_wq_0d1a6f_3 = 32;
+                        if (s3_rt_73cd02y_2 < 768) {
+                            s3_wq_28b1d4y_2 = 32;
                         }
-                        int _max_3bd31e_3 = (((s3_rt_d397d2_3 + s3_wq_0d1a6f_3 - 1) / s3_wq_0d1a6f_3 - 1) > (0) ? ((s3_rt_d397d2_3 + s3_wq_0d1a6f_3 - 1) / s3_wq_0d1a6f_3 - 1) : (0));
-                        int s3_wfull_4cf789_3 = _max_3bd31e_3;
-                        int _max_28b6a8_3 = ((s3_wfull_4cf789_3 + (s3_rt_d397d2_3 - s3_wfull_4cf789_3 * s3_wq_0d1a6f_3 + 64 - 1) / 64) > (1) ? (s3_wfull_4cf789_3 + (s3_rt_d397d2_3 - s3_wfull_4cf789_3 * s3_wq_0d1a6f_3 + 64 - 1) / 64) : (1));
-                        s3_cnt_b0ffb8_3 = _max_28b6a8_3 + 1;
-                        int _min_0aae49_3 = ((s3_cnt_b0ffb8_3) < (MOE_X_9fc62c3487) ? (s3_cnt_b0ffb8_3) : (MOE_X_9fc62c3487));
-                        s3_cnt_b0ffb8_3 = _min_0aae49_3;
-                        int _max_ea4fd7_3 = ((source_route_counts[s3_own_11b679_3]) > (0) ? (source_route_counts[s3_own_11b679_3]) : (0));
-                        int _min_d1db25_10 = ((_max_ea4fd7_3) < (MOE_X_7830131351) ? (_max_ea4fd7_3) : (MOE_X_7830131351));
-                        s3_dual_b0ccd7_3 = (int)(s3_rt_d397d2_3 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || s3_rt_d397d2_3 * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_d1db25_10 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        int _max_146c9dy_2 = (((s3_rt_73cd02y_2 + s3_wq_28b1d4y_2 - 1) / s3_wq_28b1d4y_2 - 1) > (0) ? ((s3_rt_73cd02y_2 + s3_wq_28b1d4y_2 - 1) / s3_wq_28b1d4y_2 - 1) : (0));
+                        int s3_wfull_8ad26cy_2 = _max_146c9dy_2;
+                        int _max_54043ey_2 = ((s3_wfull_8ad26cy_2 + (s3_rt_73cd02y_2 - s3_wfull_8ad26cy_2 * s3_wq_28b1d4y_2 + 64 - 1) / 64) > (1) ? (s3_wfull_8ad26cy_2 + (s3_rt_73cd02y_2 - s3_wfull_8ad26cy_2 * s3_wq_28b1d4y_2 + 64 - 1) / 64) : (1));
+                        s3_cnt_50f62cy_2 = _max_54043ey_2 + 1;
+                        int _min_f6e2f2y_2 = ((s3_cnt_50f62cy_2) < (MOE_X_9fc62c3487) ? (s3_cnt_50f62cy_2) : (MOE_X_9fc62c3487));
+                        s3_cnt_50f62cy_2 = _min_f6e2f2y_2;
+                        int _max_41ec01y_2 = ((source_route_counts[s3_own_c0965dy]) > (0) ? (source_route_counts[s3_own_c0965dy]) : (0));
+                        int _min_aadd92y_3 = ((_max_41ec01y_2) < (MOE_X_7830131351) ? (_max_41ec01y_2) : (MOE_X_7830131351));
+                        s3_dual_5eec72y_2 = (int)(s3_rt_73cd02y_2 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || s3_rt_73cd02y_2 * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_aadd92y_3 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
                     }
-                    int s3_k_996f2c_3 = 1;
-                    unsigned long long gtimer_0_de31d4_30;
-                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_de31d4_30) :: "memory");
-                    unsigned long long s3_t0 = gtimer_0_de31d4_30;
+                    int s3_k_aa4508y_2 = 1;
+                    unsigned long long gtimer_0_1c9f2fy;
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_1c9f2fy) :: "memory");
+                    unsigned long long s3_t0 = gtimer_0_1c9f2fy;
                     int s3_pend = 1;
                     while (s3_pend != 0) {
                         s3_pend = 0;
@@ -156,20 +156,20 @@
                             if (s3_dual_b0ccd7 != 0 && s3_c_909369 >= 0 && (s3_c_909369 & 1) == 1) {
                                 if ((int)peer_transport[rank * world_size + s3_own_11b679] == 2) {
                                     // gin_read_signal: acquire, 64-bit signal snapshot
-                                    uint64_t _gin_signal_542f4b_10;
+                                    uint64_t _gin_signal_ecabf9y;
                                     {
                                         ncclGin __gin{*(gin_dev_comm), (int)(1)};
-                                        _gin_signal_542f4b_10 = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + s3_own_11b679), 64, cuda::memory_order_acquire);
+                                        _gin_signal_ecabf9y = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + s3_own_11b679), 64, cuda::memory_order_acquire);
                                     }
-                                    unsigned long long s3_gv_b56b96 = _gin_signal_542f4b_10;
+                                    unsigned long long s3_gv_b56b96 = _gin_signal_ecabf9y;
                                     if (s3_gv_b56b96 >= result_signal_base_scratch[MOE_RANKS + s3_own_11b679] + (unsigned long long)((s3_c_909369 + 1) / 2)) {
                                         s3_ok_fd7c07 = 1;
                                     }
                                 } else {
                                     unsigned int* s3_lp_5fe2f6 = lsa_signals + ((MOE_X_5116877e34 + s3_own_11b679) * 32);
-                                    unsigned int _load_acquire_73f1e8_5;
-                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_5) : "l"(reinterpret_cast<unsigned int*>(s3_lp_5fe2f6)) : "memory");
-                                    unsigned int s3_ls_3294f2 = _load_acquire_73f1e8_5;
+                                    unsigned int _load_acquire_94a0f9y;
+                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_94a0f9y) : "l"(reinterpret_cast<unsigned int*>(s3_lp_5fe2f6)) : "memory");
+                                    unsigned int s3_ls_3294f2 = _load_acquire_94a0f9y;
                                     if ((int)(s3_ls_3294f2 - (unsigned int)(result_signal_base_scratch[MOE_RANKS + s3_own_11b679] + (unsigned long long)((s3_c_909369 + 1) / 2))) >= 0) {
                                         s3_ok_fd7c07 = 1;
                                     } else {
@@ -187,20 +187,20 @@
                                 }
                                 if ((int)peer_transport[rank * world_size + s3_own_11b679] == 2) {
                                     // gin_read_signal: acquire, 64-bit signal snapshot
-                                    uint64_t _gin_signal_542f4b_11;
+                                    uint64_t _gin_signal_8fa773y;
                                     {
                                         ncclGin __gin{*(gin_dev_comm), (int)(0)};
-                                        _gin_signal_542f4b_11 = __gin.readSignal((ncclGinSignal_t)(MOE_X_96e08f30e3 + s3_own_11b679), 64, cuda::memory_order_acquire);
+                                        _gin_signal_8fa773y = __gin.readSignal((ncclGinSignal_t)(MOE_X_96e08f30e3 + s3_own_11b679), 64, cuda::memory_order_acquire);
                                     }
-                                    unsigned long long s3_gv_0_913053 = _gin_signal_542f4b_11;
+                                    unsigned long long s3_gv_0_913053 = _gin_signal_8fa773y;
                                     if (s3_gv_0_913053 >= result_signal_base_scratch[s3_own_11b679] + (unsigned long long)s3_ord_099205) {
                                         s3_ok_fd7c07 = 1;
                                     }
                                 } else {
                                     unsigned int* s3_lp_0_2e4d3c = lsa_signals + ((MOE_X_fc0237aef9 + s3_own_11b679) * 32);
-                                    unsigned int _load_acquire_73f1e8_6;
-                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_6) : "l"(reinterpret_cast<unsigned int*>(s3_lp_0_2e4d3c)) : "memory");
-                                    unsigned int s3_ls_0_dff8ef = _load_acquire_73f1e8_6;
+                                    unsigned int _load_acquire_5ca484x;
+                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_5ca484x) : "l"(reinterpret_cast<unsigned int*>(s3_lp_0_2e4d3c)) : "memory");
+                                    unsigned int s3_ls_0_dff8ef = _load_acquire_5ca484x;
                                     if ((int)(s3_ls_0_dff8ef - (unsigned int)(result_signal_base_scratch[s3_own_11b679] + (unsigned long long)s3_ord_099205)) >= 0) {
                                         s3_ok_fd7c07 = 1;
                                     } else {
@@ -225,228 +225,228 @@
                                 }
                             }
                         }
-                        if (s3_k_996f2c_1 <= s3_cnt_b0ffb8_1) {
+                        if (s3_k_aa4508y <= s3_cnt_50f62cy) {
                             s3_pend = 1;
-                            int s3_c_909369_1 = s3_k_996f2c_1 - 2;
-                            int s3_ok_fd7c07_1 = 0;
-                            if (s3_dual_b0ccd7_1 != 0 && s3_c_909369_1 >= 0 && (s3_c_909369_1 & 1) == 1) {
-                                if ((int)peer_transport[rank * world_size + s3_own_11b679_1] == 2) {
+                            int s3_c_10c2day = s3_k_aa4508y - 2;
+                            int s3_ok_6d711ay = 0;
+                            if (s3_dual_5eec72y != 0 && s3_c_10c2day >= 0 && (s3_c_10c2day & 1) == 1) {
+                                if ((int)peer_transport[rank * world_size + s3_own_06dfc3y] == 2) {
                                     // gin_read_signal: acquire, 64-bit signal snapshot
-                                    uint64_t _gin_signal_542f4b_12;
+                                    uint64_t _gin_signal_ecabf9y_1;
                                     {
                                         ncclGin __gin{*(gin_dev_comm), (int)(1)};
-                                        _gin_signal_542f4b_12 = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + s3_own_11b679_1), 64, cuda::memory_order_acquire);
+                                        _gin_signal_ecabf9y_1 = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + s3_own_06dfc3y), 64, cuda::memory_order_acquire);
                                     }
-                                    unsigned long long s3_gv_b56b96_1 = _gin_signal_542f4b_12;
-                                    if (s3_gv_b56b96_1 >= result_signal_base_scratch[MOE_RANKS + s3_own_11b679_1] + (unsigned long long)((s3_c_909369_1 + 1) / 2)) {
-                                        s3_ok_fd7c07_1 = 1;
+                                    unsigned long long s3_gv_1426afy = _gin_signal_ecabf9y_1;
+                                    if (s3_gv_1426afy >= result_signal_base_scratch[MOE_RANKS + s3_own_06dfc3y] + (unsigned long long)((s3_c_10c2day + 1) / 2)) {
+                                        s3_ok_6d711ay = 1;
                                     }
                                 } else {
-                                    unsigned int* s3_lp_5fe2f6_1 = lsa_signals + ((MOE_X_5116877e34 + s3_own_11b679_1) * 32);
-                                    unsigned int _load_acquire_73f1e8_7;
-                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_7) : "l"(reinterpret_cast<unsigned int*>(s3_lp_5fe2f6_1)) : "memory");
-                                    unsigned int s3_ls_3294f2_1 = _load_acquire_73f1e8_7;
-                                    if ((int)(s3_ls_3294f2_1 - (unsigned int)(result_signal_base_scratch[MOE_RANKS + s3_own_11b679_1] + (unsigned long long)((s3_c_909369_1 + 1) / 2))) >= 0) {
-                                        s3_ok_fd7c07_1 = 1;
+                                    unsigned int* s3_lp_3f6436y = lsa_signals + ((MOE_X_5116877e34 + s3_own_06dfc3y) * 32);
+                                    unsigned int _load_acquire_94a0f9y_1;
+                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_94a0f9y_1) : "l"(reinterpret_cast<unsigned int*>(s3_lp_3f6436y)) : "memory");
+                                    unsigned int s3_ls_8a1918y = _load_acquire_94a0f9y_1;
+                                    if ((int)(s3_ls_8a1918y - (unsigned int)(result_signal_base_scratch[MOE_RANKS + s3_own_06dfc3y] + (unsigned long long)((s3_c_10c2day + 1) / 2))) >= 0) {
+                                        s3_ok_6d711ay = 1;
                                     } else {
                                         s3_lsa_wait = 1;
                                     }
                                 }
                             } else {
-                                int s3_ord_099205_1 = 1;
-                                if (s3_c_909369_1 >= 0) {
-                                    if (s3_dual_b0ccd7_1 != 0) {
-                                        s3_ord_099205_1 = s3_c_909369_1 / 2 + 2;
+                                int s3_ord_f40e49y = 1;
+                                if (s3_c_10c2day >= 0) {
+                                    if (s3_dual_5eec72y != 0) {
+                                        s3_ord_f40e49y = s3_c_10c2day / 2 + 2;
                                     } else {
-                                        s3_ord_099205_1 = s3_c_909369_1 + 2;
+                                        s3_ord_f40e49y = s3_c_10c2day + 2;
                                     }
                                 }
-                                if ((int)peer_transport[rank * world_size + s3_own_11b679_1] == 2) {
+                                if ((int)peer_transport[rank * world_size + s3_own_06dfc3y] == 2) {
                                     // gin_read_signal: acquire, 64-bit signal snapshot
-                                    uint64_t _gin_signal_542f4b_13;
+                                    uint64_t _gin_signal_4b823ey;
                                     {
                                         ncclGin __gin{*(gin_dev_comm), (int)(0)};
-                                        _gin_signal_542f4b_13 = __gin.readSignal((ncclGinSignal_t)(MOE_X_96e08f30e3 + s3_own_11b679_1), 64, cuda::memory_order_acquire);
+                                        _gin_signal_4b823ey = __gin.readSignal((ncclGinSignal_t)(MOE_X_96e08f30e3 + s3_own_06dfc3y), 64, cuda::memory_order_acquire);
                                     }
-                                    unsigned long long s3_gv_1_ac557f = _gin_signal_542f4b_13;
-                                    if (s3_gv_1_ac557f >= result_signal_base_scratch[s3_own_11b679_1] + (unsigned long long)s3_ord_099205_1) {
-                                        s3_ok_fd7c07_1 = 1;
+                                    unsigned long long s3_gv_1_ac557f = _gin_signal_4b823ey;
+                                    if (s3_gv_1_ac557f >= result_signal_base_scratch[s3_own_06dfc3y] + (unsigned long long)s3_ord_f40e49y) {
+                                        s3_ok_6d711ay = 1;
                                     }
                                 } else {
-                                    unsigned int* s3_lp_1_7e8279 = lsa_signals + ((MOE_X_fc0237aef9 + s3_own_11b679_1) * 32);
-                                    unsigned int _load_acquire_73f1e8_8;
-                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_8) : "l"(reinterpret_cast<unsigned int*>(s3_lp_1_7e8279)) : "memory");
-                                    unsigned int s3_ls_1_9256cd = _load_acquire_73f1e8_8;
-                                    if ((int)(s3_ls_1_9256cd - (unsigned int)(result_signal_base_scratch[s3_own_11b679_1] + (unsigned long long)s3_ord_099205_1)) >= 0) {
-                                        s3_ok_fd7c07_1 = 1;
+                                    unsigned int* s3_lp_1_7e8279 = lsa_signals + ((MOE_X_fc0237aef9 + s3_own_06dfc3y) * 32);
+                                    unsigned int _load_acquire_f77910x;
+                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_f77910x) : "l"(reinterpret_cast<unsigned int*>(s3_lp_1_7e8279)) : "memory");
+                                    unsigned int s3_ls_1_9256cd = _load_acquire_f77910x;
+                                    if ((int)(s3_ls_1_9256cd - (unsigned int)(result_signal_base_scratch[s3_own_06dfc3y] + (unsigned long long)s3_ord_f40e49y)) >= 0) {
+                                        s3_ok_6d711ay = 1;
                                     } else {
                                         s3_lsa_wait = 1;
                                     }
                                 }
                             }
-                            if (s3_ok_fd7c07_1 != 0) {
+                            if (s3_ok_6d711ay != 0) {
                                 {
-                                    unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (s3_own_11b679_1);
+                                    unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (s3_own_06dfc3y);
                                     unsigned int _gc_old;
                                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                 }
                                 s3_prog = 1;
-                                s3_k_996f2c_1 += 1;
-                                if (s3_k_996f2c_1 > s3_cnt_b0ffb8_1) {
+                                s3_k_aa4508y += 1;
+                                if (s3_k_aa4508y > s3_cnt_50f62cy) {
                                     {
-                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_ready) + (s3_own_11b679_1);
+                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_ready) + (s3_own_06dfc3y);
                                         unsigned int _gc_old;
                                         asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                     }
                                 }
                             }
                         }
-                        if (s3_k_996f2c_2 <= s3_cnt_b0ffb8_2) {
+                        if (s3_k_aa4508y_1 <= s3_cnt_50f62cy_1) {
                             s3_pend = 1;
-                            int s3_c_909369_2 = s3_k_996f2c_2 - 2;
-                            int s3_ok_fd7c07_2 = 0;
-                            if (s3_dual_b0ccd7_2 != 0 && s3_c_909369_2 >= 0 && (s3_c_909369_2 & 1) == 1) {
-                                if ((int)peer_transport[rank * world_size + s3_own_11b679_2] == 2) {
+                            int s3_c_10c2day_1 = s3_k_aa4508y_1 - 2;
+                            int s3_ok_6d711ay_1 = 0;
+                            if (s3_dual_5eec72y_1 != 0 && s3_c_10c2day_1 >= 0 && (s3_c_10c2day_1 & 1) == 1) {
+                                if ((int)peer_transport[rank * world_size + s3_own_b6881fy] == 2) {
                                     // gin_read_signal: acquire, 64-bit signal snapshot
-                                    uint64_t _gin_signal_542f4b_14;
+                                    uint64_t _gin_signal_ecabf9y_2;
                                     {
                                         ncclGin __gin{*(gin_dev_comm), (int)(1)};
-                                        _gin_signal_542f4b_14 = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + s3_own_11b679_2), 64, cuda::memory_order_acquire);
+                                        _gin_signal_ecabf9y_2 = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + s3_own_b6881fy), 64, cuda::memory_order_acquire);
                                     }
-                                    unsigned long long s3_gv_b56b96_2 = _gin_signal_542f4b_14;
-                                    if (s3_gv_b56b96_2 >= result_signal_base_scratch[MOE_RANKS + s3_own_11b679_2] + (unsigned long long)((s3_c_909369_2 + 1) / 2)) {
-                                        s3_ok_fd7c07_2 = 1;
+                                    unsigned long long s3_gv_1426afy_1 = _gin_signal_ecabf9y_2;
+                                    if (s3_gv_1426afy_1 >= result_signal_base_scratch[MOE_RANKS + s3_own_b6881fy] + (unsigned long long)((s3_c_10c2day_1 + 1) / 2)) {
+                                        s3_ok_6d711ay_1 = 1;
                                     }
                                 } else {
-                                    unsigned int* s3_lp_5fe2f6_2 = lsa_signals + ((MOE_X_5116877e34 + s3_own_11b679_2) * 32);
-                                    unsigned int _load_acquire_73f1e8_9;
-                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_9) : "l"(reinterpret_cast<unsigned int*>(s3_lp_5fe2f6_2)) : "memory");
-                                    unsigned int s3_ls_3294f2_2 = _load_acquire_73f1e8_9;
-                                    if ((int)(s3_ls_3294f2_2 - (unsigned int)(result_signal_base_scratch[MOE_RANKS + s3_own_11b679_2] + (unsigned long long)((s3_c_909369_2 + 1) / 2))) >= 0) {
-                                        s3_ok_fd7c07_2 = 1;
+                                    unsigned int* s3_lp_3f6436y_1 = lsa_signals + ((MOE_X_5116877e34 + s3_own_b6881fy) * 32);
+                                    unsigned int _load_acquire_94a0f9y_2;
+                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_94a0f9y_2) : "l"(reinterpret_cast<unsigned int*>(s3_lp_3f6436y_1)) : "memory");
+                                    unsigned int s3_ls_8a1918y_1 = _load_acquire_94a0f9y_2;
+                                    if ((int)(s3_ls_8a1918y_1 - (unsigned int)(result_signal_base_scratch[MOE_RANKS + s3_own_b6881fy] + (unsigned long long)((s3_c_10c2day_1 + 1) / 2))) >= 0) {
+                                        s3_ok_6d711ay_1 = 1;
                                     } else {
                                         s3_lsa_wait = 1;
                                     }
                                 }
                             } else {
-                                int s3_ord_099205_2 = 1;
-                                if (s3_c_909369_2 >= 0) {
-                                    if (s3_dual_b0ccd7_2 != 0) {
-                                        s3_ord_099205_2 = s3_c_909369_2 / 2 + 2;
+                                int s3_ord_2fb212y = 1;
+                                if (s3_c_10c2day_1 >= 0) {
+                                    if (s3_dual_5eec72y_1 != 0) {
+                                        s3_ord_2fb212y = s3_c_10c2day_1 / 2 + 2;
                                     } else {
-                                        s3_ord_099205_2 = s3_c_909369_2 + 2;
+                                        s3_ord_2fb212y = s3_c_10c2day_1 + 2;
                                     }
                                 }
-                                if ((int)peer_transport[rank * world_size + s3_own_11b679_2] == 2) {
+                                if ((int)peer_transport[rank * world_size + s3_own_b6881fy] == 2) {
                                     // gin_read_signal: acquire, 64-bit signal snapshot
-                                    uint64_t _gin_signal_542f4b_15;
+                                    uint64_t _gin_signal_eb07dcy;
                                     {
                                         ncclGin __gin{*(gin_dev_comm), (int)(0)};
-                                        _gin_signal_542f4b_15 = __gin.readSignal((ncclGinSignal_t)(MOE_X_96e08f30e3 + s3_own_11b679_2), 64, cuda::memory_order_acquire);
+                                        _gin_signal_eb07dcy = __gin.readSignal((ncclGinSignal_t)(MOE_X_96e08f30e3 + s3_own_b6881fy), 64, cuda::memory_order_acquire);
                                     }
-                                    unsigned long long s3_gv_2_c1e4a9 = _gin_signal_542f4b_15;
-                                    if (s3_gv_2_c1e4a9 >= result_signal_base_scratch[s3_own_11b679_2] + (unsigned long long)s3_ord_099205_2) {
-                                        s3_ok_fd7c07_2 = 1;
+                                    unsigned long long s3_gv_2_c1e4a9 = _gin_signal_eb07dcy;
+                                    if (s3_gv_2_c1e4a9 >= result_signal_base_scratch[s3_own_b6881fy] + (unsigned long long)s3_ord_2fb212y) {
+                                        s3_ok_6d711ay_1 = 1;
                                     }
                                 } else {
-                                    unsigned int* s3_lp_2_25a9ad = lsa_signals + ((MOE_X_fc0237aef9 + s3_own_11b679_2) * 32);
-                                    unsigned int _load_acquire_73f1e8_10;
-                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_10) : "l"(reinterpret_cast<unsigned int*>(s3_lp_2_25a9ad)) : "memory");
-                                    unsigned int s3_ls_2_20bc5f = _load_acquire_73f1e8_10;
-                                    if ((int)(s3_ls_2_20bc5f - (unsigned int)(result_signal_base_scratch[s3_own_11b679_2] + (unsigned long long)s3_ord_099205_2)) >= 0) {
-                                        s3_ok_fd7c07_2 = 1;
+                                    unsigned int* s3_lp_2_25a9ad = lsa_signals + ((MOE_X_fc0237aef9 + s3_own_b6881fy) * 32);
+                                    unsigned int _load_acquire_57c678x;
+                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_57c678x) : "l"(reinterpret_cast<unsigned int*>(s3_lp_2_25a9ad)) : "memory");
+                                    unsigned int s3_ls_2_20bc5f = _load_acquire_57c678x;
+                                    if ((int)(s3_ls_2_20bc5f - (unsigned int)(result_signal_base_scratch[s3_own_b6881fy] + (unsigned long long)s3_ord_2fb212y)) >= 0) {
+                                        s3_ok_6d711ay_1 = 1;
                                     } else {
                                         s3_lsa_wait = 1;
                                     }
                                 }
                             }
-                            if (s3_ok_fd7c07_2 != 0) {
+                            if (s3_ok_6d711ay_1 != 0) {
                                 {
-                                    unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (s3_own_11b679_2);
+                                    unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (s3_own_b6881fy);
                                     unsigned int _gc_old;
                                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                 }
                                 s3_prog = 1;
-                                s3_k_996f2c_2 += 1;
-                                if (s3_k_996f2c_2 > s3_cnt_b0ffb8_2) {
+                                s3_k_aa4508y_1 += 1;
+                                if (s3_k_aa4508y_1 > s3_cnt_50f62cy_1) {
                                     {
-                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_ready) + (s3_own_11b679_2);
+                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_ready) + (s3_own_b6881fy);
                                         unsigned int _gc_old;
                                         asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                     }
                                 }
                             }
                         }
-                        if (s3_k_996f2c_3 <= s3_cnt_b0ffb8_3) {
+                        if (s3_k_aa4508y_2 <= s3_cnt_50f62cy_2) {
                             s3_pend = 1;
-                            int s3_c_909369_3 = s3_k_996f2c_3 - 2;
-                            int s3_ok_fd7c07_3 = 0;
-                            if (s3_dual_b0ccd7_3 != 0 && s3_c_909369_3 >= 0 && (s3_c_909369_3 & 1) == 1) {
-                                if ((int)peer_transport[rank * world_size + s3_own_11b679_3] == 2) {
+                            int s3_c_10c2day_2 = s3_k_aa4508y_2 - 2;
+                            int s3_ok_6d711ay_2 = 0;
+                            if (s3_dual_5eec72y_2 != 0 && s3_c_10c2day_2 >= 0 && (s3_c_10c2day_2 & 1) == 1) {
+                                if ((int)peer_transport[rank * world_size + s3_own_c0965dy] == 2) {
                                     // gin_read_signal: acquire, 64-bit signal snapshot
-                                    uint64_t _gin_signal_542f4b_16;
+                                    uint64_t _gin_signal_ecabf9y_3;
                                     {
                                         ncclGin __gin{*(gin_dev_comm), (int)(1)};
-                                        _gin_signal_542f4b_16 = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + s3_own_11b679_3), 64, cuda::memory_order_acquire);
+                                        _gin_signal_ecabf9y_3 = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + s3_own_c0965dy), 64, cuda::memory_order_acquire);
                                     }
-                                    unsigned long long s3_gv_b56b96_3 = _gin_signal_542f4b_16;
-                                    if (s3_gv_b56b96_3 >= result_signal_base_scratch[MOE_RANKS + s3_own_11b679_3] + (unsigned long long)((s3_c_909369_3 + 1) / 2)) {
-                                        s3_ok_fd7c07_3 = 1;
+                                    unsigned long long s3_gv_1426afy_2 = _gin_signal_ecabf9y_3;
+                                    if (s3_gv_1426afy_2 >= result_signal_base_scratch[MOE_RANKS + s3_own_c0965dy] + (unsigned long long)((s3_c_10c2day_2 + 1) / 2)) {
+                                        s3_ok_6d711ay_2 = 1;
                                     }
                                 } else {
-                                    unsigned int* s3_lp_5fe2f6_3 = lsa_signals + ((MOE_X_5116877e34 + s3_own_11b679_3) * 32);
-                                    unsigned int _load_acquire_73f1e8_11;
-                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_11) : "l"(reinterpret_cast<unsigned int*>(s3_lp_5fe2f6_3)) : "memory");
-                                    unsigned int s3_ls_3294f2_3 = _load_acquire_73f1e8_11;
-                                    if ((int)(s3_ls_3294f2_3 - (unsigned int)(result_signal_base_scratch[MOE_RANKS + s3_own_11b679_3] + (unsigned long long)((s3_c_909369_3 + 1) / 2))) >= 0) {
-                                        s3_ok_fd7c07_3 = 1;
+                                    unsigned int* s3_lp_3f6436y_2 = lsa_signals + ((MOE_X_5116877e34 + s3_own_c0965dy) * 32);
+                                    unsigned int _load_acquire_94a0f9y_3;
+                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_94a0f9y_3) : "l"(reinterpret_cast<unsigned int*>(s3_lp_3f6436y_2)) : "memory");
+                                    unsigned int s3_ls_8a1918y_2 = _load_acquire_94a0f9y_3;
+                                    if ((int)(s3_ls_8a1918y_2 - (unsigned int)(result_signal_base_scratch[MOE_RANKS + s3_own_c0965dy] + (unsigned long long)((s3_c_10c2day_2 + 1) / 2))) >= 0) {
+                                        s3_ok_6d711ay_2 = 1;
                                     } else {
                                         s3_lsa_wait = 1;
                                     }
                                 }
                             } else {
-                                int s3_ord_099205_3 = 1;
-                                if (s3_c_909369_3 >= 0) {
-                                    if (s3_dual_b0ccd7_3 != 0) {
-                                        s3_ord_099205_3 = s3_c_909369_3 / 2 + 2;
+                                int s3_ord_0d7779y = 1;
+                                if (s3_c_10c2day_2 >= 0) {
+                                    if (s3_dual_5eec72y_2 != 0) {
+                                        s3_ord_0d7779y = s3_c_10c2day_2 / 2 + 2;
                                     } else {
-                                        s3_ord_099205_3 = s3_c_909369_3 + 2;
+                                        s3_ord_0d7779y = s3_c_10c2day_2 + 2;
                                     }
                                 }
-                                if ((int)peer_transport[rank * world_size + s3_own_11b679_3] == 2) {
+                                if ((int)peer_transport[rank * world_size + s3_own_c0965dy] == 2) {
                                     // gin_read_signal: acquire, 64-bit signal snapshot
-                                    uint64_t _gin_signal_542f4b_17;
+                                    uint64_t _gin_signal_e59725y;
                                     {
                                         ncclGin __gin{*(gin_dev_comm), (int)(0)};
-                                        _gin_signal_542f4b_17 = __gin.readSignal((ncclGinSignal_t)(MOE_X_96e08f30e3 + s3_own_11b679_3), 64, cuda::memory_order_acquire);
+                                        _gin_signal_e59725y = __gin.readSignal((ncclGinSignal_t)(MOE_X_96e08f30e3 + s3_own_c0965dy), 64, cuda::memory_order_acquire);
                                     }
-                                    unsigned long long s3_gv_3_a7520e = _gin_signal_542f4b_17;
-                                    if (s3_gv_3_a7520e >= result_signal_base_scratch[s3_own_11b679_3] + (unsigned long long)s3_ord_099205_3) {
-                                        s3_ok_fd7c07_3 = 1;
+                                    unsigned long long s3_gv_3_a7520e = _gin_signal_e59725y;
+                                    if (s3_gv_3_a7520e >= result_signal_base_scratch[s3_own_c0965dy] + (unsigned long long)s3_ord_0d7779y) {
+                                        s3_ok_6d711ay_2 = 1;
                                     }
                                 } else {
-                                    unsigned int* s3_lp_3_93a685 = lsa_signals + ((MOE_X_fc0237aef9 + s3_own_11b679_3) * 32);
-                                    unsigned int _load_acquire_73f1e8_12;
-                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_12) : "l"(reinterpret_cast<unsigned int*>(s3_lp_3_93a685)) : "memory");
-                                    unsigned int s3_ls_3_147795 = _load_acquire_73f1e8_12;
-                                    if ((int)(s3_ls_3_147795 - (unsigned int)(result_signal_base_scratch[s3_own_11b679_3] + (unsigned long long)s3_ord_099205_3)) >= 0) {
-                                        s3_ok_fd7c07_3 = 1;
+                                    unsigned int* s3_lp_3_93a685 = lsa_signals + ((MOE_X_fc0237aef9 + s3_own_c0965dy) * 32);
+                                    unsigned int _load_acquire_30e556x;
+                                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_30e556x) : "l"(reinterpret_cast<unsigned int*>(s3_lp_3_93a685)) : "memory");
+                                    unsigned int s3_ls_3_147795 = _load_acquire_30e556x;
+                                    if ((int)(s3_ls_3_147795 - (unsigned int)(result_signal_base_scratch[s3_own_c0965dy] + (unsigned long long)s3_ord_0d7779y)) >= 0) {
+                                        s3_ok_6d711ay_2 = 1;
                                     } else {
                                         s3_lsa_wait = 1;
                                     }
                                 }
                             }
-                            if (s3_ok_fd7c07_3 != 0) {
+                            if (s3_ok_6d711ay_2 != 0) {
                                 {
-                                    unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (s3_own_11b679_3);
+                                    unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (s3_own_c0965dy);
                                     unsigned int _gc_old;
                                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                 }
                                 s3_prog = 1;
-                                s3_k_996f2c_3 += 1;
-                                if (s3_k_996f2c_3 > s3_cnt_b0ffb8_3) {
+                                s3_k_aa4508y_2 += 1;
+                                if (s3_k_aa4508y_2 > s3_cnt_50f62cy_2) {
                                     {
-                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_ready) + (s3_own_11b679_3);
+                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_ready) + (s3_own_c0965dy);
                                         unsigned int _gc_old;
                                         asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                     }
@@ -455,12 +455,12 @@
                         }
                         if (s3_sp_live != 0) {
                             s3_pend = 1;
-                            unsigned int _load_acquire_73f1e8_13;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_13) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                            int sp_done = _load_acquire_73f1e8_13;
-                            unsigned int _load_acquire_73f1e8_14;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_14) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                            int sp_tail = _load_acquire_73f1e8_14;
+                            unsigned int _load_acquire_360280y;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_360280y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                            int sp_done = _load_acquire_360280y;
+                            unsigned int _load_acquire_933ae6y;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_933ae6y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                            int sp_tail = _load_acquire_933ae6y;
                             if (sp_tail > sp_idx) {
                                 __threadfence_block();
                                 #pragma unroll 1
@@ -484,13 +484,13 @@
                             }
                         }
                         if (s3_prog != 0) {
-                            unsigned long long gtimer_1_8156c4_9;
-                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_8156c4_9) :: "memory");
-                            s3_t0 = gtimer_1_8156c4_9;
+                            unsigned long long gtimer_1_9e1558y;
+                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_9e1558y) :: "memory");
+                            s3_t0 = gtimer_1_9e1558y;
                         } else if (s3_lsa_wait != 0) {
-                            unsigned long long gtimer_1_8156c4_10;
-                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_8156c4_10) :: "memory");
-                            if (gtimer_1_8156c4_10 - s3_t0 > 600000000000) {
+                            unsigned long long gtimer_1_4a8689y;
+                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_4a8689y) :: "memory");
+                            if (gtimer_1_4a8689y - s3_t0 > 600000000000) {
                                 asm volatile("trap;" ::: "memory");
                             }
                         }
@@ -531,8 +531,8 @@
                             }
                         }
                         int _max_81cadb = ((source_route_counts[map_source]) > (0) ? (source_route_counts[map_source]) : (0));
-                        int _min_d1db25_11 = ((_max_81cadb) < (MOE_X_7830131351) ? (_max_81cadb) : (MOE_X_7830131351));
-                        int map_routes = _min_d1db25_11;
+                        int _min_9e4e87x = ((_max_81cadb) < (MOE_X_7830131351) ? (_max_81cadb) : (MOE_X_7830131351));
+                        int map_routes = _min_9e4e87x;
                         int _max_6b25c1 = ((map_routes) > (1) ? (map_routes) : (1));
                         int map_count = _max_6b25c1;
                         unsigned long long map_local_byte = (unsigned long long)(map_source * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)MOE_X_6df838802e;
@@ -597,56 +597,56 @@
                         } else {
                             unsigned long long lsa_dst_b04e28 = lsa_peer_ptrs[5 * world_size + map_source] + map_remote_byte;
                             unsigned long long lsa_flag_dbe169 = lsa_peer_ptrs[8 * world_size + map_source];
-                            unsigned int* lsa_remote_3f3274_1 = reinterpret_cast<unsigned int*>(lsa_flag_dbe169);
+                            unsigned int* lsa_remote_f8bacay = reinterpret_cast<unsigned int*>(lsa_flag_dbe169);
                             int lsa_channel_fe4879 = MOE_X_25bb534aec + (MOE_X_96e08f30e3 + rank);
                             int lsa_state_index_85375e = (map_source * MOE_X_5fc76dab52 + lsa_channel_fe4879) * 2;
-                            unsigned int* lsa_state_3f88f4_1 = lsa_send_state + lsa_state_index_85375e;
-                            unsigned long long gtimer_0_de31d4_31;
-                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_de31d4_31) :: "memory");
-                            unsigned long long lsa_start_1fca88_1 = gtimer_0_de31d4_31;
-                            unsigned int lsa_busy_4a2194_1 = 1;
-                            while (lsa_busy_4a2194_1 != 0) {
-                                uint32_t _atomic_cas_old_1c0ce2_1 = atomicCAS(reinterpret_cast<unsigned int*>(lsa_state_3f88f4_1), static_cast<unsigned int>(0), static_cast<unsigned int>(1));
-                                lsa_busy_4a2194_1 = _atomic_cas_old_1c0ce2_1;
-                                if (lsa_busy_4a2194_1 != 0) {
-                                    unsigned long long gtimer_1_8156c4_11;
-                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_8156c4_11) :: "memory");
-                                    if (gtimer_1_8156c4_11 - lsa_start_1fca88_1 > 600000000000) {
+                            unsigned int* lsa_state_83c5a8y = lsa_send_state + lsa_state_index_85375e;
+                            unsigned long long gtimer_0_00d6c0y_1;
+                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_00d6c0y_1) :: "memory");
+                            unsigned long long lsa_start_c47806y = gtimer_0_00d6c0y_1;
+                            unsigned int lsa_busy_c43afby = 1;
+                            while (lsa_busy_c43afby != 0) {
+                                uint32_t _atomic_cas_old_04259cy = atomicCAS(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y), static_cast<unsigned int>(0), static_cast<unsigned int>(1));
+                                lsa_busy_c43afby = _atomic_cas_old_04259cy;
+                                if (lsa_busy_c43afby != 0) {
+                                    unsigned long long gtimer_1_ee26c6y_1;
+                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_ee26c6y_1) :: "memory");
+                                    if (gtimer_1_ee26c6y_1 - lsa_start_c47806y > 600000000000) {
                                         asm volatile("trap;" ::: "memory");
                                     }
                                 }
                             }
                             __threadfence();
-                            uint8_t* lsa_pd_f62f33_1 = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
+                            uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
                             uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
                             if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
-                                unsigned int* lsa_pd32_a8d17f_1 = reinterpret_cast<unsigned int*>(lsa_pd_f62f33_1);
-                                unsigned int* lsa_ps32_fcd47e_1 = reinterpret_cast<unsigned int*>(lsa_ps_490965);
+                                unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
+                                unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
                                 {
                                     int _max_a12c7f = ((1) > (1) ? (1) : (1));
                                     #pragma unroll 1
-                                    for (int lsa_i_ca8522_1 = 0; lsa_i_ca8522_1 < _max_a12c7f; lsa_i_ca8522_1++) {
-                                        lsa_pd32_a8d17f_1[lsa_i_ca8522_1] = lsa_ps32_fcd47e_1[lsa_i_ca8522_1];
+                                    for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
+                                        lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
                                     }
                                 }
                                 #pragma unroll 4
-                                for (int lsa_tail_e42467_1 = 0; lsa_tail_e42467_1 < 4; lsa_tail_e42467_1++) {
-                                    if (lsa_tail_e42467_1 < 0) {
-                                        unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_e42467_1;
-                                        lsa_pd_f62f33_1[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
+                                for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
+                                    if (lsa_tail_680f43y < 0) {
+                                        unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
+                                        lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
                                     }
                                 }
                             } else if (1) {
                                 int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
                                 #pragma unroll 1
-                                for (int lsa_byte_0ff891_1 = 0; lsa_byte_0ff891_1 < _max_e8c8d8; lsa_byte_0ff891_1++) {
-                                    lsa_pd_f62f33_1[lsa_byte_0ff891_1] = lsa_ps_490965[lsa_byte_0ff891_1];
+                                for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
+                                    lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
                                 }
                             }
-                            unsigned int lsa_seq_50db00_1 = lsa_state_3f88f4_1[1] + 1;
-                            lsa_state_3f88f4_1[1] = lsa_seq_50db00_1;
-                            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_3f3274_1 + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_50db00_1)) : "memory");
-                            asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_3f88f4_1)), "r"(static_cast<unsigned int>(0)) : "memory");
+                            unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
+                            lsa_state_83c5a8y[1] = lsa_seq_84b040y;
+                            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
+                            asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
                         }
                     }
                 }
@@ -659,12 +659,12 @@
                         int h29_done = 0;
                         int h29_tail_seen = 0;
                         {
-                            unsigned int _load_acquire_73f1e8_15;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_15) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                            h29_done = (int)_load_acquire_73f1e8_15;
-                            unsigned int _load_acquire_73f1e8_16;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_73f1e8_16) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                            h29_tail_seen = (int)_load_acquire_73f1e8_16;
+                            unsigned int _load_acquire_82a81by;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                            h29_done = (int)_load_acquire_82a81by;
+                            unsigned int _load_acquire_97aad4y;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                            h29_tail_seen = (int)_load_acquire_97aad4y;
                         }
                         if (h29_tail_seen > h29_idx) {
                             h29_ready = 1;
@@ -673,14 +673,14 @@
                         if (h29_done != 0) {
                             break;
                         }
-                        unsigned long long gtimer_0_de31d4_32;
-                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_de31d4_32) :: "memory");
-                        unsigned long long wd_now_10f925_4 = gtimer_0_de31d4_32;
+                        unsigned long long gtimer_0_c4e315y_4;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_4) :: "memory");
+                        unsigned long long wd_now_99fb2cy_3 = gtimer_0_c4e315y_4;
                         unsigned long long wd_t0_36c7fb = h29_wait_t0;
                         if (h29_wait_t0 == 0) {
-                            wd_t0_36c7fb = wd_now_10f925_4;
+                            wd_t0_36c7fb = wd_now_99fb2cy_3;
                         }
-                        if (wd_now_10f925_4 - wd_t0_36c7fb > 600000000000) {
+                        if (wd_now_99fb2cy_3 - wd_t0_36c7fb > 600000000000) {
                             asm volatile("trap;" ::: "memory");
                         }
                         h29_wait_t0 = wd_t0_36c7fb;
@@ -720,8 +720,8 @@
                         }
                         int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
                         int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
-                        int _min_d1db25_12 = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
-                        int h29_routes = _min_d1db25_12;
+                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
+                        int h29_routes = _min_30de52x;
                         int h29_pq = 128;
                         if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
                             h29_pq = 64;
@@ -749,8 +749,8 @@
                         int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
                         int h29_put_bytes = h29_chunk_rows * MOE_X_2a3dd8915f + _min_3be609 * 128;
                         int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
-                        int _min_d1db25_13 = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
-                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_d1db25_13 * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
+                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
                         {
                             if (h29_dst_lsa != 0) {
                                 atomicMax(&protocol_error[0], 1);

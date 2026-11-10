@@ -93,8 +93,10 @@ from ......core.validation.common import (
 )
 from ......weights import MoEWeightPack
 from .cake_config import (
+    RETURN_CODECS,
     TRANSPORT_TABLE_AUTO,
     TRANSPORT_TABLE_TUNED,
+    Sm120CakeMegaMoeConfigBase,
     Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
 )
 from .cake_geometry import GeometryError, KernelParams, describe_kernel, kernel_max_rows
@@ -255,10 +257,26 @@ def scratch_specs(
     P, ES, MR, T = C["PHYSICAL_RANKS"], C["EXPERT_SLOTS"], C["MAX_ROWS"], C["MAX_TASKS"]
     PR, DC, RC = C["POOL_ROWS"], C["DISPATCH_CHUNKS"], C["RESULT_CHUNKS"]
     i32, u32, u64 = torch.int32, torch.uint32, torch.uint64
+    # Pool / intermediate row widths (POOL_ACT_WORDS, INTER_ROW_BYTES), allocated pool rows (POOL_ALLOC_ROWS)
+    # and the per-expert global-scale tail of the routing weights (EXPERT_SCALE_WORDS) depend on the
+    # activation codec: MXFP8 builds have POOL_ALLOC_ROWS == POOL_ROWS, EXPERT_SCALE_WORDS == 0; NVFP4 builds
+    # pack e2m1 rows, split the FP8 rows of the in-kernel shared expert and append [fc1_alpha | fc2_alpha |
+    # fc1_norm_const].
+    PA = C["POOL_ALLOC_ROWS"]
     specs: list[tuple[str, torch.dtype, tuple[int, ...], int | None]] = [
-        ("pool_fp8_u32", i32, (PR, C["ACTIVATION_WORDS"]), _FILL_ZERO),
+        (
+            "pool_fp8_u32",
+            i32,
+            (PA, C["POOL_ACT_WORDS"]),
+            _FILL_ZERO,
+        ),
         ("pool_sf_u32", i32, (C["SCALE_WORDS"], PR), _FILL_ZERO),
-        ("routing_weight_pool", torch.float32, (PR,), _FILL_ZERO),
+        (
+            "routing_weight_pool",
+            torch.float32,
+            (PR + C["EXPERT_SCALE_WORDS"],),
+            _FILL_ZERO,
+        ),
     ]
     for name in ("meta_source_rank", "meta_token", "meta_slot", "meta_result_index"):
         specs.append((name, i32, (PR,), _FILL_MINUS_ONE))
@@ -332,7 +350,12 @@ def scratch_specs(
     specs += [
         ("W1_D", torch.bfloat16, (PR, C["W1_N"]), _FILL_NONE),
         ("W2_D", torch.bfloat16, (PR, C["W2_N"]), _FILL_NONE),
-        ("intermediate_fp8", torch.uint8, (PR, C["INTERMEDIATE"]), _FILL_NONE),
+        (
+            "intermediate_fp8",
+            torch.uint8,
+            (PA, C["INTER_ROW_BYTES"]),
+            _FILL_NONE,
+        ),
         (
             "intermediate_sfa_u8",
             torch.uint8,
@@ -721,11 +744,15 @@ class _CakeWorkspace:
 @register_mega_kernel(KERNEL_NAME)
 class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
+    # Activation codec of the device build (MOE_ACT_CODEC): 0 MXFP8 here, 1 NVFP4 in the W4A4 subclass.
+    ACT_CODEC = 0
+    # Config class this backend accepts (the configs are siblings, not subclasses of each other).
+    CONFIG_TYPE: type = Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig
 
-    def __init__(self, config: Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig) -> None:
-        if not isinstance(config, Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig):
+    def __init__(self, config: Sm120CakeMegaMoeConfigBase) -> None:
+        if not isinstance(config, self.CONFIG_TYPE):
             raise TypeError(
-                f"{KERNEL_NAME} config must be Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig, got {type(config).__name__}"
+                f"{self.kernel_name()} config must be {self.CONFIG_TYPE.__name__}, got {type(config).__name__}"
             )
         super().__init__(config)
         self._kernel_config = config
@@ -754,12 +781,14 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 
         EP world size, global (physical) expert count, hidden size and the per-rank token
         capacity come from the fleet; intermediate size, top-k, the shared-expert
-        variant, the SwiGLU clamp and the codec overflow capacity from the kernel config;
+        variant, the SwiGLU clamp, the codec overflow capacity and the return codec from the
+        kernel config;
         ``lsa_copiers`` (copier instances only) from the transport table.  The kernel's
         row capacity is ``max_tokens_per_rank`` rounded up to a multiple of 128.
         """
 
         config = self._kernel_config
+        activation, act_p0, act_p1 = config.activation_parameters()
         return KernelParams(
             ranks=world_size,
             experts=fleet_params.num_experts,
@@ -769,8 +798,13 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             intermediate=config.intermediate_size,
             shared_expert=config.variant == "fp8shared",
             swiglu_limit=config.swiglu_limit,
-            codec_ovf_blocks=config.codec_overflow_blocks,
+            codec_ovf_blocks=config.kernel_codec_overflow_blocks,
             lsa_copiers=lsa_copiers,
+            activation=activation,
+            act_p0=act_p0,
+            act_p1=act_p1,
+            return_codec=RETURN_CODECS[config.return_codec],
+            act_codec=self.ACT_CODEC,
         )
 
     def _describe(
@@ -786,7 +820,9 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 f"num_experts={fleet_params.num_experts}, hidden={fleet_params.token_hidden_size}, "
                 f"intermediate={self._kernel_config.intermediate_size}, top_k={self._kernel_config.top_k}, "
                 f"swiglu_limit={self._kernel_config.swiglu_limit}, "
+                f"activation={self._kernel_config.activation}, "
                 f"codec_overflow_blocks={self._kernel_config.codec_overflow_blocks}, "
+                f"return_codec={self._kernel_config.return_codec}, "
                 f"lsa_copiers={lsa_copiers}, "
                 f"max_tokens_per_rank={fleet_params.max_tokens_per_rank}): {error}"
             ) from error
@@ -871,6 +907,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         config = self._kernel_config
         return (
             KERNEL_NAME,
+            self.ACT_CODEC,  # a W4A8 and an NVFP4 layer must not share a workspace (different staging buffers)
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -881,7 +918,9 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.top_k,
             config.swiglu_limit,
-            config.codec_overflow_blocks,
+            config.activation_parameters(),
+            config.kernel_codec_overflow_blocks,
+            config.return_codec,
             config.variant,
             config.transport_table,
             knobs_pool_key(config.knobs),
@@ -937,11 +976,13 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 
         import torch.distributed as dist
 
-        from .cake_knob_cache import lookup_knobs, topology_digest
+        from .cake_knob_cache import lookup_knobs, topology_digest, variant_key
 
         world = session.world_size
         key = {
-            "variant": self._kernel_config.variant,
+            "variant": variant_key(
+                self._kernel_config.variant, self._kernel_config.return_codec
+            ),
             "world_size": world,
             "hidden": int(kernel["hidden"]),
             "intermediate": int(kernel["intermediate"]),
@@ -1104,9 +1145,10 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 count = int(torch.Size(entry[2]).numel())
                 views[inst][name] = raw[: count * itemsize].view(dtype).view(entry[2])
         MR, H, TK = C128["MAX_ROWS"], C128["HIDDEN"], C128["TOP_K"]
+        x_shape, sf_shape = self._activation_shapes(MR, H)
         inputs = {
-            "x_fp8": torch.zeros((MR, H), dtype=torch.uint8, device=device),
-            "x_sf": torch.zeros((MR, H // 32), dtype=torch.uint8, device=device),
+            "x_fp8": torch.zeros(x_shape, dtype=torch.uint8, device=device),
+            "x_sf": torch.zeros(sf_shape, dtype=torch.uint8, device=device),
             "topk_idx": torch.full((MR, TK), -1, dtype=torch.int64, device=device),
             "topk_weights": torch.zeros((MR, TK), dtype=torch.float32, device=device),
         }
@@ -1203,9 +1245,11 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             C = spec["constants"]
             b = views[inst_name]
             static_sources = {
+                # rows of POOL_ACT_WORDS words: H bytes (MXFP8) or H / 2 (NVFP4, plus the
+                # split shared-expert rows of POOL_ALLOC_ROWS)
                 "W1_A": b["pool_fp8_u32"]
                 .view(torch.uint8)
-                .reshape(C["POOL_ROWS"], C["HIDDEN"]),
+                .reshape(C["POOL_ALLOC_ROWS"], C["POOL_ACT_WORDS"] * 4),
                 "W1_SFA": b["pool_sf_u32"].view(torch.uint32),
                 "W1_D": b["W1_D"],
                 "W2_A": b["intermediate_fp8"],
@@ -1499,7 +1543,23 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 f"{KERNEL_NAME}: compile_tokens_per_rank={bound} is below this rank's "
                 f"{t.hidden_states.shape[0]} tokens"
             )
-        ws.staged_rows = stage_inputs(
+        ws.staged_rows = self._stage_activations(t, ws, quantize_input=quantize_input)
+        ws.staged_bound = bound
+
+    # Hooks of the activation codec (overridden by the NVFP4 W4A4 subclass).
+
+    @staticmethod
+    def _activation_shapes(
+        max_rows: int, hidden: int
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Workspace staging shapes of the activation codes and their scale bytes."""
+
+        return (max_rows, hidden), (max_rows, hidden // 32)
+
+    def _stage_activations(
+        self, t: MoEEpTensors, ws: _CakeWorkspace, *, quantize_input: bool
+    ) -> int:
+        return stage_inputs(
             t.hidden_states,
             t.topk_ids,
             t.topk_weights,
@@ -1510,7 +1570,11 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             quantize_input=quantize_input,
             scales=t.scales,
         )
-        ws.staged_bound = bound
+
+    def _before_launch(
+        self, ws: _CakeWorkspace, inst: _Instance, transformed_weights: Any
+    ) -> None:
+        """Per-call device writes ahead of the launch (stream-ordered, graph-capturable)."""
 
     def workspace_output(self, workspace: Any) -> torch.Tensor:
         return self._live(workspace).output
@@ -1605,6 +1669,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             name = entry["name"]
             if name in per_call:
                 self._write_arg(inst.arg_values, entry, per_call[name])
+        self._before_launch(ws, inst, transformed_weights)
         ws.module.launch_cooperative(
             inst.function,
             grid,
