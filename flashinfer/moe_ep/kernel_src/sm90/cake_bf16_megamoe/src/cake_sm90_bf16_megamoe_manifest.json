@@ -1012,12 +1012,12 @@
           "sha256": "019b0e26771dc6ac5f8d428ebd7dfb8ea523dfde5a0c6af150cd26d55d68c43f"
         },
         {
-          "bytes": 111,
+          "bytes": 11811,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_swap_binding.cu",
           "sha256": "93285fa7a230c24af2ff53de61288d08a537b54a371dd37e967052ba191dc812"
         }
       ],
-      "closure_sha256": "fc0b808db33e0c35de46424dbdc3a712f3525fb3f33ac96c466f7a338a238460",
+      "closure_sha256": "ad8d533c7b28b3ddf6d9752ae1b81930cd51c35850993d12443356938e56b372",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_signal_swap",
@@ -1157,12 +1157,12 @@
           "sha256": "d6e7297089a65ff8a237ada44f91b271ede8adcdd721d390f06c1a7f76a108b0"
         },
         {
-          "bytes": 117,
+          "bytes": 11841,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_swap_binding.cu",
           "sha256": "1972105d326989ac23b453d828ee694f2435141d8eb748b0ae9d83e2b4571e99"
         }
       ],
-      "closure_sha256": "712563623a5d391a60a6135a55aebf5baee8c1cb762d65dae0febbe62a8d3aee",
+      "closure_sha256": "af512c6c188f8bd112407f94c5f87a3425d05e1f3666c76da801c626c80a0e39",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_swap",
@@ -1310,12 +1310,12 @@
           "sha256": "ed3442f4661892f300e9178a60d68ee56cb653e2d4f0a760f8be42c334a53088"
         },
         {
-          "bytes": 104,
+          "bytes": 12536,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_swap_binding.cu",
           "sha256": "df207749d3f449cf2c642288b0fc0027a4080a313c4a0d47ab0020526085c183"
         }
       ],
-      "closure_sha256": "ab10d0e8eebe4be6c7685e651b9837c9d283c850f36c99434fdc443f7d66fe02",
+      "closure_sha256": "962fcf698a909316f9480deb2afac6c435913c0658e6287af11f203af1534b7e",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc2_early_swap",

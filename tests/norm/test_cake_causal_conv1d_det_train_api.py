@@ -17,7 +17,7 @@ Tests of the flashinfer public surface of the Cake packed width-4 depthwise
 causal convolution + SiLU training kernels (SM100 / SM103 / SM107): the
 ``flashinfer.cake_causal_conv1d_det_train`` facade and its re-export from the
 ``flashinfer`` top-level package.  The facade's three entry points are
-pass-throughs to ``flashinfer.cake_causal_conv1d_det_train_backend``; this module
+pass-throughs to ``flashinfer.experimental.cake.cake_causal_conv1d_det_train``; this module
 checks that identity (same objects at the top level, the backend's exact
 signatures, same bits as the backend) and leaves the numerical contract to
 ``test_cake_causal_conv1d_det_train.py``, which imports only the backend package.
@@ -32,7 +32,7 @@ import torch
 
 import flashinfer
 import flashinfer.cake_causal_conv1d_det_train
-import flashinfer.cake_causal_conv1d_det_train_backend as backend
+import flashinfer.experimental.cake.cake_causal_conv1d_det_train as backend
 from flashinfer.cake_causal_conv1d_det_train import (
     CakeCausalConv1dDetFunction,
     cake_causal_conv1d_det,
@@ -43,7 +43,7 @@ from flashinfer.cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace_bytes,
     is_cake_causal_conv1d_det_train_supported,
 )
-from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit as loader
+from flashinfer.experimental.cake.cake_causal_conv1d_det_train import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
@@ -126,6 +126,20 @@ def test_facade_signatures_mirror_the_backend() -> None:
     assert autograd["bias"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
     assert autograd["silu_grad_preactivation"].kind is inspect.Parameter.KEYWORD_ONLY
     assert backend.SILU_GRAD_PREACTIVATIONS == ("bf16", "fp32")
+    # The opt-in backward grid multiple: keyword-only, default 1 (the default grid), on the backward, the
+    # autograd entry point and both backward workspace helpers.
+    # The allowed multiples are the registry's rendered ``GRID_MULT_CHOICES``.
+    assert backend.BWD_GRID_MULTS == (1, 2, 3, 4)
+    assert backend.BWD_GRID_MULTS == backend.cake_jit.GRID_MULT_CHOICES
+    for function in (
+        cake_causal_conv1d_det_train_backward,
+        cake_causal_conv1d_det,
+        cake_causal_conv1d_det_train_backward_workspace_bytes,
+        flashinfer.cake_causal_conv1d_det_train.cake_causal_conv1d_det_train_backward_workspace,
+    ):
+        parameter = inspect.signature(function).parameters["bwd_grid_mult"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, function
+        assert parameter.default == 1, function
 
 
 def test_facade_entry_points_match_the_backend() -> None:
@@ -154,6 +168,12 @@ def test_facade_entry_points_match_the_backend() -> None:
     dx, dw = cake_causal_conv1d_det_train_backward(x, w, cu, dy)
     dx_backend, dw_backend = backend.cake_causal_conv1d_det_train_backward(x, w, cu, dy)
     assert torch.equal(dx, dx_backend) and torch.equal(dw, dw_backend)
+    dx3, dw3 = cake_causal_conv1d_det_train_backward(x, w, cu, dy, bwd_grid_mult=3)
+    dx3_backend, dw3_backend = backend.cake_causal_conv1d_det_train_backward(
+        x, w, cu, dy, bwd_grid_mult=3
+    )
+    assert torch.equal(dx3, dx3_backend) and torch.equal(dw3, dw3_backend)
+    assert torch.equal(dx3, dx)
     assert torch.equal(
         cake_causal_conv1d_det(x, w, cu), backend.cake_causal_conv1d_det(x, w, cu)
     )

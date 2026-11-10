@@ -48,16 +48,21 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_REDUCE_SMEM_OFF 0
 #define SMEM_REDUCE_SMEM_STAGE_BYTES 132
 #define SMEM_REDUCE_SMEM_STRIDE 132
 #define SMEM_RMS_SCALAR_OFF 132
 #define SMEM_RMS_SCALAR_STAGE_BYTES 4
 #define SMEM_RMS_SCALAR_STRIDE 4
+#if __CUDA_ARCH__ == 1030
+#define SMEM_RMS_PARTIALS_OFF 136
+#define SMEM_RMS_PARTIALS_STAGE_BYTES 32
+#define SMEM_RMS_PARTIALS_STRIDE 32
+#else
 #define SMEM_RMS_SLOTS_OFF 0
 #define SMEM_RMS_SLOTS_STAGE_BYTES 256
 #define SMEM_RMS_SLOTS_STRIDE 256
+#endif
 #define SMEM_TOTAL 256
 #define THREADS 256
 #define LAUNCH_MIN_BLOCKS 2
@@ -103,7 +108,10 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_bf16_lat_t1f(__nv_bfloat16* __restric
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
 
+#if __CUDA_ARCH__ == 1030
+#else
     __shared__ __align__(16) unsigned char smem_static_raw[256];
+#endif
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
 #if __CUDA_ARCH__ == 1000
@@ -113,7 +121,11 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_bf16_lat_t1f(__nv_bfloat16* __restric
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
+#if __CUDA_ARCH__ == 1030
+    const int mbar_base = smem + 168;
+#else
     const int mbar_base = smem + 136;
+#endif
     #define rms_exchange_addr (mbar_base + 0)
 
     const int bid = blockIdx.x;
@@ -130,8 +142,13 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_bf16_lat_t1f(__nv_bfloat16* __restric
     const int reduce_smem_addr = smem + 0;
     float* rms_scalar = reinterpret_cast<float*>(smem_raw + 132);
     const int rms_scalar_addr = smem + 132;
+#if __CUDA_ARCH__ == 1030
+    float* rms_partials = reinterpret_cast<float*>(smem_raw + 136);
+    const int rms_partials_addr = smem + 136;
+#else
     float* rms_slots = reinterpret_cast<float*>(smem_static_raw + 0);
     const int rms_slots_addr = (int)(unsigned long long)__cvta_generic_to_shared(rms_slots);
+#endif
     if (warp == 0) {
         if (elect_sync()) {
             mbarrier_init(rms_exchange_addr, 1);
@@ -2982,6 +2999,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_bf16_lat_t1f(__nv_bfloat16* __restric
             int access_3 = cluster_id * 896 + (unsigned int)lane_access;
             unsigned int rms_trip = 0;
             unsigned int rms_exchange_rms_trip = 0;
+#if __CUDA_ARCH__ == 1030
+#else
             if (tid == 0) {
                 #pragma unroll
                 for (int column = 7; column < 8; column++) {
@@ -2989,6 +3008,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_bf16_lat_t1f(__nv_bfloat16* __restric
                     reduce_smem[8 + column] = 0.0f;
                 }
             }
+#endif
             unsigned int _phase_rms_exchange = 0;
             #pragma unroll 1
             for (int token_1 = cluster_id; token_1 < tokens; token_1 += (int)num_clusters) {
@@ -3199,30 +3219,78 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_bf16_lat_t1f(__nv_bfloat16* __restric
                     _warp_reduce_88 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_88, offset);
                 square_sum = _warp_reduce_88;
                 int rms_parity = (int)(rms_trip & 1);
+#if __CUDA_ARCH__ == 1030
+#else
                 int slot_base = rms_parity * 32;
+#endif
                 if (lane == 0) {
+#if __CUDA_ARCH__ == 1030
+                    reduce_smem[rms_parity * 7 + warp] = square_sum;
+#else
                     reduce_smem[rms_parity * 8 + warp] = square_sum;
+#endif
                 }
                 asm volatile("bar.sync 1, 224;" ::: "memory");
+#if __CUDA_ARCH__ == 1030
+                float block_sum = 0.0f;
+                if (tid < 7) {
+                    block_sum = reduce_smem[rms_parity * 7 + tid];
+                }
+                float _warp_reduce_89 = block_sum;
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    _warp_reduce_89 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_89, offset);
+                block_sum = _warp_reduce_89;
+                int slot_base = rms_parity * 4;
+                if (tid < 4) {
+                    uint32_t _cluster_mapa_90;
+#else
                 if (tid < 8) {
                     int gather = rms_parity * 8 + tid % 2 * 4;
                     uint32_t _cluster_mapa_89;
+#endif
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
+#if __CUDA_ARCH__ == 1030
+                        : "=r"(_cluster_mapa_90) : "r"(rms_partials_addr), "r"(tid));
+                    uint32_t _mbar_peer_91;
+#else
                         : "=r"(_cluster_mapa_89) : "r"(rms_slots_addr), "r"(tid / 2));
                     uint32_t _mbar_peer_90;
+#endif
                     asm(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
+#if __CUDA_ARCH__ == 1030
+                        : "=r"(_mbar_peer_91) : "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(tid));
+#else
                         : "=r"(_mbar_peer_90) : "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(tid / 2));
+#endif
                     asm volatile(
+#if __CUDA_ARCH__ == 1030
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
+                        :: "r"(_cluster_mapa_90 + (unsigned int)((slot_base + cta_rank) * 4)), "f"(block_sum), "r"(_mbar_peer_91) : "memory");
+#else
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
                         :: "r"(_cluster_mapa_89 + (unsigned int)((slot_base + cta_rank * 8 + tid % 2 * 4) * 4)), "r"(__float_as_uint(reduce_smem[gather])), "r"(__float_as_uint(reduce_smem[gather + 1])), "r"(__float_as_uint(reduce_smem[gather + 2])), "r"(__float_as_uint(reduce_smem[gather + 3])), "r"(_mbar_peer_90) : "memory");
+#endif
                 }
                 if (tid == 0) {
+#if __CUDA_ARCH__ == 1030
+                    mbarrier_arrive_expect_tx(rms_exchange_addr + (rms_exchange_rms_trip) * 8, 16);
+#else
                     mbarrier_arrive_expect_tx(rms_exchange_addr + (rms_exchange_rms_trip) * 8, 128);
+#endif
                 }
                 asm volatile("{ .reg .pred P1; WAIT: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64 P1, [%0], %1, %2; @P1 bra.uni DONE; bra.uni WAIT; DONE: }" :: "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(uint32_t(_phase_rms_exchange)), "r"(uint32_t(10000000)) : "memory");
                 asm volatile("fence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
+#if __CUDA_ARCH__ == 1030
+                float cluster_sum = 0.0f;
+                cluster_sum = cluster_sum + rms_partials[slot_base];
+                cluster_sum = cluster_sum + rms_partials[slot_base + 1];
+                cluster_sum = cluster_sum + rms_partials[slot_base + 2];
+                cluster_sum = cluster_sum + rms_partials[slot_base + 3];
+                float rstd = rsqrtf(cluster_sum / 7168.0f + epsilon);
+#else
                 float block_sum = ((lane < 28) ? rms_slots[slot_base + lane / 7 * 8 + lane % 7] : 0.0f);
                 float _warp_reduce_91 = block_sum;
                 #pragma unroll
@@ -3230,6 +3298,7 @@ kernel_cake_trtllm_moe_allreduce_union_ws2_bf16_lat_t1f(__nv_bfloat16* __restric
                     _warp_reduce_91 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_91, offset);
                 block_sum = _warp_reduce_91;
                 float rstd = rsqrtf(block_sum / 7168.0f + epsilon);
+#endif
                 rms_trip += 1;
                 rms_exchange_rms_trip += 1;
                 if (rms_exchange_rms_trip == 2) { rms_exchange_rms_trip = 0; _phase_rms_exchange ^= 1; }

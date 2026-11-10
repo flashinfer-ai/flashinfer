@@ -51,6 +51,76 @@ def moe_gemm_backend():
     return MoeGemmBackend.TRTLLM
 
 
+@pytest.fixture(scope="module")
+def observe_swap_ab_mma_plans():
+    # K96 accumulation depends on the selected FC1/FC2 pipeline stages, including
+    # auto k_steps. Observe compilation and cache hits without changing tactics.
+    import torch
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() != (10, 3)
+        or not is_cute_dsl_available()
+    ):
+        yield
+        return
+    import cutlass.cute as cute
+    from flashinfer.fused_moe.cute_dsl.blackwell import moe_swap_ab
+    from tests.moe.test_helpers import (
+        cute_dsl_moe_swap_ab_reference as reference_module,
+    )
+
+    configs, selected = {}, {}
+    compile_kernel = cute.compile
+    reference = reference_module.cute_dsl_moe_reference
+
+    def record(compiled):
+        phase, tile = configs[id(compiled)]
+        selected[phase] = tile
+
+    def compile_observed(function, *args, **kwargs):
+        compiled = compile_kernel(function, *args, **kwargs)
+        kernel = getattr(function, "__self__", None)
+        if isinstance(kernel, moe_swap_ab.Sm100BlockScaledGroupedGemmKernel):
+            configs[id(compiled)] = (
+                kernel.scatter_output,
+                kernel.tile_k if kernel.native_mma_k == 96 else None,
+            )
+            record(compiled)
+        return compiled
+
+    class ObservedCache(dict):
+        def get(self, key, default=None):
+            compiled = super().get(key, default)
+            if compiled is not None:
+                record(compiled)
+            return compiled
+
+    def reference_observed(**kwargs):
+        if kwargs.get("sf_vec_size", 16) == 16:
+            plans = []
+            for phase, weight in ((False, "w1_weight"), (True, "w2_weight")):
+                tile = selected[phase]
+                plan = None
+                if tile is not None:
+                    k = kwargs[weight].shape[-1] * 2
+                    plan = ()
+                    for start in range(0, k, tile):
+                        extent = min(tile, k - start)
+                        plan += (96, 96) * (extent // 192)
+                        plan += (64,) * ((extent % 192) // 64)
+                plans.append(plan)
+            kwargs["mma_k_plans"] = tuple(plans)
+        return reference(**kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cute, "compile", compile_observed)
+        patch.setattr(moe_swap_ab, "_blockscaled_kernel_cache", ObservedCache())
+        patch.setattr(reference_module, "cute_dsl_moe_reference", reference_observed)
+        yield
+
+
 @pytest.fixture
 def frost_metadata_only(monkeypatch):
     """Isolate logical catalog tests from CUDA binding and device cache state."""

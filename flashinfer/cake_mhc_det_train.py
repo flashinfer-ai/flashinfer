@@ -13,12 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake four-stream mHC training forward / backward (hidden 4096, 4 streams;
-SM100 / SM103 / SM107).
+Cake four-stream mHC training forward / backward (4 streams; hidden size
+``H`` in {4096, 5120, 7168}, taken per call from ``X.shape[2]``; SM100 / SM103
+/ SM107 at all three sizes).
 
 The function (FP32 arithmetic, BF16 activation boundaries)::
 
-    u = float32(X).reshape(T, 16384)
+    u = float32(X).reshape(T, 4 * H)
     r = rsqrt(mean(u * u, axis=-1) + 1e-5)
     z = (u * r) @ fn.T                                   # [T, 24]
     pre  = sigmoid(z[:, :4]  * scale[0] + base[:4]) + 1e-6
@@ -26,7 +27,7 @@ The function (FP32 arithmetic, BF16 activation boundaries)::
     C = row_softmax((z[:, 8:] * scale[2] + base[8:]).reshape(T, 4, 4)) + 1e-6
     C = C / (column_sum(C) + 1e-6); 19 x { row-normalize; column-normalize }
     U[t, d] = BF16(sum_i pre[t, i] X[t, i, d])
-    B = external_branch(U)                               # attention / MLP, BF16 [T, 4096]
+    B = external_branch(U)                               # attention / MLP, BF16 [T, H]
     Y[t, j, d] = BF16(post[t, j] B[t, d] + sum_i C[t, i, j] X[t, i, d])
 
 Forward: ``forward_prepare`` (``U`` and a 256-byte FP32 statistics record per
@@ -50,14 +51,33 @@ recomputes them in the backward; with
 recomputed from ``X`` in the backward with bitwise the same gradients
 (checkpoint replay).  The finish node's backward hands ``dY`` and the gradient
 statistics to the prepare node's backward on autograd edges, so nothing of a
-connection stays alive once its backward has run.  Workspaces are caller-held
-(``*_workspace_bytes`` / ``*_workspace``) and the submit path allocates
-nothing.  All tensors are contiguous: ``X``, ``Y``, ``dY``, ``dX`` BF16
-``[T, 4, 4096]``; ``U``, ``B``, ``dU``, ``dB`` BF16 ``[T, 4096]``; ``fn`` FP32
-``[24, 16384]``; ``scale`` FP32 ``[3]``; ``base`` FP32 ``[24]``.  The token
-count ``T`` is a runtime scalar: it may change between calls, ``T == 1`` is
-supported and ``T == 0`` returns empty outputs without launching.  Every
-behaviour switch is a keyword argument with its default in the docstring.
+connection stays alive once its backward has run; at hidden 4096, up to 4096
+tokens on SM100 / SM107 and up to 2048 tokens on SM103, the replay also writes
+the transposed split of ``fn`` (3 MiB), handed on one more edge, so the
+backward does not split ``fn`` again.  Workspaces are caller-held
+(``*_workspace_bytes`` / ``*_workspace``) and, with preallocated outputs,
+the submit path allocates nothing; a workspace serves the calls of the
+hidden size it was sized for
+(``hidden=``, default 4096) up to ``T`` tokens.  All tensors are contiguous:
+``X``, ``Y``, ``dY``, ``dX`` BF16 ``[T, 4, H]``; ``U``, ``B``, ``dU``, ``dB``
+BF16 ``[T, H]``; ``fn`` FP32 ``[24, 4H]``; ``scale`` FP32 ``[3]``; ``base``
+FP32 ``[24]``.  The token count ``T`` is a runtime scalar: it may change
+between calls, ``T == 1`` is supported and ``T == 0`` returns empty outputs
+without launching.  Calls of different hidden sizes may be mixed in one
+process.  Every behaviour
+switch is a keyword argument with its default in the docstring.
+
+Names and mode: this is the deterministic module.  Its backend package
+``flashinfer.experimental.cake.cake_mhc_det_train`` is imported on the first
+call or attribute access (importing this module imports no backend).  Every
+name this module exports carries the mode word ``det``
+(``cake_mhc_det_train_*``, ``CakeMHCDet*Function``) except the constants
+``ARCHES`` and ``SUPPORTED_COMPUTE_CAPABILITIES``; former names have no alias
+(FlashInfer 0.7.3's ``flashinfer.cake_mhc_train`` names,
+``CakeMHCDetTrain{Prepare,Finish}Function`` and ``route_key`` fail at import).
+The entry points take no ``deterministic`` keyword, give the same results
+under ``torch.use_deterministic_algorithms(True)`` and raise no alert.  The
+non-deterministic mode is ``flashinfer.cake_mhc_nondet_train``.
 
 Usage::
 
@@ -74,49 +94,113 @@ Usage::
     Y = cake_mhc_det_train_finish(X, branch(U), handle)
 
     # caller-owned workspaces (zero-initialized; the kernels leave them reusable)
-    ws_f = cake_mhc_det_train_forward_workspace(T, X.device)
-    ws_b = cake_mhc_det_train_backward_workspace(T, X.device)
+    ws_f = cake_mhc_det_train_forward_workspace(T, X.device, hidden=X.shape[2])
+    ws_b = cake_mhc_det_train_backward_workspace(T, X.device, hidden=X.shape[2])
 
 The model's head, the stream mean ``Y = mean_i X[:, i, :]`` of the last
-layer's four streams, has its own kernels (hidden 4096, 5120 and 7168; 4096
-on SM107), bit for bit torch's BF16 ``X.mean(dim=1)`` and its gradient::
-
-    Y = cake_mhc_det_train_head_forward(X)                    # BF16 [T, H] from [T, 4, H]
-    dX = cake_mhc_det_train_head_backward(dY)                 # dX[:, i] = BF16(dY / 4)
-    cake_mhc_det_train_head_backward(dY, dX=dX, accumulate=True)   # dX += BF16(dY / 4)
-    Y = cake_mhc_det_train_head(X)                            # autograd
+layer's four streams, is the module :mod:`flashinfer.cake_mhc_head_det_train`.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import functools
+from typing import Any, Optional
 
 import torch
 
-from . import cake_mhc_det_train_backend as _backend
-from . import cake_mhc_det_train_head_backend as _head_backend
 from .api_logging import flashinfer_api
-from .cake_mhc_det_train_backend import (  # noqa: F401
-    ARCHES,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    CakeMHCDetTrainFinishFunction,
-    CakeMHCDetTrainPrepareFunction,
-    cake_mhc_det_train_backward_workspace,
-    cake_mhc_det_train_backward_workspace_bytes,
-    cake_mhc_det_train_forward_workspace,
-    cake_mhc_det_train_forward_workspace_bytes,
-    cake_mhc_det_train_reset_workspace,
-    is_cake_mhc_det_train_supported,
-    route_key,
-)
-from .cake_mhc_det_train_head_backend import (  # noqa: F401
-    CakeMHCDetTrainHeadFunction,
-    is_cake_mhc_det_train_head_supported,
-)
+
+# The default hidden size of the workspace helpers: the backend's ``cake_jit.HIDDEN``,
+# spelled here so that defining the entry points imports no backend (a test checks
+# that the two agree).
+_HIDDEN = 4096
+
+
+# The backend package is imported on first use and cached: a call does not repeat the import.
+@functools.cache
+def _pkg():
+    from .experimental.cake import cake_mhc_det_train  # noqa: PLC0415 - the backend package, imported on first use
+
+    return cake_mhc_det_train
+
 
 # The stable entry points are real ``def``s here (public-API tooling reads the
 # decorated signatures of this module); their bodies live in the self-contained
-# backend package next to the generated CUDA sources.
+# backend package next to the generated CUDA sources, imported on the first call.
+
+
+@flashinfer_api
+def cake_mhc_det_train_forward_workspace_bytes(
+    T: int, device: torch.device, *, hidden: int = _HIDDEN
+) -> int:
+    r"""Bytes of the caller-owned forward workspace for up to ``T`` tokens of hidden size ``hidden``.
+
+    The forward routes (``forward_prepare`` and the ``forward_stats`` replay)
+    hold one 256-byte ticket region (first, at the same offset for every token
+    count), the BF16 pieces of ``fn`` in the mapping operand layout and the
+    FP32 per-K-unit partials of the mapping pass.  The ticket words must be
+    zero on first use (allocate with ``torch.zeros`` or
+    :func:`cake_mhc_det_train_forward_workspace`); the kernels leave them zero.
+
+    Parameters
+    ----------
+    T : int
+        Largest token count the buffer serves.  The size is the maximum over
+        every token count up to ``T``, so the buffer also serves every smaller
+        one (and CUDA graph replays at a smaller ``T``); ``T == 0`` needs no
+        workspace (nothing is launched).
+    device : torch.device
+        CUDA device of the calls.
+    hidden : int
+        Hidden size ``H`` of the calls the buffer serves (``X.shape[2]``;
+        default ``4096``): a hidden size the device's architecture exports
+        (4096, 5120 or 7168 on SM100 / SM103 / SM107), else
+        ``ValueError``.  The ``fn`` pieces and the partials scale with ``4 H``;
+        every call checks the buffer against its own ``H`` and ``T``, so a
+        buffer sized for one ``H`` is refused (``ValueError``) by a call of a
+        larger ``H`` it is too small for.
+
+    Returns
+    -------
+    The size of the forward workspace in bytes.
+    """
+
+    return _pkg().cake_mhc_det_train_forward_workspace_bytes(T, device, hidden=hidden)
+
+
+@flashinfer_api
+def cake_mhc_det_train_backward_workspace_bytes(
+    T: int, device: torch.device, *, hidden: int = _HIDDEN
+) -> int:
+    r"""Bytes of the caller-owned backward workspace for up to ``T`` tokens of hidden size ``hidden``.
+
+    The ``backward_finish`` route holds one 256-byte ticket region (first, at
+    the same offset for every token count), the transposed BF16 pieces of
+    ``fn``, the per-token records of the token-owner pass (``dz'`` pieces and
+    the per-token scalars, padded to a multiple of 128 rows), the per-CTA
+    parameter partials and the per-chunk FP32 partials of ``dfn``.  The ticket
+    words must be zero on first use (allocate with ``torch.zeros`` or
+    :func:`cake_mhc_det_train_backward_workspace`); the kernels leave them zero.
+
+    Parameters
+    ----------
+    T : int
+        Largest token count the buffer serves (the size is the maximum over
+        every token count up to ``T``); ``T == 0`` needs no workspace.
+    device : torch.device
+        CUDA device of the calls.
+    hidden : int
+        Hidden size ``H`` of the calls the buffer serves (``X.shape[2]``;
+        default ``4096``), as in
+        :func:`cake_mhc_det_train_forward_workspace_bytes`: a buffer sized for
+        one ``H`` is refused by a call of a larger ``H`` it is too small for.
+
+    Returns
+    -------
+    The size of the backward workspace in bytes.
+    """
+
+    return _pkg().cake_mhc_det_train_backward_workspace_bytes(T, device, hidden=hidden)
 
 
 @flashinfer_api
@@ -138,10 +222,12 @@ def cake_mhc_det_train_forward_prepare(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams (``T`` is a runtime
-        scalar; ``T == 0`` returns empty outputs without launching).
+        BF16 ``[T, 4, H]`` contiguous residual streams (``T`` is a runtime
+        scalar; ``T == 0`` returns empty outputs without launching).  The
+        hidden size ``H = X.shape[2]`` is 4096, 5120 or 7168 on SM100 / SM103
+        / SM107.
     fn : torch.Tensor
-        FP32 ``[24, 16384]`` contiguous mapping matrix.
+        FP32 ``[24, 4H]`` contiguous mapping matrix.
     scale : torch.Tensor
         FP32 ``[3]`` group scales of the pre / post / Sinkhorn logits.
     base : torch.Tensor
@@ -157,12 +243,12 @@ def cake_mhc_det_train_forward_prepare(
         the run-time-count programs of the coefficient and token-owner passes.  A
         count above 64 raises ``NotImplementedError``.
     out : torch.Tensor, optional
-        Preallocated BF16 ``[T, 4096]`` contiguous ``U``.
+        Preallocated BF16 ``[T, H]`` contiguous ``U``.
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
-        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_forward_workspace`;
-        a per-device default buffer is used when omitted.
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_forward_workspace`
+        (``hidden=X.shape[2]``); a per-device default buffer is used when omitted.
 
     Returns
     -------
@@ -171,7 +257,7 @@ def cake_mhc_det_train_forward_prepare(
     (256 bytes per token) that the finish and backward entry points consume.
     """
 
-    return _backend.cake_mhc_det_train_forward_prepare(
+    return _pkg().cake_mhc_det_train_forward_prepare(
         X,
         fn,
         scale,
@@ -203,9 +289,9 @@ def cake_mhc_det_train_forward_stats(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams.
+        BF16 ``[T, 4, H]`` contiguous residual streams.
     fn : torch.Tensor
-        FP32 ``[24, 16384]`` contiguous mapping matrix.
+        FP32 ``[24, 4H]`` contiguous mapping matrix.
     scale : torch.Tensor
         FP32 ``[3]`` group scales.
     base : torch.Tensor
@@ -220,7 +306,8 @@ def cake_mhc_det_train_forward_stats(
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
-        Caller-owned forward workspace (:func:`cake_mhc_det_train_forward_workspace`).
+        Caller-owned forward workspace (:func:`cake_mhc_det_train_forward_workspace`,
+        ``hidden=X.shape[2]``).
 
     Returns
     -------
@@ -229,7 +316,7 @@ def cake_mhc_det_train_forward_stats(
     same device (the same work partition without the ``U`` write).
     """
 
-    return _backend.cake_mhc_det_train_forward_stats(
+    return _pkg().cake_mhc_det_train_forward_stats(
         X,
         fn,
         scale,
@@ -255,21 +342,21 @@ def cake_mhc_det_train_forward_finish(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams (the ``forward_prepare`` input).
+        BF16 ``[T, 4, H]`` contiguous residual streams (the ``forward_prepare`` input).
     B : torch.Tensor
-        BF16 ``[T, 4096]`` contiguous output of the external branch applied to ``U``.
+        BF16 ``[T, H]`` contiguous output of the external branch applied to ``U``.
     stats : torch.Tensor
         FP32 ``[T, 64]`` record returned by :func:`cake_mhc_det_train_forward_prepare`
         (or :func:`cake_mhc_det_train_forward_stats`).
     out : torch.Tensor, optional
-        Preallocated BF16 ``[T, 4, 4096]`` contiguous ``Y``.
+        Preallocated BF16 ``[T, 4, H]`` contiguous ``Y``.
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, 4, 4096]``; the FP32 sum is rounded once.
+    BF16 ``Y`` of shape ``[T, 4, H]``; the FP32 sum is rounded once.
     """
 
-    return _backend.cake_mhc_det_train_forward_finish(X, B, stats, out=out)
+    return _pkg().cake_mhc_det_train_forward_finish(X, B, stats, out=out)
 
 
 @flashinfer_api
@@ -287,15 +374,16 @@ def cake_mhc_det_train_backward_prepare(
     Parameters
     ----------
     dY : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous gradient of ``Y``.
+        BF16 ``[T, 4, H]`` contiguous gradient of ``Y``.
     B : torch.Tensor
-        BF16 ``[T, 4096]`` contiguous branch output of the forward.
+        BF16 ``[T, H]`` contiguous branch output of the forward.
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams of the forward.
+        BF16 ``[T, 4, H]`` contiguous residual streams of the forward
+        (``H = X.shape[2]``).
     stats : torch.Tensor
         FP32 ``[T, 64]`` record of the forward.
     dB : torch.Tensor, optional
-        Preallocated BF16 ``[T, 4096]`` contiguous output.
+        Preallocated BF16 ``[T, H]`` contiguous output.
     grad_stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 32]`` contiguous output.
 
@@ -306,7 +394,7 @@ def cake_mhc_det_train_backward_prepare(
     ``dpost[4] | dC[16] | zeros[12]`` that :func:`cake_mhc_det_train_backward_finish` consumes.
     """
 
-    return _backend.cake_mhc_det_train_backward_prepare(
+    return _pkg().cake_mhc_det_train_backward_prepare(
         dY, B, X, stats, dB=dB, grad_stats_out=grad_stats_out
     )
 
@@ -338,16 +426,17 @@ def cake_mhc_det_train_backward_finish(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams of the forward.
+        BF16 ``[T, 4, H]`` contiguous residual streams of the forward
+        (``H = X.shape[2]``).
     dY : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous gradient of ``Y``.
+        BF16 ``[T, 4, H]`` contiguous gradient of ``Y``.
     dU : torch.Tensor
-        BF16 ``[T, 4096]`` contiguous gradient of ``U`` from the branch backward.
+        BF16 ``[T, H]`` contiguous gradient of ``U`` from the branch backward.
     B : torch.Tensor, optional
-        BF16 ``[T, 4096]`` branch output of the forward; accepted for the
+        BF16 ``[T, H]`` branch output of the forward; accepted for the
         prepare / finish symmetry and validated when given, not read.
     fn : torch.Tensor
-        FP32 ``[24, 16384]`` contiguous mapping matrix of the forward.
+        FP32 ``[24, 4H]`` contiguous mapping matrix of the forward.
     scale : torch.Tensor
         FP32 ``[3]`` group scales of the forward.
     base : torch.Tensor
@@ -369,12 +458,12 @@ def cake_mhc_det_train_backward_finish(
         ``True``: the caller passes all three and the fixed-order sums are added
         to their current values (reproducible across consecutive accumulations).
     workspace : torch.Tensor, optional
-        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_backward_workspace`;
-        a per-device default buffer is used when omitted.
+        Caller-owned ``uint8`` buffer from :func:`cake_mhc_det_train_backward_workspace`
+        (``hidden=X.shape[2]``); a per-device default buffer is used when omitted.
     dX : torch.Tensor, optional
-        Preallocated BF16 ``[T, 4, 4096]`` contiguous output.
+        Preallocated BF16 ``[T, 4, H]`` contiguous output.
     dfn : torch.Tensor, optional
-        Preallocated FP32 ``[24, 16384]`` contiguous output (required with ``accumulate=True``).
+        Preallocated FP32 ``[24, 4H]`` contiguous output (required with ``accumulate=True``).
     dscale : torch.Tensor, optional
         Preallocated FP32 ``[3]`` output (required with ``accumulate=True``).
     dbase : torch.Tensor, optional
@@ -389,7 +478,7 @@ def cake_mhc_det_train_backward_finish(
     or left untouched (``accumulate=True``).
     """
 
-    return _backend.cake_mhc_det_train_backward_finish(
+    return _pkg().cake_mhc_det_train_backward_finish(
         X,
         dY,
         dU,
@@ -430,9 +519,10 @@ def cake_mhc_det_train_prepare(
     Parameters
     ----------
     X : torch.Tensor
-        BF16 ``[T, 4, 4096]`` contiguous residual streams (may require gradients).
+        BF16 ``[T, 4, H]`` contiguous residual streams (may require gradients;
+        ``H = X.shape[2]``).
     fn : torch.Tensor
-        FP32 ``[24, 16384]`` contiguous mapping matrix (may require gradients).
+        FP32 ``[24, 4H]`` contiguous mapping matrix (may require gradients).
     scale : torch.Tensor
         FP32 ``[3]`` group scales (may require gradients).
     base : torch.Tensor
@@ -449,19 +539,21 @@ def cake_mhc_det_train_prepare(
         ``False``: they are dropped after the forward and recomputed from ``X``
         in the backward (checkpoint replay); the gradients are bitwise the same.
     workspace : torch.Tensor, optional
-        Caller-owned forward workspace; a per-device default when omitted.
+        Caller-owned forward workspace (``hidden=X.shape[2]``); a per-device
+        default when omitted.
     backward_workspace : torch.Tensor, optional
-        Caller-owned backward workspace; a per-device default when omitted.
+        Caller-owned backward workspace (``hidden=X.shape[2]``); a per-device
+        default when omitted.
 
     Returns
     -------
-    ``(U, handle)``: BF16 ``U`` of shape ``[T, 4096]`` and the handle of this
+    ``(U, handle)``: BF16 ``U`` of shape ``[T, H]`` and the handle of this
     prepare node for one :func:`cake_mhc_det_train_finish`.  The backward of the
     prepare node returns the single-cast ``dX`` and FP32 ``dfn``, ``dscale``,
     ``dbase``.
     """
 
-    return _backend.cake_mhc_det_train_prepare(
+    return _pkg().cake_mhc_det_train_prepare(
         X,
         fn,
         scale,
@@ -482,9 +574,9 @@ def cake_mhc_det_train_finish(X: torch.Tensor, B: torch.Tensor, handle) -> torch
     Parameters
     ----------
     X : torch.Tensor
-        The BF16 ``[T, 4, 4096]`` tensor passed to :func:`cake_mhc_det_train_prepare`.
+        The BF16 ``[T, 4, H]`` tensor passed to :func:`cake_mhc_det_train_prepare`.
     B : torch.Tensor
-        BF16 ``[T, 4096]`` output of the external branch applied to ``U`` (may require gradients).
+        BF16 ``[T, H]`` output of the external branch applied to ``U`` (may require gradients).
     handle : object
         The handle returned by :func:`cake_mhc_det_train_prepare`, for one finish.  A
         reentrant checkpoint region (``use_reentrant=True``) holds both calls or
@@ -492,131 +584,56 @@ def cake_mhc_det_train_finish(X: torch.Tensor, B: torch.Tensor, handle) -> torch
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, 4, 4096]``.  Its backward returns ``dB`` for the
+    BF16 ``Y`` of shape ``[T, 4, H]``.  Its backward returns ``dB`` for the
     branch and no gradient for ``X`` (the residual-mixing contribution is part
     of the single-cast ``dX`` of the prepare node).
     """
 
-    return _backend.cake_mhc_det_train_finish(X, B, handle)
+    return _pkg().cake_mhc_det_train_finish(X, B, handle)
 
 
-@flashinfer_api
-def cake_mhc_det_train_head_forward(
-    X: torch.Tensor, *, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    r"""The model's head: the mean of the four residual streams, ``Y = mean_i X[:, i, :]``.
-
-    ``Y[t, d] = BF16(((X[t, 0, d] + X[t, 1, d]) + X[t, 2, d] + X[t, 3, d]) * 0.25)``
-    with the sum in FP32 from zero in stream order and one rounding: bit for
-    bit torch's ``X.mean(dim=1)`` of a BF16 ``X``, signed zeros and the NaN
-    encoding included.
-
-    Parameters
-    ----------
-    X : torch.Tensor
-        BF16 ``[T, 4, H]`` contiguous residual streams, ``H`` in 4096, 5120 or
-        7168 (:func:`is_cake_mhc_det_train_head_supported`), 32-byte aligned.  ``T``
-        is a runtime scalar; ``T == 0`` returns an empty ``Y`` without
-        launching.
-    out : torch.Tensor, optional
-        Preallocated BF16 ``[T, H]`` contiguous ``Y`` (default ``None``: a new
-        tensor); it must not overlap ``X``.
-
-    Returns
-    -------
-    BF16 ``Y`` of shape ``[T, H]``.
-
-    The launch runs on the current torch stream of ``X``'s device and
-    allocates nothing beyond the default ``out``, so it can be captured in a
-    CUDA graph once its program is loaded (one eager call first).
-    """
-
-    return _head_backend.cake_mhc_det_train_head_forward(X, out=out)
+# The backend objects this module re-exports, resolved on first access so that
+# importing this module imports no backend.
+_LAZY = (
+    "ARCHES",
+    "SUPPORTED_COMPUTE_CAPABILITIES",
+    "CakeMHCDetFinishFunction",
+    "CakeMHCDetPrepareFunction",
+    "cake_mhc_det_train_backward_workspace",
+    "cake_mhc_det_train_forward_workspace",
+    "cake_mhc_det_train_reset_workspace",
+    "cake_mhc_det_train_route_key",
+    "is_cake_mhc_det_train_supported",
+)
 
 
-@flashinfer_api
-def cake_mhc_det_train_head_backward(
-    dY: torch.Tensor,
-    *,
-    dX: Optional[torch.Tensor] = None,
-    accumulate: bool = False,
-) -> torch.Tensor:
-    r"""Gradient of the head: ``dX[t, i, d] = BF16(dY[t, d] * 0.25)`` for each of the four streams.
-
-    Bit for bit torch's ``MeanBackward`` of ``X.mean(dim=1)`` (the quarter is
-    exact unless it is subnormal, and then rounds once).  With
-    ``accumulate=True`` the kernel adds instead,
-    ``dX[t, i, d] = BF16(dX[t, i, d] + BF16(dY[t, d] * 0.25))``, bit for bit
-    torch's BF16 ``dX.add_(...)`` of that gradient (autograd's accumulation
-    into an existing ``X.grad``).
-
-    Parameters
-    ----------
-    dY : torch.Tensor
-        BF16 ``[T, H]`` contiguous gradient of ``Y``, ``H`` in 4096, 5120 or
-        7168, 32-byte aligned; ``T == 0`` launches nothing.
-    dX : torch.Tensor, optional
-        BF16 ``[T, 4, H]`` contiguous gradient of ``X`` to write (default
-        ``None``: a new tensor) or, with ``accumulate=True``, to add into (then
-        required); it must not overlap ``dY``.
-    accumulate : bool
-        Add into ``dX`` instead of overwriting it (default ``False``).
-
-    Returns
-    -------
-    BF16 ``dX`` of shape ``[T, 4, H]`` (the caller's tensor when given).
-
-    The launch runs on the current torch stream of ``dY``'s device.
-    """
-
-    return _head_backend.cake_mhc_det_train_head_backward(
-        dY, dX=dX, accumulate=accumulate
-    )
+def __getattr__(name: str) -> Any:
+    if name in _LAZY:
+        return getattr(_pkg(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-@flashinfer_api
-def cake_mhc_det_train_head(X: torch.Tensor) -> torch.Tensor:
-    """Autograd-enabled :func:`cake_mhc_det_train_head_forward`: ``Y = mean_i X[:, i, :]``.
-
-    Parameters
-    ----------
-    X : torch.Tensor
-        BF16 ``[T, 4, H]`` contiguous residual streams (may require
-        gradients), ``H`` in 4096, 5120 or 7168.
-
-    Returns
-    -------
-    BF16 ``Y`` of shape ``[T, H]``.  Its backward is
-    :func:`cake_mhc_det_train_head_backward` (bit for bit torch's gradient of
-    ``X.mean(dim=1)``); the node saves no tensor, so an activation checkpoint
-    around it keeps nothing alive and its backward needs no recomputation.
-    """
-
-    return _head_backend.cake_mhc_det_train_head(X)
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY))
 
 
 __all__ = [
-    "ARCHES",
-    "SUPPORTED_COMPUTE_CAPABILITIES",
-    "CakeMHCDetTrainFinishFunction",
-    "CakeMHCDetTrainHeadFunction",
-    "CakeMHCDetTrainPrepareFunction",
+    "ARCHES",  # noqa: F822 - resolved by __getattr__
+    "SUPPORTED_COMPUTE_CAPABILITIES",  # noqa: F822
+    "CakeMHCDetFinishFunction",  # noqa: F822
+    "CakeMHCDetPrepareFunction",  # noqa: F822
     "cake_mhc_det_train_backward_finish",
     "cake_mhc_det_train_backward_prepare",
-    "cake_mhc_det_train_backward_workspace",
+    "cake_mhc_det_train_backward_workspace",  # noqa: F822
     "cake_mhc_det_train_backward_workspace_bytes",
     "cake_mhc_det_train_finish",
     "cake_mhc_det_train_forward_finish",
     "cake_mhc_det_train_forward_prepare",
     "cake_mhc_det_train_forward_stats",
-    "cake_mhc_det_train_forward_workspace",
+    "cake_mhc_det_train_forward_workspace",  # noqa: F822
     "cake_mhc_det_train_forward_workspace_bytes",
-    "cake_mhc_det_train_head",
-    "cake_mhc_det_train_head_backward",
-    "cake_mhc_det_train_head_forward",
     "cake_mhc_det_train_prepare",
-    "cake_mhc_det_train_reset_workspace",
-    "is_cake_mhc_det_train_head_supported",
-    "is_cake_mhc_det_train_supported",
-    "route_key",
+    "cake_mhc_det_train_reset_workspace",  # noqa: F822
+    "cake_mhc_det_train_route_key",  # noqa: F822
+    "is_cake_mhc_det_train_supported",  # noqa: F822
 ]

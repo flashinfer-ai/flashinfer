@@ -47,13 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_WARP_TAB_OFF 0
-#define SMEM_WARP_TAB_STAGE_BYTES 256
-#define SMEM_WARP_TAB_STRIDE 256
-#define SMEM_TOTAL 256
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -97,7 +90,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_53bb267e88a98cd4ac00(__nv_bfloat16* __restri
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* warp_tab = reinterpret_cast<float*>(smem_raw + 0);
     const int warp_tab_addr = smem + 0;
 
@@ -135,7 +128,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_53bb267e88a98cd4ac00(__nv_bfloat16* __restri
     __nv_bfloat16* c_peer1 = reinterpret_cast<__nv_bfloat16*>(c_peer_addr1);
     int idx8[8];
     {
-        const int4* _ivptr_0 = reinterpret_cast<const int4*>(idx + (slot * 8) + 0);
+        const int4* _ivptr_0 = reinterpret_cast<const int4*>(idx + slot * 8 + 0);
         int4 _ivld_0;
         _ivld_0 = *_ivptr_0;
         idx8[0 + 0] = _ivld_0.x;
@@ -156,7 +149,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_53bb267e88a98cd4ac00(__nv_bfloat16* __restri
     if (weights_fp32 != 0) {
         float _vec_load_0[4];
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(expert_weights + (slot * 8)) + 0);
+            float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(expert_weights + slot * 8) + 0);
             _vec_load_0[0 + 0] = _v4.x;
             _vec_load_0[0 + 1] = _v4.y;
             _vec_load_0[0 + 2] = _v4.z;
@@ -181,7 +174,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_53bb267e88a98cd4ac00(__nv_bfloat16* __restri
     } else {
         unsigned int _vec_load_2[4];
         {
-            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(expert_weights + (slot * 4) + 0);
+            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(expert_weights + slot * 4 + 0);
             _vec_load_2[0 + 0] = _uv4_4.x;
             _vec_load_2[0 + 1] = _uv4_4.y;
             _vec_load_2[0 + 2] = _uv4_4.z;

@@ -24,7 +24,7 @@ import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
 from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
-from ...utils import get_compute_capability
+from ...utils import check_shape_dtype_device, get_compute_capability
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -56,17 +56,35 @@ SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
     ActivationType.GegluTanh,
     ActivationType.Relu2,
+    ActivationType.ClampedRelu2,
 )
+
+# The SM90 and W4A16 epilogues have no ClampedRelu2 variant.
+SM90_CUTE_DSL_MOE_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.GegluTanh,
+    ActivationType.Relu2,
+)
+W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES = SM90_CUTE_DSL_MOE_ACTIVATION_TYPES
 
 
 def normalize_cute_dsl_moe_activation_type(
     activation_type: Union[int, ActivationType],
+    supported: Tuple[ActivationType, ...] = SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES,
+    backend: Optional[str] = None,
 ) -> Tuple[ActivationType, bool]:
+    """Normalize ``activation_type`` and return it with its gatedness.
+
+    ``supported`` narrows the accepted activations for a backend that
+    implements only a subset; ``backend`` names it in the error message.
+    """
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES:
-        expected = " or ".join(repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES)
+    if activation_type not in supported:
+        expected = " or ".join(repr(t) for t in supported)
+        where = f" for {backend}" if backend else ""
         raise ValueError(
-            f"Unsupported activation_type {activation_type!r}; expected {expected}"
+            f"Unsupported activation_type {activation_type!r}{where}; "
+            f"expected {expected}"
         )
     return activation_type, is_gated_activation(activation_type)
 
@@ -132,6 +150,38 @@ def rubin_moe_cluster_covers_one_tile(
     """
     atom_cta_m = 2 if mma_inst_shape[0] == 256 else 1
     return mma_tiler[0] == tile_size and cluster_shape_mn[0] == atom_cta_m
+
+
+def validate_cute_dsl_moe_clamped_relu2_config(
+    activation_type: ActivationType,
+    clamped_relu2_limit: Optional[torch.Tensor],
+    device: Optional[torch.device] = None,
+) -> None:
+    """Validate the ClampedRelu2 limit: a (1,) float32 tensor, as in
+    ``cutlass_fused_moe``, required with ClampedRelu2 and rejected otherwise."""
+    if activation_type == ActivationType.ClampedRelu2:
+        if clamped_relu2_limit is None:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires a one-element "
+                "clamped_relu2_limit tensor"
+            )
+        if clamped_relu2_limit.ndim != 1 or clamped_relu2_limit.numel() != 1:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires model-wide "
+                "clamped_relu2_limit with shape (1,), got "
+                f"{tuple(clamped_relu2_limit.shape)}"
+            )
+        check_shape_dtype_device(
+            clamped_relu2_limit,
+            (1,),
+            torch.float32,
+            device,
+            "ClampedRelu2 clamped_relu2_limit",
+        )
+    elif clamped_relu2_limit is not None:
+        raise ValueError(
+            "clamped_relu2_limit is supported only with ActivationType.ClampedRelu2"
+        )
 
 
 def get_max_num_tiles(

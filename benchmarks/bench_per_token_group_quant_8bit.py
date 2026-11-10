@@ -15,9 +15,10 @@ limitations under the License.
 
 Benchmark: Per-Token-Group 8-bit Quantization Backend Comparison
 
-Compares FlashInfer's ``per_token_group_quant_8bit`` cuTile backend against
+Compares FlashInfer's ``per_token_group_quant_8bit`` CUDA and cuTile backends against
 external references across a (num_tokens, hidden_dim) sweep:
 
+  - ``cuda``   : FlashInfer register-resident native CUDA backend
   - ``cutile`` : FlashInfer ``per_token_group_quant_8bit(backend="cutile")``
   - ``sgl``    : SGLang ``sgl_kernel.sgl_per_token_group_quant_8bit`` (SOTA
                  baseline used by ocean-eval's dashboard for this op)
@@ -65,6 +66,16 @@ def _has_cutile() -> bool:
         return False
 
 
+def _has_cuda() -> bool:
+    """True if the native CUDA quantization backend can be loaded."""
+    try:
+        from flashinfer.quantization import per_token_group_quant_8bit  # noqa: F401
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
 def _has_sgl() -> bool:
     """True if SGLang's sgl_kernel quantizer is importable."""
     try:
@@ -87,8 +98,9 @@ def _has_triton() -> bool:
         return False
 
 
-ALL_PROVIDERS = ["cutile", "sgl", "triton", "torch"]
+ALL_PROVIDERS = ["cuda", "cutile", "sgl", "triton", "torch"]
 _AVAIL = {
+    "cuda": _has_cuda,
     "cutile": _has_cutile,
     "sgl": _has_sgl,
     "triton": _has_triton,
@@ -127,13 +139,13 @@ def _make_execute(
     eps: float,
 ) -> Callable[[], Tuple[torch.Tensor, torch.Tensor]]:
     """Return a zero-arg callable running `provider`'s quantizer on `x`."""
-    if provider == "cutile":
+    if provider in ("cuda", "cutile"):
         from flashinfer.quantization import per_token_group_quant_8bit
 
         def run():
-            """Run the cuTile per-token-group quantizer."""
+            """Run a FlashInfer per-token-group quantizer."""
             return per_token_group_quant_8bit(
-                x, group_size, eps=eps, dst_dtype=dst_dtype, backend="cutile"
+                x, group_size, eps=eps, dst_dtype=dst_dtype, backend=provider
             )
 
     elif provider == "sgl":

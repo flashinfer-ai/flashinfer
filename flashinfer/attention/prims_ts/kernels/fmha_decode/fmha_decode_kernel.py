@@ -986,9 +986,9 @@ def _build_decode_gen_schedule(
             pipeline_config=smem_page_offsets_cfg,
             cfg=cfg,
             stage_page_ids_per_tile=stage_page_ids_per_tile,
-            # The full membership row has no static allocation extent when
-            # KV lengths are runtime. Read its immutable GMEM words on demand.
-            cache_memberships_in_smem=cfg.fixed_seqlen,
+            # Runtime query planes use a bounded prefix cache with a GMEM
+            # fallback, so its allocation never specializes sequence lengths.
+            cache_memberships_in_smem=(cfg.fixed_seqlen or cfg.query_major_memberships),
             page_idx_kv=page_idx_kv,
             page_table_stride=page_table_stride,
             num_heads_kv=num_heads_kv,
@@ -1430,6 +1430,14 @@ def _build_decode_gen_schedule(
         tmem_softmax_global1.p_ref = smem_p1
         tmem_softmax_global1.tmem_s_ref = tmem_s1
 
+    # Compact runtime splits pack partials by the launch fanout.
+    partial_split_stride = None
+    if cfg.uses_compact_split_grid and requested_splits is not None:
+        partial_split_stride = (
+            requested_splits[0]
+            if isinstance(requested_splits, tuple)
+            else requested_splits
+        )
     tmem_corr0 = TmemCorrResource(
         inst_id=0,
         cfg=cfg,
@@ -1452,6 +1460,7 @@ def _build_decode_gen_schedule(
         q_token_offset=q_token_offset,
         seq_len_q=seq_len_q,
         active_splits_kv=active_splits_kv,
+        partial_split_stride=partial_split_stride,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr0",
         sage_v_scales_ref=sage_v_scales,
@@ -1483,6 +1492,7 @@ def _build_decode_gen_schedule(
             q_token_offset=q_token_offset,
             seq_len_q=seq_len_q,
             active_splits_kv=active_splits_kv,
+            partial_split_stride=partial_split_stride,
             static_full_split_prefix=static_full_split_prefix,
             name="tmemCorr1",
             sage_v_scales_ref=sage_v_scales,
@@ -2576,8 +2586,8 @@ def _run_decode_gen_active(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    softmax_scale_operand: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -2731,9 +2741,15 @@ def _run_decode_gen_active(
     ) = _build_decode_gen_schedule(
         cfg,
         total_kv_tiles,
-        scale_softmax_log2=scale_softmax_log2,
+        scale_softmax_log2=(
+            Float32(1.0)
+            if isinstance(softmax_scale_operand, cute.Pointer)
+            else softmax_scale_operand
+        ),
         o_ptr=o_iter,
-        output_scale=output_scale,
+        output_scale=(
+            Float32(1.0) if isinstance(output_scale, cute.Pointer) else output_scale
+        ),
         partial_o_ptr=g_partial_o,
         partial_stats_ptr=g_partial_stats,
         split_kv_counter_ptr=g_split_kv_counter,
@@ -2877,6 +2893,31 @@ def _run_decode_gen_active(
             Int32(tmem_alloc_cols),
             cfg,
         )
+    # Scales are first consumed by the task bodies. Bind their device values
+    # after the producer acquire so resource initialization can overlap it.
+    if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Pointer)):
+        scale_softmax_log2 = cute.make_tensor(
+            softmax_scale_operand, cute.make_layout(1)
+        )[0] * Float32(math.log2(math.e))
+        for resource in task_manager.resources:
+            if cutlass.const_expr(
+                isinstance(
+                    resource,
+                    (
+                        TmemSResource,
+                        SmemPResource,
+                        TmemOResource,
+                        TmemSoftmaxGlobalResource,
+                        TmemCorrResource,
+                    ),
+                )
+            ):
+                resource.scale_softmax_log2 = scale_softmax_log2
+    if cutlass.const_expr(isinstance(output_scale, cute.Pointer)):
+        resolved_output_scale = cute.make_tensor(output_scale, cute.make_layout(1))[0]
+        for resource in task_manager.resources:
+            if cutlass.const_expr(isinstance(resource, TmemCorrResource)):
+                resource.output_scale = resolved_output_scale
     task_manager.run()
 
     # Every peer async-stores into an owner CTA's distributed SMEM and charges
@@ -2937,8 +2978,8 @@ def _run_decode_gen_runtime_prefix(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    softmax_scale_operand: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -3027,7 +3068,7 @@ def _run_decode_gen_runtime_prefix(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3084,7 +3125,7 @@ def _run_decode_gen_runtime_prefix(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3142,8 +3183,8 @@ def decode_gen_kernel(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    softmax_scale_operand: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -3226,6 +3267,20 @@ def decode_gen_kernel(
     q_token_base = Int32(0)
     q_tile_is_active = cutlass.Boolean(True)
     if cutlass.const_expr(not cfg.use_persistent_scheduler):
+        if cutlass.const_expr(
+            cfg.use_pdl
+            and (
+                (
+                    cfg.use_variable_seqlens_q
+                    and not isinstance(g_cu_seqlens_q, UniformQueryOffsets)
+                )
+                or use_variable_seqlens_kv
+                or (use_native_paged_kv and not use_static_native_seqlens_kv)
+            )
+        ):
+            # Static tile pruning reads producer-owned Q/KV metadata here;
+            # persistent schedules defer those reads until TaskManager runs.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(cfg.use_variable_seqlens_q):
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
         q_token_base = _q_group_token_base(cfg, q_group_idx)
@@ -3234,8 +3289,6 @@ def decode_gen_kernel(
             use_variable_seqlens_kv
             or (use_native_paged_kv and not use_static_native_seqlens_kv)
         ):
-            if cutlass.const_expr(cfg.use_pdl):
-                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
             q_tile_is_active = q_tile_is_active & (
                 Int32(g_seqlens_kv[b_idx]) > Int32(0)
             )
@@ -3256,7 +3309,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3310,7 +3363,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3364,7 +3417,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3429,8 +3482,8 @@ def fmha_decode_launch(
     partial_stats_iter: cute.Pointer,
     split_kv_counter_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
-    softmax_scale: Float32,
-    output_scale: Float32,
+    softmax_scale: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     kv_b_stride: Int32,
     max_active_clusters: Int32,
     stream: cuda_drv.CUstream,
@@ -3448,6 +3501,8 @@ def fmha_decode_launch(
     v_page_stride: Int64 = 0,
     v_head_stride: Int64 = 0,
     v_token_stride: Int64 = 0,
+    k_sf_page_stride: Int64 = 0,
+    v_sf_page_stride: Int64 = 0,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
     sage_scales_iter: cute.Pointer | None = None,
@@ -3465,6 +3520,9 @@ def fmha_decode_launch(
     its Q, K and V scales from the prepared scales (``_SageScaleLayout``).
     """
     log2_e = math.log2(math.e)
+    softmax_scale_operand = softmax_scale
+    if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
+        softmax_scale_operand = Float32(softmax_scale * log2_e)
     if cutlass.const_expr(requested_splits is not None):
         # Prepare the reciprocal once on the host; counts stay runtime operands.
         requested_splits = (
@@ -3748,9 +3806,9 @@ def fmha_decode_launch(
     # as the packed K/V. The SF tensor is logically
     # (headdim // 16, storage_tokens_per_page, h_k, total_pages) E4M3. K uses
     # token-major layout and V uses TRT-LLM's 4-token interleaved layout. The
-    # inner SF box (headdim // 16 = 8 B) is below TMA's
-    # 16 B minimum, so fold `r` tokens into dim0 for up to a 128 B inner box,
-    # without spanning semantic page fragments.
+    # When one scale row is below TMA's 16 B minimum, fold `r` complete token
+    # rows into dim0 for up to a 128 B inner box without spanning semantic page
+    # fragments.
     # This reshape is a pure reinterpretation of the same contiguous bytes.
     tma_desc_k_sf = tma_desc_k
     tma_desc_v_sf = tma_desc_v
@@ -3766,12 +3824,29 @@ def fmha_decode_launch(
         # only the semantic fragment selected by the decoded page locator.
         sf_box_tokens_outer = cfg.num_tokens_per_page // sf_r
         sf_page_elems = Int32(sf_per_token * sf_storage_tokens_per_page)
-        sf_layout = cute.make_layout(
-            (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages),
-            stride=(1, Int32(sf_inner), sf_page_elems, sf_page_elems * h_k),
+        compact_sf_page_stride = sf_page_elems * h_k
+        # Native paged launches use the caller's scale-factor page strides;
+        # other launches use compact scale-factor pages.
+        k_sf_tma_page_stride = (
+            k_sf_page_stride
+            if cutlass.const_expr(use_native_paged_kv)
+            else compact_sf_page_stride
         )
-        k_sf_tma = cute.make_tensor(k_sf_iter, sf_layout)
-        v_sf_tma = cute.make_tensor(v_sf_iter, sf_layout)
+        v_sf_tma_page_stride = (
+            v_sf_page_stride
+            if cutlass.const_expr(use_native_paged_kv)
+            else compact_sf_page_stride
+        )
+        k_sf_layout = cute.make_layout(
+            (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages),
+            stride=(1, Int32(sf_inner), sf_page_elems, k_sf_tma_page_stride),
+        )
+        v_sf_layout = cute.make_layout(
+            (Int32(sf_inner), Int32(sf_tokens_outer), h_k, total_pages),
+            stride=(1, Int32(sf_inner), sf_page_elems, v_sf_tma_page_stride),
+        )
+        k_sf_tma = cute.make_tensor(k_sf_iter, k_sf_layout)
+        v_sf_tma = cute.make_tensor(v_sf_iter, v_sf_layout)
         tma_desc_k_sf = cuda.create_tensor_map_tiled_from_view(
             k_sf_tma,
             box_dims=(sf_inner, sf_box_tokens_outer, 1, 1),
@@ -3854,7 +3929,7 @@ def fmha_decode_launch(
                 o_iter,
                 s_k,
                 h_k,
-                Float32(softmax_scale * log2_e),
+                softmax_scale_operand,
                 output_scale,
                 seqlens_kv_iter,
                 cu_seqlens_q_iter,
@@ -3911,7 +3986,8 @@ def fmha_block_sparse_launch(
     row_route_offsets_iter: cute.Pointer,
     row_route_counts_iter: cute.Pointer,
     route_metadata_iter: cute.Pointer,
-    softmax_scale: Float32,
+    softmax_scale: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     seq_len_kv: cutlass.Constexpr[int | None],
@@ -3937,7 +4013,9 @@ def fmha_block_sparse_launch(
     if cutlass.const_expr(cfg.use_block_sparse_proxy_routes and cfg.use_paged_kv):
         raise ValueError("block-sparse proxy routes require contiguous K/V")
 
-    log2_e = math.log2(math.e)
+    softmax_scale_operand = softmax_scale
+    if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
+        softmax_scale_operand = Float32(softmax_scale * math.log2(math.e))
     b, h_q, h_k, s_k, d = problem_shape
     h_r = h_q // h_k
     q_seq = Int32(cfg.max_seq_len_q)
@@ -4165,8 +4243,8 @@ def fmha_block_sparse_launch(
         o_iter,
         s_k,
         h_k,
-        Float32(softmax_scale * log2_e),
-        Float32(1.0),
+        softmax_scale_operand,
+        output_scale,
         seqlens_kv_iter,
         null_i32_ptr,
         null_i32_ptr,

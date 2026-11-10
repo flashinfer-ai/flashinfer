@@ -34,9 +34,11 @@ import torch
 import tvm_ffi
 
 from ...jit.cake_gdn_cp_backend import (
+    MODULES,
     GDNCPArch,
     has_gdn_cp_kernel,
     load_gdn_cp_kernel,
+    program_for,
 )
 
 _BLOCK = 64
@@ -46,6 +48,40 @@ _TENSOR_MAP_BYTES = 128
 _PREFILL_TENSOR_MAPS = 5
 _STATE_IO_THREADS = 256
 _STATE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+_PREFILL_PARAMETERS = (
+    "cp_chunk_len",
+    "source_cp_chunk_len",
+    "num_q_heads",
+    "num_k_heads",
+    "num_v_heads",
+    "num_sab_heads",
+)
+# A stage-4 program may take fast divisors of the chunk length and of the
+# state-head count after ``num_sab_heads``; each is passed as its plain value
+# (the binding builds the divisor constants).
+_PREFILL_DIVISORS = ("cp_chunk_len_fdd", "num_sab_heads_fdd")
+
+
+def _prefill_divisors(kernel: str, arch: GDNCPArch) -> tuple[str, ...]:
+    """The fast-divisor parameters the stage-4 program of ``kernel`` takes, in order."""
+
+    program = program_for(kernel, arch)
+    params = [
+        name for role, name in MODULES[program]["arg_plan"] if role == "parameter"
+    ]
+    head = len(_PREFILL_PARAMETERS)
+    divisors = tuple(params[head:-1])
+    if (
+        tuple(params[:head]) != _PREFILL_PARAMETERS
+        or params[-1:] != ["scale"]
+        or not set(divisors) <= set(_PREFILL_DIVISORS)
+    ):
+        raise ValueError(
+            f"{program} ({kernel} on {arch}): unexpected stage-4 parameters {params}"
+        )
+    return divisors
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -233,6 +269,78 @@ def _default_physical_chunk_len(
     )
 
 
+# The sm_107a row-split fixup builds, by parallel-state count: (logical kernel,
+# row CTAs per state, CTAs per SM the grid must fit in, minimum CP chunks per
+# sequence).  A build gives each CTA 3, 5, 7, 8 or 10 state rows instead of 4
+# (43, 26, 19, 16 or 13 row CTAs per state); every element keeps its FMA
+# chain, so the outputs are bitwise those of the 4-row builds.
+_SM107_ROW_SPLIT_FIXUPS = {
+    4: ("state_fixup_simt_row3_sb2", 43, 1, 6),
+    8: ("state_fixup_simt_row3_sb2", 43, 2, 1),
+    14: ("state_fixup_simt_row5_mb3", 26, 2, 1),
+    16: ("state_fixup_simt_row5_mb3", 26, 2, 1),
+    22: ("state_fixup_simt_row7_sb2_mb3", 19, 2, 1),
+    24: ("state_fixup_simt_row8_sb2_mb3", 16, 2, 1),
+    26: ("state_fixup_simt_row8_mb3", 16, 2, 1),
+    32: ("state_fixup_simt_row10_sb2", 13, 2, 1),
+    36: ("state_fixup_simt_row8_sb2_mb3", 16, 3, 1),
+    48: ("state_fixup_simt_row10_mb3", 13, 3, 1),
+}
+_FIXUP_ROW_CTAS = {
+    "state_fixup_simt_row3_sb2": 43,
+    "state_fixup_simt_row4": 32,
+    "state_fixup_simt_row4_mb3": 32,
+    "state_fixup_simt_row5_mb3": 26,
+    "state_fixup_simt_row7_sb2_mb3": 19,
+    "state_fixup_simt_row8_mb3": 16,
+    "state_fixup_simt_row8_sb2_mb3": 16,
+    "state_fixup_simt_row10_mb3": 13,
+    "state_fixup_simt_row10_sb2": 13,
+    "state_fixup_utcmma64": 2,
+    "state_fixup_utcmma128": 1,
+}
+
+
+def _choose_sm107_fixup_kind(
+    num_parallel_states: int,
+    num_sms: int,
+    *,
+    all_sequences_equal: bool,
+    cp_chunks_per_seq: int,
+) -> str:
+    """The sm_107a SIMT fixup build.
+
+    Over sequences of one length with a parallel-state count of
+    ``_SM107_ROW_SPLIT_FIXUPS``, its row-split build when its grid fits the
+    listed CTAs per SM and each sequence has at least the listed CP chunks:
+    its grid fills the SMs evenly where the 32 row CTAs per state do not.
+
+    Otherwise the ``_mb3`` build (``__launch_bounds__(128, 3)``) once the 32
+    row CTAs per (sequence, head) exceed the 2 CTAs per SM of the default
+    build, but only when every sequence has the same number of CP chunks:
+    unequal sequences leave the longer ones' CTAs to finish alone, where the
+    default build runs them faster.  Equal lengths are the host-provable form
+    of that condition.  Every build computes the same outputs bit for bit.
+    """
+    split = _SM107_ROW_SPLIT_FIXUPS.get(num_parallel_states)
+    if (
+        all_sequences_equal
+        and split is not None
+        and num_parallel_states * split[1] <= split[2] * num_sms
+        and cp_chunks_per_seq >= split[3]
+        and has_gdn_cp_kernel(split[0], "sm_107a")
+    ):
+        return split[0]
+    rows = num_parallel_states * (_HEAD_DIM // 4)
+    if (
+        all_sequences_equal
+        and rows > 2 * num_sms
+        and has_gdn_cp_kernel("state_fixup_simt_row4_mb3", "sm_107a")
+    ):
+        return "state_fixup_simt_row4_mb3"
+    return "state_fixup_simt_row4"
+
+
 def _choose_fixup_kind(num_parallel_states: int, num_sms: int) -> str:
     if num_parallel_states <= num_sms * 2 // (_HEAD_DIM // 4):
         return "state_fixup_simt_row4"
@@ -381,11 +489,7 @@ class GDNCPPrefillPlan:
 
     @property
     def fixup_grid(self) -> tuple[int, int, int]:
-        row_ctas = {
-            "state_fixup_simt_row4": 32,
-            "state_fixup_utcmma64": 2,
-            "state_fixup_utcmma128": 1,
-        }[self.fixup_kernel]
+        row_ctas = _FIXUP_ROW_CTAS[self.fixup_kernel]
         return (self.num_seqs * self.num_sab_heads * row_ctas, 1, 1)
 
 
@@ -418,9 +522,10 @@ def _head_mapping_is_legal(hq: int, hk: int, hv: int) -> bool:
 
 # Architectures whose BF16 CP kernels are native: output and final state pass
 # the FP32 recurrence oracle at 1e-2 without a token-serial repair (measured at
-# <= 5.4e-4 state error on B200 and GB300).  Every other architecture keeps the
-# BF16 state repair recurrences.
-_NATIVE_BF16_ARCHES = ("sm_100a", "sm_103a")
+# <= 5.4e-4 state error on B200 and GB300; the sm_107a programs pass the same
+# oracle on R200).  Any other architecture keeps the BF16 state repair
+# recurrences.
+_NATIVE_BF16_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 
 
 def _recurrence_requirements(
@@ -436,11 +541,11 @@ def _recurrence_requirements(
     A recurrence runs where the chunked kernels do not produce the requested
     value: the normalized final state when Q/K are normalized in the kernel,
     and both the output and the final state when alpha is absent.  On compute
-    capability 10.0 and 10.3 (``_NATIVE_BF16_ARCHES``) the BF16 kernels are
-    native, so ``io_dtype`` selects no recurrence there.  Every other
-    architecture (sm_107a) keeps the BF16 state repair: the final-state
-    recurrence for BF16 I/O, and the block-64 output recurrence when alpha is
-    present and Q/K are not normalized in the kernel.
+    capability 10.0, 10.3 and 10.7 (``_NATIVE_BF16_ARCHES``) the BF16 kernels
+    are native, so ``io_dtype`` selects no recurrence there.  Any other
+    architecture keeps the BF16 state repair: the final-state recurrence for
+    BF16 I/O, and the block-64 output recurrence when alpha is present and Q/K
+    are not normalized in the kernel.
     """
 
     bf16_repair = io_dtype == torch.bfloat16 and arch not in _NATIVE_BF16_ARCHES
@@ -592,8 +697,15 @@ def _build_plan(
         # sm_107a runs the fp32 SIMT fixup only (no TF32 UTCMMA recurrence);
         # sm_100a/sm_103a keep the parallelism-based choice unchanged.
         fixup_kernel=(
-            "state_fixup_simt_row4"
-            if arch == "sm_107a" or total_tokens <= (num_seqs - 1) * max_seqlen
+            _choose_sm107_fixup_kind(
+                num_seqs * num_sab_heads,
+                num_sms,
+                all_sequences_equal=all_sequences_equal,
+                cp_chunks_per_seq=_ceil_div(max_seqlen, cp_chunk_len),
+            )
+            if arch == "sm_107a"
+            else "state_fixup_simt_row4"
+            if total_tokens <= (num_seqs - 1) * max_seqlen
             else _choose_fixup_kind(num_seqs * num_sab_heads, num_sms)
         ),
         prefill_kernel=prefill_kernel,
@@ -828,6 +940,7 @@ class GDNCPPrefill:
         self._mn = load_gdn_cp_kernel(plan.mn_kernel, plan.arch)
         self._fixup = load_gdn_cp_kernel(plan.fixup_kernel, plan.arch)
         self._prefill = load_gdn_cp_kernel(plan.prefill_kernel, plan.arch)
+        self._prefill_divisors = _prefill_divisors(plan.prefill_kernel, plan.arch)
         self._gather = None
         self._gather_source = None
         self._scatter = None
@@ -1207,6 +1320,10 @@ class GDNCPPrefill:
                 p.num_k_heads,
                 p.num_v_heads,
                 p.num_sab_heads,
+                *(
+                    getattr(p, name.removesuffix("_fdd"))
+                    for name in self._prefill_divisors
+                ),
                 self.scale,
                 *p.cp_grid,
             )

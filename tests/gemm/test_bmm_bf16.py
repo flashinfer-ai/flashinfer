@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, bmm_bf16
+from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import (
     CUDNN_AVAILABLE,
     get_blackwell_bf16_bmm_module,
@@ -80,6 +81,28 @@ def test_bmm_bf16(b, m, n, k, res_dtype, backend):
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+def test_bmm_bf16_unaligned_n(monkeypatch):
+    """CUTLASS rejects N=12 (bf16 rows not 16-byte aligned); auto tunes around it."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not bmm_bf16.is_backend_supported("cutlass", cc_num):
+        pytest.skip("cutlass backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn([2, 64, 256], device="cuda", dtype=torch.bfloat16)
+    mat2 = torch.randn([2, 12, 256], device="cuda", dtype=torch.bfloat16).transpose(
+        -2, -1
+    )
+    with pytest.raises(ValueError, match="CUTLASS backend requires K divisible"):
+        bmm_bf16(a, mat2, backend="cutlass")
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    with autotune(True, tuning_buckets=[64]):
+        out = bmm_bf16(a, mat2, backend="auto")
+    reference = torch.bmm(a.float(), mat2.float()).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
 
 
 def _cake_bmm_case(b, m, n, k, res_dtype, seed):
