@@ -216,13 +216,14 @@ def zero_fill_cycles(
 # 128-row records at one row per expert, one value for every family)
 SWAPPED_FILL_EXPOSURE = 0.4
 
-# The per-body fixed cost of a wave of CTAs -- launch, prologue (barriers, TMEM, descriptors, the group tables), epilogue tail
-# -- in SM cycles: the K -> 0 intercept of one wave at one row per expert as the fixed-cost probe measures it on each part
-# (declared empirical, named by the probe); None until a part is measured, the term is then off. Body-level and shared across
-# the formats; the chain-specific part stays in `exposed_epilogue_cycles`.
+# The per-body fixed cost of a launch -- launch latency, prologue (barriers, TMEM, descriptors, the group tables), epilogue
+# tail -- in SM cycles: the K -> 0 intercept at one row per expert as the fixed-cost probe measures it on each part, side by
+# side for the two bodies (declared empirical, named by the probe; a launch's intercept, not a wave's: a further wave adds a
+# fraction of it); None until a part is measured, the term is then off. Body-level and shared across the formats; the
+# chain-specific part stays in `exposed_epilogue_cycles`.
 FIXED_CYCLES: Dict[Tuple[str, str], Optional[float]] = {
-    ("grouped", "sm_107"): None,
-    ("swapped", "sm_107"): None,
+    ("grouped", "sm_107"): 18300.0,
+    ("swapped", "sm_107"): 18300.0,
     ("grouped", "sm_100"): None,
     ("swapped", "sm_100"): None,
     ("grouped", "sm_103"): None,
@@ -230,28 +231,10 @@ FIXED_CYCLES: Dict[Tuple[str, str], Optional[float]] = {
 }
 
 
-def launch_waves(cfg: Knobs, rows: int, n_active: int, N: int, sm_count: int) -> int:
-    """The waves of a grouped launch's CTAs over the part's SMs at the shape: the active experts' row tiles (the group's
-    rows over the record's cluster rows) times the N tiles, in CTAs (a cluster record's tile is its cluster of CTAs)."""
-    if cfg.swap_ab:
-        cluster_rows, tn, cn, ctas = cfg.tile_n, cfg.mma_tiler_mn[0], 1, 1
-    else:
-        cta_m = cfg.mma_tiler_mn[0] // (2 if cfg.use_2cta_instrs else 1)
-        cm, cn = cfg.cluster_shape_mn
-        cluster_rows, tn, ctas = cta_m * cm, cfg.mma_tiler_mn[1], cm * cn
-    tiles = max(1, n_active) * -(-max(1, rows) // cluster_rows) * -(-N // (tn * cn))
-    return max(1, -(-tiles * ctas // max(1, sm_count)))
-
-
-def fixed_cycles(
-    cfg: Knobs, rows: int, n_active: int, N: int, family: str, sm_count: int
-) -> float:
-    """``FIXED_CYCLES[body, part] x waves``: the body's per-wave floor at the launch's wave count; zero while the part's
-    constant is unmeasured."""
+def fixed_cycles(cfg: Knobs, family: str) -> float:
+    """``FIXED_CYCLES[body, part]``: the body's per-launch floor; zero while the part's constant is unmeasured."""
     c = FIXED_CYCLES.get(("swapped" if cfg.swap_ab else "grouped", family))
-    if c is None:
-        return 0.0
-    return c * launch_waves(cfg, rows, n_active, N, sm_count)
+    return 0.0 if c is None else c
 
 
 def raster_for(cfg: Knobs, rows: int) -> str:
@@ -301,15 +284,10 @@ def rank_grouped(
     distinct records, at most ``k``, never empty for an implementable shape."""
     import dataclasses
 
-    from ...gemm.batch_invariant.heuristic import (
-        PART_TABLE,
-        decode_sane,
-        estimate_cycles,
-    )
+    from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
     from .blocks.compile import can_implement_grouped, can_implement_swapped
 
     fam = family or "sm_107"
-    sms = sm_count or PART_TABLE.get(fam, PART_TABLE["sm_107"]).sm_count
     dense_n = (n_active or E) * N
     dense = (
         []
@@ -341,7 +319,7 @@ def rank_grouped(
             est * pair_term(c, rows) * tiles_term(c, rows)
             + exposed_epilogue_cycles(c, rows, nodes, pair)
             + zero_fill_cycles(c, rows, K, fam)
-            + fixed_cycles(c, rows, n_active or E, N, fam, sms)
+            + fixed_cycles(c, fam)
         )
         # three significant digits: records the estimate cannot separate (at the HBM floor every token tile reads the same
         # weights) fall through to the structural raster and the enumeration order -- the grouped records before the swapped
