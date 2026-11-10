@@ -78,12 +78,17 @@ from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
 from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
 from .core import current_compilation_context as current_compilation_context
 from .cubin_loader import setup_cubin_loader
-from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
 from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
-from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
+from .comm import gen_cake_alltoall_module as gen_cake_alltoall_module
+from .comm import (
+    gen_nvlink_one_sided_alltoall_module as gen_nvlink_one_sided_alltoall_module,
+)
+from .comm import (
+    gen_nvlink_two_sided_alltoall_module as gen_nvlink_two_sided_alltoall_module,
+)
 from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
 from .dsv3_optimizations import (
     gen_dsv3_router_gemm_module as gen_dsv3_router_gemm_module,
@@ -96,6 +101,9 @@ from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
 from .cake_megamoe_topk_reduce import (
     gen_cake_megamoe_topk_reduce_module as gen_cake_megamoe_topk_reduce_module,
 )
+from .cake_sampling import gen_cake_sampling_module as gen_cake_sampling_module
+from .cake_sampling import get_cake_sampling_uri as get_cake_sampling_uri
+from .cake_sampling import load_cake_sampling_module as load_cake_sampling_module
 from .cake_megamoe_topk_reduce import (
     get_cake_megamoe_topk_reduce_module as get_cake_megamoe_topk_reduce_module,
 )
@@ -142,19 +150,10 @@ from .cake_kda import (
     load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
 )
 from .cake_fused_moe_warp_decode import (
-    CakeWarpDecodeTarget as CakeWarpDecodeTarget,
-)
-from .cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module as gen_cake_fused_moe_warp_decode_module,
 )
 from .cake_fused_moe_warp_decode import (
     get_cake_fused_moe_warp_decode_module as get_cake_fused_moe_warp_decode_module,
-)
-from .cake_fused_moe_warp_decode import (
-    get_cake_fused_moe_warp_decode_uri as get_cake_fused_moe_warp_decode_uri,
-)
-from .cake_fused_moe_warp_decode import (
-    load_cake_fused_moe_warp_decode_module as load_cake_fused_moe_warp_decode_module,
 )
 from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,
@@ -190,16 +189,19 @@ from .nvfp4_attention_sm120 import (
 )
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
-from .blackwell_bgmv_moe import (
-    gen_blackwell_bgmv_moe_module as gen_blackwell_bgmv_moe_module,
+from .cake_bgmv_moe import (
+    gen_cake_bgmv_moe_module as gen_cake_bgmv_moe_module,
 )
-from .blackwell_bgmv_moe import (
-    load_blackwell_bgmv_moe_module as load_blackwell_bgmv_moe_module,
+from .cake_bgmv_moe import (
+    load_cake_bgmv_moe_module as load_cake_bgmv_moe_module,
 )
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
 from .fused_moe import (
     gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
+)
+from .fused_moe import (
+    gen_alphamoe_nvfp4_sm100_module as gen_alphamoe_nvfp4_sm100_module,
 )
 
 

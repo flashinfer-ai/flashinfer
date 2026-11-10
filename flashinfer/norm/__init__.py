@@ -27,7 +27,7 @@ This package provides high-performance normalization kernels:
 import functools
 import os
 import warnings
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 
@@ -36,11 +36,14 @@ from ..trace.templates.norm import (
     fused_add_rmsnorm_quant_trace,
     fused_add_rmsnorm_trace,
     fused_rmsnorm_silu_trace,
+    gated_residual_next_rmsnorm_trace_dispatch,
+    gated_residual_rmsnorm_trace,
     gemma_fused_add_rmsnorm_trace,
     gemma_rmsnorm_trace,
     layernorm_quant_trace,
     layernorm_trace,
     rmsnorm_quant_trace,
+    rmsnorm_sigmoid_gate_trace,
     rmsnorm_trace,
 )
 from ..utils import (
@@ -55,6 +58,12 @@ from ..utils import (
 # Always import gen_norm_module for JIT warmup and CUDA fallback
 from ..jit.norm import gen_norm_module
 
+# Import DSL arch probe for mixed-architecture compatibility check
+try:
+    from ..cute_dsl.availability import _dsl_captured_arch
+except ImportError:
+    _dsl_captured_arch = None
+
 # Use CUDA JIT implementation instead of CuTe DSL (for debugging/fallback)
 # Also fallback to CUDA JIT if nvidia-cutlass-dsl is not installed
 _USE_CUDA_NORM = os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
@@ -68,10 +77,61 @@ if not _USE_CUDA_NORM:
             fused_add_rmsnorm_cute,
             fused_add_rmsnorm_quant_cute,
             layernorm_cute,
+            layernorm_quant_cute,
         )
     except (ImportError, AttributeError):
         # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
+
+try:
+    from .kernels.gated_residual_rmsnorm import (
+        gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
+    )
+    from .kernels.gated_residual_next_rmsnorm import (
+        gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
+    )
+    from .kernels.rmsnorm_sigmoid_gate import (
+        rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
+    )
+    from .kernels.rmsnorm_sigmoid_gate import (
+        supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
+    )
+
+    _HAS_CUTE_DSL_FUSED_NORM = True
+except (ImportError, AttributeError):
+    _HAS_CUTE_DSL_FUSED_NORM = False
+
+    def _cute_supports_rmsnorm_sigmoid_gate(
+        dtype: torch.dtype,
+        head_dim: int,
+        device: torch.device | str | None = None,
+    ) -> bool:
+        return False
+
+
+try:
+    from ..cake_muse_spark_norm_backend import (
+        cake_gated_residual_next_rmsnorm as _cake_gated_residual_next_rmsnorm,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        cake_gated_residual_rmsnorm as _cake_gated_residual_rmsnorm,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        cake_rmsnorm_sigmoid_gate as _cake_rmsnorm_sigmoid_gate,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        is_cake_gated_residual_next_rmsnorm_supported as _cake_gated_residual_next_rmsnorm_supported,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        is_cake_gated_residual_rmsnorm_supported as _cake_gated_residual_rmsnorm_supported,
+    )
+    from ..cake_muse_spark_norm_backend import (
+        is_cake_rmsnorm_sigmoid_gate_supported as _cake_rmsnorm_sigmoid_gate_supported,
+    )
+
+    _HAS_CAKE_FUSED_NORM = True
+except (ImportError, AttributeError):
+    _HAS_CAKE_FUSED_NORM = False
 
 
 @functools.cache
@@ -86,19 +146,125 @@ def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
         return True
 
 
-def _use_cuda_norm(device: torch.device) -> bool:
-    """Return ``True`` when the CUDA JIT norm kernels should be used instead
-    of the CuTe DSL ones.
+def _is_arch_compatible(captured_arch: str, device_cap: tuple[int, int]) -> bool:
+    """Check if a captured CUDA architecture can run on a target device using
+    CUDA binary compatibility rules.
 
-    Besides the explicit ``FLASHINFER_USE_CUDA_NORM`` opt-in, this covers
-    devices whose architecture the installed CuTe DSL cannot target (e.g.
-    Rubin/sm_107 against a DSL without ``sm_107a``, unless
-    ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started).
-    The CUDA JIT kernels are functionally equivalent, so norm falls back
-    instead of raising like the DSL-only kernels do."""
+    CUDA binary compatibility: a cubin compiled for sm_X.Y can run on sm_X.Z
+    when Z >= Y (forward compatibility within the same major architecture).
+    Architecture-specific ``a``-suffixed targets (e.g. ``sm_100a``, ``sm_103a``)
+    are the exception: CUDA ``a`` targets run only on their exact compute
+    capability, so a captured ``sm_100a`` cubin cannot run on an ``sm_103``
+    device. Forward compatibility (``>=``) applies only to plain and ``f``
+    (family-portable) targets.
+
+    Args:
+        captured_arch: DSL's compile target (e.g., "sm_100a", "sm_89")
+        device_cap: Target device's compute capability (major, minor)
+
+    Returns:
+        True if the captured arch can run on the target device.
+    """
+    # Parse captured arch (e.g., "sm_100a" -> (10, 0), "sm_89" -> (8, 9))
+    if not captured_arch or not captured_arch.startswith("sm_"):
+        return False
+
+    arch_str = captured_arch[3:]  # Remove "sm_" prefix
+    # Architecture-specific targets carry an 'a' suffix (e.g. sm_100a, sm_103a).
+    # CUDA 'a' cubins run only on their exact compute capability, so keep the
+    # flag before stripping variant suffixes below.
+    arch_specific = arch_str.endswith("a")
+    # Remove trailing 'a' or 'f' (architecture variants like sm_100a, sm_100f)
+    arch_str = arch_str.rstrip("af")
+
+    try:
+        if "_" in arch_str:
+            # Format like "100" or "12_0"
+            parts = arch_str.replace("_", " ").split()
+            captured_major = int(parts[0])
+            captured_minor = int(parts[1]) if len(parts) > 1 else 0
+        else:
+            # Format like "89" -> (8, 9)
+            captured_major = int(arch_str[:-1])
+            captured_minor = int(arch_str[-1])
+    except (ValueError, IndexError):
+        return False
+
+    device_major, device_minor = device_cap
+
+    # Same major architecture
+    if captured_major == device_major:
+        if arch_specific:
+            # 'a' targets require an exact minor-version match: sm_100a cubins
+            # do not run on sm_103, even within the same major architecture.
+            return device_minor == captured_minor
+        # Plain and 'f' targets keep forward compatibility (minor >= captured).
+        return device_minor >= captured_minor
+
+    # Different major architecture: incompatible
+    return False
+
+
+def _use_cuda_norm(device: torch.device) -> bool:
+    """Determine whether to use CUDA JIT norm kernels instead of CuTe DSL.
+
+    This function implements the dispatch logic for norm operations, deciding
+    between the CuTe DSL path (default) and the CUDA JIT fallback path.
+
+    The CUDA JIT path is selected when:
+    1. ``FLASHINFER_USE_CUDA_NORM=1`` is set (explicit opt-in for debugging)
+    2. The target device's architecture is not supported by the installed CuTe DSL
+       (e.g., Rubin/sm_107 against a DSL without ``sm_107a``, unless
+       ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started)
+    3. Mixed-architecture hosts where the DSL's compile target (captured from
+       device 0 at import time) is not binary-compatible with the target device's
+       compute capability. This prevents ``cudaErrorNoKernelImageForDevice`` errors
+       when the DSL compiled for a different architecture than the target device.
+
+    CUDA binary compatibility rules: a cubin compiled for sm_X.Y can run on
+    sm_X.Z when Z >= Y (forward compatibility within the same major architecture).
+    For example, an sm_86 cubin runs on sm_89, but not vice versa.
+
+    The CUDA JIT kernels are functionally equivalent to the CuTe DSL ones, so
+    norm operations fall back to CUDA JIT instead of raising errors like the
+    DSL-only kernels do.
+
+    Args:
+        device: Target device for norm operation (e.g., ``torch.device("cuda:1")``)
+
+    Returns:
+        ``True`` if CUDA JIT kernels should be used, ``False`` for CuTe DSL path.
+
+    Examples:
+        >>> # Single-architecture host: use DSL path
+        >>> _use_cuda_norm(torch.device("cuda:0"))
+        False
+
+        >>> # Mixed-architecture host (device 0: sm_89, device 1: sm_86)
+        >>> # DSL compiled for sm_89, but launching on sm_86
+        >>> _use_cuda_norm(torch.device("cuda:1"))
+        True
+    """
     if _USE_CUDA_NORM:
         return True
-    return not _cute_dsl_supports_arch(*torch.cuda.get_device_capability(device))
+
+    device_cap = torch.cuda.get_device_capability(device)
+
+    # Check if DSL supports the device's architecture at all
+    if not _cute_dsl_supports_arch(*device_cap):
+        return True
+
+    # Check if DSL's captured compile target is compatible with this device
+    # (handles mixed-architecture hosts where device 0 != target device)
+    if _dsl_captured_arch is not None:
+        captured_arch = _dsl_captured_arch()
+        if captured_arch is not None and not _is_arch_compatible(
+            captured_arch, device_cap
+        ):
+            # DSL compiled for a different architecture; fall back to CUDA JIT
+            return True
+
+    return False
 
 
 @functools.cache
@@ -138,6 +304,936 @@ def _normalize_scale_tensor(
     return scale.contiguous()
 
 
+_GATED_RESIDUAL_HIDDEN_SIZE = 8192
+_GATED_RESIDUAL_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+_RMSNORM_SIGMOID_GATE_HEAD_DIM = 64
+_FUSED_NORM_ALIGNMENT = 16
+_DUAL_NORM_ALIGNMENT = 32
+#: The Cake package reaches rows and vectors in accesses of up to 256 bits: it serves storage aligned to 32 bytes
+#: alone (``gated_residual_rmsnorm``'s tensors; ``rmsnorm_sigmoid_gate``'s tensors and, in bytes, their token
+#: strides).  Under ``"auto"``, storage the 16-byte contract admits but the package does not runs the CuTe DSL kernel.
+_CAKE_NORM_ALIGNMENT = 32
+
+
+def _fused_norm_arch_supported(device: torch.device) -> bool:
+    cap = torch.cuda.get_device_capability(device)
+    return cap in _GATED_RESIDUAL_COMPUTE_CAPABILITIES and _cute_dsl_supports_arch(*cap)
+
+
+def _is_aligned(tensor: torch.Tensor, alignment: int = _FUSED_NORM_ALIGNMENT) -> bool:
+    return tensor.data_ptr() % alignment == 0
+
+
+def _cake_norm_layout(*tensors: Optional[torch.Tensor]) -> bool:
+    """Whether every tensor given (``None`` skipped) sits in storage the Cake package serves: 32-byte aligned."""
+    return all(
+        tensor is None or _is_aligned(tensor, _CAKE_NORM_ALIGNMENT)
+        for tensor in tensors
+    )
+
+
+def _cake_gate_layout(input: torch.Tensor, gate: torch.Tensor) -> bool:
+    """Whether a ``rmsnorm_sigmoid_gate`` call's tensors sit in storage the Cake package serves: 32-byte aligned
+    storage and token strides that are 32-byte multiples (16 elements)."""
+    return (
+        _cake_norm_layout(input, gate)
+        and (input.stride(0) * input.element_size()) % _CAKE_NORM_ALIGNMENT == 0
+        and (gate.stride(0) * gate.element_size()) % _CAKE_NORM_ALIGNMENT == 0
+    )
+
+
+_GATED_RESIDUAL_NEXT_BACKENDS = ("auto", "cake", "cute")
+
+
+def _cute_gated_residual_next_rmsnorm_available(device: torch.device) -> bool:
+    return _HAS_CUTE_DSL_FUSED_NORM and _fused_norm_arch_supported(device)
+
+
+def _cake_gated_residual_next_rmsnorm_available(
+    device: torch.device,
+    *,
+    tensor_alpha: bool,
+    has_post_weight: bool,
+    rows: Optional[int] = None,
+) -> bool:
+    return _HAS_CAKE_FUSED_NORM and _cake_gated_residual_next_rmsnorm_supported(
+        device, tensor_alpha=tensor_alpha, has_post_weight=has_post_weight, rows=rows
+    )
+
+
+def _gated_residual_next_rmsnorm_backend(
+    backend: str,
+    device: torch.device,
+    *,
+    tensor_alpha: bool,
+    has_post_weight: bool,
+    rows: Optional[int] = None,
+) -> Optional[str]:
+    """The backend one call runs on: ``"cake"`` when the Cake package ships a
+    program for the device, the call's variant and (with ``rows``) its row count
+    (preferred under ``"auto"``; a row count in a gap of the package's windows
+    falls to the CuTe DSL kernel), else ``"cute"`` when the CuTe DSL kernel
+    targets the device; ``None`` when the requested backend is not available."""
+    if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
+        )
+    if backend != "cute" and _cake_gated_residual_next_rmsnorm_available(
+        device,
+        tensor_alpha=tensor_alpha,
+        has_post_weight=has_post_weight,
+        rows=None if backend == "cake" else rows,
+    ):
+        return "cake"
+    if backend != "cake" and _cute_gated_residual_next_rmsnorm_available(device):
+        return "cute"
+    return None
+
+
+def _resolved_pdl(device: torch.device, enable_pdl: bool) -> bool:
+    """The programmatic dependent launch flag a call runs with: the caller's, where the device supports it."""
+    return bool(enable_pdl) and device_support_pdl(device)
+
+
+def _cute_gated_residual_rmsnorm_available(device: torch.device) -> bool:
+    return _HAS_CUTE_DSL_FUSED_NORM and _fused_norm_arch_supported(device)
+
+
+def _cake_gated_residual_rmsnorm_available(
+    device: torch.device,
+    *,
+    weight_before_norm: bool,
+    enable_pdl: bool,
+    rows: Optional[int] = None,
+) -> bool:
+    return _HAS_CAKE_FUSED_NORM and _cake_gated_residual_rmsnorm_supported(
+        device, weight_before_norm=weight_before_norm, enable_pdl=enable_pdl, rows=rows
+    )
+
+
+def _gated_residual_rmsnorm_backend(
+    backend: str,
+    device: torch.device,
+    *,
+    weight_before_norm: bool,
+    enable_pdl: bool,
+    rows: Optional[int] = None,
+    cake_layout: bool = True,
+) -> Optional[str]:
+    """The backend one call runs on: ``"cake"`` when the Cake package ships a
+    program for the device, the call's variant (``weight`` applied before the
+    norm or absent, programmatic dependent launch or not) and (with ``rows``)
+    its row count (preferred under ``"auto"``; a row count in a gap of the
+    package's windows falls to the CuTe DSL kernel) and the call's tensors sit
+    in storage the package serves (``cake_layout``: 32-byte aligned; other
+    storage falls to the CuTe DSL kernel too), else ``"cute"`` when the CuTe DSL
+    kernel targets the device; ``None`` when the requested backend is not
+    available."""
+    if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
+        )
+    if (
+        backend != "cute"
+        and cake_layout
+        and _cake_gated_residual_rmsnorm_available(
+            device,
+            weight_before_norm=weight_before_norm,
+            enable_pdl=enable_pdl,
+            rows=None if backend == "cake" else rows,
+        )
+    ):
+        return "cake"
+    if backend != "cake" and _cute_gated_residual_rmsnorm_available(device):
+        return "cute"
+    return None
+
+
+def _cake_rmsnorm_sigmoid_gate_available(
+    device: torch.device,
+    *,
+    heads: Optional[int] = None,
+    tokens: Optional[int] = None,
+    enable_pdl: bool = False,
+) -> bool:
+    return _HAS_CAKE_FUSED_NORM and _cake_rmsnorm_sigmoid_gate_supported(
+        device, heads=heads, tokens=tokens, enable_pdl=enable_pdl
+    )
+
+
+def _rmsnorm_sigmoid_gate_backend(
+    backend: str,
+    device: torch.device,
+    *,
+    heads: Optional[int] = None,
+    tokens: Optional[int] = None,
+    enable_pdl: bool = False,
+    cake_layout: bool = True,
+) -> Optional[str]:
+    """The backend one call runs on: ``"cake"`` when the Cake package ships a
+    program for the device, the call's launch form (its PDL route under
+    ``enable_pdl``) and (with ``heads`` and ``tokens``) the call's head count
+    and token count (preferred under ``"auto"``; a head count the package's
+    windows do not name, or a token count in a gap of them, falls to the CuTe
+    DSL kernel) and the call's tensors sit in storage the package serves
+    (``cake_layout``: 32-byte aligned rows and token strides; other storage
+    falls to the CuTe DSL kernel too),
+    else ``"cute"`` when the CuTe DSL kernel targets the device; ``None`` when
+    the requested backend is not available."""
+    if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
+        )
+    if (
+        backend != "cute"
+        and cake_layout
+        and _cake_rmsnorm_sigmoid_gate_available(
+            device,
+            heads=None if backend == "cake" else heads,
+            tokens=None if backend == "cake" else tokens,
+            enable_pdl=enable_pdl,
+        )
+    ):
+        return "cake"
+    if backend != "cake" and _cute_supports_rmsnorm_sigmoid_gate(
+        torch.bfloat16, _RMSNORM_SIGMOID_GATE_HEAD_DIM, device=device
+    ):
+        return "cute"
+    return None
+
+
+def supports_rmsnorm_sigmoid_gate(
+    dtype: torch.dtype,
+    head_dim: int,
+    device: torch.device | str | None = None,
+    *,
+    backend: Literal["auto", "cake", "cute"] = "auto",
+    enable_pdl: bool = True,
+) -> bool:
+    """Whether a BF16, head-dimension-64 call can run on ``device`` (the current
+    one when ``None``) through ``backend`` (``"auto"``: the Cake package or the
+    CuTe DSL kernel) in the launch form ``enable_pdl`` selects.  The package
+    routes on the head count and the token count of a call as well and serves
+    32-byte aligned storage alone; ``rmsnorm_sigmoid_gate`` falls to the CuTe
+    DSL kernel where they lie outside its windows or its alignment."""
+    if dtype != torch.bfloat16 or head_dim != _RMSNORM_SIGMOID_GATE_HEAD_DIM:
+        return False
+    if device is None:
+        if not torch.cuda.is_available():
+            return False
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    else:
+        resolved = torch.device(device)
+    if resolved.type != "cuda" or not torch.cuda.is_available():
+        return False
+    return (
+        _rmsnorm_sigmoid_gate_backend(
+            backend, resolved, enable_pdl=_resolved_pdl(resolved, enable_pdl)
+        )
+        is not None
+    )
+
+
+def supports_gated_residual_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    enable_pdl: bool = True,
+    backend: Literal["auto", "cake", "cute"] = "auto",
+) -> bool:
+    """Return whether tensors satisfy the SM100/SM103/SM107 fused-kernel contract
+    and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
+    the call on their device.  ``"auto"`` answers for the call's row count as
+    well: a row count in a gap of the Cake package's windows runs on the CuTe DSL
+    kernel, so the answer is false there only where that kernel is unavailable.
+    ``"cake"`` answers whether the package ships a program for the device, the
+    variant and the tensors' storage; an explicit cake call still raises for a
+    row count in a gap (``is_cake_gated_residual_rmsnorm_supported`` of
+    :mod:`flashinfer.cake_muse_spark_norm_backend` answers for the row count)."""
+    return (
+        _gated_residual_rmsnorm_tensors_ok(branch, residual, weight, alpha, beta)
+        and _gated_residual_rmsnorm_backend(
+            backend,
+            branch.device,
+            weight_before_norm=weight is not None,
+            enable_pdl=_resolved_pdl(branch.device, enable_pdl),
+            rows=branch.shape[0] or None,
+            cake_layout=_cake_norm_layout(branch, residual, weight, alpha, beta),
+        )
+        is not None
+    )
+
+
+def _gated_residual_rmsnorm_tensors_ok(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+) -> bool:
+    """The tensor contract of ``gated_residual_rmsnorm`` (shapes, dtypes, one CUDA
+    device, contiguous, aligned storage), without the backend decision; one flat
+    check, since every call pays for it."""
+    shape = branch.shape
+    if len(shape) != 2 or shape[1] != _GATED_RESIDUAL_HIDDEN_SIZE or not branch.is_cuda:
+        return False
+    device = branch.device
+    vector = (_GATED_RESIDUAL_HIDDEN_SIZE,)
+    alignment = _FUSED_NORM_ALIGNMENT
+    return (
+        residual.shape == shape
+        and alpha.shape == vector
+        and beta.shape == vector
+        and branch.dtype == torch.bfloat16
+        and residual.dtype == torch.float32
+        and alpha.dtype == torch.float32
+        and beta.dtype == torch.float32
+        and residual.device == device
+        and alpha.device == device
+        and beta.device == device
+        and branch.is_contiguous()
+        and residual.is_contiguous()
+        and alpha.is_contiguous()
+        and beta.is_contiguous()
+        and (
+            branch.data_ptr() | residual.data_ptr() | alpha.data_ptr() | beta.data_ptr()
+        )
+        % alignment
+        == 0
+        and (
+            weight is None
+            or (
+                weight.shape == vector
+                and weight.dtype == torch.bfloat16
+                and weight.device == device
+                and weight.is_contiguous()
+                and weight.data_ptr() % alignment == 0
+            )
+        )
+    )
+
+
+def supports_gated_residual_next_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    next_weight: torch.Tensor,
+    alpha: Union[torch.Tensor, float],
+    beta: torch.Tensor,
+    *,
+    post_weight: Optional[torch.Tensor] = None,
+    backend: Literal["auto", "cake", "cute"] = "auto",
+) -> bool:
+    """Return whether inputs satisfy the SM100/SM103/SM107 two-norm kernel contract
+    and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
+    the call on their device.  ``"auto"`` answers for the call's row count as
+    well: a row count in a gap of the Cake package's windows runs on the CuTe DSL
+    kernel, so the answer is false there only where that kernel is unavailable.
+    ``"cake"`` answers whether the package ships a program for the device and the
+    variant; an explicit cake call still raises for a row count in a gap
+    (``is_cake_gated_residual_next_rmsnorm_supported`` of
+    :mod:`flashinfer.cake_muse_spark_norm_backend` answers for the row count)."""
+    tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, beta)
+    if isinstance(alpha, torch.Tensor):
+        if (
+            alpha.shape != (_GATED_RESIDUAL_HIDDEN_SIZE,)
+            or alpha.dtype != torch.float32
+        ):
+            return False
+        tensors += (alpha,)
+    elif not isinstance(alpha, (int, float)):
+        return False
+    if post_weight is not None:
+        tensors += (post_weight,)
+    return (
+        branch.ndim == 2
+        and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
+        and residual.shape == branch.shape
+        and next_weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and (
+            post_weight is None
+            or (
+                post_weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+                and post_weight.dtype == torch.bfloat16
+            )
+        )
+        and beta.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and branch.dtype == torch.bfloat16
+        and residual.dtype == torch.float32
+        and next_weight.dtype == torch.bfloat16
+        and beta.dtype == torch.float32
+        and all(
+            tensor.is_cuda
+            and tensor.is_contiguous()
+            and tensor.device == branch.device
+            and _is_aligned(tensor, _DUAL_NORM_ALIGNMENT)
+            for tensor in tensors
+        )
+        and _gated_residual_next_rmsnorm_backend(
+            backend,
+            branch.device,
+            tensor_alpha=isinstance(alpha, torch.Tensor),
+            has_post_weight=post_weight is not None,
+            rows=branch.shape[0] or None,
+        )
+        is not None
+    )
+
+
+@flashinfer_api(trace=gated_residual_next_rmsnorm_trace_dispatch)
+def gated_residual_next_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    next_weight: torch.Tensor,
+    alpha: Union[torch.Tensor, float],
+    beta: torch.Tensor,
+    post_eps: float = 1e-6,
+    next_eps: float = 1e-6,
+    next_gain_center: float = 0.0,
+    residual_out: Optional[torch.Tensor] = None,
+    ffn_input: Optional[torch.Tensor] = None,
+    *,
+    post_weight: Optional[torch.Tensor] = None,
+    post_gain_center: float = 0.0,
+    enable_pdl: bool = True,
+    backend: Literal["auto", "cake", "cute"] = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Gated residual RMSNorm plus the next RMSNorm in one launch, for hidden size 8192.
+
+    This computes ``residual_out = alpha * residual + beta * RMSNorm(branch)``
+    in FP32. It then computes ``ffn_input = RMSNorm(residual_out) *
+    (next_weight + next_gain_center)`` and rounds only that output to BF16.
+    When ``post_weight`` is supplied, ``branch`` is multiplied by
+    ``post_weight + post_gain_center`` in FP32 before its RMSNorm.
+    The optimized implementation supports contiguous hidden-size-8192 tensors
+    on SM100, SM103, and SM107 GPUs.
+
+    Parameters
+    ----------
+    branch : torch.Tensor
+        Two-dimensional BF16 branch tensor.
+    residual : torch.Tensor
+        FP32 residual stream with the same shape as ``branch``.
+    next_weight : torch.Tensor
+        BF16 weight for the second RMSNorm, with shape ``(8192,)``.
+    alpha : Union[torch.Tensor, float]
+        FP32 stream gate with shape ``(8192,)``, or a scalar coefficient.
+        Use ``1.0`` for an ungated stream. Scalar values specialize the kernel
+        without allocating or loading an alpha tensor.
+    beta : torch.Tensor
+        FP32 branch gate with shape ``(8192,)``.
+    post_eps, next_eps : float
+        Epsilons for the branch and residual-stream RMSNorms.
+    next_gain_center : float
+        Constant added to ``next_weight`` in FP32.
+    residual_out : Optional[torch.Tensor]
+        Optional FP32 destination with the same shape as ``residual``.
+    ffn_input : Optional[torch.Tensor]
+        Optional BF16 destination with the same shape as ``branch``.
+    post_weight : Optional[torch.Tensor]
+        Optional BF16 input scale for the first RMSNorm, with shape ``(8192,)``.
+    post_gain_center : float
+        Constant added to ``post_weight`` in FP32; unused when it is ``None``.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch on the CuTe DSL kernel.
+        Defaults to ``True``; pass ``False`` to disable it. The Cake kernels
+        launch without the attribute and ignore this argument.
+    backend : str
+        ``"auto"`` (default) runs the Cake kernels
+        (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
+        a program for the device, the call's inputs and its row count (the
+        package's routes may leave row-count gaps where the CuTe DSL kernel
+        measured ahead), else the CuTe DSL kernel; ``"cake"`` and ``"cute"``
+        select one and raise ``ValueError`` when it is not available (``"cake"``
+        at a row count in a gap raises too). The Cake package ships programs for a tensor ``alpha``
+        with ``post_weight`` and for a scalar ``alpha`` with or without it; a
+        tensor ``alpha`` without ``post_weight`` runs its ``post_weight`` programs
+        with a zero vector and ``post_gain_center = 1.0``, which is exact.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        The FP32 residual stream and BF16 normalized FFN input.
+    """
+    if not supports_gated_residual_next_rmsnorm(
+        branch, residual, next_weight, alpha, beta, post_weight=post_weight
+    ):
+        raise ValueError(
+            "tensors do not satisfy the gated_residual_next_rmsnorm contract"
+        )
+    if (
+        _gated_residual_next_rmsnorm_backend(
+            backend,
+            branch.device,
+            tensor_alpha=isinstance(alpha, torch.Tensor),
+            has_post_weight=post_weight is not None,
+        )
+        is None
+    ):
+        raise ValueError(
+            f"gated_residual_next_rmsnorm: backend {backend!r} is not available "
+            f"on {branch.device}"
+        )
+    if residual_out is None:
+        residual_out = torch.empty_like(residual)
+    if ffn_input is None:
+        ffn_input = torch.empty_like(branch)
+    outputs = (
+        ("residual_out", residual_out, torch.float32),
+        ("ffn_input", ffn_input, torch.bfloat16),
+    )
+    for name, output, dtype in outputs:
+        if (
+            output.shape != branch.shape
+            or output.dtype != dtype
+            or output.device != branch.device
+            or not output.is_contiguous()
+            or not _is_aligned(output, _DUAL_NORM_ALIGNMENT)
+        ):
+            raise ValueError(
+                f"{name} must match branch shape, expected dtype, device, and layout"
+            )
+    # Scalar specializations never read the alpha tensor argument; reuse beta
+    # to preserve the tensor ABI without allocating a constant gate vector.
+    if isinstance(alpha, torch.Tensor):
+        alpha_tensor, alpha_scalar = alpha, None
+    else:
+        alpha_tensor, alpha_scalar = beta, float(alpha)
+    _gated_residual_next_rmsnorm_impl(
+        branch,
+        residual,
+        next_weight,
+        alpha_tensor,
+        beta,
+        residual_out,
+        ffn_input,
+        post_eps,
+        next_eps,
+        next_gain_center,
+        post_weight,
+        post_gain_center,
+        alpha_scalar,
+        enable_pdl,
+        backend,
+    )
+    return residual_out, ffn_input
+
+
+@register_custom_op(
+    "flashinfer::gated_residual_next_rmsnorm",
+    mutates_args=("residual_out", "ffn_input"),
+)
+def _gated_residual_next_rmsnorm_impl(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    next_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    residual_out: torch.Tensor,
+    ffn_input: torch.Tensor,
+    post_eps: float,
+    next_eps: float,
+    next_gain_center: float,
+    post_weight: Optional[torch.Tensor],
+    post_gain_center: float,
+    alpha_scalar: Optional[float] = None,
+    enable_pdl: bool = True,
+    backend: str = "auto",
+) -> None:
+    chosen = _gated_residual_next_rmsnorm_backend(
+        backend,
+        branch.device,
+        tensor_alpha=alpha_scalar is None,
+        has_post_weight=post_weight is not None,
+        rows=branch.shape[0],
+    )
+    if chosen == "cake":
+        # The Cake programs launch without programmatic dependent launch; a scalar
+        # gate travels as alpha_scalar and the alpha slot (beta) is unread.
+        _cake_gated_residual_next_rmsnorm(
+            branch,
+            residual,
+            next_weight,
+            alpha,
+            beta,
+            residual_out,
+            ffn_input,
+            post_eps=post_eps,
+            next_eps=next_eps,
+            next_gain_center=next_gain_center,
+            post_weight=post_weight,
+            post_gain_center=post_gain_center,
+            alpha_scalar=alpha_scalar,
+        )
+        return
+    if chosen is None:
+        raise ValueError(
+            f"gated_residual_next_rmsnorm: backend {backend!r} is not available "
+            f"on {branch.device}"
+        )
+    if enable_pdl:
+        enable_pdl = device_support_pdl(branch.device)
+    _gated_residual_next_rmsnorm_cute(
+        branch,
+        residual,
+        alpha,
+        beta,
+        next_weight,
+        post_eps,
+        next_eps,
+        next_gain_center,
+        residual_out,
+        ffn_input,
+        post_weight,
+        post_gain_center,
+        enable_pdl,
+        alpha_scalar,
+    )
+
+
+@register_fake_op("flashinfer::gated_residual_next_rmsnorm")
+def _gated_residual_next_rmsnorm_fake(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    next_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    residual_out: torch.Tensor,
+    ffn_input: torch.Tensor,
+    post_eps: float,
+    next_eps: float,
+    next_gain_center: float,
+    post_weight: Optional[torch.Tensor],
+    post_gain_center: float,
+    alpha_scalar: Optional[float] = None,
+    enable_pdl: bool = True,
+    backend: str = "auto",
+) -> None:
+    return None
+
+
+@flashinfer_api(trace=gated_residual_rmsnorm_trace)
+def gated_residual_rmsnorm(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    eps: float = 1e-6,
+    gain_center: float = 0.0,
+    out: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: bool = True,
+    backend: Literal["auto", "cake", "cute"] = "auto",
+) -> torch.Tensor:
+    r"""Gated residual RMSNorm for hidden size 8192: blend a normalized branch into the stream.
+
+    The operation is ``alpha * residual + beta * RMSNorm(branch)``. When
+    ``weight`` is supplied, ``weight + gain_center`` is applied to ``branch``
+    before its RMS reduction. When it is ``None``, the branch is unweighted.
+
+    This optimized implementation currently supports contiguous BF16 tensors
+    with hidden size 8192 on SM100, SM103, and SM107 GPUs.
+
+    Parameters
+    ----------
+    branch, residual : torch.Tensor
+        Two-dimensional BF16 and FP32 tensors, respectively, with shape
+        ``(rows, 8192)``.
+    weight : Optional[torch.Tensor]
+        Optional BF16 pre-normalization weight with shape ``(8192,)``.
+    alpha, beta : torch.Tensor
+        FP32 gate tensors with shape ``(8192,)``.
+    eps : float
+        Epsilon added to the RMS denominator.
+    gain_center : float
+        Constant added to ``weight`` in FP32.
+    out : Optional[torch.Tensor]
+        Optional FP32 output tensor with the same shape and layout as ``residual``.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch. Defaults to ``True``;
+        pass ``False`` to disable it. The Cake package ships a plain and a
+        programmatic-dependent-launch build of each program and runs the one
+        the flag selects.
+    backend : str
+        ``"auto"`` (default) runs the Cake kernels
+        (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
+        a program for the device, the call's inputs (``weight`` present or not,
+        ``enable_pdl``) and its row count (the package's routes may leave
+        row-count gaps where the CuTe DSL kernel measured ahead) and the tensors
+        sit in 32-byte aligned storage (the package's programs read and write
+        256-bit vectors; storage aligned to 16 bytes only runs the CuTe DSL
+        kernel), else the CuTe DSL kernel; ``"cake"`` and ``"cute"`` select one
+        and raise ``ValueError`` when it is not available (``"cake"`` at a row
+        count in a gap, or on storage aligned to 16 bytes only, raises too).
+
+    Returns
+    -------
+    torch.Tensor
+        The fused result.
+    """
+    if not _gated_residual_rmsnorm_tensors_ok(branch, residual, weight, alpha, beta):
+        raise ValueError("tensors do not satisfy the gated_residual_rmsnorm contract")
+    device = branch.device
+    weight_before_norm = weight is not None
+    if out is not None and (
+        out.shape != branch.shape
+        or out.dtype != residual.dtype
+        or out.device != device
+        or not out.is_contiguous()
+        or not _is_aligned(out)
+    ):
+        raise ValueError("out must match branch shape, dtype, device, and layout")
+    # One backend decision per call, handed to the implementation as the resolved backend; the Cake package
+    # serves 32-byte aligned storage alone (its programs read and write 256-bit vectors).
+    chosen = _gated_residual_rmsnorm_backend(
+        backend,
+        device,
+        weight_before_norm=weight_before_norm,
+        enable_pdl=_resolved_pdl(device, enable_pdl),
+        rows=branch.shape[0],
+        cake_layout=_cake_norm_layout(branch, residual, weight, alpha, beta, out),
+    )
+    if chosen is None:
+        raise ValueError(
+            f"gated_residual_rmsnorm: backend {backend!r} is not available on {device}"
+        )
+    if out is None:
+        out = torch.empty_like(residual)
+    if weight is not None:
+        kernel_weight = weight
+    elif chosen == "cute":
+        kernel_weight = branch.reshape(-1)[:_GATED_RESIDUAL_HIDDEN_SIZE]
+    else:
+        # The Cake package binds the unread weight slot of its mode-0 programs itself.
+        kernel_weight = branch
+    _gated_residual_rmsnorm_impl(
+        branch,
+        residual,
+        kernel_weight,
+        alpha,
+        beta,
+        out,
+        eps,
+        gain_center,
+        weight_before_norm,
+        enable_pdl,
+        chosen,
+    )
+    return out
+
+
+@register_custom_op("flashinfer::gated_residual_rmsnorm", mutates_args=("out",))
+def _gated_residual_rmsnorm_impl(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    gain_center: float,
+    apply_weight_before_norm: bool,
+    enable_pdl: bool = True,
+    backend: str = "auto",
+) -> None:
+    if enable_pdl:
+        enable_pdl = device_support_pdl(branch.device)
+    if backend == "cake" or backend == "cute":
+        chosen = backend  # resolved by the public wrapper (or requested explicitly)
+    else:
+        chosen = _gated_residual_rmsnorm_backend(
+            backend,
+            branch.device,
+            weight_before_norm=apply_weight_before_norm,
+            enable_pdl=enable_pdl,
+            rows=branch.shape[0],
+            cake_layout=_cake_norm_layout(branch, residual, weight, alpha, beta, out),
+        )
+    if chosen == "cake":
+        # The package binds the unread weight slot of its mode-0 programs itself.
+        _cake_gated_residual_rmsnorm(
+            branch,
+            residual,
+            weight if apply_weight_before_norm else None,
+            alpha,
+            beta,
+            out,
+            eps=eps,
+            gain_center=gain_center,
+            enable_pdl=enable_pdl,
+        )
+        return
+    if chosen is None:
+        raise ValueError(
+            f"gated_residual_rmsnorm: backend {backend!r} is not available on {branch.device}"
+        )
+    _gated_residual_rmsnorm_cute(
+        branch,
+        residual,
+        weight,
+        alpha,
+        beta,
+        eps,
+        gain_center,
+        int(apply_weight_before_norm),
+        out,
+        enable_pdl,
+    )
+
+
+@register_fake_op("flashinfer::gated_residual_rmsnorm")
+def _gated_residual_rmsnorm_fake(
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+    gain_center: float,
+    apply_weight_before_norm: bool,
+    enable_pdl: bool = True,
+    backend: str = "auto",
+) -> None:
+    return None
+
+
+@flashinfer_api(trace=rmsnorm_sigmoid_gate_trace)
+def rmsnorm_sigmoid_gate(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float = 1e-5,
+    *,
+    enable_pdl: bool = True,
+    backend: Literal["auto", "cake", "cute"] = "auto",
+) -> None:
+    r"""Per-head RMSNorm and sigmoid gate, in place, for head dim 64.
+
+    The last dimension is normalized independently, multiplied by
+    ``sigmoid(gate)``, and written back to ``input``. The optimized kernel
+    supports contiguous BF16 head rows of width 64 on SM100, SM103, and SM107 GPUs.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        BF16 tensor of shape ``(rows, 64)`` or ``(rows, heads, 64)``, normalized
+        in place. The last dimension must be contiguous, heads must be packed,
+        and the row stride must be a multiple of 8 elements.
+    gate : torch.Tensor
+        BF16 gate tensor with the same shape and layout constraints as ``input``.
+    eps : float
+        Epsilon added to the RMS denominator.
+    enable_pdl : bool
+        Whether to launch with programmatic dependent launch. Defaults to
+        ``True``; pass ``False`` to disable it. The CuTe DSL kernel takes the
+        attribute directly; the Cake package serves the call from its PDL
+        route, whose windows name a PDL build, a late-signal PDL build or a
+        plain build (launched without the attribute where the PDL build
+        measured slower) or leave a token count to the CuTe DSL kernel under
+        PDL (a declared gap).  The package ships that route on SM100, SM103
+        and SM107.
+    backend : str
+        ``"auto"`` (default) runs the Cake kernels
+        (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
+        a program for the device, the call's launch form, head count and token
+        count (the package routes 128, 32 and 16 heads; its windows leave
+        token-count gaps where the CuTe DSL kernel measured ahead) and the
+        tensors sit in 32-byte aligned storage with token strides that are
+        multiples of 16 elements (the package's 16-head programs on SM107 read
+        and write 256-bit vectors; other storage runs the CuTe DSL kernel),
+        else the CuTe DSL kernel; ``"cake"`` and ``"cute"`` select one and raise
+        ``ValueError`` when it is not available (``"cake"`` at a head count or
+        token count outside the package's windows, or on storage the package
+        does not serve, raises too).
+    """
+    if input.ndim not in (2, 3) or gate.shape != input.shape:
+        raise ValueError("input and gate must have matching 2-D or 3-D shapes")
+    device = input.device
+    if (
+        input.dtype != torch.bfloat16
+        or input.shape[-1] != _RMSNORM_SIGMOID_GATE_HEAD_DIM
+        or device.type != "cuda"
+    ):
+        raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
+    # One backend decision per call, handed to the implementation as the resolved backend; the implementation resolves
+    # the launch form against the device once (the package ships its PDL route on PDL-capable architectures alone, so
+    # the decision reads the requested form).
+    enable_pdl = bool(enable_pdl)
+    chosen = _rmsnorm_sigmoid_gate_backend(
+        backend,
+        device,
+        heads=input.shape[1] if input.ndim == 3 else 1,
+        tokens=input.shape[0],
+        enable_pdl=enable_pdl,
+        cake_layout=_cake_gate_layout(input, gate),
+    )
+    if chosen is None:
+        raise ValueError(
+            f"rmsnorm_sigmoid_gate: backend {backend!r} is not available on {device}"
+        )
+    if (
+        gate.dtype != torch.bfloat16
+        or not gate.is_cuda
+        or gate.device != input.device
+        or input.stride(-1) != 1
+        or gate.stride(-1) != 1
+        or input.stride(0) % 8 != 0
+        or gate.stride(0) % 8 != 0
+        or (input.ndim == 3 and input.stride(1) != input.shape[-1])
+        or (gate.ndim == 3 and gate.stride(1) != gate.shape[-1])
+        or not _is_aligned(input)
+        or not _is_aligned(gate)
+    ):
+        raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
+    _rmsnorm_sigmoid_gate_impl(input, gate, eps, enable_pdl, chosen)
+
+
+@register_custom_op("flashinfer::rmsnorm_sigmoid_gate", mutates_args=("input",))
+def _rmsnorm_sigmoid_gate_impl(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float,
+    enable_pdl: bool = True,
+    backend: str = "auto",
+) -> None:
+    if enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+    if backend == "cake" or backend == "cute":
+        chosen = backend  # resolved by the public wrapper (or requested explicitly)
+    else:
+        chosen = _rmsnorm_sigmoid_gate_backend(
+            backend,
+            input.device,
+            heads=input.shape[1] if input.ndim == 3 else 1,
+            tokens=input.shape[0],
+            enable_pdl=enable_pdl,
+            cake_layout=_cake_gate_layout(input, gate),
+        )
+    if chosen == "cake":
+        # The package's PDL route decides per window whether the program launches with the attribute.
+        _cake_rmsnorm_sigmoid_gate(input, gate, eps=eps, enable_pdl=enable_pdl)
+        return
+    if chosen is None:
+        raise ValueError(
+            f"rmsnorm_sigmoid_gate: backend {backend!r} is not available on {input.device}"
+        )
+    _rmsnorm_sigmoid_gate_cute(input, gate, eps, enable_pdl=enable_pdl)
+
+
+@register_fake_op("flashinfer::rmsnorm_sigmoid_gate")
+def _rmsnorm_sigmoid_gate_fake(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    eps: float,
+    enable_pdl: bool = True,
+    backend: str = "auto",
+) -> None:
+    return None
+
+
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
@@ -159,10 +1255,10 @@ def rmsnorm(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -238,7 +1334,7 @@ def rmsnorm_quant(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     """
     scale = _normalize_scale_tensor(scale, input)
@@ -293,7 +1389,7 @@ def fused_add_rmsnorm(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
@@ -335,7 +1431,7 @@ def fused_add_rmsnorm_quant(
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = ((residual[i] / RMS(residual)) * weight[i]).to(fp8)``
+    ``out[i] = (((residual[i] / RMS(residual)) * weight[i]) / scale).to(fp8)``
 
     Parameters
     ----------
@@ -354,7 +1450,7 @@ def fused_add_rmsnorm_quant(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     scale = _normalize_scale_tensor(scale, input)
     if enable_pdl is None or enable_pdl:
@@ -480,10 +1576,10 @@ def gemma_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor in place.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
 
     Returns
     -------
@@ -561,7 +1657,7 @@ def gemma_fused_add_rmsnorm(
         Epsilon for numerical stability.
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
     """
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
@@ -595,10 +1691,12 @@ def layernorm(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     r"""Layer normalization.
+
     Parameters
     ----------
     input: torch.Tensor
         Input tensor, shape (batch_size, hidden_size). Need to be bfloat16.
+        The last dimension must be contiguous; row strides are supported.
     gemma: torch.Tensor
         Gemma tensor, shape (hidden_size,). Need to be float32.
     beta: torch.Tensor
@@ -639,6 +1737,7 @@ def layernorm_quant(
     beta: torch.Tensor,
     scale: Union[float, torch.Tensor],
     eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Layer normalization + fp8 quantization.
 
@@ -656,15 +1755,33 @@ def layernorm_quant(
         Gemma tensor, shape (hidden_size,). Need to be float32.
     beta: torch.Tensor
         Beta tensor, shape (hidden_size,). Need to be float32.
-    scale: torch.Tensor
-        Scale factor for quantization, shape (1,). The normalized output is
-        divided by this scale before the fp8 cast.
+    scale: Union[float, torch.Tensor]
+        Scale factor for quantization; a tensor scale must have shape ``(1,)``.
+        The normalized output is divided by this scale before the fp8 cast.
     eps: float
         Epsilon for numerical stability.
+    enable_pdl: bool
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_.
+        Only honored by the CuTe-DSL backend; the CUDA fallback ignores it.
     """
     scale = _normalize_scale_tensor(scale, input)
-    # No CuTe-DSL layernorm quant kernel yet; always use the CUDA JIT module.
-    get_norm_module().layernorm_quant(out, input, gemma, beta, scale, eps)
+    if enable_pdl is None or enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+    if _use_cuda_norm(input.device):
+        get_norm_module().layernorm_quant(out, input, gemma, beta, scale, eps)
+    else:
+        if input.dtype != torch.bfloat16:
+            raise RuntimeError("input must be bfloat16")
+        if gemma.dtype != torch.float32:
+            raise RuntimeError("gamma must be float32")
+        if beta.dtype != torch.float32:
+            raise RuntimeError("beta must be float32")
+        if not input.is_contiguous():
+            raise RuntimeError("input must be contiguous")
+        if not out.is_contiguous():
+            raise RuntimeError("output must be contiguous")
+        layernorm_quant_cute(out, input, gemma, beta, scale, eps, enable_pdl=enable_pdl)
 
 
 @register_fake_op("flashinfer::layernorm_quant")
@@ -675,6 +1792,7 @@ def _layernorm_quant_fake(
     beta: torch.Tensor,
     scale: torch.Tensor,
     eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
 ) -> None:
     pass
 
@@ -705,6 +1823,13 @@ def _get_rmsnorm_silu_sm_count(device_id: int):
     """Cache the SM count per device."""
     props = torch.cuda.get_device_properties(device_id)
     return props.multi_processor_count
+
+
+@functools.cache
+def _get_rmsnorm_silu_max_threads_per_sm(device_id: int):
+    """Cache the resident-thread limit per SM (2048 on SM100/SM103, 1024 on SM107)."""
+    props = torch.cuda.get_device_properties(device_id)
+    return props.max_threads_per_multi_processor
 
 
 @functools.cache
@@ -878,6 +2003,10 @@ def fused_rmsnorm_silu(
         )
 
     warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg = knobs
+    # The LUT is tuned for 2048 threads/SM; cap occupancy on SM107 (1024).
+    max_threads_per_sm = _get_rmsnorm_silu_max_threads_per_sm(input.device.index)
+    if max_threads_per_sm <= 1024:
+        occupancy = max(1, min(occupancy, max_threads_per_sm // (warps_m * 32)))
     ctas_per_row = _estimate_ctas_per_row(C, split_cols, kernel_cfg, bytes_per_ldg)
     sm_count = _get_rmsnorm_silu_sm_count(input.device.index)
 

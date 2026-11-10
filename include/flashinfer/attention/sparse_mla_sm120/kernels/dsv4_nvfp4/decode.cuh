@@ -39,8 +39,8 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     const int* __restrict__ topk_length_ptr, const uint8_t* __restrict__ extra_kv_cache,
     const int32_t* __restrict__ extra_indices, const int* __restrict__ extra_topk_length_ptr,
     int extra_topk, int extra_page_block_size, size_t extra_page_stride_bytes, int num_tokens,
-    int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
-    bool write_direct, float lse_scale) {
+    int scratch_split_stride, int chunks_per_block, float sm_scale, int page_block_size,
+    size_t page_stride_bytes, bool write_direct, float lse_scale) {
   using KV = KVCacheTraits<MT>;
   static_assert(MT == ModelType::DSV4);
   constexpr int D_NOPE = KV::D_NOPE;
@@ -107,7 +107,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
 
   auto issue_gather = [&](int chunk, int buf) {
     gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, DECODE_KV_SMEM_STRIDE, DECODE_IO_WARPS * 32>(
-        kv_cache, idx_base, chunk, topk_len, false, PAGE_BLOCK_SIZE, page_stride_bytes,
+        kv_cache, idx_base, chunk, topk_len, false, page_block_size, page_stride_bytes,
         (warp_id - DECODE_N_WARPS) * 32 + lane, sm.kv_fp4(buf), sm.kv_rope(buf), sm.kv_sc(buf),
         sm.mbar_full(buf), num_main_chunks, extra_topk_len, extra_kv_cache,
         DUAL_CACHE ? extra_indices + size_t(token_idx) * extra_topk : nullptr,

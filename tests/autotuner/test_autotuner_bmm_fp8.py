@@ -6,7 +6,7 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import (
     _FP8_GEMM_SM100_TUNING_CONFIG,
     _cudnn_gemm_fp8_runner,
-    _get_cache_buf,
+    _get_stream_cache_buf,
     get_gemm_module,
     DEFAULT_WORKSPACE_SIZE,
 )
@@ -99,7 +99,7 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
     assert res.isfinite().all()
 
     # bmm_fp8 is tuned through fp8_gemm_sm100 and uses these inputs internally.
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, input_fp8.device
     )
     cache_inputs = [
@@ -136,12 +136,10 @@ def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
 def test_autotuner_gemm_cross_bucket_m(backend):
     """Tune at one M bucket, then run inference at a non-bucket M.
 
-    The cuBLASLt algo list is enumerated at the *real* shape, so an integer
-    tactic tuned against a different (bucketed) M may be out of range at
-    runtime. cuDNN tactics are stable engine/knob descriptors and are resolved
-    against the runtime graph. Both paths must reuse the tuned bucket entry for
-    the non-bucket M (i.e. the workspace scratch size does not leak into the
-    cache key) and produce finite output.
+    Both backends' tactics are stable descriptors (cuBLASLt algorithms, cuDNN
+    engine/knobs) resolved against the runtime problem. Both paths must reuse
+    the tuned bucket entry for the non-bucket M (i.e. the workspace scratch
+    size does not leak into the cache key) and produce finite output.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     cc = compute_capability[0] * 10 + compute_capability[1]
@@ -174,8 +172,7 @@ def test_autotuner_gemm_cross_bucket_m(backend):
     with autotune(tune_mode=True):
         bmm_fp8(a8, b8, a_s, b_s, res_dtype, backend=backend)
 
-    # 2) Run at a non-bucket M. Must not raise (out-of-range tactic is clamped)
-    #    and must produce finite output.
+    # 2) Run at a non-bucket M. Must not raise and must produce finite output.
     a8, b8, a_s, b_s = make(run_m)
     res = bmm_fp8(a8, b8, a_s, b_s, res_dtype, backend=backend)
     assert res.isfinite().all()
@@ -186,7 +183,7 @@ def test_autotuner_gemm_cross_bucket_m(backend):
         if backend == "cudnn"
         else get_gemm_module().cublas_fp8_gemm_runner()
     )
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, a8.device
     )
     is_cache_hit, runner_id, tactic, stored_profile = autotuner.search_cache(
@@ -207,7 +204,7 @@ def test_autotuner_gemm_cross_bucket_m(backend):
     if backend == "cudnn":
         _assert_engine_knob_tactic(tactic)
     else:
-        assert tactic >= 0
+        assert gemm_base._is_cublaslt_algo_tactic(tactic)
     assert stored_profile is not None
 
 

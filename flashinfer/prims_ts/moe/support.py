@@ -23,7 +23,10 @@ from typing import Any, Sequence
 
 import torch
 
-from flashinfer.prims_ts.utils import is_prims_ts_available
+from flashinfer.prims_ts.utils import (
+    is_prims_ts_arch_available,
+    is_prims_ts_available,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -40,6 +43,11 @@ _SUPPORTED_ACTIVATIONS = (
     ActivationType.Silu,
     ActivationType.Relu2,
     ActivationType.Situ,
+)
+_PRIMS_TS_ARCHS = ((10, 0), (10, 3), (10, 7))
+_UNSUPPORTED_DEVICE_REASON = (
+    "requires an SM100, SM103, or SM107 CUDA device that the installed "
+    "CuTe DSL can natively target; on SM107, install a Rubin-capable DSL"
 )
 
 
@@ -154,8 +162,18 @@ def _validate_block_major_k_storage_matches_config(
 def _device_supports_prims_ts(device: torch.device) -> bool:
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
+    compute_capability = get_compute_capability(device)
+    return compute_capability in _PRIMS_TS_ARCHS and is_prims_ts_arch_available(
+        *compute_capability
+    )
+
+
+def _sm_arch_for_device(device: torch.device) -> int:
+    """Return the mapper architecture key for a supported CUDA device."""
+    if device.type != "cuda":
+        return 100
     major, minor = get_compute_capability(device)
-    return (major, minor) in ((10, 0), (10, 3))
+    return major * 10 + minor
 
 
 def _has_gemm1_oa_params(kwargs: dict[str, Any]) -> bool:
@@ -254,6 +272,8 @@ def is_prims_ts_bf16_supported(
     runner: Any,
     moe_inputs: Any,
     tactic: int | Sequence[int],
+    *,
+    pair: Any | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
     """Return whether this BF16 MoE call is eligible for the Prims-TS path."""
@@ -262,7 +282,7 @@ def is_prims_ts_bf16_supported(
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
     if not _device_supports_prims_ts(hidden_states.device):
-        return False, "requires an SM100 or SM103 CUDA device"
+        return False, _UNSUPPORTED_DEVICE_REASON
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.Bfloat16) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.Bfloat16
     ):
@@ -301,20 +321,22 @@ def is_prims_ts_bf16_supported(
         return False, "fused shared experts are not supported"
 
     try:
-        from .config_mapper import map_trtllm_bf16_moe_tactic
+        if pair is None:
+            from .config_mapper import map_trtllm_bf16_moe_tactic
 
-        pair = map_trtllm_bf16_moe_tactic(
-            tactic,
-            activation_type=int(activation_type),
-            num_tokens=int(hidden_states.shape[0]),
-            top_k=getattr(runner, "top_k", None),
-            num_local_experts=getattr(runner, "num_local_experts", None),
-            weight_layout=_weight_layout_arg(runner, kwargs),
-            fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-            fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-            enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            **_gemm1_oa_flags(kwargs),
-        )
+            pair = map_trtllm_bf16_moe_tactic(
+                tactic,
+                sm_arch=_sm_arch_for_device(hidden_states.device),
+                activation_type=int(activation_type),
+                num_tokens=int(hidden_states.shape[0]),
+                top_k=getattr(runner, "top_k", None),
+                num_local_experts=getattr(runner, "num_local_experts", None),
+                weight_layout=_weight_layout_arg(runner, kwargs),
+                fc1_has_bias=kwargs.get("gemm1_bias") is not None,
+                fc2_has_bias=kwargs.get("gemm2_bias") is not None,
+                enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                **_gemm1_oa_flags(kwargs),
+            )
         ok, reason = _validate_block_major_k_storage_matches_config(
             runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
         )
@@ -330,6 +352,8 @@ def is_prims_ts_nvfp4_supported(
     runner: Any,
     moe_inputs: Any,
     tactic: int | Sequence[int],
+    *,
+    pair: Any | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
     """Return whether this NVFP4xNVFP4 MoE call is eligible for Prims-TS."""
@@ -338,7 +362,7 @@ def is_prims_ts_nvfp4_supported(
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
     if not _device_supports_prims_ts(hidden_states.device):
-        return False, "requires an SM100 or SM103 CUDA device"
+        return False, _UNSUPPORTED_DEVICE_REASON
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.E2m1) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.E2m1
     ):
@@ -386,22 +410,24 @@ def is_prims_ts_nvfp4_supported(
             return False, f"{name} is required"
 
     try:
-        from .config_mapper import map_trtllm_nvfp4_moe_tactic
+        if pair is None:
+            from .config_mapper import map_trtllm_nvfp4_moe_tactic
 
-        pair = map_trtllm_nvfp4_moe_tactic(
-            tactic,
-            activation_type=int(activation_type),
-            num_tokens=int(hidden_states.shape[0]),
-            top_k=getattr(runner, "top_k", None),
-            num_local_experts=getattr(runner, "num_local_experts", None),
-            weight_layout=_weight_layout_arg(runner, kwargs),
-            fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-            fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-            use_per_token_sf_b=moe_inputs.per_token_scale is not None,
-            per_token_sf_dtype=1,
-            enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            **_gemm1_oa_flags(kwargs),
-        )
+            pair = map_trtllm_nvfp4_moe_tactic(
+                tactic,
+                sm_arch=_sm_arch_for_device(hidden_states.device),
+                activation_type=int(activation_type),
+                num_tokens=int(hidden_states.shape[0]),
+                top_k=getattr(runner, "top_k", None),
+                num_local_experts=getattr(runner, "num_local_experts", None),
+                weight_layout=_weight_layout_arg(runner, kwargs),
+                fc1_has_bias=kwargs.get("gemm1_bias") is not None,
+                fc2_has_bias=kwargs.get("gemm2_bias") is not None,
+                use_per_token_sf_b=moe_inputs.per_token_scale is not None,
+                per_token_sf_dtype=1,
+                enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                **_gemm1_oa_flags(kwargs),
+            )
         ok, reason = _validate_block_major_k_storage_matches_config(
             runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
         )
@@ -417,6 +443,8 @@ def is_prims_ts_mxfp4_mxfp8_supported(
     runner: Any,
     moe_inputs: Any,
     tactic: int | Sequence[int],
+    *,
+    pair: Any | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
     """Return whether this MXFP4xMXFP8 MoE call is eligible for Prims-TS."""
@@ -425,7 +453,7 @@ def is_prims_ts_mxfp4_mxfp8_supported(
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
     if not _device_supports_prims_ts(hidden_states.device):
-        return False, "requires an SM100 or SM103 CUDA device"
+        return False, _UNSUPPORTED_DEVICE_REASON
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.MxE4m3) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.MxE2m1
     ):
@@ -471,20 +499,22 @@ def is_prims_ts_mxfp4_mxfp8_supported(
             return False, f"{name} is required"
 
     try:
-        from .config_mapper import map_trtllm_mxfp4_mxfp8_moe_tactic
+        if pair is None:
+            from .config_mapper import map_trtllm_mxfp4_mxfp8_moe_tactic
 
-        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
-            tactic,
-            activation_type=int(activation_type),
-            num_tokens=int(hidden_states.shape[0]),
-            top_k=getattr(runner, "top_k", None),
-            num_local_experts=getattr(runner, "num_local_experts", None),
-            weight_layout=_weight_layout_arg(runner, kwargs),
-            fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-            fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-            enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            **_gemm1_oa_flags(kwargs),
-        )
+            pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+                tactic,
+                sm_arch=_sm_arch_for_device(hidden_states.device),
+                activation_type=int(activation_type),
+                num_tokens=int(hidden_states.shape[0]),
+                top_k=getattr(runner, "top_k", None),
+                num_local_experts=getattr(runner, "num_local_experts", None),
+                weight_layout=_weight_layout_arg(runner, kwargs),
+                fc1_has_bias=kwargs.get("gemm1_bias") is not None,
+                fc2_has_bias=kwargs.get("gemm2_bias") is not None,
+                enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                **_gemm1_oa_flags(kwargs),
+            )
         ok, reason = _validate_block_major_k_storage_matches_config(
             runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
         )
@@ -500,6 +530,8 @@ def is_prims_ts_mxfp4_bf16_supported(
     runner: Any,
     moe_inputs: Any,
     tactic: int | Sequence[int],
+    *,
+    pair: Any | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
     """Return whether this MXFP4xBF16 MoE call is eligible for Prims-TS."""
@@ -508,7 +540,7 @@ def is_prims_ts_mxfp4_bf16_supported(
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
     if not _device_supports_prims_ts(hidden_states.device):
-        return False, "requires an SM100 or SM103 CUDA device"
+        return False, _UNSUPPORTED_DEVICE_REASON
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.Bfloat16) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.MxE2m1
     ):
@@ -555,20 +587,22 @@ def is_prims_ts_mxfp4_bf16_supported(
             return False, f"{name} is required"
 
     try:
-        from .config_mapper import map_trtllm_mxfp4_bf16_moe_tactic
+        if pair is None:
+            from .config_mapper import map_trtllm_mxfp4_bf16_moe_tactic
 
-        pair = map_trtllm_mxfp4_bf16_moe_tactic(
-            tactic,
-            activation_type=int(activation_type),
-            num_tokens=int(hidden_states.shape[0]),
-            top_k=getattr(runner, "top_k", None),
-            num_local_experts=getattr(runner, "num_local_experts", None),
-            weight_layout=_weight_layout_arg(runner, kwargs),
-            fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-            fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-            enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            **_gemm1_oa_flags(kwargs),
-        )
+            pair = map_trtllm_mxfp4_bf16_moe_tactic(
+                tactic,
+                sm_arch=_sm_arch_for_device(hidden_states.device),
+                activation_type=int(activation_type),
+                num_tokens=int(hidden_states.shape[0]),
+                top_k=getattr(runner, "top_k", None),
+                num_local_experts=getattr(runner, "num_local_experts", None),
+                weight_layout=_weight_layout_arg(runner, kwargs),
+                fc1_has_bias=kwargs.get("gemm1_bias") is not None,
+                fc2_has_bias=kwargs.get("gemm2_bias") is not None,
+                enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                **_gemm1_oa_flags(kwargs),
+            )
         ok, reason = _validate_block_major_k_storage_matches_config(
             runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
         )
@@ -584,6 +618,8 @@ def is_prims_ts_fp8_per_tensor_supported(
     runner: Any,
     moe_inputs: Any,
     tactic: int | Sequence[int],
+    *,
+    pair: Any | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
     """Return whether this FP8 per-tensor MoE call is eligible for Prims-TS."""
@@ -592,7 +628,7 @@ def is_prims_ts_fp8_per_tensor_supported(
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
     if not _device_supports_prims_ts(hidden_states.device):
-        return False, "requires an SM100 or SM103 CUDA device"
+        return False, _UNSUPPORTED_DEVICE_REASON
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.E4m3) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.E4m3
     ):
@@ -683,24 +719,26 @@ def is_prims_ts_fp8_per_tensor_supported(
             return False, f"{name} is required"
 
     try:
-        from .config_mapper import map_trtllm_fp8_per_tensor_moe_tactic
+        if pair is None:
+            from .config_mapper import map_trtllm_fp8_per_tensor_moe_tactic
 
-        pair = map_trtllm_fp8_per_tensor_moe_tactic(
-            tactic,
-            activation_type=int(activation_type),
-            num_tokens=int(hidden_states.shape[0]),
-            top_k=getattr(runner, "top_k", None),
-            num_local_experts=getattr(runner, "num_local_experts", None),
-            weight_layout=_weight_layout_arg(runner, kwargs),
-            fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-            fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-            fc1_use_per_token_sf_a=fc1_use_per_channel_weight_scale,
-            fc2_use_per_token_sf_a=fc2_use_per_channel_weight_scale,
-            use_per_token_sf_b=use_routing_scales_on_input,
-            per_token_sf_dtype=per_token_sf_dtype or 1,
-            enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            **_gemm1_oa_flags(kwargs),
-        )
+            pair = map_trtllm_fp8_per_tensor_moe_tactic(
+                tactic,
+                sm_arch=_sm_arch_for_device(hidden_states.device),
+                activation_type=int(activation_type),
+                num_tokens=int(hidden_states.shape[0]),
+                top_k=getattr(runner, "top_k", None),
+                num_local_experts=getattr(runner, "num_local_experts", None),
+                weight_layout=_weight_layout_arg(runner, kwargs),
+                fc1_has_bias=kwargs.get("gemm1_bias") is not None,
+                fc2_has_bias=kwargs.get("gemm2_bias") is not None,
+                fc1_use_per_token_sf_a=fc1_use_per_channel_weight_scale,
+                fc2_use_per_token_sf_a=fc2_use_per_channel_weight_scale,
+                use_per_token_sf_b=use_routing_scales_on_input,
+                per_token_sf_dtype=per_token_sf_dtype or 1,
+                enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                **_gemm1_oa_flags(kwargs),
+            )
         ok, reason = _validate_block_major_k_storage_matches_config(
             runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
         )
@@ -712,10 +750,96 @@ def is_prims_ts_fp8_per_tensor_supported(
     return True, ""
 
 
+def deepseek_fp8_scale_block_size(hidden_size: int, hidden_states_scale: Any) -> int:
+    """Side of the square DeepSeek FP8 scale block implied by the activation scale.
+
+    ``hidden_states_scale`` is ``[hidden_size / block, num_tokens]``. Returns
+    ``128`` when the shape does not imply a block; the support check rejects
+    such calls with a reason.
+    """
+    if hidden_states_scale is None or hidden_states_scale.ndim != 2:
+        return 128
+    rows = int(hidden_states_scale.shape[0])
+    if rows == 0 or hidden_size % rows != 0:
+        return 128
+    block = hidden_size // rows
+    return block if block in (32, 128) else 128
+
+
+def _deepseek_fp8_scale_block(
+    runner: Any, moe_inputs: Any, kwargs: dict[str, Any]
+) -> tuple[bool, str, int]:
+    """Infer the DeepSeek FP8 scale block from the scale shapes.
+
+    Returns ``(ok, reason, block)``. The block is read from
+    ``hidden_states_scale`` (``[hidden_size / block, num_tokens]``) and the
+    weight scales must use the same block:
+
+    * ``gemm1_weights_scale[..., 2I / block, H / block]``
+    * ``gemm2_weights_scale[..., H / block, I / block]``
+    """
+    hidden_size = int(runner.hidden_size)
+    intermediate_size = int(runner.intermediate_size)
+    act_scale = moe_inputs.hidden_states_scale
+    if act_scale.ndim != 2 or act_scale.shape[0] == 0:
+        return False, "DeepSeek FP8 hidden_states_scale must be 2-D", 0
+    block, rem = divmod(hidden_size, int(act_scale.shape[0]))
+    if rem != 0 or block not in (32, 128):
+        return (
+            False,
+            "DeepSeek FP8 hidden_states_scale must be [hidden_size / 128, "
+            "num_tokens] or [hidden_size / 32, num_tokens], got "
+            f"{tuple(act_scale.shape)} for hidden_size={hidden_size}",
+            0,
+        )
+    if hidden_size % block != 0 or intermediate_size % block != 0:
+        return (
+            False,
+            f"hidden_size and intermediate_size must be multiples of {block}",
+            0,
+        )
+    if _enum_eq(
+        kwargs.get("weight_layout", runner.weight_layout), WeightLayout.BlockMajorK
+    ) and (hidden_size % 128 != 0 or intermediate_size % 128 != 0):
+        return (
+            False,
+            "BlockMajorK stores weights in 128-element K blocks, so "
+            f"hidden_size={hidden_size} and intermediate_size={intermediate_size} "
+            "must be multiples of 128 or use the MajorK layout",
+            0,
+        )
+    fc1_rows = 2 * intermediate_size
+    expected = (
+        ("gemm1_weights_scale", (fc1_rows // block, hidden_size // block)),
+        ("gemm2_weights_scale", (hidden_size // block, intermediate_size // block)),
+    )
+    num_local_experts = int(runner.num_local_experts)
+    for name, shape in expected:
+        scale = kwargs[name]
+        if scale.ndim != 3 or int(scale.shape[0]) != num_local_experts:
+            return (
+                False,
+                f"DeepSeek FP8 {name} must be [num_local_experts={num_local_experts}, "
+                f"rows / {block}, K / {block}], got {tuple(scale.shape)}",
+                0,
+            )
+        actual = tuple(scale.shape[-2:])
+        if actual != shape:
+            return (
+                False,
+                f"DeepSeek FP8 {name} trailing dims {actual} do not match the "
+                f"{block}x{block} scale block {shape}",
+                0,
+            )
+    return True, "", block
+
+
 def is_prims_ts_fp8_block_scale_supported(
     runner: Any,
     moe_inputs: Any,
     tactic: int | Sequence[int],
+    *,
+    pair: Any | None = None,
     **kwargs: Any,
 ) -> tuple[bool, str]:
     """Return whether this FP8 block-scale MoE call is eligible for Prims-TS."""
@@ -724,7 +848,7 @@ def is_prims_ts_fp8_block_scale_supported(
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
     if not _device_supports_prims_ts(hidden_states.device):
-        return False, "requires an SM100 or SM103 CUDA device"
+        return False, _UNSUPPORTED_DEVICE_REASON
     if hidden_states.dtype != torch.float8_e4m3fn:
         return False, "hidden_states must be float8_e4m3fn"
     if moe_inputs.hidden_states_scale is None:
@@ -772,9 +896,7 @@ def is_prims_ts_fp8_block_scale_supported(
         kwargs.get("gemm1_bias") is not None or kwargs.get("gemm2_bias") is not None
     ):
         return False, "DeepSeek FP8 Prims-TS bias is not supported"
-    if runner.intermediate_size % 128 != 0 or runner.hidden_size % 128 != 0:
-        return False, "hidden_size and intermediate_size must be multiples of 128"
-
+    deepseek_fp8_block_size = 128
     if is_deepseek:
         if moe_inputs.hidden_states_scale.dtype != torch.float32:
             return False, "DeepSeek FP8 hidden_states_scale must be float32"
@@ -787,8 +909,15 @@ def is_prims_ts_fp8_block_scale_supported(
             return False, "DeepSeek FP8 gemm1_weights_scale must be float32"
         if kwargs["gemm2_weights_scale"].dtype != torch.float32:
             return False, "DeepSeek FP8 gemm2_weights_scale must be float32"
+        ok, reason, deepseek_fp8_block_size = _deepseek_fp8_scale_block(
+            runner, moe_inputs, kwargs
+        )
+        if not ok:
+            return False, reason
         mapper_name = "map_trtllm_deepseek_fp8_moe_tactic"
     else:
+        if runner.intermediate_size % 128 != 0 or runner.hidden_size % 128 != 0:
+            return False, "hidden_size and intermediate_size must be multiples of 128"
         if (
             kwargs.get("gemm1_weights_scale") is None
             or kwargs.get("gemm2_weights_scale") is None
@@ -803,31 +932,35 @@ def is_prims_ts_fp8_block_scale_supported(
         mapper_name = "map_trtllm_mxfp8_mxfp8_moe_tactic"
 
     try:
-        from . import config_mapper
+        if pair is None:
+            from . import config_mapper
 
-        mapper = getattr(config_mapper, mapper_name)
-        if is_deepseek:
-            pair = mapper(
-                tactic,
-                num_tokens=int(hidden_states.shape[0]),
-                top_k=getattr(runner, "top_k", None),
-                num_local_experts=getattr(runner, "num_local_experts", None),
-                weight_layout=_weight_layout_arg(runner, kwargs),
-                enable_pdl=bool(kwargs.get("enable_pdl", False)),
-            )
-        else:
-            pair = mapper(
-                tactic,
-                activation_type=int(activation_type),
-                num_tokens=int(hidden_states.shape[0]),
-                top_k=getattr(runner, "top_k", None),
-                num_local_experts=getattr(runner, "num_local_experts", None),
-                weight_layout=_weight_layout_arg(runner, kwargs),
-                fc1_has_bias=kwargs.get("gemm1_bias") is not None,
-                fc2_has_bias=kwargs.get("gemm2_bias") is not None,
-                enable_pdl=bool(kwargs.get("enable_pdl", False)),
-                **_gemm1_oa_flags(kwargs),
-            )
+            mapper = getattr(config_mapper, mapper_name)
+            if is_deepseek:
+                pair = mapper(
+                    tactic,
+                    sm_arch=_sm_arch_for_device(hidden_states.device),
+                    num_tokens=int(hidden_states.shape[0]),
+                    top_k=getattr(runner, "top_k", None),
+                    num_local_experts=getattr(runner, "num_local_experts", None),
+                    weight_layout=_weight_layout_arg(runner, kwargs),
+                    enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                    deepseek_fp8_block_size=deepseek_fp8_block_size,
+                )
+            else:
+                pair = mapper(
+                    tactic,
+                    sm_arch=_sm_arch_for_device(hidden_states.device),
+                    activation_type=int(activation_type),
+                    num_tokens=int(hidden_states.shape[0]),
+                    top_k=getattr(runner, "top_k", None),
+                    num_local_experts=getattr(runner, "num_local_experts", None),
+                    weight_layout=_weight_layout_arg(runner, kwargs),
+                    fc1_has_bias=kwargs.get("gemm1_bias") is not None,
+                    fc2_has_bias=kwargs.get("gemm2_bias") is not None,
+                    enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                    **_gemm1_oa_flags(kwargs),
+                )
         ok, reason = _validate_block_major_k_storage_matches_config(
             runner, kwargs, pair.fc1.cfg.build(), pair.fc2.cfg.build()
         )

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import weakref
-from typing import TYPE_CHECKING, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -24,10 +25,19 @@ from ..config import (
     CombineInputParams,
     DispatchInputParams,
     DispatchOutput,
+    EpAlgorithm,
+    EpLayout,
     FleetParams,
     HandleParams,
 )
-from ..core.comm.fleet import Fleet, create_fleet
+from ..core.comm.communication import (
+    MoEEpCommParams,
+    MoEEpCommunication,
+    MoEEpDispatchResult,
+    create_communication,
+    is_communication_backend,
+)
+from ..core.comm.fleet import Fleet, create_fleet, is_fleet_backend
 from ..core.kernel.base import SplitKernelBackend, SplitKernelContext
 from ..core.kernel.registry import create_split_kernel
 from ..core.runtime import (
@@ -47,6 +57,7 @@ from ..core.validation.common import (
 )
 from ..weights import MoEWeightPack
 from .config import SplitConfig
+from ..backends.split.comm.nvlink_one_sided.config import NVLinkOneSidedConfig
 from ..backends.split.kernel.identity.config import IdentityConfig
 
 if TYPE_CHECKING:
@@ -71,19 +82,26 @@ class MoEEpSplitGraphState:
     Create with :meth:`MoEEpSplitLayer.create_graph_state` **outside** any
     capture; never construct directly.
 
-    The default forward creates a ``Handle`` per call and destroys it in a
-    ``finally``. A CUDA graph records the device pointers it sees at capture
-    time, so that handle's buffers are freed the moment capture ends and every
-    replay dereferences dead memory -- which is silent at capture and faults
-    (or worse, reads garbage) at replay. This object holds one long-lived
-    handle instead: the allocating half (``ncclEpInitHandle``, via
-    ``create_handle``) runs here, outside the capture, and the per-step half
-    (``Handle.update``) is recorded inside it.
+    A CUDA graph records the device pointers it sees at capture time, so
+    everything a captured forward touches must outlive the capture. What that
+    takes depends on the layer's comm path:
 
-    It also pins the tensors the graph binds. ``topk_weights`` is bound into
-    the handle at creation and ``out`` is the address combine writes, so both
-    must be stable buffers whose *contents* the caller overwrites between
-    replays -- the standard CUDA-graph static-input discipline.
+    * Fleet/Handle path: the eager forward creates a ``Handle`` per call and
+      destroys it in a ``finally``, so that handle's buffers are freed the
+      moment capture ends and every replay dereferences dead memory -- which
+      is silent at capture and faults (or worse, reads garbage) at replay.
+      This object holds one long-lived handle instead: the allocating half
+      (``ncclEpInitHandle``, via ``create_handle``) runs here, outside the
+      capture, and the per-step half (``Handle.update``) is recorded inside it.
+    * MoEEpCommunication path: the :class:`MoEEpCommunication` already
+      outlives every forward, so the state carries ``handle=None``.
+
+    On both paths it pins the tensors the graph binds. ``out`` is the address
+    combine writes and the inputs are the addresses dispatch reads (on the
+    Fleet/Handle path ``topk_weights`` is moreover bound into the handle at
+    creation), so all must be stable buffers whose *contents* the caller
+    overwrites between replays -- the standard CUDA-graph static-input
+    discipline.
     ``forward`` re-checks the owning layer and buffer metadata on every call: a
     caller that silently passes a fresh tensor would otherwise get a graph that
     keeps serving the old one, and a caller that passes another layer's state
@@ -98,6 +116,7 @@ class MoEEpSplitGraphState:
         "_topk_ids",
         "_topk_weights",
         "_out",
+        "_runtime_max_tokens_per_rank",
         "_buffer_signatures",
         "_destroyed",
     )
@@ -105,11 +124,11 @@ class MoEEpSplitGraphState:
     def __init__(
         self,
         layer: "MoEEpSplitLayer",
-        handle: "Handle",
+        handle: "Handle | None",
         t: "MoEEpTensors",
         out: torch.Tensor,
     ) -> None:
-        """Bind one layer, one persistent handle and one static buffer set.
+        """Bind one layer, its persistent handle (if any) and one static buffer set.
 
         Not public: everything the graph will record has to be established
         outside a capture, which is what
@@ -124,6 +143,7 @@ class MoEEpSplitGraphState:
         self._topk_ids = t.topk_ids
         self._topk_weights = t.topk_weights
         self._out = out
+        self._runtime_max_tokens_per_rank = t.runtime_max_tokens_per_rank
         # Tensor metadata is mutable: retaining the tensor alone does not
         # preserve the binding if the caller uses set_(), resize_(), or .data.
         self._buffer_signatures = {
@@ -144,7 +164,7 @@ class MoEEpSplitGraphState:
 
     @property
     def destroyed(self) -> bool:
-        """Whether :meth:`destroy` has already released the handle.
+        """Whether :meth:`destroy` has already run.
 
         A destroyed state can no longer back a ``forward``, and it no longer
         occupies its layer's one graph-state slot.
@@ -156,9 +176,10 @@ class MoEEpSplitGraphState:
 
         The owner and buffer checks matter because of capture specifically,
         and neither can be caught downstream (a destroyed state is simply
-        wrong at any time, and does surface later as a faulting handle). The handle belongs to the creating layer's fleet, so
-        a state used by another layer routes that layer's tokens over a foreign
-        communicator and writes a foreign ``out`` -- and with the usual
+        wrong at any time, and does surface later as a faulting handle). The
+        state belongs to the creating layer's transport, so a state used by
+        another layer routes that layer's tokens over a foreign transport and
+        writes a foreign ``out`` -- and with the usual
         homogeneous FleetParams no shape disagrees anywhere, so it produces
         wrong results in silence. A rebound tensor is likewise fine eagerly and
         silently wrong once captured, because the graph keeps serving the
@@ -178,20 +199,19 @@ class MoEEpSplitGraphState:
             # for a second layer that no longer exists.
             raise MoEEpConfigError(
                 "the MoEEpSplitLayer that created this MoEEpSplitGraphState "
-                "has been garbage collected, so its persistent handle refers "
-                "to a destroyed fleet. Keep the layer alive for at least as "
+                "has been garbage collected, so the transport it is bound to "
+                "has been destroyed. Keep the layer alive for at least as "
                 "long as the state and any graph captured from it."
             )
         if owner is not layer:
             raise MoEEpConfigError(
                 "this MoEEpSplitGraphState belongs to a different "
-                "MoEEpSplitLayer. Its persistent handle was created by that "
-                "layer's fleet -- a different communicator and a different set "
-                "of transport buffers -- so running this layer's round trip on "
-                "it would send this layer's tokens over the other layer's "
-                "transport and write the result into the other state's `out` "
-                "buffer. Pass the state returned by THIS layer's "
-                "create_graph_state()."
+                "MoEEpSplitLayer. It is bound to that layer's transport -- a "
+                "different communicator and a different set of transport "
+                "buffers -- so running this layer's round trip on it would "
+                "send this layer's tokens over the other layer's transport and "
+                "write the result into the other state's `out` buffer. Pass "
+                "the state returned by THIS layer's create_graph_state()."
             )
         for name, bound, got in (
             ("hidden_states", self._hidden_states, t.hidden_states),
@@ -214,9 +234,16 @@ class MoEEpSplitGraphState:
                     f"got {actual}. Copy new values into the registered tensor "
                     "in place instead of rebinding it or changing its metadata."
                 )
+        if t.runtime_max_tokens_per_rank != self._runtime_max_tokens_per_rank:
+            # The dispatch records this value as a kernel argument.
+            raise ValueError(
+                "MoEEpSplitGraphState: runtime_max_tokens_per_rank must stay "
+                f"{self._runtime_max_tokens_per_rank}, the value the state was "
+                f"created with; got {t.runtime_max_tokens_per_rank}."
+            )
 
     def destroy(self) -> None:
-        """Release the persistent handle. Idempotent.
+        """Release the persistent handle, if any. Idempotent.
 
         Only safe once every graph that captured this state has been retired
         and the device synchronized; the graphs hold pointers into the
@@ -234,7 +261,8 @@ class MoEEpSplitGraphState:
         # it would permanently skip the fleet and the comm-runtime teardown
         # below it and leak both. A stranded handle is the smaller leak.
         try:
-            self._handle.destroy()
+            if self._handle is not None:
+                self._handle.destroy()
         except Exception as exc:  # noqa: BLE001
             _logger.warning(
                 "moe_ep split graph-state handle release failed: %s",
@@ -246,8 +274,71 @@ class MoEEpSplitGraphState:
             layer._graph_state = None
 
 
+_TOKEN_DTYPE_BY_BYTES = {1: torch.uint8, 2: torch.bfloat16, 4: torch.float32}
+
+
+class _StageTimer:
+    """Records a CUDA event pair around one forward stage into ``timings``."""
+
+    __slots__ = ("_timings", "_stage", "_start")
+
+    def __init__(
+        self,
+        timings: "dict[str, tuple[torch.cuda.Event, torch.cuda.Event]]",
+        stage: str,
+    ) -> None:
+        self._timings = timings
+        self._stage = stage
+
+    def __enter__(self) -> None:
+        self._start = torch.cuda.Event(enable_timing=True)
+        self._start.record()
+
+    def __exit__(self, *exc_info) -> None:
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self._timings[self._stage] = (self._start, end)
+
+
+def _communication_backend(backend, kernel: SplitKernelBackend):
+    """The communication config for this kernel. A kernel that packs its
+    dispatch rows keeps NVLink one-sided's Lamport transport off: it rewrites
+    payload words equal to its sentinel, which preserves BF16 values but not
+    other bytes. The backend's name stands for its default config, which has
+    the transport on."""
+    if not kernel.packs_dispatch_payload:
+        return backend
+    if isinstance(backend, str) and backend == NVLinkOneSidedConfig.backend_name:
+        backend = NVLinkOneSidedConfig()
+    if getattr(backend, "lamport", False) is not False:
+        return dataclasses.replace(backend, lamport=False)
+    return backend
+
+
 class MoEEpSplitLayer(nn.Module):
-    """Expert-Parallel layer: dispatch → inner kernel → combine."""
+    """Expert-Parallel layer: dispatch → inner kernel → combine.
+
+    The comm backend runs on one of two peer paths, each over its own
+    transport interface:
+
+    * **Fleet/Handle path** (``nccl_ep``, ``nixl_ep``): a long-lived
+      :class:`Fleet` creates a :class:`Handle` that carries one step's routing,
+      and dispatch and combine run on that handle.
+    * **MoEEpCommunication path** (``nvlink_one_sided``, ``cake``,
+      ``nvlink_two_sided``): one long-lived :class:`MoEEpCommunication` takes
+      the routing with each dispatch. It exchanges tokens rank-major, so it
+      requires the low-latency RANK_MAJOR layout.
+
+    Each path turns its dispatch output into the same
+    :class:`SplitKernelContext`, so the inner kernel is shared.
+
+    A forward runs the stages in :attr:`STAGES` order: ``quantize`` turns the
+    hidden states into the dispatch payload (the kernel's quantization or
+    packing; no work when tokens travel unquantized), ``dispatch`` and
+    ``combine`` run the transport, and ``compute`` the inner kernel.
+    """
+
+    STAGES = ("quantize", "dispatch", "compute", "combine")
 
     def __init__(
         self,
@@ -256,16 +347,18 @@ class MoEEpSplitLayer(nn.Module):
         weights: MoEWeightPack,
         fleet_knobs: Sequence[AlgoKnob] = (),
         backend: Union[str, SplitConfig, object] = "nccl_ep",
+        *,
+        _prepared_weights=None,
     ) -> None:
         """Validate the EP config and hand ``weights`` to the inner kernel.
 
-        The fleet is built lazily on the first forward, so construction
+        The transport is built lazily on the first forward, so construction
         allocates no transport buffers. It is not comm-free by default, though:
         ``BootstrapConfig.auto_bootstrap`` defaults to True, and this
-        constructor then calls ``bootstrap_moe_ep_runtime()``, which for the
-        ``nccl_ep`` / ``nixl_ep`` backends initializes ``torch.distributed``
-        (and, for ``world_size > 1``, raises unless it is already initialized
-        or RANK/WORLD_SIZE are set). Pass ``auto_bootstrap=False`` to keep
+        constructor then calls ``bootstrap_moe_ep_runtime()``, which for every
+        registered comm backend initializes ``torch.distributed`` (and, for
+        ``world_size > 1``, raises unless it is already initialized or
+        RANK/WORLD_SIZE are set). Pass ``auto_bootstrap=False`` to keep
         construction legal before ``torch.distributed`` is up. ``weights`` is
         released once the kernel has preprocessed it, so the layer never pins a
         second copy for the model's lifetime.
@@ -293,41 +386,66 @@ class MoEEpSplitLayer(nn.Module):
                 split_comm_runtime_requirements(self._comm_backend_name()),
             )
 
-        self._validate_at_init()
-        self._kernel.validate_init(bootstrap, fleet_params)
+        try:
+            self._validate_at_init(validate_weights=_prepared_weights is None)
+            self._kernel.validate_init(bootstrap, fleet_params)
 
-        if type(self._kernel).requires_weights():
-            self._kernel.preprocess_weights(self._weights, fleet_params)
+            if _prepared_weights is not None:
+                self._kernel._transformed_weights = _prepared_weights
+            elif type(self._kernel).requires_weights():
+                self._kernel.preprocess_weights(self._weights, fleet_params)
+        except Exception:
+            try:
+                self._kernel.destroy()
+            finally:
+                if self._runtime is not None:
+                    finalize_moe_ep_runtime(self._runtime)
+                    self._runtime = None
+                self._destroyed = True
+            raise
         # Source pack is only needed for init-time validation and kernel
         # preprocessing; the kernel retains what it needs. Release it so the
         # layer does not pin a per-layer weight copy for the model lifetime
         # (same OOM pattern as the mega path — see MoEEpMegaLayer docstring).
         self._weights = None
 
+        # The transport of whichever path the comm backend runs on; the other
+        # stays None.
         self._fleet: Fleet | None = None
+        self._communication: MoEEpCommunication | None = None
         # Set by create_graph_state(); the layer keeps at most one live state
-        # so destroy() can tear it down with the fleet it borrows buffers from.
+        # so destroy() can tear it down before the transport it borrows
+        # buffers from.
         self._graph_state: MoEEpSplitGraphState | None = None
-        # Flipped by the first successful EAGER round trip on this layer, with
-        # or without a graph state. Everything a capture needs warmed is a
-        # property of the layer and its fleet, not of one state: the inner MoE
-        # kernel's lazy build and backend selection (which captures a graph of
-        # its own -- nested capture is illegal) and the transport's cold first
-        # round trip. Both forward paths run the same _round_trip over the same
-        # fleet, so either one warms them. See the guard in forward().
+        # Flipped by the first successful EAGER forward on this layer, with or
+        # without a graph state. Everything a capture needs warmed is a
+        # property of the layer and its transport, not of one state: the inner
+        # MoE kernel's lazy build and backend selection (which captures a graph
+        # of its own -- nested capture is illegal) and the transport's cold
+        # first dispatch/combine. Both eager forwards run the same dispatch →
+        # compute → combine over the same transport, so either one warms them.
+        # See the guard in forward().
         self._warmed = False
         # Set by destroy(). Without it a later forward() silently builds a
-        # brand-new fleet on an already-finalized comm runtime (_ensure_fleet
-        # only tests for None) -- the same hole MoEEpMegaLayer closes with its
-        # own flag.
+        # brand-new transport on an already-finalized comm runtime
+        # (_ensure_fleet and _ensure_communication only test for None) -- the
+        # same hole MoEEpMegaLayer closes with its own flag.
         self._destroyed = False
 
         # Opt-in per-stage profiling. When True, forward() records CUDA events
-        # around dispatch / compute / combine and stores elapsed GPU time (ms)
-        # in ``last_timings_ms`` after a device sync. Off by default (zero
-        # overhead on the hot path). Used by benchmarks/bench_moe_ep.py.
+        # around each stage (see STAGES) and stores elapsed GPU time (ms) in
+        # ``last_timings_ms`` after a device sync. Off by default (zero
+        # overhead on the hot path). Used by benchmarks/moe_ep/bench_moe_ep_fleet.py.
         self.enable_timing = False
         self.last_timings_ms: dict[str, float] = {}
+        # Optional per-stage callback: ``stage_hook(stage)`` returns a context
+        # manager that forward() enters around each stage, on the current
+        # stream. Unlike enable_timing it never synchronizes, so it may record
+        # CUDA events while a graph is being captured; the caller reads them
+        # after the replay. Used by benchmarks/moe_ep/bench_moe_ep.py.
+        self.stage_hook: Optional[
+            Callable[[str], contextlib.AbstractContextManager[None]]
+        ] = None
 
     def _comm_backend_name(self) -> str:
         name = getattr(self._comm_backend, "backend_name", self._comm_backend)
@@ -338,12 +456,305 @@ class MoEEpSplitLayer(nn.Module):
             )
         return name
 
-    def _validate_at_init(self) -> None:
-        backend_name = self._comm_backend_name()
+    def _uses_communication(self) -> bool:
+        """Whether the comm backend runs on the MoEEpCommunication path rather
+        than the Fleet/Handle path."""
+        on_fleet = is_fleet_backend(self._comm_backend)
+        on_communication = is_communication_backend(self._comm_backend)
+        if on_fleet == on_communication:
+            raise MoEEpConfigError(
+                f"comm backend {self._comm_backend_name()!r} must be registered "
+                "as exactly one of a Fleet backend or a MoEEpCommunication "
+                f"backend; it is registered as {'both' if on_fleet else 'neither'}."
+            )
+        return on_communication
+
+    def _validate_at_init(self, *, validate_weights=True) -> None:
         validate_bootstrap_world_size(self._bootstrap)
-        validate_fleet_weights(
-            self._weights, self._fleet_params, self._bootstrap.world_size
+        if validate_weights:
+            validate_fleet_weights(
+                self._weights, self._fleet_params, self._bootstrap.world_size
+            )
+        if self._uses_communication():
+            self._validate_communication_config()
+        else:
+            self._validate_fleet_config()
+
+    def create_graph_state(
+        self,
+        t: "MoEEpTensors",
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> MoEEpSplitGraphState:
+        """Build the persistent state a CUDA-graph capture of ``forward`` needs.
+
+        Call once per (shape, buffer set) on **every** EP rank, outside any
+        capture, then pass the result to ``forward``::
+
+            state = layer.create_graph_state(t)
+            layer.forward(t, graph_state=state)      # warmup, still eager -- REQUIRED
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                y = layer.forward(t, graph_state=state)
+            ...
+            t.hidden_states.copy_(new_x)             # in place, same buffers
+            t.topk_ids.copy_(new_ids)
+            g.replay()                               # y now holds the result
+
+        ``t``'s tensors become the graph's bound buffers, so update them in
+        place between replays rather than rebinding. The warmup forward is not
+        optional: ``forward`` refuses to capture on a layer that has never
+        completed an eager forward. It is what compiles/autotunes the inner
+        kernel and establishes the transport's steady state, neither of which
+        can happen during capture.
+
+        The routing SHAPE is fixed here -- ``top_k`` and the token count are
+        baked into the graph (and, on the Fleet/Handle path, into the handle).
+        A different batch size needs its own state and its own graph, the usual
+        multi-size-graph pattern -- and, today, its own layer: a layer holds at
+        most one live state, and destroying the live one to make room frees the
+        buffers the graph already captured from it replays against.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError(
+                "this MoEEpSplitLayer has been destroyed; its transport and "
+                "comm runtime are gone."
+            )
+        if _is_capturing():
+            raise MoEEpConfigError(
+                "MoEEpSplitLayer.create_graph_state() allocates transport "
+                "buffers and cannot run during CUDA graph capture; call it "
+                "(and one warmup forward) on all EP ranks before capturing."
+            )
+        ensure_bootstrap_dist_validated(self._bootstrap)
+        validate_split_forward_inputs(
+            t.hidden_states,
+            t.topk_ids,
+            t.topk_weights,
+            self._fleet_params,
         )
+        if self._graph_state is not None and not self._graph_state.destroyed:
+            raise MoEEpConfigError(
+                "this MoEEpSplitLayer already has a live graph state (one "
+                "per layer). Destroying it frees the buffers every graph "
+                "captured from it replays against, so a second shape needs a "
+                "second layer, not a second state on this one."
+            )
+        if out is None:
+            out = torch.empty_like(
+                t.hidden_states, memory_format=torch.contiguous_format
+            )
+        elif (
+            out.shape != t.hidden_states.shape
+            or out.dtype != t.hidden_states.dtype
+            or out.device != t.hidden_states.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be contiguous and match hidden_states: expected "
+                f"shape {tuple(t.hidden_states.shape)} dtype {t.hidden_states.dtype} "
+                f"device {t.hidden_states.device}, got shape {tuple(out.shape)} "
+                f"dtype {out.dtype} device {out.device} strides {out.stride()}."
+            )
+
+        if self._uses_communication():
+            state = self._create_communication_graph_state(t, out)
+        else:
+            state = self._create_fleet_graph_state(t, out)
+        self._graph_state = state
+        return state
+
+    def forward(
+        self,
+        t: "MoEEpTensors",
+        *,
+        graph_state: Optional[MoEEpSplitGraphState] = None,
+    ) -> torch.Tensor:
+        """Run one EP forward: dispatch → inner kernel → combine.
+
+        With ``graph_state`` (from :meth:`create_graph_state`) the forward
+        writes that state's static output buffer and, on the Fleet/Handle path,
+        reuses its persistent handle instead of creating and destroying one
+        per call, which is what makes the call safe to record into a CUDA
+        graph. Without it, behaviour is unchanged.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError(
+                "this MoEEpSplitLayer has been destroyed; its transport and "
+                "comm runtime are gone."
+            )
+        ensure_bootstrap_dist_validated(self._bootstrap)
+        validate_split_forward_inputs(
+            t.hidden_states,
+            t.topk_ids,
+            t.topk_weights,
+            self._fleet_params,
+        )
+        runtime_max = t.runtime_max_tokens_per_rank
+        if runtime_max is not None and not (
+            max(t.num_tokens, 1)
+            <= runtime_max
+            <= self._fleet_params.max_tokens_per_rank
+        ):
+            raise MoEEpConfigError(
+                f"runtime_max_tokens_per_rank={runtime_max} must lie in "
+                f"[max(num_tokens, 1)={max(t.num_tokens, 1)}, "
+                f"max_tokens_per_rank={self._fleet_params.max_tokens_per_rank}]"
+            )
+
+        capturing = _is_capturing()
+        if graph_state is not None:
+            if not isinstance(graph_state, MoEEpSplitGraphState):
+                # Without this the mistyped argument reaches _check() and dies
+                # with a bare AttributeError that names neither the argument
+                # nor the call that produces a valid one.
+                raise TypeError(
+                    "graph_state must be created by "
+                    "MoEEpSplitLayer.create_graph_state(); got "
+                    f"{type(graph_state).__name__}."
+                )
+            graph_state._check(self, t)
+            if self.enable_timing and capturing:
+                raise MoEEpConfigError(
+                    "enable_timing synchronizes the device to read its CUDA "
+                    "events, which is illegal during graph capture. Turn it "
+                    "off to capture, and time the replay instead."
+                )
+            if capturing and not self._warmed:
+                # create_graph_state() builds the transport (on the
+                # Fleet/Handle path also the handle, plus the one update
+                # outside the capture that nccl_ep requires) -- but runs no
+                # forward, so the inner kernel is still unbuilt and the
+                # transport has no steady state. Caught here because the
+                # symptom otherwise surfaces from inside the inner kernel's
+                # backend selection (a nested capture plus a device sync) and
+                # names nothing in this file.
+                raise MoEEpConfigError(
+                    "this MoEEpSplitLayer has never run an eager forward, so "
+                    "the capture would be the first round trip it ever sees: "
+                    "the inner MoE kernel is still unbuilt and selecting its "
+                    "backend captures a graph of its own (nested capture is "
+                    "illegal), and the transport has no steady state. Run one "
+                    "eager forward on this layer -- layer.forward(t) or "
+                    "layer.forward(t, graph_state=state), either warms the "
+                    "same transport and kernel -- outside the capture, on "
+                    "every EP rank, first."
+                )
+
+        if self._uses_communication():
+            out = self._communication_forward(t, graph_state)
+        else:
+            out = self._fleet_forward(t, graph_state)
+        if not capturing:
+            # A completed eager forward is the warmup a later capture needs:
+            # it built the inner kernel and ran the transport.
+            self._warmed = True
+        return out
+
+    def _forward_prepared(self, t, state, *, compute=None, output=None):
+        """Execute on persistent transport storage owned by an EP selection plan."""
+        if self._destroyed or state.destroyed:
+            raise MoEEpConfigError("The prepared split workspace has been destroyed")
+        validate_split_forward_inputs(
+            t.hidden_states, t.topk_ids, t.topk_weights, self._fleet_params
+        )
+        if t.runtime_max_tokens_per_rank != state._runtime_max_tokens_per_rank:
+            raise ValueError(
+                "runtime_max_tokens_per_rank changed; prepare another plan"
+            )
+        output = state.out if output is None else output
+        if self._uses_communication():
+            out = self._communication_dispatch_compute_combine(
+                t, output, compute=compute
+            )
+        else:
+            # Fleet handles bind weights at creation; refresh their contents
+            # when eager callers provide a different routing buffer.
+            if t.topk_weights.data_ptr() != state._topk_weights.data_ptr():
+                state._topk_weights.copy_(t.topk_weights)
+            handle = state._handle
+            handle.update(HandleParams(topk_ids=t.topk_ids))
+            try:
+                out = self._fleet_dispatch_compute_combine(
+                    handle, t, output, out_is_stable=True, compute=compute
+                )
+            finally:
+                handle.complete()
+        self._warmed = True
+        return out
+
+    def destroy(self) -> None:
+        """Tear down graph state, then the transport, then comm runtime.
+
+        The order is load-bearing rather than stylistic: the graph state's
+        persistent handle holds buffers the fleet owns, and the transport
+        lives on the comm runtime. Collective on every EP rank, idempotent, and
+        safe only once every graph captured from this layer has been retired
+        and the device synchronized.
+        """
+        if self._destroyed:
+            return
+        # Before the fleet: the persistent handle holds buffers the fleet owns.
+        if self._graph_state is not None:
+            self._graph_state.destroy()
+            self._graph_state = None
+        # finally, not a plain sequence: NcclEpFleet.destroy() tears down the
+        # C++ group with no suppression of its own (NixlEpFleet suppresses its
+        # own buffer teardown), and this has to reach the runtime release even
+        # when that raises, or the bootstrap ref_count leaks and the layer keeps
+        # serving forward() on a half-destroyed transport.
+        try:
+            # Before the transport: the kernel's per-forward state may still
+            # reference its receive buffers.
+            self._kernel.destroy()
+            if self._communication is not None:
+                self._communication.destroy()
+                self._communication = None
+            if self._fleet is not None:
+                self._fleet.destroy()
+                self._fleet = None
+        finally:
+            if self._runtime is not None:
+                finalize_moe_ep_runtime(self._runtime)
+                self._runtime = None
+            self._destroyed = True
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.destroy()
+
+    def _stage(
+        self,
+        timings: "dict[str, tuple[torch.cuda.Event, torch.cuda.Event]]",
+        stage: str,
+    ) -> "contextlib.AbstractContextManager[object]":
+        """Bracket one forward stage with ``stage_hook`` and, when
+        ``enable_timing`` is set, time it into ``timings``."""
+        if self.stage_hook is None:
+            if self.enable_timing:
+                return _StageTimer(timings, stage)
+            return contextlib.nullcontext()
+        stack = contextlib.ExitStack()
+        if self.enable_timing:
+            stack.enter_context(_StageTimer(timings, stage))
+        stack.enter_context(self.stage_hook(stage))
+        return stack
+
+    def _publish_timings(
+        self, timings: "dict[str, tuple[torch.cuda.Event, torch.cuda.Event]]"
+    ) -> None:
+        if timings:
+            torch.cuda.synchronize()
+            self.last_timings_ms = {
+                stage: start.elapsed_time(end)
+                for stage, (start, end) in timings.items()
+            }
+
+    # ------------------------------------------------- Fleet/Handle path
+
+    def _validate_fleet_config(self) -> None:
+        backend_name = self._comm_backend_name()
         # nixl_ep rendezvous-store validation is deferred to fleet creation
         # (first forward): layers are routinely constructed before
         # torch.distributed is initialized, and NixlEpFleet._resolve_store
@@ -376,84 +787,9 @@ class MoEEpSplitLayer(nn.Module):
             )
         return self._fleet
 
-    def create_graph_state(
-        self,
-        t: "MoEEpTensors",
-        *,
-        out: Optional[torch.Tensor] = None,
+    def _create_fleet_graph_state(
+        self, t: "MoEEpTensors", out: torch.Tensor
     ) -> MoEEpSplitGraphState:
-        """Build the persistent state a CUDA-graph capture of ``forward`` needs.
-
-        Call once per (shape, buffer set) on **every** EP rank, outside any
-        capture, then pass the result to ``forward``::
-
-            state = layer.create_graph_state(t)
-            layer.forward(t, graph_state=state)      # warmup, still eager -- REQUIRED
-            torch.cuda.synchronize()
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                y = layer.forward(t, graph_state=state)
-            ...
-            t.hidden_states.copy_(new_x)             # in place, same buffers
-            t.topk_ids.copy_(new_ids)
-            g.replay()                               # y now holds the result
-
-        ``t``'s tensors become the graph's bound buffers, so update them in
-        place between replays rather than rebinding. The warmup forward is not
-        optional: ``forward`` refuses to capture on a layer that has never
-        completed an eager forward. It is what compiles/autotunes the inner
-        kernel and establishes the transport's steady state, neither of which
-        can happen during capture.
-
-        The routing SHAPE is fixed here -- ``top_k`` and the token count are
-        baked into the handle (and into the graph). A different batch size
-        needs its own state and its own graph, the usual multi-size-graph
-        pattern -- and, today, its own layer: a layer holds at most one live
-        state, and destroying the live one to make room frees the buffers the
-        graph already captured from it replays against.
-        """
-        if self._destroyed:
-            raise MoEEpConfigError(
-                "this MoEEpSplitLayer has been destroyed; its fleet and comm "
-                "runtime are gone."
-            )
-        if _is_capturing():
-            raise MoEEpConfigError(
-                "MoEEpSplitLayer.create_graph_state() allocates transport "
-                "buffers and cannot run during CUDA graph capture; call it "
-                "(and one warmup forward) on all EP ranks before capturing."
-            )
-        ensure_bootstrap_dist_validated(self._bootstrap)
-        validate_split_forward_inputs(
-            t.hidden_states,
-            t.topk_ids,
-            t.topk_weights,
-            self._fleet_params,
-        )
-        if self._graph_state is not None and not self._graph_state.destroyed:
-            raise MoEEpConfigError(
-                "this MoEEpSplitLayer already has a live graph state (one "
-                "persistent handle per layer). Destroying it frees the buffers "
-                "every graph captured from it replays against, so a second "
-                "shape needs a second layer, not a second state on this one."
-            )
-        if out is None:
-            out = torch.empty_like(
-                t.hidden_states, memory_format=torch.contiguous_format
-            )
-        elif (
-            out.shape != t.hidden_states.shape
-            or out.dtype != t.hidden_states.dtype
-            or out.device != t.hidden_states.device
-            or not out.is_contiguous()
-        ):
-            raise ValueError(
-                "out must be contiguous and match hidden_states: expected "
-                f"shape {tuple(t.hidden_states.shape)} dtype {t.hidden_states.dtype} "
-                f"device {t.hidden_states.device}, got shape {tuple(out.shape)} "
-                f"dtype {out.dtype} device {out.device} strides {out.stride()}."
-            )
-
         fleet = self._ensure_fleet()
         handle = fleet.create_handle(
             HandleParams(topk_ids=t.topk_ids),
@@ -486,130 +822,12 @@ class MoEEpSplitLayer(nn.Module):
         except Exception:
             handle.destroy()
             raise
+        return MoEEpSplitGraphState(self, handle, t, out)
 
-        state = MoEEpSplitGraphState(self, handle, t, out)
-        self._graph_state = state
-        return state
-
-    def _inner_compute(self, dispatch: DispatchOutput) -> torch.Tensor:
-        ctx = SplitKernelContext(
-            expert_tensors=dispatch.expert_tensors,
-            num_tokens=dispatch.get_num_tokens(),
-            fleet_params=self._fleet_params,
-            recv_topk_idx=dispatch.recv_topk_idx,
-            recv_topk_weights=dispatch.recv_topk_weights,
-        )
-        return self._kernel.compute(ctx)
-
-    def _round_trip(
-        self,
-        handle,
-        t: "MoEEpTensors",
-        out: torch.Tensor,
-        *,
-        out_is_stable: bool = False,
+    def _fleet_forward(
+        self, t: "MoEEpTensors", graph_state: Optional[MoEEpSplitGraphState]
     ) -> torch.Tensor:
-        """dispatch -> inner kernel -> combine, on an already-bound handle."""
-        if not self.enable_timing:
-            dispatch = handle.dispatch(
-                DispatchInputParams(
-                    x=[self._kernel.pack_dispatch_payload(t.hidden_states)]
-                )
-            )
-            expert_out = self._inner_compute(dispatch)
-            combine = handle.combine(
-                CombineInputParams(x=[expert_out], out=out, out_is_stable=out_is_stable)
-            )
-            return combine.x
-
-        ev = {
-            k: (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            for k in ("dispatch", "compute", "combine")
-        }
-        ev["dispatch"][0].record()
-        dispatch = handle.dispatch(
-            DispatchInputParams(x=[self._kernel.pack_dispatch_payload(t.hidden_states)])
-        )
-        ev["dispatch"][1].record()
-        ev["compute"][0].record()
-        expert_out = self._inner_compute(dispatch)
-        ev["compute"][1].record()
-        ev["combine"][0].record()
-        combine = handle.combine(
-            CombineInputParams(x=[expert_out], out=out, out_is_stable=out_is_stable)
-        )
-        ev["combine"][1].record()
-        torch.cuda.synchronize()
-        self.last_timings_ms = {
-            k: start.elapsed_time(end) for k, (start, end) in ev.items()
-        }
-        return combine.x
-
-    def forward(
-        self,
-        t: "MoEEpTensors",
-        *,
-        graph_state: Optional[MoEEpSplitGraphState] = None,
-    ) -> torch.Tensor:
-        """Run one EP round trip.
-
-        With ``graph_state`` (from :meth:`create_graph_state`) the layer reuses
-        that state's persistent handle and static output buffer instead of
-        creating and destroying a handle per call, which is what makes the call
-        safe to record into a CUDA graph. Without it, behaviour is unchanged.
-        """
-        if self._destroyed:
-            raise MoEEpConfigError(
-                "this MoEEpSplitLayer has been destroyed; its fleet and comm "
-                "runtime are gone."
-            )
-        ensure_bootstrap_dist_validated(self._bootstrap)
-        validate_split_forward_inputs(
-            t.hidden_states,
-            t.topk_ids,
-            t.topk_weights,
-            self._fleet_params,
-        )
-
         if graph_state is not None:
-            if not isinstance(graph_state, MoEEpSplitGraphState):
-                # Without this the mistyped argument reaches _check() and dies
-                # with a bare AttributeError that names neither the argument
-                # nor the call that produces a valid one.
-                raise TypeError(
-                    "graph_state must be created by "
-                    "MoEEpSplitLayer.create_graph_state(); got "
-                    f"{type(graph_state).__name__}."
-                )
-            graph_state._check(self, t)
-            capturing = _is_capturing()
-            if self.enable_timing and capturing:
-                raise MoEEpConfigError(
-                    "enable_timing synchronizes the device to read its CUDA "
-                    "events, which is illegal during graph capture. Turn it "
-                    "off to capture, and time the replay instead."
-                )
-            if capturing and not self._warmed:
-                # create_graph_state() builds the fleet and the handle, and
-                # runs the one update outside the capture that nccl_ep requires
-                # -- but no round trip, so the inner kernel is still unbuilt and
-                # the transport has no steady state. Caught here because the symptom otherwise surfaces
-                # from inside the inner kernel's backend selection (a nested
-                # capture plus a device sync) and names nothing in this file.
-                raise MoEEpConfigError(
-                    "this MoEEpSplitLayer has never run an eager forward, so "
-                    "the capture would be the first round trip it ever sees: "
-                    "the inner MoE kernel is still unbuilt and selecting its "
-                    "backend captures a graph of its own (nested capture is "
-                    "illegal), and the transport has no steady state. Run one "
-                    "eager forward on this layer -- layer.forward(t) or "
-                    "layer.forward(t, graph_state=state), either warms the "
-                    "same fleet and kernel -- outside the capture, on every EP "
-                    "rank, first."
-                )
             handle = graph_state._handle
             # The per-step half: recompute routing from the (rewritten) ids
             # into the handle's existing buffers. Recorded inside the capture.
@@ -617,14 +835,13 @@ class MoEEpSplitLayer(nn.Module):
             try:
                 # The state owns this buffer for its lifetime, so the
                 # transport may cache per-address state for it.
-                out = self._round_trip(handle, t, graph_state._out, out_is_stable=True)
+                return self._fleet_dispatch_compute_combine(
+                    handle, t, graph_state._out, out_is_stable=True
+                )
             finally:
                 # complete() only waits on staged work; the handle deliberately
                 # survives, so no destroy() here.
                 handle.complete()
-            if not capturing:
-                self._warmed = True
-            return out
 
         if _is_capturing():
             raise MoEEpConfigError(
@@ -633,7 +850,6 @@ class MoEEpSplitLayer(nn.Module):
                 "at freed memory. Pass graph_state=layer.create_graph_state(t) "
                 "(built outside the capture) to capture this layer."
             )
-
         fleet = self._ensure_fleet()
         handle_knobs: list[AlgoKnob] = [
             HandleAlgoKnobUserStream(stream=torch.cuda.current_stream().cuda_stream),
@@ -646,47 +862,170 @@ class MoEEpSplitLayer(nn.Module):
         try:
             # A fresh buffer per call: out_is_stable stays False so the
             # transport does not pin an address it will never see again.
-            out = self._round_trip(handle, t, torch.empty_like(t.hidden_states))
+            return self._fleet_dispatch_compute_combine(
+                handle, t, torch.empty_like(t.hidden_states)
+            )
         finally:
             handle.complete()
             handle.destroy()
-        # This path is unreachable under capture (refused just above), so a
-        # completed round trip here is always the eager warmup a later capture
-        # needs -- it built the inner kernel and ran the transport on this
-        # layer's fleet, exactly as the stated path would have.
-        self._warmed = True
-        return out
 
-    def destroy(self) -> None:
-        """Tear down graph state, then fleet, then comm runtime.
+    def _fleet_dispatch_compute_combine(
+        self,
+        handle: "Handle",
+        t: "MoEEpTensors",
+        out: torch.Tensor,
+        *,
+        out_is_stable: bool = False,
+        compute=None,
+    ) -> torch.Tensor:
+        """Dispatch, run the inner kernel and combine on a bound handle."""
+        timings: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+        with self._stage(timings, "quantize"):
+            payload = self._kernel.pack_dispatch_payload(t.hidden_states)
+        with self._stage(timings, "dispatch"):
+            dispatched = handle.dispatch(DispatchInputParams(x=[payload]))
+        with self._stage(timings, "compute"):
+            expert_out = (compute or self._kernel.compute)(
+                self._fleet_kernel_context(dispatched)
+            )
+        with self._stage(timings, "combine"):
+            combined = handle.combine(
+                CombineInputParams(x=[expert_out], out=out, out_is_stable=out_is_stable)
+            )
+        self._publish_timings(timings)
+        return combined.x
 
-        The order is load-bearing rather than stylistic: the graph state's
-        persistent handle holds buffers the fleet owns, and the fleet's group
-        lives on the comm runtime. Collective on every EP rank, idempotent, and
-        safe only once every graph captured from this layer has been retired
-        and the device synchronized.
-        """
-        if self._destroyed:
-            return
-        # Before the fleet: the persistent handle holds buffers the fleet owns.
-        if self._graph_state is not None:
-            self._graph_state.destroy()
-            self._graph_state = None
-        # finally, not a plain sequence: NcclEpFleet.destroy() tears down the
-        # C++ group with no suppression of its own (NixlEpFleet suppresses its
-        # own buffer teardown), and this has to reach the runtime release even
-        # when that raises, or the bootstrap ref_count leaks and the layer keeps
-        # serving forward() on a half-destroyed fleet.
-        try:
-            if self._fleet is not None:
-                self._fleet.destroy()
-                self._fleet = None
-        finally:
-            if self._runtime is not None:
-                finalize_moe_ep_runtime(self._runtime)
-                self._runtime = None
-            self._destroyed = True
+    def _fleet_kernel_context(self, dispatched: DispatchOutput) -> SplitKernelContext:
+        return SplitKernelContext(
+            expert_tensors=dispatched.expert_tensors,
+            num_tokens=dispatched.get_num_tokens(),
+            fleet_params=self._fleet_params,
+            recv_topk_idx=dispatched.recv_topk_idx,
+            recv_topk_weights=dispatched.recv_topk_weights,
+            recv_count=dispatched.expert_counts,
+        )
 
-    def __del__(self) -> None:
-        with contextlib.suppress(Exception):
-            self.destroy()
+    # ------------------------------------------ MoEEpCommunication path
+
+    def _validate_communication_config(self) -> None:
+        backend_name = self._comm_backend_name()
+        if (
+            self._fleet_params.algorithm is not EpAlgorithm.LOW_LATENCY
+            or self._fleet_params.layout is not EpLayout.RANK_MAJOR
+        ):
+            raise MoEEpConfigError(
+                f"comm backend {backend_name!r} exchanges tokens rank-major; "
+                "set FleetParams(algorithm=EpAlgorithm.LOW_LATENCY, "
+                "layout=EpLayout.RANK_MAJOR)."
+            )
+        if self._fleet_params.dtype_bytes not in _TOKEN_DTYPE_BY_BYTES:
+            raise MoEEpConfigError(
+                f"comm backend {backend_name!r} supports dtype_bytes in "
+                f"{sorted(_TOKEN_DTYPE_BY_BYTES)}, got "
+                f"{self._fleet_params.dtype_bytes}."
+            )
+
+    def _ensure_communication(self, top_k: int) -> MoEEpCommunication:
+        if self._communication is None:
+            fp = self._fleet_params
+            self._communication = create_communication(
+                self._bootstrap,
+                MoEEpCommParams(
+                    num_experts=fp.num_experts,
+                    top_k=top_k,
+                    max_tokens_per_rank=fp.max_tokens_per_rank,
+                    hidden_size=fp.token_hidden_size,
+                    dtype=_TOKEN_DTYPE_BY_BYTES[fp.dtype_bytes],
+                    dispatch_format=self._kernel.dispatch_format(),
+                ),
+                _communication_backend(self._comm_backend, self._kernel),
+            )
+        elif self._communication.params.top_k != top_k:
+            raise MoEEpConfigError(
+                f"top_k changed from {self._communication.params.top_k} to "
+                f"{top_k}; a MoEEpSplitLayer serves a single top_k."
+            )
+        return self._communication
+
+    def _create_communication_graph_state(
+        self, t: "MoEEpTensors", out: torch.Tensor
+    ) -> MoEEpSplitGraphState:
+        # The communication outlives every forward, so the state only pins
+        # the buffers; creating it here keeps its collective setup outside the
+        # capture.
+        comm = self._ensure_communication(t.topk_ids.shape[1])
+        if not comm.supports_cuda_graph:
+            raise MoEEpConfigError(
+                f"comm backend {self._comm_backend_name()!r} cannot be "
+                "captured into a CUDA graph."
+            )
+        return MoEEpSplitGraphState(self, None, t, out)
+
+    def _communication_forward(
+        self, t: "MoEEpTensors", graph_state: Optional[MoEEpSplitGraphState]
+    ) -> torch.Tensor:
+        if graph_state is not None:
+            # The communication is persistent and the state owns `out`, so
+            # the forward records as is.
+            return self._communication_dispatch_compute_combine(t, graph_state._out)
+
+        if _is_capturing():
+            raise MoEEpConfigError(
+                "capturing MoEEpSplitLayer.forward() needs "
+                "graph_state=layer.create_graph_state(t), built outside the "
+                "capture, to pin the buffers the graph binds."
+            )
+        return self._communication_dispatch_compute_combine(
+            t, torch.empty_like(t.hidden_states)
+        )
+
+    def _communication_dispatch_compute_combine(
+        self, t: "MoEEpTensors", out: torch.Tensor, *, compute=None
+    ) -> torch.Tensor:
+        """Dispatch, run the inner kernel and combine over the communication."""
+        comm = self._ensure_communication(t.topk_ids.shape[1])
+        timings: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+        # Registered backends need not take the keyword unless it is used.
+        extra = (
+            {}
+            if t.runtime_max_tokens_per_rank is None
+            else {"runtime_max_tokens_per_rank": t.runtime_max_tokens_per_rank}
+        )
+        with self._stage(timings, "quantize"):
+            if comm.params.dispatch_format is None:
+                values = self._kernel.pack_dispatch_payload(t.hidden_states)
+                scales = None
+            else:
+                values, scales = self._kernel.quantize_for_dispatch(t.hidden_states)
+        with self._stage(timings, "dispatch"):
+            received = comm.dispatch(
+                values,
+                t.topk_ids,
+                t.topk_weights,
+                hidden_states_scale=scales,
+                **extra,
+            )
+        with self._stage(timings, "compute"):
+            ctx = self._communication_kernel_context(comm, received)
+            expert_out = (compute or self._kernel.compute)(ctx)
+        with self._stage(timings, "combine"):
+            combined = comm.combine(expert_out.reshape(ctx.num_tokens, -1), output=out)
+        self._publish_timings(timings)
+        return combined
+
+    def _communication_kernel_context(
+        self, comm: MoEEpCommunication, received: MoEEpDispatchResult
+    ) -> SplitKernelContext:
+        # The received routing goes to the inner kernel as GLOBAL ids; it
+        # evaluates only the picks in this rank's local expert range.
+        return SplitKernelContext(
+            expert_tensors=received.hidden_states.view(
+                comm.ep_size, received.tokens_per_rank, -1
+            ),
+            num_tokens=comm.ep_size * received.tokens_per_rank,
+            fleet_params=self._fleet_params,
+            recv_topk_idx=received.topk_ids,
+            recv_topk_weights=received.topk_weights,
+            recv_topk_idx_global=True,
+            expert_tensors_scale=received.hidden_states_scale,
+        )

@@ -27,10 +27,14 @@ from ..cute_dsl_primitives import (
     NEGATIVE_ZERO_BF16_BITS,
     VEC_BF16,
     WARP_SIZE,
+    atomic_add_global_i32,
     bf16x2_to_packed_u32,
     bf16x4_to_packed_u32x2,
     bf16x8_to_packed_u32x4,
+    bulk_store_shared_to_global,
+    bulk_wait_group_read,
     f32_to_bf16_bits,
+    fence_proxy_async_shared_cta,
     fragment_has_negative_zero,
     load_global_bf16_as_f32,
     load_global_bf16_as_f32_predicated,
@@ -39,6 +43,7 @@ from ..cute_dsl_primitives import (
     load_global_u32x2,
     load_global_u32x2_predicated,
     load_global_u32x4,
+    load_global_u32x4_address,
     load_volatile_u32,
     packed_u32_to_bf16x2,
     packed_u32x2_to_bf16x4,
@@ -53,11 +58,18 @@ from ..cute_dsl_primitives import (
     store_global_u32x2,
     store_global_u32x4,
     store_lamport_sentinel_u32x4,
+    store_shared_u32x4_address,
 )
+from ..dynamic_fp8_epilogue import store_dynamic_fp8_cta_row
+from ..static_fp8_epilogue import store_rmsnorm_output
 
 LAMPORT_GENERATIONS = 3
 NEXT_STAGE = 0
 ACTIVE_STAGE = 1
+ARRIVAL_COUNTER = 2
+# One work-ticket counter per stage for the fused kernel's dynamic schedule.
+TICKET_COUNTERS = 3
+STAGE_STATE_WORDS = TICKET_COUNTERS + LAMPORT_GENERATIONS
 
 
 @cute.jit
@@ -1128,10 +1140,13 @@ class _MaterializeRMSNormDeviceKernel:
         write_residual_output: bool,
         enable_pdl: bool,
         apply_rms_norm: bool = True,
+        dynamic_fp8: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.capacity_m = capacity_m
         self.threads = threads
+        # FP8 output with a per-token scale written to output_scale[token].
+        self.dynamic_fp8 = dynamic_fp8
         self.rms_epsilon = rms_epsilon
         self.weight_bias = weight_bias
         self.write_residual_output = write_residual_output
@@ -1150,6 +1165,8 @@ class _MaterializeRMSNormDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         gamma: cute.Tensor,
         stage_state: cute.Tensor,
         m: Int32,
@@ -1159,12 +1176,14 @@ class _MaterializeRMSNormDeviceKernel:
             prenorm_mailbox,
             residual_output,
             norm_output,
+            norm_output_bf16,
+            output_scale,
             gamma,
             stage_state,
         ).launch(
             grid=(m, 1, 1),
             block=(self.threads, 1, 1),
-            smem=self.warps * 4,
+            smem=self.warps * 4 * (2 if self.dynamic_fp8 else 1),
             stream=stream,
             use_pdl=self.enable_pdl,
         )
@@ -1175,6 +1194,8 @@ class _MaterializeRMSNormDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         gamma: cute.Tensor,
         stage_state: cute.Tensor,
     ) -> None:
@@ -1260,7 +1281,23 @@ class _MaterializeRMSNormDeviceKernel:
                 full_sum / Float32(self.hidden_size) + Float32(self.rms_epsilon),
                 fastmath=True,
             )
-            for trip in cutlass.range_constexpr(self.trips):
+            if cutlass.const_expr(self.dynamic_fp8):
+                store_dynamic_fp8_cta_row(
+                    prenorm_fragments,
+                    gamma_fragments,
+                    inverse_rms,
+                    norm_output,
+                    norm_output_bf16,
+                    output_scale,
+                    smem.allocate_array(Float32, self.warps),
+                    tidx,
+                    token,
+                    self.hidden_size,
+                    self.threads,
+                    self.weight_bias,
+                )
+            # The dynamic FP8 epilogue above replaces this static/BF16 store.
+            for trip in cutlass.range_constexpr(0 if self.dynamic_fp8 else self.trips):
                 fragment = tidx + trip * self.threads
                 if fragment < self.fragments:
                     gamma_value = gamma_fragments[trip, None].load().to(Float32)
@@ -1274,9 +1311,12 @@ class _MaterializeRMSNormDeviceKernel:
                     output_offset = (
                         Int64(token) * self.hidden_size + Int64(fragment) * VEC_BF16
                     )
-                    store_global_u32x4(
-                        Int64((norm_output.iterator + output_offset).toint()),
+                    store_rmsnorm_output(
                         bf16x8_to_packed_u32x4(result),
+                        norm_output,
+                        Int64(output_offset),
+                        output_scale,
+                        norm_output_bf16,
                     )
 
         cute.arch.barrier()
@@ -1292,3 +1332,630 @@ class _MaterializeRMSNormDeviceKernel:
                 store_lamport_sentinel_u32x4(
                     Int64((prenorm_mailbox.iterator + mailbox_offset).toint())
                 )
+
+
+class _FusedAllReduceDeviceKernel:
+    """One persistent launch of the BT all-reduce: publish, owner reduce, materialize.
+
+    The work is cut into tickets. Ticket ``k`` stands for slot ``c = k % G``
+    of round ``r = k // G`` (``G`` = ``grid_ctas``): it publishes token
+    ``r * G + c`` to the owner of that token (``token % tp``), reduces owner
+    unit ``(r - lag) * G + c`` (a ``1/tp`` slice of one owned token) and
+    broadcasts the result, and materializes token ``(r - 2 * lag) * G + c``.
+    Readiness is detected with the negative-zero Lamport sentinels of the
+    three-launch path, so no grid barrier is needed.
+
+    Every CTA claims each of its tickets, the first one included, from a
+    per-stage counter, so CTAs that run ahead take over work instead of
+    idling; a fixed round-robin share would let independent groups of CTAs
+    drift apart, and the slowest group would set the end of the call. A CTA
+    claims its next ticket while it works on the current one, which hides the
+    atomic's latency.
+
+    Progress needs only one resident CTA per rank. A ticket publishes before
+    it waits, and it only waits on work of tickets at least
+    ``lag * G - tp + 1`` smaller: the reduce of unit ``u`` waits on token
+    ``(u // tp) * tp + rank`` of every peer, at most ``u + tp - 1``, and the
+    materialize of token ``t`` waits on the reduce of units at most
+    ``t + tp - 1``. Tickets are claimed in order, only by running CTAs, and a
+    CTA holding two tickets is blocked on the smaller one only. So the
+    smallest unfinished ticket over all ranks is either held by a running CTA
+    that can finish it, or is the next one a running CTA of its rank claims.
+    CTAs beyond what the GPU can hold at once (MPS limits, SM partitions,
+    other kernels) start when earlier ones exit and find the work done. The
+    grid is one CTA per SM so that, normally, every SM moves data. The
+    exception is a rank with no resident CTA at all, for example when another
+    spinning collective that fills the GPU runs concurrently on a different
+    stream and waits on peers that wait on this one; two such collectives must
+    not run concurrently on different streams.
+
+    Compared with the three-launch path, the NVLink traffic of publish and
+    broadcast overlaps, the HBM pass of materialization hides under it, and
+    there is no launch or grid drain between the stages.
+
+    The published token and the reduced slice are staged in shared memory and
+    sent with one ``cp.async.bulk`` copy per destination, which moves the same
+    bytes at a higher NVLink rate than 16-byte stores. The reduced slice goes
+    to every rank's prenorm mailbox through its unicast mapping: unicast moves
+    ``(tp - 1) / tp`` of the slab in each direction per rank, whereas a
+    multicast store delivers a full slab into every rank, including the
+    issuing one, so together with the publish traffic unicast has the smaller
+    per-direction volume.
+
+    All CTAs read the stage index, then the last CTA to arrive on a counter
+    advances it for the next call; a CTA that starts late still reads the
+    index of this call because the counter only completes after it arrives.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        tp_size: int,
+        rank: int,
+        capacity_m: int,
+        local_capacity: int,
+        threads: int,
+        grid_ctas: int,
+        lag: int,
+        add_residual: bool,
+        write_residual_output: bool,
+        apply_rms_norm: bool,
+        rms_epsilon: float,
+        weight_bias: float,
+        enable_pdl: bool,
+        dynamic_fp8: bool = False,
+    ) -> None:
+        self.hidden_size = hidden_size
+        self.tp_size = tp_size
+        self.rank = rank
+        self.capacity_m = capacity_m
+        self.local_capacity = local_capacity
+        self.threads = threads
+        self.warps = threads // WARP_SIZE
+        self.grid_ctas = grid_ctas
+        self.lag = lag
+        self.add_residual = add_residual
+        self.write_residual_output = write_residual_output
+        self.apply_rms_norm = apply_rms_norm
+        self.rms_epsilon = rms_epsilon
+        self.weight_bias = weight_bias
+        self.enable_pdl = enable_pdl
+        # FP8 output with a per-token scale written to output_scale[token].
+        self.dynamic_fp8 = dynamic_fp8
+        self.fragments = hidden_size // VEC_BF16
+        if self.fragments % tp_size:
+            raise ValueError("the fused BT path needs hidden_size / 8 divisible by tp")
+        if threads < WARP_SIZE + tp_size:
+            raise ValueError("the fused BT path needs threads >= 32 + tp")
+        self.slice_fragments = self.fragments // tp_size
+        self.token_trips = math.ceil(self.fragments / threads)
+        self.slice_trips = math.ceil(self.slice_fragments / threads)
+        # Two buffers each for the published token and the reduced slice, so
+        # a round stages into one while the previous round's copies drain.
+        self.smem_bytes = (
+            self.warps * 4 * (2 if dynamic_fp8 else 1)
+            + 12
+            + 256
+            + 2 * self.fragments * 16
+            + 128
+            + 2 * self.slice_fragments * 16
+            + 128
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        local_contribution: cute.Tensor,
+        residual_source: cute.Tensor,
+        gamma: cute.Tensor,
+        residual_output: cute.Tensor,
+        norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
+        contribution_mailbox: cute.Tensor,
+        contribution_mailbox_peer_addresses: cute.Tensor,
+        prenorm_mailbox: cute.Tensor,
+        prenorm_mailbox_peer_addresses: cute.Tensor,
+        stage_state: cute.Tensor,
+        m: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            local_contribution,
+            residual_source,
+            gamma,
+            residual_output,
+            norm_output,
+            norm_output_bf16,
+            output_scale,
+            contribution_mailbox,
+            contribution_mailbox_peer_addresses,
+            prenorm_mailbox,
+            prenorm_mailbox_peer_addresses,
+            stage_state,
+            m,
+        ).launch(
+            grid=(self.grid_ctas, 1, 1),
+            block=(self.threads, 1, 1),
+            smem=self.smem_bytes,
+            stream=stream,
+            use_pdl=self.enable_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        local_contribution: cute.Tensor,
+        residual_source: cute.Tensor,
+        gamma: cute.Tensor,
+        residual_output: cute.Tensor,
+        norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
+        contribution_mailbox: cute.Tensor,
+        contribution_mailbox_peer_addresses: cute.Tensor,
+        prenorm_mailbox: cute.Tensor,
+        prenorm_mailbox_peer_addresses: cute.Tensor,
+        stage_state: cute.Tensor,
+        m: Int32,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        smem = cutlass.utils.SmemAllocator()
+        warp_sums = smem.allocate_array(Float32, self.warps)
+        warp_maxima = warp_sums
+        if cutlass.const_expr(self.dynamic_fp8):
+            warp_maxima = smem.allocate_array(Float32, self.warps)
+        # Two ticket slots and the stage index.
+        ticket_slots = smem.allocate_array(Int32, 3)
+        publish_buffer = Int32(
+            smem.allocate_array(
+                Uint32, 2 * self.fragments * 4, byte_alignment=128
+            ).toint()
+        )
+        broadcast_buffer = Int32(
+            smem.allocate_array(
+                Uint32, 2 * self.slice_fragments * 4, byte_alignment=128
+            ).toint()
+        )
+
+        gamma_fragments = cute.make_rmem_tensor(
+            cute.make_layout((self.token_trips, VEC_BF16), stride=(VEC_BF16, 1)),
+            BFloat16,
+        )
+        gamma_fragments.fill(BFloat16(0.0))
+        if cutlass.const_expr(self.apply_rms_norm):
+            for trip in cutlass.range_constexpr(self.token_trips):
+                fragment = tidx + trip * self.threads
+                if fragment < self.fragments:
+                    gamma_pointer = cute.make_ptr(
+                        BFloat16,
+                        (gamma.iterator + Int64(fragment) * VEC_BF16).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    gamma_fragments[trip, None].store(
+                        packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
+                    )
+
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+
+        local_tokens = (m + Int32(self.tp_size - 1)) // Int32(self.tp_size)
+        reduce_units = local_tokens * Int32(self.tp_size)
+        token_groups = (m + Int32(self.grid_ctas - 1)) // Int32(self.grid_ctas)
+        rounds = token_groups + Int32(2 * self.lag)
+        reduce_rounds = (reduce_units + Int32(self.grid_ctas - 1)) // Int32(
+            self.grid_ctas
+        ) + Int32(self.lag)
+        if reduce_rounds > rounds:
+            rounds = reduce_rounds
+        total_tickets = rounds * Int32(self.grid_ctas)
+
+        if tidx == 0:
+            # The claim's address depends on the stage index, so the index is
+            # read before the arrival below can advance it. Both atomics are
+            # issued before either result is used, so their latencies overlap.
+            first_stage = load_volatile_u32(stage_state.iterator + NEXT_STAGE)
+            first_counter = stage_state.iterator + (
+                Int32(TICKET_COUNTERS) + Int32(first_stage)
+            )
+            first_ticket = atomic_add_global_i32(Int64(first_counter.toint()), Int32(1))
+            arrived = atomic_add_global_i32(
+                Int64((stage_state.iterator + ARRIVAL_COUNTER).toint()), Int32(1)
+            )
+            self._release_ticket_counter(first_counter, first_ticket, total_tickets)
+            self._advance_stage(stage_state, first_stage, arrived)
+            # Slot 1 is next written at the end of the second iteration.
+            cute.arch.store((ticket_slots + Int32(1)).llvm_ptr, first_ticket)
+            cute.arch.store((ticket_slots + Int32(2)).llvm_ptr, Int32(first_stage))
+        cute.arch.barrier()
+        stage = Uint32(cute.arch.load((ticket_slots + Int32(2)).llvm_ptr, Int32))
+        ticket_counter = stage_state.iterator + (Int32(TICKET_COUNTERS) + Int32(stage))
+        if cutlass.const_expr(self.enable_pdl):
+            # A dependent launch still waits for this grid to complete before
+            # it reads anything; triggering here only hides its launch latency.
+            cute.arch.griddepcontrol_launch_dependents()
+
+        contribution_base = Int64(contribution_mailbox.iterator.toint())
+        prenorm_base = Int64(prenorm_mailbox.iterator.toint())
+        ticket = cute.arch.load((ticket_slots + Int32(1)).llvm_ptr, Int32)
+        iteration = Int32(0)
+        while ticket < total_tickets:
+            round_index = ticket // Int32(self.grid_ctas)
+            virtual_cta = ticket % Int32(self.grid_ctas)
+            claimed = Int32(0)
+            if tidx == 0:
+                # Claimed now, used at the end of the ticket, so the atomic's
+                # latency hides under the ticket's work.
+                claimed = atomic_add_global_i32(Int64(ticket_counter.toint()), Int32(1))
+            buffer_slot = iteration % Int32(2)
+            publish_slot = publish_buffer + buffer_slot * Int32(self.fragments * 16)
+            broadcast_slot = broadcast_buffer + buffer_slot * Int32(
+                self.slice_fragments * 16
+            )
+            token = round_index * Int32(self.grid_ctas) + virtual_cta
+            if token < m:
+                self._stage_publish(local_contribution, token, tidx, publish_slot)
+            fence_proxy_async_shared_cta()
+            cute.arch.barrier()
+            if tidx == 0 and token < m:
+                bulk_store_shared_to_global(
+                    self._publish_destination(
+                        contribution_mailbox_peer_addresses, stage, token
+                    ),
+                    publish_slot,
+                    Int32(self.fragments * 16),
+                )
+            reduce_unit = (round_index - Int32(self.lag)) * Int32(
+                self.grid_ctas
+            ) + virtual_cta
+            reduce_active = (
+                round_index >= Int32(self.lag) and reduce_unit < reduce_units
+            )
+            if reduce_active:
+                self._reduce(
+                    residual_source,
+                    contribution_base,
+                    stage,
+                    reduce_unit,
+                    m,
+                    tidx,
+                    broadcast_slot,
+                )
+            fence_proxy_async_shared_cta()
+            cute.arch.barrier()
+            # One thread per destination rank, in the warp after thread 0's.
+            destination_rank = tidx - Int32(WARP_SIZE)
+            if (
+                reduce_active
+                and destination_rank >= Int32(0)
+                and destination_rank < Int32(self.tp_size)
+            ):
+                local_token = reduce_unit // Int32(self.tp_size)
+                part = reduce_unit % Int32(self.tp_size)
+                owned_token = local_token * Int32(self.tp_size) + Int32(self.rank)
+                if owned_token < m:
+                    destination_base = cute.arch.load(
+                        (
+                            prenorm_mailbox_peer_addresses.iterator + destination_rank
+                        ).llvm_ptr,
+                        Int64,
+                    )
+                    offset = (
+                        (Int64(stage) * self.capacity_m + Int64(owned_token))
+                        * self.hidden_size
+                        + Int64(part) * (self.slice_fragments * VEC_BF16)
+                    ) * 2
+                    bulk_store_shared_to_global(
+                        destination_base + offset,
+                        broadcast_slot,
+                        Int32(self.slice_fragments * 16),
+                    )
+            materialized = round_index - Int32(2 * self.lag)
+            if materialized >= Int32(0):
+                output_token = materialized * Int32(self.grid_ctas) + virtual_cta
+                if output_token < m:
+                    self._materialize(
+                        residual_output,
+                        norm_output,
+                        norm_output_bf16,
+                        output_scale,
+                        gamma_fragments,
+                        warp_sums,
+                        warp_maxima,
+                        prenorm_base,
+                        stage,
+                        output_token,
+                        tidx,
+                    )
+            if tidx == 0 or (
+                tidx >= Int32(WARP_SIZE) and tidx < Int32(WARP_SIZE + self.tp_size)
+            ):
+                # The next round writes the other buffer; the one written two
+                # rounds back is reused after this wait.
+                bulk_wait_group_read(1)
+            if tidx == 0:
+                self._release_ticket_counter(ticket_counter, claimed, total_tickets)
+                cute.arch.store((ticket_slots + buffer_slot).llvm_ptr, claimed)
+            # Keeps the warps of a CTA on the same ticket: warps that run ahead
+            # only add publish traffic for tokens nobody can reduce yet, which
+            # delays the broadcasts the other ranks are waiting for.
+            cute.arch.barrier()
+            ticket = cute.arch.load((ticket_slots + buffer_slot).llvm_ptr, Int32)
+            iteration = iteration + Int32(1)
+
+        bulk_wait_group_read(0)
+
+    @cute.jit
+    def _release_ticket_counter(
+        self, ticket_counter: cute.Pointer, claimed: Int32, total_tickets: Int32
+    ) -> None:
+        # Every CTA claims until it draws a ticket past the end, so a call
+        # makes total_tickets + G claims and the largest is the last use of
+        # the counter, which is next used three calls later.
+        if claimed == total_tickets + Int32(self.grid_ctas - 1):
+            store_global_u32(ticket_counter, Uint32(0))
+
+    @cute.jit
+    def _advance_stage(
+        self, stage_state: cute.Tensor, stage: Uint32, arrived: Int32
+    ) -> None:
+        if arrived == Int32(self.grid_ctas - 1):
+            store_global_u32(stage_state.iterator + ARRIVAL_COUNTER, Uint32(0))
+            store_global_u32(stage_state.iterator + ACTIVE_STAGE, stage)
+            store_global_u32(
+                stage_state.iterator + NEXT_STAGE,
+                (stage + Uint32(1)) % Uint32(LAMPORT_GENERATIONS),
+            )
+
+    @cute.jit
+    def _stage_publish(
+        self,
+        local_contribution: cute.Tensor,
+        token: Int32,
+        tidx: Int32,
+        shared_slot: Int32,
+    ) -> None:
+        """Copy one local token into shared memory with negative zeros sanitized."""
+        # All loads are issued before the first shared store.
+        values = cute.make_rmem_tensor(
+            cute.make_layout((self.token_trips, 4), stride=(4, 1)), Uint32
+        )
+        values.fill(Uint32(0))
+        for trip in cutlass.range_constexpr(self.token_trips):
+            fragment = tidx + trip * self.threads
+            if fragment < Int32(self.fragments):
+                source_pointer = cute.make_ptr(
+                    BFloat16,
+                    (
+                        local_contribution.iterator
+                        + Int64(token) * self.hidden_size
+                        + Int64(fragment) * VEC_BF16
+                    ).llvm_ptr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=16,
+                )
+                packed = load_global_u32x4(source_pointer)
+                for word in cutlass.range_constexpr(4):
+                    values[trip, word] = packed[word]
+        for trip in cutlass.range_constexpr(self.token_trips):
+            fragment = tidx + trip * self.threads
+            if fragment < Int32(self.fragments):
+                packed = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
+                for word in cutlass.range_constexpr(4):
+                    packed[word] = values[trip, word]
+                store_shared_u32x4_address(
+                    shared_slot + fragment * Int32(16),
+                    sanitize_negative_zero_u32x4(packed.load()),
+                )
+
+    @cute.jit
+    def _publish_destination(
+        self,
+        contribution_mailbox_peer_addresses: cute.Tensor,
+        stage: Uint32,
+        token: Int32,
+    ) -> Int64:
+        owner = token % Int32(self.tp_size)
+        local_token = token // Int32(self.tp_size)
+        destination_base = cute.arch.load(
+            (contribution_mailbox_peer_addresses.iterator + owner).llvm_ptr, Int64
+        )
+        row = (
+            (Int64(stage) * self.tp_size + self.rank) * self.local_capacity
+            + Int64(local_token)
+        ) * self.hidden_size
+        return destination_base + row * 2
+
+    @cute.jit
+    def _reduce(
+        self,
+        residual_source: cute.Tensor,
+        contribution_base: Int64,
+        stage: Uint32,
+        unit: Int32,
+        m: Int32,
+        tidx: Int32,
+        shared_slot: Int32,
+    ) -> None:
+        """Reduce one owned slice into ``shared_slot`` and re-arm its mailboxes."""
+        local_token = unit // Int32(self.tp_size)
+        part = unit % Int32(self.tp_size)
+        token = local_token * Int32(self.tp_size) + Int32(self.rank)
+        for trip in cutlass.range_constexpr(self.slice_trips):
+            slot = tidx + trip * self.threads
+            fragment = part * Int32(self.slice_fragments) + slot
+            active = token < m and slot < Int32(self.slice_fragments)
+            if active:
+                reduced = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+                reduced.fill(Float32(0.0))
+                if cutlass.const_expr(self.add_residual):
+                    residual_pointer = cute.make_ptr(
+                        BFloat16,
+                        (
+                            residual_source.iterator
+                            + Int64(token) * self.hidden_size
+                            + Int64(fragment) * VEC_BF16
+                        ).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    residual = packed_u32x4_to_bf16x8(
+                        load_global_u32x4(residual_pointer)
+                    ).to(Float32)
+                rank_values = cute.make_rmem_tensor(
+                    cute.make_layout((self.tp_size, 4), stride=(4, 1)), Uint32
+                )
+                rank_values.fill(Uint32(0))
+                dirty = active
+                while dirty:
+                    dirty = False
+                    for source_rank in cutlass.range_constexpr(self.tp_size):
+                        source = (
+                            contribution_base
+                            + (
+                                (
+                                    (Int64(stage) * self.tp_size + source_rank)
+                                    * self.local_capacity
+                                    + Int64(local_token)
+                                )
+                                * self.hidden_size
+                                + Int64(fragment) * VEC_BF16
+                            )
+                            * 2
+                        )
+                        packed = load_global_u32x4_address(source, volatile=True)
+                        dirty = dirty | fragment_has_negative_zero(packed)
+                        for word in cutlass.range_constexpr(4):
+                            rank_values[source_rank, word] = packed[word]
+                # Rank order matches the three-launch reduction bit for bit.
+                for source_rank in cutlass.range_constexpr(self.tp_size):
+                    packed = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
+                    for word in cutlass.range_constexpr(4):
+                        packed[word] = rank_values[source_rank, word]
+                    reduced.store(
+                        reduced.load()
+                        + packed_u32x4_to_bf16x8(packed.load()).to(Float32)
+                    )
+                prenorm = reduced.load()
+                if cutlass.const_expr(self.add_residual):
+                    prenorm = prenorm + residual
+                store_shared_u32x4_address(
+                    shared_slot + slot * Int32(16),
+                    sanitize_negative_zero_u32x4(
+                        bf16x8_to_packed_u32x4(prenorm.to(BFloat16))
+                    ),
+                )
+                for source_rank in cutlass.range_constexpr(self.tp_size):
+                    source = (
+                        contribution_base
+                        + (
+                            (
+                                (Int64(stage) * self.tp_size + source_rank)
+                                * self.local_capacity
+                                + Int64(local_token)
+                            )
+                            * self.hidden_size
+                            + Int64(fragment) * VEC_BF16
+                        )
+                        * 2
+                    )
+                    store_lamport_sentinel_u32x4(source)
+
+    @cute.jit
+    def _materialize(
+        self,
+        residual_output: cute.Tensor,
+        norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
+        gamma_fragments: cute.Tensor,
+        warp_sums: cute.Pointer,
+        warp_maxima: cute.Pointer,
+        prenorm_base: Int64,
+        stage: Uint32,
+        token: Int32,
+        tidx: Int32,
+    ) -> None:
+        prenorm_fragments = cute.make_rmem_tensor(
+            cute.make_layout((self.token_trips, VEC_BF16), stride=(VEC_BF16, 1)),
+            BFloat16,
+        )
+        prenorm_fragments.fill(BFloat16(0.0))
+        row = (Int64(stage) * self.capacity_m + Int64(token)) * self.hidden_size
+        thread_sum = Float32(0.0)
+        for trip in cutlass.range_constexpr(self.token_trips):
+            fragment = tidx + trip * self.threads
+            if fragment < self.fragments:
+                mailbox = prenorm_base + (row + Int64(fragment) * VEC_BF16) * 2
+                packed = load_global_u32x4_address(mailbox, volatile=True)
+                while fragment_has_negative_zero(packed):
+                    packed = load_global_u32x4_address(mailbox, volatile=True)
+                store_lamport_sentinel_u32x4(mailbox)
+                prenorm = packed_u32x4_to_bf16x8(packed)
+                if cutlass.const_expr(self.apply_rms_norm):
+                    prenorm_fragments[trip, None].store(prenorm)
+                    values = prenorm.to(Float32)
+                    thread_sum = thread_sum + (values * values).reduce(
+                        cute.ReductionOp.ADD,
+                        init_val=Float32(0.0),
+                        reduction_profile=0,
+                    )
+                if cutlass.const_expr(self.write_residual_output):
+                    output_offset = (
+                        Int64(token) * self.hidden_size + Int64(fragment) * VEC_BF16
+                    )
+                    store_global_u32x4(
+                        Int64((residual_output.iterator + output_offset).toint()),
+                        packed,
+                    )
+        if cutlass.const_expr(self.apply_rms_norm):
+            # The round barrier that follows keeps the next token's block sum
+            # from overwriting warp_sums before every thread has read it.
+            full_sum = _block_sum(thread_sum, warp_sums, self.warps)
+            inverse_rms = cute.math.rsqrt(
+                full_sum / Float32(self.hidden_size) + Float32(self.rms_epsilon),
+                fastmath=True,
+            )
+            if cutlass.const_expr(self.dynamic_fp8):
+                # Same round-barrier argument as warp_sums for warp_maxima.
+                store_dynamic_fp8_cta_row(
+                    prenorm_fragments,
+                    gamma_fragments,
+                    inverse_rms,
+                    norm_output,
+                    norm_output_bf16,
+                    output_scale,
+                    warp_maxima,
+                    tidx,
+                    token,
+                    self.hidden_size,
+                    self.threads,
+                    self.weight_bias,
+                )
+            # The dynamic FP8 epilogue above replaces this static/BF16 store.
+            for trip in cutlass.range_constexpr(
+                0 if self.dynamic_fp8 else self.token_trips
+            ):
+                fragment = tidx + trip * self.threads
+                if fragment < self.fragments:
+                    gamma_value = gamma_fragments[trip, None].load().to(Float32)
+                    if cutlass.const_expr(self.weight_bias != 0.0):
+                        gamma_value = gamma_value + Float32(self.weight_bias)
+                    result = (
+                        prenorm_fragments[trip, None].load().to(Float32)
+                        * inverse_rms
+                        * gamma_value
+                    ).to(BFloat16)
+                    output_offset = (
+                        Int64(token) * self.hidden_size + Int64(fragment) * VEC_BF16
+                    )
+                    store_rmsnorm_output(
+                        bf16x8_to_packed_u32x4(result),
+                        norm_output,
+                        Int64(output_offset),
+                        output_scale,
+                        norm_output_bf16,
+                    )

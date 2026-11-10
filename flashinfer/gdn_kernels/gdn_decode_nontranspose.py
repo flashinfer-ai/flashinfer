@@ -690,7 +690,7 @@ def _nontranspose_kernel_name(
     HV: int,
     K: int,
     V: int,
-    dtype: torch.dtype,
+    dtype_key: tuple,
     scale: float,
     use_qk_l2norm: bool,
 ) -> str:
@@ -704,7 +704,7 @@ def _nontranspose_kernel_name(
         HV,
         K,
         V,
-        dtype,
+        dtype_key,
         scale,
         use_qk_l2norm,
     )
@@ -719,7 +719,7 @@ def _get_compiled_decode_kernel_nontranspose(
     HV: int,
     K: int,
     V: int,
-    dtype: torch.dtype,
+    dtype_key: tuple,
     scale: float,
     use_qk_l2norm: bool,
 ):
@@ -759,6 +759,20 @@ def run_nontranspose_decode(
     """
     use_small_batch = B < SMALL_BATCH_THRESHOLD_NT
     target = gdn_device_target(q.device)
+    # from_dlpack bakes every operand dtype into the compiled signature, and the key
+    # also names the on-disk artifact, so an omission collides across processes too
+    # (#4214). Every operand converts on load here, so none need pinning to bf16.
+    dtype_key = (
+        h0_source.dtype,
+        A_log.dtype,
+        a.dtype,
+        dt_bias.dtype,
+        q.dtype,
+        k.dtype,
+        v.dtype,
+        b.dtype,
+        output.dtype,
+    )
     cache_key = (
         target.compile_key,
         use_small_batch,
@@ -767,7 +781,7 @@ def run_nontranspose_decode(
         HV,
         K,
         V,
-        q.dtype,
+        dtype_key,
         scale,
         use_qk_l2norm,
     )
@@ -794,14 +808,14 @@ def run_nontranspose_decode(
         h0_source_tensor = from_dlpack(
             h0_source, assumed_align=16
         ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
-        A_log_tensor = from_dlpack(A_log, assumed_align=16)
+        A_log_tensor = from_dlpack(A_log)
         # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
-        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
-        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+        a_tensor = from_dlpack(a).mark_layout_dynamic()
+        dt_bias_tensor = from_dlpack(dt_bias)
         q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
         k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
         v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
-        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b).mark_layout_dynamic()
         o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
         h0_indices_tensor = from_dlpack(
             h0_indices, assumed_align=16

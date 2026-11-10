@@ -1872,12 +1872,24 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         else:
             tCrA = tiled_mma.make_fragment_A(sATransformed)
 
+        # Count complete raw-TMA macro tiles, then expand each macro tile into
+        # its transform/MMA substages.  This matters for the overlap path,
+        # where one K128 TMA stage feeds two K64 compute stages: computing the
+        # K64 count first can produce an odd count and floor-dividing it later
+        # would drop the final partial K128 stage.  The padded compute substage
+        # is safe because TMA zero-fills coordinates outside the tensor extent.
         k_tile_cnt_fc1 = (
-            fc1_weight_gemm.shape[1] + self.mma_tiler[2] - 1
-        ) // self.mma_tiler[2]
+            (
+                fc1_weight_gemm.shape[1] + self.tma_k_tile - 1
+            )
+            // self.tma_k_tile
+        ) * self.tma_k_reuse
         k_tile_cnt_fc2 = (
-            fc2_weight_gemm.shape[1] + self.mma_tiler[2] - 1
-        ) // self.mma_tiler[2]
+            (
+                fc2_weight_gemm.shape[1] + self.tma_k_tile - 1
+            )
+            // self.tma_k_tile
+        ) * self.tma_k_reuse
 
         if warp_idx == self.sched_warp_id:
             if cutlass.const_expr(self.enable_token_comm):

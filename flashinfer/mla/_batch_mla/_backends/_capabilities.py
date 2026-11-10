@@ -11,6 +11,7 @@ class MLAPlanCapabilities:
     kv_layouts: frozenset[str]
     output_scales: frozenset[str]
     scale_modes: frozenset[str]
+    is_experimental: bool = False
     supports_skip_softmax: bool = False
     supports_skip_softmax_with_lse: bool = False
     supports_enable_pdl: bool = False
@@ -20,7 +21,7 @@ class MLAPlanCapabilities:
     requires_packed_kv_cache: bool = False
 
 
-class _BackendPlanUnsupportedError(RuntimeError):
+class _BackendPlanUnsupportedError(ValueError):
     """Typed signal for backend preflight rejection before launch/compile."""
 
 

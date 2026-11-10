@@ -65,7 +65,7 @@ MIXED_RUNTIME_TENSOR_ATTRS = {
     "fc1_weight_sf": "my_fc1_weight_sf",
     "fc2_weight": "my_fc2_weight",
     "fc2_weight_sf": "my_fc2_weight_sf",
-    "combine_output": "combine_output",
+    "output_activation": "output_activation",
 }
 
 
@@ -127,6 +127,10 @@ def _validate_mixed_config(
         raise ValueError("mixed kernel requires BF16 FC2 output.")
     if problem.combine_format.is_quantized:
         raise ValueError("mixed kernel supports BF16 combine only.")
+    if impl.skip_topk_reduce and impl.in_kernel_fc2_reduce:
+        raise ValueError(
+            "skip_topk_reduce requires in_kernel_fc2_reduce=False."
+        )
     if impl.token_back_mode == "standalone_warps":
         raise ValueError(
             "mixed transform warps occupy the standalone token-back "
@@ -485,21 +489,34 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
     def validate(self) -> None:
         """Validate the combine shape selected by the FC2 reduction mode.
 
-        Form A compares every independently routed ``(token, topk, hidden)``
-        cell, so slot permutations cannot hide behind a top-k sum. Form B
-        compares the kernel's singleton-topk REDG result against the
-        reference reduced over its top-k axis.
+        Form A compares ``TopkReduce``'s 2D result. Form B compares the
+        kernel's singleton-topk REDG result against the reference reduced
+        over its top-k axis.
         """
 
         if self.misc.skip_ref_check:
             return
-        if self.combine_output is None:
+        if self.impl.skip_topk_reduce:
+            if self.combine_output_ref is None:
+                raise RuntimeError("validate requires compute_reference first.")
+            actual = self._skip_topk_reduce_staging().to(torch.float32).sum(dim=1)
+            reference = self.combine_output_ref.to(torch.float32).sum(dim=1)
+            compare_and_report_mismatches(
+                actual,
+                reference,
+                name=f"combine_quant[rank{self.rank}]",
+                atol=1e-2,
+                rtol=1e-2,
+            )
+            self._validate_c_output()
+            return
+        if self.output_activation is None:
             raise RuntimeError("validate requires run_kernel first.")
         if self.combine_output_ref is None:
             raise RuntimeError("validate requires compute_reference first.")
 
         if self.impl.in_kernel_fc2_reduce:
-            actual = self.combine_output[:, 0, :].to(torch.float32)
+            actual = self.output_activation.to(torch.float32)
             reference_terms = self.combine_output_ref.to(torch.float32)
             reference = reference_terms.sum(dim=1)
 
@@ -525,12 +542,12 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
                 rtol=0.0,
             )
         else:
-            actual = self.combine_output.to(torch.float32)
-            reference = self.combine_output_ref.to(torch.float32)
+            actual = self.output_activation.to(torch.float32)
+            reference = self.combine_output_ref.to(torch.float32).sum(dim=1)
             compare_and_report_mismatches(
                 actual,
                 reference,
-                name=f"combine_output_form_a[rank{self.rank}]",
+                name=f"output_activation_form_a[rank{self.rank}]",
                 atol=1e-2,
                 rtol=1e-2,
             )
@@ -550,34 +567,24 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
                 "run_kernel requires generate_inputs first; missing "
                 + ", ".join(missing)
             )
-        self._validate_combine_output_abi()
+        self._validate_output_activation_abi()
         return tensors
 
-    def _validate_combine_output_abi(self) -> None:
-        """Mirror the kernel's mode-dependent public combine tensor contract."""
+    def _validate_output_activation_abi(self) -> None:
+        """Mirror the kernel's public output tensor contract."""
 
-        if self.combine_output is None:
-            raise RuntimeError("combine_output has not been allocated.")
-        combine_topk = (
-            1
-            if self.impl.in_kernel_fc2_reduce
-            else self.problem.num_topk
-        )
-        expected_shape = (
-            self.problem.num_tokens_per_rank,
-            combine_topk,
-            self.problem.hidden,
-        )
-        if tuple(self.combine_output.shape) != expected_shape:
+        if self.output_activation is None:
+            raise RuntimeError("output_activation has not been allocated.")
+        expected_shape = (self.problem.num_tokens_per_rank, self.problem.hidden)
+        if tuple(self.output_activation.shape) != expected_shape:
             raise ValueError(
-                f"combine_output must have shape {expected_shape} for "
-                f"in_kernel_fc2_reduce={self.impl.in_kernel_fc2_reduce}; "
-                f"got {tuple(self.combine_output.shape)}."
+                f"output_activation must have shape {expected_shape}; got "
+                f"{tuple(self.output_activation.shape)}."
             )
-        if self.combine_output.dtype is not torch.bfloat16:
+        if self.output_activation.dtype is not torch.bfloat16:
             raise TypeError(
-                "combine_output must have dtype torch.bfloat16; got "
-                f"{self.combine_output.dtype}."
+                "output_activation must have dtype torch.bfloat16; got "
+                f"{self.output_activation.dtype}."
             )
 
     def _kernel_constructor_kwargs(
@@ -620,6 +627,7 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
             "max_tokens_per_rank": self.problem.num_tokens_per_rank,
             "hidden": self.problem.hidden,
             "fc2_in_kernel_topk_reduce": self.impl.in_kernel_fc2_reduce,
+            "skip_topk_reduce": self.impl.skip_topk_reduce,
             "token_back_by_dispatch": self.impl.token_back_by_dispatch,
             "token_back_mode": self.impl.token_back_mode,
             "epi_flag_batch": self.impl.epi_flag_batch,
@@ -630,7 +638,7 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
             "use_stg_fc1": False,
         }
 
-    def _prepare_combine_output_for_launch(self) -> None:
+    def _prepare_output_activation_for_launch(self) -> None:
         """Reset the REDG destination and make the reset collective-safe.
 
         Form-B uses relaxed system-scope reduction, either directly from the
@@ -641,12 +649,12 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
 
         if not self.impl.in_kernel_fc2_reduce:
             return
-        if self.combine_output is None:
+        if self.output_activation is None:
             raise RuntimeError(
-                "Form-B launch requires an allocated combine_output."
+                "Form-B launch requires an allocated output_activation."
             )
 
-        self.combine_output.zero_()
+        self.output_activation.zero_()
         if self.world_size == 1:
             return
 
@@ -672,7 +680,7 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
             raise RuntimeError("compiled kernel is not available")
 
         def _launch() -> None:
-            self._prepare_combine_output_for_launch()
+            self._prepare_output_activation_for_launch()
             self._compiled_kernel(**runtime_kwargs)
 
         sleep_seconds = self._perf_sleep_ms / 1000.0
@@ -728,12 +736,14 @@ class MegaMoEMxfp8Bf16Tester(MegaMoEBf16Tester):
             )
             return
 
-        first_output = self.combine_output.view(torch.uint8).clone()
-        self.combine_output.fill_(float("nan"))
+        if self.impl.skip_topk_reduce:
+            return
+        first_output = self.output_activation.view(torch.uint8).clone()
+        self.output_activation.fill_(float("nan"))
         self._launch_target_kernels_with_optional_torch_profiler(
             runtime_kwargs,
         )
-        second_output = self.combine_output.view(torch.uint8)
+        second_output = self.output_activation.view(torch.uint8)
         if not torch.equal(first_output, second_output):
             byte_mismatches = int(
                 torch.count_nonzero(first_output != second_output).item()
@@ -871,7 +881,6 @@ _SYMMETRIC_RUNTIME_TENSOR_ATTRS = (
     "my_activation",
     "my_topk_idx",
     "my_topk_weights",
-    "combine_output",
     "shared_workspace",
 )
 
@@ -1030,6 +1039,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             group_hint=args.group_hint,
             non_ubulk_fc2_store=True,
             in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
+            skip_topk_reduce=args.skip_topk_reduce,
             token_back_mode=args.token_back_mode,
             epi_flag_batch=_parse_tuple(args.epi_flag_batch),
             flag_batch=1,
