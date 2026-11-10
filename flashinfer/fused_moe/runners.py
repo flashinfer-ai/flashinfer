@@ -31,7 +31,17 @@ from contextlib import suppress
 import dataclasses
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, ClassVar, List, Literal, Mapping, Optional
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    cast,
+)
 
 import torch
 
