@@ -30,14 +30,13 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-from cutlass import Float32, Int32, Uint8
+from cutlass import Int32, Uint8
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-from ....batch_invariant.quantization.cute_ext import select_f32
 from ....batch_invariant.quantization.cvt_fp8 import cvt_f32x2_to_fp8x2
 from ....gemm.batch_invariant.blocks.mainloop import mma_loop
 from ....gemm.batch_invariant.blocks.operands import (
@@ -50,7 +49,7 @@ from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs, MainloopBl
 from ..spec_fp8 import w8a8_alpha
 from .epilogue import BAR_EPI_JOIN, GROUP, MoeF32, fragment_offsets
 from ..spec_fp8 import pertoken_elem_scale
-from .fp8_epilogue import DEAD_ACC, Fp8Chain, _chain_elem
+from .fp8_epilogue import Fp8Chain, _chain_elem
 from .kernel import GROUPED_K_BLOCKS
 from .scheduler import MAX_E, TABLE_SMEM_BYTES, GroupScheduler, build_group_tables
 from .swap_bf16 import plan_knobs_of, swap_tma_producer_loop
@@ -520,12 +519,6 @@ def swapped_epilogue_loop_fp8(
             wrow = crd0[0]  # this thread's (first) weight row in the tile
             col0 = crd0[1] - Int32(offs[0][1])  # the subtile's first token column
             n_glob = n_tile * Int32(weight_tile) + wrow
-            # a dead token column's accumulators (past the group's live tokens, never stored) are replaced by a benign constant and
-            # its chain runs with the live columns' (a select per register, not a region per register); the stores carry the predicate
-            for v in cutlass.range_constexpr(nv):
-                tTR_rAcc[v] = select_f32(
-                    col0 + Int32(cols[v]) < rows_left, tTR_rAcc[v], Float32(DEAD_ACC)
-                )
             # the gate accumulators of the up rows: lane + 8 (the 128-row layout) or the thread's second row (the 64-row one)
             gate = None
             if cutlass.const_expr(pair):
@@ -575,6 +568,8 @@ def swapped_epilogue_loop_fp8(
                     scale_gate = [
                         pertoken_elem_scale(MoeF32, tok[v], chg) for v in range(nv)
                     ]
+            # the chain of a token column is computed only where the column is a live token of the group (a warp-uniform branch:
+            # every lane of the warp holds the same column), so a tile with few live tokens pays few chains
             if cutlass.const_expr(e4m3_out):
                 outs = ups if cutlass.const_expr(pair) else list(range(nv))
                 assert len(outs) % 2 == 0, offs
@@ -582,44 +577,48 @@ def swapped_epilogue_loop_fp8(
                     v0, v1 = outs[q], outs[q + 1]
                     j0 = col0 + Int32(cols[v0])
                     j1 = col0 + Int32(cols[v1])
-                    y0 = _chain_elem(
-                        chain,
-                        tTR_rAcc[v0],
-                        gate[v0] if cutlass.const_expr(pair) else None,
-                        alpha_e,
-                        inv,
-                    )
-                    y1 = _chain_elem(
-                        chain,
-                        tTR_rAcc[v1],
-                        gate[v1] if cutlass.const_expr(pair) else None,
-                        alpha_e,
-                        inv,
-                    )
-                    pr = cvt_f32x2_to_fp8x2(y0, y1, "e4m3")
-                    if store_ok & (j0 < rows_left) & (n_glob + Int32(rows[v0]) < N):
-                        mOut[(row0 + j0, out_col + Int32(rows[v0]))] = (pr & 0xFF).to(
-                            Uint8
+                    # the pair's two token columns need not share a row (an ungated output register may sit on the thread's second
+                    # weight row): each byte is stored under its own column's predicate
+                    if (j0 < rows_left) | (j1 < rows_left):
+                        y0 = _chain_elem(
+                            chain,
+                            tTR_rAcc[v0],
+                            gate[v0] if cutlass.const_expr(pair) else None,
+                            alpha_e,
+                            inv,
                         )
-                    if store_ok & (j1 < rows_left) & (n_glob + Int32(rows[v1]) < N):
-                        mOut[(row0 + j1, out_col + Int32(rows[v1]))] = (pr >> 8).to(
-                            Uint8
+                        y1 = _chain_elem(
+                            chain,
+                            tTR_rAcc[v1],
+                            gate[v1] if cutlass.const_expr(pair) else None,
+                            alpha_e,
+                            inv,
                         )
+                        pr = cvt_f32x2_to_fp8x2(y0, y1, "e4m3")
+                        if store_ok & (j0 < rows_left) & (n_glob + Int32(rows[v0]) < N):
+                            mOut[(row0 + j0, out_col + Int32(rows[v0]))] = (
+                                pr & 0xFF
+                            ).to(Uint8)
+                        if store_ok & (j1 < rows_left) & (n_glob + Int32(rows[v1]) < N):
+                            mOut[(row0 + j1, out_col + Int32(rows[v1]))] = (pr >> 8).to(
+                                Uint8
+                            )
             else:
                 for v in cutlass.range_constexpr(nv):
                     if cutlass.const_expr(pair and rows[v] != 0):
                         continue  # a gate register (two_rows): folded into its up register's chain
                     j = col0 + Int32(cols[v])
-                    val = _chain_elem(
-                        chain,
-                        tTR_rAcc[v],
-                        gate[v] if cutlass.const_expr(pair) else None,
-                        scale[v],
-                        inv,
-                        s_gate=scale_gate[v],
-                    )
-                    if store_ok & (j < rows_left) & (n_glob + Int32(rows[v]) < N):
-                        mOut[(row0 + j, out_col + Int32(rows[v]))] = val
+                    if j < rows_left:
+                        val = _chain_elem(
+                            chain,
+                            tTR_rAcc[v],
+                            gate[v] if cutlass.const_expr(pair) else None,
+                            scale[v],
+                            inv,
+                            s_gate=scale_gate[v],
+                        )
+                        if store_ok & (n_glob + Int32(rows[v]) < N):
+                            mOut[(row0 + j, out_col + Int32(rows[v]))] = val
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)
         acc_state.advance()
