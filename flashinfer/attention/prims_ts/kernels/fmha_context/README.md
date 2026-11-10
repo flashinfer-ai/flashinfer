@@ -71,7 +71,7 @@ Validation can read metadata values on the host. Trusted/captured execution uses
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state; INT8 Q/K accumulate INT32 scores that the softmax reads as FP32 |
 | Sage attention | Contiguous dense fixed-length plans with `head_dim=128`, `torch.float8_e4m3fn` or `torch.int8` (SM100a only) Q/K, `torch.float8_e4m3fn` V and a 16-bit output: `plan(sage=SageAttentionConfig(...))`, `run(sage=SageAttentionParams(...))`; see [Sage attention](../../README.md#sage-attention) |
-| Softmax statistics | Optional caller-owned FP32 maximum/denominator output for plain attention; not combined with Sage/VC or attention sinks |
+| Softmax statistics | Optional caller-owned FP32 maximum/denominator output for plain attention; not combined with Sage/VC, MXFP8 Q/K, or attention sinks |
 
 See the shared [validation scope](../../README.md#validation-scope) for the
 measured hardware and DSL versions, including SM103/GB300 coverage of the

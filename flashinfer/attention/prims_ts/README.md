@@ -237,7 +237,7 @@ attention API, produce `(-inf, 0)`.
 
 The optional base-2 `lse` output and its return-value semantics are unchanged;
 LSE and merge statistics may be enabled together. Context statistics support
-plain attention, not VC/Sage recipes or context attention sinks. Contiguous
+plain attention, not VC/Sage recipes, MXFP8 Q/K, or context attention sinks. Contiguous
 dense statistics support empty request-local K/V chunks when the physical
 packed K/V storage contains at least one token. Paged context statistics require
 positive per-request KV lengths. Statistics-disabled behavior is unchanged.

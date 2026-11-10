@@ -1401,8 +1401,14 @@ def test_attention_ts_context_stats_reuses_dynamic_requests(
     assert compile_calls[0].lse_mode == lse_mode
 
 
-@pytest.mark.parametrize("extra", ["vc_config", "sage", "use_attention_sinks"])
+@pytest.mark.parametrize("extra", ["vc_config", "sage", "use_attention_sinks", "mxfp8"])
 def test_attention_ts_context_stats_rejects_unqualified_recipes(extra):
+    qk_dtype = torch.float8_e8m0fnu if extra == "mxfp8" else torch.bfloat16
+    options = (
+        {}
+        if extra == "mxfp8"
+        else {extra: True if extra == "use_attention_sinks" else object()}
+    )
     with pytest.raises(NotImplementedError, match="softmax statistics do not support"):
         BatchPrefillTSWrapper().plan(
             device="cpu",
@@ -1412,10 +1418,10 @@ def test_attention_ts_context_stats_rejects_unqualified_recipes(extra):
             num_qo_heads=4,
             num_kv_heads=4,
             head_dim=128,
-            q_dtype=torch.bfloat16,
-            k_dtype=torch.bfloat16,
+            q_dtype=qk_dtype,
+            k_dtype=qk_dtype,
             store_softmax_stats=True,
-            **{extra: True if extra == "use_attention_sinks" else object()},
+            **options,
         )
 
 
