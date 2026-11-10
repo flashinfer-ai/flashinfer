@@ -105,7 +105,9 @@ pip install flashinfer-python
 flashinfer download-kernels
 ```
 
-`flashinfer download-kernels` installs the `flashinfer-cubin` and `flashinfer-jit-cache` wheels that match the installed `flashinfer-python` and CUDA versions. By default it installs pre-built kernels for every supported GPU architecture (several GB); pass `--mode minimal` to install the jit-cache provider only for the visible GPUs, or `--sm` (e.g. `--sm sm90a`, repeatable) to choose architectures explicitly. Re-run it after upgrading `flashinfer-python`.
+`flashinfer download-kernels` installs the `flashinfer-cubin` and `flashinfer-jit-cache` wheels that match the installed `flashinfer-python` and CUDA versions. By default it installs pre-built kernels for every supported GPU architecture (several GB); pass `--mode minimal` to install the jit-cache provider only for the visible GPUs, or `--sm` (e.g. `--sm sm90a`, repeatable) to choose architectures explicitly.
+
+> **Upgrading:** the kernel wheels must match `flashinfer-python` exactly and are not upgraded with it. Run `flashinfer download-kernels` again after every `pip install -U flashinfer-python`; until then FlashInfer warns at import and ignores the old wheels (falling back to on-demand downloads and JIT compilation). Also note that `flashinfer-cubin` is no longer published to PyPI (0.6.13 was the last release there): a plain `pip install -U flashinfer-cubin` installs that stale wheel, so install it through `flashinfer download-kernels` or from `--index-url https://flashinfer.ai/whl`. See [Upgrading](https://docs.flashinfer.ai/installation.html#upgrading).
 
 **For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
 

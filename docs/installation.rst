@@ -57,14 +57,49 @@ version and the CUDA version of the installed PyTorch. By default it installs
 pre-built kernels for every supported GPU architecture (several GB); pass
 ``--mode minimal`` to install the jit-cache provider only for the visible GPUs,
 or ``--sm`` (for example ``--sm sm90a``, repeatable) to choose architectures
-explicitly. The kernel wheels must match ``flashinfer-python``
-exactly, so re-run the command after upgrading. See :doc:`cli` for all options.
+explicitly. See :doc:`cli` for all options, and :ref:`upgrading` before
+upgrading an existing installation.
 
-.. note::
-   The ``flashinfer-cubin`` package on PyPI is no longer updated and does not
-   match current ``flashinfer-python`` releases; FlashInfer ignores a mismatched
-   wheel with a warning. Use ``flashinfer download-kernels``, which installs
-   from https://flashinfer.ai/whl, instead of ``pip install flashinfer-cubin``.
+
+.. _upgrading:
+
+Upgrading
+^^^^^^^^^
+
+The pre-built kernel wheels are tied to one exact ``flashinfer-python``
+version, and upgrading ``flashinfer-python`` does not upgrade them. Re-install
+them after every upgrade:
+
+.. code-block:: bash
+
+    pip install -U flashinfer-python
+    flashinfer download-kernels   # same --mode / --sm options as the first install
+
+Until you do, FlashInfer logs a warning at import (``Ignoring incompatible
+flashinfer-cubin package`` / ``flashinfer-jit-cache package``) and ignores the
+old wheels: cubins are downloaded on demand and kernels are JIT-compiled, as if
+the wheels were not installed. Results stay correct, but first calls are slow
+again and offline machines can fail to load kernels. Set
+``FLASHINFER_DISABLE_VERSION_CHECK=1`` only if you intentionally mix versions.
+
+**flashinfer-cubin moved off PyPI.** ``flashinfer-cubin`` 0.6.13 was the last
+release published to PyPI; newer releases are only on the FlashInfer wheel
+index, https://flashinfer.ai/whl. Because PyPI still serves 0.6.13, these
+commands silently install a stale wheel that FlashInfer then ignores:
+
+- ``pip install flashinfer-cubin`` or ``pip install -U flashinfer-cubin`` without
+  ``--index-url https://flashinfer.ai/whl``
+- a ``requirements.txt`` or lock file that resolves ``flashinfer-cubin`` from
+  PyPI
+
+Use ``flashinfer download-kernels``, which picks the right index and pins the
+matching version, or pin it yourself:
+``pip install flashinfer-cubin==<flashinfer-python version> --index-url https://flashinfer.ai/whl``.
+``flashinfer-jit-cache`` was never published to PyPI; it is served from the
+CUDA-specific index (for example https://flashinfer.ai/whl/cu130).
+
+Run ``flashinfer show-config`` to compare the installed ``flashinfer-cubin``
+and ``flashinfer-jit-cache`` versions with ``flashinfer-python``.
 
 
 .. _install-from-source:
