@@ -220,7 +220,7 @@ jobs:
             const sections = [marker];
             if (publicApiFindings.length) {
               sections.push(
-                '# 🚨 POTENTIAL BREAKING PUBLIC API CHANGE DETECTED 🚨',
+                '# 🚨🚨 POTENTIAL BREAKING PUBLIC API CHANGE DETECTED',
                 '',
                 '> [!CAUTION]',
                 '> **THIS PR APPEARS TO BREAK THE PUBLIC API. AUTHORS AND REVIEWERS: DO NOT MISS THIS.**',
