@@ -23,6 +23,7 @@ from .compile import GRID_PLACEHOLDER
 from .epilogue import GROUP
 from .fp8_epilogue import GEMM2_CHAIN, Fp8Chain
 from .fp8_kernel import IN_FMT, ScaledGroupedBlockGemmFp8
+from .fp8_swap_kernel import SwappedGroupedGemmFp8, is_swapped_record, swapped_knobs  # noqa: F401
 from .scheduler import MAX_E
 
 MODULE = "batch_invariant_moe_fp8"
@@ -137,4 +138,118 @@ def get_compiled_grouped_fp8(cfg: Knobs, chain: Fp8Chain) -> Any:
     grid in clusters."""
     return jit.build_and_load(
         MODULE, kernel_name(cfg, chain), compile_grouped_fp8_fn(cfg, chain)
+    )
+
+
+# ----------------------------------------------------------------------------- the swapped body (the swapped records)
+
+
+def swapped_kernel_name_fp8(cfg: Knobs, chain: Fp8Chain) -> str:
+    """``swapped_e4m3_<chain>_<record>``: the swapped record (its weight and token tiles) names the object beside the chain."""
+    knobs = dataclasses.replace(cfg, grid_clusters=0)
+    return jit.sanitize_symbol_name(
+        f"swapped_e4m3_{chain.describe()}_{knobs.describe()}"
+    )
+
+
+def can_implement_swapped_fp8(
+    knobs: Knobs, N: int, K: int, E: int, chain: Fp8Chain = GEMM2_CHAIN
+) -> bool:
+    """Acceptance of the fp8 swapped body (:mod:`.fp8_swap_kernel`): a swapped record of the fp8 classes (128 or 64 weight rows x
+    16 / 32 tokens, 1-CTA) under the grouped fp8 body's operand rules (16-byte-aligned K and N, the output rows aligned to its
+    format, whole ``2 x GROUP`` column blocks for the gated chain, at most ``MAX_E`` experts); every chain of the classes."""
+    if not is_swapped_record(knobs):
+        return False
+    if chain.pair and N % (2 * GROUP):
+        return False
+    al = ALIGN[IN_FMT]
+    n_out = N // 2 if chain.pair else N
+    return (
+        K % al == 0
+        and N % al == 0
+        and n_out % OUT_ALIGN_FP8[chain.out_fmt] == 0
+        and 1 <= E <= MAX_E
+    )
+
+
+def can_implement_fp8(
+    knobs: Knobs, N: int, K: int, E: int, chain: Fp8Chain = GEMM2_CHAIN
+) -> bool:
+    """A record either fp8 body takes: the grouped body (a dense record) or the swapped body (a swapped record); the two record
+    spaces are disjoint (the swapped flag)."""
+    return can_implement_grouped_fp8(
+        knobs, N, K, E, chain
+    ) or can_implement_swapped_fp8(knobs, N, K, E, chain)
+
+
+def compile_swapped_fp8_fn(cfg: Knobs, chain: Fp8Chain) -> Callable[[], Any]:
+    """The zero-argument compile closure of one swapped fp8 specialisation: ``kernel(rows3, w3, out2, counts, alpha, sa, si,
+    grid)`` -- ``rows (R, K, 1)`` the dense permuted e4m3 rows (``R >= Tk``), ``w (N, K, E)``, ``out (Tk, Nout)``."""
+    in_dt, al = IN_DT[IN_FMT], ALIGN[IN_FMT]
+    out_dt, oal = OUT_DT_FP8[chain.out_fmt], OUT_ALIGN_FP8[chain.out_fmt]
+
+    def compile_fn():
+        sym_r, sym_m, sym_n, sym_k, sym_e = (
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32, divisibility=al),
+            cute.sym_int(32, divisibility=al),
+            cute.sym_int(32),
+        )
+        sym_no = cute.sym_int(32, divisibility=oal)
+        rows_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_r, sym_k, 1),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
+        w_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_n, sym_k, sym_e),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
+        o_fake = cute.runtime.make_fake_tensor(
+            out_dt,
+            (sym_m, sym_no),
+            (cute.sym_int64(divisibility=oal), 1),
+            assumed_align=16,
+        )
+        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        alpha_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (sym_e,), (1,), assumed_align=4
+        )
+        sa_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (1,), (1,), assumed_align=4
+        )
+        si_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (1,), (1,), assumed_align=4
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        grid = GRID_PLACEHOLDER
+        return cute.compile(
+            SwappedGroupedGemmFp8(cfg, chain),
+            rows_fake,
+            w_fake,
+            o_fake,
+            c_fake,
+            alpha_fake,
+            sa_fake,
+            si_fake,
+            grid,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return compile_fn
+
+
+@functools.cache
+def get_compiled_swapped_fp8(cfg: Knobs, chain: Fp8Chain) -> Any:
+    """``kernel(rows3, w3, out2, counts, alpha, sa, si, grid)``: the fp8 swapped body for a swapped record (module
+    ``batch_invariant_moe_fp8``): rows ``(R, K, 1)`` K-major e4m3 (``R >= Tk``), w ``(N, K, E)`` K-major e4m3, out ``(Tk, Nout)``,
+    counts ``(E,)``, the scales as for the grouped body, ``grid`` the persistent grid in CTAs."""
+    assert is_swapped_record(cfg), cfg
+    return jit.build_and_load(
+        MODULE, swapped_kernel_name_fp8(cfg, chain), compile_swapped_fp8_fn(cfg, chain)
     )

@@ -528,11 +528,21 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
     from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
         all_valid_configs_fp8,
+        all_valid_configs_fp8_both,
+        all_valid_configs_swapped_fp8,
         default_configs_fp8,
         gemm1_chain,
         rank_grouped_fp8,
+        swapped_knobs_fp8,
     )
 
+    sw = swapped_knobs_fp8()
+    assert [(c.tile_m, c.tile_n) for c in sw] == [
+        (128, 16),
+        (128, 32),
+        (64, 16),
+        (64, 32),
+    ] and all(c.swap_ab and c.cluster_shape_mn == (1, 1) for c in sw)
     geoms = [
         (2048, 768, 128, 8),
         (4096, 14336, 8, 2),
@@ -542,14 +552,25 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
         (1024, 512, 64, 8),
     ]
     for H, I, E, k in geoms:
-        s1 = set(all_valid_configs_fp8(2 * I, H, E, gemm1_chain("silu")))
-        s1u = set(all_valid_configs_fp8(I, H, E, gemm1_chain("relu2", (), False)))
-        s2 = set(all_valid_configs_fp8(H, I, E, GEMM2_CHAIN))
+        s1 = set(all_valid_configs_fp8_both(2 * I, H, E, gemm1_chain("silu")))
+        s1u = set(all_valid_configs_fp8_both(I, H, E, gemm1_chain("relu2", (), False)))
+        s2 = set(all_valid_configs_fp8_both(H, I, E, GEMM2_CHAIN))
         assert s1 and s1u and s2
+        # the two record spaces are disjoint (the swapped flag) and the swapped one has every record at these shapes
+        assert not (set(all_valid_configs_fp8(H, I, E, GEMM2_CHAIN)) & set(sw))
+        assert set(all_valid_configs_swapped_fp8(H, I, E, GEMM2_CHAIN)) == set(sw)
         for T in (1, 7, 64, 300, 800, 4096, 16384):
             c1, c2 = default_configs_fp8(
                 T, k, H, I, E, sm_count, family, True, nominal=True
             )
+            a1, a2 = default_configs_fp8(
+                T, k, H, I, E, sm_count, family, True, nominal=True, swap=True
+            )
+            assert a1.swap_ab and a2.swap_ab and a1 in s1 and a2 in s2
+            n1, n2 = default_configs_fp8(
+                T, k, H, I, E, sm_count, family, True, nominal=True, swap=False
+            )
+            assert not n1.swap_ab and not n2.swap_ab and n1 in s1 and n2 in s2
             assert c1 in s1 and c2 in s2, (
                 family,
                 T,
@@ -875,6 +896,106 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits():
     assert torch.equal(bits(layer(pack, W)), ref)
     if hasattr(AutoTuner.get(), "stats"):
         assert len(AutoTuner.get().stats.failed_tactics) == failed_before
+    # a decode-sized batch: the ranked tactics include the swapped records (the swapped body), every tactic gives the bits of
+    # the class's CPU composition, and a tactic round-trips its swapped flag
+    from flashinfer.fused_moe.batch_invariant.runner import (
+        _configs_from_tactic,
+        _tactic,
+    )
+
+    xd, ld, _, _, _ = _problem(3, k, H, I, E, seed=8, adversarial=True)
+    xqd = _xq(xd, m_x)
+    packd = _logits_pack(xqd, ld)
+    ids, weights = _reference_route(ld, k, RoutingMethodType.Renormalize)
+    view = W.get_view(BatchInvariantFp8PerTensorRunner.backend_key)
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    refd, _ = _reference_ffn(
+        xqd, ids.cuda(), weights.cuda(), view, activation_of(_SWIGLU)
+    )
+    assert torch.equal(bits(layer(packd, W).cpu()), bits(refd))
+    inputs = runner.pack_inputs(packd, W)
+    tactics_d = runner.get_valid_tactics(inputs, None)
+    assert any(_configs_from_tactic(t)[0].swap_ab for t in tactics_d), tactics_d
+    for t in tactics_d:
+        c1, c2 = _configs_from_tactic(t)
+        assert _tactic(c1, c2) == t
+        out = runner.forward(runner.pack_inputs(packd, W), tactic=t)
+        assert torch.equal(bits(out.cpu()), bits(refd)), t
+
+
+@needs_device
+def test_swapped_records_equal_the_grouped_records():
+    """The fp8 swapped body (the weights on the MMA's M side -- 128 or 64 rows per CTA -- and the group's e4m3 rows a TMA box
+    of 16 / 32 tokens from the dense rows): at every swapped record its rows are a grouped record's rows bit for bit -- the raw
+    fp32 fold, GEMM2's scaled bf16 chain, every gated and the ungated fused e4m3 chain -- with groups of 1 .. 70 rows (several
+    token tiles), empty groups, E = 256, a weight width that is not a multiple of the weight tile, a partial last k-tile, and
+    the dense buffer with and without the token tile's pad rows past the live ones (the last tiles' boxes then read the pad, or
+    are zero-filled past the buffer: never stored)."""
+    from flashinfer.fused_moe.batch_invariant.api_fp8 import grouped_gemm_fp8
+    from flashinfer.fused_moe.batch_invariant.blocks.fp8_epilogue import (
+        GEMM2_CHAIN,
+        Fp8Chain,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
+        gemm1_chain,
+        swapped_knobs_fp8,
+    )
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    g = torch.Generator().manual_seed(11)
+
+    def rnd_e4m3(*shape, span=2.0):
+        return (
+            ((torch.rand(*shape, generator=g) * 2 - 1) * span)
+            .to(torch.float8_e4m3fn)
+            .cuda()
+        )
+
+    def bytes_of(t):
+        return bits(
+            t.view(torch.uint8).cpu() if t.dtype == torch.float8_e4m3fn else t.cpu()
+        )
+
+    dense = Knobs((64, 64), (1, 1), False, True, "m", 1)
+    chains = [
+        Fp8Chain("plain", "silu", "f32", (), False),
+        GEMM2_CHAIN,
+        gemm1_chain("silu"),
+        gemm1_chain("gelu_tanh"),
+        gemm1_chain("relu2", (), False),
+    ]
+    for counts, N, K in [
+        ([5, 0, 70, 1, 33, 64, 0, 3], 256, 512),
+        ([1] * 16, 192, 1024),
+        ([0] * 200 + [40] + [0] * 55, 320, 320),
+        ([3, 7, 11, 13] * 16, 1024, 128),
+    ]:
+        E, Tk = len(counts), sum(counts)
+        cnt = torch.tensor(counts, dtype=torch.int32, device="cuda")
+        w = rnd_e4m3(E, N, K)
+        s_w = (torch.rand(E, generator=g) * 0.01 + 0.001).float().cuda()
+        s_a = torch.tensor([0.02], device="cuda")
+        inv = torch.tensor([40.0], device="cuda")
+        for pad in (0, 32):
+            a_buf = rnd_e4m3(Tk + pad, K)
+            refs = {
+                ch.describe(): bytes_of(
+                    grouped_gemm_fp8(a_buf, w, s_w, s_a, inv, cnt, dense, ch, Tk=Tk)
+                )
+                for ch in chains
+            }
+            for cfg in swapped_knobs_fp8():
+                for ch in chains:
+                    got = grouped_gemm_fp8(a_buf, w, s_w, s_a, inv, cnt, cfg, ch, Tk=Tk)
+                    assert torch.equal(bytes_of(got), refs[ch.describe()]), (
+                        cfg.describe(),
+                        ch.describe(),
+                        counts[:4],
+                        N,
+                        K,
+                        pad,
+                    )
 
 
 @needs_device

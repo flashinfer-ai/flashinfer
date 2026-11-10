@@ -258,7 +258,9 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
     def _cache_key_extras(self) -> tuple:
         from ..runners import MoERunner
 
-        return MoERunner._cache_key_extras(self) + ("moe.e4m3-v1",)
+        return MoERunner._cache_key_extras(self) + (
+            "moe.e4m3-v2",
+        )  # v2: the tactic carries the swapped flag
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(

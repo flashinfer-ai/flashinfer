@@ -78,3 +78,50 @@ theorem fused_quant_is_input_quant_on_activation (a : GAct) (g u alpha inv : MTe
     quantE4m3T (.leaf "x" [0]) inv = .cvt "e4m3" (.mul (.leaf "x" [0]) inv) := ⟨rfl, rfl⟩
 
 end BIK.MoE
+
+/-! ## The swapped records of the fp8 per-tensor classes
+
+The fp8 swapped body (`fused_moe/batch_invariant/blocks/fp8_swap_kernel.py`) is the bf16 swapped body on e4m3 operands with the W8A8
+chains: `Cᵀ` per expert, the expert's weight rows on the MMA's M side (128 or 64 rows per CTA) and the group's tokens on its N
+side as a narrow tile of 16 or 32 rows (`kind::f8f6f4` takes N >= 16). The tcgen05 step folds the same K sequence per output element
+whichever operand carries the token, so every output element is the dense fp8 class's `kfold` of the row's data and the expert's
+column, and the chain per element is the grouped fp8 body's (`gluQuantE4m3T` / `actQuantE4m3T` / `scaledOutT` on the same
+accumulator): the swapped records are placements, and the dispatcher ranks them with the grouped records. The 64-row weight tile's
+TMEM layout gives a thread the rows `r` and `r + 8` (the interleaved weight's up / gate pair) instead of lane `+8`: which register
+holds the gate, never the term. The predicate mirrors `blocks/fp8_swap_kernel.is_swapped_record`; the space is the four records. -/
+
+namespace BIK.MoE
+
+/-- A swapped record of the fp8 classes: the swapped 1-CTA record at 128 or 64 weight rows and a token tile of 16 or 32, no cluster,
+swizzle 1, no in-cluster split, no in-CTA chunk fold. -/
+def swappedOKFp8 (cfg : GEMM.Config) : Bool :=
+  cfg.swapAb && (cfg.tm == 128 || cfg.tm == 64) && (cfg.tn == 16 || cfg.tn == 32) && cfg.clusterM == 1 && cfg.clusterN == 1 &&
+  !cfg.twoCta && cfg.swizzle == 1 && cfg.clusterK == 1 && !cfg.ctaChunks
+
+/-- The fp8 swapped record space (`schedule_fp8.swapped_knobs_fp8`): the weight tiles 128 then 64, each at the token tiles 16 and 32,
+raster along the token tiles. -/
+def swappedSpaceFp8 : List GEMM.Config :=
+  [⟨128, 16, 1, 1, false, true, 1, false, 1, true⟩, ⟨128, 32, 1, 1, false, true, 1, false, 1, true⟩,
+   ⟨64, 16, 1, 1, false, true, 1, false, 1, true⟩, ⟨64, 32, 1, 1, false, true, 1, false, 1, true⟩]
+
+theorem swapped_fp8_space_size : swappedSpaceFp8.length = 4 := by decide
+theorem swapped_fp8_space_ok : swappedSpaceFp8.all swappedOKFp8 = true := by decide
+
+/-- The fp8 swapped records are disjoint from the dense records (the swapped flag): no record is in both spaces. -/
+theorem swapped_fp8_not_dense (cfg : GEMM.Config) (h : swappedOKFp8 cfg = true) : GEMM.ConfigOK cfg = false := by
+  cases hs : cfg.swapAb with
+  | false => simp [swappedOKFp8, hs] at h
+  | true => simp [GEMM.ConfigOK, hs]
+
+/-- **Every record of either fp8 space computes the same tile**: a swapped record's tile result is any dense record's (the dense
+class's configuration erasure, `GEMM.config_invariance`), so the two spaces together are one guarantee space; the W8A8 chain is
+applied to that tile's accumulators after the fold, record-independently. -/
+theorem swapped_fp8_eq_dense (c₁ c₂ : GEMM.Config) (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat) :
+    GEMM.tileResult c₁ S₁ p a b kb nblk = GEMM.tileResult c₂ S₂ q a b kb nblk :=
+  GEMM.config_invariance c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem swapped_fp8_space_invariant : ∀ c₁ ∈ swappedSpaceFp8, ∀ c₂ ∈ swappedSpaceFp8, ∀ (S₁ S₂ : Nat) (p q : GEMM.GTerm) (a : GEMM.RowData) (b : GEMM.ColData) (kb nblk : Nat),
+    GEMM.tileResult c₁ S₁ p a b kb nblk = GEMM.tileResult c₂ S₂ q a b kb nblk :=
+  GEMM.space_invariant swappedSpaceFp8
+
+end BIK.MoE

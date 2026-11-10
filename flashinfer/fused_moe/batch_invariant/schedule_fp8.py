@@ -18,10 +18,13 @@ from .blocks.fp8_epilogue import GEMM2_CHAIN, Fp8Chain
 from .schedule import (
     TOP_K,
     active_experts,
+    exposed_epilogue_cycles,
     grouped_knobs,
     pair_term,
     raster_for,
     rows_per_expert,
+    tiles_term,
+    zero_fill_cycles,
 )
 
 IN_FMT = "e4m3"
@@ -45,6 +48,65 @@ def all_valid_configs_fp8(
     ]
 
 
+def swapped_knobs_fp8() -> List[Knobs]:
+    """The swapped record space of the fp8 classes (:mod:`.blocks.fp8_swap_kernel`): the swapped 1-CTA records at 128 or 64
+    weight rows x 16 / 32 tokens (``kind::f8f6f4`` takes N >= 16), no cluster, swizzle 1. Disjoint from the grouped space (the
+    swapped flag); the body reads the same dense rows through a TMA box."""
+    from .blocks.fp8_swap_kernel import swapped_knobs
+
+    return swapped_knobs()
+
+
+def all_valid_configs_swapped_fp8(
+    N: int, K: int, E: int, chain: Fp8Chain = GEMM2_CHAIN
+) -> List[Knobs]:
+    """The swapped records the fp8 swapped body accepts for a weight shape and a chain."""
+    from .blocks.fp8_compile import can_implement_swapped_fp8
+
+    return [
+        k for k in swapped_knobs_fp8() if can_implement_swapped_fp8(k, N, K, E, chain)
+    ]
+
+
+def all_valid_configs_fp8_both(
+    N: int, K: int, E: int, chain: Fp8Chain = GEMM2_CHAIN, clusters=None
+) -> List[Knobs]:
+    """Both record spaces of the fp8 classes for a weight shape and a chain: the grouped records, then the swapped ones."""
+    return all_valid_configs_fp8(
+        N, K, E, chain, clusters
+    ) + all_valid_configs_swapped_fp8(N, K, E, chain)
+
+
+def chain_nodes_fp8(chain: Fp8Chain) -> int:
+    """The node count of a W8A8 chain's term (the S-expression :mod:`..spec_fp8` builds for one output element: GEMM1's fused
+    e4m3 quantization of the gated or the ungated activation on the alpha-scaled accumulators, GEMM2's scaled conversion): the
+    exposed-epilogue term's cost unit (:func:`.schedule.exposed_epilogue_cycles`)."""
+    from . import mterm as term
+    from . import spec_fp8 as M8
+
+    alg = term.TermAlgebra()
+    alpha, inv = alg.sym("alpha"), alg.sym("inv")
+    if chain.pair:
+        t = M8.glu_quant_e4m3_elem(
+            alg,
+            alg.leaf("g", 0, 0),
+            alg.leaf("u", 0, 0),
+            alpha,
+            inv,
+            chain.act,
+            chain.params,
+        )
+    elif chain.kind == "act":
+        t = M8.act_quant_e4m3_elem(
+            alg, alg.leaf("x", 0), alpha, inv, chain.act, chain.params
+        )
+    elif chain.scaled:
+        t = M8.scaled_out_elem(alg, alg.leaf("x", 0), alpha, chain.out_fmt)
+    else:
+        return 1
+    return term.sexpr(t).count("(")
+
+
 def rank_grouped_fp8(
     rows: int,
     N: int,
@@ -56,36 +118,74 @@ def rank_grouped_fp8(
     k: int = TOP_K,
     nominal: bool = False,
     n_active: Optional[int] = None,
+    swap: Optional[bool] = None,
 ) -> List[Knobs]:
-    """The ranked grouped records for one fp8 GEMM, as the bf16 backend's ``schedule.rank_grouped``: the grouped space the
-    fp8 body accepts for the weight shape and the chain, ordered by the dense fp8 class's estimate at ``(M = rows,
-    N = n_active * N, K)`` times the pair term, each tile family priced once at the enumeration's raster and the grouped
-    scheduler's structural raster first among its twins; at a decode-sized ``rows`` the dense dispatcher's structural guard
-    selects the candidates; each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
-    list: distinct records, at most ``k``, never empty for an implementable shape."""
+    """The ranked records for one fp8 GEMM over both record spaces, as the bf16 backend's ``schedule.rank_grouped``: the grouped
+    records the fp8 body accepts for the weight shape and the chain (at a decode-sized ``rows`` the dense dispatcher's structural
+    guard selects the candidates) and the swapped records the fp8 swapped body accepts (``swap``: None ranks them with the rest,
+    True keeps only them, False excludes them), ordered by the dense fp8 class's estimate at ``(M = rows, N = n_active * N, K)``
+    (the fp8 instruction rate and operand bytes; the e4m3 output of GEMM1's chain is one byte) times the pair term and the swapped
+    records' spill factor, plus the last tile's exposed epilogue chain (the W8A8 chain's node count) and the token box's zero-fill
+    at the format's element width, rounded to three significant digits; each tile family priced once at the enumeration's raster
+    and the grouped scheduler's structural raster first among its twins; each of the best ceil(k/2) records is followed by its
+    raster twin, then the rank order fills the list: distinct records, at most ``k``, never empty for an implementable shape.
+    Numerics-neutral: every record of either space computes the class."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
-    from .blocks.fp8_compile import can_implement_grouped_fp8
+    from .blocks.fp8_compile import can_implement_grouped_fp8, can_implement_swapped_fp8
 
     fam = family or "sm_107"
     dense_n = (n_active or E) * N
-    space = [c for c in grouped_knobs() if can_implement_grouped_fp8(c, N, K, E, chain)]
-    guarded = [c for c in space if decode_sane(c, rows, False)]
+    dense = (
+        []
+        if swap is True
+        else [
+            c for c in grouped_knobs() if can_implement_grouped_fp8(c, N, K, E, chain)
+        ]
+    )
+    swapped = (
+        []
+        if swap is False
+        else [
+            c
+            for c in swapped_knobs_fp8()
+            if can_implement_swapped_fp8(c, N, K, E, chain)
+        ]
+    )
+    space = dense + swapped
+    guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
+    nodes = chain_nodes_fp8(chain)
+    out_bytes = 1 if chain.out_fmt == "e4m3" else 2
 
     def key(i, c):
         canon = dataclasses.replace(c, raster_along="m")
         est = estimate_cycles(
-            canon, rows, dense_n, K, 1, "k", IN_FMT, fam, sm_count, nominal=nominal
+            canon,
+            rows,
+            dense_n,
+            K,
+            1,
+            "k",
+            IN_FMT,
+            fam,
+            sm_count,
+            out_bytes=out_bytes,
+            nominal=nominal,
+        )
+        est = (
+            est * pair_term(c, rows) * tiles_term(c, rows)
+            + exposed_epilogue_cycles(c, rows, nodes)
+            + zero_fill_cycles(c, rows, K, fam, IN_FMT)
         )
         return (
-            est * pair_term(c, rows),
-            0 if c.raster_along == raster_for(c, rows) else 1,
+            float(f"{est:.3g}"),
+            0 if (c.swap_ab or c.raster_along == raster_for(c, rows)) else 1,
             i,
         )
 
     ranked = [
-        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded or space))
+        c for _k, c in sorted((key(i, c), c) for i, c in enumerate(guarded + swapped))
     ]
     members = set(space)
     out: List[Knobs] = []
@@ -118,9 +218,11 @@ def default_configs_fp8(
     gated: bool = True,
     nominal: bool = False,
     chain1: Optional[Fp8Chain] = None,
+    swap: Optional[bool] = None,
 ) -> Tuple[Knobs, Knobs]:
     """``(config for GEMM1 (N = 2I, K = H; N = I ungated), config for GEMM2 (N = H, K = I))``: the first record of each ranked
-    list. ``chain1`` names GEMM1's chain (the activation's; its acceptance is the chain kind's)."""
+    list over both record spaces (``swap``: None, or True / False to keep only / exclude the swapped records). ``chain1`` names
+    GEMM1's chain (the activation's; its acceptance is the chain kind's)."""
     rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
     c1chain = (
         chain1
@@ -128,9 +230,11 @@ def default_configs_fp8(
         else gemm1_chain("silu" if gated else "relu2", (), gated)
     )
     n1 = 2 * I if gated else I
-    c1 = rank_grouped_fp8(rows, n1, H, E, c1chain, sm_count, family, 1, nominal, n_act)
+    c1 = rank_grouped_fp8(
+        rows, n1, H, E, c1chain, sm_count, family, 1, nominal, n_act, swap
+    )
     c2 = rank_grouped_fp8(
-        rows, H, I, E, GEMM2_CHAIN, sm_count, family, 1, nominal, n_act
+        rows, H, I, E, GEMM2_CHAIN, sm_count, family, 1, nominal, n_act, swap
     )
     if not c1 or not c2:
         raise ValueError(

@@ -228,12 +228,21 @@ def grouped_gemm_fp8(
     config: Knobs,
     chain: Fp8Chain = GEMM2_CHAIN,
     out: Optional[torch.Tensor] = None,
+    Tk: Optional[int] = None,
 ) -> torch.Tensor:
-    """``out[p] = chain(a[p] @ w[e(p)].T, alpha = mul(s_a, s_w[e(p)]))`` for the expert segments ``counts``: ``a [Tk, K]`` e4m3
+    """``out[p] = chain(a[p] @ w[e(p)].T, alpha = mul(s_a, s_w[e(p)]))`` for the expert segments ``counts``: ``a [R >= Tk, K]`` e4m3
     row-major, ``w [E, N, K]`` e4m3 row-major, ``s_w [E]`` fp32, ``s_a [1]`` fp32 (the A operand's dequantization scale), ``inv [1]``
     fp32 (the intermediate multiplier of the e4m3 chains; ignored by the others). The e4m3 chains return ``float8_e4m3fn
-    [Tk, N / 2]`` (gated) or ``[Tk, N]``; the plain chain bf16 / fp32 ``[Tk, N]``. The persistent grid is a launch argument."""
-    from .blocks.fp8_compile import can_implement_grouped_fp8, get_compiled_grouped_fp8
+    [Tk, N / 2]`` (gated) or ``[Tk, N]``; the plain chain bf16 / fp32 ``[Tk, N]``. The record selects the body: a dense record runs
+    the grouped fp8 body, a swapped record (``config.swap_ab``: 128 or 64 weight rows x 16 / 32 tokens, the weights on the MMA's M
+    side, :mod:`.blocks.fp8_swap_kernel`) the swapped body on the same dense rows -- a placement, the same bits. ``Tk`` (default:
+    the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the swapped body's last token box then
+    stays inside the buffer instead of being zero-filled past it). The persistent grid is a launch argument."""
+    from .blocks.fp8_compile import (
+        can_implement_fp8,
+        get_compiled_grouped_fp8,
+        get_compiled_swapped_fp8,
+    )
 
     if (
         a.dtype != torch.float8_e4m3fn
@@ -242,8 +251,14 @@ def grouped_gemm_fp8(
         or w.dim() != 3
     ):
         raise TypeError("grouped_gemm_fp8 takes e4m3 a [Tk, K] and w [E, N, K]")
-    Tk, K = a.shape
+    R, K = a.shape
     E, N, K2 = w.shape
+    if Tk is None:
+        Tk = out.shape[0] if out is not None else R
+    if not 0 <= Tk <= R:
+        raise ValueError(
+            f"grouped_gemm_fp8: Tk {Tk} must lie in [0, {R}] (the rows of a)"
+        )
     if (
         K != K2
         or a.stride(1) != 1
@@ -268,7 +283,7 @@ def grouped_gemm_fp8(
         or inv.numel() != 1
     ):
         raise ValueError("grouped_gemm_fp8: s_w [E] fp32, s_a and inv 1-element fp32")
-    if not can_implement_grouped_fp8(config, N, K, E, chain):
+    if not can_implement_fp8(config, N, K, E, chain):
         raise ValueError(
             f"grouped_gemm_fp8: {config.describe()} does not implement (N={N}, K={K}, E={E}, {chain.describe()})"
         )
@@ -289,7 +304,16 @@ def grouped_gemm_fp8(
     out_k = out.view(torch.uint8) if chain.out_fmt == "e4m3" else out
     if Tk == 0:
         return out
-    get_compiled_grouped_fp8(config, chain)(
+    kernel = (
+        get_compiled_swapped_fp8(config, chain)
+        if config.swap_ab
+        else get_compiled_grouped_fp8(config, chain)
+    )
+    if not config.swap_ab and Tk != R:
+        a = a[
+            :Tk
+        ]  # the grouped body's A has the output's rows (one symbol); the swapped body's R is free
+    kernel(
         a.unsqueeze(-1),
         w.permute(1, 2, 0),
         out_k,
@@ -374,16 +398,31 @@ def fused_moe_fp8(
         plan if plan is not None else permute_plan(experts, E)
     )  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
-    x_perm = torch.empty(Tk, H, dtype=torch.float8_e4m3fn, device=dev)
+    # a swapped record reads a token box of its tile's rows at every group's row: the dense buffer it reads carries that many
+    # rows past the live ones, so the last tiles' boxes stay inside it (rows past the live ones are computed and never stored)
+    pad1 = config1.tile_n if config1.swap_ab else 0
+    pad2 = config2.tile_n if config2.swap_ab else 0
+    x_buf = torch.empty(Tk + pad1, H, dtype=torch.float8_e4m3fn, device=dev)
+    x_perm = x_buf[:Tk]
     if Tk:
         get_compiled_gather(k, "e4m3", warps_per_row(Tk, H // 16, sm_count_of(dev)))(
             xq, src, x_perm, Tk, H
         )
+    a_buf = torch.empty(Tk + pad2, I, dtype=torch.float8_e4m3fn, device=dev)
     a = grouped_gemm_fp8(
-        x_perm, w.w1q, w.s_w1, w.s_x, w.m_inter, counts, config1, w.chain1
+        x_buf,
+        w.w1q,
+        w.s_w1,
+        w.s_x,
+        w.m_inter,
+        counts,
+        config1,
+        w.chain1,
+        out=a_buf[:Tk],
+        Tk=Tk,
     )  # [Tk, I] e4m3
     y = grouped_gemm_fp8(
-        a, w.w2q, w.s_w2, w.s_inter, w.m_inter, counts, config2, GEMM2_CHAIN
+        a_buf, w.w2q, w.s_w2, w.s_inter, w.m_inter, counts, config2, GEMM2_CHAIN, Tk=Tk
     )  # [Tk, H] bf16
     if T:
         get_compiled_combine(
