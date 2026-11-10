@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from ...gemm.batch_invariant.generator import CLUSTERS, Knobs, knob_product
 
@@ -216,27 +216,6 @@ def zero_fill_cycles(
 # 128-row records at one row per expert, one value for every family)
 SWAPPED_FILL_EXPOSURE = 0.4
 
-# The per-body fixed cost of a launch -- launch latency, prologue (barriers, TMEM, descriptors, the group tables), epilogue
-# tail -- in SM cycles: the K -> 0 intercept at one row per expert as the fixed-cost probe measures it on each part, side by
-# side for the two bodies (declared empirical, named by the probe; a launch's intercept, not a wave's: a further wave adds a
-# fraction of it); None until a part is measured, the term is then off. Body-level and shared across the formats; the
-# chain-specific part stays in `exposed_epilogue_cycles`.
-FIXED_CYCLES: Dict[Tuple[str, str], Optional[float]] = {
-    ("grouped", "sm_107"): 18300.0,
-    ("swapped", "sm_107"): 18300.0,
-    ("grouped", "sm_100"): None,
-    ("swapped", "sm_100"): None,
-    ("grouped", "sm_103"): None,
-    ("swapped", "sm_103"): None,
-}
-
-
-def fixed_cycles(cfg: Knobs, family: str) -> float:
-    """``FIXED_CYCLES[body, part]``: the body's per-launch floor; zero while the part's constant is unmeasured."""
-    c = FIXED_CYCLES.get(("swapped" if cfg.swap_ab else "grouped", family))
-    return 0.0 if c is None else c
-
-
 # A cluster record's per-step cost beyond its bytes at a few live rows per expert: every k-step waits on all of the
 # cluster's CTAs releasing their stages while the token operand they share is a row or two, so a two- or four-CTA
 # cluster's step runs longer than its bytes say (one declared empirical constant per extra CTA of the cluster, scaled
@@ -294,7 +273,9 @@ def estimate_overrides(cfg: Knobs, rows: int, in_fmt: str, family: str) -> dict:
         mma_eff = 1.0 if cta_rows >= 128 else p["rows64_eff"]
         step = max(mma_raw / mma_eff, bytes_cycles) + CONSTANTS["step_floor"]
         dead = (cta_rows - live) / cta_rows
-        p["step_floor"] = CONSTANTS["step_floor"] + CLUSTER_STEP * (size - 1) * step * dead
+        p["step_floor"] = (
+            CONSTANTS["step_floor"] + CLUSTER_STEP * (size - 1) * step * dead
+        )
     return p
 
 
@@ -316,7 +297,8 @@ def record_cost(
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
     (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
     dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
-    chain, the token box's exposed fill and the body's per-launch fixed cost; in SM cycles."""
+    chain and the token box's exposed fill; in SM cycles (a launch's fixed cost is the same for both bodies on
+    every measured part, so it is no term)."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import estimate_cycles
@@ -342,7 +324,6 @@ def record_cost(
         est * pair_term(cfg, rows) * tiles_term(cfg, rows)
         + exposed_epilogue_cycles(cfg, rows, nodes, pair)
         + zero_fill_cycles(cfg, rows, K, family, in_fmt)
-        + fixed_cycles(cfg, family)
     )
 
 
