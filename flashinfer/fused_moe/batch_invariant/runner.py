@@ -8,8 +8,10 @@ The runner serves the bf16 classes on SM100 / SM103 / SM107, one declared chain 
 ``ReLU2`` is ``moe.bf16.relu2`` and ``Identity``, ``GELU``, ``ReLU``, ``SiLU`` the other ungated chains (``spec.activation_of``).
 It takes every routing input mode: ``FromLogits`` runs the class's own routing kernel
 (the declared ``exp``, the strict selection order), ``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's
-expert ids and weights. The combine is the slot-order fp32 fold (never an atomic finalize: ``MoEFinalizeConfig.use_fused_finalize``
-is ignored); with ``MoEFinalizeConfig(do_finalize=False)`` the combine is left to the caller and the forward returns the
+expert ids and weights; an expert-parallel shard (``ExpertConfig.local_expert_offset`` / ``local_num_experts``) computes the
+slots of its local experts and drops the rest (the term ``+0`` in its tokens' folds): a placement of the class on the local
+experts, the rank's partial of the dense output. The combine is the slot-order fp32 fold (never an atomic finalize:
+``MoEFinalizeConfig.use_fused_finalize`` is ignored); with ``MoEFinalizeConfig(do_finalize=False)`` the combine is left to the caller and the forward returns the
 layer's unfinalized triple ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]`` -- the per-slot rows, the
 weights and the positions exactly as the class's combine would fold them (a placement of the op: the rows are reproducible
 intermediates). The tactics are the ranked grouped-GEMM records of the dispatcher (any tactic gives the same bits), and an
@@ -114,8 +116,9 @@ class BatchInvariantMoeRunner(MoERunner):
         ReLU,
         SiLU,
     )
-    # Expert-parallel shards (a local expert range with ids outside it) are the EP classes of a later PR.
-    supports_expert_parallelism = False
+    # An expert-parallel shard computes its local experts' slots: the other slots are dropped (the term +0 in the fold),
+    # a placement of the within-rank class on the local experts.
+    supports_expert_parallelism = True
 
     def __init__(self, config, device) -> None:
         super().__init__()
@@ -135,6 +138,14 @@ class BatchInvariantMoeRunner(MoERunner):
         from .spec import activation_of
 
         return activation_of(self.config.activation)
+
+    def _local_experts(self) -> Tuple[int, int]:
+        """``(offset, count)`` of this shard's experts (every expert without expert parallelism)."""
+        experts = self.config.experts
+        n = experts.local_num_experts
+        return int(experts.local_expert_offset), int(
+            self.config.routing.num_experts if n is None else n
+        )
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -156,6 +167,15 @@ class BatchInvariantMoeRunner(MoERunner):
                 CLASS,
                 "fused shared experts",
                 "num_fused_shared_experts = 0 (a shared expert is one more routed slot)",
+            )
+        e_off, e_local = self._local_experts()
+        if not (
+            e_off >= 0 and e_local >= 1 and e_off + e_local <= cfg.routing.num_experts
+        ):
+            raise unsupported(
+                CLASS,
+                f"local experts [{e_off}, {e_off + e_local}) of {cfg.routing.num_experts}",
+                "a local expert range inside [0, num_experts)",
             )
         if experts.intermediate_size % 8 or experts.intermediate_size <= 0:
             raise unsupported(
@@ -239,17 +259,19 @@ class BatchInvariantMoeRunner(MoERunner):
         x = x.contiguous()
         T = x.shape[0]
         k, E = cfg.routing.top_k, cfg.routing.num_experts
+        e_off, e_local = self._local_experts()
         view = weights.get_view(self.backend_key)
         w = MoEWeights.from_view(view)
         if (
             x.shape[1] != w.hidden_size
-            or w.num_experts != E
+            or w.num_experts != e_local
             or cfg.experts.intermediate_size != w.intermediate_size
         ):
             raise unsupported(
                 CLASS,
-                f"weights (E {w.num_experts}, I {w.intermediate_size}, H {w.hidden_size}) for hidden {x.shape[1]}, E {E}, I {cfg.experts.intermediate_size}",
-                "weights prepared for this configuration",
+                f"weights (E {w.num_experts}, I {w.intermediate_size}, H {w.hidden_size}) for hidden {x.shape[1]}, "
+                f"local experts {e_local}, I {cfg.experts.intermediate_size}",
+                "weights prepared for this configuration (the local experts of a shard)",
             )
         a = self._activation()
         if (w.gated, w.act, w.params) != (a.gated, a.act, a.params):
@@ -303,13 +325,23 @@ class BatchInvariantMoeRunner(MoERunner):
                 and T * k <= ROUTE_PLAN_MAX_SLOTS
                 and cfg.routing.num_experts <= MAX_E
             ):
-                # routing and the permutation plan in one launch (a placement: the same bits and integers)
+                # routing and the permutation plan in one launch (a placement: the same bits and integers); a shard plans
+                # its local experts by their local ids
                 ids, wts, counts, dest, src = route_plan(
-                    act.routing_logits, k, self._method, bias, scale
+                    act.routing_logits,
+                    k,
+                    self._method,
+                    bias,
+                    scale,
+                    local=None if (e_off, e_local) == (0, E) else (e_off, e_local),
                 )
                 plan = [counts, dest, src]
+                if e_off:
+                    ids = ids - e_off
             else:
                 ids, wts = route(act.routing_logits, k, self._method, bias, scale)
+                if e_off:
+                    ids = ids - e_off
         else:
             _validate_prerouted_inputs(
                 act,
@@ -319,7 +351,11 @@ class BatchInvariantMoeRunner(MoERunner):
                 allowed_weights_dtypes=(torch.bfloat16, torch.float32),
                 require_contiguous=True,
             )
+            # a shard's local ids: the caller's global ids less the offset (an id outside the local range, like a
+            # caller's dropped slot, is a dropped slot of the plan: never host-validated, the term +0 in the fold)
             ids = act.topk_ids.contiguous()
+            if e_off:
+                ids = ids - e_off
             wts = act.topk_weights
             if mode is RoutingInputMode.PackedPrecomputed:
                 # the packed word carries the weight as bf16 (``(expert_id << 16) | bf16(weight)``): the rounded weights
@@ -342,17 +378,19 @@ class BatchInvariantMoeRunner(MoERunner):
             cfg.routing.top_k,
             cfg.experts.intermediate_size,
         )
+        E_local = self._local_experts()[1]
         H = self._hidden
-        rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
+        # the rows per expert follow the global routing; the groups are the shard's experts
+        rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E_local)
         gated = self._activation().gated
         sm_count, family = self._part if self._part is not None else (None, None)
         n1, chain1 = (2 * I, "swiglu") if gated else (I, "relu2")
         return (
             rank_grouped(
-                rows, n1, H, E, chain1, sm_count, family, TOP_K, n_active=n_act
+                rows, n1, H, E_local, chain1, sm_count, family, TOP_K, n_active=n_act
             ),
             rank_grouped(
-                rows, H, I, E, "plain", sm_count, family, TOP_K, n_active=n_act
+                rows, H, I, E_local, "plain", sm_count, family, TOP_K, n_active=n_act
             ),
         )
 

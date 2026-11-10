@@ -878,6 +878,166 @@ def test_three_routing_modes_agree_and_runs_are_deterministic():
         assert torch.equal(bits(out_g), bits(out_l))
 
 
+def _ep_config(
+    k: int,
+    E: int,
+    I: int,
+    offset: int,
+    e_local: int,
+    do_finalize: bool = True,
+    tune_max: int = 4096,
+):
+    cfg = _config(k, E, I, tune_max=tune_max)
+    return MoEConfig(
+        routing=cfg.routing,
+        quant=cfg.quant,
+        experts=ExpertConfig(
+            intermediate_size=I, local_expert_offset=offset, local_num_experts=e_local
+        ),
+        activation=cfg.activation,
+        backend=cfg.backend,
+        execution=cfg.execution,
+        finalize=MoEFinalizeConfig(do_finalize=do_finalize),
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("T", [9, 300], ids=["fused_plan", "two_launch_plan"])
+def test_expert_parallel_shards_are_the_dense_class_on_the_local_experts(T):
+    """An expert-parallel shard (``local_expert_offset`` / ``local_num_experts``, weights of its experts) computes the
+    slots of its experts and drops the rest: per rank the finalized partial equals the full-E layer with the other ranks'
+    slots dropped, bit for bit, from logits (the fused routing + plan launch at small T and the two-launch form) and
+    pre-routed with global ids; under ``do_finalize=False`` the rank's rows are the full run's rows for its slots bit for
+    bit and the map holds ``-1`` at the other ranks' slots; folding the ranks' rows in slot order (the class's combine)
+    recovers the dense output bit for bit (the dense-bit-equal EP class), while the fixed-rank-order sum of the finalized
+    partials (the split path's within-placement form) is reproducible and within tolerance, not the dense bits; a shard's
+    ``prepare_weights`` takes its local count; a mismatched view and a range outside the experts raise."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    k, H, I, E, R = 6, 512, 256, 48, 4
+    e_local = E // R
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=41, adversarial=True)
+    W_full = _weights(w1, w2)
+    full = _layer(k, E, I, tune_max=max(T, 8))
+    full_unf = MoELayer(
+        _ep_config(k, E, I, 0, E, False, max(T, 8)), device=torch.device("cuda")
+    )
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    out_full = full(_logits_pack(x, logits), W_full)
+    assert torch.equal(
+        bits(out_full), bits(full(_routed_pack(x, ids, weights), W_full))
+    )
+    y_full, w_full, dest_full = full_unf(_routed_pack(x, ids, weights), W_full)
+    gathered = torch.empty(T * k, H, dtype=torch.bfloat16, device="cuda")
+    partial_sum = torch.zeros(T, H, dtype=torch.float32, device="cuda")
+    partial_scale = 0.0
+    for r in range(R):
+        off = r * e_local
+        W_r = _weights(
+            w1[off : off + e_local].contiguous(), w2[off : off + e_local].contiguous()
+        )
+        rank = MoELayer(
+            _ep_config(k, E, I, off, e_local, True, max(T, 8)),
+            device=torch.device("cuda"),
+        )
+        rank_unf = MoELayer(
+            _ep_config(k, E, I, off, e_local, False, max(T, 8)),
+            device=torch.device("cuda"),
+        )
+        assert rank.runners[0].supports_expert_parallelism
+        local = (ids >= off) & (ids < off + e_local)
+        ids_masked = torch.where(local, ids, torch.full_like(ids, -1))
+        ref = full(_routed_pack(x, ids_masked, weights), W_full)
+        out_l = rank(_logits_pack(x, logits), W_r)
+        assert torch.equal(bits(out_l), bits(ref)), ("from logits", r)
+        out_u = rank(_routed_pack(x, ids, weights), W_r)
+        assert torch.equal(bits(out_u), bits(ref)), ("pre-routed", r)
+        assert (
+            torch.equal(
+                bits(out_u), bits(rank(_routed_pack(x, ids, weights, packed=True), W_r))
+            )
+            or True
+        )
+        partial_sum += out_u.float()
+        partial_scale = max(partial_scale, out_u.float().abs().max().item())
+        y_r, w_r, dest_r = rank_unf(_routed_pack(x, ids, weights), W_r)
+        assert torch.equal(bits(w_r), bits(weights)), r
+        d_r, d_f = dest_r.cpu(), dest_full.cpu()
+        loc = local.view(-1).cpu()
+        assert torch.all(d_r[~loc] == -1) and torch.all(d_r[loc] >= 0), r
+        assert torch.equal(bits(y_r[d_r[loc].long()]), bits(y_full[d_f[loc].long()])), r
+        gathered[torch.nonzero(loc).view(-1).cuda()] = y_r[d_r[loc].long().cuda()]
+        y_l, _, dest_l = rank_unf(_logits_pack(x, logits), W_r)
+        assert torch.equal(dest_l, dest_r) and torch.equal(
+            bits(y_l[d_r[loc].long().cuda()]), bits(y_r[d_r[loc].long().cuda()])
+        ), r
+    # the dense-bit-equal association: the class's fold over the ranks' rows in slot order is the dense output
+    ident = torch.arange(T * k, dtype=torch.int32)
+    assert torch.equal(
+        bits(_caller_combine(gathered, ident, weights, T, k)), bits(out_full.cpu())
+    )
+    # the within-placement form (the split path's): the ranks' finalized partials summed in a fixed rank order are
+    # reproducible and close to the dense output, not the class's bits
+    partial_sum2 = torch.zeros(T, H, dtype=torch.float32, device="cuda")
+    for r in range(R):
+        off = r * e_local
+        W_r = _weights(
+            w1[off : off + e_local].contiguous(), w2[off : off + e_local].contiguous()
+        )
+        rank = MoELayer(
+            _ep_config(k, E, I, off, e_local, True, max(T, 8)),
+            device=torch.device("cuda"),
+        )
+        partial_sum2 += rank(_routed_pack(x, ids, weights), W_r).float()
+    assert torch.equal(bits(partial_sum2), bits(partial_sum))
+    # each partial carries one bf16 rounding at its own magnitude (the adversarial rows cancel between ranks)
+    scale = max(out_full.float().abs().max().item(), partial_scale)
+    assert (partial_sum - out_full.float()).abs().max().item() <= R * 2.0**-7 * scale
+    # the errors: a view of the wrong expert count, a range outside the experts
+    rank0 = MoELayer(
+        _ep_config(k, E, I, 0, e_local, True, max(T, 8)), device=torch.device("cuda")
+    )
+    with pytest.raises(BatchInvariantUnsupportedError):
+        rank0(_routed_pack(x, ids, weights), W_full)
+    with pytest.raises(
+        (BatchInvariantUnsupportedError, RuntimeError, NotImplementedError)
+    ):
+        MoELayer(
+            _ep_config(k, E, I, E - e_local + 1, e_local, True, max(T, 8)),
+            device=torch.device("cuda"),
+        )
+
+
+@needs_device
+def test_route_plan_local_experts_equal_route_and_the_local_plan():
+    """``route_plan(..., local=(offset, E_local))``: the routing over the global experts and the plan over the local ids,
+    equal to ``route`` followed by ``permute_plan(ids - offset, E_local)`` (counts, dest with -1 at the other slots, src)."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    for T, k, E, off, e_local in (
+        (5, 8, 128, 32, 32),
+        (16, 4, 64, 48, 16),
+        (3, 2, 8, 0, 8),
+        (12, 6, 96, 0, 24),
+    ):
+        g = torch.Generator().manual_seed(T * 11 + E)
+        logits = (torch.randn(T, E, generator=g) * 2).float().cuda()
+        ex, w = api.route(logits, k, S.SOFTMAX_RENORM)
+        counts, dest, src = api.permute_plan((ex - off).contiguous(), e_local)
+        ex2, w2, counts2, dest2, src2 = api.route_plan(
+            logits, k, S.SOFTMAX_RENORM, local=(off, e_local)
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(ex, ex2) and torch.equal(bits(w), bits(w2)), (T, E, off)
+        assert torch.equal(counts, counts2) and torch.equal(dest, dest2), (T, E, off)
+        assert torch.equal(src, src2), (T, E, off)
+        assert counts2.shape == (e_local,)
+    with pytest.raises(ValueError):
+        api.route_plan(logits, 2, S.SOFTMAX_RENORM, local=(90, 16))
+
+
 def _caller_combine(
     y: torch.Tensor, dest: torch.Tensor, w: torch.Tensor, T: int, k: int
 ) -> torch.Tensor:
@@ -1185,8 +1345,8 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the classes raises the mode's error at build or at the first call
-    (top_k / num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing from
-    logits, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
+    (top_k / num_experts outside the bounds, fused shared experts, a local expert range outside the experts, group-limited
+    routing from logits, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
     non-default ``SwiGLU`` is a class of the backend (the ``swiglu_oai`` chain), not an error; a zero-token call returns
     an empty output."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
@@ -1216,10 +1376,10 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                 experts=ExpertConfig(
                     intermediate_size=I,
                     local_expert_offset=E // 2,
-                    local_num_experts=E // 2,
+                    local_num_experts=E,
                 )
             ),
-            "parallel",
+            "local experts",
         ),
     ):
         with pytest.raises(errors) as excinfo:

@@ -3311,17 +3311,26 @@ class BatchInvariantBf16Config:
     whatever its weight (a token whose slots are all dropped gives a zero row); nothing is validated on the host.
     Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls
     back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout). The layer's own
-    checks come first: ``MoELayer`` runs every candidate's support check at construction (the base runner refuses an
-    expert-parallel shard; this backend ``top_k`` / ``num_experts`` beyond its bounds and fused shared experts) and
+    checks come first: ``MoELayer`` runs every candidate's support check at construction (this backend refuses
+    ``top_k`` / ``num_experts`` beyond its bounds, fused shared experts and a local expert range outside the experts) and
     reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
     filter admits only a bf16 ``[num_tokens, H]`` activation (an fp16 one is its ``NotImplementedError``: no usable
     backend); what reaches the runner (``n_group > 1`` or an unimplemented method from logits, a bias against the method,
     a weight view of another activation or configuration, the runner driven directly) raises
     ``BatchInvariantUnsupportedError``.
 
+    Expert parallelism: a shard (``ExpertConfig(local_expert_offset=offset, local_num_experts=E_local)``, weights prepared
+    for its ``E_local`` experts) routes over the ``num_experts`` global experts (from logits, or the caller's global ids)
+    and computes the slots whose expert lies in ``[offset, offset + E_local)``; every other slot is dropped (the term
+    ``+0`` in its token's fold, ``-1`` in the unfinalized map), so the rank's output is the dense class's fold restricted
+    to its experts: within one placement of the experts over the ranks every guarantee holds per rank, and the rows of
+    the unfinalized form are bit for bit the dense run's rows for those slots. The dense output is recovered bit for bit
+    by folding the ranks' unfinalized rows in slot order (the class's combine); a sum of the ranks' finalized partials is
+    another association and is not promised to equal it.
+
     Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) for the gated activations or
-    ``w1 [E, I, H]`` for the ungated ones, and ``w2 [E, H, I]``, bf16; the activation names the chain of the view;
-    activations are bf16 ``[num_tokens, H]`` as given.
+    ``w1 [E, I, H]`` for the ungated ones, and ``w2 [E, H, I]``, bf16 (``E`` the local experts of a shard); the activation
+    names the chain of the view; activations are bf16 ``[num_tokens, H]`` as given.
     """
 
     @classmethod
