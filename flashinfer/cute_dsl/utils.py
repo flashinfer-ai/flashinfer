@@ -23,6 +23,7 @@ from typing import Tuple, Union
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 import torch
 from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
@@ -40,6 +41,15 @@ from .availability import (  # noqa: F401
 if not hasattr(cute.nvgpu, "OperandMajorMode"):
     with contextlib.suppress(AttributeError):
         cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
+
+
+@cute.jit
+def mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None:
+    """Wait at cluster scope on a barrier that a peer CTA's ``st.async`` completes."""
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
+    ):
+        pass
 
 
 def ceil_div(a: int, b: int) -> int:

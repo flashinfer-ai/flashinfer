@@ -67,8 +67,6 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.experimental.primitives as prims
-from cutlass import Int32
 import cutlass.testing
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_ptr
@@ -76,6 +74,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.utils.gemm.tensor_utils import decode_float4e2m1fn
+
+from flashinfer.cute_dsl.utils import mbarrier_wait_acquire_cluster
 from cutlass.pipeline import (
     PipelineAsync,
     PipelineAsyncUmma,
@@ -87,22 +87,6 @@ from cutlass.pipeline import (
     make_pipeline_state,
     PipelineUserType,
 )
-
-
-@cute.jit
-def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
-    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
-
-    The peers' ``st.async`` complete-tx operations release at cluster scope; the
-    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
-    ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
-    Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``, which
-    lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
-    """
-    while not prims.mbarrier_try_wait_parity(
-        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
-    ):
-        pass
 
 
 class WorkTileInfo(NamedTuple):
@@ -1856,7 +1840,7 @@ class LowLatencyBlockscaledGemmKernel:
                             cutlass.Int32(peer),
                         )
 
-            _mbarrier_wait_acquire_cluster(mailbox_mbar, cutlass.Int32(0))
+            mbarrier_wait_acquire_cluster(mailbox_mbar, cutlass.Int32(0))
 
             my_shard_start = split_rank * shard_ept
             for s in range(self.split_k - 1):

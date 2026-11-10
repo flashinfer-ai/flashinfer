@@ -35,10 +35,13 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
-import cutlass.experimental.primitives as prims
 from cutlass._mlir.dialects import llvm
 
-from ..cute_dsl.utils import get_cutlass_dtype, get_num_sm
+from ..cute_dsl.utils import (
+    get_cutlass_dtype,
+    get_num_sm,
+    mbarrier_wait_acquire_cluster,
+)
 
 
 # =============================================================================
@@ -750,22 +753,6 @@ def store_shared_remote(
     )
 
 
-@cute.jit
-def _mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
-    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
-
-    The peers' ``st.async`` complete-tx operations release at cluster scope; the
-    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
-    ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
-    Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``, which
-    lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
-    """
-    while not prims.mbarrier_try_wait_parity(
-        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
-    ):
-        pass
-
-
 @dsl_user_op
 def elem_pointer(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
     """Get pointer to element at coordinate in tensor."""
@@ -910,9 +897,7 @@ def cluster_reduce_multirow(
             peer_cta_rank_in_cluster=lane_idx,
         )
 
-    # The peers' st.async complete-tx release at cluster scope: acquire at
-    # cluster scope before reading their slots.
-    _mbarrier_wait_acquire_cluster(mbar_ptr, Int32(phase))
+    mbarrier_wait_acquire_cluster(mbar_ptr, Int32(phase))
 
     num_total = warps_per_row * cluster_n
     num_iter = cute.ceil_div(num_total, 32)
