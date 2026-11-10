@@ -102,6 +102,38 @@ def _cudnn_supports_paged_auto() -> bool:
         return False
 
 
+def _cudnn_prefill_prefers_cumulative_lengths(
+    device,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    max_q_len,
+    *,
+    causal,
+) -> bool:
+    """Use the measured faster mask form for SM103 BF16 D64 GQA causal prefill.
+
+    cuDNN 9.27 regresses this causal family with per-request masks, independently
+    of shape override (NVBug 7005868). A prefix sum of the valid lengths selects
+    the faster path while keeping physical ragged offsets independent. Full
+    attention retains per-request masks, which are faster for that mode.
+    """
+    return (
+        causal
+        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and (num_qo_heads, num_kv_heads) == (64, 8)
+        and head_dim_qk == head_dim_vo == 64
+        and max_q_len > 1
+        and _cudnn_supports_direct_seqlens(q_dtype)
+        and cudnn.backend_version() >= 92700
+        and get_compute_capability(device) == (10, 3)
+    )
+
+
 # Execute-time shape override for the ragged (token-indptr) path. cuDNN
 # finalizes one execution plan per declared (batch, max_seq_len) -- 55-70 ms on
 # SM100, ~1 s when a kernel variant compiles -- and serving changes both every
@@ -793,8 +825,8 @@ if CUDNN_AVAILABLE:
 
             if use_cu_seq_lens:
                 # cu_seq_len_q occupies the Q seq-len UID slot (mutually
-                # exclusive with a per-batch seq_len_q, same role). On the
-                # ragged path it is the same buffer as the Q ragged offset.
+                # exclusive with a per-batch seq_len_q, same role). Its valid
+                # lengths are independent of the physical Q ragged offsets.
                 cudnn_cu_seq_lens_q = indptr_tensor(cu_seq_lens_q)
                 cudnn_cu_seq_lens_q.set_name("cu_seq_lens_q")
                 cudnn_cu_seq_lens_q.set_uid(UIDs.ACTUAL_SEQ_LENS_Q_UID.value)
@@ -1447,9 +1479,8 @@ def _prefill_plan_bindings(metadata, dtype, device):
         var_map[UIDs.SINK_TOKEN_UID.value] = metadata.sinks
     if metadata.attn_scale is not None:
         var_map[UIDs.ATTN_SCALE_UID.value] = metadata.attn_scale
-    # The cumulative seq lens feed the padding mask via the seq-lens UID
-    # slots (on the ragged path these are the same buffers as the
-    # token-unit ragged offsets below).
+    # The cumulative valid lengths feed the padding mask via the seq-lens UID
+    # slots, independently of the physical token-unit ragged offsets below.
     if metadata.cu_seq_lens_q is not None:
         var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = metadata.cu_seq_lens_q
     elif metadata.actual_seq_lens_q is not None:
