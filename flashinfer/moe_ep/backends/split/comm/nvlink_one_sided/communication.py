@@ -265,8 +265,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             False,
             metainfo,
         )
-        # Largest step of the sentinel protocol; 0 when the instance does not use it.
-        self.sentinel_max_tokens = 0
+        self._sentinel_max_tokens = 0
         self._sentinel_format: Optional[str] = None
         self._sentinel_row: Optional[_SentinelRow] = None
         self._sentinel_workspace_bytes = 0
@@ -289,7 +288,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 getattr(index, f"SENTINEL_FORMAT_{sentinel_format}"),
                 params.hidden_size,
             )
-            self.sentinel_max_tokens = max_tokens
+            self._sentinel_max_tokens = max_tokens
             self._sentinel_format = sentinel_format
             self._sentinel_row = row
             self._sentinel_workspace_bytes = (
@@ -337,6 +336,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 "workspace": workspace,
                 "metainfo": metainfo,
                 "views": {},
+                # Instances sharing the workspace, and CFT endpoints bound to it
+                # (cft.CftEndpoints); the last one to drop its reference frees it.
                 "refcount": 0,
                 # Instance whose dispatch awaits its combine on this workspace.
                 "round_owner": None,
@@ -380,6 +381,13 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             view = self._rank_bytes.narrow(0, offset, nbytes).view(dtype).view(shape)
             views[key] = view
         return view
+
+    @property
+    def sentinel_max_tokens(self) -> int:
+        """Largest step, in tokens per rank, that the sentinel protocol takes; 0
+        when this instance does not use it. Fixed at construction: the
+        workspace's sentinel regions are sized for it."""
+        return self._sentinel_max_tokens
 
     @property
     def sentinel_enabled(self) -> bool:
@@ -719,14 +727,13 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     def destroy(self) -> None:
         """Release this instance's share of the workspace.
 
-        The last instance on a workspace frees it; every rank must have
-        finished its last combine on it.
+        The last instance on a workspace frees it, unless CFT endpoints are
+        still bound to it; every rank must have finished its last combine on
+        it.
         """
         state = self._state
         if state is None:
             return
-        import torch
-
         if state["round_owner"] is self:
             state["round_owner"] = None
         self._state = None
@@ -734,10 +741,16 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         self.workspace = None
         self.metainfo = None
         self._rank_bytes = None
+        self._release_workspace(state)
+
+    @classmethod
+    def _release_workspace(cls, state: dict[str, Any]) -> None:
+        """Drop one reference to a workspace; the last one frees it."""
+        import torch
+
         state["refcount"] -= 1
         if state["refcount"] > 0:
             return
         torch.cuda.synchronize()
-        cls = type(self)
         cls._WORKSPACES.pop(state["key"], None)
         state.clear()

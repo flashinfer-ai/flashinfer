@@ -19,8 +19,9 @@
 // flashinfer.moe_ep.NVLinkOneSidedAlltoAll. Collective steps (workspace
 // barriers and the CFT logical-endpoint exchange) are driven from Python over
 // the EP group's communicator; these ops only touch local state. Dispatch and
-// combine run one of three transports: the fence kernels, CFT counted writes
-// or, for small steps, the sentinel kernels (flashinfer/comm/moe_alltoall_sentinel.cuh).
+// combine run the fence kernels or the sentinel kernels
+// (flashinfer/comm/moe_alltoall_sentinel.cuh). Their CFT counted-write path is
+// not used by NVLinkOneSidedAlltoAll.
 
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tuple.h>

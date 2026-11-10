@@ -872,12 +872,26 @@ def _cft_endpoints_worker(rank: int, world: int, out_dir: str) -> None:
     from flashinfer.moe_ep import (
         BootstrapConfig,
         MoEEpCommParams,
+        NVLinkOneSidedAlltoAll,
         NVLinkOneSidedConfig,
         create_communication,
     )
     from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided.cft import (
         CftEndpoints,
     )
+
+    def alltoall():
+        return create_communication(
+            BootstrapConfig(world_size=world, rank=rank),
+            MoEEpCommParams(
+                num_experts=8 * world,
+                top_k=8,
+                max_tokens_per_rank=16,
+                hidden_size=1024,
+                dtype=torch.bfloat16,
+            ),
+            NVLinkOneSidedConfig(sync_protocol="fence"),
+        )
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -888,18 +902,20 @@ def _cft_endpoints_worker(rank: int, world: int, out_dir: str) -> None:
         device_id=torch.device("cuda", rank),
     )
     try:
+        if NVLinkOneSidedAlltoAll.is_platform_supported():
+            local = None
+        else:
+            local = "nvlink_one_sided is not supported on this GPU"
+        reasons = [None] * world
+        dist.all_gather_object(reasons, local)
+        if any(reasons):
+            torch.save(
+                {"skip": next(r for r in reasons if r)},
+                os.path.join(out_dir, f"rank{rank}.pt"),
+            )
+            return
         comm_backend = TorchDistBackend()
-        a2a = create_communication(
-            BootstrapConfig(world_size=world, rank=rank),
-            MoEEpCommParams(
-                num_experts=8 * world,
-                top_k=8,
-                max_tokens_per_rank=16,
-                hidden_size=1024,
-                dtype=torch.bfloat16,
-            ),
-            NVLinkOneSidedConfig(lamport=False),
-        )
+        a2a = alltoall()
         try:
             endpoints = CftEndpoints.bind(a2a, comm_backend)
             if endpoints is None:
@@ -908,10 +924,27 @@ def _cft_endpoints_worker(rank: int, world: int, out_dir: str) -> None:
                 ids = endpoints.ids()
                 gathered = [None] * world
                 dist.all_gather_object(gathered, ids.tolist())
+                second_bind = CftEndpoints.bind(a2a, comm_backend)
                 endpoints.release()
                 endpoints.rebind(comm_backend, ids)
+                # The endpoints keep the workspace after the all-to-all is gone.
+                a2a.destroy()
+                ids_without_alltoall = endpoints.ids().tolist()
                 endpoints.destroy()
-                result = {"ids": ids.tolist(), "gathered": gathered}
+                workspaces_left = len(NVLinkOneSidedAlltoAll._WORKSPACES)
+                a2a = alltoall()
+                endpoints = CftEndpoints.bind(a2a, comm_backend)
+                rebound = endpoints is not None
+                if rebound:
+                    endpoints.destroy()
+                result = {
+                    "ids": ids.tolist(),
+                    "gathered": gathered,
+                    "second_bind": second_bind,
+                    "ids_without_alltoall": ids_without_alltoall,
+                    "workspaces_left": workspaces_left,
+                    "rebound": rebound,
+                }
         finally:
             a2a.destroy()
         torch.save(result, os.path.join(out_dir, f"rank{rank}.pt"))
@@ -920,8 +953,9 @@ def _cft_endpoints_worker(rank: int, world: int, out_dir: str) -> None:
 
 
 def test_cft_endpoints() -> None:
-    """Every rank sees the same logical-endpoint ID per rank, and a rebind after
-    a release keeps the IDs."""
+    """Every rank sees the same logical-endpoint ID per rank, a rebind after a
+    release keeps the IDs, a process holds one binding, and the endpoints keep
+    the workspace until they are destroyed."""
     import torch.multiprocessing as mp
 
     world = 2
@@ -938,4 +972,9 @@ def test_cft_endpoints() -> None:
         pytest.skip(results[0]["skip"])
     assert all(r["gathered"] == results[0]["gathered"] for r in results)
     assert all(r["ids"] == results[0]["ids"] for r in results)
+    for r in results:
+        assert r["second_bind"] is None
+        assert r["ids_without_alltoall"] == r["ids"]
+        assert r["workspaces_left"] == 0
+        assert r["rebound"]
     assert len(set(results[0]["ids"])) == world

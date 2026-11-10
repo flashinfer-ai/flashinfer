@@ -1592,7 +1592,7 @@ def _host_instance(fmt, params, max_tokens=16, row=None, **config):
     comm = object.__new__(one_sided.NVLinkOneSidedAlltoAll)
     comm.config = NVLinkOneSidedConfig(**config)
     comm.params = params
-    comm.sentinel_max_tokens = max_tokens
+    comm._sentinel_max_tokens = max_tokens
     comm._sentinel_format = fmt
     comm._sentinel_row = row
     comm._state = {}

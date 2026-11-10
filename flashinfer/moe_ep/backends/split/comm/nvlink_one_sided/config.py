@@ -59,22 +59,23 @@ class NVLinkOneSidedConfig:
       sends at most ``AUTO_SENTINEL_MAX_TOKENS`` (256) tokens, the fence
       protocol for the others.
 
-    ``sync_protocol`` must be the same on every EP rank. A step's busiest-rank
-    count is the ``runtime_max_tokens_per_rank`` passed to dispatch (the same
-    on every rank, fixed in a captured CUDA graph), which ``MoEEpSplitLayer``
+    ``sync_protocol`` must be the same on every EP rank; constructing the
+    communication raises ``ValueError`` otherwise. A step's busiest-rank count
+    is the ``runtime_max_tokens_per_rank`` passed to dispatch (the same on
+    every rank, fixed in a captured CUDA graph), which ``MoEEpSplitLayer``
     passes from ``MoEEpTensors.runtime_max_tokens_per_rank``; a step that
     passes none is compared at the capacity, ``max_tokens_per_rank``.
 
-    The sentinel protocol needs compute capability 10.0, 10.3 or 10.7, at most 64 EP
-    ranks, a BF16 combine and a BF16, ``MXFP8``, ``DeepSeekFp8`` or ``NVFP4``
-    dispatch format. Where a rank does not support it, every rank uses the
-    fence protocol (logged as a warning under ``"sentinel"``). It cannot carry
-    steps with ``eplb_local_stats`` or with payloads outside the instance's
-    format; those take the fence protocol. Payload words equal to its sentinel
-    arrive rewritten to the same value (NaN stays NaN), so callers sending
-    other bytes in BF16 rows use ``"fence"``, as the split layer does for
-    kernels that pack their dispatch rows. A sentinel step places the rows it
-    receives from rank ``src`` for its token ``t`` at
+    The sentinel protocol needs compute capability 10.0, 10.3 or 10.7, at most
+    64 EP ranks, a BF16 combine and a BF16, ``MXFP8``, ``DeepSeekFp8`` or
+    ``NVFP4`` dispatch format. Where a rank does not support it, every rank
+    uses the fence protocol (logged as a warning under ``"sentinel"``). It
+    cannot carry steps with ``eplb_local_stats`` or with payloads outside the
+    instance's format; those take the fence protocol. Payload words equal to
+    its sentinel arrive rewritten to the same value (NaN stays NaN), so callers
+    sending other bytes in BF16 rows use ``"fence"``, as the split layer does
+    for kernels that pack their dispatch rows. A sentinel step places the rows
+    it receives from rank ``src`` for its token ``t`` at
     ``src * tokens_per_rank + t``, ``tokens_per_rank`` being the step's
     ``runtime_max_tokens_per_rank``. Like the fence protocol, it needs every
     rank to pass ``topk_weights`` in a step or none (see
@@ -102,7 +103,8 @@ class NVLinkOneSidedConfig:
       effect.
 
     ``lamport``, ``lamport_max_tokens`` and ``cft`` cannot be combined with a
-    ``sync_protocol`` other than ``"auto"``.
+    ``sync_protocol`` other than ``"auto"``, nor ``lamport=True`` with
+    ``cft=True``; either raises ``ValueError``.
     """
 
     backend_name: str = "nvlink_one_sided"

@@ -16,8 +16,8 @@
  */
 
 // Sentinel protocol of the NVLink one-sided MoE all-to-all (flashinfer.moe_ep
-// NVLinkOneSidedAlltoAll) for small steps: one dispatch and one combine kernel, no completion
-// flags and no fences between data and its readiness.
+// NVLinkOneSidedAlltoAll): one dispatch and one combine kernel, no completion flags and no
+// fences between data and its readiness.
 //
 // Sentinel arrival. Every landing row a peer writes into is armed with a sentinel word that no
 // payload word takes (senders rewrite the few words that could, see canonicalize_*). A receiver
