@@ -619,6 +619,7 @@ def fused_moe(
     finalize: bool = True,
     gather: Optional[bool] = None,
     grid_clip: bool = True,
+    w_round: bool = False,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
@@ -631,7 +632,9 @@ def fused_moe(
     whether GEMM1 gathers the tokens' rows itself (the swapped body's gather form: no gather launch, no permuted tensor;
     ``x_perm`` of the intermediates is then None) -- by default when GEMM1's record is a swapped one with a narrow token
     tile (`GATHER_TOKEN_TILE_MAX`), a placement with the same bits either way; ``True`` on a dense record raises. ``grid_clip``: the GEMMs' persistent grids clipped to
-    the launch's tile bound (the default), or the device's capacity (a placement either way)."""
+    the launch's tile bound (the default), or the device's capacity (a placement either way). ``w_round``: the f32 ``weights`` enter the fold as their bf16
+    rounding, done by the combine kernel (the pre-routed packed-word convention: the bits of rounding them on the host first,
+    without the host's passes over the slots)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
@@ -705,7 +708,7 @@ def fused_moe(
     )  # [Tk, H] bf16
     if finalize and T:
         get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device))
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device)), w_round
         )(y, dest, scales, out, T, H)
     if return_intermediates:
         return out, dict(
