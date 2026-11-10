@@ -136,7 +136,6 @@ def _cvt_e2m1x2_byte_to_bf16x2(packed_byte: Int32) -> Int32:
     )
 
 
-
 @cute.jit
 def gather_byte_of_words(
     w0: Int32, w1: Int32, w2: Int32, w3: Int32, byte_idx: Int32

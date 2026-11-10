@@ -2161,7 +2161,11 @@ def _build_decode_gen_schedule(
             transformed_kv: [smem_k0, smem_v0]
             if transformed_kv1 is not None
             else [smem_k0, smem_k1, smem_v0, smem_v1],
-            **({transformed_kv1: [smem_k1, smem_v1]} if transformed_kv1 is not None else {}),
+            **(
+                {transformed_kv1: [smem_k1, smem_v1]}
+                if transformed_kv1 is not None
+                else {}
+            ),
             tmem_s0: [transformed_kv, smem_q],
             smem_p0: [tmem_s0],
             tmem_softmax_local0: [tmem_s0],

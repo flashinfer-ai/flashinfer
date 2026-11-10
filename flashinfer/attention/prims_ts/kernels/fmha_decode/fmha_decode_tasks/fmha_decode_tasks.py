@@ -2987,7 +2987,9 @@ def create_transform_kv_task(
         src_resources=src,
         dst_resources=[smem_transformed_kv],
         cfg=cfg,
-        warp_idx=cfg.transform_kv1_warp_idx if inst_id == 1 else cfg.transform_kv_warp_idx,
+        warp_idx=cfg.transform_kv1_warp_idx
+        if inst_id == 1
+        else cfg.transform_kv_warp_idx,
         num_warps=(
             cfg.transform_kv1_num_warps if inst_id == 1 else cfg.transform_kv_num_warps
         ),

@@ -286,7 +286,7 @@ _GROUPED_KEEPS_PAGED_FP8_PROFILES = {
 }
 
 # FP8-Q/NVFP4-KV Keeps Q64 converts K/V into FP8 SMEM tiles with one converter
-# warp group per KV instance (``uses_per_inst_smem_transform``).
+# warp group per KV instance at D128, or separate K and V groups at D256.
 _GROUPED_KEEPS_PAGED_NVFP4_PROFILES = {
     profile
     for output_dtype in (Float16, BFloat16)
@@ -1179,7 +1179,9 @@ class FmhaDecodeConfig:
                     self.transform_v_task_num_registers - producer_regs
                 )
             if self.uses_second_smem_converter:
-                available -= self.transform_kv1_num_warps * (transform_regs - producer_regs)
+                available -= self.transform_kv1_num_warps * (
+                    transform_regs - producer_regs
+                )
         # Only whole padding warpgroups may donate independently. Padding
         # beside active tasks must execute the same setmaxnreg as its peers.
         for wg_idx in range(MAX_WARP_GROUPS):
@@ -2409,7 +2411,9 @@ class FmhaDecodeConfig:
         # above this budget for alignment, barriers, and scheduler state.
         kv_budget_bytes = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - fixed_bytes
         if cap_kv_staging:
-            kv_budget_bytes = min(MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB, kv_budget_bytes)
+            kv_budget_bytes = min(
+                MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB, kv_budget_bytes
+            )
         inferred_stages = max(1, kv_budget_bytes * BITS_PER_BYTE // kv_tile_bits)
         return inferred_stages
 
@@ -3949,7 +3953,7 @@ def _finalize_static_decode_config(
         and cfg.headdim == 128
     ):
         # Two Keeps instances, each with a four-warp converter group after
-        # the four task warp groups (20 warps in total).
+        # the four task warp groups (24 warps in total).
         _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
         _set_if_implicit(cfg, "transform_kv_warp_idx", 16, explicit_fields)
         _set_if_implicit(cfg, "transform_kv_num_warps", 4, explicit_fields)
