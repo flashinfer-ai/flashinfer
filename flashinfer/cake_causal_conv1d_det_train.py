@@ -308,10 +308,14 @@ def cake_causal_conv1d_det_train_backward(
         (:func:`cake_causal_conv1d_det_train_backward_workspace_bytes`) is the
         maximum over every backward program of every route, so one buffer
         serves whichever program a call selects.
-    dx, dweight, dbias : torch.Tensor, optional
-        Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
-        (each FP32 or BF16; the parameter's dtype when omitted), contiguous.
-        ``dbias`` needs ``bias``.
+    dx : torch.Tensor, optional
+        Preallocated contiguous BF16 gradient of ``x``'s shape.
+    dweight : torch.Tensor, optional
+        Preallocated contiguous FP32 or BF16 ``[C, 4]`` weight gradient;
+        defaults to ``weight.dtype`` when omitted.
+    dbias : torch.Tensor, optional
+        Preallocated contiguous FP32 or BF16 ``[C]`` bias gradient;
+        defaults to ``bias.dtype`` when omitted. Requires ``bias``.
     bwd_grid_mult : {1, 2, 3, 4}
         Opt-in finer static partition of the token axis; default 1 (the
         default programs, grid and bits).  The main program launches

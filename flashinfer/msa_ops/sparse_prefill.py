@@ -61,7 +61,8 @@ def msa_sparse_attention(
     workspace: Optional[MSASparseAttentionWorkspace] = None,
     out: Optional[torch.Tensor] = None,
 ):
-    """Minimax Sparse Attention forward for SM90, SM100/SM103 and SM120/SM121 GPUs.
+    """Minimax Sparse Attention forward for SM90, SM100/SM103, SM107
+    (packed-NVFP4 paged K/V only), and SM120/SM121 GPUs.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over

@@ -1539,7 +1539,8 @@ def top_p_sampling_from_probs(
 
     Note
     ----
-    This function expects float32 inputs, and the output is int32.
+    This function expects float32 inputs. The output is int32 when ``indices``
+    is omitted; otherwise it has the same dtype as ``indices`` (int32 or int64).
 
     See Also
     --------
