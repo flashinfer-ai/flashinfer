@@ -211,6 +211,12 @@ ping-pong candidates the rotation only (batching never measured faster on
 them) — 81 candidates.  Blockwise also gets the swap-AB M256 N72/N80 cga(1,1,1)
 `epi_warps` tiles (40 candidates, 89 from 1024 tokens per rank).
 
+Online autotuning controls `compact_pull_buffer` through each tactic instead
+of preserving the caller's bool. Applying any knob dict, including `{}`,
+resets omitted pull fields to the compact, serial, unrotated defaults;
+`apply_knobs(None)` leaves the current config unchanged. Explicit pull
+overrides are described in the field entries below.
+
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
   activation calibration scalars, identical on all EP ranks by contract) or
   `"blockwise"` (DeepGEMM-style 128-block fp32 scales; requires
@@ -279,7 +285,10 @@ them) — 81 candidates.  Blockwise also gets the swap-AB M256 N72/N80 cga(1,1,1
   the same contract as the Blackwell MXFP8 kernel's `generate_c`.  Read it
   back from `symm_buffer.fc1_c` after the launch; segment offsets are
   `sum(round_up(count[i], 128), i < e)` over the per-expert routed-token
-  counts.  Store path (both layouts): the values go straight from the
+  counts. Blockwise swap-AB N72/N80 requires `generate_c=False`; config
+  validation rejects the combination because its 128-row expert padding
+  does not align the activation-SF TMA bases to N72/N80.
+  Store path (both layouts): the values go straight from the
   wgmma fragments to GMEM as 16-byte stores after a lane transpose —
   non-swap: a quad holds 64 consecutive raw columns of one row for each
   pair of gate/up groups, two `shfl.bfly` levels across `lane_mod` give
@@ -343,7 +352,11 @@ them) — 81 candidates.  Blockwise also gets the swap-AB M256 N72/N80 cga(1,1,1
   or `grouped_token_back`, and batch x `active_dispatch_warps` <= 4;
   rotation needs `epi_warps` token-back.  Left unset they follow the tactic
   (the heuristic table keeps the serial, unrotated pull); an explicit value
-  wins, and an explicit batch above 1 takes the 4-slot buffer.  Measured
+  wins with `knobs=None` or a knob dict, and an explicit batch above 1 takes
+  the 4-slot buffer. Explicit pull values and tactic overrides are validated
+  together using the final `active_dispatch_warps`. The backend rejects
+  explicit pull values with `knobs="auto"`, including batch 1 and rotation
+  False. Measured
   on H200 (1830 MHz, in-process A/B against the serial compact pull,
   2026-11): H2560/I640/E512/top-10/EP2 per_tensor M64N256 cga(1,1,1) —
   batch 3 + rotation 0.914 / 0.867 / 0.842 / 0.830 at 2048 / 4096 / 8192 /
@@ -359,7 +372,9 @@ them) — 81 candidates.  Blockwise also gets the swap-AB M256 N72/N80 cga(1,1,1
   spills (728-byte stack; N72 has none, N80 24 bytes, N64 about 100
   bytes).  The shim pads the activation-SF pool to a multiple of N (the SF
   TMA addresses a tile as `(expert SF base + tile * N) // N`; every
-  power-of-two tile keeps 128).  Outputs are byte-identical to N64.
+  power-of-two tile keeps 128). These tiles require `generate_c=False`;
+  config validation rejects `generate_c=True` before kernel construction.
+  Outputs are byte-identical to N64.
   Measured on H200 (H2560/I640/E512/top-10/EP2, blockwise, batch 3, against
   the best non-swap M64N256 with the same pull): N72 0.978 / 0.910 at 1664 /
   1792 tokens per rank (65 / 70 rows per expert), N80 + rotation 0.970 at

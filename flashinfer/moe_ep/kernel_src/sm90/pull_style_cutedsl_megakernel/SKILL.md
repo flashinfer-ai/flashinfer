@@ -106,13 +106,15 @@ not picked them up):
   `make_ptr(..., assumed_align=16)` or autovec emits 16-bit stores; both
   scale modes; compiled out when off.  Host:
   `mega_runner.py --generate_c` + `_validate_c_output`, `ImplDesc.generate_c`
-  (works with any launch geometry, heuristic or explicit; no separate
-  training descriptor on Hopper), `mega_reference_fp8.py` `return_fc1_gateup`,
+  (heuristic or explicit geometry; no separate training descriptor on
+  Hopper), `mega_reference_fp8.py` `return_fc1_gateup`,
   `run_mega_tests.sh` GC01-03, `run_perf_test.sh` `FP8_GENERATE_C=1`,
   sweep `--generate-c` / `--training-geometry`.  FlashInfer side: shim
   `MegaMoEHopperFp8Config.generate_c`, `symm_buffer.fc1_c` /
   `frontend.fc1_c` read-back, backend config knob, bench `--generate-c`,
-  test `test_..._generate_c`.  Developed in the drop worktree first (branch
+  test `test_..._generate_c`. The FP8 shim rejects blockwise swap-AB N72/N80
+  with `generate_c=True`: its 128-row expert padding does not align the
+  activation-SF TMA bases to N72/N80. Developed in the drop worktree first (branch
   `hopper_fp8_generate_c`); the vendored `src/` copies match it.
 - `compact_pull_buffer` (2026-09-12, default True; `token_comm.py`
   `pull_buffer_bytes()`, Mega ctor kwarg, shim config, backend config /
@@ -177,8 +179,9 @@ not picked them up):
   `shim/tuner.py::PULL_KNOB_DEFAULTS`, compact buffer on);
   `shim/tuner.py::validate_dispatch_pull` holds the constraints for both. A
   normalized MX tactic omits them at their defaults; the FP8 `apply_knobs`
-  resets omitted ones to the defaults. Explicit frontend values override a
-  cached or default tactic, as `token_back_mode` does. MX/NV (and the MX
+  resets omitted ones to the defaults even for `{}` (`None` is a no-op).
+  Explicit frontend values override a cached or default tactic, as
+  `token_back_mode` does. MX/NV (and the MX
   backend's `compact_pull_buffer`): an explicit compact buffer or
   dispatch-side token-back drops the tactic's batch to 1 (dispatch-side
   token-back also its rotation), and an explicit batch > 1 drops the
@@ -187,7 +190,13 @@ not picked them up):
   that a tactic's value overrides: the caller's dispatch-side token-back,
   `dedup_dispatch` or dispatch-warp count drops the tactic's batch to 1
   (token-back also its rotation), and an explicit batch > 1 takes the
-  4-slot buffer. From 1024 tokens per rank the FP8 autotune adds pull
+  4-slot buffer; explicit pull values and tactic overrides are validated
+  together using the final dispatch-warp count. The FP8 backend rejects
+  `knobs="auto"` with either explicit pull value, including batch 1 or
+  rotation False; leave both `None` to tune. Online autotuning also controls
+  `compact_pull_buffer` through the tactic instead of preserving the
+  caller's bool. `knobs=None` and knob dicts keep explicit pull precedence.
+  From 1024 tokens per rank the FP8 autotune adds pull
   variants of its `epi_warps` candidates (`shim/autotune.py::_PULL_VARIANTS`).
   The drop tree has none of this. When re-syncing, re-add the two token_comm
   knobs with their properties and the rotation check,
@@ -232,7 +241,8 @@ not picked them up):
   `swapab_token_tile_n_choices`, which the swap-AB kernel and epilogue take
   for `fp8_scale_mode="mxfp4_hybrid"` and, since 2026-11, `"blockwise"`
   (the FP8 shim pads the activation-SF pool to a multiple of N and adds the
-  M256 N72/N80 tiles to the blockwise autotune candidates); per-tensor FP8
+  M256 N72/N80 tiles to the blockwise autotune candidates; those FP8 tiles
+  require `generate_c=False`); per-tensor FP8
   keeps `SwapABTokenTileNChoices`, its N128 does not spill. The swap-AB kernel also rejects N72/N80 without M=256
   and, for the scale modes with activation SF (`blockwise`, `mxfp4_hybrid`),
   an `sf_padding_block` that is not a multiple of N, because the

@@ -76,6 +76,15 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
         if self._autotune_pending:
+            if (
+                config.dispatch_pull_batch is not None
+                or config.dispatch_pull_rotate is not None
+            ):
+                raise ValueError(
+                    "knobs='auto' is mutually exclusive with explicit "
+                    "dispatch_pull_batch / dispatch_pull_rotate; leave both "
+                    "unset to autotune the pull schedule."
+                )
             import warnings
 
             warnings.warn(

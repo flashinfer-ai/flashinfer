@@ -254,10 +254,17 @@ def is_valid(
             return False
     pull = dict(PULL_KNOB_DEFAULTS)
     pull.update((k, knobs[k]) for k in PULL_KNOB_DEFAULTS if k in knobs)
+    token_back_mode = knobs.get("token_back_mode")
+    if token_back_mode is None:
+        token_back_mode = (
+            "reuse_dispatch_warps"
+            if knobs.get("token_back_by_dispatch", False)
+            else "epi_warps"
+        )
     try:
         validate_dispatch_pull(
             **pull,
-            token_back_mode=knobs.get("token_back_mode") or "epi_warps",
+            token_back_mode=token_back_mode,
             dedup_dispatch=bool(knobs.get("dedup_dispatch", False)),
             grouped_token_back=grouped,
             active_dispatch_warps=knobs.get("active_dispatch_warps", 1),

@@ -386,6 +386,11 @@ class MegaMoEHopperFp8Config:
                     "swap-AB Hopper FP8 token tiles N72/N80 require M=256; "
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
+            if self.blockwise and n in (72, 80) and self.generate_c:
+                raise ValueError(
+                    "blockwise swap-AB Hopper FP8 token tiles N72/N80 require "
+                    "generate_c=False."
+                )
         else:
             if m not in _NONSWAP_TILE_M_CHOICES or n not in _NONSWAP_TILE_N_CHOICES:
                 raise ValueError(
@@ -541,7 +546,7 @@ class MegaMoEHopperFp8Frontend:
         """
         from .tuner import with_knobs
 
-        if knobs:
+        if knobs is not None:
             knobs = {**PULL_KNOB_DEFAULTS, **knobs}
         new_config = with_knobs(self.config, knobs)
         if new_config == self._config:
@@ -1634,10 +1639,8 @@ def resolve_hopper_fp8_mega_moe_config(
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
         compact_pull_buffer=compact_pull_buffer,
-        dispatch_pull_batch=1 if dispatch_pull_batch is None else dispatch_pull_batch,
-        dispatch_pull_rotate=(
-            False if dispatch_pull_rotate is None else dispatch_pull_rotate
-        ),
+        dispatch_pull_batch=1,
+        dispatch_pull_rotate=False,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
@@ -1651,6 +1654,11 @@ def resolve_hopper_fp8_mega_moe_config(
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
     )
+    # Validate explicit pull settings together with the tactic's final layout.
+    if dispatch_pull_batch is not None:
+        knob_overrides["dispatch_pull_batch"] = dispatch_pull_batch
+    if dispatch_pull_rotate is not None:
+        knob_overrides["dispatch_pull_rotate"] = dispatch_pull_rotate
     if knob_overrides:
         # Non-geometry knobs from the cache/dict (token_back_mode,
         # load_balance_mode, flag_batch, epi_flag_batch, group_hint, ...).
