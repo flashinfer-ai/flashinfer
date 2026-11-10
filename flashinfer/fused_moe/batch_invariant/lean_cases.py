@@ -205,28 +205,30 @@ def moe_cases() -> List[Tuple[str, str, str, bool]]:
         chain(name, s_.gemm1(), f"MoE.actElemT {_UACT[act]} {ul}")
     # the fp8 per-tensor classes (`spec_fp8.py` vs `MoEFp8.lean`): the per-tile alpha from the multipliers, GEMM1's fused
     # e4m3 quantization of every gated and ungated chain, GEMM2's scaled chain, the input quantization
-    alpha1 = 'MoE.alphaOfT (.sym "m_x") (.leaf "mw1" [0])'
+    alpha1 = 'MoEFp8.alphaOfT (.sym "m_x") (.leaf "mw1" [0])'
     for name, act, params in GLU_CASES:
         s_ = M8.Fp8MoESpec(64, 32, 2, 8, act=act, params=params, alg=alg)
         chain(
             f"w8a8_gemm1_{name}",
             s_.gemm1(),
-            f'MoE.gluQuantE4m3T {lean_gact(act, params)} {gl} {ul} ({alpha1}) (.sym "m_inter")',
+            f'MoEFp8.gluQuantE4m3T {lean_gact(act, params)} {gl} {ul} ({alpha1}) (.sym "m_inter")',
         )
     for name, act in (("act_relu2", "relu2"),) + tuple(ACT_CASES):
         s_ = M8.Fp8MoESpec(64, 32, 2, 8, act=act, gated=False, alg=alg)
         chain(
             f"w8a8_gemm1_{name}",
             s_.gemm1(),
-            f'MoE.actQuantE4m3T {_UACT[act]} {ul} ({alpha1}) (.sym "m_inter")',
+            f'MoEFp8.actQuantE4m3T {_UACT[act]} {ul} ({alpha1}) (.sym "m_inter")',
         )
     s8 = M8.Fp8MoESpec(64, 32, 2, 8, alg=alg)
     chain(
         "w8a8_gemm2",
         s8.gemm2(),
-        'MoE.scaledOutT (.leaf "acc2" [0, 0]) (MoE.alphaOfT (.sym "m_inter") (.leaf "mw2" [0]))',
+        'MoEFp8.scaledOutT (.leaf "acc2" [0, 0]) (MoEFp8.alphaOfT (.sym "m_inter") (.leaf "mw2" [0]))',
     )
-    chain("x_quant_e4m3", s8.x_quant(), 'MoE.quantE4m3T (.leaf "x" [0]) (.sym "m_x")')
+    chain(
+        "x_quant_e4m3", s8.x_quant(), 'MoEFp8.quantE4m3T (.leaf "x" [0]) (.sym "m_x")'
+    )
     # the routing weights
     for meth, E, sel in ROUTING_CASES:
         s_ = M.MoESpec(64, 32, len(sel), E, meth, alg=alg)
