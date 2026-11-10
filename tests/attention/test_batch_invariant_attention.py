@@ -1558,6 +1558,7 @@ def run_decode_noncausal(pr: Problem, q_len: int, layout="NHD", ws=None):
     return w.run(pr.q[rows].contiguous(), pr.cache(layout)), rows
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("op", WRAPPERS)
 def test_noncausal_fingerprint_is_a_function_of_head_dim_and_mode(op):
     """The mask mode is a class dimension: the non-causal fingerprint differs from the causal one at every head dim, is shared by
