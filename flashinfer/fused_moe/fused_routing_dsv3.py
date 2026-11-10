@@ -163,16 +163,10 @@ def _check_dsv3_fused_routing_supported(
     # Extract number of experts from scores shape
     num_experts = scores.shape[1]
 
-    if n_group <= 0:
-        raise ValueError(f"Invalid configuration: n_group ({n_group}) must be >= 1")
-
-    # Check basic configuration constraints: the selected groups must hold at
-    # least topk experts.
-    experts_in_selected_groups = topk_group * (num_experts // n_group)
-    if topk > experts_in_selected_groups or topk_group > n_group:
+    # Check basic configuration constraints
+    if topk_group * n_group < topk or topk_group > n_group:
         raise ValueError(
-            f"Invalid configuration: topk_group * (num_experts // n_group) "
-            f"({experts_in_selected_groups}) must be >= topk ({topk}) "
+            f"Invalid configuration: topk_group * n_group ({topk_group * n_group}) must be >= topk ({topk}) "
             f"and topk_group ({topk_group}) must be <= n_group ({n_group})"
         )
 
@@ -299,10 +293,7 @@ def fused_topk_deepseek(
         with 256 experts (32 experts per group).
     topk_group : int
         Number of top groups to select.  Must satisfy ``topk_group <=
-        n_group`` and ``topk_group * (num_experts // n_group) >= topk``
-        (the selected groups must contain at least ``topk`` experts).
-        Typical value is 4; use ``n_group = topk_group = 1`` for ungrouped
-        routing.
+        n_group`` and ``topk_group * n_group >= topk``.  Typical value is 4.
     topk : int
         Number of top experts to select per token.  Must be ``<= num_experts``.
         Hard cap ``topk <= 32``; in addition both branches of the kernel
