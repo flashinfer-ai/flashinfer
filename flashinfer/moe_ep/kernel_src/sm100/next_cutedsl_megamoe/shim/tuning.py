@@ -204,7 +204,7 @@ def sm100_standard_candidates(config, *, allow_nondeterministic=False):
         )
         else (False,)
     )
-    for tile_n in (128, 256):
+    for tile_n in (64, 128, 256) if config.quant_kind == "nvfp4" else (128, 256):
         for cluster, fallback, schedule, work in (
             ((2, 1), None, ("grouped", None), "grid_stride"),
             ((4, 1), (2, 1), ("phase_interleave", None), "atomic_counter"),
@@ -214,15 +214,16 @@ def sm100_standard_candidates(config, *, allow_nondeterministic=False):
                     for reduce in reduction:
                         proposed.append(
                             dict(
-                                # K128 admits both N tiles on Blackwell. Keep
-                                # the caller's original K depth in base above.
+                                # N64 permits one FC2 TMA stage; wider tiles use two.
                                 mma_tiler_mnk=(256, tile_n, 128),
                                 cluster_shape_mn=cluster,
                                 fallback_cluster_shape_mn=fallback,
                                 schedule_policy=schedule,
                                 work_id_mode=work,
                                 fc2_use_bulk=bulk,
-                                fc2_tma_stages=2 if bulk else None,
+                                fc2_tma_stages=(1 if tile_n == 64 else 2)
+                                if bulk
+                                else None,
                                 epi_flag_batches=epi,
                                 token_in_flag_batch=1,
                                 token_back_mode="epi_warps",

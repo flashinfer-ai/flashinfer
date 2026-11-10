@@ -42,12 +42,12 @@ from tests.experimental.test_cake_kda_nondet_train_kcp_l2n import _l2n_inputs
 from tests.experimental.test_cake_kda_nondet_train_kcp_shared_ws import (
     _device_or_skip,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     make_inputs,
     make_raw_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp")

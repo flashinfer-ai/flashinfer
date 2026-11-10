@@ -33,7 +33,8 @@ deterministic registry's records, routes and record scalars of this package's
   equal field for field (the token owner's group-row forms ``_trows_dyn``
   included), plus the programs of this package: at hidden 4096
   ``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a / sm_103a,
-  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on sm_107a,
+  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep1`` on sm_107a (its last CTA
+  alone waits for the token-owner pass: ``SPLIT_CHAIN``),
   ``cake_mhc_train_bwd_slab_fold__dynr`` and its slab-fastest copy
   ``cake_mhc_train_bwd_slab_fold__dynr_os`` on all three; at 5120
   and 7168 ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>``,
@@ -133,7 +134,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import PACKAGES, cake_package
+from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
 KEY = "cake.cake_mhc_nondet_train"
 PACKAGE_NAME = "flashinfer.experimental.cake.cake_mhc_nondet_train"
@@ -166,7 +167,7 @@ ND_PREFIX, DET_PREFIX = "cake_mhc_train_", "cake_mhc_det_train_"
 # The programs of this package and their architectures (the library suffix ``__h<H>`` names a size other than 4096).
 OWN = {
     "cake_mhc_train_fn_split_atomic__tv128_dep": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fn_split_atomic__tv128_t128_dep": ("sm_107a",),
+    "cake_mhc_train_fn_split_atomic__tv128_t128_dep1": ("sm_107a",),
     "cake_mhc_train_bwd_slab_fold__dynr": ("sm_100a", "sm_103a", "sm_107a"),
     **{
         f"cake_mhc_train_{program}__h{hidden}": NEW_HIDDEN_ARCHES
@@ -181,6 +182,9 @@ OWN = {
     "cake_mhc_train_bwd_slab_fold__dynr_os__h5120": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_slab_fold__dynr_os__h7168": ("sm_100a", "sm_103a"),
 }
+# The (architecture, hidden size) pairs whose atomic fn split is the "dep1" form (only the last CTA waits for the
+# token-owner pass); the "dep" form elsewhere.
+SPLIT_CHAIN = {("sm_107a", HIDDEN): "dep1"}
 SLAB = "cake_mhc_train_bwd_slab_fold__dynr"
 LPT = "cake_mhc_train_bwd_slab_fold__lpt"
 # The slab-fastest copies of the column slab's two forms (the units drawn slab-fastest; program key ``<form>_os``); the
@@ -523,9 +527,11 @@ def _suffix(hidden: int) -> str:
 
 def _atomic_split(arch: str, hidden: int = HIDDEN) -> str:
     """The atomic fn split of ``arch`` at ``hidden``: the form of the deterministic backward split
-    (``fn_split_program(arch, 1, hidden)``), launched as the token-owner pass's programmatic dependent (``_dep``)."""
+    (``fn_split_program(arch, 1, hidden)``), launched as the token-owner pass's programmatic dependent (``_dep``; on
+    the (architecture, hidden size) pairs of ``SPLIT_CHAIN`` its ``_dep1`` form, whose last CTA alone waits)."""
     return (
-        f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1, hidden)}_dep"
+        f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1, hidden)}_"
+        + SPLIT_CHAIN.get((arch, hidden), "dep")
         + _suffix(hidden)
     )
 
@@ -1195,7 +1201,8 @@ def test_selection_refuses_a_column_slab_the_route_lacks(monkeypatch) -> None:
 def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
     """``PDL_EDGES`` = the deterministic edges without ``K7->K8``, the column slab's stem
     ``cake_mhc_train_bwd_slab_fold`` on ``K6->K7`` (every form and size); ``PDL_OFF_BANDS`` = the deterministic
-    bands without ``K7->K8`` (one table for every hidden size, as in the deterministic package).  On every path and
+    bands of every hidden size without ``K7->K8`` (one table: the deterministic package's per-size tables differ only
+    in their K7->K8 cells; test_host_rules_are_copies_of_the_deterministic_ones).  On every path and
     token count (the counts of record and every band boundary) the ``enable_pdl`` without an SM count of the
     column-slab records of each hidden size reads the bands of :func:`_pdl_cell` without an SM count: every
     deterministic column-slab record's value of the route of that size where no ``(arch, None, hidden)`` cell holds
@@ -1872,10 +1879,19 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
     for name in _SHARED_TABLES:
         assert getattr(nd, name) == getattr(det, name), name
     # The hidden sizes: the deterministic ones; the per-size table names are the deterministic ones without the
-    # column-slab and reduction tables (BWD_ROW_BANDS kept), and the tables of each size other than 4096 the
-    # deterministic tables of those names (the tables of record above are the H 4096 ones).
+    # column-slab and reduction tables (BWD_ROW_BANDS kept) and without PDL_OFF_BANDS, and the tables of each size
+    # other than 4096 the deterministic tables of those names (the tables of record above are the H 4096 ones).
+    # The deterministic PDL_OFF_BANDS of every size (4096 included) is this package's one table plus the K7->K8
+    # cells, an edge this package does not have.
     assert tuple(nd.HIDDEN_SIZES) == tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
-    kept = tuple(name for name in det.H_TABLE_NAMES if name not in _DROPPED_RULES)
+    dropped = (*_DROPPED_RULES, "PDL_OFF_BANDS")
+    kept = tuple(name for name in det.H_TABLE_NAMES if name not in dropped)
+    for hidden in HIDDEN_SIZES:
+        without_k7_k8 = {
+            a: {edge: bands for edge, bands in edges.items() if edge != "K7->K8"}
+            for a, edges in det._tab("PDL_OFF_BANDS", hidden).items()
+        }
+        assert without_k7_k8 == nd.PDL_OFF_BANDS, hidden
     assert "BWD_ROW_BANDS" in kept
     assert kept == nd.H_TABLE_NAMES
     assert HIDDEN not in det.H_TABLES and set(det.H_TABLES) == set(NEW_HIDDEN_SIZES)
@@ -3080,7 +3096,8 @@ def test_route_plan_binds_the_parameter_rows(monkeypatch, arch: str, sm: int) ->
             )
             assert [name for name, _ in plan] == list(selection), (what, plan)
             (token,) = [n for n in selection if nd.MODULES[n]["role"] == "bwd_token"]
-            assert token.endswith(GROUP_ROWS) == group_rows, (what, token)
+            stem = token.removesuffix(f"__h{hidden}")
+            assert stem.endswith(GROUP_ROWS) == group_rows, (what, token)
             (bound,) = [b for n, b in plan if nd.MODULES[n]["role"] == "bwd_slab"]
             want = _fold_plan(det.host_plan(T, sm, arch, hidden))
             assert bound["prow"] == want["prow"] == int(group_rows), (what, bound)

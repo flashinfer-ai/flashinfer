@@ -49,9 +49,7 @@ another stream that holds ``k`` of the ``N`` SMs, the forward takes at most
 the call, plus 0.02 (a CTA whose slot that kernel holds walks all of its blocks
 once it starts).
 
-Mode and dispatch rules (the same in
-:mod:`flashinfer.cake_rmsnorm_silu_gate_det_train` and
-:mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`):
+Mode and dispatch rules:
 
 1. The mode is part of every name.  Every public name of the deterministic
    module :mod:`flashinfer.cake_rmsnorm_silu_gate_det_train` (backend package
@@ -70,14 +68,14 @@ Mode and dispatch rules (the same in
    ``TypeError``.  A call of one package never runs the other package.
 3. Under ``torch.use_deterministic_algorithms(True)`` no deterministic call
    alerts: every deterministic launch gives the same bits for the same
-   inputs on the same device (a sum across CTAs is exact).  The
-   non-deterministic forward never alerts.  A non-deterministic backward that
-   computes the weight gradient raises PyTorch's alert immediately before its
-   order-varying launch (``RuntimeError``; with ``warn_only=True`` a
-   ``UserWarning``, then the non-deterministic kernel runs).  The one-cluster
-   backward of up to 256 rows (a fixed order), a call with no rows and a call
-   with ``compute_grad_weight=False`` do not alert.  The check runs on the
-   host: a CUDA Graph checks it when it is captured, not when it is replayed.
+   inputs on the same device (a sum across CTAs is exact).  A call of
+   :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train` alerts only when it
+   is a backward that computes a BF16 weight gradient in the fused band
+   (every architecture, up to 1000 rows per SM; see that module): it raises
+   PyTorch's alert immediately before that launch (``RuntimeError``; with
+   ``warn_only=True`` a ``UserWarning``, then the call runs), and no other
+   call of that module alerts.  The check runs on the host: a CUDA Graph
+   checks it when it is captured, not when it is replayed.
 4. Autograd: ``CakeRMSNormSiLUGateDetFunction`` and
    ``CakeRMSNormSiLUGateNondetFunction`` save only ``x``, ``z`` and ``weight``
    and run the backward of their own package.  A backward workspace serves

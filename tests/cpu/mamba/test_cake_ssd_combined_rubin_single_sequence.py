@@ -197,6 +197,9 @@ def _rubin(module, monkeypatch, launches, arch):
         "_launch_program",
         lambda name, _arch, **kw: launches.append((name, kw)),
     )
+    # run() also loads (builds) the shape's own program; nothing may reach
+    # nvcc in a source test.
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
     monkeypatch.setattr(
         torch.cuda, "current_stream", lambda *_: SimpleNamespace(cuda_stream=0x1234)

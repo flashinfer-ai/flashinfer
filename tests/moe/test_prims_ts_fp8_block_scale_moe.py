@@ -144,8 +144,6 @@ def test_prims_ts_deepseek_fp8_block32_smoke(cache_permute_indices):
     partial 128-wide K tile). The group-32 activation requantization is
     covered through FC2 and the final comparison.
     """
-    if get_compute_capability(torch.device(device="cuda")) == (10, 7):
-        pytest.skip("DeepSeek FP8 32x32 scale blocks are not validated on SM107 yet")
     run_moe_test(
         num_tokens=128,
         hidden_size=512,

@@ -961,7 +961,9 @@ class DSAIndexerNondetRunner:
     # call whose ``zero_region`` is the block's ticket word (8 bytes), on the run's stream.  The eager entry draws from
     # the first 16 bytes of the workspace's tail instead, which its scan binding zeroes (8 bytes) right before the
     # launch.  Any other scan launch (static, or a program drawing from the tail) gets the device's zeroed
-    # placeholder, which it never reads.
+    # placeholder, which it never reads.  The :lsf copy of a TicketWord-reading program (sm_107a's l6 ticket
+    # programs) still keeps its longest-first segment order in the tail's bytes behind the ticket word, which every
+    # launch writes before it reads them, so stale bytes there never matter and nothing zeroes them.
     # byte offset of the tail in the workspace; -1: no tail
     _tail_at: int = field(default=-1, repr=False)
     _tail_view: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -1288,7 +1290,8 @@ def _prepare_runner(
     # zeroed neither here nor per run.  A program of the record's ``static_scan_kinds``
     # (``policy_for(arch)``) keeps the static enumeration on every call: no tail view, nothing zeroed.
     # A program that reads its TicketWord argument (``reads_ticket_word``) has no tail here: it draws from its
-    # ticket block (above), so neither a caller-owned nor a backend-owned workspace is zeroed for it.
+    # ticket block (above), so neither a caller-owned nor a backend-owned workspace is zeroed for it (its :lsf copy
+    # writes the segment order behind the tail's ticket word before it reads it).
     # (``tail_at`` / ``tail_static`` were decided above, before the first device operation; a call launches
     # iff it has queries and keys.)
     tail_view = scan_ticket["zero_region"] if shared_tail else None

@@ -32,7 +32,7 @@ from datetime import timedelta
 import pytest
 import torch
 
-from tests.test_helpers.w4a16_reference import assert_w4a16_bits
+from tests.moe_ep.test_helpers.w4a16_reference import assert_w4a16_bits
 
 pytestmark = [
     pytest.mark.nvep,
