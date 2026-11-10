@@ -7,7 +7,8 @@ kernel's CTAs may become resident. No kernel of this backend triggers: the depen
 during the main work; a trigger after the persistent body's last loads still overlaps its epilogue, which at decode is most
 of the kernel). The trigger sites below mark where the other placements would go (``late``: after the CTA's last tile's
 loads; ``early``: right after the wait). The placement is baked into every compiled object and the kernel names do not
-carry it, so it is a constant of the module, not a runtime or environment setting."""
+carry it, so it is a constant of the module, not a runtime or environment setting; this file is in the kernels' source
+closure (:mod:`flashinfer.batch_invariant.jit`), so a change to the constant rebuilds every cached object."""
 
 from __future__ import annotations
 
