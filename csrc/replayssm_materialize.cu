@@ -210,16 +210,15 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     // Scan dt then multiply by A, matching checkpointing_ssu's recurrence.
     if (warp == 2) {
       load_old_dt_cumAdt(view, lane, src_slot, start, head, count, count, a, smem.old_dt,
-                        smem.old_cumAdt);
+                         smem.old_cumAdt);
     }
     __pipeline_commit();
     __pipeline_wait_prior(0);
     __syncthreads();
     int64_t const rand_seed =
-        (PHILOX_ROUNDS > 0)
-            ? (SHARED_SEED ? rand_seed_ptr[layer]
-                           : conversion::layer_philox_seed(*rand_seed_ptr, layer))
-            : 0;
+        (PHILOX_ROUNDS > 0) ? (SHARED_SEED ? rand_seed_ptr[layer]
+                                           : conversion::layer_philox_seed(*rand_seed_ptr, layer))
+                            : 0;
     if constexpr (sizeof(T) == 1) {
       // view's state and scale are used below only for the
       // destination.  state is already in smem, source_scale is
@@ -422,10 +421,10 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
     CHECK_DIM(1, seed);
     CHECK_CONTIGUOUS(seed);
     int64_t const seed_count = SHARED_SEED ? num_layers : 1;
-    FLASHINFER_CHECK(seed.numel() == seed_count && seed.dtype().code == kDLInt &&
-                         seed.dtype().bits == 64,
-                     "rand_seed must be CUDA int64 with one seed per layer for shared_seed, "
-                     "or one base seed for Philox");
+    FLASHINFER_CHECK(
+        seed.numel() == seed_count && seed.dtype().code == kDLInt && seed.dtype().bits == 64,
+        "rand_seed must be CUDA int64 with one seed per layer for shared_seed, "
+        "or one base seed for Philox");
   }
   MaterializeParams p{
       static_cast<const int64_t*>(state_ptrs.data_ptr()),
