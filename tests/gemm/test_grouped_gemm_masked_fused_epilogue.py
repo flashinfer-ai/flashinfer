@@ -262,3 +262,67 @@ def test_gated_activation_accepts_cute_dsl_prepared_weights():
         out.float().flatten(1), ref.flatten(1), dim=1
     )
     assert (cos > 0.97).all(), cos
+
+
+def test_gated_activation_compiled_kernel_allocates_half_width_output():
+    _skip_unless_sm100()
+    from flashinfer.cute_dsl.blockscaled_gemm import (
+        get_cute_dsl_compiled_masked_gemm_kernel,
+    )
+    from flashinfer.cute_dsl.utils import get_cutlass_dtype, get_num_sm
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    l, m, n, k = 2, 128, 512, 256
+    a, sfa, _ = _nvfp4_operand(l, m, k, device)
+    b, sfb, _ = _nvfp4_operand(l, n, k, device)
+    masked_m = torch.full((l,), m, dtype=torch.int32, device=device)
+    alpha = torch.full((l,), 1e-2, device=device)
+    expected = torch.empty(l, m, n // 2, dtype=torch.bfloat16, device=device)
+    grouped_gemm_nt_masked(
+        (a, sfa),
+        (b, sfb),
+        expected.permute(1, 2, 0),
+        masked_m,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=SF_VEC,
+        alpha=alpha,
+        alpha_dtype="float32",
+        activation_type=ActivationType.Swiglu,
+    )
+
+    major, minor = get_compute_capability(device)
+    tensor_api = get_cute_dsl_compiled_masked_gemm_kernel(
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=get_cutlass_dtype("float4_e2m1fn"),
+        sf_dtype=get_cutlass_dtype("float8_e4m3fn"),
+        c_dtype=get_cutlass_dtype("bfloat16"),
+        alpha_dtype=get_cutlass_dtype("float32"),
+        sf_vec_size=SF_VEC,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sm_count=get_num_sm(device),
+        sm_version=f"sm_{major}{minor}",
+        num_ranks=1,
+        enable_dst_signals=False,
+        activation_type=ActivationType.Swiglu.value,
+    )
+    out = tensor_api(
+        a_tensor_gpu=a,
+        b_tensor_gpu=b,
+        sfa_tensor_gpu=sfa,
+        sfb_tensor_gpu=sfb,
+        masked_m_tensor_gpu=masked_m,
+        dst_signals_tensor_gpu=None,
+        alpha_tensor_gpu=alpha,
+    )
+    assert out.shape == (l, m, n // 2)
+    assert torch.equal(out, expected)

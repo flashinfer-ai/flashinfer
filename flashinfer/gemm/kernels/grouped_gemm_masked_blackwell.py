@@ -3730,7 +3730,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         if c_tensor_gpu is None:
             # fp4 gemm output is not supported
             c_tensor_gpu = torch.empty(
-                (l, m, n),
+                (l, m, n // 2 if activation_type is not None else n),
                 dtype=cutlass_to_torch_dtype(c_dtype),
                 device="cuda",
             )
