@@ -251,34 +251,40 @@ class GroupScheduler:
     @cute.jit
     def get_current_work(self) -> GroupWorkTile:
         valid = self.linear < self.total
-        L = cutlass.min(self.linear, self.total - Int32(1))
-        L = cutlass.max(L, Int32(0))
-        blk = L // self.n_tiles
-        # largest e with s_pre[e] <= blk, e in [0, E)
-        lo = Int32(0)
-        hi = self.E - Int32(1)
-        while lo < hi:
-            mid = (lo + hi + Int32(1)) // Int32(2)
-            if self.s_pre[mid] <= blk:
-                lo = mid
+        e = Int32(0)
+        row0 = Int32(0)
+        row_end = Int32(0)
+        n_tile = Int32(0)
+        # no cluster tile at all (every count zero: every slot dropped, or an expert-parallel rank without a local hit):
+        # the tile is invalid before the decode, whose last group would have no row blocks to divide by
+        if self.total > Int32(0):
+            L = cutlass.min(self.linear, self.total - Int32(1))
+            blk = L // self.n_tiles
+            # largest e with s_pre[e] <= blk, e in [0, E)
+            lo = Int32(0)
+            hi = self.E - Int32(1)
+            while lo < hi:
+                mid = (lo + hi + Int32(1)) // Int32(2)
+                if self.s_pre[mid] <= blk:
+                    lo = mid
+                else:
+                    hi = mid - Int32(1)
+            e = lo
+            local = L - self.s_pre[e] * self.n_tiles
+            mb = self.s_pre[e + Int32(1)] - self.s_pre[e]
+            m_block = Int32(0)
+            n_block = Int32(0)
+            if cutlass.const_expr(self.raster_m):
+                m_block = local % mb
+                n_block = local // mb
             else:
-                hi = mid - Int32(1)
-        e = lo
-        local = L - self.s_pre[e] * self.n_tiles
-        mb = self.s_pre[e + Int32(1)] - self.s_pre[e]
-        m_block = Int32(0)
-        n_block = Int32(0)
-        if cutlass.const_expr(self.raster_m):
-            m_block = local % mb
-            n_block = local // mb
-        else:
-            n_block = local % self.n_tiles
-            m_block = local // self.n_tiles
-        row0 = self.s_off[e] + m_block * Int32(self.cluster_rows)
-        row_end = (
-            self.s_off[e] + self.counts[e]
-        )  # the real end: rows past it belong to the padding or to other groups
-        n_tile = n_block * Int32(self.cn) + self.cta_n_in_cluster
+                n_block = local % self.n_tiles
+                m_block = local // self.n_tiles
+            row0 = self.s_off[e] + m_block * Int32(self.cluster_rows)
+            row_end = (
+                self.s_off[e] + self.counts[e]
+            )  # the real end: rows past it belong to the padding or to other groups
+            n_tile = n_block * Int32(self.cn) + self.cta_n_in_cluster
         return GroupWorkTile(valid, e, row0, row_end, n_tile)
 
     @cute.jit

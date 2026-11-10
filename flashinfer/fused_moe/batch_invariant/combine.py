@@ -106,51 +106,48 @@ class CombineKernel:
         t = cutlass.min(
             t_raw, T - Int32(1)
         )  # out-of-range warps recompute a valid token and store nothing
-        if cutlass.const_expr(True):
-            ps = [mDest[t, r] for r in range(k)]
-            ws = [mW[t, r] for r in range(k)]
-            if cutlass.const_expr(self.w_round):
-                # pre-routed weights given as f32 enter as their bf16 rounding (the packed word's value): the engine's
-                # conversion here and the value's own exact widening, instead of two host passes over the slots
-                ws = [CuteF32.cvt_out(w_, "bf16").to(Float32) for w_ in ws]
-            # a dropped slot (dest -1: an expert id outside [0, E)) has no expert row: its loads take row 0 and its term is +0
-            oks = [p >= Int32(0) for p in ps]
-            ps = [cutlass.max(p, Int32(0)) for p in ps]
-            atom_in = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                mY.element_type,
-                num_bits_per_copy=VEC * mY.element_type.width,
-            )
-            atom_out = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(),
-                mOut.element_type,
-                num_bits_per_copy=VEC * mOut.element_type.width,
-            )
-            n_vec = H // Int32(VEC)
-            frags = [cute.make_rmem_tensor((VEC,), mY.element_type) for _ in range(k)]
-            out = cute.make_rmem_tensor((VEC,), mOut.element_type)
-            rows_y = [
-                mY[(ps[r], None)] for r in range(k)
-            ]  # 1-D row slices (a (1, VEC) tile mis-vectorises)
-            row_out = mOut[(t, None)]
-            # this warp's vectors: the 32-vector slabs part, part + wpt, ...; j = (jj * wpt + part) * 32 + lane < n_vec
-            n_slabs = (n_vec + Int32(LANES - 1)) // Int32(LANES)
-            n_mine = (n_slabs - part + Int32(wpt - 1)) // Int32(wpt)
-            for jj in cutlass.range(0, n_mine, 1):
-                j = (jj * Int32(wpt) + part) * LANES + lane
-                jc = cutlass.min(
-                    j, n_vec - Int32(1)
-                )  # the last slab's lanes past the row recompute a valid vector and store nothing
-                for r in cutlass.range_constexpr(k):
-                    cute.copy(
-                        atom_in, cute.local_tile(rows_y[r], (VEC,), (jc,)), frags[r]
-                    )
-                for i in cutlass.range_constexpr(VEC):
-                    out[i] = CuteF32.cvt_out(
-                        _fold_slots(self.plan, frags, ws, oks, i), self.out_fmt
-                    )
-                if valid & (j < n_vec):
-                    cute.copy(atom_out, out, cute.local_tile(row_out, (VEC,), (jc,)))
+        ps = [mDest[t, r] for r in range(k)]
+        ws = [mW[t, r] for r in range(k)]
+        if cutlass.const_expr(self.w_round):
+            # pre-routed weights given as f32 enter as their bf16 rounding (the packed word's value): the engine's
+            # conversion here and the value's own exact widening, instead of two host passes over the slots
+            ws = [CuteF32.cvt_out(w_, "bf16").to(Float32) for w_ in ws]
+        # a dropped slot (dest -1: an expert id outside [0, E)) has no expert row: its loads take row 0 and its term is +0
+        oks = [p >= Int32(0) for p in ps]
+        ps = [cutlass.max(p, Int32(0)) for p in ps]
+        atom_in = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mY.element_type,
+            num_bits_per_copy=VEC * mY.element_type.width,
+        )
+        atom_out = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            mOut.element_type,
+            num_bits_per_copy=VEC * mOut.element_type.width,
+        )
+        n_vec = H // Int32(VEC)
+        frags = [cute.make_rmem_tensor((VEC,), mY.element_type) for _ in range(k)]
+        out = cute.make_rmem_tensor((VEC,), mOut.element_type)
+        rows_y = [
+            mY[(ps[r], None)] for r in range(k)
+        ]  # 1-D row slices (a (1, VEC) tile mis-vectorises)
+        row_out = mOut[(t, None)]
+        # this warp's vectors: the 32-vector slabs part, part + wpt, ...; j = (jj * wpt + part) * 32 + lane < n_vec
+        n_slabs = (n_vec + Int32(LANES - 1)) // Int32(LANES)
+        n_mine = (n_slabs - part + Int32(wpt - 1)) // Int32(wpt)
+        for jj in cutlass.range(0, n_mine, 1):
+            j = (jj * Int32(wpt) + part) * LANES + lane
+            jc = cutlass.min(
+                j, n_vec - Int32(1)
+            )  # the last slab's lanes past the row recompute a valid vector and store nothing
+            for r in cutlass.range_constexpr(k):
+                cute.copy(atom_in, cute.local_tile(rows_y[r], (VEC,), (jc,)), frags[r])
+            for i in cutlass.range_constexpr(VEC):
+                out[i] = CuteF32.cvt_out(
+                    _fold_slots(self.plan, frags, ws, oks, i), self.out_fmt
+                )
+            if valid & (j < n_vec):
+                cute.copy(atom_out, out, cute.local_tile(row_out, (VEC,), (jc,)))
         pdl.trigger_one_wave()
 
 
