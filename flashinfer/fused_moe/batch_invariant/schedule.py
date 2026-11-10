@@ -293,15 +293,20 @@ def record_cost(
     sm_count: Optional[int] = None,
     in_fmt: str = "bf16",
     nominal: bool = False,
+    overrides: Optional[dict] = None,
 ) -> float:
     """The shared contract's cost of one grouped record at the launch's shape ``(rows per expert, n_active x N, K)``, the key
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
-    (`estimate_overrides`), times the pair term and the swapped records' tiles term, plus the exposed epilogue chain, the
-    token box's exposed fill and the body's per-launch fixed cost; in SM cycles."""
+    (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
+    dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
+    chain, the token box's exposed fill and the body's per-launch fixed cost; in SM cycles."""
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import estimate_cycles
 
+    constants = estimate_overrides(cfg, rows, in_fmt, family)
+    if overrides:
+        constants.update(overrides)
     canon = dataclasses.replace(cfg, raster_along="m")
     est = estimate_cycles(
         canon,
@@ -314,7 +319,7 @@ def record_cost(
         family,
         sm_count,
         nominal=nominal,
-        c=estimate_overrides(cfg, rows, in_fmt, family),
+        c=constants,
     )
     return (
         est * pair_term(cfg, rows) * tiles_term(cfg, rows)
