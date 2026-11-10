@@ -1382,7 +1382,7 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params, boo
   auto& smem = *reinterpret_cast<SmemT*>(smem_buf);
 
   // Grid: (1, batch, nheads).  D-tile is always 0 for int8 (D_SPLIT=1).
-  int const d_tile = blockIdx.x;
+  constexpr int d_tile = 0;
   int const seq = blockIdx.y;
   int const head = blockIdx.z;
   int const lane = threadIdx.x;
