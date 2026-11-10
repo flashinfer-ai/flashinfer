@@ -212,10 +212,12 @@ def _moe_fp8_fingerprint(
     act: object = "swiglu",
     params: Sequence[Optional[float]] = (),
     gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
 ) -> str:
     """The fp8 per-tensor MoE classes behind ``MoELayer`` with ``BatchInvariantFp8PerTensorConfig``: the dimensions of
-    :func:`_moe_bf16_fingerprint` (the routing method, the activation with its scalars and gating); the scales' values are
-    inputs, not dimensions."""
+    :func:`_moe_bf16_fingerprint` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and
+    gating); the scales' values are inputs, not dimensions."""
     from flashinfer.fused_moe.batch_invariant import spec
     from flashinfer.fused_moe.batch_invariant.spec_fp8 import spec_fingerprint_fp8
     from flashinfer.tllm_enums import RoutingMethodType
@@ -236,6 +238,12 @@ def _moe_fp8_fingerprint(
         raise TypeError(
             f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
         )
+    if (n_group or 0) > 1 or (topk_group or 0) > 1:
+        if rm is not spec.SIGMOID_BIAS_RENORM_SCALED:
+            raise ValueError(
+                "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
+            )
+        rm = rm.with_groups(int(n_group or 0), int(topk_group or 0))
     if not isinstance(act, str):
         a = spec.activation_of(act)
         name, params, gated = a.act, a.params, a.gated
@@ -300,7 +308,7 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.e4m3",
         ("H", "I", "top_k", "num_experts"),
         _moe_fp8_fingerprint,
-        ("method", "act", "params", "gated"),
+        ("method", "act", "params", "gated", "n_group", "topk_group"),
     ),
 }
 
