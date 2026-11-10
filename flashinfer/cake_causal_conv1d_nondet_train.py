@@ -188,7 +188,7 @@ def cake_causal_conv1d_nondet_train_backward_workspace_bytes(
     -------
     int
         Bytes of the caller-owned backward workspace. The size depends on
-        ``C`` and the route, not on ``S``.
+        ``C`` and the target device, not on ``S``.
     """
 
     return _backend().cake_causal_conv1d_nondet_train_backward_workspace_bytes(
