@@ -18,8 +18,10 @@ This module keeps its FlashInfer-facing validation, allocation, stream, and
 state semantics separate from the kernel source.
 """
 
+import contextlib
+import contextvars
 import math
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 
@@ -304,8 +306,27 @@ def _is_cute_dsl_kda_prefill_eligible(
     return _is_cute_dsl_kda_runtime_available()
 
 
+# The two BT=16 routes ("decomp" and the persistent "engine") do not agree bitwise; the batch-invariant class pins one.
+_ROUTE_MODE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "flashinfer_kda_cute_route", default=None
+)
+
+
+@contextlib.contextmanager
+def force_route(mode: Optional[str]) -> Iterator[None]:
+    """Pin the CuTe-DSL KDA prefill to one route ("engine" or "decomp") for the calls inside the block (context-local)."""
+    if mode not in (None, "auto", "engine", "decomp"):
+        raise ValueError(f"unknown cute-dsl KDA route {mode!r}")
+    token = _ROUTE_MODE.set(None if mode == "auto" else mode)
+    try:
+        yield
+    finally:
+        _ROUTE_MODE.reset(token)
+
+
 def _get_compiled_cute_dsl_kda(
     *,
+    mode: Optional[str] = None,
     lower_bound: float,
     state_dtype: torch.dtype,
     has_state_in: bool,
@@ -335,7 +356,7 @@ def _get_compiled_cute_dsl_kda(
         has_state_ckpt=has_state_ckpt,
         has_state_indices=has_state_indices,
         has_checkpoint_state_indices=has_checkpoint_state_indices,
-        mode=None,
+        mode=mode,
     )
 
 
@@ -459,7 +480,9 @@ def _run_cute_dsl_kda_prefill(
             )
         cu_seqlens = cu_seqlens.to(torch.int64)
 
+    route = _ROUTE_MODE.get()
     compiled = _get_compiled_cute_dsl_kda(
+        **({} if route is None else {"mode": route}),
         lower_bound=float(lower_bound),
         state_dtype=state_dtype,
         has_state_in=initial_state is not None,
