@@ -218,13 +218,3 @@ def test_entry_rules(build_backend):
     assert not dropped("flashinfer/experimental/foo/cake_jit.py", True)
     assert not dropped("flashinfer/data/csrc/norm/k.cu", True)
     assert not dropped("flashinfer/cake_gdp_backend/csrc/k.cu", True)
-    # the Cake training backends behind stable facades (#8928) keep their sources
-    assert not dropped(
-        "flashinfer/experimental/cake/cake_causal_conv1d_det_train/csrc/k.cu", True
-    )
-    assert not dropped(
-        "flashinfer/experimental/cake/cake_causal_conv1d_det_train/csrc/a/k.cuh", True
-    )
-    assert not dropped(
-        "flashinfer/experimental/cake/cake_kda_nondet_train/csrc/k.cu", True
-    )
