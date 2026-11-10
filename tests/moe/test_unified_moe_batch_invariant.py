@@ -878,6 +878,124 @@ def test_three_routing_modes_agree_and_runs_are_deterministic():
         assert torch.equal(bits(out_g), bits(out_l))
 
 
+def _caller_combine(
+    y: torch.Tensor, dest: torch.Tensor, w: torch.Tensor, T: int, k: int
+) -> torch.Tensor:
+    """The class's combine written by a caller over the unfinalized triple: per token the fp32 fold in slot order from
+    ``+0`` of ``mul(f32(y[dest[t, r]]), w[t, r])``, the term ``+0`` for a slot without a row (``dest = -1``), one bf16
+    conversion; torch float32 CPU ops (single roundings), the vectorised model's arithmetic."""
+    yc = y.detach().cpu().float()
+    d = dest.detach().cpu().long().view(T, k)
+    wc = w.detach().cpu().float().view(T, k)
+    acc = torch.zeros(T, yc.shape[1], dtype=torch.float32)
+    for r in range(k):
+        ok = d[:, r] >= 0
+        term = yc[d[:, r].clamp_min(0)] * wc[:, r : r + 1]
+        acc = acc + torch.where(ok[:, None], term, torch.zeros_like(term))
+    return acc.to(torch.bfloat16)
+
+
+@needs_device
+def test_unfinalized_output_is_the_triple_the_class_folds():
+    """``MoEFinalizeConfig(do_finalize=False)`` returns the layer's triple ``[gemm2_output, expert_weights,
+    expanded_idx_to_permuted_idx]`` in every routing input mode: the caller's slot-order fp32 fold over it (the class's
+    combine) equals the finalized layer bit for bit; the rows are grouped by expert in expert order and in token-slot
+    order inside a group (the class's permutation, a function of the routing alone, so a second call gives the same rows
+    at the same places); the map is the flat ``[T k]`` int32 of the layer's contract (a permutation of the valid rows,
+    ``-1`` at a dropped slot); the weights carry the values the fold uses in the mode's dtype (fp32 from logits and for
+    fp32 pre-routed weights, bf16 for packed and bf16 pre-routed weights); the layer's generic recombination (a plain
+    torch sum) is within tolerance; the pack filter and the autotuner take the configuration."""
+    from flashinfer.autotuner import autotune
+
+    T, k, H, I, E = 133, 6, 512, 256, 48
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=31, adversarial=True)
+    W = _weights(w1, w2)
+    fin = _layer(k, E, I)
+    cfg = _config(k, E, I)
+    unf = MoELayer(
+        MoEConfig(
+            routing=cfg.routing,
+            quant=cfg.quant,
+            experts=cfg.experts,
+            activation=cfg.activation,
+            backend=cfg.backend,
+            execution=cfg.execution,
+            finalize=MoEFinalizeConfig(do_finalize=False),
+        ),
+        device=torch.device("cuda"),
+    )
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    ids_bad = ids.clone()
+    ids_bad[3, 1] = -1
+    ids_bad[7, :] = E
+    ids_bad[11, 4] = 1 << 30
+    packs = [
+        ("logits", _logits_pack(x, logits), torch.float32),
+        ("unpacked_f32", _routed_pack(x, ids, weights), torch.float32),
+        (
+            "unpacked_bf16",
+            _routed_pack(x, ids, weights.to(torch.bfloat16)),
+            torch.bfloat16,
+        ),
+        ("packed", _routed_pack(x, ids, weights, packed=True), torch.bfloat16),
+        ("dropped", _routed_pack(x, ids_bad, weights), torch.float32),
+    ]
+    for name, pack, wdtype in packs:
+        out = fin(pack, W)
+        res = unf(pack, W)
+        assert isinstance(res, list) and len(res) == 3, name
+        y, w, dest = res
+        assert y.dtype == torch.bfloat16 and y.shape == (T * k, H), name
+        assert w.dtype == wdtype and tuple(w.shape) == (T, k), name
+        assert dest.dtype == torch.int32 and tuple(dest.shape) == (T * k,), name
+        # the fold over the triple is the finalized output
+        assert torch.equal(bits(_caller_combine(y, dest, w, T, k)), bits(out.cpu())), (
+            name
+        )
+        # the layout: the valid rows [0, n) each held by exactly one (token, slot), grouped by expert in expert order, in
+        # token-slot order inside a group; a dropped slot has no row
+        pack_ids = ids_bad if name == "dropped" else ids
+        flat_ids = pack_ids.view(-1).cpu()
+        valid = (flat_ids >= 0) & (flat_ids < E)
+        d = dest.cpu()
+        assert torch.all(d[~valid] == -1) and torch.all(d[valid] >= 0), name
+        n_valid = int(valid.sum())
+        assert sorted(d[valid].tolist()) == list(range(n_valid)), name
+        row_expert = torch.full((n_valid,), -1, dtype=torch.int64)
+        row_slot = torch.full((n_valid,), -1, dtype=torch.int64)
+        row_expert[d[valid].long()] = flat_ids[valid].long()
+        row_slot[d[valid].long()] = torch.nonzero(valid).view(-1)
+        assert torch.all(row_expert[1:] >= row_expert[:-1]), name
+        same = row_expert[1:] == row_expert[:-1]
+        assert torch.all(row_slot[1:][same] > row_slot[:-1][same]), name
+        # the weights are the fold's inputs: the class's routing weights from logits (fp32), the caller's values otherwise
+        if name == "logits":
+            assert torch.equal(bits(w), bits(weights)), name
+        elif name in ("unpacked_bf16", "packed"):
+            assert torch.equal(w, weights.to(torch.bfloat16)), name
+        else:
+            assert torch.equal(bits(w), bits(weights)), name
+        # a second call places the same rows at the same positions (the rows are reproducible, not atomically assigned)
+        y2, w2_, dest2 = unf(pack, W)
+        assert torch.equal(dest2, dest) and torch.equal(w2_, w), name
+        assert torch.equal(bits(y2[:n_valid]), bits(y[:n_valid])), name
+        # the layer's generic consumer (the unified fuzz test's recombination): a plain torch fold, within tolerance
+        dl = dest.long()
+        rows = y[dl.clamp_min(0)].view(T, k, H).float() * w.float().view(T, k, 1)
+        rows = torch.where((dl >= 0).view(T, k, 1), rows, torch.zeros_like(rows))
+        torch.testing.assert_close(rows.sum(dim=1), out.float(), rtol=2e-2, atol=2e-2)
+    # the autotuner profiles the unfinalized forward too; the triple's fold is unchanged under tuning
+    pack = _logits_pack(x, logits)
+    out = fin(pack, W)
+    with autotune(True):
+        y, w, dest = unf(pack, W)
+    assert torch.equal(bits(_caller_combine(y, dest, w, T, k)), bits(out.cpu()))
+    # the empty call
+    y, w, dest = unf(_logits_pack(x[:0], logits[:0]), W)
+    assert y.shape == (0, H) and w.shape == (0, k) and dest.shape == (0,)
+
+
 @needs_device
 def test_routing_constants_first_made_under_graph_capture_are_not_cached():
     """A routing constant (the absent bias, the scale) first materialised while a CUDA graph is being captured is a
@@ -1068,7 +1186,7 @@ def test_routing_methods_from_logits_match_the_cpu_model():
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the classes raises the mode's error at build or at the first call
     (top_k / num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing from
-    logits, no finalize, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
+    logits, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
     non-default ``SwiGLU`` is a class of the backend (the ``swiglu_oai`` chain), not an error; a zero-token call returns
     an empty output."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
@@ -1103,7 +1221,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             ),
             "parallel",
         ),
-        (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
     ):
         with pytest.raises(errors) as excinfo:
             MoELayer(

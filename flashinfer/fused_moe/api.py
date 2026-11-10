@@ -3290,10 +3290,14 @@ class BatchInvariantBf16Config:
     weights alone: the batch size and composition, the row's position, the expert loads and the grouped-GEMM record the
     dispatcher or the autotuner picks never enter the dataflow (run-to-run determinism, batch / permutation / sub-batch
     invariance, configuration agreement; the proofs are the ``MoE`` Lean module of the mode). The combine is the
-    slot-order fp32 fold of the class and the backend always performs it: ``MoEFinalizeConfig.do_finalize`` must stay
-    ``True`` (the unreduced per-slot rows of ``do_finalize=False`` are not returned; they belong with the expert-parallel
-    classes, together with the convention for non-local experts) and ``use_fused_finalize`` is ignored (the combine is
-    never an atomic finalize).
+    slot-order fp32 fold of the class; ``MoEFinalizeConfig(do_finalize=False)`` leaves it to the caller and returns the
+    layer's triple ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``: GEMM2's bf16 rows grouped by expert
+    in expert order and, inside a group, in token-slot order (a function of the routing alone, so the rows are
+    reproducible; rows past the valid ones are not written), the weights as the combine folds them (fp32 from logits
+    and for fp32 pre-routed weights; the mode's bf16 for packed and bf16 pre-routed weights, whose exact widening the
+    fold uses) and the flat ``[num_tokens * top_k]`` int32 map, ``-1`` for a dropped slot. The class's slot-order fold
+    over the triple is the finalized output bit for bit. ``use_fused_finalize`` is ignored (the combine is never an
+    atomic finalize).
     All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
     ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm`` and ``DeepSeekV3`` with ``n_group <= 1``), the pre-routed modes take the caller's ids
     and weights. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
@@ -3308,8 +3312,8 @@ class BatchInvariantBf16Config:
     Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls
     back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout). The layer's own
     checks come first: ``MoELayer`` runs every candidate's support check at construction (the base runner refuses an
-    expert-parallel shard; this backend ``do_finalize=False``, ``top_k`` / ``num_experts`` beyond its bounds and fused
-    shared experts) and reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
+    expert-parallel shard; this backend ``top_k`` / ``num_experts`` beyond its bounds and fused shared experts) and
+    reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
     filter admits only a bf16 ``[num_tokens, H]`` activation (an fp16 one is its ``NotImplementedError``: no usable
     backend); what reaches the runner (``n_group > 1`` or an unimplemented method from logits, a bias against the method,
     a weight view of another activation or configuration, the runner driven directly) raises

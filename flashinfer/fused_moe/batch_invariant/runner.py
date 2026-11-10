@@ -9,7 +9,10 @@ The runner serves the bf16 classes on SM100 / SM103 / SM107, one declared chain 
 It takes every routing input mode: ``FromLogits`` runs the class's own routing kernel
 (the declared ``exp``, the strict selection order), ``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's
 expert ids and weights. The combine is the slot-order fp32 fold (never an atomic finalize: ``MoEFinalizeConfig.use_fused_finalize``
-is ignored), the tactics are the ranked grouped-GEMM records of the dispatcher (any tactic gives the same bits), and an
+is ignored); with ``MoEFinalizeConfig(do_finalize=False)`` the combine is left to the caller and the forward returns the
+layer's unfinalized triple ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]`` -- the per-slot rows, the
+weights and the positions exactly as the class's combine would fold them (a placement of the op: the rows are reproducible
+intermediates). The tactics are the ranked grouped-GEMM records of the dispatcher (any tactic gives the same bits), and an
 unsupported configuration raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 """
 
@@ -77,6 +80,13 @@ def _configs_from_tactic(t: tuple):
         )
 
     return one(t[:6]), one(t[6:12])
+
+
+class _PackedInputs(list):
+    """The packed inputs with the mode's weight dtype attached (the dtype the unfinalized form returns the weights in; the
+    autotuner's profiling lists carry no attribute and read as fp32, the class's own weight dtype)."""
+
+    weights_dtype: torch.dtype = torch.float32
 
 
 class BatchInvariantMoeRunner(MoERunner):
@@ -167,12 +177,6 @@ class BatchInvariantMoeRunner(MoERunner):
             self._method = None
         else:
             self._method = METHOD_OF_FLASHINFER[routing.method]
-        if not cfg.finalize.do_finalize:
-            raise unsupported(
-                CLASS,
-                "do_finalize=False",
-                "do_finalize=True (the slot-order combine is part of the class)",
-            )
 
     def _build(self) -> None:
         from ...gemm.batch_invariant.api import part_of
@@ -258,6 +262,7 @@ class BatchInvariantMoeRunner(MoERunner):
                 "(prepare_weights(..., activation=config.activation))",
             )
         mode = act.routing_input_mode
+        weights_dtype = torch.float32  # the class's weights from logits are fp32
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
             # group-limited selection is a routing term the class does not have; with pre-routed ids the group
@@ -320,9 +325,12 @@ class BatchInvariantMoeRunner(MoERunner):
                 # the packed word carries the weight as bf16 (``(expert_id << 16) | bf16(weight)``): the rounded weights
                 # are the class's inputs in this mode
                 wts = wts.to(torch.bfloat16)
+            weights_dtype = wts.dtype
             wts = wts.to(torch.float32).contiguous()
         out = torch.empty(T, x.shape[1], dtype=torch.bfloat16, device=x.device)
-        return [x, ids, wts, w.w1i, w.w2, out] + plan
+        packed = _PackedInputs([x, ids, wts, w.w1i, w.w2, out] + plan)
+        packed.weights_dtype = weights_dtype
+        return packed
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int) -> Tuple[list, list]:
@@ -378,5 +386,25 @@ class BatchInvariantMoeRunner(MoERunner):
             c1, c2 = _configs_from_tactic(tuple(tactic))
         a = self._activation()
         w = MoEWeights(w1i, w2, a.gated, a.act, a.params)
+        if not self.config.finalize.do_finalize:
+            # the layer's unfinalized triple: GEMM2's per-slot rows grouped by expert in expert order and, inside a group,
+            # in token-slot order (rows past the valid ones -- a dropped slot's share -- are not written), the weights as the
+            # combine would fold them (exactly widened to fp32 by the fold: the mode's dtype carries the same values) and the
+            # row of every (token, slot) in the flat layout, -1 for a dropped slot; the class's slot-order fold over the
+            # triple is the finalized output bit for bit (TRTLLM-Gen's rows are atomically placed and not reproducible)
+            _, im = fused_moe(
+                x,
+                ids,
+                wts,
+                w,
+                out=out,
+                config1=c1,
+                config2=c2,
+                plan=plan,
+                return_intermediates=True,
+                finalize=False,
+            )
+            weights_dtype = getattr(inputs, "weights_dtype", torch.float32)
+            return [im["y"], wts.to(weights_dtype), im["dest"].reshape(-1)]
         fused_moe(x, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan)
         return out

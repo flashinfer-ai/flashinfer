@@ -461,13 +461,16 @@ def fused_moe(
     config2: Optional[Knobs] = None,
     return_intermediates: bool = False,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    finalize: bool = True,
 ):
     """The MoE FFN for pre-routed tokens: ``out[t] = sum_r w[t, r] * act(x_t W1[e]^T) W2[e]^T`` with the class's rounding
     (gated: ``act`` = SwiGLU on the gate / up pair; ungated: ReLU^2 on the single accumulator), the ``k`` slots folded in
     slot order in fp32 and converted once. An expert id outside ``[0, E)`` is a dropped slot: neither gathered nor
     computed, the term ``+0`` in its token's fold whatever its weight (a token whose slots are all dropped gives a zero
     row). ``config1`` / ``config2``: the grouped GEMMs' records (any record of the space gives the same bits; the
-    dispatcher's pick by default)."""
+    dispatcher's pick by default). ``finalize=False`` skips the combine launch and leaves ``out`` as given: the per-slot
+    rows ``y`` and the positions ``dest`` of ``return_intermediates`` are then the unfinalized form of the op (a placement:
+    the rows are the class's own intermediates, a function of the token, its expert and the routing alone)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule import default_configs
@@ -518,7 +521,7 @@ def fused_moe(
         )(x, src, x_perm, Tk, H)
     a = grouped_gemm(x_perm, w.w1i, counts, config1, w.chain1)  # [Tk, I] bf16
     y = grouped_gemm(a, w.w2, counts, config2, "plain", torch.bfloat16)  # [Tk, H] bf16
-    if T:
+    if finalize and T:
         get_compiled_combine(
             k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device))
         )(y, dest, scales, out, T, H)
