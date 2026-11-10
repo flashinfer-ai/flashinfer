@@ -243,9 +243,6 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
         }
     }
 
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-
     // === Task calls (declaration order) ===
     int off_n = blockIdx.x * 64;
     if (warp == 0) {
@@ -309,6 +306,8 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                    "r"(full_addr + 24), "l"(0x14F0000000000000ULL) : "memory");
         }
     }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     unsigned int a_frag[4];
     unsigned int b_frag[2];
     unsigned int xa0[4];
@@ -2836,16 +2835,20 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_mapa_0) : "r"(smk_mail_addr + (unsigned int)rec_lane), "r"(nw * 2));
-            uint32_t _mapa_1;
-            asm volatile(
+            uint32_t _mbar_peer_16;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_1) : "r"(mail_addr), "r"(nw * 2));
+                : "=r"(_mbar_peer_16) : "r"(mail_addr), "r"(nw * 2));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_0), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])), "r"(_mapa_1) : "memory");
+                :: "r"(_mapa_0), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])), "r"(_mbar_peer_16) : "memory");
+            uint32_t _mbar_peer_17;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_17) : "r"(mail_addr), "r"(nw * 2));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_0 + 512), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])), "r"(_mapa_1) : "memory");
+                :: "r"(_mapa_0 + 512), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])), "r"(_mbar_peer_17) : "memory");
         }
         if (nw * 2 + 1 == rank) {
             smk_mail[rec_lane / 4] = acc[8];
@@ -2857,20 +2860,24 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
             smk_mail[rec_lane / 4 + 130] = acc[14];
             smk_mail[rec_lane / 4 + 131] = acc[15];
         } else {
-            uint32_t _mapa_2;
+            uint32_t _mapa_1;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_2) : "r"(smk_mail_addr + (unsigned int)rec_lane), "r"(nw * 2 + 1));
-            uint32_t _mapa_3;
-            asm volatile(
+                : "=r"(_mapa_1) : "r"(smk_mail_addr + (unsigned int)rec_lane), "r"(nw * 2 + 1));
+            uint32_t _mbar_peer_18;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_3) : "r"(mail_addr), "r"(nw * 2 + 1));
+                : "=r"(_mbar_peer_18) : "r"(mail_addr), "r"(nw * 2 + 1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_2), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])), "r"(_mapa_3) : "memory");
+                :: "r"(_mapa_1), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])), "r"(_mbar_peer_18) : "memory");
+            uint32_t _mbar_peer_19;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_19) : "r"(mail_addr), "r"(nw * 2 + 1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_2 + 512), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])), "r"(_mapa_3) : "memory");
+                :: "r"(_mapa_1 + 512), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])), "r"(_mbar_peer_19) : "memory");
         }
         if (warp == 0) {
             if (elect_sync()) {
@@ -2949,10 +2956,10 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                 if (col < N) {
                     if (N % 2 < 1) {
                         float _scaled_0[2];
-                        const float2 _scale2_16 = {alpha_value, alpha_value};
+                        const float2 _scale2_20 = {alpha_value, alpha_value};
                         #pragma unroll
                         for (int _ls = 0; _ls < 1; _ls++)
-                            reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(rs_sum)[_ls], _scale2_16);
+                            reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(rs_sum)[_ls], _scale2_20);
                         unsigned int _packed_0[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -2970,10 +2977,10 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                 if (col + 16 < N) {
                     if (N % 2 < 1) {
                         float _scaled_1[2];
-                        const float2 _scale2_17 = {alpha_value, alpha_value};
+                        const float2 _scale2_21 = {alpha_value, alpha_value};
                         #pragma unroll
                         for (int _ls = 0; _ls < 1; _ls++)
-                            reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 4))[_ls], _scale2_17);
+                            reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 4))[_ls], _scale2_21);
                         unsigned int _packed_1[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -2994,10 +3001,10 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                 if (col < N) {
                     if (N % 2 < 1) {
                         float _scaled_2[2];
-                        const float2 _scale2_18 = {alpha_value, alpha_value};
+                        const float2 _scale2_22 = {alpha_value, alpha_value};
                         #pragma unroll
                         for (int _ls = 0; _ls < 1; _ls++)
-                            reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 2))[_ls], _scale2_18);
+                            reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 2))[_ls], _scale2_22);
                         unsigned int _packed_2[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -3015,10 +3022,10 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                 if (col + 16 < N) {
                     if (N % 2 < 1) {
                         float _scaled_3[2];
-                        const float2 _scale2_19 = {alpha_value, alpha_value};
+                        const float2 _scale2_23 = {alpha_value, alpha_value};
                         #pragma unroll
                         for (int _ls = 0; _ls < 1; _ls++)
-                            reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 6))[_ls], _scale2_19);
+                            reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 6))[_ls], _scale2_23);
                         unsigned int _packed_3[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -3107,10 +3114,10 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                 if (col_1 + 32 < N) {
                     if (N % 2 < 1) {
                         float _scaled_4[2];
-                        const float2 _scale2_20 = {alpha_value_1, alpha_value_1};
+                        const float2 _scale2_24 = {alpha_value_1, alpha_value_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 1; _ls++)
-                            reinterpret_cast<float2*>(_scaled_4)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(rs_sum_1)[_ls], _scale2_20);
+                            reinterpret_cast<float2*>(_scaled_4)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(rs_sum_1)[_ls], _scale2_24);
                         unsigned int _packed_4[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -3128,10 +3135,10 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                 if (col_1 + 48 < N) {
                     if (N % 2 < 1) {
                         float _scaled_5[2];
-                        const float2 _scale2_21 = {alpha_value_1, alpha_value_1};
+                        const float2 _scale2_25 = {alpha_value_1, alpha_value_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 1; _ls++)
-                            reinterpret_cast<float2*>(_scaled_5)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 4))[_ls], _scale2_21);
+                            reinterpret_cast<float2*>(_scaled_5)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 4))[_ls], _scale2_25);
                         unsigned int _packed_5[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -3152,10 +3159,10 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                 if (col_1 + 32 < N) {
                     if (N % 2 < 1) {
                         float _scaled_6[2];
-                        const float2 _scale2_22 = {alpha_value_1, alpha_value_1};
+                        const float2 _scale2_26 = {alpha_value_1, alpha_value_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 1; _ls++)
-                            reinterpret_cast<float2*>(_scaled_6)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 2))[_ls], _scale2_22);
+                            reinterpret_cast<float2*>(_scaled_6)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 2))[_ls], _scale2_26);
                         unsigned int _packed_6[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -3173,10 +3180,10 @@ kernel_cake_blackwell_bf16_fp4_916900985e3576f137a2(const __grid_constant__ CUte
                 if (col_1 + 48 < N) {
                     if (N % 2 < 1) {
                         float _scaled_7[2];
-                        const float2 _scale2_23 = {alpha_value_1, alpha_value_1};
+                        const float2 _scale2_27 = {alpha_value_1, alpha_value_1};
                         #pragma unroll
                         for (int _ls = 0; _ls < 1; _ls++)
-                            reinterpret_cast<float2*>(_scaled_7)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 6))[_ls], _scale2_23);
+                            reinterpret_cast<float2*>(_scaled_7)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 6))[_ls], _scale2_27);
                         unsigned int _packed_7[1];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {

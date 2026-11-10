@@ -900,8 +900,8 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cudnn_grouped_gemm_fp8_per_tensor` | `CudnnGroupedGemmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
-| `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
-| `cute_dsl` | `CuteDslConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
+| `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cute_dsl` | `CuteDslConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cutile_bf16` | `CuTileBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
@@ -938,13 +938,13 @@ python scripts/generate_moe_activation_matrix.py --write
 | `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
 | `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
-| `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
-| `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `MXFP4×BF16` | `SwiGLU` |
-| `prims_ts` | `PrimsTsConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
-| `prims_ts` | `PrimsTsConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
-| `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2`, `SiLU` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2`, `SiLU` |
+| `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2`, `SiLU` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
 | `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `ReLU2` |
@@ -968,6 +968,9 @@ while other runner-specific restrictions remain in `check_support()`.
 
 TRT-LLM FP4 SiTU is supported on SM100/SM103 but rejected on SM107 while the
 pinned Rubin BMM artifact predates `SiTuGlu`.
+
+CuTe-DSL SiTU with MXFP4×MXFP8 or MXFP8×MXFP8 requires
+`CuteDslConfig(swap_ab=True)` on SM100/SM103.
 
 CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
 `situ_linear_beta`); its flat kernel does not expose a separate SiTU
@@ -1159,7 +1162,7 @@ local + `local_expert_offset` — the real deployment shape, in scope for the
 single-GPU harness; the EP *collective* is not), all under a weight-memory
 budget so one config never hogs the GPU.
 
-**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`):
+**Known-failure ledger** (shared `tests/infra/test_helpers/fuzz_ledger.py`):
 wrong-answer findings still run and report `xfail` after healthy backends;
 crash-class findings are quarantined before launch. Unexpected passes fail
 strictly so stale waivers are removed.

@@ -126,7 +126,7 @@ class BatchAttention:
         head_dim_vo: int,
         page_size: int,
         causal: bool = False,
-        sm_scale: float = None,
+        sm_scale: Optional[float] = None,
         logits_soft_cap: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
@@ -163,7 +163,7 @@ class BatchAttention:
             Page size of the paged KV-cache.
         causal : bool
             Whether to apply a causal mask.  Defaults to ``False``.
-        sm_scale : float
+        sm_scale : Optional[float]
             Softmax scale.  If ``None``, defaults to ``1/sqrt(head_dim_qk)``.
         logits_soft_cap : Optional[float]
             Logits soft-cap value.  ``None`` or ``0`` disables capping.
@@ -700,7 +700,8 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
     output dtypes, both head dimensions and the positional-encoding mode.
     :meth:`plan` and :meth:`workspace_size` reject any value that differs from
     what was compiled, and reject the inherited options that would otherwise be
-    accepted and silently ignored.
+    accepted and silently ignored. ``v_sf_swizzled`` reads the V scale factors
+    of a packed NVFP4 cache in the trtllm-gen per-page swizzle.
 
     Example
     -------
@@ -729,6 +730,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         o_data_type: Optional[torch.dtype] = None,
         head_dim_qk: int = 128,
         head_dim_vo: int = 128,
+        v_sf_swizzled: bool = False,
     ) -> None:
         if pos_encoding_mode != "NONE":
             # POS_ENCODING_MODE is a compile-time constant of the customize
@@ -754,6 +756,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             torch.int32,
             head_dim_qk,
             head_dim_vo,
+            v_sf_swizzled,
         )
 
         super().__init__(

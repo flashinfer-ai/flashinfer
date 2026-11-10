@@ -3,11 +3,14 @@
 # tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
 # here only as deliberate regression anchors or for paths the fuzzer cannot express.
 
+from typing import Optional
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from flashinfer import autotune, mm_bf16
+from flashinfer.autotune_cache import MeasurementPolicy, ReplayCoverage, autotune_v2
 from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
@@ -39,10 +42,12 @@ _SMOKE_CASES = [
     (8, 768, 7168, torch.bfloat16, True, True, "cute-dsl", True),
     (17, 2304, 1536, torch.bfloat16, False, False, "cute-dsl", False),
     (8, 768, 8320, torch.bfloat16, False, False, "cute-dsl", False),
-    (33, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
-    (64, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
     (64, 4096, 2048, torch.bfloat16, False, False, "auto", True),
     (1, 2048, 3072, torch.float16, False, False, "auto", False),
+    # pdl=None: untuned runs without PDL; autotuning also profiles PDL variants.
+    (1, 1024, 3072, torch.bfloat16, True, None, "tinygemm", False),
+    (8, 768, 7168, torch.bfloat16, True, None, "cute-dsl", True),
+    (16, 2048, 2048, torch.bfloat16, False, None, "auto", True),
 ]
 
 
@@ -55,7 +60,7 @@ def test_mm_bf16(
     k: int,
     res_dtype: torch.dtype,
     enable_bias: bool,
-    pdl: bool,
+    pdl: Optional[bool],
     backend: str,
     auto_tuning: bool,
 ):
@@ -164,6 +169,256 @@ def test_mm_bf16_autotune_weight_layouts(monkeypatch, backend, padded):
     torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("n,k", [(1, 2560), (12, 5120)])
+def test_mm_bf16_autotune_unaligned_n(monkeypatch, n, k):
+    """Tuning auto must skip CUTLASS, not abort, when N breaks its 16-byte rows.
+
+    N=1 is an MoE shared_expert_gate, N=12 a linear-attention in_proj_ba at TP8.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("The CUTLASS BF16 backend is used on SM100-family.")
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+
+    # Correctness alone does not pin this down: the tuner already caught
+    # CUTLASS's host-side can_implement rejection and moved on, so the result
+    # was right either way. Assert the shape never reaches CUTLASS at all.
+    profiled = set()
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def record_runner(self, runner, *args, **kwargs):
+        profiled.add(type(runner).__name__)
+        return profile_single_kernel(self, runner, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_runner)
+
+    torch.manual_seed(0)
+    a = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    with autotune(True, tuning_buckets=[1, 32, 64]):
+        mm_bf16(a, w.T, backend="auto")
+
+    assert profiled, "autotuning profiled nothing, so the assertion below is vacuous"
+    assert "CutlassBf16GemmRunner" not in profiled, profiled
+
+    for m in (1, 32, 64):
+        out = mm_bf16(a[:m], w.T, backend="auto")
+        reference = (a[:m].float() @ w.float().T).to(torch.bfloat16)
+        torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mm_bf16_tgv_single_element_output(pdl):
+    """M = N = 1: the 1x1 output's batch dim also has stride 1."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("tgv", cc_num):
+        pytest.skip("TGV backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    out = mm_bf16(a, w.T, pdl=pdl, backend="tgv")
+    reference = (a.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "n,k,out_dtype,supported",
+    [
+        (12, 2560, torch.bfloat16, False),
+        (16, 2564, torch.bfloat16, False),
+        (12, 2560, torch.float32, True),
+    ],
+)
+def test_mm_bf16_cutlass_alignment(n, k, out_dtype, supported):
+    """CUTLASS needs K % 8 == 0 and 16-byte output rows; reject others up front."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cutlass", cc_num):
+        pytest.skip("cutlass backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    if not supported:
+        with pytest.raises(ValueError, match="CUTLASS backend requires K divisible"):
+            mm_bf16(a, w.T, out_dtype=out_dtype, backend="cutlass")
+        return
+    out = mm_bf16(a, w.T, out_dtype=out_dtype, backend="cutlass")
+    torch.testing.assert_close(out, a.float() @ w.float().T, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("backend", ["tinygemm", "tgv"])
+@pytest.mark.parametrize("pdl_wins", [False, True])
+def test_mm_bf16_pdl_none_tunes_both_pdl_variants(
+    monkeypatch, backend: str, pdl_wins: bool
+):
+    """pdl=None runs without PDL when untuned or when "bf16_gemm" is skipped;
+    autotuning profiles the backend without and with PDL and launches the
+    faster variant. An explicit pdl still launches as requested."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported(backend, cc_num):
+        pytest.skip(f"{backend} backend not supported on current compute capability.")
+
+    # Record the pdl argument of the kernel launch.
+    if backend == "tinygemm":
+        from flashinfer.gemm.routergemm import get_tinygemm2_module
+
+        module, name, pdl_index = get_tinygemm2_module(), "tinygemm2_nobias_op", 3
+    else:
+        from flashinfer.gemm.kernels import tgv_gemm_cute_ext as module
+
+        name, pdl_index = "run_tgv_cute_ext", 4
+    launch = getattr(module, name)
+    launched = []
+
+    def record_launch(*args):
+        launched.append(args[pdl_index])
+        return launch(*args)
+
+    monkeypatch.setattr(module, name, record_launch)
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    profiled = set()
+
+    def fake_profile(self, runner, inputs, tactic, *args, **kwargs):
+        profiled.add((inputs[3], runner.auto_pdl))
+        return 1.0 if runner.auto_pdl == pdl_wins else 2.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    torch.manual_seed(0)
+    a = torch.randn(4, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
+    mm_bf16(a, w.T, pdl=None, backend=backend)
+    with autotune(True, tuning_buckets=[4], skip_ops={"bf16_gemm"}):
+        mm_bf16(a, w.T, pdl=None, backend=backend)
+    assert launched == [False, False] and not profiled
+    with autotune(True, tuning_buckets=[4]):
+        mm_bf16(a, w.T, pdl=None, backend=backend)
+    assert profiled == {(None, False), (None, True)}
+
+    launched.clear()
+    out = mm_bf16(a, w.T, pdl=None, backend=backend)
+    mm_bf16(a, w.T, backend=backend)
+    mm_bf16(a, w.T, pdl=False, backend=backend)
+    mm_bf16(a, w.T, pdl=True, backend=backend)
+    assert launched == [pdl_wins, False, False, True]
+    reference = (a.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("backend", ["tinygemm", "tgv"])
+@pytest.mark.parametrize("pdl_wins", [False, True])
+def test_mm_bf16_pdl_v2_managed_reload_and_capture(
+    monkeypatch, tmp_path, backend, pdl_wins
+):
+    """PDL winners survive managed reload and graph capture with real launches."""
+    capability = get_compute_capability(torch.device("cuda"))
+    if not mm_bf16.is_backend_supported(backend, capability[0] * 10 + capability[1]):
+        pytest.skip(f"{backend} is not supported on this GPU.")
+
+    from flashinfer.gemm import gemm_base
+
+    profiled, launched = set(), []
+    if backend == "tinygemm":
+        module = gemm_base.get_tinygemm2_module()
+        name, pdl_index = "tinygemm2_nobias_op", 3
+        factory = gemm_base._tinygemm_bf16_gemm_runner
+    else:
+        from flashinfer.gemm.kernels import tgv_gemm_cute_ext as module
+
+        name, pdl_index = "run_tgv_cute_ext", 4
+        factory = gemm_base._tgv_gemm_runner
+    launch = getattr(module, name)
+
+    def record_launch(*args):
+        launched.append(args[pdl_index])
+        return launch(*args)
+
+    def profile(self, runner, inputs, tactic, *args, **kwargs):
+        profiled.add(runner.auto_pdl)
+        return 1.0 if runner.auto_pdl == pdl_wins else 2.0
+
+    monkeypatch.setattr(module, name, record_launch)
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    torch.manual_seed(0)
+    a = torch.randn(4, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16)
+    options = dict(
+        cache_root=tmp_path,
+        cache_scope="context",
+        measurement_policy=MeasurementPolicy(execution_mode="cuda_graph"),
+        tuning_buckets=(4,),
+    )
+    with autotune_v2(mode="tune", **options):
+        mm_bf16(a, w.T, pdl=None, backend=backend)
+    assert profiled == {False, True}
+
+    # Drop both tuner and runner identities: the winner must come from disk.
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    factory.cache_clear()
+    profiled.clear()
+    launched.clear()
+    report = ReplayCoverage()
+    with autotune_v2(
+        mode="replay", strict_replay=True, replay_report=report, **options
+    ):
+        mm_bf16(a, w.T, pdl=None, backend=backend)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = mm_bf16(a, w.T, pdl=None, backend=backend)
+    assert not profiled
+    assert launched == [pdl_wins, pdl_wins]
+    assert (report.hits, report.misses) == (2, 0)
+    assert report.records[0]["source"] == "managed"
+    a.mul_(0.5)
+    graph.replay()
+    reference = (a.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+    # Leaving graph scope preserves the default non-PDL behavior.
+    mm_bf16(a, w.T, backend=backend)
+    assert launched[-1] is False
+
+
+def test_mm_bf16_pdl_variant_cache_keys():
+    """Persisted autotune keys drop the runner hash, so under pdl=None the two
+    PDL variants of a runner need distinct extras; explicit-pdl keys stay."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("The TGV and TinyGEMM BF16 runners need SM100-family.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.gemm import gemm_base
+
+    a = torch.randn(4, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16).T
+    out = torch.empty(4, 2048, device="cuda", dtype=torch.bfloat16)
+    capability = torch.cuda.get_device_capability(a.device)
+    make_runners = [
+        lambda auto_pdl: gemm_base._tgv_gemm_runner(a.dtype, True, auto_pdl=auto_pdl),
+        lambda auto_pdl: gemm_base._tinygemm_bf16_gemm_runner(auto_pdl=auto_pdl),
+    ]
+    if is_cute_dsl_available():
+        cc_num = capability[0] * 10 + capability[1]
+        make_runners.append(
+            lambda auto_pdl: gemm_base._cute_dsl_splitk_bf16_gemm_runner(
+                cc_num, auto_pdl
+            )
+        )
+    for make_runner in make_runners:
+        base, pdl_variant = make_runner(False), make_runner(True)
+        for pdl in (None, False, True):
+            inputs = [a, b, None, pdl, out, None]
+            base_key = base.get_cache_key_extras(inputs)
+            pdl_key = pdl_variant.get_cache_key_extras(inputs)
+            assert (base_key == pdl_key) == (pdl is not None)
+
+    tgv = gemm_base._tgv_gemm_runner(a.dtype, True)
+    assert tgv.get_cache_key_extras([a, b, None, True, out, None]) == (capability,)
+
+
 def test_mm_bf16_cutile_rejects_bias_and_pdl():
     """The v1 cuTile path is alpha=1/beta=0 and ignores bias / pdl — must raise.
 
@@ -224,8 +479,8 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
     )
 
 
-def test_cublaslt_bf16_runner_zero_algos():
-    """CublasltBf16GemmRunner.forward() must raise when heuristic returns 0 algorithms."""
+def test_cublaslt_bf16_runner_zero_algos(monkeypatch):
+    """No candidate algorithms means nothing to profile; the default still runs."""
     from flashinfer.gemm.gemm_base import get_mm_bf16_cublaslt_module
     from flashinfer.utils import get_compute_capability
 
@@ -243,14 +498,12 @@ def test_cublaslt_bf16_runner_zero_algos():
     workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     inputs = [a, b, None, None, out, workspace]
 
-    zero_algo_buf = torch.empty(0, dtype=torch.uint8, device="cpu")
-    original_get_algos = runner._get_algos
-    runner._get_algos = lambda _inputs: (zero_algo_buf, 0)
-    try:
-        with pytest.raises(RuntimeError, match="zero algorithms"):
-            runner.forward(inputs)
-    finally:
-        runner._get_algos = original_get_algos
+    # The runner is memoized; monkeypatch so the stub does not outlive the test.
+    monkeypatch.setattr(runner, "_get_algos", lambda _inputs: [], raising=False)
+    assert runner.get_valid_tactics(inputs, None) == []
+    runner.forward(inputs)
+    cos_sim = F.cosine_similarity((a @ b).reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99
 
 
 @pytest.mark.parametrize("pdl", [False, True])
@@ -294,6 +547,42 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     reference = F.linear(a, b, bias)
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+@pytest.mark.parametrize("pdl", [False, None])
+def test_mm_bf16_cute_dsl_low_m_only(monkeypatch, pdl):
+    """backend="cute-dsl" serves M <= 32 only. Under "auto", a larger M still
+    lists its low-M runners (one large-M warm-up tunes the M <= 32 buckets)
+    and cuBLASLt only once, as its own backend."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.gemm import gemm_base
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16).T
+    with pytest.raises(ValueError, match="M <= 32"):
+        mm_bf16(a, b, pdl=pdl, backend="cute-dsl")
+
+    choose_one = AutoTuner.choose_one
+    runner_lists = []
+
+    def record(self, custom_op, runners, *args, **kwargs):
+        if custom_op.startswith("bf16_gemm"):
+            runner_lists.append(runners)
+        return choose_one(self, custom_op, runners, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", record)
+    out = mm_bf16(a, b, pdl=pdl, backend="auto")
+    (runners,) = runner_lists
+    names = [type(runner).__name__ for runner in runners]
+    assert sum("Cublaslt" in name for name in names) == 1, names
+    assert any(isinstance(r, gemm_base._CuteDSLBf16Runner) for r in runners), names
+    torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
 
 
 if __name__ == "__main__":

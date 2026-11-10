@@ -91,6 +91,29 @@ inline int computeEffectiveRows(int m, QuantizationSFLayout layout) {
   return effectiveRows;
 }
 
+// Resident threads/SM if the device uses the LOADS_IN_FLIGHT=2 kernels, else 0. That is
+// devices with <= 1024 threads/SM (today only SM107); major >= 10 is where the device code
+// uses kSm100EltsPerThread. Cached per device.
+inline int twoLoadsMaxThreadsPerSM() {
+  static thread_local int cachedDevice = -1;
+  static thread_local int cachedValue = 0;
+  int device = -1;
+  cudaGetDevice(&device);
+  if (device != cachedDevice) {
+    int maxThreadsPerSM = 0, major = 0;
+    cudaDeviceGetAttribute(&maxThreadsPerSM, cudaDevAttrMaxThreadsPerMultiProcessor, device);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    cachedValue = (major >= 10 && maxThreadsPerSM <= 1024) ? maxThreadsPerSM : 0;
+    cachedDevice = device;
+  }
+  return cachedValue;
+}
+
+// Device-side CVT_FP16_TO_*_ELTS_PER_THREAD (the host pass sees 8).
+constexpr int kSm100EltsPerThread =
+    (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9)) ? 16
+                                                                                             : 8;
+
 template <typename Fn>
 void dispatchBool(bool value, Fn&& fn) {
   if (value) {
@@ -215,9 +238,13 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
 
   // Grid, Block size.
   // Each thread converts 8/16 values.
-  dim3 block(128);
-  // Get number of blocks per SM (assume we can fully utilize the SM).
-  int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+  // Two-load path: block = half a row of vectors.
+  int const numColThreads = n / kSm100EltsPerThread;
+  int const twoLoadsThreadsPerSM = twoLoadsMaxThreadsPerSM();
+  bool const twoLoads = twoLoadsThreadsPerSM > 0 && numColThreads % 64 == 0;
+  dim3 block(twoLoads ? std::min(numColThreads / 2, 512) : 128);
+  int const numBlocksPerSM = twoLoads ? std::max(1, twoLoadsThreadsPerSM / int(block.x))
+                                      : static_cast<int>(std::max(1u, 2048u / block.x));
   int effectiveRows = computeEffectiveRows(m, layout);
   dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
@@ -232,11 +259,18 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
   config.numAttrs = 1;
   config.attrs = attrs;
-  cudaLaunchKernelEx(
-      &config,
-      quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true>, b,
-      m, n, padded_n, input, nullptr, reinterpret_cast<uint32_t*>(output),
-      reinterpret_cast<uint32_t*>(SFOutput), layout);
+  auto launch = [&](auto kernel) {
+    cudaLaunchKernelEx(&config, kernel, b, m, n, padded_n, input, nullptr,
+                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
+                       layout);
+  };
+  if (twoLoads) {
+    launch(quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true,
+                                    false, false, false, std::false_type, 2>);
+  } else {
+    launch(
+        quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true>);
+  }
 }
 
 template <typename T>
@@ -392,7 +426,7 @@ CUtensorMap make_3d_tma_copy_desc(T* global_address, uint64_t gmem_dim[3],
       encode_func(&tensor_map, data_type, rank, global_address, gmem_dim, stride_in_bytes, smem_dim,
                   elem_strides, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle_type,
                   CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
+                  CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "Failed to encode TMA tensor map");
   return tensor_map;
 }
@@ -482,6 +516,31 @@ template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization
 
+// The TMA kernel's work items are (batch, row tile) pairs over the rows its SF layout pads to.
+template <typename T>
+int64_t tmaWorkTiles(int b, int m, QuantizationSFLayout layout) {
+  constexpr int rowTile = TmaKernelTraits<T>::TMA_ROW_TILE;
+  int64_t rowTiles = (computeEffectiveRows(m, layout) + rowTile - 1) / rowTile;
+  return rowTiles * std::max(b, 1);
+}
+
+// Filling and draining the TMA pipeline costs ~2 us more than the vectorized kernel's launch, which
+// its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2). Its
+// grid spans the work tiles, which must also give every SM one. SM107 breaks even by row count.
+template <typename T>
+bool useTmaQuantization(int b, int m, int n, QuantizationSFLayout layout, int multiProcessorCount) {
+  if (m < 1024 || n % TmaKernelTraits<T>::TMA_COL_CHUNK != 0) {
+    return false;
+  }
+  thread_local int const smVersion = tensorrt_llm::common::getSMVersion();
+  if (smVersion == 107) {
+    return m >= (layout == QuantizationSFLayout::SWIZZLED_128x4 ? 2048 : 3072);
+  }
+  constexpr int64_t kMinTmaInputBytes = 32ll << 20;
+  return tmaWorkTiles<T>(b, m, layout) >= multiProcessorCount &&
+         static_cast<int64_t>(b) * m * n * sizeof(T) >= kMinTmaInputBytes;
+}
+
 // Helper function to launch TMA quantization kernel
 template <BlockScaleQuantizationType quantization_type, typename T, int SF_VEC_SIZE>
 void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* SFScale,
@@ -495,15 +554,11 @@ void launchFP4QuantizationTma(int b, int m, int n, T const* input, float const* 
   constexpr int TMA_COL_TILE = Traits::TMA_COL_TILE;
   constexpr int NUM_CONSUMER_WARPS = 8;
 
-  // Compute effective rows for swizzled layouts
-  int effectiveRows = computeEffectiveRows(m, layout);
-
   // Grid and block configuration for TMA kernel
   // TMA kernel uses 288 threads: 1 producer warp + 8 consumer warps
   dim3 block(288);
-  // Each block handles TMA_ROW_TILE rows
-  int numRowTiles = (effectiveRows + TMA_ROW_TILE - 1) / TMA_ROW_TILE;
-  dim3 grid(std::min(numRowTiles, multiProcessorCount * 2));
+  dim3 grid(static_cast<unsigned>(
+      std::min<int64_t>(tmaWorkTiles<T>(b, m, layout), multiProcessorCount * 2)));
 
   // Dynamic shared memory size
   size_t smem_size = get_tma_smem_size<T>();
@@ -577,11 +632,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   // recipe was always silently ignored there. Python rejects an explicit one.
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-    // Use TMA kernel for large m (high throughput mode)
-    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
+    // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
-      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (useTmaQuantization<T>(b, m, n, layout, multiProcessorCount)) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, false, inverse_scale, false, NVFP44Over6ErrMode::MAE,
@@ -589,7 +642,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         return;
       }
     }
-    // Original non-TMA path for small m or SF_VEC_SIZE != 16
+    // Original non-TMA path for small inputs or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 16 values.
     dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
@@ -615,11 +668,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   } else
 #endif
   {
-    // Use TMA kernel for large m (high throughput mode)
-    // TODO: fix the issue when n is not a multiple of NUM_CONSUMER_WARPS * TMA_COL_TILE
-    constexpr int TMA_COL_CHUNK = 8 * 64;  // NUM_CONSUMER_WARPS * TMA_COL_TILE
+    // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
-      if (m >= 1024 && n % TMA_COL_CHUNK == 0) {
+      if (useTmaQuantization<T>(b, m, n, layout, multiProcessorCount)) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, recipe.use4Over6, inverse_scale,
@@ -628,12 +679,17 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         return;
       }
     }
-    // Original non-TMA path for small m or SF_VEC_SIZE != 16
+    // Original non-TMA path for small inputs or SF_VEC_SIZE != 16
     // Grid, Block size.
     // Each thread converts 8 values.
-    dim3 block(std::min(int(n / CVT_FP16_TO_FP4_ELTS_PER_THREAD), 512));
-    // Get number of blocks per SM (assume we can fully utilize the SM).
-    int const numBlocksPerSM = std::max(1u, 2048u / block.x);
+    // MXFP4 two-load path: block = half a row of vectors.
+    int const numColThreads = n / kSm100EltsPerThread;
+    int const twoLoadsThreadsPerSM = SF_VEC_SIZE == 32 ? twoLoadsMaxThreadsPerSM() : 0;
+    bool const twoLoads = twoLoadsThreadsPerSM > 0 && numColThreads % 64 == 0;
+    dim3 block(twoLoads ? std::min(numColThreads / 2, 512)
+                        : std::min(int(n / CVT_FP16_TO_FP4_ELTS_PER_THREAD), 512));
+    int const numBlocksPerSM = twoLoads ? std::max(1, twoLoadsThreadsPerSM / int(block.x))
+                                        : static_cast<int>(std::max(1u, 2048u / block.x));
     int effectiveRows = computeEffectiveRows(m, layout);
     dim3 grid(std::min(effectiveRows, multiProcessorCount * numBlocksPerSM));
 
@@ -657,6 +713,14 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
           BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
           decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
           decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag)>;
+      if constexpr (SF_VEC_SIZE == 32) {
+        if (twoLoads) {
+          kernel_instance = &quantize_with_block_size<
+              BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE, decltype(useUE8M0Tag)::value,
+              decltype(useRowWiseScaleTag)::value, decltype(useInverseScaleTag)::value,
+              decltype(disableFP4QuantFastMathTag)::value, decltype(nvfp4_4over6_config_tag), 2>;
+        }
+      }
       cudaLaunchKernelEx(&config, kernel_instance, b, m, n, n, input, SFScale,
                          reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
                          layout);

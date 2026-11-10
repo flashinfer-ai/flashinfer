@@ -38,9 +38,9 @@ from flashinfer.experimental.kimi_k3_tp12_tail import cake_jit
 
 ATOL = RTOL = 1e-2
 SEED = 620
-# One-launch rows (M <= 8: the four-token program at 1 / 4, the eight-token program at 6 / 8), K3-ESS rows with the
-# one-shot / two-shot ESS K1 up to the last ESS row 960, and the first cp.async.bulk persistent rows 961 / 962.
-GPU_ROWS = (1, 4, 6, 8, 16, 32, 128, 256, 300, 960, 961, 962)
+# One-launch rows (M <= 8: the four-token program at 1 / 4, the eight-token program at 6 / 8), the one-shot ESS
+# rows, and the rows on both sides of every route-table boundary.
+GPU_ROWS = (1, 4, 6, 8, 16, 32, 128, 256, 300, 319, 320, 960, 961, 962)
 GPU_MAX_TOKENS = 1024
 
 
@@ -84,43 +84,71 @@ def test_route_selection_by_token_count():
     for M in (9, 12, 16):
         for rank in range(cb.WORLD_SIZE):
             assert cb.route_kernel_keys(M, rank) == ("k1_oneshot_ess", "k3_ess:grouped")
-    for M in (17, 32, 128, 255, 256, 257, 512, 960):
-        assert cb.route_kernel_keys(M, 3) == (
-            "k1_twoshot_ess:grouped",
-            "k3_ess:grouped",
-        )
-    # persistent K3 pipeline with cp.async.bulk pushes (pinned) from K3_PERSIST_MIN_TOKENS on
+    # route table above the one-shot rows: (first M, form)
+    assert cb.ROUTE_TABLE == (
+        (17, "ess"),
+        (320, "reduce"),
+        (961, "persist"),
+    )
     assert cb.GROUPED_MAX_TOKENS == 960
     assert cb.K3_PERSIST_MIN_TOKENS == cb.BULK_MIN_TOKENS == 961
-    for M in (961, 962, 1024, 2048, 4096):
-        assert cb.route_kernel_keys(M, 3) == (
-            "k1_twoshot:pinned",
-            "k3_persist_bulk:pinned",
-        )
+    expected = {
+        17: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        32: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        128: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        255: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        256: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        257: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        319: ("k1_twoshot_ess:grouped", "k3_ess:grouped"),
+        320: ("k1_twoshot_ess:grouped", "k3_reduce:grouped"),
+        512: ("k1_twoshot_ess:grouped", "k3_reduce:grouped"),
+        960: ("k1_twoshot_ess:grouped", "k3_reduce:grouped"),
+        961: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+        962: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+        1024: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+        2048: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+        4096: ("k1_twoshot:pinned", "k3_persist_bulk:pinned"),
+    }
+    for M, keys in expected.items():
+        for rank in (0, 3, 11):
+            assert cb.route_kernel_keys(M, rank) == keys, M
     for M in (1, 4, 5, 8):
         assert len(cb.route_kernel_keys(M, 0)) == 1
-    for M in (9, 255, 256, 257, 960, 961, 4096):
-        assert len(cb.route_kernel_keys(M, 0)) == 2
     assert cb.k3_form_for(8) == "k123" and cb.k3_form_for(9) == "ess"
-    assert cb.k3_form_for(256) == "ess" and cb.k3_form_for(960) == "ess"
-    assert cb.k3_form_for(961) == "persist_bulk"
+    for M, keys in expected.items():
+        tail = keys[-1].split(":")[0]
+        assert cb.k3_form_for(M) == {"k3_ess": "ess", "k3_reduce": "reduce"}.get(
+            tail, "persist_bulk"
+        ), M
+    for M in (9, 16):
+        with pytest.raises(ValueError):
+            cb.route_form_for(M)
     # the plain grouped two-shot K1 and the plain persistent K3 stay registered, but no token count selects them
     selected = {key for M in range(1, 4097) for key in cb.route_kernel_keys(M, 0)}
     assert selected == set(cake_jit.required_kernel_keys()) - {
         "k1_twoshot:grouped",
         "k3_persist:grouped",
     }
-    # K3-ESS: one CTA per token and column half; persistent forms: min(M, SM count)
+    # K3-ESS: one CTA per token and column half; persistent forms (reduce mode, bulk): min(M, SM count)
     assert cb.k3_grid(9, 152, 0) == (9, 2, 1)
+    assert cb.k3_grid(17, 148, 3) == (17, 2, 1)
+    assert cb.k3_grid(17, 152, 3) == (17, 2, 1)
     assert cb.k3_grid(100, 152, 3) == (100, 2, 1)
+    assert cb.k3_grid(255, 148, 3) == (255, 2, 1)
     assert cb.k3_grid(255, 152, 3) == (255, 2, 1)
-    assert cb.k3_grid(256, 152, 3) == (256, 2, 1)
-    assert cb.k3_grid(960, 148, 3) == (960, 2, 1)
+    assert cb.k3_grid(319, 148, 3) == (319, 2, 1)
+    assert cb.k3_grid(319, 152, 3) == (319, 2, 1)
+    assert cb.k3_grid(320, 148, 3) == (148, 2, 1)
+    assert cb.k3_grid(320, 152, 3) == (152, 2, 1)
+    assert cb.k3_grid(960, 148, 3) == (148, 2, 1)
+    assert cb.k3_grid(960, 152, 3) == (152, 2, 1)
+    assert cb.k3_grid(961, 148, 3) == (148, 2, 1)
     assert cb.k3_grid(961, 152, 3) == (152, 2, 1)
     assert cb.k3_grid(4096, 148, 3) == (148, 2, 1)
+    assert cb.k3_grid(4096, 152, 3) == (152, 2, 1)
     with pytest.raises(ValueError):
         cb.k3_grid(4096, 0, 3)
-    assert len(cake_jit.required_kernel_keys()) == 9
+    assert len(cake_jit.required_kernel_keys()) == 10
     assert set(cake_jit.required_kernel_keys()) == {
         "k1_oneshot_ess",
         "k1_twoshot_ess:grouped",
@@ -129,6 +157,7 @@ def test_route_selection_by_token_count():
         "k123:c4",
         "k123:c8",
         "k3_ess:grouped",
+        "k3_reduce:grouped",
         "k3_persist:grouped",
         "k3_persist_bulk:pinned",
     }
@@ -178,11 +207,64 @@ def test_generated_module_inventory():
             "grid",
         }
         assert record["launch"]["use_pdl"] is True
+        # the one-launch program's CTAs wait for CTAs of the same grid: it launches cooperatively, the others do not
+        assert record["launch"]["cooperative"] is key.startswith("k123:"), key
         assert tuple(record["launch"]["block"]) == (cb.THREADS, 1, 1)
     for arch in cake_jit.ARCHES:
         assert cake_jit.route_available(arch, tuple(required))
         for key in required:
             assert cake_jit.kernel_module_name(arch, key) == cake_jit.KERNELS[key]
+
+
+class _FakeCommBackend:
+    """A host-only stand-in for the comm backend's ``allgather``: every rank reports ``counts``."""
+
+    def __init__(self, counts):
+        self.counts = tuple(counts)
+        self.sent = []
+
+    def allgather(self, data):
+        self.sent.append(data)
+        return self.counts
+
+
+def test_sm_count_is_the_group_minimum():
+    # the persistent tails map token t to CTA t mod P on every rank: P is the group's smallest SM count
+    backend = _FakeCommBackend([152] * 11 + [148])
+    assert cb.group_sm_count(backend, 152) == 148
+    assert backend.sent == [152]
+    assert cb.group_sm_count(_FakeCommBackend([152] * 12), 152) == 152
+    assert cb.group_sm_count(_FakeCommBackend([148] * 12), 148) == 148
+    with pytest.raises(ValueError):
+        cb.group_sm_count(_FakeCommBackend([152] * 12), 0)
+    with pytest.raises(ValueError):
+        cb.group_sm_count(_FakeCommBackend([152] * 11 + [0]), 152)
+
+
+def test_refused_cooperative_launch_raises_cleanly(monkeypatch):
+    """A refused cooperative launch of the one-launch program raises a RuntimeError that names the SM need, after
+    the runtime's last error is cleared; other launch errors pass through unchanged (CPU only)."""
+    cleared = []
+    monkeypatch.setattr(cb, "_clear_cuda_last_error", lambda: cleared.append(True))
+
+    def launch_of(message):
+        def entry():
+            raise RuntimeError(f"cudaLaunchKernelExC failed: {message}")
+
+        return cb._Launch(
+            stage="k1", key="k123:c4", module="m", kwargs={}, entry=entry, arguments=()
+        )
+
+    need = f"needs {cb.k123_grid(1, 0)[0]} SMs resident at once"
+    with pytest.raises(RuntimeError, match=need) as info:
+        cb._launch_one_launch_program(
+            launch_of("too many blocks in cooperative launch"), 1, 0
+        )
+    assert cleared == [True]
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+    with pytest.raises(RuntimeError, match="invalid argument"):
+        cb._launch_one_launch_program(launch_of("invalid argument"), 1, 0)
+    assert cleared == [True]
 
 
 class _LaunchKwargsWorkspace:
@@ -219,7 +301,7 @@ def test_launch_kwargs_cover_every_generated_argument_plan():
     workspace = _LaunchKwargsWorkspace()
     cases = [
         (M, rank, cb.route_kernel_keys(M, rank))
-        for M in (1, 4, 5, 8, 9, 16, 17, 32, 128, 255, 256, 300, 960, 961, 1024)
+        for M in (1, 4, 5, 8, 9, 16, 17, 128, 255, 256, 300, 319, 320, 960, 961, 1024)
         for rank in (0, 5, 11)
     ]
     # registered programs no token count selects: the plain grouped two-shot K1 and the plain persistent K3
@@ -279,6 +361,26 @@ def _single_gpu_platform() -> str:
     if torch.cuda.get_device_capability(0) not in cb.SUPPORTED_COMPUTE_CAPABILITIES:
         return "generated kernels target Blackwell SM100 / SM103"
     return ""
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_clear_cuda_last_error_reaches_the_runtime_torch_reads():
+    """The clear resets the last error of the libcudart that torch's launch checks read: an error planted there by
+    a failing runtime call no longer surfaces in the next torch op (one GPU)."""
+    import ctypes
+
+    torch.ones(1, device="cuda").sum().item()
+    major = torch.version.cuda.split(".")[0]
+    cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+    cudart.cudaFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    cudart.cudaFuncSetAttribute.restype = ctypes.c_int
+    cudart.cudaPeekAtLastError.restype = ctypes.c_int
+    # a null function: cudaErrorInvalidDeviceFunction, which is not sticky
+    assert cudart.cudaFuncSetAttribute(None, 8, 0) != 0
+    assert cudart.cudaPeekAtLastError() != 0
+    cb._clear_cuda_last_error()
+    assert cudart.cudaPeekAtLastError() == 0
+    assert (torch.ones(1024, device="cuda") + 1).sum().item() == 2048
 
 
 @pytest.mark.skipif(bool(_single_gpu_platform()), reason=_single_gpu_platform() or "")
@@ -361,8 +463,28 @@ def _rank_invariant(out: torch.Tensor, world: int) -> bool:
     return all(torch.equal(outs[0], t) for t in outs[1:])
 
 
+@pytest.fixture(scope="module")
+def twelve_rank_group():
+    """The process group of the twelve-rank tests, initialised once for the module.
+
+    A process group initialised again after ``destroy_process_group`` in the same torchrun process can read the
+    previous group's rendezvous keys from the launcher's store, so the tests share one group.
+    """
+    import torch.distributed as dist
+
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    local = int(os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count())))
+    torch.cuda.set_device(local)
+    yield rank, world, torch.device("cuda", local)
+    if owns_group:
+        dist.destroy_process_group()
+
+
 @pytest.mark.skipif(bool(_twelve_rank_platform()), reason=_twelve_rank_platform() or "")
-def test_tail_matches_reference_on_twelve_ranks():
+def test_tail_matches_reference_on_twelve_ranks(twelve_rank_group):
     import torch.distributed as dist
 
     from flashinfer.kimi_k3_tp12_tail import (
@@ -370,14 +492,8 @@ def test_tail_matches_reference_on_twelve_ranks():
         prepare_kimi_k3_tp12_tail,
     )
 
-    owns_group = not dist.is_initialized()
-    if owns_group:
-        dist.init_process_group("nccl")
-    rank, world = dist.get_rank(), dist.get_world_size()
+    rank, world, device = twelve_rank_group
     assert world == cb.WORLD_SIZE
-    local = int(os.environ.get("LOCAL_RANK", rank % max(1, torch.cuda.device_count())))
-    torch.cuda.set_device(local)
-    device = torch.device("cuda", local)
     if not cb.generated_program_available(device):
         pytest.skip("no generated program registered for this architecture")
     workspace = create_kimi_k3_tp12_tail_workspace(rank=rank, max_tokens=GPU_MAX_TOKENS)
@@ -445,5 +561,114 @@ def test_tail_matches_reference_on_twelve_ranks():
     finally:
         torch.cuda.synchronize()
         workspace.destroy()
-        if owns_group:
-            dist.destroy_process_group()
+
+
+# One-launch rows of both programs and one row of every tail route.
+STREAM_ROWS = (1, 4, 8, 64, 320, 961)
+STREAM_CALLS = 24
+
+
+@pytest.mark.skipif(bool(_twelve_rank_platform()), reason=_twelve_rank_platform() or "")
+def test_alternating_streams_are_ordered_on_twelve_ranks(twelve_rank_group):
+    """Calls that alternate between two streams with no caller synchronisation run one at a time (the workspace
+    orders a launch from another stream after the previous one): every call is bitwise the single-stream result."""
+    import torch.distributed as dist
+
+    from flashinfer.kimi_k3_tp12_tail import (
+        create_kimi_k3_tp12_tail_workspace,
+        prepare_kimi_k3_tp12_tail,
+    )
+
+    rank, world, device = twelve_rank_group
+    assert world == cb.WORLD_SIZE
+    if not cb.generated_program_available(device):
+        pytest.skip("no generated program registered for this architecture")
+    workspace = create_kimi_k3_tp12_tail_workspace(rank=rank, max_tokens=GPU_MAX_TOKENS)
+    streams = (torch.cuda.Stream(), torch.cuda.Stream())
+    try:
+        for M in STREAM_ROWS:
+            inp = make_inputs(M, rank, device)
+            # one runner (and output) per stream over the one workspace: each stream touches only its own output
+            outs = (inp["out"], torch.empty_like(inp["out"]))
+            runners = [
+                prepare_kimi_k3_tp12_tail(
+                    inp["routed"],
+                    inp["shared"],
+                    inp["norm_w"],
+                    inp["up_w"],
+                    out,
+                    workspace=workspace,
+                )
+                for out in outs
+            ]
+            runners[0]()
+            torch.cuda.synchronize()
+            first = outs[0].clone()
+            copies = torch.empty(
+                (STREAM_CALLS, *first.shape), dtype=first.dtype, device=device
+            )
+            for i in range(STREAM_CALLS):
+                with torch.cuda.stream(streams[i % 2]):
+                    outs[i % 2].fill_(float("nan"))
+                    runners[i % 2]()
+                    copies[i].copy_(outs[i % 2])
+            torch.cuda.synchronize()
+            for i in range(STREAM_CALLS):
+                assert torch.equal(copies[i], first), f"M={M}: call {i} differs"
+            assert _rank_invariant(first, world), f"M={M}: output differs between ranks"
+        dist.barrier()
+    finally:
+        torch.cuda.synchronize()
+        workspace.destroy()
+
+
+@pytest.mark.skipif(bool(_twelve_rank_platform()), reason=_twelve_rank_platform() or "")
+def test_partition_below_the_grid_refuses_cleanly_on_twelve_ranks(twelve_rank_group):
+    """On a green-context stream with fewer SMs than the one-launch program's grid, every rank's call raises a
+    RuntimeError before any device work and leaves no CUDA error behind; the same runner then runs on the full
+    device with its earlier result."""
+    import torch.distributed as dist
+
+    from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+    from flashinfer.kimi_k3_tp12_tail import (
+        create_kimi_k3_tp12_tail_workspace,
+        prepare_kimi_k3_tp12_tail,
+    )
+
+    rank, world, device = twelve_rank_group
+    assert world == cb.WORLD_SIZE
+    if not cb.generated_program_available(device):
+        pytest.skip("no generated program registered for this architecture")
+    workspace = create_kimi_k3_tp12_tail_workspace(rank=rank, max_tokens=GPU_MAX_TOKENS)
+    try:
+        streams, resources = split_device_green_ctx_by_sm_count(device, [32])
+        partition_sms = int(resources[0].sm.smCount)
+        for M in (1, 8):
+            assert partition_sms < cb.k123_grid(M, rank)[0]
+            inp = make_inputs(M, rank, device)
+            runner = prepare_kimi_k3_tp12_tail(
+                inp["routed"],
+                inp["shared"],
+                inp["norm_w"],
+                inp["up_w"],
+                inp["out"],
+                workspace=workspace,
+            )
+            runner()
+            torch.cuda.synchronize()
+            first = inp["out"].clone()
+            with (
+                torch.cuda.stream(streams[0]),
+                pytest.raises(RuntimeError, match="cooperative launch was refused"),
+            ):
+                runner()
+            # no stale error: the next torch op launches and checks cleanly
+            assert (torch.ones(1024, device=device) + 1).sum().item() == 2048
+            inp["out"].fill_(float("nan"))
+            runner()
+            torch.cuda.synchronize()
+            assert torch.equal(inp["out"], first), f"M={M}: full-device call differs"
+        dist.barrier()
+    finally:
+        torch.cuda.synchronize()
+        workspace.destroy()

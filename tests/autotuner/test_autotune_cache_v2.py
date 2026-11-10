@@ -23,9 +23,11 @@ from flashinfer.autotune_cache import (
 )
 from flashinfer.autotuner import (
     AutoTuner,
+    DynamicTensorSpec,
     TuningConfig,
     autotune,
 )
+from flashinfer.utils import next_positive_power_of_2
 
 from .utils import DummyRunner, reset_autotuner
 
@@ -56,13 +58,17 @@ def cache_root(tmp_path, monkeypatch):
 
 def _install_fake_profile(monkeypatch, times, record_configs=None):
     """Replace GPU profiling with a lookup table; returns the call log.
-    Pass a list as *record_configs* to also capture each TuningConfig."""
+    Pass a list as *record_configs* to also capture each TuningConfig.
+    *times* is a ``{tactic: time}`` table, or a ``(inputs, tactic) -> time``
+    callable when the winner must depend on the profiled shape."""
     calls = []
 
     def fake_profile(self, runner, inputs, tactic, tuning_config, **kwargs):
         calls.append(tactic)
         if record_configs is not None:
             record_configs.append(tuning_config)
+        if callable(times):
+            return float(times(inputs, tactic))
         return float(times[tactic])
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
@@ -345,6 +351,51 @@ def test_hydrate_only_context_enables_reuse(cache_root, monkeypatch):
         pass  # attach only; no calls inside
     _, tactic = AutoTuner.get().choose_one(
         _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
+    )
+    assert tactic == 1
+    assert calls == []
+
+
+def test_serving_above_top_tuned_bucket_uses_largest_entry(cache_root, monkeypatch):
+    """A serving lookup whose bucket lies above every bucket in the store is
+    served from the largest hydrated entry instead of the fallback."""
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4, 8),
+                map_to_tuning_buckets=next_positive_power_of_2,
+            ),
+        ),
+    )
+
+    # Bucket 4 is won by tactic 0 and bucket 8 by tactic 1, so the served
+    # tactic shows which entry the lookup used.
+    def times_by_bucket(inputs, tactic):
+        return {
+            4: {0: 1.0, 1: 3.0, 2: 2.0},
+            8: {0: 3.0, 1: 1.0, 2: 2.0},
+        }[inputs[0].shape[0]][tactic]
+
+    _install_fake_profile(monkeypatch, times=times_by_bucket)
+    with autotune_v2():
+        AutoTuner.get().choose_one(_OP, [DummyRunner()], config, [torch.zeros(8, 16)])
+    assert len(_entry_files(cache_root)) == 2
+
+    _fresh_process()
+    calls = _install_fake_profile(monkeypatch, times=times_by_bucket)
+    with autotune_v2(mode="replay"):
+        pass  # hydrate the entries for buckets 4 and 8
+    # A malformed key must not break the scan for the top tuned bucket.
+    store = AutoTuner.get()._active_managed_store
+    for bad_key in (("too", "short"), (_OP, "DummyRunner", None, ())):
+        AutoTuner.get()._managed_decoded[(str(store.root), store.env_hash, bad_key)] = (
+            object()
+        )
+    # 12 maps to bucket 16, above both tuned buckets.
+    _, tactic = AutoTuner.get().choose_one(
+        _OP, [DummyRunner()], config, [torch.zeros(12, 16)]
     )
     assert tactic == 1
     assert calls == []

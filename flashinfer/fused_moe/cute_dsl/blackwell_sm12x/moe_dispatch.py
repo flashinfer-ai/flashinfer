@@ -25,6 +25,7 @@ from flashinfer.cute_dsl.utils import (
     make_ptr,
 )
 from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from flashinfer.utils import get_compute_capability
 from .moe_activation import SWIGLUOAI_UNINTERLEAVE, is_gated_activation
 from .moe_direct_micro_kernel import (
     MoEDirectMicroKernel,
@@ -95,6 +96,10 @@ _MICRO_MAX_TOKENS = 8
 # kernel, and only at small intermediate sizes where its CUDA-core dots
 # keep up with per-token work. Measured on GB10, pending other GPUs.
 _DIRECT_MICRO_CUTOVER_PAIRS = 32
+# NVFP4 on RTX PRO 6000 (SM120): direct micro up to 8 tokens at top-8, with FC1
+# sized to finish in one round (measured with 256 experts, top-8, hidden 2048,
+# intermediate 512).
+_SM120_NVFP4_DIRECT_MICRO_CUTOVER_PAIRS = 65
 _DIRECT_MICRO_MAX_N = 512
 # Test/bench hook: force one backend ("direct_micro", "micro", "static",
 # "dynamic"). Deliberately module-level (a monkeypatch target), not an env var.
@@ -224,6 +229,16 @@ _DYNAMIC_MAC_LADDER: Tuple[Tuple[int, int], ...] = (
     (640, 188),
     (1024, 147),
 )
+
+
+def _is_sm120_nvfp4(device: torch.device, quant_mode: str | None) -> bool:
+    """Whether the SM120 NVFP4 direct-micro values apply (never without a GPU)."""
+    return (
+        quant_mode == "nvfp4"
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+        and get_compute_capability(_canonical_cuda_device(device)) == (12, 0)
+    )
 
 
 def _lookup_mac_ladder(
@@ -1375,7 +1390,6 @@ def _static_kernel_cache_key(
     quant_mode: str,
     state_E: int,
     weight_E: int,
-    m: int,
     k: int,
     n: int,
     weight_n: int,
@@ -1406,7 +1420,6 @@ def _static_kernel_cache_key(
         quant_mode,
         state_E,
         weight_E,
-        m,
         k,
         n,
         weight_n,
@@ -1594,7 +1607,6 @@ def _get_static_kernel(
         quant_mode=quant_mode,
         state_E=state_E,
         weight_E=weight_E,
-        m=m,
         k=k,
         n=n,
         weight_n=weight_n,
@@ -1649,9 +1661,11 @@ def _get_static_kernel(
     cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     # Build fake tensors for compilation
+    sym_tokens = cute.sym_int()
+    sym_pairs = cute.sym_int()
     a_input_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (sym_tokens, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -1661,12 +1675,12 @@ def _get_static_kernel(
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
     topk_ids_fake = cute.runtime.make_fake_compact_tensor(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        (sym_pairs,),
         assumed_align=topk_ids_align,
     )
     topk_weights_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (m * num_topk,),
+        (sym_pairs,),
         assumed_align=4,
     )
     packed_a_fake = cute.runtime.make_fake_compact_tensor(
@@ -1762,7 +1776,7 @@ def _get_static_kernel(
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (sym_tokens, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -1789,7 +1803,7 @@ def _get_static_kernel(
     compiled = build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
         _disk_kernel_name(
-            f"static_m{m}_k{k}_n{n}_t{num_topk}_r{max_rows}_c{route_rows}"
+            f"static_k{k}_n{n}_t{num_topk}_r{max_rows}_c{route_rows}"
             f"{'_mg' if merged_groups else ''}{'_di' if deferred_init else ''}{'_ss' if source_scales else ''}",
             cache_key,
         ),
@@ -2111,6 +2125,7 @@ def _get_direct_micro_kernel(
     swiglu_beta: float = 1.0,
     swiglu_limit: float | None = None,
     device: torch.device | None = None,
+    one_round_fc1: bool = False,
 ):
     """Compile (or retrieve cached) the SM120 direct micro MoE kernel.
 
@@ -2140,6 +2155,7 @@ def _get_direct_micro_kernel(
         swiglu_beta,
         swiglu_limit,
         str(_canonical_cuda_device(device)) if device is not None else None,
+        one_round_fc1,
     )
     cached = _DIRECT_MICRO_LAUNCH_CACHE.get(launch_key)
     if cached is not None:
@@ -2161,6 +2177,7 @@ def _get_direct_micro_kernel(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         device=device,
+        one_round_fc1=one_round_fc1,
     )
     compile_key = ("direct_micro", kernel.__cache_key__, topk_ids_dtype)
     entry = _DIRECT_MICRO_KERNEL_CACHE.get(compile_key)
@@ -2299,13 +2316,19 @@ def launch_sm120_static_moe(
     )
     # Direct micro takes its band before the MMA micro decision. It reads
     # weights by global expert id, so EP shapes keep the compact path.
+    sm120_nvfp4 = _is_sm120_nvfp4(a.device, quant_mode)
+    direct_micro_cutover_pairs = (
+        _SM120_NVFP4_DIRECT_MICRO_CUTOVER_PAIRS
+        if sm120_nvfp4
+        else _DIRECT_MICRO_CUTOVER_PAIRS
+    )
     use_direct_micro = (
         quant_mode == "nvfp4"
         and workspace.state_E == num_experts
         and workspace.dm_barrier_count is not None
         and workspace.dm_barrier_count.numel() >= routed_rows + num_tokens * 16
         and num_tokens <= _MICRO_MAX_TOKENS
-        and (routed_rows < _DIRECT_MICRO_CUTOVER_PAIRS or direct_m4_source_shape)
+        and (routed_rows < direct_micro_cutover_pairs or direct_m4_source_shape)
         and family_n <= _DIRECT_MICRO_MAX_N
         and MoEDirectMicroKernel.is_supported(
             num_tokens, k, family_n, top_k, num_experts
@@ -2352,6 +2375,7 @@ def launch_sm120_static_moe(
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             device=a.device,
+            one_round_fc1=sm120_nvfp4,
         )
         if not block_ok:
             if _FORCED_BACKEND == "direct_micro":
@@ -3935,6 +3959,11 @@ def allocate_sm120_moe_workspace(
     raise ValueError(f"unsupported SM120 MoE backend {backend!r}")
 
 
+def _bucket_workspace_rows(routed_rows: int) -> int:
+    """Round a workspace row request up to a power-of-two (floor 128)."""
+    return 1 << (max(128, int(routed_rows)) - 1).bit_length()
+
+
 def _get_cached_workspace(
     *,
     backend: str,
@@ -4000,10 +4029,9 @@ def _get_cached_workspace(
             "functional path before capture."
         )
     _refuse_during_capture("a per-call MoE workspace")
-    workspace = allocate_sm120_moe_workspace(
+    alloc_kwargs = dict(
         state_E=state_E,
         weight_E=weight_E,
-        routed_rows=routed_rows,
         k=k,
         n=n,
         num_topk=num_topk,
@@ -4013,6 +4041,30 @@ def _get_cached_workspace(
         backend=backend,
         activation=activation,
     )
+    workspace = None
+    if backend == "static" and quant_mode != "w4a16":
+        # Allocate static workspaces on a power-of-two ladder (floor 128)
+        # rather than at the exact request. Growing replaces the cached
+        # workspace, and the new max_rows is baked into every kernel cache key
+        # compiled against it (_get_static_kernel / _get_micro_kernel), so each
+        # new high-water mark invalidates all previously compiled kernels for
+        # this key - a multi-second MLIR recompile per shape class at serving
+        # time. Bucketing bounds growth (and therefore recompile waves) to
+        # O(log) events at the cost of at most 2x scratch rows. Dynamic and
+        # W4A16 kernels do not key on max_rows, and dynamic workspaces derive
+        # their M-tile from routed_rows, so they keep exact sizing.
+        try:
+            workspace = allocate_sm120_moe_workspace(
+                routed_rows=_bucket_workspace_rows(routed_rows), **alloc_kwargs
+            )
+        except ValueError:
+            # The bucketed size can exceed the runtime memref limit where the
+            # exact request still fits; fall back to exact sizing.
+            workspace = None
+    if workspace is None:
+        workspace = allocate_sm120_moe_workspace(
+            routed_rows=routed_rows, **alloc_kwargs
+        )
 
     _WORKSPACE_CACHE[cache_key] = workspace
     return workspace

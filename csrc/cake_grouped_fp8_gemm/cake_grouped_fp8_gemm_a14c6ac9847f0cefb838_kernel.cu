@@ -357,6 +357,8 @@ kernel_cake_grouped_fp8_gemm_a14c6ac9847f0cefb838(const __grid_constant__ CUtens
             int n_tile = bid % n_tiles;
             int dm_tile = num_bids / n_tiles;
             int dn_tile = num_bids % n_tiles;
+            unsigned int acc_zero_bits = ((K == 128) ? 2147483648u : 0);
+            float acc_zero = __uint_as_float(acc_zero_bits);
             unsigned int _phase_scale_full = 0;
             unsigned int _phase_partial_full = 0;
             #pragma unroll 1
@@ -396,70 +398,70 @@ kernel_cake_grouped_fp8_gemm_a14c6ac9847f0cefb838(const __grid_constant__ CUtens
                     group = _shfl_sync_2;
                     float acc0[32];
                     float acc1[32];
-                    acc0[0] = 0.0f;
-                    acc0[1] = 0.0f;
-                    acc0[2] = 0.0f;
-                    acc0[3] = 0.0f;
-                    acc0[4] = 0.0f;
-                    acc0[5] = 0.0f;
-                    acc0[6] = 0.0f;
-                    acc0[7] = 0.0f;
-                    acc0[8] = 0.0f;
-                    acc0[9] = 0.0f;
-                    acc0[10] = 0.0f;
-                    acc0[11] = 0.0f;
-                    acc0[12] = 0.0f;
-                    acc0[13] = 0.0f;
-                    acc0[14] = 0.0f;
-                    acc0[15] = 0.0f;
-                    acc0[16] = 0.0f;
-                    acc0[17] = 0.0f;
-                    acc0[18] = 0.0f;
-                    acc0[19] = 0.0f;
-                    acc0[20] = 0.0f;
-                    acc0[21] = 0.0f;
-                    acc0[22] = 0.0f;
-                    acc0[23] = 0.0f;
-                    acc0[24] = 0.0f;
-                    acc0[25] = 0.0f;
-                    acc0[26] = 0.0f;
-                    acc0[27] = 0.0f;
-                    acc0[28] = 0.0f;
-                    acc0[29] = 0.0f;
-                    acc0[30] = 0.0f;
-                    acc0[31] = 0.0f;
-                    acc1[0] = 0.0f;
-                    acc1[1] = 0.0f;
-                    acc1[2] = 0.0f;
-                    acc1[3] = 0.0f;
-                    acc1[4] = 0.0f;
-                    acc1[5] = 0.0f;
-                    acc1[6] = 0.0f;
-                    acc1[7] = 0.0f;
-                    acc1[8] = 0.0f;
-                    acc1[9] = 0.0f;
-                    acc1[10] = 0.0f;
-                    acc1[11] = 0.0f;
-                    acc1[12] = 0.0f;
-                    acc1[13] = 0.0f;
-                    acc1[14] = 0.0f;
-                    acc1[15] = 0.0f;
-                    acc1[16] = 0.0f;
-                    acc1[17] = 0.0f;
-                    acc1[18] = 0.0f;
-                    acc1[19] = 0.0f;
-                    acc1[20] = 0.0f;
-                    acc1[21] = 0.0f;
-                    acc1[22] = 0.0f;
-                    acc1[23] = 0.0f;
-                    acc1[24] = 0.0f;
-                    acc1[25] = 0.0f;
-                    acc1[26] = 0.0f;
-                    acc1[27] = 0.0f;
-                    acc1[28] = 0.0f;
-                    acc1[29] = 0.0f;
-                    acc1[30] = 0.0f;
-                    acc1[31] = 0.0f;
+                    acc0[0] = acc_zero;
+                    acc0[1] = acc_zero;
+                    acc0[2] = acc_zero;
+                    acc0[3] = acc_zero;
+                    acc0[4] = acc_zero;
+                    acc0[5] = acc_zero;
+                    acc0[6] = acc_zero;
+                    acc0[7] = acc_zero;
+                    acc0[8] = acc_zero;
+                    acc0[9] = acc_zero;
+                    acc0[10] = acc_zero;
+                    acc0[11] = acc_zero;
+                    acc0[12] = acc_zero;
+                    acc0[13] = acc_zero;
+                    acc0[14] = acc_zero;
+                    acc0[15] = acc_zero;
+                    acc0[16] = acc_zero;
+                    acc0[17] = acc_zero;
+                    acc0[18] = acc_zero;
+                    acc0[19] = acc_zero;
+                    acc0[20] = acc_zero;
+                    acc0[21] = acc_zero;
+                    acc0[22] = acc_zero;
+                    acc0[23] = acc_zero;
+                    acc0[24] = acc_zero;
+                    acc0[25] = acc_zero;
+                    acc0[26] = acc_zero;
+                    acc0[27] = acc_zero;
+                    acc0[28] = acc_zero;
+                    acc0[29] = acc_zero;
+                    acc0[30] = acc_zero;
+                    acc0[31] = acc_zero;
+                    acc1[0] = acc_zero;
+                    acc1[1] = acc_zero;
+                    acc1[2] = acc_zero;
+                    acc1[3] = acc_zero;
+                    acc1[4] = acc_zero;
+                    acc1[5] = acc_zero;
+                    acc1[6] = acc_zero;
+                    acc1[7] = acc_zero;
+                    acc1[8] = acc_zero;
+                    acc1[9] = acc_zero;
+                    acc1[10] = acc_zero;
+                    acc1[11] = acc_zero;
+                    acc1[12] = acc_zero;
+                    acc1[13] = acc_zero;
+                    acc1[14] = acc_zero;
+                    acc1[15] = acc_zero;
+                    acc1[16] = acc_zero;
+                    acc1[17] = acc_zero;
+                    acc1[18] = acc_zero;
+                    acc1[19] = acc_zero;
+                    acc1[20] = acc_zero;
+                    acc1[21] = acc_zero;
+                    acc1[22] = acc_zero;
+                    acc1[23] = acc_zero;
+                    acc1[24] = acc_zero;
+                    acc1[25] = acc_zero;
+                    acc1[26] = acc_zero;
+                    acc1[27] = acc_zero;
+                    acc1[28] = acc_zero;
+                    acc1[29] = acc_zero;
+                    acc1[30] = acc_zero;
+                    acc1[31] = acc_zero;
                     float partial_fragment[16];
                     int k_blocks = K / 128;
                     int scale_groups = k_blocks;
@@ -554,12 +556,16 @@ kernel_cake_grouped_fp8_gemm_a14c6ac9847f0cefb838(const __grid_constant__ CUtens
                         }
                     }
                     if (homogeneous != 0) {
-                        if (warp == 0) {
+                        if (acc_warp_in_wg == 0) {
                             if (elect_sync()) {
                                 asm volatile("cp.async.bulk.wait_group.read 0;");
                             }
                         }
-                        asm volatile("barrier.sync 8, 256;" ::: "memory");
+                        if (acc_wg == 0) {
+                            asm volatile("barrier.sync 10, 128;" ::: "memory");
+                        } else {
+                            asm volatile("barrier.sync 11, 128;" ::: "memory");
+                        }
                         unsigned int epi_stage = 0;
                         int c_stage_row = epi_stage * 128 + (unsigned int)row;
                         unsigned int acc0_bf16[16];
@@ -574,35 +580,58 @@ kernel_cake_grouped_fp8_gemm_a14c6ac9847f0cefb838(const __grid_constant__ CUtens
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc1[_lp*2 + 0], acc1[_lp*2+1 + 0]));
                             acc1_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
+                        int staging_offset_wg = epi_stage * 8192;
                         if (acc_wg == 0) {
                             #pragma unroll
                             for (int chunk = 0; chunk < 4; chunk++) {
                                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_0_addr + (unsigned int)(c_stage_row * 64 + chunk * 16 ^ (c_stage_row * 64 + chunk * 16 >> 7 & 3) << 4))), "r"(acc0_bf16[chunk * 4]), "r"(acc0_bf16[chunk * 4 + 1]), "r"(acc0_bf16[chunk * 4 + 2]), "r"(acc0_bf16[chunk * 4 + 3]) : "memory");
                             }
+                        } else {
                             #pragma unroll
                             for (int chunk_1 = 0; chunk_1 < 4; chunk_1++) {
-                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_1_addr + (unsigned int)(c_stage_row * 64 + chunk_1 * 16 ^ (c_stage_row * 64 + chunk_1 * 16 >> 7 & 3) << 4))), "r"(acc1_bf16[chunk_1 * 4]), "r"(acc1_bf16[chunk_1 * 4 + 1]), "r"(acc1_bf16[chunk_1 * 4 + 2]), "r"(acc1_bf16[chunk_1 * 4 + 3]) : "memory");
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_2_addr + (unsigned int)(c_stage_row * 64 + chunk_1 * 16 ^ (c_stage_row * 64 + chunk_1 * 16 >> 7 & 3) << 4))), "r"(acc0_bf16[chunk_1 * 4]), "r"(acc0_bf16[chunk_1 * 4 + 1]), "r"(acc0_bf16[chunk_1 * 4 + 2]), "r"(acc0_bf16[chunk_1 * 4 + 3]) : "memory");
                             }
                         }
-                        if (acc_wg == 1) {
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                        if (acc_wg == 0) {
+                            asm volatile("barrier.sync 10, 128;" ::: "memory");
+                        } else {
+                            asm volatile("barrier.sync 11, 128;" ::: "memory");
+                        }
+                        if (acc_warp_in_wg == 0) {
+                            if (elect_sync()) {
+                                if (acc_wg == 0) {
+                                    tma_store_2d((&C_tma), n_tile * 128, m_tile * 128, epi_staging_0_addr + (unsigned int)staging_offset_wg);
+                                } else {
+                                    tma_store_2d((&C_tma), n_tile * 128 + 64, m_tile * 128, epi_staging_2_addr + (unsigned int)staging_offset_wg);
+                                }
+                                asm volatile("cp.async.bulk.commit_group;");
+                            }
+                        }
+                        if (acc_wg == 0) {
                             #pragma unroll
                             for (int chunk_2 = 0; chunk_2 < 4; chunk_2++) {
-                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_2_addr + (unsigned int)(c_stage_row * 64 + chunk_2 * 16 ^ (c_stage_row * 64 + chunk_2 * 16 >> 7 & 3) << 4))), "r"(acc0_bf16[chunk_2 * 4]), "r"(acc0_bf16[chunk_2 * 4 + 1]), "r"(acc0_bf16[chunk_2 * 4 + 2]), "r"(acc0_bf16[chunk_2 * 4 + 3]) : "memory");
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_1_addr + (unsigned int)(c_stage_row * 64 + chunk_2 * 16 ^ (c_stage_row * 64 + chunk_2 * 16 >> 7 & 3) << 4))), "r"(acc1_bf16[chunk_2 * 4]), "r"(acc1_bf16[chunk_2 * 4 + 1]), "r"(acc1_bf16[chunk_2 * 4 + 2]), "r"(acc1_bf16[chunk_2 * 4 + 3]) : "memory");
                             }
+                        } else {
                             #pragma unroll
                             for (int chunk_3 = 0; chunk_3 < 4; chunk_3++) {
                                 asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_staging_3_addr + (unsigned int)(c_stage_row * 64 + chunk_3 * 16 ^ (c_stage_row * 64 + chunk_3 * 16 >> 7 & 3) << 4))), "r"(acc1_bf16[chunk_3 * 4]), "r"(acc1_bf16[chunk_3 * 4 + 1]), "r"(acc1_bf16[chunk_3 * 4 + 2]), "r"(acc1_bf16[chunk_3 * 4 + 3]) : "memory");
                             }
                         }
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        asm volatile("barrier.sync 8, 256;" ::: "memory");
-                        if (warp == 0) {
+                        if (acc_wg == 0) {
+                            asm volatile("barrier.sync 10, 128;" ::: "memory");
+                        } else {
+                            asm volatile("barrier.sync 11, 128;" ::: "memory");
+                        }
+                        if (acc_warp_in_wg == 0) {
                             if (elect_sync()) {
-                                int staging_offset = epi_stage * 8192;
-                                tma_store_2d((&C_tma), n_tile * 128, m_tile * 128, epi_staging_0_addr + (unsigned int)staging_offset);
-                                tma_store_2d((&C_tma), n_tile * 128 + 32, m_tile * 128, epi_staging_1_addr + (unsigned int)staging_offset);
-                                tma_store_2d((&C_tma), n_tile * 128 + 64, m_tile * 128, epi_staging_2_addr + (unsigned int)staging_offset);
-                                tma_store_2d((&C_tma), n_tile * 128 + 96, m_tile * 128, epi_staging_3_addr + (unsigned int)staging_offset);
+                                if (acc_wg == 0) {
+                                    tma_store_2d((&C_tma), n_tile * 128 + 32, m_tile * 128, epi_staging_1_addr + (unsigned int)staging_offset_wg);
+                                } else {
+                                    tma_store_2d((&C_tma), n_tile * 128 + 96, m_tile * 128, epi_staging_3_addr + (unsigned int)staging_offset_wg);
+                                }
                                 asm volatile("cp.async.bulk.commit_group;");
                             }
                         }
@@ -667,17 +696,17 @@ kernel_cake_grouped_fp8_gemm_a14c6ac9847f0cefb838(const __grid_constant__ CUtens
                     m_tile += 1;
                 }
             }
-            if (warp == 0) {
-                if (elect_sync()) {
-                    asm volatile("cp.async.bulk.wait_group.read 0;");
-                }
-            }
-            asm volatile("barrier.sync 8, 256;" ::: "memory");
             asm volatile("barrier.sync 9, 288;" ::: "memory");
             asm volatile("tcgen05.fence::after_thread_sync;");
             if (warp == 0) {
                 asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
             }
+            if (acc_warp_in_wg == 0) {
+                if (elect_sync()) {
+                    asm volatile("cp.async.bulk.wait_group.read 0;");
+                }
+            }
+            asm volatile("barrier.sync 8, 256;" ::: "memory");
         }
     }
     // ---- Role: mma_role ----

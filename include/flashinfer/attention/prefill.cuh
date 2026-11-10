@@ -912,6 +912,8 @@ __device__ __forceinline__ void page_produce_kv_sf(
     for (uint32_t k = 0; k < NUM_SF_ITERS; ++k) {
       const uint32_t flat_uint32_idx = thread_id + k * THREADS_PER_CTA;
       const uint32_t flat_byte = flat_uint32_idx * 4;
+      // A zero-filling cp.async writes even with a false predicate; stop at the end of the SF tile.
+      if (SF_TOTAL_BYTES % (THREADS_PER_CTA * 4) != 0 && flat_byte >= SF_TOTAL_BYTES) break;
       // sf_smem_col is 4-byte aligned: flat_byte is a multiple of 4, and SF_COLS is a power of 2
       // (HEAD_DIM / 16), so flat_byte % SF_COLS is always a multiple of 4 (or 0 when SF_COLS < 4).
       const uint32_t sf_smem_row = flat_byte / SF_COLS;
@@ -1022,6 +1024,8 @@ __device__ __forceinline__ void produce_kv_sf(SmemStorage* smem_storage, uint8_t
 #pragma unroll
     for (uint32_t i = 0; i < NUM_SF_ITERS; ++i) {
       const uint32_t flat_byte = (thread_id + i * THREADS_PER_CTA) * 4;
+      // A zero-filling cp.async writes even with a false predicate; stop at the end of the SF tile.
+      if (SF_TOTAL_BYTES % (THREADS_PER_CTA * 4) != 0 && flat_byte >= SF_TOTAL_BYTES) break;
       const uint32_t sf_smem_row = flat_byte / SF_COLS;
       const uint32_t sf_smem_col = flat_byte % SF_COLS;
       const uint32_t abs_kv_row = kv_idx_base + sf_smem_row;
@@ -2108,7 +2112,10 @@ __device__ __forceinline__ void update_mdo_states(
           // Per-row clamp: fully masked rows (m == -inf) yield exp2(-inf) = 0, not NaN.
           const float m_scaled =
               max(m[mma_q][j] * sm_scale, -cuda::std::numeric_limits<float>::max());
-          float o_scale = math::ptx_exp2(m_prev * sm_scale - m_scaled);
+          // Subtract before scaling so an unchanged maximum preserves the old state exactly.
+          // An empty previous state has no mass; avoid -inf - -inf for fully masked rows.
+          float o_scale =
+              m_prev == -math::inf ? 0.f : math::ptx_exp2((m_prev - m[mma_q][j]) * sm_scale);
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
@@ -3921,9 +3928,8 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
       }
       float m_prev = float(m[mma_q][j]);
       float m_new = max(m_prev, mt);
-      // Per-row clamp for fully masked rows (see update_mdo_states).
-      const float m_new_scaled = max(m_new * sm_scale, -cuda::std::numeric_limits<float>::max());
-      o_scale[mma_q][j] = math::ptx_exp2(m_prev * sm_scale - m_new_scaled);
+      // Preserve equal maxima exactly and keep empty-state handling (see update_mdo_states).
+      o_scale[mma_q][j] = m_prev == -math::inf ? 0.f : math::ptx_exp2((m_prev - m_new) * sm_scale);
       d[mma_q][j] *= o_scale[mma_q][j];
       m[mma_q][j] = typename KTraits::DTypeQKAccum(m_new);
     }

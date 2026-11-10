@@ -463,13 +463,22 @@ def test_refuses_inputs_outside_the_contract():
     wide = torch.empty(2, 32, 128, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match=r"must be \[tokens, 64\]"):
         call(wide, wide, eps=1e-5)
-    storage = torch.empty(2 * 32 * HEAD_DIM + 8, dtype=torch.bfloat16, device="cuda")
+    storage = torch.empty(2 * 32 * HEAD_DIM + 16, dtype=torch.bfloat16, device="cuda")
     misaligned = storage[1 : 1 + 2 * 32 * HEAD_DIM].view(2, 32, HEAD_DIM)
     with pytest.raises(ValueError, match="aligned storage"):
         call(misaligned, gate, eps=1e-5)
+    # aligned to 16 bytes but not to the package's 32: the 16-head programs read and write 256-bit vectors
+    half_aligned = storage[8 : 8 + 2 * 32 * HEAD_DIM].view(2, 32, HEAD_DIM)
+    assert half_aligned.data_ptr() % 16 == 0 and half_aligned.data_ptr() % 32 != 0
+    with pytest.raises(ValueError, match="32-byte aligned storage"):
+        call(half_aligned, gate, eps=1e-5)
     odd = torch.empty(2, 68, dtype=torch.bfloat16, device="cuda")[:, :HEAD_DIM]
-    with pytest.raises(ValueError, match="multiple of 8 elements"):
+    with pytest.raises(ValueError, match="multiple of 16 elements"):
         call(odd, odd, eps=1e-5)
+    # a token stride of 16-byte multiples only (72 elements): the package serves 32-byte multiples
+    padded = torch.empty(2, 72, dtype=torch.bfloat16, device="cuda")[:, :HEAD_DIM]
+    with pytest.raises(ValueError, match="multiple of 16 elements"):
+        call(padded, padded, eps=1e-5)
     with pytest.raises(ValueError, match="supports compute capability"):
         call(x.cpu(), gate.cpu(), eps=1e-5)
     assert supports_rmsnorm_sigmoid_gate(
@@ -481,3 +490,54 @@ def test_refuses_inputs_outside_the_contract():
     assert not supports_rmsnorm_sigmoid_gate(
         torch.bfloat16, HEAD_DIM, device=torch.device("cpu"), backend="cake"
     )
+
+
+@pytest.mark.parametrize("enable_pdl", PDL_FORMS, ids=["plain", "pdl"])
+def test_storage_the_package_does_not_serve_falls_to_the_cute_kernel(
+    monkeypatch, enable_pdl
+):
+    """Storage the facade's contract admits but the package does not -- rows aligned to 16 bytes but not 32, or a
+    token stride that is a 16-byte multiple but not a 32-byte one -- runs the CuTe DSL kernel under ``auto`` and
+    launches no Cake program (the package's 16-head programs of sm_107a read and write 256-bit vectors; the package
+    admits one alignment for every program); an explicit ``"cake"`` raises.  Every head count, at a token count of
+    each window class the route admits (the 16-head 256-bit programs of sm_107a sit above 2047 tokens)."""
+    if not _cute_available():
+        pytest.skip("the CuTe DSL kernel is not available on this device")
+    if enable_pdl:
+        _skip_without_pdl_route()
+    launched = []
+    monkeypatch.setattr(pkg, "_launch", lambda *a: launched.append(a))
+    checked = 0
+    for heads in HEADS:
+        for tokens in (17, 4096, 9000):
+            if not _admits(heads, tokens, enable_pdl):
+                continue
+            x, gate, _ = _inputs(tokens, heads, seed=tokens + heads)
+            numel = tokens * heads * HEAD_DIM
+            storage = torch.empty(numel + 16, dtype=torch.bfloat16, device="cuda")
+            shifted = storage[8 : 8 + numel].view(tokens, heads, HEAD_DIM)
+            assert shifted.data_ptr() % 16 == 0 and shifted.data_ptr() % 32 != 0
+            padded = torch.empty(
+                (tokens, heads * HEAD_DIM + 8), dtype=torch.bfloat16, device="cuda"
+            )
+            strided = padded[:, : heads * HEAD_DIM].view(tokens, heads, HEAD_DIM)
+            assert strided.stride(0) % 8 == 0 and strided.stride(0) % 16 != 0
+            for view in (shifted, strided):
+                view.copy_(x)
+                expected = _reference(view, gate, 1e-5)
+                rmsnorm_sigmoid_gate(
+                    view, gate, 1e-5, enable_pdl=enable_pdl, backend="auto"
+                )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(view, expected, atol=ATOL, rtol=RTOL)
+                assert launched == []
+                with pytest.raises(ValueError, match="not available"):
+                    rmsnorm_sigmoid_gate(
+                        view, gate, 1e-5, enable_pdl=enable_pdl, backend="cake"
+                    )
+                checked += 1
+            # the same call on storage the package serves launches its program
+            rmsnorm_sigmoid_gate(x, gate, 1e-5, enable_pdl=enable_pdl, backend="auto")
+            assert len(launched) == 1
+            launched.clear()
+    assert checked >= 2 * len(HEADS)

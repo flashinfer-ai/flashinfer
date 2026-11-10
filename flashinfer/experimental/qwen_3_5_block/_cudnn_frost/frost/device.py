@@ -27,6 +27,14 @@ import contextvars
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost._device import _ck, _device_handle, _driver, device_info
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost._device import device_count, is_available  # noqa: F401 — re-exported for frost callers
 
+#: Parts served by the FROST kernels that emit only arch-portable instructions --
+#: elementwise math, warp shuffles and plain loads/stores, nothing from tcgen05, TMA
+#: multicast or the FP4 converts: tail and vision RoPE, the fp8 RoPE QDQ and the
+#: Engram gate. A part joins once those kernels have been run on it.
+PORTABLE_ELEMENTWISE_CCS = ((9, 0), (10, 0), (10, 3), (12, 0))
+#: Parts with the FP4 (e2m1x2) converts the fp4 RoPE QDQ emits, run on each: B200, B300 and RTX PRO 6000.
+FP4_CONVERT_CCS = ((10, 0), (10, 3), (12, 0))
+
 # The device a frost BUILD targets, scoped in by build_device() from the
 # cudnn.Handle the graph was built with. Every device-derived kernel constant
 # (arch, ab_stages, grid_num_clusters, sm_count, the L2/SMEM budgets) resolves

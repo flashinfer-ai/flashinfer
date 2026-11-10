@@ -16,14 +16,18 @@ limitations under the License.
 
 # SM103 (Blackwell Ultra) mega-kernel backends.
 #
-# The only backend here is experimental and lives under
+# ``bf16_nvfp4_bf16_cake`` registers ``kernel_name="sm103_bf16_nvfp4_bf16_cake"``
+# (BF16 activations x NVFP4 expert weights over the Cake fused program). The
+# experimental W8A8 backend lives under
 # ``flashinfer.experimental.cake_w8a8_megamoe_ep16``; importing its
 # ``cake_backend`` module registers ``kernel_name="sm103_mxfp8_mxfp8_bf16_cake"``.
-# That module is lightweight at import time (its JIT loader and tvm-ffi are
+# Both are lightweight at import time (their JIT loaders and tvm-ffi are
 # imported inside the functions that use them).
 
 from flashinfer.experimental.cake_w8a8_megamoe_ep16 import (
     cake_backend as mxfp8_mxfp8_bf16_cake,
 )
 
-__all__ = ["mxfp8_mxfp8_bf16_cake"]
+from . import bf16_nvfp4_bf16_cake
+
+__all__ = ["bf16_nvfp4_bf16_cake", "mxfp8_mxfp8_bf16_cake"]

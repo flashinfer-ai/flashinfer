@@ -17,7 +17,7 @@
 (the kernel symbol the device unit defines and the binding declares, the binding namespace, the
 exported ``run`` entry, the FFI checks header), its digests follow from the file bytes, its JIT spec
 carries the target flags, ``--fmad=false`` and the recorded options, and the host module's program
-table, FP8 MMA form rule and grid rule are what the kernels expect."""
+table, FP8 MMA form rule, NVFP4 tile-order rule and grid rule are what the kernels expect."""
 
 import hashlib
 import re
@@ -39,6 +39,7 @@ from flashinfer.jit.cake_minimax_h3_sm120_quant_pre_attention import (
     NORM_NVFP4,
     NVFP4_BF16,
     NVFP4_E4M3,
+    NVFP4_E4M3_G1,
     NVFP4_NVFP4,
     PROGRAMS,
 )
@@ -56,6 +57,7 @@ NAMED = {
     "NVFP4_BF16": NVFP4_BF16,
     "NVFP4_E4M3": NVFP4_E4M3,
     "NVFP4_NVFP4": NVFP4_NVFP4,
+    "NVFP4_E4M3_G1": NVFP4_E4M3_G1,
 }
 GEMMS = {name: program for name, program in NAMED.items() if "NORM" not in name}
 NORM_FP8_ARGS = (
@@ -129,9 +131,9 @@ def _host_args(identifier: str) -> tuple[str, ...]:
     return GEMM_ARGS
 
 
-def test_the_loader_publishes_the_eleven_programs() -> None:
+def test_the_loader_publishes_the_twelve_programs() -> None:
     assert tuple(NAMED.values()) == PROGRAMS
-    assert len({program.name for program in PROGRAMS}) == 11
+    assert len({program.name for program in PROGRAMS}) == 12
     for identifier, program in NAMED.items():
         assert program.name.startswith("cake_minimax_h3_sm120_quant_pre_attention_")
         assert program.operator_dir == "cake_minimax_h3_sm120_quant_pre_attention"
@@ -211,7 +213,14 @@ def test_the_host_table_names_each_gemm_once() -> None:
         (True, 1): FP8_MX_E4M3,
         (True, 2): FP8_MX_NVFP4,
     }
-    assert ops._NVFP4_GEMM == {0: NVFP4_BF16, 1: NVFP4_E4M3, 2: NVFP4_NVFP4}
+    assert ops._NVFP4_GEMM == {
+        (False, 0): NVFP4_BF16,
+        (False, 1): NVFP4_E4M3,
+        (False, 2): NVFP4_NVFP4,
+        (True, 0): NVFP4_BF16,
+        (True, 1): NVFP4_E4M3_G1,
+        (True, 2): NVFP4_NVFP4,
+    }
     assert ops._OUT_MODES == {"bf16": 0, "e4m3": 1, "nvfp4": 2}
     assert ops._SFB_ROWS * ops._SFB_ROW_BYTES == (
         ops.MINIMAX_H3_QKV_WIDTH * ops.MINIMAX_H3_HIDDEN // ops.MINIMAX_H3_SF_BLOCK
@@ -241,7 +250,9 @@ def _properties(major: int, minor: int, name: str, sms: int):
         ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 188, False),
     ],
 )
-def test_device_facts_and_fp8_mma_form(monkeypatch, name, sms, unit_scale) -> None:
+def test_device_facts_fp8_mma_form_and_nvfp4_tile_order(
+    monkeypatch, name, sms, unit_scale
+) -> None:
     ops._device_facts.cache_clear()
     monkeypatch.setattr(
         torch.cuda,
@@ -250,6 +261,7 @@ def test_device_facts_and_fp8_mma_form(monkeypatch, name, sms, unit_scale) -> No
     )
     assert ops._device_facts(0) == ("sm_120a", sms, name)
     assert ops._fp8_unit_scale_mma(0) is unit_scale
+    assert ops._nvfp4_one_m_tile_order(0) is unit_scale
     ops._device_facts.cache_clear()
 
 

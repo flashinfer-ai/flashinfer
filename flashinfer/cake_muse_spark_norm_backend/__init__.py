@@ -68,10 +68,14 @@ from .cake_jit import (
 GATED_RESIDUAL_NEXT_RMSNORM = "gated_residual_next_rmsnorm"
 GATED_RESIDUAL_RMSNORM = "gated_residual_rmsnorm"
 RMSNORM_SIGMOID_GATE = "rmsnorm_sigmoid_gate"
-#: The two-norm kernels load every operand in 256-bit accesses: rows and vectors are 32-byte aligned.
+#: Every program of the package reaches rows and vectors in accesses of up to 256 bits (the two-norm kernels on every
+#: operand, the gated residual RMSNorm on its FP32 planes, the sigmoid gate's 16-head programs on their rows): the
+#: package serves 32-byte aligned storage alone, so that no 256-bit access meets a view aligned to 16 bytes only.
 ALIGNMENT_BYTES = 32
-#: The gated residual RMSNorm and the sigmoid gate load in 128-bit accesses: 16-byte aligned storage.
-ROW_ALIGNMENT_BYTES = 16
+#: The alignment of the gated residual RMSNorm's and the sigmoid gate's rows and vectors: the package's one alignment.
+ROW_ALIGNMENT_BYTES = ALIGNMENT_BYTES
+#: The sigmoid gate's token stride is a multiple of this many BF16 elements: every token's row starts aligned.
+GATE_STRIDE_ELEMENTS = ROW_ALIGNMENT_BYTES // 2
 #: The head dimension of the sigmoid gate's rows.
 HEAD_DIM = 64
 
@@ -688,7 +692,7 @@ def cake_gated_residual_rmsnorm(
             )
         )
     # The plan's key fixes the device, the row count, the variant and the launch mode; the rest of the contract
-    # is one flat check per call (dtypes, shapes, same device, contiguous, 16-byte aligned storage).
+    # is one flat check per call (dtypes, shapes, same device, contiguous, 32-byte aligned storage).
     f32, bf16, align = torch.float32, torch.bfloat16, ROW_ALIGNMENT_BYTES
     if plan is None or not (
         shape[1] == HIDDEN_SIZE
@@ -789,7 +793,8 @@ def is_cake_rmsnorm_sigmoid_gate_supported(
 def _gate_layout(tensor: torch.Tensor, name: str, device: torch.device) -> int:
     """The token stride of ``tensor`` after the layout checks of the contract: BF16 on the call's device, 2-D
     ``(tokens, 64)`` or 3-D ``(tokens, heads, 64)``, unit stride along the row, packed heads, a token stride that is a
-    multiple of eight elements and 16-byte aligned storage."""
+    multiple of :data:`GATE_STRIDE_ELEMENTS` (16: a 32-byte multiple) and 32-byte aligned storage (the 16-head programs
+    of sm_107a read and write 256-bit vectors; the package admits one alignment for every program)."""
     if tensor.dtype != torch.bfloat16 or tensor.device != device:
         raise ValueError(
             f"cake_rmsnorm_sigmoid_gate: {name} must be a bfloat16 tensor on {device}"
@@ -802,12 +807,13 @@ def _gate_layout(tensor: torch.Tensor, name: str, device: torch.device) -> int:
     if (
         tensor.stride(-1) != 1
         or (tensor.ndim == 3 and tensor.stride(1) != HEAD_DIM)
-        or tensor.stride(0) % 8 != 0
+        or tensor.stride(0) % GATE_STRIDE_ELEMENTS != 0
         or tensor.data_ptr() % ROW_ALIGNMENT_BYTES != 0
     ):
         raise ValueError(
             f"cake_rmsnorm_sigmoid_gate: {name} must hold contiguous rows of {HEAD_DIM} with packed heads, a token "
-            f"stride that is a multiple of 8 elements and {ROW_ALIGNMENT_BYTES}-byte aligned storage"
+            f"stride that is a multiple of {GATE_STRIDE_ELEMENTS} elements and {ROW_ALIGNMENT_BYTES}-byte aligned "
+            "storage"
         )
     return int(tensor.stride(0))
 
@@ -932,6 +938,7 @@ def cake_rmsnorm_sigmoid_gate(
 
 __all__ = [
     "ALIGNMENT_BYTES",
+    "GATE_STRIDE_ELEMENTS",
     "ARCHES",
     "ARCH_BY_CAPABILITY",
     "GATED_RESIDUAL_NEXT_RMSNORM",

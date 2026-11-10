@@ -1531,6 +1531,8 @@ def test_cpu_monolithic_grid_boundary_rejects_before_compile(
         lambda *args, **kwargs: (2, 16) if grid == "reducer" else (1, 0),
     )
     monkeypatch.setattr(native, "get_num_sm", lambda _: 148)
+    monkeypatch.setattr(native, "get_compute_capability", lambda _: (10, 0))
+    monkeypatch.setattr(native, "cute_dsl_compile_arch", lambda *args: "sm_100a")
     monkeypatch.setattr(
         native, "_get_compiled_mla_kernel", lambda *args, **kwargs: calls.append(True)
     )

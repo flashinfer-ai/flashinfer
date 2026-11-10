@@ -67,7 +67,9 @@ names (:data:`FC1_ARGS`, :data:`FC2_ARGS`), derives the grid
 the route map and gathers the token rows from ``x`` itself, so the route skips
 ``moe_permute`` for it.  :func:`cake_w4a16_available` tells
 whether the loader imports and publishes every program, so tests skip cleanly
-without it.
+without it.  The programs need CUDA :data:`CAKE_W4A16_MIN_CUDA` or newer
+(:func:`cake_w4a16_toolkit_unavailable` says why an older toolkit cannot run
+them); the loader refuses to build them on an older toolkit.
 """
 
 from __future__ import annotations
@@ -84,6 +86,7 @@ from ..tllm_enums import ActivationType
 from ..utils import device_support_pdl, get_compute_capability, get_device_properties
 
 __all__ = [
+    "CAKE_W4A16_MIN_CUDA",
     "CELLS",
     "FC1_ARGS",
     "FC2_ARGS",
@@ -95,6 +98,7 @@ __all__ = [
     "cake_w4a16_fused_moe",
     "cake_w4a16_grid",
     "cake_w4a16_prepare_workspace",
+    "cake_w4a16_toolkit_unavailable",
     "cake_w4a16_workspace_size",
     "is_cake_w4a16_form",
     "select_cell",
@@ -246,6 +250,9 @@ class _Programs:
         key = (identifier, target)
         handle = self._handles.get(key)
         if handle is None:
+            unavailable = cake_w4a16_toolkit_unavailable()
+            if unavailable is not None:
+                raise RuntimeError(f"{identifier}: {unavailable}")
             record = program.launch_record()
             if not record["use_pdl"] or record["cooperative"]:
                 raise RuntimeError(
@@ -277,6 +284,29 @@ def cake_w4a16_available() -> bool:
     except ImportError:
         return False
     return all(hasattr(loader, identifier) for identifier in PROGRAM_IDENTIFIERS)
+
+
+# Built with CUDA 12.9, the FC1 programs trap at their TMEM deallocation
+# (``tcgen05.dealloc``: the ptxas 12.9 tcgen05 guardrail reports unallocated
+# columns being deallocated after its bookkeeping words in the reserved shared
+# memory window are overwritten during the kernel); CUDA 13.0 and newer
+# toolkits build and run the same programs cleanly, so the route refuses an
+# older toolkit instead of failing inside a launch.
+CAKE_W4A16_MIN_CUDA = "13.0"
+
+
+def cake_w4a16_toolkit_unavailable() -> Optional[str]:
+    """Why this CUDA toolkit cannot run the Cake W4A16 programs, or ``None``."""
+
+    from ..jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
+
+    if is_cuda_version_at_least(CAKE_W4A16_MIN_CUDA):
+        return None
+    return (
+        f"the Cake W4A16 programs need CUDA {CAKE_W4A16_MIN_CUDA} or newer (built "
+        "with CUDA 12.9 their FC1 kernels trap at the TMEM deallocation guardrail); "
+        f"the CUDA toolkit found is {get_cuda_version()}"
+    )
 
 
 @functools.cache

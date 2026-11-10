@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 from contextvars import ContextVar
-from dataclasses import dataclass
+from threading import Lock
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
 
 if TYPE_CHECKING:
@@ -26,6 +27,14 @@ def _protocol_cache_key(namespace: str, key: str) -> tuple[str, str, str]:
 
 # Scope identity is local and never enters a cache key or collective payload.
 _tuning_scope: ContextVar[object | None] = ContextVar("tuning_scope", default=None)
+_execution_generation = 0
+_execution_generation_lock = Lock()
+
+
+def _advance_execution_generation() -> None:
+    global _execution_generation
+    with _execution_generation_lock:
+        _execution_generation += 1
 
 
 @dataclass(frozen=True)
@@ -42,6 +51,23 @@ class TuningContext:
     tuning_enabled: bool
     force_tune: bool
     scope: object | None = None
+    _generation: int = field(
+        default_factory=lambda: _execution_generation,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def execution_generation(self) -> int:
+        """Process-store attachment/reload generation observed at invocation entry.
+
+        Unrelated context entry/exit and rank-local cache clearing do not change
+        this generation. Collective protocols must coordinate process-wide store
+        changes and reloads across their participants before resuming execution.
+        A transition during preparation remains visible to the next invocation.
+        """
+        return self._generation
 
     @property
     def skipped(self) -> bool:

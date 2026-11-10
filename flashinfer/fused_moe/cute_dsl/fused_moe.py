@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import warnings
 import weakref
@@ -90,6 +90,8 @@ from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
     normalize_cute_dsl_moe_activation_type,
+    rubin_moe_cluster_covers_one_tile,
+    validate_cute_dsl_moe_clamped_relu2_config,
     validate_cute_dsl_moe_situ_config,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -134,6 +136,26 @@ def _canonicalize_quant_mode(quant_mode: str) -> str:
         )
         return "w4a4"
     return quant_mode
+
+
+def _check_clamped_relu2_supported(
+    activation: ActivationType, quant_mode: str, device: Union[str, torch.device]
+) -> None:
+    """ClampedRelu2 needs the SM100/SM103 gather GEMM1 epilogue: W4A16 and the
+    Rubin (SM107) kernels do not implement it."""
+    if activation != ActivationType.ClampedRelu2:
+        return
+    if quant_mode == "w4a16":
+        raise ValueError(
+            "ActivationType.ClampedRelu2 is not supported when quant_mode='w4a16'"
+        )
+    device = torch.device(device)
+    if (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device) == (10, 7)
+    ):
+        raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
 
 
 #: ``(data_ptr, device index, e4m3_max, _version)`` of GEMM2-input scales
@@ -223,6 +245,31 @@ def _get_cuda_graph_resources() -> Dict[str, Any]:
 # =============================================================================
 # Core Implementation (Shared by Functional and Wrapper APIs)
 # =============================================================================
+
+
+def _validate_mxfp_weight_dtype(
+    quant_mode: str,
+    x: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    swap_ab: bool,
+) -> None:
+    if quant_mode == "w4a8":
+        weight_dtype = torch.uint8
+    elif quant_mode == "mxfp8":
+        weight_dtype = torch.float8_e4m3fn
+    else:
+        raise ValueError(f"Unexpected MXFP quant_mode {quant_mode!r}")
+    if x.dtype is not torch.float8_e4m3fn:
+        raise TypeError(f"quant_mode={quant_mode!r} requires float8_e4m3fn input")
+    if not swap_ab:
+        if quant_mode == "mxfp8" and w1_weight.dtype is not torch.float8_e4m3fn:
+            raise TypeError("quant_mode='mxfp8' requires float8_e4m3fn weights")
+        return
+    if w1_weight.dtype is not weight_dtype or w2_weight.dtype is not weight_dtype:
+        raise TypeError(
+            f"quant_mode={quant_mode!r} requires {weight_dtype} GEMM1 and GEMM2 weights"
+        )
 
 
 def validate_w4a8_inputs(
@@ -326,8 +373,14 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     weight_dtype: Optional[str] = None,
+    gemm1_k_steps: Optional[int] = None,
+    gemm2_k_steps: Optional[int] = None,
+    gemm1_use_clc_scheduler: bool = True,
+    gemm2_use_clc_scheduler: bool = False,
+    swap_ab: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -343,8 +396,8 @@ def _moe_core_impl(
     4. Routing-weight reduction in deterministic mode
 
     Args:
-        x: Packed W4A4 or MXFP8 W4A8 input tensor.
-        x_sf: W4A4 or W4A8 scale factors for x.
+        x: Packed W4A4 or MXFP8 W4A8/W8A8 input tensor.
+        x_sf: W4A4, W4A8, or W8A8 scale factors for x.
         token_selected_experts: Expert assignments [num_tokens, top_k].
         token_final_scales: Routing weights [num_tokens, top_k].
         w1_weight: GEMM1 weights (gate + up fused for gated activations, or a
@@ -352,7 +405,7 @@ def _moe_core_impl(
         w1_weight_sf: Scale factors for w1_weight.
         w1_alpha: Per-expert global scale for GEMM1.
         fc2_input_scale: Global scale for W4A4 GEMM2 input quantization;
-            must be None for W4A8.
+            must be None for W4A8 and W8A8.
         w2_weight: GEMM2 weights (down projection).
         w2_weight_sf: Scale factors for w2_weight.
         w2_alpha: Per-expert global scale for GEMM2.
@@ -387,14 +440,18 @@ def _moe_core_impl(
         activation_type: Activation type to apply after GEMM1. Use
             ActivationType.Swiglu for gated SwiGLU/OAI/SiTU,
             ActivationType.GegluTanh for tanh-approximate GeGLU, and
-            ActivationType.Relu2 for non-gated mode. Setting situ_beta selects
-            SiTU; swiglu_oai is represented as Swiglu with non-default
-            swiglu_alpha/beta/limit.
+            ActivationType.Relu2 or ActivationType.ClampedRelu2 for non-gated
+            mode. Setting situ_beta selects SiTU; swiglu_oai is represented as
+            Swiglu with non-default swiglu_alpha/beta/limit.
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        clamped_relu2_limit: Model-wide clamp scale ``L`` for
+            ActivationType.ClampedRelu2 (``relu(L * tanh(x / L)) ** 2`` on the
+            alpha-scaled FC1 output), a one-element float32 CUDA tensor read
+            at runtime; required with it and rejected otherwise.
         nvfp4_4over6: NVFP4 4over6 recipe for the GEMM2-input quantization.
             - omitted (the default): read FLASHINFER_NVFP4_4OVER6* on every
               call.
@@ -433,15 +490,21 @@ def _moe_core_impl(
     if not is_mxfp8 and fc2_input_scale is None:
         raise ValueError("fc2_input_scale is required when quant_mode='w4a4'")
     if is_mxfp8 and fc2_input_scale is not None:
-        raise ValueError("fc2_input_scale must be None when quant_mode='w4a8'")
+        raise ValueError("fc2_input_scale must be None for MXFP8 activations")
     if is_mxfp8 and per_token_scale is not None:
-        raise ValueError("per_token_scale is not supported when quant_mode='w4a8'")
+        raise ValueError("per_token_scale is not supported for MXFP8 activations")
     if is_mxfp8 and output_dtype is not torch.bfloat16:
-        raise ValueError("quant_mode='w4a8' supports only torch.bfloat16 output")
-    if is_mxfp8 and not use_fused_finalize:
-        raise ValueError("quant_mode='w4a8' requires use_fused_finalize=True")
-    if is_mxfp8 and (situ_beta is not None or situ_linear_beta is not None):
-        raise ValueError("SiTU is not supported when quant_mode='w4a8'")
+        raise ValueError("MXFP8 activations support only torch.bfloat16 output")
+    if is_mxfp8 and not swap_ab:
+        if not use_fused_finalize:
+            raise ValueError(
+                "MXFP8 activations require fused finalize with swap_ab=False"
+            )
+        if situ_beta is not None or situ_linear_beta is not None:
+            raise ValueError("SiTU with MXFP8 activations requires swap_ab=True")
+    validate_cute_dsl_moe_clamped_relu2_config(
+        activation, clamped_relu2_limit, x.device
+    )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if is_mxfp8:
         validate_w4a8_inputs(
@@ -531,6 +594,44 @@ def _moe_core_impl(
             memset_event = memset_event or resources["memset_event"]
 
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
+    gather_gemm: Callable[..., Tuple[torch.Tensor, Optional[torch.Tensor]]]
+    finalize_gemm: Callable[..., torch.Tensor]
+    if swap_ab:
+        for phase, mma_tiler_mn in (
+            ("GEMM1", gemm1_mma_tiler_mn),
+            ("GEMM2", gemm2_mma_tiler_mn),
+        ):
+            if mma_tiler_mn[1] != tile_size:
+                raise ValueError(
+                    f"Blackwell {phase} routed-token N={mma_tiler_mn[1]} must match "
+                    f"the routing tile_size={tile_size}."
+                )
+        from .blackwell.moe_swap_ab import (
+            launch_gather_gemm,
+            launch_finalize_gemm,
+        )
+
+        gather_gemm = launch_gather_gemm
+        finalize_gemm = launch_finalize_gemm
+        gemm1_options: Dict[str, Any] = {
+            "k_steps": gemm1_k_steps,
+            "use_clc_scheduler": gemm1_use_clc_scheduler,
+        }
+        gemm2_options: Dict[str, Any] = {
+            "k_steps": gemm2_k_steps,
+            "use_clc_scheduler": gemm2_use_clc_scheduler,
+        }
+    else:
+        gather_gemm = blockscaled_contiguous_gather_grouped_gemm_act_fusion
+        finalize_gemm = blockscaled_contiguous_grouped_gemm_finalize_fusion
+        gemm1_options = {
+            "mma_tiler": gemm1_mma_tiler,
+            "mma_inst_shape": gemm1_mma_inst_shape,
+        }
+        gemm2_options = {
+            "mma_tiler": gemm2_mma_tiler,
+            "mma_inst_shape": gemm2_mma_inst_shape,
+        }
     # Reject before routing so an unsupported call does no GPU work.
     if use_localized_path and not is_rubin:
         raise NotImplementedError(
@@ -538,18 +639,37 @@ def _moe_core_impl(
             "gemm1_mma_inst_shape."
         )
 
-    # Multi-CTA Rubin tactics are filtered out in tuner.get_valid_tactics; this
-    # is the backstop for callers that pass tactic parameters directly.
-    cluster_m = max(gemm1_cluster_shape_mn[0], gemm2_cluster_shape_mn[0])
-    if is_rubin and cluster_m > 1:
-        raise NotImplementedError(
-            f"Rubin MoE with cluster_shape_m={cluster_m} is not supported. The "
-            "tile count handed to the kernel must be rounded up to a multiple "
-            "of cluster_shape_m so every cluster reaches the barrier "
-            "uniformly, and tile_idx_to_expert_idx / tile_idx_to_mn_limit must "
-            "be initialized past num_non_exiting_tiles to match, since the "
-            "kernel bounds-checks them against that same rounded count."
-        )
+    # Rubin clusters that span several routing tiles along M are filtered out
+    # in tuner.get_valid_tactics; this is the backstop for callers that pass
+    # tactic parameters directly. A 2-CTA MMA (mma_inst_shape[0] == 256) with
+    # cluster_shape_m == 2 covers exactly one routing tile and is supported.
+    if is_rubin:
+        for name, mma_tiler, mma_inst_shape, cluster_shape_mn in (
+            ("gemm1", gemm1_mma_tiler, gemm1_mma_inst_shape, gemm1_cluster_shape_mn),
+            ("gemm2", gemm2_mma_tiler, gemm2_mma_inst_shape, gemm2_cluster_shape_mn),
+        ):
+            if mma_tiler is None or mma_inst_shape is None:
+                # No MMA CTA group size to check the cluster against, so
+                # keep requiring a single-CTA cluster along M.
+                supported = cluster_shape_mn[0] == 1
+            else:
+                supported = rubin_moe_cluster_covers_one_tile(
+                    tile_size, mma_tiler, mma_inst_shape, cluster_shape_mn
+                )
+            if not supported:
+                raise NotImplementedError(
+                    f"Rubin MoE {name} with mma_tiler={mma_tiler}, "
+                    f"mma_inst_shape={mma_inst_shape}, "
+                    f"cluster_shape_m={cluster_shape_mn[0]} at tile_size="
+                    f"{tile_size} is not supported. Each cluster must cover "
+                    "exactly one routing tile (mma_tiler[0] == tile_size and "
+                    "cluster_shape_m equal to the MMA CTA group size: 2 for a "
+                    "2-CTA mma_inst_shape[0] == 256, else 1). A cluster over "
+                    "several routing tiles would need the tile count rounded "
+                    "up to a multiple of the cluster and tile_idx_to_expert_idx "
+                    "/ tile_idx_to_mn_limit initialized past "
+                    "num_non_exiting_tiles to match."
+                )
 
     # Step 1: Sort tokens by expert
     moe_sort_kwargs = moe_sort_buffers or {}
@@ -679,6 +799,7 @@ def _moe_core_impl(
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                clamped_relu2_limit=clamped_relu2_limit,
                 gated=gated,
             )
 
@@ -704,47 +825,53 @@ def _moe_core_impl(
                 localization_main_stream.wait_event(localized_memset_done)
         intermediate, intermediate_sf = gemm1_out, gemm1_out_scale
     else:
-        intermediate, intermediate_sf = (
-            blockscaled_contiguous_gather_grouped_gemm_act_fusion(
-                a=x,
-                b=w1_weight,
-                a_scale=x_sf,
-                b_scale=w1_weight_sf,
-                alpha=w1_alpha,
-                tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                token_id_mapping=permuted_idx_to_expanded_idx,
-                num_non_exiting_tiles=num_non_exiting_tiles,
-                out=gemm1_out,
-                out_scale=None if use_per_token_activation else gemm1_out_scale,
-                global_scale=(
-                    fc2_input_scale
-                    if not is_mxfp8 and not use_per_token_activation
-                    else None
-                ),
-                a_per_token_scale=per_token_scale,
-                c_dtype=c_dtype,
-                a_dtype=a_dtype,
-                b_dtype=weight_dtype,
-                sf_dtype=sf_dtype,
-                sf_vec_size=sf_vec_size,
-                quantize_output=not use_per_token_activation,
-                topk=top_k,
-                mma_tiler_mn=gemm1_mma_tiler_mn,
-                cluster_shape_mn=gemm1_cluster_shape_mn,
-                mma_tiler=gemm1_mma_tiler,
-                mma_inst_shape=gemm1_mma_inst_shape,
-                enable_pdl=enable_pdl,
-                activation_type=activation.value,
-                swiglu_alpha=swiglu_alpha,
-                swiglu_beta=swiglu_beta,
-                swiglu_limit=swiglu_limit,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
-                gated=gated,
-            )
+        intermediate, intermediate_sf = gather_gemm(
+            a=x,
+            b=w1_weight,
+            a_scale=x_sf,
+            b_scale=w1_weight_sf,
+            alpha=w1_alpha,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            token_id_mapping=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            out=gemm1_out,
+            out_scale=None if use_per_token_activation else gemm1_out_scale,
+            global_scale=(
+                fc2_input_scale
+                if not is_mxfp8 and not use_per_token_activation
+                else None
+            ),
+            a_per_token_scale=per_token_scale,
+            c_dtype=c_dtype,
+            a_dtype=a_dtype,
+            b_dtype=weight_dtype,
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            quantize_output=not use_per_token_activation,
+            topk=top_k,
+            mma_tiler_mn=gemm1_mma_tiler_mn,
+            cluster_shape_mn=gemm1_cluster_shape_mn,
+            enable_pdl=enable_pdl,
+            activation_type=activation.value,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            clamped_relu2_limit=clamped_relu2_limit,
+            gated=gated,
+            **gemm1_options,
         )
     if use_per_token_activation:
+        quantizer_options = {}
+        if swap_ab:
+            quantizer_options = {
+                "valid_rows": total_num_padded_tokens,
+                "row_limits": tile_idx_to_mn_limit,
+                "rows_per_group": tile_size,
+                "sf_rows_per_group": (tile_size + 127) // 128 * 128,
+            }
         intermediate, intermediate_sf, intermediate_per_token_scale = (
             nvfp4_quantize_per_token_cute_dsl(
                 intermediate,
@@ -752,18 +879,19 @@ def _moe_core_impl(
                 sf_layout=SF_LAYOUT_128x4,
                 enable_pdl=enable_pdl,
                 nvfp4_4over6=nvfp4_4over6,
+                **quantizer_options,
             )
         )
         intermediate_sf = convert_sf_to_mma_layout(
             intermediate_sf,
-            m=intermediate.shape[0],
+            m=intermediate_sf.shape[0] if swap_ab else intermediate.shape[0],
             k=intermediate.shape[1] * 2,
             num_groups=1,
             sf_vec_size=16,
         )
 
     # Atomic finalize requires a zeroed token output. Deterministic finalize
-    # writes each route to a unique expanded row.
+    # writes each route to a unique scratch row.
     if use_fused_finalize:
         if use_async_memset:
             with torch.cuda.stream(aux_stream):
@@ -782,7 +910,10 @@ def _moe_core_impl(
         gemm2_output = moe_output
     else:
         gemm2_output = torch.empty(
-            (num_tokens * top_k, hidden_size),
+            (
+                permuted_idx_to_expanded_idx.numel() if swap_ab else num_tokens * top_k,
+                hidden_size,
+            ),
             dtype=output_dtype,
             device=x.device,
         )
@@ -831,7 +962,7 @@ def _moe_core_impl(
                 localization_main_stream.wait_stream(stream)
             raise
     else:
-        blockscaled_contiguous_grouped_gemm_finalize_fusion(
+        finalize_gemm(
             a=intermediate,
             b=w2_weight,
             a_scale=intermediate_sf,
@@ -851,10 +982,9 @@ def _moe_core_impl(
             out_dtype=_intermediate_c_dtype(output_dtype),
             mma_tiler_mn=gemm2_mma_tiler_mn,
             cluster_shape_mn=gemm2_cluster_shape_mn,
-            mma_tiler=gemm2_mma_tiler,
-            mma_inst_shape=gemm2_mma_inst_shape,
             enable_pdl=enable_pdl,
             use_fused_finalize=use_fused_finalize,
+            **gemm2_options,
         )
 
     # Step 4: Deterministic routing-weight reduction
@@ -868,7 +998,7 @@ def _moe_core_impl(
             topk_scales=token_final_scales,
             num_tokens=num_tokens,
             top_k=top_k,
-            input_is_expanded=True,
+            input_is_expanded=not swap_ab,
             enable_pdl=enable_pdl,
         )
 
@@ -888,7 +1018,7 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
+    Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
     SM100 and SM103.
 
     Attributes:
@@ -900,7 +1030,7 @@ class CuteDslMoEWrapper:
             resources for CUDA graph capture.
         use_fused_finalize: Use atomic fused finalize; otherwise use the
             deterministic two-stage finalize.
-        quant_mode: Selected W4A4, W4A8, or W4A16 compute mode.
+        quant_mode: Selected W4A4, W4A8, W8A8, or W4A16 compute mode.
         max_num_tokens: Deprecated; accepted for backwards compatibility
             but ignored.
 
@@ -952,6 +1082,8 @@ class CuteDslMoEWrapper:
         situ_linear_beta: Optional[float] = None,
         use_fused_finalize: bool = True,
         quant_mode: str = "w4a4",
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
+        swap_ab: bool = False,
     ):
         r"""Configure the CuTe-DSL block-scaled fused-MoE wrapper.
 
@@ -990,8 +1122,10 @@ class CuteDslMoEWrapper:
         activation_type : int
             FC1 activation type. Use ``ActivationType.Swiglu`` for gated
             SwiGLU/SiTU, ``ActivationType.GegluTanh`` for tanh-approximate
-            GeGLU, and ``ActivationType.Relu2`` for non-gated ReLU^2. Setting
-            ``situ_beta`` selects SiTU.
+            GeGLU, ``ActivationType.Relu2`` for non-gated ReLU^2, and
+            ``ActivationType.ClampedRelu2`` for non-gated clamped ReLU^2
+            (requires ``clamped_relu2_limit``). Setting ``situ_beta`` selects
+            SiTU.
         swiglu_alpha, swiglu_beta, swiglu_limit : float
             SwiGLU parameters. ``swiglu_oai`` is represented as
             ``ActivationType.Swiglu`` with non-default values.
@@ -1004,13 +1138,37 @@ class CuteDslMoEWrapper:
             Use atomic fused finalize; otherwise use the deterministic
             two-stage finalize. Defaults to ``True``.
         quant_mode : str
-            Compute mode: ``"w4a4"``, ``"w4a8"``, or ``"w4a16"``.
+            Compute mode: ``"w4a4"``, ``"w4a8"``, ``"w4a16"``, or ``"mxfp8"``.
             Defaults to ``"w4a4"``. ``"nvfp4"`` is a deprecated alias for
-            ``"w4a4"``.
+            ``"w4a4"``. W4A8 uses packed MXFP4 weights and MXFP8 activations;
+            W8A8 uses float8_e4m3fn weights and activations. Both use E8M0
+            block-32 scales, BF16 output, and either finalize mode on Blackwell
+            (SM100/SM103) with ``swap_ab=True``, including SiTU. The existing
+            path requires fused finalize and does not support SiTU. Neither
+            mode supports Rubin or per-token scales.
+        swap_ab : bool
+            Select the optimized SM100/SM103 implementation. Gated FC1 weights
+            and scales must use up16/gate16 rows when True, or the existing
+            up64/gate64 rows when False (default). W4A16 always uses weights
+            on A and activations on B; False handles the original 64-row
+            layout with an in-kernel transpose.
+        clamped_relu2_limit : Optional[torch.Tensor]
+            Model-wide positive clamp scale ``L`` for
+            ``ActivationType.ClampedRelu2``, provided as a one-element float32
+            CUDA tensor of shape ``(1,)``, as in :func:`cutlass_fused_moe`.
+            ClampedRelu2 computes ``relu(L * tanh(x / L)) ** 2`` on the
+            alpha-scaled FC1 output ``x`` (equivalently
+            ``(L * tanh(relu(x) / L)) ** 2``). The kernel reads the tensor at
+            runtime, so its value may be updated in place (e.g. between CUDA
+            graph replays) without recompiling. Required with ``ClampedRelu2``
+            and rejected for every other activation. Not supported by
+            ``"w4a16"`` or on SM107.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         quant_mode = _canonicalize_quant_mode(quant_mode)
+        validate_cute_dsl_moe_clamped_relu2_config(activation, clamped_relu2_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        _check_clamped_relu2_supported(activation, quant_mode, device)
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -1030,22 +1188,35 @@ class CuteDslMoEWrapper:
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.clamped_relu2_limit = clamped_relu2_limit
         self.use_fused_finalize = use_fused_finalize
         self.quant_mode = quant_mode
-        if quant_mode == "w4a8":
+        self.swap_ab = swap_ab
+        if swap_ab:
+            from ..prepare import _cute_dsl_gated_weight_group_size
+
+            _cute_dsl_gated_weight_group_size(torch.device(device), swap_ab)
+        if quant_mode in ("w4a8", "mxfp8"):
+            if not swap_ab:
+                if not use_fused_finalize:
+                    raise ValueError(
+                        "MXFP8 activations require fused finalize with swap_ab=False"
+                    )
+                if situ_beta is not None or situ_linear_beta is not None:
+                    raise ValueError(
+                        "SiTU with MXFP8 activations requires swap_ab=True"
+                    )
             if output_dtype is not torch.bfloat16:
-                raise ValueError("quant_mode='w4a8' supports only bfloat16 output")
-            if not use_fused_finalize:
-                raise ValueError("quant_mode='w4a8' requires fused finalize")
-            if situ_beta is not None or situ_linear_beta is not None:
-                raise ValueError("SiTU is not supported when quant_mode='w4a8'")
+                raise ValueError(
+                    f"quant_mode={quant_mode!r} supports only bfloat16 output"
+                )
             device_obj = torch.device(device)
             if (
                 device_obj.type == "cuda"
                 and torch.cuda.is_available()
                 and torch.cuda.get_device_capability(device_obj) == (10, 7)
             ):
-                raise ValueError("quant_mode='w4a8' is not supported on SM107")
+                raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
 
         # Persistent CUDA resources for async-memset / GEMM1 overlap. These
         # are created outside graph capture (so they can be reused inside it)
@@ -1058,7 +1229,7 @@ class CuteDslMoEWrapper:
         self._runner: Optional[CuteDslFusedMoERunner] = None
         self._per_token_runner: Optional[CuteDslFusedMoERunner] = None
         self._w4a16_runner: Optional[CuteDslFusedMoEW4A16Runner] = None
-        if quant_mode in ("w4a4", "w4a8"):
+        if quant_mode in ("w4a4", "w4a8", "mxfp8"):
             wrapper_ref = weakref.ref(self)
 
             def _forward_with_tactic_weak(*args, **kwargs):
@@ -1087,8 +1258,10 @@ class CuteDslMoEWrapper:
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                clamped_relu2_limit=clamped_relu2_limit,
                 use_per_token_activation=False,
                 quant_mode=quant_mode,
+                swap_ab=swap_ab,
             )
             if quant_mode == "w4a4":
                 self._per_token_runner = CuteDslFusedMoERunner(
@@ -1106,8 +1279,10 @@ class CuteDslMoEWrapper:
                     swiglu_limit=swiglu_limit,
                     situ_beta=situ_beta,
                     situ_linear_beta=situ_linear_beta,
+                    clamped_relu2_limit=clamped_relu2_limit,
                     use_per_token_activation=True,
                     quant_mode=quant_mode,
+                    swap_ab=swap_ab,
                 )
 
             if use_cuda_graph:
@@ -1129,10 +1304,12 @@ class CuteDslMoEWrapper:
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                swap_ab=swap_ab,
             )
         else:
             raise ValueError(
-                f"quant_mode must be 'w4a4', 'w4a8', or 'w4a16' (got {quant_mode!r})."
+                "quant_mode must be 'w4a4', 'w4a8', 'w4a16', or 'mxfp8' "
+                f"(got {quant_mode!r})."
             )
 
     def _forward_with_tactic(
@@ -1168,6 +1345,10 @@ class CuteDslMoEWrapper:
         enable_pdl: bool = True,
         use_async_memset: bool = True,
         nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+        gemm1_k_steps: Optional[int] = None,
+        gemm2_k_steps: Optional[int] = None,
+        gemm1_use_clc_scheduler: bool = True,
+        gemm2_use_clc_scheduler: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -1214,7 +1395,13 @@ class CuteDslMoEWrapper:
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            clamped_relu2_limit=self.clamped_relu2_limit,
             nvfp4_4over6=nvfp4_4over6,
+            gemm1_k_steps=gemm1_k_steps,
+            gemm2_k_steps=gemm2_k_steps,
+            gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
+            gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
+            swap_ab=self.swap_ab,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1246,9 +1433,9 @@ class CuteDslMoEWrapper:
         ----------
         x : torch.Tensor
             Packed NVFP4 input for ``quant_mode="w4a4"``, MXFP8 input for
-            ``quant_mode="w4a8"``, or BF16 input for ``quant_mode="w4a16"``.
+            ``quant_mode="w4a8"`` or ``"mxfp8"``, or BF16 input for ``quant_mode="w4a16"``.
         x_sf : Optional[torch.Tensor]
-            Scale factors for ``quant_mode="w4a4"`` or ``quant_mode="w4a8"``;
+            Scale factors for W4A4, W4A8, or W8A8;
             must be ``None`` for ``quant_mode="w4a16"``.
         token_selected_experts : torch.Tensor
             Expert assignments of shape ``[num_tokens, top_k]``.
@@ -1263,7 +1450,7 @@ class CuteDslMoEWrapper:
             Per-expert global scale for GEMM1.
         fc2_input_scale : Optional[torch.Tensor]
             Global scale for W4A4 GEMM2 input quantization; must be ``None``
-            for W4A8 and W4A16.
+            for W4A8, W8A8, and W4A16.
         w2_weight : torch.Tensor
             GEMM2 weights (down projection).
         w2_weight_sf : torch.Tensor
@@ -1288,12 +1475,13 @@ class CuteDslMoEWrapper:
         """
         num_tokens = token_selected_experts.size(0)
 
-        if self.quant_mode == "w4a8" and x.dtype is not torch.float8_e4m3fn:
-            raise TypeError("quant_mode='w4a8' requires float8_e4m3fn input")
-        if self.quant_mode == "w4a8":
+        if self.quant_mode in ("w4a8", "mxfp8"):
+            _validate_mxfp_weight_dtype(
+                self.quant_mode, x, w1_weight, w2_weight, self.swap_ab
+            )
             if per_token_scale is not None:
                 raise ValueError(
-                    "per_token_scale is not supported when quant_mode='w4a8'"
+                    "per_token_scale is not supported for MXFP8 activations"
                 )
         if self.quant_mode == "w4a4" and x.dtype is not torch.uint8:
             raise TypeError("quant_mode='w4a4' requires packed uint8 input")
@@ -1308,7 +1496,7 @@ class CuteDslMoEWrapper:
         tuner = AutoTuner.get()
         runner: CuteDslFusedMoERunner | CuteDslFusedMoEW4A16Runner | None
 
-        if self.quant_mode in ("w4a4", "w4a8"):
+        if self.quant_mode in ("w4a4", "w4a8", "mxfp8"):
             use_per_token_activation = per_token_scale is not None
             runner = (
                 self._per_token_runner if use_per_token_activation else self._runner
@@ -1332,7 +1520,7 @@ class CuteDslMoEWrapper:
             activation_name = (
                 "Situ" if self.situ_beta is not None else self.activation_type.name
             )
-            format_name = "w4a8" if self.quant_mode == "w4a8" else "w4a4"
+            format_name = self.quant_mode
             op_name = f"CuteDslMoEWrapper::run::{format_name}::{activation_name}"
         elif self.quant_mode == "w4a16":
             if (
@@ -1364,6 +1552,8 @@ class CuteDslMoEWrapper:
         else:
             raise RuntimeError(f"Unexpected quant_mode {self.quant_mode!r}")
 
+        if self.swap_ab:
+            op_name += "::SwapAB"
         if runner is None:
             raise RuntimeError(f"{self.quant_mode} runner was not initialized")
         recipe_kwargs = _cute_dsl_recipe_kwargs(
@@ -1379,7 +1569,7 @@ class CuteDslMoEWrapper:
             inputs,
             **recipe_kwargs,
         )
-        if self.quant_mode in ("w4a4", "w4a8"):
+        if self.quant_mode in ("w4a4", "w4a8", "mxfp8"):
             # Timed tactic runs retain the default async path; only this
             # selected-tactic execution is single-stream while tuning.
             runner_kwargs = {"use_async_memset": not tuner.is_tuning_mode}
@@ -1391,11 +1581,15 @@ class CuteDslMoEWrapper:
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
+        if self.swap_ab and self.quant_mode != "w4a16":
+            from .blackwell.moe_swap_ab_tuner import ALL_SWAP_AB_MOE_TACTICS
+
+            return list(ALL_SWAP_AB_MOE_TACTICS)
         if self.quant_mode in ("nvfp4", "w4a4"):
             # _get_arch_tactics() replaces main's ALL_MOE_TACTICS: the tactic
             # list is now architecture-dependent (Blackwell vs Rubin).
             return _get_arch_tactics()
-        elif self.quant_mode == "w4a8":
+        elif self.quant_mode in ("w4a8", "mxfp8"):
             return list(ALL_W4A8_MOE_TACTICS)
         elif self.quant_mode == "w4a16":
             return list(W4A16_MOE_TACTICS)
@@ -1470,11 +1664,17 @@ def _cute_dsl_fused_moe_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_weights: Optional[list] = None,
     localized_streams: Optional[list] = None,
     sm_count: Optional[int] = None,
+    gemm1_k_steps: Optional[int] = None,
+    gemm2_k_steps: Optional[int] = None,
+    gemm1_use_clc_scheduler: bool = True,
+    gemm2_use_clc_scheduler: bool = False,
+    swap_ab: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1515,11 +1715,17 @@ def _cute_dsl_fused_moe_impl(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        clamped_relu2_limit=clamped_relu2_limit,
         nvfp4_4over6=nvfp4_4over6,
         localized_memset_stream=localized_memset_stream,
         localized_weights=localized_weights,
         localized_streams=localized_streams,
         sm_count=sm_count,
+        gemm1_k_steps=gemm1_k_steps,
+        gemm2_k_steps=gemm2_k_steps,
+        gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
+        gemm2_use_clc_scheduler=gemm2_use_clc_scheduler,
+        swap_ab=swap_ab,
     )
 
 
@@ -1565,10 +1771,12 @@ def cute_dsl_fused_moe(
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
+    swap_ab: bool = False,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 is limited to
+    Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
     SM100 and SM103. This is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
@@ -1581,9 +1789,9 @@ def cute_dsl_fused_moe(
     ----------
     x : torch.Tensor
         Packed NVFP4 input for ``quant_mode="w4a4"``, MXFP8 input for
-        ``quant_mode="w4a8"``, or BF16 input for ``quant_mode="w4a16"``.
+        ``quant_mode="w4a8"`` or ``"mxfp8"``, or BF16 input for ``quant_mode="w4a16"``.
     x_sf : Optional[torch.Tensor]
-        Scale factors for ``quant_mode="w4a4"`` or ``quant_mode="w4a8"``;
+        Scale factors for W4A4, W4A8, or W8A8;
         must be ``None`` for ``quant_mode="w4a16"``.
     token_selected_experts : torch.Tensor
         Expert assignments of shape ``[num_tokens, top_k]``.
@@ -1598,7 +1806,7 @@ def cute_dsl_fused_moe(
         Per-expert global scale for GEMM1.
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for W4A4 GEMM2 input quantization; must be ``None`` for
-        W4A8 and W4A16.
+        W4A8, W8A8, and W4A16.
     w2_weight : torch.Tensor
         GEMM2 weights (down projection).
     w2_weight_sf : torch.Tensor
@@ -1628,9 +1836,11 @@ def cute_dsl_fused_moe(
     activation_type : int
         FC1 activation type. Use ``ActivationType.Swiglu`` for gated
         SwiGLU/SiTU, ``ActivationType.GegluTanh`` for tanh-approximate GeGLU,
-        and ``ActivationType.Relu2`` for non-gated ReLU^2. Setting
-        ``situ_beta`` selects SiTU; ``swiglu_oai`` is represented as
-        ``ActivationType.Swiglu`` with non-default ``swiglu_alpha/beta/limit``.
+        ``ActivationType.Relu2`` for non-gated ReLU^2, and
+        ``ActivationType.ClampedRelu2`` for non-gated clamped ReLU^2 (requires
+        ``clamped_relu2_limit``). Setting ``situ_beta`` selects SiTU;
+        ``swiglu_oai`` is represented as ``ActivationType.Swiglu`` with
+        non-default ``swiglu_alpha/beta/limit``.
     swiglu_alpha, swiglu_beta, swiglu_limit : float
         SwiGLU parameters.
     quant_mode : str
@@ -1640,11 +1850,27 @@ def cute_dsl_fused_moe(
         block-32 scales in the MMA layout) against MXFP8 activations
         (``x`` is ``float8_e4m3fn`` and ``x_sf`` the row-major E8M0 scales as
         ``uint8``), with ``fc2_input_scale=None`` and BF16 output.
+        W4A8 and MXFP8 support SiTU and either finalize mode on Blackwell
+        (SM100/SM103) with ``swap_ab=True``. The existing path requires fused
+        finalize and does not support SiTU. Neither mode supports Rubin or
+        per-token scales.
     situ_beta : Optional[float]
         When set with ``ActivationType.Swiglu``, use the SiTU gate
         ``beta * tanh(gate / beta) * sigmoid(gate)``.
     situ_linear_beta : Optional[float]
         Optional SiTU tanh clamp for the up branch.
+    clamped_relu2_limit : Optional[torch.Tensor]
+        Model-wide positive clamp scale ``L`` for
+        ``ActivationType.ClampedRelu2``, provided as a one-element float32
+        CUDA tensor of shape ``(1,)`` on the device of ``x``, as in
+        :func:`cutlass_fused_moe`. ClampedRelu2 computes
+        ``relu(L * tanh(x / L)) ** 2`` on the alpha-scaled FC1 output ``x``
+        (equivalently ``(L * tanh(relu(x) / L)) ** 2``, the CUTLASS MoE
+        ``ClampedRelu2``). The kernel reads the tensor at runtime, so the
+        compiled kernel does not depend on its value. Required with
+        ``ClampedRelu2`` and rejected for every other activation. Supported
+        by ``"w4a4"``, ``"w4a8"`` and ``"mxfp8"``; not by ``"w4a16"`` or on
+        SM107.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
     nvfp4_4over6 : NVFP44Over6Config or None
@@ -1721,6 +1947,12 @@ def cute_dsl_fused_moe(
     localized_allow_nonlocalized : bool
         Include the full-width path in autotuning when localized weights are
         supplied. The caller must retain usable full-width weights.
+    swap_ab : bool
+        Select the optimized SM100/SM103 implementation. Gated FC1 weights
+        and scales must use up16/gate16 rows when True, or the existing
+        up64/gate64 rows when False (default). W4A16 always uses weights
+        on A and activations on B; False handles the original 64-row
+        layout with an in-kernel transpose.
     autotune_use_cuda_graph : bool
         Profile tactics through CUDA Graph replay.
 
@@ -1732,21 +1964,21 @@ def cute_dsl_fused_moe(
     quant_mode = _canonicalize_quant_mode(quant_mode)
     recipe_kwargs = _cute_dsl_recipe_kwargs(nvfp4_4over6, quant_mode, per_token_scale)
     _require_cute_dsl_arch_for(x.device, native_only=True)
-    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
-    validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    if swap_ab:
+        from ..prepare import _cute_dsl_gated_weight_group_size
 
-    if quant_mode == "w4a8":
-        if x.dtype is not torch.float8_e4m3fn:
-            raise TypeError("quant_mode='w4a8' requires float8_e4m3fn input")
+        _cute_dsl_gated_weight_group_size(x.device, swap_ab)
+    activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    validate_cute_dsl_moe_clamped_relu2_config(
+        activation, clamped_relu2_limit, x.device
+    )
+    validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    _check_clamped_relu2_supported(activation, quant_mode, x.device)
+
+    if quant_mode in ("w4a8", "mxfp8"):
+        _validate_mxfp_weight_dtype(quant_mode, x, w1_weight, w2_weight, swap_ab)
         if torch.cuda.get_device_capability(x.device) == (10, 7):
-            raise ValueError("quant_mode='w4a8' is not supported on SM107")
-    elif quant_mode == "mxfp8":
-        if x.dtype is not torch.float8_e4m3fn:
-            raise TypeError("quant_mode='mxfp8' requires float8_e4m3fn input")
-        if w1_weight.dtype is not torch.float8_e4m3fn:
-            raise TypeError("quant_mode='mxfp8' requires float8_e4m3fn weights")
-        if torch.cuda.get_device_capability(x.device) == (10, 7):
-            raise ValueError("quant_mode='mxfp8' is not supported on SM107")
+            raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
     elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
         raise TypeError("quant_mode='w4a4' requires packed uint8 input")
 
@@ -1798,9 +2030,11 @@ def cute_dsl_fused_moe(
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            clamped_relu2_limit=clamped_relu2_limit,
             use_per_token_activation=use_per_token_activation,
             quant_mode=quant_mode,
             use_cuda_graph=autotune_use_cuda_graph,
+            swap_ab=swap_ab,
         )
         if localized_weights is None:
             runners = [CuteDslFusedMoERunner(**runner_kwargs)]
@@ -1871,6 +2105,7 @@ def cute_dsl_fused_moe(
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            swap_ab=swap_ab,
         )
         runners = [runner]
         inputs = [
@@ -1893,6 +2128,8 @@ def cute_dsl_fused_moe(
             f"(got {quant_mode!r})."
         )
 
+    if swap_ab:
+        op_name += "::SwapAB"
     if tactic is not None:
         return runners[0](inputs, tactic=tactic, aux_stream=aux_stream, **recipe_kwargs)
 
@@ -1949,6 +2186,7 @@ def cute_dsl_fused_moe_nvfp4(
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -2002,6 +2240,7 @@ def cute_dsl_fused_moe_nvfp4(
         localized_allow_nonlocalized=localized_allow_nonlocalized,
         autotune_use_cuda_graph=autotune_use_cuda_graph,
         nvfp4_4over6=nvfp4_4over6,
+        clamped_relu2_limit=clamped_relu2_limit,
     )
 
 
