@@ -19,7 +19,8 @@ Everything is stated for the opaque primitive of the class: `mma16` (bf16) and, 
 step (`tileResultG`), `mma32` (the fp8 classes, whose knob constraints `ConfigOKFp8` lack the 8-wide tile) and
 `mma32mx` / `mma64mx8` (the MXFP8 classes, whose knob constraints `ConfigOKMx8` / `ConfigOKMx8K64` are the block-scaled
 instruction's) and `mma64bs` / `mma128bs` / `mma64mx` / `mma128mx4` (the NVFP4 and MXFP4 classes, `ConfigOKNvfp4` /
-`ConfigOKNvfp4K128` / `ConfigOKMx4` / `ConfigOKMx4K128`). The hardware hypothesis is that every MMA instruction variant the space selects (`tm ∈ {64,128}` 1-CTA,
+`ConfigOKNvfp4K128` / `ConfigOKMx4` / `ConfigOKMx4K128`); the block-scale fp8 class has its own kernel model, the
+promotion loop `promoteLoop` (`ConfigOKFp8BS`). The hardware hypothesis is that every MMA instruction variant the space selects (`tm ∈ {64,128}` 1-CTA,
 `{128,256}` 2-CTA, `tn ∈ 32..256` and the decode tiles; for the block-scaled classes also the swapped operand order of
 the decode records and the B-reuse pair of the sm_107 class) is the same per-element function of its primitive. No Lean
 statement can discharge it; the GPU test `test_config_agreement` checks the dispatcher's candidates bit for bit against
@@ -104,6 +105,20 @@ def ConfigOKNvfp4 (c : Config) : Bool := ConfigOKBlockScaled false false 192 c
 def ConfigOKNvfp4K128 (c : Config) : Bool := ConfigOKBlockScaled true false 256 c
 def ConfigOKMx4 (c : Config) : Bool := ConfigOKBlockScaled false true 192 c
 def ConfigOKMx4K128 (c : Config) : Bool := ConfigOKBlockScaled true true 256 c
+
+/-- The block-scale fp8 class's knob constraints (mirror of `Knobs.well_formed("e4m3_bs")`): a 128-row CTA tile (MMA M 128
+1-CTA / 256 2-CTA: the promotion gives each epilogue thread one output row, hence one A scale), tile N 16 / 32 / 64 / 128
+(it divides the 128-column weight scale block: one B scale per tile and block; the register running sum bounds it), the
+16-wide tile on the 1-CTA instruction only, the dense classes' cluster / raster / swizzle constraints, and no in-cluster
+split, swapped tile or in-CTA chunk fold (the class has no split variant). The generated `gemm_fp8bs_space_ok` checks every
+emitted record against it. -/
+def ConfigOKFp8BS (c : Config) : Bool :=
+  (if c.twoCta then c.tm == 256 else c.tm == 128) &&
+  (c.tn == 16 || c.tn == 32 || c.tn == 64 || c.tn == 128 || c.tn == 256) && (32 ≤ c.tn || !c.twoCta) &&
+  (c.clusterM == 1 || c.clusterM == 2 || c.clusterM == 4 || c.clusterM == 8 || c.clusterM == 16) &&
+  (c.clusterN == 1 || c.clusterN == 2 || c.clusterN == 4 || c.clusterN == 8 || c.clusterN == 16) &&
+  (c.clusterM * c.clusterN ≤ 16) && (!c.twoCta || c.clusterM % 2 == 0) &&
+  (c.swizzle == 1 || c.swizzle == 2 || c.swizzle == 4 || c.swizzle == 8) && (c.clusterK == 1) && (!c.swapAb) && (!c.ctaChunks)
 
 /-- The in-CTA chunk fold (`ctaChunks`, `gemm/blocks/epilogue.py`) is the split kernel with the CONSTANT assignment
 of every chunk to one CTA: that CTA computes each chunk's partial from +0 in turn (the mainloop's fold per chunk) and
@@ -629,5 +644,74 @@ theorem tileResultMX4K128_ne_tileResultMX4 (c₁ c₂ : Config) (S₁ S₂ : Nat
     tileResultMX4K128 c₁ S₁ p a b 1 1 ≠ tileResultMX4 c₂ S₂ q a b 2 1 := by
   rw [tileResultMX4K128_eq_kfoldMX4K128, tileResultMX4_eq_kfoldMX4]
   exact kfoldMX4K128_ne_kfoldMX4 a b
+
+/-! ## The block-scale fp8 tile (`gemm.e4m3.kblock128`, `gemm/blocks/blockscale_fp8.py`)
+
+The kernel's structure IS the class's fold, block by block: the MMA warp runs the dense lowering's one-stage fold
+(`stepsPerBlock` steps from a reset accumulator; accumulator stage `kb % S`) for block `kb`, and the epilogue warps fold
+the completed partial into their running sum with `fma(blockScale kb, P_kb, sum)` from +0, blocks ascending
+(`promoteLoop`). `promoteLoop_eq_kblock128` shows the loop is the class for every stage count and block count, and the
+tile model erases the configuration as for the other classes (which tile a CTA owns never enters the term). The generated
+`gemmfp8bsloop*` cases conform the loop to the Python engine's per-block traces assembled by the block digit; the A2
+surface of this class (the `kind::f8f6f4` variants of the space and the promotion pass on every tile shape) is checked bit
+for bit against the exact CPU model by the GPU test. -/
+
+/-- The kernel's block loop: block `kb` through accumulator stage `kb % S`, its partial folded into the running sum. -/
+def promoteLoop (a : RowData) (b : ColData) (S : Nat) : Nat → GTerm
+  | 0 => .zero
+  | kb+1 =>
+    let _stage := kb % S
+    GTerm.fma (blockScale a b kb) (foldStepsG GTerm.mma32 a b .zero (kb * stepsPerBlock) stepsPerBlock) (promoteLoop a b S kb)
+
+/-- **The promotion loop computes the class**, for every stage count and block count. -/
+theorem promoteLoop_eq_kblock128 (a : RowData) (b : ColData) (S KB : Nat) : promoteLoop a b S KB = kblock128 a b KB := by
+  unfold kblock128
+  induction KB with
+  | zero => rfl
+  | succ n ih => simp only [promoteLoop, foldBlocks, blockPartial32, ih]
+
+def tileResultKB (cfg : Config) (S : Nat) (_prev : GTerm) (a : RowData) (b : ColData) (KB : Nat) : GTerm :=
+  let _owner := (cfg.tm, cfg.tn, cfg.clusterM, cfg.clusterN, cfg.twoCta, cfg.rasterM, cfg.swizzle)
+  promoteLoop a b S KB
+
+theorem tileResultKB_reset (cfg : Config) (S : Nat) (p q : GTerm) (a : RowData) (b : ColData) (KB : Nat) :
+    tileResultKB cfg S p a b KB = tileResultKB cfg S q a b KB := rfl
+
+theorem tileResultKB_eq_kblock128 (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (KB : Nat) :
+    tileResultKB cfg S p a b KB = kblock128 a b KB := by
+  unfold tileResultKB; exact promoteLoop_eq_kblock128 a b S KB
+
+/-- **Config invariance (R3) of the block-scale class**: any two configurations, stage counts and carried accumulators give
+the same per-element term; the hardware hypothesis is that the `kind::f8f6f4` variants of the space are one per-element
+function (A2). -/
+theorem config_invarianceKB (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (KB : Nat) :
+    tileResultKB c₁ S₁ p a b KB = tileResultKB c₂ S₂ q a b KB := by
+  rw [tileResultKB_eq_kblock128, tileResultKB_eq_kblock128]
+
+theorem space_invariantKB (space : List Config) :
+    ∀ c₁ ∈ space, ∀ c₂ ∈ space, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (KB : Nat),
+      tileResultKB c₁ S₁ p a b KB = tileResultKB c₂ S₂ q a b KB :=
+  fun c₁ _ c₂ _ S₁ S₂ p q a b KB => config_invarianceKB c₁ c₂ S₁ S₂ p q a b KB
+
+/-- Through the chain (the conversion alone): the output element of a tile is the class's output. -/
+theorem tileOutputKB_eq_outputKblock (fmt : String) (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (KB : Nat) :
+    outputElem false fmt (tileResultKB cfg S p a b KB) = outputKblock fmt a b KB := by
+  unfold outputKblock; rw [tileResultKB_eq_kblock128]
+
+theorem outputKB_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (KB : Nat) :
+    outputElem false fmt (tileResultKB c₁ S₁ p a b KB) = outputElem false fmt (tileResultKB c₂ S₂ q a b KB) := by
+  rw [config_invarianceKB c₁ c₂ S₁ S₂ p q a b KB]
+
+theorem config_invarianceKB_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (KB : Nat) :
+    eval P (tileResultKB c₁ S₁ p a b KB) = eval P (tileResultKB c₂ S₂ q a b KB) := by
+  rw [config_invarianceKB c₁ c₂ S₁ S₂ p q a b KB]
+
+/-- A tile of the block-scale class is never a tile of the per-tensor fp8 class, whatever the configurations and stage
+counts. -/
+theorem tileResultKB_ne_kfold32 (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) :
+    tileResultKB cfg S p a b 1 ≠ kfold32 a b stepsPerBlock := by
+  rw [tileResultKB_eq_kblock128]; exact kblock128_ne_kfold32 a b
 
 end BIK.GEMM

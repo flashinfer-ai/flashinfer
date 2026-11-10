@@ -38,7 +38,9 @@ Mode
   budgets; its results are not bitwise equal to that package's.  It also takes
   ``save_mode="light_akk"``: the light saved set plus the forward's BF16
   ``Akk`` tape, which the backward's prep replay reads instead of solving the
-  block inverse; it needs ``use_qk_l2norm_in_kernel=True``.
+  block inverse; it needs ``use_qk_l2norm_in_kernel=True`` and is the default
+  there (a call that leaves ``save_mode`` unset), while calls without the norm
+  default to ``"light"``.
 
 A stable FlashInfer API: thin ``@flashinfer_api`` entry points that import the
 package on first use.  The partition / context plan, the host orchestration,
@@ -288,7 +290,8 @@ def cake_gdn_nondet_train_kcp_forward(
     workspace : CakeGDNNondetKcpWorkspace, optional
         A reused caller-held workspace (``cake_gdn_nondet_train_kcp_workspace_bytes``); without one the call allocates its own.
     options, **knobs
-        Keyword-only options (``save_mode`` ``"light"`` | ``"full"`` | ``"light_akk"`` (see the module docstring),
+        Keyword-only options (``save_mode`` ``"light"`` | ``"full"`` | ``"light_akk"`` (see the module docstring;
+        unset: ``"light_akk"`` with ``use_qk_l2norm_in_kernel=True``, else ``"light"``),
         ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
@@ -380,7 +383,7 @@ def cake_gdn_nondet_kcp(
     ctx: Any,
     *,
     scale: Optional[float] = None,
-    save_mode: str = "light",
+    save_mode: Optional[str] = None,
     boundary_mode: str = "saved",
     workspace: Optional[Any] = None,
     graph: str = "off",

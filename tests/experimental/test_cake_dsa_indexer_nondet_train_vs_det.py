@@ -24,12 +24,16 @@ limitations under the License.
 # * every host plan has the deterministic plan's fields (scan program, split, grid, unit, capacity, check period,
 #   sampling, segment order, pair, staging and workspace bytes, ticket decisions), the deterministic package's
 #   rank-fused merge being the plain merge here;
+# * on sm_107a the sampled first threshold's launch scalars (tile count and rank shift) are this package's own
+#   (``_OWN_SAMPLING``: its ``sample_class_rule`` and the ``sample_long_rule`` the deterministic record has no field
+#   for), so that no #7549 rank input runs slower with sampling on than off (flashinfer-ai/flashinfer#7549).  Whether a
+#   call samples, and every other decision, stays the deterministic one;
 # * every row on a device is the deterministic row in another slot order: the valid slots in ascending id order
 #   (``_canonical``) are bit-identical to the deterministic row, ids, score bits, valid count and tail padding.
 #
 # The host tests run without a GPU; the device tests need a compute capability 10.0 / 10.3 / 10.7 device with the
 # generated programs of both packages registered and skip otherwise.  Both packages are named through
-# ``tests.test_helpers.cake_package``, as their own suites do.
+# ``tests.cake.test_helpers.cake_package``, as their own suites do.
 
 import dataclasses
 import itertools
@@ -37,8 +41,8 @@ import itertools
 import pytest
 import torch
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_indexer_nondet_train", "cake_backend")
 cake_jit = cake_package("cake.cake_dsa_indexer_nondet_train", "cake_jit")
@@ -67,10 +71,22 @@ P1_CU_SEQLENS_K = (0, 1777, 58619, 60742, 128665, 130788, 198711, 200834, 268757
 P2_T, P2_TKV = 16172, 267520
 
 
+# the policy fields this package sets on its own: the deterministic record has no ``sample_long_rule``, and on sm_107a
+# the sampled tile count and rank shift follow this package's class and long-unit rules (#7549)
+_OWN_FIELDS = ("sample_long_rule",)
+_OWN_SAMPLING = {"sm_107a": ("sample_class_rule", "sample_long_rule")}
+
+
 def _nondet_name(det_name: str) -> str:
     """The non-deterministic program of a deterministic program: the same twenty-hex identity, the other prefix."""
     assert det_name.startswith(DET_PREFIX), det_name
     return NONDET_PREFIX + det_name[len(DET_PREFIX) :]
+
+
+def _det_name(name: str) -> str:
+    """The deterministic program a program of this package comes from (the inverse of ``_nondet_name``)."""
+    assert name.startswith(NONDET_PREFIX), name
+    return DET_PREFIX + name[len(NONDET_PREFIX) :]
 
 
 def _bf16_keys(keys: dict) -> dict:
@@ -173,21 +189,36 @@ def test_program_keys_are_the_deterministic_bf16_scan_keys_and_the_plain_merge()
         ), arch
     assert set(cake_jit.PROGRAMS) == shipped
     for name, record in cake_jit.PROGRAMS.items():
-        det_record = det_jit.PROGRAMS[DET_PREFIX + name[len(NONDET_PREFIX) :]]
-        for field in ("role", "arches", "ticket_arg_arches"):
+        det_record = det_jit.PROGRAMS[_det_name(name)]
+        for field in ("role", "arches"):
             assert record.get(field) == det_record.get(field), (name, field)
+        assert record.get("ticket_arg_arches") == det_record.get("ticket_arg_arches"), (
+            name
+        )
         assert record["library"] == name
 
 
 def test_policy_records_are_the_deterministic_records_restricted():
     """Every architecture's dispatch record holds exactly the fields this package's policy reads, with the
-    deterministic record's values: the same scan, capacity, check-period, split, pair, sampling and ticket rules."""
+    deterministic record's values: the same scan, capacity, check-period, split, pair, sampling and ticket rules,
+    but the sm_107a sampling rules of this package (``_OWN_SAMPLING``); ``sample_long_rule`` is set on sm_107a
+    only."""
     assert set(cake_jit.POLICY) == set(det_jit.POLICY)
     for arch, record in cake_jit.POLICY.items():
         det_record = det_jit.POLICY[arch]
         assert set(record) == set(cake_policy.POLICY_FIELDS), arch
-        assert set(cake_policy.POLICY_FIELDS) <= set(det_record), arch
-        assert record == {field: det_record[field] for field in record}, arch
+        shared = set(cake_policy.POLICY_FIELDS) - set(_OWN_FIELDS)
+        assert shared <= set(det_record), arch
+        own = _OWN_SAMPLING.get(arch, ())
+        assert (record["sample_long_rule"] is not None) == (
+            "sample_long_rule" in own
+        ), arch
+        expected = {
+            field: det_record[field] if field in shared else record[field]
+            for field in record
+            if field not in own
+        }
+        assert {f: v for f, v in record.items() if f not in own} == expected, arch
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +227,13 @@ def test_policy_records_are_the_deterministic_records_restricted():
 
 
 def _assert_same_decisions(arch, plan, det_plan, where) -> None:
+    # sm_107a: the sampled tile count and rank shift are this package's own (launch scalars only; ``_OWN_SAMPLING``),
+    # whether the call samples is not
+    own = ("sample_tiles_max", "sample_shift_permille") if arch in _OWN_SAMPLING else ()
+    assert (plan.sample_tiles_max > 0) == (det_plan.sample_tiles_max > 0), where
     for field in _PLAN_FIELDS:
+        if field in own:
+            continue
         assert getattr(plan, field) == getattr(det_plan, field), (
             where,
             field,

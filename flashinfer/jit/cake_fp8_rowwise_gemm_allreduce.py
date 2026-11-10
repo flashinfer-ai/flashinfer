@@ -57,6 +57,48 @@ from .core import (
 
 # Filled mechanically from the program bundle.
 PROGRAMS: dict[str, dict[str, Any]] = {
+    "cake_fp8_rowwise_gemm_allreduce_0882885198687141cd4a": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_0882885198687141cd4a_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_0882885198687141cd4a_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 213088,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
     "cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a": {
         "family": "blackwell",
         "sources": [
@@ -306,6 +348,90 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_z",
         ],
     },
+    "cake_fp8_rowwise_gemm_allreduce_92002e9c22c1d8ea9829": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_92002e9c22c1d8ea9829_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_92002e9c22c1d8ea9829_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 225376,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
+    "cake_fp8_rowwise_gemm_allreduce_a2589cb399561c4c5a54": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_a2589cb399561c4c5a54_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_a2589cb399561c4c5a54_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 225376,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
     "cake_fp8_rowwise_gemm_allreduce_cdaec3a4bab3b1b1d6d6": {
         "family": "hopper",
         "sources": [
@@ -348,17 +474,111 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_z",
         ],
     },
+    "cake_fp8_rowwise_gemm_allreduce_d2557ff50c504747e37d": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_d2557ff50c504747e37d_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_d2557ff50c504747e37d_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 213088,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
+    "cake_fp8_rowwise_gemm_allreduce_d94d1f7305feac3269dc": {
+        "family": "hopper",
+        "sources": [
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_d94d1f7305feac3269dc_kernel.cu",
+            "csrc/cake_fp8_rowwise_gemm_allreduce/hopper/cake_fp8_rowwise_gemm_allreduce_d94d1f7305feac3269dc_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "block": [512, 1, 1],
+        "cluster": [1, 1, 1],
+        "dynamic_smem_bytes": 213088,
+        "args": [
+            "A",
+            "W",
+            "OUT",
+            "out_ptr",
+            "sa",
+            "sw",
+            "ctl",
+            "S_mc",
+            "M",
+            "N",
+            "K",
+            "grid_n",
+            "tiles",
+            "K_tiles",
+            "group_m",
+            "C",
+            "C_cap",
+            "S_bytes",
+            "flag_words",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "S",
+            "S_peers",
+            "flags",
+            "flags_peers",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+    },
 }
 ROUTES: dict[str, dict[str, str]] = {
     "sm_90a": {
         "main_ws2_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws2_p2p_ls2": "cake_fp8_rowwise_gemm_allreduce_d94d1f7305feac3269dc",
         "main_ws2_p2p_r6": "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553",
+        "main_ws2_p2p_r6_ls2": "cake_fp8_rowwise_gemm_allreduce_92002e9c22c1d8ea9829",
         "main_ws4_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws4_p2p_dp": "cake_fp8_rowwise_gemm_allreduce_d2557ff50c504747e37d",
+        "main_ws4_p2p_ls2": "cake_fp8_rowwise_gemm_allreduce_d94d1f7305feac3269dc",
+        "main_ws4_p2p_ls2_dp": "cake_fp8_rowwise_gemm_allreduce_0882885198687141cd4a",
         "main_ws4_p2p_r6": "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553",
+        "main_ws4_p2p_r6_dp": "cake_fp8_rowwise_gemm_allreduce_a2589cb399561c4c5a54",
         "main_ws8_p2p": "cake_fp8_rowwise_gemm_allreduce_32edd0405014d238b067",
+        "main_ws8_p2p_dp": "cake_fp8_rowwise_gemm_allreduce_d2557ff50c504747e37d",
         "main_ws8_p2p_g4": "cake_fp8_rowwise_gemm_allreduce_39c6c11b20cb6d7d4baa",
         "main_ws8_p2p_g4_r6": "cake_fp8_rowwise_gemm_allreduce_cdaec3a4bab3b1b1d6d6",
+        "main_ws8_p2p_ls2": "cake_fp8_rowwise_gemm_allreduce_d94d1f7305feac3269dc",
+        "main_ws8_p2p_ls2_dp": "cake_fp8_rowwise_gemm_allreduce_0882885198687141cd4a",
         "main_ws8_p2p_r6": "cake_fp8_rowwise_gemm_allreduce_82fa3df922ed493ea553",
+        "main_ws8_p2p_r6_dp": "cake_fp8_rowwise_gemm_allreduce_a2589cb399561c4c5a54",
     },
     "sm_100a": {
         "main_ws2_p2p": "cake_fp8_rowwise_gemm_allreduce_43c80d0e40bf111ee438",
@@ -493,8 +713,11 @@ CAPACITY_VARIANTS: dict[str, list[list[Any]]] = {
 # reducer warps (it also needs ``K_l * world_size <= N`` and, for a world size in
 # ``mn_limit``, ``M * N`` below that limit). ``LOCKSTEP``: route suffix, the
 # smallest raster group and the smallest tile count of the program that throttles its
-# producers to the grid's progress. Both suffixes apply in that order; an absent lever is
-# never selected.
+# producers to the grid's progress, and the program variants (``""``: the default
+# capacity) whose calls may take it. ``DRAIN``: route suffix, the world sizes, the largest
+# ``M`` and the program variants of the program whose drainer pulls from every peer at
+# once (it also needs a grid of at least ``world_size - 1`` CTAs, one per peer). The
+# suffixes apply in that order; an absent lever is never selected.
 LEVER_DISPATCH: dict[str, dict[str, Any]] = {
     "sm_90a": {
         "REDUCERS": {
@@ -502,6 +725,13 @@ LEVER_DISPATCH: dict[str, dict[str, Any]] = {
             "max_k_l": {2: 4096, 4: 1536, 8: 1536},
             "mn_limit": {2: 1073741824},
         },
+        "LOCKSTEP": {
+            "suffix": "_ls2",
+            "min_raster_group": 2,
+            "min_tiles": 12288,
+            "variants": [""],
+        },
+        "DRAIN": {"suffix": "_dp", "worlds": [4, 8], "max_m": 32768, "variants": [""]},
     },
     "sm_100a": {},
     "sm_103a": {},
@@ -803,7 +1033,7 @@ def lever_suffixes(arch: str) -> tuple[str, ...]:
 
     table = LEVER_DISPATCH.get(arch, {})
     suffixes = [""]
-    for lever in ("REDUCERS", "LOCKSTEP"):
+    for lever in ("REDUCERS", "LOCKSTEP", "DRAIN"):
         if lever in table:
             suffix = str(table[lever]["suffix"])
             suffixes += [item + suffix for item in suffixes]
@@ -811,14 +1041,26 @@ def lever_suffixes(arch: str) -> tuple[str, ...]:
 
 
 def lever_variant(
-    world_size: int, m: int, n: int, k_l: int, arch: str, *, sm_count: int
+    world_size: int,
+    m: int,
+    n: int,
+    k_l: int,
+    arch: str,
+    *,
+    sm_count: int,
+    variant: str = "",
 ) -> str:
     """The lever suffix of one call on ``arch`` (empty: the route's program).
 
     Reducers: ``K_l`` at most the world size's bound, ``K_l * world_size <= N`` and
     ``M * N`` below the world size's ``mn_limit`` (when it has one).
-    Lockstep: a raster group of at least ``min_raster_group``, at least ``min_tiles``
-    tiles and a grid below ``MAX_CTAS`` (the throttle counts in the last arrival word).
+    Lockstep: a program ``variant`` of the capacity (``program_variant``) among the
+    lever's ``variants``, a raster group of at least ``min_raster_group``, at least
+    ``min_tiles`` tiles and a grid below ``MAX_CTAS`` (the throttle counts in the last
+    arrival word).
+    Drain: a world size among the lever's ``worlds``, a program ``variant`` among its
+    ``variants``, ``M`` at most ``max_m`` and a grid (``min(sm_count, tiles)``) of at
+    least ``world_size - 1`` CTAs (one per peer).
     """
 
     table = LEVER_DISPATCH.get(arch, {})
@@ -837,11 +1079,21 @@ def lever_variant(
     lockstep = table.get("LOCKSTEP")
     if (
         lockstep is not None
+        and str(variant) in lockstep["variants"]
         and 0 < int(sm_count) < int(geometry(arch)["MAX_CTAS"])
         and raster_group_m(m, n, k_l, arch) >= int(lockstep["min_raster_group"])
         and tiles(m, n, arch) >= int(lockstep["min_tiles"])
     ):
         suffix += str(lockstep["suffix"])
+    drain = table.get("DRAIN")
+    if (
+        drain is not None
+        and str(variant) in drain["variants"]
+        and world_size in drain["worlds"]
+        and m <= int(drain["max_m"])
+        and min(int(sm_count), tiles(m, n, arch)) >= world_size - 1
+    ):
+        suffix += str(drain["suffix"])
     return suffix
 
 
@@ -858,7 +1110,13 @@ def call_program(
     """The program one call of ``(m, n, k_l)`` runs in a workspace of ``max_rows`` rows."""
 
     key = route_key(world_size, arch, max_rows) + lever_variant(
-        world_size, m, n, k_l, arch, sm_count=sm_count
+        world_size,
+        m,
+        n,
+        k_l,
+        arch,
+        sm_count=sm_count,
+        variant=program_variant(world_size, max_rows, arch),
     )
     table = ROUTES.get(arch, {})
     if key not in table:
@@ -882,8 +1140,8 @@ def dispatch_programs(
 
     With ``k_l`` (a prepared launcher binds ``N`` and ``K_l``): the programs of the calls of
     1 to ``chunk_capacity(max_rows)`` chunks, each at its first and its last row count (a
-    call's lever depends on ``M`` through its chunk count and the reducers' ``M * N``
-    limit, which a chunk's two ends bracket). Without ``k_l`` (the one-shot workspace
+    call's lever depends on ``M`` through its chunk count, the reducers' ``M * N``
+    limit and the drainer's ``max_m``, which a chunk's two ends bracket). Without ``k_l`` (the one-shot workspace
     serves any ``K_l``): every program of the route's lever keys. On an architecture
     without levers every call runs the main program, so no chunk is enumerated.
     """

@@ -111,7 +111,9 @@ def cake_causal_conv1d_det_kcp(
         BF16 ``y`` of ``x_local``'s shape.  The backward runs the head program, the backward halo exchange and the
         main ``dx`` + deterministic FP32 ``dweight`` program of this rank's fragments: with ``cooperative=False``
         (the default) an ordinary launch followed by a fixed-order reduce program on the same stream, with
-        ``True`` one cooperative kernel.
+        ``True`` one cooperative kernel.  With ``cooperative=False`` at more than one rank the main program runs
+        while the exchange is in flight and a tail-row program writes the last rows of the fragments that receive
+        rows after the wait (``dx`` and ``dweight`` keep the bits of the waiting launch).
     """
 
     return _kcp().cake_causal_conv1d_det_kcp(

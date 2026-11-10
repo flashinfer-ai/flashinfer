@@ -2506,7 +2506,9 @@ def cake_kda_det_train_kcp_saved_bytes(
     per crossing fragment); ``False`` = the re-walk form of the test knob ``saved_carry=0``.
 
     The set carries no token-row ``Aqk`` / ``Akk`` (the ``256 * T_r * H`` term of its earlier version): the backward
-    recomputes the internal rows in both modes.
+    recomputes the internal rows in both modes.  The rows a checkpoint recompute keeps for its backward
+    (``cake_kcp.INTRA_ROWS``) are not part of any set: they lie in that backward's ``dq`` / ``dk`` or go before it
+    allocates its outputs.
 
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
@@ -2846,7 +2848,7 @@ def local_scratch_table_bytes(plan) -> int:
 # The local arena of a backward workspace (``cake_kcp.CakeKDADetKcpWorkspace`` ``local_arena``): ``"replay"`` (the default)
 # is the existing backend's replay layout (4488 B per internal token-head) with its forward layout; ``"lean"`` (opt-in)
 # runs the backward on this route's lean layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, registered on the existing backend:
-# 3460 B per internal token-head plus the per-pass set where it does not fit; the fused gradient, GLM intra and the
+# 3332 B per internal token-head plus the per-pass set where it does not fit; the fused gradient, GLM intra and the
 # gate epilogue once per range of ``ceil(NC_pad / passes)`` chunks) and the forward on :data:`LOCAL_LAYOUT_FWD_ONLY`.
 # The same kernels on the same bytes: the gradients are bitwise those of ``"replay"``.  Under ``"lean"`` a row whose
 # replay fused-gradient record does not store ``dAqk`` itself (H 9-15: ``dqkg_int``, whose ``dAqk`` comes from
@@ -2854,18 +2856,17 @@ def local_scratch_table_bytes(plan) -> int:
 LOCAL_ARENAS = ("replay", "lean")
 LOCAL_ARENA_DEFAULT = "replay"
 # The lean backward layout (a mode of the existing backend's arenas that this module registers there, never one of its
-# own).  The KCP backward (the replay prep and intra / WY programs, its K1 / K2 walks, its ``kcp_dav``, then the fused
-# gradient, GLM intra and the gate epilogue) with the tail split into ``passes`` chunk ranges as in the existing
-# backend's lean layouts.  The fused-gradient records of the rows it serves (:data:`LEAN_DQKG_RECORDS`) store ``dAqk``
-# themselves, every row ``kcp_dav`` writes, so ``kcp_dav``'s ``dAqk`` goes to a dead sink over ``u`` (lifetime
-# [4, 4]) and the whole-sequence ``dAqk`` leaves the layout; ``aqk_int`` (read last by ``kcp_dav`` at 4) rides beside
-# the sink under the ``dh`` tape, and ``dv1`` (written by ``kcp_dav`` at 4, read by the adjoint walks at 5) takes
-# ``kb``'s bytes.  The walks keep no segment state in the arena, so the layout has no state blocks.  Whole-sequence
-# buffers: 3460 B per internal token-head (the live set at the adjoint tape walk, step 5).  The per-pass set (the
-# existing backend's ``_PASS_OCCUPANTS`` without the gate buffers where GLM intra fuses the epilogue) is packed
-# first-fit into the bytes of the three whole-sequence slots dead before the tail (qg / kg 512, w 256, kb / dv1 256);
-# what does not fit goes to an overflow slot.  The rows ``kcp_dav`` reads and writes in one slot (``aqk_int`` and
-# the sink) are disjoint bytes.
+# own).  The KCP backward (the replay prep and intra / WY programs, its K1 / K2 walks, then the fused gradient, GLM
+# intra and the gate epilogue) with the tail split into ``passes`` chunk ranges as in the existing backend's lean
+# layouts.  The fused-gradient records of the rows it serves (:data:`LEAN_DQKG_RECORDS`) store ``dAqk`` themselves,
+# so the backward launches no ``kcp_dav`` there (:func:`kcp_dav_needed`) and the layout holds no whole-sequence
+# ``dAqk`` and no ``dv1`` (the adjoint walks form it from ``aqk_int``).  ``kb`` (read by the WY program at 2) rides
+# beside ``u`` at +256 under the ``dh`` tape (5, 6), and ``aqk_int`` (read by the adjoint walks at 5) has a slot of its
+# own.  The walks keep no segment state in the arena, so the layout has no state blocks.  Whole-sequence buffers:
+# 3332 B per internal token-head (the live set at the adjoint tape walk, step 5).  The per-pass set (the existing
+# backend's ``_PASS_OCCUPANTS`` without the gate buffers where GLM intra fuses the epilogue) is packed first-fit into
+# the bytes of the three whole-sequence slots dead before the tail (qg / kg 512, w 256, aqk_int 128); what does not
+# fit goes to an overflow slot.
 LOCAL_LAYOUT_BWD_LEAN = "replay_kcp_lean"
 _LEAN_WHOLE = (
     (("gk", "F32", 0, (1, 7)),),
@@ -2876,18 +2877,17 @@ _LEAN_WHOLE = (
     (("h", "TAPE", 0, (3, 6)),),
     (
         ("u", "B16", 0, (2, 3)),
-        ("dAqk_sink", "A32", 0, (4, 4)),
-        ("aqk_int", "A16", 256, (1, 4)),
+        ("kb", "B16", 256, (1, 2)),
         ("dh", "TAPE", 0, (5, 6)),
     ),
     (("qg", "B16", 0, (1, 5)), ("kg", "B16", 256, (1, 5))),
     (("w", "B16", 0, (2, 5)),),
-    (("kb", "B16", 0, (1, 2)), ("dv1", "B16", 0, (4, 5))),
+    (("aqk_int", "A16", 0, (1, 5)),),
     (("beta_int", "V32", 0, (1, 7)),),
 )
 # the per-pass hosts of the lean layout: (first occupant of the slot, its bytes per internal token-head)
-_LEAN_HOSTS = (("qg", 512), ("w", 256), ("kb", 256))
-# the replay fused-gradient records that store the whole dAqk (the rows kcp_dav writes) themselves
+_LEAN_HOSTS = (("qg", 512), ("w", 256), ("aqk_int", 128))
+# the replay fused-gradient records that store the whole dAqk (the rows kcp_dav would write) themselves
 LEAN_DQKG_RECORDS = ("dqkg_int_davq", "dqkg_int_davq_nohint")
 LEAN_MAX_PASSES = 8  # the tail passes a lean arena may be sized for (from four on the per-pass set fits on sm_100a)
 # the tail passes of a lean arena without ``lean_passes``: two keep about three quarters of the four-pass saving for
@@ -2965,6 +2965,17 @@ def local_lean_serves(plan) -> bool:
     """Whether the lean layout serves ``plan`` (a ``cake_backend.Plan``): its replay fused-gradient record stores
     the whole ``dAqk`` itself (:data:`LEAN_DQKG_RECORDS`)."""
     return plan.record("dqkg", LOCAL_PATH_BWD) in LEAN_DQKG_RECORDS
+
+
+def kcp_dav_needed(plan) -> bool:
+    """Whether the KCP backward launches ``kcp_dav`` on ``plan`` (a ``cake_backend.Plan`` of the rank's problem):
+    exactly where the existing backend's plan dispatches its ``dav`` stage on :data:`LOCAL_PATH_BWD`
+    (``dav_serial_replay``: the serial route below 16 heads, H 9-15 on every architecture).  Its fused gradient there
+    (``dqkg_int`` and its raw / L2N forms) stores no ``dAqk``, so GLM intra reads ``kcp_dav``'s.  Everywhere else the
+    plan's fused gradient stores every ``dAqk`` row GLM intra reads, pad rows included (the plan's own correctness
+    rests on it: it launches no dav stage there), and the adjoint walks form ``dv1`` from ``aqk_int`` themselves (their
+    ``fuse_dv1`` builds), so no kernel reads ``kcp_dav``'s outputs and the backward skips it."""
+    return bool(plan.dispatched("dav", LOCAL_PATH_BWD))
 
 
 def local_lean_bytes(plan, passes: int) -> int:

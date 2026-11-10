@@ -74,7 +74,7 @@ kernel_cake_gdn_det_train_b902b0b0bef82d9f7c53(float* __restrict__ dg_part, floa
         int clen = chunk_len[chunk];
         if (clen > 0) {
             long long hv64 = (long long)num_heads;
-            long long ibase = (long long)chunk * 64 * hv64 + (long long)head;
+            long long ibase = (long long)chunk * 64ll * hv64 + (long long)head;
             long long ebase = (long long)chunk_bos[chunk] * hv64 + (long long)head;
             float vals[64];
             vals[0] = 0.0f;

@@ -118,9 +118,10 @@ POLICY_FIELDS = (
     "sample_tiles_tiny_units",  # sample-tile cap of tiny units (lever K3b)
     "sample_dispatch_tiny_tiles_max",  # mean unit tiles up to which the tiny-unit cap applies
     "sample_shift_permille",  # conservative shift of the sampled rank
-    "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
+    "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (shift, and tiles where the mean unit holds more), or None; explicit knobs override it
+    "sample_long_rule",  # [physical scan kinds, shift permille] of the long-unit calls of those kinds (more than sample_dispatch_mean_tiles_max mean unit tiles), or None; an explicit shift knob overrides it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
-    "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
+    "lsf_programs",  # the architecture ships longest-first segment order copies (scan key suffix :lsf) of its scan programs; the host runs the decided program's copy on packed calls whose key segments differ in length (#7549), the program itself where the registry has no copy of it
     "static_scan_kinds",  # physical scan kinds whose programs keep the static unit enumeration on a ticket architecture: they never touch the ticket tail, so the host gives their runners none
     "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
     "check_period_max",  # cap on the default selection-trigger check period (tiles)
@@ -153,9 +154,11 @@ SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
 # (``ticket_static_path``: the scan never touches the word) or runs a program of
 # ``static_scan_kinds``.  A scan program whose registry record lists the
 # architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
-# instead and never reads this tail (the eager entry hands it the tail's first
-# 16 bytes); every plan still carries the tail, so the size does not depend on
-# the program.
+# instead and never draws from this tail (the eager entry hands it the tail's
+# first 16 bytes); its :lsf copies (sm_107a's l6 ticket programs) still keep the
+# segment order in the tail, which every launch writes before it reads, so the
+# host zeroes nothing for them.  Every plan carries the tail, so the size does
+# not depend on the program.
 TICKET_TAIL_BYTES = 8 * (16 + 1024)
 
 
@@ -204,13 +207,29 @@ def sample_class_for(
     shift_knob: bool,
 ) -> tuple[int, int]:
     """The sampled first threshold ``(tiles, shift)`` of a scan program of the physical kind ``physical`` under the
-    record's ``sample_class_rule``, from the call's ``tiles`` / ``shift``: the wide-unit programs take the rule's shift on
-    packed calls (at least ``CLASS_RULE_MIN_SEGMENTS`` segments), the tiny dispatch class (packed calls of short query
-    segments and few mean unit tiles) also its tile count.  A knob
-    the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rule or with sampling off nothing changes."""
-    class_rule = policy.sample_class_rule
+    record's ``sample_class_rule`` and ``sample_long_rule``, from the call's ``tiles`` / ``shift``: the wide-unit
+    programs take the class rule's shift on packed calls (at least ``CLASS_RULE_MIN_SEGMENTS`` segments), the tiny
+    dispatch class (packed calls of short query segments and few mean unit tiles) also its tile count where the mean
+    unit holds more tiles than that count; a long-unit call
+    (more than ``sample_dispatch_mean_tiles_max`` mean unit tiles) of a kind the long rule names takes its shift.  A
+    knob the caller set (``tiles_knob`` / ``shift_knob``) stays; without the rules or with sampling off nothing
+    changes."""
+    class_rule, long_rule = policy.sample_class_rule, policy.sample_long_rule
     T, S = int(num_queries), int(num_segments)
-    if class_rule is None or tiles <= 0:
+    if tiles <= 0:
+        return tiles, shift
+    # the long-unit calls of the long rule's kinds shift further (#7549 on sm_107a)
+    if (
+        long_rule is not None
+        and physical in long_rule[0]
+        and policy.mean_unit_tiles(T, num_keys, S, ratio)
+        > policy.sample_dispatch_mean_tiles_max
+    ):
+        if not shift_knob:
+            shift = int(long_rule[1])
+        # a long-unit call keeps its tile count and never takes the class rule, which is for few mean unit tiles
+        return tiles, shift
+    if class_rule is None:
         return tiles, shift
     # the wide-unit programs shift only; the tiny dispatch class also samples more tiles (#7549)
     if "wide" in physical:
@@ -223,7 +242,9 @@ def sample_class_for(
         and S >= CLASS_RULE_MIN_SEGMENTS
         and T <= CLASS_RULE_MAX_QUERIES_PER_SEGMENT * S
     ):
-        tiles = int(class_rule[0])
+        # no more sample tiles than the mean unit holds: a shorter unit would be sampled whole
+        if policy.mean_unit_tiles(T, num_keys, S, ratio) > int(class_rule[0]):
+            tiles = int(class_rule[0])
         if not shift_knob:
             shift = int(class_rule[1])
     return tiles, shift
@@ -270,6 +291,7 @@ _OPTIONAL_RULE = (
     "tile_unroll_rule",
     "sample_shift_rule",
     "sample_class_rule",
+    "sample_long_rule",
 )
 
 
@@ -338,6 +360,7 @@ class DispatchPolicy:
     sample_shift_permille: int
     sample_shift_rule: Optional[list]
     sample_class_rule: Optional[list]
+    sample_long_rule: Optional[list]
     lsf_programs: bool
     static_scan_kinds: list
     far_sample: int
@@ -537,6 +560,21 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['sample_class_rule'] must be [tiny-unit sample tiles >= 1, shift permille in [{shift_lo}, {shift_hi}]] or None, got {class_rule!r}"
+            )
+        long_rule = raw["sample_long_rule"]
+        if long_rule is not None and (
+            len(long_rule) != 2
+            or not isinstance(long_rule[0], (list, tuple))
+            or not long_rule[0]
+            or not all(isinstance(kind, str) for kind in long_rule[0])
+            or list(long_rule[0]) != sorted(set(long_rule[0]))
+            or not set(long_rule[0]) <= set(PHYSICAL_KINDS)
+            or not _is_int(long_rule[1])
+            or not shift_lo <= long_rule[1] <= shift_hi
+        ):
+            raise ValueError(
+                f"policy['sample_long_rule'] must be [ascending physical scan kinds {PHYSICAL_KINDS}, shift permille in "
+                f"[{shift_lo}, {shift_hi}]] or None, got {long_rule!r}"
             )
         floor_rule = raw["cand_cap_floor_rule"]
         if floor_rule is not None and (
@@ -1261,6 +1299,9 @@ def select_program(
     unpaired wide program is in ``scan_keys`` (without a registry it stays off, as the l6 preference); ``split_wave_scope``
     limits the two-way wave split.  A record's ``desc_walk_kinds`` runs the descending-walk twin of the decided program
     (key kind ``<kind>_desc``) where it names the kind for the call's sampling mode and ``scan_keys`` has the twin.
+    Where the record sets ``lsf_programs``, a packed call of unequal key segments runs the longest-first copy of the
+    decided program (key suffix ``:lsf``) unless ``scan_keys`` has the program but not the copy; every rule that asks
+    ``scan_keys`` for a program looks up its key without the suffix, so the copy never changes the plan.
     ``snake_packed_rule`` keeps packed calls of few mean unit tiles over more than a few
     waves in the plain unit order (``snake_for``), and ``snake_l6_fallback_waves`` lets a sampling-off call the l6 preference moves run the plain-order
     l6 program where the snake-order one is not registered, within that many waves of the planned program's persistent
@@ -1309,7 +1350,9 @@ def select_program(
     pair = (not split) and policy.pair_for(T, Tkv, S, r, grid, K, block_q)
     # lever LSF (#7549): the longest-first segment order pays off only where the segments differ, so the copy that
     # carries it runs on packed calls whose key segments are not all equal (one segment, or num_keys == S x the
-    # call's max_seqlen_k, runs the program without it; without max_seqlen_k the host cannot tell and runs the copy)
+    # call's max_seqlen_k, runs the program without it; without max_seqlen_k the host cannot tell and runs the copy).
+    # The copy never changes the plan: every rule below that asks ``scan_keys`` for a program looks up its key without
+    # the suffix, and the decided program takes the suffix last, where the registry has its copy
     lsf = (
         policy.lsf_programs
         and S >= LSF_MIN_SEGMENTS
@@ -1333,7 +1376,6 @@ def select_program(
             policy.tile_unroll_for("wide", K, wide_snake, block_q),
             wide_snake,
             policy.sample_fit_for(T, Tkv, S, r, cap, physical_kind("wide", "wide")),
-            lsf,
         )
         if scan_keys is not None and wide_key in scan_keys:
             pair = False
@@ -1364,7 +1406,6 @@ def select_program(
             policy.tile_unroll_for("l6", K, solo_snake, policy.block_q_l6),
             solo_snake,
             solo_fit,
-            lsf,
         )
         if (
             scan_keys is not None
@@ -1377,7 +1418,6 @@ def select_program(
                 policy.tile_unroll_for("l6", K, False, policy.block_q_l6),
                 False,
                 solo_fit,
-                lsf,
             )
             solo_plain = True
         if scan_keys is not None and solo_key in scan_keys:
@@ -1414,13 +1454,26 @@ def select_program(
             )
     scan_entries = grid_ctas * block_q * cap
     staging = T * n_split * K if split else 0
-    key = scan_key(physical, unroll, snake, fit, lsf)
+    key = scan_key(physical, unroll, snake, fit)
     # desc_walk_kinds: the descending-walk twin of the decided program, where the record names its kind for the call's
     # sampling mode and the registry has it (no registry: off); the plan, the knobs and the workspace stay
     if scan_keys is not None and policy.desc_walk_for(physical, tiles > 0):
-        desc_key = scan_key(f"{physical}_desc", unroll, snake, fit, lsf)
+        desc_key = scan_key(f"{physical}_desc", unroll, snake, fit)
         if desc_key in scan_keys:
             key = desc_key
+    # lever LSF: the decided program runs its longest-first copy, but where the registry has the program and not its
+    # copy it runs in the argument order (sm_107a registers the copies of its two l6 ticket programs only, sm_100a and
+    # sm_103a that of every program); without a registry, or for a key the registry has in neither form (which then
+    # fails closed by its :lsf name in program_for), the copy stays
+    if (
+        lsf
+        and scan_keys is not None
+        and key in scan_keys
+        and key + ":lsf" not in scan_keys
+    ):
+        lsf = False
+    if lsf:
+        key += ":lsf"
     return ProgramChoice(
         num_queries=T,
         num_keys=Tkv,

@@ -102,10 +102,10 @@ kernel_cake_mhc_det_train_fwd_coef__rt64__h5120(float* __restrict__ spart, float
     for (int k = 0; k < p_k; k++) {
         long long plane = (long long)k * tp64 + tcr[0];
         float _add_0;
-        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(s_acc[0]), "f"(spart[plane * 24 + n64]));
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(s_acc[0]), "f"(spart[plane * 24ll + n64]));
         s_acc[0] = _add_0;
         float _add_1;
-        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(s_acc[1]), "f"(spart[plane * 24 + (24 + n64)]));
+        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(s_acc[1]), "f"(spart[plane * 24ll + (24ll + n64)]));
         s_acc[1] = _add_1;
     }
     float qv0 = ((lane_0 < p_k) ? qe[0] : 0.0f);
@@ -230,16 +230,16 @@ kernel_cake_mhc_det_train_fwd_coef__rt64__h5120(float* __restrict__ spart, float
         int tok = tokr[j_2];
         long long tc64 = tcr[j_2];
         if (tok < T) {
-            long long row = tc64 * 64;
+            long long row = tc64 * 64ll;
             if (lane_0 == 0) {
                 *(reinterpret_cast<float*>(stats + row) + (0)) = rr[j_2];
             }
             if (lane_0 < 24) {
-                *(reinterpret_cast<float*>(stats + (row + 1 + lane64)) + (0)) = zz[j_2];
-                *(reinterpret_cast<float*>(stats + (row + 25 + lane64)) + (0)) = cc[j_2];
+                *(reinterpret_cast<float*>(stats + (row + 1ll + lane64)) + (0)) = zz[j_2];
+                *(reinterpret_cast<float*>(stats + (row + 25ll + lane64)) + (0)) = cc[j_2];
             }
             if (lane_0 < 15) {
-                *(reinterpret_cast<float*>(stats + (row + 49 + lane64)) + (0)) = 0.0f;
+                *(reinterpret_cast<float*>(stats + (row + 49ll + lane64)) + (0)) = 0.0f;
             }
         }
     }

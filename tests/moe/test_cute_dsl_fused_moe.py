@@ -58,11 +58,11 @@ from flashinfer.quantization.nvfp4_quantization_utils import (
     resolve_nvfp4_4over6,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers import cute_dsl_moe_swap_ab_reference as swap_ab_reference
-from tests.test_helpers.cute_dsl_moe_swap_ab_reference import (
+from tests.moe.test_helpers import cute_dsl_moe_swap_ab_reference as swap_ab_reference
+from tests.moe.test_helpers.cute_dsl_moe_swap_ab_reference import (
     assert_cute_dsl_moe_bits,
 )
-from tests.test_helpers.w4a16_reference import (
+from tests.moe_ep.test_helpers.w4a16_reference import (
     assert_w4a16_bits,
     split_w4a16_reference_from_tensors,
 )

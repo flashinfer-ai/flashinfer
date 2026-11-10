@@ -22,7 +22,7 @@ S = S @ diag(g_exp) + beta * outer(v - S @ k, k)
 Output: o = S @ q
 
 Inputs:  q,k [B,T,H,K]  v,g [B,T,HV,K]  beta [B,T,HV]
-State:   [N,HV,V,K] bf16, updated in-place with optional separate initial source
+State:   [N,HV,V,K] bf16 or fp32, updated in-place with optional separate initial source
 Output:  o [B,T,HV,V]
 
 Supports GQA (H != HV), cu_seqlens for variable-length batches, and
@@ -415,7 +415,7 @@ def recurrent_kda_decode_kernel(
     vec8_layout = cute.make_layout((8,), stride=(1,))
     src_layout = cute.make_layout((VALUES_PER_THREAD,), stride=(1,))
     h_reg = cute.make_rmem_tensor(h_layout, cutlass.Float32)
-    h_bf16 = cute.make_rmem_tensor(vec8_layout, cutlass.BFloat16)
+    h_bf16 = cute.make_rmem_tensor(vec8_layout, gH.element_type)
     q_src = cute.make_rmem_tensor(src_layout, cutlass.Float32)
     k_src = cute.make_rmem_tensor(src_layout, cutlass.Float32)
     gate_src = cute.make_rmem_tensor(src_layout, cutlass.Float32)
@@ -598,7 +598,7 @@ def recurrent_kda_decode_kernel(
             for j in cutlass.range_constexpr(TILE_ROWS // V_LANES):
                 v_idx = v_offset + v_lane + V_LANES * j
                 for i in cutlass.range_constexpr(8):
-                    h_bf16[i] = h_reg[j, i].to(cutlass.BFloat16)
+                    h_bf16[i] = h_reg[j, i].to(gH.element_type)
                 h_tile = cute.local_tile(h_out, (1, 8), (v_idx, k_lane))
                 cute.autovec_copy(h_bf16, h_tile)
 
@@ -701,7 +701,7 @@ def _grouped_kda_kernel(
         row0.iterator, cute.make_layout((8, G, KS), stride=(1, KS * 8, 8))
     )
     gv0 = grow0[None, None, part]
-    sb0 = cute.make_rmem_tensor((8, G), cutlass.BFloat16)
+    sb0 = cute.make_rmem_tensor((8, G), state.element_type)
     cute.autovec_copy(
         gv0, sb0, l1c_evict_priority=cute.nvgpu.common.CacheEvictionPriority.NO_ALLOCATE
     )
@@ -832,14 +832,13 @@ def _grouped_kda_kernel(
             if part == 0:
                 out[pidx, hv, v_idx] = (rq * o).to(cutlass.BFloat16)
 
-            # bf16 checkpoint write
             row_w = state[slot, hv, v_idx, None]
             grow_w = cute.make_tensor(
                 row_w.iterator, cute.make_layout((8, G, KS), stride=(1, KS * 8, 8))
             )
             gw = grow_w[None, None, part]
-            sb1 = cute.make_rmem_tensor((8, G), cutlass.BFloat16)
-            sb1.store(s.load().to(cutlass.BFloat16))
+            sb1 = cute.make_rmem_tensor((8, G), state.element_type)
+            sb1.store(s.load().to(state.element_type))
             cute.autovec_copy(
                 sb1,
                 gw,
@@ -967,7 +966,7 @@ def _grouped_kda_host(
     )
 
 
-_grouped_compiled_cache: dict[tuple[int, ...], Callable[..., None]] = {}
+_grouped_compiled_cache: dict[tuple, Callable[..., None]] = {}
 
 
 def _get_grouped_compiled(
@@ -989,7 +988,7 @@ def _get_grouped_compiled(
 ):
     fn = _grouped_compiled_cache.get(key)
     if fn is None:
-        D, T, H, HV, gm, hdb, bl, ul2, us = key
+        D, T, H, HV, gm, hdb, bl, ul2, us, _state_dtype = key
         KS = 4 if T == 1 else 2
         VSPLIT = 4
 
@@ -1130,7 +1129,7 @@ def recurrent_kda_launch(
 _dummy_cache = {}  # device -> dict of pre-allocated dummy tensors
 
 
-def _make_compile_inputs(HEAD_DIM, USE_CU_SEQLENS):
+def _make_compile_inputs(HEAD_DIM, USE_CU_SEQLENS, state_dtype=cute.BFloat16):
     """Build the shared symbolic runtime argument list for CuTe compilation."""
     B, H, HV, N, N0 = (
         cute.sym_int(),
@@ -1154,13 +1153,13 @@ def _make_compile_inputs(HEAD_DIM, USE_CU_SEQLENS):
     # blocks. This supports block-based caches without constraining their prefix.
     HV_state = cute.sym_int()
     state_fake = cute.runtime.make_fake_tensor(
-        cute.BFloat16,
+        state_dtype,
         shape=(N, HV_state, V, K),
         stride=(cute.sym_int64(divisibility=16), V * K, K, 1),
         assumed_align=32,
     )
     source_fake = cute.runtime.make_fake_tensor(
-        cute.BFloat16,
+        state_dtype,
         shape=(N0, HV_state, V, K),
         stride=(cute.sym_int64(divisibility=16), V * K, K, 1),
         assumed_align=32,
@@ -1217,11 +1216,16 @@ def _get_compiled_kernel(
     DOT_REDUCTION_SCHEDULE,
     ZERO_PADDED_OUTPUT,
     HAS_NUM_ACCEPTED_TOKENS,
+    STATE_FP32=0,
 ):
     """Compile a register-tile specialization."""
     return cute.compile(
         recurrent_kda_launch,
-        *_make_compile_inputs(HEAD_DIM, USE_CU_SEQLENS),
+        *_make_compile_inputs(
+            HEAD_DIM,
+            USE_CU_SEQLENS,
+            cute.Float32 if STATE_FP32 else cute.BFloat16,
+        ),
         HEAD_DIM,
         USE_QK_L2NORM,
         USE_GATE_IN_KERNEL,
@@ -1936,7 +1940,8 @@ def run_recurrent_kda(
         scale (Optional[float]):
             Scale factor for queries. If None, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
+            Initial state of shape ``[N, HV, V, K]``. bfloat16 or float32; the
+            state is read and written back in its own dtype.
             If None, zero-initialized. Updated in-place. For batched spec decode
             without ``cu_seqlens``, ``N`` is the packed checkpoint-slot count
             ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is omitted.
@@ -2020,7 +2025,7 @@ def run_recurrent_kda(
 
     Note:
         - Requires SM100 (Blackwell) architecture
-        - State is bfloat16 ``[N, HV, V, K]`` and updated in-place
+        - State is bfloat16 or float32 ``[N, HV, V, K]`` and updated in-place
         - HEAD_DIM (K=V) must be 64 or 128
         - When using ``cu_seqlens``, batch size ``B`` must be 1
         - Spec mode (``num_spec_tokens=S``): ``cu_seqlens`` must step by
@@ -2043,11 +2048,13 @@ def run_recurrent_kda(
     for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)):
         if tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must be bfloat16, got {tensor.dtype}")
-    if initial_state is not None and initial_state.dtype != torch.bfloat16:
+    if initial_state is not None and initial_state.dtype not in (
+        torch.bfloat16,
+        torch.float32,
+    ):
         raise TypeError(
-            "the CuTe DSL recurrent decode kernels require a bfloat16 state, got "
-            f"{initial_state.dtype}; float32 state pools are supported only by plain "
-            "multi-token prefill (more tokens than sequences)"
+            "the CuTe DSL recurrent decode kernels require a bfloat16 or float32 "
+            f"state, got {initial_state.dtype}"
         )
     if HV < H or HV % H != 0:
         raise ValueError(f"HV must be a positive multiple of H, got H={H}, HV={HV}")
@@ -2127,9 +2134,12 @@ def run_recurrent_kda(
                 "initial_state_indices must be 1D, "
                 f"got shape {list(initial_state_indices.shape)}"
             )
-        if initial_state_source.dtype != torch.bfloat16:
+        source_dtype = (
+            initial_state.dtype if initial_state is not None else torch.bfloat16
+        )
+        if initial_state_source.dtype != source_dtype:
             raise ValueError(
-                "initial_state_source must be bfloat16, "
+                f"initial_state_source must be {source_dtype}, "
                 f"got {initial_state_source.dtype}"
             )
         if initial_state_source.shape[1:] != (HV, V, K):
@@ -2606,6 +2616,7 @@ def run_recurrent_kda(
             reduction_schedule,
             ZERO_PADDED_OUTPUT,
             HAS_NAT,
+            1 if state.dtype == torch.float32 else 0,
         )
         compiled(
             q,
@@ -2694,6 +2705,7 @@ def run_recurrent_kda(
             BETA_LOGIT,
             USE_QK_NORM,
             HAS_SOURCE,
+            state.dtype,
         )
         compiled_grouped = _get_grouped_compiled(
             grouped_key,

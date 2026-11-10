@@ -10,11 +10,11 @@ top-k 2048.  Tracking issue: flashinfer-ai/flashinfer#5676.
 This package runs the deterministic package's BF16 scan programs and its plain
 split merge unchanged.  It leaves out the ordering pass, which is the
 deterministic package's finalize / rank finalize that sorts every row into
-ascending id order.  Nothing else changes.  The scores are the same, and each
-row holds the same selected set in a different slot order.  The package
-implements the set-equality semantics of flashinfer-ai/flashinfer#8946
-(point 4): per row, the set of selected `(id, score bits)` pairs repeats bit
-for bit, but the slot order does not.
+ascending id order.  The scores are the same, and each row holds the same
+selected set in a different slot order.  The package implements the
+set-equality semantics of flashinfer-ai/flashinfer#8946 (point 4): per row,
+the set of selected `(id, score bits)` pairs repeats bit for bit, but the slot
+order does not.
 
 The entry points of `flashinfer.cake_dsa_indexer_nondet_train` are stable
 APIs.  This backend package under `flashinfer/experimental/cake/` is
@@ -176,7 +176,7 @@ reduction (registry field `NUMERICS["zero_sign_policy"] =
 "positive_accumulator"`).  Ordering rule: `+0.0` and `-0.0` compare equal, and
 an equal-score tie goes to the larger key id.  The written score keeps the
 computed bits and is never canonicalized.  The reference in
-`tests/test_helpers/cake_dsa_indexer_reference.py` follows the same reduction
+`tests/experimental/test_helpers/cake_dsa_indexer_reference.py` follows the same reduction
 model, so the bit-exact test cases compare like with like after each row is
 canonicalized (see "Tests and benchmark").
 
@@ -265,8 +265,10 @@ The choice goes through the registry's per-architecture `POLICY` record
 deterministic package's rules without its finalize, rank and FP8 rules.  A
 call therefore gets the same scan program, candidate capacity, check period,
 split count, CTA pair and ticket plan that the deterministic package picks for
-it.  Most rules use one estimate, the mean key tiles per work unit:
-`(Tkv - T / (2 ratio)) / S / 128`.
+it.  One exception is on `sm_107a`: the sampled tile count and rank
+shift follow this package's own `sample_class_rule` and `sample_long_rule`
+(whether a call samples does not change).  Most rules use one estimate, the
+mean key tiles per work unit: `(Tkv - T / (2 ratio)) / S / 128`.
 
 | decision | rule (record fields) |
 |---|---|
@@ -276,11 +278,11 @@ it.  Most rules use one estimate, the mean key tiles per work unit:
 | unpaired wide unit | where the record sets `wide_pair_snake_only` (sm_107a), a sampled call keeps the CTA pair of the wide unit only where the pair program walks the snake order; elsewhere it runs the unpaired wide program when that program is registered |
 | unpaired three-warpgroup preference | a call whose plan does not split takes the `block_q_l6` unit without a CTA pair.  With the sampled first threshold off (`sample_tiles_max=0`), where the record sets `l6_solo_unsampled_max_queries` (sm_100a, sm_103a: 16384), this applies only to a call planned on the CTA-pair l6 unit of at most that many queries; other units keep their plan.  Otherwise it applies always where the record sets `l6_solo_rule` (sm_107a).  On a sampled call, where the record sets `l6_solo_rule`, it applies with at least `l6_solo_rule[1]` segments or at most `l6_solo_rule[0]` mean unit tiles.  In every case it applies only where the l6 unit would not split either and the program it picks is registered (`PROGRAM_KEYS[arch]`, which the backend passes to `select_program`; without it the preference stays off); else the plan of the rows above applies.  Where the record sets `snake_l6_fallback_waves` (sm_107a: 310), a sampling-off call whose snake-order l6 program is not registered runs the plain-order l6 program instead, when the planned program needs at most that many waves of its persistent grid (`ceil(ceil(T / block_q) / slots)`, slots = CTAs, or CTA pairs for a pair program) |
 | unit order | snake order when `snake_rule` names the program kind and the mean tiles (the ratio-1 or the `ratio > 1` floor) and the unit-cost spread reach its floors.  On a call of two or more segments whose kind `snake_packed_rule` names (sm_107a: `[["l6"], 48.0, None, 7]`), the snake order applies only from `snake_packed_rule[1]` mean unit tiles on with the sampled first threshold on, from `snake_packed_rule[2]` with it off (None: never), or within `snake_packed_rule[3]` waves of the persistent grid.  Else the plain order |
-| segment order | the longest-first copy (`:lsf`) where the record sets `lsf_programs` (sm_100a, sm_103a) and the call packs at least two key segments that are not all equal.  `max_seqlen_k` decides: `Tkv == S x max_seqlen_k` means equal segments; without it the copy runs |
+| segment order | the longest-first copy (`:lsf`) of the decided program where the record sets `lsf_programs` (every architecture) and the call packs at least two key segments that are not all equal.  `max_seqlen_k` decides: `Tkv == S x max_seqlen_k` means equal segments; without it the copy runs.  A program registered without its copy runs in the argument order: `sm_100a` and `sm_103a` register the copy of every scan program, `sm_107a` only those of its two `l6` ticket programs (`scan:l6:u1:s0:f0`, `scan:l6:u1:s0:f1`), which keep the argument order when the longest key segment is at most 5/4 of the shortest non-empty one (same sets either way).  Every row that asks the registry for a program looks up its key without the suffix, so the copy never changes the plan |
 | descending walk | the descending-walk twin of the decided program (key kind `<kind>_desc`: the same unit, split, pair, tile unroll and fit form) where `desc_walk_kinds` names the physical kind for the call's sampling mode and the twin is registered (sm_103a: the `wide` unit with the sampled first threshold off); the plan, the knobs and the workspace stay |
 | tile-loop unroll | `tile_unroll_factor` when `tile_unroll_rule` names the program kind and `top_k` reaches its floor (yielding to the snake order where the rule says so) |
 | sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles`, the mean segment offset leaves fitting units and the program kind is one of `sample_fit_kinds` (the kinds whose sampled-fit program the architecture registers; the split programs, for example, run their plain form on every call) |
-| sampled tiles and rank shift | tiles: `sample_tiles_tiny_units` up to `sample_dispatch_tiny_tiles_max` mean unit tiles, `sample_tiles_short_units` up to `sample_dispatch_mean_tiles_max`, else `sample_tiles_max`.  Shift: `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`.  Where the record sets `sample_class_rule` (sm_100a, sm_103a), the wide-unit programs take its shift on packed calls, and the tiny dispatch class (packed calls of at most 4096 queries per segment and at most `sample_dispatch_tiny_tiles_max` mean unit tiles) takes its tile count and shift.  Explicit knobs override all of these.  Whether sampling is on enters the rules above.  The tile count and the shift are launch scalars only: they set how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or the selected set.  Unsampled calls do not read the shift |
+| sampled tiles and rank shift | tiles: `sample_tiles_tiny_units` up to `sample_dispatch_tiny_tiles_max` mean unit tiles, `sample_tiles_short_units` up to `sample_dispatch_mean_tiles_max`, else `sample_tiles_max`.  Shift: `sample_shift_rule[1]` permille where the record sets `sample_shift_rule` and `top_k >= sample_shift_rule[0]`, else `sample_shift_permille`.  Where the record sets `sample_class_rule` (sm_100a, sm_103a: `[8, 500]`; sm_107a: `[32, 500]`), the wide-unit programs take its shift on packed calls, and the tiny dispatch class (packed calls of at most 4096 queries per segment and at most `sample_dispatch_tiny_tiles_max` mean unit tiles) takes its shift, and its tile count where the mean unit holds more tiles than that count.  Where the record sets `sample_long_rule` (sm_107a: `[["l6"], 500]`), a call of more than `sample_dispatch_mean_tiles_max` mean unit tiles whose physical kind the rule names takes its shift.  On sm_107a these two rules keep every rank input of flashinfer-ai/flashinfer#7549 at or below its time with sampling off.  Explicit knobs override all of these.  Whether sampling is on enters the rules above.  The tile count and the shift are launch scalars only: they set how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again exactly), never the program, the capacity or the selected set.  Unsampled calls do not read the shift |
 | candidate capacity | `candidate_multiplier` x `top_k` (`cand_mult_rule[1]` for long units), rounded up to whole tiles.  It is raised to `cand_cap_floor` slots, or to `cand_cap_floor_rule[1]` slots from `top_k >= cand_cap_floor_rule[0]` on where the record sets that rule.  On `sm_100a` the 16384-slot floor applies from `top_k = 1024` on and smaller `top_k` keep 8192; `sm_103a` keeps its 16384-slot floor on every `top_k`.  It is lowered to `cand_cap_ceiling` slots where the record sets one: the multiplier becomes `ceiling // top_k`, so the buffer stops growing with `top_k` once it holds the ceiling.  With the sampled first threshold off (`sample_tiles_max=0`), the `candidate_multiplier_unsampled` / `cand_mult_rule_unsampled` / `cand_cap_floor_unsampled` / `cand_cap_ceiling_unsampled` values apply instead.  An explicit `candidate_multiplier` knob replaces the multiplier |
 | check period | default `min(check_period_max, (cand_cap - top_k) // 128, cand_cap // check_period_cap_divisor)`, at least 1, or the kind's `check_period_kind_overrides` value clamped to the exactness bound; an explicit `check_period` must lie in `[1, limit]` (the kernel's headroom rule) |
 
@@ -328,11 +330,13 @@ before the record is frozen.
   caching allocator.  A call without keys fills its outputs with padding (two
   fills) instead of launching.
 * **Ticket tail**.  On all three architectures (`TICKET_TAIL_ARCHES`), the
-  scan programs draw every work unit from a ticket word.  The exception is
-  the programs of the record's `static_scan_kinds` (on `sm_107a`, the l6 and
-  CTA-pair l6 programs), which keep the static unit enumeration and get no
-  tail.  Every completed scan launch leaves the word at 0.  How the word is
-  reset depends on the workspace:
+  scan programs draw every work unit from a ticket word.  A record's
+  `static_scan_kinds` would name the kinds whose programs keep the static
+  unit enumeration and get no tail; no record names one.  So a call that
+  shares the GPU with another stream slows with the SMs that stream holds,
+  not by a whole extra wave of work units (flashinfer-ai/flashinfer#7548).
+  Every completed scan launch leaves the word at 0.  How the word is reset
+  depends on the workspace:
   * Backend-owned workspace: the tail is zeroed once, when the runner is
     prepared.  The eager entry prepares a one-shot runner, so this happens
     once per eager call.
@@ -347,7 +351,9 @@ before the record is frozen.
     16-byte ticket block passed as an argument instead of the tail.  A
     prepared runner owns such a block, zeroed once at prepare.  The eager
     entry passes the first 16 bytes of the workspace's tail instead, and the
-    scan binding zeroes its ticket word right before the launch.
+    scan binding zeroes its ticket word right before the launch.  The `:lsf`
+    copies of such programs still keep the segment order in the tail; every
+    launch writes it before it reads it, so it needs no zeroing.
   * A run that raised while launching marks the tail dirty, and the next run
     zeroes it first.
 * **Prepared runner**.  `cake_backend.prepare_dsa_indexer_nondet_topk(...)`
@@ -446,7 +452,7 @@ There are four test files:
   naming rules.
 
 They share the independent FP64 / FP32 reference in
-`tests/test_helpers/cake_dsa_indexer_reference.py` with the deterministic
+`tests/experimental/test_helpers/cake_dsa_indexer_reference.py` with the deterministic
 package.  Results are compared after each row is canonicalized: valid slots
 sorted by id with their score bits, padding last.  The comparisons therefore
 check sets, not slot order.  Coverage:

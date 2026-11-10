@@ -653,6 +653,39 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_l2pf": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["tma_buffer", "tmap_swa_k"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["buffer", "compressed_KV_cache"],
+        ["parameter", "compressed_KV_rows"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "fp8_h64_source_exact_qlayout": [
         ["tma_buffer", "tmap_q"],
         ["tma_buffer", "tmap_swa_kv"],
@@ -676,6 +709,7 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "batch_size"],
         ["parameter", "has_sinks"],
         ["parameter", "total_work_items"],
+        ["parameter", "num_query_tokens"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -809,7 +843,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "h8_h16_source_exact_tokens_qlayout",
         "arches": ["sm_103a"],
         "identity": {
-            "sm_103a": "32c057dbbe84e98a6b6f5619eed73ff7561d671e13f1d3774f41ea330934817f",
+            "sm_103a": "723d365e77682461f22ae691dee3ad828a7a71656d4e47c9dbabc2edd5aa7cdd",
         },
     },
     "cake_dsv4_13091b5bf0612783f02d": {
@@ -897,7 +931,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_107a"],
         "identity": {
-            "sm_107a": "1d8b01c91f7a6f9a037cae845dea4e9fd06dce03169b69bcaca61e2bdae6cae1",
+            "sm_107a": "af63049e241f0893c206390c9119f3be022bf32513fb73a58f1f6a221a8e1ba2",
         },
     },
     "cake_dsv4_27a5d41ecb0fd5ecec7b": {
@@ -1152,6 +1186,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "f628532d65dd1875e01123a77a8871a269168fdc6d63dfa6ffaf76b1d841a58e",
         },
     },
+    "cake_dsv4_7a104353fbcabeae6af8": {
+        "sources": [
+            "sm_107a/cake_dsv4_7a104353fbcabeae6af8_kernel.cu",
+            "sm_107a/cake_dsv4_7a104353fbcabeae6af8_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_l2pf",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "d4ce9398f53bd222d2368a09a1ecde458a371cdc91091c7872c44b1915bfa3d0",
+        },
+    },
     "cake_dsv4_7c51b4b6d5b345d4fe03": {
         "sources": [
             "sm_103a/cake_dsv4_7c51b4b6d5b345d4fe03_kernel.cu",
@@ -1199,7 +1245,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_107a"],
         "identity": {
-            "sm_107a": "6bd9ce7f949a9bc4cc3317c21a21c68b78d0eff016a2d39a40703430eec29e58",
+            "sm_107a": "e524e06c9e670a135bc145055678ae3274c88f3f94f4e2695c12069b101a52db",
         },
     },
     "cake_dsv4_88757d413062636b5640": {
@@ -1248,7 +1294,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "h8_h16_source_exact_tokens_qlayout",
         "arches": ["sm_100a"],
         "identity": {
-            "sm_100a": "51dcf4f44217bf164c05ec0bfda6d81387be2283f2bb73ffb16568367ece16cc",
+            "sm_100a": "a7e68188ce894ea1ae2c0ba4babb168b040877227741c7da89d7689561757d2d",
         },
     },
     "cake_dsv4_9daa9c5ff43490ad80ac": {
@@ -1298,6 +1344,18 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a"],
         "identity": {
             "sm_100a": "fe482c106d746eb25e14b0e92414600c7894c848f56e6e2397c560edf962beec",
+        },
+    },
+    "cake_dsv4_c51bf1f09fbe07ac3be6": {
+        "sources": [
+            "sm_107a/cake_dsv4_c51bf1f09fbe07ac3be6_kernel.cu",
+            "sm_107a/cake_dsv4_c51bf1f09fbe07ac3be6_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_prefill",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "be235b6174a4e79388b4ab2221712ff4ed8006954ab3fa6fa366e3574e100ece",
         },
     },
     "cake_dsv4_cbf3168c696847fd3f69": {
@@ -1419,8 +1477,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "fp8_h64_source_exact_qlayout",
         "arches": ["sm_100a", "sm_103a"],
         "identity": {
-            "sm_100a": "34284d78f03b0284b881b9720674d1a4813c6b087a742acca08cc5f123e12364",
-            "sm_103a": "d993119b34840042a04139a493421b6bb1fad516a895b869c08da8710fe4053a",
+            "sm_100a": "13f4a547c0061816d07cdbe46b7ee77dfcad4f12a4ac9b6f9de44f32038530a4",
+            "sm_103a": "16676f60a97e85568291e8efbd7eec3750189512899b6b3721c8bd98eabf3dc1",
         },
     },
     "cake_dsv4_e880e7c12a67fe035a37": {
@@ -1470,7 +1528,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "h8_h16_source_exact_tokens_qlayout",
         "arches": ["sm_100a"],
         "identity": {
-            "sm_100a": "fd4a13f32b30471c675e21d7ac69955b43369f67e74f2be3a4736350b5d8fcb2",
+            "sm_100a": "b00e7ecf066310de780d1784a65726bdc931ec8e237c9a47a0e3ea7a065ad199",
         },
     },
     "cake_dsv4_ff4aa022aa97fded6032": {
@@ -1482,7 +1540,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "h8_h16_source_exact_tokens_qlayout",
         "arches": ["sm_103a"],
         "identity": {
-            "sm_103a": "85f6e251ee2272c1f34b4ec404e3e76aaa5e13fc25ba50cd303d5007808ac69d",
+            "sm_103a": "832dacc9ff00ef248b7be596da51588a6aca20c85fd17b4fdd25cbf7064f09b2",
         },
     },
     "cake_dsv4_ffa4216b35dae8d46543": {
@@ -1531,12 +1589,14 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_f647b239789ffbbdbd90",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4": "cake_dsv4_f647b239789ffbbdbd90",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_bcl": "cake_dsv4_f647b239789ffbbdbd90",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_l2pf": "cake_dsv4_f647b239789ffbbdbd90",
         "fp8_h64_source_exact": "cake_dsv4_e5e9d7f2a2798aec29ff",
         "fp8_h8_h16_source_exact": "cake_dsv4_fee38be0a1a558bc4cf4",
         "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
         "fp8_lowhead_one_partition": "cake_dsv4_b7c345c94f3a216b24e5",
         "fp8_lowhead_prefill": "cake_dsv4_d9d623599c9697a9ccf3",
         "fp8_lowhead_prefill_overlap": "cake_dsv4_d9d623599c9697a9ccf3",
+        "fp8_lowhead_prefill_vblock": "cake_dsv4_d9d623599c9697a9ccf3",
         "split_reduce": "cake_dsv4_5f640d72462f26d33803",
     },
     "sm_103a": {
@@ -1570,12 +1630,14 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_3fce080f96f6dc5e9f8c",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4": "cake_dsv4_3fce080f96f6dc5e9f8c",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_bcl": "cake_dsv4_3fce080f96f6dc5e9f8c",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_l2pf": "cake_dsv4_3fce080f96f6dc5e9f8c",
         "fp8_h64_source_exact": "cake_dsv4_e5e9d7f2a2798aec29ff",
         "fp8_h8_h16_source_exact": "cake_dsv4_ff4aa022aa97fded6032",
         "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
         "fp8_lowhead_one_partition": "cake_dsv4_b78d35b605cb10daf20f",
         "fp8_lowhead_prefill": "cake_dsv4_e21760e2024d7c1e85c9",
         "fp8_lowhead_prefill_overlap": "cake_dsv4_e21760e2024d7c1e85c9",
+        "fp8_lowhead_prefill_vblock": "cake_dsv4_e21760e2024d7c1e85c9",
         "split_reduce": "cake_dsv4_5f640d72462f26d33803",
     },
     "sm_107a": {
@@ -1591,8 +1653,10 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_ffa4216b35dae8d46543",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4": "cake_dsv4_8afa079cbcc688b8b5b9",
         "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_bcl": "cake_dsv4_27a5d41ecb0fd5ecec7b",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile_kv4_l2pf": "cake_dsv4_7a104353fbcabeae6af8",
         "fp8_lowhead_prefill": "cake_dsv4_8625d6529808d0d51fc2",
         "fp8_lowhead_prefill_overlap": "cake_dsv4_25addc7a80a1e13c3ece",
+        "fp8_lowhead_prefill_vblock": "cake_dsv4_c51bf1f09fbe07ac3be6",
     },
 }
 

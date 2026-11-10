@@ -82,6 +82,25 @@ def _skip_unless_cake_gpu(*, sm107: bool = False) -> None:
         )
 
 
+def _lowhead_prefill_variant(rows: int) -> str:
+    """The variant the host launches for a low-head prefill launch of ``rows``
+    query rows on this GPU: on SM107 the V-block sibling up to 27 rows and the
+    early-PV sibling up to 64 rows (both ceilings scaled down with the SM count
+    below 216 SMs), the route's program above them; elsewhere the route's
+    program."""
+    import flashinfer.mla.cake_dsv4 as cake
+
+    route = "fp8_lowhead_prefill"
+    if cake._target_arch(torch.device("cuda", 0)) != "sm_107a":
+        return route
+    sm_count = min(torch.cuda.get_device_properties(0).multi_processor_count, 216)
+    if rows <= 27 * sm_count // 216:
+        return f"{route}_vblock"
+    if rows <= 64 * sm_count // 216:
+        return f"{route}_overlap"
+    return route
+
+
 def _compressed_topk(h_q: int) -> int:
     # swa128+topk4x profiles: sparse_topk 384 / 640 / 1152 (page size 64).
     return {32: 256, 64: 512, 128: 1024}[h_q]
@@ -1461,10 +1480,11 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
     monkeypatch, form
 ):
     """The SWA-only FP8/H64 rows of one wave run the low-head prefill route: on
-    SM107 its early-PV sibling up to 64 rows (8 and 20 rows) and the route's
-    program above (68 rows), elsewhere the route's program.  As a programmatic
-    dependent each is bitwise equal to the plain launch and, inside a graph,
-    reads the query the copy right before it writes."""
+    SM107 its V-block sibling up to 27 rows (8 and 20 rows) and the route's
+    program above the early-PV sibling's 64 rows (68 rows), elsewhere the
+    route's program.  As a programmatic dependent each is bitwise equal to the
+    plain launch and, inside a graph, reads the query the copy right before it
+    writes."""
     _skip_unless_cake_gpu(sm107=True)
     import flashinfer.mla.cake_dsv4 as cake
 
@@ -1490,11 +1510,9 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
         sm_count=sm_count,
     )
     assert route == "fp8_lowhead_prefill", route
-    sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
-    early = sm107 and case.rows <= 64 * min(sm_count, 216) // 216
     workspace = _workspace_128mib()
     plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
-    assert set(launched) == {f"{route}_overlap" if early else route}, launched
+    assert set(launched) == {_lowhead_prefill_variant(case.rows)}, launched
     pdl = case.run(
         workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
     )
@@ -1813,8 +1831,9 @@ def _align_case(route, heads, dtype, q_lens, layout="dense", width=0, page=64, f
 
 # ---------------------------------------------------------- index tables off the 16-byte row loads
 # The SWA-only FP8 8-head rows of the low-head prefill route on SM107's early-PV
-# sibling (48 rows: at most 62 rows on 212 SMs, 64 on 216) and on the route's
-# own program above it (68 rows); elsewhere both run the route's program.  Then
+# sibling (48 rows: above the V-block sibling's 26 rows on 212 SMs and 27 on
+# 216, at most 62 rows on 212 SMs and 64 on 216) and on the route's own program
+# above it (68 rows); elsewhere both run the route's program.  Then
 # the persistent FP8/H128 route, whose topk4x rows every architecture builds and
 # routes there, and two routes SM107 does not build (the tests skip there).
 _INDEX_ALIGN_CASES = [
@@ -1873,10 +1892,7 @@ def test_index_tables_off_the_row_loads_raise_before_launch(
     torch.cuda.synchronize()
     assert calls and {r for r, _ in calls} == {route}
     if route == "fp8_lowhead_prefill":
-        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-        sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
-        early = sm107 and rows <= 64 * min(sm_count, 216) // 216
-        assert set(launched) == {f"{route}_overlap" if early else route}, launched
+        assert set(launched) == {_lowhead_prefill_variant(rows)}, launched
     contiguous = (list(calls), set(launched))
 
     off = torch.full((rows, cols + 1), -1, dtype=torch.int32, device="cuda:0")
@@ -2047,9 +2063,9 @@ def test_misaligned_caller_out_matches_aligned(
     (``_OUT_ALIGN_BY_ROUTE``). A contiguous caller ``out`` 2 or 16 bytes off a
     32-byte boundary gets bitwise the aligned call's result through an aligned
     staging buffer, the bytes around it stay untouched, and an aligned ``out``
-    allocates nothing.  On SM107 the low-head prefill cases run the early-PV
-    sibling up to its row ceiling (12 rows) and the route's program above it
-    (66 rows); elsewhere they run the route's program."""
+    allocates nothing.  On SM107 the low-head prefill cases run the V-block
+    sibling up to its row ceiling (12 rows) and the route's program above the
+    early-PV sibling's (66 rows); elsewhere they run the route's program."""
     _skip_unless_cake_gpu(sm107=route == "fp8_lowhead_prefill")
     import flashinfer.mla.cake_dsv4 as cake
 
@@ -2078,10 +2094,7 @@ def test_misaligned_caller_out_matches_aligned(
     torch.cuda.synchronize()
     assert calls and {r for r, _ in calls} == {route}
     if route == "fp8_lowhead_prefill":
-        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-        sm107 = cake._target_arch(torch.device("cuda", 0)) == "sm_107a"
-        early = sm107 and sum(q_lens) <= 64 * min(sm_count, 216) // 216
-        assert set(launched) == {f"{route}_overlap" if early else route}, launched
+        assert set(launched) == {_lowhead_prefill_variant(sum(q_lens))}, launched
 
     again = case.nan_out()
     after_alloc = _allocation_requests()
@@ -2100,3 +2113,118 @@ def test_misaligned_caller_out_matches_aligned(
     torch.cuda.synchronize()
     assert torch.equal(view.view(torch.int16), aligned.view(torch.int16))
     assert torch.isnan(raw[:start]).all() and torch.isnan(raw[start + numel :]).all()
+
+
+# ---------------------------------------------------------- padded rows on the source-exact routes
+# The routes whose programs launch one CTA per request position (max_q_len x
+# batch_size, whatever the metadata rows), at every head count and sparse
+# width they take.  The H8/H16 routes run request lengths 5, 3, 4 and 1, 5, 5:
+# with a one-row first request, T = 1 ends at a request boundary and both
+# later requests start at or past T.
+_SOURCE_EXACT_PADDED_CASES = [
+    _align_case(route, heads, dtype, q_lens, "ragged", width, page, form=form + tag)
+    for route, dtype in (
+        ("bf16_h8_h16_source_exact", _BF16),
+        ("fp8_h8_h16_source_exact", _FP8),
+    )
+    for heads, width, page, form in (
+        (8, 64, 64, "h8-192"),
+        (16, 128, 64, "h16-256"),
+        (8, 132, 2, "h8-260"),
+        (16, 132, 2, "h16-260"),
+    )
+    for q_lens, tag in (([5, 3, 4], ""), ([1, 5, 5], "-q1-5-5"))
+] + [_align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512)]
+
+
+@pytest.mark.parametrize("swa", ["long", "short-stale"])
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,layout,width,page", _SOURCE_EXACT_PADDED_CASES
+)
+def test_source_exact_padded_rows_match_the_unpadded_call(
+    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page, swa
+):
+    """A padded ragged call on a source-exact route: the metadata of the first
+    ``T`` rows alone (tables and lengths of exactly ``T`` rows) under the
+    query and ``cum_seq_lens_q`` of every row, for ``T`` = 1, the first
+    request boundary and one row short of the end.  Rows below ``T`` get
+    bitwise the unpadded call's output, in an aligned ``out`` and in one 2
+    bytes off its store alignment (the program writes a ``T``-row staging
+    buffer, which the host copies into ``out``).  In the aligned ``out``
+    every row at or past ``T`` keeps its NaN: the program wrote none of them.
+    In the staged call those rows are out of the program's reach, so the same
+    check holds by construction.  The bytes around ``out`` stay untouched.
+    ``T = 1`` also runs with its one row viewed out of a ``[1, W + 1]``
+    parent (odd row stride), whose next row would be a misaligned 16-byte
+    index load.  These checks see what lands in ``out`` only: a read of a
+    metadata row at or past ``T``, or a write past the end of the staging
+    buffer, leaves ``out`` as it is.  Those show under ``compute-sanitizer
+    --tool memcheck`` with ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` (each
+    ``T``-row table, the lengths and the staging buffer an allocation of its
+    own).  ``swa="short-stale"`` gives every request
+    an SWA cache a few tokens longer than its query, with valid stale slots
+    past the causal window: the rows of the requests ``T`` cuts see fewer than
+    128 SWA slots, so a window taken from the cut length instead of the
+    request's would attend a stale slot and move a row below ``T``."""
+    _skip_unless_cake_gpu()
+    calls = _count_dispatches(monkeypatch)
+    short = swa == "short-stale"
+    case = _build_case(
+        num_heads=num_heads,
+        dtype=dtype,
+        seq_lens=(
+            [q + 3 + 7 * i for i, q in enumerate(q_lens)]
+            if short
+            else [_LONG_SEQ + 37 * i for i in range(len(q_lens))]
+        ),
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=width,
+        compressed_page=page,
+        swa_tail="stale" if short else "minus_one",
+    )
+    if short:
+        # The rows below T of a request T cuts see fewer than 128 SWA slots:
+        # the first row (T = 1 cuts a first request longer than one row) and
+        # the last row below T = cum[B] - 1 (which cuts the last request).
+        visible = case.visible()
+        assert int(visible[0]) < SWA_WINDOW and int(visible[-2]) < SWA_WINDOW
+    workspace = _workspace_128mib()
+    expected = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert calls == [(route, case.rows)], calls
+    assert not torch.isnan(expected).any()
+
+    table, lens = case.sparse_indices, case.sparse_topk_lens
+    cols = int(table.shape[1])
+    ends = case.cum_seq_lens_q.tolist()
+    one_row = torch.full((1, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    one_row[:, :cols] = table[:1]
+    assert one_row[:, :cols].stride(0) % 4 != 0
+    metadata = [
+        (rows, table[:rows].clone()) for rows in sorted({1, ends[1], ends[-1] - 1})
+    ]
+    metadata.append((1, one_row[:, :cols]))
+    numel = expected.numel()
+    for rows, rows_table in metadata:
+        padded = dataclasses.replace(
+            case, sparse_indices=rows_table, sparse_topk_lens=lens[:rows].clone()
+        )
+        for offset_bytes in (0, 2):
+            raw = torch.full(
+                (numel + 32,), float("nan"), dtype=torch.bfloat16, device="cuda:0"
+            )
+            start = ((-raw.data_ptr()) % 32 + offset_bytes) // raw.element_size()
+            out = raw[start : start + numel].view(case.query.shape)
+            assert out.data_ptr() % 32 == offset_bytes
+            calls.clear()
+            got = padded.run(workspace=workspace, out=out, float_scales=True)
+            torch.cuda.synchronize()
+            where = f"T={rows} of {case.rows}, stride {rows_table.stride(0)}, out +{offset_bytes} B"
+            assert calls == [(route, rows)], (where, calls)
+            assert torch.equal(
+                got[:rows].view(torch.int16), expected[:rows].view(torch.int16)
+            ), where
+            assert torch.isnan(got[rows:]).all(), where
+            assert torch.isnan(raw[:start]).all(), where
+            assert torch.isnan(raw[start + numel :]).all(), where

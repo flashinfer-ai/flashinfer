@@ -108,6 +108,7 @@ exclude = [
 "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_dsa_sparse_attention_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_kda_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_kda_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_kda_det_train_kcp" = ["csrc/**", "build.json", "build.test.json"]
@@ -117,6 +118,7 @@ exclude = [
 "flashinfer.experimental.cake.cake_gdn_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_gdn_nondet_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_gqa_nondet_train" = ["csrc/**", "build.json"]
+"flashinfer.experimental.cake.cake_gqa_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake_rubin_mla_nvfp4_decode" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_lm_head_det_train" = ["csrc/**", "build.json"]
 # Generated sources of its non-deterministic counterpart.

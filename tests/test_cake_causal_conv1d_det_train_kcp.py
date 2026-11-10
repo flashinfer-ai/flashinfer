@@ -418,9 +418,11 @@ def test_kcp_keeps_fp32_taps_and_no_bias():
 
 
 def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
-    """KCP plans its launches with ``cake_jit.plan(..., legacy=True)``: C = 1280 keeps ``(ct_vec, n_sub,
-    n_ch_tiles) = (128, 1, 2)`` (the training routes tile it as (32, 4, 5)), and the forward's ``y`` stays
-    bitwise the unpartitioned forward's."""
+    """The KCP programs plan their launches with ``cake_jit.plan(..., legacy=True)``: C = 1280 keeps ``(ct_vec, n_sub,
+    n_ch_tiles) = (128, 1, 2)`` (the training routes tile it as (32, 4, 5)).  The backward does so on every form; so
+    does the one-launch forward (knobs ``fwd_main`` 0, ``fwd_overlap`` 0), while the shipped forward's single-rank main
+    program (``FWD_MAIN_ARCHS``) plans with the ``fwd`` route's rule for the device's architecture.  ``y`` stays
+    bitwise the unpartitioned forward's either way."""
 
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import cake_jit
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
@@ -441,15 +443,106 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
 
     monkeypatch.setattr(conv_kcp, "plan", recording_plan)
     device = torch.device("cuda")
+    arch = conv_kcp._device_arch(device)
     p = _problem((5000, 1003), (1, 2, 4997, 1003), 1280, device)
-    y, hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
-    dx, dw = cake_causal_conv1d_det_train_kcp_backward(
-        p.x_local, p.w, p.ctx, p.dy_local, hist
-    )
-    assert len(calls) == 2 and all(call.get("legacy") is True for call in calls), calls
     y_full = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
-    assert torch.equal(y, y_full[p.l2g])
-    assert torch.isfinite(dw).all() and dx.shape == p.x_local.shape
+    for knobs in ({"fwd_main": 0, "fwd_overlap": 0}, None):
+        calls.clear()
+        # the trimmed host path caches its plans per context: each form plans afresh
+        conv_kcp.cake_causal_conv1d_det_train_kcp_host_cache_clear()
+        conv_kcp._set_test_knobs(knobs)
+        try:
+            y, hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+            dx, dw = cake_causal_conv1d_det_train_kcp_backward(
+                p.x_local, p.w, p.ctx, p.dy_local, hist
+            )
+        finally:
+            conv_kcp._set_test_knobs(None)
+        assert len(calls) == 2 and calls[1].get("legacy") is True, (knobs, calls)
+        if knobs is None and arch in conv_kcp.FWD_MAIN_ARCHS:
+            assert calls[0].get("legacy") is not True, calls
+            assert (calls[0].get("route"), calls[0].get("arch")) == ("fwd", arch), calls
+        else:
+            assert calls[0].get("legacy") is True, (knobs, calls)
+        assert torch.equal(y, y_full[p.l2g]), knobs
+        assert torch.isfinite(dw).all() and dx.shape == p.x_local.shape
+
+
+@pytest.mark.parametrize("host_trim", [0, 1])
+def test_forward_grid_is_one_sm_short_unless_a_channel_tile_needs_the_sm(
+    monkeypatch, host_trim
+) -> None:
+    """On both host paths the one-launch forward (knobs ``fwd_main`` 0, ``fwd_overlap`` 0: the ``kcp_fwd`` program)
+    launches ``ctas_per_sm x (SMs - FWD_RESERVE_SMS)`` CTAs when that grid holds every channel tile of ``C``, else the
+    record's full co-resident grid (``kcp._forward_grid``): with the device's full grid made exactly ``C``'s channel
+    tile count (``_record_launch_grid`` patched), the forward launches that full grid instead of refusing ``C``, and
+    ``y`` stays bitwise the unpartitioned forward's in both cases; a full grid one CTA short of ``C``'s tile count
+    refuses ``C``."""
+
+    from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
+        kcp as conv_kcp,
+    )
+
+    device = torch.device("cuda")
+    (name,) = conv_kcp.route_modules(conv_kcp._device_arch(device), conv_kcp.KCP_FWD)
+    record = conv_kcp._loader.MODULES[name]
+    ctas_per_sm = int(record["grid_rule"]["ctas_per_sm"])
+    geometry = record["grid_rule"]["geometry"]
+    reserved = conv_kcp.FWD_RESERVE_SMS * ctas_per_sm
+
+    def tiles(C: int) -> int:
+        return conv_kcp.plan(1, C, 1, geometry=geometry, legacy=True)["n_ch_tiles"]
+
+    # the smallest C (a multiple of 1024) with more channel tiles than the reserved CTAs: a full grid of exactly its
+    # tile count then leaves a shorter grid of at least one CTA, too small for C
+    C = 1024
+    while tiles(C) <= reserved:
+        C += 1024
+    n_ch_tiles = tiles(C)
+    grids = []
+    run, launch_plan = conv_kcp.run_module, conv_kcp._launch_plan
+
+    def recording_run(module, values, **kwargs):
+        if module == name:
+            grids.append(tuple(kwargs["grid"]))
+        return run(module, values, **kwargs)
+
+    def recording_launch_plan(module, grid, device_index):
+        if module == name:
+            grids.append(tuple(grid))
+        return launch_plan(module, grid, device_index)
+
+    monkeypatch.setattr(conv_kcp, "run_module", recording_run)
+    monkeypatch.setattr(conv_kcp, "_launch_plan", recording_launch_plan)
+    device_full = conv_kcp._record_launch_grid(
+        record, device_index=conv_kcp._device_index(device)
+    )
+    conv_kcp._set_test_knobs({"host_trim": host_trim, "fwd_main": 0, "fwd_overlap": 0})
+    try:
+        for full, launched in (
+            (device_full, (device_full[0] - reserved,) + tuple(device_full[1:])),
+            ((n_ch_tiles, 1, 1), (n_ch_tiles, 1, 1)),
+        ):
+            assert full[0] - reserved < n_ch_tiles or full is device_full
+            monkeypatch.setattr(
+                conv_kcp, "_record_launch_grid", lambda record, _full=full, **_kw: _full
+            )
+            grids.clear()
+            p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
+            y, _hist = cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+            assert grids == [launched], (host_trim, full, grids)
+            y_full = cake_causal_conv1d_det_train_forward(p.x, p.w, p.cu)
+            assert torch.equal(y, y_full[p.l2g]), (host_trim, full)
+        monkeypatch.setattr(
+            conv_kcp,
+            "_record_launch_grid",
+            lambda record, **_kw: (n_ch_tiles - 1, 1, 1),
+        )
+        p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
+        with pytest.raises(ValueError, match="spans more channel tiles"):
+            cake_causal_conv1d_det_train_kcp_forward(p.x_local, p.w, p.ctx)
+    finally:
+        conv_kcp._set_test_knobs(None)
 
 
 @pytest.mark.parametrize("form", ["knob", "keyword"])
@@ -1094,14 +1187,14 @@ def test_every_output_repeats_bitwise_per_launch_form(
 
 
 def test_steady_state_calls_do_not_block_or_allocate() -> None:
-    """Census (``tests/test_helpers/cake_host_sync.py``) of a steady round on one context: the explicit forward, the
+    """Census (``tests/experimental/test_helpers/cake_host_sync.py``) of a steady round on one context: the explicit forward, the
     backward in both launch forms, the autograd entry and the three-tensor multi forward / backward.  No pageable or
     pinned host-to-device copy, no synchronizing operation (the probe queued before the round still runs when the
     host returns), no device allocation or free once the first rounds have run; bitwise the first round."""
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
         kcp as conv_kcp,
     )
-    from tests.test_helpers.cake_host_sync import (
+    from tests.experimental.test_helpers.cake_host_sync import (
         allocator_counts,
         census,
         nonblocking,
@@ -1187,14 +1280,26 @@ def test_kcp_backend_reads_no_environment_variable() -> None:
         assert conv_kcp._set_test_knobs({"host_trim": 0}) == {
             "graph": "off",
             "host_trim": 0,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
         assert conv_kcp._set_test_knobs({"graph": "replay"}) == {
             "graph": "replay",
             "host_trim": 1,
+            "bwd_overlap": 1,
+            "fwd_main": None,
+            "fwd_overlap": None,
         }
     finally:
         conv_kcp._set_test_knobs(None)
-    assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
+    assert conv_kcp._TEST_KNOBS == {
+        "graph": "off",
+        "host_trim": 1,
+        "bwd_overlap": 1,
+        "fwd_main": None,
+        "fwd_overlap": None,
+    }
 
 
 _VENDORED = """
@@ -1234,7 +1339,9 @@ for name in kcp.__all__:
 assert isinstance(kcp_jit.MODULES, dict) and kcp_jit.MODULES
 assert kcp.COOPERATIVE_DEFAULT is False and kcp._cooperative(None) is False
 assert kcp._set_test_knobs({"host_trim": 0})["host_trim"] == 0
-assert kcp._set_test_knobs(None) == {"graph": "off", "host_trim": 1}
+assert kcp._set_test_knobs(None) == {
+    "graph": "off", "host_trim": 1, "bwd_overlap": 1, "fwd_main": None, "fwd_overlap": None
+}
 
 x = torch.zeros(8, 128, dtype=torch.bfloat16)
 w = torch.zeros(128, 4, dtype=torch.float32)

@@ -233,9 +233,9 @@ def cake_causal_conv1d_det_train_forward(
         one buffer serves every later call of one stream, CUDA Graph replays
         included; two launches that may run at once need two buffers).  Its
         size (:func:`cake_causal_conv1d_det_train_forward_workspace_bytes`) is the
-        most over every forward route.  When omitted the package uses a zeroed
-        buffer it keeps per (device, current stream), or a zeroed buffer of the
-        call's own inside a CUDA Graph capture.
+        most over every forward route and token count.  When omitted the
+        package uses a zeroed buffer it keeps per (device, current stream), or
+        a zeroed buffer of the call's own inside a CUDA Graph capture.
 
     Returns
     -------

@@ -215,13 +215,13 @@ def test_kimi_k3_public_eager_graph_and_masks(kind, wire):
         _weights(rank, world, kind), config, fleet, world_size=world
     )
 
-    def make_layer(*, quantize_input=True, fast_situ=False):
+    def make_layer(*, quantize_input=True, fast_situ=False, knobs=None):
         return moe_ep.MoEEpMegaLayer(
             bootstrap=bootstrap,
             fleet_params=fleet,
             weights=moe_ep.MoEWeightPack(torch.empty(0), torch.empty(0)),
             backend=moe_ep.MegaConfig(
-                megakernel=replace(config, fast_situ=fast_situ),
+                megakernel=replace(config, fast_situ=fast_situ, knobs=knobs),
                 quantize_input=quantize_input,
                 preprocess_weights=False,
                 transformed_weights=transformed,
@@ -252,7 +252,48 @@ def test_kimi_k3_public_eager_graph_and_masks(kind, wire):
             output = torch.empty_like(tensors.hidden_states)
             result = layer(replace(tensors, output=output), workspace=workspace)
             assert result.data_ptr() == output.data_ptr()
-            _check(result, _reference(tensors, kind, wire))
+            expected = _reference(tensors, kind, wire)
+            _check(result, expected)
+            layer.stage_inputs(tensors, workspace=workspace)
+            if step == 0:
+                for invalid_output in (
+                    torch.empty(tokens, 8, dtype=torch.bfloat16, device="cuda"),
+                    torch.empty(
+                        tokens - 1, HIDDEN, dtype=torch.bfloat16, device="cuda"
+                    ),
+                    torch.empty((), dtype=torch.bfloat16, device="cuda"),
+                    torch.empty(tokens, HIDDEN, dtype=torch.float32, device="cuda"),
+                    torch.empty(tokens, HIDDEN, dtype=torch.bfloat16),
+                    torch.empty(
+                        tokens, 2 * HIDDEN, dtype=torch.bfloat16, device="cuda"
+                    )[:, ::2],
+                    torch.empty(
+                        tokens * HIDDEN + 1, dtype=torch.bfloat16, device="cuda"
+                    )[1:].reshape(tokens, HIDDEN),
+                ):
+                    with pytest.raises(ValueError, match="Kimi output"):
+                        layer.compute_staged(output=invalid_output)
+                    with pytest.raises(ValueError):
+                        layer(
+                            replace(tensors, output=invalid_output), workspace=workspace
+                        )
+            staged_output = torch.full(
+                (tokens + 2, HIDDEN), -123.0, dtype=torch.bfloat16, device="cuda"
+            )
+            result = layer.compute_staged(output=staged_output)
+            if tokens:
+                assert result.data_ptr() == staged_output.data_ptr()
+            _check(result, expected)
+            assert (staged_output[tokens:] == -123).all()
+            if step == 0:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = layer.compute_staged(output=staged_output)
+                graph.replay()
+                torch.cuda.synchronize()
+                _check(captured, expected)
+                assert (staged_output[tokens:] == -123).all()
+                graph = None
             if step == 0:
                 for name in ("hidden_states", "topk_ids", "topk_weights", "output"):
                     original = output if name == "output" else getattr(tensors, name)
@@ -309,11 +350,23 @@ def test_kimi_k3_public_eager_graph_and_masks(kind, wire):
                 (17, HIDDEN // 32), 119, dtype=torch.uint8, device="cuda"
             )
         prequantized = replace(tensors, hidden_states=data, scales=scales)
-        variants = [(False, False, prequantized)]
+        batch_limit = 32 if kind == "nvfp4" else 4
+        variants = [
+            (False, False, prequantized, None),
+            (
+                True,
+                False,
+                tensors,
+                {
+                    "epi_flag_batches": (batch_limit, batch_limit),
+                    "schedule_policy": ("grouped", 32),
+                },
+            ),
+        ]
         if (kind, wire) == ("nvfp4", "bf16"):
-            variants.append((True, True, tensors))
-        for quantize, fast, inputs in variants:
-            variant = make_layer(quantize_input=quantize, fast_situ=fast)
+            variants.append((True, True, tensors, None))
+        for quantize, fast, inputs, knobs in variants:
+            variant = make_layer(quantize_input=quantize, fast_situ=fast, knobs=knobs)
             try:
                 handle = variant.create_workspace(256)
                 variant.warmup(inputs, workspace=handle)
@@ -338,6 +391,31 @@ def test_kimi_k3_public_eager_graph_and_masks(kind, wire):
         graph = None
         torch.cuda.synchronize()
         layer.destroy()
+
+
+@pytest.mark.parametrize("wire", ["bf16", "mxfp8"])
+def test_kimi_rejects_unsafe_async_batches(wire):
+    rank, world = _runtime()
+    from flashinfer.moe_ep.kernel_src.sm100 import _kimi_k3_megamoe as native
+
+    fleet = moe_ep.FleetParams(EXPERTS, 8192, HIDDEN)
+    for batches in ((5, 1), (1, 5), (32, 1)):
+        config = moe_ep.Sm100_KimiK3_MegaMoeConfig(
+            quant_kind="mxfp4_mxfp8",
+            combine_dtype=wire,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            knobs={"epi_flag_batches": batches, "schedule_policy": ("grouped", 32)},
+        )
+        with pytest.raises(ValueError, match="async epilogue flag batches.*at most 4"):
+            native.create_workspace(
+                config,
+                fleet,
+                rank=rank,
+                world_size=world,
+                process_group=dist.group.WORLD if world > 1 else None,
+            )
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("wire", ["bf16", "mxfp8"])
