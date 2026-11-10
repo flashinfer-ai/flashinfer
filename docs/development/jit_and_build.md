@@ -45,6 +45,10 @@ from `csrc/`; render Jinja only for needed specialization and use
 `write_if_different()` to avoid unnecessary rebuilds. Follow existing
 `DISPATCH_DTYPE` / `DISPATCH_BLOCK_SIZE` macros for runtime specialization.
 
+FA2 batch-prefill JIT launchers use `DISPATCH_FA2_CTA_TILE_Q` in `utils.cuh`
+to exclude references to tiles pruned by the ragged/paged instantiation templates.
+Keep its compile-time guards aligned with those templates and `FA2DetermineCtaTileQ`.
+
 ## Module caching
 
 `@functools.cache` retains loaded modules in Python; the file cache under
