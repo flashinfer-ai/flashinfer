@@ -25,22 +25,6 @@ PREFIX_UNIFORM_HEADS = (64, 96)
 
 
 @triton.jit
-def _wait_dual_done(done_ptr, N_DONE: tl.constexpr):
-    """Wait for every dual producer and count correction programs that observed it."""
-    while tl.atomic_add(done_ptr, 0, sem="acquire", scope="gpu") < N_DONE:
-        pass
-    return tl.atomic_add(done_ptr + 1, 1, sem="relaxed", scope="gpu")
-
-
-@triton.jit
-def _reset_dual_done(done_ptr, seen, N_PROG: tl.constexpr):
-    """Reset completion counters after the final correction program observes them."""
-    if seen == N_PROG - 1:
-        tl.atomic_xchg(done_ptr, 0, sem="relaxed", scope="gpu")
-        tl.atomic_xchg(done_ptr + 1, 0, sem="relaxed", scope="gpu")
-
-
-@triton.jit
 def _split_fix_kernel(
     w_ptr,
     zo_ptr,
@@ -49,7 +33,6 @@ def _split_fix_kernel(
     p_ptr,
     z_ptr,
     final_ptr,
-    done_ptr,
     tail_tokens,
     num_heads: tl.constexpr,
     IN_HEADS: tl.constexpr,
@@ -57,8 +40,6 @@ def _split_fix_kernel(
     BLOCKS_PER_PROGRAM: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    N_DONE: tl.constexpr,
-    N_PROG: tl.constexpr,
 ):
     """Compose a complete tail using TF32 state and BF16 output products."""
     head = tl.program_id(0)
@@ -67,8 +48,6 @@ def _split_fix_kernel(
     state_parts: tl.constexpr = 128 // BLOCK_V
     base = head * 16384
     first = part * BLOCKS_PER_PROGRAM
-    if N_DONE > 0:
-        seen = _wait_dual_done(done_ptr, N_DONE)
     if first * BLOCK_T < tail_tokens:
         s_a = tl.load(sa_ptr + base + offs_d[:, None] * 128 + offs_d[None, :])
         s_a = s_a.to(tl.bfloat16)
@@ -96,8 +75,6 @@ def _split_fix_kernel(
             p = tl.load(p_ptr + base + (kk + offs_k[:, None]) * 128 + offs_d[None, :])
             state = tl.dot(s_rows, p, acc=state, input_precision="tf32")
         tl.store(final_ptr + rows + offs_d[None, :], state)
-    if N_DONE > 0:
-        _reset_dual_done(done_ptr, seen, N_PROG)
 
 
 @triton.jit
@@ -112,7 +89,6 @@ def _split_fix2_kernel(
     zb_ptr,
     final_ptr,
     cnt_ptr,
-    done_ptr,
     tail_tokens,
     num_heads: tl.constexpr,
     IN_HEADS: tl.constexpr,
@@ -124,8 +100,6 @@ def _split_fix2_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    N_DONE: tl.constexpr,
-    N_PROG: tl.constexpr,
 ):
     """Fix for a tail cut into two dual segments A (NA token blocks) and B.
 
@@ -147,8 +121,6 @@ def _split_fix2_kernel(
     sb_ptr = st_ptr + 2 * num_heads * 16384
     offs_v = part * BLOCK_V + tl.arange(0, BLOCK_V)
     rows = base + offs_v[:, None] * 128
-    if N_DONE > 0:
-        seen = _wait_dual_done(done_ptr, N_DONE)
     if part < state_parts:
         s_b = tl.load(za_ptr + rows + offs_d[None, :])
         for kk in tl.range(0, 128, BLOCK_K, num_stages=3):
@@ -205,8 +177,6 @@ def _split_fix2_kernel(
             )
             o = (o.to(tl.float32) + corr).to(tl.bfloat16)
             tl.store(out_ptr + offs, o, mask=mask, cache_modifier=".cs")
-    if N_DONE > 0:
-        _reset_dual_done(done_ptr, seen, N_PROG)
 
 
 def _handoff_pack(rows_in, n_ctas, tail_chunks):
@@ -485,8 +455,9 @@ class FixedSplitLaunch:
             self.args_d["out_tma"] = self.zw
             self.args_d["v"] = args["v"][split:]
             self.args_d["v_tma"] = args["v_tma"][split:]
-            self.done = torch.zeros(2, dtype=torch.int32, device=device)
-            self.args_d["handoff_flags_addr"] = self.done.data_ptr()
+            # Stream completion orders dual writes before correction, so
+            # no per-CTA device completion counter is needed.
+            self.args_d["handoff_flags_addr"] = 0
             self.args_d["generation"] = 0
         self.bind_inputs(q, k, g, beta)
         token_blocks = -(-tail // block_t)
@@ -543,15 +514,16 @@ class FixedSplitLaunch:
             self.args_d["g_tma"] = g_tail
 
     def launch(self):
-        """Run prefix/tail branches, using device counters to join dual writes."""
+        """Run prefix and tail concurrently, joining producers before correction."""
         main = torch.cuda.current_stream()
         if self.dual_module is not None:
             self.side_z.wait_stream(main)
             self.module.launch(grid=self.grid_p, **self.args_p)
             with torch.cuda.stream(self.side_z):
                 self.dual_module.launch(grid=self.grid_d, **self.args_d)
-            self.fix()
+            # Producer CTAs finish before correction CTAs can occupy SMs.
             main.wait_stream(self.side_z)
+            self.fix()
             return
         self.side_z.wait_stream(main)
         self.side_w.wait_stream(main)
@@ -565,7 +537,7 @@ class FixedSplitLaunch:
         self.fix()
 
     def fix(self):
-        """Correct tail outputs and state after programs observe dual completion."""
+        """Compose tail outputs and FP32 state after its producer kernels complete."""
         if self.dual_module is not None and self.seg_b:
             self._fix_two_segments()
             return
@@ -577,11 +549,9 @@ class FixedSplitLaunch:
                 self.ws_zp[0],
             )
             in_heads = 2 * self.heads
-            done, n_done = (self.done, self.grid_d[0])
         else:
             w, zo, p, z = (self.w, self.out_tail, self.ws_p[0], self.ws_state[1])
             in_heads = self.heads
-            done, n_done = (self.ws_p, 0)
         _split_fix_kernel[self.fix_grid](
             w,
             zo,
@@ -590,7 +560,6 @@ class FixedSplitLaunch:
             p,
             z,
             self.final_state,
-            done,
             self.tail,
             num_heads=self.heads,
             IN_HEADS=in_heads,
@@ -598,8 +567,6 @@ class FixedSplitLaunch:
             BLOCKS_PER_PROGRAM=self.blocks_per_program,
             BLOCK_V=self.block_v,
             BLOCK_K=self.block_k,
-            N_DONE=n_done,
-            N_PROG=self.fix_grid[0] * self.fix_grid[1],
             num_warps=self.num_warps,
         )
 
@@ -630,7 +597,6 @@ class FixedSplitLaunch:
             self.ws_zp[2],
             self.final_state,
             self.seg_cnt,
-            self.done,
             self.tail,
             num_heads=heads,
             IN_HEADS=2 * heads,
@@ -642,7 +608,5 @@ class FixedSplitLaunch:
             BLOCK_T=bt,
             BLOCK_V=self.block_v,
             BLOCK_K=self.block_k,
-            N_DONE=self.grid_d[0],
-            N_PROG=heads * parts,
             num_warps=self.num_warps,
         )

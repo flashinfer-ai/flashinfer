@@ -69,9 +69,9 @@ scheduler. The public API and explicit `backend="ptx"` selection are unchanged.
 
 Approximate splitting and expected-norm substitution are disabled by the
 adapter. Planning, compilation, and descriptor upload remain outside graph
-capture. Fixed-split correction uses release/acquire device completion
-counters; the side stream is joined after correction. This retains the original
-scheduling protocol. The benchmark includes all captured GPU work, including tail
+capture. Stream dependencies join dual-tail completion before launching
+fixed-split correction, preventing correction CTAs from starving unscheduled
+dual producers. The redundant dual-completion counters are disabled. The benchmark includes all captured GPU work, including tail
 correction. It reports GPU activity spans rather
 than CPU-inclusive end-to-end latency.
 
