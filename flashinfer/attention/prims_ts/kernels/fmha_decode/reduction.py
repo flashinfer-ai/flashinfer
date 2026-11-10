@@ -454,7 +454,9 @@ def _store_parallel_reduction_output(
     if cutlass.const_expr(cfg.store_softmax_stats):
         if reduce_col_idx == Int32(0):
             if cutlass.const_expr(isinstance(stats_scale, cute.Pointer)):
-                stats_scale = cute.make_tensor(stats_scale, cute.make_layout(1))[0]
+                natural_scale = cute.make_tensor(stats_scale, cute.make_layout(1))[0]
+            else:
+                natural_scale = stats_scale
             # Only the final row owner merges the optional max/sum states.
             # The original LSE/O recurrence and cluster communication stay unchanged;
             # statistics-disabled kernels allocate no additional state.
@@ -475,8 +477,8 @@ def _store_parallel_reduction_output(
             denominator = Float32(0.0)
             maximum = Float32(-Float32.inf)
             if raw_maximum != Float32(-Float32.inf):
-                maximum = raw_maximum * stats_scale
-                scale_log2 = stats_scale * Float32(math.log2(math.e))
+                maximum = raw_maximum * natural_scale
+                scale_log2 = natural_scale * Float32(math.log2(math.e))
                 for split_idx in cutlass.range(active_splits_kv):
                     workspace_row = _separate_workspace_row_offset(
                         logical_kv_idx,
