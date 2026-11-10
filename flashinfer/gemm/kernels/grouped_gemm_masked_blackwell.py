@@ -3829,6 +3829,32 @@ def _validate_gated_activation(
     return activation_type.value
 
 
+def _reject_gated_activation_args(
+    swiglu_alpha, swiglu_beta, swiglu_limit, alpha_up, a_per_token_scale
+) -> None:
+    # Without activation_type these would be ignored silently, which usually
+    # means the caller forgot activation_type.
+    stray = [
+        name
+        for name, value, default in (
+            ("swiglu_alpha", swiglu_alpha, DEFAULT_SWIGLU_ALPHA),
+            ("swiglu_beta", swiglu_beta, DEFAULT_SWIGLU_BETA),
+            ("swiglu_limit", swiglu_limit, DEFAULT_SWIGLU_LIMIT),
+        )
+        if value != default
+    ]
+    stray += [
+        name
+        for name, tensor in (
+            ("alpha_up", alpha_up),
+            ("a_per_token_scale", a_per_token_scale),
+        )
+        if tensor is not None
+    ]
+    if stray:
+        raise ValueError(f"{', '.join(stray)} require activation_type")
+
+
 def _grouped_gemm_nt_masked_sm100(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -4059,8 +4085,17 @@ def _grouped_gemm_nt_masked_sm100(
             a_per_token_scale=a_per_token_scale,
             mma_tiler_mn=mma_tiler_mn,
         )
-    elif alpha_up is not None or a_per_token_scale is not None:
-        raise ValueError("alpha_up and a_per_token_scale require activation_type")
+    else:
+        _reject_gated_activation_args(
+            swiglu_alpha, swiglu_beta, swiglu_limit, alpha_up, a_per_token_scale
+        )
+        # The plain epilogue writes a full-width (m, n, l) tile; a smaller buffer
+        # (e.g. one sized for the gated output) would be overrun silently.
+        if not is_combine_fusion and tuple(out.shape) != (m, n, l):
+            raise ValueError(
+                f"grouped_gemm_nt_masked expects out of shape {(m, n, l)}, got "
+                f"{tuple(out.shape)}"
+            )
 
     if is_combine_fusion:
         required = {

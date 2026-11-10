@@ -103,7 +103,9 @@ def grouped_gemm_nt_masked(
         ``(n32, n4, rn, k4, rk, l)``
         (physically ``(l, rn, rk, n32, n4, k4)``).
     out : torch.Tensor
-        Output tensor of shape ``(l, m, n)``.  Mutated in place.
+        Output tensor of logical shape ``(m, n, l)`` (physically
+        ``(l, m, n)``), or ``(m, n / 2, l)`` with ``activation_type``.
+        Mutated in place.
     masked_m : torch.Tensor
         1-D ``int32`` tensor of shape ``(l,)`` giving the valid row count of
         each batch.  Rows above ``masked_m[batch]`` are ignored.
@@ -159,7 +161,10 @@ def grouped_gemm_nt_masked(
         interleaved in 64-row blocks with the up projection first,
         ``[up_0:64, gate_0:64, up_64:128, gate_64:128, ...]``, ``n`` must be a
         multiple of ``mma_tiler_mn[1]``, and ``out`` has shape
-        ``(m, n / 2, l)``.  Each output element is
+        ``(m, n / 2, l)``.  The NVFP4 ``w1_weight`` and ``w1_weight_sf`` of
+        :meth:`flashinfer.fused_moe.CuteDslConfig.prepare_weights` already
+        use this layout; pass them as ``(w1_weight.permute(1, 2, 0),
+        w1_weight_sf)``.  Each output element is
         ``gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)`` with
         ``gate = min(alpha * s * acc_gate, swiglu_limit)``,
         ``up = clamp(alpha_up * s * acc_up, -swiglu_limit, swiglu_limit)``
@@ -168,6 +173,8 @@ def grouped_gemm_nt_masked(
         combine fusion, ``is_swap_ab`` or ``dst_signals``.
     swiglu_alpha : float
         Sigmoid multiplier of the gated activation.  Defaults to ``1.0``.
+        The ``swiglu_*`` scalars, ``alpha_up`` and ``a_per_token_scale``
+        require ``activation_type``; setting them without it raises.
     swiglu_beta : float
         Bias added to the up projection.  Defaults to ``0.0``.
     swiglu_limit : float
@@ -271,6 +278,15 @@ def grouped_gemm_nt_masked(
                 ("a_per_token_scale", a_per_token_scale, None),
             )
             if value is not default
+        ]
+        unsupported += [
+            name
+            for name, value, default in (
+                ("swiglu_alpha", swiglu_alpha, DEFAULT_SWIGLU_ALPHA),
+                ("swiglu_beta", swiglu_beta, DEFAULT_SWIGLU_BETA),
+                ("swiglu_limit", swiglu_limit, DEFAULT_SWIGLU_LIMIT),
+            )
+            if value != default
         ]
         if unsupported:
             raise NotImplementedError(

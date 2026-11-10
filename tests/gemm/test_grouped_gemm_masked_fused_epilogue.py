@@ -152,6 +152,7 @@ def _run_invalid(**overrides):
         ({"swiglu_limit": -1.0}, ValueError),
         ({"a_per_token_scale": torch.ones(2, 64)}, ValueError),
         ({"activation_type": None, "alpha_up": torch.ones(2)}, ValueError),
+        ({"activation_type": None, "swiglu_limit": 7.0}, ValueError),
     ],
 )
 def test_gated_activation_rejects_unsupported_arguments(overrides, error):
@@ -164,8 +165,56 @@ def test_gated_activation_rejects_unsupported_arguments(overrides, error):
         _run_invalid(**overrides)
 
 
-def test_gated_activation_rejects_full_width_output():
+@pytest.mark.parametrize(
+    "activation_type,out_cols",
+    [(ActivationType.Swiglu, 256), (None, 128)],
+    ids=["gated_full_width", "plain_half_width"],
+)
+def test_rejects_mismatched_output_width(activation_type, out_cols):
     _skip_unless_sm100()
-    out = torch.empty(2, 128, 256, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(2, 128, out_cols, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="out of shape"):
-        _run_invalid(out=out.permute(1, 2, 0))
+        _run_invalid(out=out.permute(1, 2, 0), activation_type=activation_type)
+
+
+def test_gated_activation_accepts_cute_dsl_prepared_weights():
+    """``CuteDslConfig.prepare_weights`` emits B/SFB in the 64-row up/gate layout."""
+    _skip_unless_sm100()
+    from flashinfer.fused_moe import CuteDslConfig
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    l, m, hidden, inter = 2, 128, 512, 256
+    a, sfa, a_ref = _nvfp4_operand(l, m, hidden, device)
+    w1 = torch.randn(l, 2 * inter, hidden, dtype=torch.bfloat16, device=device)
+    w2 = torch.randn(l, hidden, inter, dtype=torch.bfloat16, device=device)
+    weights = CuteDslConfig.prepare_weights(
+        w1, w2, num_local_experts=l, hidden_size=hidden, intermediate_size=inter
+    )
+    up = torch.bmm(a_ref, w1[:, :inter].float().transpose(1, 2))
+    gate = torch.bmm(a_ref, w1[:, inter:].float().transpose(1, 2))
+    alpha = (weights["w1_alpha"] / up.std()).contiguous()
+
+    out = torch.zeros(l, m, inter, dtype=torch.bfloat16, device=device)
+    grouped_gemm_nt_masked(
+        (a, sfa),
+        (weights["w1_weight"].permute(1, 2, 0), weights["w1_weight_sf"]),
+        out.permute(1, 2, 0),
+        torch.full((l,), m, dtype=torch.int32, device=device),
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=SF_VEC,
+        alpha=alpha,
+        alpha_dtype="float32",
+        activation_type=ActivationType.Swiglu,
+    )
+
+    # The reference uses the unquantized weights (cosine ~0.99); swapping up and
+    # gate drops it to ~0.7.
+    scale = alpha.view(l, 1, 1)
+    ref = torch.nn.functional.silu(gate * scale) * (up * scale)
+    cos = torch.nn.functional.cosine_similarity(
+        out.float().flatten(1), ref.flatten(1), dim=1
+    )
+    assert (cos > 0.97).all(), cos
