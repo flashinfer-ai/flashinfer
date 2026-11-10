@@ -249,7 +249,8 @@ In token-sparse attention, each query token attends only to its own list of
 keys, such as the 2048 keys that the DSA indexer selects for it. FlashInfer runs
 it in two ways:
 
-- `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K)` runs MQA decode on
+- `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K, uses_shared_paged_kv_idx=False)`
+  runs MQA decode on
   the token-sparse kernels of trtllm-gen. `token_sparse_kv_indices` makes its
   index lists from the key positions of each token.
 - `group_union_masks` lets a dense attention kernel that takes a mask for each
@@ -327,10 +328,10 @@ token 1 uses keys 9 and 12. These keys are on the first page of the request,
 which is cache page 5 (rows 320 to 383):
 
 ```python
-union = [[323, 329, 332]]  # the cache rows of keys 3, 9 and 12
+union[0][:3] = [323, 329, 332]  # the cache rows of keys 3, 9 and 12
 union_sizes = [3]
-mask = [[0b011],   # token 0: union columns 0 and 1
-        [0b110]]   # token 1: union columns 1 and 2
+mask[0][0] = 0b011  # token 0: union columns 0 and 1
+mask[1][0] = 0b110  # token 1: union columns 1 and 2
 ```
 
 The group then runs as one varlen entry of the dense kernel, with the union rows
@@ -362,7 +363,7 @@ The decode call rejects calls outside these limits:
 - a block table that covers `num_keys`;
 - union rows of at least `min(group * K, 128 * ceil(num_keys / 128))` columns,
   and mask rows of at least as many bits;
-- `num_keys` at most `union_key_limit(group, K)`, so that a key bitmap with a bit
+- `num_keys` at most `union_key_limit(group, K, positions.device)`, so that a key bitmap with a bit
   for each key below `num_keys`, and the mask rows, fit in shared memory. On
   SM100 with `K` 2048, that is 1,441,792 keys for groups of up to 4 tokens and
   1,179,648 for 32.
