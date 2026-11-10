@@ -55,6 +55,14 @@ void rope_quantize_append_paged_kv_cache(
 
 void rope_set_launch_override(int64_t two_heads, int64_t split);
 
+void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
+                                TensorView k_nope_in, TensorView v_in, TensorView q_rope_out,
+                                TensorView q_nope_out, TensorView cos_sin_cache, TensorView pos_ids,
+                                TensorView k_cache, TensorView v_cache, TensorView kv_indices,
+                                TensorView kv_indptr, TensorView batch_indices,
+                                TensorView positions, int64_t kv_layout_code, int64_t page_size,
+                                double kv_scale, bool interleave, bool enable_pdl);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_rope, apply_rope);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_llama31_rope, apply_llama31_rope);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(apply_rope_pos_ids, apply_rope_pos_ids);
@@ -64,3 +72,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(rope_quantize, rope_quantize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rope_quantize_append_paged_kv_cache,
                               rope_quantize_append_paged_kv_cache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rope_set_launch_override, rope_set_launch_override);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(rope_append_paged_kv_cache, rope_append_paged_kv_cache);
