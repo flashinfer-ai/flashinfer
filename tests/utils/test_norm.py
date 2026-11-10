@@ -20,8 +20,11 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
-from tests.test_helpers.pdl import late_store
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
+from tests.utils.test_helpers.pdl import late_store
 
 import flashinfer
 from flashinfer.jit import env as jit_env

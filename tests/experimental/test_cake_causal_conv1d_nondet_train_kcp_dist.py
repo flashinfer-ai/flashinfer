@@ -92,7 +92,7 @@ def _run_rank(
     from flashinfer.experimental.cake.cake_kda_det_train_kcp import (
         cake_kcp_plan as plan,
     )
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
 

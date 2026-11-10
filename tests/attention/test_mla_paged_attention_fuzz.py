@@ -19,7 +19,7 @@ import torch
 
 from flashinfer.mla import BatchMLAPagedAttentionWrapper, MLAPlanMetadata
 from flashinfer.utils import get_compute_capability, get_indptr, is_sm90a_supported
-from tests.test_helpers.fuzz_ledger import Finding, FuzzLedger
+from tests.infra.test_helpers.fuzz_ledger import Finding, FuzzLedger
 
 
 BACKENDS = ("fa2", "fa3", "cutlass", "auto")

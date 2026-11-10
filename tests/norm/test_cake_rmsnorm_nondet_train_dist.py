@@ -125,8 +125,8 @@ CASES = list(_cases())
 def _worker(rank: int, port: int, out_dir: Path) -> int:
     import torch.distributed as dist
 
-    from tests.test_helpers import cake_rmsnorm_train_reference as ref
-    from tests.test_helpers.cake_package import cake_package
+    from tests.norm.test_helpers import cake_rmsnorm_train_reference as ref
+    from tests.cake.test_helpers.cake_package import cake_package
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)

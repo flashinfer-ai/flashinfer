@@ -143,6 +143,9 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             set(k.knobs)
             & (set(STANDARD_KNOB_KEYS) - {"mma_tiler_mnk", "token_back_mode"})
         )
+        # Legacy FP4 permits N256/K256; standard inference requires K128 at N256.
+        if kind == "nvfp4" and knobs.get("mma_tiler_mnk") == (256, 256, 256):
+            knobs["mma_tiler_mnk"] = (256, 256, 128)
         if isinstance(k.knobs, dict) and not native:
             knobs.update(k.knobs)
         if not knobs.pop("force_static_sched", True):
@@ -185,9 +188,15 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         if balance not in ("static", "atomic_counter"):
             raise MoEEpConfigError(f"Unsupported load_balance_mode {balance!r}.")
         reduce = bool(knobs.get("in_kernel_fc2_reduce", False))
+        if native:
+            if unknown := set(k.knobs) - set(STANDARD_KNOB_KEYS):
+                raise MoEEpConfigError(
+                    f"unknown Blackwell standard knob keys: {sorted(unknown)}"
+                )
+            reduce = k.knobs.get("reduce_topk_in_kernel", reduce)
         if reduce and not k.enable_in_kernel_fc2_reduce:
             raise MoEEpConfigError("In-kernel reduction must be enabled in the config.")
-        config = Sm100BlockScaledMoeConfig(
+        options = dict(
             num_total_experts=fleet.num_experts,
             max_tokens_per_rank=fleet.max_tokens_per_rank,
             num_topk=k.top_k,
@@ -225,19 +234,12 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             ),
         )
         if native:
-            import dataclasses
-            from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
-                is_valid_sm100_knobs,
-            )
-
-            if not is_valid_sm100_knobs(k.knobs, config):
-                raise MoEEpConfigError("Invalid native standard tuning knobs.")
-            config = dataclasses.replace(config, **k.knobs)
-            if config.reduce_topk_in_kernel and not k.enable_in_kernel_fc2_reduce:
-                raise MoEEpConfigError(
-                    "In-kernel reduction must be enabled in the config."
-                )
-        return config
+            options.update(k.knobs)
+            try:
+                return Sm100BlockScaledMoeConfig(**options)
+            except (TypeError, ValueError) as exc:
+                raise MoEEpConfigError("Invalid native standard tuning knobs.") from exc
+        return Sm100BlockScaledMoeConfig(**options)
 
     def preprocess_weights(self, weights, fleet_params):
         from .....kernel_src.sm100.next_cutedsl_megamoe import (

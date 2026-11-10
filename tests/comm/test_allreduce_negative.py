@@ -15,7 +15,7 @@ from flashinfer.comm import (
 )
 
 # Test helpers
-from tests.test_helpers.comm import (
+from tests.comm.test_helpers.comm import (
     setup_mpi_and_cuda,
     init_torch_distributed_from_mpi,
     cleanup_torch_distributed,

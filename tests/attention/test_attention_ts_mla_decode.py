@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
-from tests.test_helpers.parametrize import parametrize_product
+from tests.infra.test_helpers.parametrize import parametrize_product
 import torch
 
 pytest.importorskip(
@@ -3796,7 +3796,7 @@ def test_attention_ts_mla_decode_2cta_runtime_small_split_reduction(seq_len_q, k
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("family", ("1cta", "2cta"))
 def test_dense_mla_global_scales_graph_replay(family):
-    from tests.test_helpers.pdl import late_store
+    from tests.utils.test_helpers.pdl import late_store
 
     case = replace(
         _make_mla_case(

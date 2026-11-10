@@ -423,7 +423,7 @@ context, the context-free BF16 forward with recompute versus saved context,
 FP32 accumulation with BF16 and MXFP8 routed experts, and MXFP8
 over unequal ranks; 288 experts at EP8 or EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter.
 `test_mok_bf16.py`, `test_mok_mxfp8.py` and `test_mok_bf16_capacity.py` import the
-package only through `tests/test_helpers/cake_package.py`; the torchrun suites and
+package only through `tests/cake/test_helpers/cake_package.py`; the torchrun suites and
 `test_mok_bf16_tolerance.py` drive the `examples/mok_*.py` scripts, which use the
 `flashinfer.mok` wrapper;
 `test_mok_bf16_api.py` checks the `flashinfer.mok` wrapper itself (experimental

@@ -30,7 +30,7 @@ import torch
 
 import flashinfer.cake_kda_det_train as det_api
 from flashinfer.experimental.cake.cake_kda_det_train import cake_backend, cake_jit
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs
+from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs
 
 ENTRY_POINTS = (
     det_api.cake_kda_det_train_forward,
