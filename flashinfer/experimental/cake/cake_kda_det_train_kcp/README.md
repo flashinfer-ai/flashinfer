@@ -163,17 +163,20 @@ scalars; the int32 tables are rebuilt from the context.  The token-row `Aqk` /
 the internal rows in both modes (saved set and checkpoint replay run the same
 local programs), so `cake_kda_det_train_kcp_saved_bytes` counts the tables, `S_in`, the
 `save_transfer` tensors and the carry plane (and the convolution's history
-rows with `with_conv`).  The one exception is a checkpoint recompute (a saving
-forward that runs inside the autograd backward pass, with or without a
-recompute handle): its intra program writes the internal `Aqk` / `Akk` rows
-(BF16 `[2, R, H, 64]`) into a tensor its backward takes, and that backward
-uses them instead of launching the intra program again.  The rows are not part
-of the saved set (its type, tensors and meta are unchanged; the package hands
-them over under the set's `S_in`), and they add nothing to the backward's peak:
-with the in-kernel Q/K L2 norm off they lie in the backward's `dq` / `dk`
-outputs (allocated by the recompute, written only after the rows' last
-reader), otherwise the backward copies them into its arena before it allocates
-any output and drops them.  The rows are the intra program's on the same
+rows with `with_conv`).  The one exception is a checkpoint recompute on a
+caller's workspace (a saving forward that runs inside the autograd backward
+pass, with or without a recompute handle): its intra program writes the
+internal `Aqk` / `Akk` rows (BF16 `[2, R, H, 64]`) into a tensor its backward
+takes, and that backward uses them instead of launching the intra program
+again.  The rows are not part of the saved set (its type, tensors and meta are
+unchanged; the package hands them over under the set's `S_in`), and they add
+nothing to the backward's peak: they lie in the first bytes of the backward's
+`dq` / `dk` outputs (one tensor, allocated by the recompute).  With the
+in-kernel Q/K L2 norm off the backward reads them there (written only after the
+rows' last reader); otherwise it first copies them into its arena.  A call with
+`workspace=None` keeps none: its default workspace frees its storage at the end
+of every call, and a tensor kept from the recompute to the backward made the
+caching allocator reserve another arena.  The rows are the intra program's on the same
 operands, so every output is unchanged; with the fused in-kernel Q/K L2 norm
 the forward and backward intra records differ, and that form keeps the rows
 only on `cake_kcp.INTRA_ROWS_L2N_ARCHS` (sm_100a, sm_103a, sm_107a), where the

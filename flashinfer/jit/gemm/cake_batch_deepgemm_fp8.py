@@ -621,6 +621,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_927fea695cd92359d999",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_927fea695cd92359d999_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_927fea695cd92359d999_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
         "sources": [
@@ -1355,6 +1367,14 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_90284e378e31f0382475_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
+    },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_927fea695cd92359d999",
+    },
+    "cake_batch_deepgemm_fp8_927fea695cd92359d999_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_927fea695cd92359d999",
     },
     "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f_sm_100a": {
         "arch": "sm_100a",
@@ -2255,13 +2275,14 @@ _ROUTES: tuple[_Route, ...] = (
            parent="seed_swap_bm"),
     # The N=512, K=128 geometry, by B, CTA = B * ceil(expected_m / 128) and M. A
     # one-shot n512_k128 grid covers every (group, M tile, N tile) a masked_m <= M
-    # reaches, and M > 1024 takes the persistent masked_bn programs; expected_m only
-    # selects the route.
+    # reaches, and M > 1024 takes the persistent masked_bn programs (with at most
+    # eight CTAs, the masked_m-once form of the BLOCK_N 32 eight-stage build);
+    # expected_m only selects the route.
     _bcta("seed_n512_k128__b1_bn32", (512, 128), (1, 1), (None, 7),
           ("cake_batch_deepgemm_fp8_c580972984193a63c3c2", "n512_k128", 32, "grid_max"),
           m=(None, 1024)),
     _bcta("seed_n512_k128__b1_mbn32", (512, 128), (1, 1), (None, 7),
-          ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128, "grid_m"),
+          ("cake_batch_deepgemm_fp8_927fea695cd92359d999", "masked_bn", 32, 128, "grid_m"),
           m=(1025, None)),
     _bcta("seed_n512_k128__b1_bn192", (512, 128), (1, 1), (8, None),
           ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128)),
@@ -2269,7 +2290,7 @@ _ROUTES: tuple[_Route, ...] = (
           ("cake_batch_deepgemm_fp8_8d6890e370790c5f11f1", "n512_k128", 32, "grid_max"),
           m=(None, 1024)),
     _bcta("seed_n512_k128__b2_8_mbn32", (512, 128), (2, 8), (None, 8),
-          ("cake_batch_deepgemm_fp8_929a5561abc99caa7f4f", "masked_bn", 32, 128, "grid_m"),
+          ("cake_batch_deepgemm_fp8_927fea695cd92359d999", "masked_bn", 32, 128, "grid_m"),
           m=(1025, None)),
     _bcta("seed_n512_k128__b2_8_bn128", (512, 128), (2, 8), (9, 32),
           ("cake_batch_deepgemm_fp8_c1541da977c9a379e49b", "masked_bn", 128, 128)),

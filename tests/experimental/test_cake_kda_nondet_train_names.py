@@ -17,7 +17,7 @@ Names of the Cake packed KDA chunked training package (non-deterministic, single
 
 The single-rank entry points live in ``flashinfer.cake_kda_nondet_train`` and the package in
 ``flashinfer.experimental.cake.cake_kda_nondet_train``.  The shared check of #8928
-(``tests.test_helpers.cake_mode_names.assert_cake_mode_module``) covers the facade: every public name states
+(``tests.cake.test_helpers.cake_mode_names.assert_cake_mode_module``) covers the facade: every public name states
 the mode (``nondet``) right after the op, no entry takes a ``deterministic`` keyword, the facade, the ``flashinfer``
 top level and the package bind each object under one name only, and the names before this scheme fail at import
 with no alias: the module ``flashinfer.cake_kda_train``, the package ``flashinfer.experimental.cake.cake_kda_train``
@@ -47,12 +47,12 @@ from flashinfer.experimental.cake.cake_kda_nondet_train import (
     cake_backend,
     cake_jit,
 )
-from tests.test_helpers.cake_mode_names import (
+from tests.cake.test_helpers.cake_mode_names import (
     assert_cake_mode_module,
     assert_mode_names,
     assert_no_deterministic_keyword,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pytestmark = pytest.mark.cpu_only
 

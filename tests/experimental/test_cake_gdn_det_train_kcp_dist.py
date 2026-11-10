@@ -66,14 +66,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
 
 
 def _mod(sub: str | None = None):
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
@@ -104,7 +107,9 @@ SIDE_STREAM_ITERS = 7
 def _reference():
     """The FP64 reference: the FlashInfer test helper once it ships, else the session harness on PYTHONPATH."""
     try:
-        from tests.test_helpers import cake_gdn_det_train_kcp_reference as ref  # type: ignore[attr-defined]
+        from tests.experimental.test_helpers import (
+            cake_gdn_det_train_kcp_reference as ref,
+        )  # type: ignore[attr-defined]
 
         return ref
     except ImportError:
@@ -114,7 +119,7 @@ def _reference():
 def _inputs():
     """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``)."""
     try:
-        from tests.test_helpers import cake_gdn_det_train_kcp_inputs as gen
+        from tests.experimental.test_helpers import cake_gdn_det_train_kcp_inputs as gen
     except ImportError as exc:
         pytest.skip(f"the seeded GDN KCP inputs helper is unavailable: {exc}")
     return gen
@@ -2523,7 +2528,8 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # generator's rows times a per-token, per-head power of two drawn from the global token index, so every rank sees
 # the bits of the global pack).  Per row and rank:
 #
-# * mode equalities with the norm (bitwise): repeat, light == full (``qk_apply``) == boundary replay, autograd ==
+# * mode equalities with the norm (bitwise): repeat, light == full (saved ``qn`` / ``kn``) == full with test knob
+#   ``full_qk="apply"`` (``qk_apply``) == boundary replay, autograd ==
 #   saved, checkpoint (replay form, kept tapes, "auto") == direct, recompute handle == direct, ``save_transfer``,
 #   ring == a2a (where the partition allows it), CUDA-graph replay == eager, ``.backward()`` twice;
 # * the composed chain: out / dv / dbeta / dg == the norm-off route on the materialized ``(qn, kn)`` (the forward's
@@ -2537,6 +2543,7 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # * packed QKV views with the norm: bitwise the contiguous call, the split still aliases the packed dQKV row;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
 #   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
+#   with ``save_mode="full"`` both grow by the saved ``qn`` / ``kn`` (``512 T_r H_qk``) as well;
 #   the peaks and a profiler count of copy ops on the packed views are recorded.
 #
 # The rows skip with a clear reason while the registry does not ship the three records (the kernel backend refuses
@@ -2558,14 +2565,14 @@ V1_LIBRARIES = {
     "kcp_fwdh_offset_vh64": "cake_gdn_det_train_fc32e3ea90cd1b718ad8_kcp",
     "kcp_fwdh_tape": "cake_gdn_det_train_01f0e0eab26c58ff3953_kcp",
     "kcp_fwdh_tape_vh64": "cake_gdn_det_train_2eade16c7f51796727a5_kcp",
-    "kcp_transfer_walk": "cake_gdn_det_train_4bf560a7ea389e92d5f1_kcp",
+    "kcp_transfer_walk": "cake_gdn_det_train_ca5488020bef49bf474b_kcp",
     "kcp_transfer_walk_three_mma": "cake_gdn_det_train_2f42874614b85ffc14fe_kcp",
     "kcp_transfer_walk_plain_tf32": "cake_gdn_det_train_efbba796414578cbd8b5_kcp",
 }
 # sha256 over the sorted lines "<file> <sha256>\n" of the 36 csrc files (<library>_kernel.cu / _binding.cu) of the
-# 18 records above as regenerated with the output walk: kernel text only changed from the package before the norm
-# (FlashInfer 615a65850), with the same bindings and the same SASS on sm_100a / sm_103a / sm_107a
-V1_CSRC_DIGEST = "a3b9ca82cf1ce9953813e288b5310a715080eeeb203d9a14af8910cf504a618a"
+# 18 records above as rendered with the v2 output walk and the exact-zero transfer walk (kcp_transfer_walk: bitwise
+# the v1 walk's outputs); every other record keeps its v1 library and SASS on sm_100a / sm_103a / sm_107a
+V1_CSRC_DIGEST = "515e92fd735ca504645b0d52356486aa6b66dd0bc00cbc34b15146ca102b3b33"
 # The output walk (#2 with #5 folded in): no v1 record, launched by the norm-off and the norm-on forward alike.
 NORM_OFF_EXTRA_RECORDS = ("kcp_fwdh_out", "kcp_fwdh_out_vh64")
 L2N_SKIP = (
@@ -2766,7 +2773,17 @@ def _run_rank_l2n(
     flags["l2n_repeat"] = _eq(res, saved_pass(**L2N))
     full = saved_pass(save_mode="full", **L2N, test_knobs={"record_qk": True})
     flags["l2n_light_eq_full"] = _eq(res, full) and (
-        T_r == 0 or full["bwd"]["qk_source"] == "qk_apply"
+        T_r == 0
+        or (
+            full["bwd"]["qk_source"] == "saved"
+            and "qk_apply" not in full["bwd"]["sequence"]
+        )
+    )
+    full_apply = saved_pass(
+        save_mode="full", **L2N, test_knobs={"record_qk": True, "full_qk": "apply"}
+    )
+    flags["l2n_light_eq_full_apply"] = _eq(res, full_apply) and (
+        T_r == 0 or full_apply["bwd"]["qk_source"] == "qk_apply"
     )
     flags["l2n_saved_eq_replay"] = _eq(res, saved_pass(boundary_mode="replay", **L2N))
     flags["l2n_save_transfer_eq"] = _eq(res, saved_pass(save_transfer=False, **L2N))
@@ -3058,6 +3075,30 @@ def _run_rank_l2n(
     info["saved_query"] = {"on": q_on, "off": q_off}
     flags["l2n_saved_bytes_on_minus_off"] = (
         saved_on_b - saved_off_b == rstd_bytes == q_on - q_off
+    )
+    # save_mode="full" keeps the forward's qn / kn as well: retained and saved grow by r and the two rows
+    kept_full_off, saved_full_off_b, _p = retained(save_mode="full")
+    kept_full_on, saved_full_on_b, _p = retained(save_mode="full", **L2N)
+    qk_bytes = 2 * T_r * H_qk * 256
+    qf_on = int(
+        gb.cake_gdn_det_train_kcp_saved_bytes(
+            ctx, H_qk=H_qk, HV=HV, save_mode="full", use_qk_l2norm_in_kernel=True
+        )
+    )
+    qf_off = int(
+        gb.cake_gdn_det_train_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV, save_mode="full")
+    )
+    info["memory"].update(
+        retained_full_off=kept_full_off,
+        retained_full_on=kept_full_on,
+        saved_full_off=saved_full_off_b,
+        saved_full_on=saved_full_on_b,
+    )
+    flags["l2n_full_post_forward_eq_off_plus_rstd_rows"] = (
+        kept_full_on - kept_full_off == rstd_bytes + qk_bytes
+    )
+    flags["l2n_full_saved_bytes_on_minus_off"] = (
+        saved_full_on_b - saved_full_off_b == rstd_bytes + qk_bytes == qf_on - qf_off
     )
 
     # gather the flags; the verdict is WORLD-wide

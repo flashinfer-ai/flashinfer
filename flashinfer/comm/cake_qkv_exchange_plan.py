@@ -98,6 +98,10 @@ PAIR_BN = 256
 PAIR_MIN_M = 4096
 PAIR_MIN_GROUPS = 4
 PAIR_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
+# The smallest cross-destination-band threshold (``xband_min_m``): a cross-destination-band row below
+# ``PAIR_MIN_M`` (a 128-column band row the band rule keeps single-CTA) runs the ``block_n = 256`` pair tile with
+# the grouped order and ``m_tiles // PAIR_MIN_GROUPS`` token tiles per group.
+XBAND_MIN_M_FLOOR = 2048
 # Group sizes the fused exchange is delivered for; every per-(architecture, world size) table below has exactly
 # these keys per architecture.
 SUPPORTED_WORLD_SIZES: tuple[int, ...] = (2, 4, 8)
@@ -323,6 +327,7 @@ def plan_policy(
     arch: str,
     pair_available: bool = True,
     group_m_scale: int | None = None,
+    xband: bool = False,
 ) -> Policy:
     """Resolve tile width, tile order and the pair tile from ``(M, K, H_local)``.
 
@@ -341,6 +346,9 @@ def plan_policy(
        takes ``group_m`` times the scale (capped at ``m_tiles``, kept even under
        the pair) within the slice budget raised by the same factor; other rows
        are unchanged.
+    5. ``xband`` (a fired cross-destination-band gate): a row below
+       ``PAIR_MIN_M`` with at least ``XBAND_MIN_M_FLOOR`` rows takes the pair
+       geometry and the grouped pair order of rule 3.
     """
 
     if group_m_scale is None:
@@ -355,12 +363,18 @@ def plan_policy(
     a_bytes = 2 * M * K
     reasons = [f"bn = {bn} (band = {geometry.c_band} columns)"]
     slice_cap = max(1, GROUP_A_SLICE_BYTES_MAX // (2 * BLOCK_M * K))
+    if not isinstance(xband, bool):
+        raise ValueError(f"xband must be a bool, got {xband!r}")
     shape_pair = pair_geometry(geometry)
+    xband_small = xband and not shape_pair and M >= XBAND_MIN_M_FLOOR
+    if xband_small:
+        shape_pair = True
     pair = shape_pair and arch in PAIR_ARCHES and pair_available
     if shape_pair:
         why = " or ".join(
             ([f"bn {bn} == {PAIR_BN}"] if bn == PAIR_BN else [])
             + ([f"M {M} >= {PAIR_MIN_M}"] if M >= PAIR_MIN_M else [])
+            + ([f"xband M {M} >= {XBAND_MIN_M_FLOOR}"] if xband_small else [])
         )
         if arch not in PAIR_ARCHES:
             launcher = f"{arch} has no 2-CTA pair producer"
@@ -373,7 +387,7 @@ def plan_policy(
         )
     else:
         reasons.append(f"bn {bn} != {PAIR_BN} and M {M} < {PAIR_MIN_M} -> 1-CTA tiles")
-    if pair and (M >= PAIR_MIN_M or a_bytes > NT_OUTER_A_BYTES_MAX):
+    if pair and (M >= PAIR_MIN_M or a_bytes > NT_OUTER_A_BYTES_MAX or xband_small):
         order = "grouped"
         cap = min(m_tiles // PAIR_MIN_GROUPS, slice_cap)
         group_m = max(PAIR_LOCKSTEP, cap - cap % PAIR_LOCKSTEP)
@@ -456,6 +470,69 @@ def _resolve_order(
     return order, effective
 
 
+def _order_dest_runs(
+    per_dest: Sequence[Sequence[Sequence[list[list[int]]]]], mode: str, tail_rows: int
+) -> list[list[int]]:
+    """Concatenate the exchange runs in the production order of ``mode`` (:data:`DEST_INTERLEAVE_MODES`).
+
+    ``per_dest[d][gi][j]`` holds the rows (lockstep pad rows included) of the ``j``-th column tile of token-tile group
+    ``gi`` of the ``d``-th destination of ``dest_order`` (the local destination last).  ``off``: destination blocks.
+    ``il``: token-tile group outer, column tile, then the destinations in ``dest_order``.  ``lt``: ``il`` with the
+    trailing local runs of at least ``tail_rows`` rows moved to the end of the table.  ``ls``: the remote destination
+    blocks with the local runs spread evenly between them."""
+
+    if mode == "off":
+        return [
+            row
+            for blocks in per_dest
+            for group in blocks
+            for run in group
+            for row in run
+        ]
+    if mode in ("il", "lt"):
+        seq: list[tuple[int, list[list[int]]]] = []
+        for gi in range(len(per_dest[0])):
+            width = max(len(blocks[gi]) for blocks in per_dest)
+            for j in range(width):
+                for d, blocks in enumerate(per_dest):
+                    if j < len(blocks[gi]):
+                        seq.append((d, blocks[gi][j]))
+        if mode == "lt":
+            local, tail, rows = len(per_dest) - 1, set(), 0
+            for index in range(len(seq) - 1, -1, -1):
+                if rows >= tail_rows:
+                    break
+                if seq[index][0] == local:
+                    tail.add(index)
+                    rows += len(seq[index][1])
+            seq = [s for i, s in enumerate(seq) if i not in tail] + [
+                s for i, s in enumerate(seq) if i in tail
+            ]
+        return [row for _, run in seq for row in run]
+    if mode != "ls":
+        raise ValueError(
+            f"dest_interleave must be one of {DEST_INTERLEAVE_MODES}, got {mode!r}"
+        )
+    local_runs = [run for group in per_dest[-1] for run in group]
+    remote = per_dest[:-1]
+    if not remote:
+        return [row for run in local_runs for row in run]
+    bounds = [len(local_runs) * i // len(remote) for i in range(len(remote) + 1)]
+    out: list[list[int]] = []
+    for r, blocks in enumerate(remote):
+        chunk = local_runs[bounds[r] : bounds[r + 1]]
+        runs = [run for group in blocks for run in group]
+        placed = 0
+        for i, run in enumerate(runs):
+            out.extend(run)
+            while placed < ((i + 1) * len(chunk)) // len(runs):
+                out.extend(chunk[placed])
+                placed += 1
+        for run in chunk[placed:]:
+            out.extend(run)
+    return out
+
+
 def _plan_rows(
     *,
     rank: int,
@@ -473,11 +550,14 @@ def _plan_rows(
     group_m: int,
     lockstep: int,
     m_tiles_per_word: int,
+    dest_interleave: str = "off",
+    interleave_tail_rows: int = 0,
 ) -> tuple[list[list[int]], int]:
-    """Tile rows in production order; returns ``(rows, pad_rows)``."""
+    """Tile rows in production order (:func:`_order_dest_runs` of ``dest_interleave``); returns
+    ``(rows, pad_rows)``."""
 
     G = m_tiles_per_word
-    rows: list[list[int]] = []
+    per_dest: list[list[list[list[list[int]]]]] = []
     pads = 0
 
     def tile(dest: int, mt: int, nt: int) -> list[int]:
@@ -502,8 +582,10 @@ def _plan_rows(
         ]
 
     for dest in dest_order:
+        blocks: list[list[list[list[int]]]] = []
         for g0 in range(0, m_tiles, group_m):
             mts = range(g0, min(m_tiles, g0 + group_m))
+            group: list[list[list[int]]] = []
             for nt in range(3 * n_sub):
                 run = [tile(int(dest), mt, nt) for mt in mts]
                 while lockstep > 1 and len(run) % lockstep:
@@ -513,8 +595,10 @@ def _plan_rows(
                     pad[TILE_LAST_TICKET] = 0
                     run.append(pad)
                     pads += 1
-                rows.extend(run)
-    return rows, pads
+                group.append(run)
+            blocks.append(group)
+        per_dest.append(blocks)
+    return _order_dest_runs(per_dest, dest_interleave, interleave_tail_rows), pads
 
 
 def _plan_rows_xband(
@@ -532,9 +616,11 @@ def _plan_rows_xband(
     group_m: int,
     lockstep: int,
     m_tiles_per_word: int,
+    dest_interleave: str = "off",
+    interleave_tail_rows: int = 0,
 ) -> tuple[list[list[int]], int]:
-    """:data:`TILE_FIELDS_XB` rows of the cross-destination-band plan in production order; returns
-    ``(rows, pad_rows)``.
+    """:data:`TILE_FIELDS_XB` rows of the cross-destination-band plan in production order (:func:`_order_dest_runs`
+    of ``dest_interleave``); returns ``(rows, pad_rows)``.
 
     Each GEMM group ``g`` (Q, K, V) is cut into ``H * head_dim / 256`` tiles; tile ``k`` covers the global heads
     ``2k`` and ``2k + 1``, each with its own destination ``head // H_local`` and the slot base of :func:`_plan_rows`
@@ -547,7 +633,7 @@ def _plan_rows_xband(
     G = m_tiles_per_word
     heads_per_tile = XBAND_BN // head_dim
     tiles_per_group = heads * head_dim // XBAND_BN
-    rows: list[list[int]] = []
+    per_dest: list[list[list[list[list[int]]]]] = []
     pads = 0
 
     def base_of(g: int, hl: int) -> int:
@@ -579,8 +665,10 @@ def _plan_rows_xband(
             for k in range(tiles_per_group)
             if (heads_per_tile * k) // h_local == int(dest)
         ]
+        blocks: list[list[list[list[int]]]] = []
         for g0 in range(0, m_tiles, group_m):
             mts = range(g0, min(m_tiles, g0 + group_m))
+            group: list[list[list[int]]] = []
             for g, k in owned:
                 run = [tile(mt, g, k) for mt in mts]
                 while lockstep > 1 and len(run) % lockstep:
@@ -591,8 +679,10 @@ def _plan_rows_xband(
                     pad[TILE_LAST_TICKET] = 0
                     run.append(pad)
                     pads += 1
-                rows.extend(run)
-    return rows, pads
+                group.append(run)
+            blocks.append(group)
+        per_dest.append(blocks)
+    return _order_dest_runs(per_dest, dest_interleave, interleave_tail_rows), pads
 
 
 @dataclass(frozen=True)
@@ -632,6 +722,10 @@ class TilePlan:
     pair: bool
     num_pad_rows: int
     xband: bool = False
+    # Destination order of the table (:data:`DEST_INTERLEAVE_MODES`; ``off`` = destination blocks) and, for ``lt``,
+    # the local-tail row budget (``0`` otherwise).  Only the order of the rows changes.
+    dest_interleave: str = "off"
+    interleave_tail_rows: int = 0
 
     @property
     def lockstep(self) -> int:
@@ -677,6 +771,9 @@ class TilePlan:
         if self.xband:
             record["xband"] = True
             record["tile_fields"] = list(TILE_FIELDS_XB)
+        if self.dest_interleave != "off":
+            record["dest_interleave"] = self.dest_interleave
+            record["interleave_tail_rows"] = self.interleave_tail_rows
         return record
 
 
@@ -691,6 +788,8 @@ def chunk_plan(
     group_m: int | None = None,
     pair: bool = False,
     xband: bool = False,
+    dest_interleave: str = "off",
+    interleave_tail_rows: int = 0,
 ) -> TilePlan:
     """The exchange plan of source ``rank`` as a tile table.
 
@@ -700,7 +799,10 @@ def chunk_plan(
     ``xband`` builds the cross-destination-band table of
     :func:`_plan_rows_xband` (``block_n = XBAND_BN`` pair plan of an
     :func:`xband_eligible` geometry; ``n_sub`` = ``H_local`` head tickets per
-    destination band and GEMM group).
+    destination band and GEMM group).  ``dest_interleave`` reorders the rows
+    (:func:`_order_dest_runs`; ``interleave_tail_rows`` is the positive ``lt``
+    local-tail budget and ``0`` for every other mode); every row keeps its
+    destination, word and ticket.
     """
 
     if layout not in LAYOUTS:
@@ -726,6 +828,23 @@ def chunk_plan(
     )
     if not isinstance(xband, bool):
         raise ValueError(f"xband must be a bool, got {xband!r}")
+    if dest_interleave not in DEST_INTERLEAVE_MODES:
+        raise ValueError(
+            f"dest_interleave must be one of {DEST_INTERLEAVE_MODES}, got {dest_interleave!r}"
+        )
+    if (
+        isinstance(interleave_tail_rows, bool)
+        or not isinstance(interleave_tail_rows, int)
+        or (
+            interleave_tail_rows <= 0
+            if dest_interleave == "lt"
+            else interleave_tail_rows != 0
+        )
+    ):
+        raise ValueError(
+            "interleave_tail_rows must be a positive int for dest_interleave='lt' and 0 otherwise, got "
+            f"{interleave_tail_rows!r} (dest_interleave={dest_interleave!r})"
+        )
     if xband:
         if block_n != XBAND_BN or not pair:
             raise ValueError(
@@ -773,6 +892,8 @@ def chunk_plan(
             group_m=group_m_eff,
             lockstep=lockstep,
             m_tiles_per_word=G,
+            dest_interleave=dest_interleave,
+            interleave_tail_rows=interleave_tail_rows,
         )
         real_rows = m_tiles * 3 * heads * head_dim // XBAND_BN
         width = len(TILE_FIELDS_XB)
@@ -793,6 +914,8 @@ def chunk_plan(
             group_m=group_m_eff,
             lockstep=lockstep,
             m_tiles_per_word=G,
+            dest_interleave=dest_interleave,
+            interleave_tail_rows=interleave_tail_rows,
         )
         real_rows = world * m_tiles * 3 * n_sub
         width = len(TILE_FIELDS)
@@ -836,6 +959,8 @@ def chunk_plan(
         pair=pair,
         num_pad_rows=num_pad_rows,
         xband=xband,
+        dest_interleave=dest_interleave,
+        interleave_tail_rows=interleave_tail_rows,
     )
 
 
@@ -851,19 +976,28 @@ def plan_for(
     pair: Optional[bool] = None,
     xband: bool = False,
     bn128_max_m: Optional[int] = None,
+    dest_interleave: str = "off",
+    reserved_sms: int = RESERVED_SMS,
 ) -> tuple[Policy, TilePlan]:
     """Policy and tile plan of one row for one rank (``group_m_scale`` ``None`` = the architecture's default for
     the geometry's world size).  ``pair`` overrides the policy's pair tile (``False`` = the single-CTA producer with
     the policy's tile order and ``group_m``, what a fired ``pair_off_large_m`` gate selects); ``None`` keeps it.
     ``xband`` (what a fired ``xband_min_m`` gate selects) builds the cross-destination-band plan: the
     ``block_n = XBAND_BN`` pair tiles with the policy's tile order and ``group_m``; the policy (``bn`` of the band)
-    must be the pair tile.  ``bn128_max_m`` is the largest row count of the 128-column tile table
-    (:data:`HOPPER_BN128_MAX_M_BY_ARCH_WORLD`; ``None`` = the table's cell of the geometry, ``0`` = off): a row of a
-    256-column band at or below it that is not a cross-destination-band row takes the 128-column tile with the band
-    policy's tile order, ``group_m`` and pair flag."""
+    must be the pair tile (below ``PAIR_MIN_M`` the policy takes the pair geometry, :func:`plan_policy`).
+    ``bn128_max_m`` is the largest row count of the 128-column tile table (:func:`default_bn128_max_m`; ``None`` = the
+    table's cell of the geometry, ``0`` = off): a row of a 256-column band at or below it that is not a
+    cross-destination-band row takes the 128-column tile with the band policy's tile order, ``group_m`` and pair flag
+    (on the pair architectures only a pair row: a single-CTA row keeps its tile).  ``dest_interleave`` (a mode of
+    :data:`DEST_INTERLEAVE_MODES` the caller selected for this row, :func:`plan_row`) orders the table; ``lt`` reads
+    its local-tail budget from ``reserved_sms`` (:func:`interleave_tail_rows`)."""
 
     policy = plan_policy(
-        geometry, arch=arch, pair_available=pair_available, group_m_scale=group_m_scale
+        geometry,
+        arch=arch,
+        pair_available=pair_available,
+        group_m_scale=group_m_scale,
+        xband=bool(xband),
     )
     if pair is not None and bool(pair) != policy.pair:
         policy = dataclasses.replace(
@@ -877,19 +1011,30 @@ def plan_for(
             ),
         )
     max_m = (
-        hopper_bn128_max_m(arch, geometry.world_size, geometry.hidden)
+        default_bn128_max_m(arch, geometry.world_size, geometry.hidden)
         if bn128_max_m is None
         else check_bn128_max_m(bn128_max_m)
     )
-    if not xband and max_m and policy.bn != HOPPER_BN128_BN and geometry.rows <= max_m:
+    if (
+        not xband
+        and max_m
+        and policy.bn != HOPPER_BN128_BN
+        and geometry.rows <= max_m
+        and (policy.pair or arch not in PAIR_ARCHES)
+    ):
+        table = (
+            "BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD"
+            if arch in PAIR_ARCHES
+            else "HOPPER_BN128_MAX_M_BY_ARCH_WORLD"
+        )
         policy = dataclasses.replace(
             policy,
             bn=HOPPER_BN128_BN,
             reasons=(
                 *policy.reasons,
                 f"128-column tile table: ({arch}, W={geometry.world_size}, K {geometry.hidden}) M {geometry.rows} <= "
-                f"{max_m} (HOPPER_BN128_MAX_M_BY_ARCH_WORLD) -> block_n {HOPPER_BN128_BN} (band rule {policy.bn}); "
-                f"order {policy.order} / group_m {policy.group_m} unchanged",
+                f"{max_m} ({table}) -> block_n {HOPPER_BN128_BN} {'pair' if policy.pair else 'single-CTA'} (band "
+                f"rule {policy.bn}); order {policy.order} / group_m {policy.group_m} unchanged",
             ),
         )
     if xband:
@@ -907,6 +1052,29 @@ def plan_for(
                 f"order {policy.order} / group_m {policy.group_m}, one persistent launch",
             ),
         )
+    if dest_interleave not in DEST_INTERLEAVE_MODES:
+        raise ValueError(
+            f"dest_interleave must be one of {DEST_INTERLEAVE_MODES}, got {dest_interleave!r}"
+        )
+    tail = 0
+    if dest_interleave != "off":
+        if arch not in DEST_INTERLEAVE_ARCHES:
+            raise ValueError(
+                f"dest_interleave={dest_interleave} is refused on {arch} (architectures: {DEST_INTERLEAVE_ARCHES})"
+            )
+        if dest_interleave == "lt":
+            tail = interleave_tail_rows(
+                arch, pair=bool(policy.pair or xband), reserved_sms=reserved_sms
+            )
+        policy = dataclasses.replace(
+            policy,
+            reasons=(
+                *policy.reasons,
+                f"destination interleave {dest_interleave} (DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD band row "
+                f"{dest_interleave_band(arch, geometry.world_size, geometry.hidden)})"
+                + (f", local tail {tail} rows" if tail else ""),
+            ),
+        )
     plan = chunk_plan(
         geometry,
         layout,
@@ -917,6 +1085,8 @@ def plan_for(
         group_m=policy.group_m if policy.order == "grouped" else None,
         pair=policy.pair,
         xband=bool(xband),
+        dest_interleave=dest_interleave,
+        interleave_tail_rows=tail,
     )
     return policy, plan
 
@@ -1177,16 +1347,17 @@ def k_band_threshold(bands: Sequence[tuple[int, int]], hidden: int) -> int:
 # two consecutive global heads, each head carries its own destination and slot base (:data:`TILE_FIELDS_XB`) and takes
 # its own readiness ticket.  ``xband_min_m`` is a row-count gate beside the four gates: an eligible call with ``rows >=
 # xband_min_m`` runs the cross-destination-band plan as one persistent launch (it takes precedence over the
-# per-destination launch gate); ``0`` = never.  A threshold is at least ``PAIR_MIN_M`` (the eligible rows pair only
-# from there) and applies on the pair architectures only.  ``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD`` lists the cells that
+# per-destination launch gate); ``0`` = never.  A threshold is at least ``XBAND_MIN_M_FLOOR`` (a fired row below
+# ``PAIR_MIN_M`` runs the pair tile with the grouped pair order, :func:`plan_policy`) and applies on the pair
+# architectures only.  ``XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD`` lists the cells that
 # ship it (every other cell: 0): SM103 and SM100 groups of 8 ranks.  The cross-band tile stores through the staged
 # row path, so on SM100, whose default producer build at 8 ranks stores through bulk row copies, the cross-band rows run
 # the staged build of the same operand load width.  The tile table and the producer program change; the stored bits do
 # not.
 XBAND_BN = 256
 XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD: dict[tuple[str, int], int] = {
-    ("sm_103a", 8): 4096,
-    ("sm_100a", 8): 4096,
+    ("sm_103a", 8): 2048,
+    ("sm_100a", 8): 2048,
 }
 
 
@@ -1202,14 +1373,14 @@ def xband_eligible(geometry: Geometry) -> bool:
 
 def check_xband_min_m(arch: str, value: Any) -> int:
     """Validate an ``xband_min_m`` threshold for ``arch``: an int ``>= 0`` (``0`` = off); a non-zero threshold is at
-    least ``PAIR_MIN_M``, below ``SHAPE_GATE_ALL_ROWS``, and refused off the pair architectures."""
+    least ``XBAND_MIN_M_FLOOR``, below ``SHAPE_GATE_ALL_ROWS``, and refused off the pair architectures."""
 
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"xband_min_m must be an int >= 0 (0 = off), got {value!r}")
-    if value and value < PAIR_MIN_M:
+    if value and value < XBAND_MIN_M_FLOOR:
         raise ValueError(
-            f"xband_min_m={value} is below PAIR_MIN_M={PAIR_MIN_M}: the cross-destination-band plan is the 2-CTA "
-            f"pair tile, which a 128-column row runs from {PAIR_MIN_M} rows only"
+            f"xband_min_m={value} is below XBAND_MIN_M_FLOOR={XBAND_MIN_M_FLOOR}: the cross-destination-band plan is "
+            f"the 2-CTA pair tile, which a 128-column row runs from {XBAND_MIN_M_FLOOR} rows only"
         )
     if value >= SHAPE_GATE_ALL_ROWS:
         raise ValueError(
@@ -1310,6 +1481,313 @@ def hopper_bn128_max_m(arch: str, world_size: int, hidden: int) -> int:
     return int(cells.get(int(hidden), 0))
 
 
+# Rows that keep the baseline producer build under the default build: per ``(arch, world_size)``, ``(min_hidden,
+# min_M)`` -- a row with ``hidden >= min_hidden`` and ``M >= min_M`` launches the baseline build's programs instead of
+# the session's default build (the loader's ``PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD``).  SM90 with 8 ranks at
+# ``hidden >= 6144``, ``M >= 8192``: there the decoupled-storer build (``sw3``) measured 0.3-1.6 % slower than the
+# baseline build, or even with it, on 8 x H100, so these rows keep the baseline build and its previous speed instead
+# of a small loss.  A build named by the environment variable runs on every row.
+PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD: dict[tuple[str, int], tuple[int, int]] = {
+    ("sm_90a", 8): (6144, 8192),
+}
+
+
+def _check_producer_shipped_rows_table() -> None:
+    for (arch, world_size), cell in PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD.items():
+        if (
+            arch not in SHAPE_GATE_DEFAULT_BY_ARCH
+            or world_size not in SUPPORTED_WORLD_SIZES
+        ):
+            raise ValueError(
+                f"PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD[{(arch, world_size)!r}] is not a delivered cell"
+            )
+        if (
+            not isinstance(cell, tuple)
+            or len(cell) != 2
+            or any(
+                isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in cell
+            )
+            or cell[0] % HEAD_DIM
+        ):
+            raise ValueError(
+                f"PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD[{(arch, world_size)!r}] = {cell!r}: (min_hidden, min_M) must be "
+                f"positive ints, min_hidden a multiple of {HEAD_DIM}"
+            )
+
+
+_check_producer_shipped_rows_table()
+
+
+def default_shipped_producer_row(
+    arch: str, world_size: int, hidden: int, rows: int
+) -> bool:
+    """Whether a row of ``M = rows`` at ``(arch, world_size, hidden)`` launches the baseline producer build under the
+    default build (:data:`PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD`)."""
+
+    cell = PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD.get((arch, int(world_size)))
+    return cell is not None and int(hidden) >= cell[0] and int(rows) >= cell[1]
+
+
+# The 128-column pair tile table of the pair architectures: per ``(arch, world_size)``, ``hidden -> largest M``
+# (inclusive) of the 256-column band rows whose policy is the 2-CTA pair tile but which run the 128-column pair tile
+# (:func:`plan_for`; tile order, ``group_m`` and the row-count gates stay the band policy's; a single-CTA row and a
+# cross-destination-band row keep their tile).  SM100 and SM103 with 8 ranks at ``hidden = 4096``, ``M <= 512``: the
+# 256-column pair plan is 192 tiles on 146 producer SMs (1.32 waves), the 128-column pair plan 384 tiles (2.63 waves).
+BLACKWELL_BN128_BN = 128
+BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD: dict[tuple[str, int], dict[int, int]] = {
+    ("sm_100a", 8): {4096: 512},
+    ("sm_103a", 8): {4096: 512},
+}
+
+
+def _check_blackwell_bn128_table() -> None:
+    for (arch, world_size), cells in BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD.items():
+        if (
+            arch not in SHAPE_GATE_DEFAULT_BY_ARCH
+            or arch not in PAIR_ARCHES
+            or world_size not in SUPPORTED_WORLD_SIZES
+        ):
+            raise ValueError(
+                f"BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD[{(arch, world_size)!r}] is not a delivered pair-architecture "
+                "cell"
+            )
+        for hidden, max_m in cells.items():
+            if (
+                isinstance(hidden, bool)
+                or not isinstance(hidden, int)
+                or hidden <= 0
+                or hidden % HEAD_DIM
+                or not check_bn128_max_m(max_m)
+            ):
+                raise ValueError(
+                    f"BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD[{(arch, world_size)!r}][{hidden!r}] = {max_m!r}: hidden "
+                    f"must be a positive multiple of {HEAD_DIM} and the bound a positive row count; list only the "
+                    "cells that ship it"
+                )
+
+
+_check_blackwell_bn128_table()
+
+
+def blackwell_bn128_max_m(arch: str, world_size: int, hidden: int) -> int:
+    """The largest row count (inclusive) of ``(arch, world_size, hidden)`` that takes the 128-column pair tile
+    (:data:`BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD`); ``0`` = no cell."""
+
+    cells = BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD.get((arch, int(world_size)), {})
+    return int(cells.get(int(hidden), 0))
+
+
+def default_bn128_max_m(arch: str, world_size: int, hidden: int) -> int:
+    """The 128-column tile bound of ``(arch, world_size, hidden)``: :data:`HOPPER_BN128_MAX_M_BY_ARCH_WORLD` off the
+    pair architectures, :data:`BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD` on them; ``0`` = no cell."""
+
+    if arch in PAIR_ARCHES:
+        return blackwell_bn128_max_m(arch, world_size, hidden)
+    return hopper_bn128_max_m(arch, world_size, hidden)
+
+
+# Destination interleave of the tile table.  The shipped table runs destination blocks (remote destinations in
+# sender-cyclic order, the local band last).  On the rows of ``DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD`` (per
+# ``(arch, world_size)``: ``hidden -> (min M, max M)``, both inclusive) a mode of ``DEST_INTERLEAVE_MODES`` reorders
+# the runs: ``il`` = token-tile group outer, column tile, then every destination (the grouped activation reuse is
+# kept); ``lt`` = ``il`` with the trailing local runs of about one persistent wave (``DEST_INTERLEAVE_WAVE_SMS`` minus
+# the row's reserved SMs) moved to the end; ``ls`` = the remote blocks with the local runs spread evenly into them.
+# Every row keeps its destination, readiness word and ticket; the stored bits do not change.
+# ``DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD`` lists the cells that ship a mode (every other cell: ``off``).  A shipped
+# mode comes with the per-destination launch precedence (``dest_interleave_pd``), except on the cells of
+# ``DEST_INTERLEAVE_DEFAULT_WITHOUT_PD`` (SM90 group of 4: ``il`` alone): on its band rows the interleaved
+# table is one persistent launch, and a fired ``per_dest_large_m`` gate yields to it (recorded in
+# ``ShapeGateVerdict.dest_interleave_suppressed``).  ``DEST_INTERLEAVE_MAX_M_DEFAULT_BY_ARCH_WORLD`` caps the band of
+# a shipped mode (rows above the cap keep the destination blocks and their own gates).  Without the precedence a band
+# row whose per-destination launch gate fired keeps the destination blocks.
+DEST_INTERLEAVE_MODES: tuple[str, ...] = ("off", "il", "lt", "ls")
+DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD: dict[
+    tuple[str, int], dict[int, tuple[int, int]]
+] = {
+    ("sm_100a", 8): {3072: (8192, 16384)},
+    ("sm_100a", 4): {3072: (8192, 32768)},
+    ("sm_100a", 2): {3072: (8192, 65536)},
+    ("sm_103a", 8): {3072: (8192, 16384)},
+    ("sm_103a", 4): {3072: (8192, 32768)},
+    ("sm_103a", 2): {3072: (8192, 65536)},
+    ("sm_90a", 4): {3072: (4096, 16384), 4096: (8192, 16384)},
+    ("sm_90a", 2): {3072: (8192, 16384), 4096: (8192, 16384)},
+}
+DEST_INTERLEAVE_ARCHES: tuple[str, ...] = tuple(
+    sorted({arch for arch, _ in DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD})
+)
+DEST_INTERLEAVE_WAVE_SMS: dict[str, int] = {
+    "sm_100a": 148,
+    "sm_103a": 148,
+    "sm_90a": 132,
+}
+DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD: dict[tuple[str, int], str] = {
+    ("sm_100a", 8): "lt",
+    ("sm_100a", 4): "lt",
+    ("sm_103a", 8): "lt",
+    ("sm_103a", 4): "lt",
+    ("sm_103a", 2): "lt",
+    ("sm_100a", 2): "lt",
+    ("sm_90a", 4): "il",
+    ("sm_90a", 2): "il",
+}
+# Cells whose shipped mode leaves the per-destination launch precedence off (the
+# measured SM90 arm is the interleave alone; no SM90 band row fires the split).
+DEST_INTERLEAVE_DEFAULT_WITHOUT_PD: frozenset[tuple[str, int]] = frozenset(
+    {("sm_90a", 4), ("sm_90a", 2)}
+)
+DEST_INTERLEAVE_MAX_M_DEFAULT_BY_ARCH_WORLD: dict[tuple[str, int], int] = {
+    ("sm_100a", 2): 16384,
+    ("sm_103a", 2): 16384,
+}
+
+
+def _check_dest_interleave_tables() -> None:
+    for (arch, world_size), cells in DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD.items():
+        if (
+            arch not in SHAPE_GATE_DEFAULT_BY_ARCH
+            or arch not in DEST_INTERLEAVE_WAVE_SMS
+            or world_size not in SUPPORTED_WORLD_SIZES
+        ):
+            raise ValueError(
+                f"DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD[{(arch, world_size)!r}] is not a delivered cell"
+            )
+        for hidden, band in cells.items():
+            if (
+                isinstance(hidden, bool)
+                or not isinstance(hidden, int)
+                or hidden <= 0
+                or hidden % HEAD_DIM
+                or len(band) != 2
+                or not 0 < int(band[0]) <= int(band[1]) < SHAPE_GATE_ALL_ROWS
+            ):
+                raise ValueError(
+                    f"DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD[{(arch, world_size)!r}][{hidden!r}] = {band!r}: hidden "
+                    f"must be a positive multiple of {HEAD_DIM} and the band (min M, max M) with 0 < min <= max"
+                )
+    for (arch, world_size), mode in DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD.items():
+        if (
+            (arch, world_size) not in DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD
+            or mode not in DEST_INTERLEAVE_MODES[1:]
+        ):
+            raise ValueError(
+                f"DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD[{(arch, world_size)!r}] = {mode!r}: a cell of "
+                f"DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD with a mode of {DEST_INTERLEAVE_MODES[1:]}"
+            )
+    for (arch, world_size), cap in DEST_INTERLEAVE_MAX_M_DEFAULT_BY_ARCH_WORLD.items():
+        if (
+            arch,
+            world_size,
+        ) not in DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD or not check_bn128_max_m(cap):
+            raise ValueError(
+                f"DEST_INTERLEAVE_MAX_M_DEFAULT_BY_ARCH_WORLD[{(arch, world_size)!r}] = {cap!r}: a positive row "
+                "count on a cell of DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD"
+            )
+    for cell in DEST_INTERLEAVE_DEFAULT_WITHOUT_PD:
+        if cell not in DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD:
+            raise ValueError(
+                f"DEST_INTERLEAVE_DEFAULT_WITHOUT_PD cell {cell!r} is not a cell of "
+                "DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD"
+            )
+
+
+_check_dest_interleave_tables()
+
+
+def dest_interleave_band(
+    arch: str, world_size: int, hidden: int
+) -> Optional[tuple[int, int]]:
+    """The ``(min M, max M)`` band of ``(arch, world_size, hidden)`` (:data:`DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD`);
+    ``None`` = no cell."""
+
+    band = DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD.get((arch, int(world_size)), {}).get(
+        int(hidden)
+    )
+    return None if band is None else (int(band[0]), int(band[1]))
+
+
+def resolve_dest_interleave(
+    arch: str,
+    world_size: int,
+    mode: Optional[str] = None,
+    *,
+    pd: Optional[bool] = None,
+    max_m: Optional[int] = None,
+) -> tuple[str, bool, Optional[int]]:
+    """``(mode, pd, max_m)`` of a session: ``mode`` ``None`` = the ``(arch, world_size)`` default
+    (:data:`DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD`, with the per-destination launch precedence -- not on the cells of
+    :data:`DEST_INTERLEAVE_DEFAULT_WITHOUT_PD` -- and the cap of
+    :data:`DEST_INTERLEAVE_MAX_M_DEFAULT_BY_ARCH_WORLD` unless ``pd`` / ``max_m`` say otherwise; ``off`` where the cell
+    ships none); an explicit mode takes ``pd`` (default ``False``) and ``max_m`` (default no cap) as given.  A mode
+    other than ``off`` is refused on an architecture without a band cell."""
+
+    default_shape_gates(arch, world_size=world_size)
+    if mode is None:
+        mode = DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD.get((arch, world_size), "off")
+        if mode != "off":
+            pd = (
+                (arch, world_size) not in DEST_INTERLEAVE_DEFAULT_WITHOUT_PD
+                if pd is None
+                else pd
+            )
+            max_m = (
+                DEST_INTERLEAVE_MAX_M_DEFAULT_BY_ARCH_WORLD.get((arch, world_size))
+                if max_m is None
+                else max_m
+            )
+    if mode not in DEST_INTERLEAVE_MODES:
+        raise ValueError(
+            f"dest_interleave must be one of {DEST_INTERLEAVE_MODES}, got {mode!r}"
+        )
+    pd = bool(pd) if pd is not None else False
+    if pd and mode == "off":
+        raise ValueError("dest_interleave_pd needs dest_interleave il, lt or ls")
+    if max_m is not None:
+        if isinstance(max_m, bool) or not isinstance(max_m, int) or max_m <= 0:
+            raise ValueError(
+                f"dest_interleave_max_m must be a positive int, got {max_m!r}"
+            )
+        if mode == "off":
+            raise ValueError("dest_interleave_max_m needs dest_interleave il, lt or ls")
+    if mode != "off" and arch not in DEST_INTERLEAVE_ARCHES:
+        raise ValueError(
+            f"dest_interleave={mode} is refused on {arch}: no DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD cell "
+            f"(architectures: {DEST_INTERLEAVE_ARCHES})"
+        )
+    return mode, pd, max_m
+
+
+def dest_interleave_row(
+    mode: str,
+    max_m: Optional[int],
+    arch: str,
+    world_size: int,
+    hidden: int,
+    rows: int,
+) -> bool:
+    """Whether a row of ``rows`` rows and ``hidden`` columns is a band row of ``mode``: the mode on, ``rows`` inside
+    the cell's :data:`DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD` band and at most ``max_m`` (``None`` = no cap)."""
+
+    if mode == "off":
+        return False
+    band = dest_interleave_band(arch, world_size, hidden)
+    if band is None:
+        return False
+    high = band[1] if max_m is None else min(band[1], int(max_m))
+    return band[0] <= int(rows) <= high
+
+
+def interleave_tail_rows(arch: str, *, pair: bool, reserved_sms: int) -> int:
+    """The ``lt`` local-tail row budget: one persistent wave of :data:`DEST_INTERLEAVE_WAVE_SMS` minus the row's
+    reserved SMs, rounded down to the lockstep (at least one lockstep unit)."""
+
+    lockstep = PAIR_LOCKSTEP if pair else 1
+    return max(
+        lockstep,
+        (DEST_INTERLEAVE_WAVE_SMS[arch] - int(reserved_sms)) // lockstep * lockstep,
+    )
+
+
 @dataclass(frozen=True)
 class ShapeGateVerdict:
     """The row-count gates of one call (``rows = batch * s_local``): which fired and what they select.
@@ -1337,6 +1815,9 @@ class ShapeGateVerdict:
     xband: Optional[bool] = None
     xband_eligible: Optional[bool] = None
     xband_suppressed: tuple[str, ...] = ()
+    # A per-destination launch gate that fired on a destination-interleave band row but yields to the interleaved
+    # table (``dest_interleave_pd``: one persistent launch); empty on every other row.
+    dest_interleave_suppressed: tuple[str, ...] = ()
 
     @property
     def fired(self) -> tuple[str, ...]:
@@ -1375,6 +1856,8 @@ class ShapeGateVerdict:
             record["xband"] = self.xband
             record["xband_eligible"] = self.xband_eligible
             record["xband_suppressed"] = list(self.xband_suppressed)
+        if self.dest_interleave_suppressed:
+            record["dest_interleave_suppressed"] = list(self.dest_interleave_suppressed)
         return record
 
 
@@ -1387,6 +1870,8 @@ def gate_rows(
     k_table: Optional[Sequence[tuple[int, int]]] = None,
     xband_min_m: int = 0,
     xband_eligible: Optional[bool] = None,
+    dest_interleave_row: bool = False,
+    dest_interleave_pd: bool = False,
 ) -> ShapeGateVerdict:
     """Resolve the row-count gates on one call's ``rows`` (inclusive thresholds; a gate at ``0`` never fires).
     ``bn`` is the call's tile width (:func:`block_n_for`), required while a gate of :data:`SHAPE_GATE_BN` is on:
@@ -1395,7 +1880,10 @@ def gate_rows(
     it).  ``xband_min_m`` (``0`` = off) is the cross-destination-band gate: it fires on a call with ``rows >=
     xband_min_m`` whose geometry is :func:`xband_eligible` (``xband_eligible``, required unless the verdict cannot
     depend on it: a ``bn == XBAND_BN`` call is never eligible, a call below the threshold never fires) and then
-    suppresses a fired per-destination launch gate (the plan is one persistent launch)."""
+    suppresses a fired per-destination launch gate (the plan is one persistent launch).  ``dest_interleave_row`` (the
+    call is a band row of the session's destination interleave, :func:`dest_interleave_row`) with
+    ``dest_interleave_pd`` suppresses a fired per-destination launch gate the same way (the interleaved table is one
+    persistent launch)."""
 
     checked = check_shape_gates(gates)
     if isinstance(rows, bool) or not isinstance(rows, int) or rows < 1:
@@ -1455,6 +1943,10 @@ def gate_rows(
         if xband and per_dest:
             per_dest = False
             suppressed = ("per_dest_large_m",)
+    dsti_suppressed: tuple[str, ...] = ()
+    if dest_interleave_row and dest_interleave_pd and per_dest:
+        per_dest = False
+        dsti_suppressed = ("per_dest_large_m",)
     return ShapeGateVerdict(
         rows=int(rows),
         gates=checked,
@@ -1470,6 +1962,7 @@ def gate_rows(
         xband=xband,
         xband_eligible=xband_eligible if xband_min_m else None,
         xband_suppressed=suppressed,
+        dest_interleave_suppressed=dsti_suppressed,
     )
 
 
@@ -1486,16 +1979,36 @@ def plan_row(
     words_capacity_per_dest: int = DEFAULT_WORDS_CAPACITY_PER_DEST,
     group_m_scale: Optional[int] = None,
     bn128_max_m: Optional[int] = None,
+    dest_interleave: Optional[str] = None,
+    dest_interleave_pd: Optional[bool] = None,
+    dest_interleave_max_m: Optional[int] = None,
 ) -> tuple[ShapeGateVerdict, Policy, TilePlan]:
     """The host plan of one call: the row-count gate verdict (:func:`gate_rows` on the call's rows, tile width,
     hidden size and cross-destination-band eligibility), then the policy and tile plan of :func:`plan_for` with the
     verdict applied -- one readiness word per destination for a fired small-row gate (otherwise
     ``words_capacity_per_dest``), the single-CTA producer for a fired pair-tile gate, the cross-destination-band plan
     for a fired ``xband_min_m`` gate, the 128-column tile on a row of the 128-column tile table (``bn128_max_m``, see
-    :func:`plan_for`; the gates read the band width).  ``verdict.producer_launches`` / ``verdict.reserved_sms`` are
-    the launch structure of the call."""
+    :func:`plan_for`; the gates read the band width), the destination interleave of :func:`resolve_dest_interleave`
+    (``dest_interleave`` ``None`` = the ``(arch, world_size)`` default) on its band rows (:func:`dest_interleave_row`)
+    unless a per-destination launch gate fired there without the precedence (the row keeps the destination blocks).
+    ``verdict.producer_launches`` / ``verdict.reserved_sms`` are the launch structure of the call."""
 
     bn = block_n_for(geometry)
+    dsti, dsti_pd, dsti_max_m = resolve_dest_interleave(
+        arch,
+        geometry.world_size,
+        dest_interleave,
+        pd=dest_interleave_pd,
+        max_m=dest_interleave_max_m,
+    )
+    dsti_row = dest_interleave_row(
+        dsti,
+        dsti_max_m,
+        arch,
+        geometry.world_size,
+        int(geometry.hidden),
+        int(geometry.rows),
+    )
     verdict = gate_rows(
         gates,
         int(geometry.rows),
@@ -1504,7 +2017,10 @@ def plan_row(
         k_table=k_table,
         xband_min_m=xband_min_m,
         xband_eligible=xband_eligible(geometry) if xband_min_m else None,
+        dest_interleave_row=dsti_row,
+        dest_interleave_pd=dsti_pd,
     )
+    row_dsti = dsti if dsti_row and verdict.producer_launches != "per_dest" else "off"
     words = (
         verdict.words_capacity_per_dest
         if verdict.words_capacity_per_dest is not None
@@ -1521,6 +2037,10 @@ def plan_row(
         pair=verdict.pair,
         xband=bool(verdict.xband),
         bn128_max_m=bn128_max_m,
+        dest_interleave=row_dsti,
+        reserved_sms=RESERVED_SMS
+        if verdict.reserved_sms is None
+        else int(verdict.reserved_sms),
     )
     return verdict, policy, plan
 
@@ -1534,6 +2054,11 @@ def dest_parts(plan: TilePlan) -> tuple[tuple[int, int], ...]:
     if plan.xband:
         raise ValueError(
             "dest_parts: a cross-destination-band plan has no per-destination runs; it runs as one persistent launch"
+        )
+    if plan.dest_interleave != "off":
+        raise ValueError(
+            f"dest_parts: a dest_interleave={plan.dest_interleave!r} plan has no per-destination runs; it runs as one "
+            "persistent launch"
         )
     dests = [int(value) for value in plan.tiles[:, TILE_FIELDS.index("dest")].tolist()]
     if not dests:
@@ -1554,10 +2079,19 @@ def dest_parts(plan: TilePlan) -> tuple[tuple[int, int], ...]:
 
 
 __all__ = [
+    "BLACKWELL_BN128_BN",
+    "BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD",
     "BLOCK_K",
     "BLOCK_M",
     "BLOCK_N_CHOICES",
     "DEFAULT_WORDS_CAPACITY_PER_DEST",
+    "DEST_INTERLEAVE_ARCHES",
+    "DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD",
+    "DEST_INTERLEAVE_DEFAULT_WITHOUT_PD",
+    "DEST_INTERLEAVE_MAX_M_DEFAULT_BY_ARCH_WORLD",
+    "DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD",
+    "DEST_INTERLEAVE_MODES",
+    "DEST_INTERLEAVE_WAVE_SMS",
     "GEMM_GROUP_NORM_KIND",
     "GROUP_M_SCALES",
     "GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD",
@@ -1571,6 +2105,7 @@ __all__ = [
     "PAIR_LOCKSTEP",
     "PAIR_MIN_GROUPS",
     "PAIR_MIN_M",
+    "PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD",
     "RESERVED_SMS",
     "SHAPE_GATE_ALL_ROWS",
     "SHAPE_GATE_ALL_ROWS_NAMES",
@@ -1586,10 +2121,12 @@ __all__ = [
     "TILE_ORDERS",
     "XBAND_BN",
     "XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD",
+    "XBAND_MIN_M_FLOOR",
     "Geometry",
     "Policy",
     "ShapeGateVerdict",
     "TilePlan",
+    "blackwell_bn128_max_m",
     "block_n_for",
     "ceil_div",
     "check_bn128_max_m",
@@ -1597,14 +2134,19 @@ __all__ = [
     "check_shape_gates",
     "check_xband_min_m",
     "chunk_plan",
+    "default_bn128_max_m",
     "default_group_m_scale",
     "default_shape_gate_k_table",
     "default_shape_gates",
+    "default_shipped_producer_row",
     "default_xband_min_m",
+    "dest_interleave_band",
+    "dest_interleave_row",
     "dest_parts",
     "gate_rows",
     "heads_divisibility_error",
     "hopper_bn128_max_m",
+    "interleave_tail_rows",
     "k_band_index",
     "k_band_threshold",
     "pair_geometry",
@@ -1612,6 +2154,7 @@ __all__ = [
     "plan_policy",
     "plan_row",
     "producer_grid",
+    "resolve_dest_interleave",
     "shape_gate_spelling",
     "spell_shape_gates",
     "words_capacity_for_rows",

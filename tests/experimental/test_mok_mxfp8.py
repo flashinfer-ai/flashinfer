@@ -16,7 +16,7 @@ tolerance of the gradient elements they reach. The ``1e-2 + 1e-2 * |reference|``
 gate itself is unchanged, and no allowance exists where no input is ambiguous.
 
 Backend suite: the package is imported only through
-:func:`tests.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
+:func:`tests.cake.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
 wrapper is covered by ``test_mok_bf16_api.py``.
 """
 
@@ -30,7 +30,7 @@ from tests.experimental._mok_reference import (
     single_rank_schedule,
     swiglu,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kernels = cake_package("cake_mok_bf16", "_kernels")
 api = cake_package("cake_mok_bf16", "api")

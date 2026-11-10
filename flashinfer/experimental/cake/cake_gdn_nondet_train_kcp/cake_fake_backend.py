@@ -72,7 +72,7 @@ own orchestration (:mod:`.cake_kcp`) runs the same programs on NCCL.
 Segment plans with ``P > 1`` are not emulated here (build the contexts with
 ``sm_count=1`` for ``P = 1``); the programs themselves take any segment list.
 
-The dictionary collective is adapted from ``tests/test_helpers/cake_kcp_fake_backend.py`` at FlashInfer
+The dictionary collective is adapted from ``tests/experimental/test_helpers/cake_kcp_fake_backend.py`` at FlashInfer
 13d7fcf4041635f5b7f573bb0dbab23570ae1034 (sha256 eb733b4e8e15556f023379332939454c4fa5b15a2d258168e3c9daa510a4b006).
 """
 
@@ -328,6 +328,8 @@ def kcp_dhu(values: Mapping[str, Any], *, tape: bool) -> None:
     dht, dht_index, dht_hg, dht_n = _walk_io(values, "dht")
     out, out_index, out_hg, out_n = _walk_io(values, "out")
     dh_tape, dv_new = values.get("dh_tape"), values.get("dv_new")
+    # the offset walk's cut table (None: every chunk): the chain of (seg, hv) is its first c_start + 1 chunks
+    cut = None if values.get("c_start") is None else _ints(values["c_start"])
     for seg in _ints(values["walk_seg"]):
         for hv in range(HV):
             hq = hv // r
@@ -335,7 +337,10 @@ def kcp_dhu(values: Mapping[str, Any], *, tape: bool) -> None:
                 dh = _pool_tile(dht, dht_index[seg], hv, dht_hg, dht_n, stride).clone()
             else:
                 dh = torch.zeros(HEAD_DIM, HEAD_DIM, dtype=F32, device=w.device)
-            for c in reversed(_segment_chunks(values, seg)):
+            chunks = _segment_chunks(values, seg)
+            if cut is not None:
+                chunks = chunks[: min(max(cut[seg * HV + hv] + 1, 0), len(chunks))]
+            for c in reversed(chunks):
                 bos, L = bos_t[c], len_t[c]
                 if L == 0:
                     continue
@@ -356,6 +361,40 @@ def kcp_dhu(values: Mapping[str, Any], *, tape: bool) -> None:
                 )
             if out_index[seg] >= 0:
                 _pool_tile(out, out_index[seg], hv, out_hg, out_n, stride).copy_(dh)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# #7 cut table (``gdn_chunk_dhu_cut_v1_kcp`` program start)
+
+CUT_MAX_VERIFY = 4  # the zero-gamma candidates the kernel verifies per (segment, value head): one per warp
+
+
+def kcp_dhu_cut_start(values: Mapping[str, Any]) -> None:
+    """``c_start[seg * HV + hv]`` of every walked (segment, value head): the first of the chain's first
+    :data:`CUT_MAX_VERIFY` local chunks with ``gamma == 0`` whose valid rows each have ``rowscale == 0`` or an all
+    +-0 BF16 ``w`` row (a NaN row factor is not zero), else ``nc - 1``; ``-1`` for an empty segment.  The walk from
+    that chunk drops nothing its final state depends on."""
+    gamma, rowscale, w, c_start = (
+        values[n] for n in ("gamma", "rowscale", "w", "c_start")
+    )
+    HV = int(values["num_heads"])
+    len_t = _ints(values["chunk_len"])
+    for seg in _ints(values["walk_seg"]):
+        chunks = _segment_chunks(values, seg)
+        for hv in range(HV):
+            cs, tried = len(chunks) - 1, 0
+            for local, c in enumerate(chunks):
+                if tried == CUT_MAX_VERIFY:
+                    break
+                if not bool(gamma[c, hv] == 0):
+                    continue
+                tried += 1
+                rows = slice(c * CHUNK, c * CHUNK + len_t[c])
+                w_set = (w[rows, hv].view(torch.int16) & 0x7FFF).ne(0).any(-1)
+                if not bool(((rowscale[rows, hv] != 0) & w_set).any()):
+                    cs = local
+                    break
+            c_start[seg * HV + hv] = cs
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -746,6 +785,8 @@ def run_module(
         kcp_dhu(values, tape=False)
     elif program == "kcp_dhu_tape":
         kcp_dhu(values, tape=True)
+    elif program == "kcp_dhu_cut_start":
+        kcp_dhu_cut_start(values)
     elif program == "bwd_dqkg":
         bwd_dqkg(values)
     elif program == "gate_epilogue":
@@ -1249,6 +1290,7 @@ def emulate_backward(
                     ),
                     **rk.zero_pool("dht"),
                     **rk.pool_args("out", pool, b1_send[rk.rank], "h0_index"),
+                    "c_start": None,  # the emulation's reference walks every chunk
                 },
             )
             if (

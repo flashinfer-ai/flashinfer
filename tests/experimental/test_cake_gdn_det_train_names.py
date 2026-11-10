@@ -24,7 +24,7 @@ entries that take the option fields through ``**`` declare them in their signatu
 parameter); the former module paths do not import, and no namespace (the ``flashinfer`` top level, the facades, the
 backend packages and their modules) binds a former name.  Importing a facade loads no backend module until first use
 (checked in fresh interpreters).  The mode-word and keyword checks, and one check of each facade with no exemption
-(``assert_cake_mode_module``), are the shared ones of ``tests/test_helpers/cake_mode_names.py``.
+(``assert_cake_mode_module``), are the shared ones of ``tests/cake/test_helpers/cake_mode_names.py``.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from pathlib import Path
 import pytest
 
 import flashinfer
-from tests.test_helpers.cake_mode_names import (
+from tests.cake.test_helpers.cake_mode_names import (
     assert_cake_mode_module,
     assert_mode_names,
     assert_no_deterministic_keyword,
@@ -52,7 +52,7 @@ FACADE = "flashinfer.cake_gdn_det_train"
 KCP_FACADE = "flashinfer.cake_gdn_det_train_kcp"
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train"
 KCP_PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
-SUBMODULES = ("cake_backend", "cake_build", "cake_chain", "cake_jit")
+SUBMODULES = ("cake_backend", "cake_build", "cake_chain", "cake_jit", "cake_plan")
 KCP_SUBMODULES = (
     "cake_backend",
     "cake_build",
@@ -197,7 +197,7 @@ KCP_FORWARDS = (
 
 
 def test_the_shared_check_reads_the_mode_word_by_token() -> None:
-    # the shared mode-name check (tests/test_helpers/cake_mode_names.py) passes the det names this suite exports and
+    # the shared mode-name check (tests/cake/test_helpers/cake_mode_names.py) passes the det names this suite exports and
     # fails a nondet name and a word that only starts with "det"
     module = importlib.import_module(KCP_PACKAGE)
     assert_mode_names(

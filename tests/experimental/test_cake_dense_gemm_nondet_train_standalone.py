@@ -40,7 +40,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 

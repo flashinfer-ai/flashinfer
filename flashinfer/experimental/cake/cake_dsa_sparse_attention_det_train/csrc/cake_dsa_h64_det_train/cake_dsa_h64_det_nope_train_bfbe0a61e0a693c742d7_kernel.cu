@@ -170,11 +170,11 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
+#if __CUDA_ARCH__ == 1030
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#else
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
-#else
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
     const int mbar_base = smem;
@@ -1168,7 +1168,7 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
     }
     // ---- Role: reduce ----
     if (warp >= 8 && warp <= 15) {
-        asm volatile("setmaxnreg.inc.sync.aligned.u32 112;");
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 104;");
         { // reduce_main
             int ntok_2 = (num_queries - blockIdx.x + gridDim.x - 1) / gridDim.x;
             int tord_2 = 0;
@@ -4880,7 +4880,7 @@ kernel_cake_dsa_h64_det_nope_train_bfbe0a61e0a693c742d7(const __grid_constant__ 
     }
     // ---- Warpgroup: 4 ----
     if (warp >= 16 && warp <= 19) {
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 112;");
         // ---- Role: mma ----
         if (warp == 16) {
             { // mma_main

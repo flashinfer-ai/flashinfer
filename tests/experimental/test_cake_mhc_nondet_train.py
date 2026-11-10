@@ -122,7 +122,7 @@ device) and ``test_cake_mhc_nondet_train_api.py`` (the
 
 The largest cases hold the FP64 reference in row blocks of 8192 tokens.  Like
 ``test_cake_mhc_det_train.py`` this suite exercises the backend packages alone
-(both named through ``tests.test_helpers.cake_package``) and imports nothing
+(both named through ``tests.cake.test_helpers.cake_package``) and imports nothing
 else from flashinfer.
 """
 
@@ -139,7 +139,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake.cake_mhc_nondet_train"
 pkg = cake_package(KEY)
@@ -1597,8 +1597,9 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
     selection = loader.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
     assert [name for name, _ in loaded[start:]] == list(selection), loaded[start:]
     assert loader.MODULES[selection[0]]["role"] == "bwd_token", selection
+    chain = "dep1" if (arch, hidden) == ("sm_107a", 4096) else "dep"
     assert selection[1] == (
-        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1, hidden)}_dep"
+        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1, hidden)}_{chain}"
         + _suffix(hidden)
     )
     program = loader.bwd_slab_atomic_program(T, sm, arch, hidden)

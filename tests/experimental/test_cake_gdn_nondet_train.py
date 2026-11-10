@@ -25,7 +25,8 @@ gone) and the backward's refusal of a tape without this package's tag, the inter
 algorithms (no alert, no fallback), the launches served by this package's records, the five source head pairs, strided
 packed QKV views, non-reentrant checkpointing and its zero retained bytes, gradient accumulation into a nonzero
 ``.grad``, changed shapes over poisoned reused workspaces, the worst case over repeated runs, two concurrent caller
-streams, a resident side-stream kernel and the same-input comparison with the deterministic package.  The tail's own
+streams, cached device tables, workspaces and backward plans across streams and CUDA graph captures, a resident
+side-stream kernel and the same-input comparison with the deterministic package.  The tail's own
 contract: it serves every value-head group, leaves its counters zero after every launch, launches in segments that
 give the bits of one launch, gives the bits of the cluster tails of a value-head group of two and three (``dq`` /
 ``dk`` rounded once after the FP32 group sum), keeps the deterministic bits of ``o``, ``dv``, ``dg`` and ``dbeta`` where
@@ -49,6 +50,7 @@ import inspect
 import json
 import math
 import re
+import time
 import types
 import warnings
 from pathlib import Path
@@ -57,7 +59,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake_gdn_nondet_train", "cake_backend")
 cake_chain = cake_package("cake_gdn_nondet_train", "cake_chain")
@@ -148,18 +150,24 @@ def _inputs(
 
 
 # The forward route sets that take a call off the prep's forward (prep, wy_tc2, fwd_ho), with their off values: a test
-# that holds this package's prep forward to the deterministic package's bits turns them off in both packages.
+# that holds this package's prep forward to the deterministic package's bits turns them off in both packages.  The
+# deterministic package's round-once tail and FP32 dv_local adjoint switches (F32X_TAIL_ARCHS, DVL32_ARCHS) are off
+# there too, so its value-head group of three runs tail_g3 on dhu_tc2, the bits this package's fixed-order tails
+# reproduce.
 PREP_FORWARD_OFF = (
     ("FWD_A_ARCHS", ()),
     ("FWD_SPLIT_ARCHS", ()),
     ("FWD_A_SERIAL_KEEP", {}),
+    ("F32X_TAIL_ARCHS", ()),
+    ("DVL32_ARCHS", ()),
 )
 
 
 def _prep_forward_on_both(monkeypatch) -> None:
     """Keep both packages on the prep's forward: FWD_A_ARCHS and FWD_SPLIT_ARCHS empty in this package, and each
     setting of :data:`PREP_FORWARD_OFF` off in the deterministic package where that package has it (a deterministic
-    package that runs the A or the split forward would otherwise compare other forward bits)."""
+    package that runs the A or the split forward, or its round-once tail / FP32 dv_local adjoint, would otherwise
+    compare other bits)."""
     monkeypatch.setattr(cake_chain, "FWD_A_ARCHS", ())
     monkeypatch.setattr(cake_chain, "FWD_SPLIT_ARCHS", ())
     det_chain = cake_package("cake_gdn_det_train", "cake_chain")
@@ -2546,6 +2554,23 @@ def _assert_tail_counters_zero() -> None:
                 assert _bits_zero(t), (key, role)
 
 
+def _recorded_tail_counters(monkeypatch, workspaces) -> list[tuple[str, torch.Tensor]]:
+    """The (role, buffer) of every self-cleaning tail counter buffer that ``workspaces`` (the pooled ones of eager
+    calls, the fresh ones of a CUDA graph capture) hands out from here on (the ``tail_ws`` slots are written before
+    they are read)."""
+    counters: list[tuple[str, torch.Tensor]] = []
+    take_zeroed = workspaces.take_zeroed
+
+    def recording(device_index, role, rows, row_shape, dtype, device):
+        buffer = take_zeroed(device_index, role, rows, row_shape, dtype, device)
+        if role != "tail_ws":
+            counters.append((role, buffer))
+        return buffer
+
+    monkeypatch.setattr(workspaces, "take_zeroed", recording)
+    return counters
+
+
 def _record_tail_launches(monkeypatch, device) -> list[tuple[str, tuple]]:
     """The (stage, grid) of every launch from here on; after each launch of the package tail, the counters it was
     given are zero (the launch's self-cleaning contract) and its workspace holds a slot per value head of its tiles."""
@@ -4133,11 +4158,22 @@ def test_concurrent_caller_streams(device) -> None:
     _assert_tail_counters_zero()
 
 
-@pytest.mark.parametrize("heads", [(2, 4), (2, 6)], ids=["g2", "g3"])
-def test_cuda_graph_replay_matches_eager(heads, device) -> None:
+# (H, HV) and the call's keywords: the default tails (one cluster-tail launch, no counters) and the pinned stage
+# "tail", whose launches count their tiles in self-cleaning counters taken from the call's workspaces
+@pytest.mark.parametrize(
+    ("heads", "pins"),
+    [
+        ((2, 4), {}),
+        ((2, 6), {}),
+        ((2, 4), {"tail": "tail"}),
+        ((2, 6), {"tail": "tail"}),
+    ],
+    ids=["g2", "g3", "g2-tail", "g3-tail"],
+)
+def test_cuda_graph_replay_matches_eager(heads, pins, device, monkeypatch) -> None:
     seq_lens = STREAM_LAYOUT
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=269)
-    eager = _run(inputs, seq_lens, streams=1)
+    eager = _run(inputs, seq_lens, streams=1, **pins)
     leaves = {
         name: inputs[name].detach().clone().requires_grad_(True)
         for name in ("q", "k", "v", "g", "beta")
@@ -4152,19 +4188,27 @@ def test_cuda_graph_replay_matches_eager(heads, device) -> None:
         o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                          scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                          cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True,
-                                         streams=1)  # fmt: skip
+                                         streams=1, **pins)  # fmt: skip
         (o.float() * inputs["do"].float()).sum().backward()
         return o
 
     warmup = torch.cuda.Stream(device=device)
     warmup.wait_stream(torch.cuda.current_stream(device))
+    # no backward plan of an earlier call: the warm-up's first backward takes its tails' workspaces itself
+    monkeypatch.setattr(cake_chain, "_BWD_PLANS", {})
+    warm = _recorded_tail_counters(monkeypatch, cake_chain._POOLED)
     with torch.cuda.stream(warmup):
         for _ in range(2):
             step()
     torch.cuda.current_stream(device).wait_stream(warmup)
+    # the capture takes fresh workspaces: the tail counters its kernels use are its own, on the eager calls' route
+    captured = _recorded_tail_counters(monkeypatch, cake_chain._FRESH)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         o = step()
+    assert bool(captured) == bool(warm), (len(warm), len(captured))
+    if pins.get("tail") == "tail":
+        assert captured, "the captured tail took no counters of its own"
     for _ in range(
         3
     ):  # every replay alone: the captured kernels leave their scratch as they found it
@@ -4176,6 +4220,8 @@ def test_cuda_graph_replay_matches_eager(heads, device) -> None:
         }
         _assert_within_budget(got, eager, OUTPUT_NAMES)
         _assert_tail_counters_zero()
+        for role, counter in captured:
+            assert _bits_zero(counter), role
 
 
 # --------------------------------------------------------------------------- round-once cluster tails, one packed row
@@ -6761,3 +6807,555 @@ def test_m_share_packed_views_give_the_contiguous_bits(
     got = _run_packed(inputs, seq_lens, heads)
     assert "stitch_mt" in stages, stages
     _assert_same_bits(got, want, OUTPUT_NAMES)
+
+
+# --------------------------------------------------------------------------- #
+# cached device tables and workspaces across streams and CUDA graph captures
+# --------------------------------------------------------------------------- #
+# the caches of host-built device tables: the chunk tables, the split tables of the adjoint walk and of the forward,
+# the identity walks of the forward scan
+TABLE_CACHES = ("_HOST_META", "_ADJOINT_SPLITS", "_FORWARD_SPLITS", "_WALKS")
+# row -> (the cache of a table that a call reads, sequence lengths, (H, HV), pins, setup): "chunk" rows reach the chunk
+# tables through _META_FRONT or, under host_cache=False, through _HOST_META alone; setup "streams" lets the planner see
+# the SMs of the two-stream groups, "adjoint-split" / "forward-split" route the layout through the one-wave split of
+# the adjoint walk / of the forward scan (the split forward, the only reader of the forward split's tables, takes FP32
+# beta: _table_inputs)
+TABLE_ROWS = {
+    "chunk": ("_HOST_META", (300, 77, 640), (2, 4), {}, None),
+    "chunk-uncached-front": ("_HOST_META", (300, 77, 640), (2, 4), {"host_cache": False}, None),
+    "chunk-two-streams": ("_HOST_META", STREAM_LAYOUT, (2, 4), STREAM_PINS, "streams"),
+    "walk": ("_WALKS", (300, 77, 640), (2, 4), {"lpt": False}, None),
+    "adjoint-split": ("_ADJOINT_SPLITS", SPLIT_LAYOUT, SPLIT_HEADS, {}, "adjoint-split"),
+    "adjoint-split-uncached-front": ("_ADJOINT_SPLITS", SPLIT_LAYOUT, SPLIT_HEADS, {"host_cache": False},
+                                     "adjoint-split"),
+    "forward-split": ("_FORWARD_SPLITS", FWD_SPLIT_CASES["g2"][1], FWD_SPLIT_CASES["g2"][0], {}, "forward-split"),
+    "forward-split-uncached-front": ("_FORWARD_SPLITS", FWD_SPLIT_CASES["g2"][1], FWD_SPLIT_CASES["g2"][0],
+                                     {"host_cache": False}, "forward-split"),
+}  # fmt: skip
+# layout -> (sequence lengths, (H, HV), setup, the cache of its own table) of the eviction and capture tests; their
+# calls take lpt=False, so a forward scan that walks its segments in order reads the cached identity walk
+TABLE_LAYOUTS = {
+    "chunk-walk": ((300, 77, 640), (2, 4), None, "_WALKS"),
+    "adjoint-split": (SPLIT_LAYOUT, SPLIT_HEADS, "adjoint-split", "_ADJOINT_SPLITS"),
+    "forward-split": (FWD_SPLIT_CASES["g2"][1], FWD_SPLIT_CASES["g2"][0], "forward-split", "_FORWARD_SPLITS"),
+}  # fmt: skip
+
+
+def _table_setup(monkeypatch, device, setup) -> None:
+    """The device view of a :data:`TABLE_ROWS` setup."""
+    if setup == "streams":
+        _small_device(monkeypatch, device, STREAM_CASES[(2, 4)])
+    elif setup == "adjoint-split":
+        _split_device(monkeypatch, device, split=True)
+    elif setup == "forward-split":
+        _fwd_split_or_skip(device)
+        monkeypatch.setattr(
+            cake_plan,
+            "FORWARD_SPLIT_MIN_PIECE",
+            types.MappingProxyType(
+                {arch: FWD_SPLIT_TEST_MIN_PIECE for arch in cake_chain.FWD_SPLIT_ARCHS}
+            ),
+        )
+
+
+def _table_inputs(seq_lens, heads, setup, device, seed) -> dict:
+    """The operands of a :data:`TABLE_ROWS` / :data:`TABLE_LAYOUTS` call: FP32 beta under setup "forward-split" (a
+    condition of the split forward), else BF16."""
+    beta_dtype = torch.float32 if setup == "forward-split" else torch.bfloat16
+    return _inputs(seq_lens, heads, beta_dtype, device, seed=seed)
+
+
+def _check_forward_route(stages, setup) -> None:
+    """Under setup "forward-split", the call whose launches are ``stages`` ran the split forward."""
+    if setup == "forward-split":
+        assert _forward_stages(stages) == _split_stages(), stages
+
+
+# cache -> the builder of its tables.  A package version whose builders cache their own tables
+# (``functools.lru_cache``, without these dicts) is emptied and counted through the builders, so the tests below
+# also run on it
+TABLE_BUILDERS = {
+    "_HOST_META": "_host_chunk_meta",
+    "_ADJOINT_SPLITS": "_host_adjoint_split",
+    "_FORWARD_SPLITS": "forward_split_tables",
+}
+
+
+def _builder_cache(cache: str):
+    """The builder of ``cache``'s tables when it caches them itself, else None."""
+    builder = getattr(cake_chain, TABLE_BUILDERS.get(cache, ""), None)
+    return builder if hasattr(builder, "cache_info") else None
+
+
+def _clear_builder_caches(caches=TABLE_CACHES) -> None:
+    for cache in caches:
+        builder = _builder_cache(cache)
+        if builder is not None:
+            builder.cache_clear()
+
+
+def _fresh_table_caches(monkeypatch) -> None:
+    """Empty device-table caches, layout front, backward plans and tables kept by captures."""
+    for name in ("_META_FRONT", *TABLE_CACHES, "_GRAPH_TABLES", "_BWD_PLANS"):
+        monkeypatch.setattr(cake_chain, name, {}, raising=False)
+    _clear_builder_caches()
+
+
+def _table_cache_size(cache: str) -> int:
+    builder = _builder_cache(cache)
+    if builder is not None:
+        return builder.cache_info().currsize
+    return len(getattr(cake_chain, cache))
+
+
+def _cached_entries() -> int:
+    """The entries of the layout front and of every device-table cache."""
+    return sum(_table_cache_size(name) for name in ("_META_FRONT", *TABLE_CACHES))
+
+
+def _drop_table_cache(monkeypatch, cache: str) -> None:
+    """Empty ``cache`` (and the layout front, which holds the tables of the other caches), so the next call builds
+    that table again."""
+    if cache != "_WALKS":
+        monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    monkeypatch.setattr(cake_chain, cache, {}, raising=False)
+    _clear_builder_caches((cache,))
+
+
+def _cached_tables(caches=TABLE_CACHES) -> list[torch.Tensor]:
+    """One view of every storage of the device tables in ``caches`` (none of zero bytes), from the caches and from the
+    layout front's ChunkMetas (which hold the tables of every cache, also of builders that cache them themselves)."""
+    metas = list(cake_chain._META_FRONT.values())
+    tables: list[torch.Tensor] = []
+    if "_HOST_META" in caches:
+        metas += list(getattr(cake_chain, "_HOST_META", {}).values())
+        tables += [m.chunk_start for m in metas]
+    if "_ADJOINT_SPLITS" in caches:
+        splits = list(getattr(cake_chain, "_ADJOINT_SPLITS", {}).values())
+        splits += [m.bwd_split for m in metas if m.bwd_split is not None]
+        tables += [s.walk for s in splits]
+    if "_FORWARD_SPLITS" in caches:
+        splits = list(getattr(cake_chain, "_FORWARD_SPLITS", {}).values())
+        splits += [m.fwd_split for m in metas if m.fwd_split is not None]
+        for s in splits:
+            tables += [s.seg_chunk_start, s.first_index]
+    if "_WALKS" in caches:  # an identity walk, or (walk, ready)
+        tables += [
+            w if isinstance(w, torch.Tensor) else w[0]
+            for w in cake_chain._WALKS.values()
+        ]
+    unique = {t.untyped_storage().data_ptr(): t for t in tables}
+    return [t for t in unique.values() if t.untyped_storage().nbytes()]
+
+
+def _drop_cached_tables() -> None:
+    """Drop every reference the package keeps to a cached device table: the caches, the layout front and the backward
+    plans (a plan holds its layout's ChunkMeta)."""
+    for name in ("_META_FRONT", *TABLE_CACHES, "_BWD_PLANS"):
+        getattr(cake_chain, name, {}).clear()
+    _clear_builder_caches()
+
+
+def _storage_addresses(tables) -> list[int]:
+    return sorted({t.untyped_storage().data_ptr() for t in tables})
+
+
+def _issue(inputs, cu_seqlens, cu_seqlens_cpu, *, backward=True, **pins) -> dict:
+    """One call on the current stream without a synchronization (``cu_seqlens`` already on the device): the output
+    and, with ``backward``, the gradients."""
+    leaves = {
+        name: inputs[name].detach().clone().requires_grad_(backward)
+        for name in ("q", "k", "v", "g", "beta")
+    }
+    o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                           scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
+                           use_qk_l2norm_in_kernel=True, **pins)  # fmt: skip
+    if not backward:
+        return {"o": o}
+    (o.float() * inputs["do"].float()).sum().backward()
+    return {
+        "o": o.detach(),
+        **{"d" + name: leaves[name].grad for name in ("q", "k", "v", "g", "beta")},
+    }
+
+
+def _cu_tensors(seq_lens, device):
+    cu = _cu(seq_lens)
+    return torch.tensor(cu, dtype=torch.int64, device=device), torch.tensor(
+        cu, dtype=torch.int64
+    )
+
+
+def _overlapping_streams(device):
+    """Two streams whose work overlaps: a launch on the second completes while the first sleeps.  Two streams can share
+    one hardware queue, which runs their work in issue order and hides the ordering under test; such a pair is replaced
+    by the next streams of the pool."""
+    current = torch.cuda.current_stream(device)
+    for _ in range(16):
+        s1, s2 = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+        s1.wait_stream(current)
+        s2.wait_stream(current)
+        woke, probe = torch.cuda.Event(), torch.cuda.Event()
+        with torch.cuda.stream(s1):
+            torch.cuda._sleep(100_000_000)
+            woke.record(s1)
+        with torch.cuda.stream(s2):
+            torch.ones(1, device=device).add_(1)
+            probe.record(s2)
+        probe.synchronize()
+        overlap = not woke.query()
+        torch.cuda.synchronize()
+        if overlap:
+            return s1, s2
+    pytest.skip("no two streams of the pool run concurrently on this device")
+
+
+def _block_states(addresses) -> dict:
+    """The caching allocator's state of the block holding each address (``active_allocated``, ``active_pending_free``
+    while a stream recorded on a freed tensor may still use it, ``inactive`` once free)."""
+    states = {}
+    for segment in torch.cuda.memory_snapshot():
+        for block in segment["blocks"]:
+            for address in addresses:
+                if block["address"] <= address < block["address"] + block["size"]:
+                    states[address] = block["state"]
+    return states
+
+
+def _native_allocator_or_skip() -> None:
+    if torch.cuda.get_allocator_backend() != "native":
+        pytest.skip("reads the state of the native caching allocator's blocks")
+
+
+@pytest.mark.parametrize("row", sorted(TABLE_ROWS))
+def test_a_cached_table_is_read_after_its_write_on_another_stream(
+    row, device, monkeypatch
+) -> None:
+    # Stream s1 sleeps, then its call rebuilds one cached table (its write queued behind the sleep); a call on stream
+    # s2 then hits that table.  s2 can run while s1 sleeps (a probe launch on s2 completes), but the s2 call must wait
+    # for the write: its work is still queued, and both calls give the bits of a call on the written table.  The
+    # adjoint split's tables are read by the backward alone
+    cache, seq_lens, heads, pins, setup = TABLE_ROWS[row]
+    _table_setup(monkeypatch, device, setup)
+    _fresh_table_caches(monkeypatch)
+    inputs = _table_inputs(seq_lens, heads, setup, device, seed=113)
+    stages = _record_launches(monkeypatch)
+    want = _run(inputs, seq_lens, **pins)
+    _check_forward_route(stages, setup)
+    assert _table_cache_size(cache) == 1
+    if setup == "streams":
+        assert any(
+            m.fwd_groups is not None or m.bwd_groups is not None
+            for m in cake_chain._META_FRONT.values()
+        )
+    _drop_table_cache(monkeypatch, cache)
+    cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
+    s1, s2 = _overlapping_streams(device)
+    woke, probe, done = torch.cuda.Event(), torch.cuda.Event(), torch.cuda.Event()
+    with torch.cuda.stream(s1):
+        torch.cuda._sleep(2_000_000_000)
+        woke.record(s1)
+        first = _issue(inputs, cu_seqlens, cu_seqlens_cpu, **pins)
+    assert _table_cache_size(cache) == 1  # s1 rebuilt the table
+    with torch.cuda.stream(s2):
+        torch.ones(1, device=device).add_(1)
+        probe.record(s2)
+        second = _issue(inputs, cu_seqlens, cu_seqlens_cpu, **pins)
+        done.record(s2)
+    probe.synchronize()
+    time.sleep(0.1)  # time for the s2 call to finish if it does not wait for the write
+    asleep, queued = not woke.query(), not done.query()
+    try:
+        assert asleep, "s1 woke before the check (s2 did not run while s1 slept)"
+        assert queued, "the call on s2 ran before the table write on s1"
+    finally:
+        torch.cuda.synchronize()
+    _assert_same_bits(first, want, OUTPUT_NAMES)
+    _assert_same_bits(second, want, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize("layout", sorted(TABLE_LAYOUTS))
+def test_an_evicted_table_waits_for_reads_on_another_stream(
+    layout, device, monkeypatch
+) -> None:
+    # A call on stream s2, queued behind a sleep, hits tables built on stream s1; the package then drops every table.
+    # The caching allocator must keep each table's block until s2's launches have read it (so no later allocation can
+    # overwrite it), and free it after them
+    _native_allocator_or_skip()
+    seq_lens, heads, setup, cache = TABLE_LAYOUTS[layout]
+    _table_setup(monkeypatch, device, setup)
+    _fresh_table_caches(monkeypatch)
+    inputs = _table_inputs(seq_lens, heads, setup, device, seed=137)
+    s1, s2 = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+    s1.wait_stream(torch.cuda.current_stream(device))
+    stages = _record_launches(monkeypatch)
+    with torch.cuda.stream(s1):
+        want = _run(inputs, seq_lens, lpt=False)
+    _check_forward_route(stages, setup)
+    assert _table_cache_size(cache) == 1
+    addresses = _storage_addresses(_cached_tables())
+    cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
+    s2.wait_stream(s1)
+    with torch.cuda.stream(s2):
+        torch.cuda._sleep(2_000_000_000)
+        got = _issue(inputs, cu_seqlens, cu_seqlens_cpu, lpt=False)
+    _drop_cached_tables()
+    gc.collect()
+    dropped = _block_states(addresses)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(s1):
+        torch.empty(
+            1, device=device
+        )  # an allocation frees the blocks whose recorded uses are done
+    read = _block_states(addresses)
+    assert dropped == dict.fromkeys(addresses, "active_pending_free"), dropped
+    assert read == dict.fromkeys(addresses, "inactive"), read
+    _assert_same_bits(got, want, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize("layout", sorted(TABLE_LAYOUTS))
+def test_tables_built_inside_a_capture_are_not_cached(
+    layout, device, monkeypatch
+) -> None:
+    # A layout's first call inside a CUDA graph capture writes its tables (the chunk tables, the split tables, the
+    # identity walk) only when the graph replays: the capture caches none of them, so an eager call of that layout
+    # before any replay builds its own (its backward reads the adjoint split's tables); the replays match too
+    seq_lens, heads, setup, _cache = TABLE_LAYOUTS[layout]
+    _table_setup(monkeypatch, device, setup)
+    inputs = _table_inputs(seq_lens, heads, setup, device, seed=127)
+    cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
+    _fresh_table_caches(monkeypatch)
+    stages = _record_launches(monkeypatch)
+    want = _issue(inputs, cu_seqlens, cu_seqlens_cpu, lpt=False)
+    torch.cuda.synchronize()
+    _check_forward_route(stages, setup)
+    # the stages stay loaded; every table of the layout is now built inside the capture
+    _fresh_table_caches(monkeypatch)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        o = _issue(inputs, cu_seqlens, cu_seqlens_cpu, backward=False, lpt=False)["o"]
+    assert _cached_entries() == 0
+    eager = _issue(inputs, cu_seqlens, cu_seqlens_cpu, lpt=False)
+    torch.cuda.synchronize()
+    _assert_same_bits(eager, want, OUTPUT_NAMES)
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(o, want["o"])
+
+
+def _graph_step(inputs, leaves, cu_seqlens, cu_seqlens_cpu, **pins):
+    """Forward and backward of one call on the current stream into ``leaves``' fresh gradients: the output."""
+    for leaf in leaves.values():
+        leaf.grad = None
+    o, _ = cake_gdn_nondet(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                           scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu,
+                           use_qk_l2norm_in_kernel=True, **pins)  # fmt: skip
+    (o.float() * inputs["do"].float()).sum().backward()
+    return o
+
+
+def _step_results(o, leaves, clone=False) -> dict:
+    got = {"o": o, **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")}}
+    return {name: t.detach().clone() for name, t in got.items()} if clone else got
+
+
+def _leaves(inputs) -> dict:
+    return {
+        name: inputs[name].detach().clone().requires_grad_(True)
+        for name in ("q", "k", "v", "g", "beta")
+    }
+
+
+@pytest.mark.parametrize("layout", sorted(TABLE_LAYOUTS))
+def test_a_capture_keeps_the_cached_tables_it_reads(
+    layout, device, monkeypatch
+) -> None:
+    # A capture of a warmed-up layout's forward and backward reads its cached tables (the backward the adjoint split's
+    # too).  Once the captured call's autograd graph and every cached table are dropped, the capture alone must keep
+    # the tables it reads: their blocks stay allocated, and reusing memory of their sizes (zero-filled) leaves the
+    # replays' bits unchanged
+    _native_allocator_or_skip()
+    seq_lens, heads, setup, cache = TABLE_LAYOUTS[layout]
+    _table_setup(monkeypatch, device, setup)
+    inputs = _table_inputs(seq_lens, heads, setup, device, seed=131)
+    cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
+    _fresh_table_caches(monkeypatch)
+    leaves = _leaves(inputs)
+    stages = _record_launches(monkeypatch)
+    want = _step_results(
+        _graph_step(inputs, leaves, cu_seqlens, cu_seqlens_cpu, lpt=False), leaves, True
+    )
+    torch.cuda.synchronize()
+    _check_forward_route(stages, setup)
+    assert _table_cache_size(cache) == 1
+    tables = _cached_tables()
+    addresses = _storage_addresses(tables)
+    own = _storage_addresses(_cached_tables(("_HOST_META", cache)))
+    sizes = [t.untyped_storage().nbytes() for t in tables]
+    del tables
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        o = _graph_step(inputs, leaves, cu_seqlens, cu_seqlens_cpu, lpt=False)
+    got = _step_results(o.detach(), leaves)
+    # o's autograd node holds the call's context, with the layout's ChunkMeta and plan
+    del o
+    _drop_cached_tables()
+    gc.collect()
+    kept = _block_states(own)
+    assert kept == dict.fromkeys(own, "active_allocated"), kept
+    junk = [
+        torch.zeros(n // 4, dtype=torch.int32, device=device)
+        for n in sizes
+        for _ in range(4)
+    ]
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_same_bits(got, want, OUTPUT_NAMES)
+    # the layout's chunk tables and its own table are kept, nothing but cached tables is
+    assert set(own) <= set(cake_chain._GRAPH_TABLES) <= set(addresses)
+    del junk
+
+
+def test_a_capture_takes_its_own_workspaces(device, monkeypatch) -> None:
+    # Eager calls on stream s fill s's pooled workspaces (and record and replay the backward's plan over them); a
+    # capture on s must take workspaces of its own: once s's pooled buffers are filled with a byte pattern, the
+    # replays leave the pattern in place and give the eager bits.  (The self-cleaning zeroed buffers are left alone:
+    # every launch leaves them zero.)
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=139)
+    cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
+    _fresh_table_caches(monkeypatch)
+    monkeypatch.setattr(cake_chain, "_POOLED", cake_chain.Workspaces())
+    replays = _counted_replays(monkeypatch)
+    s = torch.cuda.Stream(device=device)
+    s.wait_stream(torch.cuda.current_stream(device))
+    leaves = _leaves(inputs)
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            o = _graph_step(inputs, leaves, cu_seqlens, cu_seqlens_cpu)
+        want = _step_results(o, leaves, True)
+    torch.cuda.synchronize()
+    assert len(replays) == 1
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=s):
+        o = _graph_step(inputs, leaves, cu_seqlens, cu_seqlens_cpu)
+    got = _step_results(o, leaves)
+    pooled = [
+        b
+        for table in cake_chain._POOLED.tables.values()
+        for role in table.values()
+        for b in role.values()
+    ]
+    assert pooled
+    with torch.cuda.stream(s):
+        for b in pooled:
+            b.view(torch.uint8).fill_(0x5A)
+    torch.cuda.synchronize()
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        written = [b for b in pooled if not bool((b.view(torch.uint8) == 0x5A).all())]
+        assert not written, f"a replay wrote {len(written)} of s's pooled buffers"
+        _assert_same_bits(got, want, OUTPUT_NAMES)
+
+
+def test_a_replayed_backward_plan_reads_tables_kept_for_its_stream(
+    device, monkeypatch
+) -> None:
+    # The tables of a split-adjoint layout are built on stream s1; on stream s2 a call records the backward's plan and
+    # a second call, queued behind a sleep, replays it (the plan reads the adjoint split's tables without a lookup of
+    # its own).  The package (and the test) then drop every reference to the tables: the caching allocator must keep
+    # their blocks until s2's launches have read them, since s2's use was recorded when its forward found them; s1
+    # zero-fills memory of their sizes while s2 sleeps, and both calls on s2 give the bits of s1's call
+    _native_allocator_or_skip()
+    seq_lens, heads, setup, cache = TABLE_LAYOUTS["adjoint-split"]
+    _table_setup(monkeypatch, device, setup)
+    _fresh_table_caches(monkeypatch)
+    replays = _counted_replays(monkeypatch)
+    inputs = _table_inputs(seq_lens, heads, setup, device, seed=149)
+    s2, s1 = _overlapping_streams(device)  # s1's launches complete while s2 sleeps
+    with torch.cuda.stream(s1):
+        want = _run(inputs, seq_lens)
+    assert _table_cache_size(cache) == 1
+    # the tables the backward's plan reads
+    tables = _cached_tables(("_HOST_META", cache))
+    addresses = _storage_addresses(tables)
+    sizes = [t.untyped_storage().nbytes() for t in tables]
+    del tables
+    cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
+    s2.wait_stream(s1)
+    woke, filled = torch.cuda.Event(), torch.cuda.Event()
+    with torch.cuda.stream(s2):
+        first = _issue(inputs, cu_seqlens, cu_seqlens_cpu)
+        torch.cuda._sleep(2_000_000_000)
+        woke.record(s2)
+        second = _issue(inputs, cu_seqlens, cu_seqlens_cpu)
+    assert len(replays) == 1, "the second call on s2 replays the plan of the first"
+    replays.clear()  # a counted plan holds its layout's ChunkMeta
+    _drop_cached_tables()
+    gc.collect()
+    dropped = _block_states(addresses)
+    with torch.cuda.stream(s1):
+        junk = [
+            torch.zeros(n // 4, dtype=torch.int32, device=device)
+            for n in sizes
+            for _ in range(4)
+        ]
+        filled.record(s1)
+    filled.synchronize()
+    try:
+        assert dropped == dict.fromkeys(addresses, "active_pending_free"), dropped
+        assert not woke.query(), "s1's zero fill did not run while s2 slept"
+    finally:
+        torch.cuda.synchronize()
+    del junk
+    _assert_same_bits(first, want, OUTPUT_NAMES)
+    _assert_same_bits(second, want, OUTPUT_NAMES)
+
+
+def test_a_capture_neither_replays_nor_records_a_backward_plan(
+    device, monkeypatch
+) -> None:
+    # A plan's launches read the pooled workspaces of its stream.  The first call of a key inside a capture on stream s
+    # records no plan, eager calls on s then record and replay their own, and a later capture on s does not replay it;
+    # both graphs replay the eager bits
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=151)
+    cu_seqlens, cu_seqlens_cpu = _cu_tensors(seq_lens, device)
+    _fresh_table_caches(monkeypatch)
+    monkeypatch.setattr(cake_chain, "_POOLED", cake_chain.Workspaces())
+    replays = _counted_replays(monkeypatch)
+    leaves = _leaves(inputs)
+    warm, s = torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)
+    warm.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(warm):
+        for _ in range(2):  # the tables, the libraries and the warm-up stream's plan
+            o = _graph_step(inputs, leaves, cu_seqlens, cu_seqlens_cpu)
+        want = _step_results(o, leaves, True)
+    torch.cuda.synchronize()
+    assert len(replays) == 1 and len(cake_chain._BWD_PLANS) == 1
+    graphs = []
+    for eager_first in (False, True):
+        if eager_first:
+            s.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(s):
+                for _ in range(2):  # the plan of s's key, recorded and replayed
+                    o = _graph_step(inputs, leaves, cu_seqlens, cu_seqlens_cpu)
+                got = _step_results(o, leaves, True)
+            torch.cuda.synchronize()
+            assert len(replays) == 2 and len(cake_chain._BWD_PLANS) == 2
+            _assert_same_bits(got, want, OUTPUT_NAMES)
+        plans, count = dict(cake_chain._BWD_PLANS), len(replays)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s):
+            o = _graph_step(inputs, leaves, cu_seqlens, cu_seqlens_cpu)
+        assert len(replays) == count, "a capture replayed a backward plan"
+        assert plans == cake_chain._BWD_PLANS, "a capture recorded a backward plan"
+        graphs.append((graph, _step_results(o, leaves)))
+    for graph, got in graphs:
+        for _ in range(2):
+            graph.replay()
+            torch.cuda.synchronize()
+            _assert_same_bits(got, want, OUTPUT_NAMES)

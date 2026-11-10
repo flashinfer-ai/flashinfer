@@ -746,10 +746,11 @@ routine_cc_to_supported_backends = {
         "10.3": ["alphamoe"],
     },
     # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
-    # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
+    # Blackwell and Rubin; backend support checks enforce runtime requirements.
     "unified_nvfp4_moe": {
         "10.0": ["unified"],
         "10.3": ["unified"],
+        "10.7": ["unified"],
     },
     # NORM
     "rmsnorm": {

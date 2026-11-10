@@ -367,7 +367,7 @@ requires this package as a sibling directory.
 Tests:
 
 * `tests/experimental/test_cake_kda_nondet_train.py`: the backend suite against the
-  FP64 reference of `tests/test_helpers/cake_kda_det_train_reference.py`,
+  FP64 reference of `tests/experimental/test_helpers/cake_kda_det_train_reference.py`,
   the comparison with the deterministic package, the hand-off twins'
   records and rows, and the tape WY twin's record, rule and tape backward.
 * `tests/experimental/test_cake_kda_nondet_train_l2n.py`: the in-kernel q / k

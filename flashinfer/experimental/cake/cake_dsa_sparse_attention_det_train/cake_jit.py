@@ -56,6 +56,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "bwd_fold",
             "bwd_compact",
             "bwd_main_pass",
+            "bwd_bound_pack27",
+            "bwd_grid_pack27",
+            "bwd_redo_prep_fold",
+            "bwd_fold_list",
         ],
         # The key-range-pass policy: the non-deterministic package's record values (``cake_backend.KeyPassPolicy``).
         "key_pass_policy": {
@@ -209,6 +213,50 @@ MODULES: dict[str, dict[str, Any]] = {
                 "use_pdl": False,
             },
         },
+        "bwd_bound_pack27": {
+            "library": "cake_dsa_h64_det_train_3076bd8795bd9dcbdd22",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_grid_pack27": {
+            "library": "cake_dsa_h64_det_train_44c3a785582753936b7f",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_redo_prep_fold": {
+            "library": "cake_dsa_h64_det_train_e48ca0b7936f82162868",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "bwd_fold_list": {
+            "library": "cake_dsa_h64_det_train_d3c5c3176a48d8e07ed4",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
     },
     # The native zero-RoPE (NoPE) training program: shared latent K = V of 512
     # dimensions, no rope operands, one combined dK + dV gradient per key row.
@@ -228,6 +276,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "nope_bwd_redo_prep",
             "nope_bwd_redo",
             "nope_bwd_fold",
+            "nope_bwd_bound_pack27",
+            "nope_bwd_grid_pack27",
+            "nope_bwd_redo_prep_fold",
+            "nope_bwd_fold_list",
+            "nope_bwd_bound_pipe",
+            "nope_bwd_bound_pack27_pipe",
         ],
         "index_prep": {
             "library": "cake_dsa_h64_det_nope_train_db791110b21a91be1388",
@@ -339,6 +393,74 @@ MODULES: dict[str, dict[str, Any]] = {
                 "use_pdl": False,
             },
         },
+        "nope_bwd_bound_pack27": {
+            "library": "cake_dsa_h64_det_nope_train_a75be993b6f056087d05",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_grid_pack27": {
+            "library": "cake_dsa_h64_det_nope_train_bd40e409c46688d665e1",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_redo_prep_fold": {
+            "library": "cake_dsa_h64_det_nope_train_335494a34f38973c492c",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_fold_list": {
+            "library": "cake_dsa_h64_det_nope_train_9f59bd3e4363f97c2c56",
+            "ffi_entry": "run",
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_bound_pipe": {
+            "library": "cake_dsa_h64_det_nope_train_cd3686becf1223e8ca1b",
+            "ffi_entry": "run",
+            "arches": ["sm_100a", "sm_103a"],
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
+        "nope_bwd_bound_pack27_pipe": {
+            "library": "cake_dsa_h64_det_nope_train_54d8d3485d31391417d3",
+            "ffi_entry": "run",
+            "arches": ["sm_100a", "sm_103a"],
+            "launch": {
+                "block": [256, 1, 1],
+                "cluster": [1, 1, 1],
+                "cooperative": False,
+                "dynamic_smem_bytes": 0,
+                "use_pdl": False,
+            },
+        },
     },
 }
 
@@ -369,13 +491,54 @@ STAGES = FORWARD_STAGES + BACKWARD_STAGES
 # and the pass build of the main stage (``bwd_main_pass``; its dQ goes through an FP32 partial between passes).
 # The redo stays one launch.  The NoPE program has no pass stages.
 KEY_PASS_STAGES = ("bwd_compact", "bwd_main_pass")
+# The pack27 builds of the row bound and its grid decode (a 27-bit pair count with 10-bit packed terms): a backward of
+# ``2 ** 26 <= num_queries * topk < 2 ** 27`` pair slots runs them in place of ``bwd_bound`` / ``bwd_grid`` (whose
+# pack builds fall back to three reductions per pair there) when the record registers them; the choice is the
+# shapes' only. Same arguments and grids as the stages they replace.
+PACK27_STAGES = {"bwd_bound": "bwd_bound_pack27", "bwd_grid": "bwd_grid_pack27"}
+# The accumulate-mode builds of the redo preparation and the fold (a backward that adds dK / dV into the caller's
+# ``dkv_acc``): the redo preparation's fold build adds every unflagged row into ``dkv_acc`` as it scans the rows (the
+# redo touches only flagged rows, so an unflagged row's integers are final there), and after the redo the listed fold
+# adds the flagged rows alone (the redo list; every marked row when the list overflowed), on a persistent grid.  They
+# replace ``bwd_redo_prep`` / ``bwd_fold`` (the NoPE program: ``nope_``) in such a backward; the results are the same
+# bits.
+ACCUMULATE_STAGES = {"bwd_redo_prep": "bwd_redo_prep_fold", "bwd_fold": "bwd_fold_list"}
 # The NoPE program names its stages ``nope_<stage>`` (globally unique: the
 # generated launch tables are keyed by stage name across both programs).
 STAGE_PREFIX = {PROGRAM: "", NOPE_PROGRAM: "nope_"}
 NOPE_STAGES = tuple(f"{STAGE_PREFIX[NOPE_PROGRAM]}{stage}" for stage in STAGES)
 NOPE_FORWARD_STAGES = NOPE_STAGES[:1]
 NOPE_BACKWARD_STAGES = NOPE_STAGES[1:]
-STAGES_OF = {PROGRAM: STAGES + KEY_PASS_STAGES, NOPE_PROGRAM: NOPE_STAGES}
+NOPE_PACK27_STAGES = tuple(
+    f"{STAGE_PREFIX[NOPE_PROGRAM]}{stage}" for stage in PACK27_STAGES.values()
+)
+NOPE_ACCUMULATE_STAGES = {
+    f"{STAGE_PREFIX[NOPE_PROGRAM]}{stage}": f"{STAGE_PREFIX[NOPE_PROGRAM]}{alt}"
+    for stage, alt in ACCUMULATE_STAGES.items()
+}
+ACCUMULATE_STAGES_OF = {
+    PROGRAM: ACCUMULATE_STAGES,
+    NOPE_PROGRAM: NOPE_ACCUMULATE_STAGES,
+}
+# The pipelined NoPE row-bound builds (two 128-slot blocks in flight, launch_bounds(256, 5)): on the architectures of
+# ``NOPE_PIPE_ARCHES`` (their stage entries' ``arches``, the only architectures they ship for) a NoPE backward runs
+# them in place of ``nope_bwd_bound`` / ``nope_bwd_bound_pack27``; the device's architecture alone chooses.  Same
+# arguments, grid and words (bit for bit) as the stages they replace.
+NOPE_PIPE_STAGES = {
+    "nope_bwd_bound": "nope_bwd_bound_pipe",
+    "nope_bwd_bound_pack27": "nope_bwd_bound_pack27_pipe",
+}
+NOPE_PIPE_ARCHES = ("sm_100a", "sm_103a")
+_ROPE_ALTERNATES = tuple(PACK27_STAGES.values()) + tuple(ACCUMULATE_STAGES.values())
+_NOPE_ALTERNATES = (
+    NOPE_PACK27_STAGES
+    + tuple(NOPE_ACCUMULATE_STAGES.values())
+    + tuple(NOPE_PIPE_STAGES.values())
+)
+STAGES_OF = {
+    PROGRAM: STAGES + KEY_PASS_STAGES + _ROPE_ALTERNATES,
+    NOPE_PROGRAM: NOPE_STAGES + _NOPE_ALTERNATES,
+}
 BACKWARD_STAGES_OF = {PROGRAM: BACKWARD_STAGES, NOPE_PROGRAM: NOPE_BACKWARD_STAGES}
 
 
@@ -410,6 +573,12 @@ def registered_stages(program: str = PROGRAM) -> tuple[str, ...]:
     return present
 
 
+def stage_arches(stage: str, program: str = PROGRAM) -> tuple[str, ...]:
+    """The architectures ``stage`` of ``program`` ships for: its entry's own ``arches``, else the record's."""
+    rec = record(program)
+    return tuple(rec[stage].get("arches", rec["arches"]))
+
+
 def library_name(stage: str, arch: str, program: str = PROGRAM) -> str:
     """The ``build.json`` entry of ``stage`` of ``program`` on ``arch``: ``<library>_<arch>``."""
     rec = record(program)
@@ -422,6 +591,11 @@ def library_name(stage: str, arch: str, program: str = PROGRAM) -> str:
         raise NotImplementedError(
             f"stage {stage!r} of the generated DSA training program {program!r} is not "
             f"registered in this checkout (registered: {registered_stages(program)})"
+        )
+    if arch not in stage_arches(stage, program):
+        raise RuntimeError(
+            f"stage {stage!r} of the DSA training program {program!r} ships for "
+            f"{list(stage_arches(stage, program))} only, not {arch!r}"
         )
     return f"{rec[stage]['library']}_{arch}"
 
