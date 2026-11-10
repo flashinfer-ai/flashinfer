@@ -48,7 +48,8 @@ _X, _IDS, _W, _W1, _W2, _OUT = range(6)
 
 
 def _tactic(c1, c2) -> tuple:
-    """A pair of grouped records as a flat tuple of scalars (JSON round-trip safe for the autotuner's cache)."""
+    """A pair of records as a flat tuple of scalars (JSON round-trip safe for the autotuner's cache): the tile, the cluster,
+    the CTA group, the raster and the swapped flag (the record's body: the grouped or the swapped one) per record."""
     return tuple(
         int(v) if isinstance(v, bool) else v
         for cfg in (c1, c2)
@@ -59,8 +60,12 @@ def _tactic(c1, c2) -> tuple:
             cfg.cluster_shape_mn[1],
             cfg.use_2cta_instrs,
             cfg.raster_along,
+            cfg.swap_ab,
         )
     )
+
+
+_TACTIC_FIELDS = 7
 
 
 def _configs_from_tactic(t: tuple):
@@ -74,9 +79,10 @@ def _configs_from_tactic(t: tuple):
             True,
             str(v[5]),
             1,
+            swap_ab=bool(v[6]),
         )
 
-    return one(t[:6]), one(t[6:12])
+    return one(t[:_TACTIC_FIELDS]), one(t[_TACTIC_FIELDS : 2 * _TACTIC_FIELDS])
 
 
 class BatchInvariantMoeRunner(MoERunner):
@@ -334,11 +340,14 @@ class BatchInvariantMoeRunner(MoERunner):
             cfg.routing.top_k,
             cfg.experts.intermediate_size,
         )
+        from .blocks.epilogue import GroupedChain
+
         H = self._hidden
         rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
-        gated = self._activation().gated
+        a = self._activation()
         sm_count, family = self._part if self._part is not None else (None, None)
-        n1, chain1 = (2 * I, "swiglu") if gated else (I, "relu2")
+        n1 = 2 * I if a.gated else I
+        chain1 = GroupedChain("glu" if a.gated else "act", a.act, "bf16", a.params)
         return (
             rank_grouped(
                 rows, n1, H, E, chain1, sm_count, family, TOP_K, n_active=n_act
@@ -355,7 +364,9 @@ class BatchInvariantMoeRunner(MoERunner):
         return [_tactic(c1, c2) for c1 in r1 for c2 in r2]
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.bf16-v1",)
+        return super()._cache_key_extras() + (
+            "moe.bf16-v2",
+        )  # v2: the tactic carries the swapped flag
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(

@@ -191,13 +191,18 @@ def grouped_gemm(
     chain: Union[str, GroupedChain] = "plain",
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
+    Tk: Optional[int] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` for the expert segments ``counts`` (int32 ``[E]``, group order = expert order;
-    rows ``[off_e, off_e + counts[e])`` of ``a`` belong to expert ``e``). ``a [Tk, K]`` bf16 row-major, ``w [E, N, K]`` bf16
-    row-major; ``chain`` ``plain`` -> ``[Tk, N]`` in ``out_dtype`` (bf16 / f16 / f32), ``swiglu`` -> ``[Tk, N / 2]`` bf16
-    (``w`` interleaved as :func:`interleave_fc1`), ``relu2`` -> ``[Tk, N]`` bf16 (the ungated chain). The persistent grid is a
+    rows ``[off_e, off_e + counts[e])`` of ``a`` belong to expert ``e``). ``a [R >= Tk, K]`` bf16 row-major, ``w [E, N, K]``
+    bf16 row-major; ``chain`` ``plain`` -> ``[Tk, N]`` in ``out_dtype`` (bf16 / f16 / f32), ``swiglu`` -> ``[Tk, N / 2]`` bf16
+    (``w`` interleaved as :func:`interleave_fc1`), ``relu2`` -> ``[Tk, N]`` bf16 (the ungated chain). The record selects the
+    body: a dense record runs the grouped body, a swapped record (``config.swap_ab``: 128 weight rows x 8 / 16 / 32 tokens,
+    the weights on the MMA's M side, :mod:`.blocks.swap_bf16`) the swapped body on the same dense rows -- a placement, the
+    same bits. ``Tk`` (default: the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the
+    swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
     launch argument: the device's co-resident cluster capacity for the record's cluster size."""
-    from .blocks.compile import get_compiled_grouped
+    from .blocks.compile import get_compiled_grouped, get_compiled_swapped
 
     if (
         a.dtype != torch.bfloat16
@@ -206,7 +211,7 @@ def grouped_gemm(
         or w.dim() != 3
     ):
         raise TypeError("grouped_gemm takes bf16 a [Tk, K] and w [E, N, K]")
-    Tk, K = a.shape
+    R, K = a.shape
     E, N, K2 = w.shape
     if (
         K != K2
@@ -220,6 +225,10 @@ def grouped_gemm(
             "grouped_gemm: K-contiguous, 16-byte-aligned operands of one K "
             f"(a {tuple(a.shape)} strides {tuple(a.stride())}, w {tuple(w.shape)} strides {tuple(w.stride())})"
         )
+    if Tk is None:
+        Tk = out.shape[0] if out is not None else R
+    if not 0 <= Tk <= R:
+        raise ValueError(f"grouped_gemm: Tk {Tk} must lie in [0, {R}] (the rows of a)")
     if (
         counts.dtype != torch.int32
         or tuple(counts.shape) != (E,)
@@ -245,9 +254,17 @@ def grouped_gemm(
         raise ValueError(
             "grouped_gemm: out must be a 16-byte-aligned row-major [Tk, n_out] of the chain's dtype"
         )
-    kernel = get_compiled_grouped(config, chain)
+    kernel = (
+        get_compiled_swapped(config, chain)
+        if config.swap_ab
+        else get_compiled_grouped(config, chain)
+    )
     if Tk == 0:
         return out
+    if not config.swap_ab and Tk != R:
+        a = a[
+            :Tk
+        ]  # the grouped body's A has the output's rows (one symbol); the swapped body's R is free
     kernel(
         a.unsqueeze(-1),
         w.permute(1, 2, 0),
@@ -511,13 +528,23 @@ def fused_moe(
         plan if plan is not None else permute_plan(experts, E)
     )  # ``plan``: ``route_plan``'s outputs, the same integers
     Tk = T * k
-    x_perm = torch.empty(Tk, H, dtype=torch.bfloat16, device=x.device)
+    # a swapped record reads a token box of its tile's rows at every group's row: the dense buffer it reads carries that many
+    # rows past the live ones, so the last tiles' boxes stay inside it (rows past the live ones are computed and never stored)
+    pad1 = config1.tile_n if config1.swap_ab else 0
+    pad2 = config2.tile_n if config2.swap_ab else 0
+    x_buf = torch.empty(Tk + pad1, H, dtype=torch.bfloat16, device=x.device)
+    x_perm = x_buf[:Tk]
     if Tk:
         get_compiled_gather(
             k, "bf16", warps_per_row(Tk, H // 8, sm_count_of(x.device))
         )(x, src, x_perm, Tk, H)
-    a = grouped_gemm(x_perm, w.w1i, counts, config1, w.chain1)  # [Tk, I] bf16
-    y = grouped_gemm(a, w.w2, counts, config2, "plain", torch.bfloat16)  # [Tk, H] bf16
+    a_buf = torch.empty(Tk + pad2, I, dtype=torch.bfloat16, device=x.device)
+    a = grouped_gemm(
+        x_buf, w.w1i, counts, config1, w.chain1, out=a_buf[:Tk], Tk=Tk
+    )  # [Tk, I] bf16
+    y = grouped_gemm(
+        a_buf, w.w2, counts, config2, "plain", torch.bfloat16, Tk=Tk
+    )  # [Tk, H] bf16
     if T:
         get_compiled_combine(
             k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(x.device))

@@ -22,6 +22,7 @@ from ....gemm.batch_invariant.generator import TILES_N, Knobs
 from .epilogue import GROUP, GroupedChain
 from .kernel import CHAINS, GroupedBlockGemm
 from .scheduler import MAX_E
+from .swap_bf16 import SwappedGroupedGemm, is_swapped_record, swapped_knobs  # noqa: F401
 
 MODULE = "batch_invariant_moe"
 GRID_PLACEHOLDER = 1  # the compile-time value of the grid argument: a dynamic Int32 of the kernel, never compiled in
@@ -144,4 +145,132 @@ def get_compiled_grouped(
         chain = GroupedChain.legacy(chain, out_fmt)
     return jit.build_and_load(
         MODULE, kernel_name(cfg, chain), compile_grouped_fn(cfg, chain)
+    )
+
+
+# ----------------------------------------------------------------------------- the swapped body (the swapped records)
+
+
+def swapped_kernel_name(
+    cfg: Knobs, chain: Union[str, GroupedChain], out_fmt: str = "bf16"
+) -> str:
+    """``swapped_bf16_<chain>_<record>``: the swapped record (its token tile) names the object beside the chain."""
+    if isinstance(chain, str):
+        chain = GroupedChain.legacy(chain, out_fmt)
+    knobs = dataclasses.replace(cfg, grid_clusters=0)
+    return jit.sanitize_symbol_name(
+        f"swapped_bf16_{chain.describe()}_{knobs.describe()}"
+    )
+
+
+def can_implement_swapped(
+    knobs: Knobs,
+    N: int,
+    K: int,
+    E: int,
+    chain: Union[str, GroupedChain] = "plain",
+    out_fmt: str = "bf16",
+) -> bool:
+    """Acceptance of the swapped body (:mod:`.swap_bf16`): a swapped record of the bf16 classes (128 weight rows x 8 / 16 / 32
+    tokens, 1-CTA) under the grouped body's operand rules (16-byte-aligned K and N, whole ``2 x GROUP`` column blocks for the
+    gated chain, at most ``MAX_E`` experts); every chain of the classes."""
+    if isinstance(chain, str):
+        if chain not in CHAINS or out_fmt not in OUT_DT:
+            return False
+        chain = GroupedChain.legacy(chain, out_fmt)
+    if not is_swapped_record(knobs) or chain.out_fmt not in OUT_DT:
+        return False
+    if chain.pair and N % (2 * GROUP):
+        return False
+    al = ALIGN["bf16"]
+    n_out = N // 2 if chain.pair else N
+    return (
+        K % al == 0
+        and N % al == 0
+        and n_out % ALIGN[chain.out_fmt] == 0
+        and 1 <= E <= MAX_E
+    )
+
+
+def can_implement(
+    knobs: Knobs,
+    N: int,
+    K: int,
+    E: int,
+    chain: Union[str, GroupedChain] = "plain",
+    out_fmt: str = "bf16",
+) -> bool:
+    """A record either body takes: the grouped body (a dense record) or the swapped body (a swapped record); the two record
+    spaces are disjoint (the swapped flag)."""
+    return can_implement_grouped(
+        knobs, N, K, E, chain, out_fmt
+    ) or can_implement_swapped(knobs, N, K, E, chain, out_fmt)
+
+
+def compile_swapped_fn(cfg: Knobs, chain: GroupedChain) -> Callable[[], Any]:
+    """The zero-argument compile closure of one swapped specialisation: ``kernel(rows3, w3, out2, counts, grid)`` -- ``rows
+    (R, K, 1)`` the dense permuted rows (``R >= Tk``), ``w (N, K, E)``, ``out (Tk, Nout)``."""
+    in_dt, al = IN_DT["bf16"], ALIGN["bf16"]
+    out_dt, oal = OUT_DT[chain.out_fmt], ALIGN[chain.out_fmt]
+
+    def compile_fn():
+        sym_r, sym_m, sym_n, sym_k, sym_e = (
+            cute.sym_int(32),
+            cute.sym_int(32),
+            cute.sym_int(32, divisibility=al),
+            cute.sym_int(32, divisibility=al),
+            cute.sym_int(32),
+        )
+        sym_no = cute.sym_int(32, divisibility=oal)
+        rows_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_r, sym_k, 1),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
+        w_fake = cute.runtime.make_fake_tensor(
+            in_dt,
+            (sym_n, sym_k, sym_e),
+            (cute.sym_int64(divisibility=al), 1, cute.sym_int64(divisibility=al)),
+            assumed_align=16,
+        )
+        o_fake = cute.runtime.make_fake_tensor(
+            out_dt,
+            (sym_m, sym_no),
+            (cute.sym_int64(divisibility=oal), 1),
+            assumed_align=16,
+        )
+        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        grid = GRID_PLACEHOLDER
+        return cute.compile(
+            SwappedGroupedGemm(cfg, chain),
+            rows_fake,
+            w_fake,
+            o_fake,
+            c_fake,
+            grid,
+            stream_fake,
+            options="--enable-tvm-ffi",
+        )
+
+    return compile_fn
+
+
+@functools.cache
+def get_compiled_swapped(
+    cfg: Knobs, chain: Union[str, GroupedChain] = "plain", out_fmt: str = "bf16"
+) -> Any:
+    """``kernel(rows3, w3, out2, counts, grid)``: the swapped body for a swapped record (module ``batch_invariant_moe``):
+    rows ``(R, K, 1)`` K-major bf16 (``R >= Tk``), w ``(N, K, E)`` K-major bf16, out ``(Tk, Nout)``, counts ``(E,)``, ``grid``
+    the persistent grid in CTAs."""
+    if isinstance(chain, str):
+        assert chain in CHAINS and (chain == "plain" or out_fmt == "bf16"), (
+            chain,
+            out_fmt,
+        )
+        chain = GroupedChain.legacy(chain, out_fmt)
+    assert is_swapped_record(cfg), cfg
+    return jit.build_and_load(
+        MODULE, swapped_kernel_name(cfg, chain), compile_swapped_fn(cfg, chain)
     )
