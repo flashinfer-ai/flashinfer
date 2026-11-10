@@ -31,6 +31,9 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable debug build | `export FLASHINFER_JIT_DEBUG=1` |
 | Set target architectures | `export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"` |
 | Set parallel compilation | `export FLASHINFER_NVCC_THREADS=4` |
+| Set SM100-family MXFP8 CuTe-DSL compile workers (default 4; 0/1 means on-demand) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_WORKERS=4` |
+| Set MXFP8 precompile timeout per worker chunk (seconds; default 600; 0 disables) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_COMPILE_TIMEOUT=600` |
+| Limit MXFP8 CuTe-DSL autotune candidates (experimental; default 0 keeps full search) | `export FLASHINFER_MM_MXFP8_CUTE_DSL_MAX_TACTICS=32` |
 | Limit parallel ninja jobs | `export MAX_JOBS=4` |
 | Enable GDN native short-T path | `export FLASHINFER_GDN_WY_NATIVE_T=1` |
 | Enable GDN strided QKV path | `export FLASHINFER_GDN_WY_STRIDED_QKV=1` |
@@ -187,6 +190,15 @@ can change accumulation order. Cover both sides of the bitmap dispatch
 boundary at 512/513 tokens when testing cuDNN Frontend 1.32.
 
 ## Testing
+
+`benchmarks/bench_mxfp8_startup.py --output-dir /path/to/new/results` compares
+MXFP8 GEMM startup with persistence disabled, serial disk-cache population,
+parallel population, fresh-process disk hits, and saved tuning winners. It uses
+isolated caches and checks results after CUDA graph replay. Run on B200/B300;
+the default shapes exercise the SM100-family persistent/split-K runner. See
+`docs/design_docs/cute_dsl_kernel_cache.md` for the scope and cache layers.
+MXFP8 precompile workers start a dedicated interpreter entry point; they do not
+rerun application scripts or require callers to use a `__main__` guard.
 
 Run the regular test suite:
 
@@ -900,7 +912,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/_cake_lm_head_train_knobs.py` | Read once when each LM-head facade (`flashinfer.cake_lm_head_det_train`, and the non-deterministic facade) is imported and applied through its package's `cake_backend.BINDING_CACHE.configure` when that facade first reaches the backend (its first call): `0` disables the per-process LRU cache of compiled bindings. Direct users of the package call `configure` themselves. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/_cake_lm_head_train_knobs.py` | Capacity of that binding cache, read once at the same import (a value that is not a positive integer raises `ValueError`; unset or blank keeps the default) and applied through `configure` on the same first use. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
-| `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES` | unset | `build_backend.py` (`_slim_wheel`) | `1` leaves the experimental packages' generated kernel sources (`flashinfer/experimental/*/csrc/**`, `csrc/experimental/**`) out of the built `flashinfer-python` wheel and adds `flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt`; the release workflow sets it so the PyPI wheel stays under PyPI's 100 MB file limit (#7977). Nightlies and source installs keep the sources. Experimental APIs still import; their first kernel load raises. Independent of the flag, every built wheel is re-deflated at level 9 and the vendored 3rdparty trees outside the header directories are dropped. |
+| `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES` | unset | `build_backend.py` (`_slim_wheel`) | `1` leaves most experimental packages' generated kernel sources (`flashinfer/experimental/*/csrc/**`, `csrc/experimental/**`) out of the built `flashinfer-python` wheel, except the two HC JIT sources in `_EXPERIMENTAL_SOURCES_KEEP`, and adds `flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt`; the release workflow sets it so the PyPI wheel stays under PyPI's 100 MB file limit (#7977). Nightlies and source installs keep the sources. Experimental APIs still import; loads requiring omitted sources raise. Independent of the flag, every built wheel is re-deflated at level 9 and the vendored 3rdparty trees outside the header directories are dropped. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
@@ -1149,7 +1161,7 @@ for every provider and its shim when producing CUDA-specific or nightly wheels.
   - `csrc` → `flashinfer/data/csrc`
   - `include` → `flashinfer/data/include`
 - **Version**: Generated in `flashinfer/_build_meta.py` from `version.txt`
-- **Wheel post-processing**: `build_backend.build_wheel` rewrites the finished wheel (`_slim_wheel`): level-9 deflate, the vendored 3rdparty Python trees that `packages.find` sweeps in are dropped, and with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` (release workflow only) the experimental kernel sources are left out; RECORD is regenerated. Covered by `tests/cpu/infra/test_build_backend_slim_wheel.py`.
+- **Wheel post-processing**: `build_backend.build_wheel` rewrites the finished wheel (`_slim_wheel`): level-9 deflate, the vendored 3rdparty Python trees that `packages.find` sweeps in are dropped, and with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` (release workflow only) the experimental kernel sources are left out except the two HC JIT sources in `_EXPERIMENTAL_SOURCES_KEEP`; RECORD is regenerated. Covered by `tests/cpu/infra/test_build_backend_slim_wheel.py`.
 
 ## External Integrations
 
