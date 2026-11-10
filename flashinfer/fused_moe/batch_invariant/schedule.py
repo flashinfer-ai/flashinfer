@@ -172,15 +172,20 @@ def tiles_term(cfg: Knobs, rows: int) -> float:
     return expected_token_tiles(rows, cfg.tile_n) / max(1, math.ceil(rows / cfg.tile_n))
 
 
-def exposed_epilogue_cycles(cfg: Knobs, rows: int, nodes: int) -> float:
+def exposed_epilogue_cycles(
+    cfg: Knobs, rows: int, nodes: int, pair: bool = False
+) -> float:
     """The chain work of a CTA's last tile, which no mainloop overlaps (the earlier tiles' epilogues run behind the next tile's
     mainloop through the accumulator stages): a thread's chains times the chain's node cycles. The grouped body computes a
     row's outputs per thread, the tile's columns split between its epilogue warpgroups (the gated chain pairs two accumulator
     columns per output); the swapped body computes a weight row's live token columns per thread, ``min(rows, tile)`` of them
     (the chain of a dead column is skipped). At a few rows per expert this term separates the bodies: the grouped body's
-    epilogue is the tile's width wide whatever the live rows."""
+    epilogue is the tile's width wide whatever the live rows. The 64-row swapped tile gives a thread two weight rows at a
+    quarter of the columns: its busiest thread holds half the chains (plain), a quarter when one of its rows is the gate."""
     if cfg.swap_ab:
-        chains = min(rows, cfg.tile_n)
+        chains = min(rows, cfg.tile_n) * cfg.tile_m / 128
+        if pair and cfg.tile_m < 128:
+            chains /= 2
     else:
         chains = cfg.tile_n / _EPI_WARPGROUPS
     return chains * nodes * CHAIN_NODE_CYCLES
@@ -269,6 +274,11 @@ def rank_grouped(
     space = dense + swapped
     guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
     nodes = chain_nodes(chain if not isinstance(chain, str) else chain)
+    from .blocks.epilogue import GroupedChain
+
+    pair = (
+        GroupedChain.legacy(chain, "bf16") if isinstance(chain, str) else chain
+    ).pair
 
     def key(i, c):
         canon = dataclasses.replace(c, raster_along="m")
@@ -279,7 +289,7 @@ def rank_grouped(
         # spill over their token tile under the load, the last tile's exposed epilogue chain, the token box's zero-fill
         est = (
             est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes)
+            + exposed_epilogue_cycles(c, rows, nodes, pair)
             + zero_fill_cycles(c, rows, K, fam)
         )
         # three significant digits: records the estimate cannot separate (at the HBM floor every token tile reads the same

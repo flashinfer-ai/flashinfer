@@ -919,8 +919,14 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     )
 
     sw = swapped_knobs()
-    assert [c.tile_n for c in sw] == [8, 16, 32] and all(
-        c.swap_ab and c.tile_m == 128 and c.cluster_shape_mn == (1, 1) for c in sw
+    assert [(c.tile_m, c.tile_n) for c in sw] == [
+        (128, 8),
+        (128, 16),
+        (128, 32),
+        (64, 16),
+        (64, 32),
+    ] and all(
+        c.swap_ab and c.tile_m in (128, 64) and c.cluster_shape_mn == (1, 1) for c in sw
     )
     for H, I, E, k in geoms:
         s1, s1u, s2 = (

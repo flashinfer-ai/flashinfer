@@ -66,36 +66,52 @@ EPILOGUE_WARPS = (
     1,
     2,
     3,
-)  # one warpgroup: the 128 weight rows of the tile, one per thread
+)  # one warpgroup: the weight rows of the tile (one per thread, or the (r, r + 8) pair of the 64-row tile)
 MMA_WARP = 4
 TMA_WARP = 5
 THREADS = 32 * (TMA_WARP + 1)
 WEIGHT_TILE = (
     128  # weight rows per tile (the MMA's M: the 1-CTA instruction's 128 rows)
 )
+WEIGHT_TILES = (
+    WEIGHT_TILE,
+    64,
+)  # the weight tiles: 128 rows, or 64 (the two-row TMEM layout: twice the CTAs of a small weight)
 TOKEN_TILES = TILES_N_NARROW  # the swapped records' token tiles (8, 16, 32)
+# the token tiles a weight tile takes: the 64-row tile from 16 tokens (a 64 x 8 tile holds too little work per CTA)
+TOKEN_TILES_OF_WEIGHT = {
+    WEIGHT_TILE: TILES_N_NARROW,
+    64: tuple(t for t in TILES_N_NARROW if t >= 16),
+}
 
 
-def swap_knobs(token_tile: int = TOKEN_TILES[0], raster: str = "m") -> Knobs:
-    """The bf16 classes' swapped record with ``token_tile`` tokens on the MMA's N side (128 weight rows, 1-CTA, no cluster)."""
-    assert token_tile in TOKEN_TILES, token_tile
+def swap_knobs(
+    token_tile: int = TOKEN_TILES[0], raster: str = "m", weight_tile: int = WEIGHT_TILE
+) -> Knobs:
+    """The bf16 classes' swapped record with ``token_tile`` tokens on the MMA's N side and ``weight_tile`` (128 or 64) weight
+    rows on its M side, 1-CTA, no cluster."""
+    assert token_tile in TOKEN_TILES_OF_WEIGHT[weight_tile], (token_tile, weight_tile)
     return Knobs(
-        (WEIGHT_TILE, token_tile), (1, 1), False, True, raster, 1, swap_ab=True
+        (weight_tile, token_tile), (1, 1), False, True, raster, 1, swap_ab=True
     )
 
 
 def swapped_knobs() -> List[Knobs]:
-    """The swapped record space of the bf16 classes: one record per token tile."""
-    return [swap_knobs(tn) for tn in TOKEN_TILES]
+    """The swapped record space of the bf16 classes: one record per (weight tile, token tile) -- 128 x 8 / 16 / 32 and 64 x 16 / 32."""
+    return [
+        swap_knobs(tn, weight_tile=wt)
+        for wt in WEIGHT_TILES
+        for tn in TOKEN_TILES_OF_WEIGHT[wt]
+    ]
 
 
 def is_swapped_record(knobs: Knobs) -> bool:
-    """A record the swapped body takes: the swapped 1-CTA record at a narrow token tile, no cluster, swizzle 1, no in-cluster
-    split, no in-CTA chunk fold, the TMA store flag of every record."""
+    """A record the swapped body takes: the swapped 1-CTA record at one of the weight tiles and its narrow token tiles, no
+    cluster, swizzle 1, no in-cluster split, no in-CTA chunk fold, the TMA store flag of every record."""
     return (
         knobs.swap_ab
-        and knobs.tile_m == WEIGHT_TILE
-        and knobs.tile_n in TOKEN_TILES
+        and knobs.tile_m in WEIGHT_TILES
+        and knobs.tile_n in TOKEN_TILES_OF_WEIGHT[knobs.tile_m]
         and knobs.cluster_shape_mn == (1, 1)
         and not knobs.use_2cta_instrs
         and knobs.swizzle_size == 1
@@ -122,11 +138,11 @@ class SwappedGroupedGemm:
             chain = GroupedChain.legacy(chain, "bf16")
         assert isinstance(chain, GroupedChain), chain
         assert is_swapped_record(knobs), (
-            "the swapped body takes the narrow swapped records (128 weight rows x 8 / 16 / 32 tokens, 1-CTA)",
+            "the swapped body takes the narrow swapped records (128 or 64 weight rows x the narrow token tiles, 1-CTA)",
             knobs,
         )
         self.knobs, self.chain, self.gather = knobs, chain, gather
-        self.token_tile = knobs.tile_n
+        self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
 
     @cute.jit
     def __call__(
@@ -183,7 +199,7 @@ class SwappedGroupedGemm:
         self.lowering = self.block.lowering()
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         assert (
-            st.cta_tile_shape_mnk[0] == WEIGHT_TILE
+            st.cta_tile_shape_mnk[0] == self.weight_tile
             and st.cta_tile_shape_mnk[1] == self.token_tile
         ), st.cta_tile_shape_mnk
         # the weights as the A operand: (M = N, K, L = E), TMA with the expert as the batch coordinate
@@ -279,7 +295,7 @@ class SwappedGroupedGemm:
         epi_tile: cute.Tile,
     ):
         st = self.st
-        tn = self.token_tile
+        tn, wt = self.token_tile, self.weight_tile
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_w)
@@ -404,7 +420,7 @@ class SwappedGroupedGemm:
         # the scheduler's "cluster rows" are the token tile, its "N tiles" the weight tiles
         if warp_idx == TMA_WARP:
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
             )
             if cutlass.const_expr(self.gather):
                 swap_gather_producer_loop(
@@ -445,7 +461,7 @@ class SwappedGroupedGemm:
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
             )
             mma_loop(
                 self.lowering,
@@ -466,7 +482,7 @@ class SwappedGroupedGemm:
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
             )
             cute.arch.griddepcontrol_wait()  # the output rows were the predecessor chain's reads
             swapped_epilogue_loop(
@@ -760,12 +776,28 @@ def swapped_epilogue_loop(
     frag = tTR_cF[(None, None, None, 0, 0, 0, 0, 0)]
     offs = fragment_offsets(frag.layout)
     nv = len(offs)
-    assert len({m for m, _ in offs}) == 1, (
-        "the 128-row TMEM layout: one weight row per thread"
+    tile_m = st.cta_tile_shape_mnk[0]
+    # the thread's weight rows: one (the 128-row tile: lane = row, the gate row GROUP lanes below) or two (the 64-row tile's
+    # lane split: rows r and r + GROUP of one thread, so the gated pair sits in the thread's own registers)
+    row_offs = sorted({m for m, _ in offs})
+    assert row_offs in ([0], [0, GROUP]), (
+        "the swapped epilogue's TMEM layouts: one weight row per thread, or the (r, r + 8) pair",
+        offs,
+        frag.layout,
     )
+    two_rows = len(row_offs) == 2
+    index = {o: v for v, o in enumerate(offs)}
+    partner = [
+        index.get((m + GROUP, n)) for m, n in offs
+    ]  # the gate register of an up register (two_rows)
+    ups = [
+        v for v in range(nv) if offs[v][0] == 0
+    ]  # the registers that hold an up row (all, with one row)
+    assert not two_rows or all(partner[v] is not None for v in ups), offs
     cols = [
         n - offs[0][1] for _, n in offs
     ]  # the register's token column inside the subtile
+    rows = [m for m, _ in offs]  # the register's weight row inside the thread's pair
     tTR_rAcc = cute.make_rmem_tensor(frag.shape, ACC_DTYPE)
     tTR_cF = cute.group_modes(tTR_cF, 3, cute.rank(tTR_cF))
     acc_state = pipeline.make_pipeline_state(
@@ -784,19 +816,26 @@ def swapped_epilogue_loop(
         for s in cutlass.range_constexpr(subtile_cnt):
             cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
             crd0 = tTR_cF[(None, None, None, s)][(0, 0, 0)]
-            wrow = crd0[0]  # this thread's weight row in the tile
+            wrow = crd0[0]  # this thread's (first) weight row in the tile
             col0 = crd0[1] - Int32(offs[0][1])  # the subtile's first token column
-            n_glob = n_tile * Int32(WEIGHT_TILE) + wrow
-            # the gate accumulators of the up rows: lane + 8 (rows 16q + 8 + r sit 8 lanes below rows 16q + r)
+            n_glob = n_tile * Int32(tile_m) + wrow
+            # the gate accumulators of the up rows: lane + 8 (rows 16q + 8 + r sit 8 lanes below rows 16q + r in the 128-row
+            # layout), or the thread's own second row (the 64-row layout)
             gate = None
             if cutlass.const_expr(pair):
-                gate = [
-                    cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
-                    for v in range(nv)
-                ]
+                if cutlass.const_expr(two_rows):
+                    gate = [
+                        tTR_rAcc[partner[v]] if partner[v] is not None else tTR_rAcc[v]
+                        for v in range(nv)
+                    ]
+                else:
+                    gate = [
+                        cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
+                        for v in range(nv)
+                    ]
                 is_up = (wrow % Int32(2 * GROUP)) < Int32(GROUP)
                 out_col = (
-                    n_tile * Int32(WEIGHT_TILE // 2)
+                    n_tile * Int32(tile_m // 2)
                     + (wrow // Int32(2 * GROUP)) * Int32(GROUP)
                     + wrow % Int32(GROUP)
                 )
@@ -807,6 +846,8 @@ def swapped_epilogue_loop(
             # the chain of a token column is computed only where the column is a live token of the group (a warp-uniform
             # branch: every lane of the warp holds the same column), so a tile with few live tokens pays few chains
             for v in cutlass.range_constexpr(nv):
+                if cutlass.const_expr(pair and rows[v] != 0):
+                    continue  # a gate register (two_rows): folded into its up register's chain
                 j = col0 + Int32(cols[v])
                 if j < rows_left:
                     val = _chain_elem(
@@ -814,8 +855,8 @@ def swapped_epilogue_loop(
                         tTR_rAcc[v],
                         gate[v] if cutlass.const_expr(pair) else None,
                     )
-                    if store_ok:
-                        mOut[(row0 + j, out_col)] = val
+                    if store_ok & (n_glob + Int32(rows[v]) < N):
+                        mOut[(row0 + j, out_col + Int32(rows[v]))] = val
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)
         acc_state.advance()
