@@ -290,23 +290,7 @@ __device__ __forceinline__ void scale_store_partial_chunk(const DType* in_ptr, Q
   }
 }
 
-/*
-The vector path above gives a whole vector one partner half, one sign and one cos/sin load. So it
-needs rope_dim / 2 to be a multiple of vec_size, or a vector crosses from the first half into the
-second (non-interleaved) or past rope_dim (interleaved, where the check is on rope_dim).
-
-Its loads and stores also move 16 bytes at a time and fault unless the address is a multiple of 16,
-so it needs every tensor to start on, and step by, a multiple of 16 bytes.
-
-In place in the non-interleaved layout, a thread reads its partner from lanes that another thread
-stores, so all of a token's threads must share one warp, or a thread can read its partner after the
-partner's warp has stored over it. Threads fill a warp in linear order, which takes a thread count
-per token that divides the warp size, so RopeQuantize rounds its count up to one. Above 32 no count
-works.
-
-The by_lane helpers below need none of this: they load and store one element at a time. A thread
-owns both lanes of its pairs, so it reads nothing another thread stores, and it stops at rope_dim.
-*/
+// Limits of the vector path (rotary size, 16-byte alignment, in-place warp span); by_lane has none.
 inline bool RopeVectorPathIsWrong(bool interleave, uint32_t rope_dim, uint32_t vec_size) {
   return (interleave ? rope_dim : rope_dim / 2) % vec_size != 0;
 }
@@ -1460,17 +1444,25 @@ cudaError_t RopeQuantize(
                     (void*)&k_nope_out_stride_h,
                     (void*)&quant_scale_q,
                     (void*)&quant_scale_kv};
-    const bool by_lane =
-        RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size) ||
-        !RopeVectorsAligned(q_rope_in, q_rope_in_stride_n, q_rope_in_stride_h) ||
-        !RopeVectorsAligned(k_rope_in, k_rope_in_stride, k_rope_in_stride_h) ||
-        !RopeVectorsAligned(q_nope_in, q_nope_in_stride_n, q_nope_in_stride_h) ||
-        !RopeVectorsAligned(k_nope_in, k_nope_in_stride, k_nope_in_stride_h) ||
-        !RopeVectorsAligned(q_rope_out, q_rope_out_stride_n, q_rope_out_stride_h) ||
-        !RopeVectorsAligned(k_rope_out, k_rope_out_stride, k_rope_out_stride_h) ||
-        !RopeVectorsAligned(q_nope_out, q_nope_out_stride_n, q_nope_out_stride_h) ||
-        !RopeVectorsAligned(k_nope_out, k_nope_out_stride, k_nope_out_stride_h) ||
-        !RopeVectorsAligned(cos_sin_cache, 0, 0) || (!INTERLEAVE && in_place && bdx > 32);
+    // Strides of size-1 dims are unused, and with no_rope_dim 0 no block touches the nope tensors.
+    auto q_aligned = [&](const auto* ptr, size_t stride_n, size_t stride_h) {
+      return RopeVectorsAligned(ptr, nnz > 1 ? stride_n : 0, num_qo_heads > 1 ? stride_h : 0);
+    };
+    auto k_aligned = [&](const auto* ptr, size_t stride_n, size_t stride_h) {
+      return RopeVectorsAligned(ptr, nnz > 1 ? stride_n : 0, num_kv_heads > 1 ? stride_h : 0);
+    };
+    const bool nope_aligned =
+        no_rope_dim == 0 || (q_aligned(q_nope_in, q_nope_in_stride_n, q_nope_in_stride_h) &&
+                             k_aligned(k_nope_in, k_nope_in_stride, k_nope_in_stride_h) &&
+                             q_aligned(q_nope_out, q_nope_out_stride_n, q_nope_out_stride_h) &&
+                             k_aligned(k_nope_out, k_nope_out_stride, k_nope_out_stride_h));
+    const bool by_lane = RopeVectorPathIsWrong(INTERLEAVE, rope_dim, vec_size) ||
+                         !q_aligned(q_rope_in, q_rope_in_stride_n, q_rope_in_stride_h) ||
+                         !k_aligned(k_rope_in, k_rope_in_stride, k_rope_in_stride_h) ||
+                         !q_aligned(q_rope_out, q_rope_out_stride_n, q_rope_out_stride_h) ||
+                         !k_aligned(k_rope_out, k_rope_out_stride, k_rope_out_stride_h) ||
+                         !nope_aligned || !RopeVectorsAligned(cos_sin_cache, 0, 0) ||
+                         (!INTERLEAVE && in_place && bdx > 32);
     auto kernel =
         by_lane ? RopeQuantizeKernel<INTERLEAVE, true, vec_size, 1, DType, IdType, QuantType>
                 : RopeQuantizeKernel<INTERLEAVE, false, vec_size, 1, DType, IdType, QuantType>;

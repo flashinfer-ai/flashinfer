@@ -667,6 +667,89 @@ def test_rope_quantize_fp8_any_rope_dim(
             )
 
 
+def _rope_quantize_by_lane_args(call):
+    """The by_lane template argument of each RopeQuantizeKernel that ``call`` launches."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    try:
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            call()
+            torch.cuda.synchronize()
+    except Exception as ex:  # noqa: BLE001 - profiler unavailable on this host
+        pytest.skip(f"torch.profiler unavailable: {ex}")
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    if not names:
+        pytest.skip("torch.profiler captured no device events")
+    # RopeQuantizeKernel<interleave, by_lane, vec_size, bdx, DType, IdType, QuantType>
+    return [
+        name.split("RopeQuantizeKernel<", 1)[1].split(",")[1].strip()
+        for name in names
+        if "RopeQuantizeKernel<" in name
+    ]
+
+
+@pytest.mark.parametrize("num_tokens", [1, 32])
+@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("attention_type", ["mla", "gqa"])
+def test_rope_quantize_fp8_none_nope_takes_vector_path(
+    num_tokens, is_neox_style, attention_type
+):
+    device = "cuda"
+    torch.manual_seed(0)
+    num_qo_heads, rope_dim = 32, 128
+    quant_dtype = torch.float8_e4m3fn
+    rope_ref = RotaryEmbedding(
+        rope_dim, rope_dim, num_tokens, 10000, is_neox_style, torch.float32, device
+    )
+    pos_ids = torch.arange(num_tokens, device=device)
+    q_rope = torch.randn(
+        num_tokens, num_qo_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_shape = (num_tokens, rope_dim)
+    if attention_type == "gqa":
+        k_shape = (num_tokens, 8, rope_dim)
+    k_rope = torch.randn(*k_shape, dtype=torch.bfloat16, device=device)
+    q_ref, k_ref = rope_ref.forward_native(pos_ids, q_rope, k_rope)
+    quant_scale_q, quant_scale_kv = 2.0, 0.5
+    q_ref = (q_ref * quant_scale_q).to(quant_dtype).float()
+    k_ref = (k_ref * quant_scale_kv).to(quant_dtype).float()
+    if num_tokens == 1:
+        # A token stride off 16 bytes, which the kernel never uses with one token.
+        q_rope = q_rope.as_strided(q_rope.shape, (1, rope_dim, 1))
+
+    def run(q):
+        return flashinfer.rope.rope_quantize_fp8(
+            q,
+            k_rope,
+            None,
+            None,
+            rope_ref.cos_sin_cache,
+            pos_ids,
+            is_neox=is_neox_style,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+        )
+
+    q_rope_out, k_rope_out, q_nope_out, k_nope_out = run(q_rope)
+    assert q_nope_out.shape[-1] == 0 and k_nope_out.shape[-1] == 0
+    torch.testing.assert_close(q_rope_out.float(), q_ref, atol=0.5, rtol=0.25)
+    torch.testing.assert_close(k_rope_out.float(), k_ref, atol=0.5, rtol=0.25)
+    # Control: Q one element off 16 bytes takes the element-wise kernel.
+    q_shifted = torch.empty(q_rope.numel() + 1, dtype=q_rope.dtype, device=device)
+    q_shifted = q_shifted[1:].view(q_rope.shape)
+    q_shifted.copy_(q_rope)
+    q_rope_out, k_rope_out, _, _ = run(q_shifted)
+    torch.testing.assert_close(q_rope_out.float(), q_ref, atol=0.5, rtol=0.25)
+    torch.testing.assert_close(k_rope_out.float(), k_ref, atol=0.5, rtol=0.25)
+
+    # None nope tensors become zero-width ones, which no block touches: keep the vector path.
+    assert _rope_quantize_by_lane_args(lambda: run(q_rope)) == ["false"]
+    assert _rope_quantize_by_lane_args(lambda: run(q_shifted)) == ["true"]
+
+
 def _run_rope_variant(kernel, q, k, pos_ids, indptr, offsets, cos_sin_cache, inplace):
     q, k = q.clone(), k.clone()
     head_dim = q.shape[-1]
