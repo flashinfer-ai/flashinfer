@@ -103,7 +103,11 @@ REGS_SOFTMAX_W2 = 160  # per softmax thread with two softmax warpgroups (64 keys
 REGS_CORRECTION_W2 = 160
 STATS_SLOTS = 4  # softmax -> correction payload ring depth (one entry per tile: alpha, m', r_slices)
 STATS_SLOTS_PP = 8  # the same ring under the ping-pong placement: 2 entries per tile x 4 tiles (both warpgroups' tiles in tile order)
-SLOT_KEYS_256 = 64  # keys per ring slot at D = 256 (half tiles: 32 KB slots, four of them in the 128 KB ring)
+SLOT_KEYS_256 = 128  # keys per ring slot at D = 256: whole tiles (two 64 KB slots in the 128 KB ring). Half-tile slots (four of 32 KB)
+# let the producer run further ahead, but made QK^T two 128 x 64 x 16 instructions per K-step instead of one 128 x 128 x 16: the
+# MMA warp issues one tcgen05.mma per fixed interval whatever its N, so the tile's 48 instructions cost more issue time than
+# its tensor work; with whole slots the K / V loads of a tile still overlap the previous tile's MMAs (each slot's load is
+# issued when its predecessor's MMAs complete, a tile ahead of its use)
 Q_STAGES = 2  # Q tiles in smem: the load warp prefetches the next unit's Q while the MMA finishes this one
 REGS_SOFTMAX, REGS_OTHER = 192, 32
 
@@ -218,9 +222,8 @@ class StaticPlan:
         )  # keys per thread (replicated rows): warp wq of warpgroup k holds slice 4k + wq
         self.slices_rep = 4 * self.n_slices
         self.stats_slots = STATS_SLOTS_PP if q2 else STATS_SLOTS
-        # ring slots: a whole KV tile (T keys) at D <= 128; HALF tiles (64 keys, 32 KB) at D = 256, so that the 128 KB ring holds
-        # four slots instead of two and the producer runs further ahead (a placement: QK^T is then two N = 64 MMAs per tile and the
-        # PV releases its V slot per 4-step half; the per-element folds are unchanged)
+        # ring slots: a whole KV tile (T keys) at every D (SLOT_KEYS_256: the half-tile slots of D = 256 were a placement that cost more
+        # MMA issue than they saved in load latency); the code keeps the general slots_per_tile form
         self.slot_keys = SLOT_KEYS_256 if D == 256 else self.T
         self.slots_per_tile = self.T // self.slot_keys
         self.n_slots = (

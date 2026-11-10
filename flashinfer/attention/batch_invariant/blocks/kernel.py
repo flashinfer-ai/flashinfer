@@ -455,7 +455,7 @@ class AttentionKernel:
             tStS, tOtOc, tOtOm, tOrP = tmem_views(
                 st, qk_thr_mma, pv_thr_mma, p_tmem_layout, tmem_ptr
             )
-            # the S accumulator per ring slot of K: the whole S (one slot per tile) or its two 64-column halves (half-tile slots); stage 0
+            # the S accumulator per ring slot of K: the whole S (one slot per tile; two 64-column halves with half-tile slots); stage 0
             # (a tile's stage adds stage * tmem_s_stride columns: mma.py)
             ss_shape = qks_thr_mma.partition_shape_C((Q_ROWS, st.slot_keys))
             ss_layout = qks_thr_mma.make_fragment_C(ss_shape).layout
