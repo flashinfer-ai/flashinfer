@@ -41,7 +41,7 @@ from flashinfer.experimental.cake.cake_dsa_indexer_det_train.cake_backend import
     generated_program_available,
 )
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
 
 
 def _device_supported() -> bool:

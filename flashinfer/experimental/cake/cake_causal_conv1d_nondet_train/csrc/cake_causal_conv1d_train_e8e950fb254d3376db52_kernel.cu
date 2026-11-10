@@ -227,14 +227,13 @@ kernel_cake_causal_conv1d_train_e8e950fb254d3376db52(__nv_bfloat16* __restrict__
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* red = reinterpret_cast<float*>(smem_raw + 1024);
     const int red_addr = smem + 1024;
     uint8_t* stage_buf = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int stage_buf_addr = smem + 1024;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (8 barriers at smem_raw[0..64))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -335,7 +334,7 @@ kernel_cake_causal_conv1d_train_e8e950fb254d3376db52(__nv_bfloat16* __restrict__
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64 + (long long)j) * 4ll);
                     wr[j * 4 + 0] = _v4.x;
                     wr[j * 4 + 1] = _v4.y;
                     wr[j * 4 + 2] = _v4.z;
@@ -878,7 +877,7 @@ kernel_cake_causal_conv1d_train_e8e950fb254d3376db52(__nv_bfloat16* __restrict__
             #pragma unroll
             for (int j_2 = 0; j_2 < 8; j_2++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_1 + (long long)j_2) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_1 + (long long)j_2) * 4ll);
                     wr_1[j_2 * 4 + 0] = _v4.x;
                     wr_1[j_2 * 4 + 1] = _v4.y;
                     wr_1[j_2 * 4 + 2] = _v4.z;
@@ -1382,7 +1381,7 @@ kernel_cake_causal_conv1d_train_e8e950fb254d3376db52(__nv_bfloat16* __restrict__
             #pragma unroll
             for (int j_4 = 0; j_4 < 8; j_4++) {
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_2 + (long long)j_4) * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(w + (c64_2 + (long long)j_4) * 4ll);
                     wr_2[j_4 * 4 + 0] = _v4.x;
                     wr_2[j_4 * 4 + 1] = _v4.y;
                     wr_2[j_4 * 4 + 2] = _v4.z;
@@ -1879,7 +1878,7 @@ kernel_cake_causal_conv1d_train_e8e950fb254d3376db52(__nv_bfloat16* __restrict__
             if (c < C) {
                 long long c64_3 = (long long)c;
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + c64_3 * 4);
+                    float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + c64_3 * 4ll);
                     a4[0 + 0] = _v4.x;
                     a4[0 + 1] = _v4.y;
                     a4[0 + 2] = _v4.z;
@@ -1887,11 +1886,11 @@ kernel_cake_causal_conv1d_train_e8e950fb254d3376db52(__nv_bfloat16* __restrict__
                 }
                 {
                     float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw_acc + c64_3 * 4) = _v4;
+                    *reinterpret_cast<float4*>(dw_acc + c64_3 * 4ll) = _v4;
                 }
                 {
                     float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw + c64_3 * 4) = _v4;
+                    *reinterpret_cast<float4*>(dw + c64_3 * 4ll) = _v4;
                 }
             }
         }

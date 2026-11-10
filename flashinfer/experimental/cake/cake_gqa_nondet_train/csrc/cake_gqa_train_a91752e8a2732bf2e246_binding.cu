@@ -22,7 +22,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_bfloat16* __restrict__ dO, float* __restrict__ LSE, int* __restrict__ cu_seqlens_q, float* __restrict__ LSE_log2, float* __restrict__ dPsum, float* __restrict__ dQ_accum, int T_q, int H_q, int num_segments, int rows_pad);
+extern "C" __global__ void kernel_cake_gqa_train_a91752e8a2732bf2e246(__nv_bfloat16* __restrict__ O, __nv_bfloat16* __restrict__ dO, float* __restrict__ LSE, int* __restrict__ cu_seqlens_q, float* __restrict__ LSE_log2, float* __restrict__ dPsum, int T_q, int H_q, int num_segments, int rows_pad);
 
 namespace cake_binding_kernel_cake_gqa_train_a91752e8a2732bf2e246 {
 
@@ -37,7 +37,7 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
-void Run(TensorView a_O, TensorView a_dO, TensorView a_LSE, TensorView a_cu_seqlens_q, TensorView a_LSE_log2, TensorView a_dPsum, TensorView a_dQ_accum, int64_t a_T_q, int64_t a_H_q, int64_t a_num_segments, int64_t a_rows_pad, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_O, TensorView a_dO, TensorView a_LSE, TensorView a_cu_seqlens_q, TensorView a_LSE_log2, TensorView a_dPsum, int64_t a_T_q, int64_t a_H_q, int64_t a_num_segments, int64_t a_rows_pad, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_O.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_O, "O");
@@ -52,8 +52,6 @@ void Run(TensorView a_O, TensorView a_dO, TensorView a_LSE, TensorView a_cu_seql
   check_dtype(a_LSE_log2, DLDataType{kDLFloat, 32, 1}, "LSE_log2");
   check_cuda_tensor(a_dPsum, "dPsum");
   check_dtype(a_dPsum, DLDataType{kDLFloat, 32, 1}, "dPsum");
-  check_cuda_tensor(a_dQ_accum, "dQ_accum");
-  check_dtype(a_dQ_accum, DLDataType{kDLFloat, 32, 1}, "dQ_accum");
   TVM_FFI_CHECK(a_T_q >= -2147483648LL && a_T_q <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'T_q' = " << a_T_q
       << " is outside the i32 range [-2147483648, 2147483647]";
@@ -77,8 +75,6 @@ void Run(TensorView a_O, TensorView a_dO, TensorView a_LSE, TensorView a_cu_seql
   check_same_device(a_LSE_log2, a_O, "LSE_log2", "O");
   check_contiguous(a_dPsum, "dPsum");
   check_same_device(a_dPsum, a_O, "dPsum", "O");
-  check_contiguous(a_dQ_accum, "dQ_accum");
-  check_same_device(a_dQ_accum, a_O, "dQ_accum", "O");
   TVM_FFI_CHECK((a_T_q >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (T_q >= 1)";
   TVM_FFI_CHECK((a_H_q >= 2LL), ValueError)
@@ -98,12 +94,11 @@ void Run(TensorView a_O, TensorView a_dO, TensorView a_LSE, TensorView a_cu_seql
   void* v_cu_seqlens_q = DataPtr(a_cu_seqlens_q);
   void* v_LSE_log2 = DataPtr(a_LSE_log2);
   void* v_dPsum = DataPtr(a_dPsum);
-  void* v_dQ_accum = DataPtr(a_dQ_accum);
   int32_t v_T_q = static_cast<int32_t>(a_T_q);
   int32_t v_H_q = static_cast<int32_t>(a_H_q);
   int32_t v_num_segments = static_cast<int32_t>(a_num_segments);
   int32_t v_rows_pad = static_cast<int32_t>(a_rows_pad);
-  void* kernel_args[] = {&v_O, &v_dO, &v_LSE, &v_cu_seqlens_q, &v_LSE_log2, &v_dPsum, &v_dQ_accum, &v_T_q, &v_H_q, &v_num_segments, &v_rows_pad};
+  void* kernel_args[] = {&v_O, &v_dO, &v_LSE, &v_cu_seqlens_q, &v_LSE_log2, &v_dPsum, &v_T_q, &v_H_q, &v_num_segments, &v_rows_pad};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(256, 1, 1);

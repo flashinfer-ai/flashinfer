@@ -325,7 +325,9 @@ def _collect_metadata() -> dict[str, str]:
 
         * ``flashinfer_version``  -- our own bucketing / ordering changes
         * ``cuda_version``        -- CUDA driver/runtime ABI
-        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN
+        * ``cublas_version``      -- cuBLAS plan availability inside cuDNN,
+                                     and the cuBLASLt algorithm descriptors
+                                     the cuBLAS runners use as tactics
         * ``cudnn_version``       -- cuDNN **backend** version
         * ``cudnn_frontend_version`` -- cuDNN-frontend Python wrapper
                                         version (independent of backend);
@@ -978,7 +980,7 @@ def autotune(
             ``autotune(skip_ops={"B"})`` inside an outer
             ``autotune(skip_ops={"A"})`` skips both ``"A"`` and ``"B"``.
             Common op names: ``"fp4_gemm"``, ``"bf16_gemm"``,
-            ``"bf16_gemm_pdl_auto"``, ``"fp8_gemm"``, ``"mxfp8_gemm"``.
+            ``"bf16_gemm_pdl"``, ``"fp8_gemm"``, ``"mxfp8_gemm"``.
         cuda_graph_profile_replays: Number of CUDA graph samples per profiling
             repeat. Operations configured for hot L2 use back-to-back replays;
             operations configured with ``use_cold_l2_cache=True`` flush L2

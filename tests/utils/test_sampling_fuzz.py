@@ -22,7 +22,7 @@ from typing import List, Optional, Sequence, Tuple
 import pytest
 import torch
 
-from tests.test_helpers.fuzz_ledger import Finding, FuzzLedger
+from tests.infra.test_helpers.fuzz_ledger import Finding, FuzzLedger
 
 _DEFAULT_NUM_CASES = 240
 NUM_CASES = int(

@@ -18,7 +18,6 @@ limitations under the License.
 # program; do not edit by hand.  ``LAUNCH[stage](run, values, grid)`` calls the
 # binding entry ``run`` with ``values[<kernel argument>]`` in positional order;
 # ``GRID[stage](num_queries, num_kv, topk)`` is the launch grid.
-# Hand fold until the next export: identical launcher / grid copies alias one function.
 
 from __future__ import annotations
 

@@ -8,12 +8,19 @@ from typing import Sequence, Union
 from .algo_knobs import AlgoKnob
 from .config import BootstrapConfig, FleetParams
 from .core.kernel.registry import is_mega_kernel_config, is_split_kernel_config
-from .modes.config import MegaConfig, SplitConfig
+from .modes.config import AutoConfig, MegaConfig, SplitConfig
+from .modes.auto_layer import MoEEpAutoLayer
 from .modes.mega_layer import MoEEpMegaLayer, MoEEpMegaWorkspace
 from .modes.split_layer import MoEEpSplitLayer
 from .weights import MoEWeightPack
 
-__all__ = ["MoEEpLayer", "MoEEpMegaLayer", "MoEEpMegaWorkspace", "MoEEpSplitLayer"]
+__all__ = [
+    "MoEEpLayer",
+    "MoEEpMegaLayer",
+    "MoEEpMegaWorkspace",
+    "MoEEpSplitLayer",
+    "MoEEpAutoLayer",
+]
 
 
 def MoEEpLayer(
@@ -21,12 +28,13 @@ def MoEEpLayer(
     fleet_params: FleetParams,
     weights: MoEWeightPack,
     fleet_knobs: Sequence[AlgoKnob] = (),
-    backend: Union[str, SplitConfig, MegaConfig, object] = "nccl_ep",
-) -> Union[MoEEpSplitLayer, MoEEpMegaLayer]:
+    backend: Union[str, SplitConfig, MegaConfig, AutoConfig, object] = "nccl_ep",
+) -> Union[MoEEpSplitLayer, MoEEpMegaLayer, MoEEpAutoLayer]:
     """Construct the appropriate EP layer for ``backend``.
 
     - ``SplitConfig`` or a comm string/config → :class:`MoEEpSplitLayer`
     - ``MegaConfig`` → :class:`MoEEpMegaLayer`
+    - ``AutoConfig`` → :class:`MoEEpAutoLayer`
 
     ``weights`` is the canonical :class:`~flashinfer.moe_ep.weights.MoEWeightPack`
     holding this rank's expert weights; it is validated and (depending on the
@@ -34,6 +42,9 @@ def MoEEpLayer(
     afterwards — the kernel's transformed/retained tensors own the memory, so
     callers can drop their reference to reclaim the source copy.
     """
+    if isinstance(backend, AutoConfig):
+        return MoEEpAutoLayer(bootstrap, fleet_params, weights, backend, fleet_knobs)
+
     if isinstance(backend, MegaConfig):
         if fleet_knobs:
             warnings.warn(

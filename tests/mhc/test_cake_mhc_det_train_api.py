@@ -16,25 +16,31 @@ limitations under the License.
 Tests of the flashinfer public surface of the Cake four-stream mHC training
 kernels (SM100 / SM103 / SM107): the ``flashinfer.cake_mhc_det_train`` facade and
 its re-exports from the ``flashinfer`` top-level package.  The facade's entry
-points are pass-throughs to ``flashinfer.cake_mhc_det_train_backend``; this module
-checks that identity (same objects at the top level, same bits as the backend,
-documented keyword arguments, the ``hidden`` keyword of the workspace helpers)
-at each hidden size (4096, 5120, 7168) the device exports, and leaves the
-numerical contract to ``test_cake_mhc_det_train.py``, which imports only the
-backend package.
+points are pass-throughs to the backend package
+``flashinfer.experimental.cake.cake_mhc_det_train``, imported on first use; this
+module checks that wiring (same objects at the top level, the backend's own
+objects for the lazily resolved names, same signatures and bits as the backend,
+documented keyword arguments, the ``hidden`` keyword of the workspace helpers,
+no backend import before first use) at each hidden size (4096, 5120, 7168) the
+device exports, and leaves the numerical contract to
+``test_cake_mhc_det_train.py``, which imports only the backend package.
 """
 
 from __future__ import annotations
 
 import inspect
+import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 import torch
 
 import flashinfer
-import flashinfer.cake_mhc_det_train_backend as backend
+import flashinfer.experimental.cake.cake_mhc_det_train as backend
 from flashinfer import cake_mhc_det_train as facade
-from flashinfer.cake_mhc_det_train_backend import cake_jit as loader
+from flashinfer.experimental.cake.cake_mhc_det_train import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
@@ -48,12 +54,24 @@ ENTRY_POINTS = (
     "cake_mhc_det_train_prepare",
     "cake_mhc_det_train_finish",
 )
-HELPERS = (
+# The facade's own ``def``s re-exported at the top level besides the entry points.
+TOP_LEVEL_HELPERS = (
     "cake_mhc_det_train_forward_workspace_bytes",
     "cake_mhc_det_train_backward_workspace_bytes",
-    "CakeMHCDetTrainPrepareFunction",
-    "CakeMHCDetTrainFinishFunction",
 )
+# The backend objects the facade resolves on first access (the backend's own objects).
+LAZY = (
+    "ARCHES",
+    "SUPPORTED_COMPUTE_CAPABILITIES",
+    "CakeMHCDetPrepareFunction",
+    "CakeMHCDetFinishFunction",
+    "cake_mhc_det_train_forward_workspace",
+    "cake_mhc_det_train_backward_workspace",
+    "cake_mhc_det_train_reset_workspace",
+    "cake_mhc_det_train_route_key",
+    "is_cake_mhc_det_train_supported",
+)
+BACKEND = "flashinfer.experimental.cake.cake_mhc_det_train"
 WORKSPACE_HELPERS = (
     "cake_mhc_det_train_forward_workspace",
     "cake_mhc_det_train_backward_workspace",
@@ -77,11 +95,55 @@ def _supported() -> bool:
 
 
 def test_top_level_exports_are_the_facade_objects() -> None:
-    for name in ENTRY_POINTS + HELPERS:
+    """The top level re-exports the facade's ``def``s; the facade's lazily resolved names are the backend's objects,
+    and its own ``def``s are not (they forward to them)."""
+    assert backend.__name__ == BACKEND
+    for name in ENTRY_POINTS + TOP_LEVEL_HELPERS:
         assert getattr(flashinfer, name) is getattr(facade, name), name
-    for name in HELPERS:
+        assert getattr(facade, name) is not getattr(backend, name), name
+    for name in LAZY:
+        assert name in facade.__all__ and name in dir(facade), name
         assert getattr(facade, name) is getattr(backend, name), name
     assert facade.SUPPORTED_COMPUTE_CAPABILITIES == SUPPORTED_CAPABILITIES
+    # The autograd classes are top-level names bound on first access (``flashinfer._LAZY_EXPORTS``).
+    for name in ("CakeMHCDetPrepareFunction", "CakeMHCDetFinishFunction"):
+        assert flashinfer._LAZY_EXPORTS[name] == (".cake_mhc_det_train", name), name
+        assert getattr(flashinfer, name) is getattr(backend, name), name
+
+
+_LAZY_CHILD = r"""
+import json, sys
+
+backend = sys.argv[1]
+
+import flashinfer
+
+out = {"flashinfer": backend in sys.modules}
+import flashinfer.cake_mhc_det_train as facade
+
+facade.cake_mhc_det_train_forward_prepare
+facade.cake_mhc_det_train_forward_workspace_bytes
+out["entry_point"] = backend in sys.modules
+facade.ARCHES
+out["lazy_attribute"] = backend in sys.modules
+print(json.dumps(out))
+"""
+
+
+def test_the_backend_is_imported_on_first_use() -> None:
+    """In a fresh interpreter, ``import flashinfer`` and reading the facade's entry points import no backend; the
+    first lazily resolved attribute (``ARCHES``) imports it.  The facade's ``hidden`` default is the backend's."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _LAZY_CHILD, BACKEND],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out == {"flashinfer": False, "entry_point": False, "lazy_attribute": True}
+    assert facade._HIDDEN == loader.HIDDEN == 4096
 
 
 def test_entry_points_document_every_keyword() -> None:
@@ -110,11 +172,17 @@ def test_entry_points_document_every_keyword() -> None:
 
 def test_workspace_helpers_take_the_hidden_size() -> None:
     """The four workspace helpers size for one hidden size: a keyword-only ``hidden`` defaulting to 4096, named in
-    the docstring; the facade re-exports the backend's objects."""
+    the docstring; the facade re-exports the backend's allocating helpers and defines the ``*_bytes`` helpers with
+    the backend's signature (their results are compared on the device below)."""
     assert HIDDEN_SIZES == (4096, 5120, 7168)
     for name in WORKSPACE_HELPERS:
         function = getattr(facade, name)
-        assert function is getattr(backend, name), name
+        if name.endswith("_bytes"):
+            assert inspect.signature(function) == inspect.signature(
+                getattr(backend, name)
+            ), name
+        else:
+            assert function is getattr(backend, name), name
         parameter = inspect.signature(function).parameters.get("hidden")
         assert parameter is not None, name
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, name

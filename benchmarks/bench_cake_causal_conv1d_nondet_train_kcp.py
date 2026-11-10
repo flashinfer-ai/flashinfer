@@ -15,8 +15,9 @@ limitations under the License.
 
 Benchmark of the context-parallel (KCP) Cake packed width-4 depthwise causal convolution + SiLU training step in its
 two numerical modes: the deterministic KCP package (``flashinfer.cake_causal_conv1d_det_train_kcp``:
-``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_multi_kcp``; a cooperative backward launch whose grid
-reduces the ``dweight`` partial in a fixed order) against the non-deterministic KCP package
+``cake_causal_conv1d_det_kcp`` / ``cake_causal_conv1d_det_kcp_multi`` in the package's default backward launch form,
+``COOPERATIVE_DEFAULT`` of its ``kcp`` module, recorded in the JSON as ``det_cooperative_default``; either form reduces
+the ``dweight`` partial in a fixed order) against the non-deterministic KCP package
 (``flashinfer.cake_causal_conv1d_nondet_train_kcp``: ``cake_causal_conv1d_nondet_kcp`` /
 ``cake_causal_conv1d_nondet_kcp_multi``; one ordinary backward launch with unordered ``dweight`` accumulators), each
 called by its own entry-point names; the multi entry runs ``--tensors`` convolutions of one layer (one halo exchange
@@ -26,7 +27,7 @@ group (W = 1).
 
 Rows: the single-rank benchmark's performance matrix (``C = 512`` over eight packed token counts and ``S = 250340``
 over the channel counts), each the same four-document pack (0.37 / 0.29 / 0.21 / rest of ``S``, nudged off a multiple
-of 64), token-sharded over the W ranks by ``flashinfer.cake_kda_det_train_kcp.partition_det_kcp`` (``--layout``;
+of 64), token-sharded over the W ranks by ``flashinfer.cake_kda_det_train_kcp.cake_kda_det_train_kcp_partition`` (``--layout``;
 ``contiguous``: equal token shares in order, documents cut at the shard boundaries, whose first tokens read their
 history rows through the halo exchange).  ``S`` is the whole pack; a rank holds about ``S / W`` tokens.  Every rank draws the whole pack
 from the same seed and keeps its fragments.
@@ -128,8 +129,8 @@ from bench_cake_causal_conv1d_nondet_train import (  # noqa: E402
     perf_rows,
 )
 from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
-    build_context_det_kcp,
-    partition_det_kcp,
+    cake_kda_det_train_kcp_build_context,
+    cake_kda_det_train_kcp_partition,
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
@@ -142,7 +143,7 @@ MODES: dict[str, dict[str, Callable]] = {
     "det": {
         "supported": det_conv.is_cake_causal_conv1d_det_train_supported,
         "single": det_kcp_api.cake_causal_conv1d_det_kcp,
-        "multi": det_kcp_api.cake_causal_conv1d_det_multi_kcp,
+        "multi": det_kcp_api.cake_causal_conv1d_det_kcp_multi,
     },
     "nondet": {
         "supported": nondet_conv.is_cake_causal_conv1d_nondet_train_supported,
@@ -389,8 +390,8 @@ class Problem:
         for n in self.lens:
             cu.append(cu[-1] + n)
         self.cu = cu
-        self.part = partition_det_kcp(cu, world, layout)
-        self.ctx = build_context_det_kcp(
+        self.part = cake_kda_det_train_kcp_partition(cu, world, layout)
+        self.ctx = cake_kda_det_train_kcp_build_context(
             self.part, dist.group.WORLD, rank, device, conv_kernel_size=WIDTH
         )
         fragments = [f for f in self.part.fragments[rank] if f.length > 0]
@@ -815,7 +816,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         type=int,
         default=1,
         help="convolutions per layer: 1 runs cake_causal_conv1d_det_kcp / cake_causal_conv1d_nondet_kcp, more run "
-        "cake_causal_conv1d_det_multi_kcp / cake_causal_conv1d_nondet_kcp_multi",
+        "cake_causal_conv1d_det_kcp_multi / cake_causal_conv1d_nondet_kcp_multi",
     )
     parser.add_argument(
         "--layout",
@@ -891,6 +892,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "layout": args.layout,
                     "tensors": args.tensors,
                     "sota_arms": args.sota_arms,
+                    "det_cooperative_default": getattr(
+                        importlib.import_module(
+                            "flashinfer.experimental.cake.cake_causal_conv1d_det_train.kcp"
+                        ),
+                        "COOPERATIVE_DEFAULT",
+                        None,
+                    ),
                     "gpu_timer": "cuda_event",
                     "complete": complete,
                     "rows": results,
