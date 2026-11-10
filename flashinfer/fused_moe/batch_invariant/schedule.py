@@ -293,7 +293,8 @@ def estimate_overrides(cfg: Knobs, rows: int, in_fmt: str, family: str) -> dict:
     if not cfg.swap_ab and size > 1 and live < cta_rows:
         mma_eff = 1.0 if cta_rows >= 128 else p["rows64_eff"]
         step = max(mma_raw / mma_eff, bytes_cycles) + CONSTANTS["step_floor"]
-        p["step_floor"] = CONSTANTS["step_floor"] + CLUSTER_STEP * (size - 1) * step
+        dead = (cta_rows - live) / cta_rows
+        p["step_floor"] = CONSTANTS["step_floor"] + CLUSTER_STEP * (size - 1) * step * dead
     return p
 
 
