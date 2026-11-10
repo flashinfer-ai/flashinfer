@@ -5702,7 +5702,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``cutlass``
-            or ``cute-dsl``/``cute-dsl-rubin``/``cute-dsl-prims``/``cutile``/``fmha_v2``.
+            or ``cute-dsl``/``cute-dsl-rubin``/``cute-dsl-prims``/``cutile``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability: ``fa3`` on Hopper where it applies,
