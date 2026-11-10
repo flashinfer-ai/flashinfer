@@ -72,7 +72,7 @@ def pack_mxfp8_moe_sfa(a_sf, offsets):
         if s < en:
             po = compute_padded_offset(s, e)
             out[:, po : po + (en - s)] = mn_major[:, s:en]
-    return out
+    return out.view(torch.uint8)
 
 
 def _e2m1_code(x):
@@ -469,7 +469,7 @@ def _gather_inputs(bm, k, counts=None, *, n=128, activation=None, seed=19, token
         token_q,
         pack_ue8m0_to_int32(token_sf).t().contiguous(),
         routed_q,
-        pack_mxfp8_moe_sfa(routed_sf, indptr),
+        pack_mxfp8_moe_sfa(routed_sf, indptr).view(torch.int32),
         bq,
         bsf,
         indptr,
