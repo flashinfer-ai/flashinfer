@@ -39,8 +39,11 @@ convention-compat fix) makes two previously-divergent APIs share a convention, m
 same conformance group and the test will *enforce* they now agree -- and the ledger entry's removal
 becomes the proof the convention was unified.
 
-STATUS: framework + 7 grounded adapters (bf16 mm+bmm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm /
-mxfp8 mm+bmm) + a standalone quantize-root fuzzer. This file REPLACES the earlier per-op
+STATUS: framework + 9 grounded adapters (bf16 mm+bmm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm /
+mxfp8 mm+bmm, plus the two unified-GEMM-API adapters ``unified_nvfp4`` / ``unified_fp8``: ``GemmLayer``
+driven with the SAME quantized operands as ``mm_nvfp4`` / ``bmm_fp8``, declared in their conformance
+groups, so "unified == legacy" is ENFORCED by the auditor) + a standalone quantize-root fuzzer. This
+file REPLACES the earlier per-op
 ``test_mm_fp4_fuzz.py`` / ``test_bmm_fp8_fuzz.py`` (their logic + the #2440 quantize test are folded
 in here). Validated on A100/SM80, L40S/SM89, H100/SM90, B200/SM100. The mxfp8 adapters surfaced two
 real cuDNN findings (a ``_KNOWN_FAILURES`` ledger entry + the ``min_dim`` note record them). EXTEND
@@ -90,6 +93,21 @@ from flashinfer import (
     nvfp4_quantize,
 )
 from flashinfer.autotuner import AutoTuner
+from flashinfer.gemm import (
+    BackendUnsupported,
+    CublasGemmConfig,
+    CudnnGemmConfig,
+    CuteDslGemmConfig,
+    CutlassGemmConfig,
+    GemmActivationPack,
+    GemmConfig,
+    GemmLayer,
+    GemmProblem,
+    GemmWeightPack,
+    TrtllmGemmConfig,
+    supported_backends,
+)
+from flashinfer.gemm.api import BackendOptions, QuantConfig, QuantFormat
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float, mxfp4_dequantize
 from flashinfer.utils import LibraryError, get_compute_capability
 
@@ -294,6 +312,133 @@ def _run_mxfp8_bmm(a, b, out, backend, cfg):
     bmm_mxfp8(a_q, b_q.transpose(-2, -1), a_s, b_s, out.dtype, out, backend=backend)
 
 
+# --- unified GEMM API (GemmLayer) adapters --------------------------------------------------------
+# The SAME quantized operands as the legacy adapter each one mirrors (byte-identical prep: same
+# gsf / nvfp4_quantize call / to_float8 call / transposed VIEW), handed to GemmLayer through a
+# GemmActivationPack + a hand-built GemmWeightPack view instead of through mm_fp4 / bmm_fp8 args.
+# NOT prepare_weight_pack / prepare_activations: those re-quantize from bf16 with their own amax
+# clamp, and one ulp of drift there would make the conformance cross-check measure the quantizer,
+# not the call surface. One candidate per legacy backend string (BackendOptions((cfg,))) keeps the
+# fuzzer's backend axis 1:1 with the legacy adapters; "auto" (what test_autotune_cache_dynshape
+# passes every adapter) maps to every candidate in the legacy order (GemmLayer's deterministic
+# `auto` = first admitted; measured under autotune(True)).
+_UNIFIED_BACKENDS = {
+    "cutlass": CutlassGemmConfig(),
+    "cudnn": CudnnGemmConfig(),
+    "trtllm": TrtllmGemmConfig(),
+    "cute-dsl": CuteDslGemmConfig(),
+    "cublas": CublasGemmConfig(),
+}
+_UNIFIED_NVFP4_BACKENDS = ("cutlass", "cudnn", "trtllm", "cute-dsl")
+_UNIFIED_FP8_BACKENDS = ("cublas", "cudnn") + (
+    ("cutlass",) if _CC[0] in (10, 11, 12) else ()
+)
+_UNIFIED_OUT = {torch.bfloat16: QuantFormat.BF16, torch.float16: QuantFormat.FP16}
+
+
+def _unified_layer(pair_backends, backend, quant_fmt, out_dtype, m, n, k):
+    """A GemmLayer for ONE legacy backend string (or every candidate for "auto"), plus the backend
+    keys supported_backends() reports usable for this (arch, out_dtype, n, k). A backend reported
+    NOT ok is a clean skip (the reason is re-raised under the _SKIP_KW contract), never a failure:
+    it is the unified spelling of the legacy "not supported on this arch/dtype" rejection."""
+    keys = tuple(pair_backends) if backend == "auto" else (backend,)
+    cfg = GemmConfig(
+        quant=QuantConfig(
+            weight=quant_fmt, activation=quant_fmt, output=_UNIFIED_OUT[out_dtype]
+        ),
+        backend=BackendOptions(tuple(_UNIFIED_BACKENDS[key] for key in keys)),
+    )
+    reports = supported_backends(cfg, GemmProblem(n=n, k=k, m=m))
+    usable = tuple(r.backend_key for r in reports if r.ok)
+    if not usable:
+        why = "; ".join(f"{r.backend_key}: {r.reason}" for r in reports)
+        raise BackendUnsupported(f"unsupported on SM{_SM} (unified GEMM API): {why}")
+    return GemmLayer(cfg), usable
+
+
+def _unified_call(layer, act, pack, out):
+    try:
+        layer(act, pack, out=out)
+    except BackendUnsupported as e:
+        # The legacy requirement check (the very function mm_fp4 / bmm_fp8 run) declined this
+        # problem on the real tensors -> the same clean skip the legacy adapter gets.
+        raise BackendUnsupported(f"unsupported (unified GEMM API declined): {e}") from e
+
+
+def _run_unified_nvfp4_mm(a, b, out, backend, cfg):
+    # Operand prep == _run_nvfp4_mm line for line; alpha = 1/(gsf_a*gsf_b) is formed by the runner
+    # from (a_global_scale, b_global_scale) -- the same arithmetic, so the inner fp4_gemm runner
+    # sees the identical input list.
+    gsf_a = (448 * 6) / a.float().abs().nan_to_num().max().clamp_min(1e-30)
+    gsf_b = (448 * 6) / b.float().abs().nan_to_num().max().clamp_min(1e-30)
+    a_q, a_sf = nvfp4_quantize(
+        a, gsf_a, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    m, k = a.shape
+    n = b.shape[0]
+    layer, keys = _unified_layer(
+        _UNIFIED_NVFP4_BACKENDS, backend, QuantFormat.NVFP4, out.dtype, m, n, k
+    )
+    pack = GemmWeightPack((n, k))
+    views = {}
+    for key in keys:
+        # trtllm swaps A/B in-kernel and reads the SHUFFLED weight layout (test_mm_fp4.py's
+        # do_shuffle_b): same gsf_b, same values, different storage order -> its own recipe.
+        recipe = "nvfp4_128x4_shuffled" if key == "trtllm" else "nvfp4_128x4"
+        if recipe not in views:
+            b_q, b_sf = nvfp4_quantize(
+                b,
+                gsf_b,
+                sfLayout=SfLayout.layout_128x4,
+                do_shuffle=recipe.endswith("_shuffled"),
+            )
+            views[recipe] = dict(
+                recipe=recipe,
+                logical_shape=(n, k),
+                b=b_q,
+                b_descale=b_sf,
+                b_global_scale=gsf_b,
+                b_t=b_q.T,  # the (K/2, N) column-major view mm_fp4 takes as `b`
+                b_descale_t=b_sf.T,
+                alpha=None,  # formed per call from the two global scales
+            )
+        pack.prepare_for(key, views[recipe])
+    act = GemmActivationPack(a=a_q, a_scale=a_sf, a_global_scale=gsf_a)
+    _unified_call(layer, act, pack, out)
+
+
+def _run_unified_fp8(a, b, out, backend, cfg):
+    # Operand prep == _run_fp8_bmm: ONE per-tensor scale over the whole [B,.,.] tensor, B quantized
+    # as the column-major [B,K,N] transpose VIEW (never .contiguous()). The unified MVP is dense
+    # only, so each batch index runs as one dense GemmLayer call on SLICES of those same tensors:
+    # b_fp8[i].t() is the [N,K] row-major view and its `b3` = b_fp8[i].unsqueeze(0) is byte-for-
+    # byte what bmm_fp8 reads at that batch index. (A plain b>1 skip would leave the conformance
+    # auditor -- which probes at b=2 -- with nothing to compare against bmm_fp8.)
+    idt = cfg.fp8_idt or torch.float8_e4m3fn
+    mdt = cfg.fp8_mdt or torch.float8_e4m3fn
+    a_fp8, a_s = to_float8(a, dtype=idt)
+    b_fp8, b_s = to_float8(b.transpose(-2, -1), dtype=mdt)
+    nb, m, k = a_fp8.shape
+    n = b_fp8.shape[-1]
+    layer, keys = _unified_layer(
+        _UNIFIED_FP8_BACKENDS, backend, QuantFormat.FP8PerTensor, out.dtype, m, n, k
+    )
+    for i in range(nb):
+        b_i = b_fp8[i].t()  # [N, K] row-major view of the same quantized bytes
+        view = dict(
+            recipe="fp8_per_tensor",
+            logical_shape=(n, k),
+            b=b_i,
+            b_scale=b_s,
+            b3=b_i.t().unsqueeze(0),  # (1, K, N) column-major, as bmm_fp8 wants
+        )
+        pack = GemmWeightPack((n, k))
+        for key in keys:
+            pack.prepare_for(key, view)
+        act = GemmActivationPack(a=a_fp8[i], a_scale=a_s)
+        _unified_call(layer, act, pack, out[i])
+
+
 _ADAPTERS = [
     GemmAdapter(
         key="mm_bf16",
@@ -409,6 +554,39 @@ _ADAPTERS = [
     #   prepare_low_latency_gemm_weights) -> needs its OWN shape distribution, not the uniform _gen.
     # * group_gemm_*_nt_groupwise / *deepgemm*: grouped op-shape with m_indptr offsets.
     # Add one GemmAdapter each; unsupported (op_shape, arch) just skips.
+]
+
+
+def _legacy(key: str) -> GemmAdapter:
+    return next(ad for ad in _ADAPTERS if ad.key == key)
+
+
+# Unified-GEMM-API adapters: same op_shape / quant_mode and the legacy adapter's convention dict
+# BY REFERENCE, so each lands in the legacy adapter's conformance group by construction and
+# test_convention_conformance enforces unified == legacy (the hook the docstring promised).
+_ADAPTERS += [
+    GemmAdapter(
+        key="unified_nvfp4",
+        op_shape="mm",
+        quant_mode="nvfp4",
+        backends=_UNIFIED_NVFP4_BACKENDS,
+        convention=_legacy("mm_nvfp4").convention,
+        supported=lambda sm: sm >= 100,
+        run=_run_unified_nvfp4_mm,
+        deterministic=True,
+        align=32,
+    ),
+    GemmAdapter(
+        key="unified_fp8",
+        op_shape="bmm",
+        quant_mode="fp8",
+        backends=_UNIFIED_FP8_BACKENDS,
+        convention=_legacy("bmm_fp8").convention,
+        supported=lambda sm: sm >= 89,
+        run=_run_unified_fp8,
+        deterministic=True,
+        align=1,
+    ),
 ]
 
 # Known cross-mode convention incompatibilities (documented, not silently passing). The moment a

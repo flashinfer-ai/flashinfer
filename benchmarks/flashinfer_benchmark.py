@@ -36,6 +36,10 @@ def run_test(args):
         from routines.unified_moe import run_unified_moe_test
 
         res = run_unified_moe_test(args)
+    elif args.routine in benchmark_apis["unified_gemm"]:
+        from routines.unified_gemm import run_unified_gemm_test
+
+        res = run_unified_gemm_test(args)
     elif args.routine in benchmark_apis["allreduce_comm"]:
         from routines.allreduce_comm import run_allreduce_comm_test
 
@@ -125,6 +129,7 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["gemm"])
         + list(benchmark_apis["moe"])
         + list(benchmark_apis["unified_moe"])
+        + list(benchmark_apis["unified_gemm"])
         + list(benchmark_apis["allreduce_comm"])
         + list(benchmark_apis["mixed_comm"])
         + list(benchmark_apis["norm"])
@@ -260,6 +265,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.unified_moe import parse_unified_moe_args
 
         args = parse_unified_moe_args(line, parser)
+    elif args.routine in benchmark_apis["unified_gemm"]:
+        from routines.unified_gemm import parse_unified_gemm_args
+
+        args = parse_unified_gemm_args(line, parser)
     elif args.routine in benchmark_apis["allreduce_comm"]:
         from routines.allreduce_comm import parse_allreduce_comm_args
 
