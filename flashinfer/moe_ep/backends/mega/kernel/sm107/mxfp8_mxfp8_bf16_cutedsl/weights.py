@@ -53,16 +53,20 @@ def preprocess_mega_weights(
     hidden_size: int,
     kind: Sm107Mxfp8Kind = "mxfp8_e4m3",
 ) -> TransformedMegaWeights:
-    """Canonical bf16 ``w13``/``w2`` -> SM107 mxfp8 kernel layout.
-
-    Pre-quantized packs are not supported yet (the kernel-layout + swizzled-SF
-    import path can be added when a producer exists).
-    """
+    """Canonical BF16 or prequantized MXFP8 weights -> SM107 kernel layout."""
     if isinstance(weights, PrequantizedMoEWeights):
-        raise MoEEpConfigError(
-            "pre-quantized weights are not supported by the "
-            "sm107_mxfp8_mxfp8_bf16_cutedsl backend yet; pass canonical "
-            "bf16/fp32 weights."
+        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+            preprocess_prequantized_block_scaled_weights,
+        )
+
+        return preprocess_prequantized_block_scaled_weights(
+            weights.w13,
+            weights.w2,
+            weights.w13_scale,
+            weights.w2_scale,
+            quant_kind=kind,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
         )
 
     from ......kernel_src.sm107.next_cutedsl_megamoe import (

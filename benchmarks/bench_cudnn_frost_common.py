@@ -1,13 +1,14 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
 """Shared timing and correctness helpers for cuDNN Frost MoE benchmarks."""
 
+import inspect
 import json
 import os
 import subprocess
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
 )
 
@@ -99,3 +100,31 @@ def emit(file, record, *, quiet=False):
         json.dumps({k: v for k, v in record.items() if k not in ("ranked", "samples")}),
         flush=True,
     )
+
+
+# Original backends whose runners take BF16 hidden states and quantize them in
+# kernel. The pre-quantized activation pack that the block-scale Frost runners
+# consume cannot reach them in the same MoELayer call, so the block-scale
+# comparisons exclude them and record the exclusion in their audit.
+BF16_INPUT_BACKENDS = frozenset(
+    (
+        "b12x_nvfp4",
+        "cutile_mxfp4",
+        "cutile_mxfp8",
+        "cutile_nvfp4",
+        "sm12x_mxfp8_mxfp4",
+    )
+)
+
+
+def prepare_original_view(cfg_cls, w1, w2, *, quant, **kwargs):
+    """Prepare an original backend's weight view from canonical BF16 weights."""
+    parameters = inspect.signature(cfg_cls.prepare_weights).parameters
+    if list(parameters)[:2] != ["w1_bf16", "w2_bf16"]:
+        raise RuntimeError(
+            f"Add benchmark weight preparation for {cfg_cls.__name__}, which does "
+            "not prepare canonical BF16 weights"
+        )
+    if "quant" in parameters:
+        kwargs["quant"] = quant
+    return cfg_cls.prepare_weights(w1, w2, **kwargs)

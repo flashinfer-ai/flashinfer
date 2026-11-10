@@ -84,11 +84,11 @@ PrefillLaunchResult configure_dynamic_smem_per_device(Kernel kernel, size_t smem
   return {rc, "cudaFuncSetAttribute"};
 }
 
-template <int Heads, bool ExtraFp4>
+template <int Heads, bool ExtraFp4, ModelType MT>
 PrefillLaunchResult launch_dsv41_bf16_prefill(const execution::AttentionParams& params,
                                               cudaStream_t stream) {
   using namespace kernels::dsv41_bf16;
-  auto kernel = sparse_mla_prefill_dsv41_bf16_kernel<Heads, ExtraFp4>;
+  auto kernel = sparse_mla_prefill_dsv41_bf16_kernel<Heads, ExtraFp4, MT>;
   constexpr size_t bytes = sizeof(Dsv41Bf16Smem);
   static bool configured[kMaxCachedCudaDevices] = {};
   const auto result = configure_dynamic_smem_per_device(kernel, bytes, configured);
@@ -101,7 +101,7 @@ PrefillLaunchResult launch_dsv41_bf16_prefill(const execution::AttentionParams& 
 }
 
 template <ModelType MT, QkComputeMode QkMode, int NUM_HEADS, int PAGE_BLOCK_SIZE,
-          typename GatherSchedule = Dsv41PrefillGatherSchedule>
+          typename GatherSchedule = Dsv41PrefillGatherSchedule<ModelType::DSV4_1>>
 PrefillLaunchResult launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache,
                                       const int32_t* indices, const float* attn_sink, bf16* output,
                                       float* out_lse, cudaStream_t stream,
@@ -318,18 +318,18 @@ inline PrefillLaunchResult dispatch_dots3_swa_sg(int num_heads, const bf16* Q, c
 // NT_PER_WARP_XV to 0 for an 8-warp XV) rather than by smem capacity. Any
 // runtime topk made of whole index tiles is served; the binding enforces
 // topk % 64 == 0. TP1..TP8 shards of the 64-head layer ride REPLICATE_H.
-template <typename GatherSchedule>
+template <ModelType MT, template <ModelType> class GatherSchedule>
 inline PrefillLaunchResult dispatch_dsv41_sg(int num_heads, const bf16* Q, const uint8_t* KV,
                                              const int32_t* indices, const float* attn_sink,
                                              bf16* output, float* out_lse, cudaStream_t stream,
                                              const PrefillColdParams& cold) {
+  static_assert(is_dsv41(MT));
   if (cold.page_block_size <= 0) return false;
   if (cold.extra_kv != nullptr && cold.extra_page_block_size <= 0) return false;
 
-  return execution::visit_prefill_heads<ModelType::DSV4_1, 1>(num_heads, [&](auto head) {
-    return launch_prefill_sg<ModelType::DSV4_1, QkComputeMode::FP8, decltype(head)::value, 64,
-                             GatherSchedule>(Q, KV, indices, attn_sink, output, out_lse, stream,
-                                             cold);
+  return execution::visit_prefill_heads<MT, 1>(num_heads, [&](auto head) {
+    return launch_prefill_sg<MT, QkComputeMode::FP8, decltype(head)::value, 64, GatherSchedule<MT>>(
+        Q, KV, indices, attn_sink, output, out_lse, stream, cold);
   });
 }
 

@@ -703,6 +703,11 @@ class _MetadataPushRouter(KernelComponent):
 
     @cute.jit
     def _broadcast_sizes_to_peers(self, smem_expert_counts: cute.Tensor) -> Callable[[], None]:
+        # TMA reads the async proxy; a CTA barrier alone does not publish
+        # generic-proxy histogram/size writes to that proxy. Fence every writer
+        # before allowing the elected lanes to issue the bulk transfers.
+        cute.arch.fence_proxy(kind="async.shared", space="cta")
+        cute.arch.sync_threads()
         block_thread_count = self.router_warps_per_cta * 32
         row_bytes = Int32(self.expert_count_padded * 4)
         matrix_address = self._device_workspace.ptr(self.sizes_by_rank_region).toint()
@@ -909,11 +914,13 @@ class _MetadataPushRouter(KernelComponent):
         register_count = cute.size(expert_registers)
         within_expert_indices = cute.make_rmem_tensor((register_count,), cutlass.Int32)
         for register_idx in cutlass.range_constexpr(register_count):
-            within_expert_indices[register_idx] = Int32(
-                cute.arch.atomic_add(
-                    histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
+            within_expert_indices[register_idx] = Int32(0)
+            if expert_registers[register_idx] != Int32(self.expert_count_padded):
+                within_expert_indices[register_idx] = Int32(
+                    cute.arch.atomic_add(
+                        histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
+                    )
                 )
-            )
         cute.arch.sync_threads()
         return within_expert_indices
 
@@ -931,11 +938,14 @@ class _MetadataPushRouter(KernelComponent):
         for register_idx in cutlass.range_constexpr(register_count):
             token_idx, topk_slot = self._router_value_coordinate(register_idx, topk_index_type)
             flat_topk_index = token_idx * Int32(self.topk) + topk_slot
-            destination = expert_run_starts[expert_registers[register_idx]] + within_expert_indices[register_idx]
-            if cutlass.const_expr(self.apply_topk_at_fc1):
-                sorted_elements[destination] = _SortedElement(flat_topk_index, score_registers[register_idx]).pack()
-            else:
-                sorted_elements[destination] = _SortedElement(flat_topk_index, None).pack()
+            # Dump reads only the valid prefix. Invalid entries need neither
+            # unique histogram offsets nor writes beyond that prefix.
+            if expert_registers[register_idx] != Int32(self.expert_count_padded):
+                destination = expert_run_starts[expert_registers[register_idx]] + within_expert_indices[register_idx]
+                if cutlass.const_expr(self.apply_topk_at_fc1):
+                    sorted_elements[destination] = _SortedElement(flat_topk_index, score_registers[register_idx]).pack()
+                else:
+                    sorted_elements[destination] = _SortedElement(flat_topk_index, None).pack()
 
     @cute.jit
     def _router_value_coordinate(self, register_idx: int, topk_index_type: type) -> Tuple[Int32, Int32]:
@@ -956,7 +966,11 @@ class _MetadataPushRouter(KernelComponent):
         for dump_round in cutlass.range(dump_round_count, unroll=4):
             position = Int32(dump_round * block_thread_count) + self._router_thread_idx
             predicate = Int32(position < total_valid_routes)
-            element = _SortedElement.from_packed(sorted_elements[position])
+            # A partial final dump round still executes predicated stores
+            # in every lane. Inactive lanes must read an initialized slot;
+            # the nonempty valid prefix guarantees slot zero exists.
+            read_position = predicate * position
+            element = _SortedElement.from_packed(sorted_elements[read_position])
             metadata = TokenSrcMetadata(
                 src_rank=Int32(self._router_local_rank),
                 src_token=(element.flat_topk_index // Int32(self.topk)),
@@ -1145,6 +1159,7 @@ class TokenCommNonDeterministic(KernelComponent):
         self._validate_configuration()
         self._router = _MetadataPushRouter(problem_desc, impl_desc)
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
+        self.tail_reset_single_cta = False
         self._device_workspace = None
         self._token_comm_args = None
         self._local_rank = None
@@ -2088,6 +2103,16 @@ class TokenCommNonDeterministic(KernelComponent):
             return Int32(cute.arch.shuffle_sync(claimed_token, Int32(0)))
         return current_token + global_worker_count
 
+    def _configure_tail_reset_ownership(self, workspace: DeviceWorkspace) -> None:
+        # One CTA avoids a second grid join for small reset prefixes.
+        # Bound the clear work so a large CTA-local loop cannot replace the saved join.
+        # NCU replay keeps the original grid-counter phase behavior.
+        self.tail_reset_single_cta = (
+            self.world_size > 1
+            and sum(workspace.tail_reset_bytes(space) for space in ("local", "shared")) <= 16384
+            and os.environ.get("MEGA_USE_NCU", "0") != "1"
+        )
+
     @cute.jit
     def reset_tail(self) -> None:
         """Reset communication state with the four token-in transfer warps."""
@@ -2104,11 +2129,20 @@ class TokenCommNonDeterministic(KernelComponent):
             epilogue_grid_sync=False,
         )
         iket.range_pop()
-        total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
-        global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
         iket.range_push("tail.reset_workspace")
-        self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-        self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+        if cutlass.const_expr(self.tail_reset_single_cta):
+            # The peer wait and phase increment are performed by thread0.
+            # Join all four transfer warps before clearing peer-visible state
+            # or loading the next peer-barrier phase without a grid prologue.
+            if self._linear_cta_idx == Int32(0):
+                self._nvlink_barrier._cta_rendezvous(self.transfer_thread_count)
+                self._device_workspace.reset_tail_space("shared", transfer_thread_idx, self.transfer_thread_count)
+                self._device_workspace.reset_tail_space("local", transfer_thread_idx, self.transfer_thread_count)
+        else:
+            total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
+            global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
+            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
         iket.range_pop()
         iket.range_push("tail.nvlink_publish")
         self._nvlink_barrier.arrive_and_wait(
@@ -2116,7 +2150,7 @@ class TokenCommNonDeterministic(KernelComponent):
             Int32(self.promised_launchable_sm_count),
             self._linear_cta_idx,
             transfer_thread_idx,
-            prologue_grid_sync=True,
+            prologue_grid_sync=not self.tail_reset_single_cta,
             epilogue_grid_sync=False,
         )
         iket.range_pop()

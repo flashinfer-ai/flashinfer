@@ -182,6 +182,9 @@ files when ``FLASHINFER_TRACE_DUMP=1``:
    * - ``flashinfer.mla``
      - ``BatchMLAPagedAttentionWrapper.run``
      - ``mla_paged``
+   * - ``flashinfer.mla``
+     - ``trtllm_batch_decode_sparse_mla_dsv4``
+     - ``sparse_mla_dsv4``
    * - ``flashinfer.gdn_decode``
      - ``gated_delta_rule_decode``, ``gated_delta_rule_mtp``
      - ``gdn``

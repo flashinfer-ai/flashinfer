@@ -4,10 +4,9 @@
 #   - scripts/build_flashinfer_jit_cache_whl.sh         (release/nightly)
 #   - scripts/build_jit_cache_provider_wheelhouse.sh    (provider experiment)
 #   - scripts/task_test_jit_cache_package_build_import.sh (PR tests)
+#   - scripts/run_with_test_sccache.sh                  (PR GPU test lanes)
 
-SCCACHE_VERSION="0.17.0"
-SCCACHE_CUDA_134_REVISION="e9b15a35f7240a7edd1b9644583edb388c6cb5f9"
-SCCACHE_CUDA_134_SOURCE_SHA256="9e444cc5097a839f03c81c59c5cadebc20090aad1fc699e398d5c1c18c44118c"
+SCCACHE_VERSION="0.18.0"
 
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
@@ -77,6 +76,92 @@ compute_jit_cache_parallelism() {
   export MEM_PER_JOB=$mem_per_job
 }
 
+# Signal PID and everything below it: killing only a background subshell leaves
+# its `python -m build`, ninja and nvcc children running.
+_kill_process_tree() {
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    _kill_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+
+# The pool's polling runs with xtrace off: callers use `set -x`, and a trace of
+# every 0.2 s check would bury the build output. Restoring is done by each helper.
+#
+# Collect the status of items that have finished, without blocking. Works on the
+# caller's `pids` (items still counted as running) and `failed` variables: bash
+# forgets finished jobs in `jobs`, so the pids are tracked here. A pid is waited
+# for exactly once, so its status is never lost or read twice.
+_reap_finished_items() {
+  { local pid alive=() xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    else
+      wait "$pid" || failed=1
+    fi
+  done
+  pids=(${alive[@]+"${alive[@]}"})
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until a slot is free or an item has failed (`failed` is set then).
+# Uses the caller's `limit`, `pids` and `failed`.
+_wait_for_free_slot() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while :; do
+    _reap_finished_items
+    if (( failed || ${#pids[@]} < limit )); then break; fi
+    sleep 0.2
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until every item has finished or one has failed.
+_wait_for_all_items() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while (( ${#pids[@]} > 0 && ! failed )); do
+    sleep 0.2
+    _reap_finished_items
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Run "FUNCTION ITEM" for every ITEM, at most CONCURRENCY at a time, as a pool: a
+# finished item frees its slot for the next one. Output of different items
+# interleaves, so FUNCTION should prefix its own lines. On the first failure,
+# including one after the last item has started, the running items are killed
+# with their descendants and no more start. Finished items are polled every
+# 0.2 s, which is negligible against builds that take minutes.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2 - function name, $3... - items.
+# Returns 0 when every item succeeded, else 1.
+run_bounded_parallel() {
+  local limit=$1 fn=$2
+  shift 2
+  local item pid failed=0 pids=()
+  for item in "$@"; do
+    _wait_for_free_slot
+    if (( failed )); then break; fi
+    "$fn" "$item" &
+    pids+=($!)
+  done
+  # Drain what is still running, stopping it at the first failure.
+  _wait_for_all_items
+  if (( failed )); then
+    for pid in ${pids[@]+"${pids[@]}"}; do _kill_process_tree "$pid"; done
+  fi
+  # Reaps the killed items.
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    wait "$pid" || failed=1
+  done
+  return $failed
+}
+
 # Verify that the selected compiler matches the CUDA matrix entry.
 #
 # Args:
@@ -99,8 +184,9 @@ validate_jit_cache_cuda_toolchain() {
   echo "nvcc CUDA version check passed: ${nvcc_cuda_version}"
 }
 
-# Install the matrix-selected PyTorch build environment and constrain the
-# isolated PEP 517 build to that exact distribution.
+# Install the matrix-selected PyTorch build environment and constrain every
+# later pip install, including the wheel's build requirements, to that exact
+# distribution.
 #
 # Args:
 #   $1 - Python executable used to invoke the build frontend.
@@ -116,7 +202,14 @@ setup_jit_cache_python_build() {
   local pytorch_index=$3
   local pytorch_index_url="https://download.pytorch.org/whl/${pytorch_index}"
 
-  "${python_bin}" -m pip install --upgrade build
+  # pip 26.2.1 fixed ProtocolError from truncated downloads bypassing its
+  # resume logic. Provider builds download CUDA wheels hundreds of MB in size,
+  # so use that fix and allow more connection/resume attempts by default.
+  export PIP_RETRIES="${PIP_RETRIES:-10}"
+  export PIP_RESUME_RETRIES="${PIP_RESUME_RETRIES:-10}"
+  export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-120}"
+  env -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
+    "${python_bin}" -m pip install --upgrade "pip>=26.2.1" build
 
   if "${python_bin}" - "${expected_cuda_version}" <<'PY'
 import sys
@@ -218,6 +311,7 @@ install_released_sccache() {
   local sccache_tmpdir
   local sccache_sha256
   local sccache_install_started_at=${SECONDS}
+  local suffix attempt delay http_status
 
   echo "::group::Install sccache v${sccache_version} (${sccache_arch})"
 
@@ -227,8 +321,27 @@ install_released_sccache() {
   fi
 
   sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
+  # Match the Docker image pull policy: four attempts with 5/10/20s backoff.
+  # Retry each file independently so a checksum retry keeps the downloaded archive.
+  for suffix in "" ".sha256"; do
+    for attempt in 1 2 3 4; do
+      if http_status=$(curl -fsSL -w '%{http_code}' "${sccache_url}${suffix}" -o "${sccache_tmpdir}/${sccache_archive}${suffix}"); then
+        break
+      fi
+      # Missing release files will not recover with another download attempt.
+      if [ "${http_status}" = "404" ]; then
+        echo "Release file not found (HTTP 404): ${sccache_archive}${suffix}" >&2
+        return 1
+      fi
+      if (( attempt == 4 )); then
+        echo "Failed to download ${sccache_archive}${suffix} after ${attempt} attempts" >&2
+        return 1
+      fi
+      delay=$(( 5 * 2 ** (attempt - 1) ))
+      echo "sccache download failed; retrying in ${delay}s (attempt $(( attempt + 1 ))/4)" >&2
+      sleep "${delay}"
+    done
+  done
   sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
   if [ -z "${sccache_sha256}" ]; then
     echo "ERROR: Missing checksum for ${sccache_archive}"
@@ -244,79 +357,9 @@ install_released_sccache() {
   echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
 }
 
-# Build a pinned sccache revision natively. Building inside each manylinux
-# builder produces the matching x86_64 or aarch64 binary without relying on an
-# unpublished binary artifact.
-build_patched_sccache() {
-  local sccache_revision=$1
-  local expected_sha256=$2
-  local output_path=$3
-  local sccache_package="sccache-${sccache_revision}"
-  local sccache_archive="${sccache_package}.tar.gz"
-  local sccache_url="https://github.com/mozilla/sccache/archive/${sccache_revision}.tar.gz"
-  local sccache_tmpdir
-  local required_command
-  local sccache_build_started_at=${SECONDS}
-
-  for required_command in cargo curl env install make perl sha256sum tar; do
-    if ! command -v "${required_command}" >/dev/null 2>&1; then
-      echo "ERROR: ${required_command} is required to build patched sccache"
-      exit 1
-    fi
-  done
-
-  sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  printf '%s  %s\n' "${expected_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
-  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
-
-  echo "Building sccache revision ${sccache_revision} for $(uname -m)"
-  # Do not expose cache credentials to third-party Cargo build scripts.
-  env \
-    -u AWS_ACCESS_KEY_ID \
-    -u AWS_SECRET_ACCESS_KEY \
-    -u AWS_SESSION_TOKEN \
-    CARGO_INCREMENTAL=0 \
-    cargo build \
-    --locked \
-    --release \
-    --no-default-features \
-    --features s3,vendored-openssl \
-    --bin sccache \
-    --manifest-path "${sccache_tmpdir}/${sccache_package}/Cargo.toml"
-  mkdir -p "$(dirname "${output_path}")"
-  install -m 0755 \
-    "${sccache_tmpdir}/${sccache_package}/target/release/sccache" \
-    "${output_path}"
-  rm -rf "${sccache_tmpdir}"
-  echo "patched sccache build duration: $((SECONDS - sccache_build_started_at)) seconds"
-}
-
-# Install the pinned source build, reusing a binary produced by a dedicated
-# workflow step when available. Other call sites retain a self-contained
-# fallback that builds directly into /usr/local/bin.
-install_patched_sccache() {
-  local sccache_revision=$1
-  local expected_sha256=$2
-
-  if [ -n "${SCCACHE_PATCHED_BINARY_PATH:-}" ]; then
-    if [ ! -x "${SCCACHE_PATCHED_BINARY_PATH}" ]; then
-      echo "ERROR: Prebuilt patched sccache not found: ${SCCACHE_PATCHED_BINARY_PATH}"
-      exit 1
-    fi
-    echo "Installing prebuilt patched sccache from ${SCCACHE_PATCHED_BINARY_PATH}"
-    install -m 0755 "${SCCACHE_PATCHED_BINARY_PATH}" /usr/local/bin/sccache
-  else
-    build_patched_sccache \
-      "${sccache_revision}" \
-      "${expected_sha256}" \
-      /usr/local/bin/sccache
-  fi
-}
-
-# Install the official release by default. CUDA 13.4 uses the first upstream
-# revision containing the CUDA 13.3+ dry-run parser fix while that fix remains
-# unreleased: https://github.com/mozilla/sccache/pull/2722
+# Install the official sccache release. v0.18.0 is the first release that
+# includes the CUDA 13.3+ nvcc dry-run parser fix required for CUDA 13.4:
+# https://github.com/mozilla/sccache/pull/2722
 install_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
@@ -330,20 +373,9 @@ install_sccache() {
       ;;
   esac
 
-  case "${CUDA_VERSION:-}" in
-    13.4|134)
-      install_patched_sccache \
-        "${SCCACHE_CUDA_134_REVISION}" \
-        "${SCCACHE_CUDA_134_SOURCE_SHA256}"
-      export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-source"
-      export FLASHINFER_SCCACHE_REVISION="${SCCACHE_CUDA_134_REVISION}"
-      ;;
-    *)
-      install_released_sccache "${sccache_version}" "${sccache_arch}"
-      export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
-      export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
-      ;;
-  esac
+  install_released_sccache "${sccache_version}" "${sccache_arch}"
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
+  export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
 }
 
 # Install sccache (if missing), configure environment, and start the server.
@@ -356,12 +388,23 @@ install_sccache() {
 # Reads (optional): SCCACHE_REGION, SCCACHE_STATS_DIR,
 # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
 # Sets/exports: SCCACHE_*, FLASHINFER_NVCC_LAUNCHER, FLASHINFER_CXX_LAUNCHER.
+# Launchers and ACTIVE are enabled only after startup and zero-stats succeed.
+# Each setup starts a new stats session, discarding inherited runtime state.
 setup_sccache() {
   local key_prefix=$1
   local source_root=$2
   local sccache_arch
+  local setup_status
+  unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
+  unset FLASHINFER_SCCACHE_ACTIVE FLASHINFER_SCCACHE_STATS_COLLECTED
   sccache_arch=$(uname -m)
-  install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
+  if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
+    # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
+    export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
+    export FLASHINFER_SCCACHE_REVISION="${FLASHINFER_SCCACHE_REVISION:-v${SCCACHE_VERSION}}"
+  else
+    install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
+  fi
 
   export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
@@ -372,8 +415,6 @@ setup_sccache() {
   # /proc system-wide, including daemon-owned compilers, and docker --rm is the
   # final containment boundary if the watchdog cannot signal one of them.
   unset SCCACHE_CLIENT_SIDE
-  export FLASHINFER_CXX_LAUNCHER="sccache"
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
 
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0
@@ -390,8 +431,20 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  sccache --start-server
-  sccache --zero-stats
+  # Explicit returns: a caller that guards setup_sccache with `if` runs it with
+  # errexit off, and must still see failed control commands.
+  sccache --start-server || {
+    setup_status=$?
+    stop_sccache_after_setup_failure
+    return "${setup_status}"
+  }
+  sccache --zero-stats || {
+    setup_status=$?
+    stop_sccache_after_setup_failure
+    return "${setup_status}"
+  }
+  export FLASHINFER_CXX_LAUNCHER="sccache"
+  export FLASHINFER_NVCC_LAUNCHER="sccache"
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"
   echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
@@ -422,6 +475,13 @@ setup_sccache() {
       printf 'cuda_version=%s\n' "${CUDA_VERSION:-unknown}"
       printf 'cuda_arch_list=%s\n' "${FLASHINFER_CUDA_ARCH_LIST:-unknown}"
     } > "${SCCACHE_STATS_DIR}/sccache-metadata.txt"
+  fi
+}
+
+# Best-effort cleanup must not mask the original setup failure.
+stop_sccache_after_setup_failure() {
+  if ! run_sccache_control_command --stop-server >/dev/null 2>&1; then
+    echo "WARNING: Failed to stop sccache after setup failure; daemon may remain running" >&2
   fi
 }
 

@@ -1,0 +1,4312 @@
+{
+  "scope": "Same-GPU, same-checkpoint routed FC1/activation/FC2/combine GPU intervals. Preparation, router network, shared experts, EP communication, host submission and serving excluded. Synthetic model shapes, not model throughput.",
+  "numerical_contract": "FP4 Frost rounds preactivation/intermediate/expert to BF16. MXINT4 retains FP32 preactivation. Native Blackwell NVFP4 and B300 MXFP4 can retain FP32 preactivation; SM12x uses FP16 partial products and FP32 expert/combine, fused SM120 TC atomically combines into BF16. Each path has its separate reference; not bitwise-identical rounding across every backend.",
+  "timing": "CUPTI first-to-last GPU activity span on H100/SM120 with independent warm CUDA-event controls; explicit CUDA-graph globaltimer on B300 with empty-interval and A/A controls, without independent CUDA-event controls. Cold flushing outside timing. Four frozen ABBA rounds after candidate search.",
+  "main_base": "195ccacadc3b9c826a492885c8e89a8b32041ac4",
+  "runtime_commit": "45efecebb",
+  "correctness": {
+    "sm90": {
+      "passed": 402,
+      "skipped": 17
+    },
+    "sm103": {
+      "passed": 412,
+      "skipped": 7
+    },
+    "sm120": {
+      "passed": 398,
+      "skipped": 21
+    }
+  },
+  "software": {
+    "sm90": {
+      "torch": "2.14.0a0+b2c75dd062.nv26.9.68203377",
+      "nvidia-cutlass-dsl": "4.8.0",
+      "apache-tvm-ffi": "0.1.14.post1",
+      "cupti-python": "13.4.0"
+    },
+    "sm103": {
+      "torch": "2.14.1+cu130",
+      "nvidia-cutlass-dsl": "4.8.0",
+      "apache-tvm-ffi": "0.1.14.post1"
+    },
+    "sm120": {
+      "torch": "2.14.1+cu130",
+      "nvidia-cutlass-dsl": "4.8.0",
+      "apache-tvm-ffi": "0.1.14.post1",
+      "cupti-python": "13.0.1",
+      "cuda-tile": "1.6.0"
+    }
+  },
+  "runtime_sources": {
+    "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa": {
+      "flashinfer/fused_moe/api.py": "d96c903650af1f61f5971e9b4cbce694605a1a31b6fb8e45a649e7b74730b413",
+      "flashinfer/fused_moe/backends/frost_low_latency/__init__.py": "19cca05a476f8244eec58829041dec176a248e5f16d0aeb9e3ef969f94ad320d",
+      "flashinfer/fused_moe/backends/frost_low_latency/activation.py": "69b1247b0c56b785171703208a9292dcd31d3d1e340720eb072b61315c0de07a",
+      "flashinfer/fused_moe/backends/frost_low_latency/deepseek_fp8.py": "2c136b20567452955fb2d432abfe160fa0664d983ffa25600e8d98c47114a85d",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/__init__.py": "de6683449a20e3dad045d702e254ad5f62c17399513af286de9074a8c746ecc3",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/activation_config.py": "1b51203e8fbb681395798ba8711592e00c37f48c48667a2c76ef12d3c069193a",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/activations.py": "99f2ef68515e9d6c8bbf8626f4c1ad32acac9b7426b75292c6966769c61dcbfa",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/fma_fc1.py": "80ffa517079de8ff053dfdfe432ec2e4dd39b809d469787892146afb84ce70fe",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/fma_fc2.py": "7b278d4830269c67eb4e1112768f551727bcd1fb800cb43834d233bd9e3f4045",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/runtime.py": "55bf2d2e5066e45e9986d6e2167f7498383017b00a68b0f8e81845f89b95925d",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/deepseek_fp8.py": "36211ee3adbd57cc1df67632214e799ab68de5239bbef3efd35afa4cdd34ae99",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/deepseek_fp8_kernel.py": "f1817c8b4a58ea5b37a8e965401148eb859e5b58915a6bb74a01365f3c8fc3a1",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/fp4_route_group.py": "7068a5e1cabd66a02157f80635ed100abf9e27659bd1f9741aaeb6733509bcea",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/fp4_weight.py": "3eb9b266743fbde8b5be10ad1cd00448a37cf7befc91ab19981ef573c9a8975e",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/fp4_weight_only.py": "0753e1046b12393489e66335019a4377e33f890b34db7c89a444a95e37c61b57",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/fp8_per_tensor.py": "331b6be02c1c9da8a9828d8da900554887565ed119eba9f5ffe0664b8ee82b35",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_common.py": "3c5cc0878a17b82f21e09500dc3ea2bc34428facc04955bfaf5e95211f517ade",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_fc1.py": "a407fb74eba2cef85131f547d35f4e3206a1c729421addccd02d7541b20739b1",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_fc2.py": "fb2bed49c325e4c0b9ed9b003932f0416cdffac9babd6fa4a6bff1ce45b83397",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc1_o2.py": "6086984981a456144f89d0c93b3566875fef39f2a98540ede3814dade0df42ae",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc1_o4.py": "cbb7ba0d68c7a0e5719f2fd82ccea55434cacfcaad6e2d35fdb8a8e5a55e22db",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc2.py": "d53520da9bee139699d159d8070ca20dda12e1fba69a14e9f2b943fec888fe7f",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/runtime.py": "fd0f25d9c746dbe1da0a3829cec25d78d4a8d9394c801bc13839d7d1629cd651",
+      "flashinfer/fused_moe/backends/frost_low_latency/fma/runtime.py": "4d1ad53bb03efa42a2b8224e4ba8b0e0cf343e6743498ec3243f3713f842a132",
+      "flashinfer/fused_moe/backends/frost_low_latency/fp4_weight_only.py": "31bdd6d044b035cc0aeda0eff65985d3ccba569fcceb5d02b2a12f8ca10a39c5",
+      "flashinfer/fused_moe/backends/frost_low_latency/fp8_per_tensor.py": "5e7b53fececc487cffd660cb4eee0dc85243c146641e6a8f9f9c920ad92a7de1",
+      "flashinfer/fused_moe/backends/frost_low_latency/gemm.py": "5d53868fb2190bc0499eb3b28fc46607c1d2c9b753c610780a8beb428c13cd83",
+      "flashinfer/fused_moe/backends/frost_low_latency/io.py": "bce77e22086f81bf78f65f62ab31d465d721094d4160e4ace568fea914e268db",
+      "flashinfer/fused_moe/backends/frost_low_latency/nvfp4.py": "04e7a0aa7dfbb04fa205380dfea4d27213ab2ceb7b55988267a0279899ce508c",
+      "flashinfer/fused_moe/backends/frost_low_latency/pipeline.py": "18e469ce116d4e8b01921c321e50125c76eb8c9a419a16392a5dba31ad8f1469",
+      "flashinfer/fused_moe/backends/frost_low_latency/prepare.py": "6827e9b9744a89246f6ec9b207504f6246d690c42703005a21ca5c67bbf3d0fe",
+      "flashinfer/fused_moe/backends/frost_low_latency/quantization.py": "de0c5a7d2b63f0e5381560e75f6f97d9b7401d6134d8ac2dbfe30e0a6efec446",
+      "flashinfer/fused_moe/backends/frost_low_latency/runner.py": "5c5a58cb297f8d3d1488562b5278bcc7198cbb5c834163942b16a44def4fe26a",
+      "flashinfer/fused_moe/backends/frost_low_latency/runtime.py": "23b546f26e7574aa7eda6dbf1634c7061e39018f78dd18e2e5679695f5390b0c",
+      "flashinfer/fused_moe/runners.py": "ee7db65bdc6df1d3fa91f853d8ac1098d8ee7854ec8cf92baaaedf8d4106d4f1"
+    }
+  },
+  "cases": [
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "expanded-bf16",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend expanded-bf16 --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutlass_bf16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "25f38e8a4144439bb9a9ca86cf8ae42f6775e530cf29a45b25365cd13c12553f",
+      "median_us": {
+        "frost": 19.6,
+        "native": 57.4395
+      },
+      "speedup": 2.9305867346938776,
+      "selected": {
+        "frost": [
+          1,
+          2,
+          8,
+          8
+        ],
+        "native": [
+          21,
+          100
+        ]
+      },
+      "candidate_counts": {
+        "native": 5,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          57.55199999999999,
+          57.919,
+          57.1035,
+          57.36,
+          57.519000000000005,
+          57.247,
+          57.775999999999996,
+          57.247
+        ],
+        "frost": [
+          19.616000000000003,
+          19.5355,
+          19.584,
+          19.552500000000002,
+          19.664,
+          19.52,
+          19.616000000000003,
+          19.6475
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.004511140271346003,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005368893207029016,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.005325930172313714,
+            "normalized_max": 0.006756756756756757
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004382997466908789,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004410138016491154,
+            "normalized_max": 0.006756756756756757
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0036839950880068,
+          "native": 1.004048618321743
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 15.774624422192574,
+            "samples_us": [
+              15.75550064444542,
+              15.78499935567379,
+              15.771999955177307,
+              15.788499265909195,
+              15.77950082719326,
+              15.773499384522438,
+              15.775749459862709,
+              15.768250450491905,
+              15.77175036072731,
+              15.783499926328659,
+              15.777749940752983,
+              15.775749459862709,
+              15.780000016093254,
+              15.765000134706497,
+              15.761500224471092,
+              15.768000856041908,
+              15.777749940752983,
+              15.769250690937042,
+              15.777749940752983,
+              15.771999955177307
+            ]
+          },
+          "native": {
+            "median_us": 47.0536258071661,
+            "samples_us": [
+              47.185998409986496,
+              47.24625125527382,
+              47.17075079679489,
+              47.18225076794624,
+              47.214001417160034,
+              47.06750065088272,
+              47.013748437166214,
+              47.054000198841095,
+              47.053251415491104,
+              46.97525128722191,
+              47.04999923706055,
+              47.037750482559204,
+              47.03674837946892,
+              47.056250274181366,
+              47.05449938774109,
+              47.043249011039734,
+              47.07225039601326,
+              47.04274982213974,
+              47.00750112533569,
+              47.02749848365784
+            ]
+          }
+        }
+      },
+      "storage_control": "Exact offline NVFP4-to-BF16 expansion with unit global scales; 4x packed-weight storage, preprocessing excluded; not native four-bit execution.",
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "expanded-bf16",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend expanded-bf16 --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutlass_bf16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "25f38e8a4144439bb9a9ca86cf8ae42f6775e530cf29a45b25365cd13c12553f",
+      "median_us": {
+        "frost": 16.128,
+        "native": 49.8395
+      },
+      "speedup": 3.0902467757936507,
+      "selected": {
+        "frost": [
+          1,
+          8,
+          8,
+          8
+        ],
+        "native": [
+          21,
+          102
+        ]
+      },
+      "candidate_counts": {
+        "native": 5,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          50.079,
+          50.1755,
+          49.807500000000005,
+          50.063500000000005,
+          49.8715,
+          49.7755,
+          49.695,
+          49.791000000000004
+        ],
+        "frost": [
+          16.128,
+          16.048000000000002,
+          16.128,
+          16.032,
+          16.128,
+          16.032,
+          16.128,
+          16.144
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.004444410927263736,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact": {
+            "relative_l2": 0.00537927466314087,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.005151422924750393,
+            "normalized_max": 0.006756756756756757
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004382997466908789,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004410138016491154,
+            "normalized_max": 0.006756756756756757
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0054862842892769,
+          "native": 0.9982424427542074
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 15.72749949991703,
+            "samples_us": [
+              15.704749152064323,
+              15.741249546408653,
+              15.729499980807304,
+              15.73299989104271,
+              15.730749815702438,
+              15.72749949991703,
+              15.724750235676765,
+              15.72675071656704,
+              15.723500400781631,
+              15.72900079190731,
+              15.72749949991703,
+              15.72675071656704,
+              15.734000131487846,
+              15.738250687718391,
+              15.726499259471893,
+              15.716249123215675,
+              15.727000311017036,
+              15.724500641226768,
+              15.736250206828117,
+              15.744000673294067
+            ]
+          },
+          "native": {
+            "median_us": 47.17724956572056,
+            "samples_us": [
+              47.348249703645706,
+              47.30625078082085,
+              47.35250025987625,
+              47.30749875307083,
+              47.31125012040138,
+              47.40000143647194,
+              47.310251742601395,
+              47.33775183558464,
+              47.33474925160408,
+              47.35000059008598,
+              47.04824835062027,
+              46.946000307798386,
+              46.953000128269196,
+              46.988751739263535,
+              46.9834990799427,
+              46.95025086402893,
+              46.94550111889839,
+              46.979501843452454,
+              46.95349931716919,
+              46.906501054763794
+            ]
+          }
+        }
+      },
+      "storage_control": "Exact offline NVFP4-to-BF16 expansion with unit global scales; 4x packed-weight storage, preprocessing excluded; not native four-bit execution.",
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "cutlass",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend cutlass --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutlass_w4a16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 20.103749999999998,
+        "native": 51.655
+      },
+      "speedup": 2.569421127899024,
+      "selected": {
+        "frost": [
+          1,
+          1,
+          8,
+          8
+        ],
+        "native": [
+          53,
+          116
+        ]
+      },
+      "candidate_counts": {
+        "native": 5,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          51.8075,
+          51.167500000000004,
+          51.232,
+          51.759,
+          51.8075,
+          51.391,
+          51.551,
+          51.791
+        ],
+        "frost": [
+          20.064,
+          20.096,
+          20.1115,
+          20.192,
+          20.032,
+          20.1925,
+          20.0635,
+          20.191499999999998
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005150236579326546,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004918059440855242,
+            "normalized_max": 0.005474452554744526
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005150236579326546,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004918059440855242,
+            "normalized_max": 0.005474452554744526
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9936607772976587,
+          "native": 1.0020213281628694
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 16.90725050866604,
+            "samples_us": [
+              16.876250505447388,
+              16.915500164031982,
+              16.90324954688549,
+              16.90725050866604,
+              16.901250928640366,
+              16.919000074267387,
+              16.906749457120895,
+              16.901999711990356,
+              16.90950058400631,
+              16.90725050866604,
+              16.90099947154522,
+              16.90324954688549,
+              16.91100001335144,
+              16.909249126911163,
+              16.910500824451447,
+              16.906749457120895,
+              16.91325008869171,
+              16.910750418901443,
+              16.905250027775764,
+              16.907749697566032
+            ]
+          },
+          "native": {
+            "median_us": 40.57237505912781,
+            "samples_us": [
+              40.617749094963074,
+              40.571749210357666,
+              40.57300090789795,
+              40.633998811244965,
+              40.63300043344498,
+              40.69124907255173,
+              40.67249968647957,
+              40.624748915433884,
+              40.65300151705742,
+              40.64450040459633,
+              40.680501610040665,
+              40.28575122356415,
+              40.250249207019806,
+              40.24849832057953,
+              40.23424908518791,
+              40.23975133895874,
+              40.19099846482277,
+              40.213748812675476,
+              40.20174965262413,
+              40.29574990272522
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "cutlass",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend cutlass --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutlass_w4a16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 16.927999999999997,
+        "native": 43.215500000000006
+      },
+      "speedup": 2.552900519848772,
+      "selected": {
+        "frost": [
+          1,
+          2,
+          8,
+          4
+        ],
+        "native": [
+          53,
+          116
+        ]
+      },
+      "candidate_counts": {
+        "native": 5,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          43.311499999999995,
+          43.1355,
+          43.039500000000004,
+          43.295,
+          43.4075,
+          43.1195,
+          43.136,
+          43.4075
+        ],
+        "frost": [
+          16.927999999999997,
+          16.9275,
+          16.927999999999997,
+          17.024,
+          16.927999999999997,
+          17.024,
+          16.9115,
+          17.008000000000003
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005150236579326546,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004918059440855242,
+            "normalized_max": 0.005474452554744526
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005150236579326546,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004918059440855242,
+            "normalized_max": 0.005474452554744526
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9948283968030087,
+          "native": 1.0001966898259294
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 16.47699996829033,
+            "samples_us": [
+              16.449499875307083,
+              16.486000269651413,
+              16.471000388264656,
+              16.477249562740326,
+              16.490500420331955,
+              16.47699996829033,
+              16.46674983203411,
+              16.47699996829033,
+              16.472749412059784,
+              16.47075079381466,
+              16.477499157190323,
+              16.471749171614647,
+              16.47374965250492,
+              16.481749713420868,
+              16.478000208735466,
+              16.483500599861145,
+              16.475249081850052,
+              16.48074947297573,
+              16.473999246954918,
+              16.479499638080597
+            ]
+          },
+          "native": {
+            "median_us": 40.6197514384985,
+            "samples_us": [
+              40.61650112271309,
+              40.710750967264175,
+              40.68624973297119,
+              40.71899875998497,
+              40.6622514128685,
+              40.688998997211456,
+              40.623001754283905,
+              40.63750058412552,
+              40.64499959349632,
+              40.666498243808746,
+              40.69700092077255,
+              40.302250534296036,
+              40.20249843597412,
+              40.25674983859062,
+              40.22499918937683,
+              40.20849987864494,
+              40.17899930477142,
+              40.237750858068466,
+              40.27299955487251,
+              40.24349898099899
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "cutlass",
+        "timer": "cupti",
+        "tokens": 2,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "shared"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend cutlass --tokens 2 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse shared --timer cupti --output result.json",
+      "native_route": "cutlass_w4a16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 31.039750000000005,
+        "native": 51.775999999999996
+      },
+      "speedup": 1.668054671832086,
+      "selected": {
+        "frost": [
+          1,
+          2,
+          8,
+          8
+        ],
+        "native": [
+          53,
+          116
+        ]
+      },
+      "candidate_counts": {
+        "native": 5,
+        "frost": 88
+      },
+      "validation_medians": {
+        "native": [
+          51.808,
+          51.855999999999995,
+          51.568,
+          51.967,
+          51.647499999999994,
+          51.647499999999994,
+          51.984,
+          51.744
+        ],
+        "frost": [
+          30.96,
+          31.0875,
+          31.040000000000003,
+          31.040000000000003,
+          30.496,
+          31.039500000000004,
+          31.055500000000002,
+          30.9435
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005113601576251359,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004862900781007721,
+            "normalized_max": 0.005474452554744526
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005113601576251359,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004862900781007721,
+            "normalized_max": 0.005474452554744526
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9987193840156572,
+          "native": 0.9986052123552124
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 27.411499992012978,
+            "samples_us": [
+              27.40750089287758,
+              27.41749957203865,
+              27.41375006735325,
+              27.41900086402893,
+              27.415750548243523,
+              27.39899978041649,
+              27.411499992012978,
+              27.410250157117844,
+              27.4097491055727,
+              27.417000383138657,
+              27.411499992012978,
+              27.427999302744865,
+              27.40750089287758,
+              27.415750548243523,
+              27.409499511122704,
+              27.411499992012978,
+              27.411499992012978,
+              27.415499091148376,
+              27.41675078868866,
+              27.408499270677567
+            ]
+          },
+          "native": {
+            "median_us": 40.79712554812431,
+            "samples_us": [
+              40.77725112438202,
+              40.88300094008446,
+              40.84499925374985,
+              40.80824926495552,
+              40.781501680612564,
+              40.80900177359581,
+              40.79325124621391,
+              40.800999850034714,
+              40.82399979233742,
+              40.80824926495552,
+              40.823500603437424,
+              40.90049862861633,
+              40.85699841380119,
+              40.788501501083374,
+              40.69500043988228,
+              40.26700183749199,
+              40.209751576185226,
+              40.26149958372116,
+              40.22675007581711,
+              40.25549814105034
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "cutlass",
+        "timer": "cupti",
+        "tokens": 2,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "shared"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend cutlass --tokens 2 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse shared --timer cupti --output result.json",
+      "native_route": "cutlass_w4a16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 27.968,
+        "native": 43.68
+      },
+      "speedup": 1.5617848970251715,
+      "selected": {
+        "frost": [
+          1,
+          2,
+          8,
+          4
+        ],
+        "native": [
+          48,
+          164
+        ]
+      },
+      "candidate_counts": {
+        "native": 5,
+        "frost": 88
+      },
+      "validation_medians": {
+        "native": [
+          44.032000000000004,
+          43.839000000000006,
+          43.647999999999996,
+          43.68,
+          43.68,
+          43.6315,
+          43.776,
+          43.6155
+        ],
+        "frost": [
+          27.936,
+          27.968,
+          28.064,
+          28.063000000000002,
+          28.16,
+          27.968,
+          27.968,
+          27.936
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005113601576251359,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004862900781007721,
+            "normalized_max": 0.005474452554744526
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005113601576251359,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004862900781007721,
+            "normalized_max": 0.005474452554744526
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.001716247139588,
+          "native": 1.0016549939011472
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 27.357999235391617,
+            "samples_us": [
+              27.3397509008646,
+              27.36249938607216,
+              27.368750423192978,
+              27.365999296307564,
+              27.354499325156212,
+              27.357999235391617,
+              27.364250272512436,
+              27.354499325156212,
+              27.352500706911087,
+              27.362750843167305,
+              27.36474946141243,
+              27.363499626517296,
+              27.35549956560135,
+              27.3632500320673,
+              27.357999235391617,
+              27.354000136256218,
+              27.358749881386757,
+              27.355249971151352,
+              27.352750301361084,
+              27.350500226020813
+            ]
+          },
+          "native": {
+            "median_us": 41.158124804496765,
+            "samples_us": [
+              41.15749895572662,
+              41.20650142431259,
+              41.16424918174744,
+              41.17925092577934,
+              41.167501360177994,
+              41.183751076459885,
+              41.16024821996689,
+              41.19725152850151,
+              41.19525104761124,
+              41.15875065326691,
+              41.163500398397446,
+              41.1357507109642,
+              41.134998202323914,
+              40.648750960826874,
+              40.596749633550644,
+              40.54350033402443,
+              40.57775065302849,
+              40.597498416900635,
+              40.63649848103523,
+              40.59074819087982
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "cutlass",
+        "timer": "cupti",
+        "tokens": 8,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "shared"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend cutlass --tokens 8 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse shared --timer cupti --output result.json",
+      "native_route": "cutlass_w4a16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 78.5275,
+        "native": 45.055749999999996
+      },
+      "speedup": 0.5737576008404698,
+      "selected": {
+        "frost": [
+          2,
+          8,
+          4
+        ],
+        "native": [
+          53,
+          169
+        ]
+      },
+      "candidate_counts": {
+        "native": 5,
+        "frost": 88
+      },
+      "validation_medians": {
+        "native": [
+          45.152,
+          44.9915,
+          44.927,
+          45.055499999999995,
+          45.056,
+          45.056,
+          45.0715,
+          44.896
+        ],
+        "frost": [
+          78.4795,
+          78.5275,
+          78.6555,
+          78.6075,
+          78.68700000000001,
+          78.4315,
+          78.5275,
+          78.4475
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004868723702964073,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004620993361466946,
+            "normalized_max": 0.005474452554744526
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 3.1046028090150886e-05,
+            "normalized_max": 0.0009124087591240876
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004869020643141774,
+            "normalized_max": 0.0072992700729927005
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004621097659141521,
+            "normalized_max": 0.005474452554744526
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0013250517598342,
+          "native": 1.000893977589481
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 77.53074914216995,
+            "samples_us": [
+              77.59349793195724,
+              77.54124701023102,
+              77.49799638986588,
+              77.5117501616478,
+              77.57549732923508,
+              77.53700017929077,
+              77.47650146484375,
+              77.45475322008133,
+              77.47875154018402,
+              77.54100114107132,
+              77.61400192975998,
+              77.69624888896942,
+              77.54649966955185,
+              77.46774703264236,
+              77.52449810504913,
+              77.50625163316727,
+              77.98700034618378,
+              77.86600291728973,
+              77.52300053834915,
+              77.50924676656723
+            ]
+          },
+          "native": {
+            "median_us": 42.168499901890755,
+            "samples_us": [
+              42.45074838399887,
+              42.50200092792511,
+              42.497001588344574,
+              42.48474910855293,
+              42.49124974012375,
+              42.48249903321266,
+              42.50375181436539,
+              42.21174865961075,
+              42.150501161813736,
+              42.16824844479561,
+              42.16200113296509,
+              42.16599836945534,
+              42.15075075626373,
+              42.16499999165535,
+              42.17125102877617,
+              42.16524958610535,
+              42.15824976563454,
+              42.16025024652481,
+              42.1687513589859,
+              42.15649887919426
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 2,
+        "native_full_blocks": true,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cutile --tokens 2 --hidden 7168 --intermediate 2048 --experts 256 --top-k 8 --cache-mode cold --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutile_nvfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 224.02249999999998,
+        "native": 1114.34475
+      },
+      "speedup": 4.974253702195092,
+      "selected": {
+        "frost": [
+          1,
+          4,
+          8,
+          8
+        ],
+        "native": [
+          32,
+          0,
+          128,
+          64,
+          2,
+          128,
+          64,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 325,
+        "frost": 88
+      },
+      "validation_medians": {
+        "native": [
+          1107.6405,
+          1118.505,
+          1109.498,
+          1118.537,
+          1101.625,
+          1132.249,
+          1110.4569999999999,
+          1118.2325
+        ],
+        "frost": [
+          224.126,
+          226.36700000000002,
+          223.3585,
+          227.29399999999998,
+          223.0385,
+          223.199,
+          223.91899999999998,
+          225.374
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.00021834310880862874,
+            "normalized_max": 0.003401360544217687
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0047624338414037105,
+            "normalized_max": 0.006802721088435374
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004545949344051946,
+            "normalized_max": 0.006802721088435374
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.00476205960408661,
+            "normalized_max": 0.006802721088435374
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004543841580778502,
+            "normalized_max": 0.006802721088435374
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9901193382934026,
+          "native": 0.9911027598051354
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 226.18050128221512,
+            "samples_us": [
+              226.9672453403473,
+              226.82824730873108,
+              224.78875517845154,
+              224.90499913692474,
+              224.94825720787048,
+              224.94375705718994,
+              224.9460071325302,
+              227.51225531101227,
+              227.6187539100647,
+              227.61249542236328,
+              226.66099667549133,
+              226.17900371551514,
+              226.1819988489151,
+              226.26249492168427,
+              226.17250680923462,
+              226.1829972267151,
+              226.19974613189697,
+              226.17824375629425,
+              226.11549496650696,
+              226.173996925354
+            ]
+          },
+          "native": {
+            "median_us": 1089.662253856659,
+            "samples_us": [
+              1089.4967317581177,
+              1089.6462202072144,
+              1089.494228363037,
+              1089.437484741211,
+              1089.6919965744019,
+              1089.4842147827148,
+              1089.7530317306519,
+              1089.9524688720703,
+              1089.5099639892578,
+              1089.6532535552979,
+              1089.6767377853394,
+              1089.67125415802,
+              1089.8109674453735,
+              1089.805245399475,
+              1089.8348093032837,
+              1089.797019958496,
+              1089.6730422973633,
+              1089.563012123108,
+              1089.4967317581177,
+              1089.5999670028687
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 2,
+        "native_full_blocks": true,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cutile --tokens 2 --hidden 7168 --intermediate 2048 --experts 256 --top-k 8 --cache-mode warm --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutile_nvfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 217.6145,
+        "native": 1115.95325
+      },
+      "speedup": 5.128119909289133,
+      "selected": {
+        "frost": [
+          1,
+          4,
+          8,
+          8
+        ],
+        "native": [
+          32,
+          0,
+          128,
+          64,
+          2,
+          128,
+          64,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 325,
+        "frost": 88
+      },
+      "validation_medians": {
+        "native": [
+          1116.0410000000002,
+          1129.6405,
+          1114.025,
+          1116.377,
+          1090.5365000000002,
+          1129.4965000000002,
+          1114.074,
+          1115.8654999999999
+        ],
+        "frost": [
+          217.77450000000002,
+          217.63049999999998,
+          217.598,
+          220.7825,
+          217.5505,
+          217.5985,
+          217.439,
+          220.863
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.00021834310880862874,
+            "normalized_max": 0.003401360544217687
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0047624338414037105,
+            "normalized_max": 0.006802721088435374
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004545949344051946,
+            "normalized_max": 0.006802721088435374
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.00476205960408661,
+            "normalized_max": 0.006802721088435374
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004543841580778502,
+            "normalized_max": 0.006802721088435374
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9925538248181509,
+          "native": 0.9920857074096114
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 226.17637366056442,
+            "samples_us": [
+              218.93024444580078,
+              224.5577573776245,
+              224.78049993515015,
+              224.79499876499176,
+              225.1099944114685,
+              225.1800000667572,
+              225.1032441854477,
+              225.8085012435913,
+              227.57449746131897,
+              227.58924961090088,
+              226.6484946012497,
+              226.1582463979721,
+              226.25824809074402,
+              226.21850669384003,
+              226.21050477027893,
+              226.17675364017487,
+              226.19450092315674,
+              226.17599368095398,
+              226.24950110912323,
+              226.2587547302246
+            ]
+          },
+          "native": {
+            "median_us": 1089.619517326355,
+            "samples_us": [
+              1089.3962383270264,
+              1089.8184776306152,
+              1089.627742767334,
+              1089.6037817001343,
+              1089.3340110778809,
+              1089.758276939392,
+              1089.440941810608,
+              1089.4949436187744,
+              1089.6060466766357,
+              1089.279055595398,
+              1089.6224975585938,
+              1089.76149559021,
+              1089.6687507629395,
+              1089.6430015563965,
+              1089.8387432098389,
+              1089.5133018493652,
+              1089.6165370941162,
+              1089.6332263946533,
+              1089.7927284240723,
+              1089.4747972488403
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 2,
+        "native_full_blocks": true,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "cold",
+        "expert_reuse": "shared"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cutile --tokens 2 --hidden 7168 --intermediate 2048 --experts 256 --top-k 8 --cache-mode cold --expert-reuse shared --timer cupti --output result.json",
+      "native_route": "cutile_nvfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 200.6625,
+        "native": 583.0205000000001
+      },
+      "speedup": 2.9054781037812254,
+      "selected": {
+        "frost": [
+          4,
+          4,
+          2
+        ],
+        "native": [
+          32,
+          0,
+          128,
+          64,
+          2,
+          256,
+          64,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 325,
+        "frost": 88
+      },
+      "validation_medians": {
+        "native": [
+          577.644,
+          583.518,
+          583.1005,
+          582.9405,
+          582.7494999999999,
+          584.3485000000001,
+          582.7315000000001,
+          583.789
+        ],
+        "frost": [
+          199.598,
+          203.3265,
+          200.3985,
+          203.2305,
+          200.7185,
+          201.00650000000002,
+          200.558,
+          200.60649999999998
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0002391565656393413,
+            "normalized_max": 0.003401360544217687
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004730617684721512,
+            "normalized_max": 0.006802721088435374
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.00449060905928026,
+            "normalized_max": 0.006802721088435374
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 3.4070904225095716e-05,
+            "normalized_max": 0.0008503401360544217
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004730870545899464,
+            "normalized_max": 0.006802721088435374
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0044891750091866295,
+            "normalized_max": 0.006802721088435374
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9918847111966494,
+          "native": 0.9984357157114624
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 198.34737479686737,
+            "samples_us": [
+              194.37849521636963,
+              197.36875593662262,
+              197.32774794101715,
+              197.28100299835205,
+              198.3249932527542,
+              198.35874438285828,
+              198.40174913406372,
+              198.381245136261,
+              198.39175045490265,
+              198.31524789333344,
+              198.3562558889389,
+              198.42299818992615,
+              198.37500154972076,
+              198.39400053024292,
+              198.34549725055695,
+              198.3492523431778,
+              198.35124909877777,
+              198.33999872207642,
+              198.2945054769516,
+              198.32874834537506
+            ]
+          },
+          "native": {
+            "median_us": 566.4698779582977,
+            "samples_us": [
+              566.8724775314331,
+              566.5745139122009,
+              566.4287209510803,
+              566.523015499115,
+              566.156268119812,
+              566.6902661323547,
+              566.5645003318787,
+              566.277265548706,
+              566.5429830551147,
+              566.4799809455872,
+              566.4597749710083,
+              566.621720790863,
+              566.552996635437,
+              566.5764808654785,
+              566.3625001907349,
+              566.2105083465576,
+              566.337525844574,
+              566.2450194358826,
+              566.3187503814697,
+              566.2109851837158
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 2,
+        "native_full_blocks": true,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "warm",
+        "expert_reuse": "shared"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cutile --tokens 2 --hidden 7168 --intermediate 2048 --experts 256 --top-k 8 --cache-mode warm --expert-reuse shared --timer cupti --output result.json",
+      "native_route": "cutile_nvfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 194.9345,
+        "native": 580.3165
+      },
+      "speedup": 2.9769820119065633,
+      "selected": {
+        "frost": [
+          4,
+          4,
+          2
+        ],
+        "native": [
+          32,
+          0,
+          128,
+          64,
+          2,
+          256,
+          64,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 325,
+        "frost": 88
+      },
+      "validation_medians": {
+        "native": [
+          580.0930000000001,
+          580.413,
+          580.444,
+          579.868,
+          580.3810000000001,
+          581.1320000000001,
+          580.252,
+          580.156
+        ],
+        "frost": [
+          194.95850000000002,
+          194.9265,
+          196.14249999999998,
+          197.135,
+          194.2225,
+          194.1905,
+          194.9425,
+          194.382
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0002391565656393413,
+            "normalized_max": 0.003401360544217687
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004730617684721512,
+            "normalized_max": 0.006802721088435374
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.00449060905928026,
+            "normalized_max": 0.006802721088435374
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 3.4070904225095716e-05,
+            "normalized_max": 0.0008503401360544217
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004730870545899464,
+            "normalized_max": 0.006802721088435374
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0044891750091866295,
+            "normalized_max": 0.006802721088435374
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0015219292668924,
+          "native": 1.0000551453640414
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 197.29912281036377,
+            "samples_us": [
+              195.10824978351593,
+              195.64974308013916,
+              197.45874404907227,
+              197.42849469184875,
+              197.43649661540985,
+              197.34175503253937,
+              197.3094940185547,
+              197.29025661945343,
+              197.29599356651306,
+              197.19325006008148,
+              197.27425277233124,
+              197.26699590682983,
+              197.28299975395203,
+              197.26400077342987,
+              197.42724299430847,
+              197.331503033638,
+              197.29824364185333,
+              197.3000019788742,
+              197.3627507686615,
+              197.4007487297058
+            ]
+          },
+          "native": {
+            "median_us": 566.3155019283295,
+            "samples_us": [
+              566.4634704589844,
+              566.3704872131348,
+              566.3052797317505,
+              566.3225054740906,
+              566.1927461624146,
+              566.286027431488,
+              566.3732290267944,
+              566.1985278129578,
+              566.3765072822571,
+              566.6807293891907,
+              566.2549734115601,
+              566.3377642631531,
+              566.1642551422119,
+              566.2407279014587,
+              566.2804841995239,
+              565.8730268478394,
+              566.3084983825684,
+              566.4194822311401,
+              566.3964748382568,
+              566.5547251701355
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cutile --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutile_nvfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 19.296,
+        "native": 145.751
+      },
+      "speedup": 7.553430762852405,
+      "selected": {
+        "frost": [
+          1,
+          2,
+          8,
+          8
+        ],
+        "native": [
+          32,
+          0,
+          128,
+          64,
+          2,
+          256,
+          64,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 325,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          145.743,
+          145.327,
+          145.647,
+          145.75900000000001,
+          145.839,
+          145.7745,
+          145.96699999999998,
+          145.5505
+        ],
+        "frost": [
+          19.296,
+          19.264,
+          19.296,
+          19.392,
+          19.232,
+          19.343500000000002,
+          19.296,
+          19.424
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 1.9237711732597858e-05,
+            "normalized_max": 0.00021114864864864866
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004383141092767426,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004410314364826973,
+            "normalized_max": 0.006756756756756757
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004382997466908789,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004410138016491154,
+            "normalized_max": 0.006756756756756757
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9962953879516205,
+          "native": 1.000935431216627
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 15.6288743019104,
+            "samples_us": [
+              15.613500028848648,
+              15.636749565601349,
+              15.629749745130539,
+              15.631750226020813,
+              15.632249414920807,
+              15.628999099135399,
+              15.633750706911087,
+              15.620999969542027,
+              15.629500150680542,
+              15.628000721335411,
+              15.628499910235405,
+              15.621500089764595,
+              15.619000419974327,
+              15.620999969542027,
+              15.628749504685402,
+              15.628499910235405,
+              15.632500872015953,
+              15.635250136256218,
+              15.636250376701355,
+              15.627499669790268
+            ]
+          },
+          "native": {
+            "median_us": 132.56461918354034,
+            "samples_us": [
+              137.2780054807663,
+              137.29199767112732,
+              137.3714953660965,
+              133.8520050048828,
+              133.47025215625763,
+              133.4427446126938,
+              133.4022432565689,
+              133.47674906253815,
+              133.43225419521332,
+              132.51625001430511,
+              132.56074488162994,
+              132.52274692058563,
+              132.45324790477753,
+              132.48825073242188,
+              132.45774805545807,
+              132.49249756336212,
+              132.51200318336487,
+              132.49224424362183,
+              132.56849348545074,
+              132.50049948692322
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cutile --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutile_nvfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 15.904000000000002,
+        "native": 132.20725
+      },
+      "speedup": 8.3128301056338,
+      "selected": {
+        "frost": [
+          1,
+          8,
+          8,
+          8
+        ],
+        "native": [
+          64,
+          0,
+          128,
+          64,
+          4,
+          128,
+          64,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 325,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          132.11149999999998,
+          131.5665,
+          131.726,
+          132.07850000000002,
+          132.303,
+          134.079,
+          133.599,
+          133.407
+        ],
+        "frost": [
+          15.84,
+          15.84,
+          15.8555,
+          15.968,
+          15.904000000000002,
+          16.0,
+          15.904000000000002,
+          16.0
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 1.9237711732597858e-05,
+            "normalized_max": 0.00021114864864864866
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004383141092767426,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004410314364826973,
+            "normalized_max": 0.006756756756756757
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004382997466908789,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004410138016491154,
+            "normalized_max": 0.006756756756756757
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.993477852852853,
+          "native": 0.9959658813758189
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 15.798499807715416,
+            "samples_us": [
+              15.78650064766407,
+              15.818750485777855,
+              15.805000439286232,
+              15.809500589966774,
+              15.80825075507164,
+              15.802500769495964,
+              15.804750844836235,
+              15.799250453710556,
+              15.794500708580017,
+              15.803249552845955,
+              15.793250873684883,
+              15.798250213265419,
+              15.794999897480011,
+              15.797249972820282,
+              15.799000859260559,
+              15.798749402165413,
+              15.798000618815422,
+              15.792999416589737,
+              15.740999951958656,
+              15.709999948740005
+            ]
+          },
+          "native": {
+            "median_us": 127.01775133609772,
+            "samples_us": [
+              131.88475370407104,
+              129.15849685668945,
+              128.41275334358215,
+              128.3929944038391,
+              128.3862441778183,
+              128.41899693012238,
+              128.4160017967224,
+              127.44125723838806,
+              127.02025473117828,
+              127.00025737285614,
+              127.03950703144073,
+              127.01350450515747,
+              127.01524794101715,
+              126.88849866390228,
+              126.82925164699554,
+              126.83449685573578,
+              126.85100734233856,
+              126.864492893219,
+              126.8170028924942,
+              126.85374915599823
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm90",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cutile --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutile_nvfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "25f38e8a4144439bb9a9ca86cf8ae42f6775e530cf29a45b25365cd13c12553f",
+      "median_us": {
+        "frost": 15.856,
+        "native": 131.83925
+      },
+      "speedup": 8.314786200807266,
+      "selected": {
+        "frost": [
+          1,
+          8,
+          8,
+          8
+        ],
+        "native": [
+          64,
+          0,
+          128,
+          64,
+          4,
+          128,
+          64,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 325,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          132.04700000000003,
+          131.583,
+          131.71049999999997,
+          131.9355,
+          132.12699999999998,
+          132.191,
+          131.743,
+          131.615
+        ],
+        "frost": [
+          15.808,
+          15.872,
+          15.808,
+          15.9995,
+          15.808,
+          15.968,
+          15.84,
+          15.968
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 1.9237711732597858e-05,
+            "normalized_max": 0.00021114864864864866
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004383141092767426,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004410314364826973,
+            "normalized_max": 0.006756756756756757
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004382997466908789,
+            "normalized_max": 0.006756756756756757
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004410138016491154,
+            "normalized_max": 0.006756756756756757
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9899799599198397,
+          "native": 1.0009087442444617
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 15.587999951094389,
+            "samples_us": [
+              15.569750219583511,
+              15.604999847710133,
+              15.59200044721365,
+              15.590500086545944,
+              15.605749562382698,
+              15.58225043118,
+              15.587249770760536,
+              15.585250221192837,
+              15.592250041663647,
+              15.584999695420265,
+              15.585499815642834,
+              15.595249831676483,
+              15.584999695420265,
+              15.585750341415405,
+              15.587749890983105,
+              15.588250011205673,
+              15.58700017631054,
+              15.589499846100807,
+              15.590249560773373,
+              15.591000206768513
+            ]
+          },
+          "native": {
+            "median_us": 127.00662016868591,
+            "samples_us": [
+              130.4135024547577,
+              130.46100735664368,
+              130.4447501897812,
+              130.46374917030334,
+              129.12249565124512,
+              127.04050540924072,
+              127.03225016593933,
+              127.01049447059631,
+              127.02600657939911,
+              127.03275680541992,
+              127.00274586677551,
+              126.84249877929688,
+              126.8479973077774,
+              126.83899700641632,
+              126.8409937620163,
+              126.848503947258,
+              126.86499953269958,
+              126.86775624752045,
+              126.824751496315,
+              126.82999670505524
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "prims-ts",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend prims-ts --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer globaltimer --output result.json",
+      "native_route": "prims_ts",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 21.36,
+        "native": 86.624
+      },
+      "speedup": 4.055430711610486,
+      "selected": {
+        "frost": [
+          4,
+          4,
+          8,
+          8
+        ],
+        "native": [
+          16,
+          0
+        ]
+      },
+      "candidate_counts": {
+        "native": 37,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          86.528,
+          87.088,
+          86.592,
+          86.464,
+          86.528,
+          86.73599999999999,
+          87.21600000000001,
+          86.656
+        ],
+        "frost": [
+          21.36,
+          21.376,
+          21.408,
+          21.328000000000003,
+          21.392000000000003,
+          21.36,
+          21.264000000000003,
+          21.36
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.004955580723153393,
+            "normalized_max": 0.004639737991266376
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.002566596440589364,
+            "normalized_max": 0.004366812227074236
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004954492370914828,
+            "normalized_max": 0.004639737991266376
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0047101994750318385,
+            "normalized_max": 0.004366812227074236
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0007490636704122,
+          "native": 0.9984313001753253
+        },
+        "empty_interval_us": {
+          "median": 0.576,
+          "min": 0.416,
+          "max": 0.864
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "prims-ts",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend prims-ts --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer globaltimer --output result.json",
+      "native_route": "prims_ts",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 17.728,
+        "native": 83.36
+      },
+      "speedup": 4.702166064981949,
+      "selected": {
+        "frost": [
+          4,
+          4,
+          8,
+          4
+        ],
+        "native": -1
+      },
+      "candidate_counts": {
+        "native": 37,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          83.392,
+          83.344,
+          83.36,
+          83.36,
+          83.408,
+          83.328,
+          83.424,
+          83.296
+        ],
+        "frost": [
+          17.728,
+          17.76,
+          17.728,
+          17.728,
+          17.728,
+          17.744,
+          17.728,
+          17.744
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.004955580723153393,
+            "normalized_max": 0.004639737991266376
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.002566596440589364,
+            "normalized_max": 0.004366812227074236
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004954492370914828,
+            "normalized_max": 0.004639737991266376
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0047101994750318385,
+            "normalized_max": 0.004366812227074236
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9990982867448153,
+          "native": 1.0007679754247865
+        },
+        "empty_interval_us": {
+          "median": 0.46399999999999997,
+          "min": 0.448,
+          "max": 0.48
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "mxint4",
+        "native_backend": "trtllm-mxint4",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 4096,
+        "intermediate": 1536,
+        "experts": 128,
+        "top_k": 8,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxint4 --native-backend trtllm-mxint4 --tokens 1 --hidden 4096 --intermediate 1536 --experts 128 --top-k 8 --cache-mode cold --expert-reuse disjoint --timer globaltimer --output result.json",
+      "native_route": "trtllm_mxint4_routed",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "c7daf687060ff0b2c66f6832934cb6161aac6360e881107d5506d48d5788d6d4",
+      "median_us": {
+        "frost": 82.832,
+        "native": 60.72
+      },
+      "speedup": 0.7330500289743095,
+      "selected": {
+        "frost": [
+          4,
+          2,
+          8,
+          8
+        ],
+        "native": [
+          8,
+          5
+        ]
+      },
+      "candidate_counts": {
+        "native": 145,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          60.736,
+          60.736,
+          60.736,
+          60.704,
+          60.576,
+          60.704,
+          60.751999999999995,
+          60.70399999999999
+        ],
+        "frost": [
+          82.80000000000001,
+          82.848,
+          82.816,
+          82.832,
+          82.88,
+          82.896,
+          82.784,
+          82.832
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0052761519090433135,
+            "normalized_max": 0.005319148936170213
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004298039949943019,
+            "normalized_max": 0.0070921985815602835
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004109402587349162,
+            "normalized_max": 0.0035460992907801418
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0045551606761642365,
+            "normalized_max": 0.005319148936170213
+          },
+          "fp32_preact": {
+            "relative_l2": 0.00011396929954948929,
+            "normalized_max": 0.0017730496453900709
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0027224248927095788,
+            "normalized_max": 0.0035460992907801418
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9996137131820377,
+          "native": 1.000527148128624
+        },
+        "empty_interval_us": {
+          "median": 0.64,
+          "min": 0.448,
+          "max": 0.992
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "mxint4",
+        "native_backend": "trtllm-mxint4",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 4096,
+        "intermediate": 1536,
+        "experts": 128,
+        "top_k": 8,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxint4 --native-backend trtllm-mxint4 --tokens 1 --hidden 4096 --intermediate 1536 --experts 128 --top-k 8 --cache-mode warm --expert-reuse disjoint --timer globaltimer --output result.json",
+      "native_route": "trtllm_mxint4_routed",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "c7daf687060ff0b2c66f6832934cb6161aac6360e881107d5506d48d5788d6d4",
+      "median_us": {
+        "frost": 77.03999999999999,
+        "native": 58.688
+      },
+      "speedup": 0.7617860851505712,
+      "selected": {
+        "frost": [
+          4,
+          4,
+          8,
+          8
+        ],
+        "native": -1
+      },
+      "candidate_counts": {
+        "native": 145,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          58.656,
+          58.688,
+          58.768,
+          58.688,
+          58.656,
+          58.784,
+          58.784,
+          58.672
+        ],
+        "frost": [
+          77.03999999999999,
+          77.056,
+          77.024,
+          77.03999999999999,
+          77.136,
+          77.024,
+          77.056,
+          77.024
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0052761519090433135,
+            "normalized_max": 0.005319148936170213
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004298039949943019,
+            "normalized_max": 0.0070921985815602835
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004109402587349162,
+            "normalized_max": 0.0035460992907801418
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0045551606761642365,
+            "normalized_max": 0.005319148936170213
+          },
+          "fp32_preact": {
+            "relative_l2": 0.00011396929954948929,
+            "normalized_max": 0.0017730496453900709
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0027224248927095788,
+            "normalized_max": 0.0035460992907801418
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.000207705888462,
+          "native": 1.0004089422028353
+        },
+        "empty_interval_us": {
+          "median": 0.48,
+          "min": 0.448,
+          "max": 0.512
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "mxint4",
+        "native_backend": "trtllm-mxint4",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxint4 --native-backend trtllm-mxint4 --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer globaltimer --output result.json",
+      "native_route": "trtllm_mxint4_routed",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 22.496,
+        "native": 25.568
+      },
+      "speedup": 1.136557610241821,
+      "selected": {
+        "frost": [
+          4,
+          2,
+          8,
+          4
+        ],
+        "native": [
+          8,
+          5
+        ]
+      },
+      "candidate_counts": {
+        "native": 145,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          25.520000000000003,
+          25.568,
+          25.520000000000003,
+          25.456000000000003,
+          25.664,
+          25.664,
+          25.584000000000003,
+          25.568
+        ],
+        "frost": [
+          22.512,
+          22.496,
+          22.479999999999997,
+          22.448,
+          22.528,
+          22.368,
+          22.528,
+          22.496
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.005512424551527102,
+            "normalized_max": 0.007407407407407408
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004714640438012798,
+            "normalized_max": 0.007407407407407408
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004497980735544922,
+            "normalized_max": 0.003703703703703704
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.004926234676702869,
+            "normalized_max": 0.004166666666666667
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0026499531508836598,
+            "normalized_max": 0.007407407407407408
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0021359914560342,
+          "native": 0.9993742177722154
+        },
+        "empty_interval_us": {
+          "median": 1.024,
+          "min": 0.608,
+          "max": 1.28
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "mxint4",
+        "native_backend": "trtllm-mxint4",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxint4 --native-backend trtllm-mxint4 --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer globaltimer --output result.json",
+      "native_route": "trtllm_mxint4_routed",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 18.272,
+        "native": 22.688
+      },
+      "speedup": 1.2416812609457093,
+      "selected": {
+        "frost": [
+          4,
+          2,
+          8,
+          4
+        ],
+        "native": [
+          8,
+          11
+        ]
+      },
+      "candidate_counts": {
+        "native": 145,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          22.688,
+          22.688,
+          22.688,
+          22.671999999999997,
+          22.688,
+          22.656,
+          22.688,
+          22.688
+        ],
+        "frost": [
+          18.272,
+          18.272,
+          18.272,
+          18.272,
+          18.24,
+          18.272,
+          18.272,
+          18.272
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.005512424551527102,
+            "normalized_max": 0.007407407407407408
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004714640438012798,
+            "normalized_max": 0.007407407407407408
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004497980735544922,
+            "normalized_max": 0.003703703703703704
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.004926234676702869,
+            "normalized_max": 0.004166666666666667
+          },
+          "fp32_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0026499531508836598,
+            "normalized_max": 0.007407407407407408
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0,
+          "native": 1.000352733686067
+        },
+        "empty_interval_us": {
+          "median": 0.46399999999999997,
+          "min": 0.448,
+          "max": 0.48
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cute-dsl",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cute-dsl --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer globaltimer --native-tactic-json '[[[128,32,256],[2,1],true],[[128,32,256],[2,1],true]]' --output result.json",
+      "native_route": "cute_dsl",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "c7daf687060ff0b2c66f6832934cb6161aac6360e881107d5506d48d5788d6d4",
+      "median_us": {
+        "frost": 18.223999999999997,
+        "native": 25.872
+      },
+      "speedup": 1.4196663740122917,
+      "selected": {
+        "frost": [
+          2,
+          2,
+          8,
+          8
+        ],
+        "native": [
+          [
+            [
+              128,
+              32,
+              256
+            ],
+            [
+              2,
+              1
+            ],
+            true
+          ],
+          [
+            [
+              128,
+              32,
+              256
+            ],
+            [
+              2,
+              1
+            ],
+            true
+          ]
+        ]
+      },
+      "candidate_counts": {
+        "native": 24,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          25.92,
+          25.856,
+          25.904000000000003,
+          25.888,
+          25.856,
+          25.808,
+          25.856,
+          25.936
+        ],
+        "frost": [
+          18.24,
+          18.304,
+          18.208,
+          18.223999999999997,
+          18.223999999999997,
+          18.208,
+          18.192,
+          18.24
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.006705327007566066,
+            "normalized_max": 0.012711864406779662
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005231638197786765,
+            "normalized_max": 0.008438818565400843
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.005146256122122628,
+            "normalized_max": 0.008438818565400843
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004997117386384684,
+            "normalized_max": 0.004812763713080169
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004733653973442917,
+            "normalized_max": 0.004219409282700422
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9991224221149626,
+          "native": 1.000309214594929
+        },
+        "empty_interval_us": {
+          "median": 0.992,
+          "min": 0.48,
+          "max": 1.248
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost",
+      "baseline_audit": "Current 128x16 native winner: 25.208 us. Revalidated prior 128x32 native finalist: 25.872 us. Use current winner for cold headline."
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cute-dsl",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cute-dsl --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer globaltimer --native-tactic-json '[[[128,32,256],[2,1],true],[[128,32,256],[2,1],true]]' --output result.json",
+      "native_route": "cute_dsl",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "c7daf687060ff0b2c66f6832934cb6161aac6360e881107d5506d48d5788d6d4",
+      "median_us": {
+        "frost": 15.392,
+        "native": 20.12
+      },
+      "speedup": 1.3071725571725572,
+      "selected": {
+        "frost": [
+          2,
+          2,
+          8,
+          4
+        ],
+        "native": [
+          [
+            [
+              128,
+              32,
+              256
+            ],
+            [
+              2,
+              1
+            ],
+            true
+          ],
+          [
+            [
+              128,
+              32,
+              256
+            ],
+            [
+              2,
+              1
+            ],
+            true
+          ]
+        ]
+      },
+      "candidate_counts": {
+        "native": 24,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          21.056,
+          20.032,
+          20.128,
+          20.112000000000002,
+          20.128,
+          20.096,
+          20.096,
+          20.128
+        ],
+        "frost": [
+          15.392,
+          15.392,
+          15.392,
+          15.392,
+          15.392,
+          15.424,
+          15.392,
+          15.392
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.006708332946669251,
+            "normalized_max": 0.012711864406779662
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005409319311428689,
+            "normalized_max": 0.008438818565400843
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.005190072633074515,
+            "normalized_max": 0.010548523206751054
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004997117386384684,
+            "normalized_max": 0.004812763713080169
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004733653973442917,
+            "normalized_max": 0.004219409282700422
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0,
+          "native": 1.0011937922801433
+        },
+        "empty_interval_us": {
+          "median": 0.48,
+          "min": 0.448,
+          "max": 0.48
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cute-dsl",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cute-dsl --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer globaltimer --output result.json",
+      "native_route": "cute_dsl",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 18.176,
+        "native": 25.208
+      },
+      "speedup": 1.3868838028169015,
+      "selected": {
+        "frost": [
+          2,
+          2,
+          8,
+          8
+        ],
+        "native": [
+          [
+            [
+              128,
+              16,
+              256
+            ],
+            [
+              2,
+              1
+            ],
+            true
+          ],
+          [
+            [
+              128,
+              16,
+              256
+            ],
+            [
+              2,
+              1
+            ],
+            true
+          ]
+        ]
+      },
+      "candidate_counts": {
+        "native": 24,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          24.464,
+          24.384,
+          25.232,
+          24.624000000000002,
+          25.520000000000003,
+          25.264000000000003,
+          25.344,
+          25.184
+        ],
+        "frost": [
+          18.128,
+          18.08,
+          18.159999999999997,
+          18.159999999999997,
+          18.208,
+          18.192,
+          18.24,
+          18.24
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.006675318393381983,
+            "normalized_max": 0.012711864406779662
+          },
+          "fp32_preact": {
+            "relative_l2": 0.005341334936927601,
+            "normalized_max": 0.008438818565400843
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.005175384455062164,
+            "normalized_max": 0.008438818565400843
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004997117386384684,
+            "normalized_max": 0.004812763713080169
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004733653973442917,
+            "normalized_max": 0.004219409282700422
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0004401408450703,
+          "native": 1.0154192097654995
+        },
+        "empty_interval_us": {
+          "median": 1.024,
+          "min": 0.8,
+          "max": 1.472
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost",
+      "baseline_audit": "Current 128x16 native winner: 25.208 us. Revalidated prior 128x32 native finalist: 25.872 us. Use current winner for cold headline."
+    },
+    {
+      "architecture": "sm103",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "cute-dsl",
+        "timer": "globaltimer",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend cute-dsl --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer globaltimer --output result.json",
+      "native_route": "cute_dsl",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 15.392,
+        "native": 22.031999999999996
+      },
+      "speedup": 1.4313929313929312,
+      "selected": {
+        "frost": [
+          2,
+          2,
+          8,
+          4
+        ],
+        "native": [
+          [
+            [
+              128,
+              16,
+              256
+            ],
+            [
+              2,
+              1
+            ],
+            true
+          ],
+          [
+            [
+              128,
+              16,
+              256
+            ],
+            [
+              2,
+              1
+            ],
+            true
+          ]
+        ]
+      },
+      "candidate_counts": {
+        "native": 24,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          22.048,
+          22.08,
+          22.016,
+          22.031999999999996,
+          22.048,
+          22.016,
+          22.016,
+          22.031999999999996
+        ],
+        "frost": [
+          15.392,
+          15.376,
+          15.392,
+          15.392,
+          15.408,
+          15.392,
+          15.36,
+          15.392
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.006733009136550892,
+            "normalized_max": 0.012711864406779662
+          },
+          "fp32_preact": {
+            "relative_l2": 0.00529905009298602,
+            "normalized_max": 0.008438818565400843
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.005130276946660726,
+            "normalized_max": 0.008438818565400843
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004997117386384684,
+            "normalized_max": 0.004812763713080169
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004733653973442917,
+            "normalized_max": 0.004219409282700422
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0,
+          "native": 1.0
+        },
+        "empty_interval_us": {
+          "median": 0.48,
+          "min": 0.448,
+          "max": 0.48
+        }
+      },
+      "baseline_audit": "The revalidated 128x32 native finalist is faster: 20.120 us versus this 22.032 us. Use the finalist row (1.307x), not this ratio, as the best-native warm headline.",
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm120",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend cutile --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutile_mxfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 18.91175,
+        "native": 35.44725
+      },
+      "speedup": 1.8743506021388816,
+      "selected": {
+        "frost": [
+          2,
+          4,
+          8,
+          4
+        ],
+        "native": [
+          16,
+          0,
+          128,
+          256,
+          2,
+          128,
+          256,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 101,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          35.247,
+          35.615,
+          35.936,
+          35.232,
+          35.824,
+          35.2795,
+          35.215500000000006,
+          35.7435
+        ],
+        "frost": [
+          18.912,
+          18.944,
+          18.911500000000004,
+          19.008000000000003,
+          18.799999999999997,
+          18.975499999999997,
+          18.848,
+          18.8795
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004604053036152357,
+            "normalized_max": 0.0040650406504065045
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.00434813025032853,
+            "normalized_max": 0.004081632653061225
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004604053036152357,
+            "normalized_max": 0.0040650406504065045
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.00434813025032853,
+            "normalized_max": 0.004081632653061225
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9957805350808951,
+          "native": 1.0024896148502354
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 8.25162511318922,
+            "samples_us": [
+              8.248000405728817,
+              8.309000171720982,
+              8.273749612271786,
+              8.275499567389488,
+              8.253750391304493,
+              8.285249583423138,
+              8.254500105977058,
+              8.244999684393406,
+              8.246500045061111,
+              8.252750150859356,
+              8.245750330388546,
+              8.22949968278408,
+              8.247500285506248,
+              8.23924969881773,
+              8.282249793410301,
+              8.279750123620033,
+              8.250500075519085,
+              8.24424996972084,
+              8.256499655544758,
+              8.24700016528368
+            ]
+          },
+          "native": {
+            "median_us": 21.4473744854331,
+            "samples_us": [
+              21.43999934196472,
+              21.46800048649311,
+              21.456750109791756,
+              21.4610006660223,
+              21.462000906467438,
+              21.45550027489662,
+              21.45550027489662,
+              21.439500153064728,
+              21.45474962890148,
+              21.436499431729317,
+              21.43774926662445,
+              21.438749507069588,
+              21.457750350236893,
+              21.42450027167797,
+              21.457500755786896,
+              21.437250077724457,
+              21.456999704241753,
+              21.43150009214878,
+              21.43225073814392,
+              21.430499851703644
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm120",
+      "workload": {
+        "weight_format": "mxfp4",
+        "native_backend": "cutile",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format mxfp4 --native-backend cutile --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "cutile_mxfp4",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 8.576,
+        "native": 21.679000000000002
+      },
+      "speedup": 2.527868470149254,
+      "selected": {
+        "frost": [
+          2,
+          4,
+          8,
+          4
+        ],
+        "native": [
+          16,
+          0,
+          128,
+          128,
+          2,
+          128,
+          256,
+          2
+        ]
+      },
+      "candidate_counts": {
+        "native": 101,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          21.631,
+          21.76,
+          21.76,
+          21.791,
+          21.727,
+          21.6,
+          21.631,
+          21.6155
+        ],
+        "frost": [
+          8.5755,
+          8.591999999999999,
+          8.543999999999999,
+          8.576,
+          8.576,
+          8.576,
+          8.576,
+          8.576
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004604053036152357,
+            "normalized_max": 0.0040650406504065045
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.00434813025032853,
+            "normalized_max": 0.004081632653061225
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004604053036152357,
+            "normalized_max": 0.0040650406504065045
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.00434813025032853,
+            "normalized_max": 0.004081632653061225
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9999708488805968,
+          "native": 0.9995965464375051
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 8.254500105977058,
+            "samples_us": [
+              8.232000283896923,
+              8.268499746918678,
+              8.264750242233276,
+              8.276499807834625,
+              8.276750333607197,
+              8.263999596238136,
+              8.258749730885029,
+              8.252250030636787,
+              8.252499625086784,
+              8.25124979019165,
+              8.237499743700027,
+              8.26324988156557,
+              8.255749940872192,
+              8.260499686002731,
+              8.253250271081924,
+              8.238749578595161,
+              8.239500224590302,
+              8.255749940872192,
+              8.249499835073948,
+              8.24199989438057
+            ]
+          },
+          "native": {
+            "median_us": 21.165000274777412,
+            "samples_us": [
+              21.152250468730927,
+              21.172000095248222,
+              21.169250831007957,
+              21.169250831007957,
+              21.15749940276146,
+              21.172499284148216,
+              21.152250468730927,
+              21.158499643206596,
+              21.150749176740646,
+              21.157249808311462,
+              21.1582500487566,
+              21.14799991250038,
+              21.18000015616417,
+              21.165000274777412,
+              21.17050066590309,
+              21.18374966084957,
+              21.18225023150444,
+              21.167749539017677,
+              21.165000274777412,
+              21.164000034332275
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm120",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "sm120-tc",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend sm120-tc --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "sm120_fused_tc",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 19.632,
+        "native": 20.0235
+      },
+      "speedup": 1.0199419315403422,
+      "selected": {
+        "frost": [
+          2,
+          4,
+          8,
+          4
+        ],
+        "native": [
+          128,
+          64,
+          64,
+          128
+        ]
+      },
+      "candidate_counts": {
+        "native": 6,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          20.064,
+          19.776,
+          20.0475,
+          19.999499999999998,
+          19.7915,
+          20.063000000000002,
+          19.8555,
+          20.048000000000002
+        ],
+        "frost": [
+          19.616,
+          19.439,
+          19.743499999999997,
+          19.632,
+          19.856,
+          19.52,
+          19.632,
+          19.712
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.005988121420706367,
+            "normalized_max": 0.010330578512396695
+          },
+          "fp32_preact": {
+            "relative_l2": 0.006913994271125991,
+            "normalized_max": 0.012396694214876033
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.006731587121762634,
+            "normalized_max": 0.012396694214876033
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004903982053503003,
+            "normalized_max": 0.008264462809917356
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004615240789460855,
+            "normalized_max": 0.004132231404958678
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0057085206375154,
+          "native": 0.9963917847556027
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 7.939124945551157,
+            "samples_us": [
+              7.919999770820141,
+              7.9752495512366295,
+              7.950000464916229,
+              7.930999621748924,
+              7.931750267744064,
+              7.939250208437443,
+              7.935499772429466,
+              7.942750118672848,
+              7.942249998450279,
+              7.938999682664871,
+              7.932749576866627,
+              7.957750000059605,
+              7.941500283777714,
+              7.933249697089195,
+              7.931999862194061,
+              7.953000254929066,
+              7.942499592900276,
+              7.957249879837036,
+              7.933749817311764,
+              7.935250177979469
+            ]
+          },
+          "native": {
+            "median_us": 10.061000008136034,
+            "samples_us": [
+              10.040000081062317,
+              10.067249648272991,
+              10.062499903142452,
+              10.058999992907047,
+              10.06074994802475,
+              10.060000233352184,
+              10.069499723613262,
+              10.058499872684479,
+              10.059249587357044,
+              10.056249797344208,
+              10.061250068247318,
+              10.06300002336502,
+              10.061250068247318,
+              10.06575021892786,
+              10.061999782919884,
+              10.061250068247318,
+              10.063249617815018,
+              10.060000233352184,
+              10.04175003618002,
+              10.052749887108803
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm120",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "sm120-tc",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend sm120-tc --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "sm120_fused_tc",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 8.256,
+        "native": 10.112
+      },
+      "speedup": 1.2248062015503876,
+      "selected": {
+        "frost": [
+          2,
+          4,
+          8,
+          4
+        ],
+        "native": [
+          128,
+          64,
+          64,
+          128
+        ]
+      },
+      "candidate_counts": {
+        "native": 6,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          10.112,
+          10.08,
+          10.112,
+          10.08,
+          10.08,
+          10.112,
+          10.112,
+          10.1275
+        ],
+        "frost": [
+          8.224,
+          8.256,
+          8.24,
+          8.256,
+          8.256,
+          8.256,
+          8.256,
+          8.256
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.0057673417786506,
+            "normalized_max": 0.008264462809917356
+          },
+          "fp32_preact": {
+            "relative_l2": 0.006717621968696493,
+            "normalized_max": 0.012396694214876033
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0065349392263447425,
+            "normalized_max": 0.012396694214876033
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004903982053503003,
+            "normalized_max": 0.008264462809917356
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004615240789460855,
+            "normalized_max": 0.004132231404958678
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 0.9990310077519381,
+          "native": 1.0015847860538827
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 7.935250177979469,
+            "samples_us": [
+              7.919999770820141,
+              7.967250421643257,
+              7.936500012874603,
+              7.93949980288744,
+              7.934750057756901,
+              7.953249849379063,
+              7.950750179588795,
+              7.936250418424606,
+              7.935250177979469,
+              7.933749817311764,
+              7.934000343084335,
+              7.934500463306904,
+              7.934249937534332,
+              7.934000343084335,
+              7.951750420033932,
+              7.935250177979469,
+              7.935250177979469,
+              7.93249998241663,
+              7.934999652206898,
+              7.9367496073246
+            ]
+          },
+          "native": {
+            "median_us": 10.05837507545948,
+            "samples_us": [
+              10.040249675512314,
+              10.05574967712164,
+              10.042999871075153,
+              10.044500231742859,
+              10.05875039845705,
+              10.057750158011913,
+              10.059500113129616,
+              10.060000233352184,
+              10.054250247776508,
+              10.05799975246191,
+              10.060500353574753,
+              10.060500353574753,
+              10.053250007331371,
+              10.057499632239342,
+              10.053499601781368,
+              10.060000233352184,
+              10.061750188469887,
+              10.061750188469887,
+              10.064249858260155,
+              10.061750188469887
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm120",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "sm12x",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend sm12x --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode cold --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "sm12x_nvfp4_bf16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 19.951749999999997,
+        "native": 21.86375
+      },
+      "speedup": 1.0958311927525155,
+      "selected": {
+        "frost": [
+          2,
+          4,
+          8,
+          4
+        ],
+        "native": -1
+      },
+      "candidate_counts": {
+        "native": 1,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          21.728,
+          21.823999999999998,
+          22.127499999999998,
+          21.887999999999998,
+          21.872,
+          21.887500000000003,
+          21.807499999999997,
+          21.8555
+        ],
+        "frost": [
+          19.679499999999997,
+          19.584,
+          20.08,
+          19.904,
+          19.999499999999998,
+          19.7915,
+          20.192,
+          20.048000000000002
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.004538504095465225,
+            "normalized_max": 0.004132231404958678
+          },
+          "fp32_preact": {
+            "relative_l2": 0.00322487190990267,
+            "normalized_max": 0.004132231404958678
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0025941225540645784,
+            "normalized_max": 0.004132231404958678
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004903982053503003,
+            "normalized_max": 0.008264462809917356
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004615240789460855,
+            "normalized_max": 0.004132231404958678
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0096736405889837,
+          "native": 0.9985483391628374
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 7.934500463306904,
+            "samples_us": [
+              7.919999770820141,
+              7.98024982213974,
+              7.952000014483929,
+              7.934249937534332,
+              7.934500463306904,
+              7.923499681055546,
+              7.934500463306904,
+              7.934500463306904,
+              7.934750057756901,
+              7.949249818921089,
+              7.933249697089195,
+              7.933749817311764,
+              7.934249937534332,
+              7.935999892652035,
+              7.928250357508659,
+              7.934249937534332,
+              7.935250177979469,
+              7.945000194013119,
+              7.943999953567982,
+              7.935499772429466
+            ]
+          },
+          "native": {
+            "median_us": 9.408500045537949,
+            "samples_us": [
+              9.399999864399433,
+              9.417000226676464,
+              9.409500285983086,
+              9.407499805092812,
+              9.392250329256058,
+              9.414499625563622,
+              9.403250180184841,
+              9.423499926924706,
+              9.408500045537949,
+              9.408500045537949,
+              9.412500075995922,
+              9.415250271558762,
+              9.405749849975109,
+              9.417500346899033,
+              9.399999864399433,
+              9.406999684870243,
+              9.421749971807003,
+              9.405500255525112,
+              9.40600037574768,
+              9.42275021225214
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    },
+    {
+      "architecture": "sm120",
+      "workload": {
+        "weight_format": "nvfp4",
+        "native_backend": "sm12x",
+        "timer": "cupti",
+        "tokens": 1,
+        "native_full_blocks": true,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint"
+      },
+      "command": "python benchmarks/bench_frost_low_latency_w4a16.py --weight-format nvfp4 --native-backend sm12x --tokens 1 --hidden 2048 --intermediate 512 --experts 512 --top-k 10 --cache-mode warm --expert-reuse disjoint --timer cupti --output result.json",
+      "native_route": "sm12x_nvfp4_bf16",
+      "runtime_fingerprint": "3fb2b2a753278d6a141785f05bb03cddc7c16aea3f86f920e5f244f25b488aaa",
+      "benchmark_sha256": "07d31834e649df2ad7d154fb1b4169adfdc07f16acd66459f38fdf2ee829a115",
+      "median_us": {
+        "frost": 8.256,
+        "native": 9.568
+      },
+      "speedup": 1.1589147286821704,
+      "selected": {
+        "frost": [
+          2,
+          4,
+          8,
+          4
+        ],
+        "native": -1
+      },
+      "candidate_counts": {
+        "native": 1,
+        "frost": 64
+      },
+      "validation_medians": {
+        "native": [
+          9.5835,
+          9.568,
+          9.568,
+          9.568,
+          9.568,
+          9.568,
+          9.567499999999999,
+          9.568
+        ],
+        "frost": [
+          8.255500000000001,
+          8.256,
+          8.256,
+          8.256,
+          8.256,
+          8.256,
+          8.256,
+          8.256
+        ]
+      },
+      "max_reference_errors": {
+        "native": {
+          "bf16_preact": {
+            "relative_l2": 0.004538504095465225,
+            "normalized_max": 0.004132231404958678
+          },
+          "fp32_preact": {
+            "relative_l2": 0.00322487190990267,
+            "normalized_max": 0.004132231404958678
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.0025941225540645784,
+            "normalized_max": 0.004132231404958678
+          }
+        },
+        "frost": {
+          "bf16_preact": {
+            "relative_l2": 0.0,
+            "normalized_max": 0.0
+          },
+          "fp32_preact": {
+            "relative_l2": 0.004903982053503003,
+            "normalized_max": 0.008264462809917356
+          },
+          "fp32_preact_expert": {
+            "relative_l2": 0.004615240789460855,
+            "normalized_max": 0.004132231404958678
+          }
+        }
+      },
+      "controls": {
+        "aa_ratio": {
+          "frost": 1.0,
+          "native": 1.0
+        },
+        "warm_event_chain_control": {
+          "frost": {
+            "median_us": 7.9400003887712955,
+            "samples_us": [
+              7.919999770820141,
+              7.946750149130821,
+              7.938750088214874,
+              7.950250059366226,
+              7.956000044941902,
+              7.944249548017979,
+              7.938750088214874,
+              7.935999892652035,
+              7.935999892652035,
+              7.953500375151634,
+              7.955750450491905,
+              7.94025044888258,
+              7.941249758005142,
+              7.924499921500683,
+              7.934750057756901,
+              7.924499921500683,
+              7.941749878227711,
+              7.939750328660011,
+              7.924750447273254,
+              7.941749878227711
+            ]
+          },
+          "native": {
+            "median_us": 9.488875046372414,
+            "samples_us": [
+              9.479999542236328,
+              9.500750340521336,
+              9.507250040769577,
+              9.491000324487686,
+              9.47474967688322,
+              9.4802500680089,
+              9.500250220298767,
+              9.488750249147415,
+              9.491500444710255,
+              9.488999843597412,
+              9.476999752223492,
+              9.499750100076199,
+              9.496750310063362,
+              9.476499632000923,
+              9.485750459134579,
+              9.486500173807144,
+              9.484999813139439,
+              9.491750039160252,
+              9.491500444710255,
+              9.483249858021736
+            ]
+          }
+        }
+      },
+      "validation_order": "A1 B1 B2 A2 repeated four times; A=native, B=Frost"
+    }
+  ],
+  "artifact_note": "Only completed correctness-qualified cases are included. Benchmark revisions differ in adding native adapters and finalist controls; recorded per-case hashes identify each revision. The current reproducer retains those paths."
+}

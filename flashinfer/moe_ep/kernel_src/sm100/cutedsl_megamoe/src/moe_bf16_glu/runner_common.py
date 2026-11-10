@@ -20,9 +20,14 @@ class TrainingImplDesc(ImplDesc):
     mma_tiler_mnk: Tuple[int, int, int] = (256, 256, 64)
     cluster_shape_mnk: Tuple[int, int, int] = (2, 1, 1)
     use_2cta_instrs: bool = True
+    skip_topk_reduce: bool = False
     generate_c: bool = True
     use_stg_fc1: bool = False
 
     def __str__(self) -> str:
         base = super().__str__().replace("ImplDesc:", "TrainingImplDesc:", 1)
-        return f"{base} generate_c={self.generate_c} use_stg_fc1={self.use_stg_fc1}"
+        return (
+            f"{base} skip_topk_reduce={self.skip_topk_reduce} "
+            f"generate_c={self.generate_c} "
+            f"use_stg_fc1={self.use_stg_fc1}"
+        )

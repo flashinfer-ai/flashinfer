@@ -113,7 +113,7 @@
 //       timed `__global__` runs the SAME tile again through the specialization
 //       that does carry a data-derived origin: a per-row maximum over real
 //       scores, a raise to `block_max + kRebaseMargin`, and a rescale of BOTH
-//       carried quantities (`row_sum *= acc_scale` and the O accumulator in
+//       carried quantities (`row_sum` and the O accumulator in
 //       TMEM) before anything else is written.  The replay's origin is never a
 //       constant; `kFastOrigin` appears only as its starting point and only
 //       ever moves up.  The replay recomputes the tile from global memory --
@@ -1183,22 +1183,26 @@ __device__ __forceinline__ bool sparse_prefill_tile(
                 need_rebase ? (row_sum > 0.0f ? fmaxf(block_max + kRebaseMargin, exp_origin + 64.0f)
                                               : block_max + kRebaseMargin)
                             : exp_origin;
-            const float acc_scale =
-                need_rebase && row_sum > 0.0f ? exp2f(exp_origin - new_origin) : 1.0f;
+            // The rescale 2^(exp_origin - new_origin) is applied as two equal factors.
+            // The exponent is at most -64 and can fall below -126, where exp2f flushes
+            // to zero under -ftz, while row_sum * 2^d (row_sum <= kMaxSafeSum) is still
+            // a normal number down to d = -238. Each half factor is normal for d >= -252.
+            const float acc_half_scale =
+                need_rebase && row_sum > 0.0f ? exp2f(0.5f * (exp_origin - new_origin)) : 1.0f;
 
-            if (!first_pv && __any_sync(0xffffffffu, acc_scale != 1.0f)) {
+            if (!first_pv && __any_sync(0xffffffffu, acc_half_scale != 1.0f)) {
 #pragma unroll
               for (int c = 0; c < 8; ++c) {
                 float acc[16];
                 tmem_load_x16(acc, taddr + kOutputTmem + row_base + c * 16);
 #pragma unroll
-                for (int p = 0; p < 16; ++p) acc[p] *= acc_scale;
+                for (int p = 0; p < 16; ++p) acc[p] = acc[p] * acc_half_scale * acc_half_scale;
                 tmem_store_x16_f32(taddr + kOutputTmem + row_base + c * 16, acc);
               }
               asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
             }
             if (need_rebase) {
-              row_sum *= acc_scale;
+              row_sum = row_sum * acc_half_scale * acc_half_scale;
               exp_origin = new_origin;
             }
 

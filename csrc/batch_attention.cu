@@ -27,7 +27,7 @@ using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
 template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
-          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+          MaskMode MASK_MODE, bool EQUAL_KV_STRIDES, typename AttentionVariant, typename Params>
 cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
                                           const uint32_t num_blks_x, const uint32_t num_blks_y,
                                           const cudaStream_t stream);
@@ -87,6 +87,10 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
 
   // layout only constraint paged KV
   const QKVLayout kv_layout = static_cast<QKVLayout>(layout_code);
+  // Compare the original strides before narrowing to the kernel parameter types.
+  [[maybe_unused]] const bool equal_kv_strides = k_cache.stride(0) == v_cache.stride(0) &&
+                                                 k_cache.stride(1) == v_cache.stride(1) &&
+                                                 k_cache.stride(2) == v_cache.stride(2);
   unsigned int k_stride_page = k_cache.stride(0);
   unsigned int v_stride_page = v_cache.stride(0);
   unsigned int k_stride_n, k_stride_h, v_stride_n, v_stride_h;
@@ -183,9 +187,32 @@ void BatchPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_wo
           PROFILER_PARAMS_SETTER
         }
 
-        cudaError_t status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO,
-                                                           MASK_MODE, AttentionVariant>(
+        cudaError_t status;
+#if BATCH_ATTENTION_KV_STRIDE_MODE == BATCH_ATTENTION_KV_STRIDE_MODE_RUNTIME
+        if (equal_kv_strides) {
+          status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, true,
+                                                 AttentionVariant>(
+              params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        } else {
+          status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE,
+                                                 false, AttentionVariant>(
+              params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        }
+#elif BATCH_ATTENTION_KV_STRIDE_MODE == BATCH_ATTENTION_KV_STRIDE_MODE_EQUAL
+        TVM_FFI_ICHECK(equal_kv_strides)
+            << "The equal-stride BatchAttention primary requires identical K/V data strides "
+               "for page, token, and head dimensions; route unequal layouts through the "
+               "independent module.";
+        status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, true,
+                                               AttentionVariant>(
             params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+#elif BATCH_ATTENTION_KV_STRIDE_MODE == BATCH_ATTENTION_KV_STRIDE_MODE_INDEPENDENT
+        status = BatchPagedAttentionPersistent<128, 16, HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, false,
+                                               AttentionVariant>(
+            params[0], params[1], plan_info.num_blks_x, plan_info.num_blks_y, stream);
+#else
+#error "Unsupported BATCH_ATTENTION_KV_STRIDE_MODE"
+#endif
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "Failed to run persistent paged attention, error: " << cudaGetErrorString(status);
         return true;

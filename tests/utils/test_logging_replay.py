@@ -40,11 +40,36 @@ from flashinfer.utils import get_compute_capability
 from tests.utils_fp8 import to_float8
 
 
+def _flashinfer_module_names():
+    return [k for k in sys.modules if k == "flashinfer" or k.startswith("flashinfer.")]
+
+
 def _clean_flashinfer_modules():
     """Remove flashinfer modules from sys.modules."""
-    modules_to_delete = [k for k in sys.modules.keys() if k.startswith("flashinfer")]
-    for module in modules_to_delete:
-        del sys.modules[module]
+    for name in _flashinfer_module_names():
+        del sys.modules[name]
+
+
+def _restore_flashinfer_modules(saved):
+    """Put the original flashinfer modules back so other test files keep valid identities."""
+    for name in _flashinfer_module_names():
+        parent_name, _, child = name.rpartition(".")
+        if name not in saved and parent_name in saved:
+            if getattr(saved[parent_name], child, None) is sys.modules[name]:
+                delattr(saved[parent_name], child)
+    _clean_flashinfer_modules()
+    sys.modules.update(saved)
+    for name, module in saved.items():
+        parent_name, _, child = name.rpartition(".")
+        if parent_name in saved:
+            setattr(saved[parent_name], child, module)
+
+
+@pytest.fixture(autouse=True)
+def _preserve_flashinfer_modules():
+    saved = {name: sys.modules[name] for name in _flashinfer_module_names()}
+    yield
+    _restore_flashinfer_modules(saved)
 
 
 @pytest.fixture
@@ -402,9 +427,9 @@ def test_trtllm_mla_prefill_logging_attribution_in_fresh_process(
             return torch.tensor([len(calls)], dtype=torch.int32)
 
         assert not hasattr(
-            core._trtllm_batch_decode_with_kv_cache_mla_impl, "__wrapped__"
+            core._mla_with_kv_cache_impl, "__wrapped__"
         )
-        core._trtllm_batch_decode_with_kv_cache_mla_impl = shared_impl
+        core._mla_with_kv_cache_impl = shared_impl
         required = (
             torch.empty(1),
             torch.empty(1),

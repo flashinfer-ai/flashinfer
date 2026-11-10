@@ -26,11 +26,21 @@ measured on the prepared runner's stage callables.  ``--with-flashinfer``
 adds ``BatchPrefillWithRaggedKVCacheWrapper`` (planned once outside the timed
 region, ``run()`` timed) on the same tensors as the BF16 reference route.
 
+``--operand-layout`` selects how Q/K/V are laid out: ``contract`` (default,
+contiguous ``[T, H, 128]``), ``engine`` (column chunks of the fused QKV
+projection ``[T, 3 * H * 128]``, strides ``(3 * H * 128, 128, 1)``) or
+``pack`` (kind slices of the Cake pre-attention pack ``[T, H, 3, 128]``,
+strides ``(H * 384, 384, 1)``).  The BF16 kernel consumes the strided views in
+place; for the non-contract layouts the ``copies ms`` column times the three
+THD ``.contiguous()`` copies a route needed before, so the saving is visible
+without a second kernel.  The NVFP4 variants keep the contiguous contract and
+are skipped for the other layouts.
+
 Usage::
 
     python benchmarks/bench_cake_minimax_h3_varlen_attention.py \
         [--variants bf16 nvfp4_fp8 nvfp4_fp4] [--rows center_5s_p8_m4824 ...] \
-        [--with-flashinfer] [--json out.json]
+        [--operand-layout contract|engine|pack] [--with-flashinfer] [--json out.json]
 """
 
 import argparse
@@ -71,17 +81,51 @@ ROWS = {
     "seg4_6s_p2_m24384": ([0, 12285, 16401, 20393, 24384], 2),
 }
 VARIANTS = ("bf16", "nvfp4_fp8", "nvfp4_fp4")
+OPERAND_LAYOUTS = ("contract", "engine", "pack")
 
 
-def make_inputs(cu, degree, device, seed=0):
+def make_inputs(cu, degree, device, seed=0, layout="contract"):
     heads = GLOBAL_HEADS // degree
     gen = torch.Generator(device=device).manual_seed(seed)
-    shape = (cu[-1], heads, HEAD_DIM)
-    q = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=gen)
-    k = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=gen)
-    v = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=gen)
+    total = cu[-1]
+    shape = (total, heads, HEAD_DIM)
+    if layout == "contract":
+        q = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=gen)
+        k = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=gen)
+        v = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=gen)
+    elif layout == "engine":
+        # Column chunks of the fused QKV projection, never copied.
+        qkv = torch.randn(
+            (total, 3 * heads * HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        width = heads * HEAD_DIM
+        q, k, v = (
+            qkv[:, i * width : (i + 1) * width].view(total, heads, HEAD_DIM)
+            for i in range(3)
+        )
+        assert q.stride() == (3 * heads * HEAD_DIM, HEAD_DIM, 1)
+    elif layout == "pack":
+        # Kind slices of the Cake pre-attention pack [T, H, 3, 128], never copied.
+        pack = torch.randn(
+            (total, heads, 3, HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        q, k, v = (pack[:, :, i, :] for i in range(3))
+        assert q.stride() == (heads * 3 * HEAD_DIM, 3 * HEAD_DIM, 1)
+    else:
+        raise ValueError(f"unknown operand layout {layout!r}")
     cu_seqlens = torch.tensor(cu, dtype=torch.int32, device=device)
     return q, k, v, cu_seqlens, heads
+
+
+def _thd_copies(q, k, v):
+    """The three THD copies a route needed before strided Q/K/V were accepted."""
+    return q.contiguous(), k.contiguous(), v.contiguous()
 
 
 def _flops(cu, heads):
@@ -127,9 +171,11 @@ def main():
     parser.add_argument(
         "--variants", nargs="*", default=list(VARIANTS), choices=VARIANTS
     )
+    parser.add_argument("--operand-layout", choices=OPERAND_LAYOUTS, default="contract")
     parser.add_argument("--with-flashinfer", action="store_true")
     parser.add_argument("--json", default=None)
     args = parser.parse_args()
+    layout = args.operand_layout
     device = torch.device("cuda", 0)
     sm_scale = HEAD_DIM**-0.5
     fi_workspace = (
@@ -139,26 +185,39 @@ def main():
     )
     results = []
     print(
-        f"{torch.cuda.get_device_name(device)}, {len(args.rows)} rows x {len(args.variants)} variants"
+        f"{torch.cuda.get_device_name(device)}, {len(args.rows)} rows x "
+        f"{len(args.variants)} variants, operand layout: {layout}"
     )
     header = f"{'row':<36}{'variant':<11}{'total ms':>10}{'quant ms':>10}{'attn ms':>10}{'TFLOP/s':>9}"
+    if layout != "contract":
+        header += f"{'copies ms':>11}"
     if args.with_flashinfer:
         header += f"{'FI ragged ms':>14}{'speedup':>9}"
     print(header)
     for name in args.rows:
         cu, degree = ROWS[name]
-        q, k, v, cu_seqlens, heads = make_inputs(cu, degree, device)
+        q, k, v, cu_seqlens, heads = make_inputs(cu, degree, device, layout=layout)
         flops = _flops(cu, heads)
         fi_ms = None
         if args.with_flashinfer:
+            fi_q, fi_k, fi_v = _thd_copies(q, k, v)
             fi_run, _ = _flashinfer_ragged(
-                q, k, v, cu_seqlens, heads, sm_scale, fi_workspace
+                fi_q, fi_k, fi_v, cu_seqlens, heads, sm_scale, fi_workspace
             )
             fi_run()
             torch.cuda.synchronize()
             fi_ms = _median_ms(fi_run)
+            del fi_q, fi_k, fi_v
+        copies_ms = None
+        if layout != "contract":
+            copies_ms = _median_ms(lambda q=q, k=k, v=v: _thd_copies(q, k, v))
         for variant in args.variants:
-            out = torch.empty_like(q)
+            if variant != "bf16" and layout != "contract":
+                print(f"{name:<36}{variant:<11}  skipped (contiguous contract only)")
+                continue
+            out = torch.empty(
+                (cu[-1], heads, HEAD_DIM), dtype=torch.bfloat16, device=device
+            )
             quant_ms = attn_ms = None
             if variant == "bf16":
                 runner = prepare_minimax_h3_varlen_attention(
@@ -196,9 +255,12 @@ def main():
                 segments=len(cu) - 1,
                 ulysses_degree=degree,
                 local_heads=heads,
+                operand_layout=layout,
+                q_strides=list(q.stride()),
                 total_ms=total_ms,
                 quantize_ms=quant_ms,
                 attention_ms=attn_ms,
+                thd_copies_ms=copies_ms,
                 tflops=flops / total_ms / 1e9,
                 route_metadata=runner.route_metadata,
             )
@@ -207,6 +269,8 @@ def main():
                 f"{(quant_ms if quant_ms is not None else float('nan')):>10.4f}"
                 f"{(attn_ms if attn_ms is not None else float('nan')):>10.4f}{row['tflops']:>9.1f}"
             )
+            if copies_ms is not None:
+                line += f"{copies_ms:>11.4f}"
             if fi_ms is not None:
                 row.update(flashinfer_ragged_ms=fi_ms, speedup=fi_ms / total_ms)
                 line += f"{fi_ms:>14.4f}{fi_ms / total_ms:>9.3f}"
@@ -217,7 +281,11 @@ def main():
     if args.json:
         with open(args.json, "w") as handle:
             json.dump(
-                dict(device=torch.cuda.get_device_name(device), rows=results),
+                dict(
+                    device=torch.cuda.get_device_name(device),
+                    operand_layout=layout,
+                    rows=results,
+                ),
                 handle,
                 indent=2,
             )

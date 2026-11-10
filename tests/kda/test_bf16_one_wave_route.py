@@ -4,12 +4,20 @@ Licensed under the Apache License, Version 2.0.
 https://www.apache.org/licenses/LICENSE-2.0
 """
 
-"""BF16 prefill routing: one-wave grids take the M64 value split on SM100a/SM103a."""
+"""BF16 prefill routing: one-wave grids take the M64 value split on SM100a/SM103a.
+
+The prepared export serves FP32 state pools, whose split body carries FP32
+chunk state (CAKE-736 round 9), so bounded logit-beta grids keep the split at
+every length; the BF16-pool split body (not exported here) keeps its BF16
+carrier and is routed to the direct N32 body beyond one 64-token chunk.
+"""
 
 import pytest
 import torch
 
+import flashinfer.cake_kda_tf32_runtime as runtime
 from flashinfer import prepare_bf16_kda_prefill
+from flashinfer.kda_prefill import select_bf16_schedule_route
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -18,7 +26,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture
+def stock_m64_route(monkeypatch):
+    """Hold the mixed-length M64 split off: mixed-length launches keep the
+    stock M64 value-split program."""
+    monkeypatch.setattr(runtime, "MIXLEN_ARCHES", frozenset())
+
+
 def _prepare(lengths, heads, *, active_beta):
+    return _launch(lengths, heads, active_beta=active_beta)[0]
+
+
+def _launch(lengths, heads, *, active_beta):
+    """The schedule and the outputs (out, final pool rows, checkpoint rows) of one launch."""
     torch.manual_seed(7)
     tokens = sum(lengths)
     shape = (1, tokens, heads, 128)
@@ -63,7 +83,7 @@ def _prepare(lengths, heads, *, active_beta):
     assert torch.isfinite(out).all()
     assert torch.isfinite(pool[indices]).all()
     assert torch.isfinite(cp).all()
-    return str(call.schedule)
+    return str(call.schedule), out, pool[indices], cp
 
 
 @pytest.mark.parametrize(
@@ -77,8 +97,22 @@ def _prepare(lengths, heads, *, active_beta):
             True,
             "fused_active_beta_checkpoint_dvsplit_m64",
         ),
-        # Logit beta, FP32 state, 24 tasks: the FP32-state M64 split.
-        ((33, 1025), 12, False, "fused_m64_independent_dvsplit_fp32_state"),
+        # Logit beta, FP32 state, 24 tasks, 1025 tokens: the FP32-state M64
+        # split.  Its round-7 body re-derived the chunk state from a BF16 copy
+        # and drifted 0.026 at 1024 tokens under trained deep-layer statistics
+        # (CAKE-736 round 8 routed it to the direct N32 body); the round-9 body
+        # accumulates the decay correction onto the FP32 state (delta decay),
+        # so the split is back.  Its long-task load, 12 x 1058 / 1025 tokens,
+        # is in the first pair-share row of both parts (32 tasks, 1024
+        # tokens), so the 1025-token launch takes the pair-share build.
+        (
+            (33, 1025),
+            12,
+            False,
+            "fused_m64_independent_dvsplit_fp32_state_pair_share",
+        ),
+        # Logit beta, FP32 state, single-chunk residuals: the split stays.
+        ((17, 64, 33, 64, 9, 64), 6, False, "fused_m64_independent_dvsplit_fp32_state"),
         # Mixed lengths with six heads (36 tasks), active beta.
         (
             (1300, 547, 2048, 963, 271, 3063),
@@ -88,8 +122,33 @@ def _prepare(lengths, heads, *, active_beta):
         ),
     ],
 )
+@pytest.mark.usefixtures("stock_m64_route")
 def test_one_wave_bf16_grid_uses_m64_value_split(lengths, heads, active_beta, expected):
-    assert _prepare(lengths, heads, active_beta=active_beta) == expected
+    # A long launch whose 2-CTA clusters fit one wave takes the pair-share build
+    # of the same split (schedule suffix ``_pair_share``, the same bits); the
+    # active-beta split has no pair-share build and the other rows are short.
+    schedule = _prepare(lengths, heads, active_beta=active_beta)
+    assert schedule == expected
+
+
+def test_one_wave_mixed_length_grid_takes_the_mixlen_split(monkeypatch):
+    """The 33 + 1025-token logit-beta row above mixes a long and a short
+    sequence: it takes the mixed-length split ("rng": the 1025-token sequence
+    on the owner/helper build, the 33-token one on the M64 value split), bit
+    for bit the stock pair-share launch."""
+    lengths, heads = (33, 1025), 12
+    schedule, *got = _launch(lengths, heads, active_beta=False)
+    helpers = f"_owner{runtime.MIXLEN_HELPERS}helper"
+    assert schedule.startswith("mixlen_rng["), schedule
+    assert f"{helpers}@1-1" in schedule, schedule
+    assert "fused_m64_independent_dvsplit_fp32_state@0-0" in schedule, schedule
+    monkeypatch.setattr(runtime, "MIXLEN_ARCHES", frozenset())
+    stock, *want = _launch(lengths, heads, active_beta=False)
+    assert stock == "fused_m64_independent_dvsplit_fp32_state_pair_share", stock
+    for name, a, b in zip(
+        ("out", "final state", "checkpoint rows"), got, want, strict=True
+    ):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
 
 
 def test_short_h12_logit_beta_keeps_direct_n16_tile():
@@ -104,3 +163,18 @@ def test_multi_wave_grid_keeps_direct_tile():
     schedule = _prepare((128,) * 8, 12, active_beta=True)
     assert "m64" not in schedule
     assert schedule.startswith("fused_")
+
+
+def test_select_bf16_schedule_route_is_the_shared_planner_adapter():
+    """The prepared runtime shares the planner's metadata adapter, which takes
+    the compute capability directly (no device probe).  The packed H12 grid of
+    1025 + 33 tokens (24 tasks, one M64 chain wave on 148 SMs) takes the BT16
+    prepare-chain M64 split on both supported architectures."""
+    kwargs = dict(
+        sm_count=148, fixed_layout=False, sequence_lengths=(1025, 33), num_heads=12
+    )
+    for compute_capability in ((10, 0), (10, 3)):
+        assert (
+            select_bf16_schedule_route(compute_capability=compute_capability, **kwargs)
+            == "bt16_prepare_chain_m64"
+        )

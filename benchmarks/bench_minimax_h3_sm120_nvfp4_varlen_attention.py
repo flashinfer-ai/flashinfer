@@ -33,6 +33,11 @@ Usage::
     python benchmarks/bench_minimax_h3_sm120_nvfp4_varlen_attention.py --suite short
     python benchmarks/bench_minimax_h3_sm120_nvfp4_varlen_attention.py --shapes center_33472 seg4_33472
     python benchmarks/bench_minimax_h3_sm120_nvfp4_varlen_attention.py --suite all --json results.json
+    python benchmarks/bench_minimax_h3_sm120_nvfp4_varlen_attention.py --pv-mode fp8 --suite centers
+
+``--pv-mode fp8`` times the opt-in NVFP4-QK / FP8-PV route of the same operator
+(``minimax_h3_sm120_varlen_attention_nvfp4(..., pv_mode="fp8")``: NVFP4 scores, E4M3 probabilities and
+V, three PDL-chained launches) in place of the default Sage3-recipe route.
 """
 
 from __future__ import annotations
@@ -52,6 +57,7 @@ from flashinfer.diffusion_ops import (
 )
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     workspace_bytes_nvfp4,
+    workspace_bytes_nvfp4_fp8pv,
 )
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention import (
     MINIMAX_H3_HEAD_DIM,
@@ -190,7 +196,12 @@ def _measure(fn, bench_ms: float) -> float:
 
 
 def bench_shape(
-    label: str, cu_seqlens, backends, bench_ms: float, device: torch.device
+    label: str,
+    cu_seqlens,
+    backends,
+    bench_ms: float,
+    device: torch.device,
+    pv_mode: str = "fp4",
 ) -> dict:
     tokens = cu_seqlens[-1]
     q, k, v = synthetic_inputs(tokens, seed=tokens, device=device)
@@ -202,6 +213,7 @@ def bench_shape(
         "cu_seqlens": list(cu_seqlens),
         "tokens": tokens,
         "useful_flops": flops,
+        "pv_mode": pv_mode,
         "backends": {},
     }
     for backend in backends:
@@ -212,12 +224,18 @@ def bench_shape(
             before = torch.cuda.memory_allocated(device)
             if backend == "cake_nvfp4":
                 fn = lambda: minimax_h3_sm120_varlen_attention_nvfp4(
-                    q, k, v, cu, cu_seqlens_host=cu_seqlens
+                    q, k, v, cu, cu_seqlens_host=cu_seqlens, pv_mode=pv_mode
                 )  # noqa: E731
                 out = fn()
                 torch.cuda.synchronize()
+                entry["pv_mode"] = pv_mode
                 entry["error"] = error_stats(out, expected, FP4_ATOL, FP4_RTOL)
-                entry["workspace_bytes"] = workspace_bytes_nvfp4(
+                workspace_fn = (
+                    workspace_bytes_nvfp4_fp8pv
+                    if pv_mode == "fp8"
+                    else workspace_bytes_nvfp4
+                )
+                entry["workspace_bytes"] = workspace_fn(
                     tokens, MINIMAX_H3_NUM_HEADS, len(cu_seqlens) - 1
                 )
             elif backend == "cake_fp8":
@@ -280,14 +298,24 @@ def main() -> None:
     )
     parser.add_argument("--backends", nargs="*", default=[*CAKE_ROUTES, *FI_ROUTES])
     parser.add_argument("--bench-ms", type=float, default=300.0)
+    parser.add_argument(
+        "--pv-mode",
+        choices=("fp4", "fp8"),
+        default="fp4",
+        help="route of the cake_nvfp4 backend: the Sage3 recipe (fp4) or NVFP4-QK / FP8-PV (fp8)",
+    )
     parser.add_argument("--json", default=None)
     args = parser.parse_args()
     device = torch.device("cuda:0")
     labels = args.shapes or SUITES[args.suite]
     rows = []
-    print(f"GPU: {torch.cuda.get_device_name(device)}  backends={args.backends}")
+    print(
+        f"GPU: {torch.cuda.get_device_name(device)}  backends={args.backends}  pv_mode={args.pv_mode}"
+    )
     for label in labels:
-        row = bench_shape(label, SHAPES[label], args.backends, args.bench_ms, device)
+        row = bench_shape(
+            label, SHAPES[label], args.backends, args.bench_ms, device, args.pv_mode
+        )
         rows.append(row)
         parts = []
         for backend, entry in row["backends"].items():
@@ -315,6 +343,7 @@ def main() -> None:
                     "gpu": torch.cuda.get_device_name(device),
                     "timestamp": time.time(),
                     "bench_ms": args.bench_ms,
+                    "pv_mode": args.pv_mode,
                     "rows": rows,
                 },
                 f,

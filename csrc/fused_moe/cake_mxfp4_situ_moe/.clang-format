@@ -1,0 +1,6 @@
+# Checksum-attested generated sources (every unit is listed with its SHA-256 in
+# the package manifests next to this file); formatting them would break the
+# receipts that bind them to the exporter.  This file keeps the repository's
+# clang-format hook off the directory without touching .pre-commit-config.yaml.
+DisableFormat: true
+SortIncludes: Never

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -47,6 +48,280 @@ def _config(**kw):
 
 
 @pytest.mark.parametrize(
+    "kind", ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+)
+def test_inference_grid_covers_uniform_phase_launches(kind):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        is_valid_sm107,
+        sm107_candidates,
+    )
+
+    candidates = sm107_candidates(kind)
+    assert (
+        len(candidates)
+        == len({json.dumps(c, sort_keys=True) for c in candidates})
+        == 32
+    )
+    depth = 256 if kind in ("nvfp4", "mxfp4") else 128
+    expected_prefix = [
+        (tile, cluster, epi, bulk)
+        for tile in ((256, 128, depth), (256, 256, depth))
+        for cluster, epi in (
+            ((2, 1), (1, 4)),
+            ((2, 1), (2, 4)),
+            ((4, 1), (1, 4)),
+            ((4, 1), (2, 4)),
+        )
+        for bulk in (False, True)
+    ]
+    assert [
+        (
+            c["mma_tiler_mnk"],
+            c["cluster_shape_mn"],
+            c["epi_flag_batches"],
+            c["fc2_use_bulk"],
+        )
+        for c in candidates[:16]
+    ] == expected_prefix
+    added = candidates[16:]
+    assert {c["mma_tiler_mnk"] for c in added} == {
+        (256, 64, depth),
+        (256, 64, 2 * depth),
+        (256, 128, depth),
+        (256, 256, depth),
+    }
+    for c in added:
+        assert c["fallback_cluster_shape_mn"] is None
+        assert c["schedule_policy"] == ("phase_interleave", None)
+        assert c["work_id_mode"] == "atomic_counter"
+        assert c["epi_flag_batches"] == (2, 4)
+        assert c["fc2_tma_stages"] == (
+            (1 if c["mma_tiler_mnk"][1] == 64 else 2) if c["fc2_use_bulk"] else None
+        )
+    for tile in {c["mma_tiler_mnk"] for c in added}:
+        assert {
+            (c["cluster_shape_mn"], c["fc2_use_bulk"])
+            for c in added
+            if c["mma_tiler_mnk"] == tile
+        } == {((2, 1), False), ((2, 1), True), ((4, 1), False), ((4, 1), True)}
+    with_ikr = sm107_candidates(kind, allow_in_kernel_fc2_reduce=True)
+    assert len(with_ikr) == 64
+    assert [c for c in with_ikr if not c["reduce_topk_in_kernel"]] == candidates
+    assert [
+        dict(c, reduce_topk_in_kernel=False)
+        for c in with_ikr
+        if c["reduce_topk_in_kernel"]
+    ] == candidates
+    base = _config(quant_kind=kind, hidden=512, intermediate=256, world_size=4)
+    assert all(is_valid_sm107(c, base) for c in with_ikr)
+
+
+@pytest.mark.parametrize("rubin", [False, True])
+def test_route_staging_fallback_preserves_architecture_score_policy(rubin):
+    from flashinfer.moe_ep.backends.mega.kernel import routing_staging as shared
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import routing_staging
+
+    ids = torch.tensor([[0, -1, -1, -1]])
+    scores = torch.tensor([[0.25, float("nan"), float("inf"), -float("inf")]])
+    ids_out = torch.full((2, 4), -7, dtype=torch.int32)
+    scores_out = torch.full((2, 4), 123.0)
+    stage = routing_staging.stage_routes if rubin else shared.stage_routes
+    stage(ids, scores, ids_out, scores_out, workspace=SimpleNamespace())
+    expected = scores if rubin else scores.masked_fill(ids == -1, 0)
+    torch.testing.assert_close(scores_out[:1], expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(ids_out[:1], ids.to(torch.int32))
+    assert (ids_out[1:] == -7).all() and (scores_out[1:] == 123).all()
+    assert torch.isnan(scores[:, 1]).all()
+    assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
+
+
+def test_mxfp4_weights_have_independent_dtype_and_packing():
+    cfg = _config(quant_kind="mxfp4_mxfp8", intermediate=128)
+    assert cfg.torch_act_data_dtype == torch.float8_e4m3fn
+    assert cfg.torch_weight_data_dtype == getattr(
+        torch, "float4_e2m1fn_x2", torch.uint8
+    )
+    assert cfg.torch_act_sf_dtype == torch.float8_e8m0fnu
+    assert cfg.sf_vec_size == 32
+    assert cfg.instruction_k == 64
+    shapes = block_scaled._expected_weight_shapes(cfg)
+    assert shapes[:2] == ((8, 64, 256), (8, 64, 128))
+    with pytest.raises(ValueError, match="multiple of 128"):
+        _config(quant_kind="mxfp4_mxfp8", intermediate=192)
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+def test_mxfp4_w4a4_config_and_candidates(variant):
+    from flashinfer.moe_ep import Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import sm107_candidates
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache import (
+        default_knobs,
+    )
+
+    public = Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(128, 2)
+    assert public.kind == "mxfp4"
+    assert create_mega_kernel(public).kernel_name() == public.kernel_name
+    knobs = default_knobs(3, quant_kind="mxfp4", kernel_variant=variant)
+    cfg = _config(quant_kind="mxfp4", intermediate=128, kernel_variant=variant, **knobs)
+    assert cfg.torch_act_data_dtype == getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+    assert cfg.torch_weight_data_dtype == cfg.torch_act_data_dtype
+    assert cfg.torch_act_sf_dtype == torch.float8_e8m0fnu
+    assert cfg.sf_vec_size == 32
+    assert cfg.instruction_k == 128
+    assert cfg.resolved_mma_tiler_mnk == (256, 128, 256)
+    candidates = sm107_candidates(quant_kind="mxfp4", kernel_variant=variant)
+    assert candidates
+    assert all(c["mma_tiler_mnk"][2] in (256, 512) for c in candidates)
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_mxfp4_w4a4_cli_dispatch(monkeypatch, variant, early, finalize):
+    from flashinfer.moe_ep import tune
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
+        tuner,
+    )
+
+    calls = []
+
+    def run(args, kind):
+        calls.append((kind, args.kernel_variant, args.apply_routing_weights_before_fc2))
+        return 0
+
+    monkeypatch.setattr(tuner, "_run_tuning", run)
+    argv = [
+        "--dtype",
+        "mxfp4",
+        "--arch",
+        "sm107",
+        "--hidden",
+        "512",
+        "--intermediate",
+        "256",
+        "--num-experts",
+        "8",
+        "--topk",
+        "4",
+        "--max-tokens",
+        "128",
+        "--apply-routing-weights-before-fc2"
+        if early
+        else "--no-apply-routing-weights-before-fc2",
+        "--do-finalize" if finalize else "--no-do-finalize",
+    ]
+    assert tune.main([*argv, "--kernel-variant", variant]) == (0 if finalize else 2)
+    assert calls == ([("mxfp4", variant, early)] if finalize else [])
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("early", [False, True])
+def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
+    from flashinfer.moe_ep import tune, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import forward_tuning, tuning
+    from flashinfer.moe_ep.core.kernel import registry
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    def gather(results, value, **kwargs):
+        results[:] = [value] * len(results)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    args = tune._parse_args(
+        [
+            "--dtype",
+            "mxfp4",
+            "--arch",
+            "sm107",
+            "--hidden",
+            "512",
+            "--intermediate",
+            "256",
+            "--num-experts",
+            "8",
+            "--topk",
+            "4",
+            "--max-tokens",
+            "128",
+            "--kernel-variant",
+            variant,
+            "--sweep",
+            "schedule",
+            "--apply-routing-weights-before-fc2"
+            if early
+            else "--no-apply-routing-weights-before-fc2",
+        ]
+    )
+    backend = mock.Mock()
+    create = mock.Mock(return_value=backend)
+    resolve = mock.Mock(return_value=({}, "default"))
+    execution = mock.Mock()
+
+    def gather(results, result, *, group):
+        assert group is backend.ep_comm_group
+        results[:] = [result] * len(results)
+
+    exchange = mock.Mock(side_effect=gather)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
+    monkeypatch.setattr(registry, "create_mega_kernel", create)
+    monkeypatch.setattr(tuning, "_dummy_transformed_weights", lambda *a: (None, None))
+    monkeypatch.setattr(
+        tuning, "_dummy_inputs", lambda *a: mock.Mock(spec=MoEEpTensors)
+    )
+    monkeypatch.setattr(torch, "empty", mock.Mock())
+    monkeypatch.setattr(forward_tuning, "ForwardExecution", execution)
+    monkeypatch.setattr(package, "resolve_knobs", resolve)
+    monkeypatch.setattr(package, "sm107_schedule_candidates", lambda *a, **k: [{}])
+    finish = mock.Mock(return_value={"fc2_use_bulk": True})
+    monkeypatch.setattr(tuning, "finish_sweep", finish)
+
+    assert tuning.tune_one(args, 0, 2, 128, "mxfp4") == {"fc2_use_bulk": True}
+    exchange.assert_called_once()
+    assert finish.call_args.args[8] == [{}]
+    config = create.call_args.args[0]
+    assert isinstance(config, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig)
+    assert config.kernel_variant == variant
+    assert config.apply_routing_weights_before_fc2 is early
+    assert resolve.call_args.kwargs["dtype"] == "mxfp4"
+    assert resolve.call_args.kwargs["kernel_variant"] == variant
+    assert resolve.call_args.kwargs["apply_routing_weights_before_fc2"] is early
+    assert execution.call_args.kwargs["quantize_input"] is True
+    backend.destroy.assert_called_once_with(backend._allocate_workspace.return_value)
+
+
+def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
+    from flashinfer.moe_ep import (
+        PrequantizedMoEWeights,
+        preprocess_sm107_mxfp4_mega_weights,
+    )
+
+    pack = PrequantizedMoEWeights(
+        torch.zeros(1, 256, 64, dtype=torch.uint8),
+        torch.zeros(1, 128, 64, dtype=torch.uint8),
+        torch.zeros(1, 256, 4, dtype=torch.float8_e4m3fn),
+        torch.zeros(1, 128, 4, dtype=torch.float8_e4m3fn),
+    )
+    with pytest.raises(ValueError, match="block scales"):
+        preprocess_sm107_mxfp4_mega_weights(
+            pack, intermediate_size=128, hidden_size=128
+        )
+
+
+@pytest.mark.parametrize("world", [-1, 0, 3, 5, 6])
+def test_k3_geometry_rejects_invalid_world_before_device_setup(monkeypatch, world):
+    from tests.moe_ep.sm107_test_utils import run_mxfp4_k3_geometry
+
+    def unexpected_device_setup(*args, **kwargs):
+        pytest.fail("Invalid K3 geometry reached device setup")
+
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.ensure_moe_ep_cuda_device", unexpected_device_setup
+    )
+    with pytest.raises(ValueError, match="positive world size that divides 896"):
+        run_mxfp4_k3_geometry(0, world)
+
+
+@pytest.mark.parametrize(
     "overrides",
     [
         {"hidden": 192},
@@ -75,6 +350,21 @@ def _config(**kw):
         {"gate_up_clamp": float("nan")},
         {"schedule_policy": ("grouped", True)},
         {"mma_tiler_mnk": (128.0, 128, 128)},
+        {"activation": "unknown"},
+        {"activation": "situ"},
+        {"activation": "situ", "situ_beta": 1.25},
+        {"activation": "situ", "situ_linear_beta": 0.75},
+        {"activation": "situ", "situ_beta": float("nan"), "situ_linear_beta": 0.75},
+        {"activation": "situ", "situ_beta": 1.25, "situ_linear_beta": float("inf")},
+        {"activation": "situ", "situ_beta": 0, "situ_linear_beta": 0.75},
+        {"activation": "situ", "situ_beta": 1.25, "situ_linear_beta": -1},
+        {
+            "activation": "situ",
+            "situ_beta": 1.25,
+            "situ_linear_beta": 0.75,
+            "gate_up_clamp": 1,
+        },
+        {"situ_beta": 1.25, "situ_linear_beta": 0.75},
     ],
 )
 def test_reject_unsafe_config_before_workspace_allocation(overrides):
@@ -98,9 +388,14 @@ def _workspace():
     ws.config = _config()
     ws.device = torch.device("cpu")
     ws._destroyed = False
+    ws._tuning_state = block_scaled.AutoTuningState()
     ws._compiled = mock.Mock()
+    # Model a kernel that requires launch-side clearing. Native masked BF16
+    # reducers opt out via this capability; quantized combine still clears.
+    ws.kernel = SimpleNamespace(masks_invalid_combine_slots=False)
     ws._launch_key = None
     ws._launch_kwargs = None
+    ws._routing_checks = {}
     ws._runtime_kwargs = mock.Mock(side_effect=lambda a, b: {"weights": (a, b)})
     ws.topk_idx = torch.tensor([[0, 1], [2, -1], [-1, -1], [-1, -1]])
     ws._pre_reduced_activation = torch.full((4, 2, 128), 7.0)
@@ -205,7 +500,11 @@ def test_cache_keeps_reduction_and_weighting_policy_separate(tmp_path, monkeypat
     assert lookup_knobs(**key) is None
     assert lookup_knobs(**key, allow_nondeterministic=True) == knobs
     assert (
-        lookup_knobs(**key, allow_nondeterministic=True, apply_topk_at_fc1=False)
+        lookup_knobs(
+            **key,
+            allow_nondeterministic=True,
+            apply_routing_weights_before_fc2=False,
+        )
         is None
     )
     data = json.loads(path.read_text())
@@ -242,17 +541,53 @@ def test_sm100_and_sm107_cache_entries_cannot_collide(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("ids", [[[0, 0]], [[-2, 0]], [[0, 8]], [[0, 2**32]]])
-def test_invalid_routes_rejected_before_int32_conversion(ids):
+def test_invalid_routes_rejected_before_int32_conversion(ids, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     with pytest.raises(RuntimeError, match="unique expert"):
         validate_routing_values(torch.tensor(ids), torch.ones(1, 2), 8)
 
 
-def test_masked_routes_and_finite_score_contract():
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])
+def test_masked_routes_and_finite_score_contract(score, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     validate_routing_values(torch.tensor([[-1, -1], [0, 7]]), torch.ones(2, 2), 8)
+    validate_routing_values(
+        torch.tensor([[-1, -1], [0, -1]]),
+        torch.tensor([[score, score], [1.0, score]]),
+        8,
+    )
     with pytest.raises(RuntimeError, match="finite scores"):
-        validate_routing_values(
-            torch.tensor([[0, 1]]), torch.tensor([[1.0, float("nan")]]), 8
-        )
+        validate_routing_values(torch.tensor([[0, 1]]), torch.tensor([[1.0, score]]), 8)
+
+
+@pytest.mark.parametrize("check_routes", [None, "1", "0"])
+@pytest.mark.parametrize("fused", [False, True])
+def test_routing_validation_opt_in(monkeypatch, check_routes, fused):
+    if check_routes is None:
+        monkeypatch.delenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", raising=False)
+    else:
+        monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", check_routes)
+    monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1")
+    ids = torch.tensor([[0, 0]])
+    scores = torch.ones(1, 2)
+    checker = mock.Mock(side_effect=RuntimeError("unique expert IDs"))
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.moe_ep.backends.mega.kernel.sm107.routing_validation",
+        SimpleNamespace(check_routing=checker),
+    )
+    if fused:
+        ids = mock.Mock(is_cuda=True, shape=(1, 2))
+        ids.is_contiguous.return_value = True
+
+    if check_routes in (None, "0"):
+        validate_routing_values(ids, scores, 8)
+        checker.assert_not_called()
+    else:
+        with pytest.raises(RuntimeError, match="unique expert"):
+            validate_routing_values(ids, scores, 8)
+        if fused:
+            checker.assert_called_once_with(ids, scores, 8, None)
 
 
 @pytest.mark.parametrize("name", ["fc1_alpha", "fc2_alpha", "fc1_norm_const"])
@@ -261,6 +596,145 @@ def test_unsupported_scalars_are_never_silently_ignored(name):
     setattr(t, name, torch.ones(1))
     with pytest.raises(ValueError, match=name):
         validate_unit_scalars(t)
+
+
+def test_activation_cache_entries_are_distinct(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    key = dict(
+        dtype="nvfp4",
+        world_size=4,
+        hidden=128,
+        intermediate=64,
+        num_experts=8,
+        topk=2,
+        max_tokens=128,
+        device="test",
+    )
+    variants = [
+        {},
+        dict(gate_up_clamp=2.0),
+        dict(activation="situ", situ_beta=1.25, situ_linear_beta=0.75),
+        dict(activation="situ", situ_beta=2.0, situ_linear_beta=0.75),
+    ]
+    for i, variant in enumerate(variants):
+        record_knobs({"token_in_flag_batch": i + 1}, **key, **variant)
+    for i, variant in enumerate(variants):
+        assert lookup_knobs(**key, **variant) == {"token_in_flag_batch": i + 1}
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8"])
+def test_situ_workspace_configuration_and_pool_keys(kind, monkeypatch):
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    cls = (
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        if kind == "nvfp4"
+        else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+    )
+    fp = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=128)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    keys = []
+    for beta in (None, 1.25, 2.0):
+        cfg = cls(
+            64,
+            2,
+            **(
+                {}
+                if beta is None
+                else dict(activation="situ", situ_beta=beta, situ_linear_beta=0.75)
+            ),
+        )
+        backend = create_mega_kernel(cfg)
+        backend.bind_ep_bootstrap(
+            BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False)
+        )
+        resolved = backend._resolved_config(fp)
+        assert resolved.activation == ("swiglu" if beta is None else "situ")
+        assert resolved.situ_beta == beta
+        keys.append(backend._workspace_pool_key(fp))
+    assert len(set(keys)) == 3
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_input_normalization(value):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
+        validate_input_norm_const,
+    )
+
+    with pytest.raises(ValueError, match="positive and finite"):
+        validate_input_norm_const(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        torch.ones(3),
+        torch.ones(2, 1),
+        torch.ones(2, dtype=torch.bfloat16),
+        torch.ones(4)[::2],
+        torch.ones(2),
+    ],
+)
+def test_invalid_nvfp4_scalar_metadata(value):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
+        validate_nvfp4_scalars,
+    )
+
+    with pytest.raises(ValueError, match="fc1_alpha"):
+        validate_nvfp4_scalars(
+            {"fc1_alpha": value}, num_local_experts=2, device=torch.device("cuda", 0)
+        )
+
+
+def test_nvfp4_scalars_reset_between_pooled_layers(monkeypatch):
+    from flashinfer.moe_ep import Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.backend import (
+        Sm107Nvfp4BlockScaledMegaKernelBackend,
+    )
+
+    def backend(**kwargs):
+        return Sm107Nvfp4BlockScaledMegaKernelBackend(
+            Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(64, 2, **kwargs)
+        )
+
+    configured = backend(
+        fc1_alpha=torch.tensor([0.5, 0.75]),
+        fc2_alpha=torch.tensor([2.0, 3.0]),
+        fc1_norm_const=torch.tensor([1.5, 2.5]),
+    )
+    plain = backend()
+    ws = SimpleNamespace(
+        config=_config(quant_kind="nvfp4", num_total_experts=2),
+        x=torch.empty(1, 64, dtype=torch.uint8),
+        x_sf=torch.empty(1, 8, dtype=torch.float8_e4m3fn),
+        topk_idx=torch.empty(1, 2, dtype=torch.int32),
+        topk_weights=torch.empty(1, 2),
+        fc1_alpha=torch.ones(2),
+        fc2_alpha=torch.ones(2),
+        fc1_norm_const=torch.ones(2),
+        note_staged_tokens=lambda count: None,
+    )
+    t = MoEEpTensors(
+        torch.empty(0, 64, dtype=torch.uint8),
+        torch.empty(0, 2, dtype=torch.int32),
+        torch.empty(0, 2),
+    )
+    configured.stage_inputs(t, ws, quantize_input=False)
+    torch.testing.assert_close(ws.fc1_alpha, torch.tensor([0.5, 0.75]))
+    t.fc1_alpha = torch.tensor([0.2, 0.4])
+    configured.stage_inputs(t, ws, quantize_input=False)
+    torch.testing.assert_close(ws.fc1_alpha, t.fc1_alpha)
+    t.fc1_alpha = None
+    configured.stage_inputs(t, ws, quantize_input=False)
+    torch.testing.assert_close(ws.fc1_alpha, torch.tensor([0.5, 0.75]))
+    plain.stage_inputs(t, ws, quantize_input=False)
+    for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+        torch.testing.assert_close(getattr(ws, name), torch.ones(2))
 
 
 def test_transformed_layout_and_scale_encoding_contract():
@@ -297,7 +771,9 @@ def test_no_dist_rejects_multirank(monkeypatch):
 
 
 def test_ikr_requires_early_weighting():
-    with pytest.raises(ValueError, match="apply_topk_at_fc1"):
+    with pytest.raises(ValueError, match="apply_routing_weights_before_fc2"):
         dataclasses.replace(
-            _config(), reduce_topk_in_kernel=True, apply_topk_at_fc1=False
+            _config(),
+            reduce_topk_in_kernel=True,
+            apply_routing_weights_before_fc2=False,
         )

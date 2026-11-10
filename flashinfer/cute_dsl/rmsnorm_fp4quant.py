@@ -47,10 +47,9 @@ from .fp4_common import (
     get_ptr_as_int64,
     rcp_approx_ftz,
     fmin_f32,
+    fmax_f32,
     hmax2,
     hmax_to_f32,
-    bfloat2_hmax2,
-    bfloat2_hmax_to_f32,
     cvt_f32_to_e4m3,
     fp8_e4m3_to_f32_and_rcp,
     cvt_f32_to_ue8m0,
@@ -58,14 +57,14 @@ from .fp4_common import (
     # Helper functions for block processing
     load_8_half2,
     half2_mul_8,
-    bfloat2_mul_8,
     half2_max_abs_8,
-    bfloat2_max_abs_8,
     half2_to_float16,
     bfloat2_to_float16,
     quantize_and_pack_16,
+    compute_y_and_max_abs_f32,
     # Reduction utilities
     row_reduce,
+    zero_swizzled_sf_padding,
     # Predicate utility
     predicate_k,
 )
@@ -295,7 +294,16 @@ class RMSNormFP4QuantKernel:
         self.kernel(
             mX, mW, mY, mS, mGlobalScale, M, eps, enable_pdl, tv_layout, tiler_mn
         ).launch(
-            grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
+            grid=[
+                cute.ceil_div(
+                    # A swizzled scale buffer is padded to 128 rows; the CTAs past M
+                    # only zero their rows of that padding (zero_swizzled_sf_padding).
+                    (M + 127) // 128 * 128 if self.output_swizzled else M,
+                    self.rows_per_block,
+                ),
+                self.cluster_n,
+                1,
+            ],
             block=[self.num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1]
             if cutlass.const_expr(self.cluster_n > 1)
@@ -516,13 +524,13 @@ class RMSNormFP4QuantKernel:
                             max_xw_h2 = half2_max_abs_8(xw_h2)
                             max_xw = hmax_to_f32(max_xw_h2)
                             y_f32 = half2_to_float16(xw_h2, rstd)
+                            max_abs = max_xw * rstd
                         else:
-                            xw_h2 = bfloat2_mul_8(x_h2, w_h2)
-                            max_xw_h2 = bfloat2_max_abs_8(xw_h2)
-                            max_xw = bfloat2_hmax_to_f32(max_xw_h2)
-                            y_f32 = bfloat2_to_float16(xw_h2, rstd)
-
-                        max_abs = max_xw * rstd
+                            y_f32, max_abs = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2, Float32(1.0)),
+                                bfloat2_to_float16(w_h2, Float32(1.0)),
+                                rstd,
+                            )
 
                         # Compute scale factor (FP8 E4M3) - Branchless clamping
                         scale_float = global_scale_val * max_abs * fp4_max_rcp
@@ -586,17 +594,21 @@ class RMSNormFP4QuantKernel:
                             max_xw = hmax_to_f32(max_xw_h2)
                             y_f32_c0 = half2_to_float16(xw_h2_c0, rstd)
                             y_f32_c1 = half2_to_float16(xw_h2_c1, rstd)
+                            max_abs = max_xw * rstd
                         else:
-                            xw_h2_c0 = bfloat2_mul_8(x_h2_c0, w_h2_c0)
-                            xw_h2_c1 = bfloat2_mul_8(x_h2_c1, w_h2_c1)
-                            max_c0_h2 = bfloat2_max_abs_8(xw_h2_c0)
-                            max_c1_h2 = bfloat2_max_abs_8(xw_h2_c1)
-                            max_xw_h2 = bfloat2_hmax2(max_c0_h2, max_c1_h2)
-                            max_xw = bfloat2_hmax_to_f32(max_xw_h2)
-                            y_f32_c0 = bfloat2_to_float16(xw_h2_c0, rstd)
-                            y_f32_c1 = bfloat2_to_float16(xw_h2_c1, rstd)
-
-                        max_abs = max_xw * rstd
+                            # Rounding x * weight to BF16 before normalization
+                            # can move a value across an FP4 rounding midpoint.
+                            y_f32_c0, max_abs_c0 = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2_c0, Float32(1.0)),
+                                bfloat2_to_float16(w_h2_c0, Float32(1.0)),
+                                rstd,
+                            )
+                            y_f32_c1, max_abs_c1 = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2_c1, Float32(1.0)),
+                                bfloat2_to_float16(w_h2_c1, Float32(1.0)),
+                                rstd,
+                            )
+                            max_abs = fmax_f32(max_abs_c0, max_abs_c1)
 
                         # Compute scale factor (E4M3 or UE8M0 based on scale_format)
                         if cutlass.const_expr(self.scale_format == "ue8m0"):
@@ -651,6 +663,17 @@ class RMSNormFP4QuantKernel:
                             mY, actual_row_idx * (H // 2) + out_offset
                         )
                         st_global_u64(out_ptr, packed64_c1)
+
+        if cutlass.const_expr(self.output_swizzled):
+            zero_swizzled_sf_padding(
+                mS,
+                M,
+                actual_row_idx,
+                lane_in_row,
+                num_sf_blocks_per_row,
+                self.num_k_tiles,
+                self.threads_per_row,
+            )
 
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
@@ -845,7 +868,7 @@ def rmsnorm_fp4quant(
         ``None`` (default) or ``True``, PDL is enabled only if the current
         device supports it (probed via :func:`device_support_pdl`). Pass
         ``False`` to force-disable. See
-        https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
+        https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
 
     Returns
     -------
@@ -887,6 +910,13 @@ def rmsnorm_fp4quant(
 
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
+
+    # Caller-provided outputs are written in place with row-major addressing; a
+    # strided view would be written through a temporary copy and left unchanged.
+    if y_fp4 is not None:
+        assert y_fp4.is_contiguous(), "y_fp4 must be contiguous"
+    if block_scale is not None:
+        assert block_scale.is_contiguous(), "block_scale must be contiguous"
 
     # Allocate output tensors if not provided
     if y_fp4 is None:
