@@ -319,6 +319,41 @@ def cake_kda_nondet(
     backward is this package's.  ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``; another value raises
     ``ValueError``) is the checkpoint hand-off under ``torch.utils.checkpoint`` (the module docstring; the raw gate
     mode and the in-kernel Q/K L2 norm never engage it).
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        BF16 packed rows ``[1, S, H, 128]`` (or ``[S, H, 128]``), as in
+        :func:`cake_kda_nondet_train_forward`.
+    g : torch.Tensor
+        FP32 activated decay gate; raw BF16 gate when ``use_gate_in_kernel=True``.
+    beta : torch.Tensor
+        BF16 ``[1, S, H]`` delta-rule gate after the sigmoid.
+    cu_seqlens : torch.Tensor
+        int32 device document offsets, first 0 and last ``S``.
+    scale : float, optional
+        Output scale; ``128 ** -0.5`` when ``None``.
+    workspace : optional
+        Caller-owned workspace from :func:`cake_kda_nondet_train_workspace`.
+    save_mode : str, optional
+        ``"light"`` or ``"tape"``; ``None`` uses the workspace's default (``"light"`` without one).
+    arena : optional
+        Lower-memory arena option from :func:`cake_kda_nondet_train_arena`.
+    doc_lengths : sequence of int, optional
+        Host document lengths in offset order; required by a batched arena.
+    use_gate_in_kernel : bool, default=False
+        Activate the raw BF16 gate inside the kernels.
+    A_log : torch.Tensor, optional
+        Contiguous FP32 ``[H]`` raw-gate parameter.
+    dt_bias : torch.Tensor, optional
+        Contiguous FP32 ``[H * 128]`` or ``[H, 128]`` raw-gate bias.
+    lower_bound : float, optional
+        Required in raw-gate mode, with ``-5 <= lower_bound < 0``.
+    use_qk_l2norm_in_kernel : bool, default=False
+        Normalize raw query and key rows inside the kernels; input layout rules are
+        those of :func:`cake_kda_nondet_train_forward`.
+    checkpoint_handoff : str, default="auto"
+        Checkpoint hand-off mode: ``"auto"``, ``"on"`` or ``"off"``.
     """
     from .experimental.cake.cake_kda_nondet_train import cake_backend
 

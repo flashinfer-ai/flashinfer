@@ -188,7 +188,7 @@ def cake_causal_conv1d_nondet_train_backward_workspace_bytes(
     -------
     int
         Bytes of the caller-owned backward workspace. The size depends on
-        ``C`` and the target device, not on ``S``.
+        ``C`` and the route, not on ``S``.
     """
 
     return _backend().cake_causal_conv1d_nondet_train_backward_workspace_bytes(
@@ -220,7 +220,9 @@ def cake_causal_conv1d_nondet_train_backward_workspace(
     Returns
     -------
     torch.Tensor
-        Zeroed caller-owned workspace for reuse on a single stream.
+        Zeroed caller-owned workspace for reuse on a single stream. Never share it
+        between two backward launches that may run at once (e.g. two CUDA graphs
+        replayed on different streams).
     """
 
     return _backend().cake_causal_conv1d_nondet_train_backward_workspace(
