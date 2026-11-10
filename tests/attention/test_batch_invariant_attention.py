@@ -477,6 +477,50 @@ def test_fingerprint_is_a_function_of_the_head_dim(op):
         bi.fingerprint(op, head_dim=128, page_size=16)
 
 
+def test_class_constants_and_fingerprints_are_pinned():
+    """The class at a head dim is its (T, C) pair: the fingerprint is a function of it, and the published pairs are pinned."""
+    from flashinfer.attention.batch_invariant import plan as P
+    from flashinfer.attention.batch_invariant import spec
+
+    pinned = {
+        64: (128, 512, "attn-bf16-d64-9a05233ec9351b0d"),
+        128: (128, 512, "attn-bf16-d128-027b0379515b82e2"),
+        256: (128, 512, "attn-bf16-d256-b8cb59dab4eb6c0f"),
+    }
+    assert set(pinned) == set(spec.HEAD_DIMS)
+    for D, (T, C, fp) in pinned.items():
+        assert (spec.tile_keys(D), spec.chunk_len(D)) == (T, C)
+        assert spec.tiles_per_chunk(D) == C // T
+        assert spec.FINGERPRINTS[D] == fp == spec.spec_fingerprint(D)
+        assert spec.class_fingerprint(D, T, C) == fp
+        assert bi.fingerprint(WRAPPERS[0], head_dim=D) == fp
+        # another tile or another chunk is another class
+        others = {
+            spec.class_fingerprint(D, t, c) for t, c in ((T // 2, C), (T, C // 2))
+        }
+        assert len(others) == 2 and fp not in others
+        # the planner cuts tiles and chunks at the head dim's constants, whatever the problem shape
+        for q_len, kv_len, hq in (
+            (1, C + 1, 8),
+            (kv := 3 * C + T + 5, kv, 32),
+            (7, 2 * C, 64),
+        ):
+            plan = P.build_plan(
+                [0, q_len],
+                [0, -(-kv_len // 16)],
+                [(kv_len - 1) % 16 + 1],
+                hq,
+                8,
+                D,
+                16,
+                split_policy="split",
+            )
+            assert all(d[P.F_CHUNK_HI] - d[P.F_CHUNK_LO] == 1 for d in plan.desc)
+            assert max(d[P.F_CHUNK_HI] for d in plan.desc) == -(-kv_len // C)
+            assert max(d[P.F_TILE_HI] for d in plan.desc) == -(-kv_len // T)
+            assert all(d[P.F_TILE_HI] - d[P.F_TILE_LO] <= C // T for d in plan.desc)
+
+
 def test_planner_unit_kind_rules():
     """The ``auto`` unit-kind rules of the planner (placements: every kind computes the same bits): a multi-chunk tile of at most
     ``INKERNEL_MAX_ROWS`` rows splits when the fused units would fill under 2 x SM, a wider (prefill) tile only when they would fill

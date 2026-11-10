@@ -550,6 +550,7 @@ DECIDED_THEOREMS = (
 #: statements on toy rows; listed in `lean/Axioms.lean` with the generated ones.
 MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_C",
+    "Attn.output_depends_on_T",
     "Attn.output_depends_on_D",
     "Attn.output_depends_on_D_64",
 )
@@ -644,6 +645,20 @@ def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, str]]:
         )
         out.append((name, D, T, C, p, win, rid, d, sx))
     return out
+
+
+def attn_class_constants() -> Dict[int, Tuple[int, int]]:
+    """The class constants per head dim: ``(T, C)`` of ``spec.TILE_KEYS_OF`` / ``spec.CHUNK_LEN_OF``."""
+    from ..attention.batch_invariant.spec import chunk_len, tile_keys
+
+    return {D: (tile_keys(D), chunk_len(D)) for D in ATTN_HEAD_DIMS}
+
+
+def attn_slot_keys(D: int) -> int:
+    """Keys per KV ring slot at head dim ``D`` (``plan.slot_keys_for``)."""
+    from ..attention.batch_invariant.plan import slot_keys_for
+
+    return slot_keys_for(D)
 
 
 def attn_spaces() -> Dict[int, list]:
@@ -1153,6 +1168,16 @@ def _render_attention(L: List[str]) -> None:
         + ", ".join(f'("{n}", attnP_{n})' for n, *_ in ATTN_CASES)
         + "]"
     )
+    L.append("")
+    L.append(
+        "/-! The class constants per head dim: `spec.TILE_KEYS_OF` / `spec.CHUNK_LEN_OF` against the model's `Attn.tileKeys` / "
+        "`Attn.chunkLen` (the pair that `Attn.classOutput` gives every row of the head dim). -/"
+    )
+    for D, (T, C) in attn_class_constants().items():
+        L.append(
+            f"theorem attn_class_d{D}_constants : Attn.tileKeys {D} = {T} ∧ Attn.chunkLen {D} = {C} "
+            f"∧ 2 ^ Attn.tileBits {D} = {T} ∧ Attn.slotKeys {D} = {attn_slot_keys(D)} := by decide"
+        )
     L.append("")
     L.append(
         "/-! The attention kernel's configuration space per head dim (`engine.all_valid_configs(D)`): every knob record checked "

@@ -20,9 +20,9 @@ column `d` the dataflow is
 * the **row**: the present chunks merged in index order from the init state (`merge`);
 * the epilogue `cvt_bf16(add(mul(O, div(1, l)), +0))`.
 
-Tile and chunk boundaries are absolute multiples of `T` and `C`, functions of `D` only: the term of
-a token depends on its position `p`, the window and the head, never on the batch, the page table
-(paged or ragged KV) or the configuration. What is modelled: the per-row dataflow, the split kernel's
+Tile and chunk boundaries are absolute multiples of `T` and `C`, functions of `D` only (`tileKeys`, `chunkLen`: the class
+constants per head dim, `spec.TILE_KEYS_OF` / `spec.CHUNK_LEN_OF`): the term of a token depends on its position `p`, the
+window and the head, never on the batch, the page table (paged or ragged KV) or the configuration. What is modelled: the per-row dataflow, the split kernel's
 workspace and fixup, the launch model (prefill batch / decode batch -> per-row terms). What is not, and
 is covered by the hardware tests: the plumbing (TMA, TMEM, barriers), the instruction semantics (`mma16`,
 `ex2`), and the null steps (a kernel's identity steps on rows whose tile has no visible key, exact
@@ -209,6 +209,43 @@ structure Row where
 def rowOutput (steps tbits C : Nat) (win : Int) (d : Nat) (r : Row) : ATerm :=
   output ⟨steps, tbits, C, r.p, win, r.row, d⟩
 
+/-! ## The class constants per head dim
+
+`T` and `C` are parameters of the class PER HEAD DIM: the tables below mirror `spec.TILE_KEYS_OF` and `spec.CHUNK_LEN_OF`
+(the generated `Cases.lean` checks the Python tables against them), and `classOutput` is the term the three wrappers compute
+for a row at head dim `D`. Nothing but `D` selects `(T, C)`: the launch model below quantifies over every row with the
+head dim's one pair. -/
+
+/-- `spec.TILE_KEYS_OF`: keys per tile at head dim `D` (0 outside the class's head dims). -/
+def tileKeys : Nat → Nat
+  | 64 => 128
+  | 128 => 128
+  | 256 => 128
+  | _ => 0
+
+/-- `log2` of `tileKeys` (the tile is a power of two: the depth of its pairwise trees). -/
+def tileBits : Nat → Nat
+  | 64 => 7
+  | 128 => 7
+  | 256 => 7
+  | _ => 0
+
+/-- `spec.CHUNK_LEN_OF`: keys per chunk at head dim `D` (0 outside the class's head dims). -/
+def chunkLen : Nat → Nat
+  | 64 => 512
+  | 128 => 512
+  | 256 => 512
+  | _ => 0
+
+/-- The class term of a row at head dim `D`: `D / 16` MMA K-steps per score, the head dim's tile and chunk. -/
+def classOutput (D : Nat) (win : Int) (d : Nat) (r : Row) : ATerm :=
+  rowOutput (D / 16) (tileBits D) (chunkLen D) win d r
+
+/-- **One `(T, C)` per head dim, whatever the problem**: two rows at the same head dim, position, window and identity are the
+same class term whatever launches (prefill or decode, any batch, any page table) they belong to. -/
+theorem class_constants_fixed (D : Nat) (win : Int) (d : Nat) (r₁ r₂ : Row) (h : r₁ = r₂) :
+    classOutput D win d r₁ = classOutput D win d r₂ := by rw [h]
+
 /-- A prefill request: `q_len` tokens whose last one sits at position `kv_len - 1`; token `i` is at
 `kv_len - q_len + i` (bottom-right causal). -/
 def prefillRow (kv_len q_len i h row : Nat) : Row := ⟨kv_len - q_len + i, h, row⟩
@@ -226,6 +263,13 @@ theorem prefill_decode_agree (steps tbits C : Nat) (win : Int) (d : Nat) (kv_len
       = rowOutput steps tbits C win d (decodeRow (kv_len - q_len + i + 1) h row) := by
   unfold prefillRow decodeRow
   simp only [Nat.add_sub_cancel]
+
+/-- R4 for the class at head dim `D`: prefill and decode take the head dim's one `(T, C)`. -/
+theorem class_prefill_decode_agree (D : Nat) (win : Int) (d : Nat) (kv_len q_len i h row : Nat)
+    (hi : i < q_len) (hq : q_len ≤ kv_len) :
+    classOutput D win d (prefillRow kv_len q_len i h row)
+      = classOutput D win d (decodeRow (kv_len - q_len + i + 1) h row) :=
+  prefill_decode_agree _ _ _ win d kv_len q_len i h row hi hq
 
 /-- The launch applies the per-row term to every row; there is no batch parameter inside. -/
 def launch (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) : ATerm :=
@@ -255,8 +299,13 @@ position under `C` and `2C` is a different term (stated on a concrete toy row, d
 theorem output_depends_on_C :
     output ⟨1, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨1, 2, 16, 9, -1, 0, 0⟩ := by native_decide
 
+/-- **The tile length is a class parameter**: the same position under `T` and `2T` is a different term (the pairwise trees
+span the tile and the accumulator is rescaled once per tile). Stated on a concrete toy row, decided. -/
+theorem output_depends_on_T :
+    output ⟨1, 4, 64, 40, -1, 0, 0⟩ ≠ output ⟨1, 5, 64, 40, -1, 0, 0⟩ := by native_decide
+
 /-- **One class per head dim**: the same position under `D = 128` (8 MMA K-steps per score) and `D = 256` (16 steps) is a
-different term (the score fold differs; everything else -- `T`, `C`, the folds, the merge, the epilogue -- is shared). Stated
+different term (the score fold differs, here under one `(T, C)`; the folds, the merge and the epilogue are shared). Stated
 on a concrete toy row, decided. The classes at D = 64 / 128 / 256 are therefore three fingerprints. -/
 theorem output_depends_on_D :
     output ⟨8, 2, 8, 9, -1, 0, 0⟩ ≠ output ⟨16, 2, 8, 9, -1, 0, 0⟩ := by native_decide
@@ -298,10 +347,14 @@ structure Config where
   small : Nat
   deriving DecidableEq, Repr
 
-/-- The knob constraints at head dim `D`: a KV ring slot is `128 x D` bf16 and the ring holds 128 KB of K/V at every head dim,
-so `kvSlots * D ≤ 512` (2..8 slots at D = 64, 2..4 at D = 128, exactly 2 at D = 256); the other knobs do not depend on `D`. -/
+/-- Keys per KV ring slot at head dim `D` (`blocks/operands.slot_keys_for`): the tile, or 128 keys of a longer tile. -/
+def slotKeys (D : Nat) : Nat := min (tileKeys D) 128
+
+/-- The knob constraints at head dim `D`: a KV ring slot is `slotKeys D x D` bf16 and the ring holds 128 KB of K/V at every
+head dim, so `kvSlots * slotKeys D * D ≤ 65536` (with 128-key slots: 2..8 slots at D = 64, 2..4 at D = 128, exactly 2 at
+D = 256); the other knobs do not depend on `D`. -/
 def ConfigOKD (D : Nat) (c : Config) : Bool :=
-  (2 ≤ c.kvSlots && c.kvSlots * D ≤ 512) && c.policy ≤ 2 && (c.softmaxWgs == 1 || c.softmaxWgs == 2) && c.merge ≤ 2 && c.small ≤ 1
+  (2 ≤ c.kvSlots && c.kvSlots * slotKeys D * D ≤ 65536) && c.policy ≤ 2 && (c.softmaxWgs == 1 || c.softmaxWgs == 2) && c.merge ≤ 2 && c.small ≤ 1
 
 /-- A row's output under a configuration: the fused fold when the planner keeps all chunks in one unit (policy 2, or policy 0
 when its SM-count rule `fusedAuto` says so), the split kernel under the assignment `σ` otherwise. Ring depth, warpgroups

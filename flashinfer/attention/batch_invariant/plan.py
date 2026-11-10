@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-from .spec import TILE_KEYS, chunk_len
+from .spec import chunk_len, tile_keys
 
 DESC_FIELDS = 16
 # descriptor fields (int32); F_QBASE = qo_indptr[req], the packed token index of the request's first token;
@@ -156,11 +156,33 @@ class Plan:
         ]
 
 
+MAX_SLOT_KEYS = 128  # keys per KV ring slot of the row body: at most the N of one 128 x 128 x 16 QK^T instruction (a longer tile
+# takes several slots)
+
+
+def slot_keys_for(D: int) -> int:
+    """Keys per ring slot of the row body at head dim ``D``: the class's tile (``spec.tile_keys``) when it fits one slot, else
+    ``MAX_SLOT_KEYS`` (a tile of ``T / slot_keys`` consecutive slots). A placement: the slots hold the same keys at the same smem
+    bytes of the MMA operands whatever their count."""
+    return min(tile_keys(D), MAX_SLOT_KEYS)
+
+
+SWAPS_TILE_KEYS = 128  # the tile the Swaps-AB decode body is built on: the keys of a tile are the M = 128 lanes of one S^T
+# accumulator (a thread per key), so that body implements exactly the head dims whose class tile is 128 keys
+
+
+def swaps_dim(D: int) -> bool:
+    """Whether the Swaps-AB body implements the class at head dim ``D`` (``swaps/operands.py``); the other head dims' small
+    units take the row body's replicated-row placement (same bits)."""
+    return tile_keys(D) == SWAPS_TILE_KEYS
+
+
 def om_in_tmem(D: int) -> bool:
-    """Whether the body keeps the merged chunk state ``O_m`` in TMEM next to ``S | P | O_c`` (``128 + 64 + 2 D <= 512``: D <= 128). At D = 256
+    """Whether the body keeps the merged chunk state ``O_m`` in TMEM next to ``S | P | O_c`` (``T + T / 2 + 2 D <= 512``: D <= 128). At D = 256
     it lives in a per-CTA global scratch, so a fused multi-chunk unit pays one L2 round trip of its 128 x D fp32 state per chunk end -- which
     is why the planner's ``auto`` splits decode-sized units there (``build_plan``). The body (``blocks/operands.py``) reads the same rule."""
-    return 128 + 64 + 2 * D <= 512
+    T = tile_keys(D)
+    return T + T // 2 + 2 * D <= 512
 
 
 def kv_lengths(
@@ -277,7 +299,7 @@ def swaps_kind_cost(
     width -- the form used off the parts the per-CTA rate was fitted on, so that a part-filled last wave alone never turns a fused
     batch into a split one."""
     counts, fixup_rows, inkernel_groups = _swaps_lengths(
-        units, split, inkernel_max_chunks, chunk_len(D) // TILE_KEYS
+        units, split, inkernel_max_chunks, chunk_len(D) // tile_keys(D)
     )
     return _swaps_walk_cost(
         counts, fixup_rows, inkernel_groups, grid, sm_count, D, relax_last_wave
@@ -324,7 +346,7 @@ def swaps_unit_kinds(
     if n == 0:
         return [], 0
     fused = [False] * n
-    tpc = chunk_len(D) // TILE_KEYS
+    tpc = chunk_len(D) // tile_keys(D)
     f_counts, f_fixup_rows, f_inkernel = _swaps_lengths(
         units, fused, inkernel_max_chunks, tpc
     )
@@ -404,7 +426,7 @@ def build_plan(
     g = Hq // Hkv
     assert 1 <= g <= q_rows, g
     tpt = q_rows // g
-    T, C = TILE_KEYS, chunk_len(D)
+    T, C = tile_keys(D), chunk_len(D)
     B = len(qo_indptr) - 1
     kv_lens = kv_lengths(kv_indptr, kv_last_page_len, page)
     tiles = []  # (b, h, tok0, ntok, chunk_lo, chunk_hi, tile_lo, tile_hi, kv_len, q_len)

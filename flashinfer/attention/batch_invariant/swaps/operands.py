@@ -29,8 +29,9 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 
-from ..plan import ws_row
-from ..spec import MMA_K, TILE_KEYS, tiles_per_chunk
+from ..plan import SWAPS_TILE_KEYS as TILE_KEYS
+from ..plan import swaps_dim, ws_row
+from ..spec import MMA_K, tiles_per_chunk
 from ..blocks.operands import (
     ACC_DTYPE,
     HALF,
@@ -225,7 +226,7 @@ class SwapsPlan:
     def __init__(
         self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
     ):
-        assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
+        assert swaps_dim(D) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
