@@ -22,7 +22,7 @@ import pytest
 # cutedsl_megamoe shim public API (including the torch reference it re-exports);
 # it never imports the src/ kernel packages directly, so a new src/ drop can't
 # silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -197,7 +197,7 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     # Verify only against the cutedsl_megamoe shim boundary: pull constants and
     # reference tensor-makers from the package public API, never from the src/
     # kernel packages directly (so a new src/ drop can't silently break tests).
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         Mxfp8ScaleDtype,
         _make_e8m0_scale_tensor,
@@ -295,7 +295,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
             f"mxfp8_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
         )
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -309,7 +309,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
 
     # The MXFP8 torch reference is consumed via the shim boundary, not the src/
     # package directly, so tests verify against a stable public surface.
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         compute_megamoe_reference_mxfp8,
     )
 
@@ -369,8 +369,8 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
         topk_idx = symm_buffer.topk_idx[:num_tokens]
         topk_weights = symm_buffer.topk_weights[:num_tokens]
 
-        # The kernel folds the per-token topk weight into fc1 (apply_topk_in_fc1
-        # defaults to True) *before* the MXFP8 fc1-out round-trip; post-hoc
+        # The kernel folds the routing weight in before the MXFP8 FC1-output
+        # round-trip; post-hoc
         # weighting would NOT match, because the quant step changes the effective
         # magnitude. Apply it in the reference the same way and reduce with a
         # plain sum over topk (the weight is already folded in).
@@ -385,7 +385,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
             fc2_weight_sf=fc2_plain_sf.unsqueeze(0),
             ab_dtype=data_dtype,
             gate_up_clamp=problem["gate_up_clamp"],
-            apply_topk_in_fc1=True,
+            apply_routing_weights_before_fc2=True,
         )
         y_kernel = torch.empty(
             num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"

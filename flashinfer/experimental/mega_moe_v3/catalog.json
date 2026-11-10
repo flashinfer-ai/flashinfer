@@ -1,0 +1,11084 @@
+{
+ "schema": "mega_moe_v3.v3",
+ "arches": [
+  "sm_100a",
+  "sm_103a"
+ ],
+ "arg_plans": {
+  "pipeline": [
+   [
+    "buffer",
+    "topk_idx_i32"
+   ],
+   [
+    "buffer",
+    "topk_weights"
+   ],
+   [
+    "buffer",
+    "x_fp8"
+   ],
+   [
+    "buffer",
+    "x_sf"
+   ],
+   [
+    "tma_buffer",
+    "A"
+   ],
+   [
+    "buffer",
+    "pool_fp8"
+   ],
+   [
+    "buffer",
+    "pool_sf"
+   ],
+   [
+    "buffer",
+    "routing_weight_pool"
+   ],
+   [
+    "buffer",
+    "token_to_permuted"
+   ],
+   [
+    "buffer",
+    "meta_token"
+   ],
+   [
+    "buffer",
+    "meta_slot"
+   ],
+   [
+    "buffer",
+    "expert_counts"
+   ],
+   [
+    "buffer",
+    "expert_row_offsets"
+   ],
+   [
+    "buffer",
+    "expert_scatter_offsets"
+   ],
+   [
+    "buffer",
+    "tile_expert"
+   ],
+   [
+    "buffer",
+    "tile_m_local"
+   ],
+   [
+    "buffer",
+    "total_m_tiles_out"
+   ],
+   [
+    "tma_buffer",
+    "B1"
+   ],
+   [
+    "tma_buffer",
+    "SFB1"
+   ],
+   [
+    "tma_buffer",
+    "I_fp8_w"
+   ],
+   [
+    "buffer",
+    "SF_I_w"
+   ],
+   [
+    "buffer",
+    "l1_bf16_capture"
+   ],
+   [
+    "tma_buffer",
+    "A2"
+   ],
+   [
+    "buffer",
+    "SFA2"
+   ],
+   [
+    "tma_buffer",
+    "B2"
+   ],
+   [
+    "tma_buffer",
+    "SFB2"
+   ],
+   [
+    "buffer",
+    "expert_output"
+   ],
+   [
+    "buffer",
+    "y"
+   ],
+   [
+    "buffer",
+    "histogram_done"
+   ],
+   [
+    "buffer",
+    "prefix_done"
+   ],
+   [
+    "buffer",
+    "dispatch_done"
+   ],
+   [
+    "buffer",
+    "l1_arrival"
+   ],
+   [
+    "buffer",
+    "l2_done"
+   ],
+   [
+    "parameter",
+    "num_tokens"
+   ],
+   [
+    "parameter",
+    "top_k"
+   ],
+   [
+    "parameter",
+    "num_experts"
+   ],
+   [
+    "parameter",
+    "N1"
+   ],
+   [
+    "parameter",
+    "K1"
+   ],
+   [
+    "parameter",
+    "grid_n1"
+   ],
+   [
+    "parameter",
+    "K1_tiles"
+   ],
+   [
+    "parameter",
+    "N2"
+   ],
+   [
+    "parameter",
+    "K2"
+   ],
+   [
+    "parameter",
+    "grid_n2"
+   ],
+   [
+    "parameter",
+    "K2_tiles"
+   ],
+   [
+    "parameter",
+    "total_m_tiles"
+   ],
+   [
+    "parameter",
+    "M_total"
+   ],
+   [
+    "parameter",
+    "activation_clamp"
+   ],
+   [
+    "buffer",
+    "PrivateCounters"
+   ],
+   [
+    "buffer",
+    "PrivateMasks"
+   ],
+   [
+    "buffer",
+    "PublicExpertOutput"
+   ],
+   [
+    "buffer",
+    "PrivateSFBlockOffsets"
+   ],
+   [
+    "tma_buffer",
+    "PrivateSF1"
+   ],
+   [
+    "tma_buffer",
+    "PrivateSF2"
+   ],
+   [
+    "buffer",
+    "PrivateSF1Words"
+   ],
+   [
+    "buffer",
+    "PrivateSF2Bytes"
+   ],
+   [
+    "grid",
+    "grid_x"
+   ],
+   [
+    "grid",
+    "grid_y"
+   ],
+   [
+    "grid",
+    "grid_z"
+   ]
+  ]
+ },
+ "programs": {
+  "deepgemm_mega_moe_v3_pipeline_fp4_t1": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_binding.cu"
+   ],
+   "closure_sha256": "d2063f1bf14e4e59c5edf285f40a98beccdb6a0ea3b857deeda3b2428de58999",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_t1"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a": {
+   "arches": [
+    "sm_100a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_binding.cu"
+   ],
+   "closure_sha256": "2066a7d7dfe600a0ce9fda5c7d706c8ac31250f1494ccee03a0c22a190ed53a1",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_binding.cu"
+   ],
+   "closure_sha256": "e43677cf281deffcfedeeee545b507906e0fc902dc60acadaccee9be7b2d80ec",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_t16"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a": {
+   "arches": [
+    "sm_100a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_binding.cu"
+   ],
+   "closure_sha256": "f8a3d151db491218ac7db583500e0473f08de2f9823510888d70aa951a007657",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_binding.cu"
+   ],
+   "closure_sha256": "5ad7048a68900452e9c205734cc39cf4b8a06bd6513c348f988076a5de9a9a50",
+   "compile_flags": [
+    "--use_fast_math",
+    "--ptxas-options=--register-usage-level=10",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_t128"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_t512": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_binding.cu"
+   ],
+   "closure_sha256": "3984ac91bef38025716782a9363fdd35d131d951f8a44156fc221c8786a598ea",
+   "compile_flags": {
+    "sm_100a": [
+     "--use_fast_math",
+     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_t512",
+     "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_t512"
+    ],
+    "sm_103a": [
+     "--use_fast_math",
+     "--ptxas-options=--register-usage-level=10",
+     "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_t512",
+     "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_t512"
+    ]
+   },
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp8_t16": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_binding.cu"
+   ],
+   "closure_sha256": "6308c131ae94d55e5c582ddc402064be0f6f606feef3b90c6fddb339815d6e62",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_grouped_fused": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_grouped_fused_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_grouped_fused_binding.cu"
+   ],
+   "closure_sha256": "25a1beb61faefc7f18ae6f2c0f3073bdfe4c5d32ac3d864d3f62416b09630419",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "buffer",
+     "SFA1"
+    ],
+    [
+     "buffer",
+     "SFB1"
+    ],
+    [
+     "buffer",
+     "routing_weights"
+    ],
+    [
+     "buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "Out"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "workspace",
+     "tma_descriptor_workspace"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 512,
+   "ffi_prepare_entry": "run_prepare"
+  },
+  "deepgemm_mega_moe_v3_grouped_l2_scale_layout": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_grouped_l2_scale_layout_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_grouped_l2_scale_layout_binding.cu"
+   ],
+   "closure_sha256": "f4d5b79451240a6ce495c6f2941f36f9c0dd9c67b92bb4fb4938ce8a05f7b96d",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "src_a"
+    ],
+    [
+     "buffer",
+     "src_b"
+    ],
+    [
+     "buffer",
+     "dst_a"
+    ],
+    [
+     "buffer",
+     "dst_b"
+    ],
+    [
+     "parameter",
+     "a_rows"
+    ],
+    [
+     "parameter",
+     "b_rows"
+    ],
+    [
+     "parameter",
+     "b_group_rows"
+    ],
+    [
+     "parameter",
+     "words"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_grouped_l2": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_grouped_l2_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_grouped_l2_binding.cu"
+   ],
+   "closure_sha256": "2ee56da0aaf15509288f799d9d76d836aa48ef44471b2eb58b74814738bd574f",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "tma_buffer",
+     "B"
+    ],
+    [
+     "tma_buffer",
+     "SFA"
+    ],
+    [
+     "tma_buffer",
+     "SFB"
+    ],
+    [
+     "buffer",
+     "Out"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "N"
+    ],
+    [
+     "parameter",
+     "K"
+    ],
+    [
+     "parameter",
+     "grid_n"
+    ],
+    [
+     "parameter",
+     "K_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "workspace",
+     "tma_descriptor_workspace"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 512,
+   "ffi_prepare_entry": "run_prepare"
+  },
+  "deepgemm_mega_moe_v3_grouped_l1": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_grouped_l1_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_grouped_l1_binding.cu"
+   ],
+   "closure_sha256": "06b280151016c200516e31c3e216c02ab3cfa1016caa79f82ff820809d630d82",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "tma_buffer",
+     "B"
+    ],
+    [
+     "buffer",
+     "SFA"
+    ],
+    [
+     "buffer",
+     "SFB"
+    ],
+    [
+     "buffer",
+     "C_fp8"
+    ],
+    [
+     "buffer",
+     "SF_out"
+    ],
+    [
+     "buffer",
+     "routing_weights"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "N"
+    ],
+    [
+     "parameter",
+     "K"
+    ],
+    [
+     "parameter",
+     "grid_n"
+    ],
+    [
+     "parameter",
+     "K_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "workspace",
+     "tma_descriptor_workspace"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 256,
+   "ffi_prepare_entry": "run_prepare"
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_t1024": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_binding.cu"
+   ],
+   "closure_sha256": "2cc695afec524e0ae278064088101b88060c7bad6d2a6aa4a351de63cd62122d",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_t4096": {
+   "arches": [
+    "sm_100a",
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_binding.cu"
+   ],
+   "closure_sha256": "01804da860e13dbb15e277b44996d434c52a4854a1576e6cac935dd9516b1a35",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": "pipeline",
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "276efbdfb251e55e2720739e38314b0abb9401aabd3677514a3f51fc11c97fe2",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i640_t1"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "d02f001daff3dffdca390a5cefd8ac9ce7ecba4b46f76d2221ce6786f4a138c1",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i640_t4"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
+   ],
+   "closure_sha256": "49158ee7cd394876cc5e0f8d6ba29954d482bf4c3970388e8f6a4def3d056ab3",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i640_t16"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
+   ],
+   "closure_sha256": "b6dcd401923fb5a399bdf3bb254a6e0f8d82ec04c8b18b496428e717c926f31e",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i640_t32"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
+   ],
+   "closure_sha256": "d08b13132120b2c53455b09695838fdbf8355e7b92c156df7ead6157a99ecedf",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i640_t128"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t512_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t512_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
+   ],
+   "closure_sha256": "75ca47d30fafae46abf2ed8603f639e34d2775b4caebb8105e5d073c1e78fff2",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t512_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i640_t512"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_binding.cu"
+   ],
+   "closure_sha256": "0c5eb041de1deeeb1f67ec05bea974776f9791aadc455429109f3392eff2091d",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i640_t1024"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a_binding.cu"
+   ],
+   "closure_sha256": "db26a2347b0a1d1522c2bf966f3290ebdc31998e22dd43c630d820a28ff898f0",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "2d26df19117e0497a7ed3401f4a306fbac2c652feccbbec9bc3ea8a80a2e994d",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "195b5e2f07c2809496e229525b64f0f3932e131cfbb6ac2684d8fefd940dcce8",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i384_t4"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
+   ],
+   "closure_sha256": "032cdd50b4582d685658d4f9c0e25589b73f9f619440d2cdf767cc42925bcb2e",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a_binding.cu"
+   ],
+   "closure_sha256": "6d199525c2012e18fab2fc47b61f8515c5faa15669a93d5b862d4322ed31ace3",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i384_t32"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
+   ],
+   "closure_sha256": "dba32f482faad1847db2b7d626d0581846a11902a9a488ef00fa89846367478f",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a_binding.cu"
+   ],
+   "closure_sha256": "b896f8d39cb26d481f931f82ce485d9c45c862a743b8f30692b392558ac00b1b",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e384_i384_t512"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a_binding.cu"
+   ],
+   "closure_sha256": "b6fb10768468286f9a8092941500d838a922f6ba657ed4d9d04b52558a73715f",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a_binding.cu"
+   ],
+   "closure_sha256": "c62d2326f9642151496f8084657ac6915611e2c5d963995b40a6dd74a3130550",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "b6952c7963bcd2ba75fa25f5465102e35c5bf0405f35f57863c1754a723c6cd7",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e96_i2304_t1"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "de473cb82d9b11a4dbb3b0e4c821d5d9239a38c29631b1a2fbb043be6a66e697",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e96_i2304_t4"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "2b18f57a14332a23523778ecd26902b4ff7827fcd3e66144245ce0a76981f138",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e96_i2304_t16"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a_binding.cu"
+   ],
+   "closure_sha256": "8c2f8a01ec6df9b0a4afea432a7ceece32f7242153c1754e34d6af2df6fafc1c",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e96_i2304_t32"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t128_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t128_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t128_sm103a_binding.cu"
+   ],
+   "closure_sha256": "6a635f27f3c274424bfa703bf7616ba966a28504ac13479cde8377bf97c92cbc",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t512_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t512_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t512_sm103a_binding.cu"
+   ],
+   "closure_sha256": "4adf2c4cdb62e0c93200065be38908a29be5827751624db23049332f29e80c3a",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
+   ],
+   "closure_sha256": "a0393fa73f7c6a9a41e777547b0d1480193493d848cedaeee77d5f785356aea1",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e96_i2304_t1024"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a_binding.cu"
+   ],
+   "closure_sha256": "4826277fa1c7ace46bd8be9c540c9616b934e416203e6fd8f0a5c9b3a25ec255",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e96_i2304_t4096"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "135cf01a9f4de020034df2f72317a8225306c6c45bec2e484ff1fa787f789ee9",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a_binding.cu"
+   ],
+   "closure_sha256": "403515baabfbfd8b4f5d072e347587aa84a99024444e5e347826bc90de5d4d71",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e48_i2304_t4"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0,
+   "definitions": [
+    "NUM_CTAS"
+   ]
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a_binding.cu"
+   ],
+   "closure_sha256": "b2ca1640910c546d9e48ad253806f7370d3c54e9b8150204e3e04081eff65048",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a_binding.cu"
+   ],
+   "closure_sha256": "62632fece737248d1f7c6820cdd70e4aa51b9575b26a41333ee9823ca2c218b9",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t128_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t128_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t128_sm103a_binding.cu"
+   ],
+   "closure_sha256": "b373af6e366664d9550e3125689a212b8bb010dff5bb433f69d736360880e2d4",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t512_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t512_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
+   ],
+   "closure_sha256": "81c172380f4eb59ba57d011ff860f77c5c3dff30b8f164b6d97de40706f6102d",
+   "compile_flags": [
+    "--use_fast_math",
+    "-DCAKE_PROGRAM_KERNEL=kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t512_sm103a",
+    "-DCAKE_PROGRAM_SHIM=deepgemm_host_shim_pipeline_fp4_e48_i2304_t512"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a_binding.cu"
+   ],
+   "closure_sha256": "3beaf467a11cc27f1a40c53916af9abe6e838efded6efb20ff3ed6bfdc2dc9b7",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  },
+  "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a": {
+   "arches": [
+    "sm_103a"
+   ],
+   "sources": [
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a_kernel.cu",
+    "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a_binding.cu"
+   ],
+   "closure_sha256": "41a2a4234e332a743d2b6da7e938cceefc60b8cc334e881f10e47a98ad63774b",
+   "compile_flags": [
+    "--use_fast_math"
+   ],
+   "ffi_entry": "run",
+   "arg_plan": [
+    [
+     "buffer",
+     "topk_idx_i32"
+    ],
+    [
+     "buffer",
+     "topk_weights"
+    ],
+    [
+     "buffer",
+     "x_fp8"
+    ],
+    [
+     "buffer",
+     "x_sf"
+    ],
+    [
+     "tma_buffer",
+     "A"
+    ],
+    [
+     "buffer",
+     "pool_fp8"
+    ],
+    [
+     "buffer",
+     "pool_sf"
+    ],
+    [
+     "buffer",
+     "routing_weight_pool"
+    ],
+    [
+     "buffer",
+     "token_to_permuted"
+    ],
+    [
+     "buffer",
+     "meta_token"
+    ],
+    [
+     "buffer",
+     "meta_slot"
+    ],
+    [
+     "buffer",
+     "expert_counts"
+    ],
+    [
+     "buffer",
+     "expert_row_offsets"
+    ],
+    [
+     "buffer",
+     "expert_scatter_offsets"
+    ],
+    [
+     "buffer",
+     "tile_expert"
+    ],
+    [
+     "buffer",
+     "tile_m_local"
+    ],
+    [
+     "buffer",
+     "total_m_tiles_out"
+    ],
+    [
+     "tma_buffer",
+     "B1"
+    ],
+    [
+     "tma_buffer",
+     "SFB1"
+    ],
+    [
+     "tma_buffer",
+     "I_fp8_w"
+    ],
+    [
+     "buffer",
+     "SF_I_w"
+    ],
+    [
+     "buffer",
+     "l1_bf16_capture"
+    ],
+    [
+     "tma_buffer",
+     "A2"
+    ],
+    [
+     "buffer",
+     "SFA2"
+    ],
+    [
+     "tma_buffer",
+     "B2"
+    ],
+    [
+     "tma_buffer",
+     "SFB2"
+    ],
+    [
+     "buffer",
+     "expert_output"
+    ],
+    [
+     "buffer",
+     "y"
+    ],
+    [
+     "buffer",
+     "histogram_done"
+    ],
+    [
+     "buffer",
+     "prefix_done"
+    ],
+    [
+     "buffer",
+     "dispatch_done"
+    ],
+    [
+     "buffer",
+     "l1_arrival"
+    ],
+    [
+     "buffer",
+     "l2_done"
+    ],
+    [
+     "parameter",
+     "num_tokens"
+    ],
+    [
+     "parameter",
+     "top_k"
+    ],
+    [
+     "parameter",
+     "num_experts"
+    ],
+    [
+     "parameter",
+     "N1"
+    ],
+    [
+     "parameter",
+     "K1"
+    ],
+    [
+     "parameter",
+     "grid_n1"
+    ],
+    [
+     "parameter",
+     "K1_tiles"
+    ],
+    [
+     "parameter",
+     "N2"
+    ],
+    [
+     "parameter",
+     "K2"
+    ],
+    [
+     "parameter",
+     "grid_n2"
+    ],
+    [
+     "parameter",
+     "K2_tiles"
+    ],
+    [
+     "parameter",
+     "total_m_tiles"
+    ],
+    [
+     "parameter",
+     "M_total"
+    ],
+    [
+     "parameter",
+     "activation_clamp"
+    ],
+    [
+     "buffer",
+     "PrivateCounters"
+    ],
+    [
+     "buffer",
+     "PrivateMasks"
+    ],
+    [
+     "buffer",
+     "PublicExpertOutput"
+    ],
+    [
+     "buffer",
+     "PrivateSFBlockOffsets"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF1"
+    ],
+    [
+     "tma_buffer",
+     "PrivateSF2"
+    ],
+    [
+     "buffer",
+     "PrivateSF1Words"
+    ],
+    [
+     "buffer",
+     "PrivateSF2Bytes"
+    ],
+    [
+     "parameter",
+     "local_expert_offset"
+    ],
+    [
+     "grid",
+     "grid_x"
+    ],
+    [
+     "grid",
+     "grid_y"
+    ],
+    [
+     "grid",
+     "grid_z"
+    ]
+   ],
+   "tma_workspace_bytes": 0
+  }
+ },
+ "routes": {
+  "sm_100a": {
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 1,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": {
+       "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a",
+       "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a"
+      }
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 128,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": {
+       "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a",
+       "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a"
+      }
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 512,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t512"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp8",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp8_t16"
+     }
+    ]
+   },
+   "[\"grouped_fused\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_fused",
+     "M_total": 4096,
+     "total_m_tiles": 32,
+     "self_cleaning": false,
+     "reset_scope": "l1_arrival.zero_ then main",
+     "required_repack_each_invocation": false,
+     "args": {
+      "benchmark": true,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "num_experts": 4,
+      "per_expert_M": [
+       1024,
+       1024,
+       1024,
+       1024
+      ]
+     }
+    },
+    "stages": [
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_fused"
+     }
+    ]
+   },
+   "[\"grouped_l2\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_l2",
+     "M_total": 4096,
+     "total_m_tiles": 32,
+     "self_cleaning": false,
+     "reset_scope": "no reset",
+     "required_repack_each_invocation": true,
+     "args": {
+      "benchmark": true,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "num_experts": 4,
+      "per_expert_M": [
+       1024,
+       1024,
+       1024,
+       1024
+      ]
+     }
+    },
+    "stages": [
+     {
+      "name": "scale_layout",
+      "program": "deepgemm_mega_moe_v3_grouped_l2_scale_layout"
+     },
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_l2"
+     }
+    ]
+   },
+   "[\"grouped_l1\",{\"K\":512,\"N\":256,\"num_experts\":4,\"per_expert_M\":[256,256,256,256]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      16,
+      1,
+      1
+     ],
+     "sm_103a": [
+      16,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_l1",
+     "M_total": 1024,
+     "total_m_tiles": 8,
+     "self_cleaning": false,
+     "reset_scope": "no reset",
+     "required_repack_each_invocation": false,
+     "args": {
+      "num_experts": 4,
+      "per_expert_M": [
+       256,
+       256,
+       256,
+       256
+      ],
+      "N": 256,
+      "K": 512,
+      "benchmark": false
+     }
+    },
+    "stages": [
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_l1"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "args": {
+      "activation_clamp": 10.0,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "num_experts": 384,
+      "num_tokens": 1024,
+      "routed_weight_dtype": "fp4",
+      "top_k": 6
+     },
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "self_cleaning": true,
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "surface": "pipeline"
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1024"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "args": {
+      "activation_clamp": 10.0,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "num_experts": 384,
+      "num_tokens": 4096,
+      "routed_weight_dtype": "fp4",
+      "top_k": 6
+     },
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "self_cleaning": true,
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "surface": "pipeline"
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t4096"
+     }
+    ]
+   }
+  },
+  "sm_103a": {
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 1,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": {
+       "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a",
+       "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a"
+      }
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 128,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": {
+       "sm_100a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a",
+       "sm_103a": "deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a"
+      }
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 512,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t512"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "self_cleaning": true,
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp8",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp8_t16"
+     }
+    ]
+   },
+   "[\"grouped_fused\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_fused",
+     "M_total": 4096,
+     "total_m_tiles": 32,
+     "self_cleaning": false,
+     "reset_scope": "l1_arrival.zero_ then main",
+     "required_repack_each_invocation": false,
+     "args": {
+      "benchmark": true,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "num_experts": 4,
+      "per_expert_M": [
+       1024,
+       1024,
+       1024,
+       1024
+      ]
+     }
+    },
+    "stages": [
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_fused"
+     }
+    ]
+   },
+   "[\"grouped_l2\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_l2",
+     "M_total": 4096,
+     "total_m_tiles": 32,
+     "self_cleaning": false,
+     "reset_scope": "no reset",
+     "required_repack_each_invocation": true,
+     "args": {
+      "benchmark": true,
+      "hidden": 7168,
+      "intermediate": 3072,
+      "num_experts": 4,
+      "per_expert_M": [
+       1024,
+       1024,
+       1024,
+       1024
+      ]
+     }
+    },
+    "stages": [
+     {
+      "name": "scale_layout",
+      "program": "deepgemm_mega_moe_v3_grouped_l2_scale_layout"
+     },
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_l2"
+     }
+    ]
+   },
+   "[\"grouped_l1\",{\"K\":512,\"N\":256,\"num_experts\":4,\"per_expert_M\":[256,256,256,256]}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      16,
+      1,
+      1
+     ],
+     "sm_103a": [
+      16,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "grouped_l1",
+     "M_total": 1024,
+     "total_m_tiles": 8,
+     "self_cleaning": false,
+     "reset_scope": "no reset",
+     "required_repack_each_invocation": false,
+     "args": {
+      "num_experts": 4,
+      "per_expert_M": [
+       256,
+       256,
+       256,
+       256
+      ],
+      "N": 256,
+      "K": 512,
+      "benchmark": false
+     }
+    },
+    "stages": [
+     {
+      "name": "main",
+      "program": "deepgemm_mega_moe_v3_grouped_l1"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "args": {
+      "activation_clamp": 10.0,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "num_experts": 384,
+      "num_tokens": 1024,
+      "routed_weight_dtype": "fp4",
+      "top_k": 6
+     },
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "self_cleaning": true,
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "surface": "pipeline"
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t1024"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_100a": 148,
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_100a": [
+      148,
+      1,
+      1
+     ],
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "args": {
+      "activation_clamp": 10.0,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "num_experts": 384,
+      "num_tokens": 4096,
+      "routed_weight_dtype": "fp4",
+      "top_k": 6
+     },
+     "extent": {
+      "grid_derivation": "original distinct top-k lower bound saturates the SM count",
+      "minimum_tiles": 480
+     },
+     "reset_scope": "self-cleaning kernel: counter workspace zeroed once at allocation, one kernel per call",
+     "self_cleaning": true,
+     "source_prepared_callback": "one-kernel callable (no host reset)",
+     "surface": "pipeline"
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_t4096"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":640,\"num_experts\":384,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "x",
+     "kernel_intermediate": 640,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 1,
+      "hidden": 5120,
+      "intermediate": 640,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":640,\"num_experts\":384,\"num_tokens\":4,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "x",
+     "kernel_intermediate": 640,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 4,
+      "hidden": 5120,
+      "intermediate": 640,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":640,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 640,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 640,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t16_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":640,\"num_experts\":384,\"num_tokens\":32,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 640,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 32,
+      "hidden": 5120,
+      "intermediate": 640,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t32_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":640,\"num_experts\":384,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 640,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 128,
+      "hidden": 5120,
+      "intermediate": 640,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t128_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":640,\"num_experts\":384,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 640,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 512,
+      "hidden": 5120,
+      "intermediate": 640,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t512_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":640,\"num_experts\":384,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 32,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 640,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 1024,
+      "hidden": 5120,
+      "intermediate": 640,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":640,\"num_experts\":384,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 128,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 640,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 4096,
+      "hidden": 5120,
+      "intermediate": 640,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":384,\"num_experts\":384,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "x",
+     "kernel_intermediate": 384,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 1,
+      "hidden": 5120,
+      "intermediate": 384,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":384,\"num_experts\":384,\"num_tokens\":4,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "x",
+     "kernel_intermediate": 384,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 4,
+      "hidden": 5120,
+      "intermediate": 384,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":384,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 384,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 384,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":384,\"num_experts\":384,\"num_tokens\":32,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 384,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 32,
+      "hidden": 5120,
+      "intermediate": 384,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t32_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":384,\"num_experts\":384,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 384,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 128,
+      "hidden": 5120,
+      "intermediate": 384,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t128_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":384,\"num_experts\":384,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 384,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 512,
+      "hidden": 5120,
+      "intermediate": 384,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t512_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":384,\"num_experts\":384,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 32,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 384,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 1024,
+      "hidden": 5120,
+      "intermediate": 384,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":384,\"num_experts\":384,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 128,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": true,
+     "a_source": "pool",
+     "kernel_intermediate": 384,
+     "args": {
+      "num_experts": 384,
+      "top_k": 6,
+      "num_tokens": 4096,
+      "hidden": 5120,
+      "intermediate": 384,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":96,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "x",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 96,
+      "top_k": 6,
+      "num_tokens": 1,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":96,\"num_tokens\":4,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "x",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 96,
+      "top_k": 6,
+      "num_tokens": 4,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":96,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "x",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 96,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":96,\"num_tokens\":32,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 96,
+      "top_k": 6,
+      "num_tokens": 32,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t32_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":96,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 96,
+      "top_k": 6,
+      "num_tokens": 128,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t128_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":96,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 96,
+      "top_k": 6,
+      "num_tokens": 512,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t512_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":96,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 32,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 96,
+      "top_k": 6,
+      "num_tokens": 1024,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":96,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 128,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 96,
+      "top_k": 6,
+      "num_tokens": 4096,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":48,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "x",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 48,
+      "top_k": 6,
+      "num_tokens": 1,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":48,\"num_tokens\":4,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "x",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 48,
+      "top_k": 6,
+      "num_tokens": 4,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":48,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "x",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 48,
+      "top_k": 6,
+      "num_tokens": 16,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":48,\"num_tokens\":32,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 16,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 48,
+      "top_k": 6,
+      "num_tokens": 32,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t32_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":48,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 32,
+     "readiness": "block",
+     "slot_list": false,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 48,
+      "top_k": 6,
+      "num_tokens": 128,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t128_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":48,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 32,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 48,
+      "top_k": 6,
+      "num_tokens": 512,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t512_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":48,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 32,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 48,
+      "top_k": 6,
+      "num_tokens": 1024,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a"
+     }
+    ]
+   },
+   "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":48,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+    "num_sms": {
+     "sm_103a": 152
+    },
+    "grid": {
+     "sm_103a": [
+      152,
+      1,
+      1
+     ]
+    },
+    "metadata": {
+     "surface": "pipeline",
+     "self_cleaning": true,
+     "block_m": 128,
+     "readiness": "block",
+     "slot_list": true,
+     "local_expert_filter": true,
+     "w1_expert_map": false,
+     "a_source": "pool",
+     "kernel_intermediate": 2304,
+     "args": {
+      "num_experts": 48,
+      "top_k": 6,
+      "num_tokens": 4096,
+      "hidden": 5120,
+      "intermediate": 2304,
+      "routed_weight_dtype": "fp4",
+      "activation_clamp": 10.0
+     }
+    },
+    "stages": [
+     {
+      "name": "pipeline",
+      "program": "deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a"
+     }
+    ]
+   }
+  }
+ }
+}

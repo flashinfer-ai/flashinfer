@@ -6,6 +6,26 @@ from dataclasses import dataclass
 from typing import Literal, Optional, Tuple
 
 
+RANK_COMBINE_MAX_GROUPS = 4
+RANK_COMBINE_PLAN_SLOT_BITS = 3
+RANK_COMBINE_PLAN_MAX_TOPK = 8
+RANK_COMBINE_PLAN_COUNT_SHIFT = 24
+
+
+def _rank_local_vector_reduce_supported(hidden: int, num_topk: int) -> bool:
+    """Internal layout constraint, not a user-selectable tuning option.
+
+    Each half-warp processes two 256-channel fragments. Require complete
+    512-channel steps even when the row is split into four publication groups.
+    Other shapes retain the original reducer and need no contributor plan.
+    """
+    return (
+        1 <= num_topk <= RANK_COMBINE_PLAN_MAX_TOPK
+        and hidden > 0
+        and hidden % (RANK_COMBINE_MAX_GROUPS * 512) == 0
+    )
+
+
 @dataclass
 class ImplDesc:
     """Kernel-instantiation-side configuration."""

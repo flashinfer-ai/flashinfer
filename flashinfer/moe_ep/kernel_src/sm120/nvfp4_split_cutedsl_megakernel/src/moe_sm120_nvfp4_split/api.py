@@ -8,7 +8,7 @@ construction and the opaque workspace contract.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
 from typing import Any, Dict, Optional, Tuple
@@ -18,6 +18,7 @@ from .heuristic import (
     MegaMoEHeuristicOverrides,
     MegaMoEKernelConfig,
     select_megamoe_config,
+    select_compatibility_config,
 )
 from .jit_config import Sm120JitConfig
 
@@ -34,7 +35,10 @@ from .jit_config import Sm120JitConfig
 # 19 publishes each source epoch through the device-side dispatch sideband.
 # Version 20 adds the rank-local replay-entry ownership barrier before any
 # peer-written sideband state is published.
-KERNEL_CACHE_ABI = 20
+# Rank-local combine now reserves a source-generated contributor-plan plane.
+# Version 22 refreshes generated code for whole-warp rank-local reduction;
+# the workspace layout and completion protocol are unchanged.
+KERNEL_CACHE_ABI = 2737
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,8 @@ class MegaMoEProblemSpec:
             "data_parallel_size": self.data_parallel_size,
             "tensor_parallel_size": self.tensor_parallel_size,
         }
+        if any(type(value) is not int for value in positive.values()):
+            raise ValueError('Problem and topology dimensions must be integers')
         invalid = {name: value for name, value in positive.items() if value <= 0}
         if invalid:
             raise ValueError(f"problem dimensions must be positive: {invalid}")
@@ -125,6 +131,13 @@ class MegaMoECompileSpec:
     def __post_init__(self) -> None:
         self.problem.validate()
         self.build.validate()
+        if self.kernel.k2_tail_reclaim and not self.build.concurrent_k1_k2:
+            raise ValueError("K2 tail reclaim requires concurrent green execution")
+        # Explicit JIT stage override wins and is reflected in the canonical
+        # specialization record, avoiding a hidden second stage selector.
+        if self.jit.num_ab_stages_override is not None:
+            object.__setattr__(self, "kernel", replace(
+                self.kernel, k1_stages=self.jit.num_ab_stages_override))
         if self.kernel.total_sms <= 0:
             raise ValueError("kernel SM partition must be non-empty")
 
@@ -168,6 +181,32 @@ class SplitKernelBundle:
     cache_key: str
 
 
+def is_calibrated_execution(
+    *,
+    build: Optional[SplitKernelBuildOptions] = None,
+    jit: Optional[Sm120JitConfig] = None,
+    dual_k2_ctas_per_sm: int = 2,
+    complete_pipeline: bool = True,
+) -> bool:
+    """Whether the candidate cost model describes these execution options.
+
+    Nondefault options remain supported through the compatibility selector.
+    This is an evidence boundary, not a kernel legality restriction.
+    """
+    if type(dual_k2_ctas_per_sm) is not int or dual_k2_ctas_per_sm <= 0:
+        raise ValueError("dual K2 CTAs/SM must be a positive integer")
+    if type(complete_pipeline) is not bool:
+        raise ValueError("complete_pipeline must be bool")
+    if build is not None:
+        build.validate()
+    return (
+        dual_k2_ctas_per_sm == 2 and complete_pipeline
+        and
+        (build is None or build == SplitKernelBuildOptions())
+        and (jit is None or jit == Sm120JitConfig())
+    )
+
+
 def select_compile_spec(
     *,
     problem: MegaMoEProblemSpec,
@@ -177,6 +216,8 @@ def select_compile_spec(
     sm_min_partition: int,
     sm_partition_alignment: int,
     overrides: Optional[MegaMoEHeuristicOverrides] = None,
+    numerical_contract: str = "ordinary_topk",
+    host_expert_counts: Optional[Tuple[int, ...]] = None,
     jit: Optional[Sm120JitConfig] = None,
     build: Optional[SplitKernelBuildOptions] = None,
 ) -> MegaMoECompileSpec:
@@ -198,9 +239,18 @@ def select_compile_spec(
         sm_min_partition=sm_min_partition,
         sm_partition_alignment=sm_partition_alignment,
     )
+    # Nondefault launch/JIT plumbing changes actual CTA/supply/resource features.
+    # Preserve it explicitly via compatibility fallback until separately calibrated.
+    selected = (
+        select_compatibility_config(heuristic_input, overrides,
+            numerical_contract=numerical_contract)
+        if not is_calibrated_execution(build=build, jit=jit) else
+        select_megamoe_config(heuristic_input, overrides,
+            numerical_contract=numerical_contract, host_expert_counts=host_expert_counts)
+    )
     return MegaMoECompileSpec(
         problem=problem,
-        kernel=select_megamoe_config(heuristic_input, overrides),
+        kernel=selected,
         jit=jit or Sm120JitConfig(),
         build=build or SplitKernelBuildOptions(),
     )
@@ -277,9 +327,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         gate_up_clamp=problem.gate_up_clamp,
         flag_batch=options.flag_batch,
         epi_flag_batch=options.epi_flag_batch,
-        dispatch_pull_mode=config.dispatch_pull_mode,
         dispatch_warps=config.dispatch_warps,
-        dispatch_warps_per_tile=config.dispatch_warps_per_tile,
         dispatch_compute_overlap=config.dispatch_compute_overlap,
         dispatch_rank_cache=config.dispatch_rank_cache,
         rank_local_combine=config.rank_local_combine,
@@ -294,6 +342,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
 
     k1 = build_sm120_dispatch_fc1_kernel(
         group_hint=k1_group_hint,
+        num_ab_stages_override=config.k1_stages,
         mma_tiler_mnk=config.k1_tile,
         load_balance_mode="static",
         k2_tail_reclaim=config.k2_tail_reclaim,
@@ -402,4 +451,5 @@ __all__ = [
     "compile_combine_reduce",
     "compile_rank_local_combine",
     "select_compile_spec",
+    "is_calibrated_execution",
 ]

@@ -280,8 +280,6 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         # serialization is type-discriminated below.
         expert_token_sizes: Optional[cute.Tensor] = None,
         expert_token_prefix_sum: Optional[cute.Tensor] = None,
-        streaming_fc12: bool = False,
-        streaming_fc12_tiles: int = 0,
         phase_mode: Literal["fused", "fc1", "fc2"] = "fused",
         fc1_ready_major: bool = False,
         fc2_token_stripe: int = 1,
@@ -289,9 +287,9 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         """Create fused fc12 scheduler params."""
         if scenario != "2Dx3D":
             raise ValueError(f"fused fc1+fc2 only supports 2Dx3D, got {scenario!r}")
-        if load_balance_mode not in ("static", "atomic_counter", "clc"):
+        if load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError(
-                f"load_balance_mode must be one of 'static' / 'atomic_counter' / 'clc', "
+                f"load_balance_mode must be 'static' or 'atomic_counter', "
                 f"got {load_balance_mode!r}"
             )
         if load_balance_mode == "atomic_counter" and load_balance_counter_ptr is None:
@@ -301,20 +299,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             )
         if group_hint <= 0:
             raise ValueError(f"group_hint must be positive, got {group_hint}")
-        if streaming_fc12 != (streaming_fc12_tiles > 0):
-            raise ValueError(
-                "streaming_fc12 must match streaming_fc12_tiles > 0; got "
-                f"streaming_fc12={streaming_fc12}, "
-                f"streaming_fc12_tiles={streaming_fc12_tiles}."
-            )
         if phase_mode not in ("fused", "fc1", "fc2"):
             raise ValueError(
                 "phase_mode must be one of 'fused' / 'fc1' / 'fc2', got "
                 f"{phase_mode!r}."
-            )
-        if phase_mode != "fused" and streaming_fc12:
-            raise ValueError(
-                "streaming_fc12 is only valid for phase_mode='fused'."
             )
         if fc2_token_stripe <= 0:
             raise ValueError(
@@ -356,8 +344,6 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         self.load_balance_counter_ptr = load_balance_counter_ptr
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
-        self.streaming_fc12 = streaming_fc12
-        self.streaming_fc12_tiles = streaming_fc12_tiles
         self.phase_mode = phase_mode
         self.fc1_ready_major = fc1_ready_major
 
@@ -383,7 +369,7 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         )
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
-        """Type-discriminated serialization (see ``MoEStaticSchedulerParams``).
+        """Type-discriminated serialization of static and dynamic dimensions.
 
         Python int fields supplied via ``static_expert_shape`` skip the
         MLIR carry and remain inlined codegen-time literals; Int32
@@ -415,7 +401,6 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
     ) -> "MoEFusedFc12SchedulerParams":
         # Bypass __init__: stored cta_tile_shape_mnk / cluster_shape_mn are
         # already in post-swap form, going through __init__ would double-swap.
-        # Mirrors MoEStaticSchedulerParams.__new_from_mlir_values__.
         result = MoEFusedFc12SchedulerParams.__new__(MoEFusedFc12SchedulerParams)
         result.scenario = self.scenario
         result.is_swap_ab = self.is_swap_ab
@@ -427,8 +412,6 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         result.sf_padding_block = self.sf_padding_block
         result.ready_tile_tokens = self.ready_tile_tokens
         result.load_balance_mode = self.load_balance_mode
-        result.streaming_fc12 = self.streaming_fc12
-        result.streaming_fc12_tiles = self.streaming_fc12_tiles
         result.phase_mode = self.phase_mode
         result.fc1_ready_major = self.fc1_ready_major
 
@@ -498,9 +481,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
     Within a group: full fc1 sub-segment (all experts in expert order, each expert
     expanded as ``token_block`` slow / ``intermediate_block`` fast) → full fc2
     sub-segment (same expert order, each expert expanded short-side-first).
-    The optional streaming mode preserves the same group/expert state machine
-    but reorders each expert into chunks of token blocks: all FC1 tiles for a
-    chunk, followed immediately by all FC2 tiles for that chunk.
+    Split K1/K2 instances select their phase at construction; their ready
+    queues provide the inter-kernel streaming handoff.
     """
 
     def __init__(
@@ -566,12 +548,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         ext=_DEFAULT_SCHED_EXT,
         **kwargs,
     ) -> type:
-        if params.load_balance_mode == "clc":
-            raise NotImplementedError(
-                "load_balance_mode='clc' is reserved; CLC path is in"
-                " MoEDynamicPersistentTileScheduler, not the mega scheduler"
-            )
-
         num_tile_stages = params.num_sched_stages
         fields_per_stage = ext.WorkTileInfo.TotalFields
 
@@ -616,12 +592,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             raise ValueError(
                 f"num_consumer_threads must be positive, got {num_consumer_threads}"
             )
-        if params.load_balance_mode == "clc":
-            raise NotImplementedError(
-                "load_balance_mode='clc' is reserved; CLC path is in"
-                " MoEDynamicPersistentTileScheduler, not the mega scheduler"
-            )
-
         num_stages = params.num_sched_stages
         fields_per_stage = ext.WorkTileInfo.TotalFields
 
@@ -693,12 +663,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # see ``MoESchedulerParamsBase.__init__`` docstring).  fc1 GEMM-M
         # under swap-AB IS that gateup axis, so the number of cluster work
         # tiles along intermediate per ``(expert, token_block)`` is just
-        # ``ceil_div(intermediate_gateup, cluster_tile_n_post_swap)`` --
-        # the same formula ``MoEStaticPersistentTileScheduler._get_cluster_
-        # tile_counts`` uses for its swap-AB 2Dx3D N-axis count.  A prior
-        # ``2 *`` multiplier here was a bug that doubled the per-tile-block
-        # work tile count (assumed ``params.intermediate`` was the half-dim
-        # ``intermediate_downproj``); removed to match the base scheduler.
+        # ``ceil_div(intermediate_gateup, cluster_tile_n_post_swap)``.
+        # Do not multiply by two: intermediate already includes gate + up.
         #
         # ``params.hidden`` is single-semantic (fc2 GEMM-M / fc2 output cols).
         intermediate_gateup = params.intermediate
@@ -865,8 +831,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 self.current_work = self.current_work
         else:
             raise NotImplementedError(
-                "load_balance_mode='clc' is reserved; CLC scheduler is "
-                "MoEDynamicPersistentTileScheduler, not the mega scheduler"
+                "Only static and atomic_counter scheduling are supported"
             )
 
         # Codegen-time signal: gen_next_work's first trace site sees
@@ -1062,24 +1027,15 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         state.current_expert_tile_start = state.current_expert_tile_end
         # Prebind due to DSL AST.
         tiles_in_expert = Int32(0)
-        if const_expr(self.params.streaming_fc12):
+        if state.current_phase == Int32(BlockPhase.Linear1):
             tiles_in_expert = (
                 state.current_token_block_count
-                * (
-                    self._num_fc1_intermediate_blocks
-                    + self._num_fc2_hidden_blocks
-                )
+                * self._num_fc1_intermediate_blocks
             )
         else:
-            if state.current_phase == Int32(BlockPhase.Linear1):
-                tiles_in_expert = (
-                    state.current_token_block_count
-                    * self._num_fc1_intermediate_blocks
-                )
-            else:
-                tiles_in_expert = (
-                    state.current_token_block_count * self._num_fc2_hidden_blocks
-                )
+            tiles_in_expert = (
+                state.current_token_block_count * self._num_fc2_hidden_blocks
+            )
         state.current_expert_tile_end = (
             state.current_expert_tile_start + tiles_in_expert
         )
@@ -1269,99 +1225,61 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         cluster_intermediate_or_hidden_block_idx = Int32(0)
         work_phase = state.current_phase
 
-        if const_expr(params.streaming_fc12):
-            stream_tiles = Int32(params.streaming_fc12_tiles)
-            tiles_per_full_chunk = stream_tiles * (
-                self._num_fc1_intermediate_blocks
-                + self._num_fc2_hidden_blocks
-            )
-            chunk_idx = local_id // tiles_per_full_chunk
-            tile_in_chunk = local_id - chunk_idx * tiles_per_full_chunk
-            chunk_token_start = chunk_idx * stream_tiles
-            tokens_in_chunk = cutlass.min(
-                stream_tiles,
-                state.current_token_block_count - chunk_token_start,
-            )
-            fc1_tiles_in_chunk = (
-                tokens_in_chunk * self._num_fc1_intermediate_blocks
-            )
-            if tile_in_chunk < fc1_tiles_in_chunk:
-                work_phase = Int32(BlockPhase.Linear1)
-                token_in_chunk = (
-                    tile_in_chunk // self._num_fc1_intermediate_blocks
-                )
-                cluster_token_block_idx = chunk_token_start + token_in_chunk
+        is_fc1 = state.current_phase == Int32(BlockPhase.Linear1)
+        if is_fc1:
+            num_fc1_intermediate_blocks = self._num_fc1_intermediate_blocks
+            if const_expr(params.fc1_ready_major):
+                # Spread one persistent-scheduler wave across all token
+                # blocks of the expert. This avoids making every CTA in
+                # the wave wait behind the same dispatch-ready counter.
+                num_token_blocks = state.current_token_block_count
                 cluster_intermediate_or_hidden_block_idx = (
-                    tile_in_chunk
-                    - token_in_chunk * self._num_fc1_intermediate_blocks
+                    local_id // num_token_blocks
+                )
+                cluster_token_block_idx = (
+                    local_id
+                    - cluster_intermediate_or_hidden_block_idx
+                    * num_token_blocks
                 )
             else:
-                work_phase = Int32(BlockPhase.Linear2)
-                fc2_tile_in_chunk = tile_in_chunk - fc1_tiles_in_chunk
-                token_in_chunk = (
-                    fc2_tile_in_chunk // self._num_fc2_hidden_blocks
+                cluster_token_block_idx = (
+                    local_id // num_fc1_intermediate_blocks
                 )
-                cluster_token_block_idx = chunk_token_start + token_in_chunk
                 cluster_intermediate_or_hidden_block_idx = (
-                    fc2_tile_in_chunk
-                    - token_in_chunk * self._num_fc2_hidden_blocks
+                    local_id
+                    - cluster_token_block_idx
+                    * num_fc1_intermediate_blocks
                 )
         else:
-            is_fc1 = state.current_phase == Int32(BlockPhase.Linear1)
-            if is_fc1:
-                num_fc1_intermediate_blocks = self._num_fc1_intermediate_blocks
-                if const_expr(params.fc1_ready_major):
-                    # Spread one persistent-scheduler wave across all token
-                    # blocks of the expert. This avoids making every CTA in
-                    # the wave wait behind the same dispatch-ready counter.
-                    num_token_blocks = state.current_token_block_count
-                    cluster_intermediate_or_hidden_block_idx = (
-                        local_id // num_token_blocks
-                    )
-                    cluster_token_block_idx = (
-                        local_id
-                        - cluster_intermediate_or_hidden_block_idx
-                        * num_token_blocks
-                    )
-                else:
-                    cluster_token_block_idx = (
-                        local_id // num_fc1_intermediate_blocks
-                    )
-                    cluster_intermediate_or_hidden_block_idx = (
-                        local_id
-                        - cluster_token_block_idx
-                        * num_fc1_intermediate_blocks
-                    )
+            num_fc2_hidden_blocks = self._num_fc2_hidden_blocks
+            if const_expr(params.fc2_token_stripe > 1):
+                stripe = Int32(params.fc2_token_stripe)
+                tiles_per_full_stripe = num_fc2_hidden_blocks * stripe
+                stripe_idx = local_id // tiles_per_full_stripe
+                stripe_token_begin = stripe_idx * stripe
+                tokens_in_stripe = cutlass.min(
+                    stripe,
+                    state.current_token_block_count - stripe_token_begin,
+                )
+                tile_in_stripe = (
+                    local_id - stripe_idx * tiles_per_full_stripe
+                )
+                cluster_intermediate_or_hidden_block_idx = (
+                    tile_in_stripe // tokens_in_stripe
+                )
+                cluster_token_block_idx = (
+                    stripe_token_begin
+                    + tile_in_stripe
+                    - cluster_intermediate_or_hidden_block_idx
+                    * tokens_in_stripe
+                )
             else:
-                num_fc2_hidden_blocks = self._num_fc2_hidden_blocks
-                if const_expr(params.fc2_token_stripe > 1):
-                    stripe = Int32(params.fc2_token_stripe)
-                    tiles_per_full_stripe = num_fc2_hidden_blocks * stripe
-                    stripe_idx = local_id // tiles_per_full_stripe
-                    stripe_token_begin = stripe_idx * stripe
-                    tokens_in_stripe = cutlass.min(
-                        stripe,
-                        state.current_token_block_count - stripe_token_begin,
-                    )
-                    tile_in_stripe = (
-                        local_id - stripe_idx * tiles_per_full_stripe
-                    )
-                    cluster_intermediate_or_hidden_block_idx = (
-                        tile_in_stripe // tokens_in_stripe
-                    )
-                    cluster_token_block_idx = (
-                        stripe_token_begin
-                        + tile_in_stripe
-                        - cluster_intermediate_or_hidden_block_idx
-                        * tokens_in_stripe
-                    )
-                else:
-                    # Keep token-block as the slow axis in both phases.
-                    cluster_token_block_idx = local_id // num_fc2_hidden_blocks
-                    cluster_intermediate_or_hidden_block_idx = (
-                        local_id
-                        - cluster_token_block_idx * num_fc2_hidden_blocks
-                    )
+                # Keep token-block as the slow axis in both phases.
+                cluster_token_block_idx = local_id // num_fc2_hidden_blocks
+                cluster_intermediate_or_hidden_block_idx = (
+                    local_id
+                    - cluster_token_block_idx * num_fc2_hidden_blocks
+                )
         # Cluster → CTA granularity (mirrors MoESchedulerBase._get_work_tile_for_linear_idx)
         cta_token_block_idx = (
             cluster_token_block_idx * params.cluster_shape_mn[0]
@@ -1468,8 +1386,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             # fc1 → fc2 phase transition inside current group, if crossed.
             if const_expr(self.params.phase_mode != "fused"):
                 self._fused_state = self._fused_state
-            elif const_expr(self.params.streaming_fc12):
-                self._fused_state = self._fused_state
             else:
                 if (
                     state.current_phase == Int32(BlockPhase.Linear1)
@@ -1553,10 +1469,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 cluster_linear_tile_idx = (
                     self._advance_work_linear_tile_idx_static(loc=loc, ip=ip)
                 )
-            else:  # "clc"
+            else:
                 raise NotImplementedError(
-                    "load_balance_mode='clc' is reserved; CLC scheduler is "
-                    "MoEDynamicPersistentTileScheduler, not the mega scheduler"
+                    "Only static and atomic_counter scheduling are supported"
                 )
             self._gen_work_from_cluster_idx(
                 cluster_linear_tile_idx, loc=loc, ip=ip

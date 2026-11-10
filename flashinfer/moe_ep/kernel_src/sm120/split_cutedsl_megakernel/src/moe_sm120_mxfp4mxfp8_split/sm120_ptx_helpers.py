@@ -6,7 +6,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op
+from cutlass.cutlass_dsl import Float32, Int32, Int64, T, dsl_user_op
 
 
 # Implemented by nvshmem_compat.cu and linked beside the validated NVSHMEM
@@ -20,6 +20,54 @@ nvshmem_disable_p2p_peer = cute.ffi(
 
 
 @dsl_user_op
+def clamp_gate_upper_f32(
+    value: Float32,
+    limit: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Apply DeepSeek-V4's upper-only gate clamp."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [value.ir_value(loc=loc, ip=ip), limit.ir_value(loc=loc, ip=ip)],
+            "min.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def clamp_symmetric_f32(
+    value: Float32,
+    limit: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
+    """Clamp to [-limit, limit] for a non-negative FP32 limit."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [value.ir_value(loc=loc, ip=ip), limit.ir_value(loc=loc, ip=ip)],
+            "min.xorsign.abs.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ldg_b32_cv_raw(addr: Int64, *, loc=None, ip=None) -> Int32:
     """Load a u32 with ``.cv`` so peer/RDMA writes cannot be hidden by L2."""
     return Int32(
@@ -30,6 +78,53 @@ def ldg_b32_cv_raw(addr: Int64, *, loc=None, ip=None) -> Int32:
             "=r,l",
             has_side_effects=True,
             asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ldg_acquire_gpu_b32_raw(addr: Int64, *, loc=None, ip=None) -> Int32:
+    """Read dispatch-cache payload with explicit device/compiler ordering."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr.ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.u32 $0, [$1];",
+            "=r,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def atomic_cas_gpu_i32_raw(
+    addr: Int64,
+    compare: Int32,
+    value: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Claim one device-local dispatch cache slot and return its old value."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                addr.ir_value(loc=loc, ip=ip),
+                compare.ir_value(loc=loc, ip=ip),
+                value.ir_value(loc=loc, ip=ip),
+            ],
+            "atom.acquire.gpu.global.cas.b32 $0, [$1], $2, $3;",
+            "=r,l,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
             ip=ip,
         )
@@ -83,6 +178,23 @@ def lds_b32_raw(addr, *, loc=None, ip=None) -> Int32:
             "ld.shared.u32 $0, [$1];",
             "=r,r",
             has_side_effects=False,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def lds_b32_raw_ordered(addr, *, loc=None, ip=None) -> Int32:
+    """Load TMA-produced shared memory without compiler reordering."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
             asm_dialect=0,
             loc=loc,
             ip=ip,

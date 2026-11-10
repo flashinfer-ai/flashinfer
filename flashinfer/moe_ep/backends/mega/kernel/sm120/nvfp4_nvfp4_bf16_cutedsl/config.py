@@ -23,3 +23,15 @@ class Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
     knobs: dict | None = None
+    # owner_bf16 permits rounding each owner partial before the final reduction.
+    numerical_contract: str = "ordinary_topk"
+
+    def __post_init__(self) -> None:
+        if self.numerical_contract not in ("ordinary_topk", "owner_bf16"):
+            raise ValueError("unknown NVFP4 numerical contract")
+        if self.numerical_contract == "ordinary_topk" and (self.knobs or {}).get(
+            "rank_local_combine"
+        ):
+            raise ValueError(
+                "rank_local_combine requires owner_bf16 numerical permission"
+            )

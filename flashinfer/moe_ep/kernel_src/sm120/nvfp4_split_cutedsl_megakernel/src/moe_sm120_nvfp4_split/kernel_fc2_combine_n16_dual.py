@@ -10,7 +10,6 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import AddressSpace
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- wheels without cute.iket
@@ -22,7 +21,6 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils as utils
-import cutlass.utils.blackwell_helpers as sm100_utils
 
 from .custom_ext import Sm120SwapABNvfp4Fc12SchedExtension
 from .fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
@@ -106,52 +104,6 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
         )
         self.k2_tile_trace_enabled = self.jit_config.enable_k2_tile_trace
 
-    @cute.jit
-    def _owner_direct_row(self, token_comm_args, metadata):
-        output_addr = (
-            token_comm_args.combine_output.iterator.toint()
-            + (
-                cutlass.Int64(metadata.src_token)
-                * cutlass.Int64(self.num_topk)
-                + cutlass.Int64(metadata.src_topk)
-            )
-            * cutlass.Int64(self.hidden * 2)
-        )
-        local_ptr = cute.make_ptr(
-            self.fc2_output_dtype,
-            output_addr,
-            AddressSpace.gmem,
-            assumed_align=16,
-        )
-        peer_ptr = token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
-            local_ptr, metadata.src_rank
-        )
-        return cute.make_tensor(peer_ptr, cute.make_layout(self.hidden))
-
-    @cute.jit
-    def _owner_direct_row_for_slot(
-        self, token_comm_args, metadata, canonical_slot
-    ):
-        """Return the source-GPU row chosen for one owner group."""
-        output_addr = (
-            token_comm_args.combine_output.iterator.toint()
-            + (
-                cutlass.Int64(metadata.src_token)
-                * cutlass.Int64(self.num_topk)
-                + cutlass.Int64(canonical_slot)
-            )
-            * cutlass.Int64(self.hidden * 2)
-        )
-        local_ptr = cute.make_ptr(
-            self.fc2_output_dtype,
-            output_addr,
-            AddressSpace.gmem,
-            assumed_align=16,
-        )
-        peer_ptr = token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
-            local_ptr, metadata.src_rank
-        )
-        return cute.make_tensor(peer_ptr, cute.make_layout(self.hidden))
 
     @cute.kernel
     def fc2_combine_kernel_impl(self, tiled_mma: cute.TiledMma, tiled_mma_sfb: cute.TiledMma, tma_atom_fc1_weight: cute.CopyAtom, tma_tensor_fc1_weight: cute.Tensor, tma_atom_activation: cute.CopyAtom, tma_tensor_activation: cute.Tensor, tma_atom_fc1_weight_sf: cute.CopyAtom, tma_tensor_fc1_weight_sf: cute.Tensor, tma_atom_activation_sf: cute.CopyAtom, tma_tensor_activation_sf: cute.Tensor, tma_atom_fc2_weight: cute.CopyAtom, tma_tensor_fc2_weight: cute.Tensor, tma_atom_fc1_output_as_fc2_input: cute.CopyAtom, tma_tensor_fc1_output_as_fc2_input: cute.Tensor, tma_atom_fc2_weight_sf: cute.CopyAtom, tma_tensor_fc2_weight_sf: cute.Tensor, tma_atom_fc1_output_sf_as_fc2_input: cute.CopyAtom, tma_tensor_fc1_output_sf_as_fc2_input: cute.Tensor, fc1_weight_gemm: cute.Tensor, activation_gemm: cute.Tensor, fc1_output_gemm: cute.Tensor, fc1_weight_sf_gemm: cute.Tensor, activation_sf_gemm: cute.Tensor, fc1_output_sf_gemm: cute.Tensor, fc2_weight_gemm: cute.Tensor, fc2_output: cute.Tensor, fc2_weight_sf_gemm: cute.Tensor, fc1_output_sf_gemm_for_fc2_load: cute.Tensor, topk_scores: cute.Tensor, fc1_done_counter: cute.Tensor, combine_ready_flags: Optional[cute.Tensor], fc2_block_done_counter: Optional[cute.Tensor], fc1_alpha: Optional[cute.Tensor], fc2_alpha: Optional[cute.Tensor], fc1_norm_const: Optional[cute.Tensor], sched_params: MoEFusedFc12SchedulerParams, cluster_layout_vmnk: cute.Layout, cluster_layout_sfb_vmnk: cute.Layout, a_smem_layout_staged: cute.ComposedLayout, b_smem_layout_staged: cute.ComposedLayout, sfa_smem_layout_staged: cute.Layout, sfb_smem_layout_staged: cute.Layout, fc1_output_smem_layout_staged: cute.ComposedLayout, token_comm_args=None, green_trace: Optional[cute.Tensor]=None, k2_ready_queue_desc: Optional[cute.Tensor]=None, k2_ready_queue_ready: Optional[cute.Tensor]=None, k2_ready_queue_state: Optional[cute.Tensor]=None):
@@ -498,11 +450,14 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
                 iket.range_push('tma_token_fc2')
                 counter_slot = (
                     work_tile_info.cumulative_token_block_count
-                    + work_tile_info.tile_n_idx
-                    * cutlass.Int32(
-                        self.mma_tiler[1]
-                        // self.fc1_ready_tile_tokens
-                    )
+                    # K1 aggregates all producer tiles in one ready block
+                    # at its first producer slot. Every child K2 token tile
+                    # must wait on that same slot, not on an interior slot.
+                    + (
+                        work_tile_info.tile_n_idx
+                        * cutlass.Int32(self.mma_tiler[1])
+                        // cutlass.Int32(self.k2_ready_tile_tokens)
+                    ) * cutlass.Int32(self.fc1_producer_tiles_per_ready_block)
                 )
                 if cutlass.const_expr(token_comm_args is None):
                     counter_ptr = fc1_done_counter.iterator + counter_slot
@@ -1141,8 +1096,6 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
                             counter_slot = work_tile_info.expert_idx
-                            if cutlass.const_expr(self.streaming_fc12):
-                                counter_slot = work_tile_info.cumulative_data_physical_row // cutlass.Int32(self.mma_tiler[1]) + work_tile_info.tile_n_idx
                             cute.arch.atomic_add(token_comm_args.fc2_done_counter.iterator + counter_slot, cutlass.Int32(1), sem='release', scope='sys')
                 iket.range_pop()
                 if cutlass.const_expr(

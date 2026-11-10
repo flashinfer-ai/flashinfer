@@ -10,7 +10,6 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import AddressSpace
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- wheels without cute.iket
@@ -22,7 +21,6 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils as utils
-import cutlass.utils.blackwell_helpers as sm100_utils
 
 from .custom_ext import Sm120SwapABNvfp4Fc12SchedExtension
 from .fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
@@ -32,6 +30,8 @@ from .megamoe_kernel import (
 )
 from .moe_persistent_scheduler import WorkTileState
 from .moe_utils import spin_wait, spin_wait_i32_ge_inline
+from .rank_local_reduce import reduce_owner_partial
+from .rank_local_reduce_warp32 import reduce_owner_partial_warp32
 from .sm120_mma import (
     MMA_N,
     get_layout_sfa_tv,
@@ -242,109 +242,143 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     src_rank = cute.arch.shuffle_sync(
                         lane_src_rank, offset=leader
                     )
-                    if has_token:
-                        local_row = cute.slice_(
-                            token_comm_args.combine_output,
-                            (src_token, cutlass.Int32(self.local_rank), None),
-                        )
-                        peer_row = cute.make_tensor(
-                            token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
-                                local_row.iterator, src_rank
-                            ),
-                            local_row.layout,
-                        )
-                        values = cute.make_rmem_tensor(
-                            (vector_elems,), cutlass.Float32
-                        )
-                        packed = cute.make_rmem_tensor(
-                            (vector_elems,), cutlass.BFloat16
-                        )
-                        packed_i64 = cute.recast_tensor(packed, cutlass.Int64)
-                        source = cute.make_rmem_tensor(
-                            (2 * vector_elems,), cutlass.BFloat16
-                        )
-                        source_i64 = cute.recast_tensor(source, cutlass.Int64)
-                        offset_dtype: cutlass.Constexpr = (
-                            cutlass.Int32
-                            if self.pool_token_capacity * (self.hidden // 4)
-                            < (1 << 31)
-                            else cutlass.Int64
-                        )
-                        route_offsets = cute.make_rmem_tensor(
-                            (self.num_topk,), offset_dtype
-                        )
-                        route_words = cute.recast_ptr(
-                            route_output.iterator, dtype=cutlass.Int64
-                        )
-                        peer_words = cute.recast_ptr(
-                            peer_row.iterator, dtype=cutlass.Int64
-                        )
-                        for slot in cutlass.range_constexpr(self.num_topk):
-                            route = token_comm_args.combine_sf[key, slot]
-                            route_offsets[slot] = (
-                                offset_dtype(route)
-                                * offset_dtype(self.hidden // 4)
-                            )
-                        for offset in cutlass.range(
-                            0,
-                            chunk_hidden,
-                            reduction_lanes * vector_elems,
-                        ):
-                            h = (
-                                chunk_base
-                                + offset
-                                + (
-                                    lane_idx
-                                    % cutlass.Int32(reduction_lanes)
+                    if cutlass.const_expr(self.rank_local_vector_reduce and chunk_hidden % 1024 == 0):
+                        # Preserve the original pair and pair-publication boundary.
+                        # All lanes reduce A, then all lanes reduce B if present.
+                        for token_item in cutlass.range(2):
+                            if token_item == 0 or remaining != cutlass.Int32(0):
+                                whole_key = cute.arch.shuffle_sync(key, offset=token_item * 16)
+                                whole_token = cute.arch.shuffle_sync(src_token, offset=token_item * 16)
+                                whole_rank = cute.arch.shuffle_sync(src_rank, offset=token_item * 16)
+                                whole_local = cute.slice_(
+                                    token_comm_args.combine_output,
+                                    (whole_token, cutlass.Int32(self.local_rank), None),
                                 )
-                                * cutlass.Int32(vector_elems)
-                            )
-                            values.fill(cutlass.Float32(0.0))
-                            for pair in cutlass.range_constexpr(
-                                (self.num_topk + 1) // 2
-                            ):
-                                source.fill(cutlass.BFloat16(0.0))
-                                for item in cutlass.range_constexpr(2):
-                                    if cutlass.const_expr(
-                                        pair * 2 + item < self.num_topk
-                                    ):
-                                        route_offset = route_offsets[
-                                            pair * 2 + item
-                                        ]
-                                        if (
-                                            route_offset >= offset_dtype(0)
-                                            and h < chunk_end
-                                        ):
-                                            for word in cutlass.range_constexpr(
-                                                words_per_vector
-                                            ):
-                                                source_i64[
-                                                    item * words_per_vector + word
-                                                ] = route_words[
-                                                    route_offset
-                                                    + offset_dtype(h // 4 + word)
-                                                ]
-                                for item in cutlass.range_constexpr(2):
-                                    if cutlass.const_expr(
-                                        pair * 2 + item < self.num_topk
-                                    ):
-                                        for elem in cutlass.range_constexpr(
-                                            vector_elems
-                                        ):
-                                            values[elem] += cutlass.Float32(
-                                                source[
-                                                    item * vector_elems + elem
-                                                ]
-                                            )
-                            for elem in cutlass.range_constexpr(vector_elems):
-                                packed[elem] = values[elem].to(
-                                    cutlass.BFloat16
+                                whole_peer = cute.make_tensor(
+                                    token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                        whole_local.iterator, whole_rank
+                                    ), whole_local.layout,
                                 )
-                            if h < chunk_end:
-                                for word in cutlass.range_constexpr(
-                                    words_per_vector
+                                reduce_owner_partial_warp32(
+                                    route_output, whole_peer, token_comm_args.combine_sf,
+                                    token_comm_args.fc2_done_counter.iterator
+                                    + cutlass.Int32(source_tokens + self.world_size),
+                                    whole_key, lane_idx, chunk_base, self.hidden,
+                                    self.pool_token_capacity, self.num_topk, chunk_hidden,
+                                )
+                    else:
+                        if has_token:
+                            local_row = cute.slice_(
+                                token_comm_args.combine_output,
+                                (src_token, cutlass.Int32(self.local_rank), None),
+                            )
+                            peer_row = cute.make_tensor(
+                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                    local_row.iterator, src_rank
+                                ),
+                                local_row.layout,
+                            )
+                            if cutlass.const_expr(self.rank_local_vector_reduce):
+                                reduce_owner_partial(
+                                    route_output, peer_row, token_comm_args.combine_sf,
+                                    token_comm_args.fc2_done_counter.iterator
+                                    + cutlass.Int32(source_tokens + self.world_size),
+                                    key, lane_idx, chunk_base, self.hidden,
+                                    self.pool_token_capacity, self.num_topk, chunk_hidden,
+                                )
+                            else:
+                                values = cute.make_rmem_tensor(
+                                    (vector_elems,), cutlass.Float32
+                                )
+                                packed = cute.make_rmem_tensor(
+                                    (vector_elems,), cutlass.BFloat16
+                                )
+                                packed_i64 = cute.recast_tensor(packed, cutlass.Int64)
+                                source = cute.make_rmem_tensor(
+                                    (2 * vector_elems,), cutlass.BFloat16
+                                )
+                                source_i64 = cute.recast_tensor(source, cutlass.Int64)
+                                offset_dtype: cutlass.Constexpr = (
+                                    cutlass.Int32
+                                    if self.pool_token_capacity * (self.hidden // 4)
+                                    < (1 << 31)
+                                    else cutlass.Int64
+                                )
+                                route_offsets = cute.make_rmem_tensor(
+                                    (self.num_topk,), offset_dtype
+                                )
+                                route_words = cute.recast_ptr(
+                                    route_output.iterator, dtype=cutlass.Int64
+                                )
+                                peer_words = cute.recast_ptr(
+                                    peer_row.iterator, dtype=cutlass.Int64
+                                )
+                                for slot in cutlass.range_constexpr(self.num_topk):
+                                    route = token_comm_args.combine_sf[key, slot]
+                                    route_offsets[slot] = (
+                                        offset_dtype(route)
+                                        * offset_dtype(self.hidden // 4)
+                                    )
+                                for offset in cutlass.range(
+                                    0,
+                                    chunk_hidden,
+                                    reduction_lanes * vector_elems,
                                 ):
-                                    peer_words[h // 4 + word] = packed_i64[word]
+                                    h = (
+                                        chunk_base
+                                        + offset
+                                        + (
+                                            lane_idx
+                                            % cutlass.Int32(reduction_lanes)
+                                        )
+                                        * cutlass.Int32(vector_elems)
+                                    )
+                                    values.fill(cutlass.Float32(0.0))
+                                    for pair in cutlass.range_constexpr(
+                                        (self.num_topk + 1) // 2
+                                    ):
+                                        source.fill(cutlass.BFloat16(0.0))
+                                        for item in cutlass.range_constexpr(2):
+                                            if cutlass.const_expr(
+                                                pair * 2 + item < self.num_topk
+                                            ):
+                                                route_offset = route_offsets[
+                                                    pair * 2 + item
+                                                ]
+                                                if (
+                                                    route_offset >= offset_dtype(0)
+                                                    and h < chunk_end
+                                                ):
+                                                    for word in cutlass.range_constexpr(
+                                                        words_per_vector
+                                                    ):
+                                                        source_i64[
+                                                            item * words_per_vector + word
+                                                        ] = route_words[
+                                                            route_offset
+                                                            + offset_dtype(h // 4 + word)
+                                                        ]
+                                        for item in cutlass.range_constexpr(2):
+                                            if cutlass.const_expr(
+                                                pair * 2 + item < self.num_topk
+                                            ):
+                                                for elem in cutlass.range_constexpr(
+                                                    vector_elems
+                                                ):
+                                                    values[elem] += cutlass.Float32(
+                                                        source[
+                                                            item * vector_elems + elem
+                                                        ]
+                                                    )
+                                    for elem in cutlass.range_constexpr(vector_elems):
+                                        packed[elem] = values[elem].to(
+                                            cutlass.BFloat16
+                                        )
+                                    if h < chunk_end:
+                                        for word in cutlass.range_constexpr(
+                                            words_per_vector
+                                        ):
+                                            peer_words[h // 4 + word] = packed_i64[word]
 
                     cute.arch.sync_warp()
                     if (
@@ -408,52 +442,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
             number_of_threads=32 * len(self.compute_warp_id),
         )
 
-    @cute.jit
-    def _owner_direct_row(self, token_comm_args, metadata):
-        output_addr = (
-            token_comm_args.combine_output.iterator.toint()
-            + (
-                cutlass.Int64(metadata.src_token)
-                * cutlass.Int64(self.num_topk)
-                + cutlass.Int64(metadata.src_topk)
-            )
-            * cutlass.Int64(self.hidden * 2)
-        )
-        local_ptr = cute.make_ptr(
-            self.fc2_output_dtype,
-            output_addr,
-            AddressSpace.gmem,
-            assumed_align=16,
-        )
-        peer_ptr = token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
-            local_ptr, metadata.src_rank
-        )
-        return cute.make_tensor(peer_ptr, cute.make_layout(self.hidden))
-
-    @cute.jit
-    def _owner_direct_row_for_slot(
-        self, token_comm_args, metadata, canonical_slot
-    ):
-        """Return the source-GPU row chosen for one owner group."""
-        output_addr = (
-            token_comm_args.combine_output.iterator.toint()
-            + (
-                cutlass.Int64(metadata.src_token)
-                * cutlass.Int64(self.num_topk)
-                + cutlass.Int64(canonical_slot)
-            )
-            * cutlass.Int64(self.hidden * 2)
-        )
-        local_ptr = cute.make_ptr(
-            self.fc2_output_dtype,
-            output_addr,
-            AddressSpace.gmem,
-            assumed_align=16,
-        )
-        peer_ptr = token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
-            local_ptr, metadata.src_rank
-        )
-        return cute.make_tensor(peer_ptr, cute.make_layout(self.hidden))
 
     @cute.kernel
     def fc2_combine_kernel_impl(self, tiled_mma: cute.TiledMma, tiled_mma_sfb: cute.TiledMma, tma_atom_fc1_weight: cute.CopyAtom, tma_tensor_fc1_weight: cute.Tensor, tma_atom_activation: cute.CopyAtom, tma_tensor_activation: cute.Tensor, tma_atom_fc1_weight_sf: cute.CopyAtom, tma_tensor_fc1_weight_sf: cute.Tensor, tma_atom_activation_sf: cute.CopyAtom, tma_tensor_activation_sf: cute.Tensor, tma_atom_fc2_weight: cute.CopyAtom, tma_tensor_fc2_weight: cute.Tensor, tma_atom_fc1_output_as_fc2_input: cute.CopyAtom, tma_tensor_fc1_output_as_fc2_input: cute.Tensor, tma_atom_fc2_weight_sf: cute.CopyAtom, tma_tensor_fc2_weight_sf: cute.Tensor, tma_atom_fc1_output_sf_as_fc2_input: cute.CopyAtom, tma_tensor_fc1_output_sf_as_fc2_input: cute.Tensor, fc1_weight_gemm: cute.Tensor, activation_gemm: cute.Tensor, fc1_output_gemm: cute.Tensor, fc1_weight_sf_gemm: cute.Tensor, activation_sf_gemm: cute.Tensor, fc1_output_sf_gemm: cute.Tensor, fc2_weight_gemm: cute.Tensor, fc2_output: cute.Tensor, fc2_weight_sf_gemm: cute.Tensor, fc1_output_sf_gemm_for_fc2_load: cute.Tensor, topk_scores: cute.Tensor, fc1_done_counter: cute.Tensor, combine_ready_flags: Optional[cute.Tensor], fc2_block_done_counter: Optional[cute.Tensor], fc1_alpha: Optional[cute.Tensor], fc2_alpha: Optional[cute.Tensor], fc1_norm_const: Optional[cute.Tensor], sched_params: MoEFusedFc12SchedulerParams, cluster_layout_vmnk: cute.Layout, cluster_layout_sfb_vmnk: cute.Layout, a_smem_layout_staged: cute.ComposedLayout, b_smem_layout_staged: cute.ComposedLayout, sfa_smem_layout_staged: cute.Layout, sfb_smem_layout_staged: cute.Layout, fc1_output_smem_layout_staged: cute.ComposedLayout, token_comm_args=None, green_trace: Optional[cute.Tensor]=None, k2_ready_queue_desc: Optional[cute.Tensor]=None, k2_ready_queue_ready: Optional[cute.Tensor]=None, k2_ready_queue_state: Optional[cute.Tensor]=None):
@@ -1484,8 +1472,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
                             counter_slot = work_tile_info.expert_idx
-                            if cutlass.const_expr(self.streaming_fc12):
-                                counter_slot = work_tile_info.cumulative_data_physical_row // cutlass.Int32(self.mma_tiler[1]) + work_tile_info.tile_n_idx
                             cute.arch.atomic_add(token_comm_args.fc2_done_counter.iterator + counter_slot, cutlass.Int32(1), sem='release', scope='sys')
                 iket.range_pop()
                 if cutlass.const_expr(

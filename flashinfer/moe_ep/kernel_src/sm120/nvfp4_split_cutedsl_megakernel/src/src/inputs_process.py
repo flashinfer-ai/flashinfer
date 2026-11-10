@@ -58,7 +58,8 @@ class DataPreprocess:
     _amax_threads_per_cta: int = 128
     _amax_load_vec: int = 8  # 8 bf16 = 16 B per load
 
-    def __init__(self, topk: int, hidden: int, quant_type: Literal["nvfp4", "mxfp8_e5m2", "mxfp8_e4m3"]) -> None:
+    def __init__(self, topk: int, hidden: int, quant_type: Literal["nvfp4", "mxfp8_e5m2", "mxfp8_e4m3"], *, nvfp4_cuda_compatible: bool = False) -> None:
+        self.nvfp4_cuda_compatible = nvfp4_cuda_compatible
         self.topk = int(topk)
         # The routing repack assigns one lane per topk slot, so topk cannot
         # exceed the CTA width.
@@ -397,8 +398,15 @@ class DataPreprocess:
                 sfc_rt = Float32(sfc_e4m3)
                 # Per-element encode scale; the mask zeros the sfc==0 (all-zero
                 # block) case so its fp4 codes stay 0 instead of NaN.
-                acc_scale = cute.arch.fmin(nc * cute.arch.rcp_approx(sfc_rt), fp32_max)
-                acc_scale = acc_scale * cute.arch.fmin(sfc_rt * Float32(1.0e30), Float32(1.0))
+                if cutlass.const_expr(self.nvfp4_cuda_compatible):
+                    # Preserve FlashInfer CUDA FP4 rounding at E2M1 boundaries.
+                    acc_scale = cute.arch.rcp_approx(sfc_rt * cute.arch.rcp_approx(nc))
+                    # Main CUDA quantization also zeros nonzero blocks whose E4M3 scale underflows.
+                    if sfc_rt == Float32(0.0):
+                        acc_scale = Float32(0.0)
+                else:
+                    acc_scale = cute.arch.fmin(nc * cute.arch.rcp_approx(sfc_rt), fp32_max)
+                    acc_scale = acc_scale * cute.arch.fmin(sfc_rt * Float32(1.0e30), Float32(1.0))
 
                 scaled = cute.make_rmem_tensor((sf_vec,), Float32)
                 for i in cutlass.range_constexpr(sf_vec):
@@ -566,7 +574,7 @@ def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: in
     import cuda.bindings.driver as cuda_driver
     from cutlass.torch import from_dlpack
 
-    from moe_nvfp4_swapab.runner_common import nvfp4_quantize_per_block_16, dequant_block_scale_to_fp32
+    from moe_sm120_nvfp4_split.runner_common import nvfp4_quantize_per_block_16, dequant_block_scale_to_fp32
     from common.host_utils import mxfp8_quantize_per_block_32_row
 
     torch.manual_seed(0)

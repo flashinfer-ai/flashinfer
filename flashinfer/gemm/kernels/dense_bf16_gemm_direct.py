@@ -22,11 +22,12 @@ from cutlass import const_expr
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
-
 _VECTOR_WIDTH = 8
 _SUPPORTED_BLOCK_SIZES = (32, 64, 96, 128, 192, 256, 384)
 _SUPPORTED_OUTPUTS_PER_BLOCK = (1, 2, 4)
 _MAX_M = 32
+# Base budget for unrolled B prefetch: 128 16-byte vectors/thread, not registers.
+_B_PREFETCH_VECTOR_BUDGET = 128
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
 
 
@@ -66,17 +67,28 @@ def validate_tactic(tactic: DirectTactic, m: int, n: int, k: int) -> None:
 
 def default_tactic(m: int, n: int, k: int) -> DirectTactic:
     """Choose the measured register-prefetch fallback tactic."""
-    block_size = next(
-        (
-            block
-            for block in (256, 192, 128, 96, 64, 32)
-            if k % (block * _VECTOR_WIDTH) == 0
-        ),
-        None,
-    )
-    if block_size is None:
+    blocks = [
+        block
+        for block in (256, 192, 128, 96, 64, 32)
+        if k % (block * _VECTOR_WIDTH) == 0
+    ]
+    if not blocks:
         raise ValueError("direct GEMM requires a supported 16-byte K tiling")
-    outputs_per_block = next(outputs for outputs in (2, 1) if n % outputs == 0)
+    # For M <= 4, keep at least two prefetched B vectors per thread: with one,
+    # a short-K CTA has too few loads in flight (cold-L2 B200/B300 sweep: up to
+    # 15% at M <= 2, K = 2048).  Larger M already issues a load per row.
+    block_size = blocks[0]
+    if m <= 4:
+        block_size = next(
+            (block for block in blocks if k // (block * _VECTOR_WIDTH) >= 2),
+            blocks[-1],
+        )
+    # Small weights (< 4 MiB): one output per CTA doubles the CTA count (up to
+    # 20% at M=8, N=128); larger weights already fill the SMs with two.
+    if n * k < 1 << 21:
+        outputs_per_block = 1
+    else:
+        outputs_per_block = next(outputs for outputs in (2, 1) if n % outputs == 0)
     tactic = DirectTactic(
         block_size,
         outputs_per_block,
@@ -87,12 +99,7 @@ def default_tactic(m: int, n: int, k: int) -> DirectTactic:
 
 
 def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
-    """Enumerate the compact tactic space used by FlashInfer autotuning.
-
-    Block sizes cover every configuration exercised in the H100/B200 sweep;
-    output grouping spans the measured 1/2/4-column choices.  Row tiling stays
-    at the occupancy-oriented default to keep JIT cost bounded.
-    """
+    """Bound whole-K prefetch expansion while retaining the default tactic."""
     try:
         default = default_tactic(m, n, k)
     except ValueError:
@@ -109,21 +116,46 @@ def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
                 validate_tactic(tactic, m, n, k)
             except ValueError:
                 continue
+            if k // (block_size * _VECTOR_WIDTH) * outputs_per_block > max(
+                _B_PREFETCH_VECTOR_BUDGET,
+                k // (default.block_size * _VECTOR_WIDTH) * default.outputs_per_block,
+            ):
+                continue
             tactics.append(tactic)
     return list(dict.fromkeys(tactics))
 
 
-def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
-    """Return the conservative B200 no-autotune crossover heuristic.
+def is_direct_bf16_gemm_candidate_sm100(m: int, n: int) -> bool:
+    """Return whether direct is worth profiling for public ``(M, N)``.
 
-    The three bands are a compact fit to a warm/cold sweep over M=1..16,24,32,
-    18 N values, and 11 K values.  This is deliberately not a blanket rule for
-    K=8192: direct wins only where public M and N leave the tensor-core path
-    with too little independent output work.
+    Direct splits N one to four outputs per CTA, so it wins while M * N is too
+    small for the 16-wide warp / tensor-core tiles to fill the SMs; above
+    M = 8 each row group also re-reads B.  In a cold-L2 CUPTI sweep on B200
+    and B300 (M in {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}, N = 128..8192,
+    K = 768..40960, every tactic of all three runners), direct never beat warp /
+    cluster Split-K by more than 1% outside this region.  M <= 3 is profiled
+    regardless of N because direct can still win by a few percent there.
     """
-    return k == 8192 and (
-        (m == 1 and n <= 4608) or (m <= 4 and n <= 512) or (m <= 8 and n <= 256)
-    )
+    return m <= 3 or m * n <= 4096
+
+
+def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
+    """Return the no-autotune crossover heuristic (same rule on every GPU).
+
+    True implies ``default_tactic(m, n, k)`` succeeds.  The region contains the
+    previous K == 8192 bands and only shapes where the default direct tactic
+    was no slower than the previous no-autotune choice (the warp / cluster
+    Split-K default, or direct inside those bands) in cold-L2 CUPTI sweeps
+    with interleaved re-timing (within 2%).  Direct wins while M * N is too
+    small to fill the SMs with Split-K tiles; at M = 1 it also wins on long K.
+    M = 2 with larger N, M = 1 with K < 5120, and K = 40960 are left out
+    because the Split-K default can be faster there.
+    """
+    if not 1 <= m <= _MAX_M or n <= 0 or k <= 0:
+        return False
+    if k % (_SUPPORTED_BLOCK_SIZES[0] * _VECTOR_WIDTH):
+        return False
+    return m * n <= 2048 or (m == 1 and n <= 8192 and 5120 <= k <= 16384)
 
 
 class DirectDenseGemmKernel:
@@ -133,16 +165,15 @@ class DirectDenseGemmKernel:
         self,
         *,
         element_type,
-        num_rows: int,
         k_extent: int,
         tactic: DirectTactic,
         use_pdl: bool,
     ) -> None:
-        validate_tactic(tactic, num_rows, tactic.outputs_per_block, k_extent)
+        validate_tactic(
+            tactic, tactic.rows_per_block, tactic.outputs_per_block, k_extent
+        )
         self.element_type = element_type
-        self.num_rows = num_rows
         self.rows_per_block = tactic.rows_per_block
-        self.k_extent = k_extent
         self.block_size = tactic.block_size
         self.outputs_per_block = tactic.outputs_per_block
         self.vector_width = _VECTOR_WIDTH
@@ -158,7 +189,6 @@ class DirectDenseGemmKernel:
         gC: cute.Tensor,
         stream: _cuda.CUstream,
     ) -> None:
-        n = cute.size(gB, mode=[0])
         copy_a = cute.make_copy_atom(
             cute.nvgpu.CopyG2ROp(),
             self.element_type,
@@ -173,8 +203,8 @@ class DirectDenseGemmKernel:
         )
         self.kernel(gA, gB, gC, copy_a, copy_b).launch(
             grid=[
-                cute.ceil_div(n, self.outputs_per_block),
-                self.num_rows // self.rows_per_block,
+                cute.ceil_div(cute.size(gB, mode=[0]), self.outputs_per_block),
+                cute.size(gA, mode=[0]) // self.rows_per_block,
                 1,
             ],
             block=[self.block_size, 1, 1],
@@ -282,27 +312,33 @@ class DirectDenseGemmKernel:
             cute.arch.griddepcontrol_launch_dependents()
 
 
-def _from_dlpack_static(tensor: _torch.Tensor):
-    # K is specialized and the row stride must retain its 16-byte divisibility
-    # for the verifier to accept vectorized G2R copies.
-    return from_dlpack(tensor, assumed_align=32)
+def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
+    tensor = from_dlpack(tensor.detach(), assumed_align=32)
+    if dynamic_m:
+        # Keep K and the row stride static for vectorized G2R copies.
+        tensor = tensor.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1), divisibility=1
+        )
+    return tensor
 
 
-def _make_compile_repr_tensors(dtype, m: int, n: int, k: int):
+def _make_compile_repr_tensors(dtype, rows_per_block: int, n: int, k: int):
     return tuple(
-        _from_dlpack_static(tensor)
-        for tensor in (
-            _torch.empty((m, k), dtype=dtype, device="cuda"),
-            _torch.empty((n, k), dtype=dtype, device="cuda"),
-            _torch.empty((m, n), dtype=dtype, device="cuda"),
+        _from_dlpack(
+            _torch.empty(shape, dtype=dtype, device="cuda"), dynamic_m=dynamic_m
+        )
+        for shape, dynamic_m in (
+            ((rows_per_block, k), True),
+            ((n, k), False),
+            ((rows_per_block, n), True),
         )
     )
 
 
 @functools.cache
 def _get_compiled_direct_kernel(
+    device_index: int,
     dtype,
-    m: int,
     n: int,
     k: int,
     tactic: DirectTactic,
@@ -310,16 +346,19 @@ def _get_compiled_direct_kernel(
 ):
     if dtype != _torch.bfloat16:
         raise ValueError(f"direct GEMM supports BF16; got {dtype}")
-    kernel = DirectDenseGemmKernel(
-        element_type=cutlass.BFloat16,
-        num_rows=m,
-        k_extent=k,
-        tactic=tactic,
-        use_pdl=use_pdl,
-    )
-    tensors = _make_compile_repr_tensors(dtype, m, n, k)
-    stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-    return cute_ext.compile(kernel, *tensors, stream, options=_COMPILE_OPTIONS)
+
+    with _torch.cuda.device(device_index):
+        return cute_ext.compile(
+            DirectDenseGemmKernel(
+                element_type=cutlass.BFloat16,
+                k_extent=k,
+                tactic=tactic,
+                use_pdl=use_pdl,
+            ),
+            *_make_compile_repr_tensors(dtype, tactic.rows_per_block, n, k),
+            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
+            options=_COMPILE_OPTIONS,
+        )
 
 
 def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
@@ -350,11 +389,17 @@ def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
 
 def run_direct_dense(a, b, out, pdl: bool, tactic: DirectTactic):
     """Run direct ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts."""
-    m, n, k = _validate_runtime_tensors(a, b, out, tactic)
-    compiled = _get_compiled_direct_kernel(a.dtype, m, n, k, tactic, pdl)
-    tensors = tuple(_from_dlpack_static(tensor) for tensor in (a, b.T, out))
-    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
-    compiled(*tensors, stream)
+    _, n, k = _validate_runtime_tensors(a, b, out, tactic)
+    with _torch.cuda.device(a.device):
+        compiled = _get_compiled_direct_kernel(
+            a.get_device(), a.dtype, n, k, tactic, pdl
+        )
+        compiled(
+            _from_dlpack(a, dynamic_m=True),
+            _from_dlpack(b.T),
+            _from_dlpack(out, dynamic_m=True),
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
+        )
     return out
 
 
@@ -362,6 +407,7 @@ __all__ = [
     "DirectTactic",
     "autotune_tactics",
     "default_tactic",
+    "is_direct_bf16_gemm_candidate_sm100",
     "prefer_direct_bf16_gemm_sm100",
     "run_direct_dense",
 ]

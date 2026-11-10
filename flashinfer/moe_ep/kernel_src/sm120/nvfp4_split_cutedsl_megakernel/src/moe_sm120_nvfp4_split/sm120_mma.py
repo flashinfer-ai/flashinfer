@@ -15,8 +15,7 @@ required.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Tuple, Type
+from typing import Type
 
 import cutlass
 import cutlass.cute as cute
@@ -38,132 +37,10 @@ CTA_TOKEN_TILE = 64
 INTERMEDIATE_ALIGNMENT = 2 * NVFP4_BLOCK
 
 
-@dataclass(frozen=True)
-class Mma16864LaneCoords:
-    """Accumulator element coordinates owned by one lane for m16n8k64."""
-
-    m0: int
-    n0: int
-    m1: int
-    n1: int
-    m2: int
-    n2: int
-    m3: int
-    n3: int
-
-
-@dataclass(frozen=True)
-class Sm120Nvfp4ScaleSelectors:
-    """PTX scale selector attributes for one SM120 NVFP4 MMA issue."""
-
-    byte_id_a: int = 0
-    byte_id_b: int = 0
-    thread_id_a: int = 0
-    thread_id_b: int = 0
-
-
-def accumulator_coords(lane_id: int) -> Mma16864LaneCoords:
-    """Return Figure-92 C/D coordinates for c0,c1,c2,c3.
-
-    c0 = C[g,     2*t]
-    c1 = C[g,     2*t + 1]
-    c2 = C[g + 8, 2*t]
-    c3 = C[g + 8, 2*t + 1]
-    """
-
-    g = lane_id >> 2
-    t = lane_id & 3
-    return Mma16864LaneCoords(
-        g,
-        2 * t,
-        g,
-        2 * t + 1,
-        g + 8,
-        2 * t,
-        g + 8,
-        2 * t + 1,
-    )
-
-
-def swap_ab_swiglu_coords(lane_id: int, m_group: int = 0) -> Tuple[int, int, int, int]:
-    """Return (token0_n, token1_n, downproj0_m, downproj1_m) for Swap A/B.
-
-    For one M16xN8 atom with interleave=8:
-
-      c0/c2 -> token0, same downproj
-      c1/c3 -> token1, same downproj
-
-    ``m_group`` selects which M16 group inside M64 is being handled by the
-    warp.  Swap AB 1 uses one group per warp; Swap AB 2 uses m_group=0..3
-    inside the same warp.
-    """
-
-    g = lane_id >> 2
-    t = lane_id & 3
-    dp = m_group * SWAP_AB_INTERLEAVE + g
-    return 2 * t, 2 * t + 1, dp, dp
-
-
-def non_swap_swiglu_coords(lane_id: int, n8_group: int = 0) -> Tuple[int, int, int, int]:
-    """Return (token_low_m, token_high_m, downproj_low, downproj_high).
-
-    Non-swap uses C[M=token,N=gateup] and gate/up interleave=1:
-
-      c0/c1 -> token_low,  downproj
-      c2/c3 -> token_high, downproj
-
-    ``n8_group`` selects which N8 group inside N64 is being handled.
-    """
-
-    g = lane_id >> 2
-    t = lane_id & 3
-    dp = n8_group * 4 + t
-    return g, g + 8, dp, dp
-
-
 NVFP4_MMA_PTX_E2M1 = (
     "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X"
     ".m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3"
 )
-
-
-REQUIRED_SM120_DSL_SYMBOLS = (
-    "cutlass._mlir.dialects.cute_nvgpu.arch_mma_SM120_block_scaled",
-    "cutlass.utils.blockscaled_layout.sm120_make_smem_layout_sfa",
-    "cutlass.cute.nvgpu.warp.mma.MmaMXF4NVF4Op",
-)
-
-def missing_sm120_dsl_symbols() -> Tuple[str, ...]:
-    """Return missing public SM120 NVFP4 CuTe DSL helpers.
-
-    This is a quick sanity check for the API surface needed by the SM120 path.
-    It does not prove that the installed compiler backend can lower the op.
-    """
-
-    missing = []
-    try:
-        from cutlass._mlir.dialects import cute_nvgpu as cute_nvgpu_ir
-    except Exception:
-        cute_nvgpu_ir = None
-    if cute_nvgpu_ir is None or not hasattr(
-        cute_nvgpu_ir, "arch_mma_SM120_block_scaled"
-    ):
-        missing.append(REQUIRED_SM120_DSL_SYMBOLS[0])
-
-    try:
-        import cutlass.utils.blockscaled_layout as blockscaled_layout
-    except Exception:
-        blockscaled_layout = None
-    if (
-        blockscaled_layout is None
-        or not hasattr(blockscaled_layout, "sm120_make_smem_layout_sfa")
-    ):
-        missing.append(REQUIRED_SM120_DSL_SYMBOLS[1])
-
-    if not hasattr(warp_mma, "MmaMXF4NVF4Op"):
-        missing.append(REQUIRED_SM120_DSL_SYMBOLS[2])
-
-    return tuple(missing)
 
 
 def _sfa_atom_layout_tv() -> cute.Layout:
@@ -573,7 +450,6 @@ def issue_m64n8k64_nvfp4(
         sf_dtype=sf_dtype,
     )
 
-
 @cute.jit
 def issue_m64n8k64_nvfp4_packed_sfb(
     tiled_mma: cute.TiledMma,
@@ -615,51 +491,3 @@ def issue_m64n8k64_nvfp4_packed_sfb(
         acc_dtype=cutlass.Float32,
         sf_dtype=sf_dtype,
     )
-
-
-@cute.jit
-def issue_m64n8k128_nvfp4(
-    tiled_mma: cute.TiledMma,
-    acc: cute.Tensor,
-    a_frag,
-    b_frag,
-    sfa_frag,
-    sfb_frag,
-    *,
-    n_group: int,
-    active_n_groups: int,
-    sfa_m_group,
-    a_dtype: Type[cutlass.Numeric],
-    b_dtype: Type[cutlass.Numeric],
-    sf_dtype: Type[cutlass.Numeric],
-) -> None:
-    """Issue one SM120 NVFP4 ``M64 x N8 x K128`` warp-MMA slice.
-
-    ``a_frag`` / ``b_frag`` are register fragments already loaded from SMEM
-    by the SM120 ldmatrix tiled copies.  ``sfa_frag`` / ``sfb_frag`` are
-    register scale fragments copied with the SM120 scale TV layouts.  This helper is
-    intentionally the only place
-    in the SM120 mainloop that emits the block-scaled MMA operation.  The
-    public ``cute.gemm`` lowering calls the same
-    ``cute_nvgpu.arch.mma.SM120.block_scaled`` op that
-    :func:`emit_mma_m16n8k32_mxfp8_e4m3` wraps directly; keeping the call here
-    lets us swap to the explicit low-level form once fragment packing is
-    stable.
-    """
-
-    for k_inner in cutlass.range_constexpr(0, 2):
-        issue_m64n8k64_nvfp4(
-            tiled_mma,
-            acc,
-            a_frag,
-            b_frag,
-            sfa_frag,
-            sfb_frag,
-            n_group=n_group,
-            active_n_groups=active_n_groups,
-            sfa_m_group=sfa_m_group,
-            k_inner=k_inner,
-            a_dtype=a_dtype,
-            b_dtype=b_dtype,
-            sf_dtype=sf_dtype,
-        )

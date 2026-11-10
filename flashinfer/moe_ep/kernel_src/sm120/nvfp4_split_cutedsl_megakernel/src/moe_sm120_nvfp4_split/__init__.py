@@ -23,3 +23,6 @@ __all__ = [
     "compile_combine_reduce",
     "select_compile_spec",
 ]
+
+from .execution_plan import CollectiveExecutionPlan, select_collective_execution_plan
+__all__ += ["CollectiveExecutionPlan", "select_collective_execution_plan"]

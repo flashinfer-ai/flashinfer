@@ -702,12 +702,24 @@ __global__ void finalizeKernel(KernelParams params) {
           continue;
         }
 
-        if (params.expertWeightsPtr != nullptr) {
-          TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
-          data +=
-              float{scale} * float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+        if constexpr (KernelParams::UseSecondInput) {
+          float const input =
+              float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]} +
+              float{params.inPtr2[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+          if (params.expertWeightsPtr != nullptr) {
+            TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
+            data += float{scale} * input;
+          } else {
+            data += input;
+          }
         } else {
-          data += float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+          if (params.expertWeightsPtr != nullptr) {
+            TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
+            data += float{scale} *
+                    float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+          } else {
+            data += float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+          }
         }
       }
 
@@ -899,12 +911,14 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
 #endif
   __syncthreads();
 
+  auto const* inElemPtr2 = reinterpret_cast<InputElem const*>(params.inPtr2);
   for (int elemIndex = startOffset; elemIndex < numElemsInCol; elemIndex += stride) {
     ComputeElem threadOutput;
     threadOutput.fill(0);
     for (int kChunkIdx = 0; kChunkIdx < params.topK / TopKUnrollFactor; kChunkIdx++) {
       auto permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxArrSmem[kChunkIdx]);
       InputElem inputElemArr[TopKUnrollFactor];
+      InputElem inputElemArr2[TopKUnrollFactor];
 #pragma unroll
       for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
         auto const permutedIdx = permutedIdxArr[ki];
@@ -913,10 +927,15 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
         }
 
         auto const* inputPermutedPtr = inElemPtr + permutedIdx * numElemsInPaddedCol;
-
         float4 input =
             vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr[elemIndex]));
         inputElemArr[ki] = *reinterpret_cast<InputElem const*>(&input);
+        if constexpr (KernelParams::UseSecondInput) {
+          auto const* inputPermutedPtr2 = inElemPtr2 + permutedIdx * numElemsInPaddedCol;
+          float4 input2 =
+              vectorizedLoadPtx(reinterpret_cast<float4 const*>(&inputPermutedPtr2[elemIndex]));
+          inputElemArr2[ki] = *reinterpret_cast<InputElem const*>(&input2);
+        }
       }
       auto scaleArr = *reinterpret_cast<ScaleArrayType const*>(&scaleArrSmem[kChunkIdx]);
       auto const scaleFloatArr =
@@ -930,11 +949,128 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
         }
         auto scale = useScale ? scaleFloatArr[ki] : 1.0f;
         ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
+        if constexpr (KernelParams::UseSecondInput) {
+          expertResult = expertResult + arrayConvert<InputElem, ComputeElem>(inputElemArr2[ki]);
+        }
         threadOutput = threadOutput + scale * expertResult;
       }
     }
     OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
     outElemPtr[elemIndex] = outputElem;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Small-batch finalize: each CTA reduces one hidden-dim slice of one token. The topK reduction is
+// split across blockDim.y thread groups so every thread issues at most
+// SMALL_BATCH_FINALIZE_MAX_LOADS independent 128-bit loads, and the partial sums are combined
+// through shared memory. This spreads a few tokens over many SMs instead of serializing topK
+// dependent loads per thread, which dominates finalize latency at decode batch sizes.
+constexpr int SMALL_BATCH_FINALIZE_THREADS = 256;
+constexpr int SMALL_BATCH_FINALIZE_MAX_LOADS = 4;
+// Cap on topK groups: keeps at least 16 threads per block across the hidden dimension.
+constexpr int SMALL_BATCH_FINALIZE_MAX_TOPK_GROUPS = 16;
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
+    finalizeKernelSmallBatch(KernelParams params) {
+  using Type = typename KernelParams::Type;
+  using TypeExpW = typename KernelParams::TypeExpW;
+  constexpr int ElemPerVec = 128 / cutlass::sizeof_bits<Type>::value;
+  using VecElem = cutlass::Array<Type, ElemPerVec>;
+  using ComputeElem = cutlass::Array<float, ElemPerVec>;
+
+  __shared__ float partialSmem[SMALL_BATCH_FINALIZE_THREADS][ElemPerVec];
+
+  int const kSplit = blockDim.y;
+  int64_t const tokenIdx = blockIdx.x;
+  int const vecIdx = blockIdx.y * blockDim.x + threadIdx.x;
+  int const numVecs = params.hiddenDim / ElemPerVec;
+  int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
+  bool const active = vecIdx < numVecs;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Let the next kernel launch while this one runs; it waits on this grid before reading the
+  // output.
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+
+  // The permutation and the expert weights come from routing, which completed before the GEMMs
+  // this kernel depends on could start, so they are read before waiting on the primary kernel
+  // (as in finalizeKernelVecLoad). Only the GEMM output is read after the wait.
+  int permutedIdx[SMALL_BATCH_FINALIZE_MAX_LOADS];
+  float scale[SMALL_BATCH_FINALIZE_MAX_LOADS];
+#pragma unroll
+  for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+    int const k = threadIdx.y + j * kSplit;
+    permutedIdx[j] = -1;
+    scale[j] = 0.f;
+    if (active && k < params.topK) {
+      int64_t const expandedIdx = tokenIdx * params.topK + k;
+      permutedIdx[j] = params.expandedIdxToPermutedIdx[expandedIdx];
+      scale[j] = params.expertWeightsPtr != nullptr
+                     ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
+                     : 1.f;
+    }
+  }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // wait on primary kernel when using PDL
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  ComputeElem acc;
+  acc.fill(0.f);
+  if (active) {
+    VecElem in[SMALL_BATCH_FINALIZE_MAX_LOADS];
+    VecElem in2[SMALL_BATCH_FINALIZE_MAX_LOADS];
+#pragma unroll
+    for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+      if (permutedIdx[j] != -1) {
+        float4 const v = vectorizedLoadPtx(reinterpret_cast<float4 const*>(params.inPtr) +
+                                           permutedIdx[j] * numVecsPadded + vecIdx);
+        in[j] = *reinterpret_cast<VecElem const*>(&v);
+        if constexpr (KernelParams::UseSecondInput) {
+          float4 const v2 = vectorizedLoadPtx(reinterpret_cast<float4 const*>(params.inPtr2) +
+                                              permutedIdx[j] * numVecsPadded + vecIdx);
+          in2[j] = *reinterpret_cast<VecElem const*>(&v2);
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+      if (permutedIdx[j] != -1) {
+        ComputeElem expertResult = arrayConvert<VecElem, ComputeElem>(in[j]);
+        if constexpr (KernelParams::UseSecondInput) {
+          expertResult = expertResult + arrayConvert<VecElem, ComputeElem>(in2[j]);
+        }
+        acc = acc + scale[j] * expertResult;
+      }
+    }
+  }
+
+  int const tid = threadIdx.y * blockDim.x + threadIdx.x;
+  if (threadIdx.y > 0) {
+#pragma unroll
+    for (int e = 0; e < ElemPerVec; ++e) {
+      partialSmem[tid][e] = acc[e];
+    }
+  }
+  __syncthreads();
+  if (threadIdx.y == 0 && active) {
+    for (int g = 1; g < kSplit; ++g) {
+#pragma unroll
+      for (int e = 0; e < ElemPerVec; ++e) {
+        acc[e] += partialSmem[g * blockDim.x + threadIdx.x][e];
+      }
+    }
+    reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim)[vecIdx] =
+        arrayConvert<ComputeElem, VecElem>(acc);
   }
 }
 
@@ -1005,20 +1141,42 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void run(Data const& data, void* stream) {
   if (data.mUseDeepSeekFp8) {
+    FLASHINFER_CHECK(data.inPtr2 == nullptr,
+                     "DeepSeek FP8 finalize does not support a second input");
     int const numThreads = 128;
     int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
     // Capped at rather arbitrary 8192 to avoid gridDim exceeding 65535 specified by CUDA.
     int const numBlocksY = std::min(8192, data.numTokens);
     dim3 numBlocks(numBlocksX, numBlocksY);
 
-    LAUNCH_TOPK_EXPW(data, finalizeDeepSeekKernel, numBlocks, numThreads, 0, stream);
+    LAUNCH_TOPK_EXPW_SINGLE_INPUT(data, finalizeDeepSeekKernel, numBlocks, numThreads, 0, stream);
   } else {
     int const numThreads = 256;
     int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
     // Capped at rather arbitrary 8192 to avoid gridDim exceeding 65535 specified by CUDA.
     int const numBlocksY = std::min(8192, data.numTokens);
 
-    if (numBlocksX * numBlocksY < 1184) {
+    int64_t const finalizeElemsPerVector = 128 / tg::dtypeGetNumBits(data.mDtypeElt);
+    bool const vectorWidthAligned = data.hiddenDim % finalizeElemsPerVector == 0 &&
+                                    data.hiddenDimPadded % finalizeElemsPerVector == 0;
+    // With topK <= SMALL_BATCH_FINALIZE_MAX_LOADS there is a single topK group, and the
+    // shared-memory reduction costs more than the split saves.
+    bool const useSmallBatch =
+        numBlocksX * numBlocksY < 1184 && vectorWidthAligned &&
+        data.topK > SMALL_BATCH_FINALIZE_MAX_LOADS &&
+        data.topK <= SMALL_BATCH_FINALIZE_MAX_TOPK_GROUPS * SMALL_BATCH_FINALIZE_MAX_LOADS;
+    if (useSmallBatch) {
+      // Fewest topK groups that keep each thread at SMALL_BATCH_FINALIZE_MAX_LOADS loads or fewer.
+      int kSplit = 1;
+      while (kSplit * SMALL_BATCH_FINALIZE_MAX_LOADS < data.topK) {
+        kSplit *= 2;
+      }
+      int const vecsPerBlock = SMALL_BATCH_FINALIZE_THREADS / kSplit;
+      int const numVecs = data.hiddenDim / finalizeElemsPerVector;
+      dim3 numBlocks(data.numTokens, (numVecs + vecsPerBlock - 1) / vecsPerBlock);
+      dim3 blockDim(vecsPerBlock, kSplit);
+      LAUNCH_TOPK_EXPW(data, finalizeKernelSmallBatch, numBlocks, blockDim, 0, stream);
+    } else if (numBlocksX * numBlocksY < 1184 || !vectorWidthAligned) {
       // The number 1184 comes from 148 * 8, where 148 is the number of SMs (Streaming
       // Multiprocessors) in the Blackwell architecture, and the value 8 means that each Streaming
       // Multiprocessor (SM) can hold up to 8 blocks for this kernel. This limitation is intended to

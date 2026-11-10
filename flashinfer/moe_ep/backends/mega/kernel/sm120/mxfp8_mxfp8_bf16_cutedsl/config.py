@@ -27,7 +27,8 @@ class Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True
-    in_kernel_fc2_reduce: bool = False
+    # Unsupported, must be false
+    enable_in_kernel_fc2_reduce: bool = False
     # Where the cross-rank fc2 push-back runs (this drop's native enum, not
     # the sm100 token_back_by_dispatch bool): "epi_warps" (epilogue STG
     # redirect), "standalone_warps" (dedicated warps 12-15), or

@@ -8,12 +8,13 @@ construction and the opaque workspace contract.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
 from typing import Any, Dict, Literal, Optional, Tuple
 
 from .heuristic import (
+    _rank_local_combine_tuning_min_tokens,
     MegaMoEHeuristicInput,
     MegaMoEHeuristicOverrides,
     MegaMoEKernelConfig,
@@ -23,9 +24,18 @@ from .jit_config import Sm120JitConfig
 
 
 # Bump for every generated-kernel code path or opaque workspace change. This
-# revision separates the restored N32/N64/N128 SFB fast selector and the exact
-# N16 slot-0/fallback lowering from previously cached graph/kernel bundles.
-KERNEL_CACHE_ABI = 6
+# Revision 23 adds the 320-row DP4 decode specialization. The bucket is part
+# of the problem record, while the ABI bump also invalidates any standalone
+# 320-row artifacts compiled with the former N64 heuristic. Revision 25
+# narrows rank-local synchronization and removes tail-off graph reset nodes.
+# Revision 26 adds the opt-in dispatch rank-cache workspace and code path.
+# Revision 31 adds rank-local combine on top of the rank-cache workspace.
+# Revision 32 uses the public 128-byte online TMA descriptor stride.
+# Revision 33 moves the N64 SFB half selection out of the QMMA hot loop by
+# loading the selected N64 scale tile into the packed compact fragment.
+# Revision 34 orders the raw compact-fragment load after its TMA/mbarrier
+# producer so cached v34 CUBINs cannot retain the weaker load semantics.
+KERNEL_CACHE_ABI = 35
 
 
 @dataclass(frozen=True)
@@ -173,6 +183,58 @@ class SplitKernelBundle:
     cache_key: str
 
 
+_ONE_DISPATCH_WARP_ROWS_PER_EXPERT_MAX = 192.0
+
+
+def _select_dispatch_warp_count(
+    problem: MegaMoEProblemSpec,
+    kernel: MegaMoEKernelConfig,
+) -> int:
+    """Select the K1 ingest width for the compiled kernel.
+
+    Short waves use one warp. The bounded local-combine retune also uses one
+    warp at large sizes; other shapes keep the historical four-warp ingest.
+    """
+
+    if (
+        kernel.kernel_comm_backend != "p2p_direct"
+        or kernel.token_back_mode != "epi_warps"
+    ):
+        return 4
+    tuning_min_tokens = _rank_local_combine_tuning_min_tokens(
+        problem.hidden, problem.intermediate, problem.num_topk,
+        problem.num_total_experts,
+    )
+    if (
+        kernel.rank_local_combine
+        and kernel.total_sms == 110
+        and problem.expert_parallel_size == 4
+        and problem.tensor_parallel_size == 1
+        and tuning_min_tokens is not None
+        and tuning_min_tokens <= problem.tokens_per_rank <= 24576
+    ):
+        return 1
+    return (
+        1
+        if kernel.expected_rows_per_expert
+        <= _ONE_DISPATCH_WARP_ROWS_PER_EXPERT_MAX
+        else 4
+    )
+
+
+def _resolve_jit_config(
+    problem: MegaMoEProblemSpec,
+    kernel: MegaMoEKernelConfig,
+    jit: Sm120JitConfig,
+) -> Sm120JitConfig:
+    if jit.dispatch_warp_count is not None:
+        return jit
+    return replace(
+        jit,
+        dispatch_warp_count=_select_dispatch_warp_count(problem, kernel),
+    )
+
+
 def select_compile_spec(
     *,
     problem: MegaMoEProblemSpec,
@@ -203,16 +265,24 @@ def select_compile_spec(
         sm_min_partition=sm_min_partition,
         sm_partition_alignment=sm_partition_alignment,
     )
+    kernel = select_megamoe_config(heuristic_input, overrides)
+    jit_config = _resolve_jit_config(problem, kernel, jit or Sm120JitConfig())
     return MegaMoECompileSpec(
         problem=problem,
-        kernel=select_megamoe_config(heuristic_input, overrides),
-        jit=jit or Sm120JitConfig(),
+        kernel=kernel,
+        jit=jit_config,
         build=build or SplitKernelBuildOptions(),
     )
 
 
 def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     """Construct K1/K2/K2-tail objects without benchmark-runner dependencies."""
+
+    if spec.jit.dispatch_warp_count is None:
+        spec = replace(
+            spec,
+            jit=_resolve_jit_config(spec.problem, spec.kernel, spec.jit),
+        )
 
     import cutlass
 
@@ -281,12 +351,16 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         dispatch_pull_mode=config.dispatch_pull_mode,
         dispatch_warps_per_tile=config.dispatch_warps_per_tile,
         dispatch_compute_overlap=config.dispatch_compute_overlap,
+        dispatch_rank_cache=config.dispatch_rank_cache,
+        dispatch_rank_cache_debug=config.dispatch_rank_cache_debug,
+        rank_local_combine=config.rank_local_combine,
         k1_ready_queue_workspace=config.k1_ready_queue,
         k2_ready_queue=config.k2_ready_queue,
         k2_ready_queue_bundle=config.ready_queue_bundle,
         k2_natural_regs=config.k2_natural_regs,
         k2_min_blocks_per_sm=config.k2_min_blocks_per_sm,
         k1_ready_queue_m_rotation=config.k1_ready_queue_m_rotation,
+        dispatch_warp_count=spec.jit.dispatch_warp_count,
         jit_config=spec.jit,
     )
 
@@ -309,7 +383,11 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         compact_k2=(config.k2_warps in (8, 12) or config.k2_tile[1] == 256),
         load_balance_mode=k2_load_balance,
         k2_tail_reclaim=config.k2_tail_reclaim,
-        skip_global_tail=(config.k2_tail_reclaim or config.k2_warps == 12),
+        skip_global_tail=(
+            config.k2_tail_reclaim
+            or config.k2_warps == 12
+            or config.rank_local_combine
+        ),
         producer_sm_count=(
             k1_clusters * cluster_size if options.concurrent_k1_k2 else 0
         ),
@@ -338,7 +416,11 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         # launches only one drain CTA per newly released SM.
         k2_drain = k2_kernel_cls(**tail_common, **common_kwargs)
 
-    if config.k2_tail_reclaim or config.k2_warps == 12:
+    if (
+        config.k2_tail_reclaim
+        or config.k2_warps == 12
+        or config.rank_local_combine
+    ):
         finalizer_common = dict(k2_common)
         finalizer_common.update(
             group_hint=1,
@@ -352,8 +434,8 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
             **finalizer_common, **common_kwargs
         )
 
-    # The dual-N8 policy reserves the historical twelfth role slot in the
-    # config/cache key, but physically omits the idle aux warp at launch.
+    # The dual-N8 policy reserves the twelfth role in the config/cache key but
+    # physically omits the idle aux warp at launch.
     expected_threads = 32 * (11 if config.k2_warps == 12 else config.k2_warps)
     if k2.threads_per_cta != expected_threads:
         raise RuntimeError(
@@ -369,9 +451,23 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         (type(kernel).__name__, kernel.get_workspace_sizes()) for kernel in peers
     ]
     if any(sizes != workspace_sizes for _, sizes in peer_workspace_sizes):
+        def _regions(kernel):
+            return {
+                "local": [
+                    (r.name, r.shape, r.nbytes, kernel._local_offsets[r.name])
+                    for r in kernel._local_region_specs
+                ],
+                "shared": [
+                    (r.name, r.shape, r.nbytes, kernel._shared_offsets[r.name])
+                    for r in kernel._shared_region_specs
+                ],
+            }
+
         raise RuntimeError(
             "K1/K2 workspace layouts are not byte-identical: "
-            f"K1={workspace_sizes}, peers={peer_workspace_sizes}"
+            f"K1={workspace_sizes}, peers={peer_workspace_sizes}; "
+            f"K1 regions={_regions(k1)}, peer regions="
+            f"{[(type(kernel).__name__, _regions(kernel)) for kernel in peers]}"
         )
 
     return SplitKernelBundle(
@@ -393,6 +489,14 @@ def compile_combine_reduce(*args, **kwargs):
     return compile_topk_reduce(*args, **kwargs)
 
 
+def compile_rank_local_combine(*args, **kwargs):
+    """Compile the explicit owner-local BF16 K3 reduction lazily."""
+
+    from .kernel_rank_local_combine import compile_rank_local_combine as compile_k3
+
+    return compile_k3(*args, **kwargs)
+
+
 __all__ = [
     "KERNEL_CACHE_ABI",
     "MegaMoECompileSpec",
@@ -402,5 +506,6 @@ __all__ = [
     "Sm120JitConfig",
     "build_split_kernels",
     "compile_combine_reduce",
+    "compile_rank_local_combine",
     "select_compile_spec",
 ]

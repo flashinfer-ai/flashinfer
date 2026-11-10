@@ -1,0 +1,82 @@
+{
+  "name": "dsv41_fp4_quantize_append_sparse_mla_cache_2d_nhd_ps8",
+  "description": "Quantize DeepSeek-V4.1 latent KV by physical slot with the same group-16 E2M1 / clamped E4M3 conversion as full-page pack. Mutates cache in place and returns None; the trace output is the updated cache. Unaddressed data and scale slots are preserved.",
+  "op_type": "quantization",
+  "tags": [
+    "fi_api:flashinfer.mla._sparse_mla_sm120._api.dsv41_fp4_quantize_append_sparse_mla_cache",
+    "quantization:fp4",
+    "mla",
+    "inplace"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Number of slot-mapping entries."
+    },
+    "latent_dim_0": {
+      "type": "var"
+    },
+    "latent_dim": {
+      "type": "const",
+      "value": 512
+    },
+    "num_pages": {
+      "type": "var"
+    },
+    "bytes_per_token": {
+      "type": "const",
+      "value": 288
+    },
+    "page_size": {
+      "type": "const",
+      "value": 8
+    },
+    "latent_heads": {
+      "type": "const",
+      "value": 1
+    }
+  },
+  "constraints": [
+    "latent_dim_0 == num_tokens"
+  ],
+  "inputs": {
+    "latent_kv": {
+      "shape": [
+        "latent_dim_0",
+        "latent_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Contiguous BF16/FP16; flatten leading dimensions to one 512-value row per slot."
+    },
+    "slot_mapping": {
+      "shape": [
+        "num_tokens"
+      ],
+      "dtype": "int64",
+      "description": "Contiguous int32/int64 physical slots: page_id * page_size + entry_id. Negative or out-of-range slots are ignored; the lowest-index input row wins duplicate valid slots."
+    },
+    "cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "latent_heads",
+        "bytes_per_token"
+      ],
+      "dtype": "uint8",
+      "description": "Opaque V41_FP4 uint8 cache: each physical page stores page_size * 256 packed E2M1 data bytes followed by page_size * 32 E4M3 scale bytes. The last dimension is not a contiguous per-token record. Page-strided views are supported; bytes inside each page remain packed."
+    }
+  },
+  "outputs": {
+    "cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "latent_heads",
+        "bytes_per_token"
+      ],
+      "dtype": "uint8",
+      "description": "The input cache, updated in place."
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

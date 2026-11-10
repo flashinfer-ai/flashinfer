@@ -20,7 +20,10 @@ from typing import Optional, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..trace.templates.msa import msa_topk_select_trace
 from ..utils import is_sm12x_supported
+from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
+from ._blackwell_sm100 import blackwell_msa_topk_select, is_blackwell_msa_device
 
 
 @functools.cache
@@ -28,6 +31,28 @@ def _dummy_nvp(device_index: int) -> torch.Tensor:
     """Signature filler for the scalar-``num_valid_pages`` path, which never
     reads it; cached so repeat calls do not launch a fill kernel."""
     return torch.zeros(1, dtype=torch.int32, device=torch.device("cuda", device_index))
+
+
+def _compile_topk(kernel_obj, num_score_tensors: int, num_scalars: int):
+    """Compile plumbing shared by the chunked top-k variants. All tensor
+    arguments are 3D and the scalar values are placeholders (the compiled
+    kernels take them dynamically)."""
+    import cutlass
+    import cutlass.cute as cute
+
+    def fk(dtype):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            tuple(cute.sym_int() for _ in range(3)),
+            stride_order=(2, 1, 0),
+            assumed_align=4,
+        )
+
+    args = [fk(cutlass.Float32)]  # max_score (H, P, S)
+    args += [fk(cutlass.Int32) for _ in range(num_score_tensors - 1)]
+    args += [cutlass.Int32(1)] * num_scalars
+    args.append(cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True))
+    return cute.compile(kernel_obj, *args, options="--enable-tvm-ffi")
 
 
 @functools.cache
@@ -75,7 +100,18 @@ def _get_compiled_topk(topk: int, small: bool, per_token_nvp: bool):
     return compiled
 
 
-@flashinfer_api
+@functools.cache
+def _get_compiled_topk_chunked(topk: int, tiled: bool):
+    """Two-kernel (per-chunk rank + merge) variant; selections match the
+    count-rank kernel exactly (same bit-key and tie order). ``tiled`` picks
+    the full-grid partial kernel (coalesced q-tile staging) over the
+    row-per-CTA one."""
+    from .cute_dsl.topk_select_chunked_sm12x import TopKSelectChunkedSm12x
+
+    return _compile_topk(TopKSelectChunkedSm12x(topk=topk, tiled=tiled), 4, 7)
+
+
+@flashinfer_api(trace=msa_topk_select_trace)
 def msa_topk_select(
     max_score: torch.Tensor,
     topk: int,
@@ -89,7 +125,8 @@ def msa_topk_select(
     Implements the block-scoring pass of Minimax Sparse Attention: given the
     per-block maximum attention scores from a cheap proxy prefill, selects the
     ``topk`` most important KV blocks for each (query token, head) pair and
-    returns their sorted indices.
+    returns their sorted indices. Dispatch supports compute capability
+    10.0/10.3 and SM120/SM121.
 
     Parameters
     ----------
@@ -116,6 +153,10 @@ def msa_topk_select(
         Entries are clamped in-kernel to ``[0, max_k_tiles]`` (checking them on
         the host would sync), so an over-large count degrades to the full block
         range rather than reading out of bounds.
+
+        The tensor form is supported only on SM120/SM121.  On compute
+        capability 10.0/10.3, pass a scalar or ``None``; a tensor is rejected
+        before dispatch because that backend accepts only a scalar bound.
     output : torch.Tensor, optional
         Pre-allocated output tensor of shape
         ``(total_qo_len, num_qo_heads, topk)``, dtype int32.  Allocated
@@ -131,10 +172,31 @@ def msa_topk_select(
         Shape ``(total_qo_len, num_qo_heads, topk)``, dtype int32.
         Ascending KV-block indices; ``-1`` entries are tail-padded invalid
         slots.
+
+    Notes
+    -----
+    When near-tied scores compete for the last slots, either block may be
+    selected; exact indices may vary across problem sizes and releases, but
+    the selected score values always match.
     """
-    if not is_sm12x_supported(max_score.device):
+    if is_blackwell_msa_device(max_score.device):
+        if isinstance(num_valid_pages, torch.Tensor):
+            raise NotImplementedError(
+                "per-token tensor num_valid_pages is only supported on "
+                "SM120/SM121; compute capability 10.0/10.3 requires a scalar"
+            )
+        return blackwell_msa_topk_select(
+            max_score,
+            topk,
+            num_valid_pages=num_valid_pages,
+            output=output,
+            force_begin_blocks=force_begin_blocks,
+            force_end_blocks=force_end_blocks,
+        )
+    sm90 = is_sm90a_supported(max_score.device)
+    if not (sm90 or is_sm12x_supported(max_score.device)):
         raise RuntimeError(
-            "msa_topk_select requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_topk_select requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
 
     if max_score.dtype != torch.float32:
@@ -147,8 +209,6 @@ def msa_topk_select(
         )
     if topk != 16:
         raise ValueError(f"topk must be 16, got {topk}")
-
-    from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
 
     num_qo_heads, max_k_tiles, total_qo_len = max_score.shape
 
@@ -186,10 +246,6 @@ def msa_topk_select(
         # from different metadata.
         nvp_dev = num_valid_pages
         nvp_scalar = 0
-        # Cannot dispatch on the runtime values without a sync, so bound by the
-        # allocated tile count. Conservative: picks radix when max_k_tiles
-        # exceeds the SMEM cap even if every token is actually shorter.
-        small = int(max_k_tiles) <= _MAX_BLOCKS
     else:
         # Input guards (the radix kernel does not clamp internally): an
         # out-of-range num_valid_pages reads max_score out of bounds, and
@@ -207,10 +263,6 @@ def msa_topk_select(
             )
         nvp_dev = _dummy_nvp(max_score.device.index)
         nvp_scalar = int(num_valid_pages)
-        # Dispatch on the runtime valid-page count: the count-rank kernel only
-        # ever touches blocks below num_valid_pages, regardless of the allocated
-        # score dimension.
-        small = nvp_scalar <= _MAX_BLOCKS
 
     if output is None:
         output = torch.empty(
@@ -226,6 +278,79 @@ def msa_topk_select(
             )
         if output.dtype != torch.int32:
             raise ValueError(f"output must be int32, got {output.dtype}")
+
+    if sm90:
+        from ._sm90_dispatch import topk_select_sm90
+
+        return topk_select_sm90(
+            max_score,
+            topk,
+            output,
+            num_valid_pages=num_valid_pages,
+            force_begin_blocks=force_begin_blocks,
+            force_end_blocks=force_end_blocks,
+        )
+
+    from .cute_dsl.topk_select_chunked_sm12x import (
+        _CHUNK_BLOCKS,
+        _MAX_CHUNK_BLOCKS,
+        _TILED_MIN_QUERIES,
+        _MAX_CHUNKED_SCRATCH_BYTES,
+        _MAX_CHUNKS,
+        _MIN_BLOCKS,
+        _MIN_CHUNKS,
+    )
+    from .cute_dsl.topk_select_countrank_sm12x import _MAX_BLOCKS
+
+    # Count-rank (small) or radix. Per-token extents cannot dispatch on the
+    # runtime values without a sync, so bound by the allocated tile count
+    # (conservative: picks radix when max_k_tiles exceeds the SMEM cap even if
+    # every token is actually shorter). A scalar count dispatches on the
+    # runtime valid-page count: the count-rank kernel only ever touches blocks
+    # below num_valid_pages, regardless of the allocated score dimension.
+    small = (int(max_k_tiles) if per_token_nvp else nvp_scalar) <= _MAX_BLOCKS
+
+    # topk_select_chunked_sm12x explains why chunked wins on both small and
+    # full grids; per-token extents stay on the single-kernel paths.
+    # Everything here is shape-constant, so CUDA-graph safe.
+    if not per_token_nvp:
+        rows = total_qo_len * num_qo_heads
+        n_mid = nvp_scalar - force_begin_blocks - force_end_blocks
+        chunked = _MIN_BLOCKS < n_mid <= _MAX_CHUNKS * _MAX_CHUNK_BLOCKS
+        # Keyed on queries, not rows: the tiled kernel's lanes parallelize
+        # over queries only, so a head-heavy grid with few queries would run
+        # it with mostly idle lanes even though rows is large.
+        tiled = total_qo_len > _TILED_MIN_QUERIES
+        if chunked:
+            num_chunks = max(_MIN_CHUNKS, min(_MAX_CHUNKS, -(-n_mid // _CHUNK_BLOCKS)))
+            if rows * num_chunks * topk * 8 > _MAX_CHUNKED_SCRATCH_BYTES:
+                chunked = False
+        if chunked:
+            chunk_len = -(-n_mid // num_chunks)
+            # The partial kernels' SMEM staging has no in-kernel clamp.
+            assert chunk_len <= _MAX_CHUNK_BLOCKS
+            # One allocation for both candidate buffers keeps this hot path at
+            # a single allocator call.
+            cand = torch.empty(
+                (2, total_qo_len, num_qo_heads, num_chunks * topk),
+                dtype=torch.int32,
+                device=max_score.device,
+            )
+            cand_key, cand_idx = cand[0], cand[1]
+            _get_compiled_topk_chunked(topk, tiled)(
+                max_score,
+                cand_key,
+                cand_idx,
+                output,
+                nvp_scalar,
+                int(force_begin_blocks),
+                int(force_end_blocks),
+                num_chunks,
+                chunk_len,
+                int(total_qo_len),
+                int(num_qo_heads),
+            )
+            return output
 
     _get_compiled_topk(topk, small, per_token_nvp)(
         max_score,

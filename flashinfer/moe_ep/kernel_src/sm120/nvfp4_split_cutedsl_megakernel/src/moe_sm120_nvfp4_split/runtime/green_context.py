@@ -57,9 +57,7 @@ def query_green_context_sm_counts(
     total_sms = int(sm_resource.sm.smCount)
     min_partition = max(1, int(sm_resource.sm.minSmPartitionSize))
     if not min_partition <= k1_sm_count <= total_sms - min_partition:
-        raise ValueError(
-            f"invalid K1 SM count {k1_sm_count} for {total_sms} SMs"
-        )
+        raise ValueError(f"invalid K1 SM count {k1_sm_count} for {total_sms} SMs")
     groups, num_groups, remainder = _check_cuda(
         cuda.cuDevSmResourceSplitByCount(1, sm_resource, 0, k1_sm_count),
         "cuDevSmResourceSplitByCount",
@@ -117,9 +115,7 @@ class NativeGreenContextResources:
             raise ValueError("num_comm_streams must be positive")
 
         _check_cuda(cuda.cuInit(0), "cuInit")
-        (cuda_device,) = _check_cuda(
-            cuda.cuDeviceGet(device), "cuDeviceGet"
-        )
+        (cuda_device,) = _check_cuda(cuda.cuDeviceGet(device), "cuDeviceGet")
         sm_resource = Device(device).resources.sm
         total_sms = int(sm_resource.sm_count)
         min_partition = max(1, int(sm_resource.min_partition_size))
@@ -156,22 +152,16 @@ class NativeGreenContextResources:
         )
         groups, remainder = sm_resource.split(options)
         if int(remainder.sm_count) != 0 or len(groups) != 4:
-            raise RuntimeError(
-                "CUDA did not produce the requested K1/TX/RX/K2 split."
-            )
+            raise RuntimeError("CUDA did not produce the requested K1/TX/RX/K2 split.")
         actual_counts = tuple(int(group.sm_count) for group in groups)
         if min(actual_counts) <= 0:
-            raise RuntimeError(
-                f"CUDA produced an empty SM partition: {actual_counts}."
-            )
+            raise RuntimeError(f"CUDA produced an empty SM partition: {actual_counts}.")
         if actual_counts != requested_counts:
             raise RuntimeError(
                 f"CUDA produced {actual_counts}, requested {requested_counts}."
             )
 
-        driver_resources = tuple(
-            cuda.CUdevResource(group.handle) for group in groups
-        )
+        driver_resources = tuple(cuda.CUdevResource(group.handle) for group in groups)
         contexts = []
         execution_contexts = []
         raw_streams = []
@@ -244,9 +234,7 @@ class NativeGreenContextResources:
 
         for stream in self.comm_streams:
             stream.synchronize()
-        for index, raw_stream in reversed(
-            list(enumerate(self._raw_comm_streams))
-        ):
+        for index, raw_stream in reversed(list(enumerate(self._raw_comm_streams))):
             _check_cuda(
                 cuda.cuStreamDestroy(raw_stream),
                 f"cuStreamDestroy(COMM:{index})",
@@ -353,7 +341,64 @@ class NativeGreenContextGraph:
     _owns_green_contexts: bool
     _launch_ready: torch.cuda.Event
     _launch_done: torch.cuda.Event
+    _compiled_kernels: tuple[Any, ...]
+    _post_graph_k3: Optional[Callable[[], None]]
+    _post_graph_finalizer: Optional[Callable[[], None]] = None
     _closed: bool = False
+
+    @staticmethod
+    def _library_kernels(compiled_kernels: tuple[Any, ...]) -> dict[int, Any]:
+        """Map captured CUfunctions to context-independent CUkernels.
+
+        Keep the compiled owners on the graph: a CUkernel is valid only while
+        its CUlibrary remains loaded. CUDA-dialect executors alone do not
+        retain/expose all of this information through kernel_functions.
+        """
+        from cuda.bindings import driver as cuda
+
+        kernels = {}
+        libraries = set()
+        for compiled in compiled_kernels:
+            library = cuda.CUlibrary(int(compiled.library))
+            if int(library) in libraries:
+                continue
+            libraries.add(int(library))
+            (count,) = _check_cuda(
+                cuda.cuLibraryGetKernelCount(library), "cuLibraryGetKernelCount"
+            )
+            (handles,) = _check_cuda(
+                cuda.cuLibraryEnumerateKernels(count, library),
+                "cuLibraryEnumerateKernels",
+            )
+            for kernel in handles:
+                (function,) = _check_cuda(
+                    cuda.cuKernelGetFunction(kernel), "cuKernelGetFunction"
+                )
+                kernels[int(function)] = kernel
+        return kernels
+
+    @staticmethod
+    def _bind_kernel(params, function, kernel, context, device) -> None:
+        from cuda.bindings import driver as cuda
+
+        # The original function's launch attributes are not graph parameters.
+        # Preserve them when selecting a CUkernel in another context.
+        for name in (
+            "CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES",
+            "CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT",
+        ):
+            attribute = getattr(cuda.CUfunction_attribute, name)
+            (value,) = _check_cuda(
+                cuda.cuFuncGetAttribute(attribute, function), "cuFuncGetAttribute"
+            )
+            _check_cuda(
+                cuda.cuKernelSetAttribute(attribute, value, kernel, device),
+                "cuKernelSetAttribute",
+            )
+        # With a non-null func, CUDA ignores ctx and uses func's context.
+        params.func = cuda.CUfunction(0)
+        params.kern = kernel
+        params.ctx = context
 
     @staticmethod
     def _function_handles(executor: Any) -> set[int]:
@@ -377,6 +422,8 @@ class NativeGreenContextGraph:
         k2_drain_executor: Optional[Any],
         k2_finalizer_executor: Optional[Any],
         k3_executor: Optional[Any],
+        compiled_kernels: tuple[Any, ...],
+        compiled_role_owners: Optional[dict] = None,
         launch_k1: Callable[[], None],
         launch_k2: Callable[[], None],
         launch_k2_drain: Optional[Callable[[], None]],
@@ -392,7 +439,7 @@ class NativeGreenContextGraph:
         ] = None,
         device: Optional[int] = None,
     ) -> "NativeGreenContextGraph":
-        """Capture on ordinary streams, then rebind K1/K2 graph nodes."""
+        """Rebind K1/K2 to Green Contexts; join K3 on the root stream."""
         from cuda.bindings import driver as cuda
         from cuda.bindings import runtime as cudart
 
@@ -424,9 +471,7 @@ class NativeGreenContextGraph:
             k1_stream.wait_event(capture_ready)
             k2_stream.wait_event(capture_ready)
             launch_k1()
-            serialize_k2 = (
-                os.environ.get("MEGA_DIAG_SERIALIZE_K2", "0") == "1"
-            )
+            serialize_k2 = os.environ.get("MEGA_DIAG_SERIALIZE_K2", "0") == "1"
             if serialize_k2 and launch_k2_drain is not None:
                 raise RuntimeError(
                     "MEGA_DIAG_SERIALIZE_K2 is incompatible with K2 tail "
@@ -446,12 +491,10 @@ class NativeGreenContextGraph:
             k2_done.record(k2_stream)
             root_stream.wait_event(k1_done)
             root_stream.wait_event(k2_done)
-            if launch_k2_finalizer is not None:
-                # Join every peer K2 store and reclaim the shared count state
-                # before K3 consumes this epoch's combine buffer.
-                launch_k2_finalizer()
-            if launch_k3 is not None:
-                launch_k3()
+            # Primary-context finalizer and K3 run after this mixed-context
+            # graph. Embedding the finalizer here can stall a pooled Green
+            # Context launch (reproduced at the N16/dual-N8 decode bucket).
+            # launch() orders both before caller-visible completion.
             (graph,) = _check_cuda(
                 cudart.cudaStreamEndCapture(raw_root),
                 "cudaStreamEndCapture",
@@ -488,9 +531,7 @@ class NativeGreenContextGraph:
                     f"invalid K1 SM count {k1_sm_count} for {total_sms} SMs"
                 )
             groups, num_groups, remainder = _check_cuda(
-                cuda.cuDevSmResourceSplitByCount(
-                    1, sm_resource, 0, k1_sm_count
-                ),
+                cuda.cuDevSmResourceSplitByCount(1, sm_resource, 0, k1_sm_count),
                 "cuDevSmResourceSplitByCount",
             )
             if int(num_groups) != 1 or len(groups) != 1:
@@ -514,6 +555,19 @@ class NativeGreenContextGraph:
                 green_resources.execution_contexts[-1],
             ]
         try:
+            library_kernels = cls._library_kernels(compiled_kernels)
+            role_functions = {}
+            if compiled_role_owners is not None:
+                for role, owners in compiled_role_owners.items():
+                    for function in cls._library_kernels(
+                        tuple(x for x in owners if x is not None)
+                    ):
+                        if (
+                            function in role_functions
+                            and role_functions[function] != role
+                        ):
+                            raise RuntimeError("Compiled K1/K2 role identities overlap")
+                        role_functions[function] = role
             if green_resources is None:
                 for index, resource in enumerate(resources):
                     (descriptor,) = _check_cuda(
@@ -549,10 +603,7 @@ class NativeGreenContextGraph:
                     cuda.cuGraphNodeGetType(node),
                     "cuGraphNodeGetType",
                 )
-                if (
-                    node_type
-                    != cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
-                ):
+                if node_type != cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
                     continue
                 (params,) = _check_cuda(
                     cuda.cuGraphKernelNodeGetParams(node),
@@ -560,15 +611,15 @@ class NativeGreenContextGraph:
                 )
                 function = int(params.func)
                 grid_blocks = (
-                    int(params.gridDimX)
-                    * int(params.gridDimY)
-                    * int(params.gridDimZ)
+                    int(params.gridDimX) * int(params.gridDimY) * int(params.gridDimZ)
                 )
-                if k1_handles or k2_handles:
+                if compiled_role_owners is not None:
+                    context_index = role_functions.get(function)
+                elif k1_handles or k2_handles:
                     context_index = (
-                        0 if function in k1_handles
-                        else 1 if function in k2_handles
-                        else None
+                        0
+                        if function in k1_handles
+                        else 1 if function in k2_handles else None
                     )
                 else:
                     # Public CuTeDSL 4.6 uses a CUDA-dialect host shim whose
@@ -581,30 +632,34 @@ class NativeGreenContextGraph:
                     # physical SMs.
                     context_index = (
                         0
-                        if grid_blocks in {
+                        if grid_blocks
+                        in {
                             k1_grid_clusters or k1_sm_count,
                             k2_drain_grid_clusters,
                         }
-                        else 1
-                        if grid_blocks
-                        == (k2_grid_clusters or k2_sm_count)
-                        else None
+                        else (
+                            1
+                            if grid_blocks == (k2_grid_clusters or k2_sm_count)
+                            else None
+                        )
                     )
                 if context_index is None:
                     continue
 
-                if not int(params.kern):
-                    raise RuntimeError(
-                        "Green Context graph binding requires a context-independent "
-                        "CUkernel handle; the captured node exposes only CUfunction."
-                    )
                 updated = cuda.CUgraphNodeParams()
-                updated.type = (
-                    cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
+                updated.type = cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
+                kernel = library_kernels.get(function)
+                if kernel is None:
+                    raise RuntimeError(
+                        f"No retained CUkernel for captured function {function}."
+                    )
+                cls._bind_kernel(
+                    updated.kernel,
+                    params.func,
+                    kernel,
+                    execution_contexts[context_index],
+                    cuda_device,
                 )
-                # A non-null CUfunction makes CUDA ignore ctx and retains the
-                # primary context, defeating the disjoint K1/K2 SM partitions.
-                updated.kernel.kern = params.kern
                 updated.kernel.gridDimX = params.gridDimX
                 updated.kernel.gridDimY = params.gridDimY
                 updated.kernel.gridDimZ = params.gridDimZ
@@ -614,20 +669,10 @@ class NativeGreenContextGraph:
                 updated.kernel.sharedMemBytes = params.sharedMemBytes
                 updated.kernel.kernelParams = params.kernelParams
                 updated.kernel.extra = params.extra
-                updated.kernel.ctx = execution_contexts[context_index]
                 _check_cuda(
                     cuda.cuGraphNodeSetParams(node, updated),
                     f"cuGraphNodeSetParams(K{context_index + 1})",
                 )
-                (bound,) = _check_cuda(
-                    cuda.cuGraphKernelNodeGetParams(node),
-                    "cuGraphKernelNodeGetParams(bound)",
-                )
-                if int(bound.ctx) != int(execution_contexts[context_index]):
-                    raise RuntimeError(
-                        f"CUDA did not retain the K{context_index + 1} "
-                        "Green Context binding."
-                    )
                 rebound[context_index] += 1
 
             if min(rebound) <= 0:
@@ -638,9 +683,7 @@ class NativeGreenContextGraph:
 
             instantiate_params = cuda.CUDA_GRAPH_INSTANTIATE_PARAMS()
             (graph_exec,) = _check_cuda(
-                cuda.cuGraphInstantiateWithParams(
-                    graph, instantiate_params
-                ),
+                cuda.cuGraphInstantiateWithParams(graph, instantiate_params),
                 "cuGraphInstantiateWithParams",
             )
         except Exception:
@@ -660,10 +703,20 @@ class NativeGreenContextGraph:
             _owns_green_contexts=owns_green_contexts,
             _launch_ready=torch.cuda.Event(),
             _launch_done=torch.cuda.Event(),
+            _compiled_kernels=compiled_kernels,
+            _post_graph_k3=launch_k3,
+            _post_graph_finalizer=launch_k2_finalizer,
         )
 
+    def _launch_post_graph(self) -> None:
+        # Callbacks use the current stream for both eager and outer capture.
+        if self._post_graph_finalizer is not None:
+            self._post_graph_finalizer()
+        if self._post_graph_k3 is not None:
+            self._post_graph_k3()
+
     def launch(self, caller_stream: torch.cuda.Stream) -> None:
-        """Replay after prior caller-stream resets and rejoin that stream."""
+        """Replay, complete K3, then rejoin before the next caller reset."""
         from cuda.bindings import driver as cuda
 
         caller_cuda = cuda.CUstream(caller_stream.cuda_stream)
@@ -706,6 +759,11 @@ class NativeGreenContextGraph:
                 ),
                 "cuStreamUpdateCaptureDependencies",
             )
+            # K3 stays on the primary context after the mixed-context child.
+            # The frontend callback must use the current stream, not a captured
+            # root-stream handle, so outer capture records this dependency.
+            with torch.cuda.stream(caller_stream):
+                self._launch_post_graph()
             return
 
         self._launch_ready.record(caller_stream)
@@ -717,6 +775,8 @@ class NativeGreenContextGraph:
             ),
             "cuGraphLaunch",
         )
+        with torch.cuda.stream(self.root_stream):
+            self._launch_post_graph()
         self._launch_done.record(self.root_stream)
         caller_stream.wait_event(self._launch_done)
 
@@ -733,11 +793,12 @@ class NativeGreenContextGraph:
         )
         _check_cuda(cuda.cuGraphDestroy(self._graph), "cuGraphDestroy")
         if self._owns_green_contexts:
-            for index, green_context in reversed(
-                list(enumerate(self._green_contexts))
-            ):
+            for index, green_context in reversed(list(enumerate(self._green_contexts))):
                 _check_cuda(
                     cuda.cuGreenCtxDestroy(green_context),
                     f"cuGreenCtxDestroy(K{index + 1})",
                 )
         self._closed = True
+        self._post_graph_k3 = None
+        self._post_graph_finalizer = None
+        self._compiled_kernels = ()

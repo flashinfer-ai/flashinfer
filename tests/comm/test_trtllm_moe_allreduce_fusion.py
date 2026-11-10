@@ -409,7 +409,9 @@ def _run_correctness_worker(world_size, rank, dtype, distributed_init_port):
     finally:
         dist.barrier(group=group)
 
-        comm.trtllm_destroy_ipc_workspace_for_all_reduce(ipc_handles, group=group)
+        comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+            ipc_handles, group=group
+        )
 
         dist.destroy_process_group(group=group)
 

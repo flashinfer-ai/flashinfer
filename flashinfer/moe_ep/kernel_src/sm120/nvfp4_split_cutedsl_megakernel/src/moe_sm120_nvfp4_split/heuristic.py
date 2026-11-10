@@ -1,817 +1,750 @@
-"""Deterministic launch heuristics for the SM120 MegaMoE kernel.
+"""Pure candidate-based SM120 selector. No CUDA calls, routing reads or env state.
 
-This module is deliberately independent of torch, CUDA, NVSHMEM, argparse,
-and process environment state.  The FlashInfer-facing call path can therefore
-select one JIT configuration with a small amount of integer arithmetic; the
-benchmark runner may apply explicit user overrides after selection.
+Legality, numerical eligibility and performance estimates are separate layers.
+Only implemented local EP4 variants are costed. Other topologies use the frozen
+compatibility selector until independently qualified. Estimates are not counters.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, asdict
+from functools import lru_cache
+import math
 from typing import Optional, Tuple
+from .candidate_catalog import ALL_PROFILES, CATALOG_VERSION
+from .legacy_heuristic import (
+    MegaMoEHeuristicInput,
+    MegaMoEHeuristicOverrides as _LegacyOverrides,
+    MegaMoEKernelConfig as _LegacyConfig,
+    _scale_sm_partition,
+    select_megamoe_config as _legacy,
+)
 
 
-Tile = Tuple[int, int, int]
+@dataclass(frozen=True)
+class MegaMoEHeuristicOverrides(_LegacyOverrides):
+    k1_stages: Optional[int] = None
 
 
-# Blocking IBGDA puts avoid a long late-combine quiet/drain for large payloads,
-# but make tiny transfers pay the blocking round trip for every chunk.  This
-# byte threshold came from the RTX Pro 5000 EP8 scan and is intentionally
-# expressed in transport work rather than model names or token-only bands.
-_COMBINE_BLOCKING_PUT_BYTES_PER_PEER = 3 * 1024 * 1024
-_COMBINE_BLOCKING_PUT_MAX_CHUNK_BYTES = 128 * 1024
-_DISPATCH_MAX_IBGDA_CHUNK_BYTES = 384 * 1024
-# EP4 DSV4-flash sweep: one active dispatch warp/CTA wins while the expected
-# remote pull work stays below about 384 KiB per K1 CTA.  At the next bucket
-# (1024 tokens/rank, about 590 KiB/CTA), four warps recover the lead.  Keep
-# this optimization inside the measured small-shape envelope: DSV4's wider
-# hidden dimension and larger expert table make route/expert control work
-# dominate some small-token buckets even when their byte estimate is low.
-# Two warps never won by enough to justify another production branch.
-_SINGLE_DISPATCH_WARP_MAX_REMOTE_BYTES_PER_K1_CTA = 384 * 1024
-_SINGLE_DISPATCH_WARP_MAX_HIDDEN = 4096
-_SINGLE_DISPATCH_WARP_MAX_EXPERTS = 256
-_SINGLE_DISPATCH_WARP_MAX_TOPK = 6
+@dataclass(frozen=True)
+class MegaMoEKernelConfig(_LegacyConfig):
+    # None only on compatibility fallback: preserve its previous kernel resolver.
+    k1_stages: Optional[int] = None
 
-# Same-NUMA EP4 dispatch caches one activation row per (source rank, token)
-# and reuses it when several top-k routes land on the same expert owner.  Use
-# a traffic-derived threshold so the selector is independent of model names.
-_DISPATCH_RANK_CACHE_MIN_SAVED_BYTES = 64 * 1024
-_DISPATCH_RANK_CACHE_MIN_SAVED_FRACTION = 0.20
-
-# Rank-local combine is robust across balanced, power-law and zero-owner EP4
-# routes once each local expert wave reaches roughly 256 rows.  Below this
-# boundary, fixed sideband/K3 costs and owner imbalance can erase the P2P
-# savings even when the theoretical byte reduction is large.
-_RANK_LOCAL_COMBINE_MIN_ROWS_PER_EXPERT = 256.0
-
-# The measured RTX Pro 5000 presets remain the tuning anchors, but their SM
-# counts must scale to the physical device.  Green Context requires every
-# explicitly requested group except the final remainder to respect the
-# device's co-schedule alignment.
-_REFERENCE_SM_COUNT = 110
-_LOCAL_N64_SM_PARTITION = (80, 30)
-_LOCAL_DECODE_SM_PARTITION = (80, 30)
-_LOCAL_DEFAULT_SM_PARTITION = (72, 38)
-_HYBRID_SM_PARTITION = (48, 16, 16, 30)
-
-# RTX Pro 5000 EP4 NVFP4 sweep: DSV4-flash decode buckets through 128 tokens
-# (12 expected rows/expert) benefit from the N16 K2 worker and the 80/30 split.
-# The dual-N8 mapping is intentionally enabled only for the exact measured
-# model/parallel envelope below; other local shapes may still use single-N16.
-_LOCAL_DECODE_MAX_ROWS_PER_EXPERT = 12.0
-_DUAL_N8_DECODE_MAX_TOKENS_PER_RANK = 128
-_TAIL_RECLAIM_MIN_TOKENS_PER_RANK = 32
+    def with_overrides(self, overrides):
+        # Applying an idempotent backend override must preserve this config.
+        # Backend changes need shape/topology and go through the selector.
+        return _apply_overrides(self, overrides)
 
 
-def _is_validated_dual_n8_decode(shape: "MegaMoEHeuristicInput") -> bool:
+MODEL_VERSION = "candidate-v15-abi27-large-joint-unaccepted"
+NUMERICAL_CONTRACTS = ("ordinary_topk", "owner_bf16")
+
+
+@dataclass(frozen=True)
+class CandidateFeatures:
+    """Per-rank work estimates, not measured traffic or hardware counters.
+
+    Useful work uses unpadded routes; padded work and weight requests follow
+    tile counts. Wave counts divide tile tasks by resident worker CTAs. Byte
+    estimates include NVFP4 payload and scales and are expressed in bytes.
+    """
+
+    useful_fc1_flops: float
+    useful_fc2_flops: float
+    padded_fc1_flops: float
+    padded_fc2_flops: float
+    fc1_weight_request_bytes: float
+    fc2_weight_request_bytes: float
+    unique_weight_bytes: float
+    fc1_tiles: float
+    fc2_tiles: float
+    k1_ctas: int
+    k2_ctas: int
+    k1_waves: float
+    k2_waves: float
+    ready_token_n: int
+    ready_blocks: float
+    descriptors: float
+    ready_fanout: float
+    descriptor_k_steps: int
+    grain_relative_to_worker_work: float
+    dispatch_bytes: float
+    cache_saved_bytes: float
+    token_back_bytes: float
+    metadata_bytes: float
+    owner_probability: float
+    k1_smem_estimate: int
+    k2_smem_estimate: int
+    k1_threads: int
+    k2_threads: int
+    reducer: str
+
+
+@dataclass(frozen=True)
+class Cost:
+    """Predicted full-call costs in microseconds (including K3).
+
+    Components feed the calibrated overlap model; they are not disjoint
+    hardware phase timings and should not be summed again by callers.
+    """
+
+    total_us: float
+    producer_us: float
+    consumer_us: float
+    dispatch_us: float
+    tail_us: float
+    k3_us: float
+    queue_us: float
+
+
+@dataclass(frozen=True)
+class Candidate:
+    config: MegaMoEKernelConfig
+    features: CandidateFeatures
+    cost: Cost
+    resource_evidence: str = (
+        "analytic SMEM budget; constructor/codegen required for qualification"
+    )
+
+
+@lru_cache(maxsize=512)
+def _expected_tiles(mu: float, n: int) -> float:
+    """Poisson expected ceil(X/n), with bounded normal approximation at large mu.
+
+    This models unknown routing only; it is explicitly not observed expert counts.
+    """
+    if mu < 128:
+        probability = math.exp(-mu)
+        out = 0.0
+        limit = int(mu + 14 * math.sqrt(mu + 1) + 64)
+        for x in range(1, limit + 1):
+            probability *= mu / x
+            out += ((x + n - 1) // n) * probability
+        return out
+    sigma = math.sqrt(mu)
+    lo = max(0, int((mu - 10 * sigma) // n))
+    hi = int((mu + 10 * sigma) // n) + 2
+    return float(lo) + sum(
+        0.5 * math.erfc((j * n + 0.5 - mu) / (math.sqrt(2) * sigma))
+        for j in range(lo, hi)
+    )
+
+
+def _validate_counts(shape, counts):
+    if counts is None:
+        return
+    if not isinstance(counts, tuple) or len(counts) != shape.num_total_experts:
+        raise ValueError(
+            "host_expert_counts must be an already-host tuple with one count per global expert"
+        )
+    if any(type(x) is not int or x < 0 for x in counts):
+        raise ValueError("expert counts must be nonnegative integers")
+    if (
+        sum(counts)
+        != shape.tokens_per_rank * shape.expert_parallel_size * shape.num_topk
+    ):
+        raise ValueError("expert counts do not match EP route volume")
+
+
+def _tiles(shape, n, counts=None):
+    if counts is not None:
+        # Worst owner workload, not a GPU->CPU query and not an average hiding skew.
+        e = shape.num_total_experts // shape.expert_parallel_size
+        return float(
+            max(
+                sum((x + n - 1) // n for x in counts[j : j + e])
+                for j in range(0, len(counts), e)
+            )
+        )
     return (
-        shape.ep_cross_numa_peer_count == 0
-        and shape.data_parallel_size == 1
+        shape.num_total_experts
+        / shape.expert_parallel_size
+        * _expected_tiles(shape.expected_rows_per_expert, n)
+    )
+
+
+def derive_features(shape, c, host_expert_counts=None):
+    n1, n2 = c.k1_tile[1], c.k2_tile[1]
+    t1, t2 = _tiles(shape, n1, host_expert_counts), _tiles(
+        shape, n2, host_expert_counts
+    )
+    ready = max(n1, n2, 128 if c.k2_warps == 12 else 0)
+    blocks = _tiles(shape, ready, host_expert_counts)
+    htiles = (shape.hidden + 63) // 64
+    ksteps = (shape.intermediate // 2 + 127) // 128
+    descriptors = t2 * ((htiles + c.ready_queue_bundle - 1) // c.ready_queue_bundle)
+    fanout = descriptors / max(blocks, 1e-30)
+    c1 = c.k1_sms
+    c2 = c.k2_sms * (2 if c.k2_warps == 12 else 1)
+    rows = shape.tokens_per_rank * shape.num_topk
+    h, i = shape.hidden, shape.intermediate
+    owner_p = 1 - shape.probability_one_owner_is_untouched
+    row_bytes = (h + 1) // 2 + (h + 15) // 16 + 4
+    remote_rows = shape.expected_remote_route_rows
+    cache_saved = (
+        shape.expected_dispatch_rank_cache_saved_bytes if c.dispatch_rank_cache else 0.0
+    )
+    dispatch = max(0.0, remote_rows * row_bytes - cache_saved)
+    return_rows = (
+        shape.tokens_per_rank * (shape.expert_parallel_size - 1) * owner_p
+        if c.rank_local_combine
+        else remote_rows
+    )
+    metadata = shape.tokens_per_rank * shape.num_topk * 8
+
+    # SM120 TMA layouts have128-row scale padding and128-byte data granularity.
+    # These are conservative screening estimates; actual layouts remain authoritative.
+    def smem(n, stage, dispatch):
+        stage_bytes = 64 * 128 // 2 + n * 128 // 2 + 2 * 128 * 128 // 16
+        # Match kernel budget: base1024, four packed activation pull rows,
+        # aligned barriers32+128, and FC1 reduction/packed-store epilogue.
+        fixed = 1024 + (
+            32
+            + ((4 * ((shape.hidden + 1) // 2) + 127) // 128) * 128
+            + 128
+            + 2048
+            + n * 16
+            if dispatch
+            else 0
+        )
+        return stage * stage_bytes + fixed
+
+    work = t2 * htiles * ksteps
+    return CandidateFeatures(
+        2 * rows * h * i,
+        rows * h * i,
+        2 * t1 * n1 * h * i,
+        t2 * n2 * h * i,
+        t1 * h * i * 9 / 16,
+        t2 * h * i * 9 / 32,
+        _tiles(
+            shape,
+            shape.tokens_per_rank * shape.expert_parallel_size * shape.num_topk + 1,
+            host_expert_counts,
+        )
+        * h
+        * i
+        * 27
+        / 32,
+        t1,
+        t2,
+        c1,
+        c2,
+        t1 * ((i + 63) // 64) / c1,
+        t2 * htiles / c2,
+        ready,
+        blocks,
+        descriptors,
+        fanout,
+        ksteps,
+        min(c.ready_queue_bundle, htiles) * ksteps / max(work / c2, 1.0),
+        dispatch,
+        cache_saved,
+        return_rows * h * 2,
+        metadata,
+        owner_p,
+        smem(n1, c.k1_stages or 2, True),
+        smem(n2, c.k2_stages, False),
+        384,
+        352 if c.k2_warps == 12 else 256,
+        (
+            "owner_vector"
+            if c.rank_local_combine and h % 2048 == 0 and shape.num_topk <= 8
+            else "owner_scalar" if c.rank_local_combine else "ordinary_topk"
+        ),
+    )
+
+
+def legality_errors(shape, c):
+    """Kernel/layout/progress constraints only; no performance or BF16 policy."""
+    errors = []
+    if shape.hidden % 32 or shape.intermediate % 64:
+        errors.append("NVFP4 alignment requires H%32=0,I%64=0")
+    for name, tile in (("K1", c.k1_tile), ("K2", c.k2_tile)):
+        if tile[0] != 64 or tile[1] not in (16, 32, 64, 128) or tile[2] != 128:
+            errors.append(name + " tile outside implemented candidate catalog")
+    if c.k1_stages not in (None, 1, 2, 3, 4, 5):
+        errors.append("K1 stage count exceeds implemented1..5 bound")
+    if c.k2_stages not in (1, 2, 3, 4, 5):
+        errors.append("K2 stage count exceeds implemented1..5 bound")
+    if c.k2_warps not in (8, 12):
+        errors.append("K2 warp mode unsupported")
+    if c.k2_warps == 12 and c.k2_tile[1] != 16:
+        errors.append("dual group requires K2N16")
+    if c.k2_tail_reclaim and c.k2_warps != 12:
+        errors.append("tail catalog requires dual group")
+    if c.total_sms != shape.num_sms:
+        errors.append("SM coverage mismatch")
+    counts = (
+        (c.k1_sms, c.k2_sms)
+        if c.comm_backend == "p2p_direct"
+        else (c.k1_sms, c.tx_sms, c.rx_sms, c.k2_sms)
+    )
+    if any(x < shape.sm_min_partition for x in counts):
+        errors.append("SM partition below minimum")
+    if any(x % shape.sm_partition_alignment for x in counts[:-1]):
+        errors.append("SM alignment violation")
+    if c.dispatch_warps not in (1, 2, 4):
+        errors.append("dispatch warp count")
+    if c.ready_queue_bundle not in (1, 2, 4, 8, 16):
+        errors.append("unsupported Q catalog")
+    if c.comm_backend == "p2p_direct":
+        if c.tx_sms or c.rx_sms or c.token_back_mode != "epi_warps":
+            errors.append("P2P protocol mismatch")
+    elif c.comm_backend in ("nvshmem_hybrid", "nvshmem_ibgda"):
+        if c.dispatch_warps != 4 or c.token_back_mode != "reuse_dispatch_warps":
+            errors.append("transport dispatcher reuse/progress")
+        if (
+            shape.ep_cross_numa_peer_count
+            and shape.tokens_per_rank <= 128
+            and c.combine_slots < 4
+        ):
+            errors.append("small cross-NUMA combine progress requires full window")
+    else:
+        errors.append("unsupported backend")
+    if c.rank_local_combine:
+        if (
+            c.comm_backend != "p2p_direct"
+            or c.token_back_mode != "epi_warps"
+            or shape.tensor_parallel_size != 1
+            or shape.expert_parallel_size > shape.num_topk
+            or c.k2_warps == 12
+            or c.k2_tail_reclaim
+        ):
+            errors.append("RLC layout/protocol incompatibility")
+    if c.dispatch_rank_cache and c.comm_backend != "p2p_direct":
+        errors.append("rank cache requires P2P token-strided dispatch")
+    if any(
+        getattr(c, n) <= 0
+        for n in (
+            "dispatch_chunk_tokens",
+            "combine_chunk_rows",
+            "dispatch_channels",
+            "combine_channels",
+            "dispatch_slots",
+            "combine_slots",
+            "dispatch_local_handoff_windows",
+            "dispatch_remote_handoff_windows",
+            "ibgda_rc_per_pe",
+            "tp_k3_chunks",
+        )
+    ):
+        errors.append("transport capacities must be positive")
+    if shape.tensor_parallel_size == 1 and c.tp_k3_chunks != 1:
+        errors.append("TP1 K3 chunks must equal1")
+    return tuple(errors)
+
+
+def semantic_errors(c, numerical_contract):
+    """Caller permission for BF16 association; never a speed threshold."""
+    if numerical_contract not in NUMERICAL_CONTRACTS:
+        return ("unknown numerical contract",)
+    if c.rank_local_combine and numerical_contract != "owner_bf16":
+        return ("RLC requires explicit owner_bf16 numerical permission",)
+    return ()
+
+
+def qualification_limits(shape):
+    """Performance evidence scope, deliberately separate from hardware legality."""
+    limits = []
+    if shape.num_sms != 110:
+        limits.append("uncalibrated SM count")
+    # These independent ranges cover the preregistered training/holdout matrix.
+    # They are evidence bounds, not layout illegality or model identifiers.
+    if not 1 <= shape.tokens_per_rank <= 24576:
+        limits.append("uncalibrated token range")
+    if not 2048 <= shape.hidden <= 7168:
+        limits.append("uncalibrated hidden range")
+    if not 4096 <= shape.intermediate <= 8192:
+        limits.append("uncalibrated intermediate range")
+    if not 4 <= shape.num_topk <= 8:
+        limits.append("uncalibrated top-k range")
+    if not 128 <= shape.num_total_experts <= 512:
+        limits.append("uncalibrated expert-count range")
+    if (
+        shape.expert_parallel_size != 4
+        or shape.ep_same_numa_peer_count != 3
+        or shape.ep_cross_numa_peer_count
+    ):
+        limits.append("uncalibrated EP topology")
+    if shape.tensor_parallel_size != 1 or shape.data_parallel_size != 1:
+        limits.append("uncalibrated parallel decomposition")
+    return tuple(limits)
+
+
+def _apply_overrides(c, o):
+    if o is None:
+        return c
+    updates = {k: v for k, v in vars(o).items() if v is not None}
+    sms = [k for k in ("k1_sms", "k2_sms", "tx_sms", "rx_sms") if k in updates]
+    if sms and len(sms) != 4:
+        raise ValueError("SM overrides must specify K1/K2/TX/RX together")
+    if "k2_tile" in updates or "k2_warps" in updates:
+        # A constraint on N does not also choose a warp mode or disable tail.
+        # Keep each complete proposal's unspecified fields, then filter illegal
+        # combinations in enumerate_candidates. Resource flags are derived from
+        # the resulting geometry even for a warp-only override.
+        n = updates.get("k2_tile", c.k2_tile)[1]
+        dual = updates.get("k2_warps", c.k2_warps) == 12
+        updates.update(
+            k2_natural_regs=n == 32 or dual,
+            k2_min_blocks_per_sm=2 if n == 32 or dual else 1,
+        )
+    # A redundant backend override must not reset the already-selected SM partition.
+    if updates.get("comm_backend", c.comm_backend) != c.comm_backend:
+        raise ValueError("backend override requires transport-specific fallback")
+    return replace(c, **updates)
+
+
+def _base(
+    shape, n1, n2, warps, stage, sms, q, dispatch, overlap, cache, rlc, tail, k1_stage
+):
+    return MegaMoEKernelConfig(
+        comm_backend="p2p_direct",
+        kernel_comm_backend="p2p_direct",
+        token_back_mode="epi_warps",
+        k1_tile=(64, n1, 128),
+        k2_tile=(64, n2, 128),
+        k2_stages=stage,
+        k2_warps=warps,
+        k1_sms=sms,
+        k2_sms=shape.num_sms - sms,
+        tx_sms=0,
+        rx_sms=0,
+        sm_min_partition=shape.sm_min_partition,
+        sm_partition_alignment=shape.sm_partition_alignment,
+        dispatch_chunk_tokens=64,
+        combine_chunk_rows=16,
+        dispatch_channels=2,
+        combine_channels=2,
+        dispatch_slots=2,
+        combine_slots=2,
+        combine_blocking_put=False,
+        dispatch_local_handoff_windows=1,
+        dispatch_remote_handoff_windows=1,
+        ibgda_rc_per_pe=1,
+        ibgda_rc_mapping="warp",
+        tp_k3_chunks=1,
+        dispatch_warps=dispatch,
+        dispatch_compute_overlap=overlap,
+        dispatch_rank_cache=cache,
+        rank_local_combine=rlc,
+        k1_ready_queue=True,
+        k1_ready_queue_m_rotation=0,
+        k2_ready_queue=True,
+        ready_queue_bundle=q,
+        k2_natural_regs=n2 == 32 or warps == 12,
+        k2_min_blocks_per_sm=2 if n2 == 32 or warps == 12 else 1,
+        k2_tail_reclaim=tail,
+        expected_rows_per_expert=shape.expected_rows_per_expert,
+        k1_stages=k1_stage,
+    )
+
+
+def estimate_cost(shape, c, f):
+    from .fitted_cost import COEFFICIENTS, evaluate
+
+    return Cost(*evaluate(shape, c, f, COEFFICIENTS))
+
+
+def _in_cost_domain(shape, overrides):
+    # Uncalibrated explicit stage overrides remain legal but use compatibility
+    # selection for the other fields. Catalog limits are not kernel limits.
+    if overrides and (
+        overrides.k1_stages not in (None, 2, 3)
+        or overrides.k2_stages not in (None, 2, 3)
+    ):
+        return False
+    return not qualification_limits(shape) and (
+        overrides is None or overrides.comm_backend in (None, "p2p_direct")
+    )
+
+
+def _full_profiles(shape, numerical_contract):
+    for n1, n2, warps in (
+        (16, 16, 12),
+        (32, 16, 12),
+        (32, 16, 8),
+        (32, 32, 8),
+        (64, 64, 8),
+        (128, 128, 8),
+    ):
+        for k1_stage in (2, 3):
+            for stage in ((2,) if warps == 12 else (2, 3)):
+                for sms in (72, 80, 88):
+                    for q in ((2, 4) if n2 <= 32 else (4, 8, 16)):
+                        for dispatch, overlap, cache in (
+                            (1, False, False),
+                            (1, False, True),
+                            (1, True, True),
+                            (4, False, False),
+                            (4, True, False),
+                            (4, True, True),
+                        ):
+                            for rlc in (
+                                (False, True)
+                                if numerical_contract == "owner_bf16"
+                                and warps != 12
+                                and shape.expert_parallel_size <= shape.num_topk
+                                else (False,)
+                            ):
+                                for tail in (
+                                    (False, True) if warps == 12 else (False,)
+                                ):
+                                    yield n1, n2, warps, k1_stage, stage, sms, q, dispatch, overlap, cache, rlc, tail
+
+
+def correctness_qualification_errors(shape, c):
+    # Shared-buffer repair qualified on same-NUMA EP4. Preserve the historical
+    # exclusion on the unqualified cross-NUMA combination until separately tested.
+    if (
+        shape.expert_parallel_size == 4
         and shape.tensor_parallel_size == 1
-        and shape.expert_parallel_size == 4
-        and shape.hidden == 4096
-        and shape.intermediate == 4096
-        and shape.num_topk == 6
-        and shape.num_total_experts == 256
-        and shape.tokens_per_rank <= _DUAL_N8_DECODE_MAX_TOKENS_PER_RANK
-    )
+        and shape.data_parallel_size == 1
+        and shape.num_sms == 110
+        and shape.ep_cross_numa_peer_count
+        and c.comm_backend == "p2p_direct"
+        and c.dispatch_warps == 4
+        and not c.dispatch_rank_cache
+    ):
+        return (
+            "correctness qualification: cross-NUMA dispatch4/cache-off remains unqualified",
+        )
+    return ()
 
 
-def _scale_sm_partition(
+def enumerate_candidates(
+    shape,
+    overrides=None,
     *,
-    num_sms: int,
-    reference_counts: Tuple[int, ...],
-    min_partition: int,
-    alignment: int,
-) -> Tuple[int, ...]:
-    """Scale a 110-SM preset while preserving Green Context constraints."""
-
-    if sum(reference_counts) != _REFERENCE_SM_COUNT:
-        raise ValueError(
-            f"reference partition must cover {_REFERENCE_SM_COUNT} SMs, "
-            f"got {reference_counts}"
-        )
-    if num_sms < min_partition * len(reference_counts):
-        raise ValueError(
-            f"{num_sms} SMs cannot form {len(reference_counts)} partitions "
-            f"of at least {min_partition} SMs"
-        )
-
-    aligned_minimum = (
-        (min_partition + alignment - 1) // alignment * alignment
+    numerical_contract="ordinary_topk",
+    host_expert_counts=None,
+    full_catalog=False,
+):
+    shape.validate()
+    _validate_counts(shape, host_expert_counts)
+    if numerical_contract not in NUMERICAL_CONTRACTS:
+        raise ValueError("unknown numerical contract")
+    if not _in_cost_domain(shape, overrides):
+        return ()
+    result = []
+    seen = set()
+    # Keep the complete original proposal set for ABI27. The old81-profile
+    # subset was pruned by ABI26 predictions and is not used here.
+    profiles = (
+        _full_profiles(shape, numerical_contract) if full_catalog else ALL_PROFILES
     )
-    targets = tuple(
-        num_sms * count / _REFERENCE_SM_COUNT
-        for count in reference_counts
+    for (
+        n1,
+        n2,
+        warps,
+        k1_stage,
+        stage,
+        sms,
+        q,
+        dispatch,
+        overlap,
+        cache,
+        rlc,
+        tail,
+    ) in profiles:
+        if rlc and numerical_contract != "owner_bf16":
+            continue
+        c = _base(
+            shape,
+            n1,
+            n2,
+            warps,
+            stage,
+            sms,
+            q,
+            dispatch,
+            overlap,
+            cache,
+            rlc,
+            tail,
+            k1_stage,
+        )
+        c = _apply_overrides(c, overrides)
+        if c in seen:
+            continue
+        seen.add(c)
+        if (
+            legality_errors(shape, c)
+            or semantic_errors(c, numerical_contract)
+            or correctness_qualification_errors(shape, c)
+        ):
+            continue
+        f = derive_features(shape, c, host_expert_counts)
+        if (
+            f.k1_smem_estimate > 99 * 1024
+            or f.k2_smem_estimate > 99 * 1024 / c.k2_min_blocks_per_sm
+        ):
+            continue
+        result.append(Candidate(c, f, estimate_cost(shape, c, f)))
+    if not result:
+        raise ValueError(
+            "no candidate satisfies overrides, numerical/legality constraints and correctness qualification"
+        )
+    return tuple(sorted(result, key=lambda x: x.cost.total_us))
+
+
+def _policy_context():
+    """Explicit policy dependencies; no module lookup or import side effects."""
+    from .policy_context import PolicyContext
+
+    return PolicyContext(
+        derive_features=derive_features,
+        legality_errors=legality_errors,
+        semantic_errors=semantic_errors,
+        correctness_qualification_errors=correctness_qualification_errors,
     )
-    counts = []
-    for target in targets[:-1]:
-        units = int(target / alignment + 0.5)
-        counts.append(max(aligned_minimum, units * alignment))
 
-    remainder = num_sms - sum(counts)
-    while remainder < min_partition:
-        candidates = [
-            index
-            for index, count in enumerate(counts)
-            if count - alignment >= aligned_minimum
-        ]
-        if not candidates:
-            raise ValueError(
-                f"cannot align partition {reference_counts} to {num_sms} SMs"
-            )
-        # Choose the adjustment with the smallest increase in ratio error.
-        index = min(
-            candidates,
-            key=lambda candidate: (
-                abs(counts[candidate] - alignment - targets[candidate])
-                - abs(counts[candidate] - targets[candidate])
-            ),
+
+@lru_cache(maxsize=256)
+def _select_cached(shape, overrides, numerical_contract, host_expert_counts):
+    choices = enumerate_candidates(
+        shape,
+        overrides,
+        numerical_contract=numerical_contract,
+        host_expert_counts=host_expert_counts,
+    )
+    if choices:
+        from .robust_policy import select
+
+        return select(
+            _policy_context(),
+            shape,
+            choices[0].config,
+            overrides,
+            numerical_contract,
+            host_expert_counts,
+        )[0]
+    return select_compatibility_config(
+        shape, overrides, numerical_contract=numerical_contract
+    )
+
+
+def select_compatibility_config(
+    shape, overrides=None, *, numerical_contract="ordinary_topk"
+):
+    # Frozen compatibility path; never represent this as a generalized cost result.
+    shape.validate()
+    if numerical_contract not in NUMERICAL_CONTRACTS:
+        raise ValueError("unknown numerical contract")
+    if numerical_contract == "ordinary_topk":
+        if overrides and overrides.rank_local_combine:
+            raise ValueError("RLC requires explicit owner_bf16 numerical permission")
+    legacy_o = (
+        _LegacyOverrides(
+            **{k: v for k, v in vars(overrides).items() if k != "k1_stages"}
         )
-        counts[index] -= alignment
-        remainder += alignment
-
-    return (*counts, remainder)
-
-@dataclass(frozen=True)
-class MegaMoEHeuristicInput:
-    """Runtime shape, parallel decomposition, and EP-group topology."""
-
-    tokens_per_rank: int
-    hidden: int
-    intermediate: int
-    num_topk: int
-    num_total_experts: int
-    data_parallel_size: int
-    tensor_parallel_size: int
-    expert_parallel_size: int
-    ep_same_numa_peer_count: int
-    ep_cross_numa_peer_count: int
-    num_sms: int
-    sm_min_partition: int
-    sm_partition_alignment: int
-
-    @property
-    def expected_rows_per_expert(self) -> float:
-        return (
-            self.tokens_per_rank
-            * self.expert_parallel_size
-            * self.num_topk
-            / self.num_total_experts
+        if overrides
+        else None
+    )
+    base = _legacy(shape, legacy_o)
+    if numerical_contract == "ordinary_topk" and base.rank_local_combine:
+        base = _legacy(
+            shape, replace(legacy_o or _LegacyOverrides(), rank_local_combine=False)
         )
-
-    @property
-    def expected_combine_bytes_per_peer(self) -> float:
-        """Uniform-route estimate of BF16 FC2 bytes returned to one peer."""
-
-        return (
-            self.tokens_per_rank
-            * self.num_topk
-            / self.expert_parallel_size
-            * self.hidden
-            * 2
-        )
-
-    @property
-    def probability_one_owner_is_untouched(self) -> float:
-        """Uniform-route probability that top-k selects no expert on one owner."""
-
-        experts_per_owner = self.num_total_experts // self.expert_parallel_size
-        experts_outside_owner = self.num_total_experts - experts_per_owner
-        if self.num_topk > experts_outside_owner:
-            return 0.0
-        probability = 1.0
-        for index in range(self.num_topk):
-            probability *= (experts_outside_owner - index) / (
-                self.num_total_experts - index
-            )
-        return probability
-
-    @property
-    def expected_remote_route_rows(self) -> float:
-        return (
-            self.tokens_per_rank
-            * self.num_topk
-            * (self.expert_parallel_size - 1)
-            / self.expert_parallel_size
-        )
-
-    @property
-    def expected_duplicate_remote_owner_rows(self) -> float:
-        unique_remote_owner_rows = (
-            self.tokens_per_rank
-            * (self.expert_parallel_size - 1)
-            * (1.0 - self.probability_one_owner_is_untouched)
-        )
-        return max(self.expected_remote_route_rows - unique_remote_owner_rows, 0.0)
-
-    @property
-    def expected_dispatch_rank_cache_saved_bytes(self) -> float:
-        activation_row_bytes = (self.hidden + 1) // 2
-        scale_row_bytes = (self.hidden + 15) // 16
-        return self.expected_duplicate_remote_owner_rows * (
-            activation_row_bytes + scale_row_bytes
-        )
-
-    @property
-    def expected_dispatch_rank_cache_saved_fraction(self) -> float:
-        if self.expected_remote_route_rows == 0:
-            return 0.0
-        return self.expected_duplicate_remote_owner_rows / self.expected_remote_route_rows
-
-    def validate(self) -> None:
-        positive = {
-            "tokens_per_rank": self.tokens_per_rank,
-            "hidden": self.hidden,
-            "intermediate": self.intermediate,
-            "num_topk": self.num_topk,
-            "num_total_experts": self.num_total_experts,
-            "data_parallel_size": self.data_parallel_size,
-            "tensor_parallel_size": self.tensor_parallel_size,
-            "expert_parallel_size": self.expert_parallel_size,
-            "num_sms": self.num_sms,
-            "sm_min_partition": self.sm_min_partition,
-            "sm_partition_alignment": self.sm_partition_alignment,
-        }
-        invalid = {name: value for name, value in positive.items() if value <= 0}
-        if invalid:
-            raise ValueError(f"heuristic inputs must be positive, got {invalid}")
-        if self.num_total_experts % self.expert_parallel_size:
-            raise ValueError(
-                "num_total_experts must be divisible by expert_parallel_size"
-            )
-        if self.num_topk > self.num_total_experts:
-            raise ValueError("num_topk must not exceed num_total_experts")
-        if self.ep_same_numa_peer_count < 0 or self.ep_cross_numa_peer_count < 0:
-            raise ValueError("EP peer counts must be non-negative")
-        if (
-            self.ep_same_numa_peer_count
-            + self.ep_cross_numa_peer_count
-            != self.expert_parallel_size - 1
-        ):
-            raise ValueError(
-                "same-NUMA and cross-NUMA peers must describe the complete "
-                "remote EP group"
-            )
-        if self.num_sms < 2 * self.sm_min_partition:
-            raise ValueError(
-                f"{self.num_sms} SMs cannot form two Green Context "
-                f"partitions of at least {self.sm_min_partition} SMs"
-            )
-
-
-@dataclass(frozen=True)
-class MegaMoEHeuristicOverrides:
-    """Benchmark-only explicit overrides; ``None`` means use the heuristic."""
-
-    comm_backend: Optional[str] = None
-    token_back_mode: Optional[str] = None
-    k1_tile: Optional[Tile] = None
-    k2_tile: Optional[Tile] = None
-    k2_stages: Optional[int] = None
-    k2_warps: Optional[int] = None
-    k2_tail_reclaim: Optional[bool] = None
-    k1_sms: Optional[int] = None
-    k2_sms: Optional[int] = None
-    tx_sms: Optional[int] = None
-    rx_sms: Optional[int] = None
-    ready_queue_bundle: Optional[int] = None
-    dispatch_chunk_tokens: Optional[int] = None
-    combine_chunk_rows: Optional[int] = None
-    dispatch_channels: Optional[int] = None
-    combine_channels: Optional[int] = None
-    dispatch_slots: Optional[int] = None
-    combine_slots: Optional[int] = None
-    combine_blocking_put: Optional[bool] = None
-    dispatch_local_handoff_windows: Optional[int] = None
-    dispatch_remote_handoff_windows: Optional[int] = None
-    ibgda_rc_per_pe: Optional[int] = None
-    ibgda_rc_mapping: Optional[str] = None
-    tp_k3_chunks: Optional[int] = None
-    dispatch_warps: Optional[int] = None
-    dispatch_compute_overlap: Optional[bool] = None
-    dispatch_rank_cache: Optional[bool] = None
-    rank_local_combine: Optional[bool] = None
-
-
-@dataclass(frozen=True)
-class MegaMoEKernelConfig:
-    """One fully resolved JIT/launch/transport configuration."""
-
-    comm_backend: str
-    kernel_comm_backend: str
-    token_back_mode: str
-
-    k1_tile: Tile
-    k2_tile: Tile
-    k2_stages: int
-    k2_warps: int
-
-    k1_sms: int
-    k2_sms: int
-    tx_sms: int
-    rx_sms: int
-    sm_min_partition: int
-    sm_partition_alignment: int
-
-    dispatch_chunk_tokens: int
-    combine_chunk_rows: int
-    dispatch_channels: int
-    combine_channels: int
-    dispatch_slots: int
-    combine_slots: int
-    combine_blocking_put: bool
-    dispatch_local_handoff_windows: int
-    dispatch_remote_handoff_windows: int
-    ibgda_rc_per_pe: int
-    ibgda_rc_mapping: str
-    tp_k3_chunks: int
-
-    dispatch_pull_mode: str
-    dispatch_warps: int
-    dispatch_warps_per_tile: int
-    dispatch_compute_overlap: bool
-    dispatch_rank_cache: bool
-    rank_local_combine: bool
-    k1_ready_queue: bool
-    k1_ready_queue_m_rotation: int
-    k2_ready_queue: bool
-    ready_queue_bundle: int
-    k2_natural_regs: bool
-    k2_min_blocks_per_sm: int
-    k2_tail_reclaim: bool
-
-    expected_rows_per_expert: float
-
-    @property
-    def total_sms(self) -> int:
-        return self.k1_sms + self.k2_sms + self.tx_sms + self.rx_sms
-
-    def with_overrides(
-        self, overrides: MegaMoEHeuristicOverrides
-    ) -> "MegaMoEKernelConfig":
-        updates = {
-            name: value
-            for name, value in vars(overrides).items()
-            if value is not None
-        }
-        if not updates:
-            return self
-        if (
-            overrides.dispatch_warps is not None
-            and overrides.dispatch_warps not in (1, 2, 4)
-        ):
-            raise ValueError(
-                "dispatch_warps must be one of 1/2/4, got "
-                f"{overrides.dispatch_warps}"
-            )
-        sm_names = ("k1_sms", "k2_sms", "tx_sms", "rx_sms")
-        provided_sms = [name for name in sm_names if name in updates]
-        if provided_sms and len(provided_sms) != len(sm_names):
-            raise ValueError(
-                "K1/K2/TX/RX SM overrides form one transport preset; "
-                f"provide all four, got {provided_sms}"
-            )
-
-        deferred = {
-            "comm_backend",
-            "token_back_mode",
-            *sm_names,
-        }
-        config = replace(
-            self,
-            **{name: value for name, value in updates.items() if name not in deferred},
-        )
-        if overrides.k2_tile is not None:
-            token_n = config.k2_tile[1]
-            config = replace(
-                config,
-                k2_stages=(
-                    overrides.k2_stages
-                    if overrides.k2_stages is not None
-                    else (
-                        3
-                        if (
-                            token_n == 64
-                            or (
-                                token_n == 128
-                                and config.expected_rows_per_expert <= 512.0
-                            )
-                        )
-                        else 2
-                    )
-                ),
-                k2_natural_regs=(token_n == 32),
-                k2_min_blocks_per_sm=2 if token_n == 32 else 1,
-            )
-            if overrides.k2_warps is None:
-                config = replace(config, k2_warps=8)
-            if overrides.k2_tail_reclaim is None:
-                config = replace(config, k2_tail_reclaim=False)
-        if (
-            overrides.k2_warps is not None
-            and overrides.k2_warps != 12
-            and overrides.k2_tail_reclaim is None
-        ):
-            config = replace(config, k2_tail_reclaim=False)
-
-        backend = overrides.comm_backend or config.comm_backend
-        if backend == "p2p_direct":
-            reference = (
-                _LOCAL_DECODE_SM_PARTITION
-                if config.k2_tile[1] == 16
-                else (
-                    _LOCAL_N64_SM_PARTITION
-                    if config.k2_tile[1] == 64
-                    else _LOCAL_DEFAULT_SM_PARTITION
-                )
-            )
-            k1_sms, k2_sms = _scale_sm_partition(
-                num_sms=config.total_sms,
-                reference_counts=reference,
-                min_partition=config.sm_min_partition,
-                alignment=config.sm_partition_alignment,
-            )
-            config = replace(
-                config,
-                comm_backend=backend,
-                kernel_comm_backend="p2p_direct",
-                token_back_mode="epi_warps",
-                k1_sms=k1_sms,
-                k2_sms=k2_sms,
-                tx_sms=0,
-                rx_sms=0,
-            )
-        elif backend in ("nvshmem_hybrid", "nvshmem_ibgda"):
-            k1_sms, tx_sms, rx_sms, k2_sms = _scale_sm_partition(
-                num_sms=config.total_sms,
-                reference_counts=_HYBRID_SM_PARTITION,
-                min_partition=config.sm_min_partition,
-                alignment=config.sm_partition_alignment,
-            )
-            config = replace(
-                config,
-                comm_backend=backend,
-                kernel_comm_backend="nvshmem_ibgda",
-                token_back_mode="reuse_dispatch_warps",
-                k1_sms=k1_sms,
-                k2_sms=k2_sms,
-                tx_sms=tx_sms,
-                rx_sms=rx_sms,
-            )
-        else:
-            raise ValueError(f"unsupported comm backend {backend!r}")
-
-        required_token_back = (
-            "epi_warps" if backend == "p2p_direct" else "reuse_dispatch_warps"
-        )
-        if (
-            overrides.token_back_mode is not None
-            and overrides.token_back_mode != required_token_back
-        ):
-            raise ValueError(
-                f"comm backend {backend!r} requires token_back_mode "
-                f"{required_token_back!r}, got {overrides.token_back_mode!r}"
-            )
-        if provided_sms:
-            config = replace(
-                config,
-                **{name: updates[name] for name in sm_names},
-            )
-        return config
+    c = MegaMoEKernelConfig(
+        **vars(base), k1_stages=overrides.k1_stages if overrides else None
+    )
+    errors = (
+        legality_errors(shape, c)
+        + semantic_errors(c, numerical_contract)
+        + correctness_qualification_errors(shape, c)
+    )
+    if errors:
+        raise ValueError("; ".join(errors))
+    return c
 
 
 def select_megamoe_config(
-    shape: MegaMoEHeuristicInput,
-    overrides: Optional[MegaMoEHeuristicOverrides] = None,
-) -> MegaMoEKernelConfig:
-    """Select exactly one SM120 configuration without autotuning."""
+    shape,
+    overrides=None,
+    *,
+    numerical_contract="ordinary_topk",
+    host_expert_counts=None,
+):
+    """Return a complete config. Callers must explicitly permit owner BF16 order."""
+    _validate_counts(shape, host_expert_counts)
+    return _select_cached(shape, overrides, numerical_contract, host_expert_counts)
 
-    shape.validate()
-    rows = shape.expected_rows_per_expert
-    # Offline RTX Pro 5000 scan: N32 wins through 28 rows/expert, N64
-    # wins from 30 through 63, and N128 wins at 64 and above.
-    if rows < 30.0:
-        k1_token_n = 32
-    elif rows < 64.0:
-        k1_token_n = 64
-    else:
-        k1_token_n = 128
 
-    cross_numa = shape.ep_cross_numa_peer_count > 0
-    # The measured DSV4 EP4 128-token point is 10% faster with N32 K2 and
-    # the balanced 72/38 partition than with the generic local-decode N16
-    # preset. Keep this narrow until neighboring wide-hidden buckets have
-    # their own controlled sweep.
-    dsv4_ep4_t128_n32 = (
-        not cross_numa
-        and shape.tokens_per_rank == 128
-        and shape.hidden == 7168
-        and shape.intermediate == 6144
-        and shape.num_topk == 6
-        and shape.num_total_experts == 384
-        and shape.data_parallel_size == 1
-        and shape.tensor_parallel_size == 1
-        and shape.expert_parallel_size == 4
+def explain_selection(
+    shape,
+    overrides=None,
+    *,
+    numerical_contract="ordinary_topk",
+    host_expert_counts=None,
+):
+    selected = select_megamoe_config(
+        shape,
+        overrides,
+        numerical_contract=numerical_contract,
+        host_expert_counts=host_expert_counts,
     )
-    local_decode = (
-        not cross_numa
-        and rows <= _LOCAL_DECODE_MAX_ROWS_PER_EXPERT
-        and not dsv4_ep4_t128_n32
+    choices = enumerate_candidates(
+        shape,
+        overrides,
+        numerical_contract=numerical_contract,
+        host_expert_counts=host_expert_counts,
     )
-    # The dual-N8 path is enabled only for the exact four-rank DSV4-flash
-    # envelope covered by balanced, power-law, concentrated and empty-rank
-    # graph/eager replay tests. Other shapes retain the single-N16 path.
-    dual_n8_decode = _is_validated_dual_n8_decode(shape)
-    k2_token_n = 16 if local_decode else k1_token_n
-    k1_tile = (64, k1_token_n, 128)
-    k2_tile = (64, k2_token_n, 128)
+    from .fitted_cost import describe_rlc_path, describe_service
+    from .robust_policy import select as select_robust
 
-    if cross_numa:
-        # The RTX Pro 5000 cross-NUMA scan selected 48/16/16/30. Preserve
-        # those proportions on other SM120 devices and align explicit groups
-        # to the device's Green Context co-schedule granularity.
-        comm_backend = "nvshmem_hybrid"
-        kernel_comm_backend = "nvshmem_ibgda"
-        k1_sms, tx_sms, rx_sms, k2_sms = _scale_sm_partition(
-            num_sms=shape.num_sms,
-            reference_counts=_HYBRID_SM_PARTITION,
-            min_partition=shape.sm_min_partition,
-            alignment=shape.sm_partition_alignment,
-        )
-    else:
-        comm_backend = "p2p_direct"
-        kernel_comm_backend = "p2p_direct"
-        # N64 needs more K1 waves on this kernel; N32/N128 are balanced by the
-        # measured 72/38 split.  This depends on the selected tile, not DP.
-        reference = (
-            _LOCAL_DECODE_SM_PARTITION
-            if local_decode
-            else (
-                _LOCAL_N64_SM_PARTITION
-                if k2_token_n == 64
-                else _LOCAL_DEFAULT_SM_PARTITION
+    return dict(
+        model_version=MODEL_VERSION,
+        catalog_version=CATALOG_VERSION,
+        numerical_contract=numerical_contract,
+        rlc_path_features=describe_rlc_path(
+            shape, selected, derive_features(shape, selected, host_expert_counts)
+        ),
+        service_features=(
+            describe_service(
+                shape, selected, derive_features(shape, selected, host_expert_counts)
             )
-        )
-        k1_sms, k2_sms = _scale_sm_partition(
-            num_sms=shape.num_sms,
-            reference_counts=reference,
-            min_partition=shape.sm_min_partition,
-            alignment=shape.sm_partition_alignment,
-        )
-        tx_sms, rx_sms = 0, 0
-
-    # A dispatch row contains packed E2M1 activations, one E4M3 scale per 16
-    # elements, and FP32 top-k weights.  Keeping a cross-NUMA IBGDA operation
-    # below roughly 384 KiB avoids the wide-hidden head-of-line stalls seen on
-    # RTX Pro 5000.  The 512--1024-token band also benefits from a 32-row
-    # first handoff even when a 64-row payload fits the byte limit; above that
-    # band the extra operations outweigh the earlier first tile.
-    dispatch_bytes_per_token = (
-        (shape.hidden + 1) // 2
-        + (shape.hidden + 15) // 16
-        + shape.num_topk * 4
-    )
-    dispatch_chunk_tokens = (
-        32
-        if (
-            cross_numa
-            and (
-                512 <= shape.tokens_per_rank <= 1024
-                or (
-                    shape.tokens_per_rank >= 128
-                    and dispatch_bytes_per_token * 64
-                    > _DISPATCH_MAX_IBGDA_CHUNK_BYTES
-                )
+            if choices
+            else dict(
+                applicable=False,
+                reason="compatibility fallback outside calibrated cost domain",
             )
-        )
-        else 64
-    )
-    dispatch_channels = 2
-    combine_channels = 2
-    dispatch_slots = 2
-    # The EP8 128-token shape produces roughly three combine chunks per
-    # peer/channel.  Keeping only two cyclic slots makes the producer wait for
-    # an in-epoch credit while its peer is still completing the reciprocal
-    # channel, which can form a cross-NUMA progress cycle.  Four slots cover
-    # the complete small-message window; terminal ACKs still retire the epoch
-    # before the next replay can reuse it.  Larger shapes stay on the measured
-    # two-slot fast path so their streaming reuse distance is unchanged.
-    combine_slots = (
-        4
-        if cross_numa and shape.tokens_per_rank <= 128
-        else 2
-    )
-    combine_chunk_rows = 16
-    combine_blocking_put = (
-        cross_numa
-        and shape.expected_combine_bytes_per_peer
-        >= _COMBINE_BLOCKING_PUT_BYTES_PER_PEER
-        and combine_chunk_rows * shape.hidden * 2
-        <= _COMBINE_BLOCKING_PUT_MAX_CHUNK_BYTES
-    )
-    remote_handoff_windows = 2 if cross_numa else 1
-
-    # Keep the four-warp physical group for setmaxnreg and kernel-tail
-    # rendezvous, but activate only one warp for small same-NUMA dispatches.
-    # Each routed row carries one packed NVFP4 activation, its per-16 scale,
-    # and one FP32 top-k weight.  Cross-NUMA transport continues to use all
-    # four warps because those warps are also reused by the combine sender.
-    dispatch_row_bytes = (
-        (shape.hidden + 1) // 2
-        + (shape.hidden + 15) // 16
-        + 4
-    )
-    expected_remote_dispatch_rows = (
-        shape.tokens_per_rank
-        * shape.num_topk
-        * shape.ep_same_numa_peer_count
-    )
-    remote_dispatch_bytes_per_k1_cta = (
-        expected_remote_dispatch_rows * dispatch_row_bytes / k1_sms
-    )
-    dispatch_warps = (
-        1
-        if (
-            not cross_numa
-            and shape.hidden <= _SINGLE_DISPATCH_WARP_MAX_HIDDEN
-            and shape.num_total_experts <= _SINGLE_DISPATCH_WARP_MAX_EXPERTS
-            and shape.num_topk <= _SINGLE_DISPATCH_WARP_MAX_TOPK
-            and remote_dispatch_bytes_per_k1_cta
-            <= _SINGLE_DISPATCH_WARP_MAX_REMOTE_BYTES_PER_K1_CTA
-        )
-        else 4
-    )
-
-    dispatch_rank_cache = (
-        not cross_numa
-        and shape.expert_parallel_size == 4
-        and shape.ep_same_numa_peer_count == 3
-        and shape.tensor_parallel_size == 1
-        and shape.expected_dispatch_rank_cache_saved_bytes
-        >= _DISPATCH_RANK_CACHE_MIN_SAVED_BYTES
-        and shape.expected_dispatch_rank_cache_saved_fraction
-        >= _DISPATCH_RANK_CACHE_MIN_SAVED_FRACTION
-    )
-
-    rank_local_combine = (
-        not cross_numa
-        and shape.expert_parallel_size == 4
-        and shape.ep_same_numa_peer_count == 3
-        and shape.tensor_parallel_size == 1
-        and shape.expert_parallel_size <= shape.num_topk
-        and dispatch_rank_cache
-        and rows >= _RANK_LOCAL_COMBINE_MIN_ROWS_PER_EXPERT
-    )
-
-    # Except for the bounded small-message window above, keep production on
-    # the shallow two-slot fast path. Fixed peer/channel CTA ownership and
-    # independent terminal credits provide forward progress without growing
-    # the reuse distance of wide DSV4 rows.
-
-    config = MegaMoEKernelConfig(
-        comm_backend=comm_backend,
-        kernel_comm_backend=kernel_comm_backend,
-        token_back_mode=(
-            "reuse_dispatch_warps" if cross_numa else "epi_warps"
         ),
-        k1_tile=k1_tile,
-        k2_tile=k2_tile,
-        k2_stages=(
-            3
-            if k2_token_n == 64
-            or (k2_token_n == 128 and rows <= 512.0)
-            else 2
+        route_statistics=(
+            "caller_host_counts"
+            if host_expert_counts is not None
+            else "uniform_poisson_estimate"
         ),
-        k2_warps=12 if dual_n8_decode else 8,
-        k1_sms=k1_sms,
-        k2_sms=k2_sms,
-        tx_sms=tx_sms,
-        rx_sms=rx_sms,
-        sm_min_partition=shape.sm_min_partition,
-        sm_partition_alignment=shape.sm_partition_alignment,
-        dispatch_chunk_tokens=dispatch_chunk_tokens,
-        combine_chunk_rows=combine_chunk_rows,
-        dispatch_channels=dispatch_channels,
-        combine_channels=combine_channels,
-        dispatch_slots=dispatch_slots,
-        combine_slots=combine_slots,
-        combine_blocking_put=combine_blocking_put,
-        # Same-NUMA P2P hands off after one window; cross-NUMA IBGDA after
-        # two. This early epoch is independent of terminal slot ACK/credit.
-        dispatch_local_handoff_windows=1,
-        dispatch_remote_handoff_windows=remote_handoff_windows,
-        ibgda_rc_per_pe=1,
-        ibgda_rc_mapping="warp",
-        tp_k3_chunks=(
-            8
-            if shape.tensor_parallel_size == 2
-            and shape.tokens_per_rank >= 8192
-            else 1
+        communication_statistics="estimated_owner_probability_and_traffic",
+        mode="route_robust_policy" if choices else "legacy_compatibility_fallback",
+        candidate_count=len(choices),
+        robust_policy=(
+            select_robust(
+                _policy_context(),
+                shape,
+                choices[0].config,
+                overrides,
+                numerical_contract,
+                host_expert_counts,
+            )[1]
+            if choices
+            else None
         ),
-        dispatch_pull_mode="token_strided",
-        dispatch_warps=dispatch_warps,
-        dispatch_warps_per_tile=8,
-        dispatch_compute_overlap=shape.tokens_per_rank >= 1024,
-        dispatch_rank_cache=dispatch_rank_cache,
-        # This changes BF16 association order: contributions are first
-        # accumulated within each owner rank, rounded to BF16, and then
-        # reduced across owners. The conservative rows threshold keeps auto
-        # selection outside route-sensitive small-input buckets; callers can
-        # still force either semantic path through the explicit override.
-        rank_local_combine=rank_local_combine,
-        k1_ready_queue=True,
-        # Keep the production selector independent of DP layout.  The old
-        # DP-only queue rotation was an experiment, not a portable heuristic.
-        k1_ready_queue_m_rotation=0,
-        k2_ready_queue=True,
-        # Very short expert waves need finer-grained K2 distribution; larger
-        # waves amortize queue traffic with wider hidden-tile bundles.
-        ready_queue_bundle=(
-            2
-            if local_decode
-            else 4 if rows <= 128.0 else 8 if rows <= 512.0 else 16
+        qualification_limits=qualification_limits(shape),
+        selected=asdict(selected),
+        alternatives=[asdict(x) for x in choices[:8]],
+        fixed_build=dict(
+            k1_stages=selected.k1_stages or "legacy kernel default",
+            scheduler_stages=2,
+            fc2_ready_bundle_k_tiles=12,
+            k2_token_stripe=2,
+            flag_batch=4,
+            epi_flag_batch=(1, 1),
+            cluster=(1, 1, 1),
         ),
-        k2_natural_regs=(k2_token_n == 32 or dual_n8_decode),
-        k2_min_blocks_per_sm=(
-            2 if k2_token_n == 32 or dual_n8_decode else 1
-        ),
-        # Reclaim is neutral for balanced/power-law routing but shortens the
-        # concentrated slow-rank tail. Bucket 7/16 avoid the extra launch.
-        k2_tail_reclaim=(
-            dual_n8_decode
-            and shape.tokens_per_rank >= _TAIL_RECLAIM_MIN_TOKENS_PER_RANK
-        ),
-        expected_rows_per_expert=rows,
+        qualification="experimental; performance/compiled resources require offline validation",
     )
-    if overrides is not None:
-        config = config.with_overrides(overrides)
-    if (
-        config.comm_backend != "p2p_direct"
-        and (overrides is None or overrides.rank_local_combine is None)
-    ):
-        # A transport override can move an otherwise eligible EP4 shape onto
-        # IBGDA. Auto mode follows the resolved backend; explicit ``on`` is
-        # intentionally rejected by the validation below.
-        config = replace(config, rank_local_combine=False)
-    explicit_dispatch_warps = (
-        overrides is not None and overrides.dispatch_warps is not None
-    )
-    explicit_k2_stages = (
-        overrides is not None and overrides.k2_stages is not None
-    )
-    if config.rank_local_combine:
-        # With token-back traffic grouped per owner, the measured critical
-        # path shifts back to K1/K2. One logical dispatcher is sufficient
-        # when rank caching is active, and N128 K2 benefits from stage3.
-        if (
-            not explicit_dispatch_warps
-            and config.dispatch_rank_cache
-            and config.comm_backend == "p2p_direct"
-        ):
-            config = replace(config, dispatch_warps=1)
-        if not explicit_k2_stages and config.k2_tile[1] == 128:
-            config = replace(config, k2_stages=3)
-    if config.total_sms != shape.num_sms:
-        raise ValueError(
-            "resolved SM partitions must cover all device SMs: "
-            f"K1={config.k1_sms}, K2={config.k2_sms}, "
-            f"TX={config.tx_sms}, RX={config.rx_sms}, "
-            f"total={config.total_sms}, expected={shape.num_sms}"
-        )
-    if config.tp_k3_chunks <= 0:
-        raise ValueError("tp_k3_chunks must be positive")
-    if config.dispatch_warps not in (1, 2, 4):
-        raise ValueError("dispatch_warps must be one of 1/2/4")
-    if config.comm_backend != "p2p_direct" and config.dispatch_warps != 4:
-        raise ValueError(
-            "reduced dispatch_warps is currently validated only for "
-            "same-NUMA p2p_direct"
-        )
-    if config.rank_local_combine:
-        if config.comm_backend != "p2p_direct":
-            raise ValueError("rank_local_combine requires p2p_direct")
-        if config.token_back_mode != "epi_warps":
-            raise ValueError("rank_local_combine requires epi_warps token-back")
-        if shape.expert_parallel_size > shape.num_topk:
-            raise ValueError(
-                "rank_local_combine requires expert_parallel_size <= num_topk"
-            )
-        if shape.tensor_parallel_size != 1:
-            raise ValueError("rank_local_combine is currently validated only for TP1")
-        if config.k2_tail_reclaim or config.k2_warps == 12:
-            raise ValueError(
-                "rank_local_combine is not compatible with experimental K2 tail paths"
-            )
-    if config.dispatch_local_handoff_windows <= 0:
-        raise ValueError("dispatch_local_handoff_windows must be positive")
-    if config.dispatch_remote_handoff_windows <= 0:
-        raise ValueError("dispatch_remote_handoff_windows must be positive")
-    if shape.tensor_parallel_size == 1 and config.tp_k3_chunks != 1:
-        raise ValueError("TP1 requires tp_k3_chunks=1")
-    return config
 
 
 __all__ = [
@@ -819,4 +752,11 @@ __all__ = [
     "MegaMoEHeuristicOverrides",
     "MegaMoEKernelConfig",
     "select_megamoe_config",
+    "enumerate_candidates",
+    "derive_features",
+    "legality_errors",
+    "semantic_errors",
+    "qualification_limits",
+    "explain_selection",
+    "select_compatibility_config",
 ]

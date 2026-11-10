@@ -1,3 +1,4 @@
+import functools
 from enum import IntEnum
 
 import torch
@@ -8,10 +9,19 @@ from cutlass.cute.nvgpu import warp, warpgroup, cpasync
 from ...utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
-from .custom_compile_cache import KeyedCompileMixin, cached_compile
+from .custom_compile_cache import KeyedCompileMixin, cached_compile, get_cached_compile
 from .collective_inverse_hmma import CollectiveInverse
-from .helpers import SM90, round_down, select_tensor_10
+from .helpers import SM90, round_down, select_tensor_10, state_dtype_to_cutlass
 from .schedule import WorkDesc
+from .varlen_helper import (
+    check_checkpoint_key_range,
+    check_slot_args,
+    checkpoint_row_align,
+    is_integer_dtype,
+)
+
+
+_SM90_COMPILE_OPTIONS = (cute.EnableTVMFFI(True), cute.GPUArch("sm_90a"))
 
 
 # ─── Named-barrier IDs used by the compute kernel ────────────────────────────
@@ -125,6 +135,22 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         needs_checkpointing: bool,
         dtype: type[cutlass.Numeric] = cutlass.Float16,
         acc_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        initial_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        checkpoint_state_dtype: type[cutlass.Numeric] = cutlass.Float32,
+        use_state_indices: bool = False,
+        cu_seqlens_dtype: torch.dtype = torch.int64,
+        state_indices_dtype: torch.dtype | None = None,
+        checkpoint_cu_starts_dtype: torch.dtype | None = None,
+        state_inner_strides: tuple[int, ...] | None = None,
+        init_state_inner_strides: tuple[int, ...] | None = None,
+        use_output_state_indices: bool = False,
+        use_checkpoint_state_indices: bool = False,
+        use_prefix_lens: bool = False,
+        output_state_indices_dtype: torch.dtype | None = None,
+        checkpoint_state_indices_dtype: torch.dtype | None = None,
+        prefix_lens_dtype: torch.dtype | None = None,
+        checkpoint_row_align: int | None = None,
     ):
         self.needs_alpha = needs_alpha
         self.needs_beta = needs_beta
@@ -132,6 +158,34 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         self.needs_checkpointing = needs_checkpointing
         self.dtype = dtype
         self.acc_dtype = acc_dtype
+        self.initial_state_dtype = initial_state_dtype
+        self.state_dtype = state_dtype
+        self.checkpoint_state_dtype = checkpoint_state_dtype
+        self.use_state_indices = use_state_indices
+        self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.state_indices_dtype = state_indices_dtype
+        self.checkpoint_cu_starts_dtype = checkpoint_cu_starts_dtype
+        self.state_inner_strides = state_inner_strides
+        self.init_state_inner_strides = init_state_inner_strides
+        # Slot addressing (paged recurrent state). Each flag gates its own code
+        # path, so calls without these arguments compile to the same kernel.
+        # output_state_indices: final state to its own row (< 0: skipped).
+        # checkpoint_state_indices: checkpoints to pool rows (< 0: skipped).
+        # prefix_lens: absolute checkpoint positions; an unaligned prefix is
+        # processed from its 64-aligned position (virtual left padding).
+        # With any of them, a negative read row starts from the zero state.
+        self.use_output_state_indices = use_output_state_indices
+        self.use_checkpoint_state_indices = use_checkpoint_state_indices
+        self.use_prefix_lens = use_prefix_lens
+        self.output_state_indices_dtype = output_state_indices_dtype
+        self.checkpoint_state_indices_dtype = checkpoint_state_indices_dtype
+        self.prefix_lens_dtype = prefix_lens_dtype
+        # Alignment in elements of the checkpoint pool rows (see
+        # checkpoint_row_align); None without checkpoint_state_indices.
+        self.checkpoint_row_align = checkpoint_row_align
+        self.slot_mode = (
+            use_output_state_indices or use_checkpoint_state_indices or use_prefix_lens
+        )
         self.inverse_dtype = cutlass.Float16
         self.BLK_Q = 64
         self.BLK_KV = 64
@@ -150,6 +204,22 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             "needs_checkpointing",
             "dtype",
             "acc_dtype",
+            "initial_state_dtype",
+            "state_dtype",
+            "checkpoint_state_dtype",
+            "use_state_indices",
+            "cu_seqlens_dtype",
+            "state_indices_dtype",
+            "checkpoint_cu_starts_dtype",
+            "state_inner_strides",
+            "init_state_inner_strides",
+            "use_output_state_indices",
+            "use_checkpoint_state_indices",
+            "use_prefix_lens",
+            "output_state_indices_dtype",
+            "checkpoint_state_indices_dtype",
+            "prefix_lens_dtype",
+            "checkpoint_row_align",
             "inverse_dtype",
             "BLK_Q",
             "BLK_KV",
@@ -175,15 +245,15 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         o_head_idx = bx % num_sab_heads
         q_head_idx = o_head_idx * num_q_heads // num_sab_heads
         v_head_idx = o_head_idx * num_v_heads // num_sab_heads
-        tok_start = cutlass.Int32(cu_seqlens[seq_idx])
-        tok_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
+        tok_start = cu_seqlens[seq_idx]
+        seq_len = cutlass.Int32(cu_seqlens[seq_idx + 1] - tok_start)
 
         return WorkDesc(
             seq_idx=seq_idx,
             private_q_head_idx=q_head_idx,
             private_v_head_idx=v_head_idx,
             tok_offset=tok_start,
-            seq_len=tok_end - tok_start,
+            seq_len=seq_len,
             tile_idx=cutlass.Int32(0),
         )
 
@@ -469,7 +539,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         v_pipeline,
         v_producer_state,
         blk: cutlass.Int32,
-        tok_start: cutlass.Int32,
+        tok_start,
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
@@ -562,23 +632,34 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         sAlpha: cute.Tensor,
         g_alpha: cute.Tensor,
         blk_tok: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         alpha_stage: cutlass.Int32,
+        tok_begin=None,
     ):
+        # Rows outside [tok_begin, tok_end) get gate 1: padding rows before the
+        # sequence (tok_begin given) leave the state unchanged.
         lane_id = cute.arch.lane_idx()
         sAlpha_k = sAlpha[None, None, alpha_stage]
         num_iters = self.BLK_Q // 32
         for i in cutlass.range_constexpr(num_iters):
             row = cutlass.Int32(i * 32) + lane_id
             tok = blk_tok + row
-            if tok < tok_end:
-                sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = g_alpha[
-                    tok * num_sab_heads + sab_head_idx
-                ]
+            if cutlass.const_expr(tok_begin is None):
+                if tok < tok_end:
+                    sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = g_alpha[
+                        tok * num_sab_heads + sab_head_idx
+                    ]
+                else:
+                    sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = cutlass.Float32(1.0)
             else:
-                sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = cutlass.Float32(1.0)
+                if tok >= tok_begin and tok < tok_end:
+                    sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = g_alpha[
+                        tok * num_sab_heads + sab_head_idx
+                    ]
+                else:
+                    sAlpha_k[row, AlphaProcessor.CUMSUM_LOG] = cutlass.Float32(1.0)
 
     # ─── load_beta ────────────────────────────────────────────────────────────
     # Translates FlatMainloopTmaWarpSpecializedDeltaRule::load_beta.
@@ -589,21 +670,30 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         sBeta: cute.Tensor,
         g_beta: cute.Tensor,
         blk_tok: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         beta_stage: cutlass.Int32,
+        tok_begin=None,
     ):
+        # Rows outside [tok_begin, tok_end) get beta 0: with gate 1 they are
+        # identity rows that neither read nor write the state.
         lane_id = cute.arch.lane_idx()
         sBeta_k = sBeta[None, beta_stage]
         num_iters = self.BLK_KV // 32
         for i in cutlass.range_constexpr(num_iters):
             row = cutlass.Int32(i * 32) + lane_id
             tok = blk_tok + row
-            if tok < tok_end:
-                sBeta_k[row] = g_beta[tok * num_sab_heads + sab_head_idx]
+            if cutlass.const_expr(tok_begin is None):
+                if tok < tok_end:
+                    sBeta_k[row] = g_beta[tok * num_sab_heads + sab_head_idx]
+                else:
+                    sBeta_k[row] = cutlass.Float32(0.0)
             else:
-                sBeta_k[row] = cutlass.Float32(0.0)
+                if tok >= tok_begin and tok < tok_end:
+                    sBeta_k[row] = g_beta[tok * num_sab_heads + sab_head_idx]
+                else:
+                    sBeta_k[row] = cutlass.Float32(0.0)
 
     # ─── kv_load / kv_store ───────────────────────────────────────────────────
 
@@ -621,7 +711,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tiled_copy_kv = cute.make_tiled_copy_C(copy_atom_kv, kv_tiled_mma)
         thr_copy_kv = tiled_copy_kv.get_slice(thread_idx)
         tKVgKV = thr_copy_kv.partition_S(select_tensor_10(gKV))
-        cute.copy(tiled_copy_kv, tKVgKV, tKVrKV)
+        tKVrKV_storage = cute.make_rmem_tensor_like(tKVrKV, gKV.element_type)
+        cute.copy(tiled_copy_kv, tKVgKV, tKVrKV_storage)
+        tKVrKV.store(tKVrKV_storage.load().to(self.acc_dtype))
 
     @cute.jit
     def kv_store(
@@ -637,7 +729,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tiled_copy_kv = cute.make_tiled_copy_C(copy_atom_kv, kv_tiled_mma)
         thr_copy_kv = tiled_copy_kv.get_slice(thread_idx)
         tKVgKV = thr_copy_kv.partition_D(select_tensor_10(gKV))
-        cute.copy(tiled_copy_kv, tKVrKV, tKVgKV)
+        tKVrKV_storage = cute.make_rmem_tensor_like(tKVrKV, gKV.element_type)
+        tKVrKV_storage.store(tKVrKV.load().to(gKV.element_type))
+        cute.copy(tiled_copy_kv, tKVrKV_storage, tKVgKV)
 
     @cute.jit
     def maybe_store_checkpoint(
@@ -654,8 +748,13 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         total_checkpoints: cutlass.Int32,
         block_end: cutlass.Int32,
         seq_len: cutlass.Int32,
+        ckpt_key=None,
+        row_pref=None,
     ):
-        if cutlass.const_expr(self.needs_checkpointing):
+        if cutlass.const_expr(
+            self.needs_checkpointing
+            and not (self.use_prefix_lens or self.use_checkpoint_state_indices)
+        ):
             if (
                 block_end <= seq_len
                 and block_end % checkpoint_every_n_tokens == cutlass.Int32(0)
@@ -674,6 +773,171 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 )
                 gCheckpointKV = mCheckpoint[None, None, o_head_idx, checkpoint_idx]
                 self.kv_store(tKVrKV, gCheckpointKV, kv_tiled_mma, thread_idx)
+        elif cutlass.const_expr(self.needs_checkpointing):
+            self._store_slot_checkpoint(
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_tiled_mma,
+                thread_idx,
+                seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                block_end,
+                seq_len,
+                ckpt_key,
+                row_pref,
+            )
+
+    @cute.jit
+    def checkpoint_entry_key(
+        self,
+        checkpoint_cu_starts: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        seq_idx: cutlass.Int32,
+        ckpt_origin,
+    ):
+        """Per-sequence key of ``checkpoint_entry``, computed once before the
+        block loop (None on the packed path without slot arguments).
+
+        ``key = (checkpoint_cu_starts[seq] - 1) * N + origin % N`` with
+        ``origin`` the absolute position of the work item's first row (0
+        without ``prefix_lens``). ``key + block_end`` is then congruent to the
+        absolute block end modulo N, and its quotient by N is the entry of the
+        checkpoint due there. One live register replaces the origin and the
+        sequence's first entry in the register-bound math warp groups.
+        """
+        key = None
+        if cutlass.const_expr(
+            self.needs_checkpointing
+            and (self.use_prefix_lens or self.use_checkpoint_state_indices)
+        ):
+            key = (
+                cutlass.Int32(checkpoint_cu_starts[seq_idx]) - cutlass.Int32(1)
+            ) * checkpoint_every_n_tokens
+            if cutlass.const_expr(self.use_prefix_lens):
+                key = key + ckpt_origin % checkpoint_every_n_tokens
+        return key
+
+    @cute.jit
+    def checkpoint_entry(
+        self,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        block_end: cutlass.Int32,
+        seq_len: cutlass.Int32,
+        ckpt_key,
+    ):
+        """Checkpoint entry due at the end of a block, or -1 if none is due.
+
+        ``block_end`` and ``seq_len`` count from the work item's first row;
+        ``ckpt_key`` comes from ``checkpoint_entry_key``. A checkpoint is due
+        when the absolute block end is a multiple of N; the j-th one of the
+        sequence in this call is entry ``checkpoint_cu_starts[seq] + j``.
+        """
+        pos = ckpt_key + block_end
+        entry = cutlass.Int32(-1)
+        if block_end <= seq_len and pos % checkpoint_every_n_tokens == cutlass.Int32(0):
+            # pos >= 0 here: key >= -N and block_end > 0.
+            entry = pos // checkpoint_every_n_tokens
+        return entry
+
+    @cute.jit
+    def prefetch_checkpoint_row(
+        self,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        block_end: cutlass.Int32,
+        seq_len: cutlass.Int32,
+        ckpt_key,
+        g_checkpoint_rows: cute.Tensor,
+    ):
+        """Pool row of the checkpoint due at ``block_end`` (-1: none due or
+        skipped), or None without ``checkpoint_state_indices``.
+
+        Called before the block's math so that the load does not stall the
+        checkpoint store after it.
+        """
+        row = None
+        if cutlass.const_expr(
+            self.needs_checkpointing and self.use_checkpoint_state_indices
+        ):
+            row = cutlass.Int32(-1)
+            entry = self.checkpoint_entry(
+                checkpoint_every_n_tokens, block_end, seq_len, ckpt_key
+            )
+            if entry >= cutlass.Int32(0):
+                row = cutlass.Int32(g_checkpoint_rows[entry])
+        return row
+
+    @cute.jit
+    def _store_slot_checkpoint(
+        self,
+        tKVrKV: cute.Tensor,
+        g_state_checkpoints: cute.Tensor,
+        checkpoint_cu_starts: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        kv_tiled_mma,
+        thread_idx: cutlass.Int32,
+        seq_idx: cutlass.Int32,
+        o_head_idx: cutlass.Int32,
+        num_sab_heads: cutlass.Int32,
+        total_checkpoints: cutlass.Int32,
+        block_end: cutlass.Int32,
+        seq_len: cutlass.Int32,
+        ckpt_key,
+        row_pref,
+    ):
+        """Checkpoint at absolute positions (``prefix_lens``) and/or into pool
+        rows (``checkpoint_state_indices``; ``row_pref`` from
+        ``prefetch_checkpoint_row``, skipped when negative)."""
+        if cutlass.const_expr(self.use_checkpoint_state_indices):
+            if row_pref >= cutlass.Int32(0):
+                # Pool rows are dense [H, D, D] blocks (checked on the host)
+                # addressed by the pool's row stride, which may be padded.
+                row_stride = g_state_checkpoints.stride[0]
+                if cutlass.const_expr(self.checkpoint_row_align > 1):
+                    # Without it the row offset has no known alignment and
+                    # every checkpoint is written with scalar stores.
+                    row_stride = cute.assume(
+                        row_stride, divby=self.checkpoint_row_align
+                    )
+                pool_layout = cute.make_layout(
+                    (self.D, self.D, num_sab_heads, g_state_checkpoints.shape[0]),
+                    stride=(1, self.D, self.D * self.D, row_stride),
+                )
+                mPool = cute.make_tensor(g_state_checkpoints.iterator, pool_layout)
+                self.kv_store(
+                    tKVrKV,
+                    mPool[None, None, o_head_idx, row_pref],
+                    kv_tiled_mma,
+                    thread_idx,
+                )
+        else:
+            entry = self.checkpoint_entry(
+                checkpoint_every_n_tokens, block_end, seq_len, ckpt_key
+            )
+            if entry >= cutlass.Int32(0):
+                # 64-bit entry stride: entry * H * D * D exceeds 2**31 past
+                # 4096 checkpoints at H = 32.
+                checkpoint_layout = cute.make_ordered_layout(
+                    (
+                        self.D,
+                        self.D,
+                        cutlass.Int64(num_sab_heads),
+                        total_checkpoints,
+                    ),
+                    order=(0, 1, 2, 3),
+                )
+                mCheckpoint = cute.make_tensor(
+                    g_state_checkpoints.iterator, checkpoint_layout
+                )
+                self.kv_store(
+                    tKVrKV,
+                    mCheckpoint[None, None, o_head_idx, entry],
+                    kv_tiled_mma,
+                    thread_idx,
+                )
 
     # ─── compute_loop_body ───────────────────────────────────────────────────
     # Translates the C++ compute_loop_body lambda captured inside compute().
@@ -1005,7 +1269,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         k_pipeline,
         v_pipeline,
         num_blocks: cutlass.Int32,
-        tok_start: cutlass.Int32,
+        tok_start,
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
@@ -1055,10 +1319,11 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         alpha_pipeline,
         scale: cutlass.Float32,
         num_blocks: cutlass.Int32,
-        tok_start: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_start,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
+        tok_begin=None,
     ):
         alpha_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.alpha_beta_stage
@@ -1076,6 +1341,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     sab_head_idx,
                     num_sab_heads,
                     alpha_producer_state.index,
+                    tok_begin,
                 )
                 AlphaProcessor().run(
                     sAlpha[None, None, alpha_producer_state.index], scale
@@ -1091,10 +1357,11 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         g_beta: cute.Tensor,
         beta_pipeline,
         num_blocks: cutlass.Int32,
-        tok_start: cutlass.Int32,
-        tok_end: cutlass.Int32,
+        tok_start,
+        tok_end,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
+        tok_begin=None,
     ):
         beta_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.alpha_beta_stage
@@ -1112,6 +1379,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     sab_head_idx,
                     num_sab_heads,
                     beta_producer_state.index,
+                    tok_begin,
                 )
                 cute.arch.fence_view_async_shared()
                 beta_pipeline.producer_commit(beta_producer_state)
@@ -1138,6 +1406,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         alpha_pipeline,
         g_state: cute.Tensor,
         g_init_state: cute.Tensor,
+        g_state_indices: cute.Tensor,
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         work_desc: WorkDesc,
@@ -1151,6 +1420,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         num_seqs: cutlass.Int32,
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
+        g_output_state_indices: cute.Tensor = None,
+        g_checkpoint_rows: cute.Tensor = None,
+        ckpt_origin=None,
     ):
         self._math_order_init(wg_idx)
         q_consumer_state = pipeline.make_pipeline_state(
@@ -1194,20 +1466,62 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         )
         tKVrKV.fill(self.acc_dtype(0.0))
 
-        state_layout = cute.make_ordered_layout(
+        packed_state_layout = cute.make_ordered_layout(
             (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
         )
+        state_ref_shape = (g_state.shape[0], g_state.shape[1], self.D, self.D)
+        state_ref_layout = cute.make_layout(state_ref_shape, stride=g_state.stride)
+        indexed_state_layout = cute.select(state_ref_layout, mode=[3, 2, 1, 0])
+        state_idx = work_desc.seq_idx
+        if cutlass.const_expr(self.use_state_indices):
+            state_idx = cutlass.Int32(g_state_indices[work_desc.seq_idx])
+            state_layout = indexed_state_layout
+        else:
+            state_layout = packed_state_layout
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         mState = cute.make_tensor(g_state.iterator, state_layout)
-        gStateKV = mState[None, None, o_head_idx, work_desc.seq_idx]
+        write_idx = state_idx
+        if cutlass.const_expr(self.use_output_state_indices):
+            write_idx = cutlass.Int32(g_output_state_indices[work_desc.seq_idx])
+        gStateKV = mState[None, None, o_head_idx, write_idx]
         if cutlass.const_expr(self.needs_init_state):
-            mInitState = cute.make_tensor(g_init_state.iterator, state_layout)
-            gInitKV = mInitState[None, None, o_head_idx, work_desc.seq_idx]
-            self.kv_load(tKVrKV, gInitKV, kv_tiled_mma, math_tidx)
+            init_state_ref_layout = cute.make_layout(
+                state_ref_shape, stride=g_init_state.stride
+            )
+            indexed_init_state_layout = cute.select(
+                init_state_ref_layout, mode=[3, 2, 1, 0]
+            )
+            if cutlass.const_expr(self.use_state_indices):
+                init_state_layout = indexed_init_state_layout
+            else:
+                init_state_layout = packed_state_layout
+            mInitState = cute.make_tensor(g_init_state.iterator, init_state_layout)
+            gInitKV = mInitState[None, None, o_head_idx, state_idx]
+            if cutlass.const_expr(self.slot_mode):
+                # A negative read row starts from the zero state. Each thread
+                # reads its state elements here, before it writes any
+                # checkpoint or final state, so read and write rows may alias.
+                if state_idx >= cutlass.Int32(0):
+                    self.kv_load(tKVrKV, gInitKV, kv_tiled_mma, math_tidx)
+            else:
+                self.kv_load(tKVrKV, gInitKV, kv_tiled_mma, math_tidx)
 
         first_B = work_desc.seq_len
         if first_B > cutlass.Int32(self.BLK_KV):
             first_B = cutlass.Int32(self.BLK_KV)
+        ckpt_key = self.checkpoint_entry_key(
+            checkpoint_cu_starts,
+            checkpoint_every_n_tokens,
+            work_desc.seq_idx,
+            ckpt_origin,
+        )
+        first_row = self.prefetch_checkpoint_row(
+            checkpoint_every_n_tokens,
+            cutlass.Int32(self.BLK_KV),
+            work_desc.seq_len,
+            ckpt_key,
+            g_checkpoint_rows,
+        )
         if cutlass.const_expr(self.needs_init_state):
             (
                 q_consumer_state,
@@ -1303,11 +1617,20 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             total_checkpoints,
             cutlass.Int32(self.BLK_KV),
             work_desc.seq_len,
+            ckpt_key=ckpt_key,
+            row_pref=first_row,
         )
 
         for blk in cutlass.range(
             cutlass.Int32(1), num_blocks - cutlass.Int32(1), cutlass.Int32(1), unroll=1
         ):
+            loop_row = self.prefetch_checkpoint_row(
+                checkpoint_every_n_tokens,
+                (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                ckpt_key,
+                g_checkpoint_rows,
+            )
             (
                 q_consumer_state,
                 k_consumer_state,
@@ -1361,11 +1684,20 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 total_checkpoints,
                 (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
                 work_desc.seq_len,
+                ckpt_key=ckpt_key,
+                row_pref=loop_row,
             )
 
         if num_blocks != cutlass.Int32(1):
             last_blk = num_blocks - cutlass.Int32(1)
             last_B = work_desc.seq_len - last_blk * cutlass.Int32(self.BLK_KV)
+            last_row = self.prefetch_checkpoint_row(
+                checkpoint_every_n_tokens,
+                (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                ckpt_key,
+                g_checkpoint_rows,
+            )
             (
                 q_consumer_state,
                 k_consumer_state,
@@ -1419,8 +1751,14 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                 total_checkpoints,
                 (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
                 work_desc.seq_len,
+                ckpt_key=ckpt_key,
+                row_pref=last_row,
             )
-        self.kv_store(tKVrKV, gStateKV, kv_tiled_mma, math_tidx)
+        if cutlass.const_expr(self.slot_mode):
+            if write_idx >= cutlass.Int32(0):
+                self.kv_store(tKVrKV, gStateKV, kv_tiled_mma, math_tidx)
+        else:
+            self.kv_store(tKVrKV, gStateKV, kv_tiled_mma, math_tidx)
 
     @cute.jit
     def run_aux_loop_body(
@@ -1740,6 +2078,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         g_beta: cute.Tensor,
         g_state: cute.Tensor,
         g_init_state: cute.Tensor,
+        g_state_indices: cute.Tensor,
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
@@ -1752,6 +2091,9 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         num_seqs: cutlass.Int32,
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
+        g_output_state_indices: cute.Tensor,
+        g_checkpoint_rows: cute.Tensor,
+        g_prefix_lens: cute.Tensor,
         grid_x: int,
         stream,
     ):
@@ -1886,6 +2228,12 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
 
         self.shared_storage = SharedStorage
 
+        # The O tensor itself is needed only for the plain stores of the first
+        # tile of a left-padded sequence.
+        g_o_plain = None
+        if cutlass.const_expr(self.use_prefix_lens):
+            g_o_plain = g_o
+
         self.kernel(
             g_alpha,
             g_beta,
@@ -1899,6 +2247,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             tma_tensor_o,
             g_state,
             g_init_state,
+            g_state_indices,
             g_state_checkpoints,
             checkpoint_cu_starts,
             g_tensormaps,
@@ -1911,6 +2260,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             num_seqs,
             total_checkpoints,
             checkpoint_every_n_tokens,
+            g_o_plain,
+            g_output_state_indices,
+            g_checkpoint_rows,
+            g_prefix_lens,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(512, 1, 1),
@@ -1934,6 +2287,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         tma_tensor_o: cute.Tensor,
         g_state: cute.Tensor,
         g_init_state: cute.Tensor,
+        g_state_indices: cute.Tensor,
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
@@ -1946,6 +2300,10 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
         num_seqs: cutlass.Int32,
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
+        g_o: cute.Tensor,
+        g_output_state_indices: cute.Tensor,
+        g_checkpoint_rows: cute.Tensor,
+        g_prefix_lens: cute.Tensor,
     ):
         NUM_LOAD_WARP_GROUPS = 1
         NUM_STATE_MMA_WARP_GROUPS = 2
@@ -1988,6 +2346,15 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
             num_v_heads,
             num_sab_heads,
         )
+        pad = None
+        ckpt_origin = None
+        load_tok_begin = None
+        if cutlass.const_expr(self.use_prefix_lens):
+            # Padding rows lie before the sequence: alpha/beta loads mask them.
+            load_tok_begin = work_desc.tok_offset
+            work_desc, pad, ckpt_origin = work_desc.left_padded(
+                g_prefix_lens, self.BLK_KV
+            )
         tok_end = work_desc.tok_offset + work_desc.seq_len
         num_blocks = (
             work_desc.seq_len + cutlass.Int32(self.BLK_KV) - cutlass.Int32(1)
@@ -2188,19 +2555,36 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     work_desc.v_head_idx(),
                 )
             elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
-                CollectiveStoreTma(self.BLK_Q, self.D).run(
-                    sO,
-                    tma_atom_o,
-                    tma_tensor_o,
-                    g_tensormaps,
-                    o_pipeline,
-                    num_blocks,
-                    work_desc,
-                    num_seqs,
-                    self.o_stage,
-                    num_q_heads,
-                    num_v_heads,
-                )
+                if cutlass.const_expr(self.use_prefix_lens):
+                    CollectiveStoreTma(self.BLK_Q, self.D).run(
+                        sO,
+                        tma_atom_o,
+                        tma_tensor_o,
+                        g_tensormaps,
+                        o_pipeline,
+                        num_blocks,
+                        work_desc,
+                        num_seqs,
+                        self.o_stage,
+                        num_q_heads,
+                        num_v_heads,
+                        g_o,
+                        pad,
+                    )
+                else:
+                    CollectiveStoreTma(self.BLK_Q, self.D).run(
+                        sO,
+                        tma_atom_o,
+                        tma_tensor_o,
+                        g_tensormaps,
+                        o_pipeline,
+                        num_blocks,
+                        work_desc,
+                        num_seqs,
+                        self.o_stage,
+                        num_q_heads,
+                        num_v_heads,
+                    )
             elif ldst_warp_role == LoadStoreWarpRole.LOAD_BETA:
                 self.run_load_beta_role(
                     sBeta,
@@ -2211,6 +2595,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     tok_end,
                     work_desc.o_head_idx(num_q_heads, num_v_heads),
                     num_sab_heads,
+                    load_tok_begin,
                 )
             elif ldst_warp_role == LoadStoreWarpRole.LOAD_ALPHA:
                 self.run_load_alpha_role(
@@ -2223,6 +2608,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     tok_end,
                     work_desc.o_head_idx(num_q_heads, num_v_heads),
                     num_sab_heads,
+                    load_tok_begin,
                 )
         elif work_desc.seq_len != cutlass.Int32(0):
             if warp_group_idx == WarpGroupRole.MATH_AUX:
@@ -2267,6 +2653,7 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     alpha_pipeline,
                     g_state,
                     g_init_state,
+                    g_state_indices,
                     g_state_checkpoints,
                     checkpoint_cu_starts,
                     work_desc,
@@ -2280,10 +2667,59 @@ class _FullyFusedDeltaRuleSm90(KeyedCompileMixin):
                     num_seqs,
                     total_checkpoints,
                     checkpoint_every_n_tokens,
+                    g_output_state_indices,
+                    g_checkpoint_rows,
+                    ckpt_origin,
                 )
 
 
 # ─── Public API ──────────────────────────────────────────────────────────────
+
+
+@functools.cache
+def _get_prefill_kernel(
+    needs_alpha,
+    needs_beta,
+    needs_init_state,
+    needs_checkpointing,
+    kernel_dtype,
+    initial_state_dtype,
+    state_dtype,
+    checkpoint_state_dtype,
+    use_state_indices,
+    cu_seqlens_dtype,
+    state_indices_dtype,
+    checkpoint_cu_starts_dtype,
+    state_inner_strides,
+    init_state_inner_strides,
+    output_state_indices_dtype=None,
+    checkpoint_state_indices_dtype=None,
+    prefix_lens_dtype=None,
+    checkpoint_row_align=None,
+):
+    return _FullyFusedDeltaRuleSm90(
+        needs_alpha,
+        needs_beta,
+        needs_init_state,
+        needs_checkpointing,
+        kernel_dtype,
+        initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
+        state_dtype=state_dtype_to_cutlass(state_dtype),
+        checkpoint_state_dtype=state_dtype_to_cutlass(checkpoint_state_dtype),
+        use_state_indices=use_state_indices,
+        cu_seqlens_dtype=cu_seqlens_dtype,
+        state_indices_dtype=state_indices_dtype,
+        checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
+        state_inner_strides=state_inner_strides,
+        init_state_inner_strides=init_state_inner_strides,
+        use_output_state_indices=output_state_indices_dtype is not None,
+        use_checkpoint_state_indices=checkpoint_state_indices_dtype is not None,
+        use_prefix_lens=prefix_lens_dtype is not None,
+        output_state_indices_dtype=output_state_indices_dtype,
+        checkpoint_state_indices_dtype=checkpoint_state_indices_dtype,
+        prefix_lens_dtype=prefix_lens_dtype,
+        checkpoint_row_align=checkpoint_row_align,
+    )
 
 
 def delta_rule_prefill_dsl_sm90(
@@ -2300,10 +2736,26 @@ def delta_rule_prefill_dsl_sm90(
     state_checkpoints: torch.Tensor | None = None,
     checkpoint_cu_starts: torch.Tensor | None = None,
     checkpoint_every_n_tokens: int = 0,
+    state_indices: torch.Tensor | None = None,
+    output_state_indices: torch.Tensor | None = None,
+    checkpoint_state_indices: torch.Tensor | None = None,
+    prefix_lens: torch.Tensor | None = None,
 ):
-    from cutlass.cute.runtime import from_dlpack
+    """SM90 GDN prefill.
+
+    ``output_state_indices`` ([num_seqs]; needs ``state_indices``) writes
+    sequence i's final state to row ``output_state_indices[i]`` of ``state``
+    instead of row ``state_indices[i]``; ``checkpoint_state_indices`` maps
+    checkpoint entry e to row ``checkpoint_state_indices[e]`` of the pool
+    ``state_checkpoints`` [C, H, D, D]; ``prefix_lens`` ([num_seqs]) makes
+    checkpoints absolute: one is due after local token n when
+    ``(prefix_lens[i] + n) % checkpoint_every_n_tokens == 0``. Negative rows
+    skip the write; with any of them a negative ``state_indices`` row starts
+    from the zero state. ``prefix_lens`` needs ``beta``.
+    """
     import cuda.bindings.driver as cuda_driver
 
+    device = q.device
     D = q.shape[-1]
 
     num_seqs = cu_seqlens.shape[0] - 1
@@ -2323,6 +2775,7 @@ def delta_rule_prefill_dsl_sm90(
     needs_beta = beta is not None
     needs_init_state = init_state is not None
     needs_checkpointing = checkpoint_every_n_tokens > 0
+    use_state_indices = state_indices is not None
     kernel_dtype = {
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
@@ -2338,15 +2791,33 @@ def delta_rule_prefill_dsl_sm90(
         raise RuntimeError(f"alpha must have dtype torch.float32, got {alpha.dtype}")
     if beta is not None and beta.dtype != torch.float32:
         raise RuntimeError(f"beta must have dtype torch.float32, got {beta.dtype}")
-    if init_state is not None and init_state.dtype != torch.float32:
+    if init_state is not None:
+        state_dtype_to_cutlass(init_state.dtype)
+    state_dtype_to_cutlass(state.dtype)
+    if state_checkpoints is not None:
+        state_dtype_to_cutlass(state_checkpoints.dtype)
+    if not is_integer_dtype(cu_seqlens.dtype):
         raise RuntimeError(
-            f"init_state must have dtype torch.float32, got {init_state.dtype}"
+            f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
         )
-    if state.dtype != torch.float32:
-        raise RuntimeError(f"state must have dtype torch.float32, got {state.dtype}")
-    if cu_seqlens.dtype != torch.int64:
+
+    expected_state_tail = (num_sab_heads, D, D)
+    for name, tensor in (("state", state), ("init_state", init_state)):
+        if tensor is None:
+            continue
+        if (
+            not use_state_indices and tensor.shape != (num_seqs, *expected_state_tail)
+        ) or (use_state_indices and tuple(tensor.shape[1:]) != expected_state_tail):
+            raise RuntimeError(
+                f"{name} must have shape "
+                f"{('[N_pool]' if use_state_indices else f'[{num_seqs}]')} + {expected_state_tail}, "
+                f"got {tuple(tensor.shape)}"
+            )
+    if use_state_indices and (
+        not is_integer_dtype(state_indices.dtype) or state_indices.shape != (num_seqs,)
+    ):
         raise RuntimeError(
-            f"cu_seqlens must have dtype torch.int64, got {cu_seqlens.dtype}"
+            f"state_indices must have shape {(num_seqs,)} and an integer dtype"
         )
 
     for name, tensor in (
@@ -2354,14 +2825,51 @@ def delta_rule_prefill_dsl_sm90(
         ("k", k),
         ("v", v),
         ("o", o),
-        ("state", state),
         ("cu_seqlens", cu_seqlens),
     ):
         if not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
-    for name, tensor in (("alpha", alpha), ("beta", beta), ("init_state", init_state)):
+    for name, tensor in (
+        ("alpha", alpha),
+        ("beta", beta),
+        ("state_indices", state_indices),
+    ):
         if tensor is not None and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
+    for name, tensor in (("state", state), ("init_state", init_state)):
+        if tensor is None:
+            continue
+        if not use_state_indices and not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+    use_output_state_indices = output_state_indices is not None
+    use_checkpoint_state_indices = checkpoint_state_indices is not None
+    use_prefix_lens = prefix_lens is not None
+    check_slot_args(
+        num_seqs,
+        num_sab_heads,
+        D,
+        device,
+        use_state_indices,
+        needs_checkpointing,
+        beta,
+        state_checkpoints,
+        output_state_indices,
+        checkpoint_state_indices,
+        prefix_lens,
+    )
+    row_align = (
+        checkpoint_row_align(state_checkpoints)
+        if use_checkpoint_state_indices
+        else None
+    )
+    if use_checkpoint_state_indices or use_prefix_lens:
+        check_checkpoint_key_range(
+            checkpoint_state_indices.numel()
+            if use_checkpoint_state_indices
+            else state_checkpoints.shape[0],
+            checkpoint_every_n_tokens,
+            q.shape[0],
+        )
 
     total_seqlen = q.shape[0]
     num_o_heads = o.shape[1]
@@ -2383,85 +2891,153 @@ def delta_rule_prefill_dsl_sm90(
     )
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
 
-    workspace_size = get_device_sm_count(q.device) * 128
-    tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, q.device)
+    workspace_size = get_device_sm_count(device) * 128
+    tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, device)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
+    delta_rule_kernel = _get_prefill_kernel(
+        needs_alpha,
+        needs_beta,
+        needs_init_state,
+        needs_checkpointing,
+        kernel_dtype,
+        initial_state_dtype=(init_state.dtype if needs_init_state else torch.float32),
+        state_dtype=state.dtype,
+        checkpoint_state_dtype=(
+            state_checkpoints.dtype if needs_checkpointing else torch.float32
+        ),
+        use_state_indices=use_state_indices,
+        cu_seqlens_dtype=cu_seqlens.dtype,
+        state_indices_dtype=state_indices.dtype if use_state_indices else None,
+        checkpoint_cu_starts_dtype=(
+            checkpoint_cu_starts.dtype if needs_checkpointing else None
+        ),
+        state_inner_strides=(tuple(state.stride()[1:]) if use_state_indices else None),
+        init_state_inner_strides=(
+            tuple(init_state.stride()[1:])
+            if use_state_indices and needs_init_state
+            else None
+        ),
+        output_state_indices_dtype=(
+            output_state_indices.dtype if use_output_state_indices else None
+        ),
+        checkpoint_state_indices_dtype=(
+            checkpoint_state_indices.dtype if use_checkpoint_state_indices else None
+        ),
+        prefix_lens_dtype=prefix_lens.dtype if use_prefix_lens else None,
+        checkpoint_row_align=row_align,
+    )
+    # A checkpoint pool is addressed by its row stride (which may be padded),
+    # so it is passed whole, never flattened through a copy.
+    checkpoints_align = 16
+    if not needs_checkpointing:
+        checkpoints_arg = None
+    elif use_checkpoint_state_indices:
+        checkpoints_arg = state_checkpoints
+        checkpoints_align = row_align * state_checkpoints.element_size()
+    else:
+        checkpoints_arg = state_checkpoints.reshape(-1)
 
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
+    compiled_delta_rule_kernel = get_cached_compile(
+        delta_rule_kernel, _SM90_COMPILE_OPTIONS
+    )
+    if compiled_delta_rule_kernel is None:
         from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
             *args, **{**kwargs, "enable_tvm_ffi": True}
         )
-
-    # Keep head counts and varlen extents runtime values across cached compiles.
-    q_cute = from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-    k_cute = from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    v_cute = from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    o_cute = from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    alpha_cute = (
-        from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_alpha
-        else None
-    )
-    beta_cute = (
-        from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_beta
-        else None
-    )
-    state_cute = from_dlpack(state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-    init_state_cute = (
-        from_dlpack(init_state.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_init_state
-        else None
-    )
-    state_checkpoints_cute = (
-        from_dlpack(
-            state_checkpoints.reshape(-1), assumed_align=16
-        ).mark_layout_dynamic()
-        if needs_checkpointing
-        else None
-    )
-    checkpoint_cu_cute = (
-        from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
-        if needs_checkpointing
-        else None
-    )
-    tensormaps_cute = from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic()
-    cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
-
-    delta_rule_kernel = _FullyFusedDeltaRuleSm90(
-        needs_alpha, needs_beta, needs_init_state, needs_checkpointing, kernel_dtype
-    )
-
-    kernel_args = (
-        q_cute,
-        k_cute,
-        v_cute,
-        o_cute,
-        alpha_cute,
-        beta_cute,
-        state_cute,
-        init_state_cute,
-        state_checkpoints_cute,
-        checkpoint_cu_cute,
-        tensormaps_cute,
-        cu_cute,
-        cutlass.Float32(scale),
-        cutlass.Int32(num_q_heads),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_v_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(num_seqs),
-        cutlass.Int32(total_checkpoints),
-        cutlass.Int32(checkpoint_every_n_tokens),
+        kernel_args = (
+            from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            (
+                from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic()
+                if needs_alpha
+                else None
+            ),
+            (
+                from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic()
+                if needs_beta
+                else None
+            ),
+            from_dlpack(state, assumed_align=16).mark_layout_dynamic(),
+            (
+                from_dlpack(init_state, assumed_align=16).mark_layout_dynamic()
+                if needs_init_state
+                else None
+            ),
+            (
+                from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
+                if use_state_indices
+                else None
+            ),
+            (
+                from_dlpack(
+                    checkpoints_arg, assumed_align=checkpoints_align
+                ).mark_layout_dynamic()
+                if needs_checkpointing
+                else None
+            ),
+            (
+                from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
+                if needs_checkpointing
+                else None
+            ),
+            from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Float32(scale),
+            cutlass.Int32(num_q_heads),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_v_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(num_seqs),
+            cutlass.Int32(total_checkpoints),
+            cutlass.Int32(checkpoint_every_n_tokens),
+            *(
+                (
+                    from_dlpack(tensor, assumed_align=4).mark_layout_dynamic()
+                    if tensor is not None
+                    else None
+                )
+                for tensor in (
+                    output_state_indices,
+                    checkpoint_state_indices,
+                    prefix_lens,
+                )
+            ),
+            num_seqs * num_sab_heads,
+            stream,
+        )
+        compiled_delta_rule_kernel = cached_compile(
+            delta_rule_kernel,
+            *kernel_args,
+            compile_options=_SM90_COMPILE_OPTIONS,
+        )
+    compiled_delta_rule_kernel(
+        q_tma,
+        k_tma,
+        v_tma,
+        o_tma,
+        alpha.reshape(-1) if needs_alpha else None,
+        beta.reshape(-1) if needs_beta else None,
+        state,
+        init_state if needs_init_state else None,
+        state_indices if use_state_indices else None,
+        checkpoints_arg,
+        checkpoint_cu_starts if needs_checkpointing else None,
+        tensormaps_t,
+        cu_seqlens,
+        scale,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        num_seqs,
+        total_checkpoints,
+        checkpoint_every_n_tokens,
+        output_state_indices,
+        checkpoint_state_indices,
+        prefix_lens,
         num_seqs * num_sab_heads,
         stream,
     )
-    compiled_delta_rule_kernel = cached_compile(
-        delta_rule_kernel,
-        *kernel_args,
-        compile_options=(cute.GPUArch("sm_90a"),),
-    )
-    compiled_delta_rule_kernel(*kernel_args)

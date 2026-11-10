@@ -87,14 +87,14 @@ def _minimal_bf16_moe_config():
         ExpertConfig,
         MoEConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmBf16Config,
     )
 
     return MoEConfig(
         routing=RoutingConfig(num_experts=2, top_k=1),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=4,
             local_expert_offset=0,

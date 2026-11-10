@@ -74,17 +74,8 @@ def test_workspace_pool_key_covers_geometry(monkeypatch) -> None:
 def test_production_modules_do_not_import_mega_runner() -> None:
     package = Path(__file__).parents[2] / "flashinfer" / "moe_ep"
     roots = (
-        package
-        / "backends"
-        / "mega"
-        / "kernel"
-        / "sm120"
-        / "mxfp4_mxfp8_bf16_cutedsl",
-        package
-        / "kernel_src"
-        / "sm120"
-        / "split_cutedsl_megakernel"
-        / "shim",
+        package / "backends" / "mega" / "kernel" / "sm120" / "mxfp4_mxfp8_bf16_cutedsl",
+        package / "kernel_src" / "sm120" / "split_cutedsl_megakernel" / "shim",
     )
     offenders: list[str] = []
     for root in roots:

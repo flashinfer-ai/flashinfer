@@ -14,16 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import base64
+import csv
+import hashlib
+import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
 from setuptools import build_meta as orig
-from build_utils import get_git_version
+from build_utils import get_cuda_tile_compile_dependency_requirements, get_git_version
 
 _root = Path(__file__).parent.resolve()
 _data_dir = _root / "flashinfer" / "data"
@@ -31,8 +37,9 @@ _data_dir = _root / "flashinfer" / "data"
 
 # moe_ep build infra. Both EP backends are ON BY DEFAULT since the moe_ep
 # runtime deps moved into the base dependencies (`pip install .` is enough):
-#   NCCL-EP  — provided by the `nccl4py>=0.3.1` wheel (a base dep now); NO
-#              in-tree build.
+#   NCCL-EP  — provided by the `nccl-extensions>=0.1.0` wheel (a base dep
+#              now); NO in-tree build. (nccl.ep used to ship in nccl4py;
+#              nccl4py 0.4.1 dropped it — see requirements.txt.)
 #   NIXL-EP  — built in-tree from 3rdparty/nixl (meson). Missing build deps
 #              (meson/ninja/nvcc/UCX/...) skip the backend with a warning
 #              instead of failing the install (best-effort).
@@ -119,17 +126,35 @@ def _in_isolated_build_env() -> bool:
     return any(m in p for m in markers for p in paths)
 
 
-def _detect_cuda_major() -> int:
-    """Best-effort detection of the CUDA major version on the host."""
+def _no_pip_installs() -> bool:
+    """True when the environment is preprovisioned and the hooks must not install.
+
+    Set by the CI scripts: they build with --no-build-isolation, which would
+    otherwise turn hook installs that isolation always swallowed into downloads.
+    """
+    return os.environ.get("FLASHINFER_BUILD_NO_PIP") == "1"
+
+
+def _detect_cuda_release() -> tuple[int, int] | None:
+    """Best-effort detection of the CUDA major/minor release on the host."""
     try:
         out = subprocess.check_output(["nvcc", "--version"]).decode()
         for line in out.splitlines():
             if "release" in line:
                 # e.g. "Cuda compilation tools, release 13.0, V13.0.48"
                 token = line.split("release", 1)[1].split(",", 1)[0].strip()
-                return int(token.split(".")[0])
+                major, minor = token.split(".", 1)
+                return int(major), int(minor)
     except Exception:
         pass
+    return None
+
+
+def _detect_cuda_major() -> int:
+    """Best-effort detection of the CUDA major version on the host."""
+    release = _detect_cuda_release()
+    if release is not None:
+        return release[0]
     return 13  # default — pyproject's nvep extras pin cu13 packages
 
 
@@ -163,6 +188,15 @@ def _apply_patches(submodule_dir: Path, patches_dir: Path) -> None:
             check=True,
         )
         print(f"[BUILD_NVEP] applied patch: {patch.name}")
+
+
+# NIXL wheel version for the non-hermetic EP build. Pin EXACTLY to the
+# 3rdparty/nixl submodule tag: nixl_ep_cpp.so is compiled from the submodule's
+# device kernels but loads the wheel's libnixl.so at runtime, and a version
+# skew (e.g. a 1.4.x wheel against the v1.3.1 kernels) fails at runtime with
+# device asserts (nixlPut != NIXL_IN_PROG -> illegal memory access). Bump this
+# and the submodule gitlink together.
+_NIXL_WHEEL_VERSION = "1.3.1"
 
 
 def _find_nixl_wheel_lib_dir() -> Path | None:
@@ -248,7 +282,7 @@ def _build_nixl_ep() -> None:
             raise RuntimeError(
                 "The NIXL-EP build requires the nixl-cu13 wheel (the build "
                 "hook normally pre-installs it; see _ensure_nixl_wheel).\n"
-                "Run: uv pip install --no-deps 'nixl-cu13>=1.3.1'\n"
+                "Run: uv pip install --no-deps 'nixl-cu13==1.3.1'\n"
                 "Or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree."
             )
         setup_args += [
@@ -473,8 +507,9 @@ def _build_nccl_ep() -> None:
             shutil.copy(sopath, dst / soname)
             print(f"[BUILD_NVEP] staged: {soname}")
 
-    # NOTE: nccl_ep (ctypes wrapper from contrib/nccl_ep/python) and nccl4py
-    # (Cython bindings + Communicator(ptr=...) bridge) are NOT pip-installed
+    # NOTE: nccl_ep (ctypes wrapper from contrib/nccl_ep/python) and the
+    # nccl Python bindings (Cython bindings + Communicator(ptr=...) bridge)
+    # are NOT pip-installed
     # from this build hook. When `uv pip install` runs the FlashInfer build,
     # sys.executable points to uv's isolated build env (which has no pip), so
     # `python -m pip install` from here fails. Install them as a separate
@@ -482,11 +517,12 @@ def _build_nccl_ep() -> None:
     #
     #   pip install -e 3rdparty/nccl/contrib/nccl_ep/python
     #   CUDA_HOME=/usr/local/cuda pip install -e 3rdparty/nccl/bindings/nccl4py[cu13]
+    #   CUDA_HOME=/usr/local/cuda pip install -e 3rdparty/nccl-extensions/python[cu13]
     #
     # docker/Dockerfile.flashinfer-nvep already chains these after the main
     # `BUILD_NVEP=1 uv pip install ...` step.
     print(
-        "[BUILD_NVEP] nccl_ep + nccl4py pip-installs deferred to post-build "
+        "[BUILD_NVEP] nccl_ep + nccl4py/nccl-extensions pip-installs deferred to post-build "
         "step (see docker/Dockerfile.flashinfer-nvep). Skipping in hook."
     )
 
@@ -535,9 +571,37 @@ def _ensure_nixl_wheel() -> None:
     missing wheel and the backend is gated as usual (skip or hard error).
     """
     if _find_nixl_wheel_lib_dir() is not None:
+        # A wheel is present — but only the pinned version is safe (see
+        # _NIXL_WHEEL_VERSION). Warn on skew instead of silently linking
+        # against a mismatched libnixl; --no-deps reinstalls are cheap, but
+        # downgrading behind the user's back would be surprising.
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+
+            for pkg in ("nixl-cu13", "nixl-cu12", "nixl"):
+                try:
+                    found = version(pkg)
+                except PackageNotFoundError:
+                    continue
+                if found != _NIXL_WHEEL_VERSION:
+                    print(
+                        f"[BUILD_NVEP] WARNING: {pkg} {found} is installed but "
+                        f"the 3rdparty/nixl kernels are v{_NIXL_WHEEL_VERSION}; "
+                        "a version skew fails at runtime with device asserts. "
+                        f"Run: pip install --no-deps '{pkg}=={_NIXL_WHEEL_VERSION}'"
+                    )
+                break
+        except Exception:
+            pass
+        return
+    if _no_pip_installs():
+        print(
+            "[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; no NIXL wheel to "
+            "pre-install, so the pre-flight probe will skip NIXL-EP"
+        )
         return
     cuda_major = _detect_cuda_major()
-    wheel = f"nixl-cu{cuda_major}>=1.3.1"
+    wheel = f"nixl-cu{cuda_major}=={_NIXL_WHEEL_VERSION}"
     print(f"[BUILD_NVEP] pre-installing NIXL wheel --no-deps: {wheel}")
 
     uv_bin = shutil.which("uv")
@@ -571,6 +635,9 @@ def _ensure_nccl_floor() -> None:
     cuda_major = _detect_cuda_major()
     if cuda_major < 13:
         return  # EP is CUDA-13-only; nothing to upgrade on cu12 hosts.
+    if _no_pip_installs():
+        print("[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; leaving NCCL as installed")
+        return
     wheel = "nvidia-nccl-cu13>=2.30.7"
     print(f"[BUILD_NVEP] ensuring NCCL-EP floor --no-deps: {wheel}")
 
@@ -628,7 +695,7 @@ def _nixl_buildable() -> tuple[bool, str]:
         if _find_nixl_wheel_lib_dir() is None:
             return False, (
                 "nixl pip wheel not importable (or libnixl.so missing); install with "
-                "`uv pip install --no-deps 'nixl-cu13>=1.3.1'` "
+                "`uv pip install --no-deps 'nixl-cu13==1.3.1'` "
                 "or set BUILD_NIXL_EP_HERMETIC=1 to build the full NIXL tree"
             )
     return True, ""
@@ -664,8 +731,15 @@ def _install_nvep_runtime_wheels(built_nixl: bool) -> None:
     cuda_major = _detect_cuda_major()
     wheels: list[str] = []
     if built_nixl:
-        wheels.append(f"nixl-cu{cuda_major}>=1.3.1")
+        wheels.append(f"nixl-cu{cuda_major}=={_NIXL_WHEEL_VERSION}")
     if not wheels:
+        return
+    if _no_pip_installs():
+        # Reachable only if the wheel was already present, since the pre-flight
+        # probe needs it to import before anything is built.
+        print(
+            "[BUILD_NVEP] FLASHINFER_BUILD_NO_PIP=1; runtime wheels left as installed"
+        )
         return
 
     print(f"[BUILD_NVEP] installing runtime wheels --no-deps: {' '.join(wheels)}")
@@ -701,6 +775,35 @@ def _install_nvep_runtime_wheels(built_nixl: bool) -> None:
         ) from e
 
 
+def _compile_deps_installed(specs) -> bool:
+    """True when every spec is already satisfied. False on any doubt, so that an
+    unreadable environment still reaches the install below."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.version import InvalidVersion
+    except ImportError:
+        return False
+
+    for spec in specs:
+        try:
+            req = Requirement(spec)
+            if not req.specifier.contains(version(req.name), prereleases=True):
+                return False
+        except (PackageNotFoundError, InvalidRequirement, InvalidVersion):
+            return False
+    return True
+
+
+def _system_cuda_tile_compiler_available() -> bool:
+    """Return whether CUDA 13.4+ provides an executable toolkit TileIRAS."""
+    release = _detect_cuda_release()
+    if release is None or release < (13, 4):
+        return False
+    compiler = Path("/usr/local/cuda/bin/tileiras")
+    return compiler.is_file() and os.access(compiler, os.X_OK)
+
+
 def _install_cuda_tile_compile_deps() -> None:
     """Install cuda-tile's compile chain with ``--no-deps`` to dodge libcudart.so.13.
 
@@ -730,20 +833,35 @@ def _install_cuda_tile_compile_deps() -> None:
     ``pip install`` from within that environment to resolve the
     ``nvidia-cuda-runtime`` version conflict described above.
 
-    In such isolated builds (e.g. the AOT Build Import workflow) the compile
-    chain is already present on flashinfer-ci images, so we *warn and continue*
-    instead of blocking the build.  A clean PyPI install on a system that lacks
+    CUDA toolkits that provide ``/usr/local/cuda/bin/tileiras`` (CUDA 13.4 and
+    newer) do not need the pip compiler overlay. In isolated builds (e.g. the
+    AOT Build Import workflow) without that system compiler, the compile chain
+    is already present on flashinfer-ci images, so we *warn and continue*
+    instead of blocking the build. A clean PyPI install on a system that lacks
     both ``uv`` and the compile chain will surface a clear ``ImportError`` the
     first time the user calls a cuTile kernel — a better failure mode than
     aborting the install entirely.
     """
-    wheels = [
-        "nvidia-cuda-nvcc<13.4,>=13.2",
-        "nvidia-cuda-tileiras<13.4,>=13.2",
-        "nvidia-nvvm<13.4,>=13.2",
-        "nvidia-nvjitlink<14,>=13.3",
-        "nvidia-cuda-crt<13.4,>=13.2",
-    ]
+    if _system_cuda_tile_compiler_available():
+        print(
+            "[BUILD] using system cuda-tile compiler; skipping pip compile deps",
+            flush=True,
+        )
+        return
+
+    wheels = get_cuda_tile_compile_dependency_requirements()
+
+    if _compile_deps_installed(wheels):
+        print("[BUILD] cuda-tile compile deps already installed; skipping", flush=True)
+        return
+
+    if _no_pip_installs():
+        print(
+            "[BUILD] FLASHINFER_BUILD_NO_PIP=1; not installing cuda-tile compile deps",
+            flush=True,
+        )
+        return
+
     print(f"[BUILD] cuda-tile compile deps (--no-deps): {' '.join(wheels)}", flush=True)
 
     uv_bin = shutil.which("uv")
@@ -835,17 +953,17 @@ def _build_nvep_if_enabled() -> None:
             "source, disable isolation:\n"
             "    pip install --no-build-isolation .\n"
             "If NIXL-EP libs were still staged, install the runtime wheel "
-            "manually afterwards: pip install --no-deps 'nixl-cu13>=1.3.1'.",
+            "manually afterwards: pip install --no-deps 'nixl-cu13==1.3.1'.",
             flush=True,
         )
 
     # NCCL-EP is not built from source — it is provided by the released
-    # `nccl4py` wheel (>=0.3.1, the `nccl.ep` API + bundled libnccl_ep.so),
-    # which is a base dependency now. So BUILD_NCCL_EP requires no in-tree
-    # build step; we only note it here.
+    # `nccl-extensions` wheel (>=0.1.0, the `nccl.ep` API + bundled
+    # libnccl_ep.so), which is a base dependency now. So BUILD_NCCL_EP
+    # requires no in-tree build step; we only note it here.
     if _BUILD_NCCL_EP:
         print(
-            "[BUILD_NVEP] NCCL-EP is provided by the nccl4py wheel (>=0.3.1), "
+            "[BUILD_NVEP] NCCL-EP is provided by the nccl-extensions wheel (>=0.1.0), "
             "a base dependency of flashinfer-python; no in-tree build."
         )
         # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (< the B200 EP
@@ -913,7 +1031,7 @@ def _build_nvep_if_enabled() -> None:
 
     built = [b for b, is_enabled in (("NIXL-EP", built_nixl),) if is_enabled]
     if _BUILD_NCCL_EP:
-        built.append("NCCL-EP (via nccl4py wheel)")
+        built.append("NCCL-EP (via nccl-extensions wheel)")
     print(f"[BUILD_NVEP] done — built: {', '.join(built) if built else 'nothing'}")
 
 
@@ -1073,6 +1191,142 @@ def build_sdist(sdist_directory, config_settings=None):
     return orig.build_sdist(sdist_directory, config_settings)
 
 
+# Wheel post-processing (flashinfer-ai/flashinfer#7977).
+#
+# setuptools writes every zip entry at zlib level 6 and has no level knob, and
+# `packages.find` sweeps the vendored 3rdparty Python trees (cutlass/python,
+# cutlass/examples, cccl/python, ...) into the wheel although only the header
+# trees listed in [tool.setuptools.package-data] are meant to ship. Both are
+# corrected on the finished wheel: every kept entry is re-deflated at level 9
+# and the 3rdparty entries outside the header trees are dropped.
+#
+# With FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1 (set by the release
+# workflow for the wheel published to PyPI, not by nightlies or source
+# installs) the experimental packages' generated kernel sources are dropped as
+# well: flashinfer/experimental/<pkg>/csrc/** and flashinfer/data/csrc/experimental/**.
+# Experimental features are JIT-only and intended for main-branch users
+# (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
+# 100 MB. The Python modules, build.json manifests and route catalogs stay, so
+# `import flashinfer` is unchanged and an experimental kernel load fails on
+# first use; the marker file below says why and where the sources are.
+_EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"
+_EXPERIMENTAL_SOURCES_MARKER = "flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt"
+_EXPERIMENTAL_SOURCES_RE = re.compile(
+    r"^(flashinfer/experimental/[^/]+/csrc/|flashinfer/data/csrc/experimental/)"
+)
+_THIRD_PARTY_ROOTS = (
+    "flashinfer/data/cutlass/",
+    "flashinfer/data/spdlog/",
+    "flashinfer/data/cccl/",
+)
+# Mirrors the package-data globs of flashinfer.data.cutlass / .spdlog / .cccl.
+_THIRD_PARTY_KEEP = (
+    "flashinfer/data/cutlass/include/",
+    "flashinfer/data/cutlass/tools/util/include/",
+    "flashinfer/data/spdlog/include/",
+    "flashinfer/data/cccl/cub/cub/",
+    "flashinfer/data/cccl/libcudacxx/include/",
+    "flashinfer/data/cccl/thrust/thrust/",
+)
+_EXPERIMENTAL_SOURCES_MARKER_TEXT = """\
+This wheel was built with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1: the
+generated kernel sources of the experimental packages (flashinfer/experimental/*/csrc
+and csrc/experimental) are not included, so that the release wheel stays under
+PyPI's per-file size limit. Experimental APIs import normally but raise when they
+first try to compile a kernel. To use them, install a nightly wheel from
+https://flashinfer.ai/whl or install from source:
+    pip install git+https://github.com/flashinfer-ai/flashinfer.git@<tag>
+See flashinfer/experimental/README.md and flashinfer-ai/flashinfer#7977.
+"""
+
+
+def _wheel_entry_dropped(name: str, exclude_experimental: bool) -> bool:
+    if name.startswith(_THIRD_PARTY_ROOTS):
+        return not name.startswith(_THIRD_PARTY_KEEP)
+    if exclude_experimental and _EXPERIMENTAL_SOURCES_RE.match(name):
+        return True
+    return False
+
+
+def _record_hash(data: bytes) -> str:
+    digest = hashlib.sha256(data).digest()
+    return "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _slim_wheel(wheel_path: Path) -> dict[str, int]:
+    """Rewrite ``wheel_path`` in place: drop the entries described above and
+    re-deflate the rest at level 9, regenerating RECORD. Returns counters."""
+    exclude_experimental = _flag(_EXPERIMENTAL_SOURCES_FLAG)
+    before = wheel_path.stat().st_size
+    stats = {"dropped_entries": 0, "dropped_bytes": 0}
+    buf = io.BytesIO()
+    record_name = None
+    with (
+        zipfile.ZipFile(wheel_path) as src,
+        zipfile.ZipFile(
+            buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+        ) as dst,
+    ):
+        records: list[tuple[str, str, int]] = []
+
+        def put(info: zipfile.ZipInfo, data: bytes) -> None:
+            out = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            out.compress_type = zipfile.ZIP_DEFLATED
+            out.external_attr = info.external_attr
+            out.create_system = info.create_system
+            dst.writestr(out, data, compresslevel=9)
+            records.append((info.filename, _record_hash(data), len(data)))
+
+        for info in src.infolist():
+            name = info.filename
+            if name.endswith("/"):
+                continue
+            if name.endswith(".dist-info/RECORD") and name.count("/") == 1:
+                record_name = name
+                record_info = info
+                continue
+            if name == _EXPERIMENTAL_SOURCES_MARKER:
+                # Regenerated below when the flag is set; never duplicated.
+                continue
+            if _wheel_entry_dropped(name, exclude_experimental):
+                stats["dropped_entries"] += 1
+                stats["dropped_bytes"] += info.compress_size
+                continue
+            put(info, src.read(info))
+        if record_name is None:
+            raise RuntimeError(f"{wheel_path} has no .dist-info/RECORD")
+        if exclude_experimental:
+            marker = zipfile.ZipInfo(
+                _EXPERIMENTAL_SOURCES_MARKER, date_time=record_info.date_time
+            )
+            marker.external_attr = record_info.external_attr
+            marker.create_system = record_info.create_system
+            put(marker, _EXPERIMENTAL_SOURCES_MARKER_TEXT.encode("utf-8"))
+        text = io.StringIO()
+        writer = csv.writer(text, delimiter=",", quotechar='"', lineterminator="\n")
+        for row in records:
+            writer.writerow(row)
+        writer.writerow((record_name, "", ""))
+        out = zipfile.ZipInfo(record_name, date_time=record_info.date_time)
+        out.compress_type = zipfile.ZIP_DEFLATED
+        out.external_attr = record_info.external_attr
+        out.create_system = record_info.create_system
+        dst.writestr(out, text.getvalue().encode("utf-8"), compresslevel=9)
+    wheel_path.write_bytes(buf.getvalue())
+    after = wheel_path.stat().st_size
+    print(
+        f"[flashinfer build] wheel post-processing: {before:,} -> {after:,} bytes; "
+        f"dropped {stats['dropped_entries']} entries ({stats['dropped_bytes']:,} compressed bytes); "
+        f"experimental kernel sources {'excluded' if exclude_experimental else 'kept'}",
+        file=sys.stderr,
+    )
+    stats["before"] = before
+    stats["after"] = after
+    return stats
+
+
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     _prepare_for_wheel()
-    return orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    name = orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    _slim_wheel(Path(wheel_directory) / name)
+    return name

@@ -50,13 +50,19 @@ def validate_transformed_mega_weights(
     try:
         (fc1, fc1_scale), (fc2, fc2_scale) = transformed_weights
     except (TypeError, ValueError) as exc:
-        raise ValueError("transformed W4A8 weights must be ((fc1, sf1), (fc2, sf2))") from exc
+        raise ValueError(
+            "transformed W4A8 weights must be ((fc1, sf1), (fc2, sf2))"
+        ) from exc
     expected = (
         ("fc1", fc1, (local_experts, 2 * intermediate_size, hidden_size // 2)),
         ("fc2", fc2, (local_experts, hidden_size, intermediate_size // 2)),
     )
     for name, tensor, shape in expected:
-        if tuple(tensor.shape) != shape or tensor.dtype != FP4_DTYPE or not tensor.is_cuda:
+        if (
+            tuple(tensor.shape) != shape
+            or tensor.dtype != FP4_DTYPE
+            or not tensor.is_cuda
+        ):
             raise ValueError(
                 f"{name} must be CUDA {FP4_DTYPE} with shape {shape}, got "
                 f"{tensor.dtype} {tuple(tensor.shape)}"

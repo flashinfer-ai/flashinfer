@@ -170,14 +170,20 @@ def spin_wait_i32_ge_cv_raw(
 
 @dsl_user_op
 def lds_b32_raw(addr, *, loc=None, ip=None) -> Int32:
-    """Load one shared-memory u32 through a raw shared address."""
+    """Read the current shared-memory value, including reused pipeline stages.
+
+    The pointed-to storage is not an SSA operand. Declare the memory effect to
+    LLVM so it cannot CSE this read or move it across a compiler-visible write.
+    This is a compiler constraint, not a GPU fence: callers still synchronize
+    producers/consumers and TMA proxy visibility before reading the stage.
+    """
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
             "ld.shared.u32 $0, [$1];",
-            "=r,r",
-            has_side_effects=False,
+            "=r,r,~{memory}",
+            has_side_effects=True,
             asm_dialect=0,
             loc=loc,
             ip=ip,

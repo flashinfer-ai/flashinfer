@@ -6,14 +6,10 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
-- **Repo**: https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe.git
-  (fork of the NVIDIA CuTeDSL MegaMoE kernel team's repo; see the mother
-  tree's `ACKNOWLEDGEMENT.md` for authors/contacts)
 - **Branch**: `run/sm120-mxfp8-perf`
 - **Vendored commit**: `d19d30a748f9e402b8a2a33083fdf530231cf647`
   ("Adapt SM120 runner to latest MXFP8 host utils", 2026-07-27)
-- **Last synced**: 2026-08-06 (copied from the local worktree
-  `/home/scratch.mhoqueanik_gpu/cutedsl_megamoe_sm120/sm120_swapab_wt`)
+- **Last synced**: 2026-08-06 (copied from a local development worktree)
 - **Vendored subset**: the five kernel packages only (`common/`, `src/`,
   `moe_sm120_mxfp8_swapab/`, `moe_mxfp8_glu/`, `moe_nvfp4_swapab/`) under
   `src/` — no repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
@@ -52,15 +48,34 @@ replace, what to audit) lives in `SKILL.md`.
   dense data; the drop's ±0.5-sparse test data never reaches any clamp, so
   its own runner cannot see this). The FI backend rejects a set clamp; the
   shim keeps passing it to the ctor for a fixed drop.
-- **world_size=1 (`MEGA_NO_DIST`) numerics with `mma_tiler` N=128**: silently
-  wrong outputs (5–20% of cells off, worst-hit tokens scattered per expert),
-  reproduced with the drop's own `mega_runner` at
+- **`mma_tiler` N=128 numerics (every world size)**: silently wrong outputs.
+  world_size=1 (`MEGA_NO_DIST`): 5–20% of cells off (worst-hit tokens
+  scattered per expert), reproduced with the drop's own `mega_runner` at
   `MEGA_NO_DIST=1 --mma_tiler_mnk 64,128,128` on both its standard geometry
-  and ours; the same N=128 tile is bit-exact at world_size=4, and N=64 is
-  bit-exact at world_size=1. Multi-rank use is unaffected; avoid the
-  single-rank path with N=128 until a fixed drop.
+  and ours. world_size=2 and 4 (verified 2026-08-07 on RTX PRO 6000 and RTX
+  6000D, rank-sharing, dense data, deepseek_v3 geometry): rel-L2 vs the
+  bf16 dense reference sits in the ~6.35% MXFP8 band at small tokens/rank
+  and degrades once tokens fill past an N=64 tile — ws2: 10–28% across
+  16..8192 tokens/rank; ws4: 8–25% across 8..4096 — with run-to-run
+  magnitude variation (consistent with a race). N=64 stays in band at every
+  point tested (ws1/ws2/ws4, up to 8192 tokens/rank), at ~23% lower
+  large-batch throughput. NOTE: the earlier "bit-exact at world_size=4 with
+  N=128" observation came from the drop's 1%-sparse ±0.5 test data, which
+  cannot see this failure; dense activations expose it at every world size.
+  The FI backend pins `mma_tiler_mnk=(64, 64, 128)` at all world sizes
+  unless the caller passes an explicit tiler knob; avoid N=128 entirely
+  until a fixed drop.
 
 ## Pending local diffs vs upstream
+
+- Sanitization (2026-09-14): internal release-scrub markers removed across
+  `src/` (`moe_persistent_scheduler.py`, `mega_reference.py`, `moe_utils.py`
+  in both kernel packages), the marker-wrapped internal-example
+  `GeneralGroupedGemmTensormapConstructor` class deleted from both
+  `moe_utils.py` copies (unused; grep-verified), and the CLC
+  docstring's internal ISA-spec citation rewritten against the public PTX
+  clusterlaunchcontrol documentation. Upstream should strip these before
+  the next drop.
 
 The snapshot was taken from a **dirty worktree**: two files carried
 uncommitted changes on top of `d19d30a` and are vendored as found on disk
@@ -73,7 +88,7 @@ Fold these into a committed upstream state on the next re-sync.
 
 ## Related trees
 
-- `kernel_src/cutedsl_megamoe/` is the mother-repo snapshot (SM100 NVFP4 +
+- `kernel_src/sm100/cutedsl_megamoe/` is the mother-repo snapshot (SM100 NVFP4 +
   MXFP8 kernels). This tree is a **separate snapshot** of a fork carrying the
   SM120 MXFP8 swap-AB kernel; it is not merged into the mother tree on
   purpose: one kernel_src dir = one upstream commit. If upstream merges the

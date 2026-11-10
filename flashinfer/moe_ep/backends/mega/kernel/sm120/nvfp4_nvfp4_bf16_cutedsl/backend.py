@@ -44,6 +44,8 @@ def _effective_clamp(
 
 @register_mega_kernel("sm120_nvfp4_nvfp4_bf16_cutedsl")
 class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
+    supports_output_view = True
+
     def __init__(self, config: Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
@@ -114,6 +116,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 data_parallel_size=config.data_parallel_size,
                 tensor_parallel_size=config.tensor_parallel_size,
                 knobs=config.knobs,
+                numerical_contract=config.numerical_contract,
             ),
             # MEGA_NO_DIST=1 single-rank sessions intentionally have no
             # process group. Multi-rank prepare_workspace() has already
@@ -207,6 +210,14 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             and output.shape[0] >= workspace.config.max_tokens_per_rank
             else None
         )
+        if (
+            direct_output is not None
+            and torch.cuda.is_current_stream_capturing()
+            and not workspace._has_prepared_frontend(transformed_weights, direct_output)
+        ):
+            # Main allocates owned outputs before compute. A fresh capture-pool
+            # address must reuse the warmed workspace graph, then copy out.
+            direct_output = None
         full_output = run_split_mega_moe(
             workspace,
             transformed_weights,
@@ -238,6 +249,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             config.data_parallel_size,
             config.tensor_parallel_size,
             knobs_pool_key(config.knobs),
+            config.numerical_contract,
         )
 
 

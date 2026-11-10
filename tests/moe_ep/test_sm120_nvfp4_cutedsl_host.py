@@ -181,7 +181,7 @@ def test_production_modules_do_not_import_mega_runner() -> None:
     assert not offenders
 
 
-@pytest.mark.parametrize("tokens,enabled", ((2048, False), (4096, True), (8192, True)))
+@pytest.mark.parametrize("tokens,enabled", ((2048, True), (4096, True), (8192, True)))
 def test_rank_local_combine_heuristic_and_override(tokens, enabled) -> None:
     bootstrap_paths()
     from moe_sm120_nvfp4_split.api import MegaMoEProblemSpec, select_compile_spec
@@ -204,7 +204,7 @@ def test_rank_local_combine_heuristic_and_override(tokens, enabled) -> None:
         sm_min_partition=8,
         sm_partition_alignment=8,
     )
-    auto = select_compile_spec(**args)
+    auto = select_compile_spec(**args, numerical_contract="owner_bf16")
     direct = select_compile_spec(
         **args, overrides=MegaMoEHeuristicOverrides(rank_local_combine=False)
     )
@@ -213,7 +213,6 @@ def test_rank_local_combine_heuristic_and_override(tokens, enabled) -> None:
     assert not direct.kernel.rank_local_combine
     if enabled:
         assert auto.kernel.dispatch_warps == 1
-        assert auto.kernel.k2_stages == 3
         assert auto.cache_key != direct.cache_key
 
 
@@ -314,3 +313,72 @@ def test_cold_execution_rejects_capture_before_synchronization(monkeypatch) -> N
     monkeypatch.setattr(torch.cuda, "synchronize", unexpected_sync)
     with pytest.raises(RuntimeError, match="cannot run during CUDA Graph capture"):
         frontend._ensure_execution()
+
+
+def test_numerical_contract_validation():
+    config = Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(2048, 6)
+    assert config.numerical_contract == "ordinary_topk"
+    with pytest.raises(ValueError, match="unknown NVFP4 numerical contract"):
+        Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            2048, 6, numerical_contract="unknown"
+        )
+    with pytest.raises(ValueError, match="owner_bf16"):
+        Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            2048, 6, knobs={"rank_local_combine": True}
+        )
+
+
+def test_pool_separates_numerical_contracts(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    fleet = FleetParams(
+        num_experts=256, max_tokens_per_rank=8192, token_hidden_size=4096
+    )
+
+    def key(contract):
+        backend = Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(
+            Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                2048, 6, numerical_contract=contract
+            )
+        )
+        backend.bind_ep_bootstrap(
+            BootstrapConfig(world_size=4, rank=0, auto_bootstrap=False)
+        )
+        return backend._workspace_pool_key(fleet)
+
+    assert key("ordinary_topk") != key("owner_bf16")
+
+
+@pytest.mark.parametrize("contract", ["ordinary_topk", "owner_bf16"])
+def test_frontend_passes_contract_and_gate_up_width(monkeypatch, contract):
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split import api
+    from moe_sm120_nvfp4_split.runtime import green_context
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+    from dataclasses import dataclass
+
+    @dataclass
+    class Spec:
+        kernel: object
+        build: object = None
+
+    seen = {}
+
+    def select(**kwargs):
+        seen.update(kwargs)
+        return Spec(SimpleNamespace(k1_sms=80, k2_sms=30))
+
+    monkeypatch.setattr(api, "select_compile_spec", select)
+    monkeypatch.setattr(green_context, "query_sm_resource_info", lambda: (110, 8, 8))
+    monkeypatch.setattr(
+        green_context, "query_green_context_sm_counts", lambda **kw: (80, 30)
+    )
+    frontend = object.__new__(runtime.MegaMoESm120Nvfp4Frontend)
+    frontend.config = runtime.MegaMoESm120Nvfp4Config(
+        0, 4, 64, 6, 256, 4096, 2048, numerical_contract=contract
+    )
+    frontend._select_spec(64)
+    assert seen["numerical_contract"] == contract
+    assert seen["problem"].intermediate == 4096
+    assert seen["problem"].tokens_per_rank == 64

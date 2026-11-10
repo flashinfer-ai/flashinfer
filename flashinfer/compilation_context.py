@@ -46,9 +46,29 @@ def cutlass_supports_sm107() -> bool:
             text = arch_header.read_text()
         except OSError:
             continue
-        # Header found and readable: its Sm107 declaration is authoritative.
-        return "struct Sm107" in text
+        # CUTLASS declaring Sm107 is necessary but not sufficient; nvcc must agree.
+        return "struct Sm107" in text and _nvcc_supports_sm107()
     return False
+
+
+@functools.lru_cache(maxsize=1)
+def _nvcc_supports_sm107() -> bool:
+    """Can the nvcc we will actually invoke emit compute_107a? False on any error."""
+    import subprocess
+
+    from flashinfer.jit.cpp_ext import get_cuda_path
+
+    try:
+        nvcc = os.path.join(get_cuda_path(), "bin", "nvcc")
+        out = subprocess.run(
+            [nvcc, "--list-gpu-arch"], capture_output=True, text=True, timeout=60
+        )
+        if out.returncode != 0:
+            return False
+        return "compute_107" in out.stdout
+    except Exception as e:
+        logger.warning(f"Could not query nvcc for compute_107a support: {e}.")
+        return False
 
 
 class CompilationContext:
@@ -63,9 +83,11 @@ class CompilationContext:
         tuple with the correct architecture suffix for nvcc.
 
         SM 9.x  -> 'a' suffix (e.g. compute_90a)
-        SM 12.x -> 'f' suffix with minor version preserved (e.g. compute_120f for SM120, compute_121a for SM121).
-        Each SM 12.x variant gets its own cubin to avoid running SM120 code on SM121 (DGX Spark) which
-        can cause cudaErrorIllegalInstruction. Requires CUDA >= 12.9.
+        SM 12.0 -> allow CUDA 12.8+; prefer the ``f`` suffix on CUDA 12.9+
+        (compute_120f). Keep the 12.8 path available because some consumer
+        Blackwell environments ship torch/cu130 while exposing a 12.8 toolkit.
+        SM 12.1+ -> preserve the minor version and require CUDA >= 12.9
+        (e.g. compute_121a for SM121) so each variant still gets its own cubin.
         SM 10+  -> 'a' suffix (e.g. compute_100a)
         SM < 9  -> no suffix
         """
@@ -74,13 +96,15 @@ class CompilationContext:
         elif major == 12:
             from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 
-            if is_cuda_version_at_least("12.9"):
-                if minor == 0:
+            if minor == 0:
+                if is_cuda_version_at_least("12.9"):
                     return (major, "0f")
-                else:
-                    return (major, str(minor) + "a")
-            else:
-                raise RuntimeError("SM 12.x requires CUDA >= 12.9")
+                if is_cuda_version_at_least("12.8"):
+                    return (major, "0a")
+                raise RuntimeError("SM 120 requires CUDA >= 12.8")
+            if is_cuda_version_at_least("12.9"):
+                return (major, str(minor) + "a")
+            raise RuntimeError("SM 12.1+ requires CUDA >= 12.9")
         elif major >= 10:
             return (major, str(minor) + "a")
         return (major, str(minor))
@@ -105,7 +129,21 @@ class CompilationContext:
                     major, minor = torch.cuda.get_device_capability(device)
                     self.TARGET_CUDA_ARCHS.add(self._normalize_cuda_arch(major, minor))
             except Exception as e:
-                logger.warning(f"Failed to get device capability: {e}.")
+                try:
+                    cuda_available = torch.cuda.is_available()
+                except Exception as availability_error:  # pragma: no cover - defensive
+                    cuda_available = f"<error: {availability_error!r}>"
+                try:
+                    device_count = torch.cuda.device_count()
+                except Exception as device_count_error:  # pragma: no cover - defensive
+                    device_count = f"<error: {device_count_error!r}>"
+                logger.warning(
+                    "Failed to get device capability: %r. "
+                    "torch.cuda.is_available()=%s, torch.cuda.device_count()=%s",
+                    e,
+                    cuda_available,
+                    device_count,
+                )
 
     def get_nvcc_flags_list(
         self,
@@ -129,7 +167,10 @@ class CompilationContext:
         # bundled CUTLASS lacks native compute_107a support; once CUTLASS adds
         # it, callers that opt in with map_sm107_to_100f get native sm107a
         # automatically, with no code change.
-        apply_sm107_mapping = map_sm107_to_100f and not cutlass_supports_sm107()
+        # Second clause is unconditional: callers that never opt in must not emit it.
+        apply_sm107_mapping = (
+            map_sm107_to_100f and not cutlass_supports_sm107()
+        ) or not _nvcc_supports_sm107()
 
         flags = []
         for major, minor in sorted(supported_cuda_archs):

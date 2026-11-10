@@ -17,7 +17,7 @@ records *provenance and sync state* only.
 - **Vendored subset**: the whole
   `flashinfer/moe_ep/kernel_src/sm90/push_style_megamoe/` tree byte-for-byte
   (`src/{a2a,fp8_gemm}/` CUDA sources, `shim/`, `__init__.py`,
-  `ACKNOWLEDGEMENT.md`). No `{$nv-internal-release}` markers present at this
+  `ACKNOWLEDGEMENT.md`). No internal release-scrub markers present at this
   SHA (verified).
 
 ## Policy

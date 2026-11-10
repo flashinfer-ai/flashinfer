@@ -35,7 +35,10 @@ def validate_forward_inputs(
 
     tokens = hidden_states.shape[0]
     hidden = fleet_params.token_hidden_size
-    if hidden_states.shape != (tokens, hidden) or hidden_states.dtype != ACTIVATION_DTYPE:
+    if (
+        hidden_states.shape != (tokens, hidden)
+        or hidden_states.dtype != ACTIVATION_DTYPE
+    ):
         raise MoEEpConfigError(
             f"pre-quantized activation must be {ACTIVATION_DTYPE} with shape "
             f"({tokens}, {hidden})"

@@ -25,6 +25,10 @@
 #include "tensorrt_llm/kernels/helixAllToAll.h"
 #include "tvm_ffi_utils.h"
 
+#ifdef FLASHINFER_DCP_GENERATED
+#include "cake_dcp_alltoall_dispatch.cuh"
+#endif
+
 using tvm::ffi::Tensor;
 using tvm::ffi::TensorView;
 
@@ -57,9 +61,8 @@ void initializeDcpWorkspaceOp(TensorView workspace, int64_t cp_rank, int64_t cp_
   tensorrt_llm::kernels::initializeHelixWorkspace(local_ptr, static_cast<int>(cp_size), stream);
 }
 
-tvm::ffi::Tuple<Tensor, Tensor> alltoallDcpNativeOp(TensorView partial_o, TensorView softmax_stats,
-                                                    TensorView workspace, int64_t cp_rank,
-                                                    int64_t cp_size, bool enable_pdl) {
+void checkDcpInputs(TensorView partial_o, TensorView softmax_stats, TensorView workspace,
+                    int64_t cp_size) {
   CHECK_INPUT(partial_o);
   CHECK_INPUT(softmax_stats);
   CHECK_CUDA(workspace);
@@ -82,7 +85,6 @@ tvm::ffi::Tuple<Tensor, Tensor> alltoallDcpNativeOp(TensorView partial_o, Tensor
       << "softmax_stats second-to-last dim must equal cp_size";
   TVM_FFI_ICHECK(softmax_stats.size(-1) % 2 == 0 && softmax_stats.size(-1) >= 2)
       << "softmax_stats last dim must be even and >= 2";
-  bool allowVariableField1 = softmax_stats.size(-1) > 2;
 
   for (int i = 0; i < partial_o.ndim() - 2; i++) {
     TVM_FFI_ICHECK_EQ(partial_o.size(i), softmax_stats.size(i)) << "batch dimensions must match";
@@ -94,26 +96,32 @@ tvm::ffi::Tuple<Tensor, Tensor> alltoallDcpNativeOp(TensorView partial_o, Tensor
 
   TVM_FFI_ICHECK_EQ(workspace.ndim(), 2) << "workspace must be 2D";
   TVM_FFI_ICHECK_EQ(workspace.size(0), cp_size) << "workspace first dim must equal cp_size";
+}
+
+void checkDcpOutput(TensorView input, TensorView output, char const* name) {
+  CHECK_INPUT(output);
+  TVM_FFI_ICHECK(output.dtype() == input.dtype()) << name << " dtype must match its input";
+  TVM_FFI_ICHECK_EQ(output.ndim(), input.ndim()) << name << " rank must match its input";
+  for (int i = 0; i < input.ndim(); i++) {
+    TVM_FFI_ICHECK_EQ(output.size(i), input.size(i)) << name << " shape must match its input";
+  }
+  TVM_FFI_ICHECK(output.device().device_id == input.device().device_id)
+      << name << " must live on the input device";
+}
+
+// Exchanges ``partial_o`` / ``softmax_stats`` into the caller-provided,
+// already validated output tensors.
+void runDcpAllToAll(TensorView partial_o, TensorView softmax_stats, TensorView partial_o_out,
+                    TensorView softmax_stats_out, TensorView workspace, int64_t cp_rank,
+                    int64_t cp_size, bool enable_pdl) {
+  int64_t kv_lora_rank = partial_o.size(-1);
+  int64_t po_elem_size = get_element_size(partial_o);
+  bool allowVariableField1 = softmax_stats.size(-1) > 2;
 
   int64_t entry_count = 1;
   for (int i = 0; i < partial_o.ndim() - 2; i++) {
     entry_count *= partial_o.size(i);
   }
-
-  // Build output shapes matching inputs
-  std::vector<int64_t> po_shape(partial_o.ndim());
-  for (int i = 0; i < partial_o.ndim(); i++) {
-    po_shape[i] = partial_o.size(i);
-  }
-  std::vector<int64_t> ss_shape(softmax_stats.ndim());
-  for (int i = 0; i < softmax_stats.ndim(); i++) {
-    ss_shape[i] = softmax_stats.size(i);
-  }
-
-  Tensor partial_o_out =
-      alloc_tensor(tvm::ffi::Shape(po_shape), partial_o.dtype(), partial_o.device());
-  Tensor softmax_stats_out =
-      alloc_tensor(tvm::ffi::Shape(ss_shape), softmax_stats.dtype(), softmax_stats.device());
 
   int64_t ss_last = softmax_stats.size(-1);
   int64_t ss_elem_size = get_element_size(softmax_stats);
@@ -153,9 +161,52 @@ tvm::ffi::Tuple<Tensor, Tensor> alltoallDcpNativeOp(TensorView partial_o, Tensor
       tensorrt_llm::kernels::computeHelixMaxChannelCount(static_cast<int>(cp_size));
 
   auto stream = get_current_stream();
+#ifdef FLASHINFER_DCP_GENERATED
+  if (flashinfer::comm::dcp::LaunchGeneratedDcpAllToAll(params, allowVariableField1, enable_pdl,
+                                                        stream)) {
+    return;
+  }
+#endif
   tensorrt_llm::kernels::launchHelixAllToAll(params, allowVariableField1, enable_pdl, stream);
+}
+
+tvm::ffi::Tuple<Tensor, Tensor> alltoallDcpNativeOp(TensorView partial_o, TensorView softmax_stats,
+                                                    TensorView workspace, int64_t cp_rank,
+                                                    int64_t cp_size, bool enable_pdl) {
+  checkDcpInputs(partial_o, softmax_stats, workspace, cp_size);
+
+  // Build output shapes matching inputs
+  std::vector<int64_t> po_shape(partial_o.ndim());
+  for (int i = 0; i < partial_o.ndim(); i++) {
+    po_shape[i] = partial_o.size(i);
+  }
+  std::vector<int64_t> ss_shape(softmax_stats.ndim());
+  for (int i = 0; i < softmax_stats.ndim(); i++) {
+    ss_shape[i] = softmax_stats.size(i);
+  }
+
+  Tensor partial_o_out =
+      alloc_tensor(tvm::ffi::Shape(po_shape), partial_o.dtype(), partial_o.device());
+  Tensor softmax_stats_out =
+      alloc_tensor(tvm::ffi::Shape(ss_shape), softmax_stats.dtype(), softmax_stats.device());
+
+  runDcpAllToAll(partial_o, softmax_stats, partial_o_out, softmax_stats_out, workspace, cp_rank,
+                 cp_size, enable_pdl);
 
   return tvm::ffi::Tuple(partial_o_out, softmax_stats_out);
+}
+
+// Same exchange into preallocated outputs, so callers that capture CUDA graphs
+// or reuse output buffers do not pay a per-call allocation.
+void alltoallDcpNativeIntoOp(TensorView partial_o, TensorView softmax_stats,
+                             TensorView partial_o_out, TensorView softmax_stats_out,
+                             TensorView workspace, int64_t cp_rank, int64_t cp_size,
+                             bool enable_pdl) {
+  checkDcpInputs(partial_o, softmax_stats, workspace, cp_size);
+  checkDcpOutput(partial_o, partial_o_out, "partial_o_out");
+  checkDcpOutput(softmax_stats, softmax_stats_out, "softmax_stats_out");
+  runDcpAllToAll(partial_o, softmax_stats, partial_o_out, softmax_stats_out, workspace, cp_rank,
+                 cp_size, enable_pdl);
 }
 
 }  // namespace
@@ -163,3 +214,4 @@ tvm::ffi::Tuple<Tensor, Tensor> alltoallDcpNativeOp(TensorView partial_o, Tensor
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_dcp_workspace_size_per_rank, getDcpWorkspaceSizePerRank);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(initialize_dcp_workspace, initializeDcpWorkspaceOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(alltoall_dcp_native, alltoallDcpNativeOp);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(alltoall_dcp_native_into, alltoallDcpNativeIntoOp);

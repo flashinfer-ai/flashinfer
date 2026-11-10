@@ -121,5 +121,31 @@ Framework integrations should import `api.py`, not `mega_runner.py`:
 The cache ABI includes the NVFP4 dtype/layout specialization. Do not reuse a
 W4A8 or W8A8 compiled-kernel cache entry.
 
+When `rank_local_combine` is enabled, supported layouts use source-predecoded
+contributor slots, 128-bit contiguous-lane I/O, and a two-fragment register
+pipeline in the existing compute warps. This is an implementation detail, not
+an additional option. The original top-k accumulation order and completion
+protocol are unchanged. The packed plan supports top-k up to eight; hidden
+widths divisible by 2048 guarantee complete 512-channel reduction steps for
+every publication group. Other layouts automatically retain the original
+reducer without allocating a plan. Cache ABI 21 includes this workspace change.
+
 `green_graph` is the default production launch mode. `sequential` remains only
 for bring-up and debugging.
+
+Green Graph binds K1/K2 through retained `CUkernel` handles with `func=NULL`
+and an explicit Green Context. A non-null `CUfunction` would make CUDA ignore
+the supplied context. The compiled libraries and launch attributes are retained
+for the graph lifetime. K3 executes unchanged after the K1/K2 graph on its root
+stream; the completion event includes K3 before the caller can reset the next
+epoch. Physical probes verify disjoint SM ownership, not isolation of shared
+L2, DRAM or PCIe bandwidth.
+
+The current selector screens a frozen candidate catalog, evaluates fitted
+costs, then applies qualified robustness gates. See `SELECTOR.md` for the
+calibration domain and compatibility fallback. Queue bundle selection is part
+of the complete configuration; explicit overrides still win. It is distinct
+from FC1 descriptor readiness and token-back combine groups. The old ABI23
+shape-specific Q8 rule is historical, not the current selection algorithm.
+The current cache ABI is defined in `api.py`; it includes compiler-semantic
+changes as well as device layout changes.

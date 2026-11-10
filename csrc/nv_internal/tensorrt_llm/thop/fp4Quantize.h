@@ -26,19 +26,26 @@
 using tvm::ffi::Optional;
 using tvm::ffi::Tuple;
 
+// `nvfp44Over6Code` is the NVFP4 4over6 wire code (tensorrt_llm/kernels/nvfp4Recipe.h),
+// appended last. No default: TVM_FFI_DLL_EXPORT_TYPED_FUNC ignores C++ defaults, and a
+// default would let a C++ caller drop the recipe silently. Pass kNVFP44Over6FromEnv
+// for the legacy env-driven behaviour.
 void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, TensorView valueE2M1,
                   TensorView scaleFP8SF, int64_t sfVecSize, bool sfUseUE8M0,
                   bool isSfSwizzledLayout, bool isSf8x4Layout, bool isGlobalScaleInversed,
-                  bool enable_pdl);
+                  bool enable_pdl, int64_t nvfp44Over6Code);
 
 void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
-                          int64_t sfVecSize, bool sfUseUE8M0);
+                          int64_t sfVecSize, bool sfUseUE8M0, int64_t nvfp44Over6Code);
 
 void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_scale,
                                                 Tensor const input, Tensor const input_global_scale,
-                                                Tensor const mask, bool use_silu_and_mul);
+                                                Tensor const mask, bool use_silu_and_mul,
+                                                int64_t nvfp44Over6Code);
 
+// sfLayout lost its `= 2` default because nvfp44Over6Code follows it without one.
+// Python always passes it explicitly.
 void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv, TensorView output,
                                      TensorView output_scale, TensorView output_per_token_scale,
                                      Optional<TensorView> expanded_idx_to_permuted_idx,
-                                     int64_t sfLayout = 2);
+                                     int64_t sfLayout, int64_t nvfp44Over6Code);

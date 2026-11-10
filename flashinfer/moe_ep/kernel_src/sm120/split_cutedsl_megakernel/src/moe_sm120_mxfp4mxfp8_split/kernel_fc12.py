@@ -38,9 +38,16 @@ from .sm120_mma import (
     MMA_N,
     SWAP_AB_INTERLEAVE,
     issue_m64n8k32_mxfp8,
+    issue_m64n8k32_mxfp8_packed_sfb,
     make_sm120_ldmatrix_atom,
     make_swapab_m64n8k128_tiled_mma,
     shift_fp4_fragment_for_mxf8f6f4,
+)
+from .sm120_ptx_helpers import (
+    clamp_gate_upper_f32,
+    clamp_symmetric_f32,
+    lds_b32_raw,
+    lds_b32_raw_ordered,
 )
 from .split_timestamp import (
     FIELD_FIRST_WORK,
@@ -904,6 +911,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
         self,
         token_comm_args,
         token_comm_storage,
+        combine_ready_flags,
         k1_ready_queue_desc,
         k1_ready_queue_ready,
         k1_ready_queue_state,
@@ -1833,7 +1841,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         fc1_done_counter.iterator + counter_slot,
                         lambda v: v >= sched_ext.fc2_spin_threshold,
                     )
-                    cute.arch.fence_acq_rel_sys()
+                    cute.arch.fence_acq_rel_gpu()
                     cute.arch.fence_proxy("async.global")
                     real_b, _ = sched_ext.get_gmem_tensor(
                         "b", tma_tensor_fc1_output_as_fc2_input, work_tile_info,
@@ -2077,6 +2085,8 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                     sf_cols = cutlass.Int32(fc1_output_sf.shape[1])
                     sf_k_atoms = (sf_cols + cutlass.Int32(3)) // cutlass.Int32(4)
                     rAmax = cute.make_rmem_tensor((4,), cutlass.Float32)
+                    if cutlass.const_expr(self.gate_up_clamp is not None):
+                        gate_up_limit = cutlass.Float32(self.gate_up_clamp)
 
                     for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
                         acc0 = accs[ng_pair * 2]
@@ -2091,19 +2101,32 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         gate1 = acc0[1]
                         gate2 = acc1[0]
                         gate3 = acc1[1]
-                        val0 = acc0[2] * gate0 * cute.arch.rcp_approx(
+                        up0 = acc0[2]
+                        up1 = acc0[3]
+                        up2 = acc1[2]
+                        up3 = acc1[3]
+                        if cutlass.const_expr(self.gate_up_clamp is not None):
+                            gate0 = clamp_gate_upper_f32(gate0, gate_up_limit)
+                            gate1 = clamp_gate_upper_f32(gate1, gate_up_limit)
+                            gate2 = clamp_gate_upper_f32(gate2, gate_up_limit)
+                            gate3 = clamp_gate_upper_f32(gate3, gate_up_limit)
+                            up0 = clamp_symmetric_f32(up0, gate_up_limit)
+                            up1 = clamp_symmetric_f32(up1, gate_up_limit)
+                            up2 = clamp_symmetric_f32(up2, gate_up_limit)
+                            up3 = clamp_symmetric_f32(up3, gate_up_limit)
+                        val0 = up0 * gate0 * cute.arch.rcp_approx(
                             cute.math.exp2(gate0 * (-Log2E))
                             + cutlass.Float32(1.0)
                         )
-                        val1 = acc0[3] * gate1 * cute.arch.rcp_approx(
+                        val1 = up1 * gate1 * cute.arch.rcp_approx(
                             cute.math.exp2(gate1 * (-Log2E))
                             + cutlass.Float32(1.0)
                         )
-                        val2 = acc1[2] * gate2 * cute.arch.rcp_approx(
+                        val2 = up2 * gate2 * cute.arch.rcp_approx(
                             cute.math.exp2(gate2 * (-Log2E))
                             + cutlass.Float32(1.0)
                         )
-                        val3 = acc1[3] * gate3 * cute.arch.rcp_approx(
+                        val3 = up3 * gate3 * cute.arch.rcp_approx(
                             cute.math.exp2(gate3 * (-Log2E))
                             + cutlass.Float32(1.0)
                         )
@@ -2321,7 +2344,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                 cute.make_layout(1),
                             )
                             output_i32[0] = rFc1StoreI32[0]
-                    cute.arch.fence_acq_rel_sys()
+                    cute.arch.fence_acq_rel_gpu()
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=32 * len(self.compute_warp_id),
@@ -2336,7 +2359,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                             fc1_done_counter.iterator + counter_slot,
                             cutlass.Int32(1),
                             sem="release",
-                            scope="sys",
+                            scope="gpu",
                         )
                 else:
                     hidden_base = (
@@ -4049,7 +4072,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                             fail_sleep_cycles=500,
                         )
                         iket.range_pop()
-                        cute.arch.fence_acq_rel_sys()
+                        cute.arch.fence_acq_rel_gpu()
                         cute.arch.fence_proxy("async.global")
                     elif cutlass.const_expr(
                         self.scheduler_phase_mode == "fused"
@@ -4349,6 +4372,15 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
             tCrSFB = sm100_utils.partition_fragment_SFB(
                 sSFB[None, None, 0], thr_mma, tidx
             )
+            if cutlass.const_expr(self.mma_tiler[1] in (16, 32, 64)):
+                # One packed K128 scale word per N8 output group. The runtime
+                # N128 sub-tile is folded into the SMEM load address.
+                rSFBCompact = cute.make_rmem_tensor(
+                    (n_groups * 4,), self.sf_dtype
+                )
+                rSFBCompactI32 = cute.recast_tensor(
+                    rSFBCompact, cutlass.Int32
+                )
 
             atom_copy_ldmatrix_A = make_sm120_ldmatrix_atom(
                 self.a_dtype,
@@ -4638,28 +4670,44 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         tCsSFA_p_filtered[None, 0, 0],
                         tCrSFA_copy_view_filtered[None, 0, 0],
                     )
-                    cute.copy(
-                        smem_tiled_copy_SFB,
-                        tCsSFB_p_filtered[None, None, 0],
-                        tCrSFB_copy_view_filtered[None, 0, 0, None],
-                    )
-                    tCrSFB_mma_lo = tCrSFB
-                    tCrSFB_mma_hi = tCrSFB
-                    sfb_tile_is_hi = cutlass.Boolean(0)
-                    if cutlass.const_expr(self.mma_tiler[1] < 128):
-                        # Keep the N64 half selection static in RMEM. A dynamic
-                        # iterator offset forces ptxas to materialize the full
-                        # N128 SFB fragment in local memory.
-                        tCrSFB_mma_hi = cute.make_tensor(
-                            tCrSFB.iterator + n_groups // 4,
-                            tCrSFB.layout,
-                        )
+                    if cutlass.const_expr(self.mma_tiler[1] in (16, 32, 64)):
                         sfb_tiles_per_tma = 128 // self.mma_tiler[1]
-                        sfb_tile_is_hi = (
+                        sfb_tile_slot = (
                             work_tile_info.tile_n_idx
                             % cutlass.Int32(sfb_tiles_per_tma)
-                        ) != cutlass.Int32(0)
-
+                        )
+                        for ng in cutlass.range_constexpr(0, n_groups):
+                            lane_scale_row = (
+                                sfb_tile_slot
+                                * cutlass.Int32(self.mma_tiler[1])
+                                + cutlass.Int32(ng * MMA_N)
+                                + lane_idx // cutlass.Int32(4)
+                            )
+                            sfb_lane_byte_base = (
+                                (lane_scale_row % cutlass.Int32(32))
+                                * cutlass.Int32(16)
+                                + (lane_scale_row // cutlass.Int32(32))
+                                * cutlass.Int32(4)
+                            )
+                            sfb_compact_addr = (
+                                sSFB.iterator
+                                + sfb_lane_byte_base
+                                + handle_b.index * cutlass.Int32(512)
+                            )
+                            if cutlass.const_expr(self.mma_tiler[1] == 64):
+                                rSFBCompactI32[ng] = lds_b32_raw_ordered(
+                                    sfb_compact_addr
+                                )
+                            else:
+                                rSFBCompactI32[ng] = lds_b32_raw(
+                                    sfb_compact_addr
+                                )
+                    else:
+                        cute.copy(
+                            smem_tiled_copy_SFB,
+                            tCsSFB_p_filtered[None, None, 0],
+                            tCrSFB_copy_view_filtered[None, 0, 0, None],
+                        )
                     if trace_k_detail != cutlass.Int32(0):
                         if is_phase_linear1:
                             iket.range_push("sm120_fc1_k128_compute")
@@ -4687,22 +4735,27 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                 tCsSFA_p_filtered[None, 0, k_inner_next],
                                 tCrSFA_copy_view_filtered[None, 0, k_inner_next],
                             )
-                            cute.copy(
-                                smem_tiled_copy_SFB,
-                                tCsSFB_p_filtered[None, None, k_inner_next],
-                                tCrSFB_copy_view_filtered[
-                                    None, 0, k_inner_next, None
-                                ],
-                            )
-                        for ng in cutlass.range_constexpr(0, n_groups):
-                            if sfb_tile_is_hi:
-                                issue_m64n8k32_mxfp8(
+                            if cutlass.const_expr(
+                                self.mma_tiler[1] not in (16, 32, 64)
+                            ):
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered[None, None, k_inner_next],
+                                    tCrSFB_copy_view_filtered[
+                                        None, 0, k_inner_next, None
+                                    ],
+                                )
+                        if cutlass.const_expr(
+                            self.mma_tiler[1] in (16, 32, 64)
+                        ):
+                            for ng in cutlass.range_constexpr(0, n_groups):
+                                issue_m64n8k32_mxfp8_packed_sfb(
                                     tiled_mma,
                                     accumulators[None, None, ng],
                                     tCrA,
                                     tCrB,
                                     tCrSFA,
-                                    tCrSFB_mma_hi,
+                                    rSFBCompactI32[ng],
                                     n_group=ng,
                                     active_n_groups=n_groups,
                                     sfa_m_group=0,
@@ -4711,14 +4764,15 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                     b_dtype=self.b_dtype,
                                     sf_dtype=self.sf_dtype,
                                 )
-                            else:
+                        else:
+                            for ng in cutlass.range_constexpr(0, n_groups):
                                 issue_m64n8k32_mxfp8(
                                     tiled_mma,
                                     accumulators[None, None, ng],
                                     tCrA,
                                     tCrB,
                                     tCrSFA,
-                                    tCrSFB_mma_lo,
+                                    tCrSFB,
                                     n_group=ng,
                                     active_n_groups=n_groups,
                                     sfa_m_group=0,
@@ -4771,6 +4825,8 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                     if cutlass.const_expr(self.fc1_output_dtype == cutlass.Float8E5M2):
                         rcp_limit = Fp8E5M2RcpLimit
                     q_limit = cutlass.Float32(1.0 / rcp_limit)
+                    if cutlass.const_expr(self.gate_up_clamp is not None):
+                        gate_up_limit = cutlass.Float32(self.gate_up_clamp)
 
                     for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
                         acc0 = accumulators[None, None, ng_pair * 2]
@@ -4794,6 +4850,15 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         up1 = acc0[3]
                         up2 = acc1[2]
                         up3 = acc1[3]
+                        if cutlass.const_expr(self.gate_up_clamp is not None):
+                            gate0 = clamp_gate_upper_f32(gate0, gate_up_limit)
+                            gate1 = clamp_gate_upper_f32(gate1, gate_up_limit)
+                            gate2 = clamp_gate_upper_f32(gate2, gate_up_limit)
+                            gate3 = clamp_gate_upper_f32(gate3, gate_up_limit)
+                            up0 = clamp_symmetric_f32(up0, gate_up_limit)
+                            up1 = clamp_symmetric_f32(up1, gate_up_limit)
+                            up2 = clamp_symmetric_f32(up2, gate_up_limit)
+                            up3 = clamp_symmetric_f32(up3, gate_up_limit)
                         val0 = up0 * gate0 * cute.arch.rcp_approx(
                             cute.math.exp2(gate0 * (-Log2E))
                             + cutlass.Float32(1.0)
@@ -5362,7 +5427,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                 fc1_done_counter.iterator + counter_slot,
                                 cutlass.Int32(1),
                                 sem="release",
-                                scope="sys",
+                                scope="gpu",
                             )
                 else:
                     iket.range_push("sm120_fc2_store")
@@ -5765,6 +5830,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         self.token_comm_hook_dispatch_warp_body(
                             token_comm_args,
                             token_comm_storage,
+                            combine_ready_flags,
                             k2_ready_queue_desc,
                             k2_ready_queue_ready,
                             k2_ready_queue_state,
@@ -5784,6 +5850,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                     self.token_comm_hook_dispatch_warp_body(
                         token_comm_args,
                         token_comm_storage,
+                        combine_ready_flags,
                         k2_ready_queue_desc,
                         k2_ready_queue_ready,
                         k2_ready_queue_state,

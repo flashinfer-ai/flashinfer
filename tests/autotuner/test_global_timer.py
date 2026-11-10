@@ -108,40 +108,58 @@ def test_global_timer_vs_cuda_event(use_cuda_graph, shape):
     start_evt = torch.cuda.Event(enable_timing=True)
     end_evt = torch.cuda.Event(enable_timing=True)
 
-    def time_globaltimer() -> float:
+    def time_both(timed) -> tuple[float, float]:
+        """Time one execution of ``timed`` with both timers at once.
+
+        Timing separate executions would measure run-to-run variation in the
+        GEMMs themselves, not timer disagreement: on a power-limited part the
+        two runs can differ by several percent, which is what the timers are
+        being compared to. Bracketing a single execution removes that variance.
+
+        The stamps sit outside the events, so the %globaltimer interval
+        strictly contains the cudaEvent interval and %globaltimer reads larger
+        by the bracket cost (two stamp launches, order 10us). Passing a no-op
+        measures that cost on its own.
+        """
         kernel(start_ts)
-        work()
+        start_evt.record()
+        timed()
+        end_evt.record()
         kernel(end_ts)
         torch.cuda.synchronize()
-        return (end_ts.item() - start_ts.item()) / 1e6  # ns -> ms
+        return (
+            start_evt.elapsed_time(end_evt),  # ms
+            (end_ts.item() - start_ts.item()) / 1e6,  # ns -> ms
+        )
 
-    def time_cuda_event() -> float:
-        start_evt.record()
-        work()
-        end_evt.record()
-        torch.cuda.synchronize()
-        return start_evt.elapsed_time(end_evt)  # ms
+    def noop():
+        pass
 
-    time_cuda_event()  # warm the timed path
-    time_globaltimer()
+    time_both(work)  # warm the timed path
+    time_both(noop)
 
-    # Interleave trials so any clock drift / thermal ramp hits both timers alike.
-    event_times, gt_times = [], []
+    event_times, gt_times, bracket_costs = [], [], []
     for _ in range(_TRIALS):
-        event_times.append(time_cuda_event())
-        gt_times.append(time_globaltimer())
+        event_time, gt_time = time_both(work)
+        event_times.append(event_time)
+        gt_times.append(gt_time)
+        empty_event, empty_gt = time_both(noop)
+        bracket_costs.append(empty_gt - empty_event)
 
     event_mean = statistics.mean(event_times)
     gt_mean = statistics.mean(gt_times)
+    # Median: an occasional stamp launch stalls and would drag a mean up.
+    bracket_cost = statistics.median(bracket_costs)
 
     assert event_mean > 0, f"cudaEvent mean must be positive, got {event_mean}"
     assert gt_mean > 0, f"%globaltimer mean must be positive, got {gt_mean}"
 
-    combined_sem = (_sem(event_times) ** 2 + _sem(gt_times) ** 2) ** 0.5
-    allowed_diff = max(_ABS_TOL_MS, _REL_TOL * event_mean, _STAT_ZSCORE * combined_sem)
-    diff = abs(gt_mean - event_mean)
+    # Paired samples: the shared workload variance cancels in the difference.
+    paired_sem = _sem([gt - ev for ev, gt in zip(event_times, gt_times, strict=True)])
+    allowed_diff = max(_ABS_TOL_MS, _REL_TOL * event_mean, _STAT_ZSCORE * paired_sem)
+    diff = abs(gt_mean - bracket_cost - event_mean)
     assert diff <= allowed_diff, (
         f"%globaltimer vs cudaEvent mean disagree: "
         f"globaltimer={gt_mean:.4f}ms cudaEvent={event_mean:.4f}ms "
-        f"diff={diff:.4f}ms > allowed={allowed_diff:.4f}ms"
+        f"bracket={bracket_cost:.4f}ms diff={diff:.4f}ms > allowed={allowed_diff:.4f}ms"
     )

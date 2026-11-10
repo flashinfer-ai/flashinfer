@@ -86,6 +86,7 @@ def _make_layer(
     knobs=None,
     input_norm_const=1.0,
     quantize_input=True,
+    numerical_contract="ordinary_topk",
 ):
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -110,6 +111,7 @@ def _make_layer(
                 gate_up_clamp=10.0,
                 input_norm_const=input_norm_const,
                 knobs=knobs,
+                numerical_contract=numerical_contract,
             ),
             quantize_input=quantize_input,
             preprocess_weights=True,
@@ -149,7 +151,7 @@ def test_sm120_nvfp4_single_rank_replay_and_outer_cuda_graph() -> None:
 
         for tokens in (17, 64):
             oversized = _problem(0, 1, tokens=tokens, capacity=16)["inputs"]
-            with pytest.raises(MoEEpConfigError, match="capacity"):
+            with pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"):
                 layer(oversized)
             torch.testing.assert_close(
                 layer(problem["inputs"]), eager0, atol=0.0, rtol=0.0
@@ -193,8 +195,12 @@ def test_sm120_nvfp4_rank_cache_and_combine_graph_epochs(rank_local_combine) -> 
         "rank_local_combine": rank_local_combine,
     }
     baseline = _make_layer(rank, 4, problem, knobs=base_knobs)
-    candidate = _make_layer(rank, 4, problem, knobs=candidate_knobs)
-    second_layer = _make_layer(rank, 4, problem, knobs=candidate_knobs)
+    candidate = _make_layer(
+        rank, 4, problem, knobs=candidate_knobs, numerical_contract="owner_bf16"
+    )
+    second_layer = _make_layer(
+        rank, 4, problem, knobs=candidate_knobs, numerical_contract="owner_bf16"
+    )
     try:
         inputs = problem["inputs"]
         for layer in (baseline, candidate, second_layer):
@@ -291,6 +297,17 @@ def test_sm120_nvfp4_four_rank_imbalanced_second_epoch() -> None:
         layer.destroy()
 
 
+def _assert_bucket_compilation_shared(workspace, bucket):
+    compiled = [
+        f._compiled
+        for f in workspace._frontends.values()
+        if f.compile_bucket == bucket and f._compiled is not None
+    ]
+    assert compiled
+    for name in ("k1", "k2", "k2_drain", "k2_finalizer"):
+        assert len({id(getattr(c, name)) for c in compiled}) == 1
+
+
 def _assert_green_context_bindings(layer, bucket):
     """Do not mistake a successful set-params call for a retained context."""
     from cuda.bindings import driver as cuda
@@ -376,6 +393,7 @@ def test_sm120_nvfp4_model_shape_shared_workspace_graph_replay():
                 torch.cuda.synchronize()
                 _assert_green_context_bindings(layer, bucket)
             workspace = layers[0]._workspace
+            _assert_bucket_compilation_shared(workspace, bucket)
             assert workspace is layers[1]._workspace
             graphs = [f._compiled.graph for f in workspace._frontends.values()]
             resources = tuple(workspace._green_resources.values())
@@ -395,7 +413,7 @@ def test_sm120_nvfp4_model_shape_shared_workspace_graph_replay():
             for _ in range(100):
                 graph.replay()
             torch.cuda.synchronize()
-            for actual, reference in zip(captured, expected):
+            for actual, reference in zip(captured, expected, strict=True):
                 assert torch.isfinite(actual).all()
                 torch.testing.assert_close(actual, reference, atol=0, rtol=0)
             graph.reset()
@@ -639,6 +657,7 @@ def test_sm120_nvfp4_lazy_bucket_after_inflight_outer_graph() -> None:
 
             for bucket in (16, 7, 8192):
                 expected_small = forward(small, bucket)
+                _assert_bucket_compilation_shared(workspace, bucket)
                 torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -664,14 +683,63 @@ def test_sm120_nvfp4_lazy_bucket_after_inflight_outer_graph() -> None:
                 assert not stream.query()
 
                 actual = forward(ragged, bucket)
+                _assert_bucket_compilation_shared(workspace, bucket)
                 torch.cuda.synchronize()
                 reference = forward(ragged, bucket)
                 torch.cuda.synchronize()
-                for value, expected in zip(actual, reference):
+                for value, expected in zip(actual, reference, strict=True):
                     assert torch.isfinite(value).all()
                     torch.testing.assert_close(value, expected, atol=0, rtol=0)
-                for value, expected in zip(captured_small, expected_small):
+                for value, expected in zip(captured_small, expected_small, strict=True):
                     torch.testing.assert_close(value, expected, atol=0, rtol=0)
             graph.reset()
     finally:
+        layer.destroy()
+
+
+@pytest.mark.arch_sm120
+def test_sm120_nvfp4_explicit_workspace_handles_and_output_view():
+    """Main's capacity handles retain independent captures and shared weights."""
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank test")
+    problem = _problem(0, 1, tokens=16, capacity=16)
+    layer = _make_layer(0, 1, problem)
+    graphs = []
+    try:
+        small = layer.create_workspace(16)
+        large = layer.create_workspace(32)
+        assert small._backend_workspace is not large._backend_workspace
+        assert layer.supports_output_view
+        captured = []
+        for handle in (small, large):
+            layer.warmup(problem["inputs"], workspace=handle)
+            eager = layer(problem["inputs"], workspace=handle).clone()
+            view = layer(
+                problem["inputs"], workspace=handle, return_workspace_view=True
+            )
+            assert view.data_ptr() == handle._backend_workspace.output.data_ptr()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                value = layer(problem["inputs"], workspace=handle)
+            graphs.append(graph)
+            captured.append((value, eager))
+        for _ in range(5):
+            for graph, (value, eager) in zip(graphs, captured, strict=True):
+                graph.replay()
+                torch.testing.assert_close(value, eager, atol=0, rtol=0)
+        torch.cuda.synchronize()
+        graphs[0].reset()
+        small.destroy()
+        with pytest.raises(MoEEpConfigError, match="destroyed"):
+            layer(problem["inputs"], workspace=small)
+        graphs[1].replay()
+        torch.testing.assert_close(captured[1][0], captured[1][1], atol=0, rtol=0)
+    finally:
+        torch.cuda.synchronize()
+        for graph in graphs:
+            graph.reset()
         layer.destroy()

@@ -79,7 +79,7 @@ def interleave_gate_up_16(tensor: torch.Tensor, full_width: int) -> torch.Tensor
 
 
 def to_blocked(scale: torch.Tensor) -> torch.Tensor:
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import to_blocked as impl
+    from moe_sm120_nvfp4_split.runner_common import to_blocked as impl
 
     return impl(scale)
 
@@ -99,7 +99,7 @@ def scale_storage_size(rows: int, logical_k: int) -> int:
 
 
 def _quantize_weights(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from moe_sm120_nvfp4_split.runner_common import (
         nvfp4_quantize_per_block_16,
     )
 

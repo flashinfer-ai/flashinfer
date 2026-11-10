@@ -40,7 +40,7 @@ from flashinfer.fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from flashinfer.jit import setup_cubin_loader
-from flashinfer.utils import _get_cache_buf, get_compute_capability
+from flashinfer.utils import _get_stream_cache_buf, get_compute_capability
 
 # Tensor index constants for trtllm_low_latency_gemm inputs: [A, B, global_scale, out]
 _LLGEMM_A_IDX = 0
@@ -73,7 +73,8 @@ def get_trtllm_low_latency_gemm_module():
 def _get_trtllm_low_latency_gemm_module_impl(enable_rubin: bool):
     mod = gen_trtllm_low_latency_gemm_module(enable_rubin=enable_rubin)
     op = mod.build_and_load()
-    setup_cubin_loader(str(mod.get_library_path()))
+    for library_path in mod.get_library_paths():
+        setup_cubin_loader(str(library_path))
 
     class TrtllmLowLatencyGemmRunner(TunableRunner):
         def get_valid_tactics(
@@ -120,7 +121,7 @@ def _get_trtllm_low_latency_gemm_module_impl(enable_rubin: bool):
             n = b.shape[1]
             k = a.shape[1]
             workspace_size = op.get_workspace_size_in_bytes(m, n, k, tactic)
-            workspace_buffer = _get_cache_buf(
+            workspace_buffer = _get_stream_cache_buf(
                 "trllm_low_latency_gemm", workspace_size, a.device
             )
             op.trtllm_low_latency_gemm(

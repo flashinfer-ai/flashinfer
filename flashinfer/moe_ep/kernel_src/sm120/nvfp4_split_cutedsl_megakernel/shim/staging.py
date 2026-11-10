@@ -20,14 +20,14 @@ def _stage_bf16_inputs(
     *,
     norm_const: float,
 ) -> None:
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from .quant_stage import (
         fused_quant_stage,
         fused_quant_stage_supported,
     )
 
     tokens = hidden_states.shape[0]
     if fused_quant_stage_supported(hidden_states, quant_type="nvfp4"):
-        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage import (
+        from .quant_stage import (
             note_staged_tokens,
         )
 
@@ -76,7 +76,7 @@ def _stage_bf16_inputs(
     staged_topk_weights[:tokens].copy_(topk_weights)
     if tokens < x.shape[0]:
         staged_topk_ids[tokens:].fill_(-1)
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage import (
+    from .quant_stage import (
         note_staged_tokens,
     )
 

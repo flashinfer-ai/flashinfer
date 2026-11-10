@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Shared MegaMoE frontend utilities (dist bootstrap, sym heap, compile state).
 
-Ported from ``kernel_src/cutedsl_megamoe/shim/comm.py``: the SM90 drop's
+Ported from ``kernel_src/sm100/cutedsl_megamoe/shim/comm.py``: the SM90 drop's
 ``src.bootstrap`` / ``src.sym_buffer`` are the same runtime (formatting-only
 diffs), so the helpers carry over verbatim.  The ``from src...`` imports below
 resolve against THIS tree's vendored ``src/`` via ``shim._paths``.
@@ -178,6 +178,9 @@ class _CompiledMega:
     shared_workspace: torch.Tensor
     symmetric_base: int
     peer_offsets_list: Tuple[int, ...]
+    # generate_c (training forward): raw pre-SwiGLU fc1 gate+up output,
+    # (pool_token_capacity, 2 * intermediate) BF16, rank-local; None when off.
+    fc1_c: Optional[torch.Tensor] = None
     # Launch-kwargs cache: rebuilding the cute tensor views (13x from_dlpack +
     # SymBufferHost) and re-validating inputs costs real host time per launch,
     # and the launch inputs are stable session buffers in steady state.  Keyed

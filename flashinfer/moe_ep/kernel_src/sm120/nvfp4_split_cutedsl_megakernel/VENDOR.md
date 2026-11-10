@@ -2,7 +2,11 @@
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
-`d330393eb6dbf8398690d9c5e426c336d3d15f0d` (`KERNEL_CACHE_ABI=20`).
+`22c08eb561ab821839fa921ee8c48ab21592cc9a` (ABI 2737), including selector
+readability cleanup and the compiler-visible shared-load memory-effect fix.
+The fitted coefficients, candidate ordering, policy thresholds and legacy fallback
+are preserved. The `common/` and support `src/` directories retain the PR's
+framework adaptations; the source revision above describes the NVFP4 package.
 
 This drop includes dispatch rank caching, its caller-stream reset ordering,
 128-byte tensor-map descriptors, and the large-EP4 rank-local combine policy.
@@ -38,19 +42,19 @@ execution bucket. The epoch advances with a device operation, including on
 every outer CUDA Graph replay, rather than capturing a host epoch constant.
 Peer-written readiness is not independently cleared by the frontend.
 
-The standalone heuristic selects rank-local combine for eligible same-NUMA
-EP4/TP1 workloads with dispatch caching and at least 256 expected rows per
-expert. It uses the matching owner-partial K3, not ordinary top-k K3. Each
-owner partial is rounded to BF16 before final FP32 accumulation, so this path
-is deterministic but is not bit-identical to direct top-k-slot reduction.
-Set `knobs={"rank_local_combine": False}` to retain direct top-k reduction;
-`knobs={"dispatch_rank_cache": False, "rank_local_combine": False}` disables
-both optimizations. Compile buckets remain separate from workspace capacity.
+The default `numerical_contract="ordinary_topk"` preserves ordinary top-k
+reduction order and forbids rank-local combine. Explicit
+`numerical_contract="owner_bf16"` permits the selector to choose owner partials:
+each owner partial is rounded to BF16 before final FP32 accumulation. This
+contract is deterministic but not bit-identical to ordinary top-k reduction.
+It is included in the workspace pool key. `knobs={"rank_local_combine": False}`
+can disable owner partials under either contract. Compile buckets remain
+separate from workspace capacity; public intermediate width is post-SwiGLU.
 
 FlashInfer adaptation: `runtime/green_context.py` uses the graph-capture-aware
 implementation from the SM120 W4A8 integration, allowing the native Green
 Context graph to be inserted as a child node during an outer CUDA capture.
-Kernel-node rebinding retains the captured `CUkernel` and leaves `CUfunction`
+Kernel-node rebinding resolves `CUkernel` from retained compiled libraries and leaves `CUfunction`
 unset: a non-null `CUfunction` makes CUDA ignore the requested context.
 The wrapper verifies the retained context before instantiation so persistent
 K1/K2 grids cannot silently lose their disjoint SM partitions.
@@ -65,3 +69,33 @@ First allocation of a bucket's execution storage drains in-flight device work
 before entering collective NVSHMEM allocation. This avoids mixing the allocator
 with peer-dependent Green Context graphs. Cached execution/storage paths add no
 synchronization; cold allocation remains forbidden during outer graph capture.
+
+The adapter retains compiled kernel owners, identifies K1/K2 by library function
+identity (not CTA counts), and preserves launch attributes while rebinding.
+The cross-rank finalizer and K3 execute on the primary stream after the mixed-context child graph, including
+outer CUDA Graph capture. The workspace-owned two-part Green Context pair is
+retained for sequential layer reuse and closes after all layer graphs.
+
+The finalizer is deliberately outside the mixed-context child: embedding it
+stalled the first N16/dual-N8 decode launch with pooled Green Context resources.
+Both post-graph callbacks bind the current stream, so outer capture orders
+finalizer, K3 and the next layer's reset on its caller stream.
+
+K1/K2 and their optional drain/finalizer share compiled code per workspace
+bucket. Runtime arguments and graph bindings remain per frontend. This avoids
+recompiling the persistent drain for every output graph; the shared owners live
+until all referring graphs have closed.
+
+The SM120 shim owns its fused quantization stager and imports host weight
+helpers from this NVFP4 package. It does not bootstrap the SM100 source tree.
+The support `src/inputs_process.py` carries the CUDA-compatible encode-scale
+option formerly supplied by the shared stager; the default recipe is unchanged.
+Support-module imports also resolve sleep/wait and reference helpers from the
+local NVFP4 package, avoiding accidental dependency on an SM100 drop.
+
+When an outer capture allocates a fresh output address, the backend reuses its
+warmed workspace graph and copies the live rows to that output. Prepared fixed
+outputs retain their direct graph bindings. The public workspace-view option
+provides a zero-copy view with main's borrowed-output lifetime.
+The fused input stager follows main's CUDA quantizer when a nonzero block's
+E4M3 scale rounds to zero: its encoding scale is zero as well.

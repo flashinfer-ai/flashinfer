@@ -244,12 +244,38 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Allocate TMEM columns for softmax stat handoff records."""
+        if self.cfg.keeps_stats_via_smem:
+            # Do not expose a fictitious TMEM access to the allocator or the
+            # exhaustive dependency checker. The constexpr store/load paths
+            # below use only the SMEM ring for this profile.
+            return []
         if self._alloc is None:
+            num_stages = (
+                self.pipeline_config.num_stages
+                if self.pipeline_config is not None
+                else 1
+            )
             self._alloc = TmemAllocation(
                 name=f"{self.name}",
-                num_columns=self.cfg.tmem_stats_cols,
+                # Stage addresses retain the S-column stride so the producer
+                # and consumer can use the same pipeline stage index.  Include
+                # that stride in the allocation for the staged one-inst path.
+                num_columns=(num_stages - 1) * self.cfg.tmem_s_cols
+                + self.cfg.tmem_stats_cols,
             )
         return [self._alloc]
+
+    def get_producer_requirements(self) -> list[SmemAllocation | TmemAllocation]:
+        """Return the allocation written by the active stats handoff path."""
+        if self.cfg.keeps_stats_via_smem:
+            return self.get_smem_requirements()
+        return self.get_tmem_requirements()
+
+    def get_consumer_requirements(self) -> list[SmemAllocation | TmemAllocation]:
+        """Return the allocation read by the active stats handoff path."""
+        if self.cfg.keeps_stats_via_smem:
+            return self.get_smem_requirements()
+        return self.get_tmem_requirements()
 
     @cute.jit
     def _create_initial_task_locals(
@@ -478,7 +504,6 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
                 stats_ptr,
                 stats,
             )
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
@@ -491,13 +516,12 @@ class TmemSoftmaxLocalResource(DecodeGenResourceBase):
             )
         stats_ptr = self._stats_ptr(stage_info)
         # Reload exactly the payload shape written by _store_stats_vector; the
-        # wait/fence makes the TMEM read visible to scalar consumers.
+        # TMEM view fence makes the read visible to scalar consumers.
         loaded = prims.tcgen05_ld(
             "32x32b",
             stats_ptr,
             num=self.cfg.num_softmax_scale_groups * 2,
         )
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()
         return loaded
 
@@ -740,7 +764,7 @@ class TmemSoftmaxGlobalResource(DecodeGenResourceBase):
     ) -> None:
         """Apply FP8 P-quantization denominator correction through TmemS."""
         cfg = self.cfg
-        if cutlass.const_expr(not cfg.use_fp8_qkv):
+        if cutlass.const_expr(not cfg.use_fp8_pv):
             return
 
         num_scale_groups = cfg.num_softmax_scale_groups

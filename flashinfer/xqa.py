@@ -212,6 +212,7 @@ def xqa(
     v_sf_cache: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
+
     Parameters
     ----------
     q : torch.Tensor
@@ -311,7 +312,7 @@ def xqa(
     - num_q_heads from q.shape[-2]
     - head_dim from q.shape[-1]
     - input_dtype from q.dtype
-    - kv_cache_dtype from k.dtype
+    - kv_cache_dtype from k_cache.dtype
     - head_group_ratio from num_q_heads // num_kv_heads
     - max_seq_len from page_table.shape[-1] * page_size
     """
@@ -386,6 +387,7 @@ def xqa(
     if (
         k_cache.dtype == torch.float8_e4m3fn
         and get_compute_capability(torch.device(device="cuda"))[0] == 9
+        and head_dim <= 256  # SM90 kernel does not support head_dim > 256
     ):
         run_sm90_fp8_mha = True
     else:
@@ -555,6 +557,7 @@ def xqa_mla(
     enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA MLA (Multi-Head Latent Attention) kernel.
+
     Parameters
     ----------
     q : torch.Tensor

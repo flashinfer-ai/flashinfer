@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,8 +21,22 @@ from .comm import (
 from .staging import ACTIVATION_DTYPE
 from .weights import SCALE_DTYPE, TransformedWeights, ceil_div, round_up
 
-
-DECODE_GRAPH_COMPILE_BUCKETS = (7, 16, 32, 64, 128, 168, 256)
+DECODE_GRAPH_COMPILE_BUCKETS = (
+    7,
+    16,
+    32,
+    64,
+    128,
+    168,
+    256,
+    320,
+    384,
+    512,
+    1024,
+    2048,
+    4096,
+)
+_WARNED_DECODE_CAPACITY_FALLBACKS: set[int] = set()
 
 
 def select_graph_compile_bucket(
@@ -30,9 +45,8 @@ def select_graph_compile_bucket(
 ) -> int:
     """Map a collective graph row count to a kernel specialization.
 
-    Buckets above the decode range intentionally fall back to the full
-    workspace capacity. This keeps the prefill policy unchanged while decode
-    graphs use the measured low-latency specializations.
+    Keep fine-grained decode buckets and sparse medium/prefill buckets. The
+    workspace capacity remains the final fallback and is never exceeded.
     """
     if workspace_capacity <= 0:
         raise ValueError("workspace_capacity must be positive")
@@ -43,7 +57,7 @@ def select_graph_compile_bucket(
             f"compile token count {requested_tokens_per_rank} is outside "
             f"workspace capacity {workspace_capacity}"
         )
-    return next(
+    selected = next(
         (
             bucket
             for bucket in DECODE_GRAPH_COMPILE_BUCKETS
@@ -51,6 +65,23 @@ def select_graph_compile_bucket(
         ),
         workspace_capacity,
     )
+    if (
+        selected == workspace_capacity
+        and requested_tokens_per_rank < workspace_capacity
+        and requested_tokens_per_rank > DECODE_GRAPH_COMPILE_BUCKETS[-1]
+        and workspace_capacity not in _WARNED_DECODE_CAPACITY_FALLBACKS
+    ):
+        _WARNED_DECODE_CAPACITY_FALLBACKS.add(workspace_capacity)
+        warnings.warn(
+            "SM120 W4A8 MegaMoE compile request "
+            f"({requested_tokens_per_rank} rows) exceeds the largest dedicated "
+            f"graph bucket ({DECODE_GRAPH_COMPILE_BUCKETS[-1]}); "
+            f"falling back to workspace capacity ({workspace_capacity}). "
+            "Padding and the selected kernel heuristic may affect performance.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return selected
 
 
 @dataclass(frozen=True)
@@ -77,7 +108,9 @@ class MegaMoESm120W4A8Config:
         if self.num_total_experts % self.world_size:
             raise ValueError("num_total_experts must be divisible by EP world size")
         if self.hidden % 32 or self.intermediate % 32:
-            raise ValueError("hidden and post-SwiGLU intermediate must be multiples of 32")
+            raise ValueError(
+                "hidden and post-SwiGLU intermediate must be multiples of 32"
+            )
         if self.num_topk <= 0 or self.num_topk > self.num_total_experts:
             raise ValueError("invalid top-k")
         if self.max_tokens_per_rank <= 0:
@@ -102,6 +135,7 @@ class _ExecutionStorage:
     local_workspace: torch.Tensor
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
+    rank_combine_ready: torch.Tensor | None
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     green_trace: torch.Tensor | None = None
 
@@ -113,6 +147,7 @@ class _ExecutionBuffers:
     local_workspace: torch.Tensor
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
+    rank_combine_ready: torch.Tensor | None
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     green_trace: torch.Tensor | None = None
 
@@ -131,6 +166,7 @@ class _CompiledSplit:
     runtime_k2: dict[str, Any]
     runtime_k2_drain: dict[str, Any] | None
     runtime_k2_finalizer: dict[str, Any] | None
+    graph_owns_epoch_reset: bool
 
 
 @dataclass
@@ -153,6 +189,17 @@ class MegaMoESm120W4A8Workspace:
     )
     _staged_tokens: int = 0
     _destroyed: bool = False
+
+    def _has_prepared_frontend(
+        self,
+        transformed_weights: TransformedWeights,
+        output: torch.Tensor,
+    ) -> bool:
+        key = _frontend_graph_cache_key(
+            transformed_weights, output, self._compile_bucket
+        )
+        frontend = self._frontends.get(key)
+        return frontend is not None and frontend._compiled is not None
 
     def destroy(self) -> None:
         if self._destroyed:
@@ -184,6 +231,12 @@ class MegaMoESm120W4A8Frontend:
         "k2_ready_queue_desc",
         "k2_ready_queue_ready",
         "k2_ready_queue_state",
+        "rank_combine_tile_done",
+    )
+
+    _DISPATCH_CACHE_RESET_REGIONS = (
+        "dispatch_rank_cache_state",
+        "dispatch_rank_cache_debug",
     )
 
     # ``nvlink_barrier_counter`` is deliberately not reset by graph replay.
@@ -204,6 +257,7 @@ class MegaMoESm120W4A8Frontend:
         self.compile_bucket = compile_bucket
         self.control_group = control_group
         self._compiled: _CompiledSplit | None = None
+        self._rank_combine_epoch = 0
         if compile_bucket not in (
             *DECODE_GRAPH_COMPILE_BUCKETS,
             self.config.max_tokens_per_rank,
@@ -314,6 +368,7 @@ class MegaMoESm120W4A8Frontend:
         local_workspace: torch.Tensor,
         shared_workspace: torch.Tensor,
         combine_output: torch.Tensor,
+        rank_combine_ready: torch.Tensor | None,
         epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         green_trace: torch.Tensor | None,
         stream,
@@ -335,7 +390,11 @@ class MegaMoESm120W4A8Frontend:
             fc2_alpha=self._to_cute(fc2_alpha, assumed_align=4),
             fc1_norm_const=self._to_cute(fc1_norm_const, assumed_align=4),
             combine_output=self._to_cute(combine_output),
-            combine_ready_flags=None,
+            combine_ready_flags=(
+                self._to_cute(rank_combine_ready, assumed_align=4)
+                if rank_combine_ready is not None
+                else None
+            ),
             fc2_block_done_counter=None,
             local_workspace=self._to_cute(local_workspace, static_layout=True),
             shared_workspace=self._to_cute(shared_workspace),
@@ -370,6 +429,9 @@ class MegaMoESm120W4A8Frontend:
                 f"K2={kernel.k2_tile}/stage{kernel.k2_stages} "
                 f"bundle={kernel.ready_queue_bundle} "
                 f"tail_reclaim={kernel.k2_tail_reclaim} "
+                f"rank_cache={kernel.dispatch_rank_cache} "
+                f"rank_combine={kernel.rank_local_combine} "
+                f"dispatch_warps={spec.jit.dispatch_warp_count} "
                 f"green={kernel.k1_sms}/{kernel.k2_sms}",
                 flush=True,
             )
@@ -391,9 +453,7 @@ class MegaMoESm120W4A8Frontend:
                 dtype=torch.uint8,
                 device="cuda",
             )
-            shared_workspace = sym_zeros(
-                (bundle.shared_workspace_bytes,), torch.uint8
-            )
+            shared_workspace = sym_zeros((bundle.shared_workspace_bytes,), torch.uint8)
             self.workspace._sym_roots.append(shared_workspace)
             combine_output, root = sym_byte_view(
                 (
@@ -404,6 +464,13 @@ class MegaMoESm120W4A8Frontend:
                 torch.bfloat16,
             )
             self.workspace._sym_roots.append(root)
+            rank_combine_ready = None
+            if spec.kernel.rank_local_combine:
+                rank_combine_ready = sym_zeros(
+                    (self.compile_bucket + 1, self.config.world_size),
+                    torch.int32,
+                )
+                self.workspace._sym_roots.append(rank_combine_ready)
             epilogue_args = tuple(
                 torch.ones(
                     (self.config.local_experts,),
@@ -432,16 +499,44 @@ class MegaMoESm120W4A8Frontend:
                 local_workspace=local_workspace,
                 shared_workspace=shared_workspace,
                 combine_output=combine_output,
+                rank_combine_ready=rank_combine_ready,
                 epilogue_args=epilogue_args,
                 green_trace=green_trace,
             )
             self.workspace._storages[self.compile_bucket] = storage
+            if os.environ.get("FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC") == "1":
+                # Logical buffer bytes include NVSHMEM views; CUDA allocator
+                # counters alone do not account for their symmetric heap.
+                storage_bytes = sum(
+                    tensor.numel() * tensor.element_size()
+                    for item in self.workspace._storages.values()
+                    for tensor in (
+                        item.local_workspace,
+                        item.shared_workspace,
+                        item.combine_output,
+                        item.rank_combine_ready,
+                        item.green_trace,
+                        *item.epilogue_args,
+                    )
+                    if tensor is not None
+                )
+                print(
+                    "[FlashInfer MegaMoE buffers] "
+                    f"rank={self.config.rank} bucket={self.compile_bucket} "
+                    f"capacity={self.config.max_tokens_per_rank} "
+                    f"prepared_buckets={sorted(self.workspace._storages)} "
+                    f"logical_execution_bytes={storage_bytes} "
+                    f"torch_allocated={torch.cuda.memory_allocated()} "
+                    f"torch_reserved={torch.cuda.memory_reserved()}",
+                    flush=True,
+                )
         execution = _ExecutionBuffers(
             bundle=bundle,
             spec=spec,
             local_workspace=storage.local_workspace,
             shared_workspace=storage.shared_workspace,
             combine_output=storage.combine_output,
+            rank_combine_ready=storage.rank_combine_ready,
             epilogue_args=storage.epilogue_args,
             green_trace=storage.green_trace,
         )
@@ -455,7 +550,10 @@ class MegaMoESm120W4A8Frontend:
 
         import cuda.bindings.driver as cuda
         import cutlass.cute as cute
-        from moe_sm120_mxfp4mxfp8_split.api import compile_combine_reduce
+        from moe_sm120_mxfp4mxfp8_split.api import (
+            compile_combine_reduce,
+            compile_rank_local_combine,
+        )
         from moe_sm120_mxfp4mxfp8_split.runtime.green_context import (
             NativeGreenContextGraph,
         )
@@ -467,6 +565,7 @@ class MegaMoESm120W4A8Frontend:
         local_workspace = execution.local_workspace
         shared_workspace = execution.shared_workspace
         combine_output = execution.combine_output
+        rank_combine_ready = execution.rank_combine_ready
         epilogue_args = execution.epilogue_args
         green_trace = execution.green_trace
 
@@ -481,6 +580,7 @@ class MegaMoESm120W4A8Frontend:
             local_workspace,
             shared_workspace,
             combine_output,
+            rank_combine_ready,
             epilogue_args,
             green_trace,
             root_cuda,
@@ -514,9 +614,7 @@ class MegaMoESm120W4A8Frontend:
             # The dual-N8 specialization is verified at two resident CTAs/SM.
             # Use both slots on the SMs released by K1 during the drain phase.
             drain_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
-            k2_drain_launch_clusters = (
-                spec.kernel.k1_sms * drain_ctas_per_sm
-            )
+            k2_drain_launch_clusters = spec.kernel.k1_sms * drain_ctas_per_sm
             compiled_drain = cute.compile(
                 bundle.k2_drain,
                 **dict(
@@ -524,6 +622,9 @@ class MegaMoESm120W4A8Frontend:
                     max_active_clusters=k2_drain_launch_clusters,
                 ),
             )
+        k1_graph_grid_blocks = [spec.kernel.k1_sms]
+        if k2_drain_launch_clusters > 0:
+            k1_graph_grid_blocks.append(k2_drain_launch_clusters)
 
         if bundle.k2_finalizer is not None:
             runtime_finalizer = dict(base_runtime, stream=root_cuda)
@@ -534,27 +635,47 @@ class MegaMoESm120W4A8Frontend:
 
         combine_bucket = combine_output[: self.compile_bucket]
         output_bucket = inputs.output[: self.compile_bucket]
-        k3_plan = compile_combine_reduce(
-            combine_bucket,
-            output_bucket,
-            None,
-            stream=root_cuda,
-        )
-        compiled_k3, combine_cute, output_cute, score_cute, k3_stream = k3_plan
-        runtime_k3 = dict(
-            combine_cute=combine_cute,
-            reduced_cute=output_cute,
-            topk_score_cute=score_cute,
-            stream=k3_stream,
-        )
+        if spec.kernel.rank_local_combine:
+            if rank_combine_ready is None:
+                raise RuntimeError("rank-local combine ready storage is missing")
+            compiled_k3, runtime_k3 = compile_rank_local_combine(
+                combine_bucket,
+                rank_combine_ready,
+                output_bucket,
+                inputs.topk_ids,
+                world_size=self.config.world_size,
+                num_experts_per_rank=self.config.local_experts,
+                stream=root_cuda,
+            )
+        else:
+            k3_plan = compile_combine_reduce(
+                combine_bucket,
+                output_bucket,
+                None,
+                stream=root_cuda,
+            )
+            (
+                compiled_k3,
+                combine_cute,
+                output_cute,
+                score_cute,
+                k3_stream,
+            ) = k3_plan
+            runtime_k3 = dict(
+                combine_cute=combine_cute,
+                reduced_cute=output_cute,
+                topk_score_cute=score_cute,
+                stream=k3_stream,
+            )
 
         k1_executor = compiled_k1.to(None)
         k2_executor = compiled_k2.to(None)
         drain_executor = compiled_drain.to(None) if compiled_drain else None
-        finalizer_executor = (
-            compiled_finalizer.to(None) if compiled_finalizer else None
-        )
+        finalizer_executor = compiled_finalizer.to(None) if compiled_finalizer else None
         k3_executor = compiled_k3.to(None)
+        graph_owns_epoch_reset = (
+            spec.kernel.k2_tail_reclaim or finalizer_executor is not None
+        )
         all_kernels_ready = time.monotonic()
         graph = NativeGreenContextGraph.capture(
             root_stream=root_stream,
@@ -571,14 +692,25 @@ class MegaMoESm120W4A8Frontend:
                 if drain_executor is not None
                 else None
             ),
+            launch_rank_barrier=None,
             launch_k2_finalizer=(
                 (lambda: finalizer_executor(**runtime_finalizer))
                 if finalizer_executor is not None
                 else None
             ),
             launch_k3=lambda: k3_executor(**runtime_k3),
-            launch_reset=lambda: self._reset_execution(execution),
+            launch_reset=(
+                (
+                    lambda: self._reset_execution(
+                        execution, reset_dispatch_rank_cache=False
+                    )
+                )
+                if graph_owns_epoch_reset
+                else None
+            ),
+            streaming_k3=False,
             k1_sm_count=spec.kernel.k1_sms,
+            k1_grid_blocks=tuple(k1_graph_grid_blocks),
             k2_grid_blocks=k2_launch_clusters,
         )
         graph_captured = time.monotonic()
@@ -610,28 +742,60 @@ class MegaMoESm120W4A8Frontend:
             runtime_k2=runtime_k2,
             runtime_k2_drain=runtime_drain,
             runtime_k2_finalizer=runtime_finalizer,
+            graph_owns_epoch_reset=graph_owns_epoch_reset,
         )
         return self._compiled
 
-    def _reset_execution(self, execution: _ExecutionBuffers) -> None:
+    def _reset_execution(
+        self,
+        execution: _ExecutionBuffers,
+        *,
+        reset_dispatch_rank_cache: bool = True,
+    ) -> None:
         kernel = execution.bundle.k1
-        for name in self._LOCAL_RESET_REGIONS:
+        reset_regions = list(self._LOCAL_RESET_REGIONS)
+        if reset_dispatch_rank_cache:
+            reset_regions.extend(self._DISPATCH_CACHE_RESET_REGIONS)
+        for name in reset_regions:
             if name not in kernel._local_offsets:
                 continue
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
             execution.local_workspace[offset : offset + size].zero_()
-        if "expert_recv_count_sum" in kernel._shared_offsets:
-            offset = int(kernel._shared_offsets["expert_recv_count_sum"])
-            size = int(kernel._shared_region_by_name["expert_recv_count_sum"].nbytes)
-            execution.shared_workspace[offset : offset + size].zero_()
+        if "rank_combine_route_map" in kernel._local_offsets:
+            name = "rank_combine_route_map"
+            offset = int(kernel._local_offsets[name])
+            size = int(kernel._local_region_by_name[name].nbytes)
+            execution.local_workspace[offset : offset + size].view(torch.int32).fill_(
+                -1
+            )
+        if execution.rank_combine_ready is not None:
+            self._rank_combine_epoch += 1
+            execution.rank_combine_ready[-1, 0].fill_(self._rank_combine_epoch)
+        # The graph finalizer owns peer-written expert_recv_count and its
+        # published sum. It clears both between two rank barriers; clearing
+        # either here can erase an early peer's next-epoch dispatch write.
         if execution.green_trace is not None:
             execution.green_trace.zero_()
 
     def run(self, inputs: MegaMoESm120W4A8Inputs) -> torch.Tensor:
         compiled = self._ensure_compiled(inputs)
+        if compiled.graph_owns_epoch_reset:
+            if compiled.execution.spec.kernel.dispatch_rank_cache:
+                self._reset_dispatch_rank_cache(compiled.execution)
+        else:
+            self._reset_execution(compiled.execution)
         compiled.graph.launch(torch.cuda.current_stream())
         return inputs.output
+
+    def _reset_dispatch_rank_cache(self, execution: _ExecutionBuffers) -> None:
+        kernel = execution.bundle.k1
+        for name in self._DISPATCH_CACHE_RESET_REGIONS:
+            if name not in kernel._local_offsets:
+                continue
+            offset = int(kernel._local_offsets[name])
+            size = int(kernel._local_region_by_name[name].nbytes)
+            execution.local_workspace[offset : offset + size].zero_()
 
     def release(self) -> None:
         compiled = self._compiled
@@ -668,9 +832,7 @@ def allocate_workspace(
         (config.max_tokens_per_rank, scale_columns), SCALE_DTYPE
     )
     roots.append(root)
-    topk_ids = sym_zeros(
-        (config.max_tokens_per_rank, config.num_topk), torch.int64
-    )
+    topk_ids = sym_zeros((config.max_tokens_per_rank, config.num_topk), torch.int64)
     topk_ids.fill_(-1)
     roots.append(topk_ids)
     topk_weights = sym_zeros(
@@ -695,6 +857,17 @@ def allocate_workspace(
     return workspace
 
 
+def _frontend_graph_cache_key(
+    transformed_weights: TransformedWeights,
+    graph_output: torch.Tensor,
+    compile_bucket: int,
+) -> tuple[int, ...]:
+    (fc1_weight, fc1_scale), (fc2_weight, fc2_scale) = transformed_weights
+    return tuple(
+        tensor.data_ptr() for tensor in (fc1_weight, fc1_scale, fc2_weight, fc2_scale)
+    ) + (graph_output.data_ptr(), compile_bucket)
+
+
 def run_split_mega_moe(
     workspace: MegaMoESm120W4A8Workspace,
     transformed_weights: TransformedWeights,
@@ -705,10 +878,9 @@ def run_split_mega_moe(
         raise RuntimeError("W4A8 workspace has been destroyed")
     (fc1_weight, fc1_scale), (fc2_weight, fc2_scale) = transformed_weights
     graph_output = workspace.output if output is None else output
-    weight_key = tuple(
-        tensor.data_ptr()
-        for tensor in (fc1_weight, fc1_scale, fc2_weight, fc2_scale)
-    ) + (graph_output.data_ptr(), workspace._compile_bucket)
+    weight_key = _frontend_graph_cache_key(
+        transformed_weights, graph_output, workspace._compile_bucket
+    )
     frontend = workspace._frontends.get(weight_key)
     if frontend is None:
         frontend = MegaMoESm120W4A8Frontend(

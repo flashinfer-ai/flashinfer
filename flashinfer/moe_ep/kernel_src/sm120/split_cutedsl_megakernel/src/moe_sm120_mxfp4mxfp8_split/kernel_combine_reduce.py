@@ -16,9 +16,39 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Float32, Int32
 
+from .moe_utils import _nanosleep
+
 BF16_VECTOR_THREADS = 512
 BF16_HIDDEN_PER_THREAD = 8
 PERSISTENT_THREADS = 256
+READY_GATE_THREADS = 256
+
+
+@cute.kernel
+def wait_all_topk_ready_kernel(
+    ready_flags: cute.Tensor,
+    total_flags: cutlass.Constexpr[int],
+):
+    """Wait for every peer-published slot with one bounded-resource CTA."""
+
+    tid = cute.arch.thread_idx()[0]
+    flag_idx = tid
+    while flag_idx < Int32(total_flags):
+        ready = cute.arch.load(
+            ready_flags.iterator + flag_idx,
+            Int32,
+            sem="acquire",
+            scope="sys",
+        )
+        while ready == Int32(0):
+            _nanosleep(64)
+            ready = cute.arch.load(
+                ready_flags.iterator + flag_idx,
+                Int32,
+                sem="acquire",
+                scope="sys",
+            )
+        flag_idx = flag_idx + Int32(READY_GATE_THREADS)
 
 
 @cute.kernel
@@ -181,7 +211,7 @@ def topk_reduce_bf16_persistent_kernel(
                 scope="sys",
             )
             all_ready = Int32(0)
-            if first_flag != Int32(0) and first_flag != Int32(2):
+            if first_flag != Int32(0):
                 all_ready = Int32(1)
                 for k in cutlass.range_constexpr(1, num_topk, 1):
                     if cute.arch.load(
@@ -313,12 +343,6 @@ def topk_reduce_bf16_persistent_kernel(
         )
         if tid == Int32(0):
             if token_idx >= Int32(0):
-                cute.arch.store(
-                    ready_flags.iterator
-                    + token_idx * Int32(num_topk),
-                    Int32(2),
-                    scope="sys",
-                )
                 remaining_slot[0] = remaining_slot[0] - Int32(1)
         cute.arch.barrier(
             barrier_id=0,
@@ -456,6 +480,95 @@ def compile_topk_reduce(
         **compile_kwargs,
     )
     return compiled, combine_cute, reduced_cute, topk_score_cute, stream
+
+
+def compile_gated_topk_reduce(
+    combine_output: torch.Tensor,
+    reduced_output: torch.Tensor,
+    ready_flags: torch.Tensor,
+    topk_score: Optional[torch.Tensor] = None,
+    *,
+    threads: int = BF16_VECTOR_THREADS,
+    stream: Optional[cuda.CUstream] = None,
+):
+    """Compile a single-CTA readiness gate followed by regular parallel K3."""
+
+    tokens, num_topk, hidden = _validate_tensors(
+        combine_output, reduced_output, topk_score
+    )
+    if (
+        ready_flags.dtype != torch.int32
+        or not ready_flags.is_cuda
+        or tuple(ready_flags.shape) != (tokens, num_topk)
+    ):
+        raise TypeError(
+            "ready_flags must be a CUDA int32 tensor with shape "
+            f"{(tokens, num_topk)}."
+        )
+    if ready_flags.device != combine_output.device:
+        raise ValueError(
+            "ready_flags and combine_output must share a device."
+        )
+    if threads <= 0:
+        raise ValueError(f"threads must be positive, got {threads}.")
+    if stream is None:
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    combine_cute = _to_cute_tensor(combine_output)
+    reduced_cute = _to_cute_tensor(reduced_output)
+    ready_flags_cute = _to_cute_tensor(ready_flags)
+    topk_score_cute = (
+        _to_cute_tensor(topk_score) if topk_score is not None else None
+    )
+    hidden_blocks = (
+        hidden + threads * BF16_HIDDEN_PER_THREAD - 1
+    ) // (threads * BF16_HIDDEN_PER_THREAD)
+
+    @cute.jit
+    def _launcher(
+        combine_cute: cute.Tensor,
+        reduced_cute: cute.Tensor,
+        ready_flags_cute: cute.Tensor,
+        topk_score_cute: Optional[cute.Tensor],
+        stream: cuda.CUstream,
+    ):
+        wait_all_topk_ready_kernel(
+            ready_flags_cute,
+            total_flags=tokens * num_topk,
+        ).launch(
+            grid=[1, 1, 1],
+            block=[READY_GATE_THREADS, 1, 1],
+            stream=stream,
+        )
+        topk_reduce_bf16_vec_kernel(
+            combine_cute,
+            topk_score_cute,
+            reduced_cute,
+            num_topk=num_topk,
+            hidden=hidden,
+            store_dtype="bf16",
+        ).launch(
+            grid=[hidden_blocks, tokens, 1],
+            block=[threads, 1, 1],
+            stream=stream,
+        )
+
+    compiled = cute.compile(
+        _launcher,
+        combine_cute,
+        reduced_cute,
+        ready_flags_cute,
+        topk_score_cute,
+        stream,
+    )
+    return (
+        compiled,
+        combine_cute,
+        reduced_cute,
+        ready_flags_cute,
+        topk_score_cute,
+        stream,
+    )
 
 
 def compile_persistent_topk_reduce(

@@ -17,10 +17,4 @@ def build_sm120_dispatch_fc1_kernel(*args, **kwargs):
     return Sm120MegaMoEMxfp8SwapABKernel(*args, **kwargs)
 
 
-# Kept for source compatibility with existing benchmark scripts. New callers
-# should use the lower-case factory name so the symbol is not mistaken for a
-# CuTe kernel class.
-Sm120DispatchFc1Kernel = build_sm120_dispatch_fc1_kernel
-
-
-__all__ = ["build_sm120_dispatch_fc1_kernel", "Sm120DispatchFc1Kernel"]
+__all__ = ["build_sm120_dispatch_fc1_kernel"]

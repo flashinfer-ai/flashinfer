@@ -46,6 +46,7 @@ import cutlass.pipeline as pipeline
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
 
+from .config import RANK_COMBINE_MAX_GROUPS, _rank_local_vector_reduce_supported
 from .kernel_fc12 import Sm120SwapABSwigluNvfp4Fc12Kernel
 from .jit_config import Sm120JitConfig
 from .moe_utils import spin_wait
@@ -81,11 +82,6 @@ _NvlinkCounterCount = 2
 # each slot; split K1 and K2 use separate slots so concurrent grids cannot
 # advance one another's phase.
 _GridSyncSlotCount = 2
-
-# Rank-local combine partitions one hidden row into at most four independent
-# publication groups.  K1 and K2 must reserve an identical counter layout.
-RANK_COMBINE_MAX_GROUPS = 4
-
 
 # =============================================================================
 # Region spec + layout helpers
@@ -199,11 +195,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
-        dispatch_pull_mode: Literal[
-            "auto", "token_strided", "tile_cooperative"
-        ] = "auto",
         dispatch_warps: int = 4,
-        dispatch_warps_per_tile: int = 8,
         dispatch_compute_overlap: Optional[bool] = None,
         dispatch_rank_cache: bool = False,
         rank_local_combine: bool = False,
@@ -602,11 +594,6 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             self.load_balance_mode if self.token_back_by_dispatch else "static"
         )
 
-        if dispatch_pull_mode == "auto":
-            # Per-tile ready counters already let compute overlap dispatch.
-            # Token-strided pull avoids the extra warp rendezvous and release
-            # reductions of the cooperative publication experiment.
-            dispatch_pull_mode = "token_strided"
         if dispatch_compute_overlap is None:
             raise ValueError(
                 "dispatch_compute_overlap must be resolved by heuristic.py"
@@ -614,7 +601,6 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         assert dispatch_compute_overlap is not None
         if dispatch_rank_cache and (
             comm_backend != "p2p_direct"
-            or dispatch_pull_mode != "token_strided"
         ):
             raise ValueError(
                 "dispatch_rank_cache requires p2p_direct token-strided dispatch"
@@ -623,7 +609,6 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         if rank_local_combine and (
             comm_backend != "p2p_direct"
             or token_back_mode != "epi_warps"
-            or dispatch_pull_mode != "token_strided"
             or world_size > num_topk
         ):
             raise ValueError(
@@ -631,6 +616,9 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                 "epi-warp combine with world_size <= num_topk"
             )
         self.rank_local_combine = rank_local_combine
+        self.rank_local_vector_reduce = rank_local_combine and (
+            _rank_local_vector_reduce_supported(self.hidden, self.num_topk)
+        )
 
         self.token_comm = Sm120SysmemTokenInPullTokenBackPush(
             world_size=self.world_size,
@@ -655,13 +643,10 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             flag_batch=flag_batch,
             is_swap_ab=True,
             token_back_schedule_mode=self.token_back_schedule_mode,
-            dispatch_pull_mode=dispatch_pull_mode,
             num_dispatch_warps=token_comm_num_dispatch_warps,
-            dispatch_warps_per_tile=dispatch_warps_per_tile,
             dispatch_compute_overlap=dispatch_compute_overlap,
             dispatch_rank_cache=dispatch_rank_cache,
             rank_local_combine=rank_local_combine,
-            streaming_fc12=self.streaming_fc12,
             k1_ready_queue=self.k1_ready_queue,
             k1_ready_queue_m_tiles=self.k1_ready_queue_m_tiles,
             k1_ready_queue_base=self.k1_ready_queue_base,
@@ -991,11 +976,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                 _RegionSpec(
                     "fc2_done_counter",
                     cutlass.Int32,
-                    (
-                        fc1_done_slots
-                        if self.streaming_fc12
-                        else num_experts_per_rank,
-                    ),
+                    (num_experts_per_rank,),
                     16,
                 )
             )
@@ -1097,7 +1078,9 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                     "rank_combine_route_count",
                     cutlass.Int32,
                     (
-                        world_size * max_tokens_per_rank + world_size,
+                        # Counts, source epochs, then optional packed plans.
+                        (2 if self.rank_local_vector_reduce else 1)
+                        * world_size * max_tokens_per_rank + world_size,
                     ),
                     16,
                 )
@@ -1641,21 +1624,6 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                 tidx=tidx,
             )
 
-    @cute.jit
-    def token_comm_hook_tail_reset_shared_counters(
-        self,
-        token_comm_args,
-        *,
-        cta_linear_id,
-        local_warp_idx,
-        lane_idx,
-    ):
-        self.token_comm.tail_reset_shared_counters(
-            token_comm_args,
-            cta_linear_id=cta_linear_id,
-            local_warp_idx=local_warp_idx,
-            lane_idx=lane_idx,
-        )
 
     @cute.jit
     def token_comm_hook_fc1_cta_complete(

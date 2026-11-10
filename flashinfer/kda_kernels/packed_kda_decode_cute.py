@@ -22,7 +22,7 @@ path dispatches eligible decode calls here (toggle with
 for tests and benchmarks of the packed-input entry point.
 
 Same numerical contract and tensor layouts as the exported Cake backend in
-``flashinfer.kda_kernels.packed_kda_decode``: packed bf16 QKV rows, raw gate
+``flashinfer.kda_kernels.cake_packed_kda_decode``: packed bf16 QKV rows, raw gate
 and beta logits, ``scale = 1/sqrt(128)``, L2 epsilon ``1e-6``,
 ``lower_bound = -5``, bf16 state pool updated in place, and ``-1`` state
 indices producing zero output without touching the pool.
@@ -2495,10 +2495,10 @@ def _check_cuda_tensor(name, tensor, dtype):
 
 def _check_b200(device: torch.device) -> None:
     capability = get_compute_capability(device)
-    if capability != (10, 0):
+    if capability not in ((10, 0), (10, 3), (10, 7)):
         raise RuntimeError(
-            "experimental CuTe packed KDA requires exact compute capability "
-            f"10.0 (B200), got {capability[0]}.{capability[1]}"
+            "experimental CuTe packed KDA requires compute capability "
+            f"10.0, 10.3 or 10.7 (SM100 family), got {capability[0]}.{capability[1]}"
         )
     if not is_cuda_version_at_least("12.8"):
         raise RuntimeError(

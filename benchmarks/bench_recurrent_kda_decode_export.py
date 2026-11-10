@@ -16,7 +16,7 @@
 
 Run this script in separate processes with ``PYTHONPATH`` pointing at the
 pinned current-upstream, evolution-peer, or candidate checkout. Every mode
-calls ``flashinfer.kda_decode.recurrent_kda`` with an identical, deterministic
+calls ``flashinfer.recurrent_kda`` with an identical, deterministic
 D128/T=1..6 matrix. T=1 uses the standard decode ABI, T=3 uses the measured
 lower-bound contract, and the remaining token counts use packed speculative
 decode with precomputed gates. The caller can alternate mode order across
@@ -39,7 +39,7 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
-from flashinfer.kda_decode import recurrent_kda
+from flashinfer import recurrent_kda
 from flashinfer.testing import bench_gpu_time
 
 

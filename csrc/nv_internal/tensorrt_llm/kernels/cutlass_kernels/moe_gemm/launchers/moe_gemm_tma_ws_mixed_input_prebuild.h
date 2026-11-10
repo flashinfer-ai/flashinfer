@@ -41,6 +41,11 @@ using PrecomputedWorkTileCodec = cutlass::gemm::kernel::detail::PrecomputedGroup
 static constexpr int kPrecomputedSchedulerThreads = 128;
 static constexpr int kPrecomputedSchedulerMaxSwizzle = 2;
 static constexpr uint64_t kPrecomputedSchedulerSentinelTiles = 4096;
+#if defined(FLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR)
+static constexpr bool kUsePrebuiltDDescriptor = true;
+#else
+static constexpr bool kUsePrebuiltDDescriptor = false;
+#endif
 
 CUTLASS_HOST_DEVICE uint64_t div_round_up(uint64_t value, uint64_t divisor) {
   return (value + divisor - 1) / divisor;
@@ -114,6 +119,10 @@ inline size_t precomputed_scheduler_workspace_size(int num_experts, int64_t tota
   bytes += align_bytes(sizeof(cute::TmaDescriptor), 128);
   bytes +=
       align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
+  if constexpr (kUsePrebuiltDDescriptor) {
+    bytes +=
+        align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
+  }
   return bytes;
 }
 
@@ -121,6 +130,7 @@ struct PrecomputedSchedulerWorkspace {
   uint64_t* work_tiles = nullptr;
   cute::TmaDescriptor* prebuilt_tma_desc_A = nullptr;
   cute::TmaDescriptor* prebuilt_tma_desc_B = nullptr;
+  cute::TmaDescriptor* prebuilt_tma_desc_D = nullptr;
   size_t required_bytes = 0;
   dim3 gemm_grid_shape = dim3(1, 1, 1);
   uint32_t work_tiles_per_worker = 0;
@@ -131,6 +141,7 @@ template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
 inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
     TmaWarpSpecializedGroupedGemmInput const& hopper_inputs, int num_experts,
     int64_t total_routed_tokens, int64_t channels, int sm_count) {
+  constexpr bool build_prebuilt_d_descriptor = kUsePrebuiltDDescriptor && !ChunkMajorWorkMap;
   using ProblemShape = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt;
   using Scheduler =
       cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupPrecomputed<ProblemShape, 8,
@@ -176,7 +187,13 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
   size_t const prebuilt_a_bytes = align_bytes(sizeof(cute::TmaDescriptor), 128);
   size_t const prebuilt_b_bytes =
       align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor), 128);
-  size_t const required_bytes = work_tiles_bytes + prebuilt_a_bytes + prebuilt_b_bytes;
+  size_t const prebuilt_d_bytes =
+      build_prebuilt_d_descriptor
+          ? align_bytes(size_t(num_experts > 0 ? num_experts : 1) * sizeof(cute::TmaDescriptor),
+                        128)
+          : 0;
+  size_t const required_bytes =
+      work_tiles_bytes + prebuilt_a_bytes + prebuilt_b_bytes + prebuilt_d_bytes;
 
   TLLM_CHECK_WITH_INFO(
       hopper_inputs.precomputed_scheduler_workspace != nullptr,
@@ -193,6 +210,10 @@ inline PrecomputedSchedulerWorkspace partition_precomputed_scheduler_workspace(
   workspace.prebuilt_tma_desc_A = reinterpret_cast<cute::TmaDescriptor*>(base + work_tiles_bytes);
   workspace.prebuilt_tma_desc_B =
       reinterpret_cast<cute::TmaDescriptor*>(base + work_tiles_bytes + prebuilt_a_bytes);
+  if constexpr (build_prebuilt_d_descriptor) {
+    workspace.prebuilt_tma_desc_D = reinterpret_cast<cute::TmaDescriptor*>(
+        base + work_tiles_bytes + prebuilt_a_bytes + prebuilt_b_bytes);
+  }
   workspace.required_bytes = required_bytes;
   workspace.gemm_grid_shape = gemm_grid_shape;
   workspace.work_tiles_per_worker = work_tiles_per_worker;
@@ -254,13 +275,17 @@ __device__ __forceinline__ PrecomputedGroupInfo get_group_info_static(Problem co
   return {problem_blocks_m, problem_blocks_m * problem_blocks_n};
 }
 
-static constexpr int kPrebuiltTmaDescriptorScratchCount = 2;
+template <bool BuildPrebuiltDDescriptor>
+static constexpr int kPrebuiltTmaDescriptorScratchCount = 2 + (BuildPrebuiltDDescriptor ? 1 : 0);
+template <bool BuildPrebuiltDDescriptor>
 static constexpr size_t kPrebuiltTmaDescriptorScratchBytes =
-    kPrebuiltTmaDescriptorScratchCount * sizeof(cute::TmaDescriptor);
+    kPrebuiltTmaDescriptorScratchCount<BuildPrebuiltDDescriptor> * sizeof(cute::TmaDescriptor);
 static constexpr int kPrebuiltTmaDescriptorSlotA = 0;
 static constexpr int kPrebuiltTmaDescriptorSlotB = 1;
+static constexpr int kPrebuiltTmaDescriptorSlotD = 2;
 static constexpr int kPrebuiltTmaDescriptorWarpA = 0;
 static constexpr int kPrebuiltTmaDescriptorWarpB = 1;
+static constexpr int kPrebuiltTmaDescriptorWarpD = 2;
 
 CUTE_DEVICE void publish_prebuilt_tma_descriptor(cute::TmaDescriptor const* gmem_desc_ptr,
                                                  cute::TmaDescriptor& smem_desc,
@@ -356,12 +381,53 @@ __device__ __forceinline__ void build_prebuilt_tma_descriptors(
   }
 }
 
+template <class EpilogueParams, class Problem>
+__device__ __forceinline__ void build_prebuilt_d_tma_descriptor(
+    Problem const& problem, int group, cute::TmaDescriptor* smem_tma_desc,
+    EpilogueParams const& epilogue_params, cute::TmaDescriptor* prebuilt_tma_desc_D) {
+  if (cute::get<1>(problem) == 0) {
+    return;
+  }
+
+  cute::TmaDescriptor& smem_desc = smem_tma_desc[kPrebuiltTmaDescriptorSlotD];
+  if (threadIdx.x == kPrebuiltTmaDescriptorWarpD * 32) {
+    constexpr int MaxTensorRank = 5;
+    cute::array<uint32_t, MaxTensorRank> prob_shape_D = {1, 1, 1, 1, 1};
+    cute::array<uint64_t, MaxTensorRank> prob_stride_D = {0, 0, 0, 0, 0};
+    using ElementD = std::remove_cv_t<
+        std::remove_pointer_t<std::remove_reference_t<decltype(epilogue_params.ptr_D[group])>>>;
+    ElementD const* ptr_D = nullptr;
+    uint32_t const M = static_cast<uint32_t>(cute::get<0>(problem));
+    uint32_t const N = static_cast<uint32_t>(cute::get<1>(problem));
+    Tensor tensor_d =
+        make_tensor(ptr_D, make_layout(make_shape(M, N, uint32_t(1)), epilogue_params.dD[group]));
+
+    smem_desc = *epilogue_params.tma_store_d.get_tma_descriptor();
+    cute::tma_descriptor_replace_addr_in_shared_mem(smem_desc, epilogue_params.ptr_D[group]);
+    cute::detail::fill_tma_gmem_shape_stride(epilogue_params.tma_store_d, tensor_d, prob_shape_D,
+                                             prob_stride_D);
+
+    for (uint64_t& stride : prob_stride_D) {
+      stride = (stride * cutlass::sizeof_bits<ElementD>::value) / 8;
+    }
+    cute::tma_descriptor_replace_dims_strides_in_shared_mem(smem_desc, prob_shape_D, prob_stride_D);
+  }
+  publish_prebuilt_tma_descriptor(&prebuilt_tma_desc_D[group], smem_desc,
+                                  kPrebuiltTmaDescriptorWarpD);
+}
+
 template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
-          bool ChunkMajorWorkMap, class Problem, class MainloopParams>
+          bool ChunkMajorWorkMap, bool BuildPrebuiltDDescriptor, class Problem,
+          class MainloopParams, class... PrebuiltDArgs>
 __global__ void build_precomputed_work_tile_map_kernel(
     Problem const* problem_shapes, int groups, int swizzle_log, int gemm_grid_x, int gemm_grid_y,
     uint32_t work_tiles_per_worker, uint64_t* work_tiles, MainloopParams mainloop_params,
-    cute::TmaDescriptor* prebuilt_tma_desc_A, cute::TmaDescriptor* prebuilt_tma_desc_B) {
+    cute::TmaDescriptor* prebuilt_tma_desc_A, cute::TmaDescriptor* prebuilt_tma_desc_B,
+    PrebuiltDArgs... prebuilt_d_args) {
+  static_assert(!BuildPrebuiltDDescriptor || !ChunkMajorWorkMap,
+                "Single-warpgroup work maps do not use prebuilt D descriptors.");
+  static_assert(BuildPrebuiltDDescriptor ? sizeof...(PrebuiltDArgs) == 2
+                                         : sizeof...(PrebuiltDArgs) == 0);
   int const tid = threadIdx.x;
   uint64_t const total_grid_size = uint64_t(gemm_grid_x) * uint64_t(gemm_grid_y);
 
@@ -382,8 +448,8 @@ __global__ void build_precomputed_work_tile_map_kernel(
 
   extern __shared__ __align__(64) unsigned char shared_storage[];
   cute::TmaDescriptor* smem_tma_desc = reinterpret_cast<cute::TmaDescriptor*>(shared_storage);
-  unsigned long long* prefix_partials =
-      reinterpret_cast<unsigned long long*>(shared_storage + kPrebuiltTmaDescriptorScratchBytes);
+  unsigned long long* prefix_partials = reinterpret_cast<unsigned long long*>(
+      shared_storage + kPrebuiltTmaDescriptorScratchBytes<BuildPrebuiltDDescriptor>);
   unsigned long long* total_partials = nullptr;
   unsigned long long* group_info_storage = nullptr;
   if constexpr (ChunkMajorWorkMap) {
@@ -403,6 +469,11 @@ __global__ void build_precomputed_work_tile_map_kernel(
 
   build_prebuilt_tma_descriptors(mainloop_params, problem_shapes[group], group, smem_tma_desc,
                                  prebuilt_tma_desc_A, prebuilt_tma_desc_B);
+
+  if constexpr (BuildPrebuiltDDescriptor) {
+    build_prebuilt_d_tma_descriptor(problem_shapes[group], group, smem_tma_desc,
+                                    prebuilt_d_args...);
+  }
 
   uint64_t prefix_sum = 0;
   if constexpr (ChunkMajorWorkMap) {
@@ -482,11 +553,14 @@ __global__ void build_precomputed_work_tile_map_kernel(
 }
 
 template <int TileShapeM, int TileShapeN, int ClusterShapeM, int ClusterShapeN,
-          bool ChunkMajorWorkMap = false, class Problem, class MainloopParams>
+          bool ChunkMajorWorkMap = false,
+          bool BuildPrebuiltDDescriptor = kUsePrebuiltDDescriptor && !ChunkMajorWorkMap,
+          class Problem, class MainloopParams, class EpilogueParams>
 inline void build_precomputed_work_tile_map(PrecomputedSchedulerWorkspace const& workspace,
                                             Problem const* problem_shapes, int groups,
                                             int64_t total_routed_tokens, int64_t channels,
                                             MainloopParams const& mainloop_params,
+                                            EpilogueParams const& epilogue_params,
                                             cudaStream_t stream) {
   uint64_t const max_work_tiles =
       max_work_tiles_from_total_tokens<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN>(
@@ -494,16 +568,27 @@ inline void build_precomputed_work_tile_map(PrecomputedSchedulerWorkspace const&
   int const swizzle_log = log_swizzle_size(max_work_tiles, 1, kPrecomputedSchedulerMaxSwizzle);
   dim3 const scheduler_grid(groups > 0 ? groups : 1);
   size_t const scheduler_smem =
-      kPrebuiltTmaDescriptorScratchBytes +
+      kPrebuiltTmaDescriptorScratchBytes<BuildPrebuiltDDescriptor> +
       size_t((ChunkMajorWorkMap ? kPrecomputedSchedulerThreads * 2 : kPrecomputedSchedulerThreads) +
              2) *
           sizeof(unsigned long long);
-  build_precomputed_work_tile_map_kernel<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN,
-                                         ChunkMajorWorkMap, Problem, MainloopParams>
-      <<<scheduler_grid, kPrecomputedSchedulerThreads, scheduler_smem, stream>>>(
-          problem_shapes, groups, swizzle_log, workspace.gemm_grid_shape.x,
-          workspace.gemm_grid_shape.y, workspace.work_tiles_per_worker, workspace.work_tiles,
-          mainloop_params, workspace.prebuilt_tma_desc_A, workspace.prebuilt_tma_desc_B);
+  if constexpr (BuildPrebuiltDDescriptor) {
+    build_precomputed_work_tile_map_kernel<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN,
+                                           ChunkMajorWorkMap, true, Problem, MainloopParams,
+                                           EpilogueParams, cute::TmaDescriptor*>
+        <<<scheduler_grid, kPrecomputedSchedulerThreads, scheduler_smem, stream>>>(
+            problem_shapes, groups, swizzle_log, workspace.gemm_grid_shape.x,
+            workspace.gemm_grid_shape.y, workspace.work_tiles_per_worker, workspace.work_tiles,
+            mainloop_params, workspace.prebuilt_tma_desc_A, workspace.prebuilt_tma_desc_B,
+            epilogue_params, workspace.prebuilt_tma_desc_D);
+  } else {
+    build_precomputed_work_tile_map_kernel<TileShapeM, TileShapeN, ClusterShapeM, ClusterShapeN,
+                                           ChunkMajorWorkMap, false, Problem, MainloopParams>
+        <<<scheduler_grid, kPrecomputedSchedulerThreads, scheduler_smem, stream>>>(
+            problem_shapes, groups, swizzle_log, workspace.gemm_grid_shape.x,
+            workspace.gemm_grid_shape.y, workspace.work_tiles_per_worker, workspace.work_tiles,
+            mainloop_params, workspace.prebuilt_tma_desc_A, workspace.prebuilt_tma_desc_B);
+  }
   TLLM_CUDA_CHECK(cudaPeekAtLastError());
 }
 

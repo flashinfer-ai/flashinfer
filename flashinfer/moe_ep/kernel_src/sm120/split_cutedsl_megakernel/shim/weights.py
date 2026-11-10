@@ -32,7 +32,9 @@ def as_fp4(tensor: torch.Tensor) -> torch.Tensor:
         return tensor
     if tensor.dtype == torch.uint8:
         return tensor.view(FP4_DTYPE)
-    raise ValueError(f"packed MXFP4 data must be uint8 or {FP4_DTYPE}, got {tensor.dtype}")
+    raise ValueError(
+        f"packed MXFP4 data must be uint8 or {FP4_DTYPE}, got {tensor.dtype}"
+    )
 
 
 def as_e8m0(tensor: torch.Tensor) -> torch.Tensor:
@@ -40,7 +42,9 @@ def as_e8m0(tensor: torch.Tensor) -> torch.Tensor:
         return tensor
     if tensor.dtype == torch.uint8:
         return tensor.view(SCALE_DTYPE)
-    raise ValueError(f"MX block scales must be uint8 or {SCALE_DTYPE}, got {tensor.dtype}")
+    raise ValueError(
+        f"MX block scales must be uint8 or {SCALE_DTYPE}, got {tensor.dtype}"
+    )
 
 
 def interleave_gate_up_8(tensor: torch.Tensor, full_width: int) -> torch.Tensor:
@@ -57,12 +61,10 @@ def interleave_gate_up_8(tensor: torch.Tensor, full_width: int) -> torch.Tensor:
         )
     experts, _rows, columns = tensor.shape
     pairs = half // GATE_UP_INTERLEAVE
-    gate = tensor[:, :half].contiguous().view(
-        experts, pairs, GATE_UP_INTERLEAVE, columns
+    gate = (
+        tensor[:, :half].contiguous().view(experts, pairs, GATE_UP_INTERLEAVE, columns)
     )
-    up = tensor[:, half:].contiguous().view(
-        experts, pairs, GATE_UP_INTERLEAVE, columns
-    )
+    up = tensor[:, half:].contiguous().view(experts, pairs, GATE_UP_INTERLEAVE, columns)
     output = tensor.new_empty((experts, pairs, 2, GATE_UP_INTERLEAVE, columns))
     output[:, :, 0].copy_(gate)
     output[:, :, 1].copy_(up)
@@ -121,7 +123,9 @@ def transform_prequantized_weights(
         ("w2_scale", w2_scale, expected_w2_scale),
     ):
         if tuple(tensor.shape) != expected:
-            raise ValueError(f"{name} must have shape {expected}, got {tuple(tensor.shape)}")
+            raise ValueError(
+                f"{name} must have shape {expected}, got {tuple(tensor.shape)}"
+            )
 
     fc1_weight = interleave_gate_up_8(as_fp4(w13), 2 * intermediate)
     fc2_weight = as_fp4(w2).contiguous()

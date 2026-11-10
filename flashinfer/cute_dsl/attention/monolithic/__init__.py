@@ -26,7 +26,7 @@ intended to be imported directly by users. To force the monolithic path,
 pass ``cute_dsl_impl="monolithic"`` to the public API call.
 """
 
-from flashinfer.cute_dsl.utils import is_cute_dsl_available
+from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
 if is_cute_dsl_available():
     from .mla_decode import cute_dsl_mla_decode

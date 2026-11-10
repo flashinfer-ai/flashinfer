@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import warnings
 from typing import Optional, Tuple, Union
 
 import torch
@@ -26,7 +27,8 @@ from ..trace.templates.msa import (
     msa_proxy_score_trace,
 )
 from ..utils import get_device_sm_count, is_sm12x_supported
-from ._common import _BLK_KV
+from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
+from ._common import _BLK_KV, _q_offset_explicit
 
 # NVFP4 scale granularity: one e4m3 block scale per 16 e2m1 elements.
 _SF_VEC_SIZE = 16
@@ -140,6 +142,7 @@ class _ProxySplitKRunner(TunableRunner):
     ):
         # call_fn(inputs, num_splits) -> output; lets one runner serve both the
         # bf16 and (longer-signature) fp4 proxy invocations.
+        """Wrap the compiled proxy-score call for the autotuner."""
         self._call = call_fn
         self._msq = int(max_seqlen_q)
         self._mkt = int(max_k_tiles)
@@ -151,11 +154,13 @@ class _ProxySplitKRunner(TunableRunner):
         self._reduce = bool(reduce_heads)
 
     def __hash__(self):
+        """Hash by type: tactics differ by cache-key extras, not by instance."""
         return hash(type(self))
 
     def get_valid_tactics(self, inputs, profile):
         # Powers of two up to ~4 SM-waves, capped by max_k_tiles; always include
         # the closed-form heuristic so a tuned op is never worse than eager.
+        """Split-K tactics worth timing on this device."""
         num_sms = get_device_sm_count(self._device)
         cap = min(self._mkt, max(1, -(-4 * num_sms // max(self._base, 1))))
         cands = {s for s in (1, 2, 4, 8, 16, 32) if s <= cap}
@@ -165,11 +170,13 @@ class _ProxySplitKRunner(TunableRunner):
     def get_cache_key_extras(self, inputs):
         # max_seqlen_q / max_k_tiles are varlen-derived (not in any tensor shape),
         # so they must key the cache; causal/paged/reduce flip the work pattern.
+        """Fields that must match for a cached tactic to apply."""
         return (self._causal, self._paged, self._reduce, self._msq, self._mkt)
 
     def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
         # tactic == -1 falls back to the closed-form heuristic, so eager
         # (un-tuned) behavior is unchanged.
+        """Run one tactic, or only prepare its workspace."""
         ns = (
             tactic
             if tactic >= 0
@@ -190,6 +197,7 @@ def _proxy_tuned_key(
 ):
     # base_ctas folds in batch/heads/max_seqlen_q, so this matches the autotuner's
     # own cache granularity (shape + get_cache_key_extras) closely enough to gate on.
+    """Autotuner cache key for this op."""
     return (
         op_name,
         bool(causal),
@@ -256,10 +264,37 @@ def _run_proxy_autotuned(
 def _proxy_dummies(device_index: int):
     # Signature fillers for paths that never read them; cached so repeat decode
     # calls do not launch fill kernels.
+    """Dummy inputs used to warm the autotuner on a device."""
     dev = torch.device("cuda", device_index)
     return (
         torch.zeros((1, 1), dtype=torch.int32, device=dev),
         torch.zeros(1, dtype=torch.int32, device=dev),
+    )
+
+
+_F16_ACC_WARNED = False
+
+
+def _warn_f16_accumulation_once() -> None:
+    """One-time process warning for ``use_fp32_acc=False``: fp32 accumulation is the
+    required numerics; the f16 path exists to match the SM90 CuTe DSL kernel and
+    must be opted into knowingly.  Measured on H100: the f16 accumulator saturates
+    to a sticky +-inf as soon as any 128-term q.k dot or 32-term k-slice partial
+    crosses +-65,520 (-inf reads as the causal mask and the top-k then selects no
+    block), and without overflow it carries 1.6-2.2x the f32 path's error."""
+    global _F16_ACC_WARNED
+    if _F16_ACC_WARNED:
+        return
+    _F16_ACC_WARNED = True
+    warnings.warn(
+        "msa_proxy_score(use_fp32_acc=False): the prefill-regime proxy score "
+        "accumulates fp8 products in fp16 (FI #6140 numerics). Any 128-key dot or "
+        "32-term partial beyond +-65,520 saturates to +-inf and corrupts the block "
+        "selection (-inf is read as the causal mask); without overflow the scores "
+        "carry 1.6-2.2x the fp32 error. Use the default use_fp32_acc=True unless "
+        "|q.k| is bounded. This warning is emitted once per process.",
+        RuntimeWarning,
+        stacklevel=3,
     )
 
 
@@ -278,9 +313,10 @@ def msa_proxy_score(
     output: Optional[torch.Tensor] = None,
     reduce_heads: bool = False,
     q_offset=None,
+    use_fp32_acc: bool = True,
 ) -> torch.Tensor:
-    """MSA dense proxy pass for SM120/SM121: per-KV-block max attention
-    logits.
+    """MSA dense proxy pass for SM90 and SM120/SM121: per-KV-block max
+    attention logits.
 
     Computes ``max_score[h, t, q]``, the maximum of the unscaled,
     causally-masked ``Q K^T`` logits over the 128 tokens of KV block ``t``,
@@ -342,6 +378,17 @@ def msa_proxy_score(
         future optimization (saves materializing the per-head buffer).
     q_offset : int or torch.Tensor, optional
         Optional query-position offset used by the causal alignment logic.
+    use_fp32_acc : bool, default=True
+        Accumulation precision of the fp8 ``Q K^T`` products in the SM90
+        prefill regime (``max_seqlen_q > 4``). ``True`` accumulates the exact
+        products in f32 (the original MSA numerics); ``False`` accumulates in
+        f16, the numerics of the SM90 CuTe DSL prefill kernel. The SM90 decode
+        regime and the SM120/SM121 kernels accumulate in f32 whichever value is
+        given; ``False`` is accepted there as a request for at most f16
+        precision, which f32 accumulation satisfies. Passing ``False`` emits a
+        ``RuntimeWarning`` once per process: f16 accumulation saturates to
+        +-inf beyond |128-key dot| 65,520 (corrupting the block selection) and
+        carries 1.6-2.2x the f32 error otherwise.
 
     Returns
     -------
@@ -350,25 +397,13 @@ def msa_proxy_score(
         ``(num_qo_heads, max_k_tiles, total_q)``, or
         ``(1, max_k_tiles, total_q)`` when ``reduce_heads=True``.
     """
-    import cutlass
-    import cutlass.cute as cute
-
-    from .cute_dsl.proxy_score_sm12x import (
-        MsaProxyScoreDecodeKeyMajorSm12x,
-        MsaProxyScoreDecodePackedFp8Sm12x,
-        MsaProxyScoreDecodePackedSm12x,
-        MsaProxyScoreDecodeStreamSm12x,
-        MsaProxyScoreSm12x,
-    )
-    from ._common import (
-        _compile_cache,
-        _cutlass_dtype,
-        _fake,
-        _q_offset_tensor,
-    )
-
-    if not is_sm12x_supported(q.device):
-        raise RuntimeError("msa_proxy_score requires SM120 or SM121 and CUDA >= 12.8")
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
+        raise RuntimeError(
+            "msa_proxy_score requires SM90, SM120 or SM121 and CUDA >= 12.8"
+        )
+    if not use_fp32_acc:
+        _warn_f16_accumulation_once()
     q_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float16) and not q_fp8:
         raise ValueError(f"q must be bf16, fp16, or fp8 e4m3, got {q.dtype}")
@@ -410,7 +445,6 @@ def msa_proxy_score(
         pt_dev = _proxy_dummies(dev.index)[0]
         batch_size = k_len_or_cu.numel() - 1
 
-    cu_q_dev = cu_seqlens_q.to(dev)
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
         cu_seqlens_q, k_len_or_cu, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
     )
@@ -430,6 +464,51 @@ def msa_proxy_score(
     else:
         per_head = output
 
+    if sm90:
+        if not paged:
+            raise NotImplementedError("SM90 proxy-score requires the paged KV layout")
+        if not causal:
+            # Every SM90 proxy schedule masks causally with no switch; the flag
+            # used to be ignored, which silently returned causal scores.
+            raise NotImplementedError("SM90 proxy-score is causal only")
+        from ._sm90_dispatch import proxy_score_sm90
+
+        if q_offset is not None and not isinstance(q_offset, torch.Tensor):
+            # The documented integer form: one offset for every sequence.
+            q_offset = _q_offset_explicit(q_offset, batch_size, dev)
+        proxy_score_sm90(
+            q,
+            k,
+            cu_seqlens_q,
+            pt_dev,
+            k_len_or_cu,
+            per_head,
+            max_seqlen_q=max_seqlen_q,
+            batch_size=batch_size,
+            kv_fp8=kv_fp8,
+            q_offset=q_offset,
+            use_fp32_acc=use_fp32_acc,
+        )
+        if not reduce_heads:
+            return per_head
+        if output is None:
+            output = torch.empty(final_shape, dtype=torch.float32, device=dev)
+        torch.amax(per_head, dim=0, keepdim=True, out=output)
+        return output
+
+    import cutlass
+    import cutlass.cute as cute
+
+    from .cute_dsl.proxy_score_sm12x import (
+        MsaProxyScoreDecodeKeyMajorSm12x,
+        MsaProxyScoreDecodePackedFp8Sm12x,
+        MsaProxyScoreDecodePackedSm12x,
+        MsaProxyScoreDecodeStreamSm12x,
+        MsaProxyScoreSm12x,
+    )
+    from ._common import _compile_cache, _cutlass_dtype, _fake, _q_offset_tensor
+
+    cu_q_dev = cu_seqlens_q.to(dev)
     group_size = num_qo_heads // num_kv_heads
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
     p = 1
@@ -477,10 +556,10 @@ def msa_proxy_score(
         q = q.to(torch.bfloat16)
         q_fp8 = False
 
-    # Right-aligned decode on the stream and key-major paths computes the
-    # causal limit in-kernel, so no offset tensor (and its build kernels,
-    # which dominate at batch 1) is needed.
-    if (use_stream or use_keymajor) and qoff_default:
+    # Right-aligned decode on the stream and packed paths computes the causal
+    # limit in-kernel, so no offset tensor (and its build kernels, which
+    # dominate at batch 1) is needed.
+    if (use_stream or use_packed) and qoff_default:
         qoff_dev = _proxy_dummies(dev.index)[1]
     else:
         qoff_dev = _q_offset_tensor(
@@ -501,7 +580,7 @@ def msa_proxy_score(
         use_keymajor,
         group_size,
         pack_q_len,
-        qoff_default if (use_stream or use_keymajor) else None,
+        qoff_default if (use_stream or use_packed) else None,
     )
     # The packed fp8 schedules take e4m3 operands as 16-bit torch views (half
     # the last dim): the kernel moves raw bytes and upconverts in registers,
@@ -571,6 +650,7 @@ def msa_proxy_score(
                 kv_fp8=kv_fp8,
                 qhead_per_kv=group_size,
                 pack_q_len=pack_q_len,
+                qoff_default=qoff_default,
             )
         else:
             kernel_obj = MsaProxyScoreSm12x(
@@ -813,13 +893,10 @@ def msa_proxy_score_fp4(
         if k_fp4.ndim != 3:
             raise ValueError("flat k_fp4 must be (total_k, num_kv_heads, 64)")
         k_len_or_cu = cu_seqlens_k.to(dev)
-        pt_dev = torch.zeros((1, 1), dtype=torch.int32, device=dev)
+        pt_dev = _proxy_dummies(dev.index)[0]
         batch_size = k_len_or_cu.numel() - 1
 
     cu_q_dev = cu_seqlens_q.to(dev)
-    qoff_dev = _q_offset_tensor(
-        q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
-    )
     max_seqlen_q, max_k_tiles = _resolve_proxy_dims(
         cu_seqlens_q, k_len_or_cu, max_seqlen_q, max_k_tiles, output, k_is_lengths=paged
     )
@@ -847,13 +924,30 @@ def msa_proxy_score_fp4(
     )
     pack_q_len = _PACK_ROWS // group_size if use_packed else 0
 
+    # Right-aligned decode on the packed path computes the causal limit
+    # in-kernel, so no offset tensor (and its build kernels) is needed.
+    qoff_default = q_offset is None
+    if use_packed and qoff_default:
+        qoff_dev = _proxy_dummies(dev.index)[1]
+    else:
+        qoff_dev = _q_offset_tensor(
+            q_offset, cu_q_dev, k_len_or_cu, dev, k_is_lengths=paged
+        )
+
     # Base grid CTAs (feeds split-K) and cache key, as in msa_proxy_score.
     if use_packed:
         base_ctas = batch_size * num_kv_heads
     else:
         base_ctas = ((max_seqlen_q + 127) // 128) * batch_size * num_qo_heads
 
-    key = ("proxy_fp4", causal, paged, use_packed, pack_q_len)
+    key = (
+        "proxy_fp4",
+        causal,
+        paged,
+        use_packed,
+        pack_q_len,
+        qoff_default if use_packed else None,
+    )
     compiled = _compile_cache.get(key)
     if compiled is None:
         u8 = _cutlass_dtype(torch.uint8)
@@ -888,6 +982,7 @@ def msa_proxy_score_fp4(
                 paged=paged,
                 qhead_per_kv=group_size,
                 pack_q_len=pack_q_len,
+                qoff_default=qoff_default,
             )
         else:
             kernel_obj = MsaProxyScoreFp4MmaSm12x(

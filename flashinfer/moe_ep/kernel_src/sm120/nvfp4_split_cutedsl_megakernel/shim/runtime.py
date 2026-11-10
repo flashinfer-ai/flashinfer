@@ -88,12 +88,21 @@ class MegaMoESm120Nvfp4Config:
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
     knobs: dict[str, Any] | None = None
+    numerical_contract: str = "ordinary_topk"
 
     @property
     def local_experts(self) -> int:
         return self.num_total_experts // self.world_size
 
     def validate(self) -> None:
+        if self.numerical_contract not in ("ordinary_topk", "owner_bf16"):
+            raise ValueError("unknown NVFP4 numerical contract")
+        if self.numerical_contract == "ordinary_topk" and (self.knobs or {}).get(
+            "rank_local_combine"
+        ):
+            raise ValueError(
+                "rank_local_combine requires owner_bf16 numerical permission"
+            )
         if self.world_size <= 0 or not 0 <= self.rank < self.world_size:
             raise ValueError("invalid EP rank/world size")
         if self.num_total_experts % self.world_size:
@@ -177,6 +186,7 @@ class MegaMoESm120Nvfp4Workspace:
     _storages: dict[int, _ExecutionStorage] = field(default_factory=dict)
     _execution_plans: dict[int, tuple[Any, Any]] = field(default_factory=dict)
     _compiled_k12: dict[int, tuple[Any, Any]] = field(default_factory=dict)
+    _compiled_aux: dict[int, tuple[Any, Any]] = field(default_factory=dict)
     _executions: dict[int, _ExecutionBuffers] = field(default_factory=dict)
     _compile_bucket: int = 0
     _frontends: dict[tuple[int, ...], "MegaMoESm120Nvfp4Frontend"] = field(
@@ -185,6 +195,13 @@ class MegaMoESm120Nvfp4Workspace:
     _green_resources: dict[tuple[int, int], Any] = field(default_factory=dict)
     _staged_tokens: int = 0
     _destroyed: bool = False
+
+    def _has_prepared_frontend(self, transformed_weights, output: torch.Tensor) -> bool:
+        key = _frontend_graph_cache_key(
+            transformed_weights, output, self._compile_bucket
+        )
+        frontend = self._frontends.get(key)
+        return frontend is not None and frontend._compiled is not None
 
     def destroy(self) -> None:
         if self._destroyed:
@@ -197,9 +214,10 @@ class MegaMoESm120Nvfp4Workspace:
         self._green_resources.clear()
         self._executions.clear()
         self._compiled_k12.clear()
+        self._compiled_aux.clear()
         self._execution_plans.clear()
         self._storages.clear()
-        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage import (
+        from .quant_stage import (
             forget_staged_tokens,
         )
 
@@ -330,6 +348,7 @@ class MegaMoESm120Nvfp4Frontend:
             sm_min_partition=minimum,
             sm_partition_alignment=alignment,
             overrides=self._heuristic_overrides(),
+            numerical_contract=cfg.numerical_contract,
             jit=jit,
         )
         actual_k1, actual_k2 = query_green_context_sm_counts(
@@ -366,7 +385,9 @@ class MegaMoESm120Nvfp4Frontend:
         base, offsets = compute_peer_offsets(shared_workspace, self.config.world_size)
         fc1_alpha, fc2_alpha, fc1_norm_const = epilogue_args
         return dict(
-            activation=self._to_cute(inputs.activation),
+            # Dispatch addresses packed bytes; the GEMM builds its logical
+            # Float4 view from the dispatched local buffer.
+            activation=self._to_cute(inputs.activation.view(torch.uint8)),
             activation_sf=self._to_cute(inputs.activation_scale),
             topk_idx=self._to_cute(inputs.topk_ids),
             topk_weights=self._to_cute(inputs.topk_weights),
@@ -567,8 +588,12 @@ class MegaMoESm120Nvfp4Frontend:
 
         runtime_drain = None
         runtime_finalizer = None
-        compiled_drain = None
-        compiled_finalizer = None
+        # Like K1/K2, these kernels take runtime tensor/stream arguments.
+        # Reuse code per workspace bucket, while each graph binds its own
+        # arguments. Recompiling the persistent drain per output grows the
+        # CuTe compiler state for no specialization benefit.
+        compiled_aux = self.workspace._compiled_aux.get(self.compile_bucket)
+        compiled_drain, compiled_finalizer = compiled_aux or (None, None)
         k2_drain_launch_clusters = 0
         k2_drain = getattr(bundle, "k2_drain", None)
         k2_finalizer = getattr(bundle, "k2_finalizer", None)
@@ -578,19 +603,27 @@ class MegaMoESm120Nvfp4Frontend:
             # Use both slots on the SMs released by K1 during the drain phase.
             drain_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
             k2_drain_launch_clusters = spec.kernel.k1_sms * drain_ctas_per_sm
-            compiled_drain = cute.compile(
-                k2_drain,
-                **dict(
-                    runtime_drain,
-                    max_active_clusters=k2_drain_launch_clusters,
-                ),
-            )
+            if compiled_aux is None:
+                compiled_drain = cute.compile(
+                    k2_drain,
+                    **dict(
+                        runtime_drain,
+                        max_active_clusters=k2_drain_launch_clusters,
+                    ),
+                )
 
         if k2_finalizer is not None:
             runtime_finalizer = dict(base_runtime, stream=root_cuda)
-            compiled_finalizer = cute.compile(
-                k2_finalizer,
-                **dict(runtime_finalizer, max_active_clusters=1),
+            if compiled_aux is None:
+                compiled_finalizer = cute.compile(
+                    k2_finalizer,
+                    **dict(runtime_finalizer, max_active_clusters=1),
+                )
+
+        if compiled_aux is None:
+            self.workspace._compiled_aux[self.compile_bucket] = (
+                compiled_drain,
+                compiled_finalizer,
             )
 
         combine_bucket = combine_output[: self.compile_bucket]
@@ -647,6 +680,21 @@ class MegaMoESm120Nvfp4Frontend:
             k2_drain_executor=drain_executor,
             k2_finalizer_executor=finalizer_executor,
             k3_executor=k3_executor,
+            compiled_kernels=tuple(
+                k
+                for k in (
+                    compiled_k1,
+                    compiled_k2,
+                    compiled_drain,
+                    compiled_finalizer,
+                    compiled_k3,
+                )
+                if k is not None
+            ),
+            compiled_role_owners={
+                0: (compiled_k1, compiled_drain),
+                1: (compiled_k2,),
+            },
             launch_k1=lambda: k1_executor(**runtime_k1),
             launch_k2=lambda: k2_executor(**runtime_k2),
             launch_k2_drain=(
@@ -655,11 +703,26 @@ class MegaMoESm120Nvfp4Frontend:
                 else None
             ),
             launch_k2_finalizer=(
-                (lambda: finalizer_executor(**runtime_finalizer))
+                (
+                    lambda: finalizer_executor(
+                        **dict(
+                            runtime_finalizer,
+                            stream=cuda.CUstream(
+                                torch.cuda.current_stream().cuda_stream
+                            ),
+                        )
+                    )
+                )
                 if finalizer_executor is not None
                 else None
             ),
-            launch_k3=lambda: k3_executor(**runtime_k3),
+            # Used both for normal replay and insertion into an outer graph.
+            launch_k3=lambda: k3_executor(
+                **dict(
+                    runtime_k3,
+                    stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+                )
+            ),
             k1_sm_count=spec.kernel.k1_sms,
             k1_grid_clusters=spec.kernel.k1_sms,
             k2_grid_clusters=k2_launch_clusters,
@@ -799,6 +862,12 @@ def allocate_workspace(
     return workspace
 
 
+def _frontend_graph_cache_key(transformed_weights, output, bucket):
+    return tuple(
+        tensor.data_ptr() for pair in transformed_weights for tensor in pair
+    ) + (output.data_ptr(), bucket)
+
+
 def run_split_mega_moe(
     workspace: MegaMoESm120Nvfp4Workspace,
     transformed_weights: TransformedWeights,
@@ -809,9 +878,9 @@ def run_split_mega_moe(
         raise RuntimeError("NVFP4 workspace has been destroyed")
     (fc1_weight, fc1_scale), (fc2_weight, fc2_scale) = transformed_weights
     graph_output = workspace.output if output is None else output
-    weight_key = tuple(
-        tensor.data_ptr() for tensor in (fc1_weight, fc1_scale, fc2_weight, fc2_scale)
-    ) + (graph_output.data_ptr(), workspace._compile_bucket)
+    weight_key = _frontend_graph_cache_key(
+        transformed_weights, graph_output, workspace._compile_bucket
+    )
     frontend = workspace._frontends.get(weight_key)
     if frontend is None:
         frontend = MegaMoESm120Nvfp4Frontend(

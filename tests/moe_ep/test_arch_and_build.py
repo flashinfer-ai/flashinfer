@@ -207,8 +207,42 @@ def test_nccl_floor_not_checked_on_hopper_or_for_nixl():
         validate_arch_for_backend("nixl_ep")
 
 
-def test_installed_nccl_version_prefers_wheel_metadata():
+def _fake_loaded_libnccl(code):
+    """A ctypes.CDLL stand-in whose ncclGetVersion reports ``code``."""
+    lib = mock.MagicMock()
+
+    def _get_version(ptr):
+        ptr._obj.value = code
+        return 0
+
+    lib.ncclGetVersion.side_effect = _get_version
+    return mock.patch("ctypes.CDLL", return_value=lib)
+
+
+def test_installed_nccl_version_prefers_the_loaded_library():
+    """The library that actually loads wins over the wheel's metadata.
+
+    Regression guard: NGC images ship a system libnccl that the linker finds
+    ahead of the nvidia-nccl-cu13 wheel, so metadata reports a version that is
+    merely installed. Trusting it let the Blackwell floor pass while
+    libnccl_ep (built against 2.30.7 since nccl-extensions 0.1.0) aborted the
+    process with "NCCL library is too old".
+    """
     from flashinfer.moe_ep.core.validation import common
 
-    with mock.patch("importlib.metadata.version", return_value="2.30.7"):
+    with (
+        _fake_loaded_libnccl(23004),  # 2.30.4 actually loaded
+        mock.patch("importlib.metadata.version", return_value="2.30.7"),
+    ):
+        assert common._installed_nccl_version() == (2, 30, 4)
+
+
+def test_installed_nccl_version_falls_back_to_metadata():
+    """No openable libnccl -> the wheel's metadata is the only signal left."""
+    from flashinfer.moe_ep.core.validation import common
+
+    with (
+        mock.patch("ctypes.CDLL", side_effect=OSError("no libnccl")),
+        mock.patch("importlib.metadata.version", return_value="2.30.7"),
+    ):
         assert common._installed_nccl_version() == (2, 30, 7)

@@ -361,10 +361,11 @@ __global__ void routingMainKernel(KernelParams params) {
         params.mPtrTopKWeights[idxShared] = static_cast<OutputT>(1.0F);
       }
 
-      // Routing replay: record all top-K selected expert IDs per token.
-      // Layout: [num_tokens, topK] -- same indexing as mPtrTopKPacked.
+      // Routing replay is routed-only: [num_tokens, topK] with stride topK.
+      // Packed ids/weights use mTotalExpertsPerToken (= topK + fused shared).
+      auto idxReplay = blockIdx.x * params.mTopK + laneIdx;
       if (params.mPtrRoutingReplayOut != nullptr && laneIdx < params.mTopK) {
-        params.mPtrRoutingReplayOut[idxTopK] = static_cast<int16_t>(expertIdx);
+        params.mPtrRoutingReplayOut[idxReplay] = static_cast<int16_t>(expertIdx);
       }
     }
   }
