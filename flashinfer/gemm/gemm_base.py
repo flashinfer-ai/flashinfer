@@ -524,7 +524,9 @@ def _cutlass_mm_bf16_requirement(
         raise ValueError(
             "You cannot use the CUTLASS backend with a bias. Use the TGV backend instead."
         )
-    if pdl:
+    if pdl and backend != "auto":
+        # No PDL launch: backend="auto" keeps CUTLASS as a pdl=True candidate
+        # that runs without PDL, but naming it with pdl=True is an error.
         raise ValueError(
             "The CUTLASS backend does not support PDL. Use the TGV backend instead."
         )
@@ -561,7 +563,9 @@ def _cublaslt_mm_bf16_requirement(
             raise ValueError("cuBLASLt bias must be on the same CUDA device as A.")
         if not bias.is_contiguous():
             raise ValueError("cuBLASLt bias must be contiguous.")
-    if pdl:
+    if pdl and backend != "auto":
+        # No PDL launch: backend="auto" keeps cuBLASLt as a pdl=True candidate
+        # that runs without PDL, but naming it with pdl=True is an error.
         raise ValueError(
             "The cuBLASLt backend does not support PDL. Use the TGV backend instead."
         )
@@ -806,14 +810,17 @@ def _heuristic_func_mm_bf16(
     ] = "cudnn",
     batch_invariant: bool = False,
 ):
+    # pdl does not narrow the candidates: cuDNN, cuBLASLt and CUTLASS have no
+    # PDL launch and run without it here (CUTLASS and cuBLASLt reject
+    # pdl=True only when named explicitly).
     heuristic_backends = []
-    if bias is not None or pdl:
-        # CUTLASS and cuBLASLt doesn't support bias/pdl, only TGV and cuDNN do
+    if bias is not None:
+        # CUTLASS has no bias epilogue.
         if "tgv" in suitable_backends:
             heuristic_backends.append("tgv")
         if "cudnn" in suitable_backends:
             heuristic_backends.append("cudnn")
-        if bias is not None and not pdl and "cublaslt" in suitable_backends:
+        if "cublaslt" in suitable_backends:
             heuristic_backends.append("cublaslt")
     else:
         if "cutlass" in suitable_backends:
@@ -892,16 +899,18 @@ def mm_bf16(
         ``None``.
 
     pdl: Optional[bool]
-        Whether to use Programmatic Dependent Launch. Enabled for TGV,
-        TinyGEMM, and CuTeDSL backends. ``None`` leaves it to the
-        autotuner: under autotuning, each of these backends is profiled both
-        without and with PDL and the faster variant is cached; without a
-        tuned entry they run without PDL. These entries use the op name
-        ``"bf16_gemm_pdl_auto"``, while ``skip_ops={"bf16_gemm"}`` still
-        skips such calls. PDL kernels may read ``b`` and ``bias`` before
-        waiting for the preceding kernel, so pass ``pdl=False`` if a kernel
-        that may still be running writes them. Defaults to ``False`` so
-        autotuning cannot silently enable this input-dependency assumption.
+        Whether to use Programmatic Dependent Launch. TGV, TinyGEMM, and
+        CuTeDSL launch with PDL. The other backends have no PDL launch: naming
+        CUTLASS, cuBLASLt, or cuTile with ``pdl=True`` raises ``ValueError``,
+        and cuDNN runs without PDL. ``backend="auto"`` keeps the same
+        candidates under ``pdl=True``: TGV, TinyGEMM, and CuTeDSL launch with
+        PDL, while cuDNN, cuBLASLt, and CUTLASS compete without it. Tuning
+        entries for ``pdl=True`` use the op name ``"bf16_gemm_pdl"``, while
+        ``skip_ops={"bf16_gemm"}`` still skips such calls. PDL kernels may read
+        ``b`` and ``bias`` before waiting for the preceding kernel, so pass
+        ``pdl=False`` if a kernel that may still be running writes them.
+        Defaults to ``False``. ``None`` is accepted as ``False`` for backward
+        compatibility with 0.7.4rc1.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
@@ -921,8 +930,8 @@ def mm_bf16(
         search and an optional fused BF16 bias epilogue for BF16 output.
         ``"tinygemm"`` uses the TinyGEMM backend for small-M BF16 GEMM.
         ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
-            persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
-            ``bias`` / ``pdl``. Requires SM >= 90.
+            persistent-scheduled GEMM with per-shape exhaustive autotune; rejects
+            ``bias`` and ``pdl=True``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M kernels (direct,
         cluster Split-K and warp Split-K) and supports M <= 32 only; use
         ``"auto"`` or ``"cublaslt"`` for larger M. Without autotuning, the
@@ -993,6 +1002,10 @@ def mm_bf16(
     torch.bfloat16
     """
 
+    # None (accepted since #8032, shipped in 0.7.4rc1) behaves as False. The
+    # requirement checkers already ran and treat None as falsy, like False.
+    pdl = bool(pdl)
+
     if batch_invariant:
         from .batch_invariant.tuning import mm_bf16_batch_invariant_auto
 
@@ -1007,7 +1020,7 @@ def mm_bf16(
 
     # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
     # Handled before the SM100 dispatch table because it does not consume
-    # `workspace_buffer` and ignores `bias` / `pdl`.
+    # `workspace_buffer`; its checker rejects `bias` and `pdl=True`.
     if backend == "cutile":
         from .kernels.cutile.mm_bf16_cutile import mm_bf16_cutile
 
@@ -2560,27 +2573,15 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
 )
 
 
-def _resolve_pdl(pdl: Optional[bool], auto_pdl: bool) -> bool:
-    """Return the PDL flag a BF16 runner launches with.
-
-    ``pdl=None`` leaves PDL to the autotuner, which profiles one instance of
-    each PDL-capable runner per ``auto_pdl`` value; an explicit ``pdl`` wins.
-    """
-    return auto_pdl if pdl is None else bool(pdl)
-
-
 @functools.lru_cache(maxsize=64)
-def _tinygemm_bf16_gemm_runner(auto_pdl: bool = False):
+def _tinygemm_bf16_gemm_runner():
     module = get_tinygemm2_module()
 
     class TinyGemmBf16GemmRunner(TunableRunner):
-        def __init__(self, auto_pdl: bool) -> None:
-            self.auto_pdl = auto_pdl
-
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
             _, _, bias, pdl, _, _ = inputs
-            return (bias is not None, _resolve_pdl(pdl, self.auto_pdl))
+            return (bias is not None, bool(pdl))
 
         def get_valid_tactics(
             self,
@@ -2597,15 +2598,14 @@ def _tinygemm_bf16_gemm_runner(auto_pdl: bool = False):
             **kwargs,
         ) -> torch.Tensor:
             a, b, bias, pdl, out, _ = inputs
-            pdl = _resolve_pdl(pdl, self.auto_pdl)
             weight = b.transpose(-2, -1)
             if bias is None:
-                module.tinygemm2_nobias_op(a, weight, out, pdl)
+                module.tinygemm2_nobias_op(a, weight, out, bool(pdl))
             else:
-                module.tinygemm2_op(a, weight, bias, out, pdl)
+                module.tinygemm2_op(a, weight, bias, out, bool(pdl))
             return out
 
-    return TinyGemmBf16GemmRunner(auto_pdl)
+    return TinyGemmBf16GemmRunner()
 
 
 # DEBUG-ONLY toggle (not a public knob): set True to force the legacy C++
@@ -2617,7 +2617,7 @@ _TGV_DEBUG_USE_CPP: bool = False
 
 
 @functools.cache
-def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool, auto_pdl: bool = False):
+def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
     """Unified TGV runner: internally dispatches to either the CuTeDSL
     (``cute_ext``) implementation or the legacy C++ kernel based on
     ``_TGV_DEBUG_USE_CPP``. The 11 tactic ids match across both backends (see
@@ -2639,9 +2639,6 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool, auto_pdl: bool = Fal
         return cpp_runner[0]
 
     class TGVRunner(TunableRunner):
-        def __init__(self, auto_pdl: bool) -> None:
-            self.auto_pdl = auto_pdl
-
         def get_valid_tactics(
             self,
             inputs: List[torch.Tensor],
@@ -2658,11 +2655,7 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool, auto_pdl: bool = Fal
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # The valid tactic ids depend on the arch (SM107-only ids), so a
             # tuned tactic must not be reused on another arch.
-            capability = torch.cuda.get_device_capability(inputs[0].device)
-            if inputs[3] is None:
-                # pdl=None tunes this runner both without and with PDL.
-                return (capability, self.auto_pdl)
-            return (capability,)
+            return (torch.cuda.get_device_capability(inputs[0].device),)
 
         def forward(
             self,
@@ -2671,16 +2664,12 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool, auto_pdl: bool = Fal
             do_preparation: bool = False,
             **kwargs,
         ) -> torch.Tensor:
-            a, b, bias, pdl, out, *rest = inputs
-            pdl = _resolve_pdl(pdl, self.auto_pdl)
+            a, b, bias, pdl, out, *_ = inputs
             # The C++ TGV kernel is 2D-only — always fall back to cute_ext
             # for batched inputs regardless of the toggle.
             if _TGV_DEBUG_USE_CPP and a.dim() == 2:
                 return _get_cpp_runner().forward(
-                    [a, b, bias, pdl, out, *rest],
-                    tactic=tactic,
-                    do_preparation=do_preparation,
-                    **kwargs,
+                    inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
                 )
             from .kernels.tgv_gemm_cute_ext import (
                 get_tgv_cute_ext_default_tactic,
@@ -2689,9 +2678,9 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool, auto_pdl: bool = Fal
 
             if tactic < 0:
                 tactic = get_tgv_cute_ext_default_tactic()
-            return run_tgv_cute_ext(a, b, bias, out, pdl, tactic)
+            return run_tgv_cute_ext(a, b, bias, out, bool(pdl), tactic)
 
-    return TGVRunner(auto_pdl)
+    return TGVRunner()
 
 
 class _CuteDSLBf16Runner(TunableRunner):
@@ -2705,12 +2694,10 @@ class _CuteDSLBf16Runner(TunableRunner):
     ``is_tactic_compatible`` are re-checked against the real inputs because a
     cached entry can come from a bucket on the other side of
     ``_CUTE_DSL_BF16_MAX_M`` or from another M.
-    ``auto_pdl`` is the PDL flag the instance runs with under ``pdl=None``.
     """
 
-    def __init__(self, compute_capability: int, auto_pdl: bool = False) -> None:
+    def __init__(self, compute_capability: int) -> None:
         self.compute_capability = compute_capability
-        self.auto_pdl = auto_pdl
 
     def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
         a, *_ = inputs
@@ -2725,7 +2712,7 @@ class _CuteDSLBf16Runner(TunableRunner):
             str(a.dtype),
             str(out.dtype),
             bias is not None,
-            _resolve_pdl(pdl, self.auto_pdl),
+            bool(pdl),
             self.compute_capability,
         )
 
@@ -2733,7 +2720,6 @@ class _CuteDSLBf16Runner(TunableRunner):
 @functools.cache
 def _cute_dsl_splitk_bf16_gemm_runner(
     compute_capability: int,
-    auto_pdl: bool = False,
 ):
     from .kernels.dense_bf16_gemm_sm100_splitk import (
         SplitKTactic,
@@ -2783,16 +2769,13 @@ def _cute_dsl_splitk_bf16_gemm_runner(
                         "CuTeDSL split-K tactics must be "
                         "(mma_m, mma_n, split_k, ab_stages)."
                     ) from error
-            pdl = _resolve_pdl(pdl, self.auto_pdl)
-            return run_splitk_dense(a, b, bias, out, pdl, tactic)
+            return run_splitk_dense(a, b, bias, out, bool(pdl), tactic)
 
-    return CuteDSLSplitKBf16Runner(compute_capability, auto_pdl)
+    return CuteDSLSplitKBf16Runner(compute_capability)
 
 
 @functools.cache
-def _cute_dsl_warp_splitk_bf16_gemm_runner(
-    compute_capability: int, auto_pdl: bool = False
-):
+def _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability: int):
     from .kernels.dense_bf16_gemm_warp_splitk import (
         WarpSplitKTactic,
         autotune_tactics,
@@ -2859,16 +2842,14 @@ def _cute_dsl_warp_splitk_bf16_gemm_runner(
                             "(output_tile, token_tile, k_tile, stages, "
                             "b_loader_warps)."
                         ) from error
-                pdl = _resolve_pdl(pdl, self.auto_pdl)
-                return run_warp_splitk_dense(a, b, out, pdl, tactic, bias)
+                return run_warp_splitk_dense(a, b, out, bool(pdl), tactic, bias)
 
-    return CuteDSLWarpSplitKBf16Runner(compute_capability, auto_pdl)
+    return CuteDSLWarpSplitKBf16Runner(compute_capability)
 
 
 @functools.cache
 def _cute_dsl_direct_bf16_gemm_runner(
     compute_capability: int,
-    auto_pdl: bool = False,
 ):
     from .kernels.dense_bf16_gemm_direct import (
         DirectTactic,
@@ -2947,23 +2928,19 @@ def _cute_dsl_direct_bf16_gemm_runner(
                         "CuTeDSL direct tactics must be "
                         "(block_size, outputs_per_block, rows_per_block)."
                     ) from error
-            pdl = _resolve_pdl(pdl, self.auto_pdl)
-            return run_direct_dense(a, b, out, pdl, tactic)
+            return run_direct_dense(a, b, out, bool(pdl), tactic)
 
-    return CuteDSLDirectBf16Runner(compute_capability, auto_pdl)
+    return CuteDSLDirectBf16Runner(compute_capability)
 
 
-def _cute_dsl_bf16_runners(
-    inputs: List[torch.Tensor], auto_pdl: bool = False
-) -> List[_CuteDSLBf16Runner]:
+def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[_CuteDSLBf16Runner]:
     """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
 
     Keep every available runner for synthesized buckets: the low-M kernels
     serve M <= 32 and offer no tactics above it. Runtime-supported runners
     come first, so for M <= 32 ``[0]`` is a valid no-autotune default. Within
     that group, prefer direct where its shape heuristic applies, then warp,
-    then cluster Split-K. ``auto_pdl=True`` returns the PDL variants for
-    ``pdl=None``.
+    then cluster Split-K.
     """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
     from .kernels.dense_bf16_gemm_direct import prefer_direct_bf16_gemm_sm100
@@ -2973,14 +2950,14 @@ def _cute_dsl_bf16_runners(
     n = b.shape[1]
     major, minor = torch.cuda.get_device_capability(a.device)
     compute_capability = major * 10 + minor
-    direct = _cute_dsl_direct_bf16_gemm_runner(compute_capability, auto_pdl)
+    direct = _cute_dsl_direct_bf16_gemm_runner(compute_capability)
     # Older DSLs lack cutlass.experimental but can use the other runners.
     warp_splitk = (
-        _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability, auto_pdl)
+        _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability)
         if is_cute_dsl_experimental_available()
         else None
     )
-    cluster_splitk = _cute_dsl_splitk_bf16_gemm_runner(compute_capability, auto_pdl)
+    cluster_splitk = _cute_dsl_splitk_bf16_gemm_runner(compute_capability)
 
     prefer_direct = direct.supports_inputs(inputs) and prefer_direct_bf16_gemm_sm100(
         m, n, k
@@ -3000,7 +2977,7 @@ def bf16_gemm_sm100(
     a: torch.Tensor,
     b: torch.Tensor,
     bias: torch.Tensor,
-    pdl: Optional[bool],
+    pdl: bool,
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
@@ -3037,23 +3014,12 @@ def bf16_gemm_sm100(
         runners.extend(_cute_dsl_bf16_runners(inputs))
     assert runners, "No suitable runners found"
 
+    # cuDNN, cuBLASLt and CUTLASS keys do not record pdl, so a pdl=False winner
+    # would answer pdl=True lookups (and vice versa): tune pdl=True under its
+    # own op. Skipping "bf16_gemm" keeps skipping these calls.
     custom_op = "bf16_gemm"
-    if pdl is None and custom_op not in tuner._effective_skip_ops:
-        # pdl=None: also profile a PDL variant of every runner that supports
-        # PDL. They go last, so runners[0], the untuned default, runs without
-        # PDL. A separate op keeps these entries apart from explicit-pdl
-        # tuning, where cuDNN, cuBLASLt and CUTLASS keys do not record pdl.
-        # Skipping "bf16_gemm" keeps skipping these calls.
-        pdl_runners = []
-        if "tgv" in runner_names:
-            pdl_runners.append(_tgv_gemm_runner(a.dtype, use_sm_100f, auto_pdl=True))
-        if "tinygemm" in runner_names:
-            pdl_runners.append(_tinygemm_bf16_gemm_runner(auto_pdl=True))
-        if "cute-dsl" in runner_names:
-            pdl_runners.extend(_cute_dsl_bf16_runners(inputs, auto_pdl=True))
-        if pdl_runners:
-            runners.extend(pdl_runners)
-            custom_op = "bf16_gemm_pdl_auto"
+    if pdl and custom_op not in tuner._effective_skip_ops:
+        custom_op = "bf16_gemm_pdl"
 
     runner, tactic = tuner.choose_one(
         custom_op,
@@ -3549,8 +3515,6 @@ def tgv_gemm_sm100(
         - FP4 packs two values per byte, so its physical K dimension is ``K // 2``.
         - For block-scaled inputs, ``bias`` and the output must be BF16 or FP16 and share the same dtype.
     """
-    # The launchers take a bool; treat pdl=None as no PDL.
-    pdl = bool(pdl)
     if not _match_sm_version(a.device, ["100", "103", "107"]):
         raise ValueError("TGV GEMM requires SM100, SM103, SM107 architecture")
 
