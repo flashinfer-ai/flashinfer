@@ -249,6 +249,17 @@ def test_tinygemm2_is_prebuilt_without_moe(monkeypatch):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm100", "sm103", "sm107"])
+def test_bf16_cutlass_and_cublaslt_are_prebuilt_without_moe(monkeypatch, arch):
+    registered = _registered_generators(monkeypatch, {arch: True}, add_moe=False)
+
+    assert {
+        "gen_mm_bf16_cublaslt_module",
+        "gen_gemm_sm100_module_cutlass_bf16",
+    } <= registered
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("arch", "expected"),
     [
@@ -271,18 +282,40 @@ def test_tinygemm2_sm100_variant_is_prebuilt_only_for_sm10x(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("cuda", "sm103a", "sm107a"),
-    [("12.8", False, False), ("12.9", True, False), ("13.4", True, True)],
+    ("cuda", "targets", "expected"),
+    [
+        ("13.4", {(10, "0a")}, ["compute_100a"]),
+        ("13.4", {(10, "3a")}, ["compute_103a"]),
+        ("13.4", {(10, "7a")}, ["compute_107a"]),
+        (
+            "13.4",
+            {(10, "0a"), (10, "3a"), (10, "7a")},
+            ["compute_100a", "compute_103a", "compute_107a"],
+        ),
+        (
+            "13.0",
+            {(10, "0a"), (10, "3a"), (10, "7a")},
+            ["compute_100a", "compute_103a"],
+        ),
+        ("12.8", {(10, "0a"), (10, "3a"), (10, "7a")}, ["compute_100a"]),
+        ("13.4", {(9, "0a"), (10, "0a")}, ["compute_100a"]),
+    ],
 )
-def test_tinygemm2_sm100_targets_follow_the_cuda_version(
-    monkeypatch, cuda, sm103a, sm107a
+def test_tinygemm2_sm100_targets_follow_the_build_targets(
+    monkeypatch, cuda, targets, expected
 ):
     from flashinfer.jit import tinygemm2
 
     monkeypatch.setattr(
         tinygemm2, "is_cuda_version_at_least", lambda v: Version(cuda) >= Version(v)
     )
+    monkeypatch.setattr(
+        tinygemm2.current_compilation_context, "TARGET_CUDA_ARCHS", targets
+    )
     flags = tinygemm2.gen_tinygemm2_sm100_module().extra_cuda_cflags
 
-    assert ("-gencode=arch=compute_103a,code=sm_103a" in flags) == sm103a
-    assert ("-gencode=arch=compute_107a,code=sm_107a" in flags) == sm107a
+    assert [
+        flag.split("arch=")[1].split(",")[0]
+        for flag in flags
+        if flag.startswith("-gencode=")
+    ] == expected

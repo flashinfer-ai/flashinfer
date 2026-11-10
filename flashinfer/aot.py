@@ -1021,9 +1021,6 @@ def gen_all_modules(
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_fused_router_module())
-        if has_sm100 or has_sm103 or has_sm107:
-            jit_specs.append(gen_mm_bf16_cublaslt_module())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_bf16())
         jit_specs.extend(_gen_blackwell_bf16_bmm_aot_specs(sm_capabilities))
         jit_specs.extend(_gen_cake_grouped_fp8_gemm_aot_specs(sm_capabilities))
         jit_specs.extend(
@@ -1102,6 +1099,9 @@ def gen_all_modules(
     if has_sm100 or has_sm103 or has_sm107:
         # Generated SM100/SM103/SM107 variant, selected by the router GEMM bias path.
         jit_specs.append(gen_tinygemm2_sm100_module())
+        # mm_bf16(backend="cutlass" / "cublaslt") load these without MoE.
+        jit_specs.append(gen_mm_bf16_cublaslt_module())
+        jit_specs.append(gen_gemm_sm100_module_cutlass_bf16())
 
     if add_comm:
         from .jit.comm import (
