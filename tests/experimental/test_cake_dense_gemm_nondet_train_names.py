@@ -214,6 +214,32 @@ def _keyword_only(fn) -> set[str]:
     }
 
 
+def test_the_shared_mode_name_checks():
+    """The shared #8928 checks (tests/cake/test_helpers/cake_mode_names.py): mode word and stem, no ``deterministic``
+    keyword, one name per object across the module, the backend modules and the flashinfer top level, and the
+    former paths and names failing at import in a fresh interpreter."""
+    import flashinfer
+
+    from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
+
+    module = importlib.import_module(MODULE)
+    assert_cake_mode_module(
+        module,
+        MODE,
+        namespaces=[
+            flashinfer,
+            importlib.import_module(f"{BACKEND}.cake_backend"),
+            importlib.import_module(f"{BACKEND}.cake_jit"),
+        ],
+        old_modules=[FORMER_PACKAGE, *FORMER_MODULES],
+        old_names=[
+            (f"{BACKEND}.{submodule}", name)
+            for submodule, names in sorted(REMOVED.items())
+            for name in names
+        ],
+    )
+
+
 def test_all_lists_the_public_names():
     module = importlib.import_module(MODULE)
     assert set(module.__all__) == PUBLIC

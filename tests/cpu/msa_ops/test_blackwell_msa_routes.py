@@ -1710,6 +1710,32 @@ def test_prefill_fp8q_constants_and_boundaries():
 
 
 @pytest.mark.cpu_only
+def test_prefill_fp8q_q146_shape_is_served_on_sm103a_only():
+    # one request of 146 query tokens with a two-page table: the second
+    # measured shape, served on compute capability 10.3 only
+    assert backend._PREFILL_FP8Q_Q146_TARGETS == ("sm103a",)
+    assert backend._PREFILL_FP8Q_Q146_TOTAL_Q == 146
+    assert backend._PREFILL_FP8Q_Q146_MAX_PAGES == 2
+    assert set(backend._PREFILL_FP8Q_Q146_TARGETS) <= set(backend._PREFILL_FP8Q_TARGETS)
+    assert _fp8q(total_q=146, max_pages=2)
+    assert backend._prefill_fp8q_targets(146) == ("sm103a",)
+    assert backend._prefill_fp8q_targets(1) == ("sm100a", "sm103a")
+    # the calls just outside it: other query counts or page-table widths, two
+    # requests, GQA 8, non-causal, an explicit q_offset, flat, BF16 Q
+    for total_q in (1, 2, 145, 147, 292):
+        assert not _fp8q(total_q=total_q, max_pages=2), total_q
+    for pages in (-1, 0, 1, 3, 64):
+        assert not _fp8q(total_q=146, max_pages=pages), pages
+    q146 = dict(total_q=146, max_pages=2)
+    assert not _fp8q(batch_size=2, **q146)
+    assert not _fp8q(num_kv_heads=8, **q146)
+    assert not _fp8q(causal=False, **q146)
+    assert not _fp8q(derive_q_offset=False, **q146)
+    assert not _fp8q(paged=False, **q146)
+    assert not _fp8q(q_dtype=torch.bfloat16, **q146)
+
+
+@pytest.mark.cpu_only
 def test_prefill_fp8q_program_is_the_registered_unfolded_fp8q_union_prefill():
     fp8 = torch.float8_e4m3fn
     route = backend._prefill_route(
@@ -1794,6 +1820,65 @@ def test_prefill_fp8q_launch_binds_the_e4m3_q_as_bytes(target, monkeypatch):
         num_q_heads=64,
         num_kv_heads=4,
         num_sms=148,
+        persistent=False,
+    )
+
+
+@pytest.mark.cpu_only
+def test_prefill_fp8q_q146_launch_is_one_fp8q_union_launch(monkeypatch):
+    launches = []
+    monkeypatch.setattr(
+        backend, "_program", lambda route, _t: _RecordedProgram(route, launches)
+    )
+    monkeypatch.setattr(backend, "get_device_sm_count", lambda _device: 160)
+    monkeypatch.setattr(backend, "_device_index", lambda _device: 0)
+    monkeypatch.setattr(backend, "_eager_dummies", {})
+    fp8 = torch.float8_e4m3fn
+    total_q = backend._PREFILL_FP8Q_Q146_TOTAL_Q
+    pages = backend._PREFILL_FP8Q_Q146_MAX_PAGES
+    q = torch.zeros((total_q, 64, backend._HEAD_DIM), dtype=fp8)
+    k = torch.zeros((pages, 4, backend._BLOCK_SIZE, backend._HEAD_DIM), dtype=fp8)
+    out = torch.empty((total_q, 64, backend._HEAD_DIM), dtype=torch.bfloat16)
+    lse = torch.empty((total_q, 64), dtype=torch.float32)
+    backend._run_prefill(
+        target="sm103a",
+        q=q,
+        k=k,
+        v=k,
+        out=out,
+        lse=lse,
+        temperature_lse=lse,
+        q2k_indices=torch.zeros((4, total_q, backend._TOPK), dtype=torch.int32),
+        cu_q=torch.tensor([0, total_q], dtype=torch.int32),
+        cu_k=None,
+        q_offsets=None,
+        kv_lens=torch.tensor([146], dtype=torch.int32),
+        page_table=torch.arange(pages, dtype=torch.int32).reshape(1, pages),
+        paged=True,
+        folded_gqa_group=0,
+        batch_size=1,
+        max_pages=pages,
+        causal=True,
+        derive_q_offset=True,
+        softmax_scale_log2=1.0,
+        lse_temperature_scale=1.0,
+        return_softmax_lse=True,
+        return_temperature_lse=False,
+        workspace=None,
+        capturing=False,
+    )
+    ((route, grid, arguments),) = launches
+    assert route == f"{_FP8Q_ROUTE}:main"
+    assert arguments["q"].dtype == torch.uint8
+    assert arguments["q"].data_ptr() == q.data_ptr()
+    assert arguments["out"] is out and out.dtype == torch.bfloat16
+    assert tuple(grid) == backend._prefill_launch_grid(
+        total_q=total_q,
+        batch_size=1,
+        folded_gqa_group=0,
+        num_q_heads=64,
+        num_kv_heads=4,
+        num_sms=160,
         persistent=False,
     )
 

@@ -16,7 +16,7 @@ tolerance of the gradient elements they reach. The ``1e-2 + 1e-2 * |reference|``
 gate itself is unchanged, and no allowance exists where no input is ambiguous.
 
 Backend suite: the package is imported only through
-:func:`tests.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
+:func:`tests.cake.test_helpers.cake_package.cake_package`; the :mod:`flashinfer.mok`
 wrapper is covered by ``test_mok_bf16_api.py``.
 """
 
@@ -30,7 +30,7 @@ from tests.experimental._mok_reference import (
     single_rank_schedule,
     swiglu,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kernels = cake_package("cake_mok_bf16", "_kernels")
 api = cake_package("cake_mok_bf16", "api")
@@ -926,3 +926,246 @@ def test_mxfp8_recompute_context(swiglu_limit, macro):
 
     for a, b in zip(gradients(saved), gradients(rebuilt), strict=True):
         assert torch.equal(a, b)
+
+
+backend = cake_package("cake_mok_bf16", "backend")
+jit = cake_package("cake_mok_bf16", "jit")
+MoKConfig = cake_package("cake_mok_bf16", "workspace").MoKConfig
+
+
+def test_select_multimacro_decision_table():
+    """The sm_107a multimacro forward runs exactly when the observed schedule
+    rows fill two macro batches; no observation keeps the default program."""
+    select = backend.select_multimacro
+    assert select(None, 1024) is False
+    assert not select(0, 1024)
+    assert not select(1024, 1024)  # one macro batch
+    assert select(1025, 1024)
+    assert select(2048, 1024)
+    assert not select(2049, 1024)  # three macro batches
+    assert select(265472, 262144)  # u32768-class padded rows
+    assert not select(262144, 262144)
+
+
+def test_multimacro_choice_follows_the_lagged_schedule_rows(monkeypatch, capsys):
+    """The forward program choice reads this rank's padded schedule rows from the
+    asynchronous load observation: a capacity of at most one macro batch never
+    observes and keeps the default program; otherwise the latest completed
+    observation decides, the choice in force holds during graph capture, the
+    fixed communication split is unchanged and ``comm_split_log`` prints each
+    change. Off sm_107a the default program always runs."""
+    require_gpu()
+    from types import SimpleNamespace
+
+    ep_size, experts = 4, 4
+    functional = backend.MoKFunctional(ep_size, experts, 2)
+    sm107 = jit.target_arch() == "sm_107a"
+    assert functional._multimacro_target is sm107
+    # Every expert receives 128 routes (rank 0: 4 x 256 padded rows), then
+    # every route goes to rank 0's experts (4 x 512 rows).
+    balanced = (
+        torch.arange(ep_size * 256 * 2, device="cuda", dtype=torch.int32)
+        % (ep_size * experts)
+    ).view(ep_size, 256, 2)
+    skewed = balanced % experts
+    capacity = ep_size * 256 * 2 + experts * 256
+    config = MoKConfig(
+        fwd_num_comm_sms=4,
+        bwd_num_comm_sms=4,
+        minibatch_size=256,
+        macrobatch_size=512,
+        comm_split_log=True,
+    )
+    workspaces = []  # keep every stand-in alive: the adapter keys its state by id
+
+    def observe(routes, config, capacity=capacity):
+        workspace = workspaces[-1]
+        count = functional.scheduler(routes, capacity, 0)[2]
+        functional._observe_load(workspace, config, count)
+        torch.cuda.synchronize()
+        return int(count.item())
+
+    # Static guard: one macro batch holds the whole capacity.
+    single = MoKConfig(
+        fwd_num_comm_sms=4, bwd_num_comm_sms=4, minibatch_size=256, macrobatch_size=4096
+    )
+    workspaces.append(
+        SimpleNamespace(ep_rank=0, ep_size=ep_size, schedule_capacity=capacity)
+    )
+    assert observe(balanced, single) == 1024
+    assert functional._load_entry(workspaces[-1], create=False) is None
+    assert functional._multimacro(single, workspaces[-1]) is False
+
+    workspaces.append(
+        SimpleNamespace(ep_rank=0, ep_size=ep_size, schedule_capacity=capacity)
+    )
+    capsys.readouterr()
+    assert functional._multimacro(config, workspaces[-1]) is False  # no observation yet
+    assert observe(balanced, config) == 1024  # two macro batches of 512
+    assert functional._multimacro(config, workspaces[-1]) is sm107
+    assert functional._comm_split(config, workspaces[-1]) == (4, 4)
+    # Captured launches keep the choice in force: no observation is queued.
+    count = functional.scheduler(skewed, capacity, 0)[2]
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    functional._observe_load(workspaces[-1], config, count)
+    assert functional._multimacro(config, workspaces[-1]) is sm107
+    monkeypatch.undo()
+    assert observe(skewed, config) == 2048  # four macro batches of 512
+    assert functional._multimacro(config, workspaces[-1]) is False
+    prefix = "[cake_mok_bf16 rank 0] forward program -> "
+    lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "forward program" in line
+    ]
+    assert lines == (
+        [
+            prefix + "multimacro (schedule rows 1024, macro batch 512)",
+            prefix + "default (schedule rows 2048, macro batch 512)",
+        ]
+        if sm107
+        else []
+    )
+
+
+def _two_rank_routes(tokens):
+    """Expert IDs of two source ranks over 2 x 3 experts (owner = expert // 3):
+    owner 0 receives 768 + 768 + 512 rows, owner 1 512 + 299 + 213 (padded
+    512 + 512 + 256): owner 0's 2048 rows are three macro batches of 768 and
+    two of 1024 or 1280, owner 1's 1280 rows two of 768 or 1024 and one of
+    1280."""
+    t = torch.arange(tokens, device="cuda")
+    block = t % 3
+    pairs = (
+        torch.tensor([[0, 3], [1, 3], [2, 4]], device="cuda"),
+        torch.tensor([[0, 1], [1, 0], [2, 5]], device="cuda"),
+    )
+    routes = [pair[block] for pair in pairs]
+    routes[1][(t >= tokens - 128) & (block == 2), 1] = 4
+    return routes
+
+
+def _owner_schedule(routes, owner, local_experts, capacity):
+    """Owner ``owner``'s padded schedule: per local expert the route slots of
+    every source rank in rank order, then ``-1`` padding; the peer of a row is
+    its source rank."""
+    rows, peers, count_values = [], [], []
+    for expert in range(owner * local_experts, (owner + 1) * local_experts):
+        hits = [torch.where(r.flatten() == expert)[0].int() for r in routes]
+        slots = torch.cat(hits)
+        source = torch.cat([torch.full_like(h, rank) for rank, h in enumerate(hits)])
+        padded = (slots.numel() + 255) // 256 * 256
+        pad = torch.full(
+            (padded - slots.numel(),), -1, dtype=torch.int32, device="cuda"
+        )
+        rows += [slots, pad]
+        peers += [source, pad]
+        count_values.append(padded)
+    actual = sum(count_values)
+    tail = torch.full((capacity - actual,), -1, dtype=torch.int32, device="cuda")
+    return dict(
+        peers=torch.cat(peers + [tail]),
+        schedule=torch.cat(rows + [tail]),
+        num_tokens=torch.tensor([actual], device="cuda", dtype=torch.int32),
+        counts=torch.tensor(count_values, device="cuda", dtype=torch.int32),
+        actual=actual,
+    )
+
+
+@LIMITS
+@pytest.mark.parametrize("macro", [768, 1024, 1280])
+def test_mxfp8_mixed_forward_programs_are_bitwise(swiglu_limit, macro):
+    """Ranks may launch different forward programs in one step (the backend
+    chooses per rank from its own lagged observation). Two-rank emulation on one
+    GPU: each rank's forward reads both ranks' x and writes its routed rows into
+    both ranks' combine buffers through the peer tables, then each rank's
+    backward runs from its context. The programs synchronize only on this
+    GPU's own counters (no system-scope flag), and the caller's barriers order
+    the ranks, so running the ranks one after the other is the protocol. Every
+    mix of default and multimacro programs gives the all-default combine rows,
+    shared outputs, saved context and gradients bit for bit."""
+    require_gpu()
+    clamped = swiglu_limit is not None
+    forward = MoKForwardMXFP8(clamped)
+    if forward.multimacro_module is None:
+        pytest.skip("The multimacro forward is generated for sm_107a only")
+    backward = MoKBackwardMXFP8(clamped)
+    tokens, hidden, intermediate, topk, mini, comm, local = 768, 1024, 256, 2, 256, 4, 3
+    capacity = 2048 + 512
+    ranks = [
+        _setup(hidden, intermediate, 5668 + rank, experts=local, tokens=tokens)
+        for rank in range(2)
+    ]
+    routes = _two_rank_routes(tokens)
+    schedules = [_owner_schedule(routes, owner, local, capacity) for owner in range(2)]
+    assert [s["actual"] for s in schedules] == [2048, 1280]
+    weights = []
+    for _, _, _, routed, _, _ in ranks:
+        q = [quantize(w) for w in routed]
+        weights.append(([(qq[0], qq[1]) for qq in q], (q[0], q[1], (q[2][2], q[2][3]))))
+    x = [r[0] for r in ranks]
+    dy = [r[1] for r in ranks]
+    scores = [r[4] for r in ranks]
+    x_ptrs = [t.data_ptr() for t in x]
+    dy_ptrs = [t.data_ptr() for t in dy]
+    score_ptrs = [t.data_ptr() for t in scores]
+
+    def step(programs):
+        combine = [
+            torch.zeros(tokens * topk, hidden, device="cuda", dtype=torch.bfloat16)
+            for _ in range(2)
+        ]
+        combine_ptrs = [t.data_ptr() for t in combine]
+        contexts = []
+        for rank, multimacro in enumerate(programs):
+            s, shared = schedules[rank], ranks[rank][2]
+            fwd_w = weights[rank][0]
+            values = forward(
+                x[rank], x_ptrs, combine[rank], combine_ptrs,
+                shared[0], fwd_w[0], shared[1], fwd_w[1], shared[2], fwd_w[2],
+                s["peers"], s["schedule"], s["num_tokens"], s["counts"],
+                topk, swiglu_limit, comm, macro, mini, multimacro=multimacro,
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            contexts.append(values)
+        dx = [torch.zeros_like(c) for c in combine]
+        ds = [torch.zeros_like(t) for t in scores]
+        grads = []
+        for rank in range(2):
+            s, shared = schedules[rank], ranks[rank][2]
+            bwd_w = weights[rank][1]
+            values = backward(
+                dy[rank], dy_ptrs, dx[rank], [t.data_ptr() for t in dx],
+                scores[rank], score_ptrs, ds[rank], [t.data_ptr() for t in ds],
+                shared[0], bwd_w[0], shared[1], bwd_w[1], shared[2], bwd_w[2],
+                *contexts[rank][:7], x[rank], x_ptrs,
+                s["peers"], s["schedule"], s["num_tokens"], s["counts"],
+                topk, swiglu_limit, comm, macro, mini,
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            grads.append((values[0], *values[9:]))
+        words = list(combine) + dx + ds
+        for rank, values in enumerate(contexts):
+            rows = min(schedules[rank]["actual"], macro)  # the resident ring rows
+            words.append(values[7])
+            for index in (1, 3, 5):
+                words.append(values[index])
+            for index, transposed in ((0, True), (2, False), (4, False), (6, True)):
+                data, scale = values[index]
+                if transposed:  # [features, tokens] data, [feature, token] tiles
+                    words += [data[:, :rows], scale[:, : rows // 128]]
+                else:
+                    words += [data[:rows], scale[: rows // 128]]
+            words += _flat(grads[rank])
+        return [w.clone() for w in words]
+
+    reference = step((False, False))
+    for programs in ((True, False), (False, True), (True, True)):
+        words = step(programs)
+        assert len(words) == len(reference)
+        for index, (a, b) in enumerate(zip(words, reference, strict=True)):
+            assert a.shape == b.shape and a.dtype == b.dtype, (programs, index)
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), (
+                programs,
+                index,
+            )

@@ -102,7 +102,7 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int t
     for (int i = 0; i < 8; i++) {
         int pos = tid * 8 + i;
         keys[i] = 0;
-        vals[i] = 4286578688;
+        vals[i] = 4286578688ll;
         if (pos < top_k) {
             long long slot = row_base + (long long)pos;
             int kid = Indices[slot];

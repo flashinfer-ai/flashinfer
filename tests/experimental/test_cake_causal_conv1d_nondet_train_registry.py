@@ -43,7 +43,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 KEY = "cake_causal_conv1d_nondet_train"
 pkg = cake_package(KEY)
@@ -88,14 +88,15 @@ CHANNELS = (
 TOKENS = (1, 1000, 65536, 98304, 147456, 250340, 262143, 262144)
 # The deterministic package's programs this package does not have: the row-group backward program of route ``bwd``
 # on sm_107a (264 <= C < 512) and the SM-wide row-group programs of route ``bwd`` on sm_100a, sm_103a and sm_107a
-# (channel bands of 264 <= C < 512, from a token floor).  Every other record pairs with this package's at the same route
-# position.
+# (channel bands of 264 <= C < 512, from a token floor), and the copy of route ``bwd``'s fallback program on sm_107a
+# (the channel band of 520 <= C < 1024).  Every other record pairs with this package's at the same route position.
 DET_ONLY = frozenset(
     {
         "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
         "cake_causal_conv1d_det_train_e057357c655024d4ff1d",
         "cake_causal_conv1d_det_train_baca4c969c783d07d81f",
         "cake_causal_conv1d_det_train_5ca7515dd2118dd96241",
+        "cake_causal_conv1d_det_train_0d99ef0e0ed10b11dfd5",
     }
 )
 
@@ -467,15 +468,20 @@ def test_accumulators_are_sized_from_the_rule(kind, C) -> None:
 
 def _owner_tiles(record: dict, arch: str, C: int) -> int:
     """The largest channel tile count a backward ``record`` launches with at ``C`` on ``arch``, whatever ``S``:
-    the split's, or its route's :data:`cake_jit.TILE_OVERRIDES` row's when that has more."""
+    the split's, or its route's :data:`cake_jit.TILE_OVERRIDES` or :data:`cake_jit.NARROW_TILES` row's when that
+    has more."""
 
     geometry = record["grid_rule"]["geometry"]
+    route = cake_jit.record_route(record, arch)
     _, _, n_ch_tiles = cake_jit.channel_split(C, geometry=geometry, role="bwd")
-    entry = cake_jit.TILE_OVERRIDES.get(arch, {}).get(
-        (cake_jit.record_route(record, arch), C)
-    )
+    entry = cake_jit.TILE_OVERRIDES.get(arch, {}).get((route, C))
     if entry is not None:
         n_ch_tiles = max(n_ch_tiles, -(-(C // geometry["vec"]) // entry[0]))
+    elif (
+        cake_jit.narrow_tile_range(arch, route, C) is not None
+        and geometry["threads"] == 128
+    ):
+        n_ch_tiles = max(n_ch_tiles, -(-(C // geometry["vec"]) // 32))
     return n_ch_tiles
 
 
@@ -483,9 +489,10 @@ def _owner_tiles(record: dict, arch: str, C: int) -> int:
 @pytest.mark.parametrize("arch", ARCHES)
 def test_backward_workspace_serves_every_backward_program(arch) -> None:
     """The public backward workspace is the largest layout over every backward program of the architecture, each
-    at the largest tile count it may launch with (its split, or its route's ``TILE_OVERRIDES`` row), so one zeroed
-    buffer serves whichever program, plan and route a call selects; the capacity owner is an FP64 bias program
-    (8 bytes x slots x 5 taps per channel, 40 with one copy)."""
+    at the largest tile count it may launch with (its split, or its route's ``TILE_OVERRIDES`` or ``NARROW_TILES``
+    row), so one zeroed buffer serves whichever program, plan and route a call selects; the capacity owner is an
+    FP64 bias program (8 bytes x slots x 5 taps per channel, 40 with one copy).  A narrow row's three tickets fit
+    the 16-byte alignment of the single tile's, so its size is the split's."""
 
     owner = cake_jit.workspace_record(arch)
     assert (
@@ -498,7 +505,10 @@ def test_backward_workspace_serves_every_backward_program(arch) -> None:
         for kind in cake_jit.backward_kinds(arch)
     )
     overridden = {C for _, C in cake_jit.TILE_OVERRIDES.get(arch, {})}
-    for C in sorted(set(CHANNELS) | overridden):
+    narrow = {
+        C for _, c_lo, c_hi in cake_jit.NARROW_TILES.get(arch, {}) for C in (c_lo, c_hi)
+    }
+    for C in sorted(set(CHANNELS) | overridden | narrow):
         nbytes = cake_jit.backward_workspace_bytes(arch, C)
         layouts = [
             cake_jit.accumulator_layout(record, C, _owner_tiles(record, arch, C))
@@ -615,6 +625,183 @@ def test_backward_workspace_covers_every_override_row() -> None:
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# The 32-vector channel tiles of the narrow single-tile backward rows (``NARROW_TILES``).
+
+# A table that exercises the narrow-row plan on every architecture whatever the rendered table holds: the sm_100a
+# rows of the shipped rule, plus rows on the other architectures (one of them spans a ``TILE_OVERRIDES`` row of its
+# route, C = 768 on sm_103a, which keeps its override).
+SYNTHETIC_NARROW_TILES = {
+    "sm_100a": {
+        ("bwd", 224, 224): (31292, 500680),
+        ("bwd", 520, 624): (31292, 500680),
+        ("bwd", 632, 760): (31292, 500680),
+    },
+    "sm_103a": {
+        ("bwd", 632, 768): (62585, 250340),
+        ("bwd_bias", 224, 224): (31292, 125170),
+    },
+    "sm_107a": {("bwd_bias", 520, 760): (31292, 62585)},
+}
+NARROW_TABLES = ("rendered", "synthetic")
+
+
+@pytest.fixture
+def narrow_table(request, monkeypatch):
+    """The ``NARROW_TILES`` table of a test: the rendered one, or :data:`SYNTHETIC_NARROW_TILES` in its place."""
+
+    if request.param == "synthetic":
+        monkeypatch.setattr(cake_jit, "NARROW_TILES", SYNTHETIC_NARROW_TILES)
+    pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
+    yield cake_jit.NARROW_TILES
+    pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
+
+
+def _covering(table: dict, arch: str, route: str, C: int):
+    """The ``(S_min, S_max)`` of the first key of ``table[arch]`` on ``route`` covering ``C`` (``None``: none, or
+    a ``TILE_OVERRIDES`` row of ``(route, C)``)."""
+
+    if C % 8 or (route, C) in cake_jit.TILE_OVERRIDES.get(arch, {}):
+        return None
+    for (name, c_lo, c_hi), bounds in table.get(arch, {}).items():
+        if name == route and c_lo <= C <= c_hi:
+            return bounds
+    return None
+
+
+def _split3(plan: dict) -> tuple[int, int, int]:
+    return plan["ct_vec"], plan["n_sub"], plan["n_ch_tiles"]
+
+
+@pytest.mark.cpu_only
+def test_narrow_tiles_are_backward_rows() -> None:
+    """Every key of the rendered table names an exported architecture, one of its backward routes, a closed range of
+    channel counts (multiples of 8) and a closed ``S`` range; no key of an architecture and route overlaps another,
+    and no ``(route, C)`` of the architecture's ``TILE_OVERRIDES`` lies inside a key."""
+
+    assert set(cake_jit.NARROW_TILES) <= set(ARCHES)
+    for arch, rows in cake_jit.NARROW_TILES.items():
+        spans: dict[str, list[tuple[int, int]]] = {}
+        for (route, c_lo, c_hi), (s_min, s_max) in rows.items():
+            label = (arch, route, c_lo, c_hi)
+            assert route in cake_jit.backward_kinds(arch), label
+            assert 0 < c_lo <= c_hi and c_lo % 8 == 0 and c_hi % 8 == 0, label
+            assert 0 < s_min <= s_max, label
+            for name in cake_jit.route_modules(arch, route):
+                geometry = cake_jit.MODULES[name]["grid_rule"]["geometry"]
+                assert geometry["threads"] % 32 == 0, (label, name)
+            for override_route, C in cake_jit.TILE_OVERRIDES.get(arch, {}):
+                assert not (override_route == route and c_lo <= C <= c_hi), label
+            spans.setdefault(route, []).append((c_lo, c_hi))
+        for route, ranges in spans.items():
+            ranges.sort()
+            for (_, hi), (lo, _) in zip(ranges, ranges[1:], strict=False):
+                assert hi < lo, (arch, route, ranges)
+
+
+def _check_narrow_plan(table: dict, arch: str, route: str, C: int, S: int) -> int:
+    """One ``(route, C, S)`` call of ``arch`` against ``table``: the narrow-row reading on every architecture, and
+    ``plan`` of every program of the route with and without the architecture / route, under ``legacy`` and at
+    another thread count.  Returns the number of programs checked."""
+
+    for other in ARCHES:
+        bounds = _covering(table, other, route, C)
+        inside = bounds is not None and bounds[0] <= S <= bounds[1]
+        assert cake_jit.narrow_tile_range(other, route, C) == bounds, (other, route, C)
+        assert cake_jit.narrow_tile_row(other, route, C, S) == inside, (other, route, C)
+    bounds = _covering(table, arch, route, C)
+    inside = bounds is not None and bounds[0] <= S <= bounds[1]
+    override = cake_jit.tile_override(arch, route, C, S)
+    on_row = {"arch": arch, "route": route}
+    for name in cake_jit.route_modules(arch, route):
+        geometry = cake_jit.MODULES[name]["grid_rule"]["geometry"]
+        threads, vec = geometry["threads"], geometry["vec"]
+        label = (arch, route, C, S, name)
+        split = cake_jit.channel_split(C, geometry=geometry, role="bwd")
+        if override is not None:
+            want = (override, threads // override, -(-(C // vec) // override))
+        elif inside and threads == 128:
+            want = (32, threads // 32, -(-(C // vec) // 32))
+        else:
+            want = split
+        got = cake_jit.plan(S, C, 3, geometry=geometry, role="bwd", **on_row)
+        assert _split3(got) == want, label
+        for kwargs in ({}, {"arch": arch}, {"route": route}):
+            got = cake_jit.plan(S, C, 3, geometry=geometry, role="bwd", **kwargs)
+            assert _split3(got) == split, (label, kwargs)
+        got = cake_jit.plan(S, C, 3, geometry=geometry, legacy=True, **on_row)
+        legacy = cake_jit.channel_split(C, geometry=geometry, legacy=True)
+        assert _split3(got) == legacy, label
+        wide = {**geometry, "threads": 256}
+        got = cake_jit.plan(S, C, 3, geometry=wide, role="bwd", **on_row)
+        if override is None:
+            wide_split = cake_jit.channel_split(C, geometry=wide, role="bwd")
+            assert _split3(got) == wide_split, label
+        tiles = cake_jit.narrow_tiles(arch, route, C, geometry)
+        narrow = bounds is not None and threads == 128
+        assert tiles == (-(-(C // vec) // 32) if narrow else 0), label
+    return len(cake_jit.route_modules(arch, route))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("narrow_table", NARROW_TABLES, indirect=True)
+def test_narrow_tile_bounds_and_plan(narrow_table) -> None:
+    """A key covers its channel counts from ``C_lo`` through ``C_hi`` and its token counts from ``S_min`` through
+    ``S_max`` (both ends included; never a ``TILE_OVERRIDES`` row) on its architecture and route only.  ``plan`` of a
+    backward record given its architecture and route then plans 32-vector tiles at 128 threads, ``(32, threads //
+    32, ceil(C / vec / 32))``; :func:`cake_jit.channel_split`'s split (or the override's) everywhere else, at
+    another thread count, under ``legacy`` and without the architecture or the route.  ``narrow_tiles`` (the
+    workspace bound) holds the key's tile count whatever ``S``."""
+
+    checked = 0
+    for arch, rows in narrow_table.items():
+        for (route, c_lo, c_hi), (s_min, s_max) in rows.items():
+            channels = {c_lo - 8, c_lo, (c_lo + c_hi) // 16 * 8, c_hi, c_hi + 8}
+            for C in sorted(C for C in channels if C > 0):
+                for S in (s_min - 1, s_min, s_max, s_max + 1):
+                    checked += _check_narrow_plan(narrow_table, arch, route, C, S)
+    assert checked or not narrow_table
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("narrow_table", NARROW_TABLES, indirect=True)
+def test_backward_workspace_covers_every_narrow_row(narrow_table) -> None:
+    """The public workspace of a key's channel counts holds the layout of every program of the key's route at the
+    key's tile count (one ticket per tile), whatever ``S``, and is the largest layout over every backward program
+    at the largest tile count it may launch with."""
+
+    for arch, rows in narrow_table.items():
+        owners = cake_jit.workspace_owners(arch)
+        for (route, c_lo, c_hi), (s_min, _) in rows.items():
+            for C in sorted({c_lo, (c_lo + c_hi) // 16 * 8, c_hi}):
+                nbytes = cake_jit.backward_workspace_bytes(arch, C)
+                layouts = [
+                    cake_jit.accumulator_layout(
+                        record, C, _owner_tiles(record, arch, C)
+                    )
+                    for record in owners
+                ]
+                assert nbytes == max(layout["total_bytes"] for layout in layouts), (
+                    arch,
+                    route,
+                    C,
+                )
+                for name in cake_jit.route_modules(arch, route):
+                    record = cake_jit.MODULES[name]
+                    geometry = record["grid_rule"]["geometry"]
+                    tiles = cake_jit.plan(
+                        s_min,
+                        C,
+                        3,
+                        geometry=geometry,
+                        role="bwd",
+                        arch=arch,
+                        route=route,
+                    )["n_ch_tiles"]
+                    layout = cake_jit.accumulator_layout(record, C, tiles)
+                    assert layout["total_bytes"] <= nbytes, (arch, route, C, name)
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # The host plan of a call row (``_ROW_PLANS``): planned by the row's first call, the same values as a per-call plan.
 
 # The SM counts of the fake devices of the sweep, per architecture (B200 / GB300 / R200 boards first: the counts the
@@ -628,7 +815,8 @@ FULL_PLAN_SWEEP = os.environ.get("CAKE_CONV1D_FULL_PLAN_SWEEP") == "1"
 
 def _plan_sweep_channels() -> tuple[int, ...]:
     """``CHANNELS``, rows off the 32-channel grid, and every selection threshold and ``TILE_OVERRIDES`` channel count
-    of the registry with the multiple of 8 below it."""
+    of the registry with the multiple of 8 below it, and both ends of every ``NARROW_TILES`` key with their
+    neighbours outside it."""
 
     channels = {*CHANNELS, 16, 24, 248, 520, 640, 1048, 1152, 3072}
     for record in cake_jit.MODULES.values():
@@ -638,17 +826,22 @@ def _plan_sweep_channels() -> tuple[int, ...]:
     for rows in cake_jit.TILE_OVERRIDES.values():
         for _, C in rows:
             channels |= {C - 8, C, C + 8}
+    for rows in cake_jit.NARROW_TILES.values():
+        for _, c_lo, c_hi in rows:
+            channels |= {c_lo - 8, c_lo, c_hi, c_hi + 8}
     return tuple(sorted(C for C in channels if C > 0))
 
 
 def _plan_sweep_tokens() -> tuple[int, ...]:
-    """Token counts on both sides of every bound where ``S`` enters a plan: the ``TILE_OVERRIDES`` ranges, the
-    grid-trim minimums and the selection rules' token floors, plus a few others."""
+    """Token counts on both sides of every bound where ``S`` enters a plan: the ``TILE_OVERRIDES`` and
+    ``NARROW_TILES`` ranges, the grid-trim minimums and the selection rules' token floors, plus a few others."""
 
     tokens = {1, 2, 63, 64, 1000, 250340, 1 << 20}
-    for rows in cake_jit.TILE_OVERRIDES.values():
-        for _, s_min, s_max in rows.values():
-            tokens |= {s_min - 1, s_min, s_max, s_max + 1}
+    for table in (cake_jit.TILE_OVERRIDES, cake_jit.NARROW_TILES):
+        for rows in table.values():
+            for value in rows.values():
+                s_min, s_max = value[-2:]
+                tokens |= {s_min - 1, s_min, s_max, s_max + 1}
     tokens |= {cake_jit.TILE_ALIGNED_MIN_S - 1, cake_jit.TILE_ALIGNED_MIN_S}
     for classes in cake_jit.TILE_ALIGNED_CLASSES.values():
         for s_min, _ in classes.values():
@@ -668,11 +861,11 @@ def fake_device(monkeypatch):
     def use(arch: str, sms: int) -> None:
         monkeypatch.setattr(cake_jit, "device_arch", lambda device_index: arch)
         monkeypatch.setattr(cake_jit, "sm_count", lambda device_index: sms)
-        pkg.plan_cache_clear()
+        pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
 
-    pkg.plan_cache_clear()
+    pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
     yield use
-    pkg.plan_cache_clear()
+    pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
 
 
 def _per_call(arch: str, kind: str, S: int, C: int, num_docs: int, gm: int, policy):
@@ -729,7 +922,7 @@ def _sweep_row_plans(arch: str) -> int:
     docs = (1, 2, 4, 5, 1000) if FULL_PLAN_SWEEP else (1, 1000)
     checked = 0
     for order in orders:
-        pkg.plan_cache_clear()
+        pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
         for kind in cake_jit.ROUTES[arch]:
             backward = cake_jit.route_role(kind) == "bwd"
             policy = "fp32" if kind.endswith("fp32g") else "bf16" if backward else None
@@ -751,8 +944,8 @@ def test_row_plans_match_the_per_call_plan(arch, fake_device, record_property) -
     """A call planned from its ``_ROW_PLANS`` row launches the programs, plan scalars and grid a per-call plan
     (``_route`` + ``_launch``) gives, and raises the same errors, on fake devices of the architecture: every route,
     channel counts at every selection threshold and ``C % 32`` rows (whose grid ``launch_grid`` may trim by ``S``),
-    token counts at every ``TILE_OVERRIDES`` bound, grid-trim minimum and token floor, document counts and every
-    ``bwd_grid_mult``.  ``CAKE_CONV1D_FULL_PLAN_SWEEP=1`` runs the full sweep."""
+    token counts at every ``TILE_OVERRIDES`` / ``NARROW_TILES`` bound, grid-trim minimum and token floor, document
+    counts and every ``bwd_grid_mult``.  ``CAKE_CONV1D_FULL_PLAN_SWEEP=1`` runs the full sweep."""
 
     checked = 0
     for sms in PLAN_SWEEP_SMS[arch][: None if FULL_PLAN_SWEEP else 1]:
@@ -766,8 +959,8 @@ def test_row_plans_match_the_per_call_plan(arch, fake_device, record_property) -
 def test_row_plans_follow_a_replaced_override_table(
     arch, fake_device, monkeypatch
 ) -> None:
-    """A row planned before ``TILE_OVERRIDES`` changes keeps its plan until :func:`plan_cache_clear` empties the
-    cache; after it, with the rows of every architecture on ``arch``, every row's calls on both
+    """A row planned before ``TILE_OVERRIDES`` changes keeps its plan until
+    :func:`cake_causal_conv1d_nondet_train_plan_cache_clear` empties the cache; after it, with the rows of every architecture on ``arch``, every row's calls on both
     sides of its token range plan as a per-call plan does, the override's tiles inside the range."""
 
     fake_device(arch, PLAN_SWEEP_SMS[arch][0])
@@ -794,7 +987,7 @@ def test_row_plans_follow_a_replaced_override_table(
         assert _row_planned(arch, route, s_min, C, 3, 1, policy_of(route)) == before
         changed += now != before
     assert changed or rows.items() <= shipped.items(), arch
-    assert pkg.plan_cache_clear() >= 1
+    assert pkg.cake_causal_conv1d_nondet_train_plan_cache_clear() >= 1
     checked = 0
     for (route, C), (ct_vec, s_min, s_max) in rows.items():
         if route not in cake_jit.ROUTES[arch]:
@@ -810,6 +1003,49 @@ def test_row_plans_follow_a_replaced_override_table(
     assert checked
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ARCHES)
+def test_row_plans_follow_a_replaced_narrow_table(
+    arch, fake_device, monkeypatch
+) -> None:
+    """A row planned before ``NARROW_TILES`` changes keeps its plan until
+    :func:`cake_causal_conv1d_nondet_train_plan_cache_clear` empties the cache; after it, with :data:`SYNTHETIC_NARROW_TILES` in place, every key's calls at its channel ends and an
+    inner channel count, on both sides of its token range and at every ``bwd_grid_mult``, plan as a per-call plan
+    does (the 32-vector tiles inside the range, the side-stream and whole-rank grid trims included), on fake
+    devices of the architecture's SM counts."""
+
+    rows = SYNTHETIC_NARROW_TILES[arch]
+
+    def policy_of(route: str) -> str:
+        return "fp32" if route.endswith("fp32g") else "bf16"
+
+    def planned(route: str, S: int, C: int, gm: int = 1):
+        return _row_planned(arch, route, S, C, 3, gm, policy_of(route))
+
+    checked = 0
+    for sms in PLAN_SWEEP_SMS[arch]:
+        fake_device(arch, sms)
+        before = {key: planned(key[0], value[0], key[1]) for key, value in rows.items()}
+        with monkeypatch.context() as m:
+            m.setattr(cake_jit, "NARROW_TILES", SYNTHETIC_NARROW_TILES)
+            for key, value in rows.items():
+                assert planned(key[0], value[0], key[1]) == before[key], (sms, key)
+            assert pkg.cake_causal_conv1d_nondet_train_plan_cache_clear() >= 1
+            for (route, c_lo, c_hi), (s_min, s_max) in rows.items():
+                for C in sorted({c_lo, (c_lo + c_hi) // 16 * 8, c_hi}):
+                    for S in (s_min - 1, s_min, s_max, s_max + 1):
+                        ct_vec = cake_jit.tile_override(arch, route, C, S) or 32
+                        for gm in pkg.BWD_GRID_MULTS:
+                            want = _per_call(arch, route, S, C, 3, gm, policy_of(route))
+                            got = planned(route, S, C, gm)
+                            assert got == want, (arch, sms, route, C, S, gm)
+                            if s_min <= S <= s_max and isinstance(got[1], dict):
+                                assert got[1]["ct_vec"] == ct_vec, (route, C, S, gm)
+                            checked += 1
+            pkg.cake_causal_conv1d_nondet_train_plan_cache_clear()
+    assert checked
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # The public names: the mode word in every name, no mode keyword (FlashInfer issue #8928).
 
@@ -822,12 +1058,9 @@ PUBLIC = (
     "cake_causal_conv1d_nondet_train_backward_workspace",
     "cake_causal_conv1d_nondet_train_backward_workspace_bytes",
 )
-# The public helpers whose names carry no mode (they launch nothing).
-HELPERS = frozenset(
-    {"plan_cache_clear", "cake_causal_conv1d_nondet_train_kcp_graph_cache_clear"}
-)
 # The names before the mode word joined them: removed, with no alias.
 OLD_NAMES = (
+    "plan_cache_clear",
     "cake_causal_conv1d",
     "CakeCausalConv1dFunction",
     "cake_causal_conv1d_train_forward",
@@ -842,7 +1075,7 @@ OLD_NAMES = (
 
 @pytest.mark.cpu_only
 def test_public_names_carry_the_mode_and_take_no_mode_keyword() -> None:
-    """Every public name of ``__all__`` but the constants and :data:`HELPERS` carries the mode word ``nondet``; no
+    """Every public name of ``__all__`` but the constants carries the mode word ``nondet``; no
     entry point and no parameter of the autograd function's forward is a ``deterministic`` keyword; the names before
     the rename are gone (no alias)."""
 
@@ -857,7 +1090,7 @@ def test_public_names_carry_the_mode_and_take_no_mode_keyword() -> None:
         not in inspect.signature(pkg.CakeCausalConv1dNondetFunction.forward).parameters
     )
     for name in pkg.__all__:
-        assert name.isupper() or name in HELPERS or "nondet" in name.lower(), name
+        assert name.isupper() or "nondet" in name.lower(), name
     for name in OLD_NAMES:
         assert name not in pkg.__all__ and not hasattr(pkg, name), name
 

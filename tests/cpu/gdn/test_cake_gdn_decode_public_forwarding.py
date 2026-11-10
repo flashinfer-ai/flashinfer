@@ -151,3 +151,46 @@ def test_public_t1_controls_fail_closed_before_launch(kwargs, match):
     tensors = _inputs(state_dtype=torch.bfloat16, seq_len=1)
     with pytest.raises(ValueError, match=match):
         gdn.gated_delta_rule_decode_pretranspose(**tensors, **kwargs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["cake_gdn", "auto"])
+def test_public_nontranspose_decode_refuses_cpu_tensors_before_resolving(
+    backend, monkeypatch
+):
+    # A CPU row never reaches the resolver or the launch table: explicit cake_gdn
+    # requests fail closed with the device error, auto falls through to FlashInfer.
+    batch_size, num_heads, num_v_heads, dim = 2, 16, 32, 128
+    launches = {}
+    monkeypatch.setattr(gdn, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", launches)
+
+    def no_select(**kwargs):
+        raise AssertionError("resolver called for a CPU row")
+
+    def fallback(*args, **kwargs):
+        raise RuntimeError("fell through to FlashInfer")
+
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", no_select)
+    monkeypatch.setattr(gdn, "run_nontranspose_decode", fallback)
+    q = torch.zeros(batch_size, 1, num_heads, dim, dtype=torch.bfloat16)
+    args = dict(
+        q=q,
+        k=q.clone(),
+        v=torch.zeros(batch_size, 1, num_v_heads, dim, dtype=torch.bfloat16),
+        state=torch.zeros(batch_size, num_v_heads, dim, dim, dtype=torch.float32),
+        A_log=torch.zeros(num_v_heads, dtype=torch.float32),
+        a=torch.zeros(batch_size, 1, num_v_heads, dtype=torch.bfloat16),
+        dt_bias=torch.zeros(num_v_heads, dtype=torch.float32),
+        b=torch.zeros(batch_size, 1, num_v_heads, dtype=torch.bfloat16),
+        output=torch.zeros(batch_size, 1, num_v_heads, dim, dtype=torch.bfloat16),
+    )
+    if backend == "cake_gdn":
+        with pytest.raises(
+            cake_gdn.CakeGDNUnsupportedError,
+            match="^GDN non-CP nontranspose decode requires one CUDA device$",
+        ):
+            gdn.gated_delta_rule_decode(**args, backend=backend)
+    else:
+        with pytest.raises(RuntimeError, match="fell through to FlashInfer"):
+            gdn.gated_delta_rule_decode(**args, backend=backend)
+    assert launches == {}

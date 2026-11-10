@@ -22,7 +22,9 @@ Checks per case:
   distance from the BF16 result showing the routed GEMMs ran in MXFP8.
 - Recompute cases: the checkpointed iteration (forward, context dropped,
   ``recompute_forward_context``, backward) is bitwise identical to the
-  saved-context iteration on the same inputs.
+  saved-context iteration on the same inputs. BF16 recompute cases also run
+  the iteration with the context-free forward (``save_context=False``),
+  eagerly and under CUDA Graph replay, and require the same bits.
 - Every case: two eager runs and two CUDA Graph replays are bitwise equal.
 """
 
@@ -51,6 +53,7 @@ MXFP8_LIMIT = 0.375
 CASES = (
     dict(name="bf16-clamped", swiglu_limit=LIMIT),
     dict(name="bf16-recompute", recompute=True),
+    dict(name="bf16-clamped-recompute", swiglu_limit=LIMIT, recompute=True),
     dict(name="bf16-fp32-wgrad", fp32_wgrad=True),
     dict(name="mxfp8", mxfp8=True),
     dict(name="mxfp8-fp32-wgrad", mxfp8=True, fp32_wgrad=True),
@@ -165,7 +168,7 @@ def main():
                 else None
             )
 
-            def iteration(recompute):
+            def iteration(recompute, save_context=True):
                 return TrainingIteration(
                     config,
                     workspace,
@@ -179,6 +182,7 @@ def main():
                     mxfp8_weights=mxfp8_weights if mxfp8 else None,
                     recompute=recompute,
                     accumulators=accumulators,
+                    save_context=save_context,
                 )
 
             def snapshot(values):
@@ -219,6 +223,27 @@ def main():
                     if not torch.equal(a, b)
                 ]
                 assert record["recompute_bitwise"], (rank, case["name"], differs)
+                if not mxfp8:
+                    # Context-free forward: y and every gradient keep the
+                    # saved-context bits, eagerly and under graph replay.
+                    functional.prepare(limit, save_context=False)
+                    context_free = iteration(True, save_context=False)
+                    runs = [snapshot(context_free.run())]
+                    dist.barrier()
+                    context_free.capture()
+                    runs.append(snapshot(context_free.run()))
+                    differs = sorted(
+                        {
+                            n
+                            for run in runs
+                            for n, a, b in zip(RESULT_NAMES, outputs, run, strict=True)
+                            if not torch.equal(a, b)
+                        }
+                    )
+                    record["context_free_bitwise"] = not differs
+                    assert record["context_free_bitwise"], (rank, case["name"], differs)
+                    del context_free
+                    torch.cuda.synchronize()
             dist.barrier()
             expected = reference(
                 data, weights, source_counts=counts, swiglu_limit=limit
