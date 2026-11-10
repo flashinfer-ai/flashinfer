@@ -11,7 +11,13 @@ import cutlass.cute as cute
 
 
 def _make_fp8_attention(
-    compressed_k, sm_count, native_fp4, head_dim_ctas=1, kv_splits=1, persistent=False
+    compressed_k,
+    sm_count,
+    native_fp4,
+    head_dim_ctas=1,
+    kv_splits=1,
+    persistent=False,
+    enable_pdl=True,
 ):
     from ....attention.prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile
     from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
@@ -88,8 +94,9 @@ def _make_fp8_attention(
     attention.direct_sparse_capacities = (128, compressed_k)
     # Stage final BF16 rows through SMEM so global stores write whole lines.
     attention.coalesce_keeps_output = True
-    # Overlap launch and prologue with the preceding grid (PDL).
-    attention.use_pdl = True
+    # With PDL the attention and its reducer overlap launch and prologue with
+    # the preceding grid; the plan-level flag decides both.
+    attention.enable_pdl = enable_pdl
     # B200 A/B: an entry release saves 2-3% for B=1 grids (4-20 CTAs) and
     # costs 2-6% once the grid covers more SMs (e.g. B16/K512: 12.50 vs 11.74 us).
     attention.pdl_entry_trigger_max_ctas = sm_count // 4
