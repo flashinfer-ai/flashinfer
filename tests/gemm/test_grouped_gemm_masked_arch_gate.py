@@ -9,7 +9,9 @@ SM120/SM121 got past the wrapper and tripped that assert from inside the kernel
 class constructor. These tests pin the wrapper to the same triple the suite
 already skips on, and pin that SM100/SM103 still reach the kernel.
 
-Both device reads are stubbed, so this needs no GPU.
+Both device reads are stubbed, so this needs no GPU, and both kernel modules are
+injected rather than imported, so it does not depend on the installed CUTLASS DSL
+exposing every helper the real kernels pull in at import time.
 """
 
 import sys
@@ -21,18 +23,30 @@ import torch
 from flashinfer.gemm.kernels import grouped_gemm_masked_wrapper as wrapper
 
 BLACKWELL_MODULE = "flashinfer.gemm.kernels.grouped_gemm_masked_blackwell"
+RUBIN_MODULE = "flashinfer.gemm.kernels.grouped_gemm_masked_rubin"
 
 
-def _call(monkeypatch, capability, sm100_kernel=None):
+def _stub_module(monkeypatch, module_name, attr, kernel):
+    """Put a one-attribute module where the arm's import will find it."""
+    stub = types.ModuleType(module_name)
+    setattr(stub, attr, kernel)
+    monkeypatch.setitem(sys.modules, module_name, stub)
+
+
+def _call(monkeypatch, capability, sm100_kernel=None, rubin_kernel=None):
     """Run the dispatch with the device probes replaced.
 
     The tensors are only read by the kernel the branch selects, so CPU zeros are
     enough to reach -- or refuse -- it.
     """
     if sm100_kernel is not None:
-        stub = types.ModuleType(BLACKWELL_MODULE)
-        stub._grouped_gemm_nt_masked_sm100 = sm100_kernel
-        monkeypatch.setitem(sys.modules, BLACKWELL_MODULE, stub)
+        _stub_module(
+            monkeypatch, BLACKWELL_MODULE, "_grouped_gemm_nt_masked_sm100", sm100_kernel
+        )
+    if rubin_kernel is not None:
+        _stub_module(
+            monkeypatch, RUBIN_MODULE, "_grouped_gemm_nt_masked_sm107", rubin_kernel
+        )
     monkeypatch.setattr(wrapper, "get_compute_capability", lambda device: capability)
     monkeypatch.setattr(wrapper, "get_num_sm", lambda device: 1)
 
@@ -74,15 +88,12 @@ def test_blackwell_still_reaches_the_kernel(monkeypatch, capability):
 
 
 def test_rubin_still_reaches_the_rubin_kernel(monkeypatch):
-    from flashinfer.gemm.kernels import grouped_gemm_masked_rubin as rubin
-
     calls = {}
 
     def refuse(**kwargs):
         calls.update(kwargs)
         raise RuntimeError("stub")
 
-    monkeypatch.setattr(rubin, "_grouped_gemm_nt_masked_sm107", refuse)
     with pytest.raises(RuntimeError, match="stub"):
-        _call(monkeypatch, (10, 7))
+        _call(monkeypatch, (10, 7), rubin_kernel=refuse)
     assert calls, "SM107 must still be routed, not refused"
