@@ -1349,7 +1349,7 @@ def test_flush_min_bounds_and_warning(T):
 
 
 # ---------------------------------------------------------------------------
-# backend="umma_ring64" of the public gated_delta_rule_mtp_ucache_flush
+# backend="umma_ring" of the public gated_delta_rule_mtp_ucache_flush
 
 
 def _public_call(case, flush_min=None, **extra):
@@ -1376,15 +1376,15 @@ def _public_call(case, flush_min=None, **extra):
 
 
 @pytest.mark.parametrize("T", [1, 4, 8])
-def test_public_backend_umma_ring64_matches_the_direct_call(T):
-    """backend='umma_ring64' hands the call to the ring-64 kernel unchanged: outputs, state pool and rings are
+def test_public_backend_umma_ring_matches_the_direct_call(T):
+    """backend='umma_ring' hands the call to the ring-64 kernel unchanged: outputs, state pool and rings are
     bit-identical to calling gated_delta_rule_mtp_ucache_flush_umma_ring64 directly (verify and flush rows)."""
     _skip_if_not_sm100()
     hist = list(range(0, _default_fm(T) + 1))
     B = len(hist)
     case_a = _make_case(B, T, hist, 40 + T, [3] * B)
     case_b = tuple(x.clone() for x in case_a)
-    y_a = _public_call(case_a, backend="umma_ring64")
+    y_a = _public_call(case_a, backend="umma_ring")
     y_b = _run(_umma(), case_b, None)
     torch.cuda.synchronize()
     for x, y_ in (
@@ -1398,25 +1398,25 @@ def test_public_backend_umma_ring64_matches_the_direct_call(T):
 
 
 @pytest.mark.parametrize("ring", [16, 48, 128])
-def test_public_backend_umma_ring64_rejects_unsupported_ring_depths(ring):
+def test_public_backend_umma_ring_rejects_unsupported_ring_depths(ring):
     """Only 32- and 64-slot rings are served; any other depth is refused with a message naming it."""
     _skip_if_not_sm100()
     case = _make_case(2, 4, [0, 1], 5, [0, 0], ring=ring)
     with pytest.raises(ValueError, match="32- or 64-slot"):
-        _public_call(case, backend="umma_ring64")
+        _public_call(case, backend="umma_ring")
     with pytest.raises(ValueError, match="32- or 64-slot"):
-        _public_call(case, backend="umma_ring64", restart_hist_on_flush=True)
+        _public_call(case, backend="umma_ring", restart_hist_on_flush=True)
 
 
 @pytest.mark.parametrize("T", [1, 4, 8])
-def test_public_backend_umma_ring64_takes_an_fp16_u_ring(T):
+def test_public_backend_umma_ring_takes_an_fp16_u_ring(T):
     """The fp16 u ring (vLLM's u-cache dtype) next to the bf16 k ring is served: bit-identical to the direct call."""
     _skip_if_not_sm100()
     hist = list(range(0, _default_fm(T) + 1))
     B = len(hist)
     case_a = _make_case(B, T, hist, 60 + T, [3] * B, u_dtype=torch.float16)
     case_b = tuple(x.clone() for x in case_a)
-    y_a = _public_call(case_a, backend="umma_ring64")
+    y_a = _public_call(case_a, backend="umma_ring")
     y_b = _run(_umma(), case_b, None)
     torch.cuda.synchronize()
     assert case_a[9].dtype == torch.float16
@@ -1430,7 +1430,7 @@ def test_public_backend_umma_ring64_takes_an_fp16_u_ring(T):
         assert torch.equal(_bits(x), _bits(y_))
 
 
-def test_public_backend_umma_ring64_rejects_an_fp16_k_ring():
+def test_public_backend_umma_ring_rejects_an_fp16_k_ring():
     """The Gram runs bf16 mma.sync on the raw k ring: only the u ring may be fp16."""
     _skip_if_not_sm100()
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
@@ -1438,10 +1438,10 @@ def test_public_backend_umma_ring64_rejects_an_fp16_k_ring():
     )
     case = (q, k, v, a, b, A_log, dt_bias, pool, kc.half(), uc, gc, hl, cb, idx)
     with pytest.raises(ValueError, match="bf16 k ring"):
-        _public_call(case, backend="umma_ring64")
+        _public_call(case, backend="umma_ring")
 
 
-def test_public_backend_umma_ring64_needs_4_value_heads_per_key_head():
+def test_public_backend_umma_ring_needs_4_value_heads_per_key_head():
     """The kernel is specialised for HV / H = 4 (backend='umma' also serves 1 to 3)."""
     _skip_if_not_sm100()
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = _make_case(
@@ -1465,10 +1465,10 @@ def test_public_backend_umma_ring64_needs_4_value_heads_per_key_head():
         idx,
     )
     with pytest.raises(ValueError, match="4 value heads per key head"):
-        _public_call(case, backend="umma_ring64")
+        _public_call(case, backend="umma_ring")
 
 
-def test_auto_backend_never_picks_umma_ring64():
+def test_auto_backend_never_picks_umma_ring():
     """backend='auto' keeps the 32-slot contract: 64-slot rings fail its ring validation instead of being
     served by the ring-64 kernel behind the caller's back."""
     _skip_if_not_sm100()
@@ -1483,7 +1483,7 @@ def _public_restart_fn(**extra):
     def fn(A_log, a, dt_bias, *, flush_min=None, restart_hist_on_flush, **kw):
         assert not restart_hist_on_flush
         return _flashinfer_fp16_state().gated_delta_rule_mtp_ucache_flush(
-            A_log, a, dt_bias, flush_min=flush_min, backend="umma_ring64", **kw, **extra
+            A_log, a, dt_bias, flush_min=flush_min, backend="umma_ring", **kw, **extra
         )
 
     return fn
@@ -1510,7 +1510,7 @@ def test_public_restart_cursor_check_commits_like_the_direct_call():
     hist, bases = [17, 28, 29, 32], [40, 40, 63, 41]
     case_a = _make_case(len(hist), T, hist, 91, bases)
     case_b = tuple(x.clone() for x in case_a)
-    y_a = _public_call(case_a, backend="umma_ring64", restart_hist_on_flush=True)
+    y_a = _public_call(case_a, backend="umma_ring", restart_hist_on_flush=True)
     y_b = _run(_umma(), case_b, None, restart=True)
     torch.cuda.synchronize()
     for x, y_ in zip((y_a, *case_a[7:13]), (y_b, *case_b[7:13]), strict=True):
@@ -1535,7 +1535,7 @@ def test_public_restart_cursor_check_bounds_ring64(T, flush_min, hist, bases, ma
     case[11].copy_(torch.tensor([hist], dtype=torch.int32))
     case[12].copy_(torch.tensor([bases], dtype=torch.int32))
     with pytest.raises(AssertionError, match=match):
-        _public_call(case, flush_min, backend="umma_ring64", restart_hist_on_flush=True)
+        _public_call(case, flush_min, backend="umma_ring", restart_hist_on_flush=True)
 
 
 @pytest.mark.parametrize("P", [20, 24, 28, 29, 30, 31, 32])
@@ -1547,7 +1547,7 @@ def test_public_t1_step_after_t4_step_folds_the_full_window(P):
     B = len(bases)
     case4 = _make_case(B, 4, [P - 4] * B, 11, bases)
     q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case4
-    _public_call(case4, backend="umma_ring64")
+    _public_call(case4, backend="umma_ring")
     torch.cuda.synchronize()
     for r in range(B):
         assert torch.isfinite(uc[r][:, (bases[r] + P - 1) % RING].float()).all()
@@ -1557,7 +1557,7 @@ def test_public_t1_step_after_t4_step_folds_the_full_window(P):
     cb.copy_(torch.tensor(bases, dtype=torch.int32))
     y = _public_call(
         (q1, k1, v1, a1, b1, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx),
-        backend="umma_ring64",
+        backend="umma_ring",
         restart_hist_on_flush=False,
     )
     torch.cuda.synchronize()
@@ -1571,11 +1571,11 @@ def test_public_t1_step_after_t4_step_folds_the_full_window(P):
 
 
 @pytest.mark.parametrize("backend", ["auto", "umma", "hmma"])
-def test_public_restart_cursor_check_hints_umma_ring64_for_64_slot_rings(backend):
+def test_public_restart_cursor_check_hints_umma_ring_for_64_slot_rings(backend):
     """A valid 64-slot cursor under another backend gets the umma_ring64 hint, not a 32-slot range error."""
     _skip_if_not_sm100()
     case = _make_case(1, 4, [4], 7, [40])
-    with pytest.raises(ValueError, match="umma_ring64"):
+    with pytest.raises(ValueError, match="umma_ring"):
         _public_call(case, backend=backend, restart_hist_on_flush=True)
 
 
@@ -1841,7 +1841,7 @@ def test_mismatched_ring_depths_are_refused(bad):
     with pytest.raises(AssertionError):
         _run(_umma(), case, None)
     with pytest.raises(ValueError, match="one depth"):
-        _public_call(case, backend="umma_ring64")
+        _public_call(case, backend="umma_ring")
 
 
 @pytest.mark.parametrize("T", [4, 8])
@@ -1871,7 +1871,7 @@ def test_public_ring32_commits_like_the_merged_backend():
     hist, bases = [3, 12, 13, 16], [31, 30, 20, 9]
     case_a = _make_case(len(hist), T, hist, 92, bases, ring=R32)
     case_b = tuple(x.clone() for x in case_a)
-    y_a = _public_call(case_a, backend="umma_ring64", restart_hist_on_flush=True)
+    y_a = _public_call(case_a, backend="umma_ring", restart_hist_on_flush=True)
     y_b = _public_call(case_b, backend="umma", restart_hist_on_flush=True)
     torch.cuda.synchronize()
     for x, y_ in zip((y_a, *case_a[7:13]), (y_b, *case_b[7:13]), strict=True):
@@ -1895,7 +1895,7 @@ def test_public_restart_cursor_check_bounds_ring32(T, flush_min, hist, bases, ma
     case[11].copy_(torch.tensor([hist], dtype=torch.int32))
     case[12].copy_(torch.tensor([bases], dtype=torch.int32))
     with pytest.raises(AssertionError, match=match):
-        _public_call(case, flush_min, backend="umma_ring64", restart_hist_on_flush=True)
+        _public_call(case, flush_min, backend="umma_ring", restart_hist_on_flush=True)
 
 
 def test_public_ring32_refuses_deep_flush_min():
@@ -1903,4 +1903,4 @@ def test_public_ring32_refuses_deep_flush_min():
     _skip_if_not_sm100()
     case = _make_case(1, 4, [4], 7, [0], ring=R32)
     with pytest.raises(ValueError, match="64-slot rings"):
-        _public_call(case, 14, backend="umma_ring64", restart_hist_on_flush=True)
+        _public_call(case, 14, backend="umma_ring", restart_hist_on_flush=True)

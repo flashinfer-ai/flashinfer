@@ -157,14 +157,14 @@ except ImportError:
     except ImportError:
         _UMMA_RUBIN = None
 
-# Opt-in ring-64 UMMA variant (backend="umma_ring64": 64-slot rings, 32-row window), imported on first use.
+# Opt-in ring-depth UMMA variant (backend="umma_ring": 64-slot rings with a 32-row window, or 32-slot rings under the merged contract), imported on first use.
 _UMMA_RING64_SLOTS = 64
 _UMMA_RING64_WINDOW = 32  # rows of the ring-64 window (its W_RING)
 _UMMA_RING32_WINDOW = 16  # rows of the 32-slot window the ring-64 kernel serves
 _UMMA_RING_DEPTHS = (32, _UMMA_RING64_SLOTS)
 
 
-def _load_umma_ring64():
+def _load_umma_ring():
     """The ring-64 UMMA kernel function, or None when its module cannot be imported."""
     try:
         from .gdn_replay_mtp_umma_ring64 import (
@@ -3379,7 +3379,7 @@ def gated_delta_rule_mtp_ucache_flush(
     (``"umma"`` raises ``ValueError`` when unavailable). Both implement the
     same contract; they
     differ in rounding only (fp32 accumulation in both, different summation
-    orders). ``"umma_ring64"`` (never chosen by ``"auto"``) opts into the ring-64 UMMA
+    orders). ``"umma_ring"`` (never chosen by ``"auto"``) opts into the ring-depth UMMA
     kernel ``gdn_replay_mtp_umma_ring64`` and accepts **64-slot** rings
     (k [pool, H, 64, K], u [pool, HV, 64, V], g [pool, HV, 64]; +0.63 MiB per
     request and layer) or **32-slot** rings (the ring depth is compile-time,
@@ -3507,25 +3507,25 @@ def gated_delta_rule_mtp_ucache_flush(
         # appends back into the live window — the write-after-read race the
         # ring exists to remove. The graph-captured serving path passes
         # restart_hist_on_flush=False and owns these invariants.
-        # backend="umma_ring64" has its own limits: 32 or 64 slots and a window of
+        # backend="umma_ring" has its own limits: 32 or 64 slots and a window of
         # min(nu, flush_min - 1 + T) rows (64 slots: nu = min(32, 64 - T), the full
         # nu rows at T = 1, whose rings may come from larger-T steps; 32 slots: the
         # merged kernel's 16-row window, nu = 16, flush_min <= 17 - T).
         if not torch.cuda.is_current_stream_capturing():
             if (
-                backend != "umma_ring64"
+                backend != "umma_ring"
                 and k_cache is not None
                 and k_cache.shape[-2] == _UMMA_RING64_SLOTS
             ):
                 raise ValueError(
                     "gated_delta_rule_mtp_ucache_flush: 64-slot rings are served "
-                    f"by backend='umma_ring64' only, got backend={backend!r}."
+                    f"by backend='umma_ring' only, got backend={backend!r}."
                 )
-            if backend == "umma_ring64":
+            if backend == "umma_ring":
                 _slots = k_cache.shape[-2] if k_cache is not None else None
                 if _slots not in _UMMA_RING_DEPTHS:
                     raise ValueError(
-                        "gated_delta_rule_mtp_ucache_flush: backend='umma_ring64' needs "
+                        "gated_delta_rule_mtp_ucache_flush: backend='umma_ring' needs "
                         f"32- or {_UMMA_RING64_SLOTS}-slot rings; got k_cache "
                         f"{None if k_cache is None else tuple(k_cache.shape)}."
                     )
@@ -3633,7 +3633,7 @@ def gated_delta_rule_mtp_ucache_flush(
 
     h0 = initial_state_source
 
-    if backend == "umma_ring64":
+    if backend == "umma_ring":
         # Opt-in variant with its own ring contract (64 slots, 32-row window): served before the
         # 32-slot ring validation below, which would reject its rings.
         assert (
@@ -3649,7 +3649,7 @@ def gated_delta_rule_mtp_ucache_flush(
             (g_cache, "g_cache"),
         ):
             _pc &= _inner_dense(_t, _n)
-        _r64 = _load_umma_ring64()
+        _r64 = _load_umma_ring()
         _why = (
             "flashinfer.gdn_kernels.gdn_replay_mtp_umma_ring64 could not be imported"
             if _r64 is None
@@ -3684,7 +3684,7 @@ def gated_delta_rule_mtp_ucache_flush(
             )
         if _why is not None:
             raise ValueError(
-                f"gated_delta_rule_mtp_ucache_flush: backend='umma_ring64' unavailable: {_why}."
+                f"gated_delta_rule_mtp_ucache_flush: backend='umma_ring' unavailable: {_why}."
             )
         return _r64(
             A_log_in,
@@ -3754,10 +3754,10 @@ def gated_delta_rule_mtp_ucache_flush(
     cache_base = cache_base.contiguous()
 
     # --- backend ---------------------------------------------------------------
-    if backend not in ("auto", "umma", "umma_ring64", "hmma"):
+    if backend not in ("auto", "umma", "umma_ring", "hmma"):
         raise ValueError(
             f"gated_delta_rule_mtp_ucache_flush: backend={backend!r}; use 'auto', "
-            "'umma', 'umma_ring64' or 'hmma'."
+            "'umma', 'umma_ring' or 'hmma'."
         )
     _why = "backend='hmma' was requested"
     if backend != "hmma":

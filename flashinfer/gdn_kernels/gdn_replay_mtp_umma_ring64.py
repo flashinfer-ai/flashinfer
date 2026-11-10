@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GDN ReplaySSM MTP decode step (1 <= T <= 8) on the UMMA / TMEM design (Blackwell).
 
-Opt-in sibling of ``gdn_replay_mtp_umma`` (``backend="umma_ring64"`` of ``gated_delta_rule_mtp_ucache_flush``):
+Opt-in sibling of ``gdn_replay_mtp_umma`` (``backend="umma_ring"`` of ``gated_delta_rule_mtp_ucache_flush``):
 the same fp16-state arm (bf16 q/k/v/a/b/out, fp16 state pool, bf16 k ring, bf16 or fp16 u ring, fp32 g ring), but a 64-slot ring
 with a 32-row window (RING_SLOTS = 64, W_RING = 32) instead of the 32-slot ring with a 16-row window. The caller
 allocates 64-slot rings (+0.63 MiB per request and layer); the default ``flush_min`` is nu - T + 1 (T = 4: 29,
