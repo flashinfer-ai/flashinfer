@@ -435,14 +435,25 @@ def grouped_epilogue_loop(
             if warp_active:
                 cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
                 cC_sub = tRG_cC[(None, None, None, s)]
+                crd0 = cC_sub[((0, 0), 0, 0)]
+                # a dead row (past the group's end) skips its chain per lane: its lanes would run the division's slow path
+                # on the padded rows' zero or garbage operands, and its values are never stored (the loads and barriers
+                # stay warp-wide)
+                live = {
+                    m: (crd0[0] - Int32(offs[0][0]) + Int32(m)) < rows_left
+                    for m in rows_in_frag
+                }
                 # the chain, in fp32, per element (pair)
                 for v in cutlass.range_constexpr(nv):
                     if cutlass.const_expr(is_out[v]):
-                        tTR_rC[v] = _chain_elem(
-                            chain,
-                            tTR_rAcc[v],
-                            tTR_rAcc[partner[v]] if cutlass.const_expr(pair) else None,
-                        )
+                        if live[offs[v][0]]:
+                            tTR_rC[v] = _chain_elem(
+                                chain,
+                                tTR_rAcc[v],
+                                tTR_rAcc[partner[v]]
+                                if cutlass.const_expr(pair)
+                                else None,
+                            )
                 if cutlass.const_expr(staged):
                     # registers -> this warpgroup's staging buffer (the TMEM load's thread layout); the rows of a skipped warp
                     # (all past the group's end) stay stale and are predicated off below
