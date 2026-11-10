@@ -984,6 +984,10 @@ def test_download_kernels_cmd_minimal_detects_visible_sm(monkeypatch):
             "--sm cannot be combined with --mode all.",
         ),
         (["--sm", "hopper"], "Invalid SM architecture 'hopper'."),
+        (
+            ["--cuda-version", "12.7"],
+            "No compatible flashinfer-jit-cache wheel found for CUDA 12.7",
+        ),
     ],
 )
 def test_download_kernels_cmd_rejects_invalid_selection_before_install(
@@ -999,14 +1003,79 @@ def test_download_kernels_cmd_rejects_invalid_selection_before_install(
     monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
 
     result = CliRunner().invoke(
-        cli,
-        ["download-kernels", "--cuda-version", "12.9", "--flashinfer-version", "0.4.1"]
-        + args,
+        cli, ["download-kernels", "--flashinfer-version", "0.4.1", *args]
     )
 
     assert result.exit_code != 0
     assert message in result.output
     assert "=== Cubin Wheel Install ===" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("command", "flag", "expected_url"),
+    [
+        ("install-cubin-wheel", "--index-url", "https://mirror.example/cubin"),
+        ("install-cubin-wheel", "--cubin-index-url", "https://mirror.example/cubin"),
+        ("install-jit-cache-wheel", "--index-url", "https://mirror.example/jit"),
+        (
+            "install-jit-cache-wheel",
+            "--jit-cache-index-url",
+            "https://mirror.example/jit",
+        ),
+    ],
+)
+def test_install_wheel_cmds_accept_download_kernels_index_url_spelling(
+    monkeypatch, command, flag, expected_url
+):
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("subprocess.run should not be called for dry-run")
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", fail_run)
+
+    out = _test_cmd_helper(
+        [
+            command,
+            "--flashinfer-version",
+            "0.4.1",
+            *(
+                ["--cuda-version", "12.9"]
+                if command == "install-jit-cache-wheel"
+                else []
+            ),
+            flag,
+            expected_url,
+            "--dry-run",
+        ]
+    )
+
+    _assert_output_contains_all(out, f"--index-url {expected_url}")
+
+
+def test_kernel_wheel_install_cmds_share_option_help():
+    """Options the install commands share must not drift apart."""
+    import click
+
+    from flashinfer.__main__ import cli
+
+    def option_help(command_name):
+        command = cli.commands[command_name]
+        return {
+            option: param.help
+            for param in command.params
+            for option in param.opts
+            if isinstance(param, click.Option)
+        }
+
+    cubin = option_help("install-cubin-wheel")
+    jit_cache = option_help("install-jit-cache-wheel")
+    kernels = option_help("download-kernels")
+
+    for option in ("--cuda-version", "--mode", "--sm"):
+        assert jit_cache[option] == kernels[option], option
+    for option in ("--flashinfer-version", "--nightly", "--dry-run"):
+        assert cubin[option] == jit_cache[option] == kernels[option], option
+    assert cubin["--cubin-index-url"] == kernels["--cubin-index-url"]
+    assert jit_cache["--jit-cache-index-url"] == kernels["--jit-cache-index-url"]
 
 
 def test_download_kernels_cmd_allows_local_flashinfer_version(monkeypatch):

@@ -190,8 +190,16 @@ provider; ``--mode minimal`` installs only the best compatible provider for
 each visible GPU, and ``--sm`` selects the architectures explicitly (implying
 ``--mode minimal``; it may be repeated for heterogeneous targets).
 The ``flashinfer-cubin`` wheel is a shared multi-architecture package and is
-still installed unchanged. Invalid ``--mode``/``--sm`` combinations and
-malformed ``--sm`` values are rejected before either wheel is installed.
+still installed unchanged. Invalid ``--mode``/``--sm`` combinations, malformed
+``--sm`` values and an unsupported explicit ``--cuda-version`` are rejected
+before either wheel is installed.
+
+``install-cubin-wheel``, ``install-jit-cache-wheel`` and ``download-kernels``
+share the same options: ``--flashinfer-version``, ``--nightly`` and
+``--dry-run`` on all three, and ``--cuda-version``, ``--mode`` and ``--sm`` on the
+two that install jit-cache providers. Custom indexes are set with
+``--cubin-index-url`` and ``--jit-cache-index-url``; the single-wheel commands
+also accept ``--index-url`` for compatibility.
 If one wheel install fails, the command still attempts the other install and
 reports any failures at the end.
 
