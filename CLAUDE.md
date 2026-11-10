@@ -794,6 +794,10 @@ DISPATCH_DTYPE(input_dtype, DTypeIn, {
 
 Defined in `.jinja` files and expanded after rendering.
 
+FA2 batch-prefill JIT launchers use `DISPATCH_FA2_CTA_TILE_Q` in `utils.cuh`
+to exclude references to tiles pruned by the ragged/paged instantiation templates.
+Keep its compile-time guards aligned with those templates and `FA2DetermineCtaTileQ`.
+
 ## API Logging with @flashinfer_api
 
 FlashInfer provides the `@flashinfer_api` decorator for debugging API calls.

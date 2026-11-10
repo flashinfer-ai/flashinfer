@@ -139,6 +139,21 @@
     }                                                      \
   }
 
+// Match the pruned instantiations in batch_prefill_{ragged,paged}_kernel_inst.jinja.
+#define DISPATCH_FA2_CTA_TILE_Q(cta_tile_q, HEAD_DIM_QK, HEAD_DIM_VO, CTA_TILE_Q, ...)  \
+  DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {                                         \
+    if constexpr (CTA_TILE_Q == 16 || (CTA_TILE_Q == 32 && HEAD_DIM_VO >= 512) ||       \
+                  ((CTA_TILE_Q == 64 || CTA_TILE_Q == 128) && HEAD_DIM_QK < 512 &&      \
+                   HEAD_DIM_VO < 512)) {                                                \
+      __VA_ARGS__                                                                       \
+    } else {                                                                            \
+      std::ostringstream err_msg;                                                       \
+      err_msg << "Unsupported FA2 cta_tile_q: " << cta_tile_q                           \
+              << " for head_dim_qk=" << HEAD_DIM_QK << ", head_dim_vo=" << HEAD_DIM_VO; \
+      FLASHINFER_ERROR(err_msg.str());                                                  \
+    }                                                                                   \
+  })
+
 #define DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...) \
   if (group_size == 1) {                                     \
     constexpr size_t GROUP_SIZE = 1;                         \

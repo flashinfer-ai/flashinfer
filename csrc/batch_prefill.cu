@@ -223,7 +223,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
 
         cudaError_t status = cudaSuccess;
 
-        DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+        DISPATCH_FA2_CTA_TILE_Q(plan_info.cta_tile_q, HEAD_DIM_QK, HEAD_DIM_VO, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, USE_TOKEN_HEAD_SF,
