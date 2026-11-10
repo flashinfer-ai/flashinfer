@@ -3283,8 +3283,8 @@ class FrostLowLatencyConfig:
 # decode records and the PDL wait / trigger placement follow Prims-TS (the open counterpart of TRTLLM-Gen's MoE GEMMs)
 # and TRTLLM-Gen's routing and finalize kernels; the token gather folded into GEMM1 follows the CuTe-DSL MoE kernels' and
 # cuDNN Frost's GATHER variants; the slot-ordered combine follows Frost low-latency's in-kernel slot fold and the CUTLASS
-# backend's unfused finalize. Each is a placement of the class's dataflow (the same bits); the record of the survey is
-# the sandbox's docs/moe_optimization_ideas_2026-11.md.
+# backend's unfused finalize. Each is a placement of the class's dataflow: the same bits, placed as those kernels place
+# theirs.
 @dataclass(frozen=True)
 class BatchInvariantBf16Config:
     """The batch-invariant MoE backend: the bf16 classes of the mode documented in ``flashinfer/batch_invariant/README.md``
