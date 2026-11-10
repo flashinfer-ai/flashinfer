@@ -140,6 +140,19 @@ cache directory. No build output is written into the installed package. This bac
 JIT-only and is unavailable with ``FLASHINFER_DISABLE_JIT=1`` in a fresh
 process.
 
+The optimized schedules currently require a 148-SM B300, 8192 total tokens,
+64 or 96 heads, and exactly one of these sequence-length layouts:
+``[8192]``, ``[1300, 547, 2048, 963, 271, 3063]``, or ``[1024] * 8``.
+Other supported layouts use the original scheduler, including nearby layouts
+that differ by only one token or an additional sequence.
+
+The fixed-sequence split retains the full recurrence through affine state
+composition. State handoff buffers and final-state storage are FP32. The
+correction uses TF32 products with FP32 accumulation for state composition,
+and BF16 state operands with FP32 accumulation for tail-output correction.
+Its numerical contract is the validated reference tolerance; FP32 storage does
+not imply bitwise FP32 arithmetic throughout the composition.
+
 Supported inputs are contiguous CUDA BF16 ``q/k/v/g [1, T, H, 128]`` with
 ``T >= 32`` and ``H`` equal to 64 or 96, BF16 beta logits ``[1, T, H]``, FP32
 ``A_log [H]`` and ``dt_bias [H, 128]`` (or flattened). All tensors must share

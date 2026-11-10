@@ -18,8 +18,10 @@ The public entry point is `flashinfer.recurrent_kda(..., backend="ptx")`.
 `flashinfer/kda_prefill_ptx.py` adapts it to FlashInfer's state, output,
 validation, and workspace contracts. Integration changes:
 
-- Remove approximate split planning and expected-norm substitution. Splits
-  exchange the complete FP32 recurrent state.
+- Remove approximate split planning and expected-norm substitution. Piece
+  handoffs exchange complete FP32 state. Fixed-split correction retains all
+  tokens, using TF32 products for final-state composition and BF16 state
+  operands for output correction, both with FP32 accumulation.
 - Clear handoff flags before every launch, including eager launches after
   CUDA Graph replay.
 - Prefer driver JIT for PTX ISA 9.2 when the CUDA driver supports 13.2 or
@@ -52,7 +54,9 @@ scheduler. The public API and explicit `backend="ptx"` selection are unchanged.
 - A fixed sequence splits into an exact prefix and parallel zero-state and
   identity-state tail recurrences. A Triton correction kernel composes the
   tail output and final FP32 state with the prefix state; no recurrent history
-  is discarded.
+  is discarded. State composition uses TF32 products, and output correction
+  uses BF16 state operands, with FP32 accumulation and the validated numeric
+  tolerances.
 - Mixed and uniform layouts use revised piece packing, state handoffs, and
   the updated uniform-family PTX pipeline. Partial pieces use identity-token
   padding with masked output stores.
@@ -65,6 +69,19 @@ scheduler. The public API and explicit `backend="ptx"` selection are unchanged.
 
 Approximate splitting and expected-norm substitution are disabled by the
 adapter. Planning, compilation, and descriptor upload remain outside graph
-capture. The benchmark includes all captured GPU work, including tail
+capture. Fixed-split correction uses release/acquire device completion
+counters; the side stream is joined after correction. This retains the original
+scheduling protocol. The benchmark includes all captured GPU work, including tail
 correction. It reports GPU activity spans rather
 than CPU-inclusive end-to-end latency.
+
+The optimized manifest pins the first public export in
+[`smoothsmooth/flashinfer`, revision `93bb64c3`](https://github.com/smoothsmooth/flashinfer/tree/93bb64c3e8352e696aaa153718d8716fe85b8c29/csrc/kda/ptx).
+These checked-in PTX files are the authoritative hand-optimized assembly
+source, rather than output reproducible from a separate high-level generator.
+The manifest records both file checksums and comment-normalized instruction
+checksums. Rebuild a native image with CUDA 13.2 or newer, for example:
+
+```bash
+ptxas -arch=sm_103a -o optimized.cubin csrc/kda/ptx/optimized_varlen_uniform_h64_t60.ptx
+```

@@ -168,6 +168,7 @@ def _launch_ptx_kda(
     output,
     prefill_workspace,
 ):
+    """Bind or reuse a stream-owned plan and apply the public output/state contract."""
     from .kda_kernels.ptx.kda_fwd_fused import prepare_kda_forward
     from .kda_kernels.ptx.optimized_launch import OptimizedLaunch, supports
 

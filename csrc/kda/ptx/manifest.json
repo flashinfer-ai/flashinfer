@@ -25,6 +25,10 @@
       "optimized_varlen_uniform_h64_t60p.ptx": "a28ff0e4797143a612f89cd2253ad037e89bf8f9fc51c76533e53521c9f2db3f",
       "optimized_varlen_uniform_h64_dual_dd.ptx": "a9523c75d47dcebfa42bcba2dbb411c53a5253e5b46d941e1e89d5df8bb048d8",
       "optimized_varlen_uniform_h64_dual_dd90.ptx": "9f1b2b24d1097e9feace0782070ae0fadb9ac755eb34628d6fda96d56075d5af"
-    }
+    },
+    "repository": "https://github.com/smoothsmooth/flashinfer",
+    "revision": "93bb64c3e8352e696aaa153718d8716fe85b8c29",
+    "source_directory": "csrc/kda/ptx",
+    "source_format": "Hand-optimized PTX ISA 9.2 assembly; these retained PTX files are the authoritative source, assembled by ptxas or the CUDA driver JIT."
   }
 }

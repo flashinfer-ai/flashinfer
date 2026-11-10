@@ -1,5 +1,16 @@
 # Copyright 2026 Co-developed by KDA (Kernel Design Agents)
-"""Spread one long chain per head over idle SMs through state linearity."""
+# Copyright (c) 2026 KDA Team
+# SPDX-License-Identifier: MIT
+# See LICENSE.kda-for-kda.txt for the full license.
+
+"""Spread a complete recurrent chain over idle SMs through state linearity.
+
+All tokens contribute to the affine composition. Handoff and final-state
+storage are FP32. Final-state composition uses TF32 tensor-core products with
+FP32 accumulation; tail-output correction rounds its state operand to BF16
+and accumulates BF16 products in FP32. These choices follow the validated
+relative-L2 and per-element tolerances rather than bitwise FP32 equivalence.
+"""
 
 from __future__ import annotations
 
@@ -9,16 +20,13 @@ import triton.language as tl
 
 HEAD_DIM = 128
 CHUNK = 32
-
 FIX_PROGRAMS_PER_SM = 3
-
-
 PREFIX_UNIFORM_HEADS = (64, 96)
 
 
 @triton.jit
 def _wait_dual_done(done_ptr, N_DONE: tl.constexpr):
-    """Device-side join with the dual tail."""
+    """Wait for every dual producer and count correction programs that observed it."""
     while tl.atomic_add(done_ptr, 0, sem="acquire", scope="gpu") < N_DONE:
         pass
     return tl.atomic_add(done_ptr + 1, 1, sem="relaxed", scope="gpu")
@@ -26,6 +34,7 @@ def _wait_dual_done(done_ptr, N_DONE: tl.constexpr):
 
 @triton.jit
 def _reset_dual_done(done_ptr, seen, N_PROG: tl.constexpr):
+    """Reset completion counters after the final correction program observes them."""
     if seen == N_PROG - 1:
         tl.atomic_xchg(done_ptr, 0, sem="relaxed", scope="gpu")
         tl.atomic_xchg(done_ptr + 1, 0, sem="relaxed", scope="gpu")
@@ -51,6 +60,7 @@ def _split_fix_kernel(
     N_DONE: tl.constexpr,
     N_PROG: tl.constexpr,
 ):
+    """Compose a complete tail using TF32 state and BF16 output products."""
     head = tl.program_id(0)
     part = tl.program_id(1)
     offs_d = tl.arange(0, 128)
@@ -66,9 +76,7 @@ def _split_fix_kernel(
             offs_t = (first + i) * BLOCK_T + tl.arange(0, BLOCK_T)
             mask = (offs_t < tail_tokens)[None, :]
             offs = (offs_t[None, :] * num_heads + head) * 128 + offs_d[:, None]
-
             offs_in = (offs_t[None, :] * IN_HEADS + head) * 128 + offs_d[:, None]
-
             w_t = tl.load(
                 w_ptr + offs_in, mask=mask, other=0.0, eviction_policy="evict_first"
             )
@@ -150,7 +158,6 @@ def _split_fix2_kernel(
         tl.store(sb_ptr + rows + offs_d[None, :], s_b)
         tl.debug_barrier()
         tl.atomic_add(cnt_ptr + head, 1, sem="release", scope="gpu")
-
         state = tl.load(zb_ptr + rows + offs_d[None, :])
         for kk in tl.range(0, 128, BLOCK_K, num_stages=3):
             s_rows = tl.load(sb_ptr + rows + kk + offs_k[None, :])
@@ -229,7 +236,6 @@ def _handoff_pack(rows_in, n_ctas, tail_chunks):
         return None
     base, extra = divmod(n_ctas, groups)
     sizes = [base + 1] * extra + [base] * (groups - extra)
-
     while sizes.count(3) >= 2 and sizes.count(2) >= 2:
         for v in (3, 3, 2, 2):
             sizes.remove(v)
@@ -239,15 +245,17 @@ def _handoff_pack(rows_in, n_ctas, tail_chunks):
     n_split = 0
 
     def cut(row, chunks):
+        """Split a tail job at a chunk boundary with an FP32 handoff slot."""
         nonlocal n_split
         at = row[0] + chunks * CHUNK
         flag_base = n_split * 128
         n_split += 1
         first = [row[0], at, row[2], row[3], row[4], 2, row[6], flag_base]
         second = [at, row[1], at, row[3], 2, row[5], row[6], flag_base]
-        return first, second
+        return (first, second)
 
     def cut3(row, c1, c2):
+        """Partition one tail chain into three pieces linked by FP32 state slots."""
         nonlocal n_split
         at1 = row[0] + c1 * CHUNK
         at2 = at1 + c2 * CHUNK
@@ -256,7 +264,7 @@ def _handoff_pack(rows_in, n_ctas, tail_chunks):
         p1 = [row[0], at1, row[2], row[3], row[4], 2, row[6], flag_base]
         p2 = [at1, at2, at1, row[3], 2, 3, row[6], flag_base]
         p3 = [at2, row[1], at2, row[3], 2, row[5], row[6], flag_base + 128]
-        return p1, p2, p3
+        return (p1, p2, p3)
 
     for n in sizes:
         if n == 5:
@@ -275,11 +283,10 @@ def _handoff_pack(rows_in, n_ctas, tail_chunks):
             ]
             continue
         first_chunks = ((n - 1) * tail_chunks * 2 + n) // (2 * n)
-
         order = [0, n - 1, *range(1, n - 1)]
         group = [[] for _ in range(n)]
         for c in order:
-            group[c].extend(next(rows_iter) for _ in range(whole))
+            group[c].extend((next(rows_iter) for _ in range(whole)))
         for c in range(n - 1):
             head, tail = cut(next(rows_iter), first_chunks)
             group[c].insert(0, head)
@@ -291,10 +298,14 @@ def _handoff_pack(rows_in, n_ctas, tail_chunks):
     cta = []
     for rows_here in bins:
         cta.extend(
-            [len(rows), len(rows_here), sum((r[1] - r[0]) // CHUNK for r in rows_here)]
+            [
+                len(rows),
+                len(rows_here),
+                sum(((r[1] - r[0]) // CHUNK for r in rows_here)),
+            ]
         )
         rows.extend(rows_here)
-    return rows, cta, n_split
+    return (rows, cta, n_split)
 
 
 class FixedSplitLaunch:
@@ -325,6 +336,7 @@ class FixedSplitLaunch:
         dual_module=None,
         seg_b=0,
     ):
+        """Allocate private prefix, dual-tail, correction, and stream resources."""
         device = q.device
         heads = num_heads
         split = tokens - tail_chunks * CHUNK
@@ -348,19 +360,18 @@ class FixedSplitLaunch:
             .expand(1, heads, 128, 128)
             .contiguous()
         )
-
         self.v_zero = torch.zeros(16, heads, 128, dtype=torch.bfloat16, device=device)
         self.w = torch.empty(tail, heads, 128, dtype=torch.bfloat16, device=device)
         self.final_state = final_state
         self.out_tail = args["out"][split:]
         self.dual_module = dual_module
         self.seg_b = 0
-
         n_z = helpers // 2
         n_w = helpers - n_z
         self.flags = []
 
         def table(rows_in, n_ctas, tail_args=None):
+            """Pack tail jobs and allocate the corresponding private CTA tables."""
             packed = (
                 _handoff_pack(rows_in, n_ctas, tail_chunks)
                 if handoff and tail_args is not None
@@ -370,7 +381,6 @@ class FixedSplitLaunch:
                 rows, cta, n_split = packed
                 flags = torch.zeros(n_split * 128, dtype=torch.int32, device=device)
                 self.flags.append(flags)
-
                 tail_args["handoff_flags_addr"] = flags.data_ptr()
                 tail_args["generation"] = 1
                 return (
@@ -388,7 +398,7 @@ class FixedSplitLaunch:
                     [
                         len(rows),
                         len(rows_here),
-                        sum((r[1] - r[0]) // CHUNK for r in rows_here),
+                        sum(((r[1] - r[0]) // CHUNK for r in rows_here)),
                     ]
                 )
                 rows.extend(rows_here)
@@ -401,7 +411,6 @@ class FixedSplitLaunch:
         prefix = [[0, split, 0, 0, 1, 1, h, 0] for h in range(heads)]
         zero_tail = [[split, tokens, split, 0, 0, 1, h, 0] for h in range(heads)]
         ident_tail = [[0, tail, 0, 0, 1, 1, h, 0] for h in range(heads)]
-
         self.args_p = dict(args)
         pt, ct, self.grid_p = table(prefix, heads)
         self.args_p["piece_table"] = pt
@@ -409,7 +418,6 @@ class FixedSplitLaunch:
         self.args_p["initial_state"] = initial_state
         self.args_p["final_state"] = self.ws_state
         self.args_p["handoff_flags_addr"] = 0
-
         self.args_z = dict(args)
         self.args_z["handoff_flags_addr"] = 0
         pt, ct, self.grid_z = table(zero_tail, n_z, self.args_z)
@@ -417,7 +425,6 @@ class FixedSplitLaunch:
         self.args_z["cta_table"] = ct
         self.args_z["initial_state"] = initial_state
         self.args_z["final_state"] = self.ws_state[1:]
-
         self.args_b = dict(args)
         self.args_b["handoff_flags_addr"] = 0
         pt, ct, self.grid_b = table(ident_tail, n_w, self.args_b)
@@ -455,19 +462,17 @@ class FixedSplitLaunch:
                         [
                             len(rows),
                             len(rows_here),
-                            sum((r[1] - r[0]) // CHUNK for r in rows_here),
+                            sum(((r[1] - r[0]) // CHUNK for r in rows_here)),
                         ]
                     )
                     rows.extend(rows_here)
                 pt = torch.tensor(rows, dtype=torch.int32, device=device)
                 ct = torch.tensor(cta, dtype=torch.int32, device=device)
                 self.grid_d = (len(cta) // 3, 1, 1)
-
                 self.ws_state = torch.empty(
                     3, heads, 128, 128, dtype=f32, device=device
                 )
                 self.args_p["final_state"] = self.ws_state
-
                 self.seg_cnt = torch.zeros(2 * heads, dtype=torch.int32, device=device)
             else:
                 dual_rows = [[0, tail, 0, 0, 0, 1, h, 0] for h in range(heads)]
@@ -480,15 +485,14 @@ class FixedSplitLaunch:
             self.args_d["out_tma"] = self.zw
             self.args_d["v"] = args["v"][split:]
             self.args_d["v_tma"] = args["v_tma"][split:]
-
             self.done = torch.zeros(2, dtype=torch.int32, device=device)
             self.args_d["handoff_flags_addr"] = self.done.data_ptr()
             self.args_d["generation"] = 0
         self.bind_inputs(q, k, g, beta)
-
         token_blocks = -(-tail // block_t)
 
         def fix_parts(bpp):
+            """Size the correction grid to cover output tiles and state rows."""
             return max(128 // block_v, -(-token_blocks // bpp))
 
         while (
@@ -501,15 +505,12 @@ class FixedSplitLaunch:
         self.block_v = block_v
         self.block_k = block_k
         self.num_warps = num_warps
-
         self.fix_grid = (heads, fix_parts(blocks_per_program))
         self.side_z = torch.cuda.Stream(device=device)
         self.side_w = torch.cuda.Stream(device=device)
 
-        # The public API warms this plan with an eager call before capture.
-        # Preparation must not advance an aliased initial/final state.
-
     def bind_inputs(self, q, k, g, beta):
+        """Bind live gate and activation views for the split tail."""
         split = self.split
         q_tail = q[split:]
         k_tail = k[split:]
@@ -530,6 +531,7 @@ class FixedSplitLaunch:
                 self.args_d[key] = value
 
     def set_g(self, g_flat):
+        """Rebind one gate buffer consistently across prefix and tail phases."""
         for args in (self.args_p, self.args_z):
             args["g"] = g_flat
             args["g_tma"] = g_flat
@@ -541,13 +543,13 @@ class FixedSplitLaunch:
             self.args_d["g_tma"] = g_tail
 
     def launch(self):
+        """Run prefix/tail branches, using device counters to join dual writes."""
         main = torch.cuda.current_stream()
         if self.dual_module is not None:
             self.side_z.wait_stream(main)
             self.module.launch(grid=self.grid_p, **self.args_p)
             with torch.cuda.stream(self.side_z):
                 self.dual_module.launch(grid=self.grid_d, **self.args_d)
-
             self.fix()
             main.wait_stream(self.side_z)
             return
@@ -563,6 +565,7 @@ class FixedSplitLaunch:
         self.fix()
 
     def fix(self):
+        """Correct tail outputs and state after programs observe dual completion."""
         if self.dual_module is not None and self.seg_b:
             self._fix_two_segments()
             return
@@ -574,11 +577,11 @@ class FixedSplitLaunch:
                 self.ws_zp[0],
             )
             in_heads = 2 * self.heads
-            done, n_done = self.done, self.grid_d[0]
+            done, n_done = (self.done, self.grid_d[0])
         else:
-            w, zo, p, z = self.w, self.out_tail, self.ws_p[0], self.ws_state[1]
+            w, zo, p, z = (self.w, self.out_tail, self.ws_p[0], self.ws_state[1])
             in_heads = self.heads
-            done, n_done = self.ws_p, 0
+            done, n_done = (self.ws_p, 0)
         _split_fix_kernel[self.fix_grid](
             w,
             zo,
@@ -601,11 +604,12 @@ class FixedSplitLaunch:
         )
 
     def _fix_two_segments(self):
+        """Correct two consecutive tail segments and compose their final state."""
         heads = self.heads
         bt = self.block_t
         na = self.a_tok // bt
         nb = -(-(self.tail - self.a_tok) // bt)
-        parts = max(128 // self.block_v, (FIX_PROGRAMS_PER_SM * self.num_sms) // heads)
+        parts = max(128 // self.block_v, FIX_PROGRAMS_PER_SM * self.num_sms // heads)
         best = None
         for pb in range(1, parts):
             pa = parts - pb
@@ -615,7 +619,7 @@ class FixedSplitLaunch:
             if best is None or maxb < best[2]:
                 best = (pa, pb, maxb)
         pa, pb, maxb = best
-        _split_fix2_kernel[(heads, parts)](
+        _split_fix2_kernel[heads, parts](
             self.zw[:, heads:],
             self.zw,
             self.out_tail,

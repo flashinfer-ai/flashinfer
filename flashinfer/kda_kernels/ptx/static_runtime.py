@@ -82,14 +82,18 @@ def _ptxas() -> tuple[str, tuple[int, int]]:
     )
 
 
-def _cubin(name: str) -> bytes:
-    """Assemble one retained PTX file for sm_103a, cached by content."""
-
+def _validate_device() -> None:
+    """Require the retained SM103a target before loading either image format."""
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) != (10, 3):
         raise RuntimeError(
             f"the retained PTX targets {PTX_ARCH} (B300); this GPU is sm_{major}{minor}"
         )
+
+
+def _cubin(name: str) -> bytes:
+    """Assemble one retained PTX file for sm_103a, cached by content."""
+
     source = SHIMS / f"{name}.ptx"
     ptxas, version = _ptxas()
     digest = hashlib.sha256(source.read_bytes() + Path(ptxas).read_bytes()).hexdigest()[
@@ -117,6 +121,7 @@ def _cubin(name: str) -> bytes:
 
 @cache
 def _image_kind() -> str:
+    """Choose driver JIT when PTX ISA 9.2 is supported, otherwise ptxas."""
     driver = ctypes.CDLL("libcuda.so.1")
     version = ctypes.c_int()
     get_version = driver.cuDriverGetVersion
@@ -128,6 +133,8 @@ def _image_kind() -> str:
 
 
 def _kernel_image(name: str) -> bytes:
+    """Validate the launch device and return its PTX or assembled cubin image."""
+    _validate_device()
     if _image_kind() == "driver_ptx":
         return (SHIMS / f"{name}.ptx").read_bytes() + b"\0"
     return _cubin(name)
@@ -156,6 +163,7 @@ def _shim_source(program: dict) -> str:
 
 @cache
 def _load(name: str):
+    """Compile and cache one shared FFI shim with its validated PTX or cubin image."""
     from tvm_ffi import cpp
     from ...jit.core import MissingJITCacheError
 

@@ -111,7 +111,20 @@ def check(got, want):
     )
 
 
+def _driver_version():
+    """Identify the NVIDIA driver JIT using the repository's nvidia-smi query."""
+    return (
+        subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            text=True,
+        )
+        .splitlines()[0]
+        .strip()
+    )
+
+
 def main():
+    """Validate six INT21 workloads and report paired cold-L2 GPU timings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--flash-kda-source-dir", required=True, type=Path)
     parser.add_argument("--output", type=Path)
@@ -159,6 +172,7 @@ def main():
         "tvm_ffi": importlib.metadata.version("apache-tvm-ffi"),
         "ptxas": _ptxas()[1] if _image_kind() == "assembled_cubin" else None,
         "ptx_image_kind": _image_kind(),
+        "nvidia_driver_version": _driver_version(),
         "ptx_manifest_sha256": hashlib.sha256(
             (SHIMS / "manifest.json").read_bytes()
         ).hexdigest(),

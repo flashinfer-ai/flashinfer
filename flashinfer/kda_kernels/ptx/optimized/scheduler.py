@@ -1,4 +1,8 @@
 # Copyright 2026 Co-developed by KDA (Kernel Design Agents)
+# Copyright (c) 2026 KDA Team
+# SPDX-License-Identifier: MIT
+# See LICENSE.kda-for-kda.txt for the full license.
+
 """Piece-stream KDA forward runtime for B300."""
 
 from __future__ import annotations
@@ -10,9 +14,9 @@ from collections import Counter, defaultdict
 from itertools import pairwise
 
 import torch
-from .fallback import prepare_fwd
-from .plan_cache import const_table, stream_workspace
-from .plan_cache import num_sms as cached_num_sms
+
+from ....utils import get_device_sm_count as cached_num_sms
+from ..fallback import prepare_fwd
 from .static_runtime import (
     compiled_stream_m64_fixed,
     compiled_stream_m64_fixed_final,
@@ -24,71 +28,19 @@ from .static_runtime import (
 
 K2_CHUNK = 32
 HEAD_DIM = 128
-EXPECTED_INV_NORM = 0.08891101429859798
-
-
-EXPECTED_NORM_MAX_RMS_REL_ERROR = 0.08
-EXPECTED_NORM_MAX_PAIR_RMS_REL_ERROR = 0.15
-PIECE_OVERHEAD_CHUNKS = 3
-MAX_WARM = 8
-WARM_EST = 3
-
-
-PROOF_THRESHOLD_LOG2 = -48.0
-
-
-DETECT_THRESHOLD_LOG2 = PROOF_THRESHOLD_LOG2 - 2.0
-SPLIT_FRACTIONS = (
-    0.03125,
-    0.0625,
-    0.09375,
-    0.125,
-    0.15625,
-    0.1875,
-    0.21875,
-    0.25,
-    0.3125,
-    0.375,
-    0.5,
-    0.75,
-    1.0,
-)
-JITTERS = (-2, 0, 2)
-
-
-SPLIT_MARGIN = 0.99
-
-
+DETECT_THRESHOLD_LOG2 = -50.0  # Reserved proof field in the retained kernel ABI.
 EXACT_TAIL_SPLIT_MARGIN = 0.96
-
-
 EXACT_TAIL_PHASE_TAX = 8
-
-
 INLINE_SPLIT_MARGIN = 0.98
-
-
 HANDOFF_PIECE_TAX = 0.0
 HANDOFF_SPLIT_SLOPE = 0.04
-
-
 UNIFORM_H96_SPLIT_GROUPS = ((56, 6), (56, 19))
-
-
 FIXED_SPLIT_TAIL_CHUNKS = {96: 52, 64: 96}
-
-
 DUAL_SPLIT_TAIL_CHUNKS = {96: 68, 64: 103}
-
-
 DUAL_SPLIT_SEG_B = {64: 20}
 DUAL_SPLIT_TAIL_CHUNKS_SEG = {64: 120}
 FIXED_SPLIT_TOKENS = (8192,)
-
-
 MAX_STREAM_INITIAL_STATE_ABS = float(2**12)
-
-
 _MIXED_H96_FINAL_PACKING = (
     (16, (0, 0, 0, 1, 0, 3, 0, 1)),
     (24, (0, 0, 0, 2, 0, 1, 0, 1)),
@@ -100,18 +52,6 @@ _MIXED_H96_FINAL_PACKING = (
     (16, (1, 0, 1, 0, 1, 0, 1, 1)),
     (28, (1, 1, 0, 1, 0, 0, 0, 1)),
 )
-
-
-def _expected_norm_errors(q, k):
-    """Measure individual and paired Expected-Norm scale errors."""
-
-    with torch.no_grad():
-        q_scale = torch.linalg.vector_norm(q.float(), dim=-1) * EXPECTED_INV_NORM
-        k_scale = torch.linalg.vector_norm(k.float(), dim=-1) * EXPECTED_INV_NORM
-        q_error = torch.sqrt(torch.mean(torch.square(q_scale - 1.0)))
-        k_error = torch.sqrt(torch.mean(torch.square(k_scale - 1.0)))
-        pair_error = torch.sqrt(torch.mean(torch.square(q_scale * k_scale - 1.0)))
-    return max(float(q_error.item()), float(k_error.item())), float(pair_error.item())
 
 
 def _lpt_makespan(job_lens, machines):
@@ -130,84 +70,6 @@ def _lpt_makespan(job_lens, machines):
         earliest = heapq.heappop(heap)
         heapq.heappush(heap, earliest + cost)
     return max(heap)
-
-
-def _one_chunk_warm_tables(offsets):
-    """Shape-only candidate tables whose cuts all use one warmup chunk."""
-
-    tables = []
-    for bos, eos in pairwise(offsets):
-        nfull = (eos - bos) // K2_CHUNK
-        tables.append(None if nfull < 2 else [None] + [1] * nfull)
-    return tables
-
-
-def _balanced_cuts(num_chunks, pieces, jitter, cut_max):
-    """Balanced cut positions for a pieces-way chain split.
-
-    :param num_chunks: Chain length in chunks (ceil, incl. partial tail).
-    :type num_chunks: int
-    :param pieces: Piece count.
-    :type pieces: int
-    :param jitter: Offset applied to the first cut.
-    :type jitter: int
-    :param cut_max: Largest chunk-aligned cut position.
-    :type cut_max: int
-    :return: Cut positions, or None when infeasible.
-    :rtype: tuple
-    """
-    tail = max(1, round((num_chunks - WARM_EST) / pieces))
-    first = num_chunks - (pieces - 1) * tail + jitter
-    if first < 1:
-        return None
-    cuts = tuple(first + i * tail for i in range(pieces - 1))
-    if cuts[-1] > cut_max or num_chunks - cuts[-1] < 1:
-        return None
-    return cuts
-
-
-def _msweep_cuts(num_chunks, target, warms_tab, cut_max, piece_overhead):
-    """Greedy unequal cuts so every piece cost stays within ``target``.
-
-    Walks the chain head-to-tail emitting the largest provable piece each
-    step, so long chains become several ``target``-cost pieces plus one
-    small remainder that LPT can pack onto otherwise idle SMs.
-
-    :param num_chunks: Chain length in chunks (ceil, incl. partial tail).
-    :type num_chunks: int
-    :param target: Modeled per-piece cost bound in chunk slots.
-    :type target: int
-    :param warms_tab: Per-cut proven warm chunks (None when unprovable).
-    :type warms_tab: list
-    :param cut_max: Largest chunk-aligned cut position.
-    :type cut_max: int
-    :return: (cuts, warms) or None when no valid split exists.
-    :rtype: tuple
-    """
-    if num_chunks + piece_overhead <= target:
-        return None
-    cuts = []
-    warms = []
-    start = 0
-    warm_in = 0
-    while num_chunks - start + warm_in + piece_overhead > target:
-        limit = start + target - piece_overhead - warm_in
-        cut = min(limit, cut_max)
-        found = None
-        while cut > start and limit - cut <= MAX_WARM + 4:
-            if warms_tab[cut] is not None:
-                found = cut
-                break
-            cut -= 1
-        if found is None:
-            return None
-        cuts.append(found)
-        warms.append(warms_tab[found])
-        warm_in = warms_tab[found]
-        start = found
-    if not cuts:
-        return None
-    return tuple(cuts), warms
 
 
 def pack_bins(rows, num_sms, job_overhead=0):
@@ -240,9 +102,11 @@ def pack_bins(rows, num_sms, job_overhead=0):
     order = []
     cta_vals = []
     for b in range(bins):
-        cta_vals.extend([len(order), len(assign[b]), sum(costs[i] for i in assign[b])])
+        cta_vals.extend(
+            [len(order), len(assign[b]), sum((costs[i] for i in assign[b]))]
+        )
         order.extend(assign[b])
-    return order, cta_vals
+    return (order, cta_vals)
 
 
 def _simulate_handoff_bins(jobs, num_sms):
@@ -267,7 +131,7 @@ def _simulate_handoff_bins(jobs, num_sms):
     for pieces in bins:
         pieces.sort(key=lambda j: (rank[jobs[j][1]], -jobs[j][0]))
     makespan, spin = _handoff_timeline(bins, jobs)
-    return makespan, spin, bins
+    return (makespan, spin, bins)
 
 
 def _handoff_timeline(bins, jobs):
@@ -303,7 +167,7 @@ def _handoff_timeline(bins, jobs):
                     t = ready
             t += cost
         makespan = max(makespan, t)
-    return makespan, spin
+    return (makespan, spin)
 
 
 def _diversify_heads(bins, jobs, chain_heads):
@@ -315,25 +179,26 @@ def _diversify_heads(bins, jobs, chain_heads):
             where[j] = b
     by_type = defaultdict(list)
     for j, (cost, kind, _chain) in enumerate(jobs):
-        by_type[(cost, kind)].append(j)
+        by_type[cost, kind].append(j)
 
     def head(j):
+        """Recover the logical head index from a packed recurrent job."""
         return chain_heads[jobs[j][2]]
 
-    heads_in = [Counter(head(j) for j in pieces) for pieces in bins]
+    heads_in = [Counter((head(j) for j in pieces)) for pieces in bins]
     for _sweep in range(4):
         changed = False
         for b, pieces in enumerate(bins):
             for pos, j in enumerate(pieces):
                 if heads_in[b][head(j)] < 2:
                     continue
-                for p in by_type[(jobs[j][0], jobs[j][1])]:
+                for p in by_type[jobs[j][0], jobs[j][1]]:
                     pb = where[p]
                     if pb == b or heads_in[b][head(p)] or heads_in[pb][head(j)]:
                         continue
                     pieces[pos] = p
                     bins[pb][bins[pb].index(p)] = j
-                    where[j], where[p] = pb, b
+                    where[j], where[p] = (pb, b)
                     heads_in[b][head(j)] -= 1
                     heads_in[b][head(p)] += 1
                     heads_in[pb][head(p)] -= 1
@@ -347,14 +212,13 @@ def _diversify_heads(bins, jobs, chain_heads):
 
 def _pack_mixed_h96_final_handoff(jobs, num_sms, chain_heads):
     """Pack the canonical exact handoff jobs to their 173-slot lower bound."""
-
     type_costs = (5, 93, 97, 65, 42, 32, 19, 10)
     whole_type = {cost: index for index, cost in enumerate(type_costs[2:], 2)}
     buckets = defaultdict(list)
     for job_index, (cost, kind, _chain) in enumerate(jobs):
         type_index = 0 if kind == 1 else 1 if kind == 2 else whole_type[cost]
         buckets[type_index].append(job_index)
-    if tuple(len(buckets[index]) for index in range(8)) != (
+    if tuple((len(buckets[index]) for index in range(8))) != (
         64,
         64,
         32,
@@ -365,7 +229,6 @@ def _pack_mixed_h96_final_handoff(jobs, num_sms, chain_heads):
         96,
     ):
         raise RuntimeError("unexpected canonical mixed-H96 handoff jobs")
-
     bins = []
     for count, vector in _MIXED_H96_FINAL_PACKING:
         for _ in range(count):
@@ -391,13 +254,12 @@ def _pack_mixed_h96_final_handoff(jobs, num_sms, chain_heads):
                 (piece for piece in pieces if jobs[piece][1] == 0),
                 key=lambda piece: -jobs[piece][0],
             )
-
             bins.append(
                 heads + whole + tails if heads else whole[:1] + tails + whole[1:]
             )
     if len(bins) != num_sms or any(buckets.values()):
         raise RuntimeError("invalid canonical mixed-H96 handoff packing")
-    if max(sum(jobs[piece][0] for piece in pieces) for pieces in bins) != 173:
+    if max((sum((jobs[piece][0] for piece in pieces)) for pieces in bins)) != 173:
         raise RuntimeError("canonical mixed-H96 handoff span is not 173")
     return bins
 
@@ -413,7 +275,7 @@ def plan_exact_inline_split(rows, num_sms):
     count, never on tensor values, and returns fresh row lists so callers may
     mutate the plan.
     """
-    key = (tuple(tuple(row) for row in rows), num_sms)
+    key = (tuple((tuple(row) for row in rows)), num_sms)
     if key not in _EXACT_INLINE_SPLIT_CACHE:
         if len(_EXACT_INLINE_SPLIT_CACHE) >= 256:
             _EXACT_INLINE_SPLIT_CACHE.clear()
@@ -421,7 +283,6 @@ def plan_exact_inline_split(rows, num_sms):
     plan = _EXACT_INLINE_SPLIT_CACHE[key]
     if plan is None:
         return None
-
     ordered_rows, cta_vals, *scalars = plan
     return ([list(row) for row in ordered_rows], list(cta_vals), *scalars)
 
@@ -458,51 +319,60 @@ def _plan_exact_inline_split(rows, num_sms):
     canonical_mixed_h64_final = (
         num_sms == 148
         and len(rows) == 384
-        and all(row[4] == 1 and row[5] == 1 for row in rows)
-        and {row[6] for row in rows} == set(range(64))
-        and {(row[0], row[1], row[3]) for row in rows}
-        == {
-            (0, 1300, 0),
-            (1300, 1847, 1),
-            (1847, 3895, 2),
-            (3895, 4858, 3),
-            (4858, 5129, 4),
-            (5129, 8192, 5),
-        }
+        and all((row[4] == 1 and row[5] == 1 for row in rows))
+        and ({row[6] for row in rows} == set(range(64)))
+        and (
+            {(row[0], row[1], row[3]) for row in rows}
+            == {
+                (0, 1300, 0),
+                (1300, 1847, 1),
+                (1847, 3895, 2),
+                (3895, 4858, 3),
+                (4858, 5129, 4),
+                (5129, 8192, 5),
+            }
+        )
     )
     canonical_mixed_h96_final = (
         num_sms == 148
         and len(rows) == 576
-        and all(row[4] == 1 and row[5] == 1 for row in rows)
-        and {row[6] for row in rows} == set(range(96))
-        and {(row[0], row[1], row[3]) for row in rows}
-        == {
-            (0, 1300, 0),
-            (1300, 1847, 1),
-            (1847, 3895, 2),
-            (3895, 4858, 3),
-            (4858, 5129, 4),
-            (5129, 8192, 5),
-        }
+        and all((row[4] == 1 and row[5] == 1 for row in rows))
+        and ({row[6] for row in rows} == set(range(96)))
+        and (
+            {(row[0], row[1], row[3]) for row in rows}
+            == {
+                (0, 1300, 0),
+                (1300, 1847, 1),
+                (1847, 3895, 2),
+                (3895, 4858, 3),
+                (4858, 5129, 4),
+                (5129, 8192, 5),
+            }
+        )
     )
     canonical_uniform_h64_final = (
         num_sms == 148
         and len(rows) == 512
-        and all(row[4] == 1 and row[5] == 1 for row in rows)
-        and {row[6] for row in rows} == set(range(64))
-        and {(row[0], row[1], row[3]) for row in rows}
-        == {(start, start + 1024, start // 1024) for start in range(0, 8192, 1024)}
+        and all((row[4] == 1 and row[5] == 1 for row in rows))
+        and ({row[6] for row in rows} == set(range(64)))
+        and (
+            {(row[0], row[1], row[3]) for row in rows}
+            == {(start, start + 1024, start // 1024) for start in range(0, 8192, 1024)}
+        )
     )
     canonical_uniform_h96_final = (
         num_sms == 148
         and len(rows) == 768
-        and all(row[4] == 1 and row[5] == 1 for row in rows)
-        and {row[6] for row in rows} == set(range(96))
-        and {(row[0], row[1], row[3]) for row in rows}
-        == {(start, start + 1024, start // 1024) for start in range(0, 8192, 1024)}
+        and all((row[4] == 1 and row[5] == 1 for row in rows))
+        and ({row[6] for row in rows} == set(range(96)))
+        and (
+            {(row[0], row[1], row[3]) for row in rows}
+            == {(start, start + 1024, start // 1024) for start in range(0, 8192, 1024)}
+        )
     )
 
     def build_jobs(groups):
+        """Expand a candidate handoff grouping into costed recurrent jobs."""
         bounds = []
         first = 0
         for count, prefix in groups:
@@ -521,7 +391,7 @@ def _plan_exact_inline_split(rows, num_sms):
                 jobs.append((chunks - prefix + 1 + HANDOFF_PIECE_TAX, 2, idx))
             else:
                 jobs.append((chunks + 1, 0, idx))
-        return jobs, prefix_of
+        return (jobs, prefix_of)
 
     best = None
     if canonical_mixed_h64_final:
@@ -542,16 +412,15 @@ def _plan_exact_inline_split(rows, num_sms):
         built = build_jobs(groups)
         if built is None:
             continue
-        n_split = sum(count for count, _prefix in groups)
+        n_split = sum((count for count, _prefix in groups))
         span, _spin, _bins = _simulate_handoff_bins(built[0], num_sms)
-
         key = (span + HANDOFF_SPLIT_SLOPE * n_split, n_split, groups)
         if best is None or key < best[0]:
             best = (key, groups)
     if best is None or best[0][0] > base_span - 1.0:
         return None
     groups = best[1]
-    n_split = sum(count for count, _prefix in groups)
+    n_split = sum((count for count, _prefix in groups))
     prefix = groups[0][1]
     jobs, prefix_of = build_jobs(groups)
     span, spin, bins = _simulate_handoff_bins(jobs, num_sms)
@@ -593,20 +462,11 @@ def _plan_exact_inline_split(rows, num_sms):
                         flag_base,
                     ]
                 else:
-                    out_row = [
-                        cut,
-                        row[1],
-                        cut,
-                        row[3],
-                        2,
-                        row[5],
-                        row[6],
-                        flag_base,
-                    ]
+                    out_row = [cut, row[1], cut, row[3], 2, row[5], row[6], flag_base]
             ordered_rows.append(out_row)
             total += (out_row[1] - out_row[0] + K2_CHUNK - 1) // K2_CHUNK
         cta_vals.extend([start, len(ordered_rows) - start, total])
-    return ordered_rows, cta_vals, n_split, prefix, base_span, span
+    return (ordered_rows, cta_vals, n_split, prefix, base_span, span)
 
 
 _EXACT_TAIL_SPLIT_CACHE: dict = {}
@@ -621,7 +481,7 @@ def plan_exact_tail_split(rows, offsets, num_heads, num_sms, store_final):
     copy so callers may mutate the plan.
     """
     key = (
-        tuple(tuple(row) for row in rows),
+        tuple((tuple(row) for row in rows)),
         tuple(offsets),
         num_heads,
         num_sms,
@@ -659,20 +519,22 @@ def _plan_exact_tail_split(rows, offsets, num_heads, num_sms, store_final):
     if (
         num_sms == 148
         and store_final
-        and num_heads in (64, 96)
-        and offsets
-        in (
-            [0, 1300, 1847, 3895, 4858, 5129, 8192],
-            [0, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192],
+        and (num_heads in (64, 96))
+        and (
+            offsets
+            in (
+                [0, 1300, 1847, 3895, 4858, 5129, 8192],
+                [0, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192],
+            )
         )
     ):
         return None
-
     row_chunks = [(row[1] - row[0] + K2_CHUNK - 1) // K2_CHUNK for row in rows]
     base_span = _lpt_makespan([cost + 1 for cost in row_chunks], num_sms)
     best = None
 
     def consider(seq_indices, prefix_chunks, other_jobs, seq_chunks):
+        """Score a candidate exact tail partition against the current best plan."""
         nonlocal best
         split_jobs = num_heads * len(seq_indices)
         phase_a_jobs = other_jobs + [
@@ -713,7 +575,6 @@ def _plan_exact_tail_split(rows, offsets, num_heads, num_sms, store_final):
                     other_jobs,
                     seq_chunks,
                 )
-
         if len(seq_group) >= 2 and seq_chunks <= 64:
             seq_indices = tuple(seq_group[:2])
             seq_index_set = set(seq_indices)
@@ -724,18 +585,12 @@ def _plan_exact_tail_split(rows, offsets, num_heads, num_sms, store_final):
             ]
             for prefix_a in range(1, seq_chunks):
                 for prefix_b in range(1, seq_chunks):
-                    consider(
-                        seq_indices,
-                        (prefix_a, prefix_b),
-                        other_jobs,
-                        seq_chunks,
-                    )
+                    consider(seq_indices, (prefix_a, prefix_b), other_jobs, seq_chunks)
     if (
         best is None
         or best[0][0] + EXACT_TAIL_PHASE_TAX >= base_span * EXACT_TAIL_SPLIT_MARGIN
     ):
         return None
-
     total_span = best[0][0]
     seq_indices, prefix_chunks, span_a = best[1:]
     seq_index_set = set(seq_indices)
@@ -747,202 +602,44 @@ def _plan_exact_tail_split(rows, offsets, num_heads, num_sms, store_final):
         if seq_idx not in seq_index_set:
             phase_a.append(list(row))
             continue
-        bos, eos = offsets[seq_idx], offsets[seq_idx + 1]
+        bos, eos = (offsets[seq_idx], offsets[seq_idx + 1])
         cut = bos + prefix_by_seq[seq_idx] * K2_CHUNK
         prefix = list(row)
         prefix[1] = cut
         prefix[5] = 1
         phase_a.append(prefix)
         phase_b.append([cut, eos, cut, seq_idx, 1, store_final, row[6], row[7]])
-    return (
-        phase_a,
-        phase_b,
-        seq_indices,
-        prefix_chunks,
-        base_span,
-        total_span,
-        span_a,
-    )
+    return (phase_a, phase_b, seq_indices, prefix_chunks, base_span, total_span, span_a)
 
 
-def plan_pieces(offsets, num_heads, num_sms, warm_tables, use_init, store_final):
-    """Choose per-chain piece splits that minimize modeled LPT makespan.
-
-    :param offsets: Packed cu_seqlens boundaries as Python ints.
-    :type offsets: list
-    :param num_heads: Head count.
-    :type num_heads: int
-    :param num_sms: SM count used as the machine count.
-    :type num_sms: int
-    :param warm_tables: Per-sequence per-cut proven warm chunks.
-    :type warm_tables: list
-    :param use_init: Initial-state load flag.
-    :type use_init: int
-    :param store_final: Final-state store flag.
-    :type store_final: int
-    :return: (rows, has_split, windows) where rows are piece-table entries
-        sorted by modeled cost and windows are (walk_start, out_start) proof
-        windows.
-    :rtype: tuple
-    """
-    seqs = []
-    for seq_idx in range(len(offsets) - 1):
-        bos, eos = offsets[seq_idx], offsets[seq_idx + 1]
-        num_chunks = (eos - bos + K2_CHUNK - 1) // K2_CHUNK
-        nfull = (eos - bos) // K2_CHUNK
-        cut_max = min(nfull, num_chunks - 1)
-        seqs.append((num_chunks, seq_idx, bos, eos, cut_max))
+def _whole_chain_rows(offsets, num_heads, use_init, store_final):
+    """Build complete recurrent chains, longest first, without approximate cuts."""
+    seqs = [
+        ((eos - bos + K2_CHUNK - 1) // K2_CHUNK, i, bos, eos)
+        for i, (bos, eos) in enumerate(pairwise(offsets))
+    ]
     seqs.sort(key=lambda item: -item[0])
-    total_chains = len(seqs) * num_heads
-    piece_overhead = (
-        1
-        if total_chains <= num_sms // 2 or total_chains >= 5 * num_sms
-        else PIECE_OVERHEAD_CHUNKS
-    )
-
-    fill_counts = []
-    for waves in range(1, (total_chains - 1) // num_sms + 1):
-        fill = total_chains - waves * num_sms
-        if 0 < fill < total_chains:
-            fill_counts.append(fill)
-    split_counts = sorted(
-        {max(1, round(total_chains * f)) for f in SPLIT_FRACTIONS} | set(fill_counts)
-    )
-
-    candidates = [{}]
-    for pieces in (2, 3, 4):
-        for n_split in split_counts:
-            for jitter in JITTERS:
-                plan = {}
-                remaining = n_split
-                valid = True
-                for num_chunks, seq_idx, _bos, _eos, cut_max in seqs:
-                    if remaining <= 0:
-                        break
-                    k_here = min(remaining, num_heads)
-                    warms_tab = warm_tables[seq_idx]
-                    cuts = None
-                    if warms_tab is not None and num_chunks >= 2 * pieces:
-                        cuts = _balanced_cuts(num_chunks, pieces, jitter, cut_max)
-                    if cuts is None:
-                        valid = False
-                        break
-                    warms = [warms_tab[c] for c in cuts]
-                    if any(w is None for w in warms):
-                        valid = False
-                        break
-                    plan[seq_idx] = (k_here, cuts, warms)
-                    remaining -= k_here
-                if valid and plan:
-                    candidates.append(plan)
-
-    lower_area = sum(nc + piece_overhead for nc, *_ in seqs) * num_heads
-    lower_bound_span = max(1, -(-lower_area // num_sms))
-    for target in range(lower_bound_span, lower_bound_span + lower_bound_span // 4 + 8):
-        plan = {}
-        for num_chunks, seq_idx, _bos, _eos, cut_max in seqs:
-            warms_tab = warm_tables[seq_idx]
-            if warms_tab is None:
-                continue
-            result = _msweep_cuts(
-                num_chunks, target, warms_tab, cut_max, piece_overhead
-            )
-            if result is not None:
-                plan[seq_idx] = (num_heads, result[0], list(result[1]))
-        if plan:
-            candidates.append(plan)
-
-    best = None
-    trivial_makespan = None
-    for plan in candidates:
-        jobs = []
-        area = 0
-        for num_chunks, seq_idx, _bos, _eos, _cut_max in seqs:
-            k_here, cuts, warms = plan.get(seq_idx, (0, (), ()))
-            whole = num_chunks + piece_overhead
-            if k_here:
-                piece_jobs = []
-                prev = 0
-                for i, cut in enumerate(tuple(cuts) + (num_chunks,)):
-                    warm = 0 if i == 0 else warms[i - 1]
-                    piece_jobs.append(cut - prev + warm + piece_overhead)
-                    prev = cut
-                jobs.extend(piece_jobs * k_here)
-                area += sum(piece_jobs) * k_here
-            jobs.extend([whole] * (num_heads - k_here))
-            area += whole * (num_heads - k_here)
-        makespan = _lpt_makespan(jobs, num_sms)
-        if trivial_makespan is None:
-            trivial_makespan = makespan
-        key = (makespan, area, len(jobs))
-        if best is None or key < best[0]:
-            best = (key, plan)
-    plan = best[1]
-    if plan and best[0][0] >= trivial_makespan * SPLIT_MARGIN:
-        plan = {}
-
-    rows = []
-    windows = []
-    for num_chunks, seq_idx, bos, eos, _cut_max in seqs:
-        k_here, cuts, warms = plan.get(seq_idx, (0, (), ()))
-        for head in range(num_heads):
-            if head >= k_here:
-                cost = num_chunks + piece_overhead
-                rows.append(
-                    (cost, [bos, eos, bos, seq_idx, use_init, store_final, head, 0])
-                )
-                continue
-            prev = 0
-            for i, cut in enumerate(tuple(cuts) + (num_chunks,)):
-                start_tok = bos + prev * K2_CHUNK
-                end_tok = eos if cut == num_chunks else bos + cut * K2_CHUNK
-                warm = 0 if i == 0 else warms[i - 1]
-                walk_tok = start_tok - warm * K2_CHUNK
-                cost = (end_tok - walk_tok + K2_CHUNK - 1) // K2_CHUNK
-                cost += piece_overhead
-                rows.append(
-                    (
-                        cost,
-                        [
-                            walk_tok,
-                            end_tok,
-                            start_tok,
-                            seq_idx,
-                            use_init if i == 0 else 0,
-                            store_final if cut == num_chunks else 0,
-                            head,
-                            0,
-                        ],
-                    )
-                )
-                if warm and head == 0:
-                    windows.append((walk_tok, start_tok))
-                prev = cut
-    rows.sort(key=lambda item: -item[0])
-    has_split = any(r[1][0] != r[1][2] for r in rows)
-    return [r[1] for r in rows], has_split, windows
+    return [
+        [bos, eos, bos, i, use_init, store_final, head, 0]
+        for _, i, bos, eos in seqs
+        for head in range(num_heads)
+    ]
 
 
-def _exact_rebalance(rows, has_split, offsets, num_heads, num_sms, store_final):
+def _exact_rebalance(rows, offsets, num_heads, num_sms, store_final):
     """The exact single-launch (inline) or two-launch (tail) rebalancing plan."""
-
     inline_plan = None
     tail_plan = None
-    if not has_split:
-        inline_plan = plan_exact_inline_split(rows, num_sms)
-        tail_plan = plan_exact_tail_split(
-            rows,
-            offsets,
-            num_heads,
-            num_sms,
-            int(store_final),
-        )
+    inline_plan = plan_exact_inline_split(rows, num_sms)
+    tail_plan = plan_exact_tail_split(
+        rows, offsets, num_heads, num_sms, int(store_final)
+    )
     if inline_plan is not None and tail_plan is not None:
         if inline_plan[5] <= tail_plan[5] + EXACT_TAIL_PHASE_TAX:
             tail_plan = None
         else:
             inline_plan = None
-    return inline_plan, tail_plan
+    return (inline_plan, tail_plan)
 
 
 _LAYOUT_PLANS: dict = {}
@@ -951,22 +648,16 @@ _LAYOUT_CACHE_LIMIT = 256
 
 
 def _layout_plan(layout_key):
+    """Cache exact piece ordering and rebalancing decisions for a fixed layout."""
     plan = _LAYOUT_PLANS.get(layout_key)
     if plan is None:
         offsets, num_heads, num_sms, use_init, store_final, _ = layout_key
         offsets = list(offsets)
-        rows, has_split, windows = plan_pieces(
-            offsets,
-            num_heads,
-            num_sms,
-            [None] * (len(offsets) - 1),
-            use_init,
-            store_final,
-        )
+        rows = _whole_chain_rows(offsets, num_heads, use_init, store_final)
         inline_plan, tail_plan = _exact_rebalance(
-            rows, has_split, offsets, num_heads, num_sms, store_final
+            rows, offsets, num_heads, num_sms, store_final
         )
-        plan = (rows, has_split, windows, inline_plan, tail_plan, *_row_stats(rows))
+        plan = (rows, inline_plan, tail_plan, *_row_stats(rows))
         if len(_LAYOUT_PLANS) >= _LAYOUT_CACHE_LIMIT:
             _LAYOUT_PLANS.clear()
         _LAYOUT_PLANS[layout_key] = plan
@@ -974,29 +665,18 @@ def _layout_plan(layout_key):
 
 
 def _state_in_range(abs_max):
+    """Check the finite initial-state range supported by the retained PTX."""
     return math.isfinite(abs_max) and abs_max <= MAX_STREAM_INITIAL_STATE_ABS
-
-
-def _start_state_guard(initial_state):
-    """Enqueue max |initial_state| on the current stream."""
-
-    return torch.linalg.vector_norm(initial_state.detach(), float("inf"))
-
-
-def _finish_state_guard(guard):
-    return float(guard)
 
 
 def _row_stats(rows):
     """(all rows are whole chunks, number of rows with a warmup walk)."""
-
-    full = all((row[1] - row[0]) % K2_CHUNK == 0 for row in rows)
-    return full, sum(1 for r in rows if r[0] != r[2])
+    full = all(((row[1] - row[0]) % K2_CHUNK == 0 for row in rows))
+    return (full, sum((1 for r in rows if r[0] != r[2])))
 
 
 def _memo(key, build):
     """Memoize a shape-only planner result (no caching without a layout key)."""
-
     if key[0] is None:
         return build()
     value = _LAYOUT_MEMO.get(key)
@@ -1008,12 +688,9 @@ def _memo(key, build):
     return value
 
 
-def _table(layout_key, site, values, device):
-    """Read-only int32 piece / CTA table, shared per layout key and site."""
-
-    if layout_key is None:
-        return torch.tensor(values, dtype=torch.int32, device=device).contiguous()
-    return const_table(("pieces", layout_key, *site), lambda: values, device)
+def _table(values, device):
+    """Allocate a prepared plan's private int32 piece or CTA table."""
+    return torch.tensor(values, dtype=torch.int32, device=device).contiguous()
 
 
 class KDAPiecesLaunch:
@@ -1034,10 +711,9 @@ class KDAPiecesLaunch:
         initial_state=None,
         final_state=None,
         cu_seqlens=None,
-        allow_approximate_split=False,
-        use_expected_norm=False,
-        ephemeral=False,
+        offsets=None,
     ):
+        """Prepare private buffers, exact piece tables, and optional fixed-split work."""
         self.out = out
         self.final_state = final_state
         self._split = None
@@ -1045,37 +721,9 @@ class KDAPiecesLaunch:
         self._g_dtype = g.dtype
         self._g = g
         self._initial_state = initial_state
-        self.expected_norm_requested = bool(use_expected_norm)
-        self.expected_norm_rms_relative_error = None
-        self.expected_norm_pair_rms_relative_error = None
-        if use_expected_norm:
-            (
-                self.expected_norm_rms_relative_error,
-                self.expected_norm_pair_rms_relative_error,
-            ) = _expected_norm_errors(q, k)
-            use_expected_norm = (
-                math.isfinite(self.expected_norm_rms_relative_error)
-                and math.isfinite(self.expected_norm_pair_rms_relative_error)
-                and self.expected_norm_rms_relative_error
-                <= EXPECTED_NORM_MAX_RMS_REL_ERROR
-                and self.expected_norm_pair_rms_relative_error
-                <= EXPECTED_NORM_MAX_PAIR_RMS_REL_ERROR
-            )
-        self.expected_norm_enabled = bool(use_expected_norm)
-        self.normalization_mode = (
-            "expected_norm"
-            if self.expected_norm_enabled
-            else "exact_norm_guard"
-            if self.expected_norm_requested
-            else "exact_norm"
-        )
-
+        self.normalization_mode = "exact_norm"
         self._staging_in = (
-            None
-            if initial_state is None
-            else torch.empty_like(initial_state, dtype=torch.bfloat16)
-            if ephemeral
-            else initial_state.to(torch.bfloat16)
+            None if initial_state is None else initial_state.to(torch.bfloat16)
         )
         self._staging_out = (
             torch.empty_like(final_state, dtype=torch.bfloat16)
@@ -1096,95 +744,37 @@ class KDAPiecesLaunch:
             initial_state=self._staging_in,
             final_state=self._staging_out,
             cu_seqlens=cu_seqlens,
-            ephemeral=ephemeral,
         )
         base_args = self._fallback.args
-        state_guard = None
         if initial_state is not None:
-            if ephemeral:
-                state_guard = _start_state_guard(initial_state)
-            elif not _state_in_range(float(initial_state.detach().abs().max())):
+            if not _state_in_range(float(initial_state.detach().abs().max())):
                 self._route_state_guard()
                 return
         num_heads = int(base_args["num_heads"])
-        offsets = (
-            [0, q.numel() // (num_heads * q.shape[-1])]
-            if cu_seqlens is None
-            else [int(x) for x in base_args["cu_seqlens"].tolist()]
-        )
+        if offsets is None:
+            offsets = (
+                [0, q.numel() // (num_heads * q.shape[-1])]
+                if cu_seqlens is None
+                else [int(x) for x in base_args["cu_seqlens"].tolist()]
+            )
         self._num_heads = num_heads
         if num_heads not in (64, 96):
             self._module = None
-            self._detector = None
-            self.expected_norm_enabled = False
             self.normalization_mode = "exact_norm_fallback"
             self.schedule = f"unsupported_heads_{self._fallback.schedule}"
             self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
             return
         num_sms = cached_num_sms(q.device)
-
         layout_key = (
-            None
-            if allow_approximate_split or use_expected_norm
-            else (
-                tuple(offsets),
-                num_heads,
-                num_sms,
-                int(initial_state is not None),
-                int(final_state is not None),
-                float(lower_bound),
-            )
+            tuple(offsets),
+            num_heads,
+            num_sms,
+            int(initial_state is not None),
+            int(final_state is not None),
+            float(lower_bound),
         )
-        if layout_key is None:
-            warm_tables = (
-                _one_chunk_warm_tables(offsets)
-                if allow_approximate_split
-                else [None] * (len(offsets) - 1)
-            )
-            rows, has_split, self._windows = plan_pieces(
-                offsets,
-                num_heads,
-                num_sms,
-                warm_tables,
-                int(initial_state is not None),
-                int(final_state is not None),
-            )
-            inline_plan, tail_plan = _exact_rebalance(
-                rows, has_split, offsets, num_heads, num_sms, final_state is not None
-            )
-            full_chunks, n_split = _row_stats(rows)
-        else:
-            (
-                rows,
-                has_split,
-                self._windows,
-                inline_plan,
-                tail_plan,
-                full_chunks,
-                n_split,
-            ) = _layout_plan(layout_key)
-        if state_guard is not None and not _state_in_range(
-            _finish_state_guard(state_guard)
-        ):
-            self._route_state_guard()
-            return
-
-        if (
-            allow_approximate_split
-            and not has_split
-            and "m64" in self._fallback.schedule
-        ):
-            self._module = None
-            self._detector = None
-            self.expected_norm_enabled = False
-            self.normalization_mode = "exact_norm_fallback"
-            self.schedule = self._fallback.schedule
-            self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
-            return
-
+        rows, inline_plan, tail_plan, full_chunks, n_split = _layout_plan(layout_key)
         dummy = torch.empty(1, dtype=torch.float32, device=q.device)
-
-        table_key = layout_key if ephemeral else None
         args_template = dict(base_args)
         for name in (
             "cu_seqlens",
@@ -1195,7 +785,7 @@ class KDAPiecesLaunch:
             args_template.pop(name)
         beta_tma = args_template["beta_tma"]
         if num_heads % 8 != 0 and beta_tma.shape[1] == num_heads:
-            padded_heads = ((num_heads + 7) // 8) * 8
+            padded_heads = (num_heads + 7) // 8 * 8
             self._beta_tma = torch.zeros(
                 (beta.numel() // num_heads, padded_heads),
                 dtype=beta.dtype,
@@ -1205,30 +795,27 @@ class KDAPiecesLaunch:
             args_template["beta_tma"] = self._beta_tma
 
         def make_phase(tag, phase_rows, state_in, state_out, job_overhead):
+            """Bind one persistent-kernel phase to its input/output state and tables."""
+
             def build():
+                """Pack phase jobs into CTA tables and determine full-chunk eligibility."""
                 order, cta_vals = pack_bins(
-                    phase_rows,
-                    num_sms,
-                    job_overhead=job_overhead,
+                    phase_rows, num_sms, job_overhead=job_overhead
                 )
                 ordered_rows = [phase_rows[i] for i in order]
                 phase_full = all(
-                    (row[1] - row[0]) % K2_CHUNK == 0 for row in ordered_rows
+                    ((row[1] - row[0]) % K2_CHUNK == 0 for row in ordered_rows)
                 )
-                return ordered_rows, cta_vals, phase_full
+                return (ordered_rows, cta_vals, phase_full)
 
             phase = _memo((layout_key, "phase", tag, job_overhead), build)
             ordered_rows, cta_vals, phase_full = phase
             args = dict(args_template)
-            args["piece_table"] = _table(
-                table_key, ("phase_pt", tag, job_overhead), ordered_rows, q.device
-            )
-            args["cta_table"] = _table(
-                table_key, ("phase_ct", tag, job_overhead), cta_vals, q.device
-            )
+            args["piece_table"] = _table(ordered_rows, q.device)
+            args["cta_table"] = _table(cta_vals, q.device)
             args["initial_state"] = state_in if state_in is not None else dummy
             args["final_state"] = state_out if state_out is not None else dummy
-            return args, (len(cta_vals) // 3, 1, 1), ordered_rows, phase_full
+            return (args, (len(cta_vals) // 3, 1, 1), ordered_rows, phase_full)
 
         self._tail_module = None
         self._tail_args = None
@@ -1238,52 +825,43 @@ class KDAPiecesLaunch:
         use_fixed_h64_m64 = (
             inline_plan is None
             and tail_plan is None
-            and not allow_approximate_split
-            and not use_expected_norm
-            and initial_state is not None
-            and lower_bound == -5.0
-            and num_heads == 64
-            and offsets == [0, 8192]
+            and (initial_state is not None)
+            and (lower_bound == -5.0)
+            and (num_heads == 64)
+            and (offsets == [0, 8192])
             and full_chunks
         )
         use_fixed_h96_cluster8 = (
             inline_plan is None
             and tail_plan is None
-            and not allow_approximate_split
-            and not use_expected_norm
-            and initial_state is not None
-            and final_state is None
-            and lower_bound == -5.0
-            and num_heads == 96
-            and offsets == [0, 8192]
+            and (initial_state is not None)
+            and (final_state is None)
+            and (lower_bound == -5.0)
+            and (num_heads == 96)
+            and (offsets == [0, 8192])
             and full_chunks
         )
         use_fixed_h96_static_final = (
             inline_plan is None
             and tail_plan is None
-            and not allow_approximate_split
-            and not use_expected_norm
-            and initial_state is not None
-            and final_state is not None
-            and lower_bound == -5.0
-            and num_heads == 96
-            and offsets == [0, 8192]
+            and (initial_state is not None)
+            and (final_state is not None)
+            and (lower_bound == -5.0)
+            and (num_heads == 96)
+            and (offsets == [0, 8192])
             and full_chunks
         )
-
         use_fixed_split = (
             inline_plan is None
             and tail_plan is None
-            and not allow_approximate_split
-            and not use_expected_norm
-            and initial_state is not None
-            and final_state is not None
-            and lower_bound == -5.0
-            and num_heads in FIXED_SPLIT_TAIL_CHUNKS
-            and len(offsets) == 2
-            and offsets[1] in FIXED_SPLIT_TOKENS
+            and (initial_state is not None)
+            and (final_state is not None)
+            and (lower_bound == -5.0)
+            and (num_heads in FIXED_SPLIT_TAIL_CHUNKS)
+            and (len(offsets) == 2)
+            and (offsets[1] in FIXED_SPLIT_TOKENS)
             and full_chunks
-            and num_sms >= num_heads + 2
+            and (num_sms >= num_heads + 2)
         )
         if use_fixed_split:
             use_fixed_h64_m64 = False
@@ -1312,31 +890,27 @@ class KDAPiecesLaunch:
             )
 
             def new_flags():
+                """Allocate private release counters for exact inline state handoffs."""
                 return torch.zeros(
                     n_split_chains * HEAD_DIM, dtype=torch.int32, device=q.device
                 )
 
-            self._handoff_flags = (
-                stream_workspace(("inline_flags", n_split_chains), new_flags, q.device)
-                if table_key is not None
-                else new_flags()
-            )
+            self._handoff_flags = new_flags()
             use_mixed_h96_gpc_swap = (
                 num_sms == 148
-                and not allow_approximate_split
-                and not use_expected_norm
                 and initial_state is not None
-                and final_state is not None
-                and lower_bound == -5.0
-                and num_heads == 96
-                and offsets == [0, 1300, 1847, 3895, 4858, 5129, 8192]
-                and n_split_chains == 64
-                and inline_prefix == 4
-                and len(cta_vals) == 148 * 3
+                and (final_state is not None)
+                and (lower_bound == -5.0)
+                and (num_heads == 96)
+                and (offsets == [0, 1300, 1847, 3895, 4858, 5129, 8192])
+                and (n_split_chains == 64)
+                and (inline_prefix == 4)
+                and (len(cta_vals) == 148 * 3)
             )
             if use_mixed_h96_gpc_swap:
 
                 def gpc_swap(vals=cta_vals):
+                    """Reorder the canonical mixed-H96 CTA assignment across GPU partitions."""
                     cta_rows = [
                         vals[index : index + 3] for index in range(0, len(vals), 3)
                     ]
@@ -1348,12 +922,8 @@ class KDAPiecesLaunch:
 
                 cta_vals = _memo((layout_key, "inline_gpc_swap"), gpc_swap)
             self._args = dict(args_template)
-            self._args["piece_table"] = _table(
-                table_key, ("inline_pt",), ordered_rows, q.device
-            )
-            self._args["cta_table"] = _table(
-                table_key, ("inline_ct", use_mixed_h96_gpc_swap), cta_vals, q.device
-            )
+            self._args["piece_table"] = _table(ordered_rows, q.device)
+            self._args["cta_table"] = _table(cta_vals, q.device)
             self._args["initial_state"] = (
                 initial_state.contiguous() if initial_state is not None else dummy
             )
@@ -1364,25 +934,21 @@ class KDAPiecesLaunch:
                 (layout_key, "inline_full"), lambda: _row_stats(ordered_rows)[0]
             )
             use_mixed_cluster2 = (
-                not allow_approximate_split
-                and not use_expected_norm
-                and initial_state is not None
+                initial_state is not None
                 and lower_bound == -5.0
-                and num_heads in (64, 96)
-                and offsets == [0, 1300, 1847, 3895, 4858, 5129, 8192]
-                and self._grid == (148, 1, 1)
-                and not full_chunks
+                and (num_heads in (64, 96))
+                and (offsets == [0, 1300, 1847, 3895, 4858, 5129, 8192])
+                and (self._grid == (148, 1, 1))
+                and (not full_chunks)
             )
             use_mixed_static_final = (
-                not allow_approximate_split
-                and not use_expected_norm
-                and initial_state is not None
+                initial_state is not None
                 and final_state is not None
-                and lower_bound == -5.0
-                and num_heads in (64, 96)
-                and offsets == [0, 1300, 1847, 3895, 4858, 5129, 8192]
-                and self._grid == (148, 1, 1)
-                and not full_chunks
+                and (lower_bound == -5.0)
+                and (num_heads in (64, 96))
+                and (offsets == [0, 1300, 1847, 3895, 4858, 5129, 8192])
+                and (self._grid == (148, 1, 1))
+                and (not full_chunks)
             )
             inline_compiler = compiled_stream_m128
             if use_mixed_cluster2:
@@ -1393,17 +959,17 @@ class KDAPiecesLaunch:
                 else {}
             )
             use_named_mma_signals = (
-                not allow_approximate_split
-                and not use_expected_norm
-                and initial_state is not None
+                initial_state is not None
                 and final_state is not None
-                and lower_bound == -5.0
-                and num_heads in (64, 96)
-                and self._grid == (148, 1, 1)
-                and offsets
-                in (
-                    [0, 1300, 1847, 3895, 4858, 5129, 8192],
-                    [0, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192],
+                and (lower_bound == -5.0)
+                and (num_heads in (64, 96))
+                and (self._grid == (148, 1, 1))
+                and (
+                    offsets
+                    in (
+                        [0, 1300, 1847, 3895, 4858, 5129, 8192],
+                        [0, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192],
+                    )
                 )
             )
             use_named_out_empty = (
@@ -1416,10 +982,9 @@ class KDAPiecesLaunch:
                 store_final_state=True,
                 num_heads=num_heads,
                 lower_bound_m5=lower_bound == -5.0 and full_chunks,
-                expected_norm=use_expected_norm,
                 handoff=True,
-                idle_state_prefetch=not use_expected_norm,
-                first_state_prefetch=not use_expected_norm,
+                idle_state_prefetch=True,
+                first_state_prefetch=True,
                 static_final_export=use_mixed_static_final,
                 named_mma_signals=use_named_mma_signals,
                 named_out_empty=use_named_out_empty,
@@ -1435,10 +1000,7 @@ class KDAPiecesLaunch:
                 else "m128"
             )
             self.schedule = (
-                f"exact_inline_handoff_{inline_tile}_n{n_split_chains}"
-                f"_c{inline_prefix}"
-                f"_j{len(ordered_rows)}_b{self._grid[0]}"
-                f"_span{inline_base_span}-{inline_span}"
+                f"exact_inline_handoff_{inline_tile}_n{n_split_chains}_c{inline_prefix}_j{len(ordered_rows)}_b{self._grid[0]}_span{inline_base_span}-{inline_span}"
                 + ("_gpc57" if use_mixed_h96_gpc_swap else "")
                 + full_suffix
                 + nofs_suffix
@@ -1450,13 +1012,13 @@ class KDAPiecesLaunch:
                 rows,
                 initial_state.contiguous() if initial_state is not None else None,
                 final_state.contiguous() if final_state is not None else None,
-                0 if has_split else 1,
+                1,
             )
             if use_fixed_h64_m64:
                 use_split_major = (
                     final_state is not None
                     and num_sms == 148
-                    and self._grid == (64, 1, 1)
+                    and (self._grid == (64, 1, 1))
                 )
                 self._module = (
                     compiled_stream_m64_fixed()
@@ -1486,23 +1048,14 @@ class KDAPiecesLaunch:
                         store_final_state=final_state is not None,
                         num_heads=num_heads,
                         lower_bound_m5=lower_bound == -5.0 and full_chunks,
-                        expected_norm=use_expected_norm,
-                        idle_state_prefetch=(
-                            not has_split
-                            and not full_chunks
-                            and initial_state is not None
-                            and final_state is None
-                            and not use_expected_norm
-                        ),
-                        first_state_prefetch=(
-                            not has_split
-                            and full_chunks
-                            and initial_state is not None
-                            and final_state is None
-                            and not use_expected_norm
-                            and num_heads == 96
-                            and offsets == [0, 8192]
-                        ),
+                        idle_state_prefetch=not full_chunks
+                        and initial_state is not None
+                        and (final_state is None),
+                        first_state_prefetch=full_chunks
+                        and initial_state is not None
+                        and (final_state is None)
+                        and (num_heads == 96)
+                        and (offsets == [0, 8192]),
                     )
         else:
             (
@@ -1533,12 +1086,7 @@ class KDAPiecesLaunch:
                 self._handoff_state,
                 1,
             )
-            (
-                self._tail_args,
-                self._tail_grid,
-                tail_rows,
-                tail_full_chunks,
-            ) = make_phase(
+            self._tail_args, self._tail_grid, tail_rows, tail_full_chunks = make_phase(
                 "tail_b",
                 phase_b,
                 self._handoff_state,
@@ -1549,7 +1097,6 @@ class KDAPiecesLaunch:
                 full_chunks=full_chunks,
                 store_final_state=True,
                 lower_bound_m5=lower_bound == -5.0 and full_chunks,
-                expected_norm=use_expected_norm,
                 num_heads=num_heads,
             )
             self._tail_module = compiled_stream_m128(
@@ -1557,19 +1104,11 @@ class KDAPiecesLaunch:
                 store_final_state=final_state is not None,
                 num_heads=num_heads,
                 lower_bound_m5=lower_bound == -5.0 and tail_full_chunks,
-                expected_norm=use_expected_norm,
             )
-            self.schedule = (
-                f"exact_tail_stream_m128_q{tail_seqs[0]}x{len(tail_seqs)}"
-                f"_c{'-'.join(str(p) for p in prefix_chunks)}"
-                f"_j{len(rows)}+{len(tail_rows)}"
-                f"_b{self._grid[0]}+{self._tail_grid[0]}"
-                f"_span{base_span}-{span_a}-{total_span - span_a}"
-                f"{'_nofs' if final_state is None else ''}"
-            )
+            self.schedule = f"exact_tail_stream_m128_q{tail_seqs[0]}x{len(tail_seqs)}_c{'-'.join((str(p) for p in prefix_chunks))}_j{len(rows)}+{len(tail_rows)}_b{self._grid[0]}+{self._tail_grid[0]}_span{base_span}-{span_a}-{total_span - span_a}{('_nofs' if final_state is None else '')}"
             self.state_input_mode = "exact_two_launch_native_fp32_handoff"
         if inline_plan is None and tail_plan is None:
-            stream_mode = "dynamic" if has_split else "exact"
+            stream_mode = "exact"
             stream_tile = "m128"
             if use_fixed_h64_m64:
                 stream_tile = "m64"
@@ -1577,28 +1116,13 @@ class KDAPiecesLaunch:
                 stream_tile = "m128sf"
             elif use_fixed_h96_cluster8:
                 stream_tile = "m128c8"
-            self.schedule = (
-                f"{stream_mode}_stream_{stream_tile}_j{len(rows)}"
-                f"_b{self._grid[0]}_s{n_split}"
-                f"{'_full' if full_chunks else ''}"
-                f"{'_nofs' if final_state is None else ''}"
-            )
-            self.state_input_mode = (
-                "dynamic_g_inkernel_checked_native_fp32"
-                if has_split
-                else "exact_unsplit_native_fp32"
-            )
-        if self._windows and any(
-            start - walk != K2_CHUNK for walk, start in self._windows
-        ):
-            raise RuntimeError("dynamic-g plan requires one-chunk warmups")
+            self.schedule = f"{stream_mode}_stream_{stream_tile}_j{len(rows)}_b{self._grid[0]}_s{n_split}{('_full' if full_chunks else '')}{('_nofs' if final_state is None else '')}"
+            self.state_input_mode = "exact_unsplit_native_fp32"
         self._generation = 0
-        self._failure_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
-        self._done_event = torch.cuda.Event()
         for stream_args in (self._args, self._tail_args):
             if stream_args is None:
                 continue
-            stream_args["failure_addr"] = self._failure_host.data_ptr()
+            stream_args["failure_addr"] = 0
             stream_args["generation"] = 0
             stream_args["detect_threshold_log2"] = DETECT_THRESHOLD_LOG2
             if not use_fixed_h64_m64:
@@ -1638,21 +1162,21 @@ class KDAPiecesLaunch:
                 dual_module=compiled_stream_m128_dual(num_heads=num_heads),
                 seg_b=seg_b,
             )
-            self.schedule = f"split_{self.schedule}_t{split_tail}"
+            self.schedule = (
+                f"fixed_split_{self._split.module.name}"
+                f"+{self._split.dual_module.name}_t{split_tail}"
+            )
+            self.state_input_mode = "fp32_state_tf32_composition_bf16_correction"
 
     def _route_state_guard(self):
         """Route an out-of-range initial state to the exact fallback."""
-
         self._module = None
-        self._detector = None
-        self.expected_norm_enabled = False
         self.normalization_mode = "exact_norm_fallback"
         self.schedule = f"state_guard_{self._fallback.schedule}"
         self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
 
     def update_g(self, g):
         """Bind a new contiguous BF16 gate tensor without rebuilding the plan."""
-
         if tuple(g.shape) != self._g_shape or g.dtype != self._g_dtype:
             raise ValueError(
                 f"g must retain shape {self._g_shape} and dtype {self._g_dtype}"
@@ -1684,61 +1208,26 @@ class KDAPiecesLaunch:
         if self.final_state is not None:
             self.final_state.copy_(self._staging_out)
 
-    def _stream_passes(self):
-        """Launch the checked stream and read the in-kernel proof verdict.
-
-        :return: True when no warmup window published a failure.
-        :rtype: bool
-        """
+    def _launch_stream(self):
+        """Launch the full recurrence, including any exact state-handoff phases."""
         if self._split is not None:
             self._split.launch()
-            return True
+            return
         self._generation += 1
         self._args["generation"] = self._generation
         self._module.launch(grid=self._grid, **self._args)
         if self._tail_module is not None:
             self._tail_args["generation"] = self._generation
             self._tail_module.launch(grid=self._tail_grid, **self._tail_args)
-        if not self._windows:
-            return True
-        self._done_event.record()
-        self._done_event.synchronize()
-        return int(self._failure_host[0]) != self._generation
-
-    def revalidate(self):
-        """Recheck every proof window against the current gate tensor.
-
-        The proof lives inside the stream kernel, so this replays one full
-        checked launch (overwriting the bound output tensor).
-
-        :return: True when all windows still satisfy the decay threshold.
-        :rtype: bool
-        """
-        if self._module is None:
-            return True
-        return self._stream_passes()
 
     def launch(self, g=None):
-        """Launch the exact stream or checked split; rerun on proof failure.
-
-        :return: None.
-        :rtype: NoneType
-        """
+        """Run the prepared exact plan, optionally rebinding gate values."""
         if g is not None:
             self.update_g(g)
         if self._module is None:
             self._launch_fallback()
             return
-        if not self._stream_passes():
-            self._launch_fallback()
-
-    def close(self):
-        """Release nothing; FFI modules are process-resident.
-
-        :return: None.
-        :rtype: NoneType
-        """
-        return
+        self._launch_stream()
 
 
 def prepare_fwd_pieces(
@@ -1755,9 +1244,7 @@ def prepare_fwd_pieces(
     initial_state=None,
     final_state=None,
     cu_seqlens=None,
-    allow_approximate_split=False,
-    use_expected_norm=False,
-    ephemeral=False,
+    offsets=None,
 ):
     """Create a preallocated KDA forward launch.
 
@@ -1787,15 +1274,6 @@ def prepare_fwd_pieces(
     :type final_state: torch.Tensor
     :param cu_seqlens: Optional packed sequence boundaries.
     :type cu_seqlens: torch.Tensor
-    :param allow_approximate_split: Enable the workload-specialized piece split
-        whose one-chunk boundary reconstruction is validated for the 5e-2
-        benchmark tolerance but is not a general affine-transition proof.
-    :type allow_approximate_split: bool
-    :param use_expected_norm: Request the calibrated inverse norm for
-        128-channel N(0, 1) inputs. The observed Q/K norm spread is checked at
-        preparation; non-concentrated inputs retain exact per-token norms, so
-        no channel-independence assumption is required.
-    :type use_expected_norm: bool
     :return: Launch object with a launch() method.
     :rtype: KDAPiecesLaunch
 
@@ -1819,10 +1297,5 @@ def prepare_fwd_pieces(
         initial_state=initial_state,
         final_state=final_state,
         cu_seqlens=cu_seqlens,
-        allow_approximate_split=allow_approximate_split,
-        use_expected_norm=use_expected_norm,
-        ephemeral=ephemeral,
+        offsets=offsets,
     )
-
-
-__all__ = ["KDAPiecesLaunch", "pack_bins", "plan_pieces", "prepare_fwd_pieces"]
