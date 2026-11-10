@@ -172,6 +172,33 @@ def test_registered_tgv_gemm_runs_on_every_targeted_arch(
     assert calls[0] is expected_use_sm_100f
 
 
+BF16_GEMM_MODULES = {
+    "gen_mm_bf16_cublaslt_module",
+    "gen_gemm_sm100_module_cutlass_bf16",
+    "gen_tgv_gemm_sm10x_module",
+    "gen_tinygemm2_module",
+    "gen_tinygemm2_sm100_module",
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm_capabilities",
+    [
+        {"sm100": True, "sm100a_exact": True, "sm100f": True},
+        {"sm103": True, "sm103a_exact": True},
+        {"sm107": True, "sm107a_exact": True},
+    ],
+    ids=["sm100a", "sm103a", "sm107a"],
+)
+def test_bf16_gemm_modules_are_prebuilt_for_every_blackwell_target(
+    monkeypatch, sm_capabilities
+):
+    registered = _registered_generators(monkeypatch, sm_capabilities)
+
+    assert BF16_GEMM_MODULES <= registered
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("arch_list", "expected"),
