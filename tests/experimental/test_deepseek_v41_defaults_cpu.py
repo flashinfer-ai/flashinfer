@@ -186,6 +186,48 @@ def test_removed_prims_ts_mode_flag_is_rejected(path, backend):
         assert error.value.code == 2
 
 
+def test_prims_ts_decode_enable_pdl_reaches_the_attention_kernel():
+    """``enable_pdl`` is keyword-only, defaults to device support (``None``), is
+    resolved before compilation and decides the attention kernel's PDL."""
+    native = _ROOT / "flashinfer/experimental/deepseek_v41/prims_ts/__init__.py"
+    for name in ("decode_mixed", "decode_window"):
+        args = definition(native, name).args
+        assert [a.arg for a in args.kwonlyargs] == ["enable_pdl"], name
+        assert ast.literal_eval(args.kw_defaults[0]) is None, name
+    compiles = [
+        node
+        for node in ast.walk(definition(native, "decode_mixed"))
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_compile"
+    ]
+    assert [
+        ast.unparse(keyword.value)
+        for node in compiles
+        for keyword in node.keywords
+        if keyword.arg == "enable_pdl"
+    ] == ["enable_pdl"]
+    builder = definition(
+        _ROOT / "flashinfer/experimental/deepseek_v41/prims_ts/kernel.py",
+        "_make_fp8_attention",
+    )
+    assigned = {
+        ast.unparse(target): ast.unparse(node.value)
+        for node in ast.walk(builder)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+    }
+    assert assigned["attention.enable_pdl"] == "enable_pdl"
+    assert "attention.use_pdl" not in assigned
+    # The default cute-dsl backend has no such parameter and rejects it.
+    dispatcher = ast.parse((_ROOT / "flashinfer/deepseek_v41.py").read_text())
+    (keywords,) = [
+        node.value
+        for node in dispatcher.body
+        if isinstance(node, ast.Assign)
+        and ast.unparse(node.targets[0]) == "_PRIMS_TS_ONLY_KEYWORDS"
+    ]
+    assert "enable_pdl" in ast.literal_eval(keywords.args[0])
+
+
 @pytest.mark.parametrize("backend", [None, "cute-dsl", "prims-ts"])
 def test_example_parser_defaults_and_explicit_backend(backend):
     parser = extract(_EXAMPLE, "build_parser", argparse=argparse)()

@@ -32,6 +32,7 @@ def _compile(
     head_dim_ctas=1,
     kv_splits=1,
     persistent=False,
+    enable_pdl=True,
 ):
     if torch.cuda.is_current_stream_capturing():
         raise ValueError("warm up the decode specialization before CUDA Graph capture")
@@ -65,7 +66,13 @@ def _compile(
 
     sm_count = device_sm_count(device_index)
     attention = adapter_kernel._make_fp8_attention(
-        compressed_k, sm_count, native_fp4, head_dim_ctas, kv_splits, persistent
+        compressed_k,
+        sm_count,
+        native_fp4,
+        head_dim_ctas,
+        kv_splits,
+        persistent,
+        enable_pdl,
     )
     decode_kernel = adapter_kernel.Fp8SwaDecodeKernel(attention, kv_splits)
     batch = cute.sym_int()
@@ -214,7 +221,11 @@ def decode_mixed(
     bmm2_scale=1.0,
     sinks=None,
     kv_layout="HND",
+    *,
+    enable_pdl=None,
 ):
+    from ....utils import resolve_enable_pdl
+
     # bind_inputs validates every argument (E4M3 Q first) before any work.
     bound = bind_inputs(
         query,
@@ -232,6 +243,7 @@ def decode_mixed(
         backend="prims-ts",
     )
     views = bound.views
+    enable_pdl = resolve_enable_pdl(enable_pdl, query.device)
     with torch.cuda.device(query.device):
         kv_splits, head_dim_ctas = _partition(
             bound.batch, bound.compressed_k, query.device.index
@@ -243,6 +255,7 @@ def decode_mixed(
             head_dim_ctas=head_dim_ctas,
             kv_splits=kv_splits,
             persistent=_persistent(bound.batch, kv_splits, query.device.index),
+            enable_pdl=enable_pdl,
         )
         partials = (
             views.partials[: bound.batch * kv_splits * PARTIAL_SLOT_BYTES]
@@ -278,6 +291,8 @@ def decode_window(
     bmm2_scale=1.0,
     sinks=None,
     kv_layout="HND",
+    *,
+    enable_pdl=None,
 ):
     return decode_mixed(
         query,
@@ -292,4 +307,5 @@ def decode_window(
         bmm2_scale,
         sinks,
         kv_layout,
+        enable_pdl=enable_pdl,
     )
