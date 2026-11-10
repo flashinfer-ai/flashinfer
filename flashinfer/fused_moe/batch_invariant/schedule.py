@@ -180,12 +180,14 @@ def exposed_epilogue_cycles(
     """The chain work of a CTA's last tile, which no mainloop overlaps (the earlier tiles' epilogues run behind the next tile's
     mainloop through the accumulator stages): a thread's chains times the chain's node cycles. The grouped body computes a
     row's outputs per thread, the tile's columns split between its epilogue warpgroups (the gated chain pairs two accumulator
-    columns per output); the swapped body computes a weight row's live token columns per thread, ``min(rows, tile)`` of them
-    (the chain of a dead column is skipped). At a few rows per expert this term separates the bodies: the grouped body's
-    epilogue is the tile's width wide whatever the live rows. The 64-row swapped tile gives a thread two weight rows at a
-    quarter of the columns: its busiest thread holds half the chains (plain), a quarter when one of its rows is the gate."""
+    columns per output); the swapped body computes a weight row's token columns per thread, the whole token tile of them: the
+    quantizing classes' chains run for every column of the tile, and the tile is what the MMA issues whatever the live
+    rows, so the dead columns of a wide tile at a few live rows are priced as work (a class whose guards skip the dead
+    columns' chains pays less here than the term says, which the ranking tolerates: the narrow tile is its pick anyway). The
+    64-row swapped tile gives a thread two weight rows at a quarter of the columns: its busiest thread holds half the chains
+    (plain), a quarter when one of its rows is the gate."""
     if cfg.swap_ab:
-        chains = min(rows, cfg.tile_n) * cfg.tile_m / 128
+        chains = cfg.tile_n * cfg.tile_m / 128
         if pair and cfg.tile_m < 128:
             chains /= 2
     else:
