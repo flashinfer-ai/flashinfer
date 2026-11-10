@@ -84,13 +84,14 @@ class TorchF32:
 
     @staticmethod
     def fmin(a: torch.Tensor, b: Union[torch.Tensor, float]) -> torch.Tensor:
-        # fp32.fmin returns ``a`` on ties; torch.minimum returns either (equal values): same bits
-        # except for +0 / -0, which the specs never clamp against.
-        return torch.minimum(a, torch.as_tensor(b, dtype=torch.float32))
+        # fp32.fmin returns ``a`` on ties; torch.fmin returns either (equal values): same bits except for +0 / -0, which
+        # the specs never clamp against. torch.fmin (not torch.minimum) returns the other operand against a NaN, as the
+        # device's min.f32 and fp32.fmin do: the declared exp of a NaN argument is the clamp's value on every backend.
+        return torch.fmin(a, torch.as_tensor(b, dtype=torch.float32))
 
     @staticmethod
     def fmax(a: torch.Tensor, b: Union[torch.Tensor, float]) -> torch.Tensor:
-        return torch.maximum(a, torch.as_tensor(b, dtype=torch.float32))
+        return torch.fmax(a, torch.as_tensor(b, dtype=torch.float32))
 
     @staticmethod
     def exp2i(k: torch.Tensor) -> torch.Tensor:
@@ -198,7 +199,8 @@ def route_cpu(
     bias: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The routing spec for a whole batch: ``experts [T, k]`` int32, ``weights [T, k]`` f32."""
+    """The routing spec for a whole batch: ``experts [T, k]`` int32, ``weights [T, k]`` f32 (rows whose selection
+    scores are all non-NaN: the NaN fill rule is the exact model's, :func:`route_exact`)."""
     l = _f32(logits)
     T, E = l.shape
     cols = [l[:, e] for e in range(E)]
@@ -206,6 +208,22 @@ def route_cpu(
     q, w = S.per_expert_scores(TorchF32, cols, method, b)
     q = torch.stack(q, dim=1)
     w = torch.stack(w, dim=1)
+    if method.grouped:
+        # the group stage: per group the sum of its two largest scores (spec.group_score_term), the topk_group best groups
+        # kept (both orders strict, ties to the lower index), the other groups' experts out of the selection
+        n = method.n_group
+        G = E // n
+        top2 = torch.sort(q.view(T, n, G), dim=2, descending=True, stable=True).values[
+            :, :, :2
+        ]
+        gs = S.group_score_term(TorchF32, top2[:, :, 0], top2[:, :, 1])
+        kept = torch.sort(gs, dim=1, descending=True, stable=True).indices[
+            :, : method.topk_group
+        ]
+        gmask = torch.zeros(T, n, dtype=torch.bool).scatter_(1, kept, True)
+        q = torch.where(
+            gmask.repeat_interleave(G, dim=1), q, torch.full_like(q, float("-inf"))
+        )
     # (score desc, index asc): a stable descending sort keeps equal scores in index order
     order = torch.sort(q, dim=1, descending=True, stable=True).indices[:, :k]
     wsel = torch.gather(w, 1, order)

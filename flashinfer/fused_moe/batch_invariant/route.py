@@ -7,9 +7,11 @@ softmax sum; experts beyond ``E`` are absent and padded with ``+0``, which is ex
 row maximum is a warp max (exact in every order; the sign of a zero maximum never reaches the bits), the softmax sum
 runs the engine's plan with lane shuffles, the top-k selection is k rounds of a warp argmax under the strict order
 ``(score desc, index asc)`` (equal to the rank definition the CPU uses), and the weights are ``spec.slot_weights``
-through ``CuteF32``. All arithmetic through ``CuteF32``; comparisons are exact. A slot no selectable expert reaches
-(fewer than ``k`` experts with a non-NaN score) takes the lowest expert index the row has not taken, with a NaN weight:
-the row's output is NaN and every id stays in ``[0, E)``.
+through ``CuteF32``. The logit methods select on the logits themselves (the weights the logits or their sigmoid); the
+group-limited methods run the group stage before the selection (two argmax rounds per group, the kept groups chosen on
+warp-uniform scores, the other groups' experts masked out). All arithmetic through ``CuteF32``; comparisons are exact. A
+slot no selectable expert reaches (fewer than ``k`` experts with a non-NaN score) takes the lowest expert index the row has
+not taken, with a NaN weight: the row's output is NaN and every id stays in ``[0, E)``.
 """
 
 from __future__ import annotations
@@ -161,6 +163,13 @@ def route_token(
             if e >= E:
                 qi = neg_inf
             q.append(qi)
+    elif cutlass.const_expr(meth.score == "logit"):
+        # the plain top-k of the logits (no normalisation): the weights are the logits themselves or their sigmoid
+        if cutlass.const_expr(meth.weight_kind == "sigmoid"):
+            wgt = [S.sigmoid_term(CuteF32, l) for l in logits]
+        else:
+            wgt = list(logits)
+        q = logits
     else:
         m = logits[0]
         for i in cutlass.range_constexpr(1, P):
@@ -180,6 +189,82 @@ def route_token(
         Ssum = canon.run(plan, state, start, _LanePeers(), CuteF32)
         wgt = [CuteF32.div(zi, Ssum) for zi in z]
         q = logits
+    if cutlass.const_expr(meth.n_group > 1):
+        # the group-limited stage (spec.group_scores / select_topk_grouped): per group two rounds of warp argmax under
+        # (q desc, index asc) over the group's experts give its two largest scores, add of them is the group score (NaN when
+        # a round finds nothing: a NaN score is never picked, an absent expert belongs to no group); the topk_group best
+        # groups are kept in the same strict order over the warp-uniform group scores (the lowest untaken groups fill when
+        # fewer are selectable); an expert outside a kept group leaves the selection with a NaN score
+        n_group, topk_group = meth.n_group, meth.topk_group
+        nan = CuteF32.const(float("nan"))
+        G = E // Int32(n_group)
+        grp = [Int32(lane * P + i) // G for i in range(P)]
+        gsc = []
+        for j in cutlass.range_constexpr(n_group):
+            bv1 = neg_inf
+            bi1 = Int32(0x7FFFFFFF)
+            for i in cutlass.range_constexpr(P):
+                e = Int32(lane * P + i)
+                inside = grp[i] == Int32(j)
+                better = (q[i] > bv1) | ((q[i] == bv1) & (e < bi1))
+                if inside & better:
+                    bv1 = q[i]
+                    bi1 = e
+            for sh in cutlass.range_constexpr(5):
+                ov = cute.arch.shuffle_sync_bfly(bv1, offset=1 << sh)
+                oi = cute.arch.shuffle_sync_bfly(bi1, offset=1 << sh)
+                take = (ov > bv1) | ((ov == bv1) & (oi < bi1))
+                if take:
+                    bv1 = ov
+                    bi1 = oi
+            bv2 = neg_inf
+            bi2 = Int32(0x7FFFFFFF)
+            for i in cutlass.range_constexpr(P):
+                e = Int32(lane * P + i)
+                inside = (grp[i] == Int32(j)) & (e != bi1)
+                better = (q[i] > bv2) | ((q[i] == bv2) & (e < bi2))
+                if inside & better:
+                    bv2 = q[i]
+                    bi2 = e
+            for sh in cutlass.range_constexpr(5):
+                ov = cute.arch.shuffle_sync_bfly(bv2, offset=1 << sh)
+                oi = cute.arch.shuffle_sync_bfly(bi2, offset=1 << sh)
+                take = (ov > bv2) | ((ov == bv2) & (oi < bi2))
+                if take:
+                    bv2 = ov
+                    bi2 = oi
+            g = S.group_score_term(CuteF32, bv1, bv2)
+            if bi2 >= E:
+                g = nan
+            gsc.append(g)
+        gtaken = Int32(0)
+        for _r in cutlass.range_constexpr(topk_group):
+            bgv = neg_inf
+            bgj = Int32(0x7FFFFFFF)
+            for j in cutlass.range_constexpr(n_group):
+                free = ((gtaken >> j) & Int32(1)) == Int32(0)
+                better = (gsc[j] > bgv) | ((gsc[j] == bgv) & (Int32(j) < bgj))
+                if free & better:
+                    bgv = gsc[j]
+                    bgj = Int32(j)
+            if bgj >= Int32(n_group):
+                cand = Int32(0x7FFFFFFF)
+                for j in cutlass.range_constexpr(n_group):
+                    free = ((gtaken >> j) & Int32(1)) == Int32(0)
+                    if free & (Int32(j) < cand):
+                        cand = Int32(j)
+                bgj = cand
+            gtaken = gtaken | (Int32(1) << bgj)
+        q2 = []
+        for i in cutlass.range_constexpr(P):
+            qi = q[i]
+            drop = (grp[i] >= Int32(n_group)) | (
+                ((gtaken >> cutlass.min(grp[i], Int32(31))) & Int32(1)) == Int32(0)
+            )
+            if drop:
+                qi = nan
+            q2.append(qi)
+        q = q2
     # k rounds of warp argmax under (q desc, index asc)
     taken = Int32(0)
     sel_e = []

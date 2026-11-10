@@ -7,7 +7,9 @@ The runner serves the bf16 classes on SM100 / SM103 / SM107, one declared chain 
 ``SwiGLUStep``, ``GeGLU``, ``GeGLUTanh``, ``SiTU`` and ``PowLU`` are the gated chains with their scalars as class parameters;
 ``ReLU2`` is ``moe.bf16.relu2`` and ``Identity``, ``GELU``, ``ReLU``, ``SiLU`` the other ungated chains (``spec.activation_of``).
 It takes every routing input mode: ``FromLogits`` runs the class's own routing kernel
-(the declared ``exp``, the strict selection order), ``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's
+(the declared ``exp``, the strict selection order; the methods ``Default``, ``Renormalize``, ``RenormalizeNaive``,
+``Sigmoid``, ``SigmoidRenorm``, ``TopK``, ``Llama4`` at ``top_k = 1``, ``TopKSigmoid`` and ``DeepSeekV3`` with or
+without its expert groups), ``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's
 expert ids and weights; an expert-parallel shard (``ExpertConfig.local_expert_offset`` / ``local_num_experts``) computes the
 slots of its local experts and drops the rest (the term ``+0`` in its tokens' folds): a placement of the class on the local
 experts, the rank's partial of the dense output. The combine is the slot-order fp32 fold (never an atomic finalize:
@@ -38,6 +40,7 @@ from ..api import (
     ReLU,
     ReLU2,
     RoutingInputMode,
+    RoutingMethodType,
     SiLU,
     SiTU,
     SwiGLU,
@@ -149,9 +152,10 @@ class BatchInvariantMoeRunner(MoERunner):
 
     def _check_support(self) -> None:
         super()._check_support()
-        from .spec import METHOD_OF_FLASHINFER
+        from .spec import MAX_GROUPS, METHOD_OF_FLASHINFER
 
         cfg = self.config
+        self._grouped_other = False
         check_device(self.device, CLASS, MOE_BF16_ARCHS)
         try:
             self._activation()
@@ -197,6 +201,36 @@ class BatchInvariantMoeRunner(MoERunner):
             self._method = None
         else:
             self._method = METHOD_OF_FLASHINFER[routing.method]
+            grouped = (routing.n_group or 0) > 1 or (routing.topk_group or 0) > 1
+            if grouped and routing.method is RoutingMethodType.DeepSeekV3:
+                # the group-limited selection: a term of the class with the groups as parameters (its shape rule here;
+                # the pre-routed modes never consult it)
+                n_group, topk_group = (
+                    int(routing.n_group or 0),
+                    int(routing.topk_group or 0),
+                )
+                E = routing.num_experts
+                if not (
+                    1 <= topk_group <= n_group <= MAX_GROUPS
+                    and E % n_group == 0
+                    and E // n_group >= 2
+                    and routing.top_k <= topk_group * (E // n_group)
+                ):
+                    raise unsupported(
+                        CLASS,
+                        f"n_group {n_group}, topk_group {topk_group} over {E} experts for top_k {routing.top_k}",
+                        f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at "
+                        "least two experts, top_k <= topk_group * (num_experts / n_group)",
+                    )
+                self._method = self._method.with_groups(n_group, topk_group)
+            elif grouped:
+                self._grouped_other = True
+            if routing.method is RoutingMethodType.Llama4 and routing.top_k != 1:
+                raise unsupported(
+                    CLASS,
+                    f"Llama4 routing with top_k {routing.top_k}",
+                    "top_k = 1 (the method is the top-1 of the logits with its sigmoid as the weight; TopKSigmoid for other k)",
+                )
 
     def _build(self) -> None:
         from ...gemm.batch_invariant.api import part_of
@@ -287,27 +321,19 @@ class BatchInvariantMoeRunner(MoERunner):
         weights_dtype = torch.float32  # the class's weights from logits are fp32
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
-            # group-limited selection is a routing term the class does not have; with pre-routed ids the group
-            # structure never enters the computation, so only the logits mode refuses it
-            if cfg.routing.n_group not in (
-                None,
-                0,
-                1,
-            ) or cfg.routing.topk_group not in (
-                None,
-                0,
-                1,
-            ):
+            # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
+            # meaning in this module (with pre-routed ids the group structure never enters the computation)
+            if getattr(self, "_grouped_other", False):
                 raise unsupported(
                     CLASS,
-                    "group-limited routing (n_group > 1) from logits",
-                    "n_group in (None, 0, 1) from logits, or pre-routed ids for grouped routing",
+                    f"expert groups (n_group / topk_group) with {cfg.routing.method!r} from logits",
+                    "the groups with DeepSeekV3, or pre-routed ids",
                 )
             if self._method is None:
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",
-                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm or DeepSeekV3 with n_group <= 1",
+                    "Default, Renormalize, RenormalizeNaive, Sigmoid, SigmoidRenorm, TopK, Llama4, TopKSigmoid or DeepSeekV3",
                 )
             bias = act.routing_bias
             if (bias is not None) != self._method.bias:

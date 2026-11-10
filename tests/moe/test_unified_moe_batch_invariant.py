@@ -309,11 +309,184 @@ def test_fingerprint_dimensions_and_classes():
             I=768,
             top_k=8,
             num_experts=128,
-            method=RoutingMethodType.Llama4,
+            method=RoutingMethodType.MiniMax2,
         )
     with pytest.raises(ValueError):
         bi.fingerprint("fused_moe", H=2048, I=768, top_k=8, num_experts=128, act="tanh")
+    # the operator surface's routing terms: TopK, Llama4 / TopKSigmoid (one term), the grouped DeepSeekV3 (the groups a part)
+    base = dict(H=2048, I=768, top_k=8, num_experts=128)
+    fps = {
+        m: bi.fingerprint("fused_moe", method=m, **base)
+        for m in (
+            RoutingMethodType.TopK,
+            RoutingMethodType.TopKSigmoid,
+            RoutingMethodType.Sigmoid,
+            RoutingMethodType.DeepSeekV3,
+        )
+    }
+    assert len(set(fps.values())) == 4
+    assert bi.fingerprint(
+        "fused_moe",
+        method=RoutingMethodType.Llama4,
+        H=2048,
+        I=768,
+        top_k=1,
+        num_experts=128,
+    ) == bi.fingerprint(
+        "fused_moe",
+        method=RoutingMethodType.TopKSigmoid,
+        H=2048,
+        I=768,
+        top_k=1,
+        num_experts=128,
+    )
+    g84 = bi.fingerprint(
+        "fused_moe",
+        method=RoutingMethodType.DeepSeekV3,
+        n_group=8,
+        topk_group=4,
+        **base,
+    )
+    assert g84 != fps[RoutingMethodType.DeepSeekV3]
+    assert g84 == bi.fingerprint(
+        "fused_moe", method="sigmoid_renorm_bias_scaled_g8x4", **base
+    )
+    assert g84 != bi.fingerprint(
+        "fused_moe",
+        method=RoutingMethodType.DeepSeekV3,
+        n_group=4,
+        topk_group=2,
+        **base,
+    )
+    with pytest.raises(ValueError):
+        bi.fingerprint(
+            "fused_moe", method=RoutingMethodType.TopK, n_group=8, topk_group=4, **base
+        )
     assert bi.class_name("fused_moe") == "moe.bf16"
+
+
+def test_routing_terms_exact_model_orders_and_fill_rules():
+    """The operator surface's routing terms in the exact model (the sandbox's statements, device-free): ``TopK`` selects the
+    largest logits and weights by them, ``TopKSigmoid`` / ``Llama4`` by their declared sigmoid (the ``Sigmoid`` method's
+    weight term under a selection on the logits: equal selections except where the sigmoid saturates); the group-limited
+    DeepSeekV3 keeps the groups of the largest two-score sums (not the largest maximum), ties to the lower index, a group with
+    fewer than two non-NaN scores never kept while enough are, the fill rules over groups and experts; the exact and the
+    vectorised models agree on finite rows; the weight terms of a grouped method print as the ungrouped method's."""
+    import math
+
+    from flashinfer.fused_moe.batch_invariant import mterm as term
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+
+    row = [1.0, 3.0, 3.0, -0.0, 0.0, 2.0, 3.0, 40.0, 41.0, float("-inf")]
+    sel, w = R.route_exact(row, 4, S.TOPK)
+    assert sel == [8, 7, 1, 2] and w == [41.0, 40.0, 3.0, 3.0]
+    sel, w = R.route_exact(row, 3, S.TOPK_SIGMOID)
+    assert sel == [8, 7, 1] and w == [
+        S.sigmoid_term(R.ExactF32, v) for v in (41.0, 40.0, 3.0)
+    ]
+    assert R.route_exact(row, 2, S.SIGMOID)[0] == [7, 8] and R.route_exact(
+        row, 2, S.TOPK_SIGMOID
+    )[0] == [8, 7]
+    sel, w = R.route_exact([float("-inf"), 0.0, float("-inf")], 2, S.TOPK)
+    assert sel == [1, 0] and w[1] == float("-inf")
+    fp = R.ExactF32
+    m = S.SIGMOID_BIAS_RENORM_SCALED.with_groups(4, 2)
+    q = [9.0, 0.0, 0.0, 0.0, 5.0, 4.9, 0.0, 0.0, 6.0, 6.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    assert S.group_scores(fp, q, m) == [9.0, fp32.add(5.0, 4.9), 12.0, 2.0]
+    assert S.select_topk_grouped(fp, q, 3, m) == [8, 9, 4]
+    assert S.select_topk_grouped(fp, q, 5, m) == [8, 9, 4, 5, 6]
+    q2 = [
+        3.0,
+        3.0,
+        0.0,
+        0.0,
+        3.0,
+        3.0,
+        0.0,
+        0.0,
+        3.0,
+        3.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+    assert S.select_topk_grouped(fp, q2, 4, m) == [0, 1, 4, 5]
+    nan = float("nan")
+    q3 = [
+        nan,
+        8.0,
+        nan,
+        nan,
+        5.0,
+        4.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        nan,
+        nan,
+        nan,
+        nan,
+    ]
+    gs3 = S.group_scores(fp, q3, m)
+    assert math.isnan(gs3[0]) and gs3[1] == 9.0 and gs3[2] == 2.0 and math.isnan(gs3[3])
+    assert S.select_topk_grouped(fp, q3, 2, m) == [4, 5]
+    assert S.select_topk_grouped(
+        fp, q3, 4, S.SIGMOID_BIAS_RENORM_SCALED.with_groups(4, 3)
+    ) == [1, 4, 5, 8]
+    assert S.select_topk_grouped(fp, [nan] * 16, 3, m) == [0, 1, 2]
+    assert S.select_topk([nan, 1.0, nan, 1.0], 3) == [1, 3, 0]
+    sel, w = R.route_exact(
+        [nan, 2.0, nan, 1.0, nan, nan, nan, nan], 4, S.SOFTMAX_RENORM
+    )
+    assert sel == [1, 3, 0, 2] and all(math.isnan(v) for v in w)
+    sel, w = R.route_exact(
+        [0.0] * 8,
+        4,
+        S.RoutingMethod("sigmoid", False, True, False),
+        bias=[nan, 0.5, nan, 0.25, nan, nan, nan, nan],
+    )
+    assert (
+        sel == [1, 3, 0, 2]
+        and not math.isnan(w[0])
+        and not math.isnan(w[1])
+        and math.isnan(w[2])
+        and math.isnan(w[3])
+    )
+    g = torch.Generator().manual_seed(5)
+    logits = (torch.randn(12, 64, generator=g) * 2).float()
+    logits[0, ::2] = 40.0
+    logits[1] = 0.0
+    bias = (torch.randn(64, generator=g) * 0.3).float()
+    for meth, b_, sc in (
+        (S.DEEPSEEK_V3_GROUPED, bias, 2.5),
+        (S.TOPK, None, None),
+        (S.TOPK_SIGMOID, None, None),
+    ):
+        ex, ws = R.route_cpu(logits, 6, meth, b_, sc)
+        for t in range(12):
+            sel, w = R.route_exact(
+                logits[t].tolist(), 6, meth, None if b_ is None else b_.tolist(), sc
+            )
+            assert ex[t].tolist() == sel and ws[t].tolist() == w, (meth.name, t)
+    alg = term.TermAlgebra()
+    s_g = S.MoESpec(64, 32, 2, 16, m, alg=alg)
+    s_u = S.MoESpec(64, 32, 2, 16, S.SIGMOID_BIAS_RENORM_SCALED, alg=alg)
+    assert [term.sexpr(t) for t in s_g.routing([3, 9])[1]] == [
+        term.sexpr(t) for t in s_u.routing([3, 9])[1]
+    ]
+    assert term.sexpr(S.MoESpec(64, 32, 2, 16, S.TOPK, alg=alg).weight(1)) == "(l 1)"
+    assert term.sexpr(s_g.group_score(3, 1)) == term.sexpr(s_g.group_score(1, 3))
+    for bad in (dict(n_group=4, topk_group=5), dict(n_group=4, topk_group=0)):
+        with pytest.raises(AssertionError):
+            S.RoutingMethod("sigmoid", True, True, True, **bad)
 
 
 def test_activation_of_covers_every_activation_config():
@@ -645,7 +818,19 @@ def test_routing_method_map_matches_the_spec():
     assert m[RoutingMethodType.Sigmoid] is S.SIGMOID
     assert m[RoutingMethodType.SigmoidRenorm] is S.SIGMOID_RENORM
     assert m[RoutingMethodType.DeepSeekV3] is S.SIGMOID_BIAS_RENORM_SCALED
-    assert RoutingMethodType.Llama4 not in m and RoutingMethodType.TopK not in m
+    assert m[RoutingMethodType.TopK] is S.TOPK
+    assert (
+        m[RoutingMethodType.Llama4] is S.TOPK_SIGMOID
+    )  # the top-1 of the logits with its sigmoid as the weight
+    assert m[RoutingMethodType.TopKSigmoid] is S.TOPK_SIGMOID
+    assert (
+        RoutingMethodType.MiniMax2 not in m
+    )  # its renormalisation adds an epsilon: another term
+    assert S.TOPK.name == "topk" and S.TOPK_SIGMOID.name == "topk_sigmoid"
+    assert S.SIGMOID_BIAS_RENORM_SCALED.with_groups(8, 4) == S.DEEPSEEK_V3_GROUPED
+    assert S.METHODS[
+        "sigmoid_renorm_bias_scaled_g4x2"
+    ] == S.SIGMOID_BIAS_RENORM_SCALED.with_groups(4, 2)
 
 
 @pytest.mark.parametrize(
@@ -1306,20 +1491,31 @@ def test_routing_methods_from_logits_match_the_cpu_model():
         .float()
         .cuda()
     )
-    for method in (
-        RoutingMethodType.Default,
-        RoutingMethodType.Renormalize,
-        RoutingMethodType.Sigmoid,
-        RoutingMethodType.SigmoidRenorm,
-        RoutingMethodType.DeepSeekV3,
+    for method, groups in (
+        (RoutingMethodType.Default, None),
+        (RoutingMethodType.Renormalize, None),
+        (RoutingMethodType.Sigmoid, None),
+        (RoutingMethodType.SigmoidRenorm, None),
+        (RoutingMethodType.DeepSeekV3, None),
+        (RoutingMethodType.TopK, None),
+        (RoutingMethodType.TopKSigmoid, None),
+        (RoutingMethodType.Llama4, None),
+        (RoutingMethodType.DeepSeekV3, (8, 4)),
+        (RoutingMethodType.DeepSeekV3, (4, 1)),
     ):
         rm = S.METHOD_OF_FLASHINFER[method]
         kwargs = {}
         if rm.scaled:
             kwargs["routed_scaling_factor"] = 1.75
+        if groups is not None:
+            rm = rm.with_groups(*groups)
+            kwargs["n_group"], kwargs["topk_group"] = groups
+        k_m = 1 if method is RoutingMethodType.Llama4 else k
         layer = MoELayer(
             MoEConfig(
-                routing=RoutingConfig(num_experts=E, top_k=k, method=method, **kwargs),
+                routing=RoutingConfig(
+                    num_experts=E, top_k=k_m, method=method, **kwargs
+                ),
                 quant=QuantConfig(),
                 experts=ExpertConfig(intermediate_size=I),
                 activation=SwiGLU(),
@@ -1333,13 +1529,30 @@ def test_routing_methods_from_logits_match_the_cpu_model():
         out = layer(_logits_pack(x, logits, b), W)
         ex, w = R.route_cpu(
             logits.cpu(),
-            k,
+            k_m,
             rm,
             b.cpu() if b is not None else None,
             1.75 if rm.scaled else None,
         )
         ref = layer(_routed_pack(x, ex.cuda(), w.cuda()), W)
-        assert torch.equal(bits(out), bits(ref)), method
+        assert torch.equal(bits(out), bits(ref)), (method, groups)
+        # the exact model row by row (the grouped order, the logit orders)
+        from flashinfer.fused_moe.batch_invariant import api
+
+        ex_d, w_d = api.route(logits, k_m, rm, b, 1.75 if rm.scaled else None)
+        assert torch.equal(ex_d.cpu(), ex) and torch.equal(bits(w_d.cpu()), bits(w)), (
+            method,
+            groups,
+        )
+        for t in range(0, T, 9):
+            sel, ws = R.route_exact(
+                logits[t].tolist(),
+                k_m,
+                rm,
+                b.tolist() if b is not None else None,
+                1.75 if rm.scaled else None,
+            )
+            assert ex[t].tolist() == sel and w[t].tolist() == ws, (method, groups, t)
 
 
 @needs_device
@@ -1403,14 +1616,15 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # the ungated weights with the gated class: refused at the call, not computed
     with pytest.raises(BatchInvariantUnsupportedError):
         layer(_logits_pack(x, logits), _weights(w1[:, :I].contiguous(), w2, ReLU2()))
-    # group-limited routing is refused from logits only: with pre-routed ids the group structure never enters the
-    # computation, and the output equals the ungrouped configuration's on the same ids and weights
+    # expert groups are a parameter of the DeepSeekV3 term: with another method they are refused from logits only (with
+    # pre-routed ids the group structure never enters the computation, and the output equals the ungrouped configuration's
+    # on the same ids and weights); the group shape rule is checked at construction
     grouped = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
                 num_experts=E,
                 top_k=k,
-                method=RoutingMethodType.DeepSeekV3,
+                method=RoutingMethodType.Renormalize,
                 n_group=2,
                 topk_group=1,
             ),
@@ -1428,11 +1642,40 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bits(grouped(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
         bits(layer(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
     )
-    # an unimplemented routing method from logits is refused; the same layer takes pre-routed inputs
-    llama = MoELayer(
+    for n_group, topk_group, kk in (
+        (3, 1, k),
+        (64, 4, k),
+        (8, 9, k),
+        (8, 1, 9),
+        (32, 4, 1),
+    ):
+        with pytest.raises(errors) as excinfo:
+            MoELayer(
+                MoEConfig(
+                    routing=RoutingConfig(
+                        num_experts=E,
+                        top_k=kk,
+                        method=RoutingMethodType.DeepSeekV3,
+                        n_group=n_group,
+                        topk_group=topk_group,
+                        routed_scaling_factor=1.0,
+                    ),
+                    quant=QuantConfig(),
+                    experts=ExpertConfig(intermediate_size=I),
+                    backend=BackendOptions((BatchInvariantBf16Config(),)),
+                ),
+                device=torch.device("cuda"),
+            )
+        assert "n_group" in str(excinfo.value) or "top_k" in str(excinfo.value), (
+            n_group,
+            topk_group,
+            kk,
+        )
+    # MiniMax2 from logits is refused (another term); the same layer takes pre-routed inputs; Llama4 is the top-1 term
+    minimax = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
-                num_experts=E, top_k=1, method=RoutingMethodType.Llama4
+                num_experts=E, top_k=1, method=RoutingMethodType.MiniMax2
             ),
             quant=QuantConfig(),
             experts=ExpertConfig(intermediate_size=I),
@@ -1441,12 +1684,25 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         device=torch.device("cuda"),
     )
     with pytest.raises(BatchInvariantUnsupportedError):
-        llama(_logits_pack(x, logits), W)
+        minimax(_logits_pack(x, logits), W)
     ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
-    assert llama(_routed_pack(x, ids, torch.ones(8, 1, device="cuda")), W).shape == (
+    assert minimax(_routed_pack(x, ids, torch.ones(8, 1, device="cuda")), W).shape == (
         8,
         H,
     )
+    with pytest.raises(errors) as excinfo:
+        MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(
+                    num_experts=E, top_k=2, method=RoutingMethodType.Llama4
+                ),
+                quant=QuantConfig(),
+                experts=ExpertConfig(intermediate_size=I),
+                backend=BackendOptions((BatchInvariantBf16Config(),)),
+            ),
+            device=torch.device("cuda"),
+        )
+    assert "Llama4" in str(excinfo.value)
     # zero tokens
     out = layer(_logits_pack(x[:0], logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16

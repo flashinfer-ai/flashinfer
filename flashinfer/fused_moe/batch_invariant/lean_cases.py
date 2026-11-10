@@ -46,6 +46,12 @@ ROUTING_CASES: Sequence[Tuple[M.RoutingMethod, int, List[int]]] = (
     (M.SIGMOID_RENORM, 8, [2, 6]),
     (M.SIGMOID_BIAS_RENORM_SCALED, 8, [1, 7]),
     (M.SIGMOID, 64, [63]),
+    # the operator-surface terms: the logits as weights, the sigmoid weights under a selection on the logits, the
+    # group-limited DeepSeek-V3 forms (their weight terms are the ungrouped method's: `routingWeights_selection_only`)
+    (M.TOPK, 8, [2, 5]),
+    (M.TOPK_SIGMOID, 16, [9]),
+    (M.SIGMOID_BIAS_RENORM_SCALED.with_groups(4, 2), 16, [3, 9, 12]),
+    (M.DEEPSEEK_V3_GROUPED, 64, [17, 40, 5, 63]),
 )
 
 #: The gated GEMM1 chains: ``(case name, act, params)`` over ``spec.ACTS`` with one parameter set per form the term can
@@ -134,14 +140,17 @@ def lean_gact(act: str, params: Sequence[Optional[float]]) -> str:
 
 
 def lean_method(meth: M.RoutingMethod) -> str:
-    """The Lean ``MoE.Method`` record: the weight-relevant flags (a selection bias never enters a weight term)."""
+    """The Lean ``MoE.Method`` record: the weight-relevant flags (a selection bias, a selection on the logits and the
+    group-limited stage never enter a weight term; ``raw`` marks the logits themselves as the weights)."""
 
     def b(v: bool) -> str:
         return "true" if v else "false"
 
     return (
-        f"{{ softmax := {b(meth.score == 'softmax')}, renorm := {b(meth.renormalize)}, "
-        f"scaled := {b(meth.scaled)} }}"
+        f"{{ softmax := {b(meth.weight_kind == 'softmax')}, renorm := {b(meth.renormalize)}, "
+        f"scaled := {b(meth.scaled)}"
+        + (", raw := true" if meth.weight_kind == "logit" else "")
+        + " }"
     )
 
 
@@ -200,6 +209,10 @@ def moe_cases() -> List[Tuple[str, str, str, bool]]:
     for name, act in ACT_CASES:
         s_ = M.MoESpec(64, 32, 2, 8, alg=alg, act=act, gated=False)
         chain(name, s_.gemm1(), f"MoE.actElemT {_UACT[act]} {ul}")
+    # the selection terms of the group-limited stage (selection only: they never enter a weight)
+    sg = M.MoESpec(64, 32, 2, 16, M.DEEPSEEK_V3_GROUPED.with_groups(4, 2), alg=alg)
+    chain("biased_score", sg.biased_score(3), "MoE.biasedScoreT 3")
+    chain("group_score", sg.group_score(3, 1), "MoE.groupScoreT 3 1")
     # the routing weights
     for meth, E, sel in ROUTING_CASES:
         s_ = M.MoESpec(64, 32, len(sel), E, meth, alg=alg)
