@@ -4,8 +4,9 @@ The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
 `d0762b1a361c69640885f64e6529e5fec4fa7ef4` (ABI 2812).
 This revision includes qualified compact compute policies and the NCCL-only
-memory/transport runtime. The `common/` and support `src/` directories retain
-the PR's framework adaptations. `runtime/green_context.py` and its tests retain
+memory/transport runtime. The private `moe_sm120_nvfp4_split/support/common/` and `support/src/`
+directories retain the PR's framework adaptations without exposing generic
+`common` or `src` packages that could shadow other backends. `runtime/green_context.py` and its tests retain
 the graph-aware FlashInfer adapter rather than the standalone runner wrapper.
 
 This drop includes dispatch rank caching, its caller-stream reset ordering,
@@ -22,8 +23,10 @@ The cross-NUMA GIN transport is present in the vendored source but is not expose
 by this same-NUMA framework adapter.
 
 Multi-rank execution requires the pinned NCCL 2.32.3 runtime, selected through
-`MEGAMOE_NCCL_ROOT` or `nvidia-nccl-cu13==2.32.3`. The backend requests only
-Torch distributed bootstrap. It allocates one NCCL-registered arena per workspace
+`MEGAMOE_NCCL_ROOT` or `nvidia-nccl-cu13==2.32.3`. Keep `NCCL_CUMEM_ENABLE=1` set before initializing the communicator;
+frameworks such as SGLang may otherwise override this setting to zero, which is
+incompatible with the NCCL device communicator used here. The backend requests
+only Torch distributed bootstrap. It allocates one NCCL-registered arena per workspace
 and derives direct-P2P pointers through LSA. It does not initialize NVSHMEM.
 The runtime rejects processes that already load NVSHMEM, including incompatible
 PyTorch builds; use a clean compatible PyTorch build. Single-rank execution can set `MEGA_NO_DIST=1`. The backend
