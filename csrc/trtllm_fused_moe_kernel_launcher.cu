@@ -1049,14 +1049,27 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "ActivationType::SwigluStep with MxFp8.";
 }
 
+// Number of tiles below the covering tile that the autotuner profiles.
+// Rubin takes two: it gained tile 192 in #6788, and with only one lower candidate a covering tile
+// of 256 lost tile 128 (MiniMax NVFP4 9216 tokens regressed to 0.62x). Blackwell has had tile 192
+// in its ladder all along and was never measured to gain from a second lower tile. That tile is
+// the smallest candidate, so its trials cost the most (they read each expert's weights the most
+// times): it doubled cold autotuning for Nemotron-3 Ultra NVFP4 on GB300 with CPU-offloaded
+// weights (NVBug 7054527). Blackwell therefore keeps one.
+#ifdef TLLM_RUBIN_FEATURES
+constexpr int kTunerSmallerTileCandidates = 2;
+#else
+constexpr int kTunerSmallerTileCandidates = 1;
+#endif
+
 // Tile_N candidates around the tile covering num_tokens * top_k / num_local_experts. Under expert
 // parallelism a caller may pass every row it received, with global expert ids, so when
 // num_experts > num_local_experts the tile covering num_tokens * top_k / num_experts is also
 // offered if it is below every candidate: at most one extra, smaller tile.
-std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
-                                       int64_t const num_tokens, int64_t const top_k,
-                                       int64_t const num_local_experts, int64_t const num_experts,
-                                       int const num_smaller_tile_candidates = 2) {
+std::set<int32_t> computeSelectedTileN(
+    std::vector<int32_t> const& ascending_supported_tile_sizes, int64_t const num_tokens,
+    int64_t const top_k, int64_t const num_local_experts, int64_t const num_experts,
+    int const num_smaller_tile_candidates = kTunerSmallerTileCandidates) {
   TVM_FFI_ICHECK(!ascending_supported_tile_sizes.empty())
       << "ascending_supported_tile_sizes must not be empty.";
   TVM_FFI_ICHECK(num_tokens >= 0) << "num_tokens must be non-negative.";
@@ -1097,9 +1110,8 @@ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_sup
     }
   }
   // Walk down the ascending tile ladder (checked sorted above) to add up to
-  // num_smaller_tile_candidates tiles below the covering tile. The tuner receives two so that
-  // adding a tile to the ladder (e.g. 192) does not push the best smaller tile out of its window;
-  // the default-tactic path keeps one.
+  // num_smaller_tile_candidates tiles below the covering tile. The tuner receives
+  // kTunerSmallerTileCandidates (see above); the default-tactic path always keeps one.
   auto down = it;
   for (int i = 0; i < num_smaller_tile_candidates && down != ascending_supported_tile_sizes.begin();
        ++i) {
