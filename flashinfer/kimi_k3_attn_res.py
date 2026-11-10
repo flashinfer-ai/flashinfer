@@ -85,7 +85,12 @@ def prepare_kimi_k3_attn_res(
     enable_pdl : bool
         Launch the program with programmatic dependent launch.
     backend : str
-        Only ``"cake"`` is supported.
+        ``"cake"`` (generated programs, fused contract) or ``"vibecuda"``
+        (the original unfused operator only: ``delta`` must be ``None``,
+        ``block_write_idx`` must be ``-1``, ``output_norm_weight`` is
+        required, ``eps`` must equal ``output_norm_eps``, and the per-channel
+        score weight is ``norm_weight`` alone so ``qk_weight`` must be
+        ``None``).
 
     Returns
     -------
@@ -122,7 +127,29 @@ def prepare_kimi_k3_attn_res(
             output_norm_eps=output_norm_eps,
             enable_pdl=enable_pdl,
         )
-    raise ValueError("the Kimi-K3 AttnRes kernels currently support backend='cake'")
+    if backend == "vibecuda":
+        from .experimental.vibecuda_kimi_k3_attn_res.vibecuda_backend import (
+            prepare_kimi_k3_attn_res as vibecuda_prepare_kimi_k3_attn_res,
+        )
+
+        return vibecuda_prepare_kimi_k3_attn_res(
+            prefix,
+            delta,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            out,
+            num_blocks=num_blocks,
+            block_write_idx=block_write_idx,
+            eps=eps,
+            output_norm_eps=output_norm_eps,
+            enable_pdl=enable_pdl,
+        )
+    raise ValueError(
+        f"unsupported Kimi-K3 AttnRes backend {backend!r}: the kernels "
+        "currently support backend='cake' and backend='vibecuda'"
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -162,7 +189,29 @@ def kimi_k3_attn_res(
             output_norm_eps=output_norm_eps,
             enable_pdl=enable_pdl,
         )
-    raise ValueError("the Kimi-K3 AttnRes kernels currently support backend='cake'")
+    if backend == "vibecuda":
+        from .experimental.vibecuda_kimi_k3_attn_res.vibecuda_backend import (
+            kimi_k3_attn_res as vibecuda_kimi_k3_attn_res,
+        )
+
+        return vibecuda_kimi_k3_attn_res(
+            prefix,
+            delta,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            out,
+            num_blocks=num_blocks,
+            block_write_idx=block_write_idx,
+            eps=eps,
+            output_norm_eps=output_norm_eps,
+            enable_pdl=enable_pdl,
+        )
+    raise ValueError(
+        f"unsupported Kimi-K3 AttnRes backend {backend!r}: the kernels "
+        "currently support backend='cake' and backend='vibecuda'"
+    )
 
 
 def generated_program_available(
