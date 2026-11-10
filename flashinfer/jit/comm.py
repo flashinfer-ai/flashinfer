@@ -267,17 +267,32 @@ def gen_pcie_ipc_comm_debug_module(
     )
 
 
-def gen_pcie_ipc_comm_module() -> JitSpec:
+def gen_pcie_ipc_comm_module(spin_timeout_ns: int = 0) -> JitSpec:
     # No architecture restriction: the kernels use only plain PTX loads/stores
     # and CUDA IPC, both of which predate every architecture flashinfer builds
     # for. The target is a PCIe machine without NVLink, which is orthogonal to
     # the SM version.
+    #
+    # ``spin_timeout_ns`` > 0 bounds every wait on a peer: past the deadline the
+    # kernel reports and traps instead of spinning forever. It is a separate
+    # module, so the default (and AOT) build keeps the unbounded wait unchanged.
+    if spin_timeout_ns <= 0:
+        return gen_jit_spec(
+            "pcie_ipc_comm",
+            [
+                jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
+            ],
+            extra_ldflags=["-lcuda"],
+        )
     return gen_jit_spec(
-        "pcie_ipc_comm",
+        f"pcie_ipc_comm_spin_timeout_{spin_timeout_ns}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
         ],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=[
+            f"-DFLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS={spin_timeout_ns}ULL"
+        ],
     )
 
 

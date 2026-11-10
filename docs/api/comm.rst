@@ -378,8 +378,14 @@ it, since the crossovers depend on the fabric.
 ``(world_size, numel, elem_size)`` triple, and returns ``None`` only for shapes
 the kernels cannot run.
 
-The kernels spin on peer flags with no timeout, so ranks that disagree on
-shape, dtype or call order hang rather than raise. One workspace serves one
+By default the kernels spin on peer flags with no timeout, so ranks that
+disagree on shape, dtype or call order hang rather than raise. Setting
+``FLASHINFER_PCIE_IPC_TIMEOUT_S`` before the first workspace is built bounds
+that wait: a rank that waits longer than that many seconds for a peer reports
+where it was waiting and traps, so the call fails with a CUDA error instead of
+hanging. The CUDA context is unusable afterwards, so the process must restart.
+Unset or ``0`` keeps the unbounded wait and builds the same kernels as before.
+One workspace serves one
 CUDA stream; use :meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after
 ordering the two if a move is genuinely needed.
 
