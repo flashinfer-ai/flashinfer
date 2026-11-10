@@ -27,8 +27,8 @@ from . import spec as S
 from .api import interleave_fc1, permute_plan
 from .blocks.fp8_epilogue import GEMM2_CHAIN, Fp8Chain
 from .blocks.scheduler import MAX_E
-from .reference_fp8 import dequant_scale, quantize_e4m3_static
 from .schedule import launch_tile_bound
+from .reference_fp8 import dequant_scale, quantize_e4m3_static
 from .spec_fp8 import E4M3_MAX
 
 CLASS = "moe.e4m3"
