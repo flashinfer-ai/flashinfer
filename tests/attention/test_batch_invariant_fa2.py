@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Optional
+
 import pytest
 import torch
 from tests.jit.test_helpers.jit_utils import (
@@ -58,6 +60,7 @@ def warmup_jit():
 @pytest.mark.parametrize("kv_len", [4096, 8192, 5000])
 @pytest.mark.parametrize("fixed_split_size", [2048])
 @pytest.mark.parametrize("disable_split_kv", [True, False])
+@pytest.mark.parametrize("fixed_cta_tile_q", [None, 16, 64, 128])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("group_size", [1, 4, 8])
@@ -70,6 +73,7 @@ def test_batch_decode_tensor_cores(
     kv_len: int,
     fixed_split_size: int,
     disable_split_kv: bool,
+    fixed_cta_tile_q: Optional[int],
     page_size: int,
     num_kv_heads: int,
     group_size: int,
@@ -77,6 +81,10 @@ def test_batch_decode_tensor_cores(
     kv_layout: str,
     pos_encoding_mode: str,
 ):
+    if head_dim >= 256 and fixed_cta_tile_q == 128:
+        pytest.skip("fixed_cta_tile_q=128 is not supported with head_dim >= 256")
+    if fixed_cta_tile_q == 16 and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("fixed_cta_tile_q=16 requires SM80 or newer")
     num_qo_heads = num_kv_heads * group_size
     q = torch.randn(
         batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
@@ -118,7 +126,7 @@ def test_batch_decode_tensor_cores(
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
 
     wrapper_tensor_cores = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout, use_tensor_cores=True
+        workspace_buffer, kv_layout, use_tensor_cores=True, backend="fa2"
     )
     wrapper_tensor_cores.plan(
         kv_indptr,
@@ -133,6 +141,7 @@ def test_batch_decode_tensor_cores(
         q_data_type=torch.float16,
         fixed_split_size=fixed_split_size if not disable_split_kv else None,
         disable_split_kv=disable_split_kv,
+        fixed_cta_tile_q=fixed_cta_tile_q,
     )
     o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
         q, kv_data, return_lse=True
@@ -153,6 +162,7 @@ def test_batch_decode_tensor_cores(
         q_data_type=torch.float16,
         fixed_split_size=fixed_split_size if not disable_split_kv else None,
         disable_split_kv=disable_split_kv,
+        fixed_cta_tile_q=fixed_cta_tile_q,
     )
     o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tensor_cores.run(
         q[:invariant_bs], kv_data, return_lse=True
@@ -195,6 +205,7 @@ def test_batch_decode_tensor_cores(
 @pytest.mark.parametrize("qo_len", [128, 256])
 @pytest.mark.parametrize("fixed_split_size", [2048])
 @pytest.mark.parametrize("disable_split_kv", [True, False])
+@pytest.mark.parametrize("fixed_cta_tile_q", [None, 16, 64, 128])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("group_size", [1, 4, 8])
@@ -208,6 +219,7 @@ def test_batch_prefill_tensor_cores(
     qo_len: int,
     fixed_split_size: int,
     disable_split_kv: bool,
+    fixed_cta_tile_q: Optional[int],
     page_size: int,
     num_kv_heads: int,
     group_size: int,
@@ -215,6 +227,10 @@ def test_batch_prefill_tensor_cores(
     kv_layout: str,
     pos_encoding_mode: str,
 ):
+    if head_dim >= 256 and fixed_cta_tile_q == 128:
+        pytest.skip("fixed_cta_tile_q=128 is not supported with head_dim >= 256")
+    if fixed_cta_tile_q == 16 and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("fixed_cta_tile_q=16 requires SM80 or newer")
     num_qo_heads = num_kv_heads * group_size
     q = torch.randn(
         batch_size * qo_len,
@@ -265,7 +281,7 @@ def test_batch_prefill_tensor_cores(
     )
 
     wrapper_tensor_cores = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend="fa2"
     )
     wrapper_tensor_cores.plan(
         q_indptr,
@@ -281,6 +297,7 @@ def test_batch_prefill_tensor_cores(
         kv_data_type=torch.float16,
         fixed_split_size=fixed_split_size if not disable_split_kv else None,
         disable_split_kv=disable_split_kv,
+        fixed_cta_tile_q=fixed_cta_tile_q,
     )
     o_tensor_cores, lse_tensor_cores = wrapper_tensor_cores.run(
         q, kv_data, return_lse=True
@@ -304,6 +321,7 @@ def test_batch_prefill_tensor_cores(
         kv_data_type=torch.float16,
         fixed_split_size=fixed_split_size if not disable_split_kv else None,
         disable_split_kv=disable_split_kv,
+        fixed_cta_tile_q=fixed_cta_tile_q,
     )
     o_tensor_cores_invariant, lse_tensor_cores_invariant = wrapper_tensor_cores.run(
         q[: invariant_bs * qo_len], kv_data, return_lse=True

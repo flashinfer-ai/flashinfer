@@ -98,6 +98,9 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _check_fixed_cta_tile_q_backend,
+    _check_fixed_cta_tile_q_frozen,
+    _validate_fixed_cta_tile_q,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -1993,6 +1996,7 @@ def _eagle_verify_fp8kv_sm90_plan_eligibility(
     use_fp16_qk_reduction: bool,
     batch_size: int,
     device: torch.device,
+    fixed_cta_tile_q: int = -1,
 ) -> Optional[str]:
     """Plan-time guard. Returns None when the plan describes the supported
     verify problem, ``"not_verify_route:..."`` when the call is not a verify
@@ -2001,6 +2005,10 @@ def _eagle_verify_fp8kv_sm90_plan_eligibility(
     shapes -> device so the first two groups run GPU-free."""
     if backend != "fa2":
         return "not_verify_route:backend"
+    if fixed_cta_tile_q != -1:
+        # The caller pinned the FA2 query tile (batch invariance); the
+        # specialized kernel has its own tiling and would silently drop it.
+        return "not_verify_route:fixed_cta_tile_q"
     if forwarded_uniform_q_len != _EAGLE_VERIFY_FP8KV_SM90_QO_LEN:
         return "not_verify_route:uniform_q_len"
     if not has_custom_mask:
@@ -2205,6 +2213,7 @@ def _eagle_verify_fp8kv_sm90_prepare(
     batch_size: int,
     qo_indptr_host: Optional[torch.Tensor] = None,
     packed_mask_bytes: int = 0,
+    fixed_cta_tile_q: int = -1,
 ) -> None:
     """Plan-time half of the dispatch: decide eligibility, JIT-build the module
     (first time in the process), assert the host-side contract of the device
@@ -2243,6 +2252,7 @@ def _eagle_verify_fp8kv_sm90_prepare(
             use_fp16_qk_reduction,
             batch_size,
             wrapper.device,
+            fixed_cta_tile_q=fixed_cta_tile_q,
         )
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
@@ -3271,17 +3281,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
         kv_data_type: torch.dtype,
         head_dim_qk: int,
         head_dim_vo: int,
+        fixed_cta_tile_q: int = -1,
     ) -> str:
         """Resolve paged planning and sizing without changing cached plan state."""
-        backend = determine_attention_backend(
-            self.device,
-            pos_encoding_mode,
-            use_fp16_qk_reduction,
-            use_custom_mask,
-            q_data_type,
-            kv_data_type,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
+        # A fixed query tile is an FA2 planner option: auto pins FA2.
+        backend = (
+            "fa2"
+            if fixed_cta_tile_q != -1
+            else determine_attention_backend(
+                self.device,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                use_custom_mask,
+                q_data_type,
+                kv_data_type,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+            )
         )
         fp8_query = q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
         if self._cuda_graph_backend is not None:
@@ -3350,6 +3366,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -3440,6 +3457,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv : bool
             Whether to disable the split-kv. Defaults to ``False``.
 
+        fixed_cta_tile_q : Optional[int]
+            Fixed FA2 query tile, with the same head-dimension and backend restrictions
+            as :meth:`plan`. Defaults to ``None``. Pass the same value to both methods.
+
         Returns
         -------
         Tuple[int, int]
@@ -3454,7 +3475,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._requested_backend)
         if self._batch_invariant is not None:
+            self._batch_invariant.refuse(fixed_cta_tile_q=fixed_cta_tile_q)
             return self._batch_invariant.workspace_bytes(
                 qo_indptr,
                 paged_kv_indptr,
@@ -3521,6 +3544,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if fixed_split_size is None:
             fixed_split_size = -1
 
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(
+            fixed_cta_tile_q, head_dim_vo, head_dim_qk
+        )
+
         # Normalized like plan(): the native size query reads raw pointers (#5260).
         qo_indptr = qo_indptr.contiguous()
         paged_kv_indptr = paged_kv_indptr.contiguous()
@@ -3580,6 +3607,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     kv_data_type,
                     head_dim_qk,
                     head_dim_vo,
+                    fixed_cta_tile_q,
                 )
             if backend == "cudnn":
                 raise NotImplementedError(
@@ -3624,6 +3652,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if backend == "fa2":
             args.append(fixed_split_size)
             args.append(disable_split_kv)
+            args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
             args.append(0)  # num_colocated_ctas
             args.append(
                 _resolve_uniform_q_len(
@@ -3677,6 +3706,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -3807,6 +3837,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        fixed_cta_tile_q : Optional[int]
+            Fixed query tile for the FA2 planner, overriding the batch-length heuristic and
+            ``uniform_q_len`` tile selection. Defaults to ``None`` (auto heuristic).
+            Supported tiles are ``16``, ``64``, and ``128`` for VO < 256; ``16`` and
+            ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
+            QK >= 512 with VO < 512 supports only ``16``.
+            Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
+            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` requires
+            SM80 or newer for head dims below 512. Planning rejects a tile whose Q
+            tile plus one K step already exceeds the GPU's shared memory; this is a
+            lower bound, so some large-head layouts (e.g. QK=576, VO=512, tile 32 on
+            99 KiB GPUs) still pass planning and fail at launch, as they do under
+            the automatic tile choice.
+            Under CUDA graphs, every plan of a wrapper must pass the same value.
+            For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
+            A query tail after a prefix (chunked prefill, a prefix-cache hit) keeps the
+            full request's output and LSE bits wherever its tile boundaries fall; this
+            holds for the default fp32 score accumulation, not
+            ``use_fp16_qk_reduction=True``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3819,6 +3868,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._requested_backend)
+        if self._batch_invariant is not None:
+            # The batch-invariant class plans its own query tiles.
+            self._batch_invariant.refuse(fixed_cta_tile_q=fixed_cta_tile_q)
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -3902,6 +3955,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # Reject incompatible graph replans before changing any accepted plan state.
         qo_indptr = qo_indptr.contiguous()
         qo_indptr_host = qo_indptr.to("cpu")
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(
+            fixed_cta_tile_q, head_dim_vo, head_dim_qk
+        )
+        _check_fixed_cta_tile_q_frozen(self, fixed_cta_tile_q)
         auto_backend = None
         if self._requested_backend == "auto":
             if use_token_head_sf:
@@ -3924,6 +3981,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     kv_data_type,
                     head_dim_qk,
                     head_dim_vo,
+                    fixed_cta_tile_q,
                 )
 
         # Reset the specialized kernel only after checking backend compatibility.
@@ -4063,6 +4121,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 and getattr(self, "_sinks", None) is None
                 and fixed_split_size == -1
                 and not disable_split_kv
+                and fixed_cta_tile_q == -1
                 and (
                     not self.is_cuda_graph_enabled
                     or self._qo_indptr_buf.dtype == torch.int32
@@ -4420,6 +4479,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     # _nvfp4_kv_requires_disabled_split_kv for details.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
                 forwarded_uniform_q_len = _resolve_uniform_q_len(
                     uniform_q_len,
@@ -4461,6 +4521,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         if packed_custom_mask is not None
                         else 0
                     ),
+                    fixed_cta_tile_q=fixed_cta_tile_q,
                 )
 
         self._causal = causal
@@ -4630,6 +4691,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._cudnn_plan = _CudnnPrefillPlan.prepare(
                         metadata, q_data_type, self.device, previous_cudnn_plan
                     )
+        self._planned_fixed_cta_tile_q = fixed_cta_tile_q
 
         if (
             self.is_cuda_graph_enabled
@@ -5973,6 +6035,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -6079,6 +6142,25 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        fixed_cta_tile_q : Optional[int]
+            Fixed query tile for the FA2 planner, overriding the batch-length heuristic and
+            ``uniform_q_len`` tile selection. Defaults to ``None`` (auto heuristic).
+            Supported tiles are ``16``, ``64``, and ``128`` for VO < 256; ``16`` and
+            ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
+            QK >= 512 with VO < 512 supports only ``16``.
+            Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
+            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` requires
+            SM80 or newer for head dims below 512. Planning rejects a tile whose Q
+            tile plus one K step already exceeds the GPU's shared memory; this is a
+            lower bound, so some large-head layouts (e.g. QK=576, VO=512, tile 32 on
+            99 KiB GPUs) still pass planning and fail at launch, as they do under
+            the automatic tile choice.
+            Under CUDA graphs, every plan of a wrapper must pass the same value.
+            For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
+            A query tail after a prefix (chunked prefill, a prefix-cache hit) keeps the
+            full request's output and LSE bits wherever its tile boundaries fall; this
+            holds for the default fp32 score accumulation, not
+            ``use_fp16_qk_reduction=True``.
         seq_lens: Optional[torch.Tensor]
             Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
             of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``kv_indptr``.
@@ -6152,6 +6234,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._requested_backend)
+        if self._batch_invariant is not None:
+            # The batch-invariant class plans its own query tiles.
+            self._batch_invariant.refuse(fixed_cta_tile_q=fixed_cta_tile_q)
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -6217,6 +6303,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(
+            fixed_cta_tile_q, head_dim_vo, head_dim_qk
+        )
+        _check_fixed_cta_tile_q_frozen(self, fixed_cta_tile_q)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if self._backend != "cute-dsl-rubin":
@@ -6713,8 +6803,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cached_module = self._jit_module
         else:
             # use_token_head_sf pins the backend to fa2 (validation block above), so
-            # skip auto-resolution/upgrades that would override it.
-            if self._requested_backend == "auto" and not use_token_head_sf:
+            # skip auto-resolution/upgrades that would override it. A fixed query
+            # tile is an FA2 planner option and pins FA2 the same way.
+            if self._requested_backend == "auto" and fixed_cta_tile_q != -1:
+                self._backend = "fa2"
+            elif self._requested_backend == "auto" and not use_token_head_sf:
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -7034,6 +7127,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     # _nvfp4_kv_requires_disabled_split_kv for details.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
+                args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
                 args.append(
                     _resolve_uniform_q_len(
@@ -7057,6 +7151,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._planned_fixed_cta_tile_q = fixed_cta_tile_q
 
     begin_forward = plan
 

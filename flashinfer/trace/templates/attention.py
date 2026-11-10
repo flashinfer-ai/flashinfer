@@ -348,6 +348,11 @@ gqa_paged_decode_plan_trace = _BatchDecodePlanTraceTemplate(
         "non_blocking": Scalar("bool", optional=True),
         "fixed_split_size": Scalar("int32", optional=True),
         "disable_split_kv": Scalar("bool", optional=True),
+        "fixed_cta_tile_q": Scalar(
+            "int32",
+            optional=True,
+            description="Fixed FA2 query tile; None lets the planner choose.",
+        ),
         "seq_lens": Tensor(["batch_size"], dtype="int32", optional=True),
         "block_tables": Tensor(
             ["batch_size", "max_num_blocks_per_seq"],

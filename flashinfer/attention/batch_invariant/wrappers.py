@@ -124,6 +124,7 @@ class BatchInvariantAttention:
         "o_indptr": "the offsets of qo_indptr for the output",
         "rope_scale": "no fused RoPE (apply RoPE to q / k beforehand)",
         "rope_theta": "no fused RoPE (apply RoPE to q / k beforehand)",
+        "fixed_cta_tile_q": "the class's own query tiles (already batch-invariant)",
         "positional_arguments": "keyword arguments after the KV cache",
     }
 
