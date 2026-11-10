@@ -65,6 +65,17 @@ from .mxfp4_tuner import (
     require_hopper_mxfp4_fused_tuning_device,
     validate_hopper_mxfp4_tactic,
 )
+from .int4_weights import Int4WeightPack, preprocess_int4_mega_weights
+from .hopper_int4 import (
+    MegaMoEHopperInt4Config,
+    MegaMoEHopperInt4Frontend,
+    MegaMoEHopperInt4Inputs,
+    MegaMoEHopperInt4SymmBuffer,
+    TransformedInt4Weights,
+    get_symm_buffer_for_hopper_int4_mega_moe,
+    hopper_int4_mega_moe,
+    hopper_int4_mega_launch_thunk,
+)
 from .hopper_fp8 import (
     MegaMoEHopperFp8Config,
     MegaMoEHopperFp8Frontend,
@@ -131,6 +142,16 @@ from .hopper_nvfp4 import (
 )
 
 __all__ = [
+    "Int4WeightPack",
+    "preprocess_int4_mega_weights",
+    "MegaMoEHopperInt4Config",
+    "MegaMoEHopperInt4Frontend",
+    "MegaMoEHopperInt4Inputs",
+    "MegaMoEHopperInt4SymmBuffer",
+    "TransformedInt4Weights",
+    "get_symm_buffer_for_hopper_int4_mega_moe",
+    "hopper_int4_mega_moe",
+    "hopper_int4_mega_launch_thunk",
     "MegaMoEHopperNvfp4Config",
     "MegaMoEHopperNvfp4Frontend",
     "MegaMoEHopperNvfp4Inputs",
