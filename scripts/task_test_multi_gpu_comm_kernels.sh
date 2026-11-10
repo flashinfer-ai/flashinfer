@@ -95,17 +95,34 @@ main() {
             local -a TEST_STATUS_PYTEST_COMMAND
             test_status_pytest_command "${receipt}" torchrun
             rm -f "$junit_file"
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
             if ${TORCHRUN_PREFIX} "${TEST_STATUS_PYTEST_COMMAND[@]}" "${test_file}" -v --junitxml="${junit_file}"; then
-                echo "PASSED: $test_file"
+                if [ -f "$junit_file" ]; then
+                    echo "PASSED: $test_file"
+                    PASSED_TESTS=$((PASSED_TESTS + 1))
+                else
+                    echo "NO RESULT: $test_file (missing JUnit XML: $junit_file)"
+                    record_no_result_test "$test_file"
+                fi
             else
                 pytest_status=$?
-                echo "FAILED: $test_file"
-                EXIT_CODE=1
+                if [ -f "$junit_file" ]; then
+                    echo "FAILED: $test_file"
+                    record_failed_test "$test_file"
+                else
+                    echo "NO RESULT: $test_file (missing JUnit XML: $junit_file)"
+                    record_no_result_test "$test_file"
+                fi
             fi
             test_status_finish "${receipt}" "${pytest_status}"
         fi
         echo ""
     done
+
+    # Counters are cumulative across all groups, so this is the overall summary.
+    if [ "$DRY_RUN" != "true" ] && [ -n "$TORCHRUN_TEST_FILES" ]; then
+        print_execution_summary
+    fi
 
     test_status_complete "$EXIT_CODE"
     exit "$EXIT_CODE"

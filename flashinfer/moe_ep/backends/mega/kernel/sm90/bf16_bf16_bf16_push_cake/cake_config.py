@@ -140,10 +140,21 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     compressed copies of the expert weights (WCX) through the swap-AB variant
     of the FC2 early-start pair: fewer weight bytes per round, same products in
     the same order, same bits.  It applies only in rounds that run the early
-    start of the decode window (``fc2_early_max_tokens`` > 0; otherwise off).  The compressed copies are kept
-    next to the bf16 weights (dual format): each MoE layer's expert memory on
-    a rank grows by about 0.77 x its bf16 expert bytes (Gaussian weights; the
-    exact figure depends on the weights' exponent spread).  A layer whose
+    start of the decode window (``fc2_early_max_tokens`` > 0; otherwise off).
+    With WCX on, larger rounds of three measured shapes also read the copies
+    through the swap-AB early-start pair (the shape's window ``(lo, hi]`` of
+    local tokens in the runner's ``WCX_WINDOWS``, keyed by hidden size,
+    intermediate size, total experts, top_k and EP size): hidden 7168,
+    intermediate 2048, 256 experts, top-k 8 at EP 2 from 129 to 1024 tokens;
+    hidden 7168, intermediate 3072, 384 experts, top-k 6 at EP 8 from 129 to 512
+    tokens; hidden 4096, intermediate 2048, 256 experts, top-k 6 at EP 8 from 129
+    to 512 tokens.  Other shapes and rounds keep the bf16 path.  The compressed
+    copies are kept next to the bf16 weights (dual format): each MoE layer's
+    expert memory on a rank grows by about 0.77 x its bf16 expert bytes
+    (Gaussian weights; the exact figure depends on the weights' exponent
+    spread).  The copies are encoded only when WCX resolves on (with
+    ``fc2_early_max_tokens`` = 0, or a geometry without the early-start pair,
+    nothing is encoded).  A layer whose
     weights need more than 188 escape slots in a stage, or whose geometry has
     no WCX unit (``hidden_size % 512 != 0`` or ``intermediate_size % 256 != 0``),
     keeps the bf16 pair (warned once).  Pre-transformed weights

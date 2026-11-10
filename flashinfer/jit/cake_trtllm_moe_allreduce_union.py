@@ -255,6 +255,9 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
         "ws2_bf16_lat_late_b5", 5, 175, False
     ),
     ("sm_103a", 2, "bfloat16", False, "lat_t1"): Route("ws2_bf16_lat_t1", 2, 71, False),
+    ("sm_103a", 2, "bfloat16", False, "lat_t1f"): Route(
+        "ws2_bf16_lat_t1f", 2, 71, False
+    ),
     ("sm_103a", 2, "bfloat16", False, "wide_mlp"): Route(
         "ws2_bf16_wide_mlp", 4, None, False
     ),
@@ -422,7 +425,8 @@ _SPECIALIZATION_RULES: dict[
         (1536, 2048, "two_shot_b5"),
     ),
     ("sm_103a", 2, "bfloat16", False, 8): (
-        (1, 32, "lat_t1"),
+        (1, 1, "lat_t1f"),
+        (2, 32, "lat_t1"),
         (192, 384, "lat_late_b5"),
     ),
     ("sm_103a", 2, "bfloat16", False, 16): ((96, 192, "lat_b4"),),

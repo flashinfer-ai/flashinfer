@@ -58,8 +58,11 @@ P, and accumulates O^T on `kind::f8f6f4`. Requests with more rows (H96 / H128,
 MTP with q_len x H > 48) run the two-CTA wide schedule (`main_wide`, a cluster
 of two CTAs with `cta_group::2` MMAs): 128 rows per cluster, both CTAs' tokens
 in every QK (the query as a TMEM A operand), the V conversion shared by the
-pair under a uniform 2^-3 scale shift restored in the output normalisation, and
-an M128 N256 PV. The host plan (route, row tile, split count, grids, reducer)
+pair under a per-token scale shift by 2^-k (k in 0..3, the smallest that keeps
+the token's largest V value in the E4M3 range), compensated by 2^(k-3) in P
+after the row sums with the remaining 2^-3 restored in the output
+normalisation, and an M128 N256 PV. The host plan (route, row tile, split
+count, grids, reducer)
 depends only on the batch
 shape, the longest KV and the device's SM count; a split-KV merge kernel runs
 behind the attention kernel (programmatic dependent launch) when the plan has
@@ -96,6 +99,5 @@ cake_mla_nvfp4_paged_decode(
 ```
 
 The generated sources under `csrc/cake_mla_nvfp4_paged_decode/` and the
-registry in `cake_jit.py` are written by the Cake generated-program export
-(`exports/mla_nvfp4_paged_decode/` in the Cake repository); regenerate them,
-do not edit them by hand. Tests: `tests/experimental/test_cake_mla_nvfp4_paged_decode.py`.
+registry in `cake_jit.py` are written by the Cake exporter; regenerate them
+rather than editing them by hand. Tests: `tests/experimental/test_cake_mla_nvfp4_paged_decode.py`.

@@ -47,13 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_WARP_TAB_OFF 0
-#define SMEM_WARP_TAB_STAGE_BYTES 1024
-#define SMEM_WARP_TAB_STRIDE 1024
-#define SMEM_TOTAL 1024
-#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -81,7 +74,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_a3d565f005b1a0bc2642(__nv_bfloat16* __restri
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* warp_tab = reinterpret_cast<float*>(smem_raw + 0);
     const int warp_tab_addr = smem + 0;
 
@@ -177,7 +170,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_a3d565f005b1a0bc2642(__nv_bfloat16* __restri
             long long dst = push_gen_elems * (long long)gb + push_cta + rank64 * 4096;
             int idx8[8];
             {
-                const int4* _ivptr_1 = reinterpret_cast<const int4*>(idx + (tok * 8) + 0);
+                const int4* _ivptr_1 = reinterpret_cast<const int4*>(idx + tok * 8 + 0);
                 int4 _ivld_1;
                 _ivld_1 = *_ivptr_1;
                 idx8[0 + 0] = _ivld_1.x;
@@ -227,80 +220,80 @@ kernel_cake_tp_moe_finalize_rmsnorm_a3d565f005b1a0bc2642(__nv_bfloat16* __restri
             packets[29] = 0;
             packets[30] = 0;
             packets[31] = 0;
-            int ridx0 = idx8[0];
-            if (ridx0 >= 0 && ridx0 < rows) {
+            int ridx_0 = idx8[0];
+            if (ridx_0 >= 0 && ridx_0 < rows) {
                 {
-                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx0 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_3 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_0 * (long long)row_stride + col64) + 0);
                     packets[0 + 0] = _uv4_3.x;
                     packets[0 + 1] = _uv4_3.y;
                     packets[0 + 2] = _uv4_3.z;
                     packets[0 + 3] = _uv4_3.w;
                 }
             }
-            int ridx1_0 = idx8[1];
-            if (ridx1_0 >= 0 && ridx1_0 < rows) {
+            int ridx_1 = idx8[1];
+            if (ridx_1 >= 0 && ridx_1 < rows) {
                 {
-                    uint4 _uv4_4 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_0 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_4 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_1 * (long long)row_stride + col64) + 0);
                     packets[4 + 0] = _uv4_4.x;
                     packets[4 + 1] = _uv4_4.y;
                     packets[4 + 2] = _uv4_4.z;
                     packets[4 + 3] = _uv4_4.w;
                 }
             }
-            int ridx1_1 = idx8[2];
-            if (ridx1_1 >= 0 && ridx1_1 < rows) {
+            int ridx_2 = idx8[2];
+            if (ridx_2 >= 0 && ridx_2 < rows) {
                 {
-                    uint4 _uv4_5 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_1 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_5 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_2 * (long long)row_stride + col64) + 0);
                     packets[8 + 0] = _uv4_5.x;
                     packets[8 + 1] = _uv4_5.y;
                     packets[8 + 2] = _uv4_5.z;
                     packets[8 + 3] = _uv4_5.w;
                 }
             }
-            int ridx1_2 = idx8[3];
-            if (ridx1_2 >= 0 && ridx1_2 < rows) {
+            int ridx_3 = idx8[3];
+            if (ridx_3 >= 0 && ridx_3 < rows) {
                 {
-                    uint4 _uv4_6 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_2 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_6 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_3 * (long long)row_stride + col64) + 0);
                     packets[12 + 0] = _uv4_6.x;
                     packets[12 + 1] = _uv4_6.y;
                     packets[12 + 2] = _uv4_6.z;
                     packets[12 + 3] = _uv4_6.w;
                 }
             }
-            int ridx1_3 = idx8[4];
-            if (ridx1_3 >= 0 && ridx1_3 < rows) {
+            int ridx_4 = idx8[4];
+            if (ridx_4 >= 0 && ridx_4 < rows) {
                 {
-                    uint4 _uv4_7 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_3 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_7 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_4 * (long long)row_stride + col64) + 0);
                     packets[16 + 0] = _uv4_7.x;
                     packets[16 + 1] = _uv4_7.y;
                     packets[16 + 2] = _uv4_7.z;
                     packets[16 + 3] = _uv4_7.w;
                 }
             }
-            int ridx1_4 = idx8[5];
-            if (ridx1_4 >= 0 && ridx1_4 < rows) {
+            int ridx_5 = idx8[5];
+            if (ridx_5 >= 0 && ridx_5 < rows) {
                 {
-                    uint4 _uv4_8 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_4 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_8 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_5 * (long long)row_stride + col64) + 0);
                     packets[20 + 0] = _uv4_8.x;
                     packets[20 + 1] = _uv4_8.y;
                     packets[20 + 2] = _uv4_8.z;
                     packets[20 + 3] = _uv4_8.w;
                 }
             }
-            int ridx1_5 = idx8[6];
-            if (ridx1_5 >= 0 && ridx1_5 < rows) {
+            int ridx_6 = idx8[6];
+            if (ridx_6 >= 0 && ridx_6 < rows) {
                 {
-                    uint4 _uv4_9 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_5 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_9 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_6 * (long long)row_stride + col64) + 0);
                     packets[24 + 0] = _uv4_9.x;
                     packets[24 + 1] = _uv4_9.y;
                     packets[24 + 2] = _uv4_9.z;
                     packets[24 + 3] = _uv4_9.w;
                 }
             }
-            int ridx1_6 = idx8[7];
-            if (ridx1_6 >= 0 && ridx1_6 < rows) {
+            int ridx_7 = idx8[7];
+            if (ridx_7 >= 0 && ridx_7 < rows) {
                 {
-                    uint4 _uv4_10 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1_6 * (long long)row_stride + col64) + 0);
+                    uint4 _uv4_10 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_7 * (long long)row_stride + col64) + 0);
                     packets[28 + 0] = _uv4_10.x;
                     packets[28 + 1] = _uv4_10.y;
                     packets[28 + 2] = _uv4_10.z;
@@ -631,7 +624,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_a3d565f005b1a0bc2642(__nv_bfloat16* __restri
             if (weights_fp32 != 0) {
                 float _vec_load_1[4];
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(expert_weights + (tok_r * 8)) + 0);
+                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(expert_weights + tok_r * 8) + 0);
                     _vec_load_1[0 + 0] = _v4.x;
                     _vec_load_1[0 + 1] = _v4.y;
                     _vec_load_1[0 + 2] = _v4.z;
@@ -656,7 +649,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_a3d565f005b1a0bc2642(__nv_bfloat16* __restri
             } else {
                 unsigned int _vec_load_3[4];
                 {
-                    uint4 _uv4_21 = *reinterpret_cast<const uint4*>(expert_weights + (tok_r * 4) + 0);
+                    uint4 _uv4_21 = *reinterpret_cast<const uint4*>(expert_weights + tok_r * 4 + 0);
                     _vec_load_3[0 + 0] = _uv4_21.x;
                     _vec_load_3[0 + 1] = _uv4_21.y;
                     _vec_load_3[0 + 2] = _uv4_21.z;

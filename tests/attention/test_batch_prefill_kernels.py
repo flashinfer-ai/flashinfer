@@ -19,13 +19,19 @@ import math
 import numpy
 import pytest
 import torch
-from tests.test_helpers.jit_utils import gen_prefill_attention_modules
-from tests.test_helpers.paged_kv import make_padded_paged_kv_view
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.jit.test_helpers.jit_utils import gen_prefill_attention_modules
+from tests.attention.test_helpers.paged_kv import make_padded_paged_kv_view
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 import flashinfer
-from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
-from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.attention.test_helpers.test_helpers import (
+    assert_close_chunked,
+    ref_single_prefill,
+)
+from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 

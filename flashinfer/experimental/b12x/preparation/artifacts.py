@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+
+import _flashinfer_filelock as filelock
 
 from b12x._lib.cache_integrity import _fsync_directory, _mkdir_durable, valid_object
 
@@ -47,7 +48,7 @@ class CuTeArtifactCache:
             return False
         with self.path(key, ".lock").open("a") as lock:
             try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                filelock.lock(lock.fileno(), blocking=False)
             except BlockingIOError:
                 return self.has(key)
             try:
@@ -60,4 +61,4 @@ class CuTeArtifactCache:
                 _fsync_directory(self.path(key, ".o").parent)
                 return True
             finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                filelock.unlock(lock.fileno())

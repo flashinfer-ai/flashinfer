@@ -19,7 +19,7 @@ Expert-Parallel MoE with two execution modes:
 | **Split** | dispatch → inner kernel → combine | Pluggable comm + compute; NVLink one-/two-sided, NCCL-EP, NIXL-EP |
 | **Mega** | fused comm + MoE kernel | Single symmetric-memory kernel; no separate Fleet/Handle |
 
-Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer` or `MoEEpMegaLayer`.
+Entry point: `MoEEpLayer(bootstrap, fleet_params, weights, fleet_knobs=(), backend=...)` → `MoEEpSplitLayer`, `MoEEpMegaLayer`, or `MoEEpAutoLayer`.
 
 ## Available backends
 
@@ -98,7 +98,7 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
-| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); a Lamport transport for small steps (SM100 / SM103, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_lamport.cuh`); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); a Lamport transport for small steps (SM100 / SM103 / SM107, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_lamport.cuh`); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
 | `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | One-sided put/get like `nvlink_one_sided`, running generated Cake kernels (`cake/kernels.py`, `csrc/cake_moe_alltoall*`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`nvlink_two_sided/kernels.py`, `csrc/nvlink_two_sided_*`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
@@ -301,6 +301,8 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `MoEEpMegaWorkspace` | Public, layer-bound capacity-profile handle returned by `MoEEpMegaLayer.create_workspace()`; do not construct directly |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
+| `AutoConfig` | Explicit Mega/split candidates, with an optional candidate index to force one |
+| `MoEEpAutoWorkspace` | A prepared input profile, selected complete EP plan, and storage retained for its captures |
 | `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
 
 **Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune Fleet transports. The Fleet (or `MoEEpCommunication`) is lazy-created on first `forward()`; Fleet transports get a new Handle per forward. CUDA-graph capture goes through `create_graph_state()` for both kinds of comm backend; a `MoEEpCommunication` is already long-lived, so its graph state only pins the bound buffers, and `create_graph_state()` rejects backends with `supports_cuda_graph=False`. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms (`MoEEpSplitLayer.STAGES`: quantize, dispatch, compute, combine) in `last_timings_ms`; `stage_hook` brackets the same stages without synchronizing, for timing under CUDA graph capture.
@@ -312,6 +314,95 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 
 BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoEConfig.quant` weight/activation `QuantFormat` pair); quantized activations are prepared in the bridge, and W4A8 optionally packs its MXFP8 payload before dispatch (see **Available backends**).
 
+### Complete EP selection
+
+`AutoConfig` compares explicitly configured Mega and split candidates during an
+`autotune_v2()` warmup. Candidates must implement the same quantization,
+activation and expert geometry, using canonical BF16 weights and contiguous
+BF16 inputs with finalized BF16 output. Routing tensors are contiguous, with
+int32/int64 expert IDs and float32 weights. FC1 rows use the unified MoE API's
+`[up, gate]` order.
+Routing-weight placement, the NVFP4 activation recipe and the combine format
+must also agree. In particular, mixing a split candidate with Rubin Mega
+requires `apply_routing_weights_before_fc2=False` and `combine_dtype="bf16"`.
+Candidate preparation converts native weight layouts before tuning. Mega
+candidates currently use the Rubin block-scaled
+adapters. Split candidates use `FusedMoeKernelConfig` and its existing prepared
+weight views. The layer prepares and retains each candidate's weights once;
+workspaces share those views. Each split configuration pins its communication
+backend, including its default; the selector does not enumerate other transports.
+Raw allocator callbacks and CUDA stream handles carry process-local addresses
+and are not supported in automatic-selection cache contracts. The built-in
+`FleetAlgoKnobAllocator(torch_caching=True)` remains serializable.
+
+```python
+from flashinfer import autotune_v2
+from flashinfer.moe_ep import AutoConfig, MegaConfig, MoEEpLayer, SplitConfig
+
+layer = MoEEpLayer(
+    bootstrap, fleet_params, weights,
+    backend=AutoConfig(candidates=(
+        MegaConfig(megakernel=mega_config),
+        SplitConfig(comm=comm_config, kernel=split_kernel_config),
+    )),
+)
+with autotune_v2():
+    workspace = layer.create_workspace(tensors)
+    layer.warmup(tensors, workspace=workspace)
+output = layer.forward(tensors, workspace=workspace)
+selected = layer.get_selected_plan(workspace=workspace)
+```
+
+Set Rubin's `knobs="auto"` and `kernel_variant="auto"` to search its eligible
+variants and knobs. Explicit Mega variants or knob dictionaries retain their
+meaning. For each split configuration, the selector enumerates eligible
+compute backends and tactics without using MoELayer's compute-only winner.
+Every tactic is measured through input preparation, dispatch, compute, combine
+and output handling. The best backend/tactic competes with the Mega winner over
+that same boundary. Compilation, weight transformation and workspace allocation
+happen before measurement. All EP ranks use the median of the per-iteration
+maximum rank latency.
+
+The managed v2 store holds split backend winners and the overall plan in
+separate namespaces. Rubin keeps its existing variant and knob records. Outer
+records match the configured candidates, capacity, rank-local input shapes,
+numerical settings, environment and measurement policy. A replay context loads
+one complete plan without measuring; a miss prepares the first eligible
+candidate's fallback and leaves tuning pending. `candidate=i` in `AutoConfig`
+forces that candidate while allowing its inner tuning. `get_selected_plan()`
+returns its index and either a Mega variant/knob dictionary or a split backend
+position and tactic. The backend position indexes the configured `BackendOptions`.
+
+Prepare workspaces collectively with an agreed `runtime_max_tokens_per_rank`,
+or omit it to use the workspace capacity as the row bound. Live row counts may
+vary independently on each rank within that bound. NCCL-EP and NIXL-EP use
+fixed-row handles, so partial batches stage into bound-sized buffers with
+masked routing tails. A full-bound batch executes directly; NVLink one-sided
+keeps its variable-row path. Dtypes, strides, top-k, output layout and the
+runtime hint stay fixed. Prepare another workspace collectively to change them.
+
+Eager calls may use new input buffers with the same layout. Ordinary serving
+reuses the prepared plan without selector collectives; changed routing values
+do not trigger selection. An enabled tuning context selects for the actual
+rank-local live row counts, which remain distinct in the tuning cache even
+when workloads share a workspace bound. Warm up that workload before capture.
+The workspace owns the returned output and may overwrite it on its next call; pass
+`MoEEpTensors.output` to supply an output buffer. Output must not alias an input.
+Prepared fixed-row transports keep their eager stream binding; run eager
+forwards on the stream used to prepare the plan. Capture uses its capture stream.
+
+Prepared Mega plans own their symmetric scratch instead of using the process
+workspace pool. Scratch usage grows with the number of live layer/profile
+workspaces; transformed weights are shared. Independent storage prevents plans
+and older graph captures from overwriting one another.
+
+Warm up each profile before capture. Selection cannot run inside capture. Later
+warmup can replace a selected plan using fresh execution storage while retaining
+storage used by older graphs. Transformed weights remain shared. Retire all
+graphs using a handle before calling its collective `destroy()`. Separate handles
+let the engine release old profiles independently; layer destruction releases
+all remaining handles.
+
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
 After an automatic warmup, `layer.get_tuned_knobs()` returns a copy of the
@@ -319,6 +410,62 @@ selected knob dictionary. Pass it as `knobs` when constructing a fixed layer
 with the same kernel configuration and capacity. The getter performs no tuning
 or file access and raises before a successful automatic search or after layer
 destruction. `warmup()` continues to return `None`.
+
+On Rubin, `kernel_variant="auto"` together with `knobs="auto"` selects between
+inference and GenPhase. An enabled `autotune_v2()` warmup selects each variant's
+knobs, then compares the winners. Candidate measurements
+include input staging, compute and output handling at both levels.
+The same numerical settings apply to both variants;
+GenPhase is excluded when its capacity or combine requirements are not met.
+Explicit inference or GenPhase with `knobs="auto"` uses the same complete-forward
+boundary, restricted to that variant. The Rubin offline CLI also measures staging,
+compute and writing an owned output, matching the default layer forward with
+BF16 inputs. Pass `--kernel-variant auto` to search both eligible variants and
+save their winners and the overall selection; explicit variants restrict the
+search. Offline searches bypass cached winners and do not install the result.
+Output copies are measured when the selected path requires them. Input generation, weight preparation, compilation and correctness
+checks are outside measurement. Match the deployment's input and output layouts
+when reusing automatic results; kernel-only records do not satisfy this objective.
+
+Each variant's winning knobs are stored in its fixed-variant managed-cache
+records and the MegaMoE compatibility file when persistence is enabled. The
+overall selection has a separate managed entry containing the variant and knobs,
+matched to the workspace capacity, per-rank live-token counts, eligible variants
+and execution contract. Enabled tuning reuses fixed-variant records only when
+their capacity and EP-wide live-token count match the requested workload;
+otherwise it searches that variant's knob grid. Replay retains token-bucket and
+capacity fallbacks for fixed variants. On an overall miss, cached winners are
+checked and timed before comparing variants; a rejected cached choice triggers
+a fresh search within that variant. Reused records retain their search score.
+Overall selections from the previous fallback-only search are invalidated.
+An explicit fresh search bypasses both levels. Skipping fixed-variant tuning
+compares heuristic knobs
+without publishing fixed-variant managed records. A variant-selection replay
+miss uses the inference heuristic and leaves selection pending. Low-level tuning
+of already-staged workspaces remains available for kernel measurements.
+
+Use `layer.get_tuned_config()` to reconstruct a fixed layer after variant
+selection. It returns the concrete kernel config with the selected variant and
+knobs. The knobs-only getter retains its meaning; those knobs alone do not
+identify the variant. Weight preprocessing is shared between Rubin variants.
+Automatic workspace handles own separate selection state. Later selection can
+replace a captured default workspace while its old storage remains available to
+existing graphs; captured explicit handles require a new handle.
+
+Rubin automatic workspaces reuse their agreed configuration during ordinary
+eager execution, without selection collectives or cache lookups on each forward.
+Calling the layer inside an explicit tuning or replay context performs collective
+checks; the first bare forward afterward reconciles the ambient cache and controls.
+Unrelated contexts, including tuning on another thread, do not invalidate a
+prepared workspace. Use `cache_scope="context"` for rank-local cache contexts.
+Process-wide store changes and `autotune_v2_reload()` must be coordinated across
+EP ranks before serving resumes. When changing the attached store, call the layer
+in a replay or tuning context on every rank, including ranks already using that
+store. After a coordinated reload, the next eager forward reconciles the reloaded
+records. A rank-local `AutoTuner.clear_cache()` alone does not change a
+prepared workspace during bare serving; call the layer in a replay or tuning
+context on every rank to adopt the change. CUDA graph replay keeps its captured
+configuration and storage.
 
 For serving several token capacities with one layer and one transformed weight
 set, allocate explicit profiles before capture:

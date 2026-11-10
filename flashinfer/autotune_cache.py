@@ -572,6 +572,9 @@ def _resolve_managed_store(
                     f"env {tuner._managed_cache.env_hash})."
                 )
             tuner._managed_cache = store
+            from .autotuner.protocol import _advance_execution_generation
+
+            _advance_execution_generation()
             # Deliberately NOT clearing _managed_decoded: it is keyed by
             # (root, env_hash, file_key), so entries decoded under other
             # identities coexist safely and are never served cross-identity.
@@ -660,6 +663,7 @@ def autotune_v2_reload() -> None:
     when next selected. Reload inside a context scope raises ``RuntimeError``.
     """
     from .autotuner import AutoTuner
+    from .autotuner.protocol import _advance_execution_generation
 
     tuner = AutoTuner.get()
     if tuner._v2_local.active and tuner._v2_local.cache_scope == "context":
@@ -672,6 +676,7 @@ def autotune_v2_reload() -> None:
         tuner._protocol_record_partitions.clear()
         tuner._protocol_cache_generation += 1
         tuner._profiling_cache_policies.clear()
+        tuner._profiling_cache_selections.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
         # attach instead of silently degrading to lazy per-key disk reads.
@@ -686,6 +691,7 @@ def autotune_v2_reload() -> None:
             # store's final published state is wanted -- serving afterwards
             # is warm from memory rather than paying a disk read per key.
             _hydrate_from_store(tuner, store)
+        _advance_execution_generation()
     logger.info(
         "[Autotuner]: autotune_v2_reload(): in-memory winners dropped; "
         "lookups now serve the managed store's current state."

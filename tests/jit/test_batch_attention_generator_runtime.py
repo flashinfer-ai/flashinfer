@@ -10,7 +10,7 @@ from flashinfer.jit.attention.modules import (
     gen_customize_batch_attention_module,
 )
 from flashinfer.utils import MaskMode, TensorLayout, get_compute_capability
-from tests.test_helpers.paged_kv import make_paged_kv_cache_pair
+from tests.attention.test_helpers.paged_kv import make_paged_kv_cache_pair
 
 
 _VARIANT_DECL = """
