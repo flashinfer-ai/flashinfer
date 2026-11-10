@@ -585,12 +585,13 @@ def test_get_available_jit_cache_provider_tags_nightly_and_uv_target(monkeypatch
 
     monkeypatch.setattr(flashinfer_main.subprocess, "run", mock_run)
 
-    flashinfer_main._get_available_jit_cache_provider_tags(
+    tags = flashinfer_main._get_available_jit_cache_provider_tags(
         "flashinfer-jit-cache==0.4.1+cu134",
         "0.4.1+cu134",
         "https://example.invalid/nightly/cu134",
         nightly=True,
     )
+    assert tags == ("sm107f", "sm80")
     cmd = recorded["cmd"]
     assert cmd[:5] == ["/usr/bin/uv", "pip", "install", "--python", sys.executable]
     assert "--target" in cmd
