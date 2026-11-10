@@ -123,7 +123,9 @@ def chain_nodes(chain: Union[str, "GroupedChain"]) -> int:
         t = M.act_elem(alg, alg.leaf("x", 0), chain.act, chain.out_fmt, chain.params)
     else:
         return 1
-    return term.sexpr(t).count("(")
+    return term.size(
+        t
+    )  # the DAG's nodes: a shared sub-term is work once, however often the printed term repeats it
 
 
 def expected_token_tiles(rows: float, tile: int) -> float:
