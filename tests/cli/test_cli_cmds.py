@@ -1141,6 +1141,57 @@ def test_download_kernels_cmd_attempts_jit_cache_after_cubin_failure(monkeypatch
     assert recorded[1][0][-1] == "flashinfer-jit-cache==0.4.1+cu129"
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_download_kernels_cmds_as_invoked_by_vllm(monkeypatch, dry_run):
+    """Keep the commands vLLM's ``vllm download-kernels`` wrapper runs working.
+
+    vLLM (vllm/entrypoints/cli/download_kernels.py) runs ``python -m flashinfer
+    download-kernels`` when PyTorch's CUDA is 12.9 or newer and
+    ``install-cubin-wheel`` otherwise, appending only ``--dry-run``. Both must
+    keep working with no other flags and with the CUDA version detected from
+    PyTorch.
+    """
+    import flashinfer.__main__ as flashinfer_main
+
+    recorded = []
+
+    def mock_run(cmd, check=False):
+        recorded.append(cmd)
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "13.0")
+    dry_run_args = ["--dry-run"] if dry_run else []
+
+    out = _test_cmd_helper(["download-kernels", *dry_run_args])
+    _assert_output_contains_all(
+        out,
+        "flashinfer-cubin==0.4.1",
+        "Install mode: all",
+        "https://flashinfer.ai/whl/cu130",
+        "flashinfer-jit-cache==0.4.1+cu130",
+    )
+
+    out = _test_cmd_helper(["install-cubin-wheel", *dry_run_args])
+    _assert_output_contains_all(out, "flashinfer-cubin==0.4.1")
+
+    if dry_run:
+        assert recorded == []
+    else:
+        assert [cmd[-1] for cmd in recorded] == [
+            "flashinfer-cubin==0.4.1",
+            "flashinfer-jit-cache==0.4.1+cu130",
+            "flashinfer-cubin==0.4.1",
+        ]
+        # mode "all" lets pip resolve every provider from the shim.
+        assert "--no-deps" not in recorded[1]
+
+
 def test_download_kernels_cmd_with_stale_kernel_wheels_real(tmp_path):
     """Kernel wheels left behind by an upgrade must not block their replacement.
 
