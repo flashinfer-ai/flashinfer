@@ -860,7 +860,9 @@ def test_launch_tile_bound_dominates_the_scheduler_total():
             vectors[1] = [Tk // E + (1 if i < Tk % E else 0) for i in range(E)]
         for _ in range(6):
             cuts = sorted(rng.randrange(Tk + 1) for _ in range(E - 1))
-            vectors.append([b - a for a, b in zip([0] + cuts, cuts + [Tk], strict=True)])
+            vectors.append(
+                [b - a for a, b in zip([0] + cuts, cuts + [Tk], strict=True)]
+            )
         for cfg in records:
             if cfg.swap_ab:
                 cluster_rows, tn, cn = cfg.tile_n, cfg.mma_tiler_mn[0], 1
@@ -1914,10 +1916,16 @@ def test_swapped_records_equal_the_grouped_records():
 
 @needs_device
 def test_gather_form_of_the_op_equals_the_materialised_path():
-    """The op with a swapped GEMM1 gathers the tokens' rows itself (the default for a swapped record: no gather launch, no
-    permuted tensor) and gives the bits of the materialised path on the same records and of the dense records, at decode
-    grid shapes with empty experts and one-token experts; ``gather=True`` on a dense record raises."""
-    from flashinfer.fused_moe.batch_invariant.api import MoEWeights, fused_moe, route
+    """The op with a swapped GEMM1 gathers the tokens' rows itself (the default for a swapped record with a narrow token
+    tile: no gather launch, no permuted tensor) and gives the bits of the materialised path on the same records and of the
+    dense records, at decode grid shapes with empty experts and one-token experts; ``gather=True`` on a dense record
+    raises."""
+    from flashinfer.fused_moe.batch_invariant.api import (
+        GATHER_TOKEN_TILE_MAX,
+        MoEWeights,
+        fused_moe,
+        route,
+    )
     from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
     from flashinfer.gemm.batch_invariant.generator import Knobs
 
@@ -1951,7 +1959,10 @@ def test_gather_form_of_the_op_equals_the_materialised_path():
                     return_intermediates=True,
                     gather=gather,
                 )
-                assert (im["x_perm"] is None) == (gather is not False), (
+                gathered = gather is True or (
+                    gather is None and sw.tile_n <= GATHER_TOKEN_TILE_MAX
+                )
+                assert (im["x_perm"] is None) == gathered, (
                     T,
                     sw.describe(),
                     gather,
