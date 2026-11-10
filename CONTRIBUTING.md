@@ -131,7 +131,8 @@ FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVID
 Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardware on AWS self-hosted runners.
 
 Every public CI run that runs tests, targeted or full, also runs all of `tests/cpu` in a "CPU Unittest" lane on a
-CPU runner, whatever paths you named. Tests under `tests/cpu` must therefore run without a GPU. Two runs leave it out:
+CPU runner, whatever paths you named; the GPU lanes never run it. Tests under `tests/cpu` must therefore run without a GPU.
+Two runs leave it out:
 a PR that changes only docs or other skipped paths runs no tests at all, and a manual `workflow_dispatch` with
 `skip_gpu` drops every unit-test lane, this one included.
 

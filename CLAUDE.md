@@ -490,7 +490,8 @@ results only post advice. `run all` starts the expensive **full** suite, appropr
 for a cross-cutting change or final pre-merge check. The PR template has a checkbox
 to declare and justify that full-suite request. Every public run that runs tests,
 whatever its targets, also runs all of `tests/cpu` in the "CPU Unittest" lane on a CPU
-runner (no GPU), so tests under `tests/cpu` must not need one. Docs-only PRs run no
+runner (no GPU), and the GPU lanes never run it, so tests under `tests/cpu` must not
+need one. Docs-only PRs run no
 tests, and a `workflow_dispatch` with `skip_gpu` drops this lane too.
 
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**

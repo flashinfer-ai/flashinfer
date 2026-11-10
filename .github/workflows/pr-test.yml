@@ -280,7 +280,7 @@ jobs:
           # A10G is intersected per shard: each shard whose files overlap the request
           # runs as its own job, so a targeted run keeps the bare run's balancing and
           # -k splits, and shards left with nothing are not scheduled.
-          A10G_SCOPES=(); T4_SCOPE=""
+          A10G_SCOPES=(); T4_SCOPE=""; H100_SCOPE=""
           if [ "$SKIP_GPU" != "true" ] && [ -n "${REQUESTED_TEST_PATH}" ]; then
             for shard in 1 2 3 4 5; do
               A10G_SCOPES[$shard]=$(python3 scripts/pr_checks/targeted_lane_scope.py \
@@ -292,6 +292,13 @@ jobs:
               --scripts scripts/task_jit_run_tests_t4.sh \
               --targets "${REQUESTED_TEST_PATH}")
             echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
+            # tests/cpu belongs to the CPU Unittest lane, which runs on every run.
+            # The H100 lane ignores it, so drop it from the H100 scope here: a
+            # request naming only tests/cpu then schedules no H100 job instead of
+            # one that collects nothing.
+            H100_SCOPE=$(tr ' ' '\n' <<< "${REQUESTED_TEST_PATH}" \
+              | grep -Ev '^tests/+cpu(/|$)' | paste -sd ' ' - || true)
+            echo "H100 targeted scope: ${H100_SCOPE:-<none: lane not scheduled>}"
           fi
           {
             if [ "$SKIP_AOT" != "true" ]; then
@@ -322,7 +329,8 @@ jobs:
             # a CPU test that a scope naming that directory would not select.
             # It needs no GPU and takes about 5 minutes on a CPU runner, and
             # through fail-fast it stops the GPU lanes early when it fails.
-            # Bare runs also cover it on H100; the duplicate is cheap.
+            # The GPU lanes leave it out: the H100 lane ignores tests/cpu and
+            # the A10G/T4 shard lists name no file under it.
             if [ "$SKIP_GPU" != "true" ]; then
               jq -nc '{
                 name: "CPU Unittest",
@@ -411,8 +419,8 @@ jobs:
                   timeout: 360
                 }'
               fi
-              if [ "$RUN_H100" = "true" ]; then
-                jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+              if [ "$RUN_H100" = "true" ] && [ -n "${H100_SCOPE}" ]; then
+                jq -nc --arg test_path "${H100_SCOPE}" '{
                   name: "Targeted Unittest (H100)",
                   kind: "h100",
                   gpu_name: "H100",
@@ -646,6 +654,10 @@ jobs:
           TEST_RUNNER_ARGS=()
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
+            # The CPU Unittest lane runs tests/cpu on every run, so the H100
+            # lane's tests/ collection leaves it out. ci/bash.sh appends its own
+            # --ignore and forwards PYTEST_ADDOPTS into GPU containers.
+            export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--ignore=tests/cpu"
           elif [ "${MATRIX_KIND}" = "cpu" ]; then
             # No GPU in the container. ci/bash.sh forwards the lane identity
             # only for GPU containers, so pass it here for summary.py.
