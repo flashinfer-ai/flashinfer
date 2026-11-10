@@ -35,6 +35,11 @@ TOP_K = 3
 CHAIN_NODE_CYCLES = 1.0
 #: Epilogue warpgroups of the grouped body (its subtiles are split between them): `blocks.scheduler.EPI_WARPGROUPS_DENSE`.
 _EPI_WARPGROUPS = 2
+#: Bytes per cycle per SM at which a CTA's TMA engine zero-fills the rows of its token box past the group's rows (empirical, per
+#: family: the sandbox cost model's fitted rates, a fifth to a tenth of the engine's load rate). The grouped body streams a whole
+#: token tile per k-tile of which only the live rows are real, the swapped body a narrow one; the dense estimate's HBM floor hides
+#: the difference at a few rows per expert, this term prices it.
+ZERO_FILL_BYTES_PER_CLK = {"sm_107": 24.0, "sm_100": 56.0, "sm_103": 56.0}
 
 
 def active_experts(T: int, k: int, E: int) -> int:
@@ -161,6 +166,24 @@ def exposed_epilogue_cycles(cfg: Knobs, rows: int, nodes: int) -> float:
     return chains * nodes * CHAIN_NODE_CYCLES
 
 
+def zero_fill_cycles(
+    cfg: Knobs, rows: int, K: int, family: str, in_fmt: str = "bf16"
+) -> float:
+    """The zero-fill of a CTA's token box rows past the group's rows over the K extent: the grouped body's token tile (its
+    CTA rows; the box is multicast over the N-cluster, each CTA fills its share) less the live rows, the swapped body's
+    token tile less the live rows; at the family's fill rate (`ZERO_FILL_BYTES_PER_CLK`). Charged once per launch, not per
+    wave: a later wave's fill streams beside the other CTAs' loads; the first wave's is exposed."""
+    from ...gemm.batch_invariant.spec import ELEM_BITS_OF
+
+    eb = ELEM_BITS_OF[in_fmt] / 8.0
+    if cfg.swap_ab:
+        oob, share = max(0, cfg.tile_n - rows), 1.0
+    else:
+        oob, share = max(0, cfg.cta_tile_mn[0] - rows), float(cfg.cluster_n)
+    rate = ZERO_FILL_BYTES_PER_CLK.get(family, ZERO_FILL_BYTES_PER_CLK["sm_107"])
+    return oob * K * eb / share / rate
+
+
 def raster_for(cfg: Knobs, rows: int) -> str:
     """The grouped scheduler's raster as a structural rule, not an estimate term: along N once an expert's rows fill the
     record's CTA row tile (its groups then span several m-blocks and consecutive CTAs share the expert's A block while its
@@ -233,9 +256,11 @@ def rank_grouped(
             canon, rows, dense_n, K, 1, "k", "bf16", fam, sm_count, nominal=nominal
         )
         # the grouped launch's own terms on the dense estimate: the cluster tile's dummy share (pair term), the swapped records'
-        # spill over their token tile under the load, and the last tile's exposed epilogue chain
-        est = est * pair_term(c, rows) * tiles_term(c, rows) + exposed_epilogue_cycles(
-            c, rows, nodes
+        # spill over their token tile under the load, the last tile's exposed epilogue chain, the token box's zero-fill
+        est = (
+            est * pair_term(c, rows) * tiles_term(c, rows)
+            + exposed_epilogue_cycles(c, rows, nodes)
+            + zero_fill_cycles(c, rows, K, fam)
         )
         # three significant digits: records the estimate cannot separate (at the HBM floor every token tile reads the same
         # weights) fall through to the structural raster and the enumeration order -- the grouped records before the swapped
