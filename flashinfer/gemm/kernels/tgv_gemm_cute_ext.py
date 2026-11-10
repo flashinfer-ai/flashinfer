@@ -121,6 +121,10 @@ from .dense_bf16_gemm_warp_splitk import (
     split_peer_store_config,
     store_tile_to_peers,
 )
+from ...jit.cute_dsl_core import (
+    build_and_load_cute_dsl_kernel,
+    compile_option_kwargs,
+)
 
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -1219,6 +1223,64 @@ def _make_compile_repr_tensors(
     return a_, b_, c_, bias_
 
 
+def _tgv_cute_ext_form(
+    dtype: torch.dtype,
+    cta_m: int,
+    cta_n: int,
+    cta_k: int,
+    num_ab_stage: int,
+    use_2cta: bool,
+    use_pdl: bool,
+    has_bias: bool,
+    a_leading: int,
+    b_leading: int,
+    c_leading: int,
+    arch: str = "sm_100",
+):
+    name = (
+        f"{str(dtype).removeprefix('torch.')}_m{cta_m}_n{cta_n}_k{cta_k}"
+        f"_s{num_ab_stage}_c{int(use_2cta)}_pdl{int(use_pdl)}_b{int(has_bias)}"
+        f"_l{a_leading}{b_leading}{c_leading}_{arch}"
+    )
+
+    def compile_fn():
+        gemm = TgvGemmCuteExtKernel(
+            acc_dtype=cutlass.Float32,
+            cta_m=cta_m,
+            cta_n=cta_n,
+            cta_k=cta_k,
+            num_ab_stage=num_ab_stage,
+            use_2cta=use_2cta,
+            use_pdl=use_pdl,
+            has_bias=has_bias,
+            arch=arch,
+        )
+        a_, b_, c_, bias_ = _make_compile_repr_tensors(
+            dtype,
+            has_bias,
+            a_leading,
+            b_leading,
+            c_leading,
+        )
+        fake_stream = make_fake_stream()
+        if has_bias:
+            return cute_ext.compile(
+                _bmm_bias,
+                gemm,
+                a_,
+                b_,
+                c_,
+                bias_,
+                fake_stream,
+                **compile_option_kwargs(),
+            )
+        return cute_ext.compile(
+            _bmm_no_bias, gemm, a_, b_, c_, fake_stream, **compile_option_kwargs()
+        )
+
+    return "tgv_gemm_cute_ext", name, compile_fn
+
+
 def _get_compiled_cute_ext_kernel(
     dtype: torch.dtype,
     cta_m: int,
@@ -1266,33 +1328,45 @@ def _get_compiled_cute_ext_kernel(
             f"TGV cute_ext backend supports {list(_TORCH_TO_CUTLASS_DTYPE)}; got {dtype}."
         )
 
-    gemm = TgvGemmCuteExtKernel(
-        acc_dtype=cutlass.Float32,
-        cta_m=cta_m,
-        cta_n=cta_n,
-        cta_k=cta_k,
-        num_ab_stage=num_ab_stage,
-        use_2cta=use_2cta,
-        use_pdl=use_pdl,
-        has_bias=has_bias,
-        arch=arch,
-        peer_store=peer_store,
-    )
-
-    a_, b_, c_, bias_ = _make_compile_repr_tensors(
-        dtype,
-        has_bias,
-        a_leading,
-        b_leading,
-        c_leading,
-    )
-    fake_stream = make_fake_stream()
-
-    if has_bias:
-        compiled = cute_ext.compile(_bmm_bias, gemm, a_, b_, c_, bias_, fake_stream)
+    if peer_store is None:
+        module_name, name, compile_fn = _tgv_cute_ext_form(*key[:-1])
+        compiled = build_and_load_cute_dsl_kernel(
+            module_name,
+            name,
+            compile_fn,
+            extra_key_files=(__file__,),
+            enable_tvm_ffi=False,
+        )
     else:
-        extra = () if peer_store is None else (peer_args,)
-        compiled = cute_ext.compile(_bmm_no_bias, gemm, a_, b_, c_, fake_stream, *extra)
+        gemm = TgvGemmCuteExtKernel(
+            acc_dtype=cutlass.Float32,
+            cta_m=cta_m,
+            cta_n=cta_n,
+            cta_k=cta_k,
+            num_ab_stage=num_ab_stage,
+            use_2cta=use_2cta,
+            use_pdl=use_pdl,
+            has_bias=has_bias,
+            arch=arch,
+            peer_store=peer_store,
+        )
+
+        a_, b_, c_, bias_ = _make_compile_repr_tensors(
+            dtype,
+            has_bias,
+            a_leading,
+            b_leading,
+            c_leading,
+        )
+        fake_stream = make_fake_stream()
+
+        if has_bias:
+            compiled = cute_ext.compile(_bmm_bias, gemm, a_, b_, c_, bias_, fake_stream)
+        else:
+            extra = () if peer_store is None else (peer_args,)
+            compiled = cute_ext.compile(
+                _bmm_no_bias, gemm, a_, b_, c_, fake_stream, *extra
+            )
 
     _TGV_CUTE_EXT_COMPILE_CACHE[key] = compiled
     return compiled

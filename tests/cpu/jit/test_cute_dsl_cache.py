@@ -755,3 +755,60 @@ def test_sm107_fp8_groupwise_kernel_name_varies_with_every_argument(param):
     assert perturbed_name != baseline_name, param
     for name in (baseline_name, perturbed_name):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+@pytest.fixture
+def aot_cute_dsl_dirs(monkeypatch, tmp_path):
+    from flashinfer.jit import cute_dsl_core
+
+    jit_dir = tmp_path / "jit"
+    aot_dir = tmp_path / "aot"
+    jit_dir.mkdir()
+    aot_dir.mkdir()
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", jit_dir)
+    monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_AOT_DIRS", (aot_dir,))
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_103a")
+    return aot_dir
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("matching_meta", [True, False])
+def test_cute_dsl_spec_loads_prebuilt_object_from_aot_dir(
+    monkeypatch, aot_cute_dsl_dirs, matching_meta
+):
+    import json
+
+    from flashinfer.jit import cute_dsl_core
+
+    spec = cute_dsl_core.make_cute_dsl_spec(
+        "op", "kernel", lambda: None, (__file__,), enable_tvm_ffi=False
+    )
+    module_dir = aot_cute_dsl_dirs / spec.module_dir_name
+    module_dir.mkdir()
+    (module_dir / "kernel.o").write_bytes(b"object")
+    meta = dict(spec.expected_meta)
+    if not matching_meta:
+        meta["source_sha256"] = "stale"
+    (module_dir / "meta.json").write_text(json.dumps(meta))
+    monkeypatch.setattr(
+        cute_dsl_core.JitSpecCuteDsl,
+        "_load_from_disk",
+        lambda self, object_path=None: object_path or self.object_path,
+    )
+
+    loaded = spec.try_load()
+
+    assert loaded == (module_dir / "kernel.o" if matching_meta else None)
+    assert not spec.object_path.exists()
+
+
+@pytest.mark.cpu_only
+def test_cute_dsl_gpu_arch_options_follow_cute_dsl_arch(monkeypatch):
+    from flashinfer.jit import cute_dsl_core
+
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_107a")
+    assert cute_dsl_core.compile_option_kwargs() == {"options": "--gpu-arch=sm_107a"}
+
+    monkeypatch.delenv("CUTE_DSL_ARCH")
+    assert cute_dsl_core.gpu_arch_options() == ""
+    assert cute_dsl_core.compile_option_kwargs() == {}

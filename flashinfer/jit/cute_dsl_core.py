@@ -171,19 +171,41 @@ class JitSpecCuteDsl(JitSpec):
     def get_library_path(self) -> Path:
         return self.object_path
 
+    def _aot_object_path(self) -> Optional[Path]:
+        for aot_dir in jit_env.FLASHINFER_AOT_DIRS:
+            module_dir = aot_dir / self.module_dir_name
+            object_path = module_dir / f"{self.kernel_name}.o"
+            if (
+                object_path.exists()
+                and _read_meta(module_dir / _META_FILENAME) == self.expected_meta
+            ):
+                return object_path
+        return None
+
     def try_load(self) -> Optional[Any]:
         """The cached kernel iff its ``.o`` exists and meta.json matches."""
-        if not self.object_path.exists():
-            return None
-        if _read_meta(self.meta_path) != self.expected_meta:
+        if (
+            self.object_path.exists()
+            and _read_meta(self.meta_path) == self.expected_meta
+        ):
+            object_path = self.object_path
+            aot_path = None
+        else:
+            aot_path = self._aot_object_path()
+            object_path = aot_path
+        if object_path is None:
             return None
         try:
-            kernel = self._load_from_disk()
-            logger.debug(f"Loaded cached CuTe-DSL kernel from {self.object_path}")
+            kernel = (
+                self._load_from_disk()
+                if aot_path is None
+                else self._load_from_disk(aot_path)
+            )
+            logger.debug(f"Loaded cached CuTe-DSL kernel from {object_path}")
             return kernel
         except Exception as e:
             logger.warning(
-                f"Failed to load cached CuTe-DSL kernel from {self.object_path}: "
+                f"Failed to load cached CuTe-DSL kernel from {object_path}: "
                 f"{e}. Recompiling."
             )
             return None
@@ -271,11 +293,11 @@ class JitSpecCuteDsl(JitSpec):
             return self._compiled_kernel
         return self._load_from_disk()
 
-    def _load_from_disk(self) -> Any:
+    def _load_from_disk(self, object_path: Optional[Path] = None) -> Any:
         import cutlass.cute as cute
 
         module = cute.runtime.load_module(
-            str(self.object_path), enable_tvm_ffi=self.enable_tvm_ffi
+            str(object_path or self.object_path), enable_tvm_ffi=self.enable_tvm_ffi
         )
         return getattr(module, self.symbol)
 
@@ -381,3 +403,30 @@ def build_and_load_cute_dsl_kernel(
         enable_tvm_ffi=enable_tvm_ffi,
     )
     return spec.build_and_load()
+
+
+def make_cute_dsl_spec(
+    module_name: str,
+    kernel_name: str,
+    compile_fn: Callable[[], Any],
+    extra_key_files: Sequence[str] = (),
+    *,
+    enable_tvm_ffi: bool = True,
+) -> JitSpecCuteDsl:
+    return JitSpecCuteDsl(
+        module_name,
+        kernel_name,
+        compile_fn,
+        _hash_source_files(tuple(extra_key_files)),
+        enable_tvm_ffi=enable_tvm_ffi,
+    )
+
+
+def gpu_arch_options() -> str:
+    arch = os.environ.get("CUTE_DSL_ARCH")
+    return f"--gpu-arch={arch}" if arch else ""
+
+
+def compile_option_kwargs() -> dict[str, str]:
+    options = gpu_arch_options()
+    return {"options": options} if options else {}

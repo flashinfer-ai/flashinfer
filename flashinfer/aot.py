@@ -25,7 +25,7 @@ import os
 import shutil
 from itertools import product
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 from packaging.version import Version
@@ -1353,6 +1353,124 @@ def gen_all_modules(
     return ret
 
 
+BF16_GEMM_MODEL_SHAPES: Dict[str, Tuple[Tuple[int, int], ...]] = {
+    "Qwen3.8-27B": (
+        (24, 5120), (48, 5120), (96, 5120), (640, 10240),
+        (1280, 10240), (1792, 5120), (2048, 5120), (2560, 10240),
+        (3584, 5120), (4096, 5120), (4352, 5120), (5120, 768),
+        (5120, 1536), (5120, 2176), (5120, 3072), (5120, 4352),
+        (5120, 6144), (5120, 8704), (5120, 10240), (5120, 17408),
+        (7168, 5120), (8192, 5120), (8704, 5120), (14336, 5120),
+        (16384, 5120), (17408, 5120), (31040, 5120), (34816, 5120),
+        (62080, 5120), (124160, 5120), (248320, 5120),
+    ),
+    "Qwen3.8-Flash-Next": (
+        (24, 2560), (48, 2560), (96, 2560), (160, 2560),
+        (320, 2560), (320, 10240), (336, 10240), (512, 2560),
+        (640, 2560), (1280, 2560), (2048, 2560), (2560, 80),
+        (2560, 160), (2560, 320), (2560, 640), (2560, 768),
+        (2560, 1536), (2560, 2560), (2560, 3072), (2560, 6144),
+        (4096, 2560), (4224, 2560), (8192, 2560), (10240, 320),
+        (12800, 2560), (13952, 2560), (16384, 2560), (31040, 2560),
+        (62080, 2560), (124160, 2560), (248320, 2560),
+    ),
+    "Qwen3.5-397B-A17B": (
+        (16, 4096), (32, 4096), (64, 4096), (128, 4096),
+        (256, 4096), (512, 4096), (512, 8192), (1024, 4096),
+        (1024, 8192), (2048, 4096), (2048, 8192), (2560, 4096),
+        (4096, 128), (4096, 256), (4096, 512), (4096, 1024),
+        (4096, 2048), (4096, 4096), (4096, 8192), (4608, 4096),
+        (5120, 4096), (10240, 4096), (17408, 4096), (20480, 4096),
+        (31040, 4096), (62080, 4096), (124160, 4096), (248320, 4096),
+    ),
+    "MiniMax-M3.1-Flash": (
+        (25008, 6144), (50016, 6144), (100032, 6144), (200064, 6144),
+    ),
+    "DeepSeek-V4-Pro": (
+        (64, 7168), (384, 7168), (512, 7168), (1024, 7168),
+        (2048, 7168), (16160, 7168), (32320, 7168), (64640, 7168),
+        (129280, 7168),
+    ),
+    "DeepSeek-V4.1-Flash": (
+        (32, 5120), (128, 512), (384, 5120), (512, 5120),
+        (1024, 5120), (16160, 5120), (32320, 5120), (64640, 5120),
+        (129280, 256), (129280, 5120),
+    ),
+    "Muse-Spark-Open-816B-A42B": (
+        (1024, 8192), (2048, 4096), (2304, 8192), (4096, 8192),
+        (4608, 8192), (8192, 1024), (8192, 2048), (8192, 4096),
+        (8192, 8192), (9216, 8192), (18432, 8192), (25256, 8192),
+        (50512, 8192), (101024, 8192), (202048, 8192),
+    ),
+    "Kimi-K3": (
+        (896, 7168), (1536, 128), (1536, 7168), (2112, 7168),
+        (2304, 1536), (3072, 128), (3072, 512), (3072, 7168),
+        (3584, 7168), (4608, 1536), (6144, 128), (6144, 512),
+        (6144, 7168), (7168, 768), (7168, 1536), (7168, 3072),
+        (7168, 3584), (7168, 4224), (7168, 6144), (7168, 8448),
+        (7168, 12288), (7168, 16896), (7168, 33792), (8448, 7168),
+        (9216, 1536), (12288, 128), (12288, 512), (12288, 7168),
+        (12448, 7168), (16896, 7168), (18432, 1536), (24576, 512),
+        (33792, 7168), (49376, 7168), (67584, 7168), (163840, 7168),
+    ),
+    "GLM-5.3": (
+        (160, 6144), (256, 6144), (6144, 12288), (19360, 6144),
+        (38720, 6144), (77440, 6144), (154880, 6144),
+    ),
+}
+
+BF16_GEMM_M_BUCKETS: Tuple[int, ...] = (
+    1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20,
+    24, 28, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104,
+    112, 120, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416,
+    448, 480, 512, 768, 896, 1024, 1280, 1536, 1792, 2048,
+)
+
+BF16_GEMM_CUTE_DSL_GPU_ARCHS = {
+    (10, "0a"): "sm_100a",
+    (10, "0f"): "sm_100a",
+    (10, "3a"): "sm_103a",
+    (10, "3f"): "sm_103a",
+    (10, "7a"): "sm_107a",
+    (10, "7f"): "sm_107a",
+}
+
+
+def build_bf16_gemm_cute_dsl_forms(
+    out_dir: Optional[Path], build_dir: Path, verbose: bool = False
+) -> None:
+    targets = sorted(
+        {
+            BF16_GEMM_CUTE_DSL_GPU_ARCHS[arch]
+            for arch in CompilationContext().TARGET_CUDA_ARCHS
+            if arch in BF16_GEMM_CUTE_DSL_GPU_ARCHS
+        }
+    )
+    if not targets:
+        return
+    if not torch.cuda.is_available():
+        print("No CUDA device: skipping the BF16 GEMM CuTe-DSL forms")
+        return
+    from .gemm.kernels.bf16_cute_dsl_aot import (
+        build_bf16_cute_dsl_forms,
+        copy_built_forms,
+    )
+
+    shapes = sorted(
+        {shape for model in BF16_GEMM_MODEL_SHAPES.values() for shape in model}
+    )
+    workers = int(os.environ.get("MAX_JOBS") or os.cpu_count() or 1)
+    for arch in targets:
+        forms_dir = build_dir / "cute_dsl" / arch
+        built = build_bf16_cute_dsl_forms(
+            forms_dir, shapes, BF16_GEMM_M_BUCKETS, workers, arch
+        )
+        if verbose:
+            print(f"BF16 GEMM CuTe-DSL forms for {arch}: built {built}")
+        if out_dir is not None:
+            copy_built_forms(forms_dir, out_dir)
+
+
 def copy_built_kernels(
     jit_specs: List[JitSpec],
     out_dir: Path,
@@ -1469,6 +1587,7 @@ def compile_and_package_modules(
     # Copy built kernels
     if out_dir is not None:
         copy_built_kernels(jit_specs, out_dir)
+    build_bf16_gemm_cute_dsl_forms(out_dir, build_dir, verbose)
     if verbose:
         print("AOT kernels saved to:", out_dir)
 
