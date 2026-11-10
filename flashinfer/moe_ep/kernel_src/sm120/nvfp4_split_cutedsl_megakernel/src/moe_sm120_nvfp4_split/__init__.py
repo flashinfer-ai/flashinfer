@@ -26,3 +26,6 @@ __all__ = [
 
 from .execution_plan import CollectiveExecutionPlan, select_collective_execution_plan
 __all__ += ["CollectiveExecutionPlan", "select_collective_execution_plan"]
+
+from .tuning_config import TuningConfig, load_tuning_config, hardware_identity
+__all__ += ["TuningConfig", "load_tuning_config", "hardware_identity"]

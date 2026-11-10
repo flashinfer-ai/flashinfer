@@ -12,6 +12,8 @@ from typing import Any
 import torch
 
 from .comm import (
+    PeerMemorySession,
+    _no_dist,
     compute_peer_offsets,
     ensure_not_capturing,
     free_sym_tensor,
@@ -182,6 +184,7 @@ class MegaMoESm120Nvfp4Workspace:
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
+    _comm_session: Any = None
     _control_group: Any = None
     _storages: dict[int, _ExecutionStorage] = field(default_factory=dict)
     _execution_plans: dict[int, tuple[Any, Any]] = field(default_factory=dict)
@@ -225,6 +228,8 @@ class MegaMoESm120Nvfp4Workspace:
         for root in reversed(self._sym_roots):
             free_sym_tensor(root)
         self._sym_roots.clear()
+        if self._comm_session is not None:
+            self._comm_session.close()
         self._destroyed = True
 
 
@@ -279,7 +284,9 @@ class MegaMoESm120Nvfp4Frontend:
     ):
         import cutlass.torch as cutlass_torch
 
-        result = cutlass_torch.from_dlpack(tensor, assumed_align=assumed_align)
+        from moe_sm120_nvfp4_split.runtime.low_precision_dlpack import wrap
+
+        result = cutlass_torch.from_dlpack(wrap(tensor), assumed_align=assumed_align)
         if static_layout:
             return result
         return result.mark_layout_dynamic(
@@ -380,7 +387,7 @@ class MegaMoESm120Nvfp4Frontend:
         green_trace: torch.Tensor | None,
         stream,
     ) -> dict[str, Any]:
-        from src.sym_buffer import SymBufferHost
+        from moe_sm120_nvfp4_split.support.src.sym_buffer import SymBufferHost
 
         base, offsets = compute_peer_offsets(shared_workspace, self.config.world_size)
         fc1_alpha, fc2_alpha, fc1_norm_const = epilogue_args
@@ -457,7 +464,7 @@ class MegaMoESm120Nvfp4Frontend:
         spec, bundle = self._ensure_plan(self.compile_bucket)
         storage = self.workspace._storages.get(self.compile_bucket)
         if storage is None:
-            # NVSHMEM allocation is collective and not ordered on the caller
+            # NCCL workspace allocation is not ordered on every peer caller
             # stream. Drain in-flight peer-dependent graphs before entering it.
             torch.cuda.synchronize()
             local_workspace = torch.zeros(
@@ -465,7 +472,11 @@ class MegaMoESm120Nvfp4Frontend:
                 dtype=torch.uint8,
                 device="cuda",
             )
-            shared_workspace = sym_zeros((bundle.shared_workspace_bytes,), torch.uint8)
+            shared_workspace = sym_zeros(
+                (bundle.shared_workspace_bytes,),
+                torch.uint8,
+                session=self.workspace._comm_session,
+            )
             self.workspace._sym_roots.append(shared_workspace)
             combine_output, root = sym_byte_view(
                 (
@@ -474,12 +485,15 @@ class MegaMoESm120Nvfp4Frontend:
                     self.config.hidden,
                 ),
                 torch.bfloat16,
+                session=self.workspace._comm_session,
             )
             self.workspace._sym_roots.append(root)
             rank_combine_ready = None
             if spec.kernel.rank_local_combine:
                 rank_combine_ready = sym_zeros(
-                    (self.compile_bucket + 1, self.config.world_size), torch.int32
+                    (self.compile_bucket + 1, self.config.world_size),
+                    torch.int32,
+                    session=self.workspace._comm_session,
                 )
                 self.workspace._sym_roots.append(rank_combine_ready)
             epilogue_args = (
@@ -820,25 +834,72 @@ def allocate_workspace(
     control_group: Any = None,
 ) -> MegaMoESm120Nvfp4Workspace:
     config.validate()
+    ensure_not_capturing("NVFP4 workspace allocation")
+    # Plan every supported bucket before allocating the symmetric arena.
+    # This preserves one offset table across tensors and avoids registration
+    # or allocation during graph capture. Layers share this workspace.
+    from types import SimpleNamespace
+
+    planned = SimpleNamespace(config=config, _execution_plans={})
+    buckets = sorted(
+        {
+            config.max_tokens_per_rank,
+            *(
+                n
+                for n in DECODE_GRAPH_COMPILE_BUCKETS
+                if n <= config.max_tokens_per_rank
+            ),
+        }
+    )
+    size = config.max_tokens_per_rank
+    scale_columns = round_up(ceil_div(config.hidden, 16), 4)
+    sizes = [
+        size * config.hidden // 2,
+        size * scale_columns,
+        size * config.num_topk * 8,
+        size * config.num_topk * 4,
+        size * config.hidden * 2,
+    ]
+    for bucket in buckets:
+        frontend = MegaMoESm120Nvfp4Frontend(
+            planned, compile_bucket=bucket, control_group=control_group
+        )
+        spec, bundle = frontend._ensure_plan(bucket)
+        sizes += [
+            bundle.shared_workspace_bytes,
+            bucket * config.num_topk * config.hidden * 2,
+        ]
+        if spec.kernel.rank_local_combine:
+            sizes.append((bucket + 1) * config.world_size * 4)
+    capacity = sum((n + 4095) // 4096 * 4096 for n in sizes)
+    session = (
+        None
+        if _no_dist()
+        else PeerMemorySession(config.rank, config.world_size, capacity, control_group)
+    )
     roots: list[torch.Tensor] = []
     x, root = sym_byte_view(
-        (config.max_tokens_per_rank, config.hidden // 2), ACTIVATION_DTYPE
+        (config.max_tokens_per_rank, config.hidden // 2),
+        ACTIVATION_DTYPE,
+        session=session,
     )
     roots.append(root)
     scale_columns = round_up(ceil_div(config.hidden, 16), 4)
     x_scale, root = sym_byte_view(
-        (config.max_tokens_per_rank, scale_columns), SCALE_DTYPE
+        (config.max_tokens_per_rank, scale_columns), SCALE_DTYPE, session=session
     )
     roots.append(root)
-    topk_ids = sym_zeros((config.max_tokens_per_rank, config.num_topk), torch.int64)
+    topk_ids = sym_zeros(
+        (config.max_tokens_per_rank, config.num_topk), torch.int64, session=session
+    )
     topk_ids.fill_(-1)
     roots.append(topk_ids)
     topk_weights = sym_zeros(
-        (config.max_tokens_per_rank, config.num_topk), torch.float32
+        (config.max_tokens_per_rank, config.num_topk), torch.float32, session=session
     )
     roots.append(topk_weights)
     output, root = sym_byte_view(
-        (config.max_tokens_per_rank, config.hidden), torch.bfloat16
+        (config.max_tokens_per_rank, config.hidden), torch.bfloat16, session=session
     )
     roots.append(root)
     epilogue_args = tuple(
@@ -856,6 +917,8 @@ def allocate_workspace(
         fc2_alpha=epilogue_args[1],
         fc1_norm_const=epilogue_args[2],
         _sym_roots=roots,
+        _comm_session=session,
+        _execution_plans=planned._execution_plans,
         _control_group=control_group,
         _compile_bucket=config.max_tokens_per_rank,
     )

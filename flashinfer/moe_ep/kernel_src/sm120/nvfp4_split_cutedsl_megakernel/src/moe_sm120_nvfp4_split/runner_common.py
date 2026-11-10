@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from common.megamoe_constants import (
+from moe_sm120_nvfp4_split.support.common.megamoe_constants import (
     Fp8E4M3FNMax,
     Nvfp4BlockSize,
     Nvfp4E2M1RcpLimit,

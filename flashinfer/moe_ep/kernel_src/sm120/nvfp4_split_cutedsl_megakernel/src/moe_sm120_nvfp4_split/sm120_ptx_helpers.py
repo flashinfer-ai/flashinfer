@@ -9,16 +9,6 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import Float32, Int32, Int64, T, dsl_user_op
 
 
-# Implemented by nvshmem_compat.cu and linked beside the validated NVSHMEM
-# device bitcode. Keeping the field access in a header-compiled translation
-# unit means an NVSHMEM layout change fails its static assertions instead of
-# silently changing an immediate offset in inline PTX.
-nvshmem_disable_p2p_peer = cute.ffi(
-    name="megamoe_nvshmem_disable_p2p_peer",
-    params_types=[cutlass.Int32],
-)
-
-
 @dsl_user_op
 def clamp_gate_upper_f32(
     value: Float32,

@@ -51,7 +51,7 @@ from .kernel_fc12 import Sm120SwapABSwigluNvfp4Fc12Kernel
 from .jit_config import Sm120JitConfig
 from .moe_utils import spin_wait
 from .token_comm import Sm120SysmemTokenInPullTokenBackPush
-from src.token_comm import (
+from moe_sm120_nvfp4_split.support.src.token_comm import (
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenSrcMetadata,
 )
@@ -185,7 +185,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         num_topk: int,
         max_tokens_per_rank: int,
         hidden: int,
-        comm_backend: Literal["p2p_direct", "nvshmem_ibgda"],
+        comm_backend: Literal["p2p_direct", "gin"],
         ibgda_dispatch_chunk_tokens: int,
         fc2_output_dtype: Type[cutlass.Numeric],
         token_back_mode: Literal[
@@ -218,9 +218,9 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         k1_ready_queue_m_rotation: int = 0,
         jit_config: Optional[Sm120JitConfig] = None,
     ) -> None:
-        if comm_backend not in ("p2p_direct", "nvshmem_ibgda"):
+        if comm_backend not in ("p2p_direct", "gin"):
             raise ValueError(
-                "comm_backend must be p2p_direct or nvshmem_ibgda, got "
+                "comm_backend must be p2p_direct or gin, got "
                 f"{comm_backend!r}."
             )
         if dispatch_warps not in (1, 2, 4):
@@ -258,18 +258,18 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         if (
             token_back_mode != "epi_warps"
             and not (
-                comm_backend == "nvshmem_ibgda"
+                comm_backend == "gin"
                 and token_back_mode == "reuse_dispatch_warps"
             )
         ):
             raise ValueError(
                 "Split K1/K2 require token_back_mode='epi_warps', except "
-                "the nvshmem_ibgda backend which requires "
+                "the gin backend which requires "
                 "'reuse_dispatch_warps'."
             )
-        if comm_backend == "nvshmem_ibgda" and token_back_mode != "reuse_dispatch_warps":
+        if comm_backend == "gin" and token_back_mode != "reuse_dispatch_warps":
             raise ValueError(
-                "nvshmem_ibgda requires token_back_mode='reuse_dispatch_warps'."
+                "gin requires token_back_mode='reuse_dispatch_warps'."
             )
         if (
             load_balance_mode != "static"
@@ -514,7 +514,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             self.pool_task_tile_capacity,
         ) = self._pool_shapes()
         self.ibgda_k2_direct_staging = (
-            self.comm_backend == "nvshmem_ibgda"
+            self.comm_backend == "gin"
         )
         fc1_done_slots = (
             (
@@ -945,8 +945,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                     ),
                 ]
             )
-        if self.comm_backend == "nvshmem_ibgda":
-            # NVSHMEM get_warp writes a contiguous local destination.  The
+        if self.comm_backend == "gin":
+            # The peer copy writes a contiguous local destination.  The
             # FC1 scale-factor pool is atom-swizzled, so use a compact plain
             # staging row and let dispatch lanes scatter it into the existing
             # swizzled layout after each blocking get.
@@ -1235,9 +1235,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         Pointer-mapping contract:
           * ``activation`` / ``activation_sf`` / ``topk_weights`` MUST
             point into memory reachable via ``peer_rank_ptr_mapper.map(...)``
-            (typically NVSHMEM symmetric heap).  Single-rank degenerate
-            runs (``peer_rank_ptr_mapper.offsets[local_rank] == 0`` by NVSHMEM
-            convention) are allowed.
+            (the NCCL-registered P2P arena). The local-rank alias may have
+            a nonzero offset; always use the supplied peer mapping.
           * ``topk_idx`` is read on the local rank only; placement is
             unconstrained (cuda local or sym heap).
           * ``fc1_weight`` / ``fc1_weight_sf`` / ``fc2_weight`` /
@@ -1436,7 +1435,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                 local_workspace, "rank_combine_tile_done",
             )
 
-        if cutlass.const_expr(self.comm_backend == "nvshmem_ibgda"):
+        if cutlass.const_expr(self.comm_backend == "gin"):
             ibgda_sf_staging = self._view_local(
                 local_workspace, "ibgda_sf_staging",
             )
@@ -1651,7 +1650,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         tidx,
     ):
         if cutlass.const_expr(
-            self.comm_backend == "nvshmem_ibgda"
+            self.comm_backend == "gin"
             and self.split_role == "k1"
         ):
             self.token_comm.kernel_tail_ibgda(
@@ -1664,7 +1663,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             self.split_role == "k1"
             or (self.split_role == "k2" and self.skip_global_tail)
             or (
-                self.comm_backend == "nvshmem_ibgda"
+                self.comm_backend == "gin"
                 and self.split_role == "k2"
             )
         ):

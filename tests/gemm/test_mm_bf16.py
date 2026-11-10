@@ -169,6 +169,86 @@ def test_mm_bf16_autotune_weight_layouts(monkeypatch, backend, padded):
     torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("n,k", [(1, 2560), (12, 5120)])
+def test_mm_bf16_autotune_unaligned_n(monkeypatch, n, k):
+    """Tuning auto must skip CUTLASS, not abort, when N breaks its 16-byte rows.
+
+    N=1 is an MoE shared_expert_gate, N=12 a linear-attention in_proj_ba at TP8.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("The CUTLASS BF16 backend is used on SM100-family.")
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+
+    # Correctness alone does not pin this down: the tuner already caught
+    # CUTLASS's host-side can_implement rejection and moved on, so the result
+    # was right either way. Assert the shape never reaches CUTLASS at all.
+    profiled = set()
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def record_runner(self, runner, *args, **kwargs):
+        profiled.add(type(runner).__name__)
+        return profile_single_kernel(self, runner, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_runner)
+
+    torch.manual_seed(0)
+    a = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    with autotune(True, tuning_buckets=[1, 32, 64]):
+        mm_bf16(a, w.T, backend="auto")
+
+    assert profiled, "autotuning profiled nothing, so the assertion below is vacuous"
+    assert "CutlassBf16GemmRunner" not in profiled, profiled
+
+    for m in (1, 32, 64):
+        out = mm_bf16(a[:m], w.T, backend="auto")
+        reference = (a[:m].float() @ w.float().T).to(torch.bfloat16)
+        torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mm_bf16_tgv_single_element_output(pdl):
+    """M = N = 1: the 1x1 output's batch dim also has stride 1."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("tgv", cc_num):
+        pytest.skip("TGV backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    out = mm_bf16(a, w.T, pdl=pdl, backend="tgv")
+    reference = (a.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "n,k,out_dtype,supported",
+    [
+        (12, 2560, torch.bfloat16, False),
+        (16, 2564, torch.bfloat16, False),
+        (12, 2560, torch.float32, True),
+    ],
+)
+def test_mm_bf16_cutlass_alignment(n, k, out_dtype, supported):
+    """CUTLASS needs K % 8 == 0 and 16-byte output rows; reject others up front."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cutlass", cc_num):
+        pytest.skip("cutlass backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    if not supported:
+        with pytest.raises(ValueError, match="CUTLASS backend requires K divisible"):
+            mm_bf16(a, w.T, out_dtype=out_dtype, backend="cutlass")
+        return
+    out = mm_bf16(a, w.T, out_dtype=out_dtype, backend="cutlass")
+    torch.testing.assert_close(out, a.float() @ w.float().T, rtol=2e-2, atol=5e-2)
+
+
 @pytest.mark.parametrize("backend", ["tinygemm", "tgv"])
 @pytest.mark.parametrize("pdl_wins", [False, True])
 def test_mm_bf16_pdl_none_tunes_both_pdl_variants(
@@ -399,8 +479,8 @@ def test_mm_bf16_cutile_repeat_uses_tune_cache():
     )
 
 
-def test_cublaslt_bf16_runner_zero_algos():
-    """CublasltBf16GemmRunner.forward() must raise when heuristic returns 0 algorithms."""
+def test_cublaslt_bf16_runner_zero_algos(monkeypatch):
+    """No candidate algorithms means nothing to profile; the default still runs."""
     from flashinfer.gemm.gemm_base import get_mm_bf16_cublaslt_module
     from flashinfer.utils import get_compute_capability
 
@@ -418,14 +498,12 @@ def test_cublaslt_bf16_runner_zero_algos():
     workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     inputs = [a, b, None, None, out, workspace]
 
-    zero_algo_buf = torch.empty(0, dtype=torch.uint8, device="cpu")
-    original_get_algos = runner._get_algos
-    runner._get_algos = lambda _inputs: (zero_algo_buf, 0)
-    try:
-        with pytest.raises(RuntimeError, match="zero algorithms"):
-            runner.forward(inputs)
-    finally:
-        runner._get_algos = original_get_algos
+    # The runner is memoized; monkeypatch so the stub does not outlive the test.
+    monkeypatch.setattr(runner, "_get_algos", lambda _inputs: [], raising=False)
+    assert runner.get_valid_tactics(inputs, None) == []
+    runner.forward(inputs)
+    cos_sim = F.cosine_similarity((a @ b).reshape(-1), out.reshape(-1), dim=0)
+    assert cos_sim > 0.99
 
 
 @pytest.mark.parametrize("pdl", [False, True])

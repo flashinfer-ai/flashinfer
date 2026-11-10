@@ -172,7 +172,7 @@ def test_p2p_dispatch_admission_does_not_depend_on_rank_local_combine() -> None:
     )
     backend = next(
         node for node in dispatch.body
-        if isinstance(node, ast.If) and "nvshmem_ibgda" in ast.unparse(node.test)
+        if isinstance(node, ast.If) and "gin" in ast.unparse(node.test)
     )
     # These must be direct statements in the P2P branch, not RLC-conditional.
     admission, preparation = backend.orelse[:2]

@@ -56,7 +56,9 @@ _GRAPH_CAPTURED_BUFFERS: set[int] = set()
 def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
     import cutlass.torch as cutlass_torch
 
-    cute_tensor = cutlass_torch.from_dlpack(tensor, assumed_align=assumed_align)
+    from moe_sm120_nvfp4_split.runtime.low_precision_dlpack import wrap
+
+    cute_tensor = cutlass_torch.from_dlpack(wrap(tensor), assumed_align=assumed_align)
     leading_dim = cutlass_torch.get_leading_dim(tensor)
     return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
@@ -181,7 +183,7 @@ def fused_quant_stage(
     stager = _STAGERS.get(key)
     if stager is None:
         ensure_not_capturing("fused staging construction")
-        from src.inputs_process import DataPreprocess
+        from moe_sm120_nvfp4_split.support.src.inputs_process import DataPreprocess
 
         stager = _CompiledStager(
             dp=DataPreprocess(

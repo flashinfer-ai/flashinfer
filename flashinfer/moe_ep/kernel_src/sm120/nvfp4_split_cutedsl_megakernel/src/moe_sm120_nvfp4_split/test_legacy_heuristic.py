@@ -225,7 +225,7 @@ class HeuristicTest(unittest.TestCase):
 
     def test_parallel_topology_selects_transport(self):
         cases = (
-            ("ep8", _shape(tokens=8192, dp=1, ep=8, cross=4), "nvshmem_hybrid"),
+            ("ep8", _shape(tokens=8192, dp=1, ep=8, cross=4), "gin_hybrid"),
             ("dp2ep4", _shape(tokens=8192, dp=2, ep=4, cross=0), "p2p_direct"),
             ("ep4", _shape(tokens=8192, dp=1, ep=4, cross=0), "p2p_direct"),
             ("dp2ep2", _shape(tokens=8192, dp=2, ep=2, cross=0), "p2p_direct"),
@@ -306,7 +306,7 @@ class HeuristicTest(unittest.TestCase):
 
         ep4_hybrid = select_megamoe_config(
             _shape(tokens=8192, dp=1, ep=4, cross=0),
-            MegaMoEHeuristicOverrides(comm_backend="nvshmem_hybrid"),
+            MegaMoEHeuristicOverrides(comm_backend="gin_hybrid"),
         )
         self.assertEqual(
             (
@@ -341,7 +341,7 @@ class HeuristicTest(unittest.TestCase):
         shape = _shape(tokens=8192, dp=1, ep=8, cross=4)
         valid_cases = (
             ("p2p_direct", "epi_warps"),
-            ("nvshmem_ibgda", "reuse_dispatch_warps"),
+            ("gin", "reuse_dispatch_warps"),
         )
         for backend, token_back_mode in valid_cases:
             with self.subTest(backend=backend, token_back_mode=token_back_mode):
@@ -356,7 +356,7 @@ class HeuristicTest(unittest.TestCase):
 
         invalid_cases = (
             ("p2p_direct", "reuse_dispatch_warps"),
-            ("nvshmem_ibgda", "epi_warps"),
+            ("gin", "epi_warps"),
         )
         for backend, token_back_mode in invalid_cases:
             with self.subTest(backend=backend, token_back_mode=token_back_mode):

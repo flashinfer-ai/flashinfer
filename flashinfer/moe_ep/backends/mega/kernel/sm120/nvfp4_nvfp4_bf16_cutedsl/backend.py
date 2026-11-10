@@ -9,7 +9,7 @@ import torch
 from ......config import BootstrapConfig, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
-from ......core.runtime import nvfp4_cutedsl_runtime_requirements
+from ......core.runtime import TORCH_DIST
 from ......core.validation.common import (
     validate_mega_arch_sm120,
     validate_mega_fleet_params,
@@ -59,7 +59,11 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         return "sm120_nvfp4_nvfp4_bf16_cutedsl"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
-        return nvfp4_cutedsl_runtime_requirements(bootstrap)
+        from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.comm import (
+            _no_dist,
+        )
+
+        return frozenset() if _no_dist() else frozenset({TORCH_DIST})
 
     def validate_init(
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams

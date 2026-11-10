@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     try:
         from cutlass.cute.experimental import iket  # type: ignore
     except ImportError:
-        from src.iket_compat import iket
+        from moe_sm120_nvfp4_split.support.src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
@@ -75,16 +75,16 @@ from .split_timestamp import (
     read_globaltimer,
     trace_word,
 )
-from common.moe_utils import (
+from moe_sm120_nvfp4_split.support.common.moe_utils import (
     cvt_f32_to_f8_to_f32,
 )
-from common.megamoe_constants import (
+from moe_sm120_nvfp4_split.support.common.megamoe_constants import (
     Fp8E4M3FNMax,
     Fp32Max,
     Log2E,
     Nvfp4E2M1RcpLimit,
 )
-from src.token_comm import TokenSrcMetadata
+from moe_sm120_nvfp4_split.support.src.token_comm import TokenSrcMetadata
 
 
 UseScaleTma = True
@@ -239,6 +239,8 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
         # Split-MegaMoE subclasses specialize the shared scheduler without
         # duplicating the validated SM120 QMMA mainloop.
         self.scheduler_phase_mode: Literal["fused", "fc1", "fc2"] = "fused"
+        # Set from the immutable compile spec before CuTe specialization.
+        self.compact_token_rows = False
         self.k1_ready_queue: bool = False
         self.k1_ready_queue_base: int = 0
         self.scheduler_generation_mode: Literal["fused", "fc1", "fc2"] = "fused"
@@ -2891,7 +2893,6 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
             acc_shape = tiled_mma.partition_shape_C(
                 (self.mma_tiler[0], self.mma_tiler[1])
             )
-            accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
             work_tile_info = sched_consumer.consume_work()
             fc1_detail_tiles_seen = cutlass.Int32(0)
@@ -2979,1002 +2980,4619 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                         if lane_idx == cutlass.Int32(0):
                             k2_trace_mainloop_start = read_globaltimer()
 
-                accumulators.fill(0.0)
+                if cutlass.const_expr(self.compact_token_rows and self.mma_tiler[1] == 128 and self.scheduler_phase_mode == "fc1"):
+                    if work_tile_info.valid_tokens_in_tile <= cutlass.Int32(32):
+                        accumulators = cute.make_rmem_tensor(tiled_mma.partition_shape_C((self.mma_tiler[0], 32)), self.acc_dtype)
+                        accumulators.fill(0.0)
 
-                a_consumer.reset()
-                b_consumer.reset()
-                peek_a_full_status = cutlass.Boolean(1)
-                peek_b_full_status = cutlass.Boolean(1)
-                if k_tile_cnt > 0:
-                    peek_a_full_status = a_consumer.try_wait()
-                    peek_b_full_status = b_consumer.try_wait()
+                        a_consumer.reset()
+                        b_consumer.reset()
+                        peek_a_full_status = cutlass.Boolean(1)
+                        peek_b_full_status = cutlass.Boolean(1)
+                        if k_tile_cnt > 0:
+                            peek_a_full_status = a_consumer.try_wait()
+                            peek_b_full_status = b_consumer.try_wait()
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    trace_k_detail = cutlass.Int32(0)
-                    if trace_compute_detail != cutlass.Int32(0):
-                        if trace_all_k_detail != cutlass.Int32(0):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile < cutlass.Int32(2):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(11):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(12):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(23):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(24):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile + cutlass.Int32(2) >= k_tile_cnt:
-                            trace_k_detail = cutlass.Int32(1)
+                        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                            trace_k_detail = cutlass.Int32(0)
+                            if trace_compute_detail != cutlass.Int32(0):
+                                if trace_all_k_detail != cutlass.Int32(0):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile < cutlass.Int32(2):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(11):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(12):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(23):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(24):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile + cutlass.Int32(2) >= k_tile_cnt:
+                                    trace_k_detail = cutlass.Int32(1)
 
-                    if trace_k_detail != cutlass.Int32(0):
-                        if is_phase_linear1:
-                            iket.range_push("sm120_fc1_wait_a")
-                        else:
-                            iket.range_push("sm120_fc2_wait_a")
-                    k2_trace_a_wait_start = cutlass.Int64(0)
-                    k2_trace_a_wait_active = cutlass.Boolean(0)
-                    if cutlass.const_expr(green_trace is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            if lane_idx == cutlass.Int32(0):
-                                if peek_a_full_status == cutlass.Boolean(0):
-                                    k2_trace_tma_a_wait_calls += cutlass.Int64(1)
-                                    if (
-                                        (
-                                            k_tile
-                                            + fc2_detail_tiles_seen
-                                            + cta_linear_id
-                                        )
-                                        % cutlass.Int32(
-                                            TRACE_TMA_WAIT_SAMPLE_STRIDE
-                                        )
-                                        == cutlass.Int32(0)
-                                    ):
-                                        k2_trace_a_wait_start = read_globaltimer()
-                                        k2_trace_a_wait_active = cutlass.Boolean(1)
-                                        k2_trace_tma_a_timed_calls += (
-                                            cutlass.Int64(1)
-                                        )
-                    handle_a = a_consumer.wait_and_advance(peek_a_full_status)
-                    if cutlass.const_expr(green_trace is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            if lane_idx == cutlass.Int32(0):
-                                if k2_trace_a_wait_active:
-                                    k2_trace_tma_a_wait_ns += (
-                                        read_globaltimer()
-                                        - k2_trace_a_wait_start
-                                    )
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
-                        if is_phase_linear1:
-                            iket.range_push("sm120_fc1_wait_b")
-                        else:
-                            iket.range_push("sm120_fc2_wait_b")
-                    k2_trace_b_wait_start = cutlass.Int64(0)
-                    k2_trace_b_wait_active = cutlass.Boolean(0)
-                    if cutlass.const_expr(green_trace is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            if lane_idx == cutlass.Int32(0):
-                                if peek_b_full_status == cutlass.Boolean(0):
-                                    k2_trace_tma_b_wait_calls += cutlass.Int64(1)
-                                    if (
-                                        (
-                                            k_tile
-                                            + fc2_detail_tiles_seen
-                                            + cta_linear_id
-                                        )
-                                        % cutlass.Int32(
-                                            TRACE_TMA_WAIT_SAMPLE_STRIDE
-                                        )
-                                        == cutlass.Int32(0)
-                                    ):
-                                        k2_trace_b_wait_start = read_globaltimer()
-                                        k2_trace_b_wait_active = cutlass.Boolean(1)
-                                        k2_trace_tma_b_timed_calls += (
-                                            cutlass.Int64(1)
-                                        )
-                    handle_b = b_consumer.wait_and_advance(peek_b_full_status)
-                    if cutlass.const_expr(green_trace is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            if lane_idx == cutlass.Int32(0):
-                                if k2_trace_b_wait_active:
-                                    k2_trace_tma_b_wait_ns += (
-                                        read_globaltimer()
-                                        - k2_trace_b_wait_start
-                                    )
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
-                    peek_a_full_status = cutlass.Boolean(1)
-                    peek_b_full_status = cutlass.Boolean(1)
-                    if handle_a.count + 1 < k_tile_cnt:
-                        peek_a_full_status = a_consumer.try_wait()
-                    if handle_b.count + 1 < k_tile_cnt:
-                        peek_b_full_status = b_consumer.try_wait()
+                            if trace_k_detail != cutlass.Int32(0):
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_wait_a")
+                                else:
+                                    iket.range_push("sm120_fc2_wait_a")
+                            k2_trace_a_wait_start = cutlass.Int64(0)
+                            k2_trace_a_wait_active = cutlass.Boolean(0)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if peek_a_full_status == cutlass.Boolean(0):
+                                            k2_trace_tma_a_wait_calls += cutlass.Int64(1)
+                                            if (
+                                                (
+                                                    k_tile
+                                                    + fc2_detail_tiles_seen
+                                                    + cta_linear_id
+                                                )
+                                                % cutlass.Int32(
+                                                    TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                                )
+                                                == cutlass.Int32(0)
+                                            ):
+                                                k2_trace_a_wait_start = read_globaltimer()
+                                                k2_trace_a_wait_active = cutlass.Boolean(1)
+                                                k2_trace_tma_a_timed_calls += (
+                                                    cutlass.Int64(1)
+                                                )
+                            handle_a = a_consumer.wait_and_advance(peek_a_full_status)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if k2_trace_a_wait_active:
+                                            k2_trace_tma_a_wait_ns += (
+                                                read_globaltimer()
+                                                - k2_trace_a_wait_start
+                                            )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_wait_b")
+                                else:
+                                    iket.range_push("sm120_fc2_wait_b")
+                            k2_trace_b_wait_start = cutlass.Int64(0)
+                            k2_trace_b_wait_active = cutlass.Boolean(0)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if peek_b_full_status == cutlass.Boolean(0):
+                                            k2_trace_tma_b_wait_calls += cutlass.Int64(1)
+                                            if (
+                                                (
+                                                    k_tile
+                                                    + fc2_detail_tiles_seen
+                                                    + cta_linear_id
+                                                )
+                                                % cutlass.Int32(
+                                                    TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                                )
+                                                == cutlass.Int32(0)
+                                            ):
+                                                k2_trace_b_wait_start = read_globaltimer()
+                                                k2_trace_b_wait_active = cutlass.Boolean(1)
+                                                k2_trace_tma_b_timed_calls += (
+                                                    cutlass.Int64(1)
+                                                )
+                            handle_b = b_consumer.wait_and_advance(peek_b_full_status)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if k2_trace_b_wait_active:
+                                            k2_trace_tma_b_wait_ns += (
+                                                read_globaltimer()
+                                                - k2_trace_b_wait_start
+                                            )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                            peek_a_full_status = cutlass.Boolean(1)
+                            peek_b_full_status = cutlass.Boolean(1)
+                            if handle_a.count + 1 < k_tile_cnt:
+                                peek_a_full_status = a_consumer.try_wait()
+                            if handle_b.count + 1 < k_tile_cnt:
+                                peek_b_full_status = b_consumer.try_wait()
 
-                    tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
-                    tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
-                    tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
-                    tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
-                    sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
-                        self.mma_tiler_sfa[0] // self.mma_tiler[0]
-                    )
-                    # partition_fragment_SFA packs the two M64 groups of the
-                    # staged M128 scale tile eight bytes apart. Select the
-                    # group in SMEM so the RMEM fragment is statically indexed.
-                    tCsSFA_selected = cute.make_tensor(
-                        tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
-                        tCsSFA_p.layout,
-                    )
-                    tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
-                    tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
-                    cute.copy(
-                        smem_tiled_copy_A,
-                        tCsA_p[None, None, 0],
-                        tCrA_copy_view[None, None, 0],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_B,
-                        tCsB_p[None, None, 0],
-                        tCrB_copy_view[None, None, 0],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_SFA,
-                        tCsSFA_p_filtered[None, None, 0],
-                        tCrSFA_copy_view_filtered[None, None, 0],
-                    )
-                    if cutlass.const_expr(self.mma_tiler[1] < 128):
-                        sfb_tiles_per_tma = 128 // self.mma_tiler[1]
-                        sfb_tile_slot = (
-                            work_tile_info.tile_n_idx
-                            % cutlass.Int32(sfb_tiles_per_tma)
-                        )
-                        sfb_stage_byte_offset = (
-                            handle_b.index
-                            * cutlass.Int32(cute.cosize(sfb_smem_layout))
-                        )
-                        for ng in cutlass.range_constexpr(0, n_groups):
-                            lane_scale_row = (
-                                sfb_tile_slot
-                                * cutlass.Int32(self.mma_tiler[1])
-                                + cutlass.Int32(ng * MMA_N)
-                                + lane_idx // cutlass.Int32(4)
+                            tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                            tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                            tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
+                            tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
+                            sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                                self.mma_tiler_sfa[0] // self.mma_tiler[0]
                             )
-                            sfb_lane_byte_base = (
-                                (lane_scale_row % cutlass.Int32(32))
-                                * cutlass.Int32(16)
-                                + (lane_scale_row // cutlass.Int32(32))
-                                * cutlass.Int32(4)
-                                + sfb_stage_byte_offset
+                            # partition_fragment_SFA packs the two M64 groups of the
+                            # staged M128 scale tile eight bytes apart. Select the
+                            # group in SMEM so the RMEM fragment is statically indexed.
+                            tCsSFA_selected = cute.make_tensor(
+                                tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                                tCsSFA_p.layout,
                             )
-                            rSFBCompactI32[ng * 2] = lds_b32_raw(
-                                sSFB.iterator + sfb_lane_byte_base
-                            )
-                            rSFBCompactI32[ng * 2 + 1] = lds_b32_raw(
-                                sSFB.iterator
-                                + sfb_lane_byte_base
-                                + cutlass.Int32(512)
-                            )
-                    else:
-                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                        tCrSFB_copy_view_filtered = cute.filter_zeros(
-                            tCrSFB_copy_view
-                        )
-                        cute.copy(
-                            smem_tiled_copy_SFB,
-                            tCsSFB_p_filtered[None, None, 0],
-                            tCrSFB_copy_view_filtered[None, 0, None, 0],
-                        )
-
-                    if trace_k_detail != cutlass.Int32(0):
-                        if is_phase_linear1:
-                            iket.range_push("sm120_fc1_k128_compute")
-                        else:
-                            iket.range_push("sm120_fc2_k128_compute")
-                    for k_inner_mma in cutlass.range_constexpr(0, 2):
-                        if cutlass.const_expr(k_inner_mma + 1 < 2):
-                            k_inner_next = k_inner_mma + 1
+                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                            tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
                             cute.copy(
                                 smem_tiled_copy_A,
-                                tCsA_p[None, None, k_inner_next],
-                                tCrA_copy_view[None, None, k_inner_next],
+                                tCsA_p[None, None, 0],
+                                tCrA_copy_view[None, None, 0],
                             )
-                            cute.copy(
-                                smem_tiled_copy_B,
-                                tCsB_p[None, None, k_inner_next],
-                                tCrB_copy_view[None, None, k_inner_next],
-                            )
+                            for row_ng in cutlass.range_constexpr(0, 1):
+                                cute.copy(smem_tiled_copy_B, tCsB_p[None, row_ng, 0], tCrB_copy_view[None, row_ng, 0])
                             cute.copy(
                                 smem_tiled_copy_SFA,
-                                tCsSFA_p_filtered[None, None, k_inner_next],
-                                tCrSFA_copy_view_filtered[
-                                    None, None, k_inner_next
-                                ],
+                                tCsSFA_p_filtered[None, None, 0],
+                                tCrSFA_copy_view_filtered[None, None, 0],
                             )
-                            if cutlass.const_expr(self.mma_tiler[1] == 128):
+                            if cutlass.const_expr(self.mma_tiler[1] < 128):
+                                sfb_tiles_per_tma = 128 // self.mma_tiler[1]
+                                sfb_tile_slot = (
+                                    work_tile_info.tile_n_idx
+                                    % cutlass.Int32(sfb_tiles_per_tma)
+                                )
+                                sfb_stage_byte_offset = (
+                                    handle_b.index
+                                    * cutlass.Int32(cute.cosize(sfb_smem_layout))
+                                )
+                                for ng in cutlass.range_constexpr(0, 4):
+                                    lane_scale_row = (
+                                        sfb_tile_slot
+                                        * cutlass.Int32(self.mma_tiler[1])
+                                        + cutlass.Int32(ng * MMA_N)
+                                        + lane_idx // cutlass.Int32(4)
+                                    )
+                                    sfb_lane_byte_base = (
+                                        (lane_scale_row % cutlass.Int32(32))
+                                        * cutlass.Int32(16)
+                                        + (lane_scale_row // cutlass.Int32(32))
+                                        * cutlass.Int32(4)
+                                        + sfb_stage_byte_offset
+                                    )
+                                    rSFBCompactI32[ng * 2] = lds_b32_raw(
+                                        sSFB.iterator + sfb_lane_byte_base
+                                    )
+                                    rSFBCompactI32[ng * 2 + 1] = lds_b32_raw(
+                                        sSFB.iterator
+                                        + sfb_lane_byte_base
+                                        + cutlass.Int32(512)
+                                    )
+                            else:
+                                tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                                tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                    tCrSFB_copy_view
+                                )
                                 cute.copy(
                                     smem_tiled_copy_SFB,
-                                    tCsSFB_p_filtered[
-                                        None, None, k_inner_next
-                                    ],
-                                    tCrSFB_copy_view_filtered[
-                                        None, 0, None, k_inner_next
-                                    ],
+                                    tCsSFB_p_filtered[None, None, 0],
+                                    tCrSFB_copy_view_filtered[None, 0, None, 0],
                                 )
-                        for ng in cutlass.range_constexpr(0, n_groups):
-                            if cutlass.const_expr(self.mma_tiler[1] < 128):
-                                issue_m64n8k64_nvfp4_packed_sfb(
-                                    tiled_mma,
-                                    accumulators[None, None, ng],
-                                    tCrA,
-                                    tCrB,
-                                    tCrSFA,
-                                    rSFBCompactI32,
-                                    n_group=ng,
-                                    active_n_groups=n_groups,
-                                    sfa_m_group=0,
-                                    k_inner=k_inner_mma,
-                                    a_dtype=self.a_dtype,
-                                    b_dtype=self.b_dtype,
-                                    sf_dtype=self.sf_dtype,
+
+                            if trace_k_detail != cutlass.Int32(0):
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_k128_compute")
+                                else:
+                                    iket.range_push("sm120_fc2_k128_compute")
+                            for k_inner_mma in cutlass.range_constexpr(0, 2):
+                                if cutlass.const_expr(k_inner_mma + 1 < 2):
+                                    k_inner_next = k_inner_mma + 1
+                                    cute.copy(
+                                        smem_tiled_copy_A,
+                                        tCsA_p[None, None, k_inner_next],
+                                        tCrA_copy_view[None, None, k_inner_next],
+                                    )
+                                    for row_ng in cutlass.range_constexpr(0, 1):
+                                        cute.copy(smem_tiled_copy_B, tCsB_p[None, row_ng, k_inner_next], tCrB_copy_view[None, row_ng, k_inner_next])
+                                    cute.copy(
+                                        smem_tiled_copy_SFA,
+                                        tCsSFA_p_filtered[None, None, k_inner_next],
+                                        tCrSFA_copy_view_filtered[
+                                            None, None, k_inner_next
+                                        ],
+                                    )
+                                    if cutlass.const_expr(self.mma_tiler[1] == 128):
+                                        cute.copy(
+                                            smem_tiled_copy_SFB,
+                                            tCsSFB_p_filtered[
+                                                None, None, k_inner_next
+                                            ],
+                                            tCrSFB_copy_view_filtered[
+                                                None, 0, None, k_inner_next
+                                            ],
+                                        )
+                                for ng in cutlass.range_constexpr(0, 4):
+                                    if cutlass.const_expr(self.mma_tiler[1] < 128):
+                                        issue_m64n8k64_nvfp4_packed_sfb(
+                                            tiled_mma,
+                                            accumulators[None, None, ng],
+                                            tCrA,
+                                            tCrB,
+                                            tCrSFA,
+                                            rSFBCompactI32,
+                                            n_group=ng,
+                                            active_n_groups=4,
+                                            sfa_m_group=0,
+                                            k_inner=k_inner_mma,
+                                            a_dtype=self.a_dtype,
+                                            b_dtype=self.b_dtype,
+                                            sf_dtype=self.sf_dtype,
+                                        )
+                                    else:
+                                        issue_m64n8k64_nvfp4(
+                                            tiled_mma,
+                                            accumulators[None, None, ng],
+                                            tCrA,
+                                            tCrB,
+                                            tCrSFA,
+                                            tCrSFB,
+                                            n_group=ng,
+                                            active_n_groups=4,
+                                            sfa_m_group=0,
+                                            k_inner=k_inner_mma,
+                                            a_dtype=self.a_dtype,
+                                            b_dtype=self.b_dtype,
+                                            sf_dtype=self.sf_dtype,
+                                        )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                            # Experimental: retain a proxy fence in every reader lane.
+                            # Each warp rendezvous precedes its elected empty arrival;
+                            # producer reuse still waits for all four warp arrivals.
+                            if cutlass.const_expr(self.scheduler_phase_mode == "fc1"):
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                cute.arch.sync_warp()
+                            handle_a.release()
+                            handle_b.release()
+
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    k2_trace_mainloop_ns += (
+                                        read_globaltimer()
+                                        - k2_trace_mainloop_start
+                                    )
+                        trace_post_mainloop_start = cutlass.Int64(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    trace_post_mainloop_start = read_globaltimer()
+                        iket.range_pop()
+                        if self.scheduler_phase_mode != "fc2" and is_phase_linear1:
+                            iket.range_push("sm120_fc1_epilogue")
+                            real_fc1_output, _ = ext.get_gmem_tensor(
+                                "c", fc1_output_gemm, work_tile_info,
+                            )
+                            real_fc1_output_sf, _ = ext.get_gmem_tensor(
+                                "sfc", fc1_output_sf_gemm, work_tile_info,
+                            )
+                            if cutlass.const_expr(token_comm_args is not None):
+                                real_topk_scores, _ = ext.get_gmem_tensor(
+                                    "topk", topk_scores, work_tile_info,
+                                )
+                            fc1_col_base = (
+                                work_tile_info.tile_m_idx * cutlass.Int32(downproj_per_cta)
+                            )
+                            tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
+                                self.mma_tiler[1]
+                            )
+                            # SF tensor K coordinates are element coordinates.  The
+                            # within-block vec mode is stride-zero, so block starts
+                            # are 0, sf_vec_size, 2*sf_vec_size, ... .
+                            warp_pair = compute_warp // cutlass.Int32(2)
+                            sf_col = fc1_col_base + warp_pair * cutlass.Int32(16)
+                            fc1_alpha_value = cutlass.Float32(1.0)
+                            fc1_norm_value = cutlass.Float32(1.0)
+                            if cutlass.const_expr(fc1_alpha is not None):
+                                fc1_alpha_value = cutlass.Float32(
+                                    fc1_alpha[work_tile_info.expert_idx]
+                                )
+                            if cutlass.const_expr(fc1_norm_const is not None):
+                                fc1_norm_value = cutlass.Float32(
+                                    fc1_norm_const[work_tile_info.expert_idx]
+                                )
+
+                            for ng_pair in cutlass.range_constexpr(0, 4 // 2):
+                                acc0 = accumulators[None, None, ng_pair * 2]
+                                acc1 = accumulators[None, None, ng_pair * 2 + 1]
+
+                                token0 = lane_t * cutlass.Int32(2)
+                                token1 = token0 + cutlass.Int32(1)
+                                token2 = token0 + cutlass.Int32(MMA_N)
+                                token3 = token1 + cutlass.Int32(MMA_N)
+                                token_pair_base = cutlass.Int32(ng_pair * 2 * MMA_N)
+                                tile_token0 = token_pair_base + token0
+                                tile_token1 = token_pair_base + token1
+                                tile_token2 = token_pair_base + token2
+                                tile_token3 = token_pair_base + token3
+
+                                gate0 = acc0[0] * fc1_alpha_value
+                                gate1 = acc0[1] * fc1_alpha_value
+                                gate2 = acc1[0] * fc1_alpha_value
+                                gate3 = acc1[1] * fc1_alpha_value
+                                up0 = acc0[2] * fc1_alpha_value
+                                up1 = acc0[3] * fc1_alpha_value
+                                up2 = acc1[2] * fc1_alpha_value
+                                up3 = acc1[3] * fc1_alpha_value
+                                if cutlass.const_expr(self.gate_up_clamp is not None):
+                                    limit = cutlass.Float32(self.gate_up_clamp)
+                                    gate0 = clamp_gate_upper_f32(gate0, limit)
+                                    gate1 = clamp_gate_upper_f32(gate1, limit)
+                                    gate2 = clamp_gate_upper_f32(gate2, limit)
+                                    gate3 = clamp_gate_upper_f32(gate3, limit)
+                                    up0 = clamp_symmetric_f32(up0, limit)
+                                    up1 = clamp_symmetric_f32(up1, limit)
+                                    up2 = clamp_symmetric_f32(up2, limit)
+                                    up3 = clamp_symmetric_f32(up3, limit)
+                                val0 = up0 * gate0 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate0 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val1 = up1 * gate1 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate1 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val2 = up2 * gate2 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate2 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val3 = up3 * gate3 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate3 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+
+                                raw_token0 = tile_token_base + tile_token0
+                                raw_token1 = tile_token_base + tile_token1
+                                raw_token2 = tile_token_base + tile_token2
+                                raw_token3 = tile_token_base + tile_token3
+                                if cutlass.const_expr(token_comm_args is not None):
+                                    if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                        val0 = val0 * cutlass.Float32(
+                                            real_topk_scores[raw_token0]
+                                        )
+                                    if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                        val1 = val1 * cutlass.Float32(
+                                            real_topk_scores[raw_token1]
+                                        )
+                                    if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                        val2 = val2 * cutlass.Float32(
+                                            real_topk_scores[raw_token2]
+                                        )
+                                    if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                        val3 = val3 * cutlass.Float32(
+                                            real_topk_scores[raw_token3]
+                                        )
+
+                                if tile_token0 >= work_tile_info.valid_tokens_in_tile:
+                                    val0 = cutlass.Float32(0.0)
+                                if tile_token1 >= work_tile_info.valid_tokens_in_tile:
+                                    val1 = cutlass.Float32(0.0)
+                                if tile_token2 >= work_tile_info.valid_tokens_in_tile:
+                                    val2 = cutlass.Float32(0.0)
+                                if tile_token3 >= work_tile_info.valid_tokens_in_tile:
+                                    val3 = cutlass.Float32(0.0)
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_amax_reduce")
+                                amax0 = cute.math.absf(val0)
+                                amax1 = cute.math.absf(val1)
+                                amax2 = cute.math.absf(val2)
+                                amax3 = cute.math.absf(val3)
+                                for xor_mask in (4, 8, 16):
+                                    peer_lane = lane_idx ^ cutlass.Int32(xor_mask)
+                                    amax0 = cute.arch.fmax(
+                                        amax0, cute.arch.shuffle_sync(amax0, peer_lane)
+                                    )
+                                    amax1 = cute.arch.fmax(
+                                        amax1, cute.arch.shuffle_sync(amax1, peer_lane)
+                                    )
+                                    amax2 = cute.arch.fmax(
+                                        amax2, cute.arch.shuffle_sync(amax2, peer_lane)
+                                    )
+                                    amax3 = cute.arch.fmax(
+                                        amax3, cute.arch.shuffle_sync(amax3, peer_lane)
+                                    )
+                                if lane_g == cutlass.Int32(0):
+                                    sFc1Swiglu[token0, compute_warp] = amax0
+                                    sFc1Swiglu[token1, compute_warp] = amax1
+                                    sFc1Swiglu[token2, compute_warp] = amax2
+                                    sFc1Swiglu[token3, compute_warp] = amax3
+
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+
+                                amax0 = cutlass.Float32(0.0)
+                                amax1 = cutlass.Float32(0.0)
+                                amax2 = cutlass.Float32(0.0)
+                                amax3 = cutlass.Float32(0.0)
+                                if lane_g == cutlass.Int32(0):
+                                    pair_first_warp = warp_pair * cutlass.Int32(2)
+                                    for warp_offset in cutlass.range_constexpr(0, 2):
+                                        warp = pair_first_warp + cutlass.Int32(warp_offset)
+                                        amax0 = cute.arch.fmax(
+                                            amax0, sFc1Swiglu[token0, warp]
+                                        )
+                                        amax1 = cute.arch.fmax(
+                                            amax1, sFc1Swiglu[token1, warp]
+                                        )
+                                        amax2 = cute.arch.fmax(
+                                            amax2, sFc1Swiglu[token2, warp]
+                                        )
+                                        amax3 = cute.arch.fmax(
+                                            amax3, sFc1Swiglu[token3, warp]
+                                        )
+                                amax0 = cute.arch.shuffle_sync(amax0, lane_t)
+                                amax1 = cute.arch.shuffle_sync(amax1, lane_t)
+                                amax2 = cute.arch.shuffle_sync(amax2, lane_t)
+                                amax3 = cute.arch.shuffle_sync(amax3, lane_t)
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_quant_pack")
+                                raw_scale0 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax0 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale1 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax1 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale2 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax2 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale3 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax3 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                scale0 = cvt_f32_to_f8_to_f32(raw_scale0, self.sf_dtype)
+                                scale1 = cvt_f32_to_f8_to_f32(raw_scale1, self.sf_dtype)
+                                scale2 = cvt_f32_to_f8_to_f32(raw_scale2, self.sf_dtype)
+                                scale3 = cvt_f32_to_f8_to_f32(raw_scale3, self.sf_dtype)
+                                inv0 = cutlass.Float32(0.0)
+                                inv1 = cutlass.Float32(0.0)
+                                inv2 = cutlass.Float32(0.0)
+                                inv3 = cutlass.Float32(0.0)
+                                if scale0 > cutlass.Float32(0.0):
+                                    inv0 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale0) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale1 > cutlass.Float32(0.0):
+                                    inv1 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale1) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale2 > cutlass.Float32(0.0):
+                                    inv2 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale2) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale3 > cutlass.Float32(0.0):
+                                    inv3 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale3) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+
+                                if (
+                                    lane_g == cutlass.Int32(0)
+                                    and (compute_warp & cutlass.Int32(1)) == cutlass.Int32(0)
+                                ):
+                                    if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token0, sf_col, 0] = (
+                                            raw_scale0
+                                        ).to(self.sf_dtype)
+                                    if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token1, sf_col, 0] = (
+                                            raw_scale1
+                                        ).to(self.sf_dtype)
+                                    if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token2, sf_col, 0] = (
+                                            raw_scale2
+                                        ).to(self.sf_dtype)
+                                    if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token3, sf_col, 0] = (
+                                            raw_scale3
+                                        ).to(self.sf_dtype)
+
+                                q0 = cutlass.Float32(0.0)
+                                q1 = cutlass.Float32(0.0)
+                                q2 = cutlass.Float32(0.0)
+                                q3 = cutlass.Float32(0.0)
+                                if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                    q0 = val0 * inv0
+                                if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                    q1 = val1 * inv1
+                                if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                    q2 = val2 * inv2
+                                if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                    q3 = val3 * inv3
+
+                                rFc1OutputLocal[0] = q0
+                                rFc1OutputLocal[1] = q1
+                                rFc1OutputLocal[2] = q2
+                                rFc1OutputLocal[3] = q3
+                                partner_lane = lane_idx ^ cutlass.Int32(4)
+                                peer_q0 = cute.arch.shuffle_sync(q0, partner_lane)
+                                peer_q1 = cute.arch.shuffle_sync(q1, partner_lane)
+                                peer_q2 = cute.arch.shuffle_sync(q2, partner_lane)
+                                peer_q3 = cute.arch.shuffle_sync(q3, partner_lane)
+                                if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                    byte_col = (
+                                        compute_warp * cutlass.Int32(4)
+                                        + (lane_g >> cutlass.Int32(1))
+                                    )
+                                    sFc1OutputBytes[tile_token0, byte_col] = pack_e2m1x2(
+                                        q0, peer_q0
+                                    )
+                                    sFc1OutputBytes[tile_token1, byte_col] = pack_e2m1x2(
+                                        q1, peer_q1
+                                    )
+                                    sFc1OutputBytes[tile_token2, byte_col] = pack_e2m1x2(
+                                        q2, peer_q2
+                                    )
+                                    sFc1OutputBytes[tile_token3, byte_col] = pack_e2m1x2(
+                                        q3, peer_q3
+                                    )
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_pack_smem")
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                            chunks_per_row = downproj_per_cta // 8
+                            # N16 has fewer chunks than compute threads. Round up;
+                            # the existing valid-token guard protects every GMEM store
+                            # and the corresponding scratch load for inactive threads.
+                            store_iters = (
+                                self.mma_tiler[1] * chunks_per_row
+                                + 32 * len(self.compute_warp_id) - 1
+                            ) // (32 * len(self.compute_warp_id))
+                            for store_iter in cutlass.range_constexpr(
+                                0, store_iters
+                            ):
+                                linear_chunk = (
+                                    tidx
+                                    + cutlass.Int32(
+                                        store_iter
+                                        * 32
+                                        * len(self.compute_warp_id)
+                                    )
+                                )
+                                store_token = linear_chunk // cutlass.Int32(
+                                    chunks_per_row
+                                )
+                                store_byte = (
+                                    linear_chunk
+                                    % cutlass.Int32(chunks_per_row)
+                                ) * cutlass.Int32(4)
+                                scratch_ptr = (
+                                    sFc1OutputBytes.iterator
+                                    + store_token * cutlass.Int32(downproj_per_cta // 2)
+                                    + store_byte
+                                ).align(4)
+                                scratch_i32 = cute.make_tensor(
+                                    cute.recast_ptr(scratch_ptr, dtype=cutlass.Int32),
+                                    cute.make_layout(1),
+                                )
+                                if (
+                                    store_token
+                                    < work_tile_info.valid_tokens_in_tile
+                                ):
+                                    output_row = tile_token_base + store_token
+                                    output_col = fc1_col_base + store_byte * cutlass.Int32(2)
+                                    output_ptr = (
+                                        cute.recast_ptr(
+                                            real_fc1_output.iterator,
+                                            dtype=cutlass.Uint8,
+                                        )
+                                        + output_row
+                                        * (
+                                            real_fc1_output.stride[0]
+                                            // cutlass.Int32(2)
+                                        )
+                                        + output_col // cutlass.Int32(2)
+                                    ).align(4)
+                                    output_i32 = cute.make_tensor(
+                                        cute.recast_ptr(
+                                            output_ptr,
+                                            dtype=cutlass.Int32,
+                                        ),
+                                        cute.make_layout(1),
+                                    )
+                                    output_i32[0] = scratch_i32[0]
+                            # K2 consumes this rank-local expert-pool data from a
+                            # distinct Green Context. GPU scope orders the local HBM
+                            # stores; the K2 TMA warp performs the async-proxy acquire.
+                            cute.arch.fence_acq_rel_gpu()
+                            cute.arch.barrier(
+                                barrier_id=self.epilog_sync_bar_id,
+                                number_of_threads=32 * len(self.compute_warp_id),
+                            )
+                            if cutlass.const_expr(
+                                self.fc1_producer_tiles_per_ready_block == 1
+                            ):
+                                counter_slot = (
+                                    work_tile_info.cumulative_token_block_count
+                                    + work_tile_info.tile_n_idx
                                 )
                             else:
-                                issue_m64n8k64_nvfp4(
-                                    tiled_mma,
-                                    accumulators[None, None, ng],
-                                    tCrA,
-                                    tCrB,
-                                    tCrSFA,
-                                    tCrSFB,
-                                    n_group=ng,
-                                    active_n_groups=n_groups,
-                                    sfa_m_group=0,
-                                    k_inner=k_inner_mma,
-                                    a_dtype=self.a_dtype,
-                                    b_dtype=self.b_dtype,
-                                    sf_dtype=self.sf_dtype,
-                                )
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
-                    # Experimental: retain a proxy fence in every reader lane.
-                    # Each warp rendezvous precedes its elected empty arrival;
-                    # producer reuse still waits for all four warp arrivals.
-                    if cutlass.const_expr(self.scheduler_phase_mode == "fc1"):
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        cute.arch.sync_warp()
-                    handle_a.release()
-                    handle_b.release()
-
-                if cutlass.const_expr(green_trace is not None):
-                    if compute_warp == cutlass.Int32(0):
-                        if lane_idx == cutlass.Int32(0):
-                            k2_trace_mainloop_ns += (
-                                read_globaltimer()
-                                - k2_trace_mainloop_start
-                            )
-                trace_post_mainloop_start = cutlass.Int64(0)
-                if cutlass.const_expr(green_trace is not None):
-                    if compute_warp == cutlass.Int32(0):
-                        if lane_idx == cutlass.Int32(0):
-                            trace_post_mainloop_start = read_globaltimer()
-                iket.range_pop()
-                if self.scheduler_phase_mode != "fc2" and is_phase_linear1:
-                    iket.range_push("sm120_fc1_epilogue")
-                    real_fc1_output, _ = ext.get_gmem_tensor(
-                        "c", fc1_output_gemm, work_tile_info,
-                    )
-                    real_fc1_output_sf, _ = ext.get_gmem_tensor(
-                        "sfc", fc1_output_sf_gemm, work_tile_info,
-                    )
-                    if cutlass.const_expr(token_comm_args is not None):
-                        real_topk_scores, _ = ext.get_gmem_tensor(
-                            "topk", topk_scores, work_tile_info,
-                        )
-                    fc1_col_base = (
-                        work_tile_info.tile_m_idx * cutlass.Int32(downproj_per_cta)
-                    )
-                    tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
-                        self.mma_tiler[1]
-                    )
-                    # SF tensor K coordinates are element coordinates.  The
-                    # within-block vec mode is stride-zero, so block starts
-                    # are 0, sf_vec_size, 2*sf_vec_size, ... .
-                    warp_pair = compute_warp // cutlass.Int32(2)
-                    sf_col = fc1_col_base + warp_pair * cutlass.Int32(16)
-                    fc1_alpha_value = cutlass.Float32(1.0)
-                    fc1_norm_value = cutlass.Float32(1.0)
-                    if cutlass.const_expr(fc1_alpha is not None):
-                        fc1_alpha_value = cutlass.Float32(
-                            fc1_alpha[work_tile_info.expert_idx]
-                        )
-                    if cutlass.const_expr(fc1_norm_const is not None):
-                        fc1_norm_value = cutlass.Float32(
-                            fc1_norm_const[work_tile_info.expert_idx]
-                        )
-
-                    for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
-                        acc0 = accumulators[None, None, ng_pair * 2]
-                        acc1 = accumulators[None, None, ng_pair * 2 + 1]
-
-                        token0 = lane_t * cutlass.Int32(2)
-                        token1 = token0 + cutlass.Int32(1)
-                        token2 = token0 + cutlass.Int32(MMA_N)
-                        token3 = token1 + cutlass.Int32(MMA_N)
-                        token_pair_base = cutlass.Int32(ng_pair * 2 * MMA_N)
-                        tile_token0 = token_pair_base + token0
-                        tile_token1 = token_pair_base + token1
-                        tile_token2 = token_pair_base + token2
-                        tile_token3 = token_pair_base + token3
-
-                        gate0 = acc0[0] * fc1_alpha_value
-                        gate1 = acc0[1] * fc1_alpha_value
-                        gate2 = acc1[0] * fc1_alpha_value
-                        gate3 = acc1[1] * fc1_alpha_value
-                        up0 = acc0[2] * fc1_alpha_value
-                        up1 = acc0[3] * fc1_alpha_value
-                        up2 = acc1[2] * fc1_alpha_value
-                        up3 = acc1[3] * fc1_alpha_value
-                        if cutlass.const_expr(self.gate_up_clamp is not None):
-                            limit = cutlass.Float32(self.gate_up_clamp)
-                            gate0 = clamp_gate_upper_f32(gate0, limit)
-                            gate1 = clamp_gate_upper_f32(gate1, limit)
-                            gate2 = clamp_gate_upper_f32(gate2, limit)
-                            gate3 = clamp_gate_upper_f32(gate3, limit)
-                            up0 = clamp_symmetric_f32(up0, limit)
-                            up1 = clamp_symmetric_f32(up1, limit)
-                            up2 = clamp_symmetric_f32(up2, limit)
-                            up3 = clamp_symmetric_f32(up3, limit)
-                        val0 = up0 * gate0 * cute.arch.rcp_approx(
-                            cute.math.exp2(gate0 * (-Log2E))
-                            + cutlass.Float32(1.0)
-                        )
-                        val1 = up1 * gate1 * cute.arch.rcp_approx(
-                            cute.math.exp2(gate1 * (-Log2E))
-                            + cutlass.Float32(1.0)
-                        )
-                        val2 = up2 * gate2 * cute.arch.rcp_approx(
-                            cute.math.exp2(gate2 * (-Log2E))
-                            + cutlass.Float32(1.0)
-                        )
-                        val3 = up3 * gate3 * cute.arch.rcp_approx(
-                            cute.math.exp2(gate3 * (-Log2E))
-                            + cutlass.Float32(1.0)
-                        )
-
-                        raw_token0 = tile_token_base + tile_token0
-                        raw_token1 = tile_token_base + tile_token1
-                        raw_token2 = tile_token_base + tile_token2
-                        raw_token3 = tile_token_base + tile_token3
-                        if cutlass.const_expr(token_comm_args is not None):
-                            if tile_token0 < work_tile_info.valid_tokens_in_tile:
-                                val0 = val0 * cutlass.Float32(
-                                    real_topk_scores[raw_token0]
-                                )
-                            if tile_token1 < work_tile_info.valid_tokens_in_tile:
-                                val1 = val1 * cutlass.Float32(
-                                    real_topk_scores[raw_token1]
-                                )
-                            if tile_token2 < work_tile_info.valid_tokens_in_tile:
-                                val2 = val2 * cutlass.Float32(
-                                    real_topk_scores[raw_token2]
-                                )
-                            if tile_token3 < work_tile_info.valid_tokens_in_tile:
-                                val3 = val3 * cutlass.Float32(
-                                    real_topk_scores[raw_token3]
-                                )
-
-                        if tile_token0 >= work_tile_info.valid_tokens_in_tile:
-                            val0 = cutlass.Float32(0.0)
-                        if tile_token1 >= work_tile_info.valid_tokens_in_tile:
-                            val1 = cutlass.Float32(0.0)
-                        if tile_token2 >= work_tile_info.valid_tokens_in_tile:
-                            val2 = cutlass.Float32(0.0)
-                        if tile_token3 >= work_tile_info.valid_tokens_in_tile:
-                            val3 = cutlass.Float32(0.0)
-                        if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_push("sm120_fc1_epi_amax_reduce")
-                        amax0 = cute.math.absf(val0)
-                        amax1 = cute.math.absf(val1)
-                        amax2 = cute.math.absf(val2)
-                        amax3 = cute.math.absf(val3)
-                        for xor_mask in (4, 8, 16):
-                            peer_lane = lane_idx ^ cutlass.Int32(xor_mask)
-                            amax0 = cute.arch.fmax(
-                                amax0, cute.arch.shuffle_sync(amax0, peer_lane)
-                            )
-                            amax1 = cute.arch.fmax(
-                                amax1, cute.arch.shuffle_sync(amax1, peer_lane)
-                            )
-                            amax2 = cute.arch.fmax(
-                                amax2, cute.arch.shuffle_sync(amax2, peer_lane)
-                            )
-                            amax3 = cute.arch.fmax(
-                                amax3, cute.arch.shuffle_sync(amax3, peer_lane)
-                            )
-                        if lane_g == cutlass.Int32(0):
-                            sFc1Swiglu[token0, compute_warp] = amax0
-                            sFc1Swiglu[token1, compute_warp] = amax1
-                            sFc1Swiglu[token2, compute_warp] = amax2
-                            sFc1Swiglu[token3, compute_warp] = amax3
-
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=32 * len(self.compute_warp_id),
-                        )
-
-                        amax0 = cutlass.Float32(0.0)
-                        amax1 = cutlass.Float32(0.0)
-                        amax2 = cutlass.Float32(0.0)
-                        amax3 = cutlass.Float32(0.0)
-                        if lane_g == cutlass.Int32(0):
-                            pair_first_warp = warp_pair * cutlass.Int32(2)
-                            for warp_offset in cutlass.range_constexpr(0, 2):
-                                warp = pair_first_warp + cutlass.Int32(warp_offset)
-                                amax0 = cute.arch.fmax(
-                                    amax0, sFc1Swiglu[token0, warp]
-                                )
-                                amax1 = cute.arch.fmax(
-                                    amax1, sFc1Swiglu[token1, warp]
-                                )
-                                amax2 = cute.arch.fmax(
-                                    amax2, sFc1Swiglu[token2, warp]
-                                )
-                                amax3 = cute.arch.fmax(
-                                    amax3, sFc1Swiglu[token3, warp]
-                                )
-                        amax0 = cute.arch.shuffle_sync(amax0, lane_t)
-                        amax1 = cute.arch.shuffle_sync(amax1, lane_t)
-                        amax2 = cute.arch.shuffle_sync(amax2, lane_t)
-                        amax3 = cute.arch.shuffle_sync(amax3, lane_t)
-                        if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_pop()
-
-                        if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_push("sm120_fc1_epi_quant_pack")
-                        raw_scale0 = cute.arch.fmin(
-                            cutlass.Float32(Fp8E4M3FNMax),
-                            amax0 * cutlass.Float32(Nvfp4E2M1RcpLimit)
-                            * fc1_norm_value,
-                        )
-                        raw_scale1 = cute.arch.fmin(
-                            cutlass.Float32(Fp8E4M3FNMax),
-                            amax1 * cutlass.Float32(Nvfp4E2M1RcpLimit)
-                            * fc1_norm_value,
-                        )
-                        raw_scale2 = cute.arch.fmin(
-                            cutlass.Float32(Fp8E4M3FNMax),
-                            amax2 * cutlass.Float32(Nvfp4E2M1RcpLimit)
-                            * fc1_norm_value,
-                        )
-                        raw_scale3 = cute.arch.fmin(
-                            cutlass.Float32(Fp8E4M3FNMax),
-                            amax3 * cutlass.Float32(Nvfp4E2M1RcpLimit)
-                            * fc1_norm_value,
-                        )
-                        scale0 = cvt_f32_to_f8_to_f32(raw_scale0, self.sf_dtype)
-                        scale1 = cvt_f32_to_f8_to_f32(raw_scale1, self.sf_dtype)
-                        scale2 = cvt_f32_to_f8_to_f32(raw_scale2, self.sf_dtype)
-                        scale3 = cvt_f32_to_f8_to_f32(raw_scale3, self.sf_dtype)
-                        inv0 = cutlass.Float32(0.0)
-                        inv1 = cutlass.Float32(0.0)
-                        inv2 = cutlass.Float32(0.0)
-                        inv3 = cutlass.Float32(0.0)
-                        if scale0 > cutlass.Float32(0.0):
-                            inv0 = cute.arch.fmin(
-                                cute.arch.rcp_approx(scale0) * fc1_norm_value,
-                                cutlass.Float32(Fp32Max),
-                            )
-                        if scale1 > cutlass.Float32(0.0):
-                            inv1 = cute.arch.fmin(
-                                cute.arch.rcp_approx(scale1) * fc1_norm_value,
-                                cutlass.Float32(Fp32Max),
-                            )
-                        if scale2 > cutlass.Float32(0.0):
-                            inv2 = cute.arch.fmin(
-                                cute.arch.rcp_approx(scale2) * fc1_norm_value,
-                                cutlass.Float32(Fp32Max),
-                            )
-                        if scale3 > cutlass.Float32(0.0):
-                            inv3 = cute.arch.fmin(
-                                cute.arch.rcp_approx(scale3) * fc1_norm_value,
-                                cutlass.Float32(Fp32Max),
-                            )
-
-                        if (
-                            lane_g == cutlass.Int32(0)
-                            and (compute_warp & cutlass.Int32(1)) == cutlass.Int32(0)
-                        ):
-                            if tile_token0 < work_tile_info.valid_tokens_in_tile:
-                                real_fc1_output_sf[raw_token0, sf_col, 0] = (
-                                    raw_scale0
-                                ).to(self.sf_dtype)
-                            if tile_token1 < work_tile_info.valid_tokens_in_tile:
-                                real_fc1_output_sf[raw_token1, sf_col, 0] = (
-                                    raw_scale1
-                                ).to(self.sf_dtype)
-                            if tile_token2 < work_tile_info.valid_tokens_in_tile:
-                                real_fc1_output_sf[raw_token2, sf_col, 0] = (
-                                    raw_scale2
-                                ).to(self.sf_dtype)
-                            if tile_token3 < work_tile_info.valid_tokens_in_tile:
-                                real_fc1_output_sf[raw_token3, sf_col, 0] = (
-                                    raw_scale3
-                                ).to(self.sf_dtype)
-
-                        q0 = cutlass.Float32(0.0)
-                        q1 = cutlass.Float32(0.0)
-                        q2 = cutlass.Float32(0.0)
-                        q3 = cutlass.Float32(0.0)
-                        if tile_token0 < work_tile_info.valid_tokens_in_tile:
-                            q0 = val0 * inv0
-                        if tile_token1 < work_tile_info.valid_tokens_in_tile:
-                            q1 = val1 * inv1
-                        if tile_token2 < work_tile_info.valid_tokens_in_tile:
-                            q2 = val2 * inv2
-                        if tile_token3 < work_tile_info.valid_tokens_in_tile:
-                            q3 = val3 * inv3
-
-                        rFc1OutputLocal[0] = q0
-                        rFc1OutputLocal[1] = q1
-                        rFc1OutputLocal[2] = q2
-                        rFc1OutputLocal[3] = q3
-                        partner_lane = lane_idx ^ cutlass.Int32(4)
-                        peer_q0 = cute.arch.shuffle_sync(q0, partner_lane)
-                        peer_q1 = cute.arch.shuffle_sync(q1, partner_lane)
-                        peer_q2 = cute.arch.shuffle_sync(q2, partner_lane)
-                        peer_q3 = cute.arch.shuffle_sync(q3, partner_lane)
-                        if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
-                            byte_col = (
-                                compute_warp * cutlass.Int32(4)
-                                + (lane_g >> cutlass.Int32(1))
-                            )
-                            sFc1OutputBytes[tile_token0, byte_col] = pack_e2m1x2(
-                                q0, peer_q0
-                            )
-                            sFc1OutputBytes[tile_token1, byte_col] = pack_e2m1x2(
-                                q1, peer_q1
-                            )
-                            sFc1OutputBytes[tile_token2, byte_col] = pack_e2m1x2(
-                                q2, peer_q2
-                            )
-                            sFc1OutputBytes[tile_token3, byte_col] = pack_e2m1x2(
-                                q3, peer_q3
-                            )
-                        if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_pop()
-
-                        if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_push("sm120_fc1_epi_pack_smem")
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=32 * len(self.compute_warp_id),
-                        )
-                        if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_pop()
-
-                    chunks_per_row = downproj_per_cta // 8
-                    # N16 has fewer chunks than compute threads. Round up;
-                    # the existing valid-token guard protects every GMEM store
-                    # and the corresponding scratch load for inactive threads.
-                    store_iters = (
-                        self.mma_tiler[1] * chunks_per_row
-                        + 32 * len(self.compute_warp_id) - 1
-                    ) // (32 * len(self.compute_warp_id))
-                    for store_iter in cutlass.range_constexpr(
-                        0, store_iters
-                    ):
-                        linear_chunk = (
-                            tidx
-                            + cutlass.Int32(
-                                store_iter
-                                * 32
-                                * len(self.compute_warp_id)
-                            )
-                        )
-                        store_token = linear_chunk // cutlass.Int32(
-                            chunks_per_row
-                        )
-                        store_byte = (
-                            linear_chunk
-                            % cutlass.Int32(chunks_per_row)
-                        ) * cutlass.Int32(4)
-                        scratch_ptr = (
-                            sFc1OutputBytes.iterator
-                            + store_token * cutlass.Int32(downproj_per_cta // 2)
-                            + store_byte
-                        ).align(4)
-                        scratch_i32 = cute.make_tensor(
-                            cute.recast_ptr(scratch_ptr, dtype=cutlass.Int32),
-                            cute.make_layout(1),
-                        )
-                        if (
-                            store_token
-                            < work_tile_info.valid_tokens_in_tile
-                        ):
-                            output_row = tile_token_base + store_token
-                            output_col = fc1_col_base + store_byte * cutlass.Int32(2)
-                            output_ptr = (
-                                cute.recast_ptr(
-                                    real_fc1_output.iterator,
-                                    dtype=cutlass.Uint8,
-                                )
-                                + output_row
-                                * (
-                                    real_fc1_output.stride[0]
-                                    // cutlass.Int32(2)
-                                )
-                                + output_col // cutlass.Int32(2)
-                            ).align(4)
-                            output_i32 = cute.make_tensor(
-                                cute.recast_ptr(
-                                    output_ptr,
-                                    dtype=cutlass.Int32,
-                                ),
-                                cute.make_layout(1),
-                            )
-                            output_i32[0] = scratch_i32[0]
-                    # K2 consumes this rank-local expert-pool data from a
-                    # distinct Green Context. GPU scope orders the local HBM
-                    # stores; the K2 TMA warp performs the async-proxy acquire.
-                    cute.arch.fence_acq_rel_gpu()
-                    cute.arch.barrier(
-                        barrier_id=self.epilog_sync_bar_id,
-                        number_of_threads=32 * len(self.compute_warp_id),
-                    )
-                    if cutlass.const_expr(
-                        self.fc1_producer_tiles_per_ready_block == 1
-                    ):
-                        counter_slot = (
-                            work_tile_info.cumulative_token_block_count
-                            + work_tile_info.tile_n_idx
-                        )
-                    else:
-                        counter_slot = (
-                            work_tile_info.cumulative_token_block_count
-                            + (
-                                work_tile_info.tile_n_idx
-                                // cutlass.Int32(
-                                    self.fc1_producer_tiles_per_ready_block
-                                )
-                            )
-                            * cutlass.Int32(
-                                self.fc1_producer_tiles_per_ready_block
-                            )
-                        )
-                    if cutlass.const_expr(token_comm_args is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            ready_bundle_idx = (
-                                work_tile_info.tile_m_idx
-                                // cutlass.Int32(
-                                    fc1_tiles_per_fc2_k_tile
-                                    * self.fc2_ready_bundle_k_tiles
-                                )
-                            )
-                            bundle_begin = (
-                                ready_bundle_idx
-                                * cutlass.Int32(self.fc2_ready_bundle_k_tiles)
-                            )
-                            bundle_k_tiles = cutlass.min(
-                                cutlass.Int32(self.fc2_ready_bundle_k_tiles),
-                                k_tile_cnt_fc2 - bundle_begin,
-                            )
-                            ready_old = cutlass.Int32(0)
-                            if lane_idx == cutlass.Int32(0):
-                                ready_old = cute.arch.atomic_add(
-                                    fc1_done_counter.iterator
-                                    + counter_slot * fc2_ready_bundle_cnt
-                                    + ready_bundle_idx,
-                                    cutlass.Int32(1),
-                                    # The last completer publishes the K2
-                                    # descriptor.  Acquire the preceding
-                                    # release sequence so that publication
-                                    # transitively exposes every producer
-                                    # CTA's rank-local FC1 data and scale stores.
-                                    sem="acq_rel",
-                                    scope="gpu",
-                                )
-                            if cutlass.const_expr(
-                                k2_ready_queue_state is not None
-                            ):
-                                ready_old = cute.arch.shuffle_sync(
-                                    ready_old,
-                                    offset=0,
-                                    mask=0xFFFFFFFF,
-                                    mask_and_clamp=31,
-                                )
-                                if cutlass.const_expr(
-                                    self.fc1_producer_tiles_per_ready_block == 1
-                                ):
-                                    ready_tile_n_idx = (
+                                counter_slot = (
+                                    work_tile_info.cumulative_token_block_count
+                                    + (
                                         work_tile_info.tile_n_idx
-                                    )
-                                    ready_tile_valid_tokens = (
-                                        work_tile_info.valid_tokens_in_tile
-                                    )
-                                    producer_tiles_in_ready_block = (
-                                        cutlass.Int32(1)
-                                    )
-                                else:
-                                    ready_tile_n_idx = (
-                                        work_tile_info.tile_n_idx
-                                        * cutlass.Int32(self.mma_tiler[1])
                                         // cutlass.Int32(
-                                            self.k2_ready_tile_tokens
+                                            self.fc1_producer_tiles_per_ready_block
                                         )
                                     )
-                                    packed_expert_count = (
-                                        token_comm_args.expert_recv_count_sum[
-                                            work_tile_info.expert_idx
-                                        ]
-                                    )
-                                    expert_token_count = cutlass.Int32(
-                                        cutlass.Int64(packed_expert_count)
-                                        & cutlass.Int64(0xFFFFFFFF)
-                                    )
-                                    ready_tile_valid_tokens = cutlass.min(
-                                        cutlass.Int32(
-                                            self.k2_ready_tile_tokens
-                                        ),
-                                        expert_token_count
-                                        - ready_tile_n_idx
-                                        * cutlass.Int32(
-                                            self.k2_ready_tile_tokens
-                                        ),
-                                    )
-                                    producer_tiles_in_ready_block = (
-                                        ready_tile_valid_tokens
-                                        + cutlass.Int32(
-                                            self.fc1_ready_tile_tokens - 1
-                                        )
-                                    ) // cutlass.Int32(
-                                        self.fc1_ready_tile_tokens
-                                    )
-                                bundle_expected = (
-                                    bundle_k_tiles
                                     * cutlass.Int32(
-                                        fc1_tiles_per_fc2_k_tile
+                                        self.fc1_producer_tiles_per_ready_block
                                     )
-                                    * producer_tiles_in_ready_block
                                 )
-                                bundle_complete = (
-                                    (ready_old & cutlass.Int32(0xFFFF))
-                                    + cutlass.Int32(1)
-                                    == bundle_expected
-                                )
-                                all_bundles_complete = cutlass.Int32(0)
-                                if bundle_complete:
-                                    completed_bundle_old = cutlass.Int32(0)
+                            if cutlass.const_expr(token_comm_args is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    ready_bundle_idx = (
+                                        work_tile_info.tile_m_idx
+                                        // cutlass.Int32(
+                                            fc1_tiles_per_fc2_k_tile
+                                            * self.fc2_ready_bundle_k_tiles
+                                        )
+                                    )
+                                    bundle_begin = (
+                                        ready_bundle_idx
+                                        * cutlass.Int32(self.fc2_ready_bundle_k_tiles)
+                                    )
+                                    bundle_k_tiles = cutlass.min(
+                                        cutlass.Int32(self.fc2_ready_bundle_k_tiles),
+                                        k_tile_cnt_fc2 - bundle_begin,
+                                    )
+                                    ready_old = cutlass.Int32(0)
                                     if lane_idx == cutlass.Int32(0):
-                                        # Pack the ready-block bundle count in
-                                        # the high 16 bits of its first
-                                        # contribution counter.  Queue
-                                        # publication must not depend on the
-                                        # final K bundle happening to finish
-                                        # after every earlier bundle.
-                                        completed_bundle_old = cute.arch.atomic_add(
+                                        ready_old = cute.arch.atomic_add(
                                             fc1_done_counter.iterator
-                                            + counter_slot * fc2_ready_bundle_cnt,
-                                            cutlass.Int32(1 << 16),
+                                            + counter_slot * fc2_ready_bundle_cnt
+                                            + ready_bundle_idx,
+                                            cutlass.Int32(1),
+                                            # The last completer publishes the K2
+                                            # descriptor.  Acquire the preceding
+                                            # release sequence so that publication
+                                            # transitively exposes every producer
+                                            # CTA's rank-local FC1 data and scale stores.
                                             sem="acq_rel",
                                             scope="gpu",
                                         )
-                                    completed_bundle_old = cute.arch.shuffle_sync(
-                                        completed_bundle_old,
-                                        offset=0,
-                                        mask=0xFFFFFFFF,
-                                        mask_and_clamp=31,
-                                    )
-                                    completed_bundle_count = (
-                                        completed_bundle_old
-                                        >> cutlass.Int32(16)
-                                    ) + cutlass.Int32(1)
-                                    if (
-                                        completed_bundle_count
-                                        == cutlass.Int32(fc2_ready_bundle_cnt)
+                                    if cutlass.const_expr(
+                                        k2_ready_queue_state is not None
                                     ):
-                                        all_bundles_complete = cutlass.Int32(1)
-                                if all_bundles_complete != cutlass.Int32(0):
-                                    # Acquire every FC1 producer's release
-                                    # before this last producer publishes the
-                                    # descriptor and its ready flag.
-                                    cute.arch.fence_acq_rel_gpu()
-                                    hidden_tiles = (
-                                        self.hidden
-                                        + self.mma_tiler[0]
-                                        - 1
-                                    ) // self.mma_tiler[0]
-                                    queue_bundle_count = (
-                                        hidden_tiles
-                                        + self.k2_ready_queue_bundle
-                                        - 1
-                                    ) // self.k2_ready_queue_bundle
-                                    k2_token_tiles_per_ready_block = (
-                                        self.k2_ready_tile_tokens
-                                        // self.k2_token_tile_tokens
-                                    )
-                                    valid_k2_token_tiles = (
-                                        ready_tile_valid_tokens
-                                        + cutlass.Int32(
-                                            self.k2_token_tile_tokens - 1
+                                        ready_old = cute.arch.shuffle_sync(
+                                            ready_old,
+                                            offset=0,
+                                            mask=0xFFFFFFFF,
+                                            mask_and_clamp=31,
                                         )
-                                    ) // cutlass.Int32(
-                                        self.k2_token_tile_tokens
+                                        if cutlass.const_expr(
+                                            self.fc1_producer_tiles_per_ready_block == 1
+                                        ):
+                                            ready_tile_n_idx = (
+                                                work_tile_info.tile_n_idx
+                                            )
+                                            ready_tile_valid_tokens = (
+                                                work_tile_info.valid_tokens_in_tile
+                                            )
+                                            producer_tiles_in_ready_block = (
+                                                cutlass.Int32(1)
+                                            )
+                                        else:
+                                            ready_tile_n_idx = (
+                                                work_tile_info.tile_n_idx
+                                                * cutlass.Int32(self.mma_tiler[1])
+                                                // cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                )
+                                            )
+                                            packed_expert_count = (
+                                                token_comm_args.expert_recv_count_sum[
+                                                    work_tile_info.expert_idx
+                                                ]
+                                            )
+                                            expert_token_count = cutlass.Int32(
+                                                cutlass.Int64(packed_expert_count)
+                                                & cutlass.Int64(0xFFFFFFFF)
+                                            )
+                                            ready_tile_valid_tokens = cutlass.min(
+                                                cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                ),
+                                                expert_token_count
+                                                - ready_tile_n_idx
+                                                * cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                ),
+                                            )
+                                            producer_tiles_in_ready_block = (
+                                                ready_tile_valid_tokens
+                                                + cutlass.Int32(
+                                                    self.fc1_ready_tile_tokens - 1
+                                                )
+                                            ) // cutlass.Int32(
+                                                self.fc1_ready_tile_tokens
+                                            )
+                                        bundle_expected = (
+                                            bundle_k_tiles
+                                            * cutlass.Int32(
+                                                fc1_tiles_per_fc2_k_tile
+                                            )
+                                            * producer_tiles_in_ready_block
+                                        )
+                                        bundle_complete = (
+                                            (ready_old & cutlass.Int32(0xFFFF))
+                                            + cutlass.Int32(1)
+                                            == bundle_expected
+                                        )
+                                        all_bundles_complete = cutlass.Int32(0)
+                                        if bundle_complete:
+                                            completed_bundle_old = cutlass.Int32(0)
+                                            if lane_idx == cutlass.Int32(0):
+                                                # Pack the ready-block bundle count in
+                                                # the high 16 bits of its first
+                                                # contribution counter.  Queue
+                                                # publication must not depend on the
+                                                # final K bundle happening to finish
+                                                # after every earlier bundle.
+                                                completed_bundle_old = cute.arch.atomic_add(
+                                                    fc1_done_counter.iterator
+                                                    + counter_slot * fc2_ready_bundle_cnt,
+                                                    cutlass.Int32(1 << 16),
+                                                    sem="acq_rel",
+                                                    scope="gpu",
+                                                )
+                                            completed_bundle_old = cute.arch.shuffle_sync(
+                                                completed_bundle_old,
+                                                offset=0,
+                                                mask=0xFFFFFFFF,
+                                                mask_and_clamp=31,
+                                            )
+                                            completed_bundle_count = (
+                                                completed_bundle_old
+                                                >> cutlass.Int32(16)
+                                            ) + cutlass.Int32(1)
+                                            if (
+                                                completed_bundle_count
+                                                == cutlass.Int32(fc2_ready_bundle_cnt)
+                                            ):
+                                                all_bundles_complete = cutlass.Int32(1)
+                                        if all_bundles_complete != cutlass.Int32(0):
+                                            # Acquire every FC1 producer's release
+                                            # before this last producer publishes the
+                                            # descriptor and its ready flag.
+                                            cute.arch.fence_acq_rel_gpu()
+                                            hidden_tiles = (
+                                                self.hidden
+                                                + self.mma_tiler[0]
+                                                - 1
+                                            ) // self.mma_tiler[0]
+                                            queue_bundle_count = (
+                                                hidden_tiles
+                                                + self.k2_ready_queue_bundle
+                                                - 1
+                                            ) // self.k2_ready_queue_bundle
+                                            k2_token_tiles_per_ready_block = (
+                                                self.k2_ready_tile_tokens
+                                                // self.k2_token_tile_tokens
+                                            )
+                                            valid_k2_token_tiles = (
+                                                ready_tile_valid_tokens
+                                                + cutlass.Int32(
+                                                    self.k2_token_tile_tokens - 1
+                                                )
+                                            ) // cutlass.Int32(
+                                                self.k2_token_tile_tokens
+                                            )
+                                            queue_entry_count = (
+                                                cutlass.Int32(queue_bundle_count)
+                                                * valid_k2_token_tiles
+                                            )
+                                            queue_base = cutlass.Int32(0)
+                                            if lane_idx == cutlass.Int32(0):
+                                                queue_base = cute.arch.atomic_add(
+                                                    k2_ready_queue_state.iterator
+                                                    + cutlass.Int32(1),
+                                                    queue_entry_count,
+                                                    scope="gpu",
+                                                )
+                                            queue_base = cute.arch.shuffle_sync(
+                                                queue_base,
+                                                offset=0,
+                                                mask=0xFFFFFFFF,
+                                                mask_and_clamp=31,
+                                            )
+                                            queue_store_iters = (
+                                                queue_bundle_count
+                                                * k2_token_tiles_per_ready_block
+                                                + 31
+                                            ) // 32
+                                            for queue_store_iter in cutlass.range_constexpr(
+                                                0, queue_store_iters
+                                            ):
+                                                queue_entry_idx = (
+                                                    lane_idx
+                                                    + cutlass.Int32(
+                                                        queue_store_iter * 32
+                                                    )
+                                                )
+                                                if queue_entry_idx < queue_entry_count:
+                                                    k2_token_tile = (
+                                                        queue_entry_idx
+                                                        // cutlass.Int32(
+                                                            queue_bundle_count
+                                                        )
+                                                    )
+                                                    queue_bundle_idx = (
+                                                        queue_entry_idx
+                                                        % cutlass.Int32(
+                                                            queue_bundle_count
+                                                        )
+                                                    )
+                                                    queue_pos = (
+                                                        queue_base + queue_entry_idx
+                                                    )
+                                                    desc_base = (
+                                                        queue_pos * cutlass.Int32(7)
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(0)
+                                                    ] = work_tile_info.expert_idx
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(1)
+                                                    ] = (
+                                                        ready_tile_n_idx
+                                                        * cutlass.Int32(
+                                                            k2_token_tiles_per_ready_block
+                                                        )
+                                                        + k2_token_tile
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(2)
+                                                    ] = work_tile_info.cumulative_data_physical_row
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(3)
+                                                    ] = work_tile_info.cumulative_sf_physical_row
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(4)
+                                                    ] = work_tile_info.cumulative_token_block_count
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(5)
+                                                    ] = cutlass.min(
+                                                        cutlass.Int32(
+                                                            self.k2_token_tile_tokens
+                                                        ),
+                                                        ready_tile_valid_tokens
+                                                        - k2_token_tile
+                                                        * cutlass.Int32(
+                                                            self.k2_token_tile_tokens
+                                                        ),
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(6)
+                                                    ] = (
+                                                        queue_bundle_idx
+                                                        * cutlass.Int32(
+                                                            self.k2_ready_queue_bundle
+                                                        )
+                                                    )
+                                            cute.arch.sync_warp()
+                                            for queue_store_iter in cutlass.range_constexpr(
+                                                0, queue_store_iters
+                                            ):
+                                                queue_entry_idx = (
+                                                    lane_idx
+                                                    + cutlass.Int32(
+                                                        queue_store_iter * 32
+                                                    )
+                                                )
+                                                if queue_entry_idx < queue_entry_count:
+                                                    queue_pos = (
+                                                        queue_base + queue_entry_idx
+                                                    )
+                                                    # The release store orders this
+                                                    # lane's descriptor writes; no
+                                                    # second explicit GPU fence is
+                                                    # required.
+                                                    cute.arch.store(
+                                                        k2_ready_queue_ready.iterator
+                                                        + queue_pos,
+                                                        cutlass.Int32(1),
+                                                        sem="release",
+                                                        scope="gpu",
+                                                    )
+                            else:
+                                if lane_idx == cutlass.Int32(0):
+                                    cute.arch.atomic_add(
+                                        fc1_done_counter.iterator + counter_slot,
+                                        cutlass.Int32(1),
+                                        sem="release",
+                                        scope="gpu",
                                     )
-                                    queue_entry_count = (
-                                        cutlass.Int32(queue_bundle_count)
-                                        * valid_k2_token_tiles
-                                    )
-                                    queue_base = cutlass.Int32(0)
+                        else:
+                            iket.range_push("sm120_fc2_store")
+                            hidden_base = (
+                                work_tile_info.tile_m_idx * cutlass.Int32(self.mma_tiler[0])
+                            )
+                            tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
+                                self.mma_tiler[1]
+                            )
+                            fc2_alpha_value = cutlass.Float32(1.0)
+                            if cutlass.const_expr(fc2_alpha is not None):
+                                fc2_alpha_value = cutlass.Float32(
+                                    fc2_alpha[work_tile_info.expert_idx]
+                                )
+                            for ng in cutlass.range_constexpr(0, 4):
+                                acc = accumulators[None, None, ng]
+
+                                token0 = cutlass.Int32(ng * MMA_N) + lane_t * cutlass.Int32(2)
+                                token1 = token0 + cutlass.Int32(1)
+                                hidden0 = hidden_base + compute_warp * cutlass.Int32(16) + lane_g
+                                hidden1 = hidden0 + cutlass.Int32(8)
+                                pool_token0 = (
+                                    work_tile_info.cumulative_data_physical_row
+                                    + tile_token_base
+                                    + token0
+                                )
+                                pool_token1 = (
+                                    work_tile_info.cumulative_data_physical_row
+                                    + tile_token_base
+                                    + token1
+                                )
+                                if cutlass.const_expr(self.fc2_packed_store):
+                                    partner_lane = lane_idx ^ cutlass.Int32(4)
+                                    rFc2Store[0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[1] = cute.arch.shuffle_sync(
+                                        acc[0] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[2] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[3] = cute.arch.shuffle_sync(
+                                        acc[2] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[4] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[5] = cute.arch.shuffle_sync(
+                                        acc[1] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[6] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[7] = cute.arch.shuffle_sync(
+                                        acc[3] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                if token0 < work_tile_info.valid_tokens_in_tile:
+                                    if cutlass.const_expr(self.fc2_packed_store):
+                                        if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                            if cutlass.const_expr(
+                                                token_comm_args is not None
+                                                and not self.token_back_by_dispatch
+                                            ):
+                                                md0 = TokenSrcMetadata.load(
+                                                    token_comm_args.token_src_metadata.iterator.toint()
+                                                    + cutlass.Int64(pool_token0)
+                                                    * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                                )
+                                                local_row0 = cute.slice_(
+                                                    fc2_output,
+                                                    (md0.src_token, md0.src_topk, None),
+                                                )
+                                                row0 = cute.make_tensor(
+                                                    token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                        local_row0.iterator, md0.src_rank
+                                                    ),
+                                                    local_row0.layout,
+                                                )
+                                            else:
+                                                row0 = cute.slice_(
+                                                    fc2_output, (pool_token0, 0, None)
+                                                )
+                                            row0_hidden0 = (
+                                                row0.iterator + hidden0
+                                            ).align(4)
+                                            row0_hidden1 = (
+                                                row0.iterator + hidden1
+                                            ).align(4)
+                                            row0_i32_0 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row0_hidden0, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row0_i32_1 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row0_hidden1, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row0_i32_0[0] = rFc2StoreI32[0]
+                                            row0_i32_1[0] = rFc2StoreI32[1]
+                                    else:
+                                        if cutlass.const_expr(
+                                            token_comm_args is not None
+                                            and not self.token_back_by_dispatch
+                                        ):
+                                            md0 = TokenSrcMetadata.load(
+                                                token_comm_args.token_src_metadata.iterator.toint()
+                                                + cutlass.Int64(pool_token0)
+                                                * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                            )
+                                            local_row0 = cute.slice_(
+                                                fc2_output,
+                                                (md0.src_token, md0.src_topk, None),
+                                            )
+                                            peer_row0 = cute.make_tensor(
+                                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                    local_row0.iterator, md0.src_rank
+                                                ),
+                                                local_row0.layout,
+                                            )
+                                            peer_row0[hidden0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                            peer_row0[hidden1] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        else:
+                                            fc2_output[pool_token0, 0, hidden0] = (acc[0] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                            fc2_output[pool_token0, 0, hidden1] = (acc[2] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                if token1 < work_tile_info.valid_tokens_in_tile:
+                                    if cutlass.const_expr(self.fc2_packed_store):
+                                        if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                            if cutlass.const_expr(
+                                                token_comm_args is not None
+                                                and not self.token_back_by_dispatch
+                                            ):
+                                                md1 = TokenSrcMetadata.load(
+                                                    token_comm_args.token_src_metadata.iterator.toint()
+                                                    + cutlass.Int64(pool_token1)
+                                                    * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                                )
+                                                local_row1 = cute.slice_(
+                                                    fc2_output,
+                                                    (md1.src_token, md1.src_topk, None),
+                                                )
+                                                row1 = cute.make_tensor(
+                                                    token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                        local_row1.iterator, md1.src_rank
+                                                    ),
+                                                    local_row1.layout,
+                                                )
+                                            else:
+                                                row1 = cute.slice_(
+                                                    fc2_output, (pool_token1, 0, None)
+                                                )
+                                            row1_hidden0 = (
+                                                row1.iterator + hidden0
+                                            ).align(4)
+                                            row1_hidden1 = (
+                                                row1.iterator + hidden1
+                                            ).align(4)
+                                            row1_i32_0 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row1_hidden0, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row1_i32_1 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row1_hidden1, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row1_i32_0[0] = rFc2StoreI32[2]
+                                            row1_i32_1[0] = rFc2StoreI32[3]
+                                    else:
+                                        if cutlass.const_expr(
+                                            token_comm_args is not None
+                                            and not self.token_back_by_dispatch
+                                        ):
+                                            md1 = TokenSrcMetadata.load(
+                                                token_comm_args.token_src_metadata.iterator.toint()
+                                                + cutlass.Int64(pool_token1)
+                                                * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                            )
+                                            local_row1 = cute.slice_(
+                                                fc2_output,
+                                                (md1.src_token, md1.src_topk, None),
+                                            )
+                                            peer_row1 = cute.make_tensor(
+                                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                    local_row1.iterator, md1.src_rank
+                                                ),
+                                                local_row1.layout,
+                                            )
+                                            peer_row1[hidden0] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                            peer_row1[hidden1] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        else:
+                                            fc2_output[pool_token1, 0, hidden0] = (acc[1] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                            fc2_output[pool_token1, 0, hidden1] = (acc[3] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+
+                            if cutlass.const_expr(
+                                combine_ready_flags is not None
+                                and fc2_block_done_counter is not None
+                            ):
+                                # The last hidden tile for this token block publishes
+                                # one ready flag per source (token, top-k) row.
+                                cute.arch.fence_acq_rel_sys()
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                self.token_comm_hook_fc2_tile_complete(
+                                    token_comm_args,
+                                    combine_ready_flags,
+                                    fc2_block_done_counter,
+                                    work_tile_info,
+                                    compute_warp=compute_warp,
+                                    lane_idx=lane_idx,
+                                )
+
+                            if cutlass.const_expr(self.token_back_by_dispatch):
+                                # token-back consumes this tile from the local FC2
+                                # workspace only after all four compute warps have
+                                # made their disjoint hidden slices system-visible.
+                                # Publish exactly once per scheduler FC2 work tile.
+                                # Grouped token-back aggregates completion per expert.
+                                cute.arch.fence_acq_rel_sys()
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                if compute_warp == cutlass.Int32(0):
                                     if lane_idx == cutlass.Int32(0):
-                                        queue_base = cute.arch.atomic_add(
-                                            k2_ready_queue_state.iterator
-                                            + cutlass.Int32(1),
-                                            queue_entry_count,
+                                        counter_slot = work_tile_info.expert_idx
+                                        cute.arch.atomic_add(
+                                            token_comm_args.fc2_done_counter.iterator
+                                            + counter_slot,
+                                            cutlass.Int32(1),
+                                            sem="release",
+                                            scope="sys",
+                                        )
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    k2_trace_store_ns += (
+                                        read_globaltimer() - trace_post_mainloop_start
+                                    )
+
+                    elif work_tile_info.valid_tokens_in_tile <= cutlass.Int32(64):
+                        accumulators = cute.make_rmem_tensor(tiled_mma.partition_shape_C((self.mma_tiler[0], 64)), self.acc_dtype)
+                        accumulators.fill(0.0)
+
+                        a_consumer.reset()
+                        b_consumer.reset()
+                        peek_a_full_status = cutlass.Boolean(1)
+                        peek_b_full_status = cutlass.Boolean(1)
+                        if k_tile_cnt > 0:
+                            peek_a_full_status = a_consumer.try_wait()
+                            peek_b_full_status = b_consumer.try_wait()
+
+                        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                            trace_k_detail = cutlass.Int32(0)
+                            if trace_compute_detail != cutlass.Int32(0):
+                                if trace_all_k_detail != cutlass.Int32(0):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile < cutlass.Int32(2):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(11):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(12):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(23):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(24):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile + cutlass.Int32(2) >= k_tile_cnt:
+                                    trace_k_detail = cutlass.Int32(1)
+
+                            if trace_k_detail != cutlass.Int32(0):
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_wait_a")
+                                else:
+                                    iket.range_push("sm120_fc2_wait_a")
+                            k2_trace_a_wait_start = cutlass.Int64(0)
+                            k2_trace_a_wait_active = cutlass.Boolean(0)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if peek_a_full_status == cutlass.Boolean(0):
+                                            k2_trace_tma_a_wait_calls += cutlass.Int64(1)
+                                            if (
+                                                (
+                                                    k_tile
+                                                    + fc2_detail_tiles_seen
+                                                    + cta_linear_id
+                                                )
+                                                % cutlass.Int32(
+                                                    TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                                )
+                                                == cutlass.Int32(0)
+                                            ):
+                                                k2_trace_a_wait_start = read_globaltimer()
+                                                k2_trace_a_wait_active = cutlass.Boolean(1)
+                                                k2_trace_tma_a_timed_calls += (
+                                                    cutlass.Int64(1)
+                                                )
+                            handle_a = a_consumer.wait_and_advance(peek_a_full_status)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if k2_trace_a_wait_active:
+                                            k2_trace_tma_a_wait_ns += (
+                                                read_globaltimer()
+                                                - k2_trace_a_wait_start
+                                            )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_wait_b")
+                                else:
+                                    iket.range_push("sm120_fc2_wait_b")
+                            k2_trace_b_wait_start = cutlass.Int64(0)
+                            k2_trace_b_wait_active = cutlass.Boolean(0)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if peek_b_full_status == cutlass.Boolean(0):
+                                            k2_trace_tma_b_wait_calls += cutlass.Int64(1)
+                                            if (
+                                                (
+                                                    k_tile
+                                                    + fc2_detail_tiles_seen
+                                                    + cta_linear_id
+                                                )
+                                                % cutlass.Int32(
+                                                    TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                                )
+                                                == cutlass.Int32(0)
+                                            ):
+                                                k2_trace_b_wait_start = read_globaltimer()
+                                                k2_trace_b_wait_active = cutlass.Boolean(1)
+                                                k2_trace_tma_b_timed_calls += (
+                                                    cutlass.Int64(1)
+                                                )
+                            handle_b = b_consumer.wait_and_advance(peek_b_full_status)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if k2_trace_b_wait_active:
+                                            k2_trace_tma_b_wait_ns += (
+                                                read_globaltimer()
+                                                - k2_trace_b_wait_start
+                                            )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                            peek_a_full_status = cutlass.Boolean(1)
+                            peek_b_full_status = cutlass.Boolean(1)
+                            if handle_a.count + 1 < k_tile_cnt:
+                                peek_a_full_status = a_consumer.try_wait()
+                            if handle_b.count + 1 < k_tile_cnt:
+                                peek_b_full_status = b_consumer.try_wait()
+
+                            tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                            tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                            tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
+                            tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
+                            sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                                self.mma_tiler_sfa[0] // self.mma_tiler[0]
+                            )
+                            # partition_fragment_SFA packs the two M64 groups of the
+                            # staged M128 scale tile eight bytes apart. Select the
+                            # group in SMEM so the RMEM fragment is statically indexed.
+                            tCsSFA_selected = cute.make_tensor(
+                                tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                                tCsSFA_p.layout,
+                            )
+                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                            tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, 0],
+                                tCrA_copy_view[None, None, 0],
+                            )
+                            for row_ng in cutlass.range_constexpr(0, 2):
+                                cute.copy(smem_tiled_copy_B, tCsB_p[None, row_ng, 0], tCrB_copy_view[None, row_ng, 0])
+                            cute.copy(
+                                smem_tiled_copy_SFA,
+                                tCsSFA_p_filtered[None, None, 0],
+                                tCrSFA_copy_view_filtered[None, None, 0],
+                            )
+                            if cutlass.const_expr(self.mma_tiler[1] < 128):
+                                sfb_tiles_per_tma = 128 // self.mma_tiler[1]
+                                sfb_tile_slot = (
+                                    work_tile_info.tile_n_idx
+                                    % cutlass.Int32(sfb_tiles_per_tma)
+                                )
+                                sfb_stage_byte_offset = (
+                                    handle_b.index
+                                    * cutlass.Int32(cute.cosize(sfb_smem_layout))
+                                )
+                                for ng in cutlass.range_constexpr(0, 8):
+                                    lane_scale_row = (
+                                        sfb_tile_slot
+                                        * cutlass.Int32(self.mma_tiler[1])
+                                        + cutlass.Int32(ng * MMA_N)
+                                        + lane_idx // cutlass.Int32(4)
+                                    )
+                                    sfb_lane_byte_base = (
+                                        (lane_scale_row % cutlass.Int32(32))
+                                        * cutlass.Int32(16)
+                                        + (lane_scale_row // cutlass.Int32(32))
+                                        * cutlass.Int32(4)
+                                        + sfb_stage_byte_offset
+                                    )
+                                    rSFBCompactI32[ng * 2] = lds_b32_raw(
+                                        sSFB.iterator + sfb_lane_byte_base
+                                    )
+                                    rSFBCompactI32[ng * 2 + 1] = lds_b32_raw(
+                                        sSFB.iterator
+                                        + sfb_lane_byte_base
+                                        + cutlass.Int32(512)
+                                    )
+                            else:
+                                tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                                tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                    tCrSFB_copy_view
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered[None, None, 0],
+                                    tCrSFB_copy_view_filtered[None, 0, None, 0],
+                                )
+
+                            if trace_k_detail != cutlass.Int32(0):
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_k128_compute")
+                                else:
+                                    iket.range_push("sm120_fc2_k128_compute")
+                            for k_inner_mma in cutlass.range_constexpr(0, 2):
+                                if cutlass.const_expr(k_inner_mma + 1 < 2):
+                                    k_inner_next = k_inner_mma + 1
+                                    cute.copy(
+                                        smem_tiled_copy_A,
+                                        tCsA_p[None, None, k_inner_next],
+                                        tCrA_copy_view[None, None, k_inner_next],
+                                    )
+                                    for row_ng in cutlass.range_constexpr(0, 2):
+                                        cute.copy(smem_tiled_copy_B, tCsB_p[None, row_ng, k_inner_next], tCrB_copy_view[None, row_ng, k_inner_next])
+                                    cute.copy(
+                                        smem_tiled_copy_SFA,
+                                        tCsSFA_p_filtered[None, None, k_inner_next],
+                                        tCrSFA_copy_view_filtered[
+                                            None, None, k_inner_next
+                                        ],
+                                    )
+                                    if cutlass.const_expr(self.mma_tiler[1] == 128):
+                                        cute.copy(
+                                            smem_tiled_copy_SFB,
+                                            tCsSFB_p_filtered[
+                                                None, None, k_inner_next
+                                            ],
+                                            tCrSFB_copy_view_filtered[
+                                                None, 0, None, k_inner_next
+                                            ],
+                                        )
+                                for ng in cutlass.range_constexpr(0, 8):
+                                    if cutlass.const_expr(self.mma_tiler[1] < 128):
+                                        issue_m64n8k64_nvfp4_packed_sfb(
+                                            tiled_mma,
+                                            accumulators[None, None, ng],
+                                            tCrA,
+                                            tCrB,
+                                            tCrSFA,
+                                            rSFBCompactI32,
+                                            n_group=ng,
+                                            active_n_groups=8,
+                                            sfa_m_group=0,
+                                            k_inner=k_inner_mma,
+                                            a_dtype=self.a_dtype,
+                                            b_dtype=self.b_dtype,
+                                            sf_dtype=self.sf_dtype,
+                                        )
+                                    else:
+                                        issue_m64n8k64_nvfp4(
+                                            tiled_mma,
+                                            accumulators[None, None, ng],
+                                            tCrA,
+                                            tCrB,
+                                            tCrSFA,
+                                            tCrSFB,
+                                            n_group=ng,
+                                            active_n_groups=8,
+                                            sfa_m_group=0,
+                                            k_inner=k_inner_mma,
+                                            a_dtype=self.a_dtype,
+                                            b_dtype=self.b_dtype,
+                                            sf_dtype=self.sf_dtype,
+                                        )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                            # Experimental: retain a proxy fence in every reader lane.
+                            # Each warp rendezvous precedes its elected empty arrival;
+                            # producer reuse still waits for all four warp arrivals.
+                            if cutlass.const_expr(self.scheduler_phase_mode == "fc1"):
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                cute.arch.sync_warp()
+                            handle_a.release()
+                            handle_b.release()
+
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    k2_trace_mainloop_ns += (
+                                        read_globaltimer()
+                                        - k2_trace_mainloop_start
+                                    )
+                        trace_post_mainloop_start = cutlass.Int64(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    trace_post_mainloop_start = read_globaltimer()
+                        iket.range_pop()
+                        if self.scheduler_phase_mode != "fc2" and is_phase_linear1:
+                            iket.range_push("sm120_fc1_epilogue")
+                            real_fc1_output, _ = ext.get_gmem_tensor(
+                                "c", fc1_output_gemm, work_tile_info,
+                            )
+                            real_fc1_output_sf, _ = ext.get_gmem_tensor(
+                                "sfc", fc1_output_sf_gemm, work_tile_info,
+                            )
+                            if cutlass.const_expr(token_comm_args is not None):
+                                real_topk_scores, _ = ext.get_gmem_tensor(
+                                    "topk", topk_scores, work_tile_info,
+                                )
+                            fc1_col_base = (
+                                work_tile_info.tile_m_idx * cutlass.Int32(downproj_per_cta)
+                            )
+                            tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
+                                self.mma_tiler[1]
+                            )
+                            # SF tensor K coordinates are element coordinates.  The
+                            # within-block vec mode is stride-zero, so block starts
+                            # are 0, sf_vec_size, 2*sf_vec_size, ... .
+                            warp_pair = compute_warp // cutlass.Int32(2)
+                            sf_col = fc1_col_base + warp_pair * cutlass.Int32(16)
+                            fc1_alpha_value = cutlass.Float32(1.0)
+                            fc1_norm_value = cutlass.Float32(1.0)
+                            if cutlass.const_expr(fc1_alpha is not None):
+                                fc1_alpha_value = cutlass.Float32(
+                                    fc1_alpha[work_tile_info.expert_idx]
+                                )
+                            if cutlass.const_expr(fc1_norm_const is not None):
+                                fc1_norm_value = cutlass.Float32(
+                                    fc1_norm_const[work_tile_info.expert_idx]
+                                )
+
+                            for ng_pair in cutlass.range_constexpr(0, 8 // 2):
+                                acc0 = accumulators[None, None, ng_pair * 2]
+                                acc1 = accumulators[None, None, ng_pair * 2 + 1]
+
+                                token0 = lane_t * cutlass.Int32(2)
+                                token1 = token0 + cutlass.Int32(1)
+                                token2 = token0 + cutlass.Int32(MMA_N)
+                                token3 = token1 + cutlass.Int32(MMA_N)
+                                token_pair_base = cutlass.Int32(ng_pair * 2 * MMA_N)
+                                tile_token0 = token_pair_base + token0
+                                tile_token1 = token_pair_base + token1
+                                tile_token2 = token_pair_base + token2
+                                tile_token3 = token_pair_base + token3
+
+                                gate0 = acc0[0] * fc1_alpha_value
+                                gate1 = acc0[1] * fc1_alpha_value
+                                gate2 = acc1[0] * fc1_alpha_value
+                                gate3 = acc1[1] * fc1_alpha_value
+                                up0 = acc0[2] * fc1_alpha_value
+                                up1 = acc0[3] * fc1_alpha_value
+                                up2 = acc1[2] * fc1_alpha_value
+                                up3 = acc1[3] * fc1_alpha_value
+                                if cutlass.const_expr(self.gate_up_clamp is not None):
+                                    limit = cutlass.Float32(self.gate_up_clamp)
+                                    gate0 = clamp_gate_upper_f32(gate0, limit)
+                                    gate1 = clamp_gate_upper_f32(gate1, limit)
+                                    gate2 = clamp_gate_upper_f32(gate2, limit)
+                                    gate3 = clamp_gate_upper_f32(gate3, limit)
+                                    up0 = clamp_symmetric_f32(up0, limit)
+                                    up1 = clamp_symmetric_f32(up1, limit)
+                                    up2 = clamp_symmetric_f32(up2, limit)
+                                    up3 = clamp_symmetric_f32(up3, limit)
+                                val0 = up0 * gate0 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate0 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val1 = up1 * gate1 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate1 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val2 = up2 * gate2 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate2 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val3 = up3 * gate3 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate3 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+
+                                raw_token0 = tile_token_base + tile_token0
+                                raw_token1 = tile_token_base + tile_token1
+                                raw_token2 = tile_token_base + tile_token2
+                                raw_token3 = tile_token_base + tile_token3
+                                if cutlass.const_expr(token_comm_args is not None):
+                                    if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                        val0 = val0 * cutlass.Float32(
+                                            real_topk_scores[raw_token0]
+                                        )
+                                    if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                        val1 = val1 * cutlass.Float32(
+                                            real_topk_scores[raw_token1]
+                                        )
+                                    if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                        val2 = val2 * cutlass.Float32(
+                                            real_topk_scores[raw_token2]
+                                        )
+                                    if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                        val3 = val3 * cutlass.Float32(
+                                            real_topk_scores[raw_token3]
+                                        )
+
+                                if tile_token0 >= work_tile_info.valid_tokens_in_tile:
+                                    val0 = cutlass.Float32(0.0)
+                                if tile_token1 >= work_tile_info.valid_tokens_in_tile:
+                                    val1 = cutlass.Float32(0.0)
+                                if tile_token2 >= work_tile_info.valid_tokens_in_tile:
+                                    val2 = cutlass.Float32(0.0)
+                                if tile_token3 >= work_tile_info.valid_tokens_in_tile:
+                                    val3 = cutlass.Float32(0.0)
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_amax_reduce")
+                                amax0 = cute.math.absf(val0)
+                                amax1 = cute.math.absf(val1)
+                                amax2 = cute.math.absf(val2)
+                                amax3 = cute.math.absf(val3)
+                                for xor_mask in (4, 8, 16):
+                                    peer_lane = lane_idx ^ cutlass.Int32(xor_mask)
+                                    amax0 = cute.arch.fmax(
+                                        amax0, cute.arch.shuffle_sync(amax0, peer_lane)
+                                    )
+                                    amax1 = cute.arch.fmax(
+                                        amax1, cute.arch.shuffle_sync(amax1, peer_lane)
+                                    )
+                                    amax2 = cute.arch.fmax(
+                                        amax2, cute.arch.shuffle_sync(amax2, peer_lane)
+                                    )
+                                    amax3 = cute.arch.fmax(
+                                        amax3, cute.arch.shuffle_sync(amax3, peer_lane)
+                                    )
+                                if lane_g == cutlass.Int32(0):
+                                    sFc1Swiglu[token0, compute_warp] = amax0
+                                    sFc1Swiglu[token1, compute_warp] = amax1
+                                    sFc1Swiglu[token2, compute_warp] = amax2
+                                    sFc1Swiglu[token3, compute_warp] = amax3
+
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+
+                                amax0 = cutlass.Float32(0.0)
+                                amax1 = cutlass.Float32(0.0)
+                                amax2 = cutlass.Float32(0.0)
+                                amax3 = cutlass.Float32(0.0)
+                                if lane_g == cutlass.Int32(0):
+                                    pair_first_warp = warp_pair * cutlass.Int32(2)
+                                    for warp_offset in cutlass.range_constexpr(0, 2):
+                                        warp = pair_first_warp + cutlass.Int32(warp_offset)
+                                        amax0 = cute.arch.fmax(
+                                            amax0, sFc1Swiglu[token0, warp]
+                                        )
+                                        amax1 = cute.arch.fmax(
+                                            amax1, sFc1Swiglu[token1, warp]
+                                        )
+                                        amax2 = cute.arch.fmax(
+                                            amax2, sFc1Swiglu[token2, warp]
+                                        )
+                                        amax3 = cute.arch.fmax(
+                                            amax3, sFc1Swiglu[token3, warp]
+                                        )
+                                amax0 = cute.arch.shuffle_sync(amax0, lane_t)
+                                amax1 = cute.arch.shuffle_sync(amax1, lane_t)
+                                amax2 = cute.arch.shuffle_sync(amax2, lane_t)
+                                amax3 = cute.arch.shuffle_sync(amax3, lane_t)
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_quant_pack")
+                                raw_scale0 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax0 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale1 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax1 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale2 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax2 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale3 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax3 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                scale0 = cvt_f32_to_f8_to_f32(raw_scale0, self.sf_dtype)
+                                scale1 = cvt_f32_to_f8_to_f32(raw_scale1, self.sf_dtype)
+                                scale2 = cvt_f32_to_f8_to_f32(raw_scale2, self.sf_dtype)
+                                scale3 = cvt_f32_to_f8_to_f32(raw_scale3, self.sf_dtype)
+                                inv0 = cutlass.Float32(0.0)
+                                inv1 = cutlass.Float32(0.0)
+                                inv2 = cutlass.Float32(0.0)
+                                inv3 = cutlass.Float32(0.0)
+                                if scale0 > cutlass.Float32(0.0):
+                                    inv0 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale0) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale1 > cutlass.Float32(0.0):
+                                    inv1 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale1) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale2 > cutlass.Float32(0.0):
+                                    inv2 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale2) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale3 > cutlass.Float32(0.0):
+                                    inv3 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale3) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+
+                                if (
+                                    lane_g == cutlass.Int32(0)
+                                    and (compute_warp & cutlass.Int32(1)) == cutlass.Int32(0)
+                                ):
+                                    if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token0, sf_col, 0] = (
+                                            raw_scale0
+                                        ).to(self.sf_dtype)
+                                    if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token1, sf_col, 0] = (
+                                            raw_scale1
+                                        ).to(self.sf_dtype)
+                                    if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token2, sf_col, 0] = (
+                                            raw_scale2
+                                        ).to(self.sf_dtype)
+                                    if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token3, sf_col, 0] = (
+                                            raw_scale3
+                                        ).to(self.sf_dtype)
+
+                                q0 = cutlass.Float32(0.0)
+                                q1 = cutlass.Float32(0.0)
+                                q2 = cutlass.Float32(0.0)
+                                q3 = cutlass.Float32(0.0)
+                                if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                    q0 = val0 * inv0
+                                if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                    q1 = val1 * inv1
+                                if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                    q2 = val2 * inv2
+                                if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                    q3 = val3 * inv3
+
+                                rFc1OutputLocal[0] = q0
+                                rFc1OutputLocal[1] = q1
+                                rFc1OutputLocal[2] = q2
+                                rFc1OutputLocal[3] = q3
+                                partner_lane = lane_idx ^ cutlass.Int32(4)
+                                peer_q0 = cute.arch.shuffle_sync(q0, partner_lane)
+                                peer_q1 = cute.arch.shuffle_sync(q1, partner_lane)
+                                peer_q2 = cute.arch.shuffle_sync(q2, partner_lane)
+                                peer_q3 = cute.arch.shuffle_sync(q3, partner_lane)
+                                if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                    byte_col = (
+                                        compute_warp * cutlass.Int32(4)
+                                        + (lane_g >> cutlass.Int32(1))
+                                    )
+                                    sFc1OutputBytes[tile_token0, byte_col] = pack_e2m1x2(
+                                        q0, peer_q0
+                                    )
+                                    sFc1OutputBytes[tile_token1, byte_col] = pack_e2m1x2(
+                                        q1, peer_q1
+                                    )
+                                    sFc1OutputBytes[tile_token2, byte_col] = pack_e2m1x2(
+                                        q2, peer_q2
+                                    )
+                                    sFc1OutputBytes[tile_token3, byte_col] = pack_e2m1x2(
+                                        q3, peer_q3
+                                    )
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_pack_smem")
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                            chunks_per_row = downproj_per_cta // 8
+                            # N16 has fewer chunks than compute threads. Round up;
+                            # the existing valid-token guard protects every GMEM store
+                            # and the corresponding scratch load for inactive threads.
+                            store_iters = (
+                                self.mma_tiler[1] * chunks_per_row
+                                + 32 * len(self.compute_warp_id) - 1
+                            ) // (32 * len(self.compute_warp_id))
+                            for store_iter in cutlass.range_constexpr(
+                                0, store_iters
+                            ):
+                                linear_chunk = (
+                                    tidx
+                                    + cutlass.Int32(
+                                        store_iter
+                                        * 32
+                                        * len(self.compute_warp_id)
+                                    )
+                                )
+                                store_token = linear_chunk // cutlass.Int32(
+                                    chunks_per_row
+                                )
+                                store_byte = (
+                                    linear_chunk
+                                    % cutlass.Int32(chunks_per_row)
+                                ) * cutlass.Int32(4)
+                                scratch_ptr = (
+                                    sFc1OutputBytes.iterator
+                                    + store_token * cutlass.Int32(downproj_per_cta // 2)
+                                    + store_byte
+                                ).align(4)
+                                scratch_i32 = cute.make_tensor(
+                                    cute.recast_ptr(scratch_ptr, dtype=cutlass.Int32),
+                                    cute.make_layout(1),
+                                )
+                                if (
+                                    store_token
+                                    < work_tile_info.valid_tokens_in_tile
+                                ):
+                                    output_row = tile_token_base + store_token
+                                    output_col = fc1_col_base + store_byte * cutlass.Int32(2)
+                                    output_ptr = (
+                                        cute.recast_ptr(
+                                            real_fc1_output.iterator,
+                                            dtype=cutlass.Uint8,
+                                        )
+                                        + output_row
+                                        * (
+                                            real_fc1_output.stride[0]
+                                            // cutlass.Int32(2)
+                                        )
+                                        + output_col // cutlass.Int32(2)
+                                    ).align(4)
+                                    output_i32 = cute.make_tensor(
+                                        cute.recast_ptr(
+                                            output_ptr,
+                                            dtype=cutlass.Int32,
+                                        ),
+                                        cute.make_layout(1),
+                                    )
+                                    output_i32[0] = scratch_i32[0]
+                            # K2 consumes this rank-local expert-pool data from a
+                            # distinct Green Context. GPU scope orders the local HBM
+                            # stores; the K2 TMA warp performs the async-proxy acquire.
+                            cute.arch.fence_acq_rel_gpu()
+                            cute.arch.barrier(
+                                barrier_id=self.epilog_sync_bar_id,
+                                number_of_threads=32 * len(self.compute_warp_id),
+                            )
+                            if cutlass.const_expr(
+                                self.fc1_producer_tiles_per_ready_block == 1
+                            ):
+                                counter_slot = (
+                                    work_tile_info.cumulative_token_block_count
+                                    + work_tile_info.tile_n_idx
+                                )
+                            else:
+                                counter_slot = (
+                                    work_tile_info.cumulative_token_block_count
+                                    + (
+                                        work_tile_info.tile_n_idx
+                                        // cutlass.Int32(
+                                            self.fc1_producer_tiles_per_ready_block
+                                        )
+                                    )
+                                    * cutlass.Int32(
+                                        self.fc1_producer_tiles_per_ready_block
+                                    )
+                                )
+                            if cutlass.const_expr(token_comm_args is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    ready_bundle_idx = (
+                                        work_tile_info.tile_m_idx
+                                        // cutlass.Int32(
+                                            fc1_tiles_per_fc2_k_tile
+                                            * self.fc2_ready_bundle_k_tiles
+                                        )
+                                    )
+                                    bundle_begin = (
+                                        ready_bundle_idx
+                                        * cutlass.Int32(self.fc2_ready_bundle_k_tiles)
+                                    )
+                                    bundle_k_tiles = cutlass.min(
+                                        cutlass.Int32(self.fc2_ready_bundle_k_tiles),
+                                        k_tile_cnt_fc2 - bundle_begin,
+                                    )
+                                    ready_old = cutlass.Int32(0)
+                                    if lane_idx == cutlass.Int32(0):
+                                        ready_old = cute.arch.atomic_add(
+                                            fc1_done_counter.iterator
+                                            + counter_slot * fc2_ready_bundle_cnt
+                                            + ready_bundle_idx,
+                                            cutlass.Int32(1),
+                                            # The last completer publishes the K2
+                                            # descriptor.  Acquire the preceding
+                                            # release sequence so that publication
+                                            # transitively exposes every producer
+                                            # CTA's rank-local FC1 data and scale stores.
+                                            sem="acq_rel",
                                             scope="gpu",
                                         )
-                                    queue_base = cute.arch.shuffle_sync(
-                                        queue_base,
+                                    if cutlass.const_expr(
+                                        k2_ready_queue_state is not None
+                                    ):
+                                        ready_old = cute.arch.shuffle_sync(
+                                            ready_old,
+                                            offset=0,
+                                            mask=0xFFFFFFFF,
+                                            mask_and_clamp=31,
+                                        )
+                                        if cutlass.const_expr(
+                                            self.fc1_producer_tiles_per_ready_block == 1
+                                        ):
+                                            ready_tile_n_idx = (
+                                                work_tile_info.tile_n_idx
+                                            )
+                                            ready_tile_valid_tokens = (
+                                                work_tile_info.valid_tokens_in_tile
+                                            )
+                                            producer_tiles_in_ready_block = (
+                                                cutlass.Int32(1)
+                                            )
+                                        else:
+                                            ready_tile_n_idx = (
+                                                work_tile_info.tile_n_idx
+                                                * cutlass.Int32(self.mma_tiler[1])
+                                                // cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                )
+                                            )
+                                            packed_expert_count = (
+                                                token_comm_args.expert_recv_count_sum[
+                                                    work_tile_info.expert_idx
+                                                ]
+                                            )
+                                            expert_token_count = cutlass.Int32(
+                                                cutlass.Int64(packed_expert_count)
+                                                & cutlass.Int64(0xFFFFFFFF)
+                                            )
+                                            ready_tile_valid_tokens = cutlass.min(
+                                                cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                ),
+                                                expert_token_count
+                                                - ready_tile_n_idx
+                                                * cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                ),
+                                            )
+                                            producer_tiles_in_ready_block = (
+                                                ready_tile_valid_tokens
+                                                + cutlass.Int32(
+                                                    self.fc1_ready_tile_tokens - 1
+                                                )
+                                            ) // cutlass.Int32(
+                                                self.fc1_ready_tile_tokens
+                                            )
+                                        bundle_expected = (
+                                            bundle_k_tiles
+                                            * cutlass.Int32(
+                                                fc1_tiles_per_fc2_k_tile
+                                            )
+                                            * producer_tiles_in_ready_block
+                                        )
+                                        bundle_complete = (
+                                            (ready_old & cutlass.Int32(0xFFFF))
+                                            + cutlass.Int32(1)
+                                            == bundle_expected
+                                        )
+                                        all_bundles_complete = cutlass.Int32(0)
+                                        if bundle_complete:
+                                            completed_bundle_old = cutlass.Int32(0)
+                                            if lane_idx == cutlass.Int32(0):
+                                                # Pack the ready-block bundle count in
+                                                # the high 16 bits of its first
+                                                # contribution counter.  Queue
+                                                # publication must not depend on the
+                                                # final K bundle happening to finish
+                                                # after every earlier bundle.
+                                                completed_bundle_old = cute.arch.atomic_add(
+                                                    fc1_done_counter.iterator
+                                                    + counter_slot * fc2_ready_bundle_cnt,
+                                                    cutlass.Int32(1 << 16),
+                                                    sem="acq_rel",
+                                                    scope="gpu",
+                                                )
+                                            completed_bundle_old = cute.arch.shuffle_sync(
+                                                completed_bundle_old,
+                                                offset=0,
+                                                mask=0xFFFFFFFF,
+                                                mask_and_clamp=31,
+                                            )
+                                            completed_bundle_count = (
+                                                completed_bundle_old
+                                                >> cutlass.Int32(16)
+                                            ) + cutlass.Int32(1)
+                                            if (
+                                                completed_bundle_count
+                                                == cutlass.Int32(fc2_ready_bundle_cnt)
+                                            ):
+                                                all_bundles_complete = cutlass.Int32(1)
+                                        if all_bundles_complete != cutlass.Int32(0):
+                                            # Acquire every FC1 producer's release
+                                            # before this last producer publishes the
+                                            # descriptor and its ready flag.
+                                            cute.arch.fence_acq_rel_gpu()
+                                            hidden_tiles = (
+                                                self.hidden
+                                                + self.mma_tiler[0]
+                                                - 1
+                                            ) // self.mma_tiler[0]
+                                            queue_bundle_count = (
+                                                hidden_tiles
+                                                + self.k2_ready_queue_bundle
+                                                - 1
+                                            ) // self.k2_ready_queue_bundle
+                                            k2_token_tiles_per_ready_block = (
+                                                self.k2_ready_tile_tokens
+                                                // self.k2_token_tile_tokens
+                                            )
+                                            valid_k2_token_tiles = (
+                                                ready_tile_valid_tokens
+                                                + cutlass.Int32(
+                                                    self.k2_token_tile_tokens - 1
+                                                )
+                                            ) // cutlass.Int32(
+                                                self.k2_token_tile_tokens
+                                            )
+                                            queue_entry_count = (
+                                                cutlass.Int32(queue_bundle_count)
+                                                * valid_k2_token_tiles
+                                            )
+                                            queue_base = cutlass.Int32(0)
+                                            if lane_idx == cutlass.Int32(0):
+                                                queue_base = cute.arch.atomic_add(
+                                                    k2_ready_queue_state.iterator
+                                                    + cutlass.Int32(1),
+                                                    queue_entry_count,
+                                                    scope="gpu",
+                                                )
+                                            queue_base = cute.arch.shuffle_sync(
+                                                queue_base,
+                                                offset=0,
+                                                mask=0xFFFFFFFF,
+                                                mask_and_clamp=31,
+                                            )
+                                            queue_store_iters = (
+                                                queue_bundle_count
+                                                * k2_token_tiles_per_ready_block
+                                                + 31
+                                            ) // 32
+                                            for queue_store_iter in cutlass.range_constexpr(
+                                                0, queue_store_iters
+                                            ):
+                                                queue_entry_idx = (
+                                                    lane_idx
+                                                    + cutlass.Int32(
+                                                        queue_store_iter * 32
+                                                    )
+                                                )
+                                                if queue_entry_idx < queue_entry_count:
+                                                    k2_token_tile = (
+                                                        queue_entry_idx
+                                                        // cutlass.Int32(
+                                                            queue_bundle_count
+                                                        )
+                                                    )
+                                                    queue_bundle_idx = (
+                                                        queue_entry_idx
+                                                        % cutlass.Int32(
+                                                            queue_bundle_count
+                                                        )
+                                                    )
+                                                    queue_pos = (
+                                                        queue_base + queue_entry_idx
+                                                    )
+                                                    desc_base = (
+                                                        queue_pos * cutlass.Int32(7)
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(0)
+                                                    ] = work_tile_info.expert_idx
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(1)
+                                                    ] = (
+                                                        ready_tile_n_idx
+                                                        * cutlass.Int32(
+                                                            k2_token_tiles_per_ready_block
+                                                        )
+                                                        + k2_token_tile
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(2)
+                                                    ] = work_tile_info.cumulative_data_physical_row
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(3)
+                                                    ] = work_tile_info.cumulative_sf_physical_row
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(4)
+                                                    ] = work_tile_info.cumulative_token_block_count
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(5)
+                                                    ] = cutlass.min(
+                                                        cutlass.Int32(
+                                                            self.k2_token_tile_tokens
+                                                        ),
+                                                        ready_tile_valid_tokens
+                                                        - k2_token_tile
+                                                        * cutlass.Int32(
+                                                            self.k2_token_tile_tokens
+                                                        ),
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(6)
+                                                    ] = (
+                                                        queue_bundle_idx
+                                                        * cutlass.Int32(
+                                                            self.k2_ready_queue_bundle
+                                                        )
+                                                    )
+                                            cute.arch.sync_warp()
+                                            for queue_store_iter in cutlass.range_constexpr(
+                                                0, queue_store_iters
+                                            ):
+                                                queue_entry_idx = (
+                                                    lane_idx
+                                                    + cutlass.Int32(
+                                                        queue_store_iter * 32
+                                                    )
+                                                )
+                                                if queue_entry_idx < queue_entry_count:
+                                                    queue_pos = (
+                                                        queue_base + queue_entry_idx
+                                                    )
+                                                    # The release store orders this
+                                                    # lane's descriptor writes; no
+                                                    # second explicit GPU fence is
+                                                    # required.
+                                                    cute.arch.store(
+                                                        k2_ready_queue_ready.iterator
+                                                        + queue_pos,
+                                                        cutlass.Int32(1),
+                                                        sem="release",
+                                                        scope="gpu",
+                                                    )
+                            else:
+                                if lane_idx == cutlass.Int32(0):
+                                    cute.arch.atomic_add(
+                                        fc1_done_counter.iterator + counter_slot,
+                                        cutlass.Int32(1),
+                                        sem="release",
+                                        scope="gpu",
+                                    )
+                        else:
+                            iket.range_push("sm120_fc2_store")
+                            hidden_base = (
+                                work_tile_info.tile_m_idx * cutlass.Int32(self.mma_tiler[0])
+                            )
+                            tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
+                                self.mma_tiler[1]
+                            )
+                            fc2_alpha_value = cutlass.Float32(1.0)
+                            if cutlass.const_expr(fc2_alpha is not None):
+                                fc2_alpha_value = cutlass.Float32(
+                                    fc2_alpha[work_tile_info.expert_idx]
+                                )
+                            for ng in cutlass.range_constexpr(0, 8):
+                                acc = accumulators[None, None, ng]
+
+                                token0 = cutlass.Int32(ng * MMA_N) + lane_t * cutlass.Int32(2)
+                                token1 = token0 + cutlass.Int32(1)
+                                hidden0 = hidden_base + compute_warp * cutlass.Int32(16) + lane_g
+                                hidden1 = hidden0 + cutlass.Int32(8)
+                                pool_token0 = (
+                                    work_tile_info.cumulative_data_physical_row
+                                    + tile_token_base
+                                    + token0
+                                )
+                                pool_token1 = (
+                                    work_tile_info.cumulative_data_physical_row
+                                    + tile_token_base
+                                    + token1
+                                )
+                                if cutlass.const_expr(self.fc2_packed_store):
+                                    partner_lane = lane_idx ^ cutlass.Int32(4)
+                                    rFc2Store[0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[1] = cute.arch.shuffle_sync(
+                                        acc[0] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[2] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[3] = cute.arch.shuffle_sync(
+                                        acc[2] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[4] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[5] = cute.arch.shuffle_sync(
+                                        acc[1] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[6] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[7] = cute.arch.shuffle_sync(
+                                        acc[3] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                if token0 < work_tile_info.valid_tokens_in_tile:
+                                    if cutlass.const_expr(self.fc2_packed_store):
+                                        if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                            if cutlass.const_expr(
+                                                token_comm_args is not None
+                                                and not self.token_back_by_dispatch
+                                            ):
+                                                md0 = TokenSrcMetadata.load(
+                                                    token_comm_args.token_src_metadata.iterator.toint()
+                                                    + cutlass.Int64(pool_token0)
+                                                    * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                                )
+                                                local_row0 = cute.slice_(
+                                                    fc2_output,
+                                                    (md0.src_token, md0.src_topk, None),
+                                                )
+                                                row0 = cute.make_tensor(
+                                                    token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                        local_row0.iterator, md0.src_rank
+                                                    ),
+                                                    local_row0.layout,
+                                                )
+                                            else:
+                                                row0 = cute.slice_(
+                                                    fc2_output, (pool_token0, 0, None)
+                                                )
+                                            row0_hidden0 = (
+                                                row0.iterator + hidden0
+                                            ).align(4)
+                                            row0_hidden1 = (
+                                                row0.iterator + hidden1
+                                            ).align(4)
+                                            row0_i32_0 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row0_hidden0, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row0_i32_1 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row0_hidden1, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row0_i32_0[0] = rFc2StoreI32[0]
+                                            row0_i32_1[0] = rFc2StoreI32[1]
+                                    else:
+                                        if cutlass.const_expr(
+                                            token_comm_args is not None
+                                            and not self.token_back_by_dispatch
+                                        ):
+                                            md0 = TokenSrcMetadata.load(
+                                                token_comm_args.token_src_metadata.iterator.toint()
+                                                + cutlass.Int64(pool_token0)
+                                                * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                            )
+                                            local_row0 = cute.slice_(
+                                                fc2_output,
+                                                (md0.src_token, md0.src_topk, None),
+                                            )
+                                            peer_row0 = cute.make_tensor(
+                                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                    local_row0.iterator, md0.src_rank
+                                                ),
+                                                local_row0.layout,
+                                            )
+                                            peer_row0[hidden0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                            peer_row0[hidden1] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        else:
+                                            fc2_output[pool_token0, 0, hidden0] = (acc[0] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                            fc2_output[pool_token0, 0, hidden1] = (acc[2] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                if token1 < work_tile_info.valid_tokens_in_tile:
+                                    if cutlass.const_expr(self.fc2_packed_store):
+                                        if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                            if cutlass.const_expr(
+                                                token_comm_args is not None
+                                                and not self.token_back_by_dispatch
+                                            ):
+                                                md1 = TokenSrcMetadata.load(
+                                                    token_comm_args.token_src_metadata.iterator.toint()
+                                                    + cutlass.Int64(pool_token1)
+                                                    * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                                )
+                                                local_row1 = cute.slice_(
+                                                    fc2_output,
+                                                    (md1.src_token, md1.src_topk, None),
+                                                )
+                                                row1 = cute.make_tensor(
+                                                    token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                        local_row1.iterator, md1.src_rank
+                                                    ),
+                                                    local_row1.layout,
+                                                )
+                                            else:
+                                                row1 = cute.slice_(
+                                                    fc2_output, (pool_token1, 0, None)
+                                                )
+                                            row1_hidden0 = (
+                                                row1.iterator + hidden0
+                                            ).align(4)
+                                            row1_hidden1 = (
+                                                row1.iterator + hidden1
+                                            ).align(4)
+                                            row1_i32_0 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row1_hidden0, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row1_i32_1 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row1_hidden1, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row1_i32_0[0] = rFc2StoreI32[2]
+                                            row1_i32_1[0] = rFc2StoreI32[3]
+                                    else:
+                                        if cutlass.const_expr(
+                                            token_comm_args is not None
+                                            and not self.token_back_by_dispatch
+                                        ):
+                                            md1 = TokenSrcMetadata.load(
+                                                token_comm_args.token_src_metadata.iterator.toint()
+                                                + cutlass.Int64(pool_token1)
+                                                * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                            )
+                                            local_row1 = cute.slice_(
+                                                fc2_output,
+                                                (md1.src_token, md1.src_topk, None),
+                                            )
+                                            peer_row1 = cute.make_tensor(
+                                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                    local_row1.iterator, md1.src_rank
+                                                ),
+                                                local_row1.layout,
+                                            )
+                                            peer_row1[hidden0] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                            peer_row1[hidden1] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        else:
+                                            fc2_output[pool_token1, 0, hidden0] = (acc[1] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                            fc2_output[pool_token1, 0, hidden1] = (acc[3] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+
+                            if cutlass.const_expr(
+                                combine_ready_flags is not None
+                                and fc2_block_done_counter is not None
+                            ):
+                                # The last hidden tile for this token block publishes
+                                # one ready flag per source (token, top-k) row.
+                                cute.arch.fence_acq_rel_sys()
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                self.token_comm_hook_fc2_tile_complete(
+                                    token_comm_args,
+                                    combine_ready_flags,
+                                    fc2_block_done_counter,
+                                    work_tile_info,
+                                    compute_warp=compute_warp,
+                                    lane_idx=lane_idx,
+                                )
+
+                            if cutlass.const_expr(self.token_back_by_dispatch):
+                                # token-back consumes this tile from the local FC2
+                                # workspace only after all four compute warps have
+                                # made their disjoint hidden slices system-visible.
+                                # Publish exactly once per scheduler FC2 work tile.
+                                # Grouped token-back aggregates completion per expert.
+                                cute.arch.fence_acq_rel_sys()
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        counter_slot = work_tile_info.expert_idx
+                                        cute.arch.atomic_add(
+                                            token_comm_args.fc2_done_counter.iterator
+                                            + counter_slot,
+                                            cutlass.Int32(1),
+                                            sem="release",
+                                            scope="sys",
+                                        )
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    k2_trace_store_ns += (
+                                        read_globaltimer() - trace_post_mainloop_start
+                                    )
+
+                    else:
+                        accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                        accumulators.fill(0.0)
+
+                        a_consumer.reset()
+                        b_consumer.reset()
+                        peek_a_full_status = cutlass.Boolean(1)
+                        peek_b_full_status = cutlass.Boolean(1)
+                        if k_tile_cnt > 0:
+                            peek_a_full_status = a_consumer.try_wait()
+                            peek_b_full_status = b_consumer.try_wait()
+
+                        for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                            trace_k_detail = cutlass.Int32(0)
+                            if trace_compute_detail != cutlass.Int32(0):
+                                if trace_all_k_detail != cutlass.Int32(0):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile < cutlass.Int32(2):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(11):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(12):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(23):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile == cutlass.Int32(24):
+                                    trace_k_detail = cutlass.Int32(1)
+                                if k_tile + cutlass.Int32(2) >= k_tile_cnt:
+                                    trace_k_detail = cutlass.Int32(1)
+
+                            if trace_k_detail != cutlass.Int32(0):
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_wait_a")
+                                else:
+                                    iket.range_push("sm120_fc2_wait_a")
+                            k2_trace_a_wait_start = cutlass.Int64(0)
+                            k2_trace_a_wait_active = cutlass.Boolean(0)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if peek_a_full_status == cutlass.Boolean(0):
+                                            k2_trace_tma_a_wait_calls += cutlass.Int64(1)
+                                            if (
+                                                (
+                                                    k_tile
+                                                    + fc2_detail_tiles_seen
+                                                    + cta_linear_id
+                                                )
+                                                % cutlass.Int32(
+                                                    TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                                )
+                                                == cutlass.Int32(0)
+                                            ):
+                                                k2_trace_a_wait_start = read_globaltimer()
+                                                k2_trace_a_wait_active = cutlass.Boolean(1)
+                                                k2_trace_tma_a_timed_calls += (
+                                                    cutlass.Int64(1)
+                                                )
+                            handle_a = a_consumer.wait_and_advance(peek_a_full_status)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if k2_trace_a_wait_active:
+                                            k2_trace_tma_a_wait_ns += (
+                                                read_globaltimer()
+                                                - k2_trace_a_wait_start
+                                            )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_wait_b")
+                                else:
+                                    iket.range_push("sm120_fc2_wait_b")
+                            k2_trace_b_wait_start = cutlass.Int64(0)
+                            k2_trace_b_wait_active = cutlass.Boolean(0)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if peek_b_full_status == cutlass.Boolean(0):
+                                            k2_trace_tma_b_wait_calls += cutlass.Int64(1)
+                                            if (
+                                                (
+                                                    k_tile
+                                                    + fc2_detail_tiles_seen
+                                                    + cta_linear_id
+                                                )
+                                                % cutlass.Int32(
+                                                    TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                                )
+                                                == cutlass.Int32(0)
+                                            ):
+                                                k2_trace_b_wait_start = read_globaltimer()
+                                                k2_trace_b_wait_active = cutlass.Boolean(1)
+                                                k2_trace_tma_b_timed_calls += (
+                                                    cutlass.Int64(1)
+                                                )
+                            handle_b = b_consumer.wait_and_advance(peek_b_full_status)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if k2_trace_b_wait_active:
+                                            k2_trace_tma_b_wait_ns += (
+                                                read_globaltimer()
+                                                - k2_trace_b_wait_start
+                                            )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                            peek_a_full_status = cutlass.Boolean(1)
+                            peek_b_full_status = cutlass.Boolean(1)
+                            if handle_a.count + 1 < k_tile_cnt:
+                                peek_a_full_status = a_consumer.try_wait()
+                            if handle_b.count + 1 < k_tile_cnt:
+                                peek_b_full_status = b_consumer.try_wait()
+
+                            tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                            tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                            tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
+                            tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
+                            sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                                self.mma_tiler_sfa[0] // self.mma_tiler[0]
+                            )
+                            # partition_fragment_SFA packs the two M64 groups of the
+                            # staged M128 scale tile eight bytes apart. Select the
+                            # group in SMEM so the RMEM fragment is statically indexed.
+                            tCsSFA_selected = cute.make_tensor(
+                                tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                                tCsSFA_p.layout,
+                            )
+                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                            tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, 0],
+                                tCrA_copy_view[None, None, 0],
+                            )
+                            cute.copy(
+                                smem_tiled_copy_B,
+                                tCsB_p[None, None, 0],
+                                tCrB_copy_view[None, None, 0],
+                            )
+                            cute.copy(
+                                smem_tiled_copy_SFA,
+                                tCsSFA_p_filtered[None, None, 0],
+                                tCrSFA_copy_view_filtered[None, None, 0],
+                            )
+                            if cutlass.const_expr(self.mma_tiler[1] < 128):
+                                sfb_tiles_per_tma = 128 // self.mma_tiler[1]
+                                sfb_tile_slot = (
+                                    work_tile_info.tile_n_idx
+                                    % cutlass.Int32(sfb_tiles_per_tma)
+                                )
+                                sfb_stage_byte_offset = (
+                                    handle_b.index
+                                    * cutlass.Int32(cute.cosize(sfb_smem_layout))
+                                )
+                                for ng in cutlass.range_constexpr(0, n_groups):
+                                    lane_scale_row = (
+                                        sfb_tile_slot
+                                        * cutlass.Int32(self.mma_tiler[1])
+                                        + cutlass.Int32(ng * MMA_N)
+                                        + lane_idx // cutlass.Int32(4)
+                                    )
+                                    sfb_lane_byte_base = (
+                                        (lane_scale_row % cutlass.Int32(32))
+                                        * cutlass.Int32(16)
+                                        + (lane_scale_row // cutlass.Int32(32))
+                                        * cutlass.Int32(4)
+                                        + sfb_stage_byte_offset
+                                    )
+                                    rSFBCompactI32[ng * 2] = lds_b32_raw(
+                                        sSFB.iterator + sfb_lane_byte_base
+                                    )
+                                    rSFBCompactI32[ng * 2 + 1] = lds_b32_raw(
+                                        sSFB.iterator
+                                        + sfb_lane_byte_base
+                                        + cutlass.Int32(512)
+                                    )
+                            else:
+                                tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                                tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                    tCrSFB_copy_view
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered[None, None, 0],
+                                    tCrSFB_copy_view_filtered[None, 0, None, 0],
+                                )
+
+                            if trace_k_detail != cutlass.Int32(0):
+                                if is_phase_linear1:
+                                    iket.range_push("sm120_fc1_k128_compute")
+                                else:
+                                    iket.range_push("sm120_fc2_k128_compute")
+                            for k_inner_mma in cutlass.range_constexpr(0, 2):
+                                if cutlass.const_expr(k_inner_mma + 1 < 2):
+                                    k_inner_next = k_inner_mma + 1
+                                    cute.copy(
+                                        smem_tiled_copy_A,
+                                        tCsA_p[None, None, k_inner_next],
+                                        tCrA_copy_view[None, None, k_inner_next],
+                                    )
+                                    cute.copy(
+                                        smem_tiled_copy_B,
+                                        tCsB_p[None, None, k_inner_next],
+                                        tCrB_copy_view[None, None, k_inner_next],
+                                    )
+                                    cute.copy(
+                                        smem_tiled_copy_SFA,
+                                        tCsSFA_p_filtered[None, None, k_inner_next],
+                                        tCrSFA_copy_view_filtered[
+                                            None, None, k_inner_next
+                                        ],
+                                    )
+                                    if cutlass.const_expr(self.mma_tiler[1] == 128):
+                                        cute.copy(
+                                            smem_tiled_copy_SFB,
+                                            tCsSFB_p_filtered[
+                                                None, None, k_inner_next
+                                            ],
+                                            tCrSFB_copy_view_filtered[
+                                                None, 0, None, k_inner_next
+                                            ],
+                                        )
+                                for ng in cutlass.range_constexpr(0, n_groups):
+                                    if cutlass.const_expr(self.mma_tiler[1] < 128):
+                                        issue_m64n8k64_nvfp4_packed_sfb(
+                                            tiled_mma,
+                                            accumulators[None, None, ng],
+                                            tCrA,
+                                            tCrB,
+                                            tCrSFA,
+                                            rSFBCompactI32,
+                                            n_group=ng,
+                                            active_n_groups=n_groups,
+                                            sfa_m_group=0,
+                                            k_inner=k_inner_mma,
+                                            a_dtype=self.a_dtype,
+                                            b_dtype=self.b_dtype,
+                                            sf_dtype=self.sf_dtype,
+                                        )
+                                    else:
+                                        issue_m64n8k64_nvfp4(
+                                            tiled_mma,
+                                            accumulators[None, None, ng],
+                                            tCrA,
+                                            tCrB,
+                                            tCrSFA,
+                                            tCrSFB,
+                                            n_group=ng,
+                                            active_n_groups=n_groups,
+                                            sfa_m_group=0,
+                                            k_inner=k_inner_mma,
+                                            a_dtype=self.a_dtype,
+                                            b_dtype=self.b_dtype,
+                                            sf_dtype=self.sf_dtype,
+                                        )
+                            if trace_k_detail != cutlass.Int32(0):
+                                iket.range_pop()
+                            # Experimental: retain a proxy fence in every reader lane.
+                            # Each warp rendezvous precedes its elected empty arrival;
+                            # producer reuse still waits for all four warp arrivals.
+                            if cutlass.const_expr(self.scheduler_phase_mode == "fc1"):
+                                cute.arch.fence_proxy("async.shared", space="cta")
+                                cute.arch.sync_warp()
+                            handle_a.release()
+                            handle_b.release()
+
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    k2_trace_mainloop_ns += (
+                                        read_globaltimer()
+                                        - k2_trace_mainloop_start
+                                    )
+                        trace_post_mainloop_start = cutlass.Int64(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    trace_post_mainloop_start = read_globaltimer()
+                        iket.range_pop()
+                        if self.scheduler_phase_mode != "fc2" and is_phase_linear1:
+                            iket.range_push("sm120_fc1_epilogue")
+                            real_fc1_output, _ = ext.get_gmem_tensor(
+                                "c", fc1_output_gemm, work_tile_info,
+                            )
+                            real_fc1_output_sf, _ = ext.get_gmem_tensor(
+                                "sfc", fc1_output_sf_gemm, work_tile_info,
+                            )
+                            if cutlass.const_expr(token_comm_args is not None):
+                                real_topk_scores, _ = ext.get_gmem_tensor(
+                                    "topk", topk_scores, work_tile_info,
+                                )
+                            fc1_col_base = (
+                                work_tile_info.tile_m_idx * cutlass.Int32(downproj_per_cta)
+                            )
+                            tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
+                                self.mma_tiler[1]
+                            )
+                            # SF tensor K coordinates are element coordinates.  The
+                            # within-block vec mode is stride-zero, so block starts
+                            # are 0, sf_vec_size, 2*sf_vec_size, ... .
+                            warp_pair = compute_warp // cutlass.Int32(2)
+                            sf_col = fc1_col_base + warp_pair * cutlass.Int32(16)
+                            fc1_alpha_value = cutlass.Float32(1.0)
+                            fc1_norm_value = cutlass.Float32(1.0)
+                            if cutlass.const_expr(fc1_alpha is not None):
+                                fc1_alpha_value = cutlass.Float32(
+                                    fc1_alpha[work_tile_info.expert_idx]
+                                )
+                            if cutlass.const_expr(fc1_norm_const is not None):
+                                fc1_norm_value = cutlass.Float32(
+                                    fc1_norm_const[work_tile_info.expert_idx]
+                                )
+
+                            for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
+                                acc0 = accumulators[None, None, ng_pair * 2]
+                                acc1 = accumulators[None, None, ng_pair * 2 + 1]
+
+                                token0 = lane_t * cutlass.Int32(2)
+                                token1 = token0 + cutlass.Int32(1)
+                                token2 = token0 + cutlass.Int32(MMA_N)
+                                token3 = token1 + cutlass.Int32(MMA_N)
+                                token_pair_base = cutlass.Int32(ng_pair * 2 * MMA_N)
+                                tile_token0 = token_pair_base + token0
+                                tile_token1 = token_pair_base + token1
+                                tile_token2 = token_pair_base + token2
+                                tile_token3 = token_pair_base + token3
+
+                                gate0 = acc0[0] * fc1_alpha_value
+                                gate1 = acc0[1] * fc1_alpha_value
+                                gate2 = acc1[0] * fc1_alpha_value
+                                gate3 = acc1[1] * fc1_alpha_value
+                                up0 = acc0[2] * fc1_alpha_value
+                                up1 = acc0[3] * fc1_alpha_value
+                                up2 = acc1[2] * fc1_alpha_value
+                                up3 = acc1[3] * fc1_alpha_value
+                                if cutlass.const_expr(self.gate_up_clamp is not None):
+                                    limit = cutlass.Float32(self.gate_up_clamp)
+                                    gate0 = clamp_gate_upper_f32(gate0, limit)
+                                    gate1 = clamp_gate_upper_f32(gate1, limit)
+                                    gate2 = clamp_gate_upper_f32(gate2, limit)
+                                    gate3 = clamp_gate_upper_f32(gate3, limit)
+                                    up0 = clamp_symmetric_f32(up0, limit)
+                                    up1 = clamp_symmetric_f32(up1, limit)
+                                    up2 = clamp_symmetric_f32(up2, limit)
+                                    up3 = clamp_symmetric_f32(up3, limit)
+                                val0 = up0 * gate0 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate0 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val1 = up1 * gate1 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate1 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val2 = up2 * gate2 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate2 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+                                val3 = up3 * gate3 * cute.arch.rcp_approx(
+                                    cute.math.exp2(gate3 * (-Log2E))
+                                    + cutlass.Float32(1.0)
+                                )
+
+                                raw_token0 = tile_token_base + tile_token0
+                                raw_token1 = tile_token_base + tile_token1
+                                raw_token2 = tile_token_base + tile_token2
+                                raw_token3 = tile_token_base + tile_token3
+                                if cutlass.const_expr(token_comm_args is not None):
+                                    if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                        val0 = val0 * cutlass.Float32(
+                                            real_topk_scores[raw_token0]
+                                        )
+                                    if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                        val1 = val1 * cutlass.Float32(
+                                            real_topk_scores[raw_token1]
+                                        )
+                                    if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                        val2 = val2 * cutlass.Float32(
+                                            real_topk_scores[raw_token2]
+                                        )
+                                    if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                        val3 = val3 * cutlass.Float32(
+                                            real_topk_scores[raw_token3]
+                                        )
+
+                                if tile_token0 >= work_tile_info.valid_tokens_in_tile:
+                                    val0 = cutlass.Float32(0.0)
+                                if tile_token1 >= work_tile_info.valid_tokens_in_tile:
+                                    val1 = cutlass.Float32(0.0)
+                                if tile_token2 >= work_tile_info.valid_tokens_in_tile:
+                                    val2 = cutlass.Float32(0.0)
+                                if tile_token3 >= work_tile_info.valid_tokens_in_tile:
+                                    val3 = cutlass.Float32(0.0)
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_amax_reduce")
+                                amax0 = cute.math.absf(val0)
+                                amax1 = cute.math.absf(val1)
+                                amax2 = cute.math.absf(val2)
+                                amax3 = cute.math.absf(val3)
+                                for xor_mask in (4, 8, 16):
+                                    peer_lane = lane_idx ^ cutlass.Int32(xor_mask)
+                                    amax0 = cute.arch.fmax(
+                                        amax0, cute.arch.shuffle_sync(amax0, peer_lane)
+                                    )
+                                    amax1 = cute.arch.fmax(
+                                        amax1, cute.arch.shuffle_sync(amax1, peer_lane)
+                                    )
+                                    amax2 = cute.arch.fmax(
+                                        amax2, cute.arch.shuffle_sync(amax2, peer_lane)
+                                    )
+                                    amax3 = cute.arch.fmax(
+                                        amax3, cute.arch.shuffle_sync(amax3, peer_lane)
+                                    )
+                                if lane_g == cutlass.Int32(0):
+                                    sFc1Swiglu[token0, compute_warp] = amax0
+                                    sFc1Swiglu[token1, compute_warp] = amax1
+                                    sFc1Swiglu[token2, compute_warp] = amax2
+                                    sFc1Swiglu[token3, compute_warp] = amax3
+
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+
+                                amax0 = cutlass.Float32(0.0)
+                                amax1 = cutlass.Float32(0.0)
+                                amax2 = cutlass.Float32(0.0)
+                                amax3 = cutlass.Float32(0.0)
+                                if lane_g == cutlass.Int32(0):
+                                    pair_first_warp = warp_pair * cutlass.Int32(2)
+                                    for warp_offset in cutlass.range_constexpr(0, 2):
+                                        warp = pair_first_warp + cutlass.Int32(warp_offset)
+                                        amax0 = cute.arch.fmax(
+                                            amax0, sFc1Swiglu[token0, warp]
+                                        )
+                                        amax1 = cute.arch.fmax(
+                                            amax1, sFc1Swiglu[token1, warp]
+                                        )
+                                        amax2 = cute.arch.fmax(
+                                            amax2, sFc1Swiglu[token2, warp]
+                                        )
+                                        amax3 = cute.arch.fmax(
+                                            amax3, sFc1Swiglu[token3, warp]
+                                        )
+                                amax0 = cute.arch.shuffle_sync(amax0, lane_t)
+                                amax1 = cute.arch.shuffle_sync(amax1, lane_t)
+                                amax2 = cute.arch.shuffle_sync(amax2, lane_t)
+                                amax3 = cute.arch.shuffle_sync(amax3, lane_t)
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_quant_pack")
+                                raw_scale0 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax0 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale1 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax1 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale2 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax2 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                raw_scale3 = cute.arch.fmin(
+                                    cutlass.Float32(Fp8E4M3FNMax),
+                                    amax3 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                    * fc1_norm_value,
+                                )
+                                scale0 = cvt_f32_to_f8_to_f32(raw_scale0, self.sf_dtype)
+                                scale1 = cvt_f32_to_f8_to_f32(raw_scale1, self.sf_dtype)
+                                scale2 = cvt_f32_to_f8_to_f32(raw_scale2, self.sf_dtype)
+                                scale3 = cvt_f32_to_f8_to_f32(raw_scale3, self.sf_dtype)
+                                inv0 = cutlass.Float32(0.0)
+                                inv1 = cutlass.Float32(0.0)
+                                inv2 = cutlass.Float32(0.0)
+                                inv3 = cutlass.Float32(0.0)
+                                if scale0 > cutlass.Float32(0.0):
+                                    inv0 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale0) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale1 > cutlass.Float32(0.0):
+                                    inv1 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale1) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale2 > cutlass.Float32(0.0):
+                                    inv2 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale2) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+                                if scale3 > cutlass.Float32(0.0):
+                                    inv3 = cute.arch.fmin(
+                                        cute.arch.rcp_approx(scale3) * fc1_norm_value,
+                                        cutlass.Float32(Fp32Max),
+                                    )
+
+                                if (
+                                    lane_g == cutlass.Int32(0)
+                                    and (compute_warp & cutlass.Int32(1)) == cutlass.Int32(0)
+                                ):
+                                    if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token0, sf_col, 0] = (
+                                            raw_scale0
+                                        ).to(self.sf_dtype)
+                                    if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token1, sf_col, 0] = (
+                                            raw_scale1
+                                        ).to(self.sf_dtype)
+                                    if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token2, sf_col, 0] = (
+                                            raw_scale2
+                                        ).to(self.sf_dtype)
+                                    if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                        real_fc1_output_sf[raw_token3, sf_col, 0] = (
+                                            raw_scale3
+                                        ).to(self.sf_dtype)
+
+                                q0 = cutlass.Float32(0.0)
+                                q1 = cutlass.Float32(0.0)
+                                q2 = cutlass.Float32(0.0)
+                                q3 = cutlass.Float32(0.0)
+                                if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                    q0 = val0 * inv0
+                                if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                    q1 = val1 * inv1
+                                if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                    q2 = val2 * inv2
+                                if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                    q3 = val3 * inv3
+
+                                rFc1OutputLocal[0] = q0
+                                rFc1OutputLocal[1] = q1
+                                rFc1OutputLocal[2] = q2
+                                rFc1OutputLocal[3] = q3
+                                partner_lane = lane_idx ^ cutlass.Int32(4)
+                                peer_q0 = cute.arch.shuffle_sync(q0, partner_lane)
+                                peer_q1 = cute.arch.shuffle_sync(q1, partner_lane)
+                                peer_q2 = cute.arch.shuffle_sync(q2, partner_lane)
+                                peer_q3 = cute.arch.shuffle_sync(q3, partner_lane)
+                                if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                    byte_col = (
+                                        compute_warp * cutlass.Int32(4)
+                                        + (lane_g >> cutlass.Int32(1))
+                                    )
+                                    sFc1OutputBytes[tile_token0, byte_col] = pack_e2m1x2(
+                                        q0, peer_q0
+                                    )
+                                    sFc1OutputBytes[tile_token1, byte_col] = pack_e2m1x2(
+                                        q1, peer_q1
+                                    )
+                                    sFc1OutputBytes[tile_token2, byte_col] = pack_e2m1x2(
+                                        q2, peer_q2
+                                    )
+                                    sFc1OutputBytes[tile_token3, byte_col] = pack_e2m1x2(
+                                        q3, peer_q3
+                                    )
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_push("sm120_fc1_epi_pack_smem")
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                if trace_compute_detail != cutlass.Int32(0):
+                                    iket.range_pop()
+
+                            chunks_per_row = downproj_per_cta // 8
+                            # N16 has fewer chunks than compute threads. Round up;
+                            # the existing valid-token guard protects every GMEM store
+                            # and the corresponding scratch load for inactive threads.
+                            store_iters = (
+                                self.mma_tiler[1] * chunks_per_row
+                                + 32 * len(self.compute_warp_id) - 1
+                            ) // (32 * len(self.compute_warp_id))
+                            for store_iter in cutlass.range_constexpr(
+                                0, store_iters
+                            ):
+                                linear_chunk = (
+                                    tidx
+                                    + cutlass.Int32(
+                                        store_iter
+                                        * 32
+                                        * len(self.compute_warp_id)
+                                    )
+                                )
+                                store_token = linear_chunk // cutlass.Int32(
+                                    chunks_per_row
+                                )
+                                store_byte = (
+                                    linear_chunk
+                                    % cutlass.Int32(chunks_per_row)
+                                ) * cutlass.Int32(4)
+                                scratch_ptr = (
+                                    sFc1OutputBytes.iterator
+                                    + store_token * cutlass.Int32(downproj_per_cta // 2)
+                                    + store_byte
+                                ).align(4)
+                                scratch_i32 = cute.make_tensor(
+                                    cute.recast_ptr(scratch_ptr, dtype=cutlass.Int32),
+                                    cute.make_layout(1),
+                                )
+                                if (
+                                    store_token
+                                    < work_tile_info.valid_tokens_in_tile
+                                ):
+                                    output_row = tile_token_base + store_token
+                                    output_col = fc1_col_base + store_byte * cutlass.Int32(2)
+                                    output_ptr = (
+                                        cute.recast_ptr(
+                                            real_fc1_output.iterator,
+                                            dtype=cutlass.Uint8,
+                                        )
+                                        + output_row
+                                        * (
+                                            real_fc1_output.stride[0]
+                                            // cutlass.Int32(2)
+                                        )
+                                        + output_col // cutlass.Int32(2)
+                                    ).align(4)
+                                    output_i32 = cute.make_tensor(
+                                        cute.recast_ptr(
+                                            output_ptr,
+                                            dtype=cutlass.Int32,
+                                        ),
+                                        cute.make_layout(1),
+                                    )
+                                    output_i32[0] = scratch_i32[0]
+                            # K2 consumes this rank-local expert-pool data from a
+                            # distinct Green Context. GPU scope orders the local HBM
+                            # stores; the K2 TMA warp performs the async-proxy acquire.
+                            cute.arch.fence_acq_rel_gpu()
+                            cute.arch.barrier(
+                                barrier_id=self.epilog_sync_bar_id,
+                                number_of_threads=32 * len(self.compute_warp_id),
+                            )
+                            if cutlass.const_expr(
+                                self.fc1_producer_tiles_per_ready_block == 1
+                            ):
+                                counter_slot = (
+                                    work_tile_info.cumulative_token_block_count
+                                    + work_tile_info.tile_n_idx
+                                )
+                            else:
+                                counter_slot = (
+                                    work_tile_info.cumulative_token_block_count
+                                    + (
+                                        work_tile_info.tile_n_idx
+                                        // cutlass.Int32(
+                                            self.fc1_producer_tiles_per_ready_block
+                                        )
+                                    )
+                                    * cutlass.Int32(
+                                        self.fc1_producer_tiles_per_ready_block
+                                    )
+                                )
+                            if cutlass.const_expr(token_comm_args is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    ready_bundle_idx = (
+                                        work_tile_info.tile_m_idx
+                                        // cutlass.Int32(
+                                            fc1_tiles_per_fc2_k_tile
+                                            * self.fc2_ready_bundle_k_tiles
+                                        )
+                                    )
+                                    bundle_begin = (
+                                        ready_bundle_idx
+                                        * cutlass.Int32(self.fc2_ready_bundle_k_tiles)
+                                    )
+                                    bundle_k_tiles = cutlass.min(
+                                        cutlass.Int32(self.fc2_ready_bundle_k_tiles),
+                                        k_tile_cnt_fc2 - bundle_begin,
+                                    )
+                                    ready_old = cutlass.Int32(0)
+                                    if lane_idx == cutlass.Int32(0):
+                                        ready_old = cute.arch.atomic_add(
+                                            fc1_done_counter.iterator
+                                            + counter_slot * fc2_ready_bundle_cnt
+                                            + ready_bundle_idx,
+                                            cutlass.Int32(1),
+                                            # The last completer publishes the K2
+                                            # descriptor.  Acquire the preceding
+                                            # release sequence so that publication
+                                            # transitively exposes every producer
+                                            # CTA's rank-local FC1 data and scale stores.
+                                            sem="acq_rel",
+                                            scope="gpu",
+                                        )
+                                    if cutlass.const_expr(
+                                        k2_ready_queue_state is not None
+                                    ):
+                                        ready_old = cute.arch.shuffle_sync(
+                                            ready_old,
+                                            offset=0,
+                                            mask=0xFFFFFFFF,
+                                            mask_and_clamp=31,
+                                        )
+                                        if cutlass.const_expr(
+                                            self.fc1_producer_tiles_per_ready_block == 1
+                                        ):
+                                            ready_tile_n_idx = (
+                                                work_tile_info.tile_n_idx
+                                            )
+                                            ready_tile_valid_tokens = (
+                                                work_tile_info.valid_tokens_in_tile
+                                            )
+                                            producer_tiles_in_ready_block = (
+                                                cutlass.Int32(1)
+                                            )
+                                        else:
+                                            ready_tile_n_idx = (
+                                                work_tile_info.tile_n_idx
+                                                * cutlass.Int32(self.mma_tiler[1])
+                                                // cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                )
+                                            )
+                                            packed_expert_count = (
+                                                token_comm_args.expert_recv_count_sum[
+                                                    work_tile_info.expert_idx
+                                                ]
+                                            )
+                                            expert_token_count = cutlass.Int32(
+                                                cutlass.Int64(packed_expert_count)
+                                                & cutlass.Int64(0xFFFFFFFF)
+                                            )
+                                            ready_tile_valid_tokens = cutlass.min(
+                                                cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                ),
+                                                expert_token_count
+                                                - ready_tile_n_idx
+                                                * cutlass.Int32(
+                                                    self.k2_ready_tile_tokens
+                                                ),
+                                            )
+                                            producer_tiles_in_ready_block = (
+                                                ready_tile_valid_tokens
+                                                + cutlass.Int32(
+                                                    self.fc1_ready_tile_tokens - 1
+                                                )
+                                            ) // cutlass.Int32(
+                                                self.fc1_ready_tile_tokens
+                                            )
+                                        bundle_expected = (
+                                            bundle_k_tiles
+                                            * cutlass.Int32(
+                                                fc1_tiles_per_fc2_k_tile
+                                            )
+                                            * producer_tiles_in_ready_block
+                                        )
+                                        bundle_complete = (
+                                            (ready_old & cutlass.Int32(0xFFFF))
+                                            + cutlass.Int32(1)
+                                            == bundle_expected
+                                        )
+                                        all_bundles_complete = cutlass.Int32(0)
+                                        if bundle_complete:
+                                            completed_bundle_old = cutlass.Int32(0)
+                                            if lane_idx == cutlass.Int32(0):
+                                                # Pack the ready-block bundle count in
+                                                # the high 16 bits of its first
+                                                # contribution counter.  Queue
+                                                # publication must not depend on the
+                                                # final K bundle happening to finish
+                                                # after every earlier bundle.
+                                                completed_bundle_old = cute.arch.atomic_add(
+                                                    fc1_done_counter.iterator
+                                                    + counter_slot * fc2_ready_bundle_cnt,
+                                                    cutlass.Int32(1 << 16),
+                                                    sem="acq_rel",
+                                                    scope="gpu",
+                                                )
+                                            completed_bundle_old = cute.arch.shuffle_sync(
+                                                completed_bundle_old,
+                                                offset=0,
+                                                mask=0xFFFFFFFF,
+                                                mask_and_clamp=31,
+                                            )
+                                            completed_bundle_count = (
+                                                completed_bundle_old
+                                                >> cutlass.Int32(16)
+                                            ) + cutlass.Int32(1)
+                                            if (
+                                                completed_bundle_count
+                                                == cutlass.Int32(fc2_ready_bundle_cnt)
+                                            ):
+                                                all_bundles_complete = cutlass.Int32(1)
+                                        if all_bundles_complete != cutlass.Int32(0):
+                                            # Acquire every FC1 producer's release
+                                            # before this last producer publishes the
+                                            # descriptor and its ready flag.
+                                            cute.arch.fence_acq_rel_gpu()
+                                            hidden_tiles = (
+                                                self.hidden
+                                                + self.mma_tiler[0]
+                                                - 1
+                                            ) // self.mma_tiler[0]
+                                            queue_bundle_count = (
+                                                hidden_tiles
+                                                + self.k2_ready_queue_bundle
+                                                - 1
+                                            ) // self.k2_ready_queue_bundle
+                                            k2_token_tiles_per_ready_block = (
+                                                self.k2_ready_tile_tokens
+                                                // self.k2_token_tile_tokens
+                                            )
+                                            valid_k2_token_tiles = (
+                                                ready_tile_valid_tokens
+                                                + cutlass.Int32(
+                                                    self.k2_token_tile_tokens - 1
+                                                )
+                                            ) // cutlass.Int32(
+                                                self.k2_token_tile_tokens
+                                            )
+                                            queue_entry_count = (
+                                                cutlass.Int32(queue_bundle_count)
+                                                * valid_k2_token_tiles
+                                            )
+                                            queue_base = cutlass.Int32(0)
+                                            if lane_idx == cutlass.Int32(0):
+                                                queue_base = cute.arch.atomic_add(
+                                                    k2_ready_queue_state.iterator
+                                                    + cutlass.Int32(1),
+                                                    queue_entry_count,
+                                                    scope="gpu",
+                                                )
+                                            queue_base = cute.arch.shuffle_sync(
+                                                queue_base,
+                                                offset=0,
+                                                mask=0xFFFFFFFF,
+                                                mask_and_clamp=31,
+                                            )
+                                            queue_store_iters = (
+                                                queue_bundle_count
+                                                * k2_token_tiles_per_ready_block
+                                                + 31
+                                            ) // 32
+                                            for queue_store_iter in cutlass.range_constexpr(
+                                                0, queue_store_iters
+                                            ):
+                                                queue_entry_idx = (
+                                                    lane_idx
+                                                    + cutlass.Int32(
+                                                        queue_store_iter * 32
+                                                    )
+                                                )
+                                                if queue_entry_idx < queue_entry_count:
+                                                    k2_token_tile = (
+                                                        queue_entry_idx
+                                                        // cutlass.Int32(
+                                                            queue_bundle_count
+                                                        )
+                                                    )
+                                                    queue_bundle_idx = (
+                                                        queue_entry_idx
+                                                        % cutlass.Int32(
+                                                            queue_bundle_count
+                                                        )
+                                                    )
+                                                    queue_pos = (
+                                                        queue_base + queue_entry_idx
+                                                    )
+                                                    desc_base = (
+                                                        queue_pos * cutlass.Int32(7)
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(0)
+                                                    ] = work_tile_info.expert_idx
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(1)
+                                                    ] = (
+                                                        ready_tile_n_idx
+                                                        * cutlass.Int32(
+                                                            k2_token_tiles_per_ready_block
+                                                        )
+                                                        + k2_token_tile
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(2)
+                                                    ] = work_tile_info.cumulative_data_physical_row
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(3)
+                                                    ] = work_tile_info.cumulative_sf_physical_row
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(4)
+                                                    ] = work_tile_info.cumulative_token_block_count
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(5)
+                                                    ] = cutlass.min(
+                                                        cutlass.Int32(
+                                                            self.k2_token_tile_tokens
+                                                        ),
+                                                        ready_tile_valid_tokens
+                                                        - k2_token_tile
+                                                        * cutlass.Int32(
+                                                            self.k2_token_tile_tokens
+                                                        ),
+                                                    )
+                                                    k2_ready_queue_desc[
+                                                        desc_base + cutlass.Int32(6)
+                                                    ] = (
+                                                        queue_bundle_idx
+                                                        * cutlass.Int32(
+                                                            self.k2_ready_queue_bundle
+                                                        )
+                                                    )
+                                            cute.arch.sync_warp()
+                                            for queue_store_iter in cutlass.range_constexpr(
+                                                0, queue_store_iters
+                                            ):
+                                                queue_entry_idx = (
+                                                    lane_idx
+                                                    + cutlass.Int32(
+                                                        queue_store_iter * 32
+                                                    )
+                                                )
+                                                if queue_entry_idx < queue_entry_count:
+                                                    queue_pos = (
+                                                        queue_base + queue_entry_idx
+                                                    )
+                                                    # The release store orders this
+                                                    # lane's descriptor writes; no
+                                                    # second explicit GPU fence is
+                                                    # required.
+                                                    cute.arch.store(
+                                                        k2_ready_queue_ready.iterator
+                                                        + queue_pos,
+                                                        cutlass.Int32(1),
+                                                        sem="release",
+                                                        scope="gpu",
+                                                    )
+                            else:
+                                if lane_idx == cutlass.Int32(0):
+                                    cute.arch.atomic_add(
+                                        fc1_done_counter.iterator + counter_slot,
+                                        cutlass.Int32(1),
+                                        sem="release",
+                                        scope="gpu",
+                                    )
+                        else:
+                            iket.range_push("sm120_fc2_store")
+                            hidden_base = (
+                                work_tile_info.tile_m_idx * cutlass.Int32(self.mma_tiler[0])
+                            )
+                            tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
+                                self.mma_tiler[1]
+                            )
+                            fc2_alpha_value = cutlass.Float32(1.0)
+                            if cutlass.const_expr(fc2_alpha is not None):
+                                fc2_alpha_value = cutlass.Float32(
+                                    fc2_alpha[work_tile_info.expert_idx]
+                                )
+                            for ng in cutlass.range_constexpr(0, n_groups):
+                                acc = accumulators[None, None, ng]
+
+                                token0 = cutlass.Int32(ng * MMA_N) + lane_t * cutlass.Int32(2)
+                                token1 = token0 + cutlass.Int32(1)
+                                hidden0 = hidden_base + compute_warp * cutlass.Int32(16) + lane_g
+                                hidden1 = hidden0 + cutlass.Int32(8)
+                                pool_token0 = (
+                                    work_tile_info.cumulative_data_physical_row
+                                    + tile_token_base
+                                    + token0
+                                )
+                                pool_token1 = (
+                                    work_tile_info.cumulative_data_physical_row
+                                    + tile_token_base
+                                    + token1
+                                )
+                                if cutlass.const_expr(self.fc2_packed_store):
+                                    partner_lane = lane_idx ^ cutlass.Int32(4)
+                                    rFc2Store[0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[1] = cute.arch.shuffle_sync(
+                                        acc[0] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[2] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[3] = cute.arch.shuffle_sync(
+                                        acc[2] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[4] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[5] = cute.arch.shuffle_sync(
+                                        acc[1] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                    rFc2Store[6] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                    rFc2Store[7] = cute.arch.shuffle_sync(
+                                        acc[3] * fc2_alpha_value, partner_lane
+                                    ).to(self.fc2_output_dtype)
+                                if token0 < work_tile_info.valid_tokens_in_tile:
+                                    if cutlass.const_expr(self.fc2_packed_store):
+                                        if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                            if cutlass.const_expr(
+                                                token_comm_args is not None
+                                                and not self.token_back_by_dispatch
+                                            ):
+                                                md0 = TokenSrcMetadata.load(
+                                                    token_comm_args.token_src_metadata.iterator.toint()
+                                                    + cutlass.Int64(pool_token0)
+                                                    * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                                )
+                                                local_row0 = cute.slice_(
+                                                    fc2_output,
+                                                    (md0.src_token, md0.src_topk, None),
+                                                )
+                                                row0 = cute.make_tensor(
+                                                    token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                        local_row0.iterator, md0.src_rank
+                                                    ),
+                                                    local_row0.layout,
+                                                )
+                                            else:
+                                                row0 = cute.slice_(
+                                                    fc2_output, (pool_token0, 0, None)
+                                                )
+                                            row0_hidden0 = (
+                                                row0.iterator + hidden0
+                                            ).align(4)
+                                            row0_hidden1 = (
+                                                row0.iterator + hidden1
+                                            ).align(4)
+                                            row0_i32_0 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row0_hidden0, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row0_i32_1 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row0_hidden1, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row0_i32_0[0] = rFc2StoreI32[0]
+                                            row0_i32_1[0] = rFc2StoreI32[1]
+                                    else:
+                                        if cutlass.const_expr(
+                                            token_comm_args is not None
+                                            and not self.token_back_by_dispatch
+                                        ):
+                                            md0 = TokenSrcMetadata.load(
+                                                token_comm_args.token_src_metadata.iterator.toint()
+                                                + cutlass.Int64(pool_token0)
+                                                * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                            )
+                                            local_row0 = cute.slice_(
+                                                fc2_output,
+                                                (md0.src_token, md0.src_topk, None),
+                                            )
+                                            peer_row0 = cute.make_tensor(
+                                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                    local_row0.iterator, md0.src_rank
+                                                ),
+                                                local_row0.layout,
+                                            )
+                                            peer_row0[hidden0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                            peer_row0[hidden1] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        else:
+                                            fc2_output[pool_token0, 0, hidden0] = (acc[0] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                            fc2_output[pool_token0, 0, hidden1] = (acc[2] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                if token1 < work_tile_info.valid_tokens_in_tile:
+                                    if cutlass.const_expr(self.fc2_packed_store):
+                                        if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                            if cutlass.const_expr(
+                                                token_comm_args is not None
+                                                and not self.token_back_by_dispatch
+                                            ):
+                                                md1 = TokenSrcMetadata.load(
+                                                    token_comm_args.token_src_metadata.iterator.toint()
+                                                    + cutlass.Int64(pool_token1)
+                                                    * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                                )
+                                                local_row1 = cute.slice_(
+                                                    fc2_output,
+                                                    (md1.src_token, md1.src_topk, None),
+                                                )
+                                                row1 = cute.make_tensor(
+                                                    token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                        local_row1.iterator, md1.src_rank
+                                                    ),
+                                                    local_row1.layout,
+                                                )
+                                            else:
+                                                row1 = cute.slice_(
+                                                    fc2_output, (pool_token1, 0, None)
+                                                )
+                                            row1_hidden0 = (
+                                                row1.iterator + hidden0
+                                            ).align(4)
+                                            row1_hidden1 = (
+                                                row1.iterator + hidden1
+                                            ).align(4)
+                                            row1_i32_0 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row1_hidden0, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row1_i32_1 = cute.make_tensor(
+                                                cute.recast_ptr(
+                                                    row1_hidden1, dtype=cutlass.Int32
+                                                ),
+                                                cute.make_layout(1),
+                                            )
+                                            row1_i32_0[0] = rFc2StoreI32[2]
+                                            row1_i32_1[0] = rFc2StoreI32[3]
+                                    else:
+                                        if cutlass.const_expr(
+                                            token_comm_args is not None
+                                            and not self.token_back_by_dispatch
+                                        ):
+                                            md1 = TokenSrcMetadata.load(
+                                                token_comm_args.token_src_metadata.iterator.toint()
+                                                + cutlass.Int64(pool_token1)
+                                                * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                            )
+                                            local_row1 = cute.slice_(
+                                                fc2_output,
+                                                (md1.src_token, md1.src_topk, None),
+                                            )
+                                            peer_row1 = cute.make_tensor(
+                                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                    local_row1.iterator, md1.src_rank
+                                                ),
+                                                local_row1.layout,
+                                            )
+                                            peer_row1[hidden0] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                            peer_row1[hidden1] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        else:
+                                            fc2_output[pool_token1, 0, hidden0] = (acc[1] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+                                            fc2_output[pool_token1, 0, hidden1] = (acc[3] * fc2_alpha_value).to(
+                                                self.fc2_output_dtype
+                                            )
+
+                            if cutlass.const_expr(
+                                combine_ready_flags is not None
+                                and fc2_block_done_counter is not None
+                            ):
+                                # The last hidden tile for this token block publishes
+                                # one ready flag per source (token, top-k) row.
+                                cute.arch.fence_acq_rel_sys()
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                self.token_comm_hook_fc2_tile_complete(
+                                    token_comm_args,
+                                    combine_ready_flags,
+                                    fc2_block_done_counter,
+                                    work_tile_info,
+                                    compute_warp=compute_warp,
+                                    lane_idx=lane_idx,
+                                )
+
+                            if cutlass.const_expr(self.token_back_by_dispatch):
+                                # token-back consumes this tile from the local FC2
+                                # workspace only after all four compute warps have
+                                # made their disjoint hidden slices system-visible.
+                                # Publish exactly once per scheduler FC2 work tile.
+                                # Grouped token-back aggregates completion per expert.
+                                cute.arch.fence_acq_rel_sys()
+                                cute.arch.barrier(
+                                    barrier_id=self.epilog_sync_bar_id,
+                                    number_of_threads=32 * len(self.compute_warp_id),
+                                )
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        counter_slot = work_tile_info.expert_idx
+                                        cute.arch.atomic_add(
+                                            token_comm_args.fc2_done_counter.iterator
+                                            + counter_slot,
+                                            cutlass.Int32(1),
+                                            sem="release",
+                                            scope="sys",
+                                        )
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    k2_trace_store_ns += (
+                                        read_globaltimer() - trace_post_mainloop_start
+                                    )
+
+                else:
+                    accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                    accumulators.fill(0.0)
+
+                    a_consumer.reset()
+                    b_consumer.reset()
+                    peek_a_full_status = cutlass.Boolean(1)
+                    peek_b_full_status = cutlass.Boolean(1)
+                    if k_tile_cnt > 0:
+                        peek_a_full_status = a_consumer.try_wait()
+                        peek_b_full_status = b_consumer.try_wait()
+
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        trace_k_detail = cutlass.Int32(0)
+                        if trace_compute_detail != cutlass.Int32(0):
+                            if trace_all_k_detail != cutlass.Int32(0):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile < cutlass.Int32(2):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile == cutlass.Int32(11):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile == cutlass.Int32(12):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile == cutlass.Int32(23):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile == cutlass.Int32(24):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile + cutlass.Int32(2) >= k_tile_cnt:
+                                trace_k_detail = cutlass.Int32(1)
+
+                        if trace_k_detail != cutlass.Int32(0):
+                            if is_phase_linear1:
+                                iket.range_push("sm120_fc1_wait_a")
+                            else:
+                                iket.range_push("sm120_fc2_wait_a")
+                        k2_trace_a_wait_start = cutlass.Int64(0)
+                        k2_trace_a_wait_active = cutlass.Boolean(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if peek_a_full_status == cutlass.Boolean(0):
+                                        k2_trace_tma_a_wait_calls += cutlass.Int64(1)
+                                        if (
+                                            (
+                                                k_tile
+                                                + fc2_detail_tiles_seen
+                                                + cta_linear_id
+                                            )
+                                            % cutlass.Int32(
+                                                TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                            )
+                                            == cutlass.Int32(0)
+                                        ):
+                                            k2_trace_a_wait_start = read_globaltimer()
+                                            k2_trace_a_wait_active = cutlass.Boolean(1)
+                                            k2_trace_tma_a_timed_calls += (
+                                                cutlass.Int64(1)
+                                            )
+                        handle_a = a_consumer.wait_and_advance(peek_a_full_status)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if k2_trace_a_wait_active:
+                                        k2_trace_tma_a_wait_ns += (
+                                            read_globaltimer()
+                                            - k2_trace_a_wait_start
+                                        )
+                        if trace_k_detail != cutlass.Int32(0):
+                            iket.range_pop()
+                            if is_phase_linear1:
+                                iket.range_push("sm120_fc1_wait_b")
+                            else:
+                                iket.range_push("sm120_fc2_wait_b")
+                        k2_trace_b_wait_start = cutlass.Int64(0)
+                        k2_trace_b_wait_active = cutlass.Boolean(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if peek_b_full_status == cutlass.Boolean(0):
+                                        k2_trace_tma_b_wait_calls += cutlass.Int64(1)
+                                        if (
+                                            (
+                                                k_tile
+                                                + fc2_detail_tiles_seen
+                                                + cta_linear_id
+                                            )
+                                            % cutlass.Int32(
+                                                TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                            )
+                                            == cutlass.Int32(0)
+                                        ):
+                                            k2_trace_b_wait_start = read_globaltimer()
+                                            k2_trace_b_wait_active = cutlass.Boolean(1)
+                                            k2_trace_tma_b_timed_calls += (
+                                                cutlass.Int64(1)
+                                            )
+                        handle_b = b_consumer.wait_and_advance(peek_b_full_status)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if k2_trace_b_wait_active:
+                                        k2_trace_tma_b_wait_ns += (
+                                            read_globaltimer()
+                                            - k2_trace_b_wait_start
+                                        )
+                        if trace_k_detail != cutlass.Int32(0):
+                            iket.range_pop()
+                        peek_a_full_status = cutlass.Boolean(1)
+                        peek_b_full_status = cutlass.Boolean(1)
+                        if handle_a.count + 1 < k_tile_cnt:
+                            peek_a_full_status = a_consumer.try_wait()
+                        if handle_b.count + 1 < k_tile_cnt:
+                            peek_b_full_status = b_consumer.try_wait()
+
+                        tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                        tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                        tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
+                        tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
+                        sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                            self.mma_tiler_sfa[0] // self.mma_tiler[0]
+                        )
+                        # partition_fragment_SFA packs the two M64 groups of the
+                        # staged M128 scale tile eight bytes apart. Select the
+                        # group in SMEM so the RMEM fragment is statically indexed.
+                        tCsSFA_selected = cute.make_tensor(
+                            tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                            tCsSFA_p.layout,
+                        )
+                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tCsA_p[None, None, 0],
+                            tCrA_copy_view[None, None, 0],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_B,
+                            tCsB_p[None, None, 0],
+                            tCrB_copy_view[None, None, 0],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_SFA,
+                            tCsSFA_p_filtered[None, None, 0],
+                            tCrSFA_copy_view_filtered[None, None, 0],
+                        )
+                        if cutlass.const_expr(self.mma_tiler[1] < 128):
+                            sfb_tiles_per_tma = 128 // self.mma_tiler[1]
+                            sfb_tile_slot = (
+                                work_tile_info.tile_n_idx
+                                % cutlass.Int32(sfb_tiles_per_tma)
+                            )
+                            sfb_stage_byte_offset = (
+                                handle_b.index
+                                * cutlass.Int32(cute.cosize(sfb_smem_layout))
+                            )
+                            for ng in cutlass.range_constexpr(0, n_groups):
+                                lane_scale_row = (
+                                    sfb_tile_slot
+                                    * cutlass.Int32(self.mma_tiler[1])
+                                    + cutlass.Int32(ng * MMA_N)
+                                    + lane_idx // cutlass.Int32(4)
+                                )
+                                sfb_lane_byte_base = (
+                                    (lane_scale_row % cutlass.Int32(32))
+                                    * cutlass.Int32(16)
+                                    + (lane_scale_row // cutlass.Int32(32))
+                                    * cutlass.Int32(4)
+                                    + sfb_stage_byte_offset
+                                )
+                                rSFBCompactI32[ng * 2] = lds_b32_raw(
+                                    sSFB.iterator + sfb_lane_byte_base
+                                )
+                                rSFBCompactI32[ng * 2 + 1] = lds_b32_raw(
+                                    sSFB.iterator
+                                    + sfb_lane_byte_base
+                                    + cutlass.Int32(512)
+                                )
+                        else:
+                            tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                            tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                tCrSFB_copy_view
+                            )
+                            cute.copy(
+                                smem_tiled_copy_SFB,
+                                tCsSFB_p_filtered[None, None, 0],
+                                tCrSFB_copy_view_filtered[None, 0, None, 0],
+                            )
+
+                        if trace_k_detail != cutlass.Int32(0):
+                            if is_phase_linear1:
+                                iket.range_push("sm120_fc1_k128_compute")
+                            else:
+                                iket.range_push("sm120_fc2_k128_compute")
+                        for k_inner_mma in cutlass.range_constexpr(0, 2):
+                            if cutlass.const_expr(k_inner_mma + 1 < 2):
+                                k_inner_next = k_inner_mma + 1
+                                cute.copy(
+                                    smem_tiled_copy_A,
+                                    tCsA_p[None, None, k_inner_next],
+                                    tCrA_copy_view[None, None, k_inner_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_B,
+                                    tCsB_p[None, None, k_inner_next],
+                                    tCrB_copy_view[None, None, k_inner_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_SFA,
+                                    tCsSFA_p_filtered[None, None, k_inner_next],
+                                    tCrSFA_copy_view_filtered[
+                                        None, None, k_inner_next
+                                    ],
+                                )
+                                if cutlass.const_expr(self.mma_tiler[1] == 128):
+                                    cute.copy(
+                                        smem_tiled_copy_SFB,
+                                        tCsSFB_p_filtered[
+                                            None, None, k_inner_next
+                                        ],
+                                        tCrSFB_copy_view_filtered[
+                                            None, 0, None, k_inner_next
+                                        ],
+                                    )
+                            for ng in cutlass.range_constexpr(0, n_groups):
+                                if cutlass.const_expr(self.mma_tiler[1] < 128):
+                                    issue_m64n8k64_nvfp4_packed_sfb(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        rSFBCompactI32,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        k_inner=k_inner_mma,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
+                                else:
+                                    issue_m64n8k64_nvfp4(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        k_inner=k_inner_mma,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
+                        if trace_k_detail != cutlass.Int32(0):
+                            iket.range_pop()
+                        # Experimental: retain a proxy fence in every reader lane.
+                        # Each warp rendezvous precedes its elected empty arrival;
+                        # producer reuse still waits for all four warp arrivals.
+                        if cutlass.const_expr(self.scheduler_phase_mode == "fc1"):
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            cute.arch.sync_warp()
+                        handle_a.release()
+                        handle_b.release()
+
+                    if cutlass.const_expr(green_trace is not None):
+                        if compute_warp == cutlass.Int32(0):
+                            if lane_idx == cutlass.Int32(0):
+                                k2_trace_mainloop_ns += (
+                                    read_globaltimer()
+                                    - k2_trace_mainloop_start
+                                )
+                    trace_post_mainloop_start = cutlass.Int64(0)
+                    if cutlass.const_expr(green_trace is not None):
+                        if compute_warp == cutlass.Int32(0):
+                            if lane_idx == cutlass.Int32(0):
+                                trace_post_mainloop_start = read_globaltimer()
+                    iket.range_pop()
+                    if self.scheduler_phase_mode != "fc2" and is_phase_linear1:
+                        iket.range_push("sm120_fc1_epilogue")
+                        real_fc1_output, _ = ext.get_gmem_tensor(
+                            "c", fc1_output_gemm, work_tile_info,
+                        )
+                        real_fc1_output_sf, _ = ext.get_gmem_tensor(
+                            "sfc", fc1_output_sf_gemm, work_tile_info,
+                        )
+                        if cutlass.const_expr(token_comm_args is not None):
+                            real_topk_scores, _ = ext.get_gmem_tensor(
+                                "topk", topk_scores, work_tile_info,
+                            )
+                        fc1_col_base = (
+                            work_tile_info.tile_m_idx * cutlass.Int32(downproj_per_cta)
+                        )
+                        tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
+                            self.mma_tiler[1]
+                        )
+                        # SF tensor K coordinates are element coordinates.  The
+                        # within-block vec mode is stride-zero, so block starts
+                        # are 0, sf_vec_size, 2*sf_vec_size, ... .
+                        warp_pair = compute_warp // cutlass.Int32(2)
+                        sf_col = fc1_col_base + warp_pair * cutlass.Int32(16)
+                        fc1_alpha_value = cutlass.Float32(1.0)
+                        fc1_norm_value = cutlass.Float32(1.0)
+                        if cutlass.const_expr(fc1_alpha is not None):
+                            fc1_alpha_value = cutlass.Float32(
+                                fc1_alpha[work_tile_info.expert_idx]
+                            )
+                        if cutlass.const_expr(fc1_norm_const is not None):
+                            fc1_norm_value = cutlass.Float32(
+                                fc1_norm_const[work_tile_info.expert_idx]
+                            )
+
+                        for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
+                            acc0 = accumulators[None, None, ng_pair * 2]
+                            acc1 = accumulators[None, None, ng_pair * 2 + 1]
+
+                            token0 = lane_t * cutlass.Int32(2)
+                            token1 = token0 + cutlass.Int32(1)
+                            token2 = token0 + cutlass.Int32(MMA_N)
+                            token3 = token1 + cutlass.Int32(MMA_N)
+                            token_pair_base = cutlass.Int32(ng_pair * 2 * MMA_N)
+                            tile_token0 = token_pair_base + token0
+                            tile_token1 = token_pair_base + token1
+                            tile_token2 = token_pair_base + token2
+                            tile_token3 = token_pair_base + token3
+
+                            gate0 = acc0[0] * fc1_alpha_value
+                            gate1 = acc0[1] * fc1_alpha_value
+                            gate2 = acc1[0] * fc1_alpha_value
+                            gate3 = acc1[1] * fc1_alpha_value
+                            up0 = acc0[2] * fc1_alpha_value
+                            up1 = acc0[3] * fc1_alpha_value
+                            up2 = acc1[2] * fc1_alpha_value
+                            up3 = acc1[3] * fc1_alpha_value
+                            if cutlass.const_expr(self.gate_up_clamp is not None):
+                                limit = cutlass.Float32(self.gate_up_clamp)
+                                gate0 = clamp_gate_upper_f32(gate0, limit)
+                                gate1 = clamp_gate_upper_f32(gate1, limit)
+                                gate2 = clamp_gate_upper_f32(gate2, limit)
+                                gate3 = clamp_gate_upper_f32(gate3, limit)
+                                up0 = clamp_symmetric_f32(up0, limit)
+                                up1 = clamp_symmetric_f32(up1, limit)
+                                up2 = clamp_symmetric_f32(up2, limit)
+                                up3 = clamp_symmetric_f32(up3, limit)
+                            val0 = up0 * gate0 * cute.arch.rcp_approx(
+                                cute.math.exp2(gate0 * (-Log2E))
+                                + cutlass.Float32(1.0)
+                            )
+                            val1 = up1 * gate1 * cute.arch.rcp_approx(
+                                cute.math.exp2(gate1 * (-Log2E))
+                                + cutlass.Float32(1.0)
+                            )
+                            val2 = up2 * gate2 * cute.arch.rcp_approx(
+                                cute.math.exp2(gate2 * (-Log2E))
+                                + cutlass.Float32(1.0)
+                            )
+                            val3 = up3 * gate3 * cute.arch.rcp_approx(
+                                cute.math.exp2(gate3 * (-Log2E))
+                                + cutlass.Float32(1.0)
+                            )
+
+                            raw_token0 = tile_token_base + tile_token0
+                            raw_token1 = tile_token_base + tile_token1
+                            raw_token2 = tile_token_base + tile_token2
+                            raw_token3 = tile_token_base + tile_token3
+                            if cutlass.const_expr(token_comm_args is not None):
+                                if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                    val0 = val0 * cutlass.Float32(
+                                        real_topk_scores[raw_token0]
+                                    )
+                                if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                    val1 = val1 * cutlass.Float32(
+                                        real_topk_scores[raw_token1]
+                                    )
+                                if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                    val2 = val2 * cutlass.Float32(
+                                        real_topk_scores[raw_token2]
+                                    )
+                                if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                    val3 = val3 * cutlass.Float32(
+                                        real_topk_scores[raw_token3]
+                                    )
+
+                            if tile_token0 >= work_tile_info.valid_tokens_in_tile:
+                                val0 = cutlass.Float32(0.0)
+                            if tile_token1 >= work_tile_info.valid_tokens_in_tile:
+                                val1 = cutlass.Float32(0.0)
+                            if tile_token2 >= work_tile_info.valid_tokens_in_tile:
+                                val2 = cutlass.Float32(0.0)
+                            if tile_token3 >= work_tile_info.valid_tokens_in_tile:
+                                val3 = cutlass.Float32(0.0)
+                            if trace_compute_detail != cutlass.Int32(0):
+                                iket.range_push("sm120_fc1_epi_amax_reduce")
+                            amax0 = cute.math.absf(val0)
+                            amax1 = cute.math.absf(val1)
+                            amax2 = cute.math.absf(val2)
+                            amax3 = cute.math.absf(val3)
+                            for xor_mask in (4, 8, 16):
+                                peer_lane = lane_idx ^ cutlass.Int32(xor_mask)
+                                amax0 = cute.arch.fmax(
+                                    amax0, cute.arch.shuffle_sync(amax0, peer_lane)
+                                )
+                                amax1 = cute.arch.fmax(
+                                    amax1, cute.arch.shuffle_sync(amax1, peer_lane)
+                                )
+                                amax2 = cute.arch.fmax(
+                                    amax2, cute.arch.shuffle_sync(amax2, peer_lane)
+                                )
+                                amax3 = cute.arch.fmax(
+                                    amax3, cute.arch.shuffle_sync(amax3, peer_lane)
+                                )
+                            if lane_g == cutlass.Int32(0):
+                                sFc1Swiglu[token0, compute_warp] = amax0
+                                sFc1Swiglu[token1, compute_warp] = amax1
+                                sFc1Swiglu[token2, compute_warp] = amax2
+                                sFc1Swiglu[token3, compute_warp] = amax3
+
+                            cute.arch.barrier(
+                                barrier_id=self.epilog_sync_bar_id,
+                                number_of_threads=32 * len(self.compute_warp_id),
+                            )
+
+                            amax0 = cutlass.Float32(0.0)
+                            amax1 = cutlass.Float32(0.0)
+                            amax2 = cutlass.Float32(0.0)
+                            amax3 = cutlass.Float32(0.0)
+                            if lane_g == cutlass.Int32(0):
+                                pair_first_warp = warp_pair * cutlass.Int32(2)
+                                for warp_offset in cutlass.range_constexpr(0, 2):
+                                    warp = pair_first_warp + cutlass.Int32(warp_offset)
+                                    amax0 = cute.arch.fmax(
+                                        amax0, sFc1Swiglu[token0, warp]
+                                    )
+                                    amax1 = cute.arch.fmax(
+                                        amax1, sFc1Swiglu[token1, warp]
+                                    )
+                                    amax2 = cute.arch.fmax(
+                                        amax2, sFc1Swiglu[token2, warp]
+                                    )
+                                    amax3 = cute.arch.fmax(
+                                        amax3, sFc1Swiglu[token3, warp]
+                                    )
+                            amax0 = cute.arch.shuffle_sync(amax0, lane_t)
+                            amax1 = cute.arch.shuffle_sync(amax1, lane_t)
+                            amax2 = cute.arch.shuffle_sync(amax2, lane_t)
+                            amax3 = cute.arch.shuffle_sync(amax3, lane_t)
+                            if trace_compute_detail != cutlass.Int32(0):
+                                iket.range_pop()
+
+                            if trace_compute_detail != cutlass.Int32(0):
+                                iket.range_push("sm120_fc1_epi_quant_pack")
+                            raw_scale0 = cute.arch.fmin(
+                                cutlass.Float32(Fp8E4M3FNMax),
+                                amax0 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                * fc1_norm_value,
+                            )
+                            raw_scale1 = cute.arch.fmin(
+                                cutlass.Float32(Fp8E4M3FNMax),
+                                amax1 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                * fc1_norm_value,
+                            )
+                            raw_scale2 = cute.arch.fmin(
+                                cutlass.Float32(Fp8E4M3FNMax),
+                                amax2 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                * fc1_norm_value,
+                            )
+                            raw_scale3 = cute.arch.fmin(
+                                cutlass.Float32(Fp8E4M3FNMax),
+                                amax3 * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                                * fc1_norm_value,
+                            )
+                            scale0 = cvt_f32_to_f8_to_f32(raw_scale0, self.sf_dtype)
+                            scale1 = cvt_f32_to_f8_to_f32(raw_scale1, self.sf_dtype)
+                            scale2 = cvt_f32_to_f8_to_f32(raw_scale2, self.sf_dtype)
+                            scale3 = cvt_f32_to_f8_to_f32(raw_scale3, self.sf_dtype)
+                            inv0 = cutlass.Float32(0.0)
+                            inv1 = cutlass.Float32(0.0)
+                            inv2 = cutlass.Float32(0.0)
+                            inv3 = cutlass.Float32(0.0)
+                            if scale0 > cutlass.Float32(0.0):
+                                inv0 = cute.arch.fmin(
+                                    cute.arch.rcp_approx(scale0) * fc1_norm_value,
+                                    cutlass.Float32(Fp32Max),
+                                )
+                            if scale1 > cutlass.Float32(0.0):
+                                inv1 = cute.arch.fmin(
+                                    cute.arch.rcp_approx(scale1) * fc1_norm_value,
+                                    cutlass.Float32(Fp32Max),
+                                )
+                            if scale2 > cutlass.Float32(0.0):
+                                inv2 = cute.arch.fmin(
+                                    cute.arch.rcp_approx(scale2) * fc1_norm_value,
+                                    cutlass.Float32(Fp32Max),
+                                )
+                            if scale3 > cutlass.Float32(0.0):
+                                inv3 = cute.arch.fmin(
+                                    cute.arch.rcp_approx(scale3) * fc1_norm_value,
+                                    cutlass.Float32(Fp32Max),
+                                )
+
+                            if (
+                                lane_g == cutlass.Int32(0)
+                                and (compute_warp & cutlass.Int32(1)) == cutlass.Int32(0)
+                            ):
+                                if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                    real_fc1_output_sf[raw_token0, sf_col, 0] = (
+                                        raw_scale0
+                                    ).to(self.sf_dtype)
+                                if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                    real_fc1_output_sf[raw_token1, sf_col, 0] = (
+                                        raw_scale1
+                                    ).to(self.sf_dtype)
+                                if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                    real_fc1_output_sf[raw_token2, sf_col, 0] = (
+                                        raw_scale2
+                                    ).to(self.sf_dtype)
+                                if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                    real_fc1_output_sf[raw_token3, sf_col, 0] = (
+                                        raw_scale3
+                                    ).to(self.sf_dtype)
+
+                            q0 = cutlass.Float32(0.0)
+                            q1 = cutlass.Float32(0.0)
+                            q2 = cutlass.Float32(0.0)
+                            q3 = cutlass.Float32(0.0)
+                            if tile_token0 < work_tile_info.valid_tokens_in_tile:
+                                q0 = val0 * inv0
+                            if tile_token1 < work_tile_info.valid_tokens_in_tile:
+                                q1 = val1 * inv1
+                            if tile_token2 < work_tile_info.valid_tokens_in_tile:
+                                q2 = val2 * inv2
+                            if tile_token3 < work_tile_info.valid_tokens_in_tile:
+                                q3 = val3 * inv3
+
+                            rFc1OutputLocal[0] = q0
+                            rFc1OutputLocal[1] = q1
+                            rFc1OutputLocal[2] = q2
+                            rFc1OutputLocal[3] = q3
+                            partner_lane = lane_idx ^ cutlass.Int32(4)
+                            peer_q0 = cute.arch.shuffle_sync(q0, partner_lane)
+                            peer_q1 = cute.arch.shuffle_sync(q1, partner_lane)
+                            peer_q2 = cute.arch.shuffle_sync(q2, partner_lane)
+                            peer_q3 = cute.arch.shuffle_sync(q3, partner_lane)
+                            if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                byte_col = (
+                                    compute_warp * cutlass.Int32(4)
+                                    + (lane_g >> cutlass.Int32(1))
+                                )
+                                sFc1OutputBytes[tile_token0, byte_col] = pack_e2m1x2(
+                                    q0, peer_q0
+                                )
+                                sFc1OutputBytes[tile_token1, byte_col] = pack_e2m1x2(
+                                    q1, peer_q1
+                                )
+                                sFc1OutputBytes[tile_token2, byte_col] = pack_e2m1x2(
+                                    q2, peer_q2
+                                )
+                                sFc1OutputBytes[tile_token3, byte_col] = pack_e2m1x2(
+                                    q3, peer_q3
+                                )
+                            if trace_compute_detail != cutlass.Int32(0):
+                                iket.range_pop()
+
+                            if trace_compute_detail != cutlass.Int32(0):
+                                iket.range_push("sm120_fc1_epi_pack_smem")
+                            cute.arch.barrier(
+                                barrier_id=self.epilog_sync_bar_id,
+                                number_of_threads=32 * len(self.compute_warp_id),
+                            )
+                            if trace_compute_detail != cutlass.Int32(0):
+                                iket.range_pop()
+
+                        chunks_per_row = downproj_per_cta // 8
+                        # N16 has fewer chunks than compute threads. Round up;
+                        # the existing valid-token guard protects every GMEM store
+                        # and the corresponding scratch load for inactive threads.
+                        store_iters = (
+                            self.mma_tiler[1] * chunks_per_row
+                            + 32 * len(self.compute_warp_id) - 1
+                        ) // (32 * len(self.compute_warp_id))
+                        for store_iter in cutlass.range_constexpr(
+                            0, store_iters
+                        ):
+                            linear_chunk = (
+                                tidx
+                                + cutlass.Int32(
+                                    store_iter
+                                    * 32
+                                    * len(self.compute_warp_id)
+                                )
+                            )
+                            store_token = linear_chunk // cutlass.Int32(
+                                chunks_per_row
+                            )
+                            store_byte = (
+                                linear_chunk
+                                % cutlass.Int32(chunks_per_row)
+                            ) * cutlass.Int32(4)
+                            scratch_ptr = (
+                                sFc1OutputBytes.iterator
+                                + store_token * cutlass.Int32(downproj_per_cta // 2)
+                                + store_byte
+                            ).align(4)
+                            scratch_i32 = cute.make_tensor(
+                                cute.recast_ptr(scratch_ptr, dtype=cutlass.Int32),
+                                cute.make_layout(1),
+                            )
+                            if (
+                                store_token
+                                < work_tile_info.valid_tokens_in_tile
+                            ):
+                                output_row = tile_token_base + store_token
+                                output_col = fc1_col_base + store_byte * cutlass.Int32(2)
+                                output_ptr = (
+                                    cute.recast_ptr(
+                                        real_fc1_output.iterator,
+                                        dtype=cutlass.Uint8,
+                                    )
+                                    + output_row
+                                    * (
+                                        real_fc1_output.stride[0]
+                                        // cutlass.Int32(2)
+                                    )
+                                    + output_col // cutlass.Int32(2)
+                                ).align(4)
+                                output_i32 = cute.make_tensor(
+                                    cute.recast_ptr(
+                                        output_ptr,
+                                        dtype=cutlass.Int32,
+                                    ),
+                                    cute.make_layout(1),
+                                )
+                                output_i32[0] = scratch_i32[0]
+                        # K2 consumes this rank-local expert-pool data from a
+                        # distinct Green Context. GPU scope orders the local HBM
+                        # stores; the K2 TMA warp performs the async-proxy acquire.
+                        cute.arch.fence_acq_rel_gpu()
+                        cute.arch.barrier(
+                            barrier_id=self.epilog_sync_bar_id,
+                            number_of_threads=32 * len(self.compute_warp_id),
+                        )
+                        if cutlass.const_expr(
+                            self.fc1_producer_tiles_per_ready_block == 1
+                        ):
+                            counter_slot = (
+                                work_tile_info.cumulative_token_block_count
+                                + work_tile_info.tile_n_idx
+                            )
+                        else:
+                            counter_slot = (
+                                work_tile_info.cumulative_token_block_count
+                                + (
+                                    work_tile_info.tile_n_idx
+                                    // cutlass.Int32(
+                                        self.fc1_producer_tiles_per_ready_block
+                                    )
+                                )
+                                * cutlass.Int32(
+                                    self.fc1_producer_tiles_per_ready_block
+                                )
+                            )
+                        if cutlass.const_expr(token_comm_args is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                ready_bundle_idx = (
+                                    work_tile_info.tile_m_idx
+                                    // cutlass.Int32(
+                                        fc1_tiles_per_fc2_k_tile
+                                        * self.fc2_ready_bundle_k_tiles
+                                    )
+                                )
+                                bundle_begin = (
+                                    ready_bundle_idx
+                                    * cutlass.Int32(self.fc2_ready_bundle_k_tiles)
+                                )
+                                bundle_k_tiles = cutlass.min(
+                                    cutlass.Int32(self.fc2_ready_bundle_k_tiles),
+                                    k_tile_cnt_fc2 - bundle_begin,
+                                )
+                                ready_old = cutlass.Int32(0)
+                                if lane_idx == cutlass.Int32(0):
+                                    ready_old = cute.arch.atomic_add(
+                                        fc1_done_counter.iterator
+                                        + counter_slot * fc2_ready_bundle_cnt
+                                        + ready_bundle_idx,
+                                        cutlass.Int32(1),
+                                        # The last completer publishes the K2
+                                        # descriptor.  Acquire the preceding
+                                        # release sequence so that publication
+                                        # transitively exposes every producer
+                                        # CTA's rank-local FC1 data and scale stores.
+                                        sem="acq_rel",
+                                        scope="gpu",
+                                    )
+                                if cutlass.const_expr(
+                                    k2_ready_queue_state is not None
+                                ):
+                                    ready_old = cute.arch.shuffle_sync(
+                                        ready_old,
                                         offset=0,
                                         mask=0xFFFFFFFF,
                                         mask_and_clamp=31,
                                     )
-                                    queue_store_iters = (
-                                        queue_bundle_count
-                                        * k2_token_tiles_per_ready_block
-                                        + 31
-                                    ) // 32
-                                    for queue_store_iter in cutlass.range_constexpr(
-                                        0, queue_store_iters
+                                    if cutlass.const_expr(
+                                        self.fc1_producer_tiles_per_ready_block == 1
                                     ):
-                                        queue_entry_idx = (
-                                            lane_idx
-                                            + cutlass.Int32(
-                                                queue_store_iter * 32
+                                        ready_tile_n_idx = (
+                                            work_tile_info.tile_n_idx
+                                        )
+                                        ready_tile_valid_tokens = (
+                                            work_tile_info.valid_tokens_in_tile
+                                        )
+                                        producer_tiles_in_ready_block = (
+                                            cutlass.Int32(1)
+                                        )
+                                    else:
+                                        ready_tile_n_idx = (
+                                            work_tile_info.tile_n_idx
+                                            * cutlass.Int32(self.mma_tiler[1])
+                                            // cutlass.Int32(
+                                                self.k2_ready_tile_tokens
                                             )
                                         )
-                                        if queue_entry_idx < queue_entry_count:
-                                            k2_token_tile = (
-                                                queue_entry_idx
-                                                // cutlass.Int32(
-                                                    queue_bundle_count
-                                                )
-                                            )
-                                            queue_bundle_idx = (
-                                                queue_entry_idx
-                                                % cutlass.Int32(
-                                                    queue_bundle_count
-                                                )
-                                            )
-                                            queue_pos = (
-                                                queue_base + queue_entry_idx
-                                            )
-                                            desc_base = (
-                                                queue_pos * cutlass.Int32(7)
-                                            )
-                                            k2_ready_queue_desc[
-                                                desc_base + cutlass.Int32(0)
-                                            ] = work_tile_info.expert_idx
-                                            k2_ready_queue_desc[
-                                                desc_base + cutlass.Int32(1)
-                                            ] = (
-                                                ready_tile_n_idx
-                                                * cutlass.Int32(
-                                                    k2_token_tiles_per_ready_block
-                                                )
-                                                + k2_token_tile
-                                            )
-                                            k2_ready_queue_desc[
-                                                desc_base + cutlass.Int32(2)
-                                            ] = work_tile_info.cumulative_data_physical_row
-                                            k2_ready_queue_desc[
-                                                desc_base + cutlass.Int32(3)
-                                            ] = work_tile_info.cumulative_sf_physical_row
-                                            k2_ready_queue_desc[
-                                                desc_base + cutlass.Int32(4)
-                                            ] = work_tile_info.cumulative_token_block_count
-                                            k2_ready_queue_desc[
-                                                desc_base + cutlass.Int32(5)
-                                            ] = cutlass.min(
-                                                cutlass.Int32(
-                                                    self.k2_token_tile_tokens
-                                                ),
-                                                ready_tile_valid_tokens
-                                                - k2_token_tile
-                                                * cutlass.Int32(
-                                                    self.k2_token_tile_tokens
-                                                ),
-                                            )
-                                            k2_ready_queue_desc[
-                                                desc_base + cutlass.Int32(6)
-                                            ] = (
-                                                queue_bundle_idx
-                                                * cutlass.Int32(
-                                                    self.k2_ready_queue_bundle
-                                                )
-                                            )
-                                    cute.arch.sync_warp()
-                                    for queue_store_iter in cutlass.range_constexpr(
-                                        0, queue_store_iters
-                                    ):
-                                        queue_entry_idx = (
-                                            lane_idx
-                                            + cutlass.Int32(
-                                                queue_store_iter * 32
-                                            )
+                                        packed_expert_count = (
+                                            token_comm_args.expert_recv_count_sum[
+                                                work_tile_info.expert_idx
+                                            ]
                                         )
-                                        if queue_entry_idx < queue_entry_count:
-                                            queue_pos = (
-                                                queue_base + queue_entry_idx
+                                        expert_token_count = cutlass.Int32(
+                                            cutlass.Int64(packed_expert_count)
+                                            & cutlass.Int64(0xFFFFFFFF)
+                                        )
+                                        ready_tile_valid_tokens = cutlass.min(
+                                            cutlass.Int32(
+                                                self.k2_ready_tile_tokens
+                                            ),
+                                            expert_token_count
+                                            - ready_tile_n_idx
+                                            * cutlass.Int32(
+                                                self.k2_ready_tile_tokens
+                                            ),
+                                        )
+                                        producer_tiles_in_ready_block = (
+                                            ready_tile_valid_tokens
+                                            + cutlass.Int32(
+                                                self.fc1_ready_tile_tokens - 1
                                             )
-                                            # The release store orders this
-                                            # lane's descriptor writes; no
-                                            # second explicit GPU fence is
-                                            # required.
-                                            cute.arch.store(
-                                                k2_ready_queue_ready.iterator
-                                                + queue_pos,
-                                                cutlass.Int32(1),
-                                                sem="release",
+                                        ) // cutlass.Int32(
+                                            self.fc1_ready_tile_tokens
+                                        )
+                                    bundle_expected = (
+                                        bundle_k_tiles
+                                        * cutlass.Int32(
+                                            fc1_tiles_per_fc2_k_tile
+                                        )
+                                        * producer_tiles_in_ready_block
+                                    )
+                                    bundle_complete = (
+                                        (ready_old & cutlass.Int32(0xFFFF))
+                                        + cutlass.Int32(1)
+                                        == bundle_expected
+                                    )
+                                    all_bundles_complete = cutlass.Int32(0)
+                                    if bundle_complete:
+                                        completed_bundle_old = cutlass.Int32(0)
+                                        if lane_idx == cutlass.Int32(0):
+                                            # Pack the ready-block bundle count in
+                                            # the high 16 bits of its first
+                                            # contribution counter.  Queue
+                                            # publication must not depend on the
+                                            # final K bundle happening to finish
+                                            # after every earlier bundle.
+                                            completed_bundle_old = cute.arch.atomic_add(
+                                                fc1_done_counter.iterator
+                                                + counter_slot * fc2_ready_bundle_cnt,
+                                                cutlass.Int32(1 << 16),
+                                                sem="acq_rel",
                                                 scope="gpu",
                                             )
+                                        completed_bundle_old = cute.arch.shuffle_sync(
+                                            completed_bundle_old,
+                                            offset=0,
+                                            mask=0xFFFFFFFF,
+                                            mask_and_clamp=31,
+                                        )
+                                        completed_bundle_count = (
+                                            completed_bundle_old
+                                            >> cutlass.Int32(16)
+                                        ) + cutlass.Int32(1)
+                                        if (
+                                            completed_bundle_count
+                                            == cutlass.Int32(fc2_ready_bundle_cnt)
+                                        ):
+                                            all_bundles_complete = cutlass.Int32(1)
+                                    if all_bundles_complete != cutlass.Int32(0):
+                                        # Acquire every FC1 producer's release
+                                        # before this last producer publishes the
+                                        # descriptor and its ready flag.
+                                        cute.arch.fence_acq_rel_gpu()
+                                        hidden_tiles = (
+                                            self.hidden
+                                            + self.mma_tiler[0]
+                                            - 1
+                                        ) // self.mma_tiler[0]
+                                        queue_bundle_count = (
+                                            hidden_tiles
+                                            + self.k2_ready_queue_bundle
+                                            - 1
+                                        ) // self.k2_ready_queue_bundle
+                                        k2_token_tiles_per_ready_block = (
+                                            self.k2_ready_tile_tokens
+                                            // self.k2_token_tile_tokens
+                                        )
+                                        valid_k2_token_tiles = (
+                                            ready_tile_valid_tokens
+                                            + cutlass.Int32(
+                                                self.k2_token_tile_tokens - 1
+                                            )
+                                        ) // cutlass.Int32(
+                                            self.k2_token_tile_tokens
+                                        )
+                                        queue_entry_count = (
+                                            cutlass.Int32(queue_bundle_count)
+                                            * valid_k2_token_tiles
+                                        )
+                                        queue_base = cutlass.Int32(0)
+                                        if lane_idx == cutlass.Int32(0):
+                                            queue_base = cute.arch.atomic_add(
+                                                k2_ready_queue_state.iterator
+                                                + cutlass.Int32(1),
+                                                queue_entry_count,
+                                                scope="gpu",
+                                            )
+                                        queue_base = cute.arch.shuffle_sync(
+                                            queue_base,
+                                            offset=0,
+                                            mask=0xFFFFFFFF,
+                                            mask_and_clamp=31,
+                                        )
+                                        queue_store_iters = (
+                                            queue_bundle_count
+                                            * k2_token_tiles_per_ready_block
+                                            + 31
+                                        ) // 32
+                                        for queue_store_iter in cutlass.range_constexpr(
+                                            0, queue_store_iters
+                                        ):
+                                            queue_entry_idx = (
+                                                lane_idx
+                                                + cutlass.Int32(
+                                                    queue_store_iter * 32
+                                                )
+                                            )
+                                            if queue_entry_idx < queue_entry_count:
+                                                k2_token_tile = (
+                                                    queue_entry_idx
+                                                    // cutlass.Int32(
+                                                        queue_bundle_count
+                                                    )
+                                                )
+                                                queue_bundle_idx = (
+                                                    queue_entry_idx
+                                                    % cutlass.Int32(
+                                                        queue_bundle_count
+                                                    )
+                                                )
+                                                queue_pos = (
+                                                    queue_base + queue_entry_idx
+                                                )
+                                                desc_base = (
+                                                    queue_pos * cutlass.Int32(7)
+                                                )
+                                                k2_ready_queue_desc[
+                                                    desc_base + cutlass.Int32(0)
+                                                ] = work_tile_info.expert_idx
+                                                k2_ready_queue_desc[
+                                                    desc_base + cutlass.Int32(1)
+                                                ] = (
+                                                    ready_tile_n_idx
+                                                    * cutlass.Int32(
+                                                        k2_token_tiles_per_ready_block
+                                                    )
+                                                    + k2_token_tile
+                                                )
+                                                k2_ready_queue_desc[
+                                                    desc_base + cutlass.Int32(2)
+                                                ] = work_tile_info.cumulative_data_physical_row
+                                                k2_ready_queue_desc[
+                                                    desc_base + cutlass.Int32(3)
+                                                ] = work_tile_info.cumulative_sf_physical_row
+                                                k2_ready_queue_desc[
+                                                    desc_base + cutlass.Int32(4)
+                                                ] = work_tile_info.cumulative_token_block_count
+                                                k2_ready_queue_desc[
+                                                    desc_base + cutlass.Int32(5)
+                                                ] = cutlass.min(
+                                                    cutlass.Int32(
+                                                        self.k2_token_tile_tokens
+                                                    ),
+                                                    ready_tile_valid_tokens
+                                                    - k2_token_tile
+                                                    * cutlass.Int32(
+                                                        self.k2_token_tile_tokens
+                                                    ),
+                                                )
+                                                k2_ready_queue_desc[
+                                                    desc_base + cutlass.Int32(6)
+                                                ] = (
+                                                    queue_bundle_idx
+                                                    * cutlass.Int32(
+                                                        self.k2_ready_queue_bundle
+                                                    )
+                                                )
+                                        cute.arch.sync_warp()
+                                        for queue_store_iter in cutlass.range_constexpr(
+                                            0, queue_store_iters
+                                        ):
+                                            queue_entry_idx = (
+                                                lane_idx
+                                                + cutlass.Int32(
+                                                    queue_store_iter * 32
+                                                )
+                                            )
+                                            if queue_entry_idx < queue_entry_count:
+                                                queue_pos = (
+                                                    queue_base + queue_entry_idx
+                                                )
+                                                # The release store orders this
+                                                # lane's descriptor writes; no
+                                                # second explicit GPU fence is
+                                                # required.
+                                                cute.arch.store(
+                                                    k2_ready_queue_ready.iterator
+                                                    + queue_pos,
+                                                    cutlass.Int32(1),
+                                                    sem="release",
+                                                    scope="gpu",
+                                                )
+                        else:
+                            if lane_idx == cutlass.Int32(0):
+                                cute.arch.atomic_add(
+                                    fc1_done_counter.iterator + counter_slot,
+                                    cutlass.Int32(1),
+                                    sem="release",
+                                    scope="gpu",
+                                )
                     else:
-                        if lane_idx == cutlass.Int32(0):
-                            cute.arch.atomic_add(
-                                fc1_done_counter.iterator + counter_slot,
-                                cutlass.Int32(1),
-                                sem="release",
-                                scope="gpu",
+                        iket.range_push("sm120_fc2_store")
+                        hidden_base = (
+                            work_tile_info.tile_m_idx * cutlass.Int32(self.mma_tiler[0])
+                        )
+                        tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
+                            self.mma_tiler[1]
+                        )
+                        fc2_alpha_value = cutlass.Float32(1.0)
+                        if cutlass.const_expr(fc2_alpha is not None):
+                            fc2_alpha_value = cutlass.Float32(
+                                fc2_alpha[work_tile_info.expert_idx]
                             )
-                else:
-                    iket.range_push("sm120_fc2_store")
-                    hidden_base = (
-                        work_tile_info.tile_m_idx * cutlass.Int32(self.mma_tiler[0])
-                    )
-                    tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(
-                        self.mma_tiler[1]
-                    )
-                    fc2_alpha_value = cutlass.Float32(1.0)
-                    if cutlass.const_expr(fc2_alpha is not None):
-                        fc2_alpha_value = cutlass.Float32(
-                            fc2_alpha[work_tile_info.expert_idx]
-                        )
-                    for ng in cutlass.range_constexpr(0, n_groups):
-                        acc = accumulators[None, None, ng]
+                        for ng in cutlass.range_constexpr(0, n_groups):
+                            acc = accumulators[None, None, ng]
 
-                        token0 = cutlass.Int32(ng * MMA_N) + lane_t * cutlass.Int32(2)
-                        token1 = token0 + cutlass.Int32(1)
-                        hidden0 = hidden_base + compute_warp * cutlass.Int32(16) + lane_g
-                        hidden1 = hidden0 + cutlass.Int32(8)
-                        pool_token0 = (
-                            work_tile_info.cumulative_data_physical_row
-                            + tile_token_base
-                            + token0
-                        )
-                        pool_token1 = (
-                            work_tile_info.cumulative_data_physical_row
-                            + tile_token_base
-                            + token1
-                        )
-                        if cutlass.const_expr(self.fc2_packed_store):
-                            partner_lane = lane_idx ^ cutlass.Int32(4)
-                            rFc2Store[0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
-                            rFc2Store[1] = cute.arch.shuffle_sync(
-                                acc[0] * fc2_alpha_value, partner_lane
-                            ).to(self.fc2_output_dtype)
-                            rFc2Store[2] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
-                            rFc2Store[3] = cute.arch.shuffle_sync(
-                                acc[2] * fc2_alpha_value, partner_lane
-                            ).to(self.fc2_output_dtype)
-                            rFc2Store[4] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
-                            rFc2Store[5] = cute.arch.shuffle_sync(
-                                acc[1] * fc2_alpha_value, partner_lane
-                            ).to(self.fc2_output_dtype)
-                            rFc2Store[6] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
-                            rFc2Store[7] = cute.arch.shuffle_sync(
-                                acc[3] * fc2_alpha_value, partner_lane
-                            ).to(self.fc2_output_dtype)
-                        if token0 < work_tile_info.valid_tokens_in_tile:
+                            token0 = cutlass.Int32(ng * MMA_N) + lane_t * cutlass.Int32(2)
+                            token1 = token0 + cutlass.Int32(1)
+                            hidden0 = hidden_base + compute_warp * cutlass.Int32(16) + lane_g
+                            hidden1 = hidden0 + cutlass.Int32(8)
+                            pool_token0 = (
+                                work_tile_info.cumulative_data_physical_row
+                                + tile_token_base
+                                + token0
+                            )
+                            pool_token1 = (
+                                work_tile_info.cumulative_data_physical_row
+                                + tile_token_base
+                                + token1
+                            )
                             if cutlass.const_expr(self.fc2_packed_store):
-                                if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                partner_lane = lane_idx ^ cutlass.Int32(4)
+                                rFc2Store[0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                rFc2Store[1] = cute.arch.shuffle_sync(
+                                    acc[0] * fc2_alpha_value, partner_lane
+                                ).to(self.fc2_output_dtype)
+                                rFc2Store[2] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                rFc2Store[3] = cute.arch.shuffle_sync(
+                                    acc[2] * fc2_alpha_value, partner_lane
+                                ).to(self.fc2_output_dtype)
+                                rFc2Store[4] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                rFc2Store[5] = cute.arch.shuffle_sync(
+                                    acc[1] * fc2_alpha_value, partner_lane
+                                ).to(self.fc2_output_dtype)
+                                rFc2Store[6] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                rFc2Store[7] = cute.arch.shuffle_sync(
+                                    acc[3] * fc2_alpha_value, partner_lane
+                                ).to(self.fc2_output_dtype)
+                            if token0 < work_tile_info.valid_tokens_in_tile:
+                                if cutlass.const_expr(self.fc2_packed_store):
+                                    if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                        if cutlass.const_expr(
+                                            token_comm_args is not None
+                                            and not self.token_back_by_dispatch
+                                        ):
+                                            md0 = TokenSrcMetadata.load(
+                                                token_comm_args.token_src_metadata.iterator.toint()
+                                                + cutlass.Int64(pool_token0)
+                                                * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                            )
+                                            local_row0 = cute.slice_(
+                                                fc2_output,
+                                                (md0.src_token, md0.src_topk, None),
+                                            )
+                                            row0 = cute.make_tensor(
+                                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                    local_row0.iterator, md0.src_rank
+                                                ),
+                                                local_row0.layout,
+                                            )
+                                        else:
+                                            row0 = cute.slice_(
+                                                fc2_output, (pool_token0, 0, None)
+                                            )
+                                        row0_hidden0 = (
+                                            row0.iterator + hidden0
+                                        ).align(4)
+                                        row0_hidden1 = (
+                                            row0.iterator + hidden1
+                                        ).align(4)
+                                        row0_i32_0 = cute.make_tensor(
+                                            cute.recast_ptr(
+                                                row0_hidden0, dtype=cutlass.Int32
+                                            ),
+                                            cute.make_layout(1),
+                                        )
+                                        row0_i32_1 = cute.make_tensor(
+                                            cute.recast_ptr(
+                                                row0_hidden1, dtype=cutlass.Int32
+                                            ),
+                                            cute.make_layout(1),
+                                        )
+                                        row0_i32_0[0] = rFc2StoreI32[0]
+                                        row0_i32_1[0] = rFc2StoreI32[1]
+                                else:
                                     if cutlass.const_expr(
                                         token_comm_args is not None
                                         and not self.token_back_by_dispatch
@@ -3988,68 +7606,68 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                             fc2_output,
                                             (md0.src_token, md0.src_topk, None),
                                         )
-                                        row0 = cute.make_tensor(
+                                        peer_row0 = cute.make_tensor(
                                             token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
                                                 local_row0.iterator, md0.src_rank
                                             ),
                                             local_row0.layout,
                                         )
+                                        peer_row0[hidden0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        peer_row0[hidden1] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
                                     else:
-                                        row0 = cute.slice_(
-                                            fc2_output, (pool_token0, 0, None)
+                                        fc2_output[pool_token0, 0, hidden0] = (acc[0] * fc2_alpha_value).to(
+                                            self.fc2_output_dtype
                                         )
-                                    row0_hidden0 = (
-                                        row0.iterator + hidden0
-                                    ).align(4)
-                                    row0_hidden1 = (
-                                        row0.iterator + hidden1
-                                    ).align(4)
-                                    row0_i32_0 = cute.make_tensor(
-                                        cute.recast_ptr(
-                                            row0_hidden0, dtype=cutlass.Int32
-                                        ),
-                                        cute.make_layout(1),
-                                    )
-                                    row0_i32_1 = cute.make_tensor(
-                                        cute.recast_ptr(
-                                            row0_hidden1, dtype=cutlass.Int32
-                                        ),
-                                        cute.make_layout(1),
-                                    )
-                                    row0_i32_0[0] = rFc2StoreI32[0]
-                                    row0_i32_1[0] = rFc2StoreI32[1]
-                            else:
-                                if cutlass.const_expr(
-                                    token_comm_args is not None
-                                    and not self.token_back_by_dispatch
-                                ):
-                                    md0 = TokenSrcMetadata.load(
-                                        token_comm_args.token_src_metadata.iterator.toint()
-                                        + cutlass.Int64(pool_token0)
-                                        * cutlass.Int64(TokenSrcMetadata.nbytes)
-                                    )
-                                    local_row0 = cute.slice_(
-                                        fc2_output,
-                                        (md0.src_token, md0.src_topk, None),
-                                    )
-                                    peer_row0 = cute.make_tensor(
-                                        token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
-                                            local_row0.iterator, md0.src_rank
-                                        ),
-                                        local_row0.layout,
-                                    )
-                                    peer_row0[hidden0] = (acc[0] * fc2_alpha_value).to(self.fc2_output_dtype)
-                                    peer_row0[hidden1] = (acc[2] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        fc2_output[pool_token0, 0, hidden1] = (acc[2] * fc2_alpha_value).to(
+                                            self.fc2_output_dtype
+                                        )
+                            if token1 < work_tile_info.valid_tokens_in_tile:
+                                if cutlass.const_expr(self.fc2_packed_store):
+                                    if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                                        if cutlass.const_expr(
+                                            token_comm_args is not None
+                                            and not self.token_back_by_dispatch
+                                        ):
+                                            md1 = TokenSrcMetadata.load(
+                                                token_comm_args.token_src_metadata.iterator.toint()
+                                                + cutlass.Int64(pool_token1)
+                                                * cutlass.Int64(TokenSrcMetadata.nbytes)
+                                            )
+                                            local_row1 = cute.slice_(
+                                                fc2_output,
+                                                (md1.src_token, md1.src_topk, None),
+                                            )
+                                            row1 = cute.make_tensor(
+                                                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                                    local_row1.iterator, md1.src_rank
+                                                ),
+                                                local_row1.layout,
+                                            )
+                                        else:
+                                            row1 = cute.slice_(
+                                                fc2_output, (pool_token1, 0, None)
+                                            )
+                                        row1_hidden0 = (
+                                            row1.iterator + hidden0
+                                        ).align(4)
+                                        row1_hidden1 = (
+                                            row1.iterator + hidden1
+                                        ).align(4)
+                                        row1_i32_0 = cute.make_tensor(
+                                            cute.recast_ptr(
+                                                row1_hidden0, dtype=cutlass.Int32
+                                            ),
+                                            cute.make_layout(1),
+                                        )
+                                        row1_i32_1 = cute.make_tensor(
+                                            cute.recast_ptr(
+                                                row1_hidden1, dtype=cutlass.Int32
+                                            ),
+                                            cute.make_layout(1),
+                                        )
+                                        row1_i32_0[0] = rFc2StoreI32[2]
+                                        row1_i32_1[0] = rFc2StoreI32[3]
                                 else:
-                                    fc2_output[pool_token0, 0, hidden0] = (acc[0] * fc2_alpha_value).to(
-                                        self.fc2_output_dtype
-                                    )
-                                    fc2_output[pool_token0, 0, hidden1] = (acc[2] * fc2_alpha_value).to(
-                                        self.fc2_output_dtype
-                                    )
-                        if token1 < work_tile_info.valid_tokens_in_tile:
-                            if cutlass.const_expr(self.fc2_packed_store):
-                                if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
                                     if cutlass.const_expr(
                                         token_comm_args is not None
                                         and not self.token_back_by_dispatch
@@ -4063,113 +7681,69 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                             fc2_output,
                                             (md1.src_token, md1.src_topk, None),
                                         )
-                                        row1 = cute.make_tensor(
+                                        peer_row1 = cute.make_tensor(
                                             token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
                                                 local_row1.iterator, md1.src_rank
                                             ),
                                             local_row1.layout,
                                         )
+                                        peer_row1[hidden0] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
+                                        peer_row1[hidden1] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
                                     else:
-                                        row1 = cute.slice_(
-                                            fc2_output, (pool_token1, 0, None)
+                                        fc2_output[pool_token1, 0, hidden0] = (acc[1] * fc2_alpha_value).to(
+                                            self.fc2_output_dtype
                                         )
-                                    row1_hidden0 = (
-                                        row1.iterator + hidden0
-                                    ).align(4)
-                                    row1_hidden1 = (
-                                        row1.iterator + hidden1
-                                    ).align(4)
-                                    row1_i32_0 = cute.make_tensor(
-                                        cute.recast_ptr(
-                                            row1_hidden0, dtype=cutlass.Int32
-                                        ),
-                                        cute.make_layout(1),
-                                    )
-                                    row1_i32_1 = cute.make_tensor(
-                                        cute.recast_ptr(
-                                            row1_hidden1, dtype=cutlass.Int32
-                                        ),
-                                        cute.make_layout(1),
-                                    )
-                                    row1_i32_0[0] = rFc2StoreI32[2]
-                                    row1_i32_1[0] = rFc2StoreI32[3]
-                            else:
-                                if cutlass.const_expr(
-                                    token_comm_args is not None
-                                    and not self.token_back_by_dispatch
-                                ):
-                                    md1 = TokenSrcMetadata.load(
-                                        token_comm_args.token_src_metadata.iterator.toint()
-                                        + cutlass.Int64(pool_token1)
-                                        * cutlass.Int64(TokenSrcMetadata.nbytes)
-                                    )
-                                    local_row1 = cute.slice_(
-                                        fc2_output,
-                                        (md1.src_token, md1.src_topk, None),
-                                    )
-                                    peer_row1 = cute.make_tensor(
-                                        token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
-                                            local_row1.iterator, md1.src_rank
-                                        ),
-                                        local_row1.layout,
-                                    )
-                                    peer_row1[hidden0] = (acc[1] * fc2_alpha_value).to(self.fc2_output_dtype)
-                                    peer_row1[hidden1] = (acc[3] * fc2_alpha_value).to(self.fc2_output_dtype)
-                                else:
-                                    fc2_output[pool_token1, 0, hidden0] = (acc[1] * fc2_alpha_value).to(
-                                        self.fc2_output_dtype
-                                    )
-                                    fc2_output[pool_token1, 0, hidden1] = (acc[3] * fc2_alpha_value).to(
-                                        self.fc2_output_dtype
-                                    )
+                                        fc2_output[pool_token1, 0, hidden1] = (acc[3] * fc2_alpha_value).to(
+                                            self.fc2_output_dtype
+                                        )
 
-                    if cutlass.const_expr(
-                        combine_ready_flags is not None
-                        and fc2_block_done_counter is not None
-                    ):
-                        # The last hidden tile for this token block publishes
-                        # one ready flag per source (token, top-k) row.
-                        cute.arch.fence_acq_rel_sys()
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=32 * len(self.compute_warp_id),
-                        )
-                        self.token_comm_hook_fc2_tile_complete(
-                            token_comm_args,
-                            combine_ready_flags,
-                            fc2_block_done_counter,
-                            work_tile_info,
-                            compute_warp=compute_warp,
-                            lane_idx=lane_idx,
-                        )
+                        if cutlass.const_expr(
+                            combine_ready_flags is not None
+                            and fc2_block_done_counter is not None
+                        ):
+                            # The last hidden tile for this token block publishes
+                            # one ready flag per source (token, top-k) row.
+                            cute.arch.fence_acq_rel_sys()
+                            cute.arch.barrier(
+                                barrier_id=self.epilog_sync_bar_id,
+                                number_of_threads=32 * len(self.compute_warp_id),
+                            )
+                            self.token_comm_hook_fc2_tile_complete(
+                                token_comm_args,
+                                combine_ready_flags,
+                                fc2_block_done_counter,
+                                work_tile_info,
+                                compute_warp=compute_warp,
+                                lane_idx=lane_idx,
+                            )
 
-                    if cutlass.const_expr(self.token_back_by_dispatch):
-                        # token-back consumes this tile from the local FC2
-                        # workspace only after all four compute warps have
-                        # made their disjoint hidden slices system-visible.
-                        # Publish exactly once per scheduler FC2 work tile.
-                        # Grouped token-back aggregates completion per expert.
-                        cute.arch.fence_acq_rel_sys()
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=32 * len(self.compute_warp_id),
-                        )
+                        if cutlass.const_expr(self.token_back_by_dispatch):
+                            # token-back consumes this tile from the local FC2
+                            # workspace only after all four compute warps have
+                            # made their disjoint hidden slices system-visible.
+                            # Publish exactly once per scheduler FC2 work tile.
+                            # Grouped token-back aggregates completion per expert.
+                            cute.arch.fence_acq_rel_sys()
+                            cute.arch.barrier(
+                                barrier_id=self.epilog_sync_bar_id,
+                                number_of_threads=32 * len(self.compute_warp_id),
+                            )
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    counter_slot = work_tile_info.expert_idx
+                                    cute.arch.atomic_add(
+                                        token_comm_args.fc2_done_counter.iterator
+                                        + counter_slot,
+                                        cutlass.Int32(1),
+                                        sem="release",
+                                        scope="sys",
+                                    )
+                    if cutlass.const_expr(green_trace is not None):
                         if compute_warp == cutlass.Int32(0):
                             if lane_idx == cutlass.Int32(0):
-                                counter_slot = work_tile_info.expert_idx
-                                cute.arch.atomic_add(
-                                    token_comm_args.fc2_done_counter.iterator
-                                    + counter_slot,
-                                    cutlass.Int32(1),
-                                    sem="release",
-                                    scope="sys",
+                                k2_trace_store_ns += (
+                                    read_globaltimer() - trace_post_mainloop_start
                                 )
-                if cutlass.const_expr(green_trace is not None):
-                    if compute_warp == cutlass.Int32(0):
-                        if lane_idx == cutlass.Int32(0):
-                            k2_trace_store_ns += (
-                                read_globaltimer() - trace_post_mainloop_start
-                            )
 
                 if is_phase_linear1:
                     fc1_detail_tiles_seen += cutlass.Int32(1)

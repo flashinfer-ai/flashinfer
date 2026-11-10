@@ -1,6 +1,6 @@
 """Deterministic launch heuristics for the SM120 MegaMoE kernel.
 
-This module is deliberately independent of torch, CUDA, NVSHMEM, argparse,
+This module is deliberately independent of torch, CUDA, NCCL, argparse,
 and process environment state.  The FlashInfer-facing call path can therefore
 select one JIT configuration with a small amount of integer arithmetic; the
 benchmark runner may apply explicit user overrides after selection.
@@ -455,7 +455,7 @@ class MegaMoEKernelConfig:
                 tx_sms=0,
                 rx_sms=0,
             )
-        elif backend in ("nvshmem_hybrid", "nvshmem_ibgda"):
+        elif backend in ("gin_hybrid", "gin"):
             k1_sms, tx_sms, rx_sms, k2_sms = _scale_sm_partition(
                 num_sms=config.total_sms,
                 reference_counts=_HYBRID_SM_PARTITION,
@@ -465,7 +465,7 @@ class MegaMoEKernelConfig:
             config = replace(
                 config,
                 comm_backend=backend,
-                kernel_comm_backend="nvshmem_ibgda",
+                kernel_comm_backend="gin",
                 token_back_mode="reuse_dispatch_warps",
                 k1_sms=k1_sms,
                 k2_sms=k2_sms,
@@ -544,8 +544,8 @@ def select_megamoe_config(
         # The RTX Pro 5000 cross-NUMA scan selected 48/16/16/30. Preserve
         # those proportions on other SM120 devices and align explicit groups
         # to the device's Green Context co-schedule granularity.
-        comm_backend = "nvshmem_hybrid"
-        kernel_comm_backend = "nvshmem_ibgda"
+        comm_backend = "gin_hybrid"
+        kernel_comm_backend = "gin"
         k1_sms, tx_sms, rx_sms, k2_sms = _scale_sm_partition(
             num_sms=shape.num_sms,
             reference_counts=_HYBRID_SM_PARTITION,

@@ -1,1 +1,1 @@
-"""Topology-aware NVSHMEM transport support for SM120 Split-MegaMoE."""
+"""NCCL GIN network transport and NCCL LSA local P2P support."""

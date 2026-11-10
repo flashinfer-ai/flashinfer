@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover -- wheels without cute.iket
     try:
         from cutlass.cute.experimental import iket  # type: ignore
     except ImportError:
-        from src.iket_compat import iket
+        from moe_sm120_nvfp4_split.support.src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -73,8 +73,8 @@ from .split_timestamp import (
     trace_word,
 )
 from .sm120_ptx_helpers import lds_b32_raw
-from src.ptx_helpers import ldg_f32_raw
-from src.token_comm import TokenSrcMetadata
+from moe_sm120_nvfp4_split.support.src.ptx_helpers import ldg_f32_raw
+from moe_sm120_nvfp4_split.support.src.token_comm import TokenSrcMetadata
 
 
 UseScaleTma = True

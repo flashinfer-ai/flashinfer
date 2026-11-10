@@ -2,11 +2,11 @@
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
-`22c08eb561ab821839fa921ee8c48ab21592cc9a` (ABI 2737), including selector
-readability cleanup and the compiler-visible shared-load memory-effect fix.
-The fitted coefficients, candidate ordering, policy thresholds and legacy fallback
-are preserved. The `common/` and support `src/` directories retain the PR's
-framework adaptations; the source revision above describes the NVFP4 package.
+`d0762b1a361c69640885f64e6529e5fec4fa7ef4` (ABI 2812).
+This revision includes qualified compact compute policies and the NCCL-only
+memory/transport runtime. The `common/` and support `src/` directories retain
+the PR's framework adaptations. `runtime/green_context.py` and its tests retain
+the graph-aware FlashInfer adapter rather than the standalone runner wrapper.
 
 This drop includes dispatch rank caching, its caller-stream reset ordering,
 128-byte tensor-map descriptors, and the large-EP4 rank-local combine policy.
@@ -18,11 +18,15 @@ FP32 accumulation, and BF16 output. FlashInfer imports only this package's
 `shim`; backend code does not import benchmark runners.
 
 The initial integration supports the production same-NUMA `p2p_direct` path.
-The standalone cross-NUMA IBGDA transport remains outside this drop until its
-transport state is exposed through the framework API.
+The cross-NUMA GIN transport is present in the vendored source but is not exposed
+by this same-NUMA framework adapter.
 
-Multi-rank execution requires NVSHMEM 3.7.0 and matching `nvshmem4py-cu13`
-0.3.1 bindings. Single-rank execution can set `MEGA_NO_DIST=1`. The backend
+Multi-rank execution requires the pinned NCCL 2.32.3 runtime, selected through
+`MEGAMOE_NCCL_ROOT` or `nvidia-nccl-cu13==2.32.3`. The backend requests only
+Torch distributed bootstrap. It allocates one NCCL-registered arena per workspace
+and derives direct-P2P pointers through LSA. It does not initialize NVSHMEM.
+The runtime rejects processes that already load NVSHMEM, including incompatible
+PyTorch builds; use a clean compatible PyTorch build. Single-rank execution can set `MEGA_NO_DIST=1`. The backend
 must be warmed up collectively before an outer CUDA Graph capture begins.
 
 Layers with identical geometry share activation, routing, K1/K2 scratch, and
@@ -66,7 +70,7 @@ Offset/misaligned-width inputs use the CUDA quantizer fallback. Padding IDs
 remain -1; only scale-column alignment padding requires zeroing.
 
 First allocation of a bucket's execution storage drains in-flight device work
-before entering collective NVSHMEM allocation. This avoids mixing the allocator
+before suballocating shared execution storage. This avoids mixing the allocator
 with peer-dependent Green Context graphs. Cached execution/storage paths add no
 synchronization; cold allocation remains forbidden during outer graph capture.
 
@@ -99,3 +103,13 @@ outputs retain their direct graph bindings. The public workspace-view option
 provides a zero-copy view with main's borrowed-output lifetime.
 The fused input stager follows main's CUDA quantizer when a nonzero block's
 E4M3 scale rounds to zero: its encoding scale is zero as well.
+
+Shared arena capacity is planned collectively for the prefill bucket and all
+reachable decode buckets before allocating workspace storage. Every peer-visible
+tensor is a slice of that arena: the kernel's single peer-offset table therefore
+remains valid for activation, routing, readiness, scratch and output buffers.
+Independent workspace handles own independent NCCL communicators and arenas;
+layer pooling retains the arena until all associated frontends are destroyed.
+Packed FP4 weight interleave uses byte views so it is bit-preserving on PyTorch
+versions without native FP4 `copy_` support. CuTe DLPack conversion uses the
+vendored low-precision wrapper where Torch does not export FP4/FP8 DLPack.

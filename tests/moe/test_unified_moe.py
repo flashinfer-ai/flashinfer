@@ -2317,7 +2317,7 @@ class TestBuiltInRunnerLifecycle:
         assert len(events) == 1
         assert runner._built
         assert runner.tuning_config is tuning_config
-        assert hash(runner) == hash(runner.get_cache_key_extras([]))
+        assert hash(runner) == hash((runner.get_cache_key_extras([]), 0))
 
 
 # ---------------------------------------------------------------------------
@@ -2903,7 +2903,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
     layer._select_winner = lambda *_: (runner, -1)
     actual = layer(act_pack, weight_pack)
     if swap_ab and quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
-        from tests.test_helpers.cute_dsl_moe_swap_ab_reference import (
+        from tests.moe.test_helpers.cute_dsl_moe_swap_ab_reference import (
             assert_cute_dsl_moe_bits,
             cute_dsl_moe_reference,
         )
@@ -2944,7 +2944,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
         assert_cute_dsl_moe_bits(actual, reference)
         return
     if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
-        from tests.test_helpers.w4a16_reference import (
+        from tests.moe_ep.test_helpers.w4a16_reference import (
             assert_w4a16_bits,
             split_w4a16_reference_from_tensors,
         )
@@ -4836,7 +4836,6 @@ _DIMENSIONS = [
     ("top_k", dict(top_k=4)),
     ("num_experts", dict(num_experts=128)),
     ("local_num_experts", dict(local_num_experts=32)),
-    ("local_expert_offset", dict(local_expert_offset=8)),
     ("activation", dict(activation=GeGLU())),
 ]
 

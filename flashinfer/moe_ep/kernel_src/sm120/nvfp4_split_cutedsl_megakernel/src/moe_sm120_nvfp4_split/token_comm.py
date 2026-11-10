@@ -1,4 +1,4 @@
-"""SM120 token communication specialization for NVSHMEM GPU heaps.
+"""SM120 token communication using NCCL-registered GPU memory.
 
 The common protocol stays in :mod:`src.token_comm`.  This subclass carries the
 SM120 adaptations: peer-store barriers, local receive-count reduction,
@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     try:
         from cutlass.cute.experimental import iket as _iket  # type: ignore
     except ImportError:
-        from src.iket_compat import iket as _iket
+        from moe_sm120_nvfp4_split.support.src.iket_compat import iket as _iket
 
 from .config import (
     RANK_COMBINE_PLAN_COUNT_SHIFT,
@@ -28,9 +28,9 @@ from .config import (
 )
 from .moe_utils import spin_wait
 from .sm120_ptx_helpers import atomic_cas_gpu_i32_raw, lds_b32_raw, red_add_relaxed_sys_v2_bf16x2_raw
-from src.flag_batch import GpuReleaseFlagBatchTracker
-from src.grid_sync import software_grid_sync
-from src.ptx_helpers import (
+from moe_sm120_nvfp4_split.support.src.flag_batch import GpuReleaseFlagBatchTracker
+from moe_sm120_nvfp4_split.support.src.grid_sync import software_grid_sync
+from moe_sm120_nvfp4_split.support.src.ptx_helpers import (
     fns_b32,
     ldg_b32_raw,
     ldg_f32_raw,
@@ -40,8 +40,8 @@ from src.ptx_helpers import (
     tma_load_1d_raw,
     tma_store_1d,
 )
-from src.sf_swizzle import sf_atom_int32_offset
-from src.token_comm import CombineFormat, TokenInPullTokenBackPush, TokenSrcMetadata
+from moe_sm120_nvfp4_split.support.src.sf_swizzle import sf_atom_int32_offset
+from moe_sm120_nvfp4_split.support.src.token_comm import CombineFormat, TokenInPullTokenBackPush, TokenSrcMetadata
 
 
 class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
@@ -60,7 +60,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         k1_ready_queue_m_rotation: int = 0,
         max_tokens_per_rank: int,
         ibgda_dispatch_chunk_tokens: int,
-        comm_backend: Literal["p2p_direct", "nvshmem_ibgda"] = "p2p_direct",
+        comm_backend: Literal["p2p_direct", "gin"] = "p2p_direct",
         **kwargs,
     ) -> None:
         if num_dispatch_warps not in (1, 2, 4):
@@ -88,9 +88,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         super().__init__(**kwargs)
         self.local_rank = local_rank
         self.max_tokens_per_rank = max_tokens_per_rank
-        if comm_backend not in ("p2p_direct", "nvshmem_ibgda"):
+        if comm_backend not in ("p2p_direct", "gin"):
             raise ValueError(
-                "comm_backend must be 'p2p_direct' or 'nvshmem_ibgda', got "
+                "comm_backend must be 'p2p_direct' or 'gin', got "
                 f"{comm_backend!r}."
             )
         self.comm_backend = comm_backend
@@ -102,12 +102,12 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         ) // self.ibgda_dispatch_chunk_tokens
         self.ibgda_dispatch_ready_words = (
             1 + self.world_size * max_tokens_per_rank
-            if comm_backend == "nvshmem_ibgda"
+            if comm_backend == "gin"
             else 0
         )
         self.ibgda_owner_plan_ready_words = (
             self.world_size * self.num_experts_per_rank
-            if comm_backend == "nvshmem_ibgda"
+            if comm_backend == "gin"
             else 0
         )
 
@@ -420,7 +420,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         *,
         num_sms,
     ):
-        if cutlass.const_expr(self.comm_backend == "nvshmem_ibgda"):
+        if cutlass.const_expr(self.comm_backend == "gin"):
             return self._dispatch_pull_token_strided(
                 token_comm_storage,
                 input_token_buffer,
@@ -663,7 +663,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 # source/expert route list is copied independently as its
                 # compact sideband chunk arrives.  Do not consume a stale
                 # metadata row from the previous replay.
-                if cutlass.const_expr(self.comm_backend == "nvshmem_ibgda"):
+                if cutlass.const_expr(self.comm_backend == "gin"):
                     if lane_idx == Int32(0):
                         owner_plan_ready_idx = (
                             Int32(self.ibgda_dispatch_ready_words)
@@ -745,7 +745,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 for _ in cutlass.range_constexpr(0, sf_passes, 1):
                     sf_vals.append(Int32(0))
                 weight = Float32(0.0)
-                if cutlass.const_expr(self.comm_backend == "nvshmem_ibgda"):
+                if cutlass.const_expr(self.comm_backend == "gin"):
                     # Sparse streaming dispatch publishes readiness for the
                     # exact source token after activation, scale factors and
                     # top-k weights have all reached local HBM. Word zero
@@ -930,7 +930,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 if lane_idx == Int32(0):
                     fc1_input_topk_weights_buffer[pool_token_idx] = weight
 
-                if cutlass.const_expr(self.comm_backend != "nvshmem_ibgda"):
+                if cutlass.const_expr(self.comm_backend != "gin"):
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_wait(mbar_ptr_warp, phase_bit)
                     with cute.arch.elect_one():
@@ -955,7 +955,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     )
 
                 if cutlass.const_expr(
-                    self.comm_backend != "nvshmem_ibgda"
+                    self.comm_backend != "gin"
                 ):
                     # ``tma_store_1d`` is asynchronous.  The original wide
                     # 72-CTA pull happened to leave enough time before FC1
@@ -1067,7 +1067,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 if _iket_pull_emit:
                     _iket.range_pop()  # Pull.Arrival_Atomic
 
-                if cutlass.const_expr(self.comm_backend != "nvshmem_ibgda"):
+                if cutlass.const_expr(self.comm_backend != "gin"):
                     phase_bit = phase_bit ^ Int32(1)
 
                 token_idx = token_idx + Int32(num_global_warps)
@@ -1495,11 +1495,11 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         if iket_active:
             _iket.range_push("Dispatch_Prep")
 
-        if cutlass.const_expr(self.comm_backend == "nvshmem_ibgda"):
-            # Standalone GPU NVSHMEM kernels have already pushed contiguous
+        if cutlass.const_expr(self.comm_backend == "gin"):
+            # Standalone GPU communication kernels have already pushed contiguous
             # activation/SF/weight buffers and installed the immutable route
             # control tables before K1 starts.  There are no peer pointers or
-            # device-side NVSHMEM calls in the persistent compute kernel.
+            # device-side communication calls in the persistent compute kernel.
             pass
         else:
             # Both combine paths publish peer-written dispatch counts; RLC
@@ -1636,7 +1636,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             _iket.range_pop()
             _iket.range_push("Dispatch_Barrier")
 
-        if cutlass.const_expr(self.comm_backend != "nvshmem_ibgda"):
+        if cutlass.const_expr(self.comm_backend != "gin"):
             self.dispatch_barrier(
                 token_comm_args.expert_send_count,
                 token_comm_args.expert_recv_count,
@@ -1728,7 +1728,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
 
         if cutlass.const_expr(
             self.enable_token_back
-            and self.comm_backend != "nvshmem_ibgda"
+            and self.comm_backend != "gin"
         ):
             if iket_active:
                 _iket.range_push("Token_Back_By_Push")
@@ -1965,7 +1965,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         """Rendezvous K1 threads for the externally staged transport path.
 
         Cross-rank dispatch/combine completion is enforced by stream-ordered
-        NVSHMEM barriers in the host launcher.  Persistent K1 therefore only
+        communication barriers in the host launcher.  Persistent K1 therefore only
         needs its ordinary CTA-local tail rendezvous; replay counters are
         reset by the launcher before the next invocation.
         """

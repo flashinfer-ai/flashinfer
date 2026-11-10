@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     try:
         from cutlass.cute.experimental import iket  # type: ignore
     except ImportError:
-        from src.iket_compat import iket
+        from moe_sm120_nvfp4_split.support.src.iket_compat import iket
 
 from .moe_persistent_scheduler import (
     MoEWorkTileInfo,

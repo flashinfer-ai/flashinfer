@@ -18,7 +18,7 @@ K1 and K2 execute concurrently in disjoint Green Contexts. K1 publishes FC1
 output ready state bundle-by-bundle, so K2 can start before K1 finishes the
 whole expert pool. Same-NUMA EP uses direct P2P activation pull and direct
 peer-store combine. Cross-NUMA EP keeps local peers on P2P and sends only
-cross-NUMA traffic through staged NVSHMEM IBGDA transport.
+cross-NUMA dispatch and return traffic through NCCL GIN. P2P allocations and peer mappings use NCCL LSA; no NVSHMEM initialization, allocator, host library or device bitcode is required.
 
 ## Data contract
 
@@ -43,18 +43,29 @@ K3: BF16 top-k reduction
 They are part of the NVFP4 numerical contract and must not be folded into a
 different stage without updating the reference implementation.
 
-## Validated environment
+## Runtime environment
 
-- Python 3.12
-- `nvidia-cutlass-dsl==4.6.0`
-- CUDA Toolkit 13.3
-- NVSHMEM 3.7.0 and NVSHMEM4Py 0.3.1
-- SM120 RTX Pro 5000
+- Python 3.12, `nvidia-cutlass-dsl==4.6.0`, SM120 GPUs.
+- NCCL `nvidia-nccl-cu13==2.32.3`; the packaged device and host bridge
+  artifacts are version/hash checked and fail closed on mismatch.
+- CUDA toolkit 13.x for the bridge, a compatible driver and an RDMA/GDR stack
+  for cross-NUMA GIN. Same-NUMA traffic uses NCCL LSA peer mappings.
+- The dependency-removal qualification uses official `torch==2.8.0+cu128`
+  and its CUDA 12.8 dependencies. The local low-precision DLPack adapter
+  preserves packed FP4/FP8 storage without requiring a newer Torch export.
+  Some newer vendor Torch builds themselves link NVSHMEM; using such a
+  build does not make the process NVSHMEM-free even though MegaMoE does not
+  call it. Use the qualified isolated environment for a dependency-free process.
 
-The same-NUMA EP4 path requires CUDA peer access and an NVSHMEM symmetric GPU
-heap. The cross-NUMA hybrid path additionally requires the matching NVSHMEM
-3.7.0 headers/device bitcode and an IBGDA-capable NIC/GDR stack; its
-compatibility guard rejects an unknown NVSHMEM device ABI.
+For every supported positive token count, network dispatch and return use
+GIN. There is no exact-token whitelist and no runtime NVSHMEM fallback.
+Same-NUMA EP4 uses P2P and does not need network transfers. Inputs outside
+measured ranges still require memory-capacity and correctness qualification;
+policy coverage does not imply exhaustive GPU testing. T=0 is rejected.
+
+The P2P arena is sized from the input shape. Additional GIN workspaces are
+registered separately. `MEGAMOE_SYMMETRIC_BYTES` may enlarge the P2P arena,
+but a value below the calculated requirement is rejected.
 
 ## Run
 
@@ -63,8 +74,6 @@ DSV4-flash requires `--gate_up_clamp 10.0`; omitting it disables the clamp.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NVSHMEM_HEAP_KIND=VIDMEM
-export NVSHMEM_SYMMETRIC_SIZE=16G
 export MEGA_STRICT_TORCH_REF=1
 
 torchrun --standalone --nproc_per_node=4 \

@@ -12,9 +12,6 @@ fi
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
-export NVSHMEM_HEAP_KIND=VIDMEM
-export NVSHMEM_SYMMETRIC_SIZE="${NVSHMEM_SYMMETRIC_SIZE:-2G}"
-export NVSHMEM_DEBUG="${NVSHMEM_DEBUG:-WARN}"
 # Transport correctness is gated by the byte-exact replay checks below.
 export MEGA_STRICT_TORCH_REF="${MEGA_STRICT_TORCH_REF:-0}"
 export MEGA_SPLIT_INCLUDE_K3=1
@@ -30,7 +27,7 @@ run_case() {
     --hidden 1024 --intermediate 2048 \
     --num_topk 4 --num_total_experts 64 \
     --enable_static_expert_shape \
-    --comm_backend nvshmem_hybrid "$@"
+    --comm_backend gin_hybrid "$@"
 }
 
 # Independent Torch-reference coverage for representative route distributions.

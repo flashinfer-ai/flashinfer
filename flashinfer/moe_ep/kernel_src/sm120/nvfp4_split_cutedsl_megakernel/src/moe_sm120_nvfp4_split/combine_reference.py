@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Pure PyTorch combine references; no kernel, CUDA or NVSHMEM imports.
+"""Pure PyTorch combine references; no kernel, CUDA or communication-runtime imports.
 
 Input terms are BF16 expert outputs, *after* FC2's output conversion. Arithmetic
 validation must obtain them from an independent expert reference. Transport
@@ -73,11 +73,17 @@ def owner_grouped_bf16_reference(
     ))
 
 
-def byte_difference(actual: torch.Tensor, expected: torch.Tensor) -> int:
+def byte_difference(actual: torch.Tensor, expected: torch.Tensor, *, chunk_bytes=16*1024**2) -> int:
     if actual.shape != expected.shape or actual.dtype != expected.dtype:
         raise ValueError("byte comparison requires equal shapes and dtypes")
-    return int((actual.contiguous().view(torch.uint8)
-                != expected.contiguous().view(torch.uint8)).sum().item())
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+    a = actual.contiguous().view(torch.uint8).reshape(-1)
+    b = expected.contiguous().view(torch.uint8).reshape(-1)
+    # Reduce each bounded chunk before creating the next one. A full boolean
+    # sum may materialize an int64 temporary eight times the byte-buffer size.
+    return sum(int((a[start:start+chunk_bytes] != b[start:start+chunk_bytes]).sum().item())
+               for start in range(0, a.numel(), chunk_bytes))
 
 
 def numerical_comparison(actual, expected, *, atol=0.05, rtol=0.05) -> dict:

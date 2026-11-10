@@ -140,7 +140,7 @@ the program and the split factor, and binds the launch.
 The tests in `tests/experimental/test_cake_msa_nvfp4_decode.py` compare the
 programs with the FP32 oracle of the existing NVFP4 route and with that route
 itself, check that a token's union output does not depend on its siblings'
-selections, and replay captured graphs; `tests/test_helpers/cake_msa_nvfp4_inputs.py`
+selections, and replay captured graphs; `tests/experimental/test_helpers/cake_msa_nvfp4_inputs.py`
 builds the inputs (independent or overlap-controlled selections, shuffled,
 identity or shared-prefix page tables); `benchmarks/bench_cake_msa_nvfp4_decode.py`
 times the programs against `msa_sparse_decode_attention` on the same tensors

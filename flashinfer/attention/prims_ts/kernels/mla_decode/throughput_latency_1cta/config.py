@@ -34,6 +34,7 @@ from ....split_kv_mode_policy import select_split_kv_modes
 from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.nvfp4_kv import (
     Nvfp4KVConfig,
+    is_sm107_target,
     nvfp4_row_bytes,
 )
 from ..helpers.mask import MaskType, normalize_mask_type
@@ -50,6 +51,18 @@ SUPPORTED_TILE_SIZE_Q = (8, 16, 32, 64)
 SM100A_SMEM_CAPACITY_BYTES = 232448
 ESTIMATED_TS_BARRIER_BYTES = 512
 MAX_CLUSTER_SMEM_DATA_BYTES = SM100A_SMEM_CAPACITY_BYTES - ESTIMATED_TS_BARRIER_BYTES
+# SM107 exposes 327 KiB of dynamic SMEM per CTA. Only resources gated on an
+# SM107 compile target (see is_sm107_target) may use the difference.
+SM107_SMEM_CAPACITY_BYTES = 327 * 1024
+
+
+def target_smem_capacity_bytes() -> int:
+    """Return the per-CTA dynamic SMEM capacity of the CuTe DSL compile target."""
+    return (
+        SM107_SMEM_CAPACITY_BYTES if is_sm107_target() else SM100A_SMEM_CAPACITY_BYTES
+    )
+
+
 # CUDA's nonportable cluster launch attribute accepts at most 32 CTAs.  This is
 # a launch-geometry limit, not a problem-shape policy.
 MAX_CLUSTER_SIZE = 32
@@ -179,6 +192,8 @@ class MlaConfig(Nvfp4KVConfig):
     load_num_warps: int = 1
     whole_kv_tile: bool = False
     single_raw_prefetch: bool = False
+    # Whole-tile raw NVFP4 record buffers (1 or 2); see raw_record_stages.
+    raw_record_ring: int = 1
     compact_nv_rope: bool = False
     q_tma_stage: bool = False
     q_nope_tmem: bool = False
@@ -277,6 +292,50 @@ class MlaConfig(Nvfp4KVConfig):
     def async_nvfp4_kv_gather(self) -> bool:
         """Use independent gather/transform warps with two retained tiles."""
         return self.has_nvfp4_kv and self.whole_kv_tile
+
+    def raw_record_ring_fits(self) -> bool:
+        """Return whether a second 128-row raw record buffer fits in SMEM.
+
+        D512 pure-NVFP4 records (288 B, 36 KiB per buffer) leave room beside
+        the two retained whole tiles. D576 records (352 B, 44 KiB per buffer)
+        take the H64 whole-tile schedule to 264 KB, which fits only SM107's
+        327 KiB. Mixed FP8 sources (512 B records) keep one raw buffer.
+        """
+        if self.rope_dim:
+            return is_sm107_target() and self.raw_record_stride <= 352
+        return self.raw_record_stride <= 288
+
+    @property
+    def raw_record_stages(self) -> int:
+        """Return how many whole-tile raw NVFP4 record buffers the gather ring holds.
+
+        With two buffers the metadata warps gather tile i+1 while converters
+        still read tile i; see configure_sparse_mla for when it is selected.
+        """
+        if not self.single_raw_prefetch:
+            return 1
+        assert self.raw_record_ring in (1, 2)
+        assert self.raw_record_ring == 1 or self.raw_record_ring_fits()
+        return self.raw_record_ring
+
+    @property
+    def early_raw_snapshot(self) -> bool:
+        """Snapshot raw NVFP4 records into registers before acquiring the KV tile.
+
+        Enabled with the two-slot raw ring (pure NVFP4 D512 sources only), so
+        the converter's raw-slot release no longer waits for PV to free a
+        retained whole-tile stage and two gathers stay in flight.
+        """
+        return (
+            self.async_nvfp4_kv_gather
+            and self.raw_record_stages == 2
+            and self.kv_cache_format != "fp8"
+        )
+
+    @property
+    def raw_record_stage_bytes(self) -> int:
+        """Return SMEM bytes of one raw record buffer (128 gathered rows)."""
+        return 128 * self.raw_record_stride
 
     @property
     def one_insts_kv_swap(self) -> bool:
@@ -2033,8 +2092,26 @@ def configure_sparse_mla(
         page_stages = 1
     if profile.page_pipeline_stages:
         page_stages = profile.page_pipeline_stages
+    # Persistent D512 NVFP4 schedules (several work tiles per CTA) use a
+    # two-slot raw record ring with early register snapshots and four
+    # metadata stages, so two gathers stay in flight while PV holds both
+    # retained tiles (GB300 H64 B128 top-k 1024 Sq4: 83.4 -> 78.3 us;
+    # prefill H64 Sq1024: 136.5 -> 130.0 us). Short nonpersistent split
+    # loops keep one raw buffer: there the extra 36 KiB of SMEM costs
+    # ~0.3 us (H128 B1-B4: 13.3 -> 13.6 us) and gains nothing. D576 records
+    # need SM107's SMEM (raw_record_ring_fits); there the ring makes
+    # persistent top-k 2048 decode 5-9% faster (VR200 H12 832 rows: 125.8 ->
+    # 115.6 us; H64: 145.9 -> 132.5 us).
+    raw_record_ring = (
+        2
+        if retained_nvfp4_kv
+        and cfg.raw_record_ring_fits()
+        and cfg.kv_cache_format != "fp8"
+        and cfg.use_persistent_scheduler
+        else 1
+    )
     if retained_nvfp4_kv:
-        page_stages = 2
+        page_stages = 4 if raw_record_ring == 2 else 2
     if single and reuse and kv_stages >= 6 and not cfg.is_fp8_qkv():
         page_stages = 1
 
@@ -2114,6 +2191,7 @@ def configure_sparse_mla(
             single_raw_prefetch=True,
             page_offsets_entries_per_stage=132,
             whole_kv_tile=True,
+            raw_record_ring=raw_record_ring,
         )
         kv_stages = 2
     return dataclass_replace(

@@ -14,17 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from threading import Barrier
+
 import pytest
 import torch
 
 import flashinfer
 from flashinfer.utils import device_support_pdl
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
-from tests.test_helpers.pdl import late_store
-from tests.test_helpers.sampling import (
+from tests.utils.test_helpers.pdl import late_store
+from tests.utils.test_helpers.sampling import (
     required_num_collision_rows,
     required_num_trials,
 )
@@ -32,6 +36,51 @@ from tests.test_helpers.sampling import (
 
 # H100 CI peak GPU memory: 39.5 GiB.
 pytestmark = pytest.mark.gpu_exclusive
+
+
+@pytest.mark.parametrize("use_default_generator", [False, True])
+def test_get_seed_and_offset_threaded_reservations(use_default_generator):
+    device = torch.device("cuda", torch.cuda.current_device())
+    increments = (1, 4, 5, 13)
+    calls_per_thread = 256
+    start = Barrier(len(increments))
+
+    # Preserve the process-default generator for the remaining sampling tests.
+    with torch.random.fork_rng(devices=[device.index]):
+        generator = (
+            torch.cuda.default_generators[device.index]
+            if use_default_generator
+            else torch.Generator(device=device)
+        )
+        generator.manual_seed(1234)
+        generator.set_offset(128)
+
+        def reserve(increment):
+            start.wait(timeout=10)
+            ranges = []
+            for _ in range(calls_per_thread):
+                seed, offset = flashinfer.sampling.get_seed_and_offset(
+                    increment,
+                    None if use_default_generator else generator,
+                    device,
+                )
+                assert seed == 1234
+                ranges.append((offset, (increment + 3) // 4 * 4))
+            return ranges
+
+        with ThreadPoolExecutor(max_workers=len(increments)) as executor:
+            ranges = [
+                item
+                for group in executor.map(reserve, increments, timeout=30)
+                for item in group
+            ]
+
+        # Every reservation owns one disjoint range, with no lost advancement.
+        next_offset = 128
+        for offset, length in sorted(ranges):
+            assert offset == next_offset
+            next_offset += length
+        assert generator.get_offset() == next_offset
 
 
 def normal_distribution(std):
@@ -1502,6 +1551,74 @@ def test_softmax(
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
     assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("api", ["online_softmax", "sampling", "logits_pipe"])
+def test_softmax_concurrent_streams(api):
+    torch.manual_seed(42)
+    shape = (128, 131072)
+    logits = [
+        torch.randn(shape, device="cuda"),
+        torch.randn(shape, device="cuda") * 2 + 3,
+    ]
+    references = [value.softmax(dim=-1) for value in logits]
+
+    if api == "online_softmax":
+        # Public APIs dispatch to a different kernel on Blackwell. Exercise
+        # OnlineSoftmax directly with the same workspace for both graphs.
+        workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+        run = partial(
+            flashinfer.sampling.get_sampling_module().softmax,
+            workspace,
+            maybe_temperature_arr=None,
+            temperature_val=1.0,
+            enable_pdl=False,
+        )
+    elif api == "sampling":
+        run = partial(flashinfer.sampling.softmax, enable_pdl=False)
+    else:
+        from flashinfer.logits_processor import LogitsPipe, Softmax, Temperature
+
+        pipe = LogitsPipe([Temperature(), Softmax(enable_pdl=False)], compile=True)
+        run = partial(pipe, temperature=1.0)
+
+    run(logits[0])  # Compile before capture.
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    outputs = []
+    for graph, stream, value in zip(graphs, streams, logits, strict=True):
+        with torch.cuda.graph(graph, stream=stream):
+            outputs.append(run(value))
+
+    for _ in range(10):
+        for graph, stream in zip(graphs, streams, strict=True):
+            with torch.cuda.stream(stream):
+                graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        for output, reference in zip(outputs, references, strict=True):
+            torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("offset", [0, 4, -4, 32768])
+def test_softmax_split_output_overlap(offset):
+    from flashinfer.jit.sampling import gen_sampling_module
+
+    vocab_size = 32768
+    storage = torch.randn(vocab_size + abs(offset), device="cuda")
+    logits = storage.narrow(0, max(-offset, 0), vocab_size).view(1, vocab_size)
+    output = storage.narrow(0, max(offset, 0), vocab_size).view(1, vocab_size)
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = gen_sampling_module().build_and_load().softmax
+    if offset == vocab_size:
+        softmax(workspace, logits, output, None, 1.0, False)
+        torch.testing.assert_close(output, logits.softmax(dim=-1), atol=1e-5, rtol=1e-5)
+    else:
+        with pytest.raises(
+            RuntimeError, match="OnlineSoftmax failed with error code invalid argument"
+        ):
+            softmax(workspace, logits, output, None, 1.0, False)
 
 
 # Batches of at most 128 rows with a vocabulary of at least 24576 take the vocab-splitting

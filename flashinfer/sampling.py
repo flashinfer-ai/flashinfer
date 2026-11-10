@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from numbers import Real
+from threading import Lock
 from types import SimpleNamespace
 from typing import Optional, Tuple, Union
 import torch
@@ -26,10 +27,12 @@ from .jit.sampling import gen_sampling_module
 from .topk import _get_row_states_buffer
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
+    log_probs_trace,
+    log_softmax_trace,
     min_p_sampling_trace,
     sampling_from_logits_trace,
     sampling_from_probs_trace,
-    softmax_trace,
+    softmax_trace_dispatch,
     top_k_mask_logits_trace,
     top_k_renorm_probs_trace,
     top_k_sampling_trace,
@@ -47,23 +50,36 @@ from .utils import (
 )
 
 
+_rng_state_lock = Lock()
+
+
 def get_seed_and_offset(
     increment: int,
     generator: Optional[torch.Generator] = None,
     device: Optional[torch.device] = None,
 ) -> Tuple[int, int]:
+    """Reserve a four-aligned RNG range and return its seed and starting offset.
+
+    Reservations through this helper are serialized across host threads. The
+    lock does not coordinate with PyTorch RNG operations or other mutations of
+    the same generator; callers must serialize such mixed use, including when
+    using the default generator.
+    """
     if generator is None:
         generator = get_default_generators(device)
-    # add mutex if multi-trheading needed
-    state = generator.get_state()
-    seed, offset = map(int, state.view(torch.int64))
-    # Reserve this call's range, leaving the generator at the next unused offset.
-    next_offset = offset + (increment + 3) // 4 * 4
-    generator.set_state(
-        torch.tensor(
-            [seed, next_offset], dtype=torch.int64, device=torch.device("cpu")
-        ).view(torch.uint8)
-    )
+    # Serialize FlashInfer reservations: get_state/set_state alone do not
+    # make the read-modify-write atomic. A shared lock avoids retaining
+    # caller-owned generators in a per-generator lock cache.
+    with _rng_state_lock:
+        state = generator.get_state()
+        seed, offset = map(int, state.view(torch.int64))
+        # Reserve this call's range, leaving the generator at the next unused offset.
+        next_offset = offset + (increment + 3) // 4 * 4
+        generator.set_state(
+            torch.tensor(
+                [seed, next_offset], dtype=torch.int64, device=torch.device("cpu")
+            ).view(torch.uint8)
+        )
     return seed, offset
 
 
@@ -939,11 +955,14 @@ def _validate_and_convert_seed_offset(
     return maybe_seed_arr, seed_val, maybe_offset_arr, offset_val
 
 
-@flashinfer_api(trace=softmax_trace)
+@flashinfer_api(trace=softmax_trace_dispatch)
 def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[torch.Tensor, float]] = None,
     enable_pdl: Optional[bool] = None,
+    *,
+    batch_invariant: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for `online safe softmax <https://arxiv.org/abs/1805.02867>`_ with temperature scaling.
 
@@ -966,6 +985,28 @@ def softmax(
         existing PDL behavior. On SM100/SM103/SM107, 32-byte aligned rows whose
         vocabulary is a multiple of 8 and at most 262144 take the row-caching
         cluster route, which reads and writes each row exactly once.
+    batch_invariant : bool
+        ``True`` runs the batch-invariant class ``lse.row`` in place of the kernels above: a row's bits
+        depend on its values, the vocabulary size and the temperature alone, not on the batch it is
+        computed in, its position, the configuration chosen or the SM count, and the result is
+        deterministic (CUDA-graph replay included). The dataflow is a fixed pair of row trees (the
+        maximum and the sum of ``ex2.approx`` weights), fingerprinted as
+        ``flashinfer.batch_invariant.fingerprint("softmax", N=, dtype=, temperature=)``; the same trees
+        serve :func:`log_probs`, so a token's log-probability and the softmax of its row agree by
+        construction. Supported: bf16 / f16 / fp32 logits of any vocabulary up to 2^21 (and beyond it where
+        the row's alignment admits a configuration), every temperature form
+        above (a per-row tensor may also take the shape of the leading dimensions of 3-D logits; its values
+        are not validated on the device, so a ``0`` yields a NaN row: substitute ``1.0`` for greedy rows),
+        SM100 / SM103 / SM107. Cost: with 16-bit logits the class is faster than the operator's default
+        route (which casts to fp32 and writes fp32); with fp32 logits it is slower, about 0.4-0.7x of the
+        default route on SM100 / SM107 (three passes over the row against the fused route's one), while
+        faster than torch's softmax. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+        See ``flashinfer/batch_invariant/README.md``.
+    out_dtype : Optional[torch.dtype]
+        Only with ``batch_invariant=True``: ``None`` (default) returns the input dtype; ``torch.float32``
+        returns the probabilities before the class's output conversion, which for a 16-bit input are the
+        fp32 input's class bit for bit (the samplers' ``softmax(dtype=torch.float32)`` without the copy).
     Returns
     -------
     probs : torch.Tensor
@@ -994,9 +1035,22 @@ def softmax(
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
 
+    if batch_invariant:
+        # the class validates its own arguments (a per-row temperature may take the shape of the leading dimensions
+        # of 3-D logits, which the operator's 1-D rule below rejects)
+        from .batch_invariant.sampling.api import softmax_batch_invariant
+
+        return softmax_batch_invariant(
+            logits, temperature, enable_pdl, out_dtype=out_dtype
+        )
+
     maybe_temperature_arr, temperature_val, temperature_is_none = (
         _validate_softmax_temperature(logits, temperature)
     )
+    if out_dtype is not None:
+        raise ValueError(
+            "out_dtype is a parameter of the batch-invariant class (batch_invariant=True)"
+        )
     workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
 
     # Auto-detect PDL support if not specified
@@ -1024,6 +1078,153 @@ def softmax(
         temperature_val,
         enable_pdl,
     )
+
+
+@flashinfer_api(trace=log_probs_trace)
+def log_probs(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    *,
+    return_lse: bool = False,
+    enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = True,
+):
+    r"""The log-probability of one token per row under ``softmax(logits / temperature)``, with a batch-invariant
+    dataflow: the teacher-forced score of a sampled token (a trainer re-scoring a rollout) and the returned
+    log-probability of a decode step (an inference engine) are the same bits whatever the batch, its padding,
+    the row's position or the SM count, and run-to-run deterministic.
+
+    The dataflow is the class ``lse.row`` (``flashinfer/batch_invariant/README.md``): the row maximum ``m`` and the sum
+    ``s`` of the ``ex2.approx`` weights as fixed trees over the vocabulary, then
+    ``logp = ((x_t - m) * c - lg2(s)) * ln2`` with ``c = log2(e) / temperature``; :func:`softmax` under
+    ``batch_invariant=True`` computes its probabilities from the same ``m`` and ``s``. The fingerprint is
+    ``flashinfer.batch_invariant.fingerprint("log_probs", N=, dtype=, temperature=)``.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        CUDA tensor of logits of shape ``(..., vocab_size)``, dtype bfloat16, float16 or float32 (the 16-bit
+        inputs are widened exactly).
+    token_ids : torch.Tensor
+        Integer tensor of shape ``logits.shape[:-1]`` (one token id scored per row) or ``logits.shape[:-1] + (K,)``
+        (``K`` ids per row: a sampled token with its top-k or requested alternatives, in one launch). An id outside
+        ``[0, vocab_size)`` gives NaN.
+    temperature : Optional[Union[torch.Tensor, float]]
+        ``None`` (no scaling), a positive scalar, or a tensor with one positive value per row (float16,
+        bfloat16, float32 or float64; a float64 temperature is rounded to float32), of shape ``logits.shape[:-1]``
+        or ``(rows,)``. A scalar is validated on the host; a tensor's values are not validated on the device (a
+        check would need a synchronisation and would break CUDA-graph capture): every value must be positive and
+        finite, a ``0`` yields a NaN row, a negative or non-finite value an undefined row. Callers whose
+        temperature tensors carry ``0`` for greedy rows (vLLM, SGLang) must substitute ``1.0`` there: the greedy
+        log-probabilities are read from the unscaled row.
+    return_lse : bool
+        Also return the natural log-sum-exp of each scaled row (the normaliser), from the same launch.
+    enable_pdl : Optional[bool]
+        Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
+    batch_invariant : bool
+        This entry has no other implementation: ``True`` (the default) is the only accepted value.
+
+    Returns
+    -------
+    logp : torch.Tensor
+        float32 tensor of the token ids' shape with the natural log-probabilities.
+    lse : torch.Tensor
+        Only with ``return_lse=True``: float32 tensor of shape ``logits.shape[:-1]`` with the natural
+        log-sum-exp of each scaled row.
+
+    Notes
+    -----
+    For two callers to agree bit for bit (a sampler and the trainer re-scoring its tokens) they must call with the
+    same arguments: raw logits with the temperature (the class scales inside its chain) or identically pre-scaled
+    logits with ``temperature=None``. A row view into a wider tensor whose row stride is a multiple of the vector
+    alignment (16 bytes) is read in place; other views are copied first.
+
+    Raises
+    ------
+    flashinfer.batch_invariant.BatchInvariantUnsupportedError
+        For inputs outside the class (dtype, device, architecture); the entry never falls back.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> logits = torch.randn(4, 32000, device="cuda", dtype=torch.bfloat16)
+    >>> token_ids = torch.randint(0, 32000, (4,), device="cuda")
+    >>> logp = flashinfer.sampling.log_probs(logits, token_ids, temperature=0.7)
+    >>> logp.shape, logp.dtype
+    (torch.Size([4]), torch.float32)
+    """
+    if not batch_invariant:
+        raise ValueError(
+            "log_probs has only its batch-invariant class; batch_invariant=False selects nothing"
+        )
+    if not logits.is_cuda:
+        raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+    from .batch_invariant.sampling.api import log_probs_batch_invariant
+
+    return log_probs_batch_invariant(
+        logits, token_ids, temperature, enable_pdl, return_lse=return_lse
+    )
+
+
+@flashinfer_api(trace=log_softmax_trace)
+def log_softmax(
+    logits: torch.Tensor,
+    temperature: Optional[Union[torch.Tensor, float]] = None,
+    *,
+    enable_pdl: Optional[bool] = None,
+    batch_invariant: bool = True,
+):
+    r"""The log-softmax row of ``logits / temperature`` in fp32, with a batch-invariant dataflow: the row every
+    deterministic sampling path forms before gathering a token's log-probability (the top-k log-probabilities, the
+    ranks, the full-row consumers), the same bits whatever the batch, its padding, the row's position or the SM count,
+    and run-to-run deterministic.
+
+    The dataflow is the class ``lse.row`` (``flashinfer/batch_invariant/README.md``): the row maximum ``m`` and the sum
+    ``s`` of the ``ex2.approx`` weights as fixed trees over the vocabulary, then ``logp_j = ((x_j - m) * c - lg2(s)) *
+    ln2`` with ``c = log2(e) / temperature``; :func:`log_probs` is this row gathered at the token ids, and
+    :func:`softmax` under ``batch_invariant=True`` forms its probabilities from the same ``m`` and ``s`` (``p_j = e_j /
+    s``), so the three share the row's statistics bit for bit. The
+    fingerprint is ``flashinfer.batch_invariant.fingerprint("log_softmax", N=, dtype=, temperature=)``.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        CUDA tensor of logits of shape ``(..., vocab_size)``, dtype bfloat16, float16 or float32 (the 16-bit
+        inputs are widened exactly).
+    temperature : Optional[Union[torch.Tensor, float]]
+        ``None`` (no scaling), a positive scalar, or a tensor with one positive value per row (float16,
+        bfloat16, float32 or float64; a float64 temperature is rounded to float32), of shape ``logits.shape[:-1]``
+        or ``(rows,)``. A scalar is validated on the host; a tensor's values are not validated on the device (a
+        check would need a synchronisation and would break CUDA-graph capture): every value must be positive and
+        finite, a ``0`` yields a NaN row, a negative or non-finite value an undefined row. Callers whose
+        temperature tensors carry ``0`` for greedy rows (vLLM, SGLang) must substitute ``1.0`` there: the greedy
+        log-probabilities are read from the unscaled row.
+    enable_pdl : Optional[bool]
+        Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
+    batch_invariant : bool
+        This entry has no other implementation: ``True`` (the default) is the only accepted value.
+
+    Returns
+    -------
+    logprobs : torch.Tensor
+        float32 tensor of shape ``logits.shape`` with the natural log-probabilities of every element.
+
+    Raises
+    ------
+    flashinfer.batch_invariant.BatchInvariantUnsupportedError
+        For inputs outside the class (dtype, device, architecture); the entry never falls back.
+    """
+    if not batch_invariant:
+        raise ValueError(
+            "log_softmax has only its batch-invariant class; batch_invariant=False selects nothing"
+        )
+    if not logits.is_cuda:
+        raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+    from .batch_invariant.sampling.api import log_softmax_batch_invariant
+
+    return log_softmax_batch_invariant(logits, temperature, enable_pdl)
 
 
 @flashinfer_api(trace=sampling_from_logits_trace)

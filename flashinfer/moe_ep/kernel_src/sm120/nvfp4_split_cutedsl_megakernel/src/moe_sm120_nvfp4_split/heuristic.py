@@ -8,6 +8,7 @@ compatibility selector until independently qualified. Estimates are not counters
 from __future__ import annotations
 from dataclasses import dataclass, replace, asdict
 from functools import lru_cache
+from copy import deepcopy
 import math
 from typing import Optional, Tuple
 from .candidate_catalog import ALL_PROFILES, CATALOG_VERSION
@@ -22,11 +23,15 @@ from .legacy_heuristic import (
 
 @dataclass(frozen=True)
 class MegaMoEHeuristicOverrides(_LegacyOverrides):
+    k1_compact_tokens: Optional[bool] = None
+    k2_compact_tokens: Optional[bool] = None
     k1_stages: Optional[int] = None
 
 
 @dataclass(frozen=True)
 class MegaMoEKernelConfig(_LegacyConfig):
+    k1_compact_tokens: bool = False
+    k2_compact_tokens: bool = False
     # None only on compatibility fallback: preserve its previous kernel resolver.
     k1_stages: Optional[int] = None
 
@@ -258,6 +263,14 @@ def derive_features(shape, c, host_expert_counts=None):
 def legality_errors(shape, c):
     """Kernel/layout/progress constraints only; no performance or BF16 policy."""
     errors = []
+    for label in ("k1", "k2"):
+        flag = getattr(c, label + "_compact_tokens")
+        if type(flag) is not bool:
+            errors.append(label + " compact token flag must be bool")
+        if flag and getattr(c, label + "_tile")[1] != 128:
+            errors.append(label + " compact token path requires an N128 task")
+    if c.k2_compact_tokens and (c.k2_warps != 8 or c.k2_tail_reclaim):
+        errors.append("compact K2 requires qualified 8-warp non-tail path")
     if shape.hidden % 32 or shape.intermediate % 64:
         errors.append("NVFP4 alignment requires H%32=0,I%64=0")
     for name, tile in (("K1", c.k1_tile), ("K2", c.k2_tile)):
@@ -291,7 +304,7 @@ def legality_errors(shape, c):
     if c.comm_backend == "p2p_direct":
         if c.tx_sms or c.rx_sms or c.token_back_mode != "epi_warps":
             errors.append("P2P protocol mismatch")
-    elif c.comm_backend in ("nvshmem_hybrid", "nvshmem_ibgda"):
+    elif c.comm_backend in ("gin_hybrid", "gin"):
         if c.dispatch_warps != 4 or c.token_back_mode != "reuse_dispatch_warps":
             errors.append("transport dispatcher reuse/progress")
         if (
@@ -637,7 +650,7 @@ def select_compatibility_config(
             raise ValueError("RLC requires explicit owner_bf16 numerical permission")
     legacy_o = (
         _LegacyOverrides(
-            **{k: v for k, v in vars(overrides).items() if k != "k1_stages"}
+            **{k: v for k, v in vars(overrides).items() if k not in ("k1_stages", "k1_compact_tokens", "k2_compact_tokens")}
         )
         if overrides
         else None
@@ -648,7 +661,9 @@ def select_compatibility_config(
             shape, replace(legacy_o or _LegacyOverrides(), rank_local_combine=False)
         )
     c = MegaMoEKernelConfig(
-        **vars(base), k1_stages=overrides.k1_stages if overrides else None
+        **vars(base), k1_stages=overrides.k1_stages if overrides else None,
+        k1_compact_tokens=bool(overrides.k1_compact_tokens) if overrides else False,
+        k2_compact_tokens=bool(overrides.k2_compact_tokens) if overrides else False
     )
     errors = (
         legality_errors(shape, c)
@@ -666,10 +681,34 @@ def select_megamoe_config(
     *,
     numerical_contract="ordinary_topk",
     host_expert_counts=None,
+    tuning_config=None,
+    hardware=None,
 ):
     """Return a complete config. Callers must explicitly permit owner BF16 order."""
     _validate_counts(shape, host_expert_counts)
-    return _select_cached(shape, overrides, numerical_contract, host_expert_counts)
+    return _select_with_profiles(shape, overrides, numerical_contract, host_expert_counts,
+                                 tuning_config, hardware)[0]
+
+
+@lru_cache(maxsize=256)
+def _select_with_profiles(shape, overrides, contract, counts, tuning_config, hardware):
+    # Cache the FINAL immutable config, including policy and offline validation.
+    # Diagnostics are private cache state; explain_selection returns a deep copy.
+    # The existing selector remains the anchor and authoritative override validator.
+    base = _select_cached(shape, overrides, contract, counts)
+    from .model_policy import select as select_model
+    selected, builtin = select_model(shape, base, overrides, contract, counts)
+    info = dict(builtin=builtin, offline=None, source=(
+        'builtin_model' if builtin['matched'] else 'general'))
+    if tuning_config is not None:
+        from .tuning_config import resolve_tuning
+        tuned, detail = resolve_tuning(tuning_config, shape, overrides, contract, hardware)
+        info['offline'] = detail
+        if tuned is not None:
+            return tuned, deepcopy(dict(info, source='offline_tuning'))
+    from .compact_policy import select as select_compact
+    selected, info["compact"] = select_compact(shape, selected, overrides, contract, counts)
+    return selected, deepcopy(info)
 
 
 def explain_selection(
@@ -678,12 +717,12 @@ def explain_selection(
     *,
     numerical_contract="ordinary_topk",
     host_expert_counts=None,
+    tuning_config=None,
+    hardware=None,
 ):
-    selected = select_megamoe_config(
-        shape,
-        overrides,
-        numerical_contract=numerical_contract,
-        host_expert_counts=host_expert_counts,
+    _validate_counts(shape, host_expert_counts)
+    selected, profile_info = _select_with_profiles(
+        shape, overrides, numerical_contract, host_expert_counts, tuning_config, hardware
     )
     choices = enumerate_candidates(
         shape,
@@ -696,6 +735,7 @@ def explain_selection(
 
     return dict(
         model_version=MODEL_VERSION,
+        profiles=deepcopy(profile_info),
         catalog_version=CATALOG_VERSION,
         numerical_contract=numerical_contract,
         rlc_path_features=describe_rlc_path(

@@ -30,8 +30,8 @@ def shape(tokens=8192, **updates):
 @pytest.mark.parametrize('case', CASES, ids=lambda c: c['name'])
 def test_selected_configuration_matches_measured_fixture(case):
     s = MegaMoEHeuristicInput(**case['shape'])
-    c = select_megamoe_config(s, numerical_contract='owner_bf16')
-    assert json.loads(json.dumps(asdict(c))) == case['config']
+    c = select_megamoe_config(s, MegaMoEHeuristicOverrides(k1_compact_tokens=False, k2_compact_tokens=False), numerical_contract='owner_bf16')
+    assert json.loads(json.dumps(asdict(c))) == dict(case['config'], k1_compact_tokens=False, k2_compact_tokens=False)
     assert not legality_errors(s, c)
     assert not semantic_errors(c, 'owner_bf16')
 

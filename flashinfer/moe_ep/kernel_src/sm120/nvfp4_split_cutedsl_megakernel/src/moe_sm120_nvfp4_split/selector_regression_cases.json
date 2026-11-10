@@ -2406,6 +2406,54 @@
         128,
         128
       ],
+      "k2_stages": 3,
+      "k2_warps": 8,
+      "k1_sms": 72,
+      "k2_sms": 38,
+      "tx_sms": 0,
+      "rx_sms": 0,
+      "sm_min_partition": 8,
+      "sm_partition_alignment": 8,
+      "dispatch_chunk_tokens": 64,
+      "combine_chunk_rows": 16,
+      "dispatch_channels": 2,
+      "combine_channels": 2,
+      "dispatch_slots": 2,
+      "combine_slots": 2,
+      "combine_blocking_put": false,
+      "dispatch_local_handoff_windows": 1,
+      "dispatch_remote_handoff_windows": 1,
+      "ibgda_rc_per_pe": 1,
+      "ibgda_rc_mapping": "warp",
+      "tp_k3_chunks": 1,
+      "dispatch_warps": 1,
+      "dispatch_compute_overlap": true,
+      "dispatch_rank_cache": true,
+      "rank_local_combine": true,
+      "k1_ready_queue": true,
+      "k1_ready_queue_m_rotation": 0,
+      "k2_ready_queue": true,
+      "ready_queue_bundle": 4,
+      "k2_natural_regs": false,
+      "k2_min_blocks_per_sm": 1,
+      "k2_tail_reclaim": false,
+      "expected_rows_per_expert": 1820.4444444444443,
+      "k1_stages": 3
+    },
+    "historical_22c08eb_config": {
+      "comm_backend": "p2p_direct",
+      "kernel_comm_backend": "p2p_direct",
+      "token_back_mode": "epi_warps",
+      "k1_tile": [
+        64,
+        128,
+        128
+      ],
+      "k2_tile": [
+        64,
+        128,
+        128
+      ],
       "k2_stages": 2,
       "k2_warps": 8,
       "k1_sms": 72,
@@ -2439,7 +2487,8 @@
       "k2_tail_reclaim": false,
       "expected_rows_per_expert": 1820.4444444444443,
       "k1_stages": 3
-    }
+    },
+    "qualification_evidence": "/lustre/raplab/client/hanyueh/workspace/log/sm120_selector_tuning_20261105/DYNAMIC_PLAN_RESULTS.json"
   },
   {
     "name": "glm_20480",

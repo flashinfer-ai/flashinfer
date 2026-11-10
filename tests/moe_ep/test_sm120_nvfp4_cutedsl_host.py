@@ -106,7 +106,7 @@ def test_transport_requires_matching_token_back_mode() -> None:
     )
     valid_cases = (
         ("p2p_direct", "epi_warps"),
-        ("nvshmem_ibgda", "reuse_dispatch_warps"),
+        ("gin_hybrid", "reuse_dispatch_warps"),
     )
     for backend, token_back_mode in valid_cases:
         config = select_megamoe_config(
@@ -120,7 +120,7 @@ def test_transport_requires_matching_token_back_mode() -> None:
 
     invalid_cases = (
         ("p2p_direct", "reuse_dispatch_warps"),
-        ("nvshmem_ibgda", "epi_warps"),
+        ("gin_hybrid", "epi_warps"),
     )
     for backend, token_back_mode in invalid_cases:
         with pytest.raises(ValueError, match="requires token_back_mode"):
@@ -266,6 +266,7 @@ def test_execution_allocation_synchronizes_only_new_storage(
         _executions={},
         _storages={32: storage} if reuse_storage else {},
         _sym_roots=[],
+        _comm_session=None,
         fc1_alpha=tensor,
         fc2_alpha=tensor,
         fc1_norm_const=tensor,
@@ -281,13 +282,15 @@ def test_execution_allocation_synchronizes_only_new_storage(
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
     monkeypatch.setattr(torch, "zeros", lambda *a, **kw: tensor)
 
-    def allocate(*args):
+    def allocate(*args, **kwargs):
         events.append("allocate")
         assert events[0] == "sync"
         return tensor
 
     monkeypatch.setattr(runtime, "sym_zeros", allocate)
-    monkeypatch.setattr(runtime, "sym_byte_view", lambda *args: (tensor, tensor))
+    monkeypatch.setattr(
+        runtime, "sym_byte_view", lambda *args, **kwargs: (tensor, tensor)
+    )
     monkeypatch.delenv("MEGA_SPLIT_GLOBALTIMER", raising=False)
     monkeypatch.delenv("MEGA_SPLIT_K2_TILE_TRACE", raising=False)
     execution = frontend._ensure_execution()
@@ -382,3 +385,14 @@ def test_frontend_passes_contract_and_gate_up_width(monkeypatch, contract):
     assert seen["numerical_contract"] == contract
     assert seen["problem"].intermediate == 4096
     assert seen["problem"].tokens_per_rank == 64
+
+
+@pytest.mark.parametrize("dtype", (torch.float4_e2m1fn_x2, torch.float8_e4m3fn))
+def test_low_precision_interleave_preserves_payload_bytes(dtype):
+    payload = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(2, 32, 4)
+    expected = torch.cat(
+        (payload[:, :8], payload[:, 16:24], payload[:, 8:16], payload[:, 24:]), dim=1
+    )
+    actual = interleave_gate_up_8(payload.view(dtype), full_width=32)
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual.view(torch.uint8), expected, atol=0, rtol=0)

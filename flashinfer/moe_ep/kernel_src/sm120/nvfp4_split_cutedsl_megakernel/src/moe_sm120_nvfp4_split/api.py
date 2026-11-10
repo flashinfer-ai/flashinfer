@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
+from functools import lru_cache
 import json
 from typing import Any, Dict, Optional, Tuple
 
@@ -38,7 +39,7 @@ from .jit_config import Sm120JitConfig
 # Rank-local combine now reserves a source-generated contributor-plan plane.
 # Version 22 refreshes generated code for whole-warp rank-local reduction;
 # the workspace layout and completion protocol are unchanged.
-KERNEL_CACHE_ABI = 2737
+KERNEL_CACHE_ABI = 2812
 
 
 @dataclass(frozen=True)
@@ -207,6 +208,7 @@ def is_calibrated_execution(
     )
 
 
+@lru_cache(maxsize=256)
 def select_compile_spec(
     *,
     problem: MegaMoEProblemSpec,
@@ -218,10 +220,17 @@ def select_compile_spec(
     overrides: Optional[MegaMoEHeuristicOverrides] = None,
     numerical_contract: str = "ordinary_topk",
     host_expert_counts: Optional[Tuple[int, ...]] = None,
+    tuning_config=None,
+    hardware: Optional[str] = None,
     jit: Optional[Sm120JitConfig] = None,
     build: Optional[SplitKernelBuildOptions] = None,
 ) -> MegaMoECompileSpec:
-    """Resolve the production heuristic into a cacheable compile spec."""
+    """Resolve and reuse an immutable compile spec (bounded process-local cache).
+
+    The key includes the EP rank, build/JIT options, numerical contract, already
+    host route counts and the content-identified offline tuning profile. No GPU
+    objects, tensor pointers or CUDA contexts are retained by this cache.
+    """
 
     problem.validate()
     heuristic_input = MegaMoEHeuristicInput(
@@ -246,7 +255,8 @@ def select_compile_spec(
             numerical_contract=numerical_contract)
         if not is_calibrated_execution(build=build, jit=jit) else
         select_megamoe_config(heuristic_input, overrides,
-            numerical_contract=numerical_contract, host_expert_counts=host_expert_counts)
+            numerical_contract=numerical_contract, host_expert_counts=host_expert_counts,
+            tuning_config=tuning_config, hardware=hardware)
     )
     return MegaMoECompileSpec(
         problem=problem,
@@ -261,7 +271,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
 
     import cutlass
 
-    from common.megamoe_constants import SfPaddingBlock
+    from moe_sm120_nvfp4_split.support.common.megamoe_constants import SfPaddingBlock
     from .kernel_dispatch_fc1 import build_sm120_dispatch_fc1_kernel
     from .kernel_fc2_combine import Sm120Fc2CombineKernel
     from .kernel_fc2_combine_n16_dual import (
@@ -349,6 +359,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         green_trace_role=0,
         **common_kwargs,
     )
+    k1.compact_token_rows = config.k1_compact_tokens
     k2_load_balance = (
         "atomic_counter" if config.k2_tail_reclaim else "static"
     )
@@ -371,6 +382,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         else Sm120Fc2CombineKernel
     )
     k2 = k2_kernel_cls(**k2_common, **common_kwargs)
+    k2.compact_token_rows = config.k2_compact_tokens
 
     k2_drain = None
     k2_finalizer = None
@@ -384,6 +396,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
             green_trace_role=2,
         )
         k2_drain = k2_kernel_cls(**drain_common, **common_kwargs)
+        k2_drain.compact_token_rows = config.k2_compact_tokens
 
     if config.k2_tail_reclaim or config.k2_warps == 12:
         finalizer_common = dict(k2_common)

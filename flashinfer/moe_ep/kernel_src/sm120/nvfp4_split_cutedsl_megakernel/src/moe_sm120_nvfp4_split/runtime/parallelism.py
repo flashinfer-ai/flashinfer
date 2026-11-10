@@ -27,7 +27,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-import nvshmem.core
 
 from .gpu_topology import (
     EpTransportTopology,
@@ -91,11 +90,11 @@ def init_parallel_context(
     data_parallel_size: int,
     tensor_parallel_size: int,
 ) -> ParallelContext:
-    """Create process groups and discover topology, but do not init NVSHMEM.
+    """Create process groups and discover topology before NCCL memory setup.
 
-    Splitting process-group/topology bootstrap from NVSHMEM initialization is
+    Splitting process-group/topology bootstrap from NCCL memory initialization is
     required because the real EP peer layout selects the transport preset and
-    NVSHMEM environment. Every process still creates groups in identical order.
+    GIN/LSA requirements. Every process still creates groups in identical order.
     """
 
     if dist.is_initialized():
@@ -131,7 +130,7 @@ def init_parallel_context(
 
     # Keep a CPU-only global control group so every rank can create both the
     # contiguous EP groups and the strided TP groups.  Avoiding an otherwise
-    # unused global NCCL communicator also leaves NVSHMEM's per-EP NCCL team
+    # unused global NCCL communicator also leaves the per-EP NCCL session
     # initialization independent of the torch global world.
     dist.init_process_group(backend="gloo")
 
@@ -237,55 +236,9 @@ def init_parallel_context(
     )
 
 
-def init_nvshmem(context: ParallelContext) -> ParallelContext:
-    """Initialize the package-local EP NVSHMEM world after transport setup."""
-
-    uid = nvshmem.core.get_unique_id(empty=(context.ep_rank != 0))
-    uid_bytes = uid._data.view(np.uint8).copy()
-    uid_tensor = torch.from_numpy(uid_bytes).cuda()
-    dist.broadcast(
-        uid_tensor,
-        src=context.ep_global_ranks[0],
-        group=context.ep_group,
-    )
-    dist.barrier(group=context.ep_group)
-    uid._data[:] = uid_tensor.cpu().numpy().view(uid._data.dtype)
-
-    nvshmem.core.init(
-        device=context.device,
-        uid=uid,
-        rank=context.ep_rank,
-        nranks=context.ep_size,
-        initializer_method="uid",
-    )
-    print(
-        "[DP/TP/EP bootstrap] "
-        f"global_rank={context.global_rank}/{context.global_world_size} "
-        f"local_rank={context.local_rank} "
-        f"DP={context.data_parallel_rank}/{context.data_parallel_size} "
-        f"TP={context.tensor_parallel_rank}/{context.tensor_parallel_size} "
-        f"EP={context.ep_rank}/{context.ep_size} "
-        f"ep_ranks={context.ep_global_ranks} "
-        f"tp_ranks={context.tp_global_ranks} nvshmem_world=ep",
-        flush=True,
-    )
+def init_nccl_memory(context: ParallelContext, arena_bytes: int) -> ParallelContext:
+    from ..transport import gin_bridge
+    gin_bridge.initialize(context, arena_bytes)
     return context
 
-
-def init_parallel_and_nvshmem(
-    data_parallel_size: int,
-    tensor_parallel_size: int,
-) -> ParallelContext:
-    """Compatibility wrapper for callers that do not need transport setup."""
-
-    return init_nvshmem(
-        init_parallel_context(data_parallel_size, tensor_parallel_size)
-    )
-
-
-__all__ = [
-    "ParallelContext",
-    "init_nvshmem",
-    "init_parallel_context",
-    "init_parallel_and_nvshmem",
-]
+__all__ = ['ParallelContext', 'init_nccl_memory', 'init_parallel_context']

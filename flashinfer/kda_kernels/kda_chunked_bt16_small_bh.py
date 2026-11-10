@@ -1652,6 +1652,9 @@ class ChunkKdaFwdK1:
                 )
 
         tma_full.release()
+        # The MMA warpgroup TMA-stores sQd and sKd as soon as this stage is
+        # committed; make these shared-memory writes visible to the async proxy.
+        cute.arch.fence_view_async_shared()
         mma_empty.commit()
         return tma_consumer, gate_mma_producer
 
@@ -1800,9 +1803,10 @@ class ChunkKdaFwdK2:
         mMkk: cute.Tensor,  # (B, NT, H, BT, BT)
         mGk: cute.Tensor,  # (B, NT, H, D)
         mO: cute.Tensor,  # (B, T, H, D)
-        mS_in: Optional[cute.Tensor] = None,  # (B, H, D, D)
-        mS_out: Optional[cute.Tensor] = None,  # (B, H, D, D)
+        mS_in: Optional[cute.Tensor] = None,  # (B, H, D, D) or (P, H, D, D) pool
+        mS_out: Optional[cute.Tensor] = None,  # (B, H, D, D) or (P, H, D, D) pool
         mCuSeqlens: Optional[cute.Tensor] = None,  # (B + 1,)
+        mStateIndices: Optional[cute.Tensor] = None,  # (B,) pool slot per sequence
         stream=None,
     ):
         if cutlass.const_expr(mCuSeqlens is not None):
@@ -2076,6 +2080,7 @@ class ChunkKdaFwdK2:
             mS_in,
             mS_out,
             mCuSeqlens,
+            mStateIndices,
             sQK_layout_staged,
             sQKt_layout_staged,
             sV_layout_staged,
@@ -2123,6 +2128,7 @@ class ChunkKdaFwdK2:
         mS_in: Optional[cute.Tensor],
         mS_out: Optional[cute.Tensor],
         mCuSeqlens: Optional[cute.Tensor],
+        mStateIndices: Optional[cute.Tensor],
         sQK_layout_staged: cute.ComposedLayout,
         sQKt_layout_staged: cute.ComposedLayout,
         sV_layout_staged: cute.ComposedLayout,
@@ -2148,6 +2154,9 @@ class ChunkKdaFwdK2:
         warpgroup_idx = cute.arch.make_warp_uniform(tidx // self.warpgroup_threads)
 
         v_idx, h_idx, b_idx = cute.arch.block_idx()
+        state_idx = b_idx
+        if cutlass.const_expr(mStateIndices is not None):
+            state_idx = mStateIndices[b_idx]
 
         seq_len = cute.size(tma_tensor_Q, mode=[0])
         seq_offset = 0
@@ -2475,11 +2484,15 @@ class ChunkKdaFwdK2:
             if cutlass.const_expr(mS_in is not None):
                 if cutlass.const_expr(self.transpose_S):
                     gS_in = cute.local_tile(
-                        mS_in[None, None, h_idx, b_idx], (self.BV, self.D), (v_idx, 0)
+                        mS_in[None, None, h_idx, state_idx],
+                        (self.BV, self.D),
+                        (v_idx, 0),
                     )
                 else:
                     gS_in = cute.local_tile(
-                        mS_in[None, None, h_idx, b_idx], (self.D, self.BV), (0, v_idx)
+                        mS_in[None, None, h_idx, state_idx],
+                        (self.D, self.BV),
+                        (0, v_idx),
                     )
                     gS_in = cute.make_tensor(
                         gS_in.iterator, cute.select(gS_in.layout, mode=[1, 0])
@@ -2763,11 +2776,15 @@ class ChunkKdaFwdK2:
             if cutlass.const_expr(mS_out is not None):
                 if cutlass.const_expr(self.transpose_S):
                     gS_out = cute.local_tile(
-                        mS_out[None, None, h_idx, b_idx], (self.BV, self.D), (v_idx, 0)
+                        mS_out[None, None, h_idx, state_idx],
+                        (self.BV, self.D),
+                        (v_idx, 0),
                     )
                 else:
                     gS_out = cute.local_tile(
-                        mS_out[None, None, h_idx, b_idx], (self.D, self.BV), (0, v_idx)
+                        mS_out[None, None, h_idx, state_idx],
+                        (self.D, self.BV),
+                        (0, v_idx),
                     )
                     gS_out = cute.make_tensor(
                         gS_out.iterator, cute.select(gS_out.layout, mode=[1, 0])
@@ -2808,12 +2825,12 @@ def _cute_dtype(dtype: torch.dtype):
     raise ValueError(f"unsupported dtype: {dtype}")
 
 
-def _fake(dtype, shape):
+def _fake(dtype, shape, assumed_align=16):
     return cute.runtime.make_fake_compact_tensor(
         dtype,
         shape,
         stride_order=tuple(reversed(range(len(shape)))),
-        assumed_align=16,
+        assumed_align=assumed_align,
     )
 
 
@@ -2904,6 +2921,7 @@ def _compile_k2(
     has_state_output: bool,
     transpose_state: bool,
     is_varlen: bool,
+    has_state_indices: bool = False,
 ):
     cu_dtype = _cute_dtype(dtype)
     b, bs, t, tp, h, nt = (cute.sym_int() for _ in range(6))
@@ -2923,7 +2941,29 @@ def _compile_k2(
         matrix = (b, nt, h, _BT, _BT)
         gate = (b, nt, h, d)
         cu_seqlens = None
-    state = (b, h, d, d)
+    state_cute_dtype = _cute_dtype(state_dtype)
+    if has_state_indices:
+        # An indexed state is a pool of (H, D, D) slots whose row stride may be
+        # padded, and a slot may start beyond 2**31 elements into the pool, so
+        # the row stride is a 64-bit runtime value rather than a compact one.
+        pool_slots = cute.sym_int()
+        state_row_stride = cute.sym_int64(divisibility=16 // state_dtype.itemsize)
+
+        def fake_state():
+            return cute.runtime.make_fake_tensor(
+                state_cute_dtype,
+                (pool_slots, h, d, d),
+                stride=(state_row_stride, d * d, d, 1),
+                assumed_align=16,
+            )
+
+        state_indices = _fake(cutlass.Int32, (b,), assumed_align=4)
+    else:
+
+        def fake_state():
+            return _fake(state_cute_dtype, (b, h, d, d))
+
+        state_indices = None
 
     q, k, kr = [_fake(cu_dtype, feature) for _ in range(3)]
     kernel = ChunkKdaFwdK2(D=d, BT=_BT, BV=bv, transpose_S=transpose_state)
@@ -2938,9 +2978,10 @@ def _compile_k2(
         _fake(cu_dtype, matrix),
         _fake(cutlass.Float32, gate),
         _fake(cu_dtype, output),
-        _fake(_cute_dtype(state_dtype), state) if has_state_input else None,
-        _fake(_cute_dtype(state_dtype), state) if has_state_output else None,
+        fake_state() if has_state_input else None,
+        fake_state() if has_state_output else None,
         cu_seqlens,
+        state_indices,
         stream,
         options="--enable-tvm-ffi",
     )
@@ -3040,6 +3081,7 @@ def chunk_kda_fwd_k2(
     output: torch.Tensor | None = None,
     state_input: torch.Tensor | None = None,
     state_output: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
     max_active_clusters: int = 152,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     is_varlen = cu_seqlens is not None
@@ -3051,6 +3093,11 @@ def chunk_kda_fwd_k2(
     bv = d if b * h * 2 > max_active_clusters else d // 2
 
     output = torch.empty_like(v) if output is None else output
+    if state_indices is not None and (
+        (state_input is None and state_output is None)
+        or (return_state and state_output is None)
+    ):
+        raise ValueError("state_indices requires a caller-owned state pool")
     if return_state and state_output is None:
         state_output = torch.empty((b, h, d, d), dtype=torch.float32, device=q.device)
 
@@ -3072,6 +3119,7 @@ def chunk_kda_fwd_k2(
         has_output,
         transpose_state,
         is_varlen,
+        state_indices is not None,
     )
     compiled(
         q,
@@ -3085,6 +3133,7 @@ def chunk_kda_fwd_k2(
         state_input,
         state_output,
         cu_seqlens,
+        state_indices,
     )
     return output, state_output
 
@@ -3108,6 +3157,7 @@ def chunk_kda_fwd(
     output: torch.Tensor | None = None,
     state_input: torch.Tensor | None = None,
     state_output: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
     workspace_tensors: tuple[torch.Tensor, ...] | None = None,
     max_active_clusters: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -3142,6 +3192,7 @@ def chunk_kda_fwd(
         output=output,
         state_input=state_input,
         state_output=state_output,
+        state_indices=state_indices,
         max_active_clusters=max_active_clusters,
     )
 

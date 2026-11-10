@@ -11,6 +11,7 @@ from cutlass.cutlass_dsl import Int32, Int64
 from cuda.bindings import driver as cuda
 
 from ..moe_utils import spin_wait
+from . import gin_bridge
 
 class GpuDispatchRouteBuilder:
     """Build sparse data lists and source-side owner-plan route chunks."""
@@ -379,7 +380,10 @@ class GpuChunkedOwnerRoutePlanBuilder:
         *,
         route_block_elements: int = 256,
         plan_slots: int = 2,
+        hybrid_force_ibgda_mask: int = 0,
     ) -> None:
+        gin_bridge.bind(self, 'dispatch_plan')
+        self.hybrid_force_ibgda_mask = hybrid_force_ibgda_mask
         self.world_size = world_size
         self.num_tokens = num_tokens
         self.num_topk = num_topk
@@ -419,16 +423,12 @@ class GpuChunkedOwnerRoutePlanBuilder:
         )
         if tid < Int32(self.world_size):
             source = tid
-            spin_wait(
-                count_signals.iterator
+            gin_bridge.wait_commit64(self, source, count_signals.iterator
                 + (
                     plan_slot * Int32(self.world_size)
                     + source
                 )
-                * Int32(self.commit_elements),
-                lambda value: value >= Int64(epoch),
-                fail_sleep_cycles=500,
-            )
+                * Int32(self.commit_elements), Int64(epoch))
             route_base = Int32(0)
             for expert in cutlass.range_constexpr(
                 0, self.num_experts_per_rank, 1
@@ -550,11 +550,7 @@ class GpuChunkedOwnerRoutePlanBuilder:
                 * Int32(self.commit_elements)
             )
             if tid == Int32(0):
-                spin_wait(
-                    route_signals.iterator + source_signal_base,
-                    lambda value: value >= Int64(epoch),
-                    fail_sleep_cycles=500,
-                )
+                gin_bridge.wait_commit64(self, source, route_signals.iterator + source_signal_base, Int64(epoch))
             cute.arch.barrier(barrier_id=0, number_of_threads=128)
             count_index = (
                 source * Int32(self.num_experts_per_rank)

@@ -56,6 +56,10 @@ def _interleave_gate_up(
     half = full_width // 2
     if half % interleave:
         raise ValueError(f"post-SwiGLU width {half} must be divisible by {interleave}")
+    if tensor.dtype in (FP4_DTYPE, SCALE_DTYPE):
+        return _interleave_gate_up(
+            tensor.view(torch.uint8), full_width, interleave
+        ).view(tensor.dtype)
     experts, _rows, columns = tensor.shape
     pairs = half // interleave
     gate = tensor[:, :half].contiguous().view(experts, pairs, interleave, columns)
@@ -163,7 +167,7 @@ def transform_weights(
                 f"w2_scale must have shape {expected_w2_scale}, got {tuple(w2_scale.shape)}"
             )
         fc1_weight = interleave_gate_up_8(as_fp4(w13), 2 * intermediate)
-        fc2_weight = as_fp4(w2).contiguous()
+        fc2_weight = as_fp4(w2).view(torch.uint8).contiguous().view(FP4_DTYPE)
         fc1_scale = interleave_gate_up_8(as_e4m3(w13_scale), 2 * intermediate)
         fc2_scale = as_e4m3(w2_scale).contiguous()
 

@@ -1,5 +1,10 @@
 # SM120 NVFP4 configuration selection
 
+Qualified model rules and immutable user tuning profiles layer over this
+general selector. See [TUNING.md](TUNING.md) for the offline script, precedence,
+exact-match scope, runtime loading and fallback behavior. The general model
+below remains the fallback for unqualified shapes and configurations.
+
 The selector returns a complete configuration for dispatch/FC1, FC2/token-back,
 and combine. The API and runner default to `numerical_contract="ordinary_topk"`.
 To permit intermediate owner-grouped BF16 rounding and allow rank-local combine

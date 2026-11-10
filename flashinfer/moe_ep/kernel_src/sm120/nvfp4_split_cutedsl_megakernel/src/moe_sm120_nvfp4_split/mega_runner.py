@@ -13,7 +13,7 @@ Design choices worth knowing:
     seed (numpy rng + ``torch.from_numpy(...).cuda()``).  Every rank
     reproduces the full ``(num_ranks, num_tokens_per_rank, *)`` view
     and the ``(num_ranks, num_experts_per_rank, ...)`` weight bank in
-    lock-step -- zero NCCL/NVSHMEM traffic during input gen.
+    lock-step -- zero NCCL traffic during input gen.
 
   * The reference is computed against the full global view on every
     rank; each rank picks its own ``(T, K, hidden)`` slice for validate.
@@ -55,9 +55,9 @@ from datetime import timedelta
 from typing import List, Literal, Optional, Tuple
 
 import numpy as np
-import nvshmem.core
-import nvshmem.core.rma
 import torch
+from .transport import gin_bridge
+from .runtime.low_precision_dlpack import wrap as wrap_dlpack
 from cuda.bindings import driver as cuda
 
 
@@ -80,7 +80,7 @@ from moe_sm120_nvfp4_split.combine_reference import (
 )
 from moe_sm120_nvfp4_split.combine_validation import rank_local_staging_report
 
-from common.megamoe_constants import Nvfp4BlockSize
+from moe_sm120_nvfp4_split.support.common.megamoe_constants import Nvfp4BlockSize
 from moe_sm120_nvfp4_split.sm120_mma import (
     INTERMEDIATE_ALIGNMENT,
 )
@@ -113,18 +113,6 @@ from moe_sm120_nvfp4_split.api import (
 )
 from moe_sm120_nvfp4_split.jit_config import Sm120JitConfig
 from moe_sm120_nvfp4_split.transport.hybrid_transport import HybridTransportState
-from moe_sm120_nvfp4_split.transport.nvshmem_compat import (
-    find_nvshmem_device_bitcode,
-    prepare_nvshmem_hybrid_compat,
-)
-
-
-def _nvshmem_link_libraries() -> str:
-    """Return validated comma-separated device link inputs for this run."""
-
-    configured = os.environ.get("MEGAMOE_NVSHMEM_LINK_LIBRARIES")
-    return configured if configured else find_nvshmem_device_bitcode()
-
 # =============================================================================
 # Problem descriptor
 # =============================================================================
@@ -644,7 +632,7 @@ def _make_nvfp4_scale_tensor(
 # =============================================================================
 
 
-# MEGA_NO_DIST=1: opt out of torch.distributed + NVSHMEM init so the
+# MEGA_NO_DIST=1: opt out of torch.distributed + communication init so the
 # runner can be launched as plain ``python mega_runner.py`` (e.g. under
 # compute-sanitizer).  Single-rank only; sym tensors degrade to plain
 # CUDA ``torch.zeros`` and the SymBuffer offsets list is hard-coded to
@@ -653,27 +641,15 @@ _NO_DIST: bool = bool(int(os.environ.get("MEGA_NO_DIST", "0")))
 
 
 def _sym_zeros(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-    """Zero-initialised symmetric-heap tensor.
-
-    Restricted to dtypes nvshmem4py natively supports (``uint8``, ``int32``,
-    ``int64``, ``float32``, ``bfloat16``, ``float16``).  FP8/E8M0 go
-    through the byte-buf reinterpret helpers below.
-
-    Caller is responsible for freeing via ``nvshmem.core.free_tensor``
-    before ``nvshmem.core.finalize()``.
-    """
     if _NO_DIST:
-        return torch.zeros(shape, dtype=dtype, device="cuda")
-    import nvshmem.core
-    tensor = nvshmem.core.tensor(shape, dtype=dtype)
-    tensor.zero_()
-    return tensor
+        return torch.zeros(shape, dtype=dtype, device='cuda')
+    return gin_bridge.arena_zeros(shape, dtype)
 
 
 def _sym_zeros_byte_view(
     logical_shape: Tuple[int, ...], target_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Sym-heap allocation for 1-byte dtypes not native to nvshmem4py."""
+    """P2P arena allocation using byte views for packed low-precision dtypes."""
 
     if target_dtype not in (
         torch.float8_e4m3fn,
@@ -695,43 +671,10 @@ def _sym_zeros_byte_view(
     return _sym_zeros((total_bytes,), torch.uint8).view(target_dtype).reshape(storage_shape)
 
 
-def _compute_peer_offsets(
-    sym_tensor: torch.Tensor, world_size: int
-) -> Tuple[int, Tuple[int, ...]]:
-    """Host-side peer-delta table for one sym-heap allocation.
-
-    Returns ``(local_base, peer_offsets_list)`` where:
-      * ``local_base`` = ``int(sym_tensor.data_ptr())`` -- the local
-        rank's symmetric-heap base byte address.
-      * ``peer_offsets_list[r] = peer_r_base - local_base`` in bytes,
-        as a length-``world_size`` ``Tuple[int, ...]``.  Per NVSHMEM
-        convention, ``peer_offsets_list[local_rank] == 0``.
-
-    NVSHMEM keeps every rank's symmetric heap laid out identically (same
-    allocation order -> same offsets), so this single per-peer constant
-    works for every sub-allocation in the heap.  These ints are passed
-    through ``SymBufferHost`` as runtime launch args; kernel.__call__
-    packs them into ``SymBuffer{world_size}`` before entering device
-    code.  The offsets land in the kernel parameter bank, and a
-    runtime-indexed peer lookup lowers to a single ``ld.param.b64`` (=
-    ``LDC.U64``) with no GMEM traffic at all.
-
-    The legacy version returned a ``(world_size,) int64`` device tensor
-    to obtain an ``LDC.E.64`` indexed load via an extra GMEM step; the
-    byval ``SymBuffer`` removes that indirection entirely (one LDC
-    against the param bank, zero GMEM).
-    """
+def _compute_peer_offsets(sym_tensor, world_size):
     if _NO_DIST:
-        local_base = int(sym_tensor.data_ptr())
-        return local_base, tuple(0 for _ in range(world_size))
-    import nvshmem.core
-    local_base = int(sym_tensor.data_ptr())
-    peer_offsets_list = tuple(
-        int(nvshmem.core.get_peer_tensor(sym_tensor, peer).data_ptr())
-        - local_base
-        for peer in range(world_size)
-    )
-    return local_base, peer_offsets_list
+        return int(sym_tensor.data_ptr()), (0,) * world_size
+    return gin_bridge.peer_offsets(sym_tensor, world_size)
 
 
 # =============================================================================
@@ -757,7 +700,7 @@ class MegaMoETester:
       5. ``validate``: bf16-grade compare own-rank ``combine_output``
          against ``combine_output_ref``.
 
-    None of steps 1-3 emit NCCL/NVSHMEM traffic; only step 4 (kernel
+    None of steps 1-3 emit NCCL traffic; only step 4 (kernel
     launch) and step 5's compare touch sym memory.
     """
 
@@ -884,7 +827,7 @@ class MegaMoETester:
             )
         # Single source of truth for world size; ``local_rank`` was only
         # needed for the upstream ``torch.cuda.set_device`` inside the
-        # NCCL+NVSHMEM bootstrap, the tester itself doesn't reference it.
+        # NCCL bootstrap, the tester itself doesn't reference it.
         self.world_size = problem.world_size
 
         torch.manual_seed(misc.seed)
@@ -965,7 +908,26 @@ class MegaMoETester:
         self._compiled_kernel_k2 = None
         self._compiled_kernel_k2_drain = None
         self._compiled_kernel_k2_finalizer = None
-        self._transport.kernel_objects = []
+        # Materialize every communication function before starting persistent
+        # receivers. A first-use module load may synchronize the context and
+        # deadlock behind a receiver that is waiting for that very sender.
+        # CUDA_MODULE_LOADING=EAGER alone is insufficient for CuTe CUlibrary.
+        def checked(result):
+            if int(result[0]) != 0:
+                raise RuntimeError(f'Communication function preload failed: {result}')
+            return result[1] if len(result) == 2 else result[1:]
+        loaded = set()
+        for name, compiled in vars(self._transport).items():
+            if not name.startswith('compiled_') or compiled is None:
+                continue
+            library = int(compiled.library)
+            if library in loaded:
+                continue
+            loaded.add(library)
+            module = checked(cuda.cuLibraryGetModule(cuda.CUlibrary(library)))
+            count = checked(cuda.cuModuleGetFunctionCount(module))
+            for function in checked(cuda.cuModuleEnumerateFunctions(count, module)):
+                checked(cuda.cuFuncLoad(function))
         self._runtime_kwargs_k1 = None
         self._runtime_kwargs_k2 = None
         self._runtime_kwargs_k2_drain = None
@@ -1221,7 +1183,7 @@ class MegaMoETester:
             raise RuntimeError("TP reduce requires the K3 reduced output.")
         self._tp_all_reduce(self.combine_reduced_output)
         # Keep reference collectives out of compute_reference(): launching a
-        # TP NCCL collective there can overlap NVSHMEM/CuTeDSL setup on the
+        # TP NCCL collective there can overlap communication/CuTeDSL setup on the
         # other execution context.  Once K3 has completed, reduce the actual
         # output and its reference back-to-back in the same TP-group order.
         self._tp_reduce_reference_output()
@@ -1476,8 +1438,8 @@ class MegaMoETester:
         own_topk_idx = self._global_topk_idx[self.rank]
         own_topk_weights = self._global_topk_weights[self.rank]
 
-        # Packed E2M1/E4M3 go through byte-buffer views because nvshmem4py does
-        # not natively support these dtypes.
+        # Packed E2M1/E4M3 use byte-buffer views in the NCCL arena;
+        # the original element types are retained by the tensor views.
         self.my_activation = _sym_zeros_byte_view(
             (num_tokens_per_rank, hidden), self.torch_activation_dtype,
         )
@@ -1619,7 +1581,7 @@ class MegaMoETester:
         # FC1 is column-parallel and FC2 is row-parallel across TP.  The
         # reference is TP-reduced immediately after the actual K3 output in
         # _tp_reduce_actual_output, keeping both NCCL calls after the
-        # CuTeDSL/NVSHMEM kernel work.
+        # CuTeDSL/communication kernel work.
         if self._tp_reduce_enabled():
             self._tp_reference_reduced = False
 
@@ -1641,7 +1603,7 @@ class MegaMoETester:
         if not (
             self._phase_timing_enabled
             and self._phase_timing_collect
-            and self.comm_backend == "nvshmem_ibgda"
+            and self.comm_backend == "gin"
         ):
             return None
         start = torch.cuda.Event(enable_timing=True)
@@ -1681,6 +1643,18 @@ class MegaMoETester:
                 )
 
     def _ibgda_streaming_dispatch_begin(self) -> None:
+        if not getattr(self, '_gin_receiver_preloaded', False):
+            # Load/allocate receiver resources before any persistent ACK wait.
+            # Epoch zero and the initialized zero-count control records make
+            # this an empty receive: no payload, signal, ACK or GIN RMA.
+            assert self._transport.dispatch_epoch == 1
+            assert torch.count_nonzero(self._transport.dispatch_control_rx.view(torch.int32)[::32]).item() == 0
+            prewarm_args = list(self._transport.dispatch_ring_receiver_runtime_args)
+            prewarm_args[-2] = 0
+            prewarm_args[-1] = cuda.CUstream(self._transport.dispatch_recv_stream.cuda_stream)
+            self._transport.compiled_dispatch_ring_receiver(*prewarm_args)
+            self._transport.dispatch_recv_stream.synchronize()
+            self._gin_receiver_preloaded = True
         tokens = self.problem.num_tokens_per_rank
         own = self.rank
         activation_by_rank = self._transport.activation_rx.view(
@@ -1752,7 +1726,7 @@ class MegaMoETester:
             self._transport.owner_plan_route_push_done = torch.cuda.Event()
             self._transport.owner_plan_route_push_done.record(plan_stream)
         # Give the IBGDA producer a head start before enqueuing persistent
-        # polling CTAs.  Launching the receiver first can occupy NVSHMEM
+        # polling CTAs.  Launching the receiver first can occupy communication
         # progress resources while every CTA is waiting on its first signal.
         with torch.cuda.stream(self._transport.dispatch_send_stream):
             sender_phase = self._phase_timing_begin(
@@ -1962,14 +1936,14 @@ class MegaMoETester:
         """Allocate the two opaque byte buffers the kernel partitions internally.
 
         ``local_workspace`` normally lives in plain CUDA device memory.  The
-        NVSHMEM-IBGDA path places it on the symmetric GPU heap so the
+        GIN path places it in an NCCL-registered GPU allocation so the
         peer-major K2 output staging region has a registered lkey and can be
         used directly as an RMA source; counters / FC1 output remain local
         accesses even though their backing allocation is registered.
-        ``shared_workspace`` lives on the NVSHMEM symmetric heap so the
+        ``shared_workspace`` lives in the NCCL LSA peer-mapped arena so the
         dispatch warps' ``peer_rank_ptr_mapper.map`` writes can reach peer ranks.
         ``(symmetric_base, peer_offsets_list)`` is computed once from the
-        symmetric workspace's base address -- NVSHMEM guarantees the same
+        P2P arena base address -- the allocator preserves the same
         delta works for every sub-allocation in the heap, so the same
         table also covers ``my_activation`` / ``my_activation_sf`` /
         ``my_topk_weights`` / ``combine_output``.  ``run_kernel`` passes
@@ -1987,8 +1961,9 @@ class MegaMoETester:
 
         local_ws_bytes, shared_ws_bytes = self._kernel.get_workspace_sizes()
 
-        if self.comm_backend == "nvshmem_ibgda":
-            self.local_workspace = _sym_zeros(
+        if self.comm_backend == "gin":
+            gin_bridge.prepare_network_arena(self, local_ws_bytes, _IBGDA_OWNER_PLAN_SLOTS, _IBGDA_OWNER_PLAN_BLOCK_ELEMENTS, _IBGDA_OWNER_PLAN_PAYLOAD_ELEMENTS)
+            self.local_workspace = gin_bridge.sym_zeros(
                 (local_ws_bytes,), torch.uint8
             )
         else:
@@ -2001,7 +1976,7 @@ class MegaMoETester:
                 (self.problem.num_tokens_per_rank + 1, self.world_size),
                 torch.int32,
             )
-        if self.comm_backend == "nvshmem_ibgda":
+        if self.comm_backend == "gin":
             tokens = self.problem.num_tokens_per_rank
             max_routes_per_source = tokens * self.problem.num_topk
             # Fixed-capacity GPU control buffers; their logical lengths
@@ -2081,24 +2056,24 @@ class MegaMoETester:
                 self.world_size,
                 self._transport.owner_plan_route_capacity,
             )
-            self._transport.owner_plan_count_rx = _sym_zeros(
+            self._transport.owner_plan_count_rx = gin_bridge.sym_zeros(
                 count_shape, torch.int64
             )
-            self._transport.owner_plan_count_signal_rx = _sym_zeros(
+            self._transport.owner_plan_count_signal_rx = gin_bridge.sym_zeros(
                 (_IBGDA_OWNER_PLAN_SLOTS, self.world_size),
                 torch.int64,
             )
-            self._transport.owner_plan_count_signal_tx = _sym_zeros(
+            self._transport.owner_plan_count_signal_tx = gin_bridge.sym_zeros(
                 (_IBGDA_OWNER_PLAN_SLOTS, self.world_size),
                 torch.int64,
             )
-            self._transport.owner_plan_count_tx = _sym_zeros(
+            self._transport.owner_plan_count_tx = gin_bridge.sym_zeros(
                 count_shape, torch.int64
             )
-            self._transport.owner_plan_route_rx = _sym_zeros(
+            self._transport.owner_plan_route_rx = gin_bridge.sym_zeros(
                 route_shape, torch.int64
             )
-            self._transport.owner_plan_route_signal_rx = _sym_zeros(
+            self._transport.owner_plan_route_signal_rx = gin_bridge.sym_zeros(
                 (
                     _IBGDA_OWNER_PLAN_SLOTS,
                     self.world_size,
@@ -2106,7 +2081,7 @@ class MegaMoETester:
                 ),
                 torch.int64,
             )
-            self._transport.owner_plan_route_signal_tx = _sym_zeros(
+            self._transport.owner_plan_route_signal_tx = gin_bridge.sym_zeros(
                 (
                     _IBGDA_OWNER_PLAN_SLOTS,
                     self.world_size,
@@ -2114,7 +2089,7 @@ class MegaMoETester:
                 ),
                 torch.int64,
             )
-            self._transport.owner_plan_route_tx = _sym_zeros(
+            self._transport.owner_plan_route_tx = gin_bridge.sym_zeros(
                 route_shape, torch.int64
             )
             plan_shape = (
@@ -2145,7 +2120,7 @@ class MegaMoETester:
             dispatch_slot_bytes = (
                 (dispatch_payload_bytes + 8 + 15) // 16
             ) * 16
-            self._transport.dispatch_ring_rx = _sym_zeros(
+            self._transport.dispatch_ring_rx = gin_bridge.sym_zeros(
                 (
                     self.world_size,
                     channels,
@@ -2154,7 +2129,7 @@ class MegaMoETester:
                 ),
                 torch.uint8,
             )
-            self._transport.dispatch_ring_tx = _sym_zeros(
+            self._transport.dispatch_ring_tx = gin_bridge.sym_zeros(
                 (
                     self.world_size,
                     channels,
@@ -2163,16 +2138,16 @@ class MegaMoETester:
                 ),
                 torch.uint8,
             )
-            self._transport.dispatch_ring_ack = _sym_zeros(
+            self._transport.dispatch_ring_ack = gin_bridge.sym_zeros(
                 (self.world_size, channels, slots, 128), torch.uint8
             )
-            self._transport.dispatch_ring_ack_tx = _sym_zeros(
+            self._transport.dispatch_ring_ack_tx = gin_bridge.sym_zeros(
                 (self.world_size, channels, slots, 128), torch.uint8
             )
-            self._transport.dispatch_control_rx = _sym_zeros(
+            self._transport.dispatch_control_rx = gin_bridge.sym_zeros(
                 (self.world_size, 128), torch.uint8
             )
-            self._transport.dispatch_control_tx = _sym_zeros(
+            self._transport.dispatch_control_tx = gin_bridge.sym_zeros(
                 (self.world_size, 128), torch.uint8
             )
             dispatch_tasks = self.world_size * channels
@@ -2222,18 +2197,18 @@ class MegaMoETester:
             slot_bytes = (
                 (chunk_rows * (4 + payload_bytes) + 8 + 15) // 16
             ) * 16
-            self._transport.ring_rx = _sym_zeros(
+            self._transport.ring_rx = gin_bridge.sym_zeros(
                 (self.world_size, channels, slots, slot_bytes),
                 torch.uint8,
             )
-            self._transport.ring_tx = _sym_zeros(
+            self._transport.ring_tx = gin_bridge.sym_zeros(
                 (self.world_size, channels, slots, slot_bytes),
                 torch.uint8,
             )
-            self._transport.ring_ack = _sym_zeros(
+            self._transport.ring_ack = gin_bridge.sym_zeros(
                 (self.world_size, channels, slots, 128), torch.uint8
             )
-            self._transport.ring_ack_tx = _sym_zeros(
+            self._transport.ring_ack_tx = gin_bridge.sym_zeros(
                 (self.world_size, channels, slots, 128), torch.uint8
             )
             shape = (self.world_size, self._transport.max_pair_routes)
@@ -2261,18 +2236,20 @@ class MegaMoETester:
             self.symmetric_base, self.peer_offsets_list = _compute_peer_offsets(
                 self.shared_workspace, self.world_size,
             )
+            gin_bridge.configure(self)
 
     def _compile_ibgda_gpu_push_kernels(self, cute_module) -> None:
+        gin_bridge.configure(self)
         import cuda.bindings.driver as cuda
         from cutlass.cute.runtime import from_dlpack
-        from moe_sm120_nvfp4_split.transport.nvshmem_gpu_comm import (
-            NvshmemGpuOwnerPlanPush,
+        from moe_sm120_nvfp4_split.transport.gin_gpu_comm import (
+            GinGpuOwnerPlanPush,
         )
-        from moe_sm120_nvfp4_split.transport.nvshmem_gpu_ring import (
-            NvshmemGpuRingCombineReceiver,
-            NvshmemGpuRingCombineSender,
-            NvshmemGpuRingDispatchReceiver,
-            NvshmemGpuRingDispatchSender,
+        from moe_sm120_nvfp4_split.transport.gin_gpu_ring import (
+            GinGpuRingCombineReceiver,
+            GinGpuRingCombineSender,
+            GinGpuRingDispatchReceiver,
+            GinGpuRingDispatchSender,
         )
         from moe_sm120_nvfp4_split.transport.gpu_runtime_route import (
             GpuChunkedOwnerRoutePlanBuilder,
@@ -2280,9 +2257,9 @@ class MegaMoETester:
         )
 
         def comm_to_cute(tensor):
-            return from_dlpack(tensor).mark_layout_dynamic()
+            return from_dlpack(wrap_dlpack(tensor)).mark_layout_dynamic()
 
-        # NVSHMEM progress must be established before the long-lived
+        # communication progress must be established before the long-lived
         # receiver polling CTA is admitted.  A high-priority producer
         # stream prevents the scheduler from choosing the waiter first.
         if self._transport.dispatch_send_stream is None:
@@ -2319,7 +2296,7 @@ class MegaMoETester:
         dispatch_tx_workers = dispatch_tasks
         dispatch_rx_workers = dispatch_tasks
         self._transport.dispatch_ring_sender_kernel = (
-            NvshmemGpuRingDispatchSender(
+            GinGpuRingDispatchSender(
                 self.world_size,
                 self.problem.num_tokens_per_rank,
                 act_bpt,
@@ -2339,7 +2316,7 @@ class MegaMoETester:
             )
         )
         self._transport.dispatch_ring_receiver_kernel = (
-            NvshmemGpuRingDispatchReceiver(
+            GinGpuRingDispatchReceiver(
                 self._transport.dispatch_ring_sender_kernel,
                 worker_ctas=dispatch_rx_workers,
             )
@@ -2398,7 +2375,7 @@ class MegaMoETester:
             cuda.CUstream(self._transport.dispatch_send_stream.cuda_stream),
         )
         self._transport.owner_plan_push_kernel = (
-            NvshmemGpuOwnerPlanPush(
+            GinGpuOwnerPlanPush(
                 self.world_size,
                 self.problem.num_experts_per_rank,
                 self._transport.owner_plan_route_capacity,
@@ -2469,7 +2446,7 @@ class MegaMoETester:
         )
         combine_tx_workers = combine_tasks
         combine_rx_workers = combine_tasks
-        self._transport.ring_sender_kernel = NvshmemGpuRingCombineSender(
+        self._transport.ring_sender_kernel = GinGpuRingCombineSender(
             self.world_size,
             payload_bytes,
             self._transport.max_pair_routes,
@@ -2485,7 +2462,7 @@ class MegaMoETester:
             ),
             progress_windows=(self.problem.num_tokens_per_rank <= 128),
         )
-        self._transport.ring_receiver_kernel = NvshmemGpuRingCombineReceiver(
+        self._transport.ring_receiver_kernel = GinGpuRingCombineReceiver(
             self.world_size,
             payload_bytes,
             self._transport.max_pair_routes,
@@ -2717,6 +2694,7 @@ class MegaMoETester:
                 self._transport.owner_plan_route_capacity,
                 route_block_elements=_IBGDA_OWNER_PLAN_BLOCK_ELEMENTS,
                 plan_slots=_IBGDA_OWNER_PLAN_SLOTS,
+                hybrid_force_ibgda_mask=self.hybrid_force_ibgda_mask,
             )
         )
         owner_count_builder_args = (
@@ -2773,7 +2751,7 @@ class MegaMoETester:
             self._transport.dispatch_epoch,
             metadata_stream,
         )
-        link_options = f"--link-libraries={_nvshmem_link_libraries()}"
+        link_options = f"--link-libraries={gin_bridge.device_bitcode()}"
         self._transport.compiled_owner_plan_count_push = cute_module.compile(
             self._transport.owner_plan_push_kernel.count_launcher,
             *owner_plan_count_push_args,
@@ -2821,10 +2799,12 @@ class MegaMoETester:
         self._transport.compiled_owner_count_builder = cute_module.compile(
             self._transport.owner_route_builder_kernel.count_launcher,
             *owner_count_builder_args,
+            options=link_options,
         )
         self._transport.compiled_owner_metadata_builder = cute_module.compile(
             self._transport.owner_route_builder_kernel.metadata_launcher,
             *owner_metadata_builder_args,
+            options=link_options,
         )
         self._transport.dispatch_ring_sender_runtime_args = dispatch_sender_args
         self._transport.dispatch_ring_ack_runtime_args = dispatch_ack_args
@@ -2857,14 +2837,26 @@ class MegaMoETester:
             self._transport.compiled_ring_ack_waiter,
             self._transport.compiled_ring_receiver,
         )
-        self._transport.kernel_objects = []
-        for compiled in compiled_kernels:
-            kernel_object = nvshmem.core.NvshmemKernelObject.from_handle(
-                int(compiled.library)
-            )
-            nvshmem.core.library_init(kernel_object)
-            self._transport.kernel_objects.append(kernel_object)
-
+        # Materialize every communication function before starting persistent
+        # receivers. A first-use module load may synchronize the context and
+        # deadlock behind a receiver that is waiting for that very sender.
+        # CUDA_MODULE_LOADING=EAGER alone is insufficient for CuTe CUlibrary.
+        def checked(result):
+            if int(result[0]) != 0:
+                raise RuntimeError(f'Communication function preload failed: {result}')
+            return result[1] if len(result) == 2 else result[1:]
+        loaded = set()
+        for name, compiled in vars(self._transport).items():
+            if not name.startswith('compiled_') or compiled is None:
+                continue
+            library = int(compiled.library)
+            if library in loaded:
+                continue
+            loaded.add(library)
+            module = checked(cuda.cuLibraryGetModule(cuda.CUlibrary(library)))
+            count = checked(cuda.cuModuleGetFunctionCount(module))
+            for function in checked(cuda.cuModuleEnumerateFunctions(count, module)):
+                checked(cuda.cuFuncLoad(function))
     # ------------------------------------------------------------------
     # Step 4: kernel launch
     # ------------------------------------------------------------------
@@ -3049,7 +3041,7 @@ class MegaMoETester:
                     off = kernel._shared_offsets[name]
                     nbytes = kernel._shared_region_by_name[name].nbytes
                     self.shared_workspace[off:off + nbytes].zero_()
-        if self.comm_backend == "nvshmem_ibgda":
+        if self.comm_backend == "gin":
             ready_bytes = (
                 self._kernel.token_comm.ibgda_dispatch_ready_words
                 + self._kernel.token_comm.ibgda_owner_plan_ready_words
@@ -3564,7 +3556,7 @@ class MegaMoETester:
             raise RuntimeError("compiled topk reduce kernel is not available")
 
         def _launch() -> None:
-            use_ibgda = self.comm_backend == "nvshmem_ibgda"
+            use_ibgda = self.comm_backend == "gin"
             if use_ibgda:
                 self._ibgda_dispatch_inputs()
                 self._ibgda_build_runtime_owner_route_plan()
@@ -3614,23 +3606,23 @@ class MegaMoETester:
             return
 
         if self._use_cuda_events:
-            drain_streaming_nvshmem_replays = self.comm_backend in (
-                "nvshmem_ibgda",
-                "nvshmem_hybrid",
+            drain_streaming_transport_replays = self.comm_backend in (
+                "gin",
+                "gin_hybrid",
             )
             strict_replay_barriers = (
-                drain_streaming_nvshmem_replays
+                drain_streaming_transport_replays
                 and self.misc.enable_debug_checks
             )
             # Phase events are also the explicit cross-stream progress
             # boundaries for the Green-Context compute graph and the two
-            # NVSHMEM rings.  Create them during warmup as well, then discard
+            # communication rings.  Create them during warmup as well, then discard
             # their timings.  Correctness must not depend on whether the
             # caller asks us to report the warmup phases.
             self._phase_timing_events = {}
             self._phase_timing_collect = self._phase_timing_enabled
             for warmup_index in range(self._perf_warmup):
-                if drain_streaming_nvshmem_replays:
+                if drain_streaming_transport_replays:
                     self._wait_for_previous_streaming_replay()
                 self._update_runtime_route(
                     warmup_index - self._perf_warmup
@@ -3645,12 +3637,12 @@ class MegaMoETester:
                 _launch()
                 # Warmup is outside the measured interval.  Drain each replay
                 # before reusing the device-side epoch/control records: a
-                # queue of persistent NVSHMEM polling kernels can otherwise
+                # queue of persistent communication polling kernels can otherwise
                 # amplify rank launch skew and let a later replay occupy the
                 # progress resources needed to retire an earlier replay.
                 if strict_replay_barriers:
                     torch.cuda.synchronize()
-                    if drain_streaming_nvshmem_replays:
+                    if drain_streaming_transport_replays:
                         self._validate_dispatch_handoff_epoch()
                     # A terminal slot ACK protects that slot, but does not say
                     # that every PE has retired all compute/control consumers
@@ -3718,7 +3710,7 @@ class MegaMoETester:
                 )
                 else None
             )
-            # A streaming NVSHMEM replay owns the ready/credit rings and their
+            # A streaming communication replay owns the ready/credit rings and their
             # backing slot storage until both the sender and receiver terminal
             # ACKs have joined the caller stream.  Queueing the next replay
             # before that join has retired lets its reset and epoch publication
@@ -3729,9 +3721,9 @@ class MegaMoETester:
             # Synchronizing the per-replay end event preserves CUDA-event
             # device timing (host wait time is outside start..end) while making
             # the benchmark obey the same sequential dependency as production
-            # MoE steps.  Ordinary non-NVSHMEM launches remain back-to-back.
+            # MoE steps.  Ordinary non-communication launches remain back-to-back.
             for replay, (start, end) in enumerate(zip(starts, ends)):
-                if drain_streaming_nvshmem_replays:
+                if drain_streaming_transport_replays:
                     self._wait_for_previous_streaming_replay()
                 self._update_runtime_route(replay)
                 self._reset_before_launch()
@@ -3751,29 +3743,7 @@ class MegaMoETester:
                 start.record()
                 _launch()
                 end.record()
-                if os.environ.get("MEGA_RANK_LOCAL_VALIDATE_EVERY_REPLAY", "0") == "1":
-                    # Debug/stress only.  The reference runs after the timed
-                    # end event and verifies every changing route, rather than
-                    # merely the final replay.  Performance sweeps leave this
-                    # disabled.
-                    end.synchronize()
-                    gathered_routes = [
-                        torch.empty_like(self.my_topk_idx)
-                        for _ in range(self.world_size)
-                    ]
-                    self._ep_all_gather(gathered_routes, self.my_topk_idx)
-                    self._global_topk_idx.copy_(torch.stack(gathered_routes))
-                    self.compute_reference(force=True)
-                    self.validate(force=True)
-                if trace_replays is not None:
-                    # Synchronize outside the measured start..end interval,
-                    # then preserve this replay before the next reset clears
-                    # the compact CTA trace.
-                    end.synchronize()
-                    trace_replays.append(
-                        self._split_green_trace.detach().cpu().clone()
-                    )
-                if drain_streaming_nvshmem_replays:
+                if drain_streaming_transport_replays:
                     # Submit/query every Green-Context stream once before the
                     # host blocks on the replay end event.  Without this
                     # non-blocking driver flush, immediate event synchronization
@@ -3820,6 +3790,28 @@ class MegaMoETester:
                         torch.cuda.synchronize()
                         self._validate_dispatch_handoff_epoch()
                         self._ep_barrier()
+                if os.environ.get("MEGA_RANK_LOCAL_VALIDATE_EVERY_REPLAY", "0") == "1":
+                    # Debug/stress only.  The reference runs after the timed
+                    # end event and verifies every changing route, rather than
+                    # merely the final replay.  Performance sweeps leave this
+                    # disabled.
+                    end.synchronize()
+                    gathered_routes = [
+                        torch.empty_like(self.my_topk_idx)
+                        for _ in range(self.world_size)
+                    ]
+                    self._ep_all_gather(gathered_routes, self.my_topk_idx)
+                    self._global_topk_idx.copy_(torch.stack(gathered_routes))
+                    self.compute_reference(force=True)
+                    self.validate(force=True)
+                if trace_replays is not None:
+                    # Synchronize outside the measured start..end interval,
+                    # then preserve this replay before the next reset clears
+                    # the compact CTA trace.
+                    end.synchronize()
+                    trace_replays.append(
+                        self._split_green_trace.detach().cpu().clone()
+                    )
                 if self._verify_replay_bit_determinism:
                     torch.cuda.synchronize()
                     current = self.combine_output.view(torch.uint8)
@@ -3957,9 +3949,8 @@ class MegaMoETester:
                     if replay_reference is None:
                         replay_reference = current.clone()
                     else:
-                        current_byte_diff = int(
-                            (current != replay_reference).sum().item()
-                        )
+                        from .combine_reference import byte_difference
+                        current_byte_diff = byte_difference(current, replay_reference)
                         replay_byte_diff += current_byte_diff
                         if current_byte_diff and replay_first_mismatch < 0:
                             replay_first_mismatch = replay
@@ -4247,7 +4238,7 @@ class MegaMoETester:
 
         # Build the failure-detecting CPU control plane before per-rank JIT.
         # A rank that fails compilation can then be detected before any peer
-        # enters the device-side NVSHMEM barrier.
+        # enters the device-side communication barrier.
         self._ensure_host_control_group()
 
         # SF leg caller contract guard: the host-supplied
@@ -4270,7 +4261,7 @@ class MegaMoETester:
         import cutlass.torch as cutlass_torch
         import cutlass.utils as utils
 
-        from src.sym_buffer import SymBufferHost
+        from moe_sm120_nvfp4_split.support.src.sym_buffer import SymBufferHost
         from moe_sm120_nvfp4_split.kernel_combine_reduce import (
             compile_topk_reduce,
         )
@@ -4283,7 +4274,7 @@ class MegaMoETester:
         reserved_comm_sms = 0
         if self.split_launch == "green_graph":
             if (
-                self.comm_backend == "nvshmem_ibgda"
+                self.comm_backend == "gin"
             ):
                 from moe_sm120_nvfp4_split.runtime.green_context import (
                     NativeGreenContextResources,
@@ -4470,7 +4461,7 @@ class MegaMoETester:
         # i32/fp32 control buffers.
         def _to_cute(tensor: torch.Tensor, assumed_align: int = 16, force_static_layout = False):
             cute_tensor = cutlass_torch.from_dlpack(
-                tensor, assumed_align=assumed_align,
+                wrap_dlpack(tensor), assumed_align=assumed_align,
             )
             if force_static_layout:
                 return cute_tensor
@@ -4479,17 +4470,17 @@ class MegaMoETester:
 
         kernel_activation = (
             self._transport.activation_rx
-            if self.comm_backend == "nvshmem_ibgda"
+            if self.comm_backend == "gin"
             else self.my_activation.view(torch.uint8)
         )
         kernel_activation_sf = (
             self._transport.sf_rx
-            if self.comm_backend == "nvshmem_ibgda"
+            if self.comm_backend == "gin"
             else self.my_activation_sf
         )
         kernel_topk_weights = (
             self._transport.topk_weight_rx
-            if self.comm_backend == "nvshmem_ibgda"
+            if self.comm_backend == "gin"
             else self.my_topk_weights
         )
         activation_cute = _to_cute(kernel_activation)
@@ -4611,7 +4602,7 @@ class MegaMoETester:
         # Compile the small device-RMA translation units first.  Compiling
         # them after the very large persistent K1/K2 modules can exhaust the
         # current CuTe/LLVM process and terminate inside device-bitcode link.
-        if self.comm_backend == "nvshmem_ibgda":
+        if self.comm_backend == "gin":
             self._compile_ibgda_gpu_push_kernels(cute)
         if self.rank == 0:
             print("[compile timing] K1 begin", flush=True)
@@ -4670,7 +4661,7 @@ class MegaMoETester:
             )
             topk_runtime_stream = (
                 cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-                if self.comm_backend == "nvshmem_ibgda"
+                if self.comm_backend == "gin"
                 else stream
             )
             if self.rank_local_combine:
@@ -4789,7 +4780,7 @@ class MegaMoETester:
                 self._compiled_topk_reduce.to(None)
                 if self._compiled_topk_reduce is not None
                 and self._tp_k3_chunk_runtime_kwargs is None
-                and self.comm_backend != "nvshmem_ibgda"
+                and self.comm_backend != "gin"
                 else None
             )
             graph_topk_runtime_kwargs = topk_reduce_runtime_kwargs
@@ -4887,7 +4878,7 @@ class MegaMoETester:
         #       opening the capture window.  Without this, a rank that
         #       finishes setup early opens cudaProfilerStart, launches
         #       its mega kernel, and then spin-waits inside the kernel's
-        #       NVSHMEM cross-rank ops for slower ranks to reach the
+        #       communication cross-rank ops for slower ranks to reach the
         #       same launch point; that spin time gets baked into the
         #       captured kernel duration and pollutes per-rank timing.
         #       The NCCL barrier kernel itself runs OUTSIDE the
@@ -4903,7 +4894,7 @@ class MegaMoETester:
         #   (d) Cross-rank ``dist.barrier()`` AFTER cudaProfilerStop --
         #       ensures every rank has closed its capture window before
         #       advancing into the post-launch path (``free_tensor`` /
-        #       ``nvshmem.finalize`` / etc.).  Without this, a fast rank
+        #       communication-session teardown / etc.).  Without this, a fast rank
         #       can start freeing its sym tensors while a slower rank's
         #       mega kernel is still touching the sym heap, which races
         #       the symmetric-memory teardown and is the leading suspect
@@ -5273,6 +5264,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fc2_output_dtype", type=_parse_output_dtype, default=torch.bfloat16,
     )
+    parser.add_argument("--tuning_config", default=None,
+                        help="Qualified offline JSON; incompatible entries use the normal selector")
     parser.add_argument(
         "--route_distribution", type=str, default="balanced",
         choices=["balanced", "power_law", "zero_count_peer"],
@@ -5320,10 +5313,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--comm_backend",
         type=str,
         default=None,
-        choices=["p2p_direct", "nvshmem_ibgda", "nvshmem_hybrid"],
-        help="GPU-heap communication backend. nvshmem_ibgda disables peer "
+        choices=["p2p_direct", "gin", "gin_hybrid"],
+        help="GPU-heap communication backend. gin disables peer "
              "mappings and routes every remote PE through GPU-initiated IB; "
-             "nvshmem_hybrid keeps same-NUMA P2P mappings and masks only "
+             "gin_hybrid keeps same-NUMA P2P mappings and masks only "
              "cross-NUMA peers so their device RMAs use IBGDA.",
     )
     parser.add_argument("--perf_run", action="store_true", default=False)
@@ -5456,7 +5449,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Bootstrap NCCL + NVSHMEM, build the tester, run one pass.
+    """Bootstrap NCCL control, GIN/LSA memory, then run the tester.
 
     Launcher::
 
@@ -5495,12 +5488,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         cross_numa_remote_peers = 0
     else:
         from moe_sm120_nvfp4_split.runtime.parallelism import (
-            init_nvshmem,
+            init_nccl_memory,
             init_parallel_context,
         )
 
         # Build the control/process groups first, then discover the physical
-        # PCI/NUMA layout.  NVSHMEM must not initialize until that topology has
+        # PCI/NUMA layout.  communication must not initialize until that topology has
         # selected the transport preset and environment below.
         parallel_context = init_parallel_context(
             data_parallel_size=data_parallel_size,
@@ -5519,6 +5512,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         sm_min_partition,
         sm_partition_alignment,
     ) = query_sm_resource_info()
+    from moe_sm120_nvfp4_split.tuning_config import load_tuning_config, hardware_identity
+    offline_tuning = load_tuning_config(args.tuning_config) if args.tuning_config else None
+    offline_hardware = hardware_identity() if offline_tuning is not None else None
     heuristic_input = MegaMoEHeuristicInput(
         tokens_per_rank=args.num_tokens_per_rank,
         hidden=args.hidden,
@@ -5603,10 +5599,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         else select_compatibility_config
     )
+    profile_kwargs = (dict(tuning_config=offline_tuning, hardware=offline_hardware)
+                      if select_for_execution is select_megamoe_config else {})
     kernel_config = select_for_execution(
         heuristic_input, heuristic_overrides,
-        numerical_contract=args.numerical_contract,
+        numerical_contract=args.numerical_contract, **profile_kwargs,
     )
+    if args.tuning_config and parallel_context is not None:
+        # Setup-only consensus: divergent files/fallbacks must not launch
+        # incompatible persistent protocols on different EP ranks.
+        from dataclasses import asdict
+        agreed = [None] * world_size
+        torch.distributed.all_gather_object(
+            agreed, dict(config=asdict(kernel_config), profile=offline_tuning.sha256,
+                         hardware=offline_hardware),
+            group=parallel_context.ep_control_group)
+        if any(item != agreed[0] for item in agreed):
+            raise ValueError('EP ranks disagree on offline tuning configuration or hardware')
+    if offline_tuning is not None and rank == 0:
+        if profile_kwargs:
+            from moe_sm120_nvfp4_split.heuristic import explain_selection
+            print("Offline tuning selection:", explain_selection(
+                heuristic_input, heuristic_overrides,
+                numerical_contract=args.numerical_contract, **profile_kwargs)['profiles'])
+        else:
+            print("Offline tuning ignored: nondefault execution requires compatibility fallback")
     if rank == 0 and kernel_config.rank_local_combine:
         print(
             "WARNING: rank_local_combine is active. It rounds one BF16 "
@@ -5614,9 +5631,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "need not be bit-identical to top-k-slot accumulation."
         )
     requested_comm_backend = kernel_config.comm_backend
-    hybrid_transport = requested_comm_backend == "nvshmem_hybrid"
+    hybrid_transport = requested_comm_backend == "gin_hybrid"
     ring_transport = requested_comm_backend in (
-        "nvshmem_ibgda", "nvshmem_hybrid"
+        "gin", "gin_hybrid"
     )
     if ring_transport:
         if kernel_config.token_back_mode != "reuse_dispatch_warps":
@@ -5624,69 +5641,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"--comm_backend {requested_comm_backend} requires "
                 "--token_back_mode reuse_dispatch_warps"
             )
-        # These variables are consumed by NVSHMEM initialization below and
-        # therefore must be fixed before src.bootstrap is imported/called.
-        os.environ["NVSHMEM_HEAP_KIND"] = "VIDMEM"
-        os.environ["NVSHMEM_DISABLE_P2P"] = "0" if hybrid_transport else "1"
-        os.environ.setdefault("NVSHMEM_REMOTE_TRANSPORT", "ibrc")
-        os.environ["NVSHMEM_IB_ENABLE_IBGDA"] = "1"
-        os.environ.setdefault("NVSHMEM_IBGDA_NIC_HANDLER", "auto")
-        os.environ.setdefault(
-            "NVSHMEM_IBGDA_FORCE_NIC_BUF_MEMTYPE", "gpumem"
-        )
-        os.environ["NVSHMEM_IBGDA_NUM_RC_PER_PE"] = str(
-            kernel_config.ibgda_rc_per_pe
-        )
-        os.environ["NVSHMEM_IBGDA_RC_MAP_BY"] = (
-            kernel_config.ibgda_rc_mapping
-        )
-
     hybrid_force_ibgda_mask = 0
     if hybrid_transport:
         if parallel_context is None:
-            parser.error("nvshmem_hybrid requires distributed topology discovery")
-        hybrid_force_ibgda_mask = (
-            parallel_context.ep_transport_topology.force_ibgda_peer_mask
-        )
-        if hybrid_force_ibgda_mask == 0:
-            parser.error(
-                "nvshmem_hybrid selected but this EP world has no cross-NUMA peers"
-            )
-
-        # Only one local rank compiles the cached helper. Broadcast either its
-        # validated link inputs or the error so no rank can wait forever after
-        # another rank rejects the ABI.
-        compat_result = [None]
-        if parallel_context.global_rank == 0:
-            try:
-                artifacts = prepare_nvshmem_hybrid_compat()
-                compat_result[0] = {
-                    "link_libraries": artifacts.link_libraries,
-                    "version": artifacts.version,
-                    "sha256": artifacts.device_bitcode_sha256,
-                }
-            except Exception as exc:
-                compat_result[0] = {"error": f"{type(exc).__name__}: {exc}"}
-        torch.distributed.broadcast_object_list(compat_result, src=0)
-        if "error" in compat_result[0]:
-            raise RuntimeError(
-                "NVSHMEM hybrid transport disabled by compatibility guard: "
-                + compat_result[0]["error"]
-            )
-        os.environ["MEGAMOE_NVSHMEM_LINK_LIBRARIES"] = compat_result[0][
-            "link_libraries"
-        ]
-        if parallel_context.global_rank == 0:
-            print(
-                "[NVSHMEM hybrid guard] "
-                f"version={compat_result[0]['version']} "
-                f"device_bitcode_sha256={compat_result[0]['sha256']} "
-                f"force_ibgda_mask=0x{hybrid_force_ibgda_mask:x}",
-                flush=True,
-            )
-
+            parser.error('Network transport requires distributed topology discovery')
+        hybrid_force_ibgda_mask = parallel_context.ep_transport_topology.force_ibgda_peer_mask
     if not _NO_DIST:
-        parallel_context = init_nvshmem(parallel_context)
+        parallel_context = init_nccl_memory(parallel_context, gin_bridge.p2p_capacity(
+            args.num_tokens_per_rank, args.hidden, args.num_topk,
+            args.num_total_experts, world_size, kernel_config.rank_local_combine))
 
     if args.intermediate % tensor_parallel_size != 0:
         raise ValueError(
@@ -5800,10 +5763,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         tester.close_split_execution_contexts()
 
     if not _NO_DIST:
-        # nvshmem_free/finalize are collective barriers; an unsynchronized or
-        # GC-driven teardown deadlocks once per-rank free order diverges.  So
-        # just barrier-align, then os._exit and let the driver reclaim the heap
-        # on exit.  os._exit skips finalizers/GC, hence the manual flush.
+        # Drain device work and align ranks before process exit. Regular CLI
+        # runs retain the tested fast-exit lifecycle; the profiling path below
+        # performs explicit collective NCCL window/communicator teardown.
+        # os._exit skips Python finalizers, hence the manual output flush.
         torch.cuda.synchronize()
         if torch.distributed.is_initialized():
             # The global default group is the CPU/Gloo control plane.  A short
@@ -5817,11 +5780,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         # IKET's tracker dump.  Profiling runs instead perform a collective,
         # explicitly ordered teardown and return normally so the injection
         # library can write its tracker/trace files.  Regular runs retain the
-        # NVSHMEM-safe fast-exit behavior below.
+        # synchronized fast-exit behavior below.
         if os.environ.get("MEGAMOE_IKET_PROFILE_TEARDOWN") == "1":
-            from src.bootstrap import finalize_dist_and_nvshmem
-
-            finalize_dist_and_nvshmem()
+            gin_bridge.close()
+            torch.distributed.destroy_process_group()
             return return_code
         os._exit(return_code)
     return return_code
