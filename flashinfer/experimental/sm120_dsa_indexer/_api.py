@@ -435,6 +435,17 @@ def dsa_indexer_det_topk_paged(
             "(page_rows key rows, then their scales)"
         )
     page_stride = kv_cache.stride(0) * kv_cache.element_size()
+    # The binding reads the pages through TMA tensor maps, whose global
+    # strides must be 16-byte multiples; it checks this stride too. Raising
+    # here names the cache instead of leaving the binding's check to surface.
+    if kv_cache.shape[0] > 0 and (
+        page_stride < page_bytes or page_stride % 16 or kv_cache.data_ptr() % 16
+    ):
+        raise ValueError(
+            f"the paged cache needs a page stride of at least {page_bytes} bytes "
+            f"and a multiple of 16, on a 16-byte-aligned base: got {page_stride} "
+            f"bytes at {kv_cache.data_ptr():#x}"
+        )
     pages = torch.as_strided(
         kv_cache.view(torch.uint8), (kv_cache.shape[0], page_bytes), (page_stride, 1)
     )
