@@ -237,12 +237,21 @@ def fixed_cycles(cfg: Knobs, family: str) -> float:
     return 0.0 if c is None else c
 
 
+# A cluster record's per-step cost beyond its bytes at a few live rows per expert: every k-step waits on all of the
+# cluster's CTAs releasing their stages while the token operand they share is a row or two, so a two- or four-CTA
+# cluster's step runs longer than its bytes say (one declared empirical constant per extra CTA of the cluster, scaled
+# by the record's own step; nothing once the live rows fill the tile)
+CLUSTER_STEP = 0.2
+
+
 def estimate_overrides(cfg: Knobs, rows: int, in_fmt: str, family: str) -> dict:
     """The dense estimate's constants as the MoE ranking applies them to a grouped launch at ``rows`` live rows per expert
     (the dense dispatcher's own constants untouched): the cluster's multicast credit on the bytes the cluster actually
     shares -- the live rows of the token tile, so one live row of a tile earns almost none and rows at the tile the whole
-    credit (the prefill ranking unchanged); and the 64-row CTA tile's MMA penalty confined to the compute share of the step
-    (at one row per expert the swapped records are bytes-bound, so a 64-row weight tile is priced by its bytes per CTA)."""
+    credit (the prefill ranking unchanged); the cluster's per-step cost beyond its bytes at those live rows
+    (`CLUSTER_STEP`, through the step floor); and the 64-row CTA tile's MMA penalty confined to the compute share of
+    the step (at one row per expert the swapped records are bytes-bound, so a 64-row weight tile is priced by its bytes
+    per CTA)."""
     from ...gemm.batch_invariant.heuristic import CONSTANTS, PART_TABLE
     from ...gemm.batch_invariant.spec import ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
 
@@ -254,30 +263,37 @@ def estimate_overrides(cfg: Knobs, rows: int, in_fmt: str, family: str) -> dict:
     )  # the CTA's rows (a swapped record's weight rows)
     tn = cfg.mma_tiler_mn[1]
     cm, cn = cfg.cluster_shape_mn
+    live = min(max(1, rows), cta_rows)
     if not cfg.swap_ab:
-        live = min(max(1, rows), cta_rows)
         p["mcast_pow"] = CONSTANTS["mcast_pow"] * live / cta_rows
+    # the record's k-step as the estimate forms it: MMA cycles against operand bytes
+    eb = ELEM_BITS_OF[in_fmt] / 8.0
+    kk = MMA_K_OF[in_fmt]
+    rate = part.mma_flop_per_clk * MMA_RATE_OF[in_fmt]
+    wb = tn / group * max(eb, 1.0)
+    b_eff = (
+        1.0
+        if cfg.swap_ab
+        else p["eff16b"]
+        if wb <= 16
+        else p["eff32b"]
+        if wb <= 32
+        else p["eff64b"]
+        if wb <= 64
+        else 1.0
+    )
+    mma_raw = 2.0 * cta_rows * tn * kk / rate
+    a_bytes = cta_rows * kk * eb / (cn ** p["mcast_pow"])
+    b_bytes = tn * kk * eb / (cm ** p["mcast_pow"]) / b_eff
+    bytes_cycles = (a_bytes + b_bytes) / part.load_bytes_per_clk
     if cta_rows < 128:
-        eb = ELEM_BITS_OF[in_fmt] / 8.0
-        kk = MMA_K_OF[in_fmt]
-        rate = part.mma_flop_per_clk * MMA_RATE_OF[in_fmt]
-        wb = tn / group * max(eb, 1.0)
-        b_eff = (
-            1.0
-            if cfg.swap_ab
-            else p["eff16b"]
-            if wb <= 16
-            else p["eff32b"]
-            if wb <= 32
-            else p["eff64b"]
-            if wb <= 64
-            else 1.0
-        )
-        mma_raw = 2.0 * cta_rows * tn * kk / rate
-        a_bytes = cta_rows * kk * eb / (cn ** p["mcast_pow"])
-        b_bytes = tn * kk * eb / (cm ** p["mcast_pow"]) / b_eff
-        share = min(1.0, mma_raw / ((a_bytes + b_bytes) / part.load_bytes_per_clk))
+        share = min(1.0, mma_raw / bytes_cycles)
         p["rows64_eff"] = 1.0 - (1.0 - CONSTANTS["rows64_eff"]) * share
+    size = cm * cn
+    if not cfg.swap_ab and size > 1 and live < cta_rows:
+        mma_eff = 1.0 if cta_rows >= 128 else p["rows64_eff"]
+        step = max(mma_raw / mma_eff, bytes_cycles) + CONSTANTS["step_floor"]
+        p["step_floor"] = CONSTANTS["step_floor"] + CLUSTER_STEP * (size - 1) * step
     return p
 
 
