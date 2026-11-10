@@ -261,11 +261,23 @@ class TopkReduce:
         num_sms: Optional[int] = None,
         max_fetch: int = 8,
         fetch_rounds: int = 4,
+        num_remote_nodes: int = 0,
+        ranks_per_node: int = 1,
+        num_experts_per_rank: int = 1,
+        combine_slot_indexed: bool = False,
     ) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.num_experts = None if num_experts is None else int(num_experts)
         self.combine_format = combine_format
+        self.num_remote_nodes = num_remote_nodes
+        self.ranks_per_node = ranks_per_node
+        self.num_experts_per_rank = num_experts_per_rank
+        self.combine_slot_indexed = combine_slot_indexed
+        if num_remote_nodes:
+            if persistent or combine_format.is_quantized:
+                raise ValueError("GIN ordered reduce requires static BF16 combine.")
+            vector_bytes = 16  # Preserve the donor's 128-bit BF16 worker geometry.
         # ``sm_arch=None`` means "Blackwell or newer", the greenfield default.
         # SM90 has no packed f32x2 math, so the Hopper MegaMoE kernel passes its
         # arch explicitly and gets the scalar form of _fma/_fmul below.
@@ -413,6 +425,12 @@ class TopkReduce:
         counters: Optional[cute.Tensor] = None,  # persistent only: int32 x1 work cursor, caller-zeroed per launch
         num_tokens_dev: Optional[cute.Tensor] = None,  # persistent only: int32 x1 in gmem
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk); BF16 only, masks invalid routes
+        *,
+        internode_combine=None,
+        combine_phase_snapshot=None,
+        topk_idx=None,
+        local_rank=None,
+        token_node_slot=None,
     ):
         """Launch the reduce.
 
@@ -423,6 +441,11 @@ class TopkReduce:
         kernel never modifies. The kernel clamps it to the output extent, so a
         stale or garbage value can never index past the workspace.
         """
+        if cutlass.const_expr(internode_combine is not None):
+            self._launch_internode(combine_quant, combine_sf, reduced_output,
+                topk_score, stream, internode_combine, combine_phase_snapshot,
+                topk_idx, local_rank, token_node_slot)
+            return
         if cutlass.const_expr(topk_indices is not None):
             if cutlass.const_expr(self.num_experts is None or self.combine_format.is_quantized):
                 raise ValueError("Masked combine requires BF16 storage and a static expert count.")
@@ -798,4 +821,347 @@ class TopkReduce:
                 cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=store_bits),
                 out,
                 mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
+            )
+
+    @cute.jit
+    def _launch_internode(
+        self,
+        combine_quant: cute.Tensor,         # (token, topk, hidden)
+        combine_sf: Optional[cute.Tensor],  # (token, topk, hidden)
+        reduced_output: cute.Tensor,        # (token, hidden)
+        topk_score: Optional[cute.Tensor],  # (token, topk)
+        stream: cuda.CUstream,
+        internode_combine: Optional[cute.Tensor] = None,
+        combine_phase_snapshot: Optional[cute.Tensor] = None,
+        topk_idx: Optional[cute.Tensor] = None,
+        local_rank: Optional[Int32] = None,
+        token_node_slot: Optional[cute.Tensor] = None,
+    ):
+        threads = self._threads
+        total_workers = reduced_output.shape[0] * self.hidden_tiles
+        grid = [(total_workers + threads - 1) // threads, 1, 1]
+        block = [threads, 1, 1]
+
+        if cutlass.const_expr(internode_combine is not None):
+            combine_quant = cute.make_tensor(
+                combine_quant.iterator,
+                cute.make_layout(
+                    (2, combine_quant.shape[1], self.num_topk, self.hidden),
+                    stride=combine_quant.stride,
+                ),
+            )
+            internode_combine = cute.make_tensor(
+                internode_combine.iterator,
+                cute.make_layout(
+                    (
+                        2,
+                        self.num_remote_nodes,
+                        internode_combine.shape[2],
+                        self.hidden,
+                    ),
+                    stride=internode_combine.stride,
+                ),
+            )
+            topk_idx = cute.make_tensor(
+                topk_idx.iterator,
+                cute.make_layout(
+                    (topk_idx.shape[0], self.num_topk),
+                    stride=topk_idx.stride,
+                ),
+            )
+            if cutlass.const_expr(self.combine_slot_indexed):
+                if cutlass.const_expr(token_node_slot is None):
+                    raise ValueError(
+                        "combine_slot_indexed requires token_node_slot"
+                    )
+                token_node_slot = cute.make_tensor(
+                    token_node_slot.iterator,
+                    cute.make_layout(
+                        (self.num_remote_nodes, token_node_slot.shape[1]),
+                        stride=token_node_slot.stride,
+                    ),
+                )
+            else:
+                token_node_slot = None
+        else:
+            combine_quant = cute.make_tensor(
+                combine_quant.iterator,
+                cute.make_layout(
+                    (combine_quant.shape[0], self.num_topk, self.hidden),
+                    stride=combine_quant.stride,
+                ),
+            )
+        reduced_output = cute.make_tensor(
+            reduced_output.iterator,
+            cute.make_layout((reduced_output.shape[0], self.hidden), stride=reduced_output.stride))
+        if cutlass.const_expr(topk_score is not None):
+            topk_score = cute.make_tensor(
+                topk_score.iterator,
+                cute.make_layout((topk_score.shape[0], self.num_topk), stride=topk_score.stride))
+
+        self._reduce_bf16_internode(combine_quant, internode_combine,
+            combine_phase_snapshot, topk_idx, topk_score, reduced_output,
+            local_rank, token_node_slot).launch(grid=grid, block=block, stream=stream)
+
+    @cute.jit
+    def _mark_alignment(self, tensor: cute.Tensor, align_bytes: int) -> cute.Tensor:
+        p = tensor.iterator
+        return cute.make_tensor(
+            cute.make_ptr(p.dtype, p.toint(), p.memspace, assumed_align=align_bytes),
+            tensor.layout,
+        )
+
+    @cute.kernel
+    def _reduce_bf16_internode(
+        self,
+        combine_output: cute.Tensor,
+        internode_combine: cute.Tensor,
+        combine_phase_snapshot: cute.Tensor,
+        topk_idx: cute.Tensor,
+        topk_score: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        local_rank,
+        token_node_slot: Optional[cute.Tensor],
+    ):
+        worker_idx = (
+            cute.arch.block_idx()[0] * Int32(self._threads)
+            + cute.arch.thread_idx()[0]
+        )
+        self._reduce_bf16_internode_worker(
+            combine_output, internode_combine, combine_phase_snapshot,
+            topk_idx, topk_score, reduced_output, local_rank,
+            token_node_slot, worker_idx,
+        )
+
+    @cute.jit
+    def reduce_internode_tail(
+        self,
+        combine_output: cute.Tensor,
+        internode_combine: cute.Tensor,
+        combine_phase_snapshot: cute.Tensor,
+        topk_idx: cute.Tensor,
+        topk_score: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        local_rank,
+        token_node_slot: Optional[cute.Tensor],
+        worker_idx: Int32,
+        worker_stride: Int32,
+    ):
+        """Same ordered worker, grid-strided by the tail's dispatch threads.
+
+        The caller must have drained GIN arrivals and the first tail NVLink
+        barrier. No phase advance or combine-buffer reuse may precede this call.
+        Restore the same static modes as the standalone host launcher; this
+        creates views only, with no additional allocations or data movement.
+        """
+        combine_output = cute.make_tensor(
+            combine_output.iterator,
+            cute.make_layout(
+                (2, combine_output.shape[1], self.num_topk, self.hidden),
+                stride=combine_output.stride,
+            ),
+        )
+        internode_combine = cute.make_tensor(
+            internode_combine.iterator,
+            cute.make_layout(
+                (2, self.num_remote_nodes, internode_combine.shape[2], self.hidden),
+                stride=internode_combine.stride,
+            ),
+        )
+        topk_idx = cute.make_tensor(
+            topk_idx.iterator,
+            cute.make_layout((topk_idx.shape[0], self.num_topk), stride=topk_idx.stride),
+        )
+        reduced_output = cute.make_tensor(
+            reduced_output.iterator,
+            cute.make_layout((reduced_output.shape[0], self.hidden), stride=reduced_output.stride),
+        )
+        if cutlass.const_expr(topk_score is not None):
+            topk_score = cute.make_tensor(
+                topk_score.iterator,
+                cute.make_layout((topk_score.shape[0], self.num_topk), stride=topk_score.stride),
+            )
+        if cutlass.const_expr(self.combine_slot_indexed):
+            if cutlass.const_expr(token_node_slot is None):
+                raise ValueError("combine_slot_indexed requires token_node_slot")
+            token_node_slot = cute.make_tensor(
+                token_node_slot.iterator,
+                cute.make_layout(
+                    (self.num_remote_nodes, token_node_slot.shape[1]),
+                    stride=token_node_slot.stride,
+                ),
+            )
+        else:
+            token_node_slot = None
+
+        total_workers = Int32(reduced_output.shape[0] * self.hidden_tiles)
+        while worker_idx < total_workers:
+            self._reduce_bf16_internode_worker(
+                combine_output, internode_combine, combine_phase_snapshot,
+                topk_idx, topk_score, reduced_output, local_rank,
+                token_node_slot, worker_idx,
+            )
+            worker_idx = worker_idx + worker_stride
+
+    @cute.jit
+    def _reduce_bf16_internode_worker(
+        self,
+        combine_output: cute.Tensor,          # (phase, token, topk, hidden)
+        internode_combine: cute.Tensor,       # (phase, node, token, hidden)
+        combine_phase_snapshot: cute.Tensor,  # (1,)
+        topk_idx: cute.Tensor,                 # (token, topk)
+        topk_score: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        local_rank,
+        token_node_slot: Optional[cute.Tensor],
+        worker_idx: Int32,
+    ):
+        """FP32 sum of local top-k cells plus one reduced partial per node."""
+        hidden_per_thread = self.hidden_per_thread
+        hidden_tiles = self.hidden_tiles
+        num_topk: cutlass.Constexpr[int] = self.num_topk
+        needs_guard = self.require_predicate
+        out_dtype = reduced_output.element_type
+
+        token_idx = worker_idx // hidden_tiles
+        hidden_tile_idx = worker_idx % hidden_tiles
+
+        if (not needs_guard) or token_idx < reduced_output.shape[0]:
+            phase = Int32(
+                cute.arch.load(
+                    combine_phase_snapshot.iterator,
+                    Int32,
+                    sem="acquire",
+                    scope="gpu",
+                )
+            ) & Int32(1)
+            local_terms = cute.zipped_divide(
+                combine_output[phase, token_idx, None, None],
+                (num_topk, hidden_per_thread),
+            )[(None, None), (0, hidden_tile_idx)]
+            remote_terms = cute.zipped_divide(
+                internode_combine[phase, None, token_idx, None],
+                (self.num_remote_nodes, hidden_per_thread),
+            )[(None, None), (0, hidden_tile_idx)]
+            dst = cute.zipped_divide(
+                reduced_output[token_idx, None], (hidden_per_thread,),
+            )[(None,), (hidden_tile_idx,)]
+
+            load_atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.BFloat16,
+                num_bits_per_copy=128,
+            )
+            acc = cute.make_rmem_tensor(
+                (hidden_per_thread,), cutlass.Float32,
+            )
+            for i in cutlass.range_constexpr(hidden_per_thread):
+                acc[i] = Float32(0.0)
+
+            my_node = Int32(local_rank) // Int32(self.ranks_per_node)
+            for k in cutlass.range_constexpr(0, num_topk, 1):
+                term = cute.make_rmem_tensor(
+                    (hidden_per_thread,), cutlass.BFloat16,
+                )
+                cute.copy(load_atom, local_terms[k, None], term)
+                expert_id = Int32(topk_idx[token_idx, Int32(k)])
+                expert_node = Int32(-1)
+                if expert_id >= Int32(0):
+                    expert_node = (
+                        expert_id
+                        // Int32(self.num_experts_per_rank)
+                        // Int32(self.ranks_per_node)
+                    )
+                if expert_node == my_node:
+                    score = Float32(1.0)
+                    if cutlass.const_expr(topk_score is not None):
+                        score = Float32(topk_score[token_idx, Int32(k)])
+                    if cutlass.const_expr(self.use_scalar_math):
+                        for i in cutlass.range_constexpr(hidden_per_thread):
+                            acc[i] = self._fma(
+                                Float32(term[i]), score, acc[i],
+                            )
+                    else:
+                        for i in cutlass.range_constexpr(
+                            0, hidden_per_thread, 2
+                        ):
+                            acc[i], acc[i + 1] = self._fma(
+                                (Float32(term[i]), Float32(term[i + 1])),
+                                score,
+                                (acc[i], acc[i + 1]),
+                            )
+
+            # Each remote node already reduced all of this token's hits in
+            # FP32 and cast once to BF16. Add exactly one row for each distinct
+            # node present in topk_idx; stale rows/cells in the selected phase
+            # are therefore never consumed and need no cross-node clear race.
+            for remote_slot_off in cutlass.range_constexpr(
+                0, self.num_remote_nodes, 1
+            ):
+                remote_slot = Int32(remote_slot_off)
+                remote_node = remote_slot
+                if remote_slot >= my_node:
+                    remote_node = remote_slot + Int32(1)
+                has_remote = Int32(0)
+                for k in cutlass.range_constexpr(0, num_topk, 1):
+                    expert_id = Int32(topk_idx[token_idx, Int32(k)])
+                    expert_node = Int32(-1)
+                    if expert_id >= Int32(0):
+                        expert_node = (
+                            expert_id
+                            // Int32(self.num_experts_per_rank)
+                            // Int32(self.ranks_per_node)
+                        )
+                    if expert_node == remote_node:
+                        has_remote = Int32(1)
+
+                term = cute.make_rmem_tensor(
+                    (hidden_per_thread,), cutlass.BFloat16,
+                )
+                if cutlass.const_expr(token_node_slot is not None):
+                    # Slot-indexed landing plane: dispatch_prep recorded this
+                    # token's message slot for each remote node it was sent to.
+                    # A token without a hit on that node has no valid slot, so
+                    # the row is loaded only under has_remote.
+                    if has_remote != Int32(0):
+                        landing_slot = Int32(
+                            token_node_slot[remote_slot, token_idx]
+                        )
+                        remote_row = cute.zipped_divide(
+                            internode_combine[
+                                phase, remote_slot, landing_slot, None
+                            ],
+                            (hidden_per_thread,),
+                        )[(None,), (hidden_tile_idx,)]
+                        cute.copy(load_atom, remote_row, term)
+                else:
+                    cute.copy(load_atom, remote_terms[remote_slot, None], term)
+                if has_remote != Int32(0):
+                    if cutlass.const_expr(self.use_scalar_math):
+                        for i in cutlass.range_constexpr(hidden_per_thread):
+                            acc[i] = self._fma(
+                                Float32(term[i]), Float32(1.0), acc[i],
+                            )
+                    else:
+                        for i in cutlass.range_constexpr(
+                            0, hidden_per_thread, 2
+                        ):
+                            acc[i], acc[i + 1] = self._fma(
+                                (Float32(term[i]), Float32(term[i + 1])),
+                                Float32(1.0),
+                                (acc[i], acc[i + 1]),
+                            )
+
+            out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
+            out.store(acc.load().to(out_dtype))
+            cute.copy(
+                cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    out_dtype,
+                    num_bits_per_copy=128,
+                ),
+                out,
+                self._mark_alignment(
+                    dst, hidden_per_thread * out_dtype.width // 8,
+                ),
             )

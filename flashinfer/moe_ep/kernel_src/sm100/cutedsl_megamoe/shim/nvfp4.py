@@ -44,8 +44,9 @@ import dataclasses
 import math
 import os
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Literal, Optional, Tuple, Union
 
 import torch
 from common.megamoe_constants import Nvfp4BlockSize
@@ -94,6 +95,8 @@ class MegaMoENvfp4Config:
     num_total_experts: int
     hidden: int
     intermediate: int
+    internode: bool = dataclasses.field(default=False, kw_only=True)
+    ranks_per_node: Optional[int] = dataclasses.field(default=None, kw_only=True)
 
     mma_tiler_mnk: Tuple[int, int, int] = (128, 128, 256)
     cluster_shape_mnk: Tuple[int, int, int] = (1, 1, 1)
@@ -319,6 +322,8 @@ class MegaMoENvfp4Frontend:
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
+        self._gin_session: Any = None
+        self._gin_wire_layout: Any = None
 
     @property
     def config(self) -> MegaMoENvfp4Config:
@@ -331,6 +336,8 @@ class MegaMoENvfp4Frontend:
         """Update ``gate_up_clamp`` and invalidate compile cache when it changes."""
         if self._gate_up_clamp == clamp:
             return
+        if self.config.internode:
+            raise ValueError("Internode GIN clamp changes are not qualified.")
         ensure_not_capturing("set_gate_up_clamp (clamp change)")
         self._release_workspace()
         self._gate_up_clamp = clamp
@@ -340,6 +347,8 @@ class MegaMoENvfp4Frontend:
         """Set uniform activation constants and invalidate the compiled session."""
         if (alpha, beta) == (self._config.swiglu_alpha, self._config.swiglu_beta):
             return
+        if self.config.internode:
+            raise ValueError("Internode GIN activation changes are not qualified.")
         new_config = dataclasses.replace(
             self.config, swiglu_alpha=alpha, swiglu_beta=beta
         )
@@ -354,6 +363,8 @@ class MegaMoENvfp4Frontend:
         Invalidates the compile cache when the effective config changes; the
         next ``run()``/``warmup()`` recompiles.  Used by :mod:`.autotune`.
         """
+        if self.config.internode:
+            raise ValueError("Internode GIN tuning is not qualified.")
         from .tuner import with_checked_knobs
 
         new_config = with_checked_knobs(self.config, knobs)
@@ -366,8 +377,13 @@ class MegaMoENvfp4Frontend:
 
     def release(self) -> None:
         """Free compiled workspaces (symmetric heap when using NVSHMEM)."""
+        if self._gin_session is not None and not self._gin_session._closed:
+            # Keep compiled local workspace alive until all pointer users drain.
+            self._gin_session._synchronize()
         self._release_workspace()
         self._invalidate_compile_cache()
+        if self._gin_session is not None:
+            self._gin_session.close()
 
     def warmup(
         self,
@@ -376,6 +392,9 @@ class MegaMoENvfp4Frontend:
         num_tokens: Optional[int] = None,
     ) -> None:
         """Compile (if needed) without launching."""
+        if self.config.internode:
+            self.make_launch_thunk(inputs, num_tokens=num_tokens)
+            return None
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return None
@@ -415,6 +434,16 @@ class MegaMoENvfp4Frontend:
                 "run() cannot return an unreduced output when "
                 "use_custom_finalize=True; use the terminal adapter"
             )
+        if self.config.internode:
+            if reset_counters:
+                self._gin_agree(
+                    "GIN counter recovery requires a new session.", "launch-prepare"
+                )
+            thunk = self.make_launch_thunk(inputs, num_tokens=num_tokens)
+            thunk()
+            if sync:
+                torch.cuda.synchronize()
+            return inputs.output_activation
         resolved = self._resolve_num_tokens(inputs, num_tokens)
         if resolved == 0:
             return None
@@ -469,11 +498,26 @@ class MegaMoENvfp4Frontend:
         ``output_activation.zero_()`` then the kernel launch (accumulate-from-
         zero contract of the REDG target); both are CUDA-graph capturable.
         """
-        launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
-        if launch_inputs is None:
-            return lambda: None
-        mega = self._ensure_mega_compiled(inputs)
-        runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+        if self.config.internode:
+            error = None
+            try:
+                # Compilation, registration and launch lowering belong to
+                # eager warmup. Capture may only use an existing thunk.
+                ensure_not_capturing("internode GIN preparation")
+                launch_inputs = self._prepare_launch_inputs(
+                    inputs, num_tokens=num_tokens
+                )
+                mega = self._ensure_mega_compiled(inputs)
+                runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            self._gin_agree(error, "launch-prepare")
+        else:
+            launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
+            if launch_inputs is None:
+                return lambda: None
+            mega = self._ensure_mega_compiled(inputs)
+            runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
 
         if self.config.fc2_reduces_topk:
@@ -488,7 +532,46 @@ class MegaMoENvfp4Frontend:
             def thunk() -> None:
                 compiled(**runtime_kwargs)
 
+        if self.config.internode:
+            from cuda.bindings import driver as cuda
+
+            inner = thunk
+            session = self._gin_session
+
+            def thunk() -> None:
+                error = None
+                try:
+                    if session is None or session._closed:
+                        raise RuntimeError(
+                            "GIN launch thunk belongs to a closed session."
+                        )
+                    if torch.cuda.current_device() != session.device:
+                        raise RuntimeError("GIN launch uses a different CUDA device.")
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                self._gin_agree(error, "launch")
+                runtime_kwargs["stream"] = cuda.CUstream(
+                    torch.cuda.current_stream().cuda_stream
+                )
+                inner()
+
         return thunk
+
+    def _gin_agree(self, error, phase):
+        from .gin import collective_gin_preflight
+        import torch.distributed as dist
+
+        key = self._mega_compile_key()
+        collective_gin_preflight(
+            dist,
+            signature=(
+                key[:1] + key[2:],
+                getattr(self._gin_session, "identity", None),
+                torch.cuda.is_current_stream_capturing(),
+            ),
+            local_error=error,
+            phase=phase,
+        )
 
     def custom_finalize_workspace(
         self,
@@ -595,18 +678,12 @@ class MegaMoENvfp4Frontend:
             c.swiglu_beta,
             c.enable_iket,
             c.enable_fc1_activation_per_token_scale,
+            c.internode,
+            c.ranks_per_node if c.internode else None,
         )
 
-    def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
-        key = self._mega_compile_key()
-        if self._mega is not None and self._mega_key == key:
-            return self._mega
-
-        ensure_not_capturing("cute.compile + symmetric-heap allocation")
-        self._release_workspace()
-
+    def _construct_kernel(self):
         import cutlass
-        import cutlass.cute as cute
         from common.megamoe_constants import SfPaddingBlock
         from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue
         from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel
@@ -664,7 +741,29 @@ class MegaMoENvfp4Frontend:
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
+            internode=c.internode,
+            ranks_per_node=(c.ranks_per_node or c.world_size)
+            if c.internode
+            else c.world_size,
+            enable_internode_relay=c.internode,
+            enable_nccl_gin=c.internode,
+            publish_relay_counts_to_gemm=c.internode,
         )
+
+        return kernel, max_active_clusters
+
+    def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
+        key = self._mega_compile_key()
+        if self._mega is not None and self._mega_key == key:
+            return self._mega
+
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
+        self._release_workspace()
+
+        import cutlass.cute as cute
+
+        c = self.config
+        kernel, max_active_clusters = self._construct_kernel()
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -672,11 +771,19 @@ class MegaMoENvfp4Frontend:
             dtype=torch.uint8,
             device="cuda",
         )
-        shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace,
-            c.world_size,
-        )
+        if c.internode:
+            if self._gin_session is None or self._gin_session._closed:
+                raise RuntimeError("GIN session is not live; recreate the workspace.")
+            shared_workspace = self._gin_session.view(
+                "shared_workspace", dtype=torch.uint8, shape=(shared_ws_bytes,)
+            )
+            symmetric_base = int(self._gin_session.root.data_ptr())
+            peer_offsets_list = self._gin_session.peer_offsets
+        else:
+            shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
+            symmetric_base, peer_offsets_list = _compute_peer_offsets(
+                shared_workspace, c.world_size
+            )
 
         mega = _CompiledMega(
             compiled=None,
@@ -691,7 +798,12 @@ class MegaMoENvfp4Frontend:
         if c.enable_iket:
             compile_kwargs["options"] = "iket"
 
-        mega.compiled = cute.compile(kernel, **compile_kwargs)
+        # Optional GIN arguments still cost Python argument binding even when
+        # the device compiler folds them away. Keep the ordinary off entry's
+        # launch ABI lean, as the fixed legacy donor runner does. FI-only
+        # persistent/token-scale arguments retain the full qualified entry.
+        target = kernel.launch_without_gin if self._uses_non_gin_entry() else kernel
+        mega.compiled = cute.compile(target, **compile_kwargs)
         self._mega_key = key
         self._mega = mega
         return self._mega
@@ -707,14 +819,19 @@ class MegaMoENvfp4Frontend:
     def _release_workspace(self) -> None:
         if self._mega is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
-            free_sym_tensor(self._mega.shared_workspace)
+            if not self.config.internode:
+                free_sym_tensor(self._mega.shared_workspace)
 
-    @staticmethod
     def _resolve_num_tokens(
+        self,
         inputs: MegaMoENvfp4Inputs,
         num_tokens: Optional[int],
     ) -> int:
         buf_tokens = inputs.activation.shape[0]
+        if self.config.internode:
+            if num_tokens is not None and not 0 <= num_tokens <= buf_tokens:
+                raise ValueError("GIN live tokens exceed the workspace capacity.")
+            return buf_tokens  # Empty and partial ranks still join the full-capacity protocol.
         if num_tokens is None:
             return buf_tokens
         if num_tokens < 0 or num_tokens > buf_tokens:
@@ -781,6 +898,26 @@ class MegaMoENvfp4Frontend:
         from moe_nvfp4_swapab.runner_common import _DataDtype, _ScaleDtype
 
         c = self.config
+        if c.internode:
+            session = self._gin_session
+            if session is None or session._closed:
+                raise ValueError(
+                    "GIN input validation requires a live registered arena."
+                )
+            for name, tensor in (
+                ("activation", inputs.activation),
+                ("activation_sf", inputs.activation_sf),
+                ("topk_weights", inputs.topk_weights),
+            ):
+                region = session.layout.region(name)
+                if (
+                    tensor.data_ptr() != session.root.data_ptr() + region.offset
+                    or tensor.untyped_storage().data_ptr()
+                    != session.root.untyped_storage().data_ptr()
+                ):
+                    raise ValueError(
+                        f"GIN {name} must be a view of its registered root arena."
+                    )
         buf_tokens = inputs.activation.shape[0]
         if num_tokens > buf_tokens:
             raise ValueError(
@@ -989,6 +1126,14 @@ class MegaMoENvfp4Frontend:
             )
         return cute_tensor
 
+    def _uses_non_gin_entry(self) -> bool:
+        c = self.config
+        return (
+            not c.internode
+            and not c.use_persistent_finalize_kernel
+            and not c.enable_fc1_activation_per_token_scale
+        )
+
     def _build_mega_runtime_kwargs(
         self,
         inputs: MegaMoENvfp4Inputs,
@@ -1005,11 +1150,17 @@ class MegaMoENvfp4Frontend:
             )
 
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        peer_rank_ptr_mapper_host = SymBufferHost(
+        if c.internode:
+            from src.lsa_peer_mapper import LsaPeerMapperHost
+
+            mapper_type = LsaPeerMapperHost
+        else:
+            mapper_type = SymBufferHost
+        peer_rank_ptr_mapper_host = mapper_type(
             base_addr=mega.symmetric_base,
             offsets=tuple(mega.peer_offsets_list),
             rank_idx=c.rank,
-            num_max_ranks=c.world_size,
+            num_max_ranks=c.ranks_per_node if c.internode else c.world_size,
         )
         dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
 
@@ -1051,11 +1202,52 @@ class MegaMoENvfp4Frontend:
                 else None
             ),
         )
+        if c.internode:
+            from nccl.core.device import cute as nccl_cute
+
+            session = self._gin_session
+            layout = self._gin_wire_layout
+            from .gin import GinArenaRegion, gin_arena_view
+
+            def wire_view(name, shape, dtype, nbytes):
+                view = gin_arena_view(
+                    session.root,
+                    GinArenaRegion(name, getattr(layout, name + "_offset"), nbytes),
+                    dtype=dtype,
+                    shape=shape,
+                )
+                session.views[name] = view
+                return self._to_cute(view, assumed_align=128, static_layout=True)
+
+            kwargs.update(
+                gin_dev_comm=nccl_cute.DevComm(session.dev_comm),
+                gin_window=nccl_cute.Window(session.window),
+                gin_internode_send_count=wire_view(
+                    "internode_send_count",
+                    layout.internode_send_count_shape,
+                    torch.int32,
+                    math.prod(layout.internode_send_count_shape) * 4,
+                ),
+                gin_internode_recv_splits=wire_view(
+                    "internode_recv_splits",
+                    layout.internode_recv_splits_shape,
+                    torch.int32,
+                    math.prod(layout.internode_recv_splits_shape) * 4,
+                ),
+                gin_internode_combine_buffer=wire_view(
+                    "internode_combine_buffer",
+                    layout.internode_combine_buffer_shape,
+                    torch.bfloat16,
+                    math.prod(layout.internode_combine_buffer_shape) * 2,
+                ),
+            )
         if c.enable_fc1_activation_per_token_scale:
             # Only passed when enabled so the default compile ABI is unchanged.
             kwargs["fc1_activation_per_token_scale"] = self._to_cute(
                 inputs.fc1_activation_per_token_scale, assumed_align=4
             )
+        if self._uses_non_gin_entry():
+            kwargs.pop("num_valid_tokens")
         return kwargs
 
     @staticmethod
@@ -1249,6 +1441,9 @@ def get_symm_buffer_for_mega_moe(
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     enable_fc1_activation_per_token_scale: bool = False,
     knobs: Optional[dict] = None,
+    internode: bool = False,
+    ranks_per_node: Optional[int] = None,
+    process_group=None,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
 
@@ -1306,6 +1501,52 @@ def get_symm_buffer_for_mega_moe(
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, scale)`` tuples to :func:`nvfp4_mega_moe` instead.
     """
+    if internode:
+        from .gin import collective_gin_preflight
+        import torch.distributed as dist
+
+        error = None
+        expected = (
+            world_size,
+            ranks_per_node,
+            num_max_tokens,
+            hidden,
+            intermediate,
+            num_total_experts,
+            num_topk,
+        )
+        if torch.cuda.is_current_stream_capturing():
+            error = "Internode GIN initialization cannot run during CUDA Graph capture."
+        if expected != (4, 2, 32, 7168, 3072, 48, 4):
+            error = "GIN v1 qualification case requires N2R2, T32/H7168/J3072/E48/K4."
+        if (
+            activation != "swiglu"
+            or swiglu_alpha is not None
+            or swiglu_beta is not None
+            or gate_up_clamp is not None
+            or activation_clamp is not None
+            or situ_beta is not None
+            or situ_linear_beta is not None
+            or enable_in_kernel_fc2_reduce
+            or use_custom_finalize
+            or use_persistent_finalize_kernel
+            or num_valid_tokens_tensor is not None
+            or combine_dtype != "bf16"
+            or enable_fc1_activation_per_token_scale
+            or any(
+                value is not None for value in (fc1_alpha, fc2_alpha, fc1_norm_const)
+            )
+            or not apply_routing_weights_before_fc2
+            or knobs is not None
+        ):
+            error = "GIN v1 requires standard SwiGLU, early routing weights and separate BF16 reduce; no custom scales/finalize/tuning."
+        collective_gin_preflight(
+            dist,
+            signature=expected,
+            local_error=error,
+            phase="workspace-config",
+            requested_group=process_group,
+        )
     if hidden % 64 != 0 or intermediate % 64 != 0:
         raise ValueError(
             "MegaMoE requires hidden and intermediate to be multiples of 64."
@@ -1329,7 +1570,9 @@ def get_symm_buffer_for_mega_moe(
     # knobs=None -> pure lookup: offline-tuned cache entry for this session
     # key when present, else the built-in token-count heuristic.  An explicit
     # knobs= dict overrides both entirely.
-    if knobs is None:
+    if internode:
+        knobs = {}
+    elif knobs is None:
         knobs, _ = resolve_knobs(
             dtype="nvfp4",
             world_size=world_size,
@@ -1354,6 +1597,8 @@ def get_symm_buffer_for_mega_moe(
         num_total_experts=num_total_experts,
         hidden=hidden,
         intermediate=intermediate,
+        internode=internode,
+        ranks_per_node=ranks_per_node,
         gate_up_clamp=clamp,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -1372,7 +1617,15 @@ def get_symm_buffer_for_mega_moe(
             "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
         ),
     )
-    cfg = with_checked_knobs(cfg, knobs)
+    if internode:
+        cfg = dataclasses.replace(
+            cfg,
+            group_hint=2**29,
+            epi_flag_batch=(1, 4),
+            token_back_mode="reuse_dispatch_warps",
+        )
+    else:
+        cfg = with_checked_knobs(cfg, knobs)
     # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
     #   despite the autotuner supporting disabling ikr if it would be faster.
     #   ikr is taken as permission to violate batch invariance so selecting different knobs is fine
@@ -1386,75 +1639,136 @@ def get_symm_buffer_for_mega_moe(
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
 
     sym_roots: list[torch.Tensor] = []
-    x, x_root = _sym_zeros_byte_view((num_max_tokens, hidden), _DataDtype)
-    sym_roots.append(x_root)
-    x_sf, x_sf_root = _sym_zeros_byte_view(
-        (num_max_tokens, hidden_sf_cols_padded),
-        _ScaleDtype,
-    )
-    sym_roots.append(x_sf_root)
-    topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
-    # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
-    # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
-    # tail, but start from the masked state so a partial first staging is safe.
-    topk_idx.fill_(-1)
-    sym_roots.append(topk_idx)
-    topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
-    sym_roots.append(topk_weights)
-    # Single 2D (T, hidden) bf16 output; the kernel reduces the top-k combine
-    # internally.  Allocated on the symmetric heap unconditionally: under
-    # in_kernel_fc2_reduce it IS the cross-rank REDG atomic-add target (hard
-    # requirement), and in explicit-reduce mode a sym allocation behaves like
-    # plain CUDA memory locally.  Always-sym keeps the session ikr-capable so
-    # the knob can flip per-compile (autotune / apply_knobs) without
-    # reallocating; the cost ((T, hidden) bf16) is negligible next to the
-    # internal combine staging.
-    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
-    sym_roots.append(output_activation)
-    fc1_activation_per_token_scale = None
-    if enable_fc1_activation_per_token_scale:
-        # Peer-pulled by the dispatch warps (like topk_weights) -> symmetric
-        # heap.  1.0 keeps unstaged rows neutral.
-        fc1_activation_per_token_scale = sym_zeros((num_max_tokens,), torch.float32)
-        fc1_activation_per_token_scale.fill_(1.0)
-        sym_roots.append(fc1_activation_per_token_scale)
-    fc1_alpha = _resolve_per_expert_epilogue(
-        "fc1_alpha",
-        fc1_alpha,
-        num_experts_per_rank,
-    )
-    fc2_alpha = _resolve_per_expert_epilogue(
-        "fc2_alpha",
-        fc2_alpha,
-        num_experts_per_rank,
-    )
-    fc1_norm_const = _resolve_per_expert_epilogue(
-        "fc1_norm_const",
-        fc1_norm_const,
-        num_experts_per_rank,
-    )
+    if internode:
+        from src.nccl_gin_layout import build_megamoe_gin_window_layout
+        from .gin import build_gin_arena_layout, create_gin_session
 
-    return MegaMoESymmBuffer(
-        num_total_experts=num_total_experts,
-        num_max_tokens=num_max_tokens,
-        num_topk=num_topk,
-        hidden=hidden,
-        intermediate=intermediate,
-        rank=rank,
-        world_size=world_size,
-        x=x,
-        x_sf=x_sf,
-        topk_idx=topk_idx,
-        topk_weights=topk_weights,
-        output_activation=output_activation,
-        num_valid_tokens=num_valid_tokens_tensor,
-        fc1_alpha=fc1_alpha,
-        fc2_alpha=fc2_alpha,
-        fc1_norm_const=fc1_norm_const,
-        _frontend=frontend,
-        fc1_activation_per_token_scale=fc1_activation_per_token_scale,
-        _sym_roots=sym_roots,
-    )
+        kernel, _ = frontend._construct_kernel()
+        _, shared_bytes = kernel.get_workspace_sizes()
+        wire = build_megamoe_gin_window_layout(
+            world_size=world_size,
+            ranks_per_node=ranks_per_node,
+            num_experts_per_rank=num_experts_per_rank,
+            max_relay_tokens_per_node=num_max_tokens,
+            hidden_bytes=hidden // 2,
+            sf_uint32_per_token=kernel.sf_uint32_per_token,
+            num_topk=num_topk,
+            combine_hidden=hidden,
+        )
+        arena = build_gin_arena_layout(
+            transport_bytes=wire.total_bytes,
+            num_tokens=num_max_tokens,
+            hidden=hidden,
+            num_topk=num_topk,
+            shared_workspace_bytes=shared_bytes,
+        )
+        session = create_gin_session(
+            rank=rank,
+            world_size=world_size,
+            ranks_per_node=ranks_per_node,
+            device=torch.cuda.current_device(),
+            layout=arena,
+            signal_count=wire.total_signal_count,
+            signature=(
+                num_max_tokens,
+                hidden,
+                intermediate,
+                num_total_experts,
+                num_topk,
+            ),
+            process_group=process_group,
+        )
+        frontend._gin_session = session
+        frontend._gin_wire_layout = wire
+    with session.workspace_construction() if internode else nullcontext():
+        if internode:
+            x = session.view(
+                "activation", dtype=_DataDtype, shape=(num_max_tokens, hidden // 2)
+            )
+            x_sf = session.view(
+                "activation_sf",
+                dtype=_ScaleDtype,
+                shape=(num_max_tokens, hidden_sf_cols_padded),
+            )
+            topk_weights = session.view(
+                "topk_weights", dtype=torch.float32, shape=(num_max_tokens, num_topk)
+            )
+            topk_idx = torch.full(
+                (num_max_tokens, num_topk), -1, dtype=torch.int64, device="cuda"
+            )
+            output_activation = torch.empty(
+                (num_max_tokens, hidden), dtype=torch.bfloat16, device="cuda"
+            )
+        else:
+            x, x_root = _sym_zeros_byte_view((num_max_tokens, hidden), _DataDtype)
+            sym_roots.append(x_root)
+            x_sf, x_sf_root = _sym_zeros_byte_view(
+                (num_max_tokens, hidden_sf_cols_padded),
+                _ScaleDtype,
+            )
+            sym_roots.append(x_sf_root)
+            topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
+            # The kernel treats -1 as the pad-row mask; zero-filled rows would dispatch
+            # as live tokens routed to expert 0. Stagers overwrite [:n] and re-fill the
+            # tail, but start from the masked state so a partial first staging is safe.
+            topk_idx.fill_(-1)
+            sym_roots.append(topk_idx)
+            topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
+            sym_roots.append(topk_weights)
+            # Single 2D (T, hidden) bf16 output; the kernel reduces the top-k combine
+            # internally.  Allocated on the symmetric heap unconditionally: under
+            # in_kernel_fc2_reduce it IS the cross-rank REDG atomic-add target (hard
+            # requirement), and in explicit-reduce mode a sym allocation behaves like
+            # plain CUDA memory locally.  Always-sym keeps the session ikr-capable so
+            # the knob can flip per-compile (autotune / apply_knobs) without
+            # reallocating; the cost ((T, hidden) bf16) is negligible next to the
+            # internal combine staging.
+            output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
+            sym_roots.append(output_activation)
+        fc1_activation_per_token_scale = None
+        if enable_fc1_activation_per_token_scale:
+            # Peer-pulled by the dispatch warps (like topk_weights) -> symmetric
+            # heap.  1.0 keeps unstaged rows neutral.
+            fc1_activation_per_token_scale = sym_zeros((num_max_tokens,), torch.float32)
+            fc1_activation_per_token_scale.fill_(1.0)
+            sym_roots.append(fc1_activation_per_token_scale)
+        fc1_alpha = _resolve_per_expert_epilogue(
+            "fc1_alpha",
+            fc1_alpha,
+            num_experts_per_rank,
+        )
+        fc2_alpha = _resolve_per_expert_epilogue(
+            "fc2_alpha",
+            fc2_alpha,
+            num_experts_per_rank,
+        )
+        fc1_norm_const = _resolve_per_expert_epilogue(
+            "fc1_norm_const",
+            fc1_norm_const,
+            num_experts_per_rank,
+        )
+
+        return MegaMoESymmBuffer(
+            num_total_experts=num_total_experts,
+            num_max_tokens=num_max_tokens,
+            num_topk=num_topk,
+            hidden=hidden,
+            intermediate=intermediate,
+            rank=rank,
+            world_size=world_size,
+            x=x,
+            x_sf=x_sf,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            output_activation=output_activation,
+            num_valid_tokens=num_valid_tokens_tensor,
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            fc1_norm_const=fc1_norm_const,
+            _frontend=frontend,
+            fc1_activation_per_token_scale=fc1_activation_per_token_scale,
+            _sym_roots=sym_roots,
+        )
 
 
 def nvfp4_mega_moe(
@@ -1499,6 +1813,35 @@ def nvfp4_mega_moe(
     stream-order before reading it on the host).  Pass ``True`` for a
     blocking call (e.g. host-side timing).
     """
+    if symm_buffer._frontend.config.internode:
+        error = None
+        try:
+            if symm_buffer._destroyed:
+                raise ValueError("GIN workspace is already destroyed.")
+            if not fast_math or any(
+                value is not None
+                for value in (
+                    swiglu_alpha,
+                    swiglu_beta,
+                    gate_up_clamp,
+                    activation_clamp,
+                )
+            ):
+                raise ValueError(
+                    "Internode GIN runtime math overrides are not qualified."
+                )
+            n = num_tokens if num_tokens is not None else symm_buffer.num_max_tokens
+            if not 0 <= n <= symm_buffer.num_max_tokens:
+                raise ValueError("GIN live token count exceeds capacity.")
+            if y is not None and (
+                y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16
+            ):
+                raise ValueError("GIN output shape or dtype is invalid.")
+            if len(transformed_l1) != 2 or len(transformed_l2) != 2:
+                raise ValueError("GIN transformed weights must be weight/scale pairs.")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        symm_buffer._frontend._gin_agree(error, "public-arguments")
     if not fast_math:
         warnings.warn(
             "fast_math=False has no effect in the CuTeDSL NVFP4 MegaMoE path.",
@@ -1602,13 +1945,17 @@ def nvfp4_mega_launch_thunk(
     """Prebuilt zero-arg NVFP4 mega launcher for steady-state timing loops.
 
     Tester-parity timed region (``tester/solver.py perf_run``): the returned
-    thunk is a bare compiled-kernel launch -- args prebuilt once, no per-call
-    Python, no workspace reset (the kernel tail-cleans), no sync, no output
-    copy. The reduced output lands in ``symm_buffer.output_activation``;
+    thunk uses prebuilt args, no workspace reset (the kernel tail-cleans),
+    no device sync and no output copy. The reduced output lands in
+    ``symm_buffer.output_activation``;
     custom-finalize sessions expose per-route output through the frontend's
     ``custom_finalize_workspace()`` instead.
     Compiles on this call if needed.  Rebuild the thunk after knob/clamp
     changes or buffer destruction.
+
+    GIN thunks use the current execution/capture stream and perform CPU
+    agreement at invocation. Prepare them outside capture and retain their
+    session for the graph lifetime. Graph replay executes only GPU work.
     """
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")

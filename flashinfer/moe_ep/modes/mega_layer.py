@@ -566,9 +566,11 @@ class MoEEpMegaLayer(nn.Module):
         *,
         workspace: MoEEpMegaWorkspace | None = None,
         compile_tokens_per_rank: int | None = None,
+        _validated_kernel: MegaKernelBackend | None = None,
     ) -> tuple[FleetParams, Any, MegaKernelBackend, bool, Any]:
         if (
-            compile_tokens_per_rank is not None
+            not self._kernel.requires_collective_forward_validation
+            and compile_tokens_per_rank is not None
             and compile_tokens_per_rank < t.num_tokens
         ):
             raise MoEEpConfigError(
@@ -590,6 +592,16 @@ class MoEEpMegaLayer(nn.Module):
                 kernel = self._default_workspace_handle._kernel
         else:
             fleet_params, backend_workspace, kernel = self._resolve_workspace(workspace)
+        if (
+            kernel.requires_collective_forward_validation
+            and kernel is not _validated_kernel
+        ):
+            kernel.validate_collective_forward(
+                t,
+                fleet_params,
+                quantize_input=self._mega_config.quantize_input,
+                compile_tokens_per_rank=compile_tokens_per_rank,
+            )
         quantize_input = self._resolve_quantize_input(t)
         signature = self._input_signature(t)
         validation_key = None if backend_workspace is None else id(backend_workspace)
@@ -598,7 +610,9 @@ class MoEEpMegaLayer(nn.Module):
             if validation_key is None
             else self._forward_signatures.get(validation_key)
         )
-        if previous_signature is None:
+        if kernel.requires_collective_forward_validation:
+            pass  # Validated collectively above, including steady-state metadata.
+        elif previous_signature is None:
             kernel.validate_forward(
                 t,
                 fleet_params,
@@ -750,6 +764,10 @@ class MoEEpMegaLayer(nn.Module):
             fleet_params = self._fleet_params
         else:
             fleet_params, _, _ = self._resolve_workspace(workspace)
+        if self._kernel.requires_collective_forward_validation:
+            self._kernel.validate_forward(
+                t, fleet_params, quantize_input=self._mega_config.quantize_input
+            )
         if t.num_tokens > fleet_params.max_tokens_per_rank:
             raise MoEEpConfigError(
                 f"{t.num_tokens} tokens exceed max_tokens_per_rank="
@@ -761,7 +779,18 @@ class MoEEpMegaLayer(nn.Module):
             kernel,
             quantize_input,
             transformed_weights,
-        ) = self._prepare_inputs(t, workspace=workspace)
+        ) = self._prepare_inputs(
+            t,
+            workspace=workspace,
+            # forward() has already agreed on this call's input errors. An
+            # explicit workspace may resolve to another backend; that backend
+            # must still validate before the core's rank-local checks.
+            _validated_kernel=(
+                self._kernel
+                if self._kernel.requires_collective_forward_validation
+                else None
+            ),
+        )
         output = t.output
         if output is None and not return_workspace_view:
             # Owned-output allocation must stay ahead of the staging round

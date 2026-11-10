@@ -135,6 +135,14 @@ _GENPHASE_EXPORTS = (
 
 
 def __getattr__(name):  # PEP 562
+    if name in ("snapshot_nvfp4_gin_terms", "ordered_nvfp4_gin_reference"):
+        from .shim import gin_debug
+
+        return getattr(gin_debug, name)
+    if name == "collective_gin_preflight":
+        from .shim.gin import collective_gin_preflight
+
+        return collective_gin_preflight
     if name in _GENPHASE_EXPORTS:
         from .. import next_cutedsl_megamoe
 
@@ -235,3 +243,6 @@ __all__ = [
 ]
 __all__ += [name for name in _kernel_helpers.__all__ if name not in __all__]
 __all__ += _GENPHASE_EXPORTS
+__all__ += ["collective_gin_preflight"]
+
+__all__ += ["snapshot_nvfp4_gin_terms", "ordered_nvfp4_gin_reference"]

@@ -50,7 +50,9 @@ from src.ptx_helpers import (
     cp_reduce_async_bulk_add_noftz_bf16_s2g as _cp_reduce_async_bulk_add_noftz_bf16_s2g,
     red_add_relaxed_sys_v2_bf16x2 as _red_add_relaxed_sys_v2_bf16x2,
 )
-from src.flag_batch import GpuReleaseFlagBatchTracker
+from src.flag_batch import GpuReleaseFlagBatchTracker, SysReleaseFlagBatchTracker
+from common.pipeline_timing import FC_TILE_TIMELINE_MAX_TILES
+from src.ptx_helpers import read_globaltimer as _fctl_read_globaltimer
 from src.sym_buffer import SymBufferDeviceBase
 
 @dataclasses.dataclass(frozen=True)
@@ -466,12 +468,19 @@ class QuantImpl:
         if cutlass.const_expr(self.sf_vec_size == 32):
             return cute.arch.warp_redux_sync(v, "fmax", abs=True)
         first_half = (self.lane_idx % cutlass.Int32(32)) < cutlass.Int32(16)
-        vsel = cutlass.Float32(0.0)
+        vsel0 = cutlass.Float32(0.0)
+        vsel1 = cutlass.Float32(0.0)
         if first_half:
-            vsel = v
-        amax = cute.arch.warp_redux_sync(vsel, "fmax", abs=True)
-        if not first_half:
-            amax = cute.arch.warp_redux_sync(v, "fmax", abs=True)
+            vsel0 = v
+        else:
+            vsel1 = v
+        amax0 = cute.arch.warp_redux_sync(vsel0, "fmax", abs=True)
+        amax1 = cute.arch.warp_redux_sync(vsel1, "fmax", abs=True)
+        amax = cutlass.Float32(0.0)
+        if first_half:
+            amax = amax0
+        else:
+            amax = amax1
         return amax
 
     @cute.jit
@@ -884,7 +893,7 @@ class TmemTranspose32x32Inplace:
             )
         self.top = TmemTranspose16x32(tmem_ptr, Region.Top, reg_tensor=reg_tensor_top)
         self.bot = TmemTranspose16x32(tmem_ptr, Region.Bottom, reg_tensor=reg_tensor_bot)
-    
+
     def from_r1_perm_until_last_store(self) -> Tuple[cute.Tensor, cute.Tensor]:
         self.bot.r1_perm();   self.top.r1_perm()
         self.bot.r1_store();  self.top.r1_store()
@@ -961,7 +970,7 @@ class SwapABSwigluFp4Epilogue:
         fc1_output_dtype: Type[cutlass.Numeric],
         combine_format: CombineFormat,          # fc2 combine wire: act_dtype (data) + scale_dtype (sf)
         non_ubulk_fc2_store: bool,              # Whether epilogue warps use STG or UBLK in fc2
-        in_kernel_fc2_reduce: bool,             # Whether epilogue warps reduce fc2 output to peer 
+        in_kernel_fc2_reduce: bool,             # Whether epilogue warps reduce fc2 output to peer
         token_back_by_dispatch: bool = False,   # Whether epilogue warps store fc2 to local or peer
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         fc1_output_sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
@@ -979,7 +988,10 @@ class SwapABSwigluFp4Epilogue:
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),                 # (fc1, fc2) done-counter publish batch
+        fc_tile_timeline: bool = False,                                     # per-tile timeline rows (diagnostic)
     ) -> None:
+        # Plain bool so cutlass.const_expr folds the timeline branches.
+        self.fc_tile_timeline_enabled = bool(fc_tile_timeline)
         if fc1_output_dtype is not cutlass.Float4E2M1FN:
             raise NotImplementedError(
                 "SwapABSwigluFp4Epilogue currently assumes fc1 output in "
@@ -1108,6 +1120,7 @@ class SwapABSwigluFp4Epilogue:
         tidx: cutlass.Int32,
         optional_epi_args: NvFp4OptinalEpiArgs = None,      # Epilogue optinal runtime arguments.
         token_comm_args=None,                               # Only valid when enable token communication
+        fc_tile_cta_id=None,                                # Per-tile timeline CTA id (fc_tile_timeline diagnostic)
     ):
         if cutlass.const_expr(optional_epi_args is None):
             optional_epi_args = NvFp4OptinalEpiArgs(
@@ -1138,13 +1151,32 @@ class SwapABSwigluFp4Epilogue:
         is_odd_turn = cutlass.Int32(1)
         work_tile_info = sched_consumer.consume_work()
 
-        flag_tracker = GpuReleaseFlagBatchTracker(
-            flag_addr=Int64(0),
-            cumulated_flags=cutlass.Int32(0),
-            phase=cutlass.Int32(work_tile_info.phase),
-            tid=tidx % (self._EpilogueWarpCnt * 32),
-        )
+        if cutlass.const_expr(
+            token_comm_args is not None
+            and token_comm_args.system_scope_done_flags
+        ):
+            # FC2 is ordinary STG on this path, so system-scope release is
+            # sufficient to publish it to an LSA peer; no async-proxy fence is
+            # needed.  Keep the common tail fire below: dropping a partial
+            # batch would leave Combine Stage 1 waiting forever.
+            flag_tracker = SysReleaseFlagBatchTracker(
+                flag_addr=Int64(0),
+                cumulated_flags=cutlass.Int32(0),
+                phase=cutlass.Int32(work_tile_info.phase),
+                tid=tidx % (self._EpilogueWarpCnt * 32),
+            )
+        else:
+            flag_tracker = GpuReleaseFlagBatchTracker(
+                flag_addr=Int64(0),
+                cumulated_flags=cutlass.Int32(0),
+                phase=cutlass.Int32(work_tile_info.phase),
+                tid=tidx % (self._EpilogueWarpCnt * 32),
+            )
 
+        if cutlass.const_expr(
+            self.fc_tile_timeline_enabled and fc_tile_cta_id is not None
+        ):
+            fctl_seq = cutlass.Int32(0)
         while work_tile_info.is_valid_tile:
             if cutlass.const_expr(self.overlapping_accum):
                 tmem_stage_idx = acc_consumer_state.phase
@@ -1186,6 +1218,17 @@ class SwapABSwigluFp4Epilogue:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             # _fence_rel_gpu()
             wait_only_named_barrier.arrive_and_wait()
+            if cutlass.const_expr(
+                self.fc_tile_timeline_enabled and fc_tile_cta_id is not None
+            ):
+                # Epilogue end of the tile snapshotted above: its stores are
+                # drained and all four epilogue warps passed the barrier.
+                if tidx == cutlass.Int32(0):
+                    if fctl_seq < cutlass.Int32(FC_TILE_TIMELINE_MAX_TILES):
+                        token_comm_args.fc_tile_timeline[
+                            fc_tile_cta_id, fctl_seq, 7
+                        ] = _fctl_read_globaltimer()
+                fctl_seq = fctl_seq + cutlass.Int32(1)
 
             # Publish completion for the work tile snapshotted above.
             if cur_was_linear1:
@@ -1218,12 +1261,12 @@ class _ImmutableAfterInit:
 # Device only object
 class SwapABFc1Epilogue(_ImmutableAfterInit):
     def __init__(
-        self, 
-        base: SwapABSwigluFp4Epilogue, 
-        tidx: cutlass.Int32, 
-        epi_smem_storage, 
-        sched_ext: MoESchedExtension, 
-        tma_atom_fc1_output: cute.CopyAtom, 
+        self,
+        base: SwapABSwigluFp4Epilogue,
+        tidx: cutlass.Int32,
+        epi_smem_storage,
+        sched_ext: MoESchedExtension,
+        tma_atom_fc1_output: cute.CopyAtom,
         fc1_output: cute.Tensor,            # fake (m,n,l) domain
         fc1_output_sf: cute.Tensor,         # fake (m,n,l) domain
         fc1_done_counter: cute.Tensor,      # 1D tensor
@@ -1286,14 +1329,14 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         )
         flag_addr = Int64(0)
         if in_bound:
-            flag_addr = (self.fc1_done_counter.iterator + slot).toint()            
+            flag_addr = (self.fc1_done_counter.iterator + slot).toint()
         return flag_tracker.accumulate(
             next_work_tile_info.phase, self.fc1_epi_flag_batch, flag_addr,
         )
 
     @cute.jit
     def __call__(
-        self, 
+        self,
         work_tile_info: MoEWorkTileInfo,
         tmem_acc_tensor: cute.Tensor,       # (cta_tile_m, cta_tile_n)
         acc_pipeline,
@@ -1419,7 +1462,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         norm_const: Optional[cutlass.Float32],
     ):
         if cutlass.const_expr(self.optional_epi_args.topk_scores is not None):
-            # This means we need to perform DeepGEMM computation graph, topk_score at fc1 pre-quant 
+            # This means we need to perform DeepGEMM computation graph, topk_score at fc1 pre-quant
             topk_score_tensor, _ = self.sched_ext.get_gmem_tensor(
                 "topk", self.optional_epi_args.topk_scores, work_tile_info,
             )      # (tokens_this_expert)
@@ -1513,7 +1556,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 ),
                 wrap_into_copy_standard_layout(up_token_32_64),
             )
-        
+
         # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
         token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
             gate_token_0_32,
@@ -1553,7 +1596,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # Step 2: Quant
         self.nvfp4_quant(
             work_tile_info=work_tile_info,
-            two_token=(token_0_32_pre_quant, token_32_64_pre_quant), 
+            two_token=(token_0_32_pre_quant, token_32_64_pre_quant),
             topk_scores=topk_scores,
             norm_const=norm_const,
             intermediate_output_size=cute.size(fc1_output, 1),
@@ -1836,7 +1879,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
     def nvfp4_quant(
         self,
         work_tile_info: MoEWorkTileInfo,
-        two_token: Tuple[cute.Tensor, cute.Tensor],     # two rmem tensor, each fp32 @ (token_1, intermediate_16) 
+        two_token: Tuple[cute.Tensor, cute.Tensor],     # two rmem tensor, each fp32 @ (token_1, intermediate_16)
         topk_scores: Optional[Tuple[cutlass.Float32, cutlass.Float32]],
         norm_const: Optional[cutlass.Float32],
         intermediate_output_size: cutlass.Int32,
@@ -1953,12 +1996,12 @@ class Fc2ProcessPipeline():
 # Device only object
 class SwapABFc2Epilogue(_ImmutableAfterInit):
     def __init__(
-        self, 
-        base: SwapABSwigluFp4Epilogue, 
-        tidx: cutlass.Int32, 
+        self,
+        base: SwapABSwigluFp4Epilogue,
+        tidx: cutlass.Int32,
         epi_smem_storage,
         fc2_output: cute.Tensor,        # MoE domain (token, topk, hidden)
-        token_comm_args: TokenCommArgs, 
+        token_comm_args: TokenCommArgs,
         optional_epi_args: NvFp4OptinalEpiArgs,
     ):
         self.base = base
@@ -2102,7 +2145,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
 
     @cute.jit
     def __call__(
-        self, 
+        self,
         work_tile_info: MoEWorkTileInfo,
         tmem_acc_tensor: cute.Tensor,
         acc_pipeline,
@@ -2358,7 +2401,7 @@ class Fc2OutputRouter:
                     # Int64 token coord: dst_tokens*K*H overflows int32 once
                     # T*K*H exceeds 2^31 (data_output is (token, topk, hidden)).
                     dst_ptrs[iter_idx] = self.data_output[Int64(dst_tokens), None, dst_hidden].iterator.toint()
-                    
+
                 else:
                     md = TokenSrcMetadata.load(
                         self.metadata.iterator.toint()
@@ -2609,7 +2652,7 @@ def make_fc2_ublk_store_out_contract(combine_format: CombineFormat, cta_token_ti
     return store_out_mapping, sf_store_out_mapping, fundamental_mapping
 
 # (...) -> ((atom_v, 1))
-@cute.jit 
+@cute.jit
 def wrap_into_copy_standard_layout(tensor: cute.Tensor):
     tensor = cute.coalesce(cute.flatten(tensor))
     tensor = cute.append_ones(tensor, cute.rank(tensor) + 1)
@@ -2639,7 +2682,7 @@ def fc2_f2fp(
             dst.store(t.load().to(reorder_dtype))
         else:
             if cutlass.const_expr(current_tensor_size % 2 != 0):
-                raise ValueError("fc2_f2fp expects even elements for each input tensor.") 
+                raise ValueError("fc2_f2fp expects even elements for each input tensor.")
             scaled = cute.make_rmem_tensor((current_tensor_size,), cutlass.Float32)
             for i in cutlass.range_constexpr(0, current_tensor_size, 2):
                 # scaled[i] = t[i] * alpha_val
@@ -2683,7 +2726,7 @@ def fc2_ublk_tmem_acc_load(*, tmem_subtile_tensor: cute.Tensor, epi, **_):
 
 @cute.jit
 def fc2_stg_post_f2fp_reorder(
-    *, 
+    *,
     casted: cute.Tensor,                # (subtile_cnt,)
     tmem_subtile_view: cute.Tensor,     # (epi_tile_m, epi_tile_n)
     **_
@@ -2769,10 +2812,10 @@ def fc2_redg_post_f2fp_reorder(
 
 @cute.jit
 def fc2_stg_store_function(
-    *, 
+    *,
     epi,
     subtile: cute.Tensor,       # Always bf16 pre quant tesnor
-    subtile_idx: cutlass.Int32, 
+    subtile_idx: cutlass.Int32,
     fc2_output_router: Fc2OutputRouter,
     **_
 ):

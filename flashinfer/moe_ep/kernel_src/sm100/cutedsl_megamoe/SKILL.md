@@ -69,6 +69,35 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
+The legacy NVFP4 GIN migration uses a targeted MR !100 import,
+not the full-drop procedure below. Follow its
+[design and validation record](../../../../../docs/design_docs/legacy_nvfp4_gin.md)
+and the pending-local-diffs record in VENDOR.md. `shim/gin.py` owns live NCCL initialization,
+registered arenas and lifecycle; the formal NVFP4 backend exposes an explicit
+default-off experimental internode path with a fixed allowlist. Keep Torch
+and NCCL imports lazy in that module and preserve all existing FI device
+patches. `src/src/nccl_gin_layout.py` is a byte-identical donor helper. Preserve
+the documented token-back generation-race correction until upstream absorbs
+it; numerical and performance acceptance status lives in the design document.
+`internode=False` is the default master gate: off eager/graph calls must not
+enter GIN preflight or session creation, and must ignore GIN-only topology.
+This subset port adds no non-GIN
+features. Do not reintroduce the explicit `f4cvt_use_manual` option or `_f4man`
+tag into this GIN-only subset; keep FI's existing FP4 environment control intact.
+GIN graphs require collective eager warmup with the same shape bucket before
+capture. Keep resources live and streams ordered; metadata/mode errors are
+agreed over CPU control during capture, while replay runs no host checks.
+Do not reintroduce GPU-to-host route reads into capture; each replay requires
+valid route IDs. Mixed eager/capture ranks must reject before device work.
+Reject initialization capture and unsupported explicit compile buckets through
+CPU agreement. Keep all post-session allocations, epilogue vectors and workspace
+construction inside `GinSession.workspace_construction`; publish only after
+all ranks succeed, coordinate cleanup on rejection, and escalate failed cleanup
+collectively. Do not add steady-state/replay collectives for these checks.
+Qualify host contracts with
+`python -m unittest discover -s tests/cpu/moe_ep -p test_legacy_nvfp4_gin_contracts.py -v`
+from the repository root; this does not qualify CUDA or NCCL execution.
+
 1. **Replace `src/`** with the drop's five kernel packages (the drop is a full
    repo; copy only these dirs):
    ```bash

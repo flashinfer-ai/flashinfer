@@ -128,6 +128,7 @@ class MegaKernelBackend(ABC):
     # existing backends retain the materializing output path.
     supports_output_view: bool = False
     supports_unfinalized_output: bool = False
+    requires_collective_forward_validation: bool = False
     supports_live_token_tuning: bool = False
     supports_auto_workspaces: bool = False
     _knob_cache_module: str
@@ -384,6 +385,17 @@ class MegaKernelBackend(ABC):
         quantize_input: bool,
     ) -> None:
         """Optional per-iteration validation before staging/compute."""
+
+    def validate_collective_forward(
+        self,
+        t: "MoEEpTensors",
+        fleet_params: "FleetParams",
+        *,
+        quantize_input: bool,
+        compile_tokens_per_rank: int | None,
+    ) -> None:
+        """Collective backends must agree on input and compile-bucket errors."""
+        raise NotImplementedError("Collective input validation is not implemented")
 
     def validate_capture_ready(  # noqa: B027 - intentional no-op default
         self,

@@ -389,6 +389,10 @@ def autotune_nvfp4_mega_moe(
         )
 
     cfg = symm_buffer._frontend.config
+    if cfg.internode:
+        symm_buffer._frontend._gin_agree(
+            "Internode GIN autotuning is not qualified.", "autotune"
+        )
     prepare_launch = None
     if cfg.use_custom_finalize:
         n = num_tokens if num_tokens is not None else cfg.num_tokens_per_rank

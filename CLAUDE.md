@@ -48,6 +48,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
 | Disable SM107 fused routing tail masking (enabled by default; use a separate fill) | `export FLASHINFER_SM107_FUSED_TAIL_MASK=0` |
 | Log MegaMoE compilation and workspace diagnostics | `export FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC=1` |
+| Print legacy NCCL GIN guard source-site tags before device traps (default off; read at JIT compilation; guards remain active when off) | `export FLASHINFER_GIN_GUARD_DIAGNOSTICS=1` |
 | Enable MoE EP EXPERT_MAJOR padding-row exclusion (opt-in; shape-dependent) | `export FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
