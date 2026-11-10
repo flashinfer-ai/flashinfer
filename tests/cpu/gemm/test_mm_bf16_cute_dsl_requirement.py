@@ -51,6 +51,6 @@ def test_low_m_rejects_k_not_divisible_by_128(sm100_with_cute_dsl, m, k):
 
 @pytest.mark.cpu_only
 def test_m_above_32_accepts_k_not_divisible_by_128(sm100_with_cute_dsl):
-    """K % 128 != 0 stays accepted for M > 32, which the low-M kernels do not serve."""
+    """Under backend="auto", K is not checked above M = 32."""
     a, b = _operands(33, 320)
-    assert _cute_dsl_mm_bf16_requirement(a, b)
+    assert _cute_dsl_mm_bf16_requirement(a, b, backend="auto")
