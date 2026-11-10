@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""Inputs for token-sparse attention, where each query token attends to its own
-list of keys. trtllm-gen's token-sparse kernels
+"""SDSA (Simplified DSA) inputs for token-sparse attention, where each query
+token attends to its own list of keys. trtllm-gen's token-sparse kernels
 (``trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K)``) read a K and a V
 slot list per token. Dense attention kernels that take a mask can instead attend
 over a group of tokens' union of keys, with a bitmask per token."""
@@ -12,10 +12,10 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
 
-from .api_logging import flashinfer_api
-from .cute_dsl.launch import launch
-from .topk_varlen.kernels import block_scan
-from .trace.templates.token_sparse import (
+from ..api_logging import flashinfer_api
+from ..cute_dsl.launch import launch
+from ..topk_varlen.kernels import block_scan
+from ..trace.templates.sdsa import (
     group_union_masks_trace,
     token_sparse_kv_indices_trace,
 )

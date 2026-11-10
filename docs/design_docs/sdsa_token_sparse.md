@@ -1,4 +1,4 @@
-# Token-sparse attention for MQA
+# SDSA (Simplified DSA) token-sparse attention for MQA
 
 In token-sparse attention, each query token attends only to its own list of
 keys, such as the 2048 keys that the DSA indexer selects for it. FlashInfer runs
@@ -16,8 +16,8 @@ it in two ways:
 | API | Purpose |
 | --- | --- |
 | `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K, uses_shared_paged_kv_idx=False)` | Each query token attends to the K and V rows in its own lists. |
-| `flashinfer.token_sparse.token_sparse_kv_indices(positions, requests, block_table, *, block_tables, seq_lens, requests_per_token)` | Make `block_tables` and `seq_lens` from the key positions of each token, in one launch. |
-| `flashinfer.token_sparse.group_union_masks(positions, query_rows, group_unions, requests, block_table, *, union, union_sizes, mask, num_keys)` | Make the union of keys of each group of tokens, and the mask of each token over that union, in one launch. |
+| `flashinfer.sdsa.token_sparse.token_sparse_kv_indices(positions, requests, block_table, *, block_tables, seq_lens, requests_per_token)` | Make `block_tables` and `seq_lens` from the key positions of each token, in one launch. |
+| `flashinfer.sdsa.token_sparse.group_union_masks(positions, query_rows, group_unions, requests, block_table, *, union, union_sizes, mask, num_keys)` | Make the union of keys of each group of tokens, and the mask of each token over that union, in one launch. |
 
 ## Layout
 
@@ -171,7 +171,7 @@ and every replay.
 
   It also checks that the call rejects several KV heads, a sliding window,
   attention sinks and head dim 512.
-- `tests/attention/test_token_sparse.py` compares both helpers with PyTorch
+- `tests/sdsa/test_token_sparse.py` compares both helpers with PyTorch
   references, without tolerance, eagerly and in a CUDA graph replay:
   - `token_sparse_kv_indices`: `K` 512 and 2048, and 1 to 77 tokens with 1 to 4
     requests per token. Rows after the output stay as they are.

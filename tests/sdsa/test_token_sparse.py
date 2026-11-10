@@ -1,12 +1,12 @@
-"""Token-sparse attention inputs from key positions: token_sparse_kv_indices's K/V
-index lists, group_union_masks's unions and masks."""
+"""SDSA (Simplified DSA) token-sparse attention inputs from key positions:
+token_sparse_kv_indices's K/V index lists, group_union_masks's unions and masks."""
 
 from functools import partial
 
 import pytest
 import torch
 
-from flashinfer.token_sparse import group_union_masks, token_sparse_kv_indices
+from flashinfer.sdsa.token_sparse import group_union_masks, token_sparse_kv_indices
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,

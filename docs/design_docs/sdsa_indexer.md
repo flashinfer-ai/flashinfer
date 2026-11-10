@@ -19,7 +19,7 @@ module has five parts:
 
 For decode, a Top-K kernel takes the Top-K from the scores. The Top-K keys feed
 token-sparse attention
-([token_sparse_attention.md](token_sparse_attention.md)).
+([sdsa_token_sparse.md](sdsa_token_sparse.md)).
 
 ## Public API
 
