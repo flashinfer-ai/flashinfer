@@ -3306,8 +3306,7 @@ def run_mtp_decode(
         raise ValueError(
             "verify_parents is only supported by the tcgen05 ReplaySSM verify "
             "(SM100/SM103, cache_replayssm with a contiguous fp32 pool, int32 "
-            "indices and BF16 output, 4 <= T <= 16, B <= 256, K = V = 128, even HV "
-            "and HV // H, use_qk_l2norm); this call does not qualify"
+            "indices and BF16 output, 4 <= T <= 16, B <= 256, K = V = 128, use_qk_l2norm); this call does not qualify"
         )
 
     # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.

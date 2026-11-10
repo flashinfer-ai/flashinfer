@@ -514,10 +514,24 @@ def commit_gdn_replayssm_u_all_layers(
     ``[layers, slots, HV, T]`` FP32.  Index and accept-length semantics match
     :func:`commit_gdn_replayssm_fold_all_layers`.  Validation is done by the
     caller.
+
+    ``warps_per_cta`` and ``tiles_per_warp`` are occupancy knobs; their product
+    with ``_ROWS_PER_TILE`` is the number of value rows one CTA owns and must
+    divide the 128 rows of a head, since the grid is sized by integer division.
     """
     num_layers, num_slots, HV, V, K = checkpoint_state.shape
     T = u_cache.shape[3]
     H = rawk_cache.shape[2]
+    # A CTA covers rows_per_cta of the 128 value rows and the grid holds
+    # _V // rows_per_cta of them, so a product that does not divide _V would
+    # drop the tail rows (or, above _V, launch an empty grid) and leave stale
+    # checkpoint values behind without any error.
+    rows_per_cta = warps_per_cta * tiles_per_warp * _ROWS_PER_TILE
+    if _V % rows_per_cta:
+        raise ValueError(
+            f"warps_per_cta * tiles_per_warp * {_ROWS_PER_TILE} = {rows_per_cta} "
+            f"must divide the {_V} value rows of a head"
+        )
     target = gdn_device_target(checkpoint_state.device)
     has_track = track_state_indices is not None
     if has_track:

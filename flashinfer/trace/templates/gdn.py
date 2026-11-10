@@ -1339,14 +1339,14 @@ gdn_fused_decode_trace = TraceTemplate(
 @torch.no_grad()
 def _gdn_replayssm_commit_reference(
     checkpoint_state,
-    rawv_cache,
     rawk_cache,
     g_cache,
-    beta_cache,
     state_indices,
     accept_lens,
     accept_paths=None,
     *,
+    rawv_cache=None,
+    beta_cache=None,
     track_state_indices=None,
     track_steps=None,
     use_qk_l2norm=True,
@@ -1356,8 +1356,16 @@ def _gdn_replayssm_commit_reference(
 ):
     """Direct recurrence over accepted tokens; mutates the checkpoint pool.
 
-    With ``u_cache`` the cached corrections replace the raw V/beta prediction.
+    With ``u_cache`` the cached corrections replace the raw V/beta prediction,
+    and ``rawv_cache``/``beta_cache`` are absent.  Every optional input keeps a
+    ``None`` default so that a caller binding the template's inputs by name --
+    Trace Apply drops the absent ones rather than passing ``None`` -- can invoke
+    this reference as a solution for either window kind.
     """
+    if u_cache is None and (rawv_cache is None or beta_cache is None):
+        raise ValueError(
+            "a raw window needs both rawv_cache and beta_cache, a u window u_cache"
+        )
     hv, h = g_cache.shape[2], rawk_cache.shape[2]
     steps = g_cache.shape[3]
     for row, slot in enumerate(state_indices.tolist()):

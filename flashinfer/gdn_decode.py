@@ -1920,6 +1920,20 @@ def gated_delta_rule_replayssm_prefer_u(
     SM100/SM103 only, where the raw commit is compute bound and u mode is
     faster for every batch size and head count measured with windows of 3 to
     32 tokens.
+
+    Parameters
+    ----------
+    max_cache_len : int
+        Length of the ReplaySSM window the caller will allocate, in tokens.
+        Only windows of 3 to ``MAX_WINDOW`` tokens can be committed from ``u``.
+    device : torch.device
+        Device the verify and commit kernels will run on; its compute
+        capability decides whether the u commit kernel exists.
+
+    Returns
+    -------
+    bool
+        True when verify should write ``u`` and commit should read ``u_cache``.
     """
     from .gdn_kernels.gdn_replayssm_u_commit import MAX_WINDOW
 
