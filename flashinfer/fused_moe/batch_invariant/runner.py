@@ -99,7 +99,7 @@ def routing_term(routing: Any, cls: str) -> Tuple[Optional[Any], bool]:
     with DeepSeekV3's expert groups attached (``with_groups``: the group-limited selection is a term of that method, its shape
     rule here) and the Llama4 top-1 rule; the flag: expert groups given with another method (no meaning in this module; the
     logits mode refuses them at the call). ``cls``: the class name of the errors. Every class runner derives its term here."""
-    from .spec import MAX_GROUPS, METHOD_OF_FLASHINFER
+    from .spec import METHOD_OF_FLASHINFER, group_shape_error
 
     if routing.method not in METHOD_OF_FLASHINFER:
         # the pre-routed modes never consult the method; the logits mode does (pack_inputs raises there too)
@@ -116,17 +116,12 @@ def routing_term(routing: Any, cls: str) -> Tuple[Optional[Any], bool]:
                 int(routing.topk_group or 0),
             )
             E = routing.num_experts
-            if not (
-                1 <= topk_group <= n_group <= MAX_GROUPS
-                and E % n_group == 0
-                and E // n_group >= 2
-                and routing.top_k <= topk_group * (E // n_group)
-            ):
+            rule = group_shape_error(E, routing.top_k, n_group, topk_group)
+            if rule is not None:
                 raise unsupported(
                     cls,
                     f"n_group {n_group}, topk_group {topk_group} over {E} experts for top_k {routing.top_k}",
-                    f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at "
-                    "least two experts, top_k <= topk_group * (num_experts / n_group)",
+                    rule,
                 )
             method = method.with_groups(n_group, topk_group)
         elif grouped:
@@ -243,9 +238,13 @@ class BatchInvariantMoeRunner(MoERunner):
             raise unsupported(
                 CLASS, f"top_k {routing.top_k}", "1 <= top_k <= min(num_experts, 16)"
             )
-        if not 1 <= routing.num_experts <= 1024:
+        from .blocks.scheduler import MAX_E
+
+        if not 1 <= routing.num_experts <= MAX_E:
             raise unsupported(
-                CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
+                CLASS,
+                f"num_experts {routing.num_experts}",
+                f"1 <= num_experts <= {MAX_E}",
             )
         self._method, self._grouped_other = routing_term(routing, CLASS)
 

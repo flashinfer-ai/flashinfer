@@ -186,6 +186,26 @@ DEEPSEEK_V3_GROUPED = SIGMOID_BIAS_RENORM_SCALED.with_groups(
 MAX_GROUPS = 16
 
 
+def group_shape_error(
+    E: int, top_k: int, n_group: int, topk_group: int
+) -> Optional[str]:
+    """The shape rule of a group-limited selection (``n_group`` groups, ``topk_group`` of them kept) over ``E`` experts
+    for ``top_k`` slots: ``None`` when it holds, else the rule as text (the runner, the fingerprint and the routing entry
+    points raise with it). The kernels hold at most ``MAX_GROUPS`` group scores, a group's score is the sum of its two
+    largest scores (so a group holds at least two experts), and the kept groups hold at least ``top_k`` experts."""
+    if (
+        1 <= topk_group <= n_group <= MAX_GROUPS
+        and E % n_group == 0
+        and E // n_group >= 2
+        and top_k <= topk_group * (E // n_group)
+    ):
+        return None
+    return (
+        f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at least two "
+        "experts, top_k <= topk_group * (num_experts / n_group)"
+    )
+
+
 class _Methods(dict):
     """The named methods; a grouped name ``<method>_g<n>x<t>`` not in the table resolves to the named method with the
     group-limited stage (``RoutingMethod.with_groups``), so every grouped configuration has a name (the kernels' key)."""

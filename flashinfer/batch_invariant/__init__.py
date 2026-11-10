@@ -180,11 +180,18 @@ def _moe_bf16_fingerprint(
             f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
         )
     if (n_group or 0) > 1 or (topk_group or 0) > 1:
-        if rm is not spec.SIGMOID_BIAS_RENORM_SCALED:
+        if rm != spec.SIGMOID_BIAS_RENORM_SCALED:
             raise ValueError(
                 "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
             )
-        rm = rm.with_groups(int(n_group or 0), int(topk_group or 0))
+        n_group, topk_group = int(n_group or 0), int(topk_group or 0)
+        # the runner's shape rule, as a ValueError here: a receipt names a class some layer can build
+        rule = spec.group_shape_error(num_experts, top_k, n_group, topk_group)
+        if rule is not None:
+            raise ValueError(
+                f"n_group {n_group}, topk_group {topk_group} over {num_experts} experts for top_k {top_k}: {rule}"
+            )
+        rm = rm.with_groups(n_group, topk_group)
     if not isinstance(act, str):
         a = spec.activation_of(act)
         name, params, gated = a.act, a.params, a.gated
