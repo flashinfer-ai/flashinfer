@@ -11,7 +11,7 @@ through FlashInfer.  The package registries (``cake_jit.py`` / ``jit.py`` /
 
 The manifest's ``package`` field is the dotted import path of the package
 directory (``flashinfer.experimental.cake_mok_bf16``,
-``flashinfer.experimental.cake.cake_rmsnorm_det_train``): the one spelling every exporter
+``flashinfer.cake_gdp_backend``): the one spelling every exporter
 writes and this checker compares (``Package.name``); a directory path is not
 accepted.  ``name`` is the unique key of ``libraries``; ``closure_sha256`` is
 not unique (two entries of one program and architecture, for example two tile
@@ -42,8 +42,7 @@ In-tree checks (``--in-tree``, the default):
 * the ``cake_build.py`` files of all checked packages are byte-identical;
 * ``common.requires.tvm_ffi.python`` equals line 1 of ``requirements.txt``;
 * every package a package requires (``Package.requires``: a package it imports
-  as its sibling, as the non-deterministic ``cake_dense_gemm_nondet_train`` imports
-  the deterministic ``cake_dense_gemm_det_train``) is a row of this table with the
+  as its sibling) is a row of this table with the
   same parent package;
 * ``common.requires.packages`` of ``build.json`` lists the directory names of
   the packages it requires (``Package.requires``), sorted and without
@@ -238,12 +237,6 @@ def module_literals(path: Path) -> dict[str, Any]:
     return values
 
 
-def _tag(specializations: dict[str, Any]) -> str:
-    return "".join(
-        f"_{key.lower()}{value}" for key, value in sorted(specializations.items())
-    )
-
-
 def generic_library_refs(value: Any, arches: tuple[str, ...] = ()) -> set[str]:
     """Every ``<library>_<arch>`` a literal tree references: a mapping carrying ``library`` names one build
     per architecture of the nearest enclosing ``arches`` list (or ``arch`` string)."""
@@ -271,54 +264,6 @@ def refs_generic(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader))
 
 
-def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
-    """Compact rows ``[unit, arg_plan, launch, grid_x, grid_y, grid_z]`` per stage of a per-architecture record;
-    the stage's library stem is ``cake_lm_head_det_loss_<unit>``."""
-    registry = module_literals(package_dir / loader)["_REGISTRY"]
-    return {
-        f"cake_lm_head_det_loss_{row[0]}_{compact['arch']}"
-        for compact in registry.values()
-        for row in compact["stages"].values()
-    }
-
-
-def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
-    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_nondet_train``: the registry shape of
-    :func:`refs_lm_head_det_loss`; the stage's library stem is ``cake_lm_head_loss_<unit>``."""
-    registry = module_literals(package_dir / loader)["_REGISTRY"]
-    return {
-        f"cake_lm_head_loss_{row[0]}_{compact['arch']}"
-        for compact in registry.values()
-        for row in compact["stages"].values()
-    }
-
-
-def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
-    """Route stages bind a program and its compile-line specializations; the build is
-    ``<library><tag>_<arch>`` for every architecture the route and the program share."""
-    literals = module_literals(package_dir / loader)
-    programs, routes = literals["PROGRAMS"], literals["ROUTES"]
-    refs: set[str] = set()
-    used: set[str] = set()
-    for route in routes.values():
-        for stage in route["stages"]:
-            program = programs[stage["program"]]
-            used.add(stage["program"])
-            tag = _tag(stage.get("specializations") or {})
-            for arch in route["arches"]:
-                if arch in program["arches"]:
-                    refs.add(f"{program['library']}{tag}_{arch}")
-    unused = set(programs) - used
-    if unused:
-        raise ValueError(f"PROGRAMS not referenced by any route: {sorted(unused)}")
-    return refs
-
-
-# The non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train`` has the same registry shape
-# (``PROGRAMS`` + ``ROUTES`` with per-stage specializations).
-refs_moe_grouped_gemm = refs_moe_grouped_det_gemm
-
-
 def refs_stepfun(package_dir: Path, loader: str) -> set[str]:
     """Compact rows keyed by the 20-hex program digest (``_PROGRAMS``; the library stem is
     ``_PREFIX + digest``), every program built for every architecture of ``ARCHES``."""
@@ -335,14 +280,6 @@ def refs_shipped_modules(package_dir: Path, loader: str) -> set[str]:
     """A registry whose ``MODULES`` literal holds the shipped records and whose other tables (``TEST_MODULES``)
     hold programs of a side manifest ``build.json`` never lists: the generic walk over ``MODULES`` alone."""
     return generic_library_refs(module_literals(package_dir / loader)["MODULES"])
-
-
-def refs_with_kcp(package_dir: Path, loader: str) -> set[str]:
-    """A package whose ``build.json`` also lists the programs of its context-parallel registry ``kcp_jit.py``: the
-    generic walk over ``loader`` and the ``MODULES`` records of ``kcp_jit.py``."""
-    return refs_generic(package_dir, loader) | refs_shipped_modules(
-        package_dir, "kcp_jit.py"
-    )
 
 
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
@@ -366,56 +303,14 @@ class Package:
     requires: tuple[str, ...] = ()
 
 
-# dsa_train, cake.cake_kda_det_train (and cake.cake_kda_nondet_train), dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
+# The ulysses, the NVFP4 SVDQuant GEMM, the Sage
 # block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention (and its per-tile-max
 # variant cake_nvfp4_ptilemax_attention), the SM90 VSA,
 # the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm), the experimental batched FP8 projection (deepgemm_batched_gemm) and the experimental Mega Gate (deepgemm_mega_gate) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
-# ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
-# (dsa_indexer PROGRAMS, rmsnorm, mhc, causal conv1d, ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
-# nvfp4_attention, cake_nvfp4_ptilemax_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+# ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and ``library``
+# (ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
+# nvfp4_attention, cake_nvfp4_ptilemax_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES).
 PACKAGES: tuple[Package, ...] = (
-    Package(
-        "flashinfer.experimental.cake.cake_rmsnorm_det_train",
-        "flashinfer/experimental/cake/cake_rmsnorm_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_rmsnorm_nondet_train",
-        "flashinfer/experimental/cake/cake_rmsnorm_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_causal_conv1d_det_train",
-        "flashinfer/experimental/cake/cake_causal_conv1d_det_train",
-        "cake_jit.py",
-        refs_with_kcp,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_causal_conv1d_nondet_train",
-        "flashinfer/experimental/cake/cake_causal_conv1d_nondet_train",
-        "cake_jit.py",
-        refs_with_kcp,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train",
-        "flashinfer/experimental/cake/cake_gated_act_mxfp8_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train",
-        "flashinfer/experimental/cake/cake_rmsnorm_silu_gate_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train",
-        "flashinfer/experimental/cake/cake_rmsnorm_silu_gate_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
     Package(
         "flashinfer.cake_ulysses_backend",
         "flashinfer/cake_ulysses_backend",
@@ -441,142 +336,16 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_mhc_det_train",
-        "flashinfer/experimental/cake/cake_mhc_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_mhc_head_det_train",
-        "flashinfer/experimental/cake/cake_mhc_head_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_mhc_head_nondet_train",
-        "flashinfer/experimental/cake/cake_mhc_head_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_mhc_nondet_train",
-        "flashinfer/experimental/cake/cake_mhc_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train",
-        "flashinfer/experimental/cake/cake_dsa_sparse_attention_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_dsa_sparse_attention_det_train",
-        "flashinfer/experimental/cake/cake_dsa_sparse_attention_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_dsa_indexer_det_train",
-        "flashinfer/experimental/cake/cake_dsa_indexer_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_dsa_indexer_nondet_train",
-        "flashinfer/experimental/cake/cake_dsa_indexer_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
         "flashinfer.experimental.cake_msa_icp_indexer",
         "flashinfer/experimental/cake_msa_icp_indexer",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake.cake_kda_det_train",
-        "flashinfer/experimental/cake/cake_kda_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_kda_nondet_train",
-        "flashinfer/experimental/cake/cake_kda_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_kda_det_train_kcp",
-        "flashinfer/experimental/cake/cake_kda_det_train_kcp",
-        "cake_kcp_jit.py",
-        refs_shipped_modules,
-        # each rank runs the deterministic single-rank package's chunk stages (its ``_single_rank``)
-        requires=("flashinfer.experimental.cake.cake_kda_det_train",),
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_kda_nondet_train_kcp",
-        "flashinfer/experimental/cake/cake_kda_nondet_train_kcp",
-        "cake_kcp_jit.py",
-        refs_shipped_modules,
-        # each rank runs the non-deterministic single-rank package's chunk stages (its ``_single_rank``)
-        requires=("flashinfer.experimental.cake.cake_kda_nondet_train",),
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_gdn_det_train_kcp",
-        "flashinfer/experimental/cake/cake_gdn_det_train_kcp",
-        "cake_jit.py",
-        refs_shipped_modules,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp",
-        "flashinfer/experimental/cake/cake_gdn_nondet_train_kcp",
-        "cake_jit.py",
-        refs_shipped_modules,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_moe_grouped_gemm_det_train",
-        "flashinfer/experimental/cake/cake_moe_grouped_gemm_det_train",
-        "cake_jit.py",
-        refs_moe_grouped_det_gemm,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_moe_grouped_gemm_nondet_train",
-        "flashinfer/experimental/cake/cake_moe_grouped_gemm_nondet_train",
-        "cake_jit.py",
-        refs_moe_grouped_gemm,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_lm_head_det_train",
-        "flashinfer/experimental/cake/cake_lm_head_det_train",
-        "cake_jit.py",
-        refs_lm_head_det_loss,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_lm_head_nondet_train",
-        "flashinfer/experimental/cake/cake_lm_head_nondet_train",
-        "cake_jit.py",
-        refs_lm_head_loss,
-    ),
-    Package(
         "flashinfer.experimental.cake_mok_bf16",
         "flashinfer/experimental/cake_mok_bf16",
         "sources.json",
         refs_mok_bf16,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_dense_gemm_det_train",
-        "flashinfer/experimental/cake/cake_dense_gemm_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_dense_gemm_nondet_train",
-        "flashinfer/experimental/cake/cake_dense_gemm_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-        # its fixed-order rows run the deterministic package's programs
-        requires=("flashinfer.experimental.cake.cake_dense_gemm_det_train",),
     ),
     Package(
         "flashinfer.experimental.cake_stepfun_moe",
@@ -641,30 +410,6 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.sm110_xqa",
         "flashinfer/experimental/sm110_xqa",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_gdn_det_train",
-        "flashinfer/experimental/cake/cake_gdn_det_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_gdn_nondet_train",
-        "flashinfer/experimental/cake/cake_gdn_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_gqa_nondet_train",
-        "flashinfer/experimental/cake/cake_gqa_nondet_train",
-        "cake_jit.py",
-        refs_generic,
-    ),
-    Package(
-        "flashinfer.experimental.cake.cake_gqa_det_train",
-        "flashinfer/experimental/cake/cake_gqa_det_train",
         "cake_jit.py",
         refs_generic,
     ),

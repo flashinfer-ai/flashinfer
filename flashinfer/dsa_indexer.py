@@ -22,15 +22,12 @@ from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry point of the SM120 serving form; validation of the
 # backend contract, launch binding and JIT registration live in
-# flashinfer.experimental.sm120_dsa_indexer (backend="sm120").  The
-# deterministic Cake training form (SM100 / SM103 / SM107) is
-# flashinfer.cake_dsa_indexer_det_train (flashinfer-ai/flashinfer#8928).
+# flashinfer.experimental.sm120_dsa_indexer (backend="sm120").
 
 _FEATURE = "DSA indexer top-k selection (sm120: FP8 / MXFP4 32/64x128 on SM120)"
 
-_CAKE_MOVED = (
-    "the deterministic Cake DSA indexer (BF16 / FP8 on SM100 / SM103 / SM107) is "
-    "flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk; "
+_CAKE_REMOVED = (
+    "the Cake DSA indexer training form was removed from FlashInfer; "
     "flashinfer.dsa_indexer.dsa_indexer_det_topk takes backend='sm120' only"
 )
 
@@ -64,10 +61,8 @@ def dsa_indexer_det_topk(
     Attention indexer), the experimental FP8 / MXFP4 serving form on SM120:
     ``backend="sm120"``, the only backend.
 
-    The deterministic Cake training form (BF16 / FP8 on SM100 / SM103 / SM107)
-    is :func:`flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk`
-    (flashinfer-ai/flashinfer#8928); ``backend="cake"`` raises a ``ValueError``
-    that names it.
+    The Cake training form was removed from FlashInfer;
+    ``backend="cake"`` raises a ``ValueError``.
 
     Every row selects the exact global top ``min(top_k, visible)`` keys of its
     visible prefix, ranked by score descending then key id descending
@@ -187,7 +182,7 @@ def dsa_indexer_det_topk(
     and the kernels never hang.
     """
     if backend == "cake":
-        raise ValueError(_CAKE_MOVED)
+        raise ValueError(_CAKE_REMOVED)
     if backend != "sm120":
         raise ValueError(
             f"DSA indexer top-k supports backend='sm120' only, got {backend!r}"
