@@ -1145,7 +1145,9 @@ class CpAsyncWarpSplitKKernel:
                     ].to(output.element_type)
             if const_expr(self.peer_store is not None):
                 peer_store = bind_peer_store_args(self.peer_store, peer_args)
-                # Ordered after the B loader's grid-dependency wait by the mainloop barriers.
+                # Ordered after the prerequisite grids by the griddepcontrol_wait above
+                # (under PDL), not by the mainloop barriers: those carry the B loaders'
+                # wait to this warp only through asynchronous mbarrier arrives.
                 parity = load_peer_epoch_parity(peer_store)
                 m = cute.size(activation, mode=[0])
                 n = cute.size(weight, mode=[0])
