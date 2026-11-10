@@ -328,13 +328,14 @@ def cake_causal_conv1d_det_train_backward(
 
     Returns
     -------
-    ``(dx, dweight)``, with a third element ``dbias`` only when ``bias`` is
-    given: BF16 ``dx`` of ``x``'s shape, ``dx[t, c] = bf16(sum_k weight[c, k] *
-    dpre[t + 3 - k, c])`` over the tokens of the same document, the ``[C, 4]``
-    ``dweight[c, k] = sum_t dpre[t, c] * x[t - 3 + k, c]`` and the ``[C]``
-    ``dbias[c] = sum_t dpre[t, c]``, each reduced in a fixed order, so they are
-    bitwise reproducible for a given ``(S, C, device)`` and route.  ``S == 0``
-    returns the empty ``dx`` and zero gradients without launching.
+    tuple of torch.Tensor
+        ``(dx, dweight)``, with a third element ``dbias`` only when ``bias`` is
+        given: BF16 ``dx`` of ``x``'s shape, ``dx[t, c] = bf16(sum_k weight[c, k] *
+        dpre[t + 3 - k, c])`` over the tokens of the same document, the ``[C, 4]``
+        ``dweight[c, k] = sum_t dpre[t, c] * x[t - 3 + k, c]`` and the ``[C]``
+        ``dbias[c] = sum_t dpre[t, c]``, each reduced in a fixed order, so they are
+        bitwise reproducible for a given ``(S, C, device)`` and route.  ``S == 0``
+        returns the empty ``dx`` and zero gradients without launching.
     """
 
     return _backend().cake_causal_conv1d_det_train_backward(
