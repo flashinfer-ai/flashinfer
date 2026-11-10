@@ -41,6 +41,29 @@ def kernel_name(cfg: Knobs, chain: Fp8Chain) -> str:
     )
 
 
+def scale_fakes(chain: Fp8Chain, sym_e, sym_n):
+    """The scale operands' fakes ``(alpha, sa, si)``: W8A8 -- the per-expert weight scales ``(E,)``, the A scale ``(1,)``, the intermediate
+    multiplier ``(1,)``; the per-token class -- the per-channel weight scales ``(E, N)``, the per-row A scales ``(R,)``, ``si`` unread."""
+    if chain.pertoken:
+        alpha_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (sym_e, sym_n), (cute.sym_int64(), 1), assumed_align=4
+        )
+        sa_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
+    else:
+        alpha_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (sym_e,), (1,), assumed_align=4
+        )
+        sa_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (1,), (1,), assumed_align=4
+        )
+    si_fake = cute.runtime.make_fake_tensor(
+        cutlass.Float32, (1,), (1,), assumed_align=4
+    )
+    return alpha_fake, sa_fake, si_fake
+
+
 def can_implement_grouped_fp8(
     knobs: Knobs, N: int, K: int, E: int, chain: Fp8Chain = GEMM2_CHAIN
 ) -> bool:
@@ -102,15 +125,7 @@ def compile_grouped_fp8_fn(cfg: Knobs, chain: Fp8Chain) -> Callable[[], Any]:
             assumed_align=16,
         )
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
-        alpha_fake = cute.runtime.make_fake_tensor(
-            cutlass.Float32, (sym_e,), (1,), assumed_align=4
-        )
-        sa_fake = cute.runtime.make_fake_tensor(
-            cutlass.Float32, (1,), (1,), assumed_align=4
-        )
-        si_fake = cute.runtime.make_fake_tensor(
-            cutlass.Float32, (1,), (1,), assumed_align=4
-        )
+        alpha_fake, sa_fake, si_fake = scale_fakes(chain, sym_e, sym_n)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         return cute.compile(
@@ -216,15 +231,7 @@ def compile_swapped_fp8_fn(cfg: Knobs, chain: Fp8Chain) -> Callable[[], Any]:
             assumed_align=16,
         )
         c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
-        alpha_fake = cute.runtime.make_fake_tensor(
-            cutlass.Float32, (sym_e,), (1,), assumed_align=4
-        )
-        sa_fake = cute.runtime.make_fake_tensor(
-            cutlass.Float32, (1,), (1,), assumed_align=4
-        )
-        si_fake = cute.runtime.make_fake_tensor(
-            cutlass.Float32, (1,), (1,), assumed_align=4
-        )
+        alpha_fake, sa_fake, si_fake = scale_fakes(chain, sym_e, sym_n)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         return cute.compile(

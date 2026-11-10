@@ -16,15 +16,12 @@ from typing import List, Optional, Tuple
 from ...gemm.batch_invariant.generator import Knobs
 from .blocks.fp8_epilogue import GEMM2_CHAIN, Fp8Chain
 from .schedule import (
+    record_cost,
     TOP_K,
     active_experts,
-    exposed_epilogue_cycles,
     grouped_knobs,
-    pair_term,
     raster_for,
     rows_per_expert,
-    tiles_term,
-    zero_fill_cycles,
 )
 
 IN_FMT = "e4m3"
@@ -86,6 +83,31 @@ def chain_nodes_fp8(chain: Fp8Chain) -> int:
 
     alg = term.TermAlgebra()
     alpha, inv = alg.sym("alpha"), alg.sym("inv")
+    if chain.pertoken:
+        # the per-token class: the gated chain under the two (row x channel) scales, the ungated chain under one, GEMM2's scaled conversion
+        sg, su = alg.sym("sg"), alg.sym("su")
+        if chain.pair:
+            t = M8.glu_scaled2_elem(
+                alg,
+                alg.leaf("g", 0, 0),
+                alg.leaf("u", 0, 0),
+                sg,
+                su,
+                chain.act,
+                chain.out_fmt,
+                chain.params,
+            )
+        elif chain.kind == "act":
+            t = M8.act_scaled_elem(
+                alg, alg.leaf("x", 0), su, chain.act, chain.out_fmt, chain.params
+            )
+        else:
+            t = M8.scaled_out_elem(alg, alg.leaf("x", 0), su, chain.out_fmt)
+        return (
+            term.node_count(t)
+            if hasattr(term, "node_count")
+            else len(term.sexpr(t).split("("))
+        )
     if chain.pair:
         t = M8.glu_quant_e4m3_elem(
             alg,
@@ -132,11 +154,10 @@ def rank_grouped_fp8(
     Numerics-neutral: every record of either space computes the class."""
     import dataclasses
 
-    from ...gemm.batch_invariant.heuristic import decode_sane, estimate_cycles
+    from ...gemm.batch_invariant.heuristic import decode_sane
     from .blocks.fp8_compile import can_implement_grouped_fp8, can_implement_swapped_fp8
 
     fam = family or "sm_107"
-    dense_n = (n_active or E) * N
     dense = (
         []
         if swap is True
@@ -156,27 +177,20 @@ def rank_grouped_fp8(
     space = dense + swapped
     guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
     nodes = chain_nodes_fp8(chain)
-    out_bytes = 1 if chain.out_fmt == "e4m3" else 2
 
     def key(i, c):
-        canon = dataclasses.replace(c, raster_along="m")
-        est = estimate_cycles(
-            canon,
+        est = record_cost(
+            c,
             rows,
-            dense_n,
+            n_active or E,
+            N,
             K,
-            1,
-            "k",
-            IN_FMT,
+            nodes,
+            chain.pair,
             fam,
             sm_count,
-            out_bytes=out_bytes,
-            nominal=nominal,
-        )
-        est = (
-            est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes)
-            + zero_fill_cycles(c, rows, K, fam, IN_FMT)
+            IN_FMT,
+            nominal,
         )
         return (
             float(f"{est:.3g}"),

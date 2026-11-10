@@ -243,6 +243,59 @@ def _moe_fp8_fingerprint(
     return spec_fingerprint_fp8(H, I, top_k, num_experts, rm, name, params, gated)
 
 
+def _moe_fp8_pertoken_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+) -> str:
+    """The per-token fp8 MoE classes behind ``MoELayer`` with ``BatchInvariantFp8PerTokenConfig``: the dimensions of
+    :func:`_moe_fp8_fingerprint`; the per-token and per-channel scales are inputs, their terms (the row amax, the multiplier,
+    the (row x channel) epilogue scale) are the class's."""
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.spec_fp8 import (
+        spec_fingerprint_fp8_pertoken,
+    )
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    if isinstance(method, str) and method in RoutingMethodType.__members__:
+        method = RoutingMethodType[method]
+    if isinstance(method, RoutingMethodType):
+        if method not in spec.METHOD_OF_FLASHINFER:
+            raise ValueError(
+                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+            )
+        rm = spec.METHOD_OF_FLASHINFER[method]
+    elif isinstance(method, str):
+        rm = spec.METHODS[method]
+    elif isinstance(method, spec.RoutingMethod):
+        rm = method
+    else:
+        raise TypeError(
+            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
+        )
+    if not isinstance(act, str):
+        a = spec.activation_of(act)
+        name, params, gated = a.act, a.params, a.gated
+    elif act == "swiglu":
+        name, gated = "silu", True
+    elif act == "relu2":
+        name, gated = "relu2", False
+    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
+        name = act
+        if gated is None:
+            gated = act in spec.ACTS
+    else:
+        raise ValueError(f"no MoE chain named {act!r}")
+    return spec_fingerprint_fp8_pertoken(
+        H, I, top_k, num_experts, rm, name, params, gated
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
@@ -291,6 +344,14 @@ CLASSES: Dict[str, ClassInfo] = {
         "moe.e4m3",
         ("H", "I", "top_k", "num_experts"),
         _moe_fp8_fingerprint,
+        ("method", "act", "params", "gated"),
+    ),
+    # the unified MoE layer with `BatchInvariantFp8PerTokenConfig`: the same dimensions; the per-token and per-channel scales are
+    # inputs of the class (its quantization terms are part of the identifier, their values are not)
+    "fused_moe_fp8_pertoken": ClassInfo(
+        "moe.e4m3.pertoken",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_fp8_pertoken_fingerprint,
         ("method", "act", "params", "gated"),
     ),
 }

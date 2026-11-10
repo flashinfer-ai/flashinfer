@@ -33,6 +33,7 @@ class ExactF32:
     sqrt = staticmethod(fp32.sqrt)
     fabs = staticmethod(fp32.fabs)
     fmaxc = staticmethod(fp32.fmaxc)
+    nzor = staticmethod(fp32.nzor)
     frexpm = staticmethod(frexpm_f32)
     frexpe = staticmethod(frexpe_f32)
     neg = staticmethod(fp32.neg)
@@ -100,6 +101,12 @@ class TorchF32:
     @staticmethod
     def fabs(a: torch.Tensor) -> torch.Tensor:
         return torch.abs(a)
+
+    @staticmethod
+    def nzor(a: torch.Tensor, b: Union[torch.Tensor, float]) -> torch.Tensor:
+        """``a`` if ``a != 0`` else ``b`` (both signed zeros count as zero): the exact select."""
+        b = torch.as_tensor(b, dtype=torch.float32)
+        return torch.where(a != 0, a, b.expand_as(a) if b.dim() == 0 else b)
 
     @staticmethod
     def fmaxc(a: torch.Tensor, b: Union[torch.Tensor, float]) -> torch.Tensor:

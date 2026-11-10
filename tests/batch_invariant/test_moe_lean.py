@@ -72,6 +72,23 @@ def test_generated_cases_are_current():
         "w8a8_gemm1_act_gelu",
         "w8a8_gemm2",
         "x_quant_e4m3",
+        # the per-token fp8 classes (`spec_fp8.py` per-token terms vs `MoEFp8.lean`)
+        "pt_mult",
+        "pt_quant",
+        "pt_scale",
+        "pt_gemm1_swiglu",
+        "pt_gemm1_glu_gelu",
+        "pt_gemm1_glu_gelu_erf",
+        "pt_gemm1_glu_swiglu_oai",
+        "pt_gemm1_glu_swiglu_step_l7",
+        "pt_gemm1_glu_swiglu_step_l3",
+        "pt_gemm1_glu_situ_clamp",
+        "pt_gemm1_act_relu2",
+        "pt_gemm1_act_identity",
+        "pt_gemm1_act_relu",
+        "pt_gemm1_act_silu",
+        "pt_gemm1_act_gelu",
+        "pt_gemm2",
     }
     for name in theorems:
         assert f"theorem moe_{name} :" in committed
@@ -86,6 +103,9 @@ def test_generated_cases_are_current():
         "w8a8_gemm1_glu_situ_clamp",
         "w8a8_gemm1_glu_powlu_default",
         "w8a8_gemm1_glu_powlu_limit",
+        "pt_gemm1_glu_situ_default",
+        "pt_gemm1_glu_powlu_default",
+        "pt_gemm1_glu_powlu_limit",
     }
     assert large <= set(names) and not (large & theorems)
     for name, sx, _, as_thm in cases:
@@ -138,12 +158,16 @@ def test_lean_model_matches_python_spec():
     r = _lake("exe", "moeconformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
     lean = {}
+    rows = {}
     for line in r.stdout.splitlines():
         tag = line.split(" ", 1)[0]
         if tag == "moe":
             _, name, sx = line.split(" ", 2)
             assert name not in lean, f"duplicate conformance case {name}"
             lean[name] = sx
+        elif tag == "ptrowamax":
+            _, K, rb, sx = line.split(" ", 3)
+            rows[(int(K), int(rb))] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -151,6 +175,10 @@ def test_lean_model_matches_python_spec():
         assert lean[name] == sx, f"MoE model differs from the Python spec: {name}"
         checked += 1
     assert checked == len(lean) == len(lean_cases.moe_cases()) >= 37
+    # the per-token quantizer's row amax: the Lean canon reduction prints the Python spec's canonical term per row length
+    for K, rb, sx in lean_cases.pt_row_cases():
+        assert rows[(K, rb)] == sx, f"the per-token row amax differs at K = {K}"
+    assert len(rows) == len(lean_cases.pt_row_cases())
 
 
 @needs_lake

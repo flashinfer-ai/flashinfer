@@ -1,4 +1,6 @@
 import BIKernels.MoE
+import BIKernels.Quant
+import BIKernels.Support
 /-!
 # The fp8 per-tensor MoE classes (W8A8): the declared chains around the fp8 GEMM folds
 
@@ -77,6 +79,45 @@ theorem fused_quant_is_input_quant_on_activation (a : GAct) (g u alpha inv : MTe
     gluQuantE4m3T a g u alpha inv = quantE4m3T (gluPreT a (.mul g alpha) (.mul u alpha)) inv ∧
     quantE4m3T (.leaf "x" [0]) inv = .cvt "e4m3" (.mul (.leaf "x" [0]) inv) := ⟨rfl, rfl⟩
 
+
+/-! ## The per-token fp8 classes `moe.e4m3.<act>.pertoken` (`spec_fp8.py`: `pertoken_*`, `glu_scaled2_elem`, `act_scaled_elem`)
+
+e4m3 experts with one fp32 scale per output channel, e4m3 activations with one dynamic fp32 scale per token (and per
+intermediate row), the fold the W8A8 classes'. The row's multiplier is `div(448, nzor(amax, 448))` (1 for a zero row: the
+select keeps the division finite), the quantization the W8A8 classes' `quantE4m3T` on it, the dequantization scale `div(1, m)`;
+the epilogue scale of an element is the row's scale times the column's channel scale; GEMM1 is the bf16 classes' gated chain on
+the two accumulators under their OWN scales (`gluScaled2T`) or the ungated chain on the single scaled accumulator (`actScaledT`),
+converted to bf16 once; GEMM2 is `scaledOutT` under the (row x channel) scale. The row amax is a `Canon` reduction (`MoEPT.rowAmax`
+below): every association of `fmaxc` over `fabs(x_i)` is the same term. -/
+
+/-- `m = div(448, nzor(amax, 448))`: the row's e4m3 multiplier (`spec_fp8.pertoken_mult`). -/
+def pertokenMultT (amax : MTerm) : MTerm := .div (c "448.0") (.nzor amax (c "448.0"))
+
+/-- `s = div(1, m)`: the row's dequantization scale (`spec_fp8.pertoken_scale`). -/
+def pertokenScaleT (m : MTerm) : MTerm := invScaleT m
+
+/-- The per-token quantization is the static classes' `quantE4m3T` with the dynamic multiplier in the static one's place. -/
+theorem pertoken_quant_is_quantE4m3T (v amax : MTerm) :
+    quantE4m3T v (pertokenMultT amax) = .cvt "e4m3" (.mul v (pertokenMultT amax)) := rfl
+
+/-- `mul(s_row, s_col)`: the epilogue scale of one output element (`spec_fp8.pertoken_elem_scale`). -/
+def pertokenElemScaleT (sr sc : MTerm) : MTerm := .mul sr sc
+
+/-- GEMM1 of the per-token classes: the gated chain on the (gate, up) pair under their own scales (`spec_fp8.glu_scaled2_elem`). -/
+def gluScaled2T (a : GAct) (g u sg su : MTerm) : MTerm := gluT a (.mul g sg) (.mul u su)
+
+/-- The ungated GEMM1 chain of the per-token classes: the bf16 classes' chain on the scaled accumulator (`spec_fp8.act_scaled_elem`). -/
+def actScaledT (a : UAct) (acc s : MTerm) : MTerm := actElemT a (.mul acc s)
+
+/-- The per-token chain is the bf16 classes' gated chain on the scaled accumulators: the scales enter once, before the activation. -/
+theorem gluScaled2T_is_gluT_of_scaled (a : GAct) (g u sg su : MTerm) : gluScaled2T a g u sg su = gluT a (.mul g sg) (.mul u su) := rfl
+
+/-- With one scale for both columns the two-scale chain is one scaled pair: the per-tensor alpha's form. -/
+theorem gluScaled2T_same_scale (a : GAct) (g u s : MTerm) : gluScaled2T a g u s s = gluT a (.mul g s) (.mul u s) := rfl
+
+/-- GEMM2 of the per-token classes: `cvt_bf16(mul(acc, mul(s_row, s_col)))`. -/
+theorem pertoken_gemm2 (acc sr sc : MTerm) : scaledOutT acc (pertokenElemScaleT sr sc) = .cvt "bf16" (.mul acc (.mul sr sc)) := rfl
+
 end BIK.MoE
 
 /-! ## The swapped records of the fp8 per-tensor classes
@@ -125,3 +166,36 @@ theorem swapped_fp8_space_invariant : ∀ c₁ ∈ swappedSpaceFp8, ∀ c₂ ∈
   GEMM.space_invariant swappedSpaceFp8
 
 end BIK.MoE
+
+
+/-! ## The per-token quantizer's row amax (`spec_fp8.pertoken_row_reduction` vs this section)
+
+`fmaxc` over `fabs(x_i)`, `i < K`, as a `Canon` reduction with the digits `elem` (3 bits: 8 consecutive elements, one 16-byte
+vector), `lane` (5 bits: 32 lanes) and `rest` (`rb` bits: the row above 256 elements, the leaves past `K` absent -- `fmaxc(v, +0) = v`
+on the non-negative leaves). `row_amax_invariance` is the class's R3 for the quantizer: every placement of the digits (the kernel's
+register tree, its lane shuffles, its warp exchange) computes the canonical term, so the quantizer's bits are a function of the row
+alone. -/
+namespace BIK.MoEPT
+
+open BIK
+
+/-- The leaf index of the digit bits `elem ++ lane ++ rest`: `rest * 256 + lane * 8 + elem`. -/
+def leafIdx (bs : List Bool) : Nat :=
+  bitsToNat (takeN 3 bs) + 8 * bitsToNat (takeN 5 (dropN 3 bs)) + 256 * bitsToNat (dropN 8 bs)
+
+/-- The leaf `fabs(x_i)` of the row, absent past `K`. -/
+def rowLeaf (K : Nat) (row : Nat → Term) (bs : List Bool) : Option Term :=
+  if leafIdx bs < K then some (Quant.leaf row (leafIdx bs)) else none
+
+/-- The spec's row amax: `pertoken_row_reduction(K, ...).canonical`, digits `[3, 5, rb]`. -/
+def rowAmax (K rb : Nat) (row : Nat → Term) : Option Term :=
+  canonicalDigitsC .fmaxc [3, 5, rb] (rowLeaf K row)
+
+/-- **The row amax is config-invariant**: any placement of the three digits over registers, lanes and warps computes the
+canonical term (`config_invarianceC` on the commutative `fmaxc`). -/
+theorem row_amax_invariance (K rb : Nat) (row : Nat → Term) (ps : List (List Factor)) (cs : List (List Bool))
+    (hp : PlacementOK [3, 5, rb] ps) (hc : CoordsOK (flatten ps) cs) :
+    OEquiv (execC .fmaxc (flatten ps) (rowLeaf K row) cs) (rowAmax K rb row) :=
+  config_invarianceC .fmaxc [3, 5, rb] ps (rowLeaf K row) cs hp hc
+
+end BIK.MoEPT

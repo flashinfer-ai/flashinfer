@@ -77,6 +77,10 @@ class TermAlgebra(_Base):
         a, b = self._sorted2(a, b)
         return self._mk("fmaxc", a, b)
 
+    def nzor(self, a: Term, b: Term) -> Term:
+        """``a`` if ``a != 0`` else ``b`` (``setp.ne`` + ``selp``): the exact select (the per-token class's zero-row multiplier)."""
+        return self._mk("nzor", a, b)
+
     def sqrt(self, a: Term) -> Term:
         """``sqrt.rn.f32`` (correctly rounded)."""
         return self._mk("sqrt", a)
@@ -152,6 +156,8 @@ def evaluate(
             v = fp32.fmax(memo[A[0].uid], memo[A[1].uid])
         elif op == "fmaxc":
             v = fp32.fmaxc(memo[A[0].uid], memo[A[1].uid])
+        elif op == "nzor":
+            v = fp32.nzor(memo[A[0].uid], memo[A[1].uid])
         elif op == "exp2i":
             v = fp32.exp2i(memo[A[0].uid])
         elif op == "fabs":
@@ -237,7 +243,7 @@ def sexpr(t: Term) -> str:
             out = f"({op} {a} {b})"
         elif op in ("neg", "exp2i", "fabs", "sqrt", "frexpm", "frexpe"):
             out = f"({op} {A[0]})"
-        elif op in ("div", "fmin", "fmax"):
+        elif op in ("div", "fmin", "fmax", "nzor"):
             out = f"({op} {A[0]} {A[1]})"
         elif op == "rowmax":
             out = "(rowmax " + " ".join(A) + ")"

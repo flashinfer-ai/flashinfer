@@ -70,6 +70,11 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     # the fp8 per-tensor MoE grouped GEMM: its own module (the fp8 body and epilogue compose the bf16 blocks, which are in
     # its closure; the bf16 module's key does not move with an fp8 edit)
     "batch_invariant_moe_fp8": ("fused_moe/batch_invariant/blocks/fp8_compile.py",),
+    # the per-token fp8 MoE class's quantizer (the input quantization fused with the scatter, the intermediate's requantization): its
+    # own module, so an edit to it leaves the fp8 GEMM objects valid
+    "batch_invariant_moe_fp8pt": (
+        "fused_moe/batch_invariant/blocks/fp8_pertoken_quant.py",
+    ),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer

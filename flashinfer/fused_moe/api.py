@@ -96,6 +96,8 @@ class QuantFormat(Enum):
     MXFP4 = 6
     MXINT4 = 7
     INT4 = 8
+    FP8PerChannel = 9  # e4m3 + one fp32 scale per output channel (a weight axis)
+    FP8PerToken = 10  # e4m3 + one dynamic fp32 scale per token row (an activation axis)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
@@ -3452,6 +3454,71 @@ class BatchInvariantFp8PerTensorConfig:
         return "BatchInvariantFp8PerTensorConfig()"
 
 
+class BatchInvariantFp8PerTokenConfig:
+    """The batch-invariant per-token fp8 MoE backend: the classes ``moe.e4m3.<act>.pertoken`` of the mode documented in
+    ``flashinfer/batch_invariant/README.md`` (one class per typed activation and parameter set), on SM100 / SM103 / SM107.
+
+    The recipe is the per-token / per-channel fp8 one (``QuantConfig(weight=QuantFormat.FP8PerChannel, activation=
+    QuantFormat.FP8PerToken)``): e4m3 experts with one fp32 scale per output channel, e4m3 activations with one dynamic fp32 scale
+    per token. ``prepare_weights`` quantizes the bf16 experts per channel with the class's own term (``448 / amax`` of the row, 1
+    for a zero row, the dequantization scale its correctly rounded reciprocal); ``prepare_activations`` quantizes the bf16 tokens
+    the same way (an e4m3 ``[num_tokens, H]`` and the fp32 ``[num_tokens]`` scales), or the layer takes the bf16 tokens as they are
+    and its quantizer kernel writes the codes straight into the grouped operand (the input quantization fused with the scatter: the
+    same bytes). GEMM1 scales every fp32 accumulator by the token's scale times the channel's, applies the activation and converts
+    to bf16 once; the intermediate is requantized per row by the same term; GEMM2 scales by the row's scale times the channel's; the
+    slot-order fp32 combine. Every output bit is a function of the token's own row, its ``top_k`` experts and routing weights and the
+    expert bytes; all three routing input modes; ``do_finalize=True`` only; unsupported inputs raise
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; never a default candidate. ``H`` and ``I`` are multiples
+    of 16 (16-byte e4m3 rows).
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103, 107)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16: torch.Tensor,
+        w2_bf16: torch.Tensor,
+        *,
+        num_local_experts: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+        activation: Optional["ActivationConfig"] = None,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
+        """The backend's weight view: the experts quantized to e4m3 per output channel, the gate / up rows interleaved for a gated
+        activation, the per-channel dequantization scales, the activation's chain (``activation`` defaults to ``SwiGLU()``)."""
+        from .batch_invariant.api_fp8 import MoEWeightsE4M3PerChannel
+        from .batch_invariant.spec import activation_of
+
+        chain = activation_of(activation if activation is not None else SwiGLU())
+        w1 = w1_bf16.to(device=device) if device is not None else w1_bf16
+        w2 = w2_bf16.to(device=device) if device is not None else w2_bf16
+        return MoEWeightsE4M3PerChannel.prepare(
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+        ).view()
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The per-token input quantization as torch ops (the class's declared term; graph-capturable): the e4m3 codes and the fp32
+        per-token dequantization scales ``[num_tokens]``. The layer also takes the bf16 tokens directly (``hidden_states_q`` bf16,
+        no scale), quantizing them with its own kernel: the same bytes."""
+        from .batch_invariant.api_fp8 import quantize_e4m3_pertoken
+
+        x = hidden_states_bf16.to(torch.bfloat16).contiguous()
+        return quantize_e4m3_pertoken(x)
+
+    def __repr__(self) -> str:
+        return "BatchInvariantFp8PerTokenConfig()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     BatchInvariantBf16Config,
@@ -3498,6 +3565,7 @@ BackendConfigType = Union[
     B12xNvfp4Config,
     B12xW4A16Config,
     BatchInvariantFp8PerTensorConfig,
+    BatchInvariantFp8PerTokenConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3545,6 +3613,7 @@ ALL_BACKEND_CONFIGS = (
     B12xNvfp4Config,
     B12xW4A16Config,
     BatchInvariantFp8PerTensorConfig,
+    BatchInvariantFp8PerTokenConfig,
 )
 
 

@@ -49,6 +49,7 @@ from ....gemm.batch_invariant.blocks.operands import (
 from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs, MainloopBlock
 from ..spec_fp8 import w8a8_alpha
 from .epilogue import BAR_EPI_JOIN, GROUP, MoeF32, fragment_offsets
+from ..spec_fp8 import pertoken_elem_scale
 from .fp8_epilogue import DEAD_ACC, Fp8Chain, _chain_elem
 from .kernel import GROUPED_K_BLOCKS
 from .scheduler import MAX_E, TABLE_SMEM_BYTES, GroupScheduler, build_group_tables
@@ -506,7 +507,9 @@ def swapped_epilogue_loop_fp8(
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()
         rows_left = cutlass.min(row_end, Tk) - row0  # valid tokens of this tile
-        alpha_e = w8a8_alpha(MoeF32, mSa[0], mAlpha[e])
+        alpha_e = None
+        if cutlass.const_expr(not chain.pertoken):
+            alpha_e = w8a8_alpha(MoeF32, mSa[0], mAlpha[e])
         tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_state.index)]
         acc_pipeline.consumer_wait(acc_state)
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
@@ -546,6 +549,32 @@ def swapped_epilogue_loop_fp8(
             else:
                 out_col = n_glob
                 store_ok = n_glob < N
+            # the per-token class: the thread's weight rows' channel scales (the gate row's: GROUP rows below the up row, or the thread's
+            # second row) times the token column's scale (``mSa``: the per-row scales of the token rows)
+            scale = [alpha_e] * nv
+            scale_gate = [None] * nv
+            if cutlass.const_expr(chain.pertoken):
+                ch = {
+                    m: mAlpha[(e, cutlass.min(n_glob + Int32(m), N - Int32(1)))]
+                    for m in row_offs
+                }
+                chg = (
+                    ch[GROUP]
+                    if two_rows
+                    else mAlpha[(e, cutlass.min(n_glob + Int32(GROUP), N - Int32(1)))]
+                )
+                r_pts = mSa.shape[0]
+                tok = [
+                    mSa[cutlass.min(row0 + col0 + Int32(cols[v]), r_pts - Int32(1))]
+                    for v in range(nv)
+                ]
+                scale = [
+                    pertoken_elem_scale(MoeF32, tok[v], ch[rows[v]]) for v in range(nv)
+                ]
+                if cutlass.const_expr(pair):
+                    scale_gate = [
+                        pertoken_elem_scale(MoeF32, tok[v], chg) for v in range(nv)
+                    ]
             if cutlass.const_expr(e4m3_out):
                 outs = ups if cutlass.const_expr(pair) else list(range(nv))
                 assert len(outs) % 2 == 0, offs
@@ -585,8 +614,9 @@ def swapped_epilogue_loop_fp8(
                         chain,
                         tTR_rAcc[v],
                         gate[v] if cutlass.const_expr(pair) else None,
-                        alpha_e,
+                        scale[v],
                         inv,
+                        s_gate=scale_gate[v],
                     )
                     if store_ok & (j < rows_left) & (n_glob + Int32(rows[v]) < N):
                         mOut[(row0 + j, out_col + Int32(rows[v]))] = val

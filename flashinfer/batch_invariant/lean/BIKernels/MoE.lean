@@ -60,6 +60,7 @@ inductive MTerm where
   | frexpe (a : MTerm)
   | exp2i (a : MTerm)
   | rowmax (E : Nat)
+  | nzor (a b : MTerm)
   | cvt (fmt : String) (a : MTerm)
   deriving Repr, DecidableEq, Inhabited
 
@@ -90,6 +91,7 @@ def MTerm.sexpr : MTerm → String
   | .frexpe a => s!"(frexpe {a.sexpr})"
   | .exp2i a => s!"(exp2i {a.sexpr})"
   | .rowmax E => "(rowmax" ++ logitsStr 0 E ++ ")"
+  | .nzor a b => s!"(nzor {a.sexpr} {b.sexpr})"
   | .cvt f a => s!"(cvt {f} {a.sexpr})"
 
 /-! ## The declared exp, sigmoid, silu, tanh, erf, log and the GEMM1 chains (`spec.exp_term`, `sigmoid_term`,

@@ -35,7 +35,15 @@ from ....batch_invariant.quantization.cute_ext import select_f32
 from ....batch_invariant.quantization.cvt_fp8 import cvt_f32x2_to_fp8x2
 from ....gemm.batch_invariant.blocks.operands import ACC_DTYPE
 from ..spec import ACT_PARAMS, ACTS, UNGATED_ACTS
-from ..spec_fp8 import act_quant_pre, glu_quant_pre, scaled_out_elem, w8a8_alpha
+from ..spec_fp8 import (
+    act_quant_pre,
+    act_scaled_elem,
+    glu_quant_pre,
+    glu_scaled2_elem,
+    pertoken_elem_scale,
+    scaled_out_elem,
+    w8a8_alpha,
+)
 from .epilogue import (
     BAR_EPI_STAGE,
     GROUP,
@@ -82,12 +90,24 @@ class Fp8Chain:
     out_fmt: str = "bf16"
     params: Tuple[Optional[float], ...] = ()
     scaled: bool = True
+    #: the per-token class (``moe.e4m3.<act>.pertoken``): the element scale is the A row's scale times the output column's
+    #: channel scale, the activation chains emit bf16 (the standalone pass requantizes the row), GEMM2 converts the scaled accumulator
+    pertoken: bool = False
 
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in OUT_FMTS_FP8, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
         expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
         assert len(self.params) == expected, (self, expected)
+        if self.pertoken:
+            assert (
+                self.scaled
+                and self.out_fmt in ("bf16", "f32")
+                and (self.kind != "glu" or self.out_fmt == "bf16")
+            ), (
+                "the per-token class's chains: scaled, bf16 out (the gated chain converts once), or the plain / ungated f32 oracle"
+            )
+            return
         if self.kind in ("glu", "act"):
             assert self.scaled and self.out_fmt == "e4m3", (
                 "the activation chains are GEMM1's fused quantization: scaled, e4m3 out"
@@ -107,7 +127,7 @@ class Fp8Chain:
         suffix = "".join(
             "_pn" if v is None else f"_p{f32_bits(v):08x}" for v in self.params
         )
-        scale = "w8a8" if self.scaled else "raw"
+        scale = "pertoken" if self.pertoken else ("w8a8" if self.scaled else "raw")
         return f"{self.kind}_{self.act}_{scale}_{self.out_fmt}{suffix}"
 
 
@@ -115,10 +135,28 @@ class Fp8Chain:
 GEMM2_CHAIN = Fp8Chain("plain", "silu", "bf16", (), True)
 
 
-def _chain_elem(chain: Fp8Chain, acc, acc_gate, alpha_e, inv):
+def _chain_elem(chain: Fp8Chain, acc, acc_gate, alpha_e, inv, s_gate=None):
     """One output element of the chain in fp32 (before the paired e4m3 conversion) for the e4m3 outputs, converted for the
-    others; every op through ``MoeF32``."""
+    others; every op through ``MoeF32``. The per-token class passes the element's (row x channel) scale as ``alpha_e`` and the gate
+    column's own as ``s_gate``."""
     fp = MoeF32
+    if chain.pertoken:
+        if chain.pair:
+            return glu_scaled2_elem(
+                fp,
+                acc_gate,
+                acc,
+                s_gate,
+                alpha_e,
+                chain.act,
+                chain.out_fmt,
+                chain.params,
+            )
+        if chain.kind == "act":
+            return act_scaled_elem(
+                fp, acc, alpha_e, chain.act, chain.out_fmt, chain.params
+            )
+        return scaled_out_elem(fp, acc, alpha_e, chain.out_fmt)
     if chain.pair:
         return fp.mul(
             glu_quant_pre(fp, acc_gate, acc, alpha_e, chain.act, chain.params), inv
@@ -199,6 +237,10 @@ def grouped_epilogue_loop_fp8(
     cF_epi = cute.flat_divide(tCcF, epi_tile)
     frag = thr_t2r.partition_D(cF_epi)[(None, None, None, 0, 0, 0, 0, 0)]
     offs = fragment_offsets(frag.layout)
+    tTR_cFg = thr_t2r.partition_D(
+        cF_epi
+    )  # the flat column coordinates per subtile (the per-token class's channel index)
+    tTR_cFg = cute.group_modes(tTR_cFg, 3, cute.rank(tTR_cFg))
     # the register vectors: 16 bytes, or 8 for the e4m3 output (its staging rows are skewed by STAGE_PAD bytes)
     ve, partner, is_out = store_plan(
         offs, pair, 8 if out_dt.width == 8 else 16 // (out_dt.width // 8)
@@ -289,7 +331,7 @@ def grouped_epilogue_loop_fp8(
         work_tile = tile_sched.get_current_work()
         rows_left = row_end - row0
         alpha_e = None
-        if cutlass.const_expr(chain.scaled):
+        if cutlass.const_expr(chain.scaled and not chain.pertoken):
             alpha_e = w8a8_alpha(
                 MoeF32, mSa[0], mAlpha[e]
             )  # the tile's alpha: one mul.rn per tile
@@ -350,6 +392,47 @@ def grouped_epilogue_loop_fp8(
                         pr = cvt_f32x2_to_fp8x2(y0, y1, "e4m3")
                         tTR_rC[v0] = (pr & 0xFF).to(Uint8)
                         tTR_rC[v1] = (pr >> 8).to(Uint8)
+                elif cutlass.const_expr(chain.pertoken):
+                    # the per-token class: the row's scale (``mSa``: the per-row scales of the A operand) once per distinct row of the
+                    # fragment, the expert's channel scale (``mAlpha[e, n]`` in the accumulator's column space) per register column, the
+                    # element's scale their product; the gate column's own scale for the pair
+                    row_scale = {}
+                    crd0 = cC_sub[((0, 0), 0, 0)]
+                    for m in rows_in_frag:
+                        p = row0 + (crd0[0] - Int32(offs[0][0]) + Int32(m))
+                        p = cutlass.min(
+                            cutlass.max(p, Int32(0)), mSa.shape[0] - Int32(1)
+                        )
+                        row_scale[m] = mSa[p]
+                    crdF = tTR_cFg[(None, None, None, s)][(0, 0, 0)]
+                    ncol0 = n_tile * Int32(tn) + crdF[1] - Int32(offs[0][1])
+                    col_scale = [None] * nv
+                    for v in cutlass.range_constexpr(nv):
+                        col_scale[v] = mAlpha[
+                            (e, cutlass.min(ncol0 + Int32(offs[v][1]), N - Int32(1)))
+                        ]
+                    for v in cutlass.range_constexpr(nv):
+                        if cutlass.const_expr(is_out[v]):
+                            sv = pertoken_elem_scale(
+                                MoeF32, row_scale[offs[v][0]], col_scale[v]
+                            )
+                            sg = (
+                                pertoken_elem_scale(
+                                    MoeF32, row_scale[offs[v][0]], col_scale[partner[v]]
+                                )
+                                if cutlass.const_expr(pair)
+                                else None
+                            )
+                            tTR_rC[v] = _chain_elem(
+                                chain,
+                                tTR_rAcc[v],
+                                tTR_rAcc[partner[v]]
+                                if cutlass.const_expr(pair)
+                                else None,
+                                sv,
+                                inv,
+                                s_gate=sg,
+                            )
                 else:
                     for v in cutlass.range_constexpr(nv):
                         if cutlass.const_expr(is_out[v]):
