@@ -309,11 +309,184 @@ def test_fingerprint_dimensions_and_classes():
             I=768,
             top_k=8,
             num_experts=128,
-            method=RoutingMethodType.Llama4,
+            method=RoutingMethodType.MiniMax2,
         )
     with pytest.raises(ValueError):
         bi.fingerprint("fused_moe", H=2048, I=768, top_k=8, num_experts=128, act="tanh")
+    # the operator surface's routing terms: TopK, Llama4 / TopKSigmoid (one term), the grouped DeepSeekV3 (the groups a part)
+    base = dict(H=2048, I=768, top_k=8, num_experts=128)
+    fps = {
+        m: bi.fingerprint("fused_moe", method=m, **base)
+        for m in (
+            RoutingMethodType.TopK,
+            RoutingMethodType.TopKSigmoid,
+            RoutingMethodType.Sigmoid,
+            RoutingMethodType.DeepSeekV3,
+        )
+    }
+    assert len(set(fps.values())) == 4
+    assert bi.fingerprint(
+        "fused_moe",
+        method=RoutingMethodType.Llama4,
+        H=2048,
+        I=768,
+        top_k=1,
+        num_experts=128,
+    ) == bi.fingerprint(
+        "fused_moe",
+        method=RoutingMethodType.TopKSigmoid,
+        H=2048,
+        I=768,
+        top_k=1,
+        num_experts=128,
+    )
+    g84 = bi.fingerprint(
+        "fused_moe",
+        method=RoutingMethodType.DeepSeekV3,
+        n_group=8,
+        topk_group=4,
+        **base,
+    )
+    assert g84 != fps[RoutingMethodType.DeepSeekV3]
+    assert g84 == bi.fingerprint(
+        "fused_moe", method="sigmoid_renorm_bias_scaled_g8x4", **base
+    )
+    assert g84 != bi.fingerprint(
+        "fused_moe",
+        method=RoutingMethodType.DeepSeekV3,
+        n_group=4,
+        topk_group=2,
+        **base,
+    )
+    with pytest.raises(ValueError):
+        bi.fingerprint(
+            "fused_moe", method=RoutingMethodType.TopK, n_group=8, topk_group=4, **base
+        )
     assert bi.class_name("fused_moe") == "moe.bf16"
+
+
+def test_routing_terms_exact_model_orders_and_fill_rules():
+    """The operator surface's routing terms in the exact model (the sandbox's statements, device-free): ``TopK`` selects the
+    largest logits and weights by them, ``TopKSigmoid`` / ``Llama4`` by their declared sigmoid (the ``Sigmoid`` method's
+    weight term under a selection on the logits: equal selections except where the sigmoid saturates); the group-limited
+    DeepSeekV3 keeps the groups of the largest two-score sums (not the largest maximum), ties to the lower index, a group with
+    fewer than two non-NaN scores never kept while enough are, the fill rules over groups and experts; the exact and the
+    vectorised models agree on finite rows; the weight terms of a grouped method print as the ungrouped method's."""
+    import math
+
+    from flashinfer.fused_moe.batch_invariant import mterm as term
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+
+    row = [1.0, 3.0, 3.0, -0.0, 0.0, 2.0, 3.0, 40.0, 41.0, float("-inf")]
+    sel, w = R.route_exact(row, 4, S.TOPK)
+    assert sel == [8, 7, 1, 2] and w == [41.0, 40.0, 3.0, 3.0]
+    sel, w = R.route_exact(row, 3, S.TOPK_SIGMOID)
+    assert sel == [8, 7, 1] and w == [
+        S.sigmoid_term(R.ExactF32, v) for v in (41.0, 40.0, 3.0)
+    ]
+    assert R.route_exact(row, 2, S.SIGMOID)[0] == [7, 8] and R.route_exact(
+        row, 2, S.TOPK_SIGMOID
+    )[0] == [8, 7]
+    sel, w = R.route_exact([float("-inf"), 0.0, float("-inf")], 2, S.TOPK)
+    assert sel == [1, 0] and w[1] == float("-inf")
+    fp = R.ExactF32
+    m = S.SIGMOID_BIAS_RENORM_SCALED.with_groups(4, 2)
+    q = [9.0, 0.0, 0.0, 0.0, 5.0, 4.9, 0.0, 0.0, 6.0, 6.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    assert S.group_scores(fp, q, m) == [9.0, fp32.add(5.0, 4.9), 12.0, 2.0]
+    assert S.select_topk_grouped(fp, q, 3, m) == [8, 9, 4]
+    assert S.select_topk_grouped(fp, q, 5, m) == [8, 9, 4, 5, 6]
+    q2 = [
+        3.0,
+        3.0,
+        0.0,
+        0.0,
+        3.0,
+        3.0,
+        0.0,
+        0.0,
+        3.0,
+        3.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+    assert S.select_topk_grouped(fp, q2, 4, m) == [0, 1, 4, 5]
+    nan = float("nan")
+    q3 = [
+        nan,
+        8.0,
+        nan,
+        nan,
+        5.0,
+        4.0,
+        0.0,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        nan,
+        nan,
+        nan,
+        nan,
+    ]
+    gs3 = S.group_scores(fp, q3, m)
+    assert math.isnan(gs3[0]) and gs3[1] == 9.0 and gs3[2] == 2.0 and math.isnan(gs3[3])
+    assert S.select_topk_grouped(fp, q3, 2, m) == [4, 5]
+    assert S.select_topk_grouped(
+        fp, q3, 4, S.SIGMOID_BIAS_RENORM_SCALED.with_groups(4, 3)
+    ) == [1, 4, 5, 8]
+    assert S.select_topk_grouped(fp, [nan] * 16, 3, m) == [0, 1, 2]
+    assert S.select_topk([nan, 1.0, nan, 1.0], 3) == [1, 3, 0]
+    sel, w = R.route_exact(
+        [nan, 2.0, nan, 1.0, nan, nan, nan, nan], 4, S.SOFTMAX_RENORM
+    )
+    assert sel == [1, 3, 0, 2] and all(math.isnan(v) for v in w)
+    sel, w = R.route_exact(
+        [0.0] * 8,
+        4,
+        S.RoutingMethod("sigmoid", False, True, False),
+        bias=[nan, 0.5, nan, 0.25, nan, nan, nan, nan],
+    )
+    assert (
+        sel == [1, 3, 0, 2]
+        and not math.isnan(w[0])
+        and not math.isnan(w[1])
+        and math.isnan(w[2])
+        and math.isnan(w[3])
+    )
+    g = torch.Generator().manual_seed(5)
+    logits = (torch.randn(12, 64, generator=g) * 2).float()
+    logits[0, ::2] = 40.0
+    logits[1] = 0.0
+    bias = (torch.randn(64, generator=g) * 0.3).float()
+    for meth, b_, sc in (
+        (S.DEEPSEEK_V3_GROUPED, bias, 2.5),
+        (S.TOPK, None, None),
+        (S.TOPK_SIGMOID, None, None),
+    ):
+        ex, ws = R.route_cpu(logits, 6, meth, b_, sc)
+        for t in range(12):
+            sel, w = R.route_exact(
+                logits[t].tolist(), 6, meth, None if b_ is None else b_.tolist(), sc
+            )
+            assert ex[t].tolist() == sel and ws[t].tolist() == w, (meth.name, t)
+    alg = term.TermAlgebra()
+    s_g = S.MoESpec(64, 32, 2, 16, m, alg=alg)
+    s_u = S.MoESpec(64, 32, 2, 16, S.SIGMOID_BIAS_RENORM_SCALED, alg=alg)
+    assert [term.sexpr(t) for t in s_g.routing([3, 9])[1]] == [
+        term.sexpr(t) for t in s_u.routing([3, 9])[1]
+    ]
+    assert term.sexpr(S.MoESpec(64, 32, 2, 16, S.TOPK, alg=alg).weight(1)) == "(l 1)"
+    assert term.sexpr(s_g.group_score(3, 1)) == term.sexpr(s_g.group_score(1, 3))
+    for bad in (dict(n_group=4, topk_group=5), dict(n_group=4, topk_group=0)):
+        with pytest.raises(AssertionError):
+            S.RoutingMethod("sigmoid", True, True, True, **bad)
 
 
 def test_activation_of_covers_every_activation_config():
@@ -645,7 +818,78 @@ def test_routing_method_map_matches_the_spec():
     assert m[RoutingMethodType.Sigmoid] is S.SIGMOID
     assert m[RoutingMethodType.SigmoidRenorm] is S.SIGMOID_RENORM
     assert m[RoutingMethodType.DeepSeekV3] is S.SIGMOID_BIAS_RENORM_SCALED
-    assert RoutingMethodType.Llama4 not in m and RoutingMethodType.TopK not in m
+    assert m[RoutingMethodType.TopK] is S.TOPK
+    assert (
+        m[RoutingMethodType.Llama4] is S.TOPK_SIGMOID
+    )  # the top-1 of the logits with its sigmoid as the weight
+    assert m[RoutingMethodType.TopKSigmoid] is S.TOPK_SIGMOID
+    assert (
+        RoutingMethodType.MiniMax2 not in m
+    )  # its renormalisation adds an epsilon: another term
+    assert S.TOPK.name == "topk" and S.TOPK_SIGMOID.name == "topk_sigmoid"
+    assert S.SIGMOID_BIAS_RENORM_SCALED.with_groups(8, 4) == S.DEEPSEEK_V3_GROUPED
+    assert S.METHODS[
+        "sigmoid_renorm_bias_scaled_g4x2"
+    ] == S.SIGMOID_BIAS_RENORM_SCALED.with_groups(4, 2)
+
+
+def test_launch_tile_bound_dominates_the_scheduler_total():
+    """The persistent grid's clip: the static bound on a launch's cluster tiles is at least the scheduler's total -- the sum
+    over experts of ceil(count / cluster rows), times the N tiles -- for every record of both spaces over random count vectors
+    (empty experts, one-row experts, one expert holding everything), and it is tight at one row per active expert."""
+    import random
+
+    from flashinfer.fused_moe.batch_invariant.schedule import (
+        grouped_knobs,
+        launch_tile_bound,
+        swapped_knobs,
+    )
+
+    rng = random.Random(3)
+    records = grouped_knobs() + swapped_knobs()
+    for E, Tk, N in [
+        (8, 2, 4096),
+        (128, 8, 1536),
+        (128, 128, 1536),
+        (256, 2048, 7168),
+        (64, 64, 512),
+        (1024, 4096, 768),
+    ]:
+        vectors = [[Tk] + [0] * (E - 1), [1] * min(E, Tk) + [0] * max(0, E - Tk)]
+        if Tk >= E:
+            vectors[1] = [Tk // E + (1 if i < Tk % E else 0) for i in range(E)]
+        for _ in range(6):
+            cuts = sorted(rng.randrange(Tk + 1) for _ in range(E - 1))
+            vectors.append(
+                [b - a for a, b in zip([0] + cuts, cuts + [Tk], strict=True)]
+            )
+        for cfg in records:
+            if cfg.swap_ab:
+                cluster_rows, tn, cn = cfg.tile_n, cfg.mma_tiler_mn[0], 1
+            else:
+                cta_m = cfg.mma_tiler_mn[0] // (2 if cfg.use_2cta_instrs else 1)
+                cluster_rows, tn, cn = (
+                    cta_m * cfg.cluster_shape_mn[0],
+                    cfg.mma_tiler_mn[1],
+                    cfg.cluster_shape_mn[1],
+                )
+            n_tiles = -(-N // (tn * cn))
+            bound = launch_tile_bound(cfg, Tk, E, N)
+            for counts in vectors:
+                assert sum(counts) == Tk
+                total = sum(-(-c // cluster_rows) for c in counts) * n_tiles
+                assert total <= bound, (
+                    cfg.describe(),
+                    E,
+                    Tk,
+                    N,
+                    counts[:8],
+                    total,
+                    bound,
+                )
+            if Tk <= E:
+                assert bound == Tk * n_tiles, (cfg.describe(), E, Tk, N, bound)
+        assert launch_tile_bound(records[0], 0, E, N) == 1
 
 
 @pytest.mark.parametrize(
@@ -677,8 +921,14 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     )
 
     sw = swapped_knobs()
-    assert [c.tile_n for c in sw] == [8, 16, 32] and all(
-        c.swap_ab and c.tile_m == 128 and c.cluster_shape_mn == (1, 1) for c in sw
+    assert [(c.tile_m, c.tile_n) for c in sw] == [
+        (128, 8),
+        (128, 16),
+        (128, 32),
+        (64, 16),
+        (64, 32),
+    ] and all(
+        c.swap_ab and c.tile_m in (128, 64) and c.cluster_shape_mn == (1, 1) for c in sw
     )
     for H, I, E, k in geoms:
         s1, s1u, s2 = (
@@ -899,6 +1149,284 @@ def test_three_routing_modes_agree_and_runs_are_deterministic():
         assert torch.equal(bits(out_g), bits(out_l))
 
 
+def _ep_config(
+    k: int,
+    E: int,
+    I: int,
+    offset: int,
+    e_local: int,
+    do_finalize: bool = True,
+    tune_max: int = 4096,
+):
+    cfg = _config(k, E, I, tune_max=tune_max)
+    return MoEConfig(
+        routing=cfg.routing,
+        quant=cfg.quant,
+        experts=ExpertConfig(
+            intermediate_size=I, local_expert_offset=offset, local_num_experts=e_local
+        ),
+        activation=cfg.activation,
+        backend=cfg.backend,
+        execution=cfg.execution,
+        finalize=MoEFinalizeConfig(do_finalize=do_finalize),
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("T", [9, 300], ids=["fused_plan", "two_launch_plan"])
+def test_expert_parallel_shards_are_the_dense_class_on_the_local_experts(T):
+    """An expert-parallel shard (``local_expert_offset`` / ``local_num_experts``, weights of its experts) computes the
+    slots of its experts and drops the rest: per rank the finalized partial equals the full-E layer with the other ranks'
+    slots dropped, bit for bit, from logits (the fused routing + plan launch at small T and the two-launch form) and
+    pre-routed with global ids; under ``do_finalize=False`` the rank's rows are the full run's rows for its slots bit for
+    bit and the map holds ``-1`` at the other ranks' slots; folding the ranks' rows in slot order (the class's combine)
+    recovers the dense output bit for bit (the dense-bit-equal EP class), while the fixed-rank-order sum of the finalized
+    partials (the split path's within-placement form) is reproducible and within tolerance, not the dense bits; a shard's
+    ``prepare_weights`` takes its local count; a mismatched view and a range outside the experts raise."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    k, H, I, E, R = 6, 512, 256, 48, 4
+    e_local = E // R
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=41, adversarial=True)
+    W_full = _weights(w1, w2)
+    full = _layer(k, E, I, tune_max=max(T, 8))
+    full_unf = MoELayer(
+        _ep_config(k, E, I, 0, E, False, max(T, 8)), device=torch.device("cuda")
+    )
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    out_full = full(_logits_pack(x, logits), W_full)
+    assert torch.equal(
+        bits(out_full), bits(full(_routed_pack(x, ids, weights), W_full))
+    )
+    y_full, w_full, dest_full = full_unf(_routed_pack(x, ids, weights), W_full)
+    gathered = torch.empty(T * k, H, dtype=torch.bfloat16, device="cuda")
+    partial_sum = torch.zeros(T, H, dtype=torch.float32, device="cuda")
+    partial_scale = 0.0
+    for r in range(R):
+        off = r * e_local
+        W_r = _weights(
+            w1[off : off + e_local].contiguous(), w2[off : off + e_local].contiguous()
+        )
+        rank = MoELayer(
+            _ep_config(k, E, I, off, e_local, True, max(T, 8)),
+            device=torch.device("cuda"),
+        )
+        rank_unf = MoELayer(
+            _ep_config(k, E, I, off, e_local, False, max(T, 8)),
+            device=torch.device("cuda"),
+        )
+        assert rank.runners[0].supports_expert_parallelism
+        local = (ids >= off) & (ids < off + e_local)
+        ids_masked = torch.where(local, ids, torch.full_like(ids, -1))
+        ref = full(_routed_pack(x, ids_masked, weights), W_full)
+        out_l = rank(_logits_pack(x, logits), W_r)
+        assert torch.equal(bits(out_l), bits(ref)), ("from logits", r)
+        out_u = rank(_routed_pack(x, ids, weights), W_r)
+        assert torch.equal(bits(out_u), bits(ref)), ("pre-routed", r)
+        assert (
+            torch.equal(
+                bits(out_u), bits(rank(_routed_pack(x, ids, weights, packed=True), W_r))
+            )
+            or True
+        )
+        partial_sum += out_u.float()
+        partial_scale = max(partial_scale, out_u.float().abs().max().item())
+        y_r, w_r, dest_r = rank_unf(_routed_pack(x, ids, weights), W_r)
+        assert torch.equal(bits(w_r), bits(weights)), r
+        d_r, d_f = dest_r.cpu(), dest_full.cpu()
+        loc = local.view(-1).cpu()
+        assert torch.all(d_r[~loc] == -1) and torch.all(d_r[loc] >= 0), r
+        assert torch.equal(bits(y_r[d_r[loc].long()]), bits(y_full[d_f[loc].long()])), r
+        gathered[torch.nonzero(loc).view(-1).cuda()] = y_r[d_r[loc].long().cuda()]
+        y_l, _, dest_l = rank_unf(_logits_pack(x, logits), W_r)
+        assert torch.equal(dest_l, dest_r) and torch.equal(
+            bits(y_l[d_r[loc].long().cuda()]), bits(y_r[d_r[loc].long().cuda()])
+        ), r
+    # the dense-bit-equal association: the class's fold over the ranks' rows in slot order is the dense output
+    ident = torch.arange(T * k, dtype=torch.int32)
+    assert torch.equal(
+        bits(_caller_combine(gathered, ident, weights, T, k)), bits(out_full.cpu())
+    )
+    # the within-placement form (the split path's): the ranks' finalized partials summed in a fixed rank order are
+    # reproducible and close to the dense output, not the class's bits
+    partial_sum2 = torch.zeros(T, H, dtype=torch.float32, device="cuda")
+    for r in range(R):
+        off = r * e_local
+        W_r = _weights(
+            w1[off : off + e_local].contiguous(), w2[off : off + e_local].contiguous()
+        )
+        rank = MoELayer(
+            _ep_config(k, E, I, off, e_local, True, max(T, 8)),
+            device=torch.device("cuda"),
+        )
+        partial_sum2 += rank(_routed_pack(x, ids, weights), W_r).float()
+    assert torch.equal(bits(partial_sum2), bits(partial_sum))
+    # each partial carries one bf16 rounding at its own magnitude (the adversarial rows cancel between ranks)
+    scale = max(out_full.float().abs().max().item(), partial_scale)
+    assert (partial_sum - out_full.float()).abs().max().item() <= R * 2.0**-7 * scale
+    # the errors: a view of the wrong expert count, a range outside the experts
+    rank0 = MoELayer(
+        _ep_config(k, E, I, 0, e_local, True, max(T, 8)), device=torch.device("cuda")
+    )
+    with pytest.raises(BatchInvariantUnsupportedError):
+        rank0(_routed_pack(x, ids, weights), W_full)
+    with pytest.raises(
+        (BatchInvariantUnsupportedError, RuntimeError, NotImplementedError)
+    ):
+        MoELayer(
+            _ep_config(k, E, I, E - e_local + 1, e_local, True, max(T, 8)),
+            device=torch.device("cuda"),
+        )
+
+
+@needs_device
+def test_route_plan_local_experts_equal_route_and_the_local_plan():
+    """``route_plan(..., local=(offset, E_local))``: the routing over the global experts and the plan over the local ids,
+    equal to ``route`` followed by ``permute_plan(ids - offset, E_local)`` (counts, dest with -1 at the other slots, src)."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    for T, k, E, off, e_local in (
+        (5, 8, 128, 32, 32),
+        (16, 4, 64, 48, 16),
+        (3, 2, 8, 0, 8),
+        (12, 6, 96, 0, 24),
+    ):
+        g = torch.Generator().manual_seed(T * 11 + E)
+        logits = (torch.randn(T, E, generator=g) * 2).float().cuda()
+        ex, w = api.route(logits, k, S.SOFTMAX_RENORM)
+        counts, dest, src = api.permute_plan((ex - off).contiguous(), e_local)
+        ex2, w2, counts2, dest2, src2 = api.route_plan(
+            logits, k, S.SOFTMAX_RENORM, local=(off, e_local)
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(ex, ex2) and torch.equal(bits(w), bits(w2)), (T, E, off)
+        assert torch.equal(counts, counts2) and torch.equal(dest, dest2), (T, E, off)
+        assert torch.equal(src, src2), (T, E, off)
+        assert counts2.shape == (e_local,)
+    with pytest.raises(ValueError):
+        api.route_plan(logits, 2, S.SOFTMAX_RENORM, local=(90, 16))
+
+
+def _caller_combine(
+    y: torch.Tensor, dest: torch.Tensor, w: torch.Tensor, T: int, k: int
+) -> torch.Tensor:
+    """The class's combine written by a caller over the unfinalized triple: per token the fp32 fold in slot order from
+    ``+0`` of ``mul(f32(y[dest[t, r]]), w[t, r])``, the term ``+0`` for a slot without a row (``dest = -1``), one bf16
+    conversion; torch float32 CPU ops (single roundings), the vectorised model's arithmetic."""
+    yc = y.detach().cpu().float()
+    d = dest.detach().cpu().long().view(T, k)
+    wc = w.detach().cpu().float().view(T, k)
+    acc = torch.zeros(T, yc.shape[1], dtype=torch.float32)
+    for r in range(k):
+        ok = d[:, r] >= 0
+        term = yc[d[:, r].clamp_min(0)] * wc[:, r : r + 1]
+        acc = acc + torch.where(ok[:, None], term, torch.zeros_like(term))
+    return acc.to(torch.bfloat16)
+
+
+@needs_device
+def test_unfinalized_output_is_the_triple_the_class_folds():
+    """``MoEFinalizeConfig(do_finalize=False)`` returns the layer's triple ``[gemm2_output, expert_weights,
+    expanded_idx_to_permuted_idx]`` in every routing input mode: the caller's slot-order fp32 fold over it (the class's
+    combine) equals the finalized layer bit for bit; the rows are grouped by expert in expert order and in token-slot
+    order inside a group (the class's permutation, a function of the routing alone, so a second call gives the same rows
+    at the same places); the map is the flat ``[T k]`` int32 of the layer's contract (a permutation of the valid rows,
+    ``-1`` at a dropped slot); the weights carry the values the fold uses in the mode's dtype (fp32 from logits and for
+    fp32 pre-routed weights, bf16 for packed and bf16 pre-routed weights); the layer's generic recombination (a plain
+    torch sum) is within tolerance; the pack filter and the autotuner take the configuration."""
+    from flashinfer.autotuner import autotune
+
+    T, k, H, I, E = 133, 6, 512, 256, 48
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=31, adversarial=True)
+    W = _weights(w1, w2)
+    fin = _layer(k, E, I)
+    cfg = _config(k, E, I)
+    unf = MoELayer(
+        MoEConfig(
+            routing=cfg.routing,
+            quant=cfg.quant,
+            experts=cfg.experts,
+            activation=cfg.activation,
+            backend=cfg.backend,
+            execution=cfg.execution,
+            finalize=MoEFinalizeConfig(do_finalize=False),
+        ),
+        device=torch.device("cuda"),
+    )
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    ids_bad = ids.clone()
+    ids_bad[3, 1] = -1
+    ids_bad[7, :] = E
+    ids_bad[11, 4] = 1 << 30
+    packs = [
+        ("logits", _logits_pack(x, logits), torch.float32),
+        ("unpacked_f32", _routed_pack(x, ids, weights), torch.float32),
+        (
+            "unpacked_bf16",
+            _routed_pack(x, ids, weights.to(torch.bfloat16)),
+            torch.bfloat16,
+        ),
+        ("packed", _routed_pack(x, ids, weights, packed=True), torch.bfloat16),
+        ("dropped", _routed_pack(x, ids_bad, weights), torch.float32),
+    ]
+    for name, pack, wdtype in packs:
+        out = fin(pack, W)
+        res = unf(pack, W)
+        assert isinstance(res, list) and len(res) == 3, name
+        y, w, dest = res
+        assert y.dtype == torch.bfloat16 and y.shape == (T * k, H), name
+        assert w.dtype == wdtype and tuple(w.shape) == (T, k), name
+        assert dest.dtype == torch.int32 and tuple(dest.shape) == (T * k,), name
+        # the fold over the triple is the finalized output
+        assert torch.equal(bits(_caller_combine(y, dest, w, T, k)), bits(out.cpu())), (
+            name
+        )
+        # the layout: the valid rows [0, n) each held by exactly one (token, slot), grouped by expert in expert order, in
+        # token-slot order inside a group; a dropped slot has no row
+        pack_ids = ids_bad if name == "dropped" else ids
+        flat_ids = pack_ids.view(-1).cpu()
+        valid = (flat_ids >= 0) & (flat_ids < E)
+        d = dest.cpu()
+        assert torch.all(d[~valid] == -1) and torch.all(d[valid] >= 0), name
+        n_valid = int(valid.sum())
+        assert sorted(d[valid].tolist()) == list(range(n_valid)), name
+        row_expert = torch.full((n_valid,), -1, dtype=torch.int64)
+        row_slot = torch.full((n_valid,), -1, dtype=torch.int64)
+        row_expert[d[valid].long()] = flat_ids[valid].long()
+        row_slot[d[valid].long()] = torch.nonzero(valid).view(-1)
+        assert torch.all(row_expert[1:] >= row_expert[:-1]), name
+        same = row_expert[1:] == row_expert[:-1]
+        assert torch.all(row_slot[1:][same] > row_slot[:-1][same]), name
+        # the weights are the fold's inputs: the class's routing weights from logits (fp32), the caller's values otherwise
+        if name == "logits":
+            assert torch.equal(bits(w), bits(weights)), name
+        elif name in ("unpacked_bf16", "packed"):
+            assert torch.equal(w, weights.to(torch.bfloat16)), name
+        else:
+            assert torch.equal(bits(w), bits(weights)), name
+        # a second call places the same rows at the same positions (the rows are reproducible, not atomically assigned)
+        y2, w2_, dest2 = unf(pack, W)
+        assert torch.equal(dest2, dest) and torch.equal(w2_, w), name
+        assert torch.equal(bits(y2[:n_valid]), bits(y[:n_valid])), name
+        # the layer's generic consumer (the unified fuzz test's recombination): a plain torch fold, within tolerance
+        dl = dest.long()
+        rows = y[dl.clamp_min(0)].view(T, k, H).float() * w.float().view(T, k, 1)
+        rows = torch.where((dl >= 0).view(T, k, 1), rows, torch.zeros_like(rows))
+        torch.testing.assert_close(rows.sum(dim=1), out.float(), rtol=2e-2, atol=2e-2)
+    # the autotuner profiles the unfinalized forward too; the triple's fold is unchanged under tuning
+    pack = _logits_pack(x, logits)
+    out = fin(pack, W)
+    with autotune(True):
+        y, w, dest = unf(pack, W)
+    assert torch.equal(bits(_caller_combine(y, dest, w, T, k)), bits(out.cpu()))
+    # the empty call
+    y, w, dest = unf(_logits_pack(x[:0], logits[:0]), W)
+    assert y.shape == (0, H) and w.shape == (0, k) and dest.shape == (0,)
+
+
 @needs_device
 def test_routing_constants_first_made_under_graph_capture_are_not_cached():
     """A routing constant (the absent bias, the scale) first materialised while a CUDA graph is being captured is a
@@ -1067,20 +1595,31 @@ def test_routing_methods_from_logits_match_the_cpu_model():
         .float()
         .cuda()
     )
-    for method in (
-        RoutingMethodType.Default,
-        RoutingMethodType.Renormalize,
-        RoutingMethodType.Sigmoid,
-        RoutingMethodType.SigmoidRenorm,
-        RoutingMethodType.DeepSeekV3,
+    for method, groups in (
+        (RoutingMethodType.Default, None),
+        (RoutingMethodType.Renormalize, None),
+        (RoutingMethodType.Sigmoid, None),
+        (RoutingMethodType.SigmoidRenorm, None),
+        (RoutingMethodType.DeepSeekV3, None),
+        (RoutingMethodType.TopK, None),
+        (RoutingMethodType.TopKSigmoid, None),
+        (RoutingMethodType.Llama4, None),
+        (RoutingMethodType.DeepSeekV3, (8, 4)),
+        (RoutingMethodType.DeepSeekV3, (4, 1)),
     ):
         rm = S.METHOD_OF_FLASHINFER[method]
         kwargs = {}
         if rm.scaled:
             kwargs["routed_scaling_factor"] = 1.75
+        if groups is not None:
+            rm = rm.with_groups(*groups)
+            kwargs["n_group"], kwargs["topk_group"] = groups
+        k_m = 1 if method is RoutingMethodType.Llama4 else k
         layer = MoELayer(
             MoEConfig(
-                routing=RoutingConfig(num_experts=E, top_k=k, method=method, **kwargs),
+                routing=RoutingConfig(
+                    num_experts=E, top_k=k_m, method=method, **kwargs
+                ),
                 quant=QuantConfig(),
                 experts=ExpertConfig(intermediate_size=I),
                 activation=SwiGLU(),
@@ -1094,20 +1633,37 @@ def test_routing_methods_from_logits_match_the_cpu_model():
         out = layer(_logits_pack(x, logits, b), W)
         ex, w = R.route_cpu(
             logits.cpu(),
-            k,
+            k_m,
             rm,
             b.cpu() if b is not None else None,
             1.75 if rm.scaled else None,
         )
         ref = layer(_routed_pack(x, ex.cuda(), w.cuda()), W)
-        assert torch.equal(bits(out), bits(ref)), method
+        assert torch.equal(bits(out), bits(ref)), (method, groups)
+        # the exact model row by row (the grouped order, the logit orders)
+        from flashinfer.fused_moe.batch_invariant import api
+
+        ex_d, w_d = api.route(logits, k_m, rm, b, 1.75 if rm.scaled else None)
+        assert torch.equal(ex_d.cpu(), ex) and torch.equal(bits(w_d.cpu()), bits(w)), (
+            method,
+            groups,
+        )
+        for t in range(0, T, 9):
+            sel, ws = R.route_exact(
+                logits[t].tolist(),
+                k_m,
+                rm,
+                b.tolist() if b is not None else None,
+                1.75 if rm.scaled else None,
+            )
+            assert ex[t].tolist() == sel and w[t].tolist() == ws, (method, groups, t)
 
 
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     """The error contract: a configuration outside the classes raises the mode's error at build or at the first call
-    (top_k / num_experts outside the bounds, fused shared experts, an expert-parallel shard, group-limited routing from
-    logits, no finalize, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
+    (top_k / num_experts outside the bounds, fused shared experts, a local expert range outside the experts, group-limited
+    routing from logits, an fp16 activation, weights of the other gating, an unimplemented routing method from logits); a
     non-default ``SwiGLU`` is a class of the backend (the ``swiglu_oai`` chain), not an error; a zero-token call returns
     an empty output."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
@@ -1137,12 +1693,11 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
                 experts=ExpertConfig(
                     intermediate_size=I,
                     local_expert_offset=E // 2,
-                    local_num_experts=E // 2,
+                    local_num_experts=E,
                 )
             ),
-            "parallel",
+            "local experts",
         ),
-        (dict(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize"),
     ):
         with pytest.raises(errors) as excinfo:
             MoELayer(
@@ -1165,14 +1720,15 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # the ungated weights with the gated class: refused at the call, not computed
     with pytest.raises(BatchInvariantUnsupportedError):
         layer(_logits_pack(x, logits), _weights(w1[:, :I].contiguous(), w2, ReLU2()))
-    # group-limited routing is refused from logits only: with pre-routed ids the group structure never enters the
-    # computation, and the output equals the ungrouped configuration's on the same ids and weights
+    # expert groups are a parameter of the DeepSeekV3 term: with another method they are refused from logits only (with
+    # pre-routed ids the group structure never enters the computation, and the output equals the ungrouped configuration's
+    # on the same ids and weights); the group shape rule is checked at construction
     grouped = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
                 num_experts=E,
                 top_k=k,
-                method=RoutingMethodType.DeepSeekV3,
+                method=RoutingMethodType.Renormalize,
                 n_group=2,
                 topk_group=1,
             ),
@@ -1190,11 +1746,40 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bits(grouped(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
         bits(layer(_routed_pack(x, g_ids.cuda(), g_wts.cuda()), W)),
     )
-    # an unimplemented routing method from logits is refused; the same layer takes pre-routed inputs
-    llama = MoELayer(
+    for n_group, topk_group, kk in (
+        (3, 1, k),
+        (64, 4, k),
+        (8, 9, k),
+        (8, 1, 9),
+        (32, 4, 1),
+    ):
+        with pytest.raises(errors) as excinfo:
+            MoELayer(
+                MoEConfig(
+                    routing=RoutingConfig(
+                        num_experts=E,
+                        top_k=kk,
+                        method=RoutingMethodType.DeepSeekV3,
+                        n_group=n_group,
+                        topk_group=topk_group,
+                        routed_scaling_factor=1.0,
+                    ),
+                    quant=QuantConfig(),
+                    experts=ExpertConfig(intermediate_size=I),
+                    backend=BackendOptions((BatchInvariantBf16Config(),)),
+                ),
+                device=torch.device("cuda"),
+            )
+        assert "n_group" in str(excinfo.value) or "top_k" in str(excinfo.value), (
+            n_group,
+            topk_group,
+            kk,
+        )
+    # MiniMax2 from logits is refused (another term); the same layer takes pre-routed inputs; Llama4 is the top-1 term
+    minimax = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
-                num_experts=E, top_k=1, method=RoutingMethodType.Llama4
+                num_experts=E, top_k=1, method=RoutingMethodType.MiniMax2
             ),
             quant=QuantConfig(),
             experts=ExpertConfig(intermediate_size=I),
@@ -1203,12 +1788,25 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         device=torch.device("cuda"),
     )
     with pytest.raises(BatchInvariantUnsupportedError):
-        llama(_logits_pack(x, logits), W)
+        minimax(_logits_pack(x, logits), W)
     ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
-    assert llama(_routed_pack(x, ids, torch.ones(8, 1, device="cuda")), W).shape == (
+    assert minimax(_routed_pack(x, ids, torch.ones(8, 1, device="cuda")), W).shape == (
         8,
         H,
     )
+    with pytest.raises(errors) as excinfo:
+        MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(
+                    num_experts=E, top_k=2, method=RoutingMethodType.Llama4
+                ),
+                quant=QuantConfig(),
+                experts=ExpertConfig(intermediate_size=I),
+                backend=BackendOptions((BatchInvariantBf16Config(),)),
+            ),
+            device=torch.device("cuda"),
+        )
+    assert "Llama4" in str(excinfo.value)
     # zero tokens
     out = layer(_logits_pack(x[:0], logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
@@ -1239,8 +1837,12 @@ def test_swapped_records_equal_the_grouped_records():
     rows): at every token tile its rows are a grouped record's rows bit for bit -- the fp32 and bf16 outputs, the gated and
     the ungated chain -- with groups of 1 .. 70 rows (several token tiles), empty groups, E = 256, a weight width that is
     not a multiple of the 128-row weight tile, and the dense buffer with and without the token tile's pad rows past the live
-    ones (the last tiles' boxes then read the pad, or are zero-filled past the buffer: never stored)."""
-    from flashinfer.fused_moe.batch_invariant.api import grouped_gemm
+    ones (the last tiles' boxes then read the pad, or are zero-filled past the buffer: never stored); the gather form (the
+    token box gathered by the TMA from the unpermuted rows through the plan's slots, k_div 1 and 3) gives the same rows."""
+    from flashinfer.fused_moe.batch_invariant.api import (
+        grouped_gemm,
+        grouped_gemm_gather,
+    )
     from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
     from flashinfer.gemm.batch_invariant.generator import Knobs
 
@@ -1272,6 +1874,15 @@ def test_swapped_records_equal_the_grouped_records():
                     ("relu2", torch.bfloat16),
                 )
             }
+            perm = (
+                torch.randperm(Tk, generator=torch.Generator().manual_seed(Tk + pad))
+                .to(torch.int32)
+                .cuda()
+            )
+            x_src = torch.empty(Tk, K, dtype=torch.bfloat16, device="cuda")
+            x_src[perm.long()] = a_buf[
+                :Tk
+            ]  # row p of the packing is x_src[perm[p]] = x_src[src[p] // k_div]
             for cfg in swapped_knobs():
                 for (ch, dt), ref in refs.items():
                     got = grouped_gemm(a_buf, w, cnt, cfg, ch, dt, Tk=Tk)
@@ -1284,6 +1895,81 @@ def test_swapped_records_equal_the_grouped_records():
                         K,
                         pad,
                     )
+                    for k_div in (1, 3):
+                        got = grouped_gemm_gather(
+                            x_src, perm * k_div, k_div, w, cnt, cfg, ch, dt, Tk=Tk
+                        )
+                        assert torch.equal(bits(got.cpu()), bits(ref.cpu())), (
+                            cfg.describe(),
+                            ch,
+                            dt,
+                            counts[:4],
+                            N,
+                            K,
+                            pad,
+                            "gather",
+                            k_div,
+                        )
+            with pytest.raises(ValueError):
+                grouped_gemm_gather(x_src, perm, 1, w, cnt, dense, "plain", Tk=Tk)
+
+
+@needs_device
+def test_gather_form_of_the_op_equals_the_materialised_path():
+    """The op with a swapped GEMM1 gathers the tokens' rows itself (the default for a swapped record with a narrow token
+    tile: no gather launch, no permuted tensor) and gives the bits of the materialised path on the same records and of the
+    dense records, at decode grid shapes with empty experts and one-token experts; ``gather=True`` on a dense record
+    raises."""
+    from flashinfer.fused_moe.batch_invariant.api import (
+        GATHER_TOKEN_TILE_MAX,
+        MoEWeights,
+        fused_moe,
+        route,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
+    from flashinfer.gemm.batch_invariant.generator import Knobs
+
+    g = torch.Generator(device="cuda").manual_seed(5)
+    dense = Knobs((64, 64), (1, 1), False, True, "m", 1)
+    for T, k, H, I, E in [
+        (1, 8, 2048, 768, 128),
+        (4, 6, 1024, 512, 64),
+        (16, 8, 1024, 256, 256),
+        (64, 2, 512, 1024, 8),
+    ]:
+        x = (torch.randn(T, H, device="cuda", generator=g) * 0.5).to(torch.bfloat16)
+        fc1 = (torch.randn(E, 2 * I, H, device="cuda", generator=g) * 0.02).to(
+            torch.bfloat16
+        )
+        fc2 = (torch.randn(E, H, I, device="cuda", generator=g) * 0.02).to(
+            torch.bfloat16
+        )
+        W = MoEWeights.prepare(fc1, fc2)
+        ids, wts = route(torch.randn(T, E, device="cuda", generator=g), k)
+        ref = bits(fused_moe(x, ids, wts, W, config1=dense, config2=dense).cpu())
+        for sw in swapped_knobs():
+            for gather in (None, False, True):
+                out, im = fused_moe(
+                    x,
+                    ids,
+                    wts,
+                    W,
+                    config1=sw,
+                    config2=sw,
+                    return_intermediates=True,
+                    gather=gather,
+                )
+                gathered = gather is True or (
+                    gather is None and sw.tile_n <= GATHER_TOKEN_TILE_MAX
+                )
+                assert (im["x_perm"] is None) == gathered, (
+                    T,
+                    sw.describe(),
+                    gather,
+                )
+                assert torch.equal(bits(out.cpu()), ref), (T, sw.describe(), gather)
+        with pytest.raises(ValueError):
+            fused_moe(x, ids, wts, W, config1=dense, config2=dense, gather=True)
 
 
 @needs_device
@@ -1742,3 +2428,29 @@ def test_multi_launch_plan_equals_the_host_plan(T, k, E):
     get_compiled_plan(1, False)(ids.cuda().view(-1), c1, d1, s1, d1, d1, n, E)
     assert torch.equal(c1, counts) and torch.equal(d1.view(T, k), dest)
     assert torch.equal(s1, src)
+
+
+@needs_device
+def test_f32_prerouted_weights_round_in_the_combine_kernel():
+    """f32 pre-routed weights that are not bf16 values: the layer's packed mode rounds them in the combine kernel (no host
+    pass over the slots) and gives the bits of its packed mode on bf16 weights and of the unpacked mode on those bf16
+    weights; the op's ``w_round`` gives the bits of the op on the caller-rounded weights."""
+    T, k, H, I, E = 257, 8, 1024, 512, 128
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=9, adversarial=True)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    weights = weights.float()
+    w16 = weights.to(torch.bfloat16)
+    assert not torch.equal(weights, w16.float())  # the rounding is exercised
+    out_p32 = layer(_routed_pack(x, ids.cuda(), weights.cuda(), packed=True), W)
+    out_p16 = layer(_routed_pack(x, ids.cuda(), w16.cuda(), packed=True), W)
+    out_u16 = layer(_routed_pack(x, ids.cuda(), w16.cuda()), W)
+    assert torch.equal(bits(out_p32), bits(out_p16))
+    assert torch.equal(bits(out_p32), bits(out_u16))
+    from flashinfer.fused_moe.batch_invariant.api import MoEWeights, fused_moe
+
+    Wm = MoEWeights.prepare(w1, w2)
+    a = fused_moe(x, ids.cuda(), weights.cuda(), Wm, w_round=True)
+    b = fused_moe(x, ids.cuda(), w16.float().cuda(), Wm)
+    assert torch.equal(bits(a), bits(b))

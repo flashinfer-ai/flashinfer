@@ -88,6 +88,14 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
                 CLASS, "group-limited routing (n_group > 1)", "n_group in (None, 0, 1)"
             )
         self._method = METHOD_OF_FLASHINFER.get(routing.method)
+        if experts.local_expert_offset or (
+            experts.local_num_experts not in (None, 0, routing.num_experts)
+        ):
+            raise unsupported(
+                CLASS,
+                "expert-parallel shards (local_expert_offset / local_num_experts)",
+                "the full expert set (the class's EP form is not part of this backend)",
+            )
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 CLASS,

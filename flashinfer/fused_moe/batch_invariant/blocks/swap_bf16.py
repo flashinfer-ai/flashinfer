@@ -24,6 +24,11 @@ weight rows per CTA. The dispatcher ranks the swapped records with the grouped o
 Operands: ``rows (R, K, 1)`` K-major (the dense permuted rows; ``R >= Tk``: with ``R >= Tk + token_tile`` the last tiles'
 boxes stay inside the buffer, else they are zero-filled past it), ``w (N, K, E)`` K-major, ``out (Tk, Nout)`` row-major
 (``Nout = N`` plain and ungated, ``N / 2`` gated; bf16 / f16 / f32), ``counts (E,)`` int32.
+The gather form (``gather=True``, :meth:`SwappedGroupedGemm.gathered`): the token tile's rows gathered by the TMA's gather4
+mode from the unpermuted ``x (T, K)`` through the plan's ``src`` (row ``p`` reads ``x[src[p] // k_div]``; rows past the
+group's end repeat its last row and are never stored), one swizzle atom of K per stage (the gather4 box is the atom): GEMM1
+without the gather launch and the permuted tensor, the same bytes in the stage, the same fold. Its predecessor is the plan's
+launch, so every warp waits for it before the group tables.
 """
 
 from __future__ import annotations
@@ -61,36 +66,52 @@ EPILOGUE_WARPS = (
     1,
     2,
     3,
-)  # one warpgroup: the 128 weight rows of the tile, one per thread
+)  # one warpgroup: the weight rows of the tile (one per thread, or the (r, r + 8) pair of the 64-row tile)
 MMA_WARP = 4
 TMA_WARP = 5
 THREADS = 32 * (TMA_WARP + 1)
 WEIGHT_TILE = (
     128  # weight rows per tile (the MMA's M: the 1-CTA instruction's 128 rows)
 )
+WEIGHT_TILES = (
+    WEIGHT_TILE,
+    64,
+)  # the weight tiles: 128 rows, or 64 (the two-row TMEM layout: twice the CTAs of a small weight)
 TOKEN_TILES = TILES_N_NARROW  # the swapped records' token tiles (8, 16, 32)
+# the token tiles a weight tile takes: the 64-row tile from 16 tokens (a 64 x 8 tile holds too little work per CTA)
+TOKEN_TILES_OF_WEIGHT = {
+    WEIGHT_TILE: TILES_N_NARROW,
+    64: tuple(t for t in TILES_N_NARROW if t >= 16),
+}
 
 
-def swap_knobs(token_tile: int = TOKEN_TILES[0], raster: str = "m") -> Knobs:
-    """The bf16 classes' swapped record with ``token_tile`` tokens on the MMA's N side (128 weight rows, 1-CTA, no cluster)."""
-    assert token_tile in TOKEN_TILES, token_tile
+def swap_knobs(
+    token_tile: int = TOKEN_TILES[0], raster: str = "m", weight_tile: int = WEIGHT_TILE
+) -> Knobs:
+    """The bf16 classes' swapped record with ``token_tile`` tokens on the MMA's N side and ``weight_tile`` (128 or 64) weight
+    rows on its M side, 1-CTA, no cluster."""
+    assert token_tile in TOKEN_TILES_OF_WEIGHT[weight_tile], (token_tile, weight_tile)
     return Knobs(
-        (WEIGHT_TILE, token_tile), (1, 1), False, True, raster, 1, swap_ab=True
+        (weight_tile, token_tile), (1, 1), False, True, raster, 1, swap_ab=True
     )
 
 
 def swapped_knobs() -> List[Knobs]:
-    """The swapped record space of the bf16 classes: one record per token tile."""
-    return [swap_knobs(tn) for tn in TOKEN_TILES]
+    """The swapped record space of the bf16 classes: one record per (weight tile, token tile) -- 128 x 8 / 16 / 32 and 64 x 16 / 32."""
+    return [
+        swap_knobs(tn, weight_tile=wt)
+        for wt in WEIGHT_TILES
+        for tn in TOKEN_TILES_OF_WEIGHT[wt]
+    ]
 
 
 def is_swapped_record(knobs: Knobs) -> bool:
-    """A record the swapped body takes: the swapped 1-CTA record at a narrow token tile, no cluster, swizzle 1, no in-cluster
-    split, no in-CTA chunk fold, the TMA store flag of every record."""
+    """A record the swapped body takes: the swapped 1-CTA record at one of the weight tiles and its narrow token tiles, no
+    cluster, swizzle 1, no in-cluster split, no in-CTA chunk fold, the TMA store flag of every record."""
     return (
         knobs.swap_ab
-        and knobs.tile_m == WEIGHT_TILE
-        and knobs.tile_n in TOKEN_TILES
+        and knobs.tile_m in WEIGHT_TILES
+        and knobs.tile_n in TOKEN_TILES_OF_WEIGHT[knobs.tile_m]
         and knobs.cluster_shape_mn == (1, 1)
         and not knobs.use_2cta_instrs
         and knobs.swizzle_size == 1
@@ -110,16 +131,18 @@ class SwappedGroupedGemm:
     and the group's rows as a narrow TMA box on its B side. The persistent grid (``max_active_clusters``, in CTAs) is a dynamic
     launch argument: which CTA computes a tile, never the bits."""
 
-    def __init__(self, knobs: Knobs, chain: Union[str, GroupedChain]):
+    def __init__(
+        self, knobs: Knobs, chain: Union[str, GroupedChain], gather: bool = False
+    ):
         if isinstance(chain, str):
             chain = GroupedChain.legacy(chain, "bf16")
         assert isinstance(chain, GroupedChain), chain
         assert is_swapped_record(knobs), (
-            "the swapped body takes the narrow swapped records (128 weight rows x 8 / 16 / 32 tokens, 1-CTA)",
+            "the swapped body takes the narrow swapped records (128 or 64 weight rows x the narrow token tiles, 1-CTA)",
             knobs,
         )
-        self.knobs, self.chain = knobs, chain
-        self.token_tile = knobs.tile_n
+        self.knobs, self.chain, self.gather = knobs, chain, gather
+        self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
 
     @cute.jit
     def __call__(
@@ -131,11 +154,34 @@ class SwappedGroupedGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        """The TMA-box form: ``rows (R, K, 1)`` the dense permuted rows."""
+        assert not self.gather
+        self._launch(rows, w, out, counts, max_active_clusters, stream, None, Int32(1))
+
+    @cute.jit
+    def gathered(
+        self,
+        x: cute.Tensor,
+        src: cute.Tensor,
+        k_div: Int32,
+        w: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The gather form: ``x (T, K)`` the unpermuted rows, ``src (>= Tk,)`` int32 the plan's slot of every expanded row."""
+        assert self.gather
+        self._launch(x, w, out, counts, max_active_clusters, stream, src, k_div)
+
+    def _launch(self, rows, w, out, counts, max_active_clusters, stream, src, k_div):
         if cutlass.const_expr(rows.element_type != w.element_type):
             raise TypeError(
                 f"rows and w must have one type: {rows.element_type} != {w.element_type}"
             )
         assert rows.element_type is IN_DT["bf16"], rows.element_type
+        # the gather form's slab is one swizzle atom of K wide (the gather4 box is the atom): it keeps the format's default stage
+        k_blocks = None if self.gather else GROUPED_K_BLOCKS
         st = StaticPlan(
             plan_knobs_of(self.knobs),
             w.element_type,
@@ -146,14 +192,14 @@ class SwappedGroupedGemm:
             LayoutEnum.ROW_MAJOR,
             c_in_smem=False,
             extra_smem_bytes=TABLE_SMEM_BYTES,
-            k_blocks=GROUPED_K_BLOCKS,
+            k_blocks=k_blocks,
         )
         self.st = st
-        self.block = MainloopBlock("bf16", inner_steps=GROUPED_K_BLOCKS)
+        self.block = MainloopBlock("bf16", inner_steps=k_blocks)
         self.lowering = self.block.lowering()
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         assert (
-            st.cta_tile_shape_mnk[0] == WEIGHT_TILE
+            st.cta_tile_shape_mnk[0] == self.weight_tile
             and st.cta_tile_shape_mnk[1] == self.token_tile
         ), st.cta_tile_shape_mnk
         # the weights as the A operand: (M = N, K, L = E), TMA with the expert as the batch coordinate
@@ -167,17 +213,45 @@ class SwappedGroupedGemm:
         atom_w, tensor_w = cute.nvgpu.make_tiled_tma_atom_A(
             a_op, w, a_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
         )
-        # the token rows as the B operand: a box of token_tile rows x one k-tile, re-addressed per tile at the group's row
-        b_op = utils.sm100.cluster_shape_to_tma_atom_B(
-            st.cluster_shape_mn, st.tiled_mma.thr_id
-        )
         b_one = cute.select(
             st.b_smem_layout_staged,
             mode=list(range(cute.rank(st.b_smem_layout_staged) - 1)),
         )
-        atom_tok, tensor_tok = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op, rows, b_one, st.mma_tiler, st.tiled_mma, st.cluster_layout_vmnk.shape
-        )
+        tile_k = st.cta_tile_shape_mnk[2]
+        if cutlass.const_expr(self.gather):
+            # the token rows gathered by the TMA's gather4 mode over the 2-D x: a (token_tile, k-tile) box whose rows come
+            # from the index tensor, written to the swizzled stage as the dense box writes it (the atom carries the swizzle)
+            slab = cute.make_composed_layout(
+                st.b_smem_layout_staged.inner,
+                0,
+                cute.make_layout((self.token_tile, tile_k), stride=(tile_k, 1)),
+            )
+            gI = cute.make_tensor(
+                src.iterator,
+                cute.make_layout((src.shape[0], rows.shape[1]), stride=(1, 0)),
+            )
+            atom_tok, tensor_tok = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensor2DGather4G2SOp(tcgen05.CtaGroup.ONE),
+                rows,
+                slab,
+                (self.token_tile, tile_k),
+                gmem_coord_tensor=gI,
+            )
+            m_src = src
+        else:
+            # the token rows as the B operand: a box of token_tile rows x one k-tile, re-addressed per tile at the group's row
+            b_op = utils.sm100.cluster_shape_to_tma_atom_B(
+                st.cluster_shape_mn, st.tiled_mma.thr_id
+            )
+            atom_tok, tensor_tok = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op,
+                rows,
+                b_one,
+                st.mma_tiler,
+                st.tiled_mma,
+                st.cluster_layout_vmnk.shape,
+            )
+            m_src = counts  # unread
         self.num_tma_load_bytes = cute.size_in_bytes(
             st.a_dtype, a_one
         ) + cute.size_in_bytes(st.b_dtype, b_one)
@@ -189,6 +263,8 @@ class SwappedGroupedGemm:
             tensor_tok,
             out,
             counts,
+            m_src,
+            k_div,
             st.cluster_layout_vmnk,
             st.a_smem_layout_staged,
             st.b_smem_layout_staged,
@@ -211,13 +287,15 @@ class SwappedGroupedGemm:
         mTok_nkl: cute.Tensor,
         mOut: cute.Tensor,
         counts: cute.Tensor,
+        mSrc: cute.Tensor,
+        k_div: Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
     ):
         st = self.st
-        tn = self.token_tile
+        tn, wt = self.token_tile, self.weight_tile
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_w)
@@ -288,6 +366,10 @@ class SwappedGroupedGemm:
         )
         s_off = storage.group_off.get_tensor(cute.make_layout((MAX_E + 1,)))
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
+        if cutlass.const_expr(self.gather):
+            # the gather form follows the plan's launch directly (no gather kernel between): the tables read the plan's
+            # counts, so every warp waits for the predecessor first (the weight prefetch then follows the wait)
+            cute.arch.griddepcontrol_wait()
         if warp_idx == EPILOGUE_WARPS[0]:
             build_group_tables(
                 counts, E, tn, s_off, s_pre
@@ -338,29 +420,48 @@ class SwappedGroupedGemm:
         # the scheduler's "cluster rows" are the token tile, its "N tiles" the weight tiles
         if warp_idx == TMA_WARP:
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
             )
-            swap_tma_producer_loop(
-                st,
-                k_tile_cnt,
-                tile_sched,
-                ab_producer,
-                tma_atom_w,
-                tma_atom_tok,
-                tWgW,
-                tWsW,
-                mTok_nkl,
-                sTok,
-                thr_mma,
-                block_in_cluster_coord_vmnk[1],
-                b_cta_layout,
-            )
+            if cutlass.const_expr(self.gather):
+                swap_gather_producer_loop(
+                    st,
+                    k_tile_cnt,
+                    tile_sched,
+                    ab_producer,
+                    tma_atom_w,
+                    tma_atom_tok,
+                    tWgW,
+                    tWsW,
+                    mTok_nkl,
+                    mSrc,
+                    k_div,
+                    sTok,
+                    Tk,
+                    tn,
+                    st.cta_tile_shape_mnk[2],
+                )
+            else:
+                swap_tma_producer_loop(
+                    st,
+                    k_tile_cnt,
+                    tile_sched,
+                    ab_producer,
+                    tma_atom_w,
+                    tma_atom_tok,
+                    tWgW,
+                    tWsW,
+                    mTok_nkl,
+                    sTok,
+                    thr_mma,
+                    block_in_cluster_coord_vmnk[1],
+                    b_cta_layout,
+                )
         if warp_idx == MMA_WARP:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
             )
             mma_loop(
                 self.lowering,
@@ -381,7 +482,7 @@ class SwappedGroupedGemm:
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             tile_sched = GroupScheduler.create(
-                s_off, s_pre, counts, E, N, tn, WEIGHT_TILE, 1, raster_m, 0, 0
+                s_off, s_pre, counts, E, N, tn, wt, 1, raster_m, 0, 0
             )
             cute.arch.griddepcontrol_wait()  # the output rows were the predecessor chain's reads
             swapped_epilogue_loop(
@@ -510,6 +611,127 @@ def swap_tma_producer_loop(
 
 
 @cute.jit
+def swap_gather_producer_loop(
+    st,
+    k_tile_cnt: Int32,
+    tile_sched,
+    tma_producer,
+    tma_atom_w: cute.CopyAtom,
+    tma_atom_tok: cute.CopyAtom,
+    tWgW: cute.Tensor,
+    tWsW: cute.Tensor,
+    mX: cute.Tensor,
+    mSrc: cute.Tensor,
+    k_div: Int32,
+    sTok: cute.Tensor,
+    Tk: Int32,
+    tn: cutlass.Constexpr,
+    tile_k: cutlass.Constexpr,
+):
+    """The TMA producer of the gather form: per tile the expert's 128 weight rows (the expert as the batch coordinate) and the
+    token tile gathered by the TMA's gather4 mode from the unpermuted rows -- the tile's ``tn`` token indices (``src[p] //
+    k_div`` for the group's rows, the group's last row past its end: a valid box whose extra rows are never stored) go into
+    registers once per tile and every k-tile's gather issues from them; both copies count on the stage's transaction barrier.
+    The kernel has waited for the predecessor (the plan's launch) before its tables, so the wait here returns at once; the
+    loop keeps the box form's shape (the first tile's weight stages, the wait, the token gathers)."""
+    stage_elems = tn * tile_k
+    sTok_plain = cute.make_tensor(
+        sTok.iterator,
+        cute.make_layout(
+            (tn, tile_k, st.num_ab_stage), stride=(tile_k, 1, stage_elems)
+        ),
+    )  # the atom applies the swizzle
+    sTok_plain = cute.group_modes(sTok_plain, 0, 2)
+    idx = cute.make_rmem_tensor(cute.make_layout((tn,)), Int32)
+    work_tile = tile_sched.initial_work_tile_info()
+    n_pre = cutlass.min(Int32(st.num_ab_stage), k_tile_cnt)
+    if not work_tile.is_valid_tile:
+        n_pre = Int32(0)
+    tWgW_slice = tWgW[(None, work_tile.n_tile, None, work_tile.e)]
+    tma_producer.reset()
+    tok_producer = tma_producer.clone()
+    for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
+        handle = tma_producer.acquire_and_advance()
+        cute.copy(
+            tma_atom_w,
+            tWgW_slice[(None, handle.count)],
+            tWsW[(None, handle.index)],
+            tma_bar_ptr=handle.barrier,
+        )
+    cute.arch.griddepcontrol_wait()  # the plan's row map is the predecessor's
+    row0 = work_tile.row0
+    last = cutlass.max(cutlass.min(work_tile.row_end, Tk) - Int32(1), Int32(0))
+    for j in cutlass.range_constexpr(tn):
+        idx[j] = mSrc[cutlass.min(row0 + Int32(j), last)] // k_div
+    gX = cute.local_tile(
+        mX, (tn, tile_k), (0, None)
+    )  # (tn, tile_k, n_kt): the K tiles of the gathered rows
+    n_kt = cute.size(gX, mode=[2])
+    gI = cute.make_tensor(
+        idx.iterator, cute.make_layout((tn, tile_k, n_kt), stride=(1, 0, 0))
+    )
+    tTsTok, tTgX, tTgI = cpasync.tma_partition(
+        tma_atom_tok,
+        0,
+        cute.make_layout(1),
+        sTok_plain,
+        [cute.group_modes(gX, 0, 2), cute.group_modes(gI, 0, 2)],
+    )
+    for _k_tile in cutlass.range(0, n_pre, 1, unroll=1):
+        handle = tok_producer.current_handle()
+        cute.copy(
+            tma_atom_tok,
+            [tTgX[(None, handle.count)], tTgI[(None, handle.count)]],
+            tTsTok[(None, handle.index)],
+            tma_bar_ptr=handle.barrier,
+        )
+        tok_producer.advance()
+    k_start = n_pre
+    while work_tile.is_valid_tile:
+        tWgW_slice = tWgW[(None, work_tile.n_tile, None, work_tile.e)]
+        row0 = work_tile.row0
+        last = cutlass.max(cutlass.min(work_tile.row_end, Tk) - Int32(1), Int32(0))
+        for j in cutlass.range_constexpr(tn):
+            idx[j] = mSrc[cutlass.min(row0 + Int32(j), last)] // k_div
+        gI = cute.make_tensor(
+            idx.iterator, cute.make_layout((tn, tile_k, n_kt), stride=(1, 0, 0))
+        )
+        tTsTok, tTgX, tTgI = cpasync.tma_partition(
+            tma_atom_tok,
+            0,
+            cute.make_layout(1),
+            sTok_plain,
+            [cute.group_modes(gX, 0, 2), cute.group_modes(gI, 0, 2)],
+        )
+        peek_empty = cutlass.Boolean(1)
+        if k_start < k_tile_cnt:
+            peek_empty = tma_producer.try_acquire()
+        for _k_tile in cutlass.range(k_start, k_tile_cnt, 1, unroll=1):
+            handle = tma_producer.acquire_and_advance(peek_empty)
+            cute.copy(
+                tma_atom_w,
+                tWgW_slice[(None, handle.count)],
+                tWsW[(None, handle.index)],
+                tma_bar_ptr=handle.barrier,
+            )
+            cute.copy(
+                tma_atom_tok,
+                [tTgX[(None, handle.count)], tTgI[(None, handle.count)]],
+                tTsTok[(None, handle.index)],
+                tma_bar_ptr=handle.barrier,
+            )
+            peek_empty = cutlass.Boolean(1)
+            if handle.count + 1 < k_tile_cnt:
+                peek_empty = tma_producer.try_acquire()
+        tma_producer.reset()
+        k_start = Int32(0)
+        tile_sched.advance_to_next_work()
+        work_tile = tile_sched.get_current_work()
+    pdl.trigger_late()
+    tma_producer.tail()
+
+
+@cute.jit
 def swapped_epilogue_loop(
     st,
     chain: cutlass.Constexpr,
@@ -554,12 +776,28 @@ def swapped_epilogue_loop(
     frag = tTR_cF[(None, None, None, 0, 0, 0, 0, 0)]
     offs = fragment_offsets(frag.layout)
     nv = len(offs)
-    assert len({m for m, _ in offs}) == 1, (
-        "the 128-row TMEM layout: one weight row per thread"
+    tile_m = st.cta_tile_shape_mnk[0]
+    # the thread's weight rows: one (the 128-row tile: lane = row, the gate row GROUP lanes below) or two (the 64-row tile's
+    # lane split: rows r and r + GROUP of one thread, so the gated pair sits in the thread's own registers)
+    row_offs = sorted({m for m, _ in offs})
+    assert row_offs in ([0], [0, GROUP]), (
+        "the swapped epilogue's TMEM layouts: one weight row per thread, or the (r, r + 8) pair",
+        offs,
+        frag.layout,
     )
+    two_rows = len(row_offs) == 2
+    index = {o: v for v, o in enumerate(offs)}
+    partner = [
+        index.get((m + GROUP, n)) for m, n in offs
+    ]  # the gate register of an up register (two_rows)
+    ups = [
+        v for v in range(nv) if offs[v][0] == 0
+    ]  # the registers that hold an up row (all, with one row)
+    assert not two_rows or all(partner[v] is not None for v in ups), offs
     cols = [
         n - offs[0][1] for _, n in offs
     ]  # the register's token column inside the subtile
+    rows = [m for m, _ in offs]  # the register's weight row inside the thread's pair
     tTR_rAcc = cute.make_rmem_tensor(frag.shape, ACC_DTYPE)
     tTR_cF = cute.group_modes(tTR_cF, 3, cute.rank(tTR_cF))
     acc_state = pipeline.make_pipeline_state(
@@ -578,19 +816,26 @@ def swapped_epilogue_loop(
         for s in cutlass.range_constexpr(subtile_cnt):
             cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
             crd0 = tTR_cF[(None, None, None, s)][(0, 0, 0)]
-            wrow = crd0[0]  # this thread's weight row in the tile
+            wrow = crd0[0]  # this thread's (first) weight row in the tile
             col0 = crd0[1] - Int32(offs[0][1])  # the subtile's first token column
-            n_glob = n_tile * Int32(WEIGHT_TILE) + wrow
-            # the gate accumulators of the up rows: lane + 8 (rows 16q + 8 + r sit 8 lanes below rows 16q + r)
+            n_glob = n_tile * Int32(tile_m) + wrow
+            # the gate accumulators of the up rows: lane + 8 (rows 16q + 8 + r sit 8 lanes below rows 16q + r in the 128-row
+            # layout), or the thread's own second row (the 64-row layout)
             gate = None
             if cutlass.const_expr(pair):
-                gate = [
-                    cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
-                    for v in range(nv)
-                ]
+                if cutlass.const_expr(two_rows):
+                    gate = [
+                        tTR_rAcc[partner[v]] if partner[v] is not None else tTR_rAcc[v]
+                        for v in range(nv)
+                    ]
+                else:
+                    gate = [
+                        cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
+                        for v in range(nv)
+                    ]
                 is_up = (wrow % Int32(2 * GROUP)) < Int32(GROUP)
                 out_col = (
-                    n_tile * Int32(WEIGHT_TILE // 2)
+                    n_tile * Int32(tile_m // 2)
                     + (wrow // Int32(2 * GROUP)) * Int32(GROUP)
                     + wrow % Int32(GROUP)
                 )
@@ -601,6 +846,8 @@ def swapped_epilogue_loop(
             # the chain of a token column is computed only where the column is a live token of the group (a warp-uniform
             # branch: every lane of the warp holds the same column), so a tile with few live tokens pays few chains
             for v in cutlass.range_constexpr(nv):
+                if cutlass.const_expr(pair and rows[v] != 0):
+                    continue  # a gate register (two_rows): folded into its up register's chain
                 j = col0 + Int32(cols[v])
                 if j < rows_left:
                     val = _chain_elem(
@@ -608,8 +855,8 @@ def swapped_epilogue_loop(
                         tTR_rAcc[v],
                         gate[v] if cutlass.const_expr(pair) else None,
                     )
-                    if store_ok:
-                        mOut[(row0 + j, out_col)] = val
+                    if store_ok & (n_glob + Int32(rows[v]) < N):
+                        mOut[(row0 + j, out_col + Int32(rows[v]))] = val
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(acc_state)
         acc_state.advance()

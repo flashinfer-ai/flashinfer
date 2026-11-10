@@ -13,7 +13,9 @@ form up to ``ROUTE_PLAN_MAX_TOKENS`` tokens (one CTA's warps route the tokens se
 form's parallel plan wins). ``align``: the group offsets rounded up to ``align`` rows (the block-scaled classes' padded packing:
 ``src`` then spans the padded bound and the launch writes ``-1`` into every padding slot, the two-launch form's host fill).
 An id outside ``[0, E)`` (a dropped slot of a caller's plan) is not counted and gets ``dest -1``; ``src`` holds ``-1`` past
-the valid rows.
+the valid rows. An expert-parallel shard plans the local experts only: the routing stays over the ``E`` global experts and
+the plan counts the local ids ``e - e_off`` in ``[0, E_plan)`` (``E_plan = E``, ``e_off = 0`` without a shard), the other
+slots dropped.
 ``dual``: the dense positions and, next to them, the positions with the groups padded to ``pad_align`` rows (``dest_pad``,
 ``pos_pad``: the block-scaled classes' dense packing, whose scale factors and row scales sit at the padded positions).
 """
@@ -91,10 +93,25 @@ class RoutePlanKernel:
         mPosPad: cute.Tensor,
         T: Int32,
         E: Int32,
+        E_plan: Int32,
+        e_off: Int32,
         stream,
     ):
         self.kernel(
-            mL, mBias, mScale, mExp, mW, mCounts, mDest, mSrc, mDestPad, mPosPad, T, E
+            mL,
+            mBias,
+            mScale,
+            mExp,
+            mW,
+            mCounts,
+            mDest,
+            mSrc,
+            mDestPad,
+            mPosPad,
+            T,
+            E,
+            E_plan,
+            e_off,
         ).launch(grid=[1, 1, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=True)
 
     @cute.kernel
@@ -112,6 +129,8 @@ class RoutePlanKernel:
         mPosPad: cute.Tensor,
         T: Int32,
         E: Int32,
+        E_plan: Int32,
+        e_off: Int32,
     ):
         P, k, meth = self.P, self.k, self.method
         tidx, _, _ = cute.arch.thread_idx()
@@ -169,10 +188,10 @@ class RoutePlanKernel:
                 valid = i < n
                 e = Int32(-1)
                 if valid:
-                    e = s_exp[i]
+                    e = s_exp[i] - e_off  # the local id of a shard's plan
                 ok = (
-                    valid & (e >= Int32(0)) & (e < E)
-                )  # a dropped slot (id outside [0, E)) is ranked by nothing
+                    valid & (e >= Int32(0)) & (e < E_plan)
+                )  # a dropped slot (id outside the plan's range) is ranked by nothing
                 m = cute.arch.match_sync(Uint32(0xFFFFFFFF), e)
                 intra = Int32(cute.arch.popc(m & cute.arch.lanemask_lt()))
                 r = Int32(0)
@@ -188,7 +207,7 @@ class RoutePlanKernel:
                 rs[c] = r
         cute.arch.barrier()
         # phase B2: per expert, the exclusive prefix over the rank warps (in place) and the total = the histogram
-        for e in cutlass.range(tidx, E, THREADS):
+        for e in cutlass.range(tidx, E_plan, THREADS):
             run = Int32(0)
             for w in cutlass.range_constexpr(RANK_WARPS):
                 v = wcnt[w * MAX_E + e].to(Int32)
@@ -198,9 +217,11 @@ class RoutePlanKernel:
             mCounts[e] = run
         cute.arch.barrier()
         if warp == 0:
-            build_group_tables(hist, E, 1, s_off, s_pre, self.align)
+            build_group_tables(hist, E_plan, 1, s_off, s_pre, self.align)
             if cutlass.const_expr(self.dual):
-                build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
+                build_group_tables(
+                    hist, E_plan, 1, s_off_pad, s_pre_pad, self.pad_align
+                )
         cute.arch.barrier()
         # phase B3: the positions
         if warp < Int32(RANK_WARPS):
@@ -209,7 +230,7 @@ class RoutePlanKernel:
                 i = base_w + Int32(c * LANES) + lane
                 if i < n:
                     e = es[c]
-                    if (e >= Int32(0)) & (e < E):
+                    if (e >= Int32(0)) & (e < E_plan):
                         rank = wcnt[warp * MAX_E + e].to(Int32) + rs[c]
                         p = s_off[e] + rank
                         mDest[i] = p
@@ -218,14 +239,14 @@ class RoutePlanKernel:
                             pp = s_off_pad[e] + rank
                             mDestPad[i] = pp
                             mPosPad[p] = pp
-                    if (e < Int32(0)) | (e >= E):
+                    if (e < Int32(0)) | (e >= E_plan):
                         mDest[i] = Int32(-1)  # a dropped slot has no position
                         if cutlass.const_expr(self.dual):
                             mDestPad[i] = Int32(-1)
         if cutlass.const_expr(self.align > 1):
             # the padded packing's -1 slots: every group's rows past its count up to its rounded extent (one warp per expert)
             al = Int32(self.align)
-            for e in cutlass.range(warp, E, WARPS_RP):
+            for e in cutlass.range(warp, E_plan, WARPS_RP):
                 lo = s_off[e] + hist[e]
                 hi = s_off[e] + ((hist[e] + al - Int32(1)) // al) * al
                 for r in cutlass.range(lo + lane, hi, LANES):
@@ -264,19 +285,21 @@ def get_compiled_route_plan(
     dual: bool = False,
     pad_align: int = 128,
 ) -> Any:
-    """``kernel(logits [T, E], bias [E] f32, scale [1] f32, experts [T, k] i32, weights [T, k] f32, counts [E] i32,
+    """``kernel(logits [T, E], bias [E] f32, scale [1] f32, experts [T, k] i32, weights [T, k] f32, counts [E_plan] i32,
     dest [T k] i32, src [T k] i32 (the padded bound's rows when ``align > 1``), dest_pad [T k] i32, pos_pad [T k] i32 (the dual
-    form's padded positions; any int32 tensors otherwise), T, E)``; ``Ep`` the expert bucket, ``T`` and
-    ``E`` runtime."""
+    form's padded positions; any int32 tensors otherwise), T, E, E_plan, e_off)``; ``Ep`` the expert bucket, ``T``, ``E`` (the
+    routed experts), ``E_plan`` and ``e_off`` (the planned experts ``[e_off, e_off + E_plan)``; ``E`` and ``0`` without an
+    expert-parallel shard) runtime."""
     in_dt = get_cutlass_dtype(in_fmt)
 
     def compile_fn():
-        sym_t, sym_e, sym_n, sym_p = (
+        sym_t, sym_e, sym_n, sym_p, sym_c = (
             cute.sym_int(32),
             cute.sym_int(32),
             cute.sym_int(32),
             cute.sym_int(32),
-        )
+            cute.sym_int(32),
+        )  # the counts have their own extent: a shard plans fewer experts than it routes
         l_fake = cute.runtime.make_fake_tensor(
             in_dt, (sym_t, sym_e), (cute.sym_int64(), 1), assumed_align=4
         )
@@ -288,7 +311,7 @@ def get_compiled_route_plan(
         w_fake = cute.runtime.make_fake_tensor(
             Float32, (sym_t, k), (k, 1), assumed_align=4
         )
-        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_e,), (1,), assumed_align=4)
+        c_fake = cute.runtime.make_fake_tensor(Int32, (sym_c,), (1,), assumed_align=4)
         d_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         src_fake = cute.runtime.make_fake_tensor(Int32, (sym_p,), (1,), assumed_align=4)
         dp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
@@ -308,6 +331,8 @@ def get_compiled_route_plan(
             pp_fake,
             Int32(1),
             Int32(1),
+            Int32(1),
+            Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )

@@ -3292,13 +3292,17 @@ class BatchInvariantBf16Config:
     weights alone: the batch size and composition, the row's position, the expert loads and the grouped-GEMM record the
     dispatcher or the autotuner picks never enter the dataflow (run-to-run determinism, batch / permutation / sub-batch
     invariance, configuration agreement; the proofs are the ``MoE`` Lean module of the mode). The combine is the
-    slot-order fp32 fold of the class and the backend always performs it: ``MoEFinalizeConfig.do_finalize`` must stay
-    ``True`` (the unreduced per-slot rows of ``do_finalize=False`` are not returned; they belong with the expert-parallel
-    classes, together with the convention for non-local experts) and ``use_fused_finalize`` is ignored (the combine is
-    never an atomic finalize).
+    slot-order fp32 fold of the class; ``MoEFinalizeConfig(do_finalize=False)`` leaves it to the caller and returns the
+    layer's triple ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``: GEMM2's bf16 rows grouped by expert
+    in expert order and, inside a group, in token-slot order (a function of the routing alone, so the rows are
+    reproducible; rows past the valid ones are not written), the weights as the combine folds them (fp32 from logits
+    and for fp32 pre-routed weights; the mode's bf16 for packed and bf16 pre-routed weights, whose exact widening the
+    fold uses) and the flat ``[num_tokens * top_k]`` int32 map, ``-1`` for a dropped slot. The class's slot-order fold
+    over the triple is the finalized output bit for bit. ``use_fused_finalize`` is ignored (the combine is never an
+    atomic finalize).
     All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
-    ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm`` and ``DeepSeekV3`` with ``n_group <= 1``), the pre-routed modes take the caller's ids
-    and weights. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
+    ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm``, ``TopK``, ``Llama4`` (``top_k = 1``), ``TopKSigmoid`` and
+    ``DeepSeekV3`` with or without expert groups), the pre-routed modes take the caller's ids and weights. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
     its argument below, so a masked expert keeps a positive score of the smallest magnitudes; while ``top_k`` unmasked
     experts exist it is never selected and the weights are exactly those of the row without it, otherwise masked experts
     fill the remaining slots (in index order; by their bias for the biased methods) with such weights, and a fully masked
@@ -3309,17 +3313,26 @@ class BatchInvariantBf16Config:
     whatever its weight (a token whose slots are all dropped gives a zero row); nothing is validated on the host.
     Unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; the backend never falls
     back and is not a default candidate: name it in ``BackendOptions`` (alone, it skips the shootout). The layer's own
-    checks come first: ``MoELayer`` runs every candidate's support check at construction (the base runner refuses an
-    expert-parallel shard; this backend ``do_finalize=False``, ``top_k`` / ``num_experts`` beyond its bounds and fused
-    shared experts) and reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
+    checks come first: ``MoELayer`` runs every candidate's support check at construction (this backend refuses
+    ``top_k`` / ``num_experts`` beyond its bounds, fused shared experts and a local expert range outside the experts) and
+    reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
     filter admits only a bf16 ``[num_tokens, H]`` activation (an fp16 one is its ``NotImplementedError``: no usable
-    backend); what reaches the runner (``n_group > 1`` or an unimplemented method from logits, a bias against the method,
+    backend); what reaches the runner (an unimplemented method from logits, a bias or expert groups against the method,
     a weight view of another activation or configuration, the runner driven directly) raises
     ``BatchInvariantUnsupportedError``.
 
+    Expert parallelism: a shard (``ExpertConfig(local_expert_offset=offset, local_num_experts=E_local)``, weights prepared
+    for its ``E_local`` experts) routes over the ``num_experts`` global experts (from logits, or the caller's global ids)
+    and computes the slots whose expert lies in ``[offset, offset + E_local)``; every other slot is dropped (the term
+    ``+0`` in its token's fold, ``-1`` in the unfinalized map), so the rank's output is the dense class's fold restricted
+    to its experts: within one placement of the experts over the ranks every guarantee holds per rank, and the rows of
+    the unfinalized form are bit for bit the dense run's rows for those slots. The dense output is recovered bit for bit
+    by folding the ranks' unfinalized rows in slot order (the class's combine); a sum of the ranks' finalized partials is
+    another association and is not promised to equal it.
+
     Weights: ``prepare_weights`` takes the canonical ``w1 [E, 2I, H]`` (rows ``[up, gate]``) for the gated activations or
-    ``w1 [E, I, H]`` for the ungated ones, and ``w2 [E, H, I]``, bf16; the activation names the chain of the view;
-    activations are bf16 ``[num_tokens, H]`` as given.
+    ``w1 [E, I, H]`` for the ungated ones, and ``w2 [E, H, I]``, bf16 (``E`` the local experts of a shard); the activation
+    names the chain of the view; activations are bf16 ``[num_tokens, H]`` as given.
     """
 
     @classmethod

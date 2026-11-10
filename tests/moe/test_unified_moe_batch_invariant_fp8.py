@@ -316,8 +316,13 @@ def test_fingerprint_dimensions_and_classes():
     assert bi.fingerprint("fused_moe_fp8", act="relu2", **dims) == bi.fingerprint(
         "fused_moe_fp8", act=ReLU2(), **dims
     )
+    assert (
+        bi.fingerprint("fused_moe_fp8", method=RoutingMethodType.Llama4, **dims) != fp
+    )  # the Llama4 (top-k sigmoid) routing term is a class dimension of its own
     with pytest.raises(ValueError):
-        bi.fingerprint("fused_moe_fp8", method=RoutingMethodType.Llama4, **dims)
+        bi.fingerprint(
+            "fused_moe_fp8", method=RoutingMethodType.MiniMax2, **dims
+        )  # a method without a term in the mode
     with pytest.raises(TypeError):
         bi.fingerprint("fused_moe_fp8", m_x=1.0, **dims)
     for cfg in ACTIVATIONS:
@@ -1158,8 +1163,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         ),
         device=torch.device("cuda"),
     )
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        llama(_logits_pack(xq, logits), W)
+    # the Llama4 (top-k sigmoid) routing term is the shared backend's: the layer routes from the logits and the bits repeat
+    out_l = llama(_logits_pack(xq, logits), W)
+    assert out_l.shape == (xq.shape[0], H) and out_l.dtype == torch.bfloat16
+    assert torch.equal(
+        out_l.view(torch.int16), llama(_logits_pack(xq, logits), W).view(torch.int16)
+    )
     ids = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
     assert llama(_routed_pack(xq, ids, torch.ones(8, 1, device="cuda")), W).shape == (
         8,
