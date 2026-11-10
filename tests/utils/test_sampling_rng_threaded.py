@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Exercise generator reservation through real sampling kernels and graph replay.
+# Exercise shared-generator reservation through real sampling kernels.
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, local
@@ -107,24 +107,3 @@ def test_threaded_sampling_matches_reserved_rng_ranges(
             expected = _sample(name, values, seed=seed, offset=offset)
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
         assert generator.get_offset() == next_offset
-
-
-@pytest.mark.parametrize("name", SAMPLERS)
-def test_sampling_explicit_rng_cuda_graph_replay(name):
-    device = torch.device("cuda", torch.cuda.current_device())
-    values = torch.linspace(-2, 2, 4 * 128, device=device).reshape(4, 128).softmax(-1)
-    seed = torch.tensor([1234], dtype=torch.int64, device=device)
-    offset = torch.tensor([0], dtype=torch.int64, device=device)
-    _sample(name, values, seed=seed, offset=offset)
-    torch.cuda.synchronize(device)
-    graph = torch.cuda.CUDAGraph()
-    try:
-        with torch.cuda.graph(graph):
-            output = _sample(name, values, seed=seed, offset=offset)
-        for value in (0, 128, 4096):
-            offset.fill_(value)
-            graph.replay()
-            expected = _sample(name, values, seed=seed, offset=offset)
-            torch.testing.assert_close(output, expected, rtol=0, atol=0)
-    finally:
-        graph.reset()

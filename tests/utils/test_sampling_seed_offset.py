@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Per-output RNG tensors must match scalar RNG values at the same output row."""
+"""Cover per-output RNG tensors and generator reservations with scalar references."""
 
 from functools import partial
 
@@ -182,3 +182,122 @@ def test_sampling_rng_tensor_ffi_rejects_invalid_length(name, size):
         offset = invalid
     with pytest.raises(RuntimeError, match=f"{name} tensor length must be 1 or 4"):
         module.sampling_from_logits(logits, output, indices, True, seed, 0, offset, 0)
+
+
+@pytest.mark.parametrize("use_default_generator", [False, True])
+@pytest.mark.parametrize("seed", [0, 1234, (1 << 63) - 1, 1 << 63, (1 << 64) - 1])
+@pytest.mark.parametrize(
+    "initial_offset", [0, 128, (1 << 63) - 256, 1 << 63, (1 << 64) - 4]
+)
+def test_generator_reservation_state(use_default_generator, seed, initial_offset):
+    device = torch.device("cuda", torch.cuda.current_device())
+    with torch.random.fork_rng(devices=[device.index]):
+        generator = (
+            torch.cuda.default_generators[device.index]
+            if use_default_generator
+            else torch.Generator(device=device)
+        )
+        generator.manual_seed(seed)
+        generator.set_offset(initial_offset)
+        expected = torch.Generator(device=device)
+        expected.set_state(generator.get_state())
+        for increment in (0, 1, 3, 4, 5, 17, 128):
+            # The state-tensor representation is the pre-optimization contract,
+            # including signed seed/offset bits and uint64 offset wraparound.
+            expected_seed, expected_offset = map(
+                int, expected.get_state().view(torch.int64)
+            )
+            next_offset = expected_offset + (increment + 3) // 4 * 4
+            expected.set_state(
+                torch.tensor([expected_seed, next_offset], dtype=torch.int64).view(
+                    torch.uint8
+                )
+            )
+            actual = sampling.get_seed_and_offset(
+                increment, None if use_default_generator else generator, device
+            )
+            assert actual == (expected_seed, expected_offset)
+            torch.testing.assert_close(
+                generator.get_state(), expected.get_state(), rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize(
+    "initial_offset,increment", [((1 << 63) - 4, 1), ((1 << 63) - 8, 5)]
+)
+def test_generator_reservation_overflow_preserves_state(initial_offset, increment):
+    generator = torch.Generator(device="cuda").manual_seed(1234)
+    generator.set_offset(initial_offset)
+    state = generator.get_state()
+    with pytest.raises((RuntimeError, ValueError), match="[Oo]verflow"):
+        sampling.get_seed_and_offset(increment, generator)
+    torch.testing.assert_close(generator.get_state(), state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
+@pytest.mark.parametrize("use_default_generator", [False, True])
+@pytest.mark.parametrize("seed", [1234, (1 << 64) - 1])
+def test_sampling_generator_cuda_graph(monkeypatch, name, use_default_generator, seed):
+    device = torch.device("cuda", torch.cuda.current_device())
+    sample = _chain_sampler(1) if name == "chain" else _sampler(name, True)
+    sample(seed=1234, offset=0)  # Compile before capture.
+    torch.cuda.synchronize(device)
+    reservations = []
+    reserve = sampling.get_seed_and_offset
+
+    def record_reservation(increment, generator=None, device=None):
+        assert torch.cuda.is_current_stream_capturing()
+        result = reserve(increment, generator, device)
+        reservations.append(result)
+        return result
+
+    monkeypatch.setattr(sampling, "get_seed_and_offset", record_reservation)
+    with torch.random.fork_rng(devices=[device.index]):
+        generator = (
+            torch.cuda.default_generators[device.index]
+            if use_default_generator
+            else torch.Generator(device=device)
+        )
+        generator.manual_seed(seed)
+        generator.set_offset(128)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                outputs = [
+                    sample(generator=None if use_default_generator else generator)
+                    for _ in range(2)
+                ]
+            assert len(reservations) == 2
+            assert reservations[1][1] > reservations[0][1]
+            # Check the actual ranges chosen during capture: PyTorch versions
+            # differ in their capture-time generator offset bookkeeping.
+            for _ in range(3):
+                graph.replay()
+                for output, (captured_seed, captured_offset) in zip(
+                    outputs, reservations, strict=True
+                ):
+                    expected = sample(seed=captured_seed, offset=captured_offset)
+                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            assert len(reservations) == 2  # Replay must not reserve on the host.
+        finally:
+            graph.reset()
+
+
+@pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
+@pytest.mark.parametrize("use_default_generator", [False, True])
+@pytest.mark.parametrize("seed", [1234, (1 << 64) - 1])
+def test_sampling_generator_matches_explicit_rng(name, use_default_generator, seed):
+    device = torch.device("cuda", torch.cuda.current_device())
+    sample = _chain_sampler(1) if name == "chain" else _sampler(name, True)
+    with torch.random.fork_rng(devices=[device.index]):
+        generator = (
+            torch.cuda.default_generators[device.index]
+            if use_default_generator
+            else torch.Generator(device=device)
+        )
+        generator.manual_seed(seed)
+        generator.set_offset(128)
+        actual = sample(generator=None if use_default_generator else generator)
+        signed_seed = seed if seed < 1 << 63 else seed - (1 << 64)
+        expected = sample(seed=signed_seed, offset=128)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
