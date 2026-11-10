@@ -170,7 +170,9 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     s_gram = smem.allocate_tensor(_ACC, cute.make_layout((16, N), stride=(N, 1)), 16)
     # Tree-verify tables; one element placeholders on the chain path.
     TP = T if HAS_PATHS else 1
-    s_log_path = smem.allocate_tensor(_ACC, cute.make_layout((2, TP), stride=(TP, 1)), 16)
+    s_log_path = smem.allocate_tensor(
+        _ACC, cute.make_layout((2, TP), stride=(TP, 1)), 16
+    )
     s_path_decay = smem.allocate_tensor(
         _ACC, cute.make_layout((2, TP), stride=(TP, 1)), 16
     )
@@ -587,9 +589,9 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
                     # accepted prefix, since the unit-triangular chunk solve makes
                     # u_t depend only on tokens 1..t.
                     if valid:
-                        replayssm_u[(safe_cache_idx, i_hv0 + epilogue_head, i_t, m_idx)] = (
-                            delta
-                        )
+                        replayssm_u[
+                            (safe_cache_idx, i_hv0 + epilogue_head, i_t, m_idx)
+                        ] = delta
                 result = state_scale * r_base[T + i_t]
                 for j in cutlass.range_constexpr(i_t + 1):
                     result = result + coeff[j] * s_gram[(j, T + i_t)]
