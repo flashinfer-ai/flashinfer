@@ -2386,6 +2386,25 @@ class AutoTuner:
                 or self._v2_local.strict_replay
             ):
                 return result
+            identity = self._winner_cache_identity()
+            retired_keys = (
+                self._invalidated_file_keys
+                if identity is None
+                else self._excluded_file_keys.get(identity)
+            )
+            if retired_keys and any(
+                self._get_cache_key(
+                    custom_op,
+                    runner,
+                    input_shapes,
+                    tuning_config,
+                    runner.get_cache_key_extras(inputs) if inputs is not None else (),
+                ).file_key
+                in retired_keys
+                for runner in runners
+            ):
+                # Do not borrow another bucket's winner for a rejected bucket.
+                return result
             top_profile = self._top_tuned_profile(
                 custom_op, runners, input_shapes, tuning_config, inputs
             )
@@ -3644,6 +3663,10 @@ class AutoTuner:
                 if not _all_ranks_hit_cache(
                     has_selection, selection, phase=("final_selection", custom_op)
                 ):
+                    # Serving does not consult the tuning group.
+                    self._discard_profile_cache(
+                        custom_op, runners, input_shapes, tuning_config, inputs
+                    )
                     return runners[0], -1
             return runners[runner_id], tactic
 

@@ -742,13 +742,16 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from flashinfer.autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig, autotune, set_autotune_process_group
+from flashinfer.autotune_cache import autotune_v2, autotune_v2_reload
 from flashinfer.utils import last_positive_power_of_2
 
 rank = int(os.environ["RANK"])
 case = os.environ["CACHE_CASE"]
 single_runner = case.startswith("final_single_runner_")
 different_valid_tactics = case == "final_single_runner_different_valid_tactics"
-complete = single_runner or case == "final_cached_disagreement"
+cached_disagreement = case.startswith("final_cached_disagreement")
+managed = case == "final_cached_disagreement_managed"
+complete = single_runner or cached_disagreement
 agreed = case in ("final_incomplete_agreement", "final_single_runner_agreement")
 root = Path(os.environ["CASE_ROOT"])
 
@@ -790,7 +793,7 @@ try:
     runners = [winner] if single_runner else [RunnerA(), winner]
     inputs = [torch.zeros(8, 8)]
     config = TuningConfig()
-    expected_profiled = runners
+    expected_profiled = [runners[0], *runners] if managed else runners
     if different_valid_tactics:
         # Agree on each bucket's winner before selecting with rank-local inputs.
         inputs = [torch.zeros(4 if rank == 0 else 8, 8)]
@@ -807,14 +810,23 @@ try:
         expected_profiled = [winner] * 4
     expected = (winner, 0) if agreed else (runners[0], -1)
     selections = []
-    with autotune(True):
+    context = autotune_v2(cache_root=root / "cache") if managed else autotune(True)
+    with context:
         for repeat in (False, True):
             profiled.clear()
             selections.append(tuner.choose_one("test::final_selection", runners, config, inputs))
-            assert profiled == ([] if repeat and complete else expected_profiled)
+            expected_calls = [] if repeat and complete and agreed else expected_profiled
+            assert profiled == expected_calls
     assert selections == [expected, expected], (
         rank, case, [(type(runner).__name__, tactic) for runner, tactic in selections]
     )
+    if complete:
+        set_autotune_process_group(None)
+        if managed:
+            dist.barrier()
+            autotune_v2_reload()
+        serving = tuner.choose_one("test::final_selection", runners, config, inputs)
+        assert serving == expected, (rank, case, type(serving[0]).__name__, serving[1])
     print("cache agreement OK", rank, case, flush=True)
 finally:
     set_autotune_process_group(None)
@@ -841,6 +853,7 @@ finally:
         "final_incomplete_disagreement",
         "final_incomplete_agreement",
         "final_cached_disagreement",
+        "final_cached_disagreement_managed",
         "final_single_runner_disagreement",
         "final_single_runner_agreement",
         "final_single_runner_different_valid_tactics",
