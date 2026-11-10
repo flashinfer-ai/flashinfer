@@ -84,6 +84,7 @@ def _gdn_replayssm_fold_kernel(
     HAS_TRACK: cutlass.Constexpr[bool],
     HAS_PATHS: cutlass.Constexpr[bool],
     TRACK_ONLY: cutlass.Constexpr[bool],
+    PREFETCH_NEXT_STEP: cutlass.Constexpr[bool],
 ):
     row_tile, i_n, layer_head = cute.arch.block_idx()
     lane = cute.arch.lane_idx()
@@ -139,56 +140,88 @@ def _gdn_replayssm_fold_kernel(
                 safe_track_slot = cutlass.Int32(0)
             flat_track_slot = cutlass.Int64(i_layer) * slots_per_layer + safe_track_slot
 
-        # Step t+1's raw inputs are loaded while step t computes, keeping
-        # global-load latency off the serial recurrence.  Every lane loads
-        # the per-head gate scalars from one uniform address.  A tree accept
-        # replays an ordered path, so only the loaded row moves.
-        next_key_bf16 = cute.make_rmem_tensor((_CHANNELS_PER_LANE,), _BF16)
+        # The recurrence is serial, so each step's global loads for raw K, raw V
+        # and the gate scalars sit on its critical path.  On SM120 the next
+        # step's inputs are loaded while the current step computes, which hides
+        # that latency for long windows.  SM100/SM103 commits do not benefit
+        # (the extra live registers cost a few percent), so they load each
+        # step's inputs at the top of the step.  A tree accept replays an
+        # ordered path, so only the loaded row moves.
         step_inputs = cute.make_rmem_tensor((3,), _F32)
-        next_step_inputs = cute.make_rmem_tensor((3,), _F32)
-        next_row = cutlass.Int32(0)
-        if cutlass.const_expr(HAS_PATHS):
-            next_row = accept_paths[i_n * MAX_CACHE_LEN]
-            if next_row < 0:
-                next_row = cutlass.Int32(0)
-            if next_row >= MAX_CACHE_LEN:
-                next_row = cutlass.Int32(MAX_CACHE_LEN - 1)
-        cute.copy(
-            copy_bf16x4,
-            _aligned_tensor(rawk[(None, lane, next_row, i_h, flat_slot)], 8),
-            next_key_bf16,
-        )
-        next_step_inputs[0] = log_g[(next_row, i_hv, flat_slot)]
-        next_step_inputs[1] = beta[(next_row, i_hv, flat_slot)]
-        next_step_inputs[2] = _F32(0.0)
-        if lane < _ROWS_PER_WARP:
-            next_step_inputs[2] = rawv[
-                (lane, warp, row_tile, next_row, i_hv, flat_slot)
-            ].to(_F32)
+        if cutlass.const_expr(PREFETCH_NEXT_STEP):
+            next_key_bf16 = cute.make_rmem_tensor((_CHANNELS_PER_LANE,), _BF16)
+            next_step_inputs = cute.make_rmem_tensor((3,), _F32)
+            next_row = cutlass.Int32(0)
+            if cutlass.const_expr(HAS_PATHS):
+                next_row = accept_paths[i_n * MAX_CACHE_LEN]
+                if next_row < 0:
+                    next_row = cutlass.Int32(0)
+                if next_row >= MAX_CACHE_LEN:
+                    next_row = cutlass.Int32(MAX_CACHE_LEN - 1)
+            cute.copy(
+                copy_bf16x4,
+                _aligned_tensor(rawk[(None, lane, next_row, i_h, flat_slot)], 8),
+                next_key_bf16,
+            )
+            next_step_inputs[0] = log_g[(next_row, i_hv, flat_slot)]
+            next_step_inputs[1] = beta[(next_row, i_hv, flat_slot)]
+            next_step_inputs[2] = _F32(0.0)
+            if lane < _ROWS_PER_WARP:
+                next_step_inputs[2] = rawv[
+                    (lane, warp, row_tile, next_row, i_hv, flat_slot)
+                ].to(_F32)
 
         for t in cutlass.range(n_commit, unroll=1):
-            for channel in cutlass.range_constexpr(_CHANNELS_PER_LANE):
-                key_bf16[channel] = next_key_bf16[channel]
-            for item in cutlass.range_constexpr(3):
-                step_inputs[item] = next_step_inputs[item]
-            if t + 1 < n_commit:
-                next_row = t + 1
+            if cutlass.const_expr(PREFETCH_NEXT_STEP):
+                for channel in cutlass.range_constexpr(_CHANNELS_PER_LANE):
+                    key_bf16[channel] = next_key_bf16[channel]
+                for item in cutlass.range_constexpr(3):
+                    step_inputs[item] = next_step_inputs[item]
+                if t + 1 < n_commit:
+                    next_row = t + 1
+                    if cutlass.const_expr(HAS_PATHS):
+                        next_row = accept_paths[i_n * MAX_CACHE_LEN + t + 1]
+                        if next_row < 0:
+                            next_row = cutlass.Int32(0)
+                        if next_row >= MAX_CACHE_LEN:
+                            next_row = cutlass.Int32(MAX_CACHE_LEN - 1)
+                    cute.copy(
+                        copy_bf16x4,
+                        _aligned_tensor(
+                            rawk[(None, lane, next_row, i_h, flat_slot)], 8
+                        ),
+                        next_key_bf16,
+                    )
+                    next_step_inputs[0] = log_g[(next_row, i_hv, flat_slot)]
+                    next_step_inputs[1] = beta[(next_row, i_hv, flat_slot)]
+                    if lane < _ROWS_PER_WARP:
+                        next_step_inputs[2] = rawv[
+                            (lane, warp, row_tile, next_row, i_hv, flat_slot)
+                        ].to(_F32)
+            else:
+                row = t
                 if cutlass.const_expr(HAS_PATHS):
-                    next_row = accept_paths[i_n * MAX_CACHE_LEN + t + 1]
-                    if next_row < 0:
-                        next_row = cutlass.Int32(0)
-                    if next_row >= MAX_CACHE_LEN:
-                        next_row = cutlass.Int32(MAX_CACHE_LEN - 1)
+                    row = accept_paths[i_n * MAX_CACHE_LEN + t]
+                    if row < 0:
+                        row = cutlass.Int32(0)
+                    if row >= MAX_CACHE_LEN:
+                        row = cutlass.Int32(MAX_CACHE_LEN - 1)
                 cute.copy(
                     copy_bf16x4,
-                    _aligned_tensor(rawk[(None, lane, next_row, i_h, flat_slot)], 8),
-                    next_key_bf16,
+                    _aligned_tensor(rawk[(None, lane, row, i_h, flat_slot)], 8),
+                    key_bf16,
                 )
-                next_step_inputs[0] = log_g[(next_row, i_hv, flat_slot)]
-                next_step_inputs[1] = beta[(next_row, i_hv, flat_slot)]
+                log_decay = _F32(0.0)
+                beta_load = _F32(0.0)
+                if lane == 0:
+                    log_decay = log_g[(row, i_hv, flat_slot)]
+                    beta_load = beta[(row, i_hv, flat_slot)]
+                step_inputs[0] = cute.arch.shuffle_sync(log_decay, 0)
+                step_inputs[1] = cute.arch.shuffle_sync(beta_load, 0)
+                step_inputs[2] = _F32(0.0)
                 if lane < _ROWS_PER_WARP:
-                    next_step_inputs[2] = rawv[
-                        (lane, warp, row_tile, next_row, i_hv, flat_slot)
+                    step_inputs[2] = rawv[
+                        (lane, warp, row_tile, row, i_hv, flat_slot)
                     ].to(_F32)
 
             key_norm = _F32(0.0)
@@ -297,6 +330,7 @@ def _launch_gdn_replayssm_fold(
     HAS_TRACK: cutlass.Constexpr[bool],
     HAS_PATHS: cutlass.Constexpr[bool],
     TRACK_ONLY: cutlass.Constexpr[bool],
+    PREFETCH_NEXT_STEP: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     rows_per_cta = WARPS_PER_CTA * _ROWS_PER_WARP
@@ -387,6 +421,7 @@ def _launch_gdn_replayssm_fold(
         HAS_TRACK,
         HAS_PATHS,
         TRACK_ONLY,
+        PREFETCH_NEXT_STEP,
     ).launch(
         grid=(row_tiles, state_indices.shape[0], NUM_LAYERS * HV),
         block=(WARPS_PER_CTA * 32, 1, 1),
@@ -692,6 +727,7 @@ def commit_gdn_replayssm_fold_all_layers(
                     HAS_TRACK=bool(has_track),
                     HAS_PATHS=has_paths,
                     TRACK_ONLY=track_only,
+                    PREFETCH_NEXT_STEP=target.major == 12,
                     stream=stream,
                 ),
                 extra_key_files=(__file__,),
