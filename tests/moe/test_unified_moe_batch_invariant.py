@@ -116,6 +116,14 @@ def bits(t: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _same_bits_or_both_nan(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Bitwise equality with NaN matching NaN (the NaN rows' weights: the payload of a propagated NaN is not specified)."""
+    a, b = a.float().cpu(), b.float().cpu()
+    return torch.equal(torch.isnan(a), torch.isnan(b)) and torch.equal(
+        bits(torch.nan_to_num(a, nan=0.0)), bits(torch.nan_to_num(b, nan=0.0))
+    )
+
+
 def _problem(
     T: int,
     k: int,
@@ -362,6 +370,28 @@ def test_fingerprint_dimensions_and_classes():
         bi.fingerprint(
             "fused_moe", method=RoutingMethodType.TopK, n_group=8, topk_group=4, **base
         )
+    # the runner's group shape rule, as a ValueError (never an assertion): a topk_group without n_group, more kept groups
+    # than groups, a group count that does not divide the experts; a caller-built method equal to the DeepSeekV3 constant
+    # takes the groups
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    for bad in (
+        dict(topk_group=2),
+        dict(n_group=4, topk_group=5),
+        dict(n_group=3, topk_group=1),
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            bi.fingerprint(
+                "fused_moe", method=RoutingMethodType.DeepSeekV3, **bad, **base
+            )
+        assert "n_group" in str(excinfo.value), bad
+    assert g84 == bi.fingerprint(
+        "fused_moe",
+        method=S.RoutingMethod("sigmoid", True, True, True),
+        n_group=8,
+        topk_group=4,
+        **base,
+    )
     assert bi.class_name("fused_moe") == "moe.bf16"
 
 
@@ -656,6 +686,258 @@ def test_ulp_error_counts_subnormal_spacing_at_zero_and_subnormal_references():
     assert ulp_error(torch.tensor([3 * tiny]), torch.tensor([2 * tiny])) == 1.0
     assert ulp_error(torch.tensor([normal + tiny]), torch.tensor([normal])) == 1.0
     assert ulp_error(torch.tensor([1.0 + 2.0**-23]), torch.tensor([1.0])) == 1.0
+
+
+def test_expert_count_bound_at_every_entry_point():
+    """Every entry point refuses more than ``MAX_E`` experts before any kernel runs (the plan kernel's shared-memory
+    tables are ``MAX_E`` wide, the route kernels' widest bucket is ``MAX_E``): ``permute_plan``, ``grouped_gemm`` and its
+    gather form, ``fused_moe`` with weights to prepare and with a ready view, ``MoEWeights.prepare`` /
+    ``BatchInvariantBf16Config.prepare_weights``, ``route`` and ``route_plan``; the bound itself is taken."""
+    import dataclasses
+
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import MAX_E
+    from flashinfer.fused_moe.batch_invariant.schedule import grouped_knobs
+
+    E, bf16 = MAX_E + 1, torch.bfloat16
+    ids = torch.zeros(2, 2, dtype=torch.int32)
+    x = torch.zeros(2, 8, dtype=bf16)
+    scales = torch.ones(2, 2)
+    w1, w2 = torch.zeros(E, 16, 8, dtype=bf16), torch.zeros(E, 8, 8, dtype=bf16)
+    with pytest.raises(ValueError):
+        api.permute_plan(ids, E)
+    with pytest.raises(ValueError):
+        api.MoEWeights.prepare(w1, w2)
+    with pytest.raises(ValueError):
+        BatchInvariantBf16Config.prepare_weights(w1, w2)
+    with pytest.raises(ValueError):
+        api.fused_moe(x, ids, scales, (w1, w2))
+    with pytest.raises(ValueError):
+        api.fused_moe(x, ids, scales, api.MoEWeights(w1, w2))
+    cfg = grouped_knobs()[0]
+    counts = torch.zeros(E, dtype=torch.int32)
+    with pytest.raises(ValueError):
+        api.grouped_gemm(x, w2, counts, cfg)
+    with pytest.raises(ValueError):
+        api.grouped_gemm_gather(
+            x,
+            torch.zeros(4, dtype=torch.int32),
+            2,
+            w2,
+            counts,
+            dataclasses.replace(cfg, swap_ab=True),
+        )
+    logits = torch.zeros(2, E)
+    with pytest.raises(ValueError):
+        api.route(logits, 2)
+    with pytest.raises(ValueError):
+        api.route_plan(logits, 2)
+    w1m, w2m = (
+        torch.zeros(MAX_E, 16, 8, dtype=bf16),
+        torch.zeros(MAX_E, 8, 8, dtype=bf16),
+    )
+    assert api.MoEWeights.prepare(w1m, w2m).num_experts == MAX_E
+
+
+def test_combine_oracle_treats_a_dropped_slot_as_zero():
+    """The vectorised combine oracle folds a dropped slot (``dest = -1``) as the term ``+0`` -- never the last row of
+    ``y`` by negative indexing -- so it equals the exact per-element fold with that slot's product zeroed, and a token
+    whose slots are all dropped is the zero row."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    T, k, H = 6, 4, 16
+    g = torch.Generator().manual_seed(12)
+    y = torch.randn(T * k, H, generator=g).to(torch.bfloat16)
+    w = torch.randn(T, k, generator=g)
+    dest = torch.arange(T * k, dtype=torch.int32).view(T, k)
+    dest[1, 2] = -1
+    dest[3, :] = -1
+    dest[4, 0] = -1
+    out = R.combine_cpu(y, dest, w)
+    yf = y.float()
+    for t in range(T):
+        for h in range(H):
+            ys = [
+                yf[dest[t, r], h].item() if dest[t, r] >= 0 else 0.0 for r in range(k)
+            ]
+            ref = S.combine_elem(R.ExactF32, ys, w[t].tolist())
+            assert out[t, h].item() == ref, (t, h)
+    assert torch.all(out[3] == 0)
+    # a negative index would have folded the last row in at the dropped slots
+    naive = R.combine_cpu(
+        y, torch.where(dest < 0, torch.full_like(dest, T * k - 1), dest), w
+    )
+    assert not torch.equal(bits(naive[1]), bits(out[1]))
+
+
+def test_vectorised_e5m2_conversion_matches_the_exact_backend():
+    """``TorchF32.cvt_out(., "e5m2")`` is the exact backend's ``cvt.rn.satfinite.e5m2x2.f32`` (RNE, the magnitudes
+    beyond the largest finite value saturate to it, infinities included, NaN stays NaN) on every finite bf16 value and the
+    saturation boundary; the e4m3 path is unchanged."""
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+    from flashinfer.fused_moe.batch_invariant import reference as R
+
+    vals = (
+        torch.arange(0, 2**16, dtype=torch.int32)
+        .to(torch.int16)
+        .view(torch.bfloat16)
+        .float()
+    )
+    vals = torch.cat(
+        [
+            vals[torch.isfinite(vals)],
+            torch.tensor([57344.0, 61440.0, 61441.0, 65536.0, 3e38, -3e38]),
+        ]
+    )
+    got = R.TorchF32.cvt_out(vals, "e5m2")
+    ref = torch.tensor([fp32.to_fp8(v, "e5m2") for v in vals.tolist()])
+    assert torch.equal(bits(got), bits(ref))
+    special = torch.tensor([float("inf"), -float("inf"), float("nan")])
+    sp = R.TorchF32.cvt_out(special, "e5m2")
+    assert sp[0].item() == 57344.0 and sp[1].item() == -57344.0 and torch.isnan(sp[2])
+    assert R.ExactF32.cvt_out(61440.0, "e5m2") == 57344.0
+    assert torch.equal(
+        bits(R.TorchF32.cvt_out(vals, "e4m3")),
+        bits(torch.tensor([fp32.to_fp8(v, "e4m3") for v in vals.tolist()])),
+    )
+
+
+def test_ranking_is_memoised_per_token_count():
+    """``rank_grouped`` (the dispatcher's enumeration, acceptance and pricing of both record spaces) is memoised on its
+    scalar arguments: a repeated call is a cache hit returning an equal list, and ``default_configs`` (the ``fused_moe``
+    path without records) hits twice per call; the lists are copies (a caller cannot alter the cache)."""
+    from flashinfer.fused_moe.batch_invariant.schedule import (
+        _rank_grouped,
+        default_configs,
+        rank_grouped,
+    )
+
+    _rank_grouped.cache_clear()
+    args = (7, 1536, 2048, 128, "swiglu", 212, "sm_107", 3)
+    a = rank_grouped(*args, n_active=56)
+    misses = _rank_grouped.cache_info().misses
+    b = rank_grouped(*args, n_active=56)
+    assert b == a and b is not a and len(a) == 3
+    assert _rank_grouped.cache_info().hits == 1
+    assert _rank_grouped.cache_info().misses == misses
+    a.clear()
+    assert rank_grouped(*args, n_active=56) == b
+    c = default_configs(1, 8, 2048, 768, 128, 212, "sm_107")
+    hits = _rank_grouped.cache_info().hits
+    assert default_configs(1, 8, 2048, 768, 128, 212, "sm_107") == c
+    assert _rank_grouped.cache_info().hits == hits + 2
+
+
+def test_powlu_chain_normalises_subnormal_gates():
+    """The declared log scales a positive subnormal gate into the normal range before its mantissa / exponent split, so
+    the PowLU chain at the smallest subnormals lands within a few binary32 ulps of the activation's definition (its
+    value in binary64) as it does at normal gates, wherever the power stays inside the declared exp's range (below it
+    the chain is the clamp's value, as documented); the exact and the vectorised chains agree there; the gate ``0``
+    (and ``-0``) gives ``+0``."""
+    import math
+
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    gates = [
+        2.0**-149,
+        3 * 2.0**-149,
+        2.0**-140,
+        2.0**-130,
+        2.0**-127,
+        2.0**-126,
+        2.0**-125,
+        0.3,
+    ]
+    checked = 0
+    for m, limit in ((0.5, None), (1.5, 4.0), (2.5, None)):
+        for gate in gates:
+            v = S.glu_pre(R.ExactF32, gate, 1.0, "powlu", (m, limit))
+            e = m / (math.sqrt(gate) + 1)
+            if e * math.log(gate) < S.EXP_MIN + 1:
+                continue  # the power underflows the declared exp's range: the clamp's value
+            ref = gate**e / (1 + math.exp(-gate))
+            assert abs(v - ref) <= 2.0**-14 * ref, (m, limit, gate, v, ref)
+            checked += 1
+        vec = R.glu_cpu_act(
+            torch.tensor(gates + [0.0, -0.0]),
+            torch.ones(len(gates) + 2),
+            "powlu",
+            (m, limit),
+        )
+        exact = [
+            S.glu_elem(R.ExactF32, gi, 1.0, "powlu", "bf16", (m, limit))
+            for gi in gates + [0.0, -0.0]
+        ]
+        assert torch.equal(bits(vec), bits(torch.tensor(exact).to(torch.bfloat16)))
+        assert (
+            vec[-1].item() == 0 and vec[-2].item() == 0 and not torch.signbit(vec[-1])
+        )
+    assert checked >= 8
+
+
+def test_nan_logits_in_the_exact_model_are_skipped_by_the_normalisation():
+    """The spec's NaN rule, device-free: under the softmax methods a NaN logit is skipped by the row maximum and its term
+    is ``+0`` (the same row with the NaN logits at ``-inf`` gives the bits: the clamped exp's terms are absorbed exactly
+    by the finite partial sums at these magnitudes); under the sigmoid and logit methods its selection score is NaN
+    (never selected, where the declared exp of a NaN would have made a finite score) and the row without it selects and
+    weights the same experts; when fewer than ``k`` logits are non-NaN the fill rule takes the lowest untaken experts
+    with NaN weights, the finite slots keeping their weights under the methods without renormalisation; the vectorised
+    and the exact models agree on finite rows."""
+    import math
+
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    nan, ninf = float("nan"), float("-inf")
+    bias = [0.1, -0.2, 0.05, 0.3, -0.1, 0.2, 0.0, -0.3]
+    row = [1.0, nan, 2.0, 3.0, nan, -1.0, 0.5, 2.5]
+    masked = [ninf if v != v else v for v in row]
+    sub = [v for v in row if v == v]
+    sub_bias = [b for v, b in zip(row, bias, strict=True) if v == v]
+    keep = [e for e, v in enumerate(row) if v == v]
+    for meth, b_, sc in (
+        (S.SOFTMAX, None, None),
+        (S.SOFTMAX_RENORM, None, None),
+        (S.SIGMOID, None, None),
+        (S.SIGMOID_RENORM, None, None),
+        (S.SIGMOID_BIAS_RENORM_SCALED, bias, 1.75),
+        (S.TOPK, None, None),
+        (S.TOPK_SIGMOID, None, None),
+    ):
+        sel, w = R.route_exact(row, 3, meth, b_, sc)
+        if meth.score == "softmax":
+            sel_s, w_s = R.route_exact(masked, 3, meth, b_, sc)
+            assert sel == sel_s and w == w_s, meth.name
+        else:
+            sel_s, w_s = R.route_exact(sub, 3, meth, sub_bias if b_ else None, sc)
+            assert sel == [keep[e] for e in sel_s] and w == w_s, meth.name
+        assert 1 not in sel and 4 not in sel
+    sel, w = R.route_exact([nan, 1.0, nan, 3.0], 3, S.SOFTMAX)
+    assert sel == [3, 1, 0] and math.isnan(w[2])
+    assert w[:2] == R.route_exact([ninf, 1.0, ninf, 3.0], 2, S.SOFTMAX)[1]
+    sel, w = R.route_exact([nan, 1.0, nan, 3.0], 3, S.SIGMOID)
+    assert (
+        sel == [3, 1, 0]
+        and math.isnan(w[2])
+        and w[:2] == R.route_exact([1.0, 3.0], 2, S.SIGMOID)[1]
+    )
+    sel, w = R.route_exact([nan, 1.0, nan, 3.0], 3, S.SOFTMAX_RENORM)
+    assert sel == [3, 1, 0] and all(math.isnan(v) for v in w)
+    assert R.ExactF32.rowmax(nan, 1.0, nan) == 1.0 and math.isnan(
+        R.ExactF32.rowmax(nan, nan)
+    )
+    assert R.TorchF32.rowmax(
+        torch.tensor([nan, 2.0]), torch.tensor([1.0, nan])
+    ).tolist() == [1.0, 2.0]
+    g = torch.Generator().manual_seed(4)
+    logits = (torch.randn(8, 16, generator=g) * 2).float()
+    for meth in (S.SOFTMAX, S.SIGMOID_RENORM, S.TOPK):
+        ex, ws = R.route_cpu(logits, 4, meth)
+        for t in range(8):
+            sel, w = R.route_exact(logits[t].tolist(), 4, meth)
+            assert ex[t].tolist() == sel and ws[t].tolist() == w, (meth.name, t)
 
 
 def _adversarial_accumulators(
@@ -1224,12 +1506,12 @@ def test_expert_parallel_shards_are_the_dense_class_on_the_local_experts(T):
         assert torch.equal(bits(out_l), bits(ref)), ("from logits", r)
         out_u = rank(_routed_pack(x, ids, weights), W_r)
         assert torch.equal(bits(out_u), bits(ref)), ("pre-routed", r)
-        assert (
-            torch.equal(
-                bits(out_u), bits(rank(_routed_pack(x, ids, weights, packed=True), W_r))
-            )
-            or True
-        )
+        # the packed mode rounds the weights to bf16: the shard's bits are the full layer's on the masked ids with the
+        # rounded weights
+        assert torch.equal(
+            bits(rank(_routed_pack(x, ids, weights, packed=True), W_r)),
+            bits(full(_routed_pack(x, ids_masked, weights.to(torch.bfloat16)), W_full)),
+        ), ("packed", r)
         partial_sum += out_u.float()
         partial_scale = max(partial_scale, out_u.float().abs().max().item())
         y_r, w_r, dest_r = rank_unf(_routed_pack(x, ids, weights), W_r)
@@ -2215,8 +2497,10 @@ def test_nan_logits_route_to_the_lowest_untaken_experts_with_nan_weights(E):
     in ``[0, E)`` (never the bucket's absent experts at ``E = 48``, never the argmax sentinel at ``E = 64``), the row's
     output is NaN, nothing faults, and the rows without a NaN keep the class's bits, in the fused route + plan form (a
     small token count) and the two-launch form; ``route_plan`` gives ``route`` + ``permute_plan``'s integers on such
-    logits. A row with exactly ``top_k`` finite logits selects them in the strict order."""
+    logits. A row with exactly ``top_k`` finite logits selects them in the strict order, with the NaN experts absent from
+    the weights; every method's ids and weights on the NaN rows are the exact model's."""
     from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant import reference as R
     from flashinfer.fused_moe.batch_invariant import spec as S
 
     k, H, I = 8, 256, 128
@@ -2264,6 +2548,53 @@ def test_nan_logits_route_to_the_lowest_untaken_experts_with_nan_weights(E):
         assert torch.equal(ids, ex2) and torch.equal(bits(wts), bits(w2_))
         assert torch.equal(counts, counts2) and torch.equal(dest, dest2)
         assert torch.equal(src, src2)
+        # the NaN rule per method, ids and weights of the NaN rows against the exact model: the row maximum skips a NaN
+        # logit, its softmax term is +0 and its selection score NaN, so the finite experts' weights are those of the row
+        # without the NaN logits (Default / Renormalize, the sigmoid methods with and without bias, scale and groups)
+        bias = (
+            (torch.randn(E, generator=torch.Generator().manual_seed(E)) * 0.1)
+            .float()
+            .cuda()
+        )
+        for rm, b_, sc in (
+            (S.SOFTMAX, None, None),
+            (S.SOFTMAX_RENORM, None, None),
+            (S.SIGMOID, None, None),
+            (S.SIGMOID_RENORM, None, None),
+            (S.SIGMOID_BIAS_RENORM_SCALED, bias, 1.75),
+            (S.SIGMOID_BIAS_RENORM_SCALED.with_groups(8, 4), bias, 1.75),
+        ):
+            ids_m, wts_m = api.route(logits, k, rm, b_, sc)
+            ids_m, wts_m = ids_m.cpu(), wts_m.cpu()
+            b_c = None if b_ is None else b_.cpu().tolist()
+            for t, cols in finite.items():
+                sel, ws = R.route_exact(logits_c[t].tolist(), k, rm, b_c, sc)
+                assert ids_m[t].tolist() == sel, (rm.name, t)
+                assert _same_bits_or_both_nan(wts_m[t], torch.tensor(ws)), (rm.name, t)
+                if len(cols) == k and not rm.grouped:
+                    if rm.score == "softmax":
+                        # the NaN experts as -inf logits of the same row: the clamped exp's terms are absorbed exactly
+                        # by the finite experts' partial sums at these magnitudes, so the bits are the +0 terms' (the
+                        # sum tree of the row keeps its shape: a sub-row of another expert count is another tree)
+                        row = logits_c[t].clone()
+                        row[torch.isnan(row)] = float("-inf")
+                        sel_s, ws_s = R.route_exact(row.tolist(), k, rm, b_c, sc)
+                        assert sel_s == sel and ws_s == ws, (rm.name, t)
+                    else:
+                        # per-expert weights: the row without its NaN logits selects and weights the same experts
+                        sub = logits_c[t, cols].tolist()
+                        sub_b = None if b_c is None else [b_c[e] for e in cols]
+                        sel_s, ws_s = R.route_exact(sub, k, rm, sub_b, sc)
+                        assert [cols[e] for e in sel_s] == sel and ws_s == ws, (
+                            rm.name,
+                            t,
+                        )
+            clean_ids, clean_w = R.route_cpu(
+                logits_c[clean], k, rm, None if b_ is None else b_.cpu(), sc
+            )
+            assert torch.equal(ids_m[clean], clean_ids) and torch.equal(
+                bits(wts_m[clean]), bits(clean_w)
+            ), rm.name
         layer, W = _layer(k, E, I), _weights(w1, w2)
         out = layer(_logits_pack(x, logits), W)
         nan_rows = torch.tensor([keep.get(t, k) < k for t in range(T)]).cuda()
@@ -2316,6 +2647,16 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
         )
         assert torch.equal(bits(out.cpu()), bits(ref))
         assert torch.all(out[rows[0]] == 0)
+        # the combine oracle over the op's own intermediates folds the dropped slots as +0: the kernel's bits
+        from flashinfer.fused_moe.batch_invariant import reference as R
+
+        out_api, im = api.fused_moe(
+            x, ids_bad.cuda(), wts.cuda(), (w1, w2), return_intermediates=True
+        )
+        assert torch.equal(bits(out_api.cpu()), bits(out.cpu()))
+        assert torch.equal(
+            bits(out_api.cpu()), bits(R.combine_cpu(im["y"], im["dest"], wts))
+        )
         whole = (~dropped.any(dim=1)).cuda()
         ref_whole = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W)
         assert torch.equal(bits(out[whole]), bits(ref_whole[whole]))
@@ -2350,6 +2691,54 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots():
             assert torch.all(pp[n_valid:] == -1) and torch.all(pp[:n_valid] >= 0), multi
             assert torch.all(dp[valid_i] >= 0)
             assert torch.equal(pp[d2[valid_i].long()], dp[valid_i]), multi
+
+
+@needs_device
+def test_every_slot_dropped_launches_the_grouped_gemms_without_a_tile():
+    """With every expanded row dropped the plan's counts are all zero while the grouped GEMMs still launch (``Tk > 0``):
+    the scheduler's tile total is zero, every CTA takes the invalid tile and exits (no decode of an empty group), the
+    output is the zero row of every token -- pre-routed ids all ``-1`` through the op on the dense and on the swapped
+    records, and an expert-parallel rank none of whose local experts any token selects, pre-routed and from logits,
+    finalized (zero rows) and unfinalized (the map all ``-1``)."""
+    from flashinfer.fused_moe.batch_invariant import api
+    from flashinfer.fused_moe.batch_invariant.schedule import default_configs
+
+    T, k, H, I, E = 37, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=44)
+    ids = torch.full((T, k), -1, dtype=torch.int32, device="cuda")
+    wts = torch.rand(T, k, device="cuda")
+    out, im = api.fused_moe(x, ids, wts, (w1, w2), return_intermediates=True)
+    torch.cuda.synchronize()
+    assert torch.all(out == 0) and int(im["counts"].sum()) == 0
+    assert torch.all(im["dest"] == -1)
+    for swap in (False, True):
+        c1, c2 = default_configs(T, k, H, I, E, *api._part(x.device), swap=swap)
+        assert c1.swap_ab == swap and c2.swap_ab == swap
+        out2 = api.fused_moe(x, ids, wts, (w1, w2), config1=c1, config2=c2)
+        torch.cuda.synchronize()
+        assert torch.all(out2 == 0), swap
+    e_local = 4
+    off = E - e_local
+    ids_g, w_g = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids_g = torch.where(
+        ids_g >= off, ids_g - off, ids_g
+    ).cuda()  # no slot on the rank's experts
+    w_g = w_g.cuda()
+    W_r = _weights(w1[off:].contiguous(), w2[off:].contiguous())
+    rank = MoELayer(_ep_config(k, E, I, off, e_local), device=torch.device("cuda"))
+    rank_unf = MoELayer(
+        _ep_config(k, E, I, off, e_local, False), device=torch.device("cuda")
+    )
+    assert torch.all(rank(_routed_pack(x, ids_g, w_g), W_r) == 0)
+    y, w, dest = rank_unf(_routed_pack(x, ids_g, w_g), W_r)
+    assert torch.all(dest == -1) and y.shape == (T * k, H)
+    logits_m = logits.clone()
+    logits_m[:, off:] = float(
+        "-inf"
+    )  # k unmasked experts remain: the masked ones are never selected
+    assert torch.all(rank(_logits_pack(x, logits_m), W_r) == 0)
+    _, _, dest_l = rank_unf(_logits_pack(x, logits_m), W_r)
+    assert torch.all(dest_l == -1)
 
 
 @needs_device
