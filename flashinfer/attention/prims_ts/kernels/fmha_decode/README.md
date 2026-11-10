@@ -40,12 +40,17 @@ separate warp groups: one per KV instance at D128, one per operand at D256.
 It requires the grouped token/head layout.
 
 Native SM107 targets use compact FP4 repacking for TMEM conversion and retain
-dense nibble pairs for SMEM conversion. D256 narrow-Swaps and dual-converter
-Keeps profiles use the 327-KiB shared-memory capacity for three complete raw
-K/V tiles; family targets retain the portable capacity. Automatic grouped-Q
-selection accounts for the software conversion cost on SM107. Split candidates
-whose logical Q grid exceeds the shared fused-counter reserve must qualify a
-standalone reducer before they can be selected.
+dense nibble pairs for SMEM conversion. D256 defaults can use the 327-KiB
+shared-memory capacity for three complete raw K/V tiles; family targets retain
+the portable capacity. The BF16-output policy also compares Q1 Keeps on full
+Q grids and on underfilled grids with at least 32K KV tokens. Extra waves from
+underfilled Keeps grids retain at least 8K KV tokens per CTA. Full Q grids and
+those extra-wave launches use one complete raw K/V tile; underfilled one-wave
+launches retain three. FP16 and FP8 output keep their existing policies.
+
+Automatic grouped-Q selection accounts for software conversion cost on SM107.
+Split candidates whose logical Q grid exceeds the shared fused-counter reserve
+must qualify a standalone reducer before they can be selected.
 
 D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
 

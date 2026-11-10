@@ -3654,7 +3654,14 @@ class FmhaDecodeConfig:
                 self.use_paged_kv
                 and self.tile_size_q == 64
                 and self.uses_second_smem_converter
-                and self.is_multi_token_q
+                and (
+                    self.is_multi_token_q
+                    or (
+                        is_sm107_compile_target()
+                        and self.headdim == 256
+                        and self.out_dtype == BFloat16
+                    )
+                )
                 and not self.use_variable_seqlens_q
                 and not self.use_persistent_scheduler
                 and not self.use_sliding_window_causal
@@ -5150,6 +5157,12 @@ def _resolve_grouped_q_launch_candidates(
     # A full grid can still waste a partial final wave, so these profiles
     # also score multi-wave splits instead of forcing every full grid direct.
     transformed_multi_wave = probe.use_nvfp4_kv and probe.use_fp8_pv
+    sm107_smem_transform = (
+        is_sm107_compile_target()
+        and probe.headdim == 256
+        and probe.out_dtype == BFloat16
+        and probe.uses_fast_smem_nvfp4_transform
+    )
     multi_wave = (
         transformed_multi_wave and (candidate.tile_size_q >= 48 or fills_wave)
     ) or (probe.use_fp8_qkv and fills_wave)
@@ -5162,10 +5175,10 @@ def _resolve_grouped_q_launch_candidates(
             // (cost_tile_size_kv * cost_num_insts_kv)
         )
     if probe.use_keeps_mma_ab and probe.target_ctas_per_sm == 1:
-        # A lone resident CTA cannot hide its K/V pipeline fill behind a
-        # second CTA: extra waves of short splits lose until the direct grid
-        # fills a wave (D256 B32/KV128K: 2 splits 0.54 ms, 7 splits 0.65 ms).
-        multi_wave = multi_wave and fills_wave
+        # A lone resident CTA cannot hide pipeline fills behind another CTA.
+        # Keep underfilled grids within one wave unless the native SM107
+        # BF16-output converter qualifies for long extra waves.
+        multi_wave = multi_wave and (fills_wave or sm107_smem_transform)
 
     split_candidates = (
         (cfg.splits_kv if cfg.use_split_kv else 1,)
@@ -5187,6 +5200,19 @@ def _resolve_grouped_q_launch_candidates(
     )
     recipes = []
     for candidate_splits_kv in split_candidates:
+        if (
+            sm107_smem_transform
+            and splits_kv <= 0
+            and not (_LAUNCH_SELECTION_FIELDS & explicit_fields)
+            and not fills_wave
+            and batch_size * num_heads_kv * candidate.q_tiles * candidate_splits_kv
+            > service_capacity
+            and (seq_len_kv + candidate_splits_kv - 1) // candidate_splits_kv
+            < FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA
+        ):
+            # Extra waves must retain enough KV work to amortize each
+            # converter's startup. Keep ordinary one-wave fanouts eligible.
+            continue
         candidate_reduction_mode = "gmem_reduction"
         if candidate_splits_kv > 1:
             split_probe = deepcopy(probe)
@@ -5242,7 +5268,9 @@ def _resolve_grouped_q_launch_candidates(
             # The empirical D256 factor accounts for the TMEM converter's
             # repacking and scaling instructions. Keeps consumes dense pairs
             # with two converters, so it retains its own cost.
-            profile_cost = 1.8 * (
+            # The refreshed factor is qualified for BF16 publication;
+            # other output types retain their established policy calibration.
+            profile_cost = (2.0 if probe.out_dtype == BFloat16 else 1.8) * (
                 profile_cost
                 if profile_cost is not None
                 else _GROUPED_Q_MAINLOOP_COST[cost_kv_width][candidate.tile_size_q]
@@ -5279,10 +5307,10 @@ def _apply_auto_grouped_q_mma_config(
 ) -> GroupedQLaunchCandidate | None:
     """Select a legal multi-Q MMA and KV-split recipe within caller constraints.
 
-    SQ1, packed sliding windows, explicit launch modes, and ungrouped layouts
-    retain the existing path. Explicit MMA fields filter candidates; explicit launch
-    fields and fanout controls constrain their launch recipes.
-    Mixed-precision candidates use SwapsMmaAb since Keeps is not supported yet.
+    Qualified transformed SQ1 grids share this search. Packed sliding windows,
+    explicit launch modes, and ungrouped layouts retain the existing path.
+    Explicit MMA fields filter candidates; launch fields constrain their recipes.
+    FP8 Q with NVFP4 K/V at D128/D256 may also compare SMEM-converted Keeps.
 
     Fanout arguments here are caller overrides, before automatic selection.
     Each Q candidate gets its own automatic split search; final KV/reduction
@@ -5293,16 +5321,27 @@ def _apply_auto_grouped_q_mma_config(
     # The SQ1 path never splits a grid that already fills a wave. Transformed
     # NVFP4 K/V instead scores multi-wave splits that trim a partial final
     # wave (D512 B128/Hkv2/KV128K: 3.83 -> 3.32 ms with four splits).
-    single_token_full_grid_transform = (
+    # SM107 D256 also compares underfilled Q1 grids for long KV scans.
+    # Below 32K tokens the converter startup can outweigh grouped-Q reuse;
+    # retain the existing single-token launch policy for those short grids.
+    single_token_transform = (
         seq_len_q == 1
         and cfg.use_nvfp4_kv
         and cfg.use_fp8_pv
-        and batch_size * num_heads_kv >= get_max_active_clusters_for_cluster_size(1)
+        and (
+            batch_size * num_heads_kv >= get_max_active_clusters_for_cluster_size(1)
+            or (
+                is_sm107_compile_target()
+                and cfg.headdim == 256
+                and cfg.out_dtype == BFloat16
+                and seq_len_kv >= 32768
+            )
+        )
     )
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
-        or (seq_len_q <= 1 and not single_token_full_grid_transform)
+        or (seq_len_q <= 1 and not single_token_transform)
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
         or (cfg.use_variable_seqlens_q and cfg.use_sliding_window_causal)
@@ -6392,8 +6431,9 @@ def make_decode_config(
        D128 launch from KV128 to KV256; every other automatic Q tile retains
        KV128. The final KV width re-derives launch policy instead of reusing a
        fanout scored for KV128. Explicit policies remain caller-controlled.
-       TileQ128 remains automatic over TileQ64 only for staged D256. SQ1 is
-       outside this cost model and remains KV128, but ratios above 32 select
+       TileQ128 remains automatic over TileQ64 only for staged D256. SQ1 NVFP4
+       searches full grids and qualified long-KV SM107 BF16-output grids;
+       other SQ1 launches retain KV128, while ratios above 32 select
        the smallest qualified Q64/Q128 Keeps tile. Other profile families use
        exact-width ungrouped Keeps or ungrouped Swaps head bands as a fallback.
     3. Shapes outside that qualified Q/launch selector retain the general launch
@@ -6664,6 +6704,23 @@ def make_decode_config(
                 _fanout_was_explicit or selected_grouped_q_recipe is not None
             ),
         )
+
+    if (
+        selected_grouped_q_recipe is not None
+        and is_sm107_compile_target()
+        and cfg.headdim == 256
+        and cfg.out_dtype == BFloat16
+        and cfg.uses_fast_smem_nvfp4_transform
+        and (
+            selected_grouped_q_recipe.base_ctas
+            >= get_max_active_clusters_for_cluster_size(1)
+            or selected_grouped_q_recipe.waves > 1
+        )
+    ):
+        # Full launch grids, including split-filled grids, need less raw
+        # lookahead. One complete K/V tile improves SM107 throughput;
+        # underfilled launches retain three tiles to hide input latency.
+        _set_if_implicit(cfg, "kv_stages", 4, explicit_fields)
 
     _validate_mixed_kv_dtype_profile(cfg)
     _validate_kv256_static_config(cfg)
