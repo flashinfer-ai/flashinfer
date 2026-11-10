@@ -191,6 +191,26 @@ def test_fp8_groupwise_gemm_trtllm_k_requirement(k, supported):
             _trtllm_gemm_fp8_nt_groupwise_requirement(a, b, a_scale, b_scale, "MN")
 
 
+@pytest.mark.parametrize("m,n,k", [(64, 7168, 384)])
+def test_fp8_groupwise_gemm_trtllm_rejects_k_not_multiple_of_256(m, n, k):
+    """backend="trtllm" rejects K % 256 != 0 before reaching the kernel."""
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported("trtllm", cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend trtllm does not support SM{cc}")
+
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device="cuda")
+    a_scale = torch.empty((k // 128, m), dtype=torch.float32, device="cuda")
+    b_scale = torch.empty((n // 128, k // 128), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="multiple of 256"):
+        gemm_fp8_nt_groupwise(
+            a, b, a_scale, b_scale, "MN", out_dtype=torch.bfloat16, backend="trtllm"
+        )
+
+
 @pytest.mark.parametrize(
     "m,n,k", [(4, 896, 5120), (32, 8192, 28672), (512, 8192, 28672), (300, 1280, 8192)]
 )

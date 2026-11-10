@@ -288,8 +288,8 @@ def testGemmFp8NtGroupwise(args):
                 "[INFO] trtllm only supports MN scale_major_mode, removing trtllm from backends"
             )
             remove_trtllm = True
-        if k < 256:
-            print("[INFO] trtllm only supports k >= 256, removing trtllm from backends")
+        if k % 256 != 0:
+            print("[INFO] trtllm requires k % 256 == 0, removing trtllm from backends")
             remove_trtllm = True
         if remove_trtllm:
             backends.remove("trtllm")
