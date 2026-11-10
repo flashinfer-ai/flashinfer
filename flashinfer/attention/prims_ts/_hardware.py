@@ -39,3 +39,13 @@ def get_max_active_clusters(cluster_size: int) -> int:
     import torch
 
     return _query_max_active_clusters(torch.cuda.current_device(), cluster_size)
+
+
+def is_sm107_compile_target() -> bool:
+    """Whether generated code may use resources exclusive to native SM107."""
+    from cutlass.base_dsl.arch import Arch
+    from cutlass.cutlass_dsl import BaseDSL
+    from ...cute_dsl.availability import is_rubin_cute_dsl_available
+
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f

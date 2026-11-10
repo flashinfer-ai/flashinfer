@@ -39,6 +39,14 @@ separate warp groups. Keeps Q64 NVFP4 converts K/V into FP8 SMEM rings in
 separate warp groups: one per KV instance at D128, one per operand at D256.
 It requires the grouped token/head layout.
 
+Native SM107 targets use compact FP4 repacking for TMEM conversion and retain
+dense nibble pairs for SMEM conversion. D256 narrow-Swaps and dual-converter
+Keeps profiles use the 327-KiB shared-memory capacity for three complete raw
+K/V tiles; family targets retain the portable capacity. Automatic grouped-Q
+selection accounts for the software conversion cost on SM107. Split candidates
+whose logical Q grid exceeds the shared fused-counter reserve must qualify a
+standalone reducer before they can be selected.
+
 D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
 
 Fixed-Q D192 Keeps supports contiguous and paged K/V, dense/causal masks, direct/CLC scheduling, and the shared GMEM split reducer. FP16/BF16 uses 128- or 192-wide head stages; FP8 E4M3 uses 128-wide stages and FP16/BF16/E4M3 output, subject to the reducer's dtype contract. Automatic windows retain 128-wide staging. Sparse D192 Keeps has its own profile validator and staging policy.

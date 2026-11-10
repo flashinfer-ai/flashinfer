@@ -47,7 +47,10 @@ from .helpers_common import (
     _qkv_smem_swizzle,
 )
 from .smem_resources import SmemKvResource, SmemKvTileResource
-from .tmem_transformed_kv import _mul_e2m1x4_e4m3x4_bx
+from .tmem_transformed_kv import (
+    _has_packed_e4m3_e2m1_mul,
+    _mul_e2m1x4_e4m3x4_bx,
+)
 
 
 @cute.jit
@@ -551,13 +554,25 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                 blk = chunk * 2 + half
                 fp8_words = []
                 for w in cutlass.range_constexpr(2):
-                    unpacked = unpack_e2m1x8_word(packed[chunk][half * 2 + w])
-                    for part in cutlass.range_constexpr(2):
-                        fp8_words.append(
-                            _mul_e2m1x4_e4m3x4_bx(
-                                unpacked[part], scale_words[blk // 4], blk % 4
+                    if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
+                        unpacked = unpack_e2m1x8_word(packed[chunk][half * 2 + w])
+                        for part in cutlass.range_constexpr(2):
+                            fp8_words.append(
+                                _mul_e2m1x4_e4m3x4_bx(
+                                    unpacked[part], scale_words[blk // 4], blk % 4
+                                )
                             )
+                    else:
+                        # The f16x2 converter consumes dense nibble pairs.
+                        # Avoid expanding to bytes only to repack them again.
+                        scale = (scale_words[blk // 4] >> Int32((blk % 4) * 8)) & Int32(
+                            255
                         )
+                        converted = _cvt_e2m1_word_to_e4m3_words(
+                            packed[chunk][half * 2 + w], scale
+                        )
+                        fp8_words.append(converted[0])
+                        fp8_words.append(converted[1])
                 (
                     dst_words.data_ptr()
                     + row * Int32(32)

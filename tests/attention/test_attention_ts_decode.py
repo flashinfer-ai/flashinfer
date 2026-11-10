@@ -10385,3 +10385,52 @@ def test_attention_ts_decode_large_tile_size_q(
     graph.replay()
     torch.cuda.synchronize()
     _assert_case_correct(out, case)
+
+
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_large_grouped_nvfp4_grid():
+    """Large grouped grids plan and replay beyond the fused-counter reserve."""
+    batch, heads_q, heads_kv, dim, page, context, queries = 64, 32, 4, 256, 64, 2048, 12
+    spec = _resolve_decode_launch_spec(
+        torch.cuda.current_device(),
+        batch,
+        heads_q,
+        heads_kv,
+        dim,
+        page,
+        context,
+        queries,
+        "float8_e4m3fn",
+        "float4_e2m1fn",
+        "float4_e2m1fn",
+        "bfloat16",
+        "HND",
+        "dense",
+        False,
+        -1,
+    )
+    case, scales = _make_mixed_precision_decode_case(
+        batch_size=batch,
+        seq_len_kv=context,
+        num_qo_heads=heads_q,
+        num_kv_heads=heads_kv,
+        head_dim=dim,
+        seq_len_q=queries,
+        page_size=page,
+        q_dtype=_FP8,
+        kv_dtype=torch.uint8,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+        seed=9311,
+        splits_kv=spec.requested_splits or 1,
+        num_insts_kv=spec.config.num_insts_kv,
+        q_tokens_per_cta=spec.config.q_tokens_per_cta,
+        mask_type="dense",
+    )
+    _check_workspace_and_graph(
+        case,
+        scales,
+        seq_len_kv=context,
+        seq_len_q=queries,
+        page_size=page,
+    )

@@ -28,6 +28,7 @@ import math
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float4E2M1FN, Float8E4M3FN, Int8
 
+from ..._hardware import is_sm107_compile_target
 from ...sage.config import SAGE_K_BLOCK_SIZES, is_power_of_two
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
@@ -1997,9 +1998,10 @@ class FmhaDecodeConfig:
 
         Each of 128 converter threads owns one KV row of a 128x128 stage. It
         reads the dense packed row (64-byte rows, 64B TMA swizzle) with 16-byte
-        loads, unpacks one FP4 value per byte, applies each 16-column block
-        scale with QMUL4, and writes 16-byte chunks of the 128B-swizzled
-        K-major FP8 row read by the Keeps QK and PV descriptors.
+        loads, scales each 16-column block, and writes 16-byte chunks of the
+        128B-swizzled K-major FP8 row read by the Keeps QK and PV descriptors.
+        Packed-multiply targets expand the nibbles to bytes; software
+        conversion retains dense pairs for f16x2 conversion.
         """
         return (
             self.use_keeps_mma_ab
@@ -4148,6 +4150,25 @@ def _finalize_static_decode_config(
             cfg, "transformed_kv_stages", min(cfg.kv_stages, 4), explicit_fields
         )
 
+    if (
+        is_sm107_compile_target()
+        and cfg.headdim == 256
+        and cfg.use_nvfp4_kv
+        and cfg.use_fp8_q
+        and cfg.num_insts_kv == 1
+        and cfg.target_ctas_per_sm == 1
+        and (
+            (cfg.store_transformed_kv_in_tmem and cfg.tile_size_q <= 32)
+            or cfg.uses_dual_smem_transform
+        )
+    ):
+        # SM107's extra 100 KiB holds three complete raw K/V tiles. A
+        # whole-tile ring keeps the load lookahead aligned with the
+        # converter's alternating K/V order.
+        _set_if_implicit(
+            cfg, "kv_stages", 3 * 2 * cfg.num_head_dim_stages_kv, explicit_fields
+        )
+
     # Split-KV mode forbids persistent scheduling. Canonicalize here so
     # downstream consumers can gate on use_persistent_scheduler alone without
     # having to repeat the (... and not use_split_kv) check.
@@ -5166,18 +5187,29 @@ def _resolve_grouped_q_launch_candidates(
     )
     recipes = []
     for candidate_splits_kv in split_candidates:
+        candidate_reduction_mode = "gmem_reduction"
         if candidate_splits_kv > 1:
             split_probe = deepcopy(probe)
             split_probe.use_split_kv = True
             split_probe.splits_kv = candidate_splits_kv
             split_probe.max_splits_kv = candidate_splits_kv
+            if (
+                not probe.use_q_token_kv_block_sparse_route
+                and batch_size * num_heads_kv * candidate.q_tiles > 2 * service_capacity
+            ):
+                # Sparse routes own their slice; shared-workspace fused
+                # counters reserve two device waves.
+                # Larger grids must qualify a counter-free reducer before
+                # their split recipe can participate in cost selection.
+                split_probe.use_separate_reduction_kernel = True
+                candidate_reduction_mode = "gmem_reduction_with_separate_kernel"
             try:
                 _validate_profile_support(
                     cfg=split_probe,
                     seq_len_q=seq_len_q,
                     num_heads_q=num_heads_q,
                     num_heads_kv=num_heads_kv,
-                    split_kv_mode="gmem_reduction",
+                    split_kv_mode=candidate_reduction_mode,
                 )
             except ValueError:
                 continue
@@ -5192,11 +5224,29 @@ def _resolve_grouped_q_launch_candidates(
             service_capacity=service_capacity,
             cost_kv_width=cost_kv_width,
         )
+        if candidate_splits_kv > 1:
+            recipe = replace(recipe, split_kv_mode=candidate_reduction_mode)
         profile_cost = (
             _GROUPED_Q_TRANSFORM_MAINLOOP_COST
             if candidate.variant == "swaps_mma_ab"
             else _GROUPED_Q_KEEPS_TRANSFORM_MAINLOOP_COST
         ).get((probe.headdim, candidate.tile_size_q))
+        if (
+            is_sm107_compile_target()
+            and probe.headdim == 256
+            and probe.use_fp8_q
+            and probe.use_nvfp4_kv
+            and candidate.variant == "swaps_mma_ab"
+        ):
+            # SM107 scales unpacked FP4 through f16x2 rather than QMUL4.
+            # The empirical D256 factor accounts for the TMEM converter's
+            # repacking and scaling instructions. Keeps consumes dense pairs
+            # with two converters, so it retains its own cost.
+            profile_cost = 1.8 * (
+                profile_cost
+                if profile_cost is not None
+                else _GROUPED_Q_MAINLOOP_COST[cost_kv_width][candidate.tile_size_q]
+            )
         if profile_cost is not None and probe.use_fp8_q and probe.use_nvfp4_kv:
             recipe = replace(
                 recipe,

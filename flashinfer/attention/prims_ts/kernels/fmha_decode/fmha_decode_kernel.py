@@ -58,6 +58,7 @@ from cutlass.experimental.task_scheduling.task_manager import TaskManager
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
+from ..._hardware import is_sm107_compile_target
 from ..._block_sparse.common import (
     _block_sparse_contiguous_kv_copy_geometry,
     _block_sparse_proxy_summary_geometry,
@@ -1662,8 +1663,11 @@ def _build_decode_gen_schedule(
         ) // cfg.stensor_align * cfg.stensor_align + allocator.barrier_smem_bytes
 
     # The static profile checks bound only the Q and K/V pipelines; check the
-    # complete layout against the SM100-family SMEM capacity.
-    smem_capacity_bytes = SMEM_CAPACITY_KIB * BYTES_PER_KIB
+    # complete layout against the compile target's SMEM capacity.
+    # Native SM107 targets can use 327 KiB. A family
+    # sm_100f compilation must retain the portable 227-KiB limit.
+    target_smem_kib = 327 if is_sm107_compile_target() else SMEM_CAPACITY_KIB
+    smem_capacity_bytes = target_smem_kib * BYTES_PER_KIB
     smem_allocator, clc_response_alloc = allocate_smem()
     if (
         cfg.uses_q_token_kv_block_sparse_page_membership
@@ -1682,7 +1686,7 @@ def _build_decode_gen_schedule(
         # Every resident CTA pays the system reservation that
         # SMEM_CAPACITY_KIB already excludes for one CTA.
         smem_capacity_bytes = (
-            (SMEM_CAPACITY_KIB + SMEM_RESERVED_PER_CTA_KIB) * BYTES_PER_KIB
+            (target_smem_kib + SMEM_RESERVED_PER_CTA_KIB) * BYTES_PER_KIB
             - cfg.target_ctas_per_sm * SMEM_RESERVED_PER_CTA_KIB * BYTES_PER_KIB
         ) // cfg.target_ctas_per_sm
     if launch_smem_bytes > smem_capacity_bytes:

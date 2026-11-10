@@ -76,22 +76,17 @@ def _mul_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
             read_only_args=[packed_fp4, packed_sf],
         )
     else:
+        # LDSM leaves one FP4 nibble per byte. OR with a four-bit shift
+        # packs adjacent values into bytes 0 and 2 without scalar extraction.
         return cute.arch.inline_ptx(
             """
             {
-                .reg .b8 fp4_01, fp4_23, unused0, unused1, unused2;
+                .reg .b8 fp4_01, fp4_23, unused0, unused1;
                 .reg .b16 sf_01, sf_23, e4m3_01, e4m3_23;
                 .reg .b32 tmp, h_01, h_23, sf_h_01, sf_h_23;
-                and.b32 tmp, {$r0}, 0x0000000f;
-                bfe.u32 h_01, {$r0}, 8, 4;
-                shl.b32 h_01, h_01, 4;
-                or.b32 h_01, h_01, tmp;
-                mov.b32 {fp4_01, unused0, unused1, unused2}, h_01;
-                bfe.u32 h_23, {$r0}, 16, 4;
-                bfe.u32 tmp, {$r0}, 24, 4;
-                shl.b32 tmp, tmp, 4;
-                or.b32 h_23, h_23, tmp;
-                mov.b32 {fp4_23, unused0, unused1, unused2}, h_23;
+                shr.u32 tmp, {$r0}, 4;
+                or.b32 tmp, tmp, {$r0};
+                mov.b32 {fp4_01, unused0, fp4_23, unused1}, tmp;
                 mov.b32 {sf_01, sf_23}, {$r1};
                 cvt.rn.f16x2.e2m1x2 h_01, fp4_01;
                 cvt.rn.f16x2.e2m1x2 h_23, fp4_23;
