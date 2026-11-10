@@ -316,6 +316,8 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
     # the last accepted step; zero-accept and null rows also remain untouched.
     track_steps[2] = accepts[2]
     track_steps[3] = 1
+    # A negative step is outside the accepted prefix and must be a no-op.
+    track_steps[4] = -1
     for _ in range(2):
         before = checkpoint.clone()
         expected_state = checkpoint.clone()
@@ -341,7 +343,7 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
                 if slot < 0 or count == 0:
                     continue
                 expected_state[layer, slot] = ref_states[row, count - 1].float()
-                if track and track_ids[row] >= 0 and track_steps[row] < count:
+                if track and track_ids[row] >= 0 and 0 <= track_steps[row] < count:
                     expected_state[layer, track_ids[row]] = ref_states[
                         row, track_steps[row]
                     ].float()
@@ -1194,6 +1196,8 @@ def test_replayssm_u_verify_commit_cycles(steps, heads, hv, variant, track, sing
         track_ids[1] = -1
         track_steps[2] = accepts[2]
         track_steps[3] = 1
+        # A negative step is outside the accepted prefix and must be a no-op.
+        track_steps[4] = -1
     for _ in range(2):
         before = checkpoint.clone()
         expected_state = checkpoint.clone()
@@ -1229,7 +1233,7 @@ def test_replayssm_u_verify_commit_cycles(steps, heads, hv, variant, track, sing
                 if slot < 0 or count == 0:
                     continue
                 expected_state[layer, slot] = ref_states[row, count - 1].float()
-                if track and track_ids[row] >= 0 and track_steps[row] < count:
+                if track and track_ids[row] >= 0 and 0 <= track_steps[row] < count:
                     expected_state[layer, track_ids[row]] = ref_states[
                         row, track_steps[row]
                     ].float()

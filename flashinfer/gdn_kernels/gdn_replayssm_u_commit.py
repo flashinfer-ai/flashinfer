@@ -282,7 +282,9 @@ def _gdn_replayssm_u_commit_kernel(
             requested_track_slot = track_indices[i_n]
             track_count = track_steps[i_n] + 1
             track_live = (
-                requested_track_slot > NULL_BLOCK_ID and track_count <= n_commit
+                requested_track_slot > NULL_BLOCK_ID
+                and track_count >= 1
+                and track_count <= n_commit
             )
             if track_live:
                 flat_track_slot = (
