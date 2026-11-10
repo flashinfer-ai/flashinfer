@@ -112,15 +112,17 @@ def check(got, want):
 
 
 def _driver_version():
-    """Identify the NVIDIA driver JIT using the repository's nvidia-smi query."""
-    return (
-        subprocess.check_output(
+    """Return the NVIDIA driver version, or None if it cannot be queried."""
+    try:
+        output = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
             text=True,
+            stderr=subprocess.DEVNULL,
         )
-        .splitlines()[0]
-        .strip()
-    )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    lines = output.strip().splitlines()
+    return lines[0].strip() if lines else None
 
 
 def main():
