@@ -165,14 +165,25 @@ def _moe_bf16_fingerprint(
     """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
     :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, with ``n_group`` /
     ``topk_group`` for ``DeepSeekV3``'s group-limited selection (``RoutingConfig``'s values; the groups are a parameter of
-    the routing term); ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters), ``"swiglu"`` /
-    ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with
-    ``params`` (and ``gated`` for the names in both tables)."""
+    the routing term), or the class's own method name (``spec.METHODS``; a grouped one as ``<method>_g<n>x<t>``, the same
+    class as the enum form with the groups) or a ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its
+    scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of
+    ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the names in both tables). The receipt names
+    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``."""
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
     from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import MAX_E
     from flashinfer.tllm_enums import RoutingMethodType
 
+    if not 1 <= num_experts <= MAX_E:
+        raise ValueError(
+            f"fingerprint('fused_moe'): num_experts {num_experts} must lie in [1, {MAX_E}]"
+        )
+    if not 1 <= top_k <= min(num_experts, spec.MAX_TOP_K):
+        raise ValueError(
+            f"fingerprint('fused_moe'): top_k {top_k} must lie in [1, min(num_experts, {spec.MAX_TOP_K})]"
+        )
     if isinstance(method, str) and method in RoutingMethodType.__members__:
         method = RoutingMethodType[method]
     if isinstance(method, RoutingMethodType):
@@ -182,7 +193,7 @@ def _moe_bf16_fingerprint(
             )
         rm = spec.METHOD_OF_FLASHINFER[method]
     elif isinstance(method, str):
-        rm = spec.METHODS[method]
+        rm = spec.method_named(method)
     elif isinstance(method, spec.RoutingMethod):
         rm = method
     else:
@@ -190,18 +201,28 @@ def _moe_bf16_fingerprint(
             f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
         )
     if (n_group or 0) > 1 or (topk_group or 0) > 1:
-        if rm != spec.SIGMOID_BIAS_RENORM_SCALED:
+        n_group, topk_group = int(n_group or 0), int(topk_group or 0)
+        if rm.grouped and (rm.n_group, rm.topk_group) != (n_group, topk_group):
+            raise ValueError(
+                f"method {rm.name!r} carries the groups {rm.n_group} x {rm.topk_group}; n_group / topk_group give "
+                f"{n_group} x {topk_group}"
+            )
+        if not rm.grouped and rm != spec.SIGMOID_BIAS_RENORM_SCALED:
             raise ValueError(
                 "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
             )
-        n_group, topk_group = int(n_group or 0), int(topk_group or 0)
-        # the runner's shape rule, as a ValueError here: a receipt names a class some layer can build
-        rule = spec.group_shape_error(num_experts, top_k, n_group, topk_group)
-        if rule is not None:
+        if not 1 <= topk_group <= n_group:
             raise ValueError(
-                f"n_group {n_group}, topk_group {topk_group} over {num_experts} experts for top_k {top_k}: {rule}"
+                f"n_group {n_group}, topk_group {topk_group} over {num_experts} experts for top_k {top_k}: "
+                + str(spec.group_shape_error(num_experts, top_k, n_group, topk_group))
             )
         rm = rm.with_groups(n_group, topk_group)
+    # the runner's group rule (the groups a term of DeepSeekV3 alone, the shape rule), as a ValueError here
+    rule = spec.group_rule_error(rm, num_experts, top_k)
+    if rule is not None:
+        raise ValueError(
+            f"n_group {rm.n_group}, topk_group {rm.topk_group} over {num_experts} experts for top_k {top_k}: {rule}"
+        )
     if not isinstance(act, str):
         a = spec.activation_of(act)
         name, params, gated = a.act, a.params, a.gated

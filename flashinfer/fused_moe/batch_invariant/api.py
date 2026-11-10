@@ -203,9 +203,9 @@ def grouped_gemm(
     rows ``[off_e, off_e + counts[e])`` of ``a`` belong to expert ``e``). ``a [R >= Tk, K]`` bf16 row-major, ``w [E, N, K]``
     bf16 row-major; ``chain`` ``plain`` -> ``[Tk, N]`` in ``out_dtype`` (bf16 / f16 / f32), ``swiglu`` -> ``[Tk, N / 2]`` bf16
     (``w`` interleaved as :func:`interleave_fc1`), ``relu2`` -> ``[Tk, N]`` bf16 (the ungated chain). The record selects the
-    body: a dense record runs the grouped body, a swapped record (``config.swap_ab``: 128 weight rows x 8 / 16 / 32 tokens,
-    the weights on the MMA's M side, :mod:`.blocks.swap_bf16`) the swapped body on the same dense rows -- a placement, the
-    same bits. ``Tk`` (default: the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the
+    body: a dense record runs the grouped body, a swapped record (``config.swap_ab``: a 128- or 64-row weight tile x 8 / 16 /
+    32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_bf16`) the swapped body on the same dense rows -- a
+    placement, the same bits. ``Tk`` (default: the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the
     swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
     launch argument: the device's co-resident cluster capacity for the record's cluster size."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
@@ -409,11 +409,13 @@ def _routing_args(
 ) -> Tuple[S.RoutingMethod, int, int, torch.Tensor, torch.Tensor]:
     """The routing entry points' shared validation and constants: ``(method, T, E, bias, scale)`` for :func:`route` and
     :func:`route_plan` (``name`` prefixes the errors). The bounds (``E <= MAX_E``: the route kernels' widest bucket is the
-    plan's table size; ``1 <= top_k <= min(E, 16)``), the group shape rule of a group-limited method
-    (:func:`.spec.group_shape_error`), a bias exactly for the methods that select on ``sigmoid(l) + bias`` and a scaling
-    factor exactly for the scaled methods; the absent bias and the unit scale are the cached constants (:func:`_const`), a
-    Python scaling factor other than ``1`` a fill per call, a one-element tensor read as given."""
-    method = S.METHODS[method] if isinstance(method, str) else method
+    plan's table size; ``1 <= top_k <= min(E, MAX_TOP_K)``), the group rule of a group-limited method
+    (:func:`.spec.group_rule_error`: the groups a term of the DeepSeekV3 method alone, its shape rule), a bias exactly for the
+    methods that select on ``sigmoid(l) + bias`` and a scaling factor exactly for the scaled methods; a method name resolves
+    through :func:`.spec.method_named` (a grouped name as ``<method>_g<n>x<t>``); the absent bias and the unit scale are the
+    cached constants (:func:`_const`), a Python scaling factor other than ``1`` a fill per call, a one-element tensor read as
+    given."""
+    method = S.method_named(method) if isinstance(method, str) else method
     if logits.dim() != 2 or logits.stride(1) != 1 or logits.dtype not in _IN:
         raise TypeError(f"{name}: logits must be a row-major f32 or bf16 [T, E]")
     T, E = logits.shape
@@ -421,15 +423,14 @@ def _routing_args(
         raise ValueError(
             f"{name}: {E} experts; the routing kernels score at most {MAX_E} experts"
         )
-    if not 1 <= top_k <= min(E, 16):
-        raise ValueError(f"{name}: top_k {top_k} must be in [1, min(E, 16)]")
-    if method.grouped:
-        rule = S.group_shape_error(E, top_k, method.n_group, method.topk_group)
-        if rule is not None:
-            raise ValueError(
-                f"{name}: n_group {method.n_group}, topk_group {method.topk_group} over {E} experts for top_k "
-                f"{top_k}: {rule}"
-            )
+    if not 1 <= top_k <= min(E, S.MAX_TOP_K):
+        raise ValueError(f"{name}: top_k {top_k} must be in [1, min(E, {S.MAX_TOP_K})]")
+    rule = S.group_rule_error(method, E, top_k)
+    if rule is not None:
+        raise ValueError(
+            f"{name}: n_group {method.n_group}, topk_group {method.topk_group} over {E} experts for top_k "
+            f"{top_k}: {rule}"
+        )
     if (bias is not None) != method.bias:
         raise ValueError(
             f"{name}: a bias is given iff the method selects on sigmoid(l) + bias"
@@ -594,6 +595,10 @@ def permute_plan(
             f"permute_plan: E {E} must lie in [1, {MAX_E}] (the plan kernel's expert tables)"
         )
     T, k = experts.shape
+    if not 1 <= k <= S.MAX_TOP_K:
+        raise ValueError(
+            f"permute_plan: {k} slots per token; the kernels fold at most {S.MAX_TOP_K}"
+        )
     flat = experts.reshape(-1)
     if not flat.is_contiguous() or flat.dtype != torch.int32:
         raise TypeError("permute_plan: experts must be a contiguous int32 [T, k]")
@@ -669,6 +674,11 @@ def fused_moe(
         or token_selected_experts.dtype != torch.int32
     ):
         raise TypeError("fused_moe: token_selected_experts must be an int32 [T, k]")
+    if not 1 <= k <= S.MAX_TOP_K:
+        # the bound of the slots per token (a shard's k is the global routing's, so E does not bound it here)
+        raise ValueError(
+            f"fused_moe: {k} slots per token; the plan, gather and combine kernels fold at most {S.MAX_TOP_K}"
+        )
     if (
         tuple(token_final_scales.shape) != (T, k)
         or token_final_scales.dtype != torch.float32
@@ -741,6 +751,66 @@ def fused_moe(
             y=y,
             config1=config1,
             config2=config2,
+        )
+    return out
+
+
+def combine_unfinalized(
+    gemm2_output: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The class's combine over the layer's unfinalized triple (``MoEFinalizeConfig(do_finalize=False)``: ``[gemm2_output,
+    expert_weights, expanded_idx_to_permuted_idx]``): ``out[t] = cvt_bf16(fold_r add(acc, mul(f32(y[map[t, r]]), w[t, r])))``,
+    the fold in slot order from ``+0``, a dropped slot (``map = -1``) the term ``+0`` whatever its weight -- the finalized
+    layer's output bit for bit, through the combine kernel the finalized forward runs. ``gemm2_output [rows, H]`` bf16 (the
+    rows in the class's permutation), ``expert_weights [T, k]`` fp32 or bf16 (a bf16 weight widens exactly: the fold is the
+    same), ``expanded_idx_to_permuted_idx`` int32 of ``T k`` entries (flat or ``[T, k]``), each in ``[0, rows)`` or ``-1``
+    (the triple as the layer returned it; the map is not validated on the host). The receiver of expert-parallel ranks'
+    triples folds the ranks' rows the same way (one row buffer, one map, every token's ``k`` slots)."""
+    from .combine import get_compiled_combine, warps_per_token
+
+    y, w, dest = gemm2_output, expert_weights, expanded_idx_to_permuted_idx
+    if y.dtype != torch.bfloat16 or y.dim() != 2 or y.stride(1) != 1 or y.stride(0) % 8:
+        raise TypeError(
+            "combine_unfinalized: gemm2_output must be a row-major, 16-byte-aligned bf16 [rows, H]"
+        )
+    if w.dim() != 2 or w.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(
+            "combine_unfinalized: expert_weights must be an fp32 or bf16 [T, k]"
+        )
+    T, k = w.shape
+    H = y.shape[1]
+    if dest.dtype != torch.int32 or dest.numel() != T * k:
+        raise TypeError(
+            f"combine_unfinalized: expanded_idx_to_permuted_idx must be an int32 of {T} x {k} entries"
+        )
+    if not 1 <= k <= S.MAX_TOP_K:
+        raise ValueError(
+            f"combine_unfinalized: {k} slots per token; the combine kernel folds at most {S.MAX_TOP_K}"
+        )
+    if out is None:
+        out = torch.empty(T, H, dtype=torch.bfloat16, device=y.device)
+    if (
+        tuple(out.shape) != (T, H)
+        or out.dtype != torch.bfloat16
+        or out.stride(1) != 1
+        or out.stride(0) % 8
+    ):
+        raise ValueError(
+            "combine_unfinalized: out must be a row-major, 16-byte-aligned bf16 [T, H]"
+        )
+    if T:
+        get_compiled_combine(
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(y.device)), False
+        )(
+            y,
+            dest.reshape(T, k).contiguous(),
+            w.to(torch.float32).contiguous(),
+            out,
+            T,
+            H,
         )
     return out
 

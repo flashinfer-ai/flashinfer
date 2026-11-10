@@ -9,8 +9,9 @@ The runner serves the bf16 classes on SM100 / SM103 / SM107, one declared chain 
 It takes every routing input mode: ``FromLogits`` runs the class's own routing kernel
 (the declared ``exp``, the strict selection order; the methods ``Default``, ``Renormalize``, ``RenormalizeNaive``,
 ``Sigmoid``, ``SigmoidRenorm``, ``TopK``, ``Llama4`` at ``top_k = 1``, ``TopKSigmoid`` and ``DeepSeekV3`` with or
-without its expert groups), ``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's
-expert ids and weights; an expert-parallel shard (``ExpertConfig.local_expert_offset`` / ``local_num_experts``) computes the
+without its expert groups; a configuration outside these terms is refused at the from-logits call, not at construction),
+``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's expert ids and weights under any ``RoutingConfig`` (the
+selection is the caller's); an expert-parallel shard (``ExpertConfig.local_expert_offset`` / ``local_num_experts``) computes the
 slots of its local experts and drops the rest (the term ``+0`` in its tokens' folds): a placement of the class on the local
 experts, the rank's partial of the dense output. The combine is the slot-order fp32 fold (never an atomic finalize:
 ``MoEFinalizeConfig.use_fused_finalize`` is ignored); with ``MoEFinalizeConfig(do_finalize=False)`` the combine is left to the caller and the forward returns the
@@ -27,7 +28,11 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from ...autotuner import TuningConfig
-from ...batch_invariant.support import check_device, unsupported
+from ...batch_invariant.support import (
+    BatchInvariantUnsupportedError,
+    check_device,
+    unsupported,
+)
 from ..api import (
     GELU,
     GeGLU,
@@ -234,9 +239,13 @@ class BatchInvariantMoeRunner(MoERunner):
                 "a positive multiple of 8",
             )
         routing = cfg.routing
-        if not 1 <= routing.top_k <= min(routing.num_experts, 16):
+        from .spec import MAX_TOP_K
+
+        if not 1 <= routing.top_k <= min(routing.num_experts, MAX_TOP_K):
             raise unsupported(
-                CLASS, f"top_k {routing.top_k}", "1 <= top_k <= min(num_experts, 16)"
+                CLASS,
+                f"top_k {routing.top_k}",
+                f"1 <= top_k <= min(num_experts, {MAX_TOP_K})",
             )
         from .blocks.scheduler import MAX_E
 
@@ -246,7 +255,17 @@ class BatchInvariantMoeRunner(MoERunner):
                 f"num_experts {routing.num_experts}",
                 f"1 <= num_experts <= {MAX_E}",
             )
-        self._method, self._grouped_other = routing_term(routing, CLASS)
+        self._routing_term(routing, CLASS)
+
+    def _routing_term(self, routing: Any, cls: str) -> None:
+        """``_method`` / ``_grouped_other`` from :func:`routing_term`; a refusal (a group shape or a Llama4 top-k outside the
+        term) is deferred to a from-logits call (``_logits_refusal``), since the pre-routed modes never consult the method:
+        a layer that only ever receives pre-routed ids builds under any ``RoutingConfig``."""
+        self._logits_refusal: Optional[BatchInvariantUnsupportedError] = None
+        try:
+            self._method, self._grouped_other = routing_term(routing, cls)
+        except BatchInvariantUnsupportedError as e:
+            self._method, self._grouped_other, self._logits_refusal = None, False, e
 
     def _build(self) -> None:
         from ...gemm.batch_invariant.api import part_of
@@ -347,6 +366,10 @@ class BatchInvariantMoeRunner(MoERunner):
                     "the groups with DeepSeekV3, or pre-routed ids",
                 )
             if self._method is None:
+                # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
+                refusal = getattr(self, "_logits_refusal", None)
+                if refusal is not None:
+                    raise refusal
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",

@@ -190,6 +190,9 @@ DEEPSEEK_V3_GROUPED = SIGMOID_BIAS_RENORM_SCALED.with_groups(
 )  # DeepSeek-V3 with its group-limited selection
 #: The route kernels hold the group scores of at most this many groups per token.
 MAX_GROUPS = 16
+#: The route kernels select, and the plan / gather / combine kernels fold, at most this many slots per token
+#: (``1 <= top_k <= min(num_experts, MAX_TOP_K)``: the bound of every entry point and of the fingerprint).
+MAX_TOP_K = 16
 
 
 def group_shape_error(
@@ -212,17 +215,60 @@ def group_shape_error(
     )
 
 
+def group_rule_error(method: RoutingMethod, E: int, top_k: int) -> Optional[str]:
+    """The rule of a method's expert groups over ``E`` experts for ``top_k`` slots, or ``None``: the group-limited stage is a
+    term of the DeepSeekV3 method alone (``SIGMOID_BIAS_RENORM_SCALED``), under :func:`group_shape_error`; an ungrouped method
+    passes. The fingerprint and the routing entry points raise ``ValueError`` with it, the runner its unsupported error."""
+    if not method.grouped:
+        return None
+    if method.with_groups(0, 0) != SIGMOID_BIAS_RENORM_SCALED:
+        return "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
+    return group_shape_error(E, top_k, method.n_group, method.topk_group)
+
+
+def _parse_group_suffix(name: str) -> Tuple[str, int, int]:
+    """``<base>_g<n>x<t>`` -> ``(base, n, t)``; ``(name, 0, 0)`` without the suffix."""
+    base, sep, grp = name.rpartition("_g")
+    if sep and "x" in grp:
+        n, t = grp.split("x", 1)
+        if n.isdigit() and t.isdigit():
+            return base, int(n), int(t)
+    return name, 0, 0
+
+
+def method_named(name: str) -> RoutingMethod:
+    """The method of a name: a table entry, or ``<method>_g<n>x<t>`` -- the named method with the group-limited stage
+    (``RoutingMethod.with_groups``; its shape over the experts and slots is the callers' :func:`group_rule_error`). Any other
+    name, and a group suffix the dataclass could not hold (fewer than two groups, more kept than groups, groups on a method
+    without the sigmoid score), is a ``ValueError``: no public input reaches an assertion."""
+    if dict.__contains__(METHODS, name):
+        return dict.__getitem__(METHODS, name)
+    base, n, t = _parse_group_suffix(name)
+    if n == 0 or not dict.__contains__(METHODS, base):
+        raise ValueError(f"no routing method named {name!r}")
+    m = dict.__getitem__(METHODS, base)
+    if m.score != "sigmoid":
+        raise ValueError(
+            f"routing method {name!r}: the group-limited selection is a sigmoid-routing feature ({base!r} selects on the "
+            f"{m.score})"
+        )
+    if n < 2 or not 1 <= t <= n:
+        raise ValueError(
+            f"routing method {name!r}: a group suffix takes at least two groups and 1 <= topk_group <= n_group"
+        )
+    return m.with_groups(n, t)
+
+
 class _Methods(dict):
     """The named methods; a grouped name ``<method>_g<n>x<t>`` not in the table resolves to the named method with the
-    group-limited stage (``RoutingMethod.with_groups``), so every grouped configuration has a name (the kernels' key)."""
+    group-limited stage (:func:`method_named`), so every grouped configuration has a name (the kernels' key); an unknown
+    name is a ``KeyError`` as for any table, a malformed group suffix on a known method the ``ValueError`` of ``method_named``."""
 
     def __missing__(self, name: str) -> RoutingMethod:
-        base, sep, grp = name.rpartition("_g")
-        if sep and "x" in grp and base in self:
-            n, t = grp.split("x", 1)
-            if n.isdigit() and t.isdigit():
-                return self[base].with_groups(int(n), int(t))
-        raise KeyError(name)
+        base, n, _ = _parse_group_suffix(name)
+        if n == 0 or not dict.__contains__(self, base):
+            raise KeyError(name)
+        return method_named(name)
 
 
 METHODS: Dict[str, RoutingMethod] = _Methods(

@@ -143,6 +143,13 @@ class SwappedGroupedGemm:
         )
         self.knobs, self.chain, self.gather = knobs, chain, gather
         self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
+        # the box form reads the group counts before its wait (the kernel body): a placement that triggers before its wait
+        # would let this grid launch before the plan completed (pdl.BOX_FORM_TRIGGERS)
+        assert gather or pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS, (
+            "the swapped box form reads the plan's counts before its PDL wait: it compiles under the trigger placements "
+            f"{pdl.BOX_FORM_TRIGGERS} only",
+            pdl.TRIGGER,
+        )
 
     @cute.jit
     def __call__(
@@ -303,7 +310,9 @@ class SwappedGroupedGemm:
         # programmatic dependent launch: the wait for the predecessor grid sits in each warp before its first read of the
         # predecessor's output (the token rows); the weight loads and the group tables (the plan: complete before this grid
         # launched, as no kernel of the chain triggers before its own wait) do not wait, so the weight ring fills during the
-        # launch; the trigger placement is the chain's (``pdl.TRIGGER``)
+        # launch; the trigger placement is the chain's (``pdl.TRIGGER``). The counts read below, before the wait, is the
+        # box form's reliance on that rule (``pdl.BOX_FORM_TRIGGERS``, asserted at the builder); the gather form, whose
+        # predecessor is the plan itself, waits first.
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
@@ -520,8 +529,8 @@ def swap_tma_producer_loop(
     b_cta_coord,
     b_cta_layout,
 ):
-    """The TMA producer: per tile the expert's 128 weight rows ``n_tile`` (the expert as the batch coordinate) and the token
-    box re-addressed at the group's row ``row0`` (``token_tile`` rows: the rows past the group's end are computed and never
+    """The TMA producer: per tile the expert's weight tile ``n_tile`` (128 or 64 rows; the expert as the batch coordinate) and
+    the token box re-addressed at the group's row ``row0`` (``token_tile`` rows: the rows past the group's end are computed and never
     stored, the rows past the buffer are zero-filled); k-tiles ascending, one ring slot holds both. The weights are inputs of
     the whole chain, the token rows the predecessor's output: the first tile's weight stages (as many as the ring holds) are
     issued before the programmatic-dependent-launch wait and their token boxes right after it, so the ring fills while the
@@ -628,8 +637,8 @@ def swap_gather_producer_loop(
     tn: cutlass.Constexpr,
     tile_k: cutlass.Constexpr,
 ):
-    """The TMA producer of the gather form: per tile the expert's 128 weight rows (the expert as the batch coordinate) and the
-    token tile gathered by the TMA's gather4 mode from the unpermuted rows -- the tile's ``tn`` token indices (``src[p] //
+    """The TMA producer of the gather form: per tile the expert's weight tile (128 or 64 rows; the expert as the batch
+    coordinate) and the token tile gathered by the TMA's gather4 mode from the unpermuted rows -- the tile's ``tn`` token indices (``src[p] //
     k_div`` for the group's rows, the group's last row past its end: a valid box whose extra rows are never stored) go into
     registers once per tile and every k-tile's gather issues from them; both copies count on the stage's transaction barrier.
     The kernel has waited for the predecessor (the plan's launch) before its tables, so the wait here returns at once; the
