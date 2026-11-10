@@ -360,7 +360,8 @@ The decode call rejects calls outside these limits:
 - groups of equal size that cover the tokens, with an entry in `query_rows`
   for each token;
 - a block table that covers `num_keys`;
-- union and mask rows that hold the union of every group;
+- union rows of at least `min(group * K, 128 * ceil(num_keys / 128))` columns,
+  and mask rows of at least as many bits;
 - `num_keys` at most `union_key_limit(group, K)`, so that a key bitmap with a bit
   for each key below `num_keys`, and the mask rows, fit in shared memory. On
   SM100 with `K` 2048, that is 1,441,792 keys for groups of up to 4 tokens and

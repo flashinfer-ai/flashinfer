@@ -51,6 +51,7 @@ Build grouped key unions and masks for masked dense attention.
 
     token_sparse_kv_indices
     group_union_masks
+    union_key_limit
 
 
 SDSA Indexer
