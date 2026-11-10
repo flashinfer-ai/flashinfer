@@ -740,6 +740,35 @@ def test_default_path_races_and_can_win(cache_root, monkeypatch):
     assert tactic == -1 and calls == []
 
 
+@pytest.mark.parametrize("reload", [False, True])
+def test_reordered_runners_race_the_current_default(cache_root, monkeypatch, reload):
+    first, second = DummyRunner((0,)), DummyRunnerB((0,))
+    inputs = [torch.zeros(8, 16)]
+    profiled = []
+
+    def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
+        profiled.append((runner, tactic))
+        if tactic == -1:
+            return 0.5 if runner is second else 4.0
+        return 2.0 if runner is second else 3.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    tuner = AutoTuner.get()
+    with autotune_v2():
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 0)
+    assert (second, -1) not in profiled
+
+    if reload:
+        tuner = _fresh_process()
+    profiled.clear()
+    with autotune_v2():
+        assert tuner.choose_one(_OP, [second, first], _CONFIG, inputs) == (second, -1)
+        assert (second, -1) in profiled
+        profiled.clear()
+        assert tuner.choose_one(_OP, [second, first], _CONFIG, inputs) == (second, -1)
+        assert not profiled
+
+
 def test_v1_selection_does_not_race_default(monkeypatch):
     """Plain autotune() selection stays byte-identical: no -1 candidate."""
     calls = _install_fake_profile(monkeypatch, times={-1: 0.5, 0: 1.0, 1: 2.0, 2: 3.0})
@@ -895,7 +924,7 @@ def test_persisted_winner_requires_candidate_coverage_for_tuning(
         assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 1)
     with context(True):
         assert tuner.choose_one(_OP, [second, first], _CONFIG, inputs) == (second, 1)
-    assert calls == []
+    assert calls == ([-1, 1, 0] if storage == "managed" else [])
 
     with context(True):
         assert tuner.choose_one(_OP, [first], _CONFIG, inputs) == (first, 0)
