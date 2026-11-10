@@ -100,11 +100,16 @@ the same arguments and stream before capture.
 Input layout
 ~~~~~~~~~~~~
 
-Ordinary prefill with ``auto``, ``cute-dsl``, ``cake`` or ``small-bh`` accepts
-strided Q/K and packs them before selecting dense-only kernels. ``cudnn``
-retains supported strides. V, gates, state and output keep their existing
-layout requirements. Output alias checks use the original Q/K storage,
-and decode retains its existing layout contract.
+Ordinary prefill with ``auto``, ``cake`` or ``small-bh`` packs strided Q/K
+before backend selection. ``auto`` can select CuTe prefill with supported
+token-strided V. Explicit ``cute-dsl`` consumes supported Q/K/V token-strided
+views directly on SM100/SM103/SM107 and SM120, and packs Q/K layouts the kernel
+cannot read directly. ``cute-dsl-persistent`` requires supported Q/K/V
+token-strided views on SM100/SM103. V is never packed automatically and must
+meet the selected backend's layout requirements. ``cudnn`` retains its supported
+strides. Gates, state and output keep their existing layout requirements.
+Output alias checks use the original Q/K storage, and decode retains its
+existing layout contract.
 
 .. currentmodule:: flashinfer.kda
 
@@ -204,6 +209,11 @@ Key-Driven Attention (KDA) decode API. The CuTe-DSL kernel lives under
 The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
 sequence (``T>=2``).
+
+The CuTe DSL decode kernels accept a BF16 or FP32 ``initial_state`` pool and read and
+write it in its own dtype. Any other dtype raises ``TypeError``. ``backend="cake"``
+and ``packed_kda_decode`` still require a BF16 state; the fused decode ops already
+accept BF16 or FP32.
 
 ``fused_kda_decode`` combines width-four causal convolution, one KDA update,
 and gated RMSNorm for ``T=1``. ``packed_fused_kda_decode`` extends the same
@@ -375,8 +385,14 @@ unsupported contracts. Decode retains the existing KDA decode routing.
 raise when its contract is unsupported.
 
 For multi-token prefill, ``backend="cute-dsl"`` selects a BT=16 CuTe DSL kernel.
-It supports contiguous BF16 Q, K, V, G, and beta with one shared head count and
-head dimension 128, the in-kernel lower-bound gate, fixed or packed-varlen
+It supports BF16 Q, K, V, G, and beta with one shared head count and
+head dimension 128. Q/K/V may use independent,
+non-overlapping token-row strides with contiguous head/features, 16-byte-aligned
+base pointers and token strides divisible by eight BF16 elements. Fixed batches
+must flatten without a copy (batch stride equals token count times token stride).
+Explicit ``backend="cute-dsl"`` consumes these views directly, including views
+into packed QKV storage; G, beta and output retain their contiguous layouts.
+It supports the in-kernel lower-bound gate, fixed or packed-varlen
 layout, BF16 recurrent state, explicit ``seq_order``, and the same checkpoint
 contract as Cake. ``checkpoint_cu_starts`` must always be int64. Packed
 ``cu_seqlens`` must be int64 during CUDA graph capture. The CuTe DSL schedule
@@ -612,9 +628,10 @@ refused rather than silently executed by another backend.
   against architecture-specific instructions;
 * input is ordinary multi-token prefill: fixed ``T > 1``, or packed input
   whose total token count exceeds its number of sequences;
-* Q, K, V and G are contiguous BF16 ``[B,T,H,128]`` tensors sharing one head
-  count, and beta is contiguous BF16 ``[B,T,H]``. GQA and ``V != K`` are not
-  supported;
+* Q, K, V and G are BF16 ``[B,T,H,128]`` tensors sharing one head count.
+  Q/K/V support the token-strided layout described above for ``cute-dsl``;
+  G and beta remain contiguous. Beta has shape ``[B,T,H]``.
+  GQA and ``V != K`` are not supported;
 * the output fits an INT32 extent: ``T_total * H * 128 <= 2**31 - 1``, which permits up to
   16,383 tokens at H=1024 and imposes no practical constraint at ordinary head counts. Larger is
   refused with the backend's own error, because the two things that stop there
@@ -747,8 +764,9 @@ Short-sequence tests additionally compare with an independent FP64 recurrence.
 This backend requires SM100 or SM103 with
 ``nvidia-cutlass-dsl>=4.7.0``. Its supported contract is:
 
-* contiguous, 16-byte-aligned BF16 Q/K/V/G ``[B,T,H,128]`` and beta
-  ``[B,T,H]``, with ``T > 1``, positive H divisible by eight and
+* BF16 Q/K/V ``[B,T,H,128]`` with the token-strided layout described above
+  for ``cute-dsl``; contiguous, 16-byte-aligned BF16 G ``[B,T,H,128]`` and
+  beta ``[B,T,H]``; ``T > 1``, positive H divisible by eight and
   ``B*T*H*128 < 2**31``;
 * contiguous FP32 ``A_log[H]`` and ``dt_bias[H*128]`` or ``dt_bias[H,128]``;
 * ``use_qk_l2norm_in_kernel=True``, ``use_gate_in_kernel=True``,

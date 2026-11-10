@@ -51,7 +51,7 @@ from flashinfer.msa_ops import (
     msa_sparse_decode_attention,
     prepare_msa_nvfp4_sparse_decode,
 )
-from tests.test_helpers.cake_msa_nvfp4_inputs import (
+from tests.experimental.test_helpers.cake_msa_nvfp4_inputs import (
     build_decode_inputs,
     page_layout,
     upstream_route_kwargs,

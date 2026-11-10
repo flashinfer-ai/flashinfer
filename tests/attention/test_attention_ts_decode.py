@@ -2719,6 +2719,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "split_kv",
         "validate",
         "initialize_workspace",
+        "softmax_scale",
+        "output_scale",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -5115,6 +5117,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         "_TrustedDecodePlanState",
         (),
         {
+            "device": torch.device("cpu"),
             "out_dtype": torch.bfloat16,
             "lse_mode": "none",
             "use_attention_sinks": False,
@@ -5126,6 +5129,8 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
             "workspace": object(),
             "compiled_main": object(),
             "compiled_reducer": None,
+            "softmax_scale": 1.0,
+            "output_scale": 1.0,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
         },
@@ -5189,6 +5194,8 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
             "packed_query": True,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
+            "softmax_scale": 1.0,
+            "output_scale": 1.0,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
         },
@@ -5212,6 +5219,8 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
             "packed_query": False,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
+            "softmax_scale": 1.0,
+            "output_scale": 1.0,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
         },
@@ -10089,3 +10098,111 @@ def test_attention_ts_decode_fp8_speculative_runtime_reduction(out_dtype):
         max_kv_len=16384,
         exercise_all_paths=True,
     )
+
+
+@_REQUIRES_PRIMTS_GPU
+def test_decode_global_scales_graph_and_prepared(monkeypatch):
+    """Device scales stay live through the standalone reducer and prepared API."""
+    original = fmha_decode_config.make_decode_config
+
+    def configured(*args, **kwargs):
+        profile = dict(
+            use_keeps_mma_ab=False,
+            tile_size_q=16,
+            tile_size_kv=128,
+            use_persistent_scheduler=False,
+        )
+        kwargs["args"] = (kwargs["args"], profile) if kwargs.get("args") else profile
+        kwargs.update(
+            split_kv_mode="gmem_reduction_with_separate_kernel",
+            splits_kv=2,
+            max_splits_kv=2,
+            auto_tuner=False,
+        )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(81)
+        dtype = torch.bfloat16
+        q = (torch.randn((1, 8, 128), device="cuda", generator=generator) * 0.5).to(
+            dtype
+        )
+        k = (
+            torch.randn((128, 1, 16, 128), device="cuda", generator=generator) * 0.5
+        ).to(dtype)
+        v = torch.randn(k.shape, device="cuda", generator=generator).to(dtype)
+        lengths = torch.tensor([2048], dtype=torch.int32, device="cuda")
+        table = torch.arange(128, dtype=torch.int32, device="cuda").view(1, -1)
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device="cuda")
+        scales = dict(
+            softmax_scale=torch.tensor(0.125, device="cuda"),
+            output_scale=torch.tensor(0.75, device="cuda"),
+        )
+        wrapper = BatchDecodePagedTSWrapper()
+        wrapper.plan(
+            "cuda",
+            1,
+            8,
+            1,
+            128,
+            16,
+            2048,
+            q_dtype=dtype,
+            k_dtype=dtype,
+            v_dtype=dtype,
+            out_dtype=out.dtype,
+            **scales,
+        )
+        assert wrapper._plan_state.config.use_separate_reduction_kernel
+        args = (q, (k, v), lengths, table)
+
+        def check(sm, output):
+            scores = q[0].float() @ k[:, 0].reshape(-1, 128).float().T * sm
+            expected = (scores.softmax(-1) @ v[:, 0].reshape(-1, 128).float() * output)[
+                None
+            ]
+            torch.testing.assert_close(out.float(), expected, atol=0.02, rtol=0.05)
+
+        wrapper.run(*args, out=out)
+        check(0.125, 0.75)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper.run(*args, out=out, validate=False)
+        for scale in scales.values():
+            scale.mul_(1.5)
+        graph.replay()
+        check(0.1875, 1.125)
+        workspace = wrapper._plan_state.workspace_buffer
+        batch_decode_with_paged_kv_cache(
+            q,
+            (k, v),
+            table,
+            lengths,
+            max_kv_len=2048,
+            out=out,
+            workspace_buffer=workspace,
+            validate=False,
+            **scales,
+        )
+        check(0.1875, 1.125)
+        prepared = prepare_prims_ts_batch_decode_with_kv_cache(
+            q,
+            (k, v),
+            workspace,
+            table,
+            lengths,
+            2048,
+            out=out,
+            **scales,
+        )
+        prepared_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(prepared_graph):
+            prepared.run(q, out=out, validate=False)
+        for scale in scales.values():
+            scale.mul_(0.5)
+        prepared_graph.replay()
+        check(0.09375, 0.5625)
+    finally:
+        _resolve_decode_launch_spec.cache_clear()

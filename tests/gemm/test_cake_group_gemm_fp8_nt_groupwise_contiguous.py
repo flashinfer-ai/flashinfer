@@ -97,7 +97,9 @@ BLOCK_SCALED_ONLY_TESTS = frozenset(
         "test_block_scaled_rejects_invalid_inputs",
         "test_block_scaled_route_rule_sm107a",
         "test_block_scaled_lead_prefetch_rule",
+        "test_block_scaled_lead_prefetch_rule_bounds",
         "test_block_scaled_block_n_routes_write_the_same_bits",
+        "test_block_scaled_block_n_128_routes_cover_partial_scale_words",
         "test_block_scaled_lead_prefetch_writes_the_same_bits",
         "test_block_scaled_only_arch_routes_name_registered_programs",
         "test_block_scaled_only_arch_rejects_float32_scales",
@@ -1229,8 +1231,8 @@ def test_block_scaled_route_rule_sm107a():
 
 def test_block_scaled_lead_prefetch_rule():
     """SM107a single-run layouts of at most two K blocks whose bounded valid blocks are at most four fifths of
-    the M blocks take the lead-prefetch program; longer K, other architectures, run32 layouts and unknown group
-    counts do not."""
+    the M blocks take the lead-prefetch program; few-row longer-K layouts, other architectures, run32 layouts and
+    unknown group counts do not."""
     from flashinfer.gemm.cake_grouped_fp8_gemm import bs_lead_prefetch
 
     # Qwen3.5-397B down (K 256), 1 / 32 tokens (512 experts): 128 / 384 routed rows bound, 509 / 511 M blocks.
@@ -1242,7 +1244,7 @@ def test_block_scaled_lead_prefetch_rule():
         assert not bs_lead_prefetch(
             m, 256, alignment=128, num_groups=None, arch="sm_107a"
         )
-        # K 512 (4 K blocks) and longer: never.
+        # K 512 (4 K blocks) and longer at under 160 routed rows per group: no.
         for k in (512, 2048, 4096):
             assert not bs_lead_prefetch(
                 m, k, alignment=128, num_groups=512, arch="sm_107a"
@@ -1331,9 +1333,7 @@ def test_block_scaled_route_rule():
         == BS_N256_RUN32_ROUTE
     )
     for route in BS_ROUTES | BS_SWAP_ROUTES:
-        assert route in ROUTES or any(
-            route in table for table in ROUTES.values() if isinstance(table, dict)
-        )
+        assert route in ROUTES or route in SM107A_ROUTES
     with pytest.raises(ValueError, match="multiple of 32"):
         bs_route_for_shape(4096, 1024, 2048, alignment=48, sm_count=148)
 
@@ -2375,6 +2375,66 @@ def test_block_scaled_rejects_invalid_inputs():
         )
 
 
+def _lpf_layout_m(rows_per_group, num_groups, alignment=128):
+    """The compact layout's M for ``rows_per_group * num_groups`` routed rows."""
+    return rows_per_group * num_groups + num_groups * (alignment - 1)
+
+
+def test_block_scaled_lead_prefetch_rule_bounds():
+    """At most two K blocks: at most 10 routed rows per group take the lead-prefetch program
+    whatever the share of valid blocks; more than two K blocks: at least 160 rows per group do."""
+    from flashinfer.gemm.cake_grouped_fp8_gemm import (
+        BS_LPF_LONG_K_MIN_ROWS,
+        BS_LPF_SHORT_K,
+        BS_LPF_SHORT_K_MAX_ROWS,
+        bs_lead_prefetch,
+    )
+
+    assert (BS_LPF_SHORT_K, BS_LPF_SHORT_K_MAX_ROWS, BS_LPF_LONG_K_MIN_ROWS) == (
+        256,
+        10,
+        160,
+    )
+    g = 512
+
+    def lpf(rows, k, num_groups=g, **kw):
+        return bs_lead_prefetch(
+            _lpf_layout_m(rows, num_groups),
+            k,
+            alignment=128,
+            num_groups=num_groups,
+            arch=kw.get("arch", "sm_107a"),
+        )
+
+    # Short K, 10 / 11 rows per group (K 256 / 257): 10 takes it, 11 keeps the
+    # valid-block bound, which these mostly-routed layouts miss; K 257 is long K.
+    assert lpf(10, 256) and not lpf(11, 256)
+    assert not lpf(10, 257) and not lpf(11, 257)
+    # Long K, 159 / 160 rows per group (K 257, 512, 4096): 160 takes it.
+    for k in (257, 512, 4096):
+        assert lpf(160, k) and not lpf(159, k)
+    # K 256 keeps the short-K rule at 160 rows per group.
+    assert not lpf(160, 256) and not lpf(159, 256)
+    # Off SM107a, run32 layouts and unknown group counts: never.
+    for rows, k in ((10, 256), (160, 512)):
+        assert not lpf(rows, k, arch="sm_103a")
+        m = _lpf_layout_m(rows, g)
+        assert not bs_lead_prefetch(
+            m, k, alignment=128, num_groups=None, arch="sm_107a"
+        )
+        assert not bs_lead_prefetch(
+            rows * g + g * 31, k, alignment=32, num_groups=g, arch="sm_107a"
+        )
+    # Qwen3.5-397B down (K 256, 512 experts, top-10) at 64 / 256 / 512 tokens:
+    # 640 / 2560 / 5120 routed rows (1.25 / 5 / 10 per group); gate_up (K 4096)
+    # at 8192 / 16384 tokens: 160 / 320 rows per group.
+    for routed in (640, 2560, 5120):
+        assert bs_lead_prefetch(
+            routed + g * 127, 256, alignment=128, num_groups=g, arch="sm_107a"
+        )
+    assert lpf(160, 4096) and lpf(320, 4096)
+
+
 # (group_counts, N, K, alignment): 128-row aligned layouts both single-run
 # BLOCK_N routes serve.
 BLOCK_SCALED_BLOCK_N_CASES = [
@@ -2473,6 +2533,68 @@ def test_block_scaled_block_n_routes_write_the_same_bits(
     assert torch.equal(
         outs[128][routed].view(torch.int16), outs[256][routed].view(torch.int16)
     )
+
+
+# (group_counts, N, K, alignment): K of 1 to 9 K blocks (each packed UE8M0
+# scale word holds the scales of 4 K blocks), single-run and 32-row aligned.
+BLOCK_SCALED_PARTIAL_WORD_CASES = [
+    pytest.param([128, 0, 256, 1, 130], 512, k, 128, id=f"single_k{k}")
+    for k in (128, 256, 384, 640, 896, 1152)
+] + [
+    pytest.param([100, 0, 3, 69, 64, 129, 1, 97], 1024, k, 32, id=f"run32_k{k}")
+    for k in (128, 256, 384, 640, 896, 1152)
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k,alignment", BLOCK_SCALED_PARTIAL_WORD_CASES)
+def test_block_scaled_block_n_128_routes_cover_partial_scale_words(
+    group_counts, n, k, alignment, monkeypatch
+):
+    """On SM107a the BLOCK_N 128 routes are exact when K is not a multiple of 4 K blocks.
+
+    Their programs read each packed scale word once for 4 K blocks, so the last
+    word of a row can cover fewer.  The single-run route also writes the same
+    bits as the BLOCK_N 256 single-run route.
+    """
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) != "sm_107a":
+        pytest.skip("checks the SM107a programs")
+    from flashinfer.gemm import cake_grouped_fp8_gemm as host
+
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = _make_block_scaled_inputs(
+        group_counts,
+        n,
+        k,
+        alignment=alignment,
+        seed=4830 + k + alignment,
+        device=device,
+    )
+    m = int(m_indices.numel())
+    single_run = alignment % 128 == 0
+    routes = (
+        {128: BS_N128_ROUTE, 256: BS_N256_ROUTE}
+        if single_run
+        else {128: BS_N128_RUN32_ROUTE}
+    )
+    outs = {}
+    for block_n, route in routes.items():
+        monkeypatch.setattr(host, "bs_block_n", lambda *args, _n=block_n, **kw: _n)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, b_packed, m_indices, out=out, alignment=alignment
+        )
+        assert prepared.route == route
+        prepared.launch()
+        outs[block_n] = out
+    monkeypatch.undo()
+    torch.cuda.synchronize()
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    _assert_block_scaled(outs[128], expected, m_indices)
+    if single_run:
+        routed = m_indices >= 0
+        assert torch.equal(
+            outs[128][routed].view(torch.int16), outs[256][routed].view(torch.int16)
+        )
 
 
 def test_block_scaled_only_arch_routes_name_registered_programs():

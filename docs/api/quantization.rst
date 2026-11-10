@@ -256,13 +256,39 @@ FP8 Quantization
     dependency) and ``"cake"`` requires compute capability 10.0 or 10.3.
     ``K`` must be divisible by 32 and is padded internally to 128-column tiles.
 
-Fused gated-activation MXFP8 quantization
------------------------------------------
+Fused gated-activation MXFP8 quantization (Cake, deterministic)
+----------------------------------------------------------------
 
-.. currentmodule:: flashinfer.gated_act_mxfp8
+.. currentmodule:: flashinfer.cake_gated_act_mxfp8_det_train
 
 .. autosummary::
     :toctree: ../generated
 
-    silu_and_mul_mxfp8_quantize
-    silu_and_mul_mxfp8_quantize_backward
+    cake_gated_act_mxfp8_det_train_forward
+    cake_gated_act_mxfp8_det_train_backward
+    is_cake_gated_act_mxfp8_det_train_supported
+
+Every output (the E4M3 values and E8M0 scales of both orientations, forward
+and backward) repeats bit for bit for identical inputs. The backend package is
+``flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train``. The former
+names are removed, with no alias:
+
+.. list-table::
+    :header-rows: 1
+
+    * - Former name
+      - New name
+    * - ``flashinfer.gated_act_mxfp8`` (module)
+      - ``flashinfer.cake_gated_act_mxfp8_det_train``
+    * - ``silu_and_mul_mxfp8_quantize``
+      - ``cake_gated_act_mxfp8_det_train_forward``
+    * - ``silu_and_mul_mxfp8_quantize_backward``
+      - ``cake_gated_act_mxfp8_det_train_backward``
+    * - ``get_gated_act_mxfp8_module``
+      - ``cake_gated_act_mxfp8_det_train_register_custom_ops``
+    * - ``GatedActMxfp8Outputs``
+      - ``CakeGatedActMXFP8DetOutputs``
+    * - ``torch.ops.flashinfer.silu_and_mul_mxfp8_quantize`` / ``_backward``
+      - ``torch.ops.flashinfer.cake_gated_act_mxfp8_det_train_forward`` / ``_backward``
+    * - ``flashinfer/cake_gated_act_mxfp8_backend/`` (backend directory)
+      - ``flashinfer/experimental/cake/cake_gated_act_mxfp8_det_train/``
