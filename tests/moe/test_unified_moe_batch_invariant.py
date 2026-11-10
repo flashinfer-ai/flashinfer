@@ -2428,3 +2428,29 @@ def test_multi_launch_plan_equals_the_host_plan(T, k, E):
     get_compiled_plan(1, False)(ids.cuda().view(-1), c1, d1, s1, d1, d1, n, E)
     assert torch.equal(c1, counts) and torch.equal(d1.view(T, k), dest)
     assert torch.equal(s1, src)
+
+
+@needs_device
+def test_f32_prerouted_weights_round_in_the_combine_kernel():
+    """f32 pre-routed weights that are not bf16 values: the layer's packed mode rounds them in the combine kernel (no host
+    pass over the slots) and gives the bits of its packed mode on bf16 weights and of the unpacked mode on those bf16
+    weights; the op's ``w_round`` gives the bits of the op on the caller-rounded weights."""
+    T, k, H, I, E = 257, 8, 1024, 512, 128
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=9, adversarial=True)
+    layer = _layer(k, E, I)
+    W = _weights(w1, w2)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    weights = weights.float()
+    w16 = weights.to(torch.bfloat16)
+    assert not torch.equal(weights, w16.float())  # the rounding is exercised
+    out_p32 = layer(_routed_pack(x, ids.cuda(), weights.cuda(), packed=True), W)
+    out_p16 = layer(_routed_pack(x, ids.cuda(), w16.cuda(), packed=True), W)
+    out_u16 = layer(_routed_pack(x, ids.cuda(), w16.cuda()), W)
+    assert torch.equal(bits(out_p32), bits(out_p16))
+    assert torch.equal(bits(out_p32), bits(out_u16))
+    from flashinfer.fused_moe.batch_invariant.api import MoEWeights, fused_moe
+
+    Wm = MoEWeights.prepare(w1, w2)
+    a = fused_moe(x, ids.cuda(), weights.cuda(), Wm, w_round=True)
+    b = fused_moe(x, ids.cuda(), w16.float().cuda(), Wm)
+    assert torch.equal(bits(a), bits(b))

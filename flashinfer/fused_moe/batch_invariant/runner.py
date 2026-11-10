@@ -98,6 +98,7 @@ class _PackedInputs(list):
     autotuner's profiling lists carry no attribute and read as fp32, the class's own weight dtype)."""
 
     weights_dtype: torch.dtype = torch.float32
+    w_round: bool = False  # f32 weights of the packed mode: rounded to bf16 by the combine kernel, not on the host
 
 
 class BatchInvariantMoeRunner(MoERunner):
@@ -325,6 +326,7 @@ class BatchInvariantMoeRunner(MoERunner):
             )
         mode = act.routing_input_mode
         weights_dtype = torch.float32  # the class's weights from logits are fp32
+        w_round = False
         if mode is RoutingInputMode.FromLogits:
             _validate_logits_inputs(act, T, E, type(self).__name__)
             # the group-limited selection is a term of the DeepSeekV3 method; with another method the groups have no
@@ -391,13 +393,17 @@ class BatchInvariantMoeRunner(MoERunner):
             wts = act.topk_weights
             if mode is RoutingInputMode.PackedPrecomputed:
                 # the packed word carries the weight as bf16 (``(expert_id << 16) | bf16(weight)``): the rounded weights
-                # are the class's inputs in this mode
-                wts = wts.to(torch.bfloat16)
-            weights_dtype = wts.dtype
+                # are the class's inputs in this mode; f32 weights are rounded by the combine kernel itself (no host pass
+                # over the slots), bf16 ones widen exactly
+                weights_dtype = torch.bfloat16
+                w_round = wts.dtype != torch.bfloat16
+            else:
+                weights_dtype = wts.dtype
             wts = wts.to(torch.float32).contiguous()
         out = torch.empty(T, x.shape[1], dtype=torch.bfloat16, device=x.device)
         packed = _PackedInputs([x, ids, wts, w.w1i, w.w2, out] + plan)
         packed.weights_dtype = weights_dtype
+        packed.w_round = w_round
         return packed
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
@@ -481,5 +487,15 @@ class BatchInvariantMoeRunner(MoERunner):
             )
             weights_dtype = getattr(inputs, "weights_dtype", torch.float32)
             return [im["y"], wts.to(weights_dtype), im["dest"].reshape(-1)]
-        fused_moe(x, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan)
+        fused_moe(
+            x,
+            ids,
+            wts,
+            w,
+            out=out,
+            config1=c1,
+            config2=c2,
+            plan=plan,
+            w_round=getattr(inputs, "w_round", False),
+        )
         return out
