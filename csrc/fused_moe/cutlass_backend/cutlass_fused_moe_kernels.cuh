@@ -3908,6 +3908,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   if (using_tma_ws_gemm2) {
     tma_ws_input = tma_ws_input_template;
     if (tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE) {
+      // The fused epilogue zero-fills every buffer row and stores OutputType, so it can honor
+      // neither a device token count nor an fp32 output; both select the unfused finalize.
+      TLLM_CHECK_WITH_INFO(num_active_tokens_ptr == nullptr && !fp32_final_output,
+                           "GEMM2 finalize fusion is incompatible with num_active_tokens and "
+                           "fp32 output");
       // TODO For some reason this has to be done here, it should not overlap with anything else,
       // but doing it in setupTmaWarpSpecializedInputs gives a different result. Ideally, we want
       // this to run on a second stream and overlap with everything else

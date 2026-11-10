@@ -1701,7 +1701,9 @@ def cutlass_fused_moe(
         stale) and are not written to ``output``, and the finalize runs a persistent grid sized
         by the SM count instead of one block per row. Use it when a CUDA graph is captured over a
         fixed-size buffer whose live prefix changes from step to step. ``None`` treats every row
-        as live. Not supported in ``min_latency_mode``.
+        as live. Not supported in ``min_latency_mode``. The count requires the unfused finalize:
+        ``use_fused_finalize`` resolves to False (an explicit True raises), and a pre-allocated
+        workspace must be sized with ``use_fused_finalize=False``.
 
     enable_alltoall : bool = False
         Whether to enable all-to-all communication for expert outputs. Defaults to False.
@@ -1754,8 +1756,10 @@ def cutlass_fused_moe(
         finalize path. When ``None`` (default) the fused path is used unless
         ``torch.are_deterministic_algorithms_enabled()`` is true, in which case the
         autotuner never offers or replays a fused-finalize GEMM2 tactic. An explicit
-        True or False always wins. The flag is part of the autotune cache key, so pass the
-        same resolved value to :func:`cutlass_fused_moe_workspace_size`.
+        True or False always wins, except that ``num_active_tokens`` and
+        ``output_dtype=torch.float32`` require the unfused finalize: ``None`` then resolves
+        to False and an explicit True raises ``ValueError``. The flag is part of the autotune
+        cache key, so pass the same resolved value to :func:`cutlass_fused_moe_workspace_size`.
 
     profile_ids : Optional[List[int]]
         Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
@@ -1822,8 +1826,23 @@ def cutlass_fused_moe(
         are not implemented for Blackwell architecture.
 
     """
+    # A device token count or an fp32 output needs the unfused finalize: the fused GEMM2
+    # epilogue zero-fills every row of ``output`` and stores the activation dtype. The flag is
+    # part of the runner key and the autotune cache key, so it is resolved here, once.
+    unfused_finalize_required = (
+        num_active_tokens is not None or output_dtype == torch.float32
+    )
     if use_fused_finalize is None:
-        use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
+        use_fused_finalize = (
+            not unfused_finalize_required
+            and not torch.are_deterministic_algorithms_enabled()
+        )
+    elif use_fused_finalize and unfused_finalize_required:
+        raise ValueError(
+            "use_fused_finalize=True cannot be combined with num_active_tokens or "
+            "output_dtype=torch.float32: the fused finalize epilogue zero-fills every "
+            "row of the output and stores the activation dtype"
+        )
     # Reject an unhonorable pinned recipe before any device work. The NVFP4
     # test mirrors the binding's isNvfp4Quant() plus the W4A16 flag.
     is_nvfp4 = (
@@ -2055,7 +2074,9 @@ def cutlass_fused_moe_workspace_size(
     use_fused_finalize : Optional[bool]
         Must match the value :func:`cutlass_fused_moe` resolves to. ``None``
         (default) follows the same rule: fused unless
-        ``torch.are_deterministic_algorithms_enabled()`` is true.
+        ``torch.are_deterministic_algorithms_enabled()`` is true or
+        ``output_dtype`` is ``torch.float32``. Pass ``False`` when the forward
+        call will use ``num_active_tokens``, which also selects the unfused finalize.
     device : torch.device, optional
         CUDA device on which the workspace will be used. Defaults to the
         current CUDA device.
@@ -2070,7 +2091,14 @@ def cutlass_fused_moe_workspace_size(
         only. It requires BF16/uint8, TP8, SiTU and the documented fixed geometry.
     """
     if use_fused_finalize is None:
-        use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
+        use_fused_finalize = (
+            output_dtype != torch.float32
+            and not torch.are_deterministic_algorithms_enabled()
+        )
+    elif use_fused_finalize and output_dtype == torch.float32:
+        raise ValueError(
+            "use_fused_finalize=True cannot be combined with output_dtype=torch.float32"
+        )
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_workspace_size
 

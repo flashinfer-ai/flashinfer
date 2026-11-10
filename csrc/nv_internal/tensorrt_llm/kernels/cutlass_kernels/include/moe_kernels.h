@@ -481,7 +481,8 @@ class CutlassMoeFCRunnerInterface {
 
   // num_active_tokens_ptr: optional device int32 scalar, the number of leading rows that hold
   // tokens. Rows at or beyond it are ignored by the expert-map build and left untouched by the
-  // finalize, so a CUDA graph captured over a fixed buffer pays for the live rows only.
+  // unfused finalize, so a CUDA graph captured over a fixed buffer pays for the live rows only.
+  // Requires use_fused_finalize_ == false: the fused GEMM2 epilogue zero-fills every row.
   virtual void runMoe(void const* input_activations, void const* input_sf,
                       bool const swizzled_input_sf, int const* token_selected_experts,
                       float const* token_final_scales, void const* fc1_expert_weights,

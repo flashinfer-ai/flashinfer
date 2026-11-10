@@ -390,6 +390,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK_EQ(num_active_tokens.value().device().device_id, input.device().device_id)
           << "num_active_tokens must live on the input's device";
       num_active_tokens_ptr = static_cast<int const*>(num_active_tokens.value().data_ptr());
+      TVM_FFI_ICHECK(!mUseFusedFinalize)
+          << "num_active_tokens requires the unfused finalize (use_fused_finalize=False): the "
+             "fused GEMM2 epilogue zero-fills every row of the output";
     }
     if (mWeightDtype == dl_uint4x2) {
       // Since dlpack does not support uint4x2, here uses uint8 to bypass
