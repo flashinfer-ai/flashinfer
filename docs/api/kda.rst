@@ -350,17 +350,32 @@ gathers the selected state-pool rows into a temporary and scatters them back
 following decode. In-place updates therefore do not imply that the call avoids
 state copies. Each gather and scatter moves the full selected state: at
 ``HV=64`` and ``K=V=128``, that is 2 MiB of BF16 state per sequence.
-This also applies when ``auto`` falls back to this CuTe DSL path; Cake paths
-that directly index the pool do not have this gather/scatter cost.
+
+Calls served by the ``T=1`` fast path are the exception. It is on by default
+(``FLASHINFER_KDA_T1_FAST_PATH=0`` disables it) and takes batched indexed calls
+with ``H=HV=12``, ``K=V=128`` on SM100, SM103 or SM107,
+``output_final_state=False``, no ``cu_seqlens`` and one of the two supported
+gate conventions (raw gates with ``use_gate_in_kernel=True``,
+``beta_is_logit=True`` and ``lower_bound=-5.0``, or precomputed log gates with
+sigmoid ``beta``); see ``_t1_fast_path_mode`` in
+``flashinfer/kda_kernels/recurrent_kda.py`` for the full conditions. The fast
+path indexes the pool inside the kernel, with no gather or scatter.
+
+Both cases also apply when ``auto`` resolves to the CuTe DSL backend: eligible
+calls take the fast path, other batched indexed calls gather and scatter. Cake
+paths that directly index the pool do not have this gather/scatter cost.
 
 Frozen decode (``disable_state_update=True``) is different: the batched indexed
 form reads the selected pool rows directly and writes no state back, so it
 needs no layout change. In frozen mode the packed ``cu_seqlens`` form below
 requires ``correction_cache`` and ``kg_cache`` and raises without them.
 
-For a serving pool, use the packed ``[1, B, ...]`` form with one token per
-sequence and ``cu_seqlens = [0, 1, ..., B]`` to let the decode kernel access the
-selected slots directly. For example, given contiguous BF16 CUDA tensors
+For a serving pool whose calls are not eligible for the fast path (for example
+``HV=64``), use the packed ``[1, B, ...]`` form with one token per sequence and
+``cu_seqlens = [0, 1, ..., B]`` to let the decode kernel access the selected
+slots directly. Keep fast-path-eligible calls in the batched form: passing
+``cu_seqlens`` opts out of the fast path, and the packed form is then slower.
+For example, given contiguous BF16 CUDA tensors
 ``q, k, v, g`` of shape ``[B, 1, H, 128]``, ``beta`` of shape ``[B, 1, H]``,
 a contiguous BF16 ``state_pool`` of shape ``[num_slots, H, 128, 128]``, and
 contiguous CUDA int32 ``slots`` of shape ``[B]`` containing unique, in-range,
