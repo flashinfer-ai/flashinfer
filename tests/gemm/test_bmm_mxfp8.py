@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer import autotune, bmm_mxfp8
+from flashinfer import autotune, autotune_v2, bmm_mxfp8
 from flashinfer.fp8_quantization import mxfp8_quantize
 from flashinfer.gemm import gemm_base
 from flashinfer.utils import get_compute_capability
@@ -318,6 +318,64 @@ def test_bmm_mxfp8_sm107_mxfp8_out_tactic_fits():
     assert not fits(512, 768, ((128, 192), (1, 1), False, 128))
     assert fits(768, 1024, ((256, 128), (2, 1), False, 256))
     assert fits(16384, 1024, ((256, 256), (2, 4), False, 256))
+
+
+def test_bmm_mxfp8_cute_dsl_tuning_buckets_cover_kernel_reads():
+    config = gemm_base._BMM_MXFP8_CUTE_DSL_TUNING_CONFIG  # pyright: ignore[reportPrivateUsage]
+    (spec,) = config.dynamic_tensor_specs
+    a_scale = next(c for c in config.constraint_specs if c.input_idx == 2)
+    for b, m, k in [(2, 2432, 1024), (8, 512, 1024), (32, 256, 2688), (2, 128, 128)]:
+        buckets = spec.gen_tuning_buckets(m)
+        assert buckets and all(mb % 128 == 0 for mb in buckets)
+        for mb in buckets:
+            # the SM107 kernel reads each batch's scales as whole 128-row blocks
+            assert a_scale.infer_shape(((b, mb, k),)) >= b * mb * ((k + 127) // 128 * 4)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_bmm_mxfp8_cute_dsl_autotune_modes(out_dtype):
+    """autotune(True) and autotune_v2(mode="tune"), which also races tactic -1 at every M
+    bucket, run a batched call on their own profiling buffers and give the untuned result."""
+    if tuple(get_compute_capability(torch.device("cuda"))) != (10, 7):
+        pytest.skip("bmm_mxfp8 cute-dsl backend requires SM107.")
+    b, m, n, k = 2, 384, 384, 512
+    torch.manual_seed(0)
+    x = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
+    w = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16) * 0.05
+    a, a_scale = mxfp8_quantize(x, True)
+    q, q_scale = mxfp8_quantize(w, True)
+    mxfp8_out = out_dtype == torch.float8_e4m3fn
+
+    def run():
+        out_scale = (
+            torch.empty(b * m * n // 32, device="cuda", dtype=torch.uint8)
+            if mxfp8_out
+            else None
+        )
+        out = bmm_mxfp8(
+            a,
+            q.transpose(-2, -1),
+            a_scale,
+            q_scale,
+            out_dtype,
+            backend="cute-dsl",
+            out_scale=out_scale,
+        )
+        torch.cuda.synchronize()
+        return out.view(torch.uint8) if mxfp8_out else out, out_scale
+
+    ref, ref_scale = run()
+    for ctx in (autotune(True), autotune_v2(mode="tune", persistent_cache=False)):
+        gemm_base.AutoTuner.get().clear_cache()
+        with ctx:
+            out, out_scale = run()
+        if mxfp8_out:
+            assert torch.equal(out, ref) and torch.equal(out_scale, ref_scale)
+        else:
+            cos = F.cosine_similarity(
+                out.float().reshape(-1), ref.float().reshape(-1), dim=0
+            )
+            assert cos > 0.999
 
 
 if __name__ == "__main__":

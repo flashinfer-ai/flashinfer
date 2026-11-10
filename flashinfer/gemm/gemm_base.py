@@ -7624,6 +7624,8 @@ def _cute_dsl_bmm_mxfp8_sm107_runner(out_dtype: torch.dtype):
             self, inputs: List[torch.Tensor], profile: OptimizationProfile
         ) -> list:
             A, B, _, _, _, _ = inputs
+            if A.shape[1] % 128 != 0 or B.shape[2] % 128 != 0:
+                return []
             return list(
                 _sm107_bmm_mxfp8_tactics(A.shape[1], B.shape[2], A.shape[2], out_dtype)
             )
@@ -7657,6 +7659,8 @@ def _cute_dsl_bmm_mxfp8_sm107_runner(out_dtype: torch.dtype):
                     m, n, real_k, batch, get_device_sm_count(A.device), out_dtype
                 )
                 if tactic is None:
+                    if do_preparation:
+                        return out
                     raise ValueError(
                         f"The SM107 CuTe-DSL kernel cannot run bmm_mxfp8 with "
                         f"b={batch}, m={m}, n={n}, k={real_k}."
@@ -10317,14 +10321,22 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     use_cold_l2_cache=True,
 )
 
+
+def _bmm_mxfp8_cute_dsl_m_buckets(max_m: int) -> Tuple[int, ...]:
+    """M buckets for bmm_mxfp8(backend="cute-dsl"), which only runs m % 128 == 0."""
+    buckets = get_hybrid_num_tokens_buckets(max_m, 128)
+    return tuple(m for m in buckets if m % 128 == 0) or (128,)
+
+
 # bmm_mxfp8(backend="cute-dsl") inputs: A [b, m, k], B, A_scale, B_scale, out [b, m, n],
-# out_scale. Profiling tensors for an M bucket are contiguous.
+# out_scale. Profiling tensors for an M bucket are contiguous; the kernel pads each
+# batch's scales to whole 128-row blocks.
 _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
     dynamic_tensor_specs=(
         DynamicTensorSpec(
             (0,),
             (1,),
-            get_hybrid_num_tokens_buckets,
+            _bmm_mxfp8_cute_dsl_m_buckets,
             map_to_hybrid_bucket_uncapped,
         ),
     ),
@@ -10332,8 +10344,9 @@ _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
         ConstraintSpec(
             2,
             0,
-            lambda shapes: _mxfp8_swizzled_scale_len(
-                shapes[0][0] * shapes[0][1], shapes[0][2], SfLayout.layout_128x4
+            lambda shapes: shapes[0][0]
+            * _mxfp8_swizzled_scale_len(
+                shapes[0][1], shapes[0][2], SfLayout.layout_128x4
             ),
         ),
         ConstraintSpec(4, 1, lambda shapes: shapes[0][1]),
@@ -13735,7 +13748,8 @@ def bmm_mxfp8(
         ``i`` starts ``i * out.stride(0)`` elements in). For a contiguous ``out`` this is
         ``mxfp8_quantize(out_bf16.view(b * m, n), is_sf_swizzled_layout=True)``'s scale layout;
         for ``out = y.view(m, b, n).transpose(0, 1)`` it is the scale of ``y.view(m, b * n)``.
-        The values match a bf16 ``bmm_mxfp8`` followed by ``mxfp8_quantize`` bit for bit.
+        For finite outputs the values match a bf16 ``bmm_mxfp8`` followed by ``mxfp8_quantize``
+        bit for bit (an infinite accumulator becomes NaN here, where ``mxfp8_quantize`` saturates).
 
     The ``"cute-dsl"`` backend (SM107) runs the batch in one launch, takes ``A`` and ``out`` as
     strided views (row-major per batch, 16-byte-aligned strides) and needs ``m`` and ``n`` to be
