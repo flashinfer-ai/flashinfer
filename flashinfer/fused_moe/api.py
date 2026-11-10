@@ -3299,8 +3299,8 @@ class BatchInvariantBf16Config:
     over the triple is the finalized output bit for bit. ``use_fused_finalize`` is ignored (the combine is never an
     atomic finalize).
     All three routing input modes are taken: ``FromLogits`` runs the class's own routing (``Default``, ``Renormalize``,
-    ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm`` and ``DeepSeekV3`` with ``n_group <= 1``), the pre-routed modes take the caller's ids
-    and weights. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
+    ``RenormalizeNaive``, ``Sigmoid``, ``SigmoidRenorm``, ``TopK``, ``Llama4`` (``top_k = 1``), ``TopKSigmoid`` and
+    ``DeepSeekV3`` with or without expert groups), the pre-routed modes take the caller's ids and weights. A ``-inf`` logit (a framework's expert mask) is not an exact mask: the class's declared ``exp`` clamps
     its argument below, so a masked expert keeps a positive score of the smallest magnitudes; while ``top_k`` unmasked
     experts exist it is never selected and the weights are exactly those of the row without it, otherwise masked experts
     fill the remaining slots (in index order; by their bias for the biased methods) with such weights, and a fully masked
@@ -3315,7 +3315,7 @@ class BatchInvariantBf16Config:
     ``top_k`` / ``num_experts`` beyond its bounds, fused shared experts and a local expert range outside the experts) and
     reports the rejections as its ``RuntimeError`` listing each reason, and at the call its pack
     filter admits only a bf16 ``[num_tokens, H]`` activation (an fp16 one is its ``NotImplementedError``: no usable
-    backend); what reaches the runner (``n_group > 1`` or an unimplemented method from logits, a bias against the method,
+    backend); what reaches the runner (an unimplemented method from logits, a bias or expert groups against the method,
     a weight view of another activation or configuration, the runner driven directly) raises
     ``BatchInvariantUnsupportedError``.
 
