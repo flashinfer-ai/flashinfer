@@ -45,11 +45,20 @@ if not hasattr(cute.nvgpu, "OperandMajorMode"):
 
 @cute.jit
 def mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None:
-    """Wait at cluster scope on a barrier that a peer CTA's ``st.async`` completes."""
+    """Wait at cluster scope on a barrier that a peer CTA's ``st.async`` completes.
+
+    A relaxed cluster-scope wait followed by an acquire fence restricted to
+    ``shared::cluster``: the acquire pattern of the PTX memory model without the
+    L1 invalidation an ``.acquire.cluster`` wait would cost.
+    """
     while not prims.mbarrier_try_wait_parity(
-        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER
+        mbar_ptr,
+        phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
     ):
         pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 def ceil_div(a: int, b: int) -> int:

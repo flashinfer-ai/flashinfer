@@ -1817,7 +1817,6 @@ class GroupedQueryAttentionDecode:
                     cute.copy(
                         dsmem_store_atom_r, tRrM_final, tRsR_peer, mbar_ptr=peer_mbar
                     )
-                    cute.arch.fence_acq_rel_cta()  # dont reorder dsmem store after wait
                     mbarrier_wait_acquire_cluster(local_mbar, Int32(0))
                     tRrR = tRsR_local.load()
                     for j in cutlass.range_constexpr(cute.size(tRrM_final)):
@@ -1853,7 +1852,6 @@ class GroupedQueryAttentionDecode:
                     cute.copy(
                         dsmem_store_atom_r, tRrL_local, tRsR_peer, mbar_ptr=peer_mbar
                     )
-                    cute.arch.fence_acq_rel_cta()  # dont reorder dsmem store after wait
                     mbarrier_wait_acquire_cluster(local_mbar, Int32(0))
                     colsum += tRsR_local.load()
 
