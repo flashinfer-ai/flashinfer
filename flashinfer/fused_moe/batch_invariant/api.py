@@ -599,6 +599,13 @@ def permute_plan(
     return counts, dest.view(T, k), src
 
 
+# The gather form's token tiles: the swapped GEMM1 gathers the tokens' rows itself (no gather launch) when its token tile is
+# at most this wide. The gather stage streams one swizzle atom of K at a time where the box form's stage streams two, and a
+# wide token tile exposes that slower stream; the narrow tiles of the decode regime hide it behind the launch they save
+# (declared empirical: the in-op A/B of the two forms per token tile).
+GATHER_TOKEN_TILE_MAX = 16
+
+
 def fused_moe(
     x: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -622,8 +629,8 @@ def fused_moe(
     rows ``y`` and the positions ``dest`` of ``return_intermediates`` are then the unfinalized form of the op (a placement:
     the rows are the class's own intermediates, a function of the token, its expert and the routing alone). ``gather``:
     whether GEMM1 gathers the tokens' rows itself (the swapped body's gather form: no gather launch, no permuted tensor;
-    ``x_perm`` of the intermediates is then None) -- by default exactly when GEMM1's record is a swapped one, a placement
-    with the same bits either way; ``True`` on a dense record raises. ``grid_clip``: the GEMMs' persistent grids clipped to
+    ``x_perm`` of the intermediates is then None) -- by default when GEMM1's record is a swapped one with a narrow token
+    tile (`GATHER_TOKEN_TILE_MAX`), a placement with the same bits either way; ``True`` on a dense record raises. ``grid_clip``: the GEMMs' persistent grids clipped to
     the launch's tile bound (the default), or the device's capacity (a placement either way)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
@@ -676,7 +683,7 @@ def fused_moe(
     g1 = None if grid_clip else persistent_clusters(x.device, config1)
     g2 = None if grid_clip else persistent_clusters(x.device, config2)
     if gather is None:
-        gather = bool(config1.swap_ab)
+        gather = bool(config1.swap_ab) and config1.tile_n <= GATHER_TOKEN_TILE_MAX
     if gather:
         # the swapped GEMM1 gathers the tokens' rows itself through the plan's slots: no gather launch, no permuted tensor
         x_perm = None
