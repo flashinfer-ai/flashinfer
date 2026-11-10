@@ -75,6 +75,7 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None, add_moe
                 monkeypatch.setattr(
                     module, attr, lambda *args, _result=result, **kwargs: _result
                 )
+    monkeypatch.setattr(aot, "tinygemm2_sm100_has_targets", lambda: True)
     for attr, stub in (overrides or {}).items():
         monkeypatch.setattr(aot, attr, stub)
     monkeypatch.setattr(aot, "_gen_blackwell_bf16_bmm_aot_specs", lambda caps: [])
@@ -196,7 +197,7 @@ def test_bf16_gemm_modules_are_prebuilt_for_every_blackwell_target(
 ):
     registered = _registered_generators(monkeypatch, sm_capabilities)
 
-    assert BF16_GEMM_MODULES <= registered
+    assert registered >= BF16_GEMM_MODULES
 
 
 @pytest.mark.cpu_only
@@ -278,6 +279,34 @@ def test_tinygemm2_sm100_variant_is_prebuilt_only_for_sm10x(
     registered = _registered_generators(monkeypatch, {arch: True})
 
     assert ("gen_tinygemm2_sm100_module" in registered) == expected
+
+
+@pytest.mark.cpu_only
+def test_tinygemm2_sm100_is_skipped_when_no_target_survives_the_cuda_gate(
+    monkeypatch,
+):
+    from flashinfer.jit import tinygemm2
+
+    monkeypatch.setattr(
+        tinygemm2, "is_cuda_version_at_least", lambda v: Version("13.0") >= Version(v)
+    )
+    monkeypatch.setattr(
+        tinygemm2.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, "7a")}
+    )
+
+    registered = _registered_generators(
+        monkeypatch,
+        {"sm107": True},
+        overrides={
+            "tinygemm2_sm100_has_targets": tinygemm2.tinygemm2_sm100_has_targets
+        },
+    )
+
+    assert "gen_tinygemm2_sm100_module" not in registered
+    assert {
+        "gen_mm_bf16_cublaslt_module",
+        "gen_gemm_sm100_module_cutlass_bf16",
+    } <= registered
 
 
 @pytest.mark.cpu_only
