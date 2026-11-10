@@ -42,22 +42,31 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
 def _cluster_pipeline_consumer_wait_acquire_cluster(
     cluster_pipeline, consumer_state
 ) -> None:
-    """``consumer_wait`` with ``.acquire.cluster`` semantics.
+    """``consumer_wait`` that acquires at cluster scope.
 
     The leader CTA completes every peer's copy of the full barrier with
     ``st.async ... mbarrier::complete_tx``, a release at cluster scope; the
     pipeline's default ``.acquire.cta`` wait does not synchronize with it.
     ``cute.arch.mbarrier_wait`` has no scope argument, so this uses the
-    Primitives ``mbarrier_try_wait_parity`` with ``MBarrierScope.CLUSTER``, which
-    lowers to ``mbarrier.try_wait.parity.acquire.cluster``.
+    Primitives ``mbarrier_try_wait_parity`` at ``MBarrierScope.CLUSTER`` with a
+    relaxed order (``mbarrier.try_wait.parity.relaxed.cluster``) and follows it
+    with ``fence_sync_restrict(ACQUIRE)``
+    (``fence.acquire.sync_restrict::shared::cluster.cluster``). That is the PTX
+    acquire pattern (a strong read that observes the phase flip, then an acquire
+    fence), and restricting the fence to ``shared::cluster`` lets ptxas skip the
+    L1 invalidation it emits after a ``.acquire.cluster`` try_wait.
     """
     full_barrier_ptr = cluster_pipeline.sync_object_full.get_barrier(
         consumer_state.index
     )
     while not prims.mbarrier_try_wait_parity(
-        full_barrier_ptr, consumer_state.phase, scope=prims.MBarrierScope.CLUSTER
+        full_barrier_ptr,
+        consumer_state.phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
     ):
         pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 # =============================================================================
