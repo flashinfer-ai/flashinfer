@@ -198,6 +198,14 @@
       "dtype": "float32",
       "optional": true
     },
+    "verify_parents": {
+      "shape": [
+        "batch_size",
+        "seq_len"
+      ],
+      "dtype": "int32",
+      "optional": true
+    },
     "replayssm_u": {
       "shape": [
         "pool_size",
