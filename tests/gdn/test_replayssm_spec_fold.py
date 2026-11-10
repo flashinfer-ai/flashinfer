@@ -929,6 +929,7 @@ def test_replayssm_commit_noop(batch, backend):
         ((10, 3), 32, True),
         ((10, 0), 33, False),
         ((10, 0), 2, False),
+        ((10, 7), 8, False),
         ((12, 0), 8, False),
         ((12, 1), 8, False),
         ((9, 0), 8, False),

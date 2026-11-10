@@ -1903,6 +1903,7 @@ def gated_delta_rule_mtp(
     return output, initial_state
 
 
+@flashinfer_api
 def gated_delta_rule_replayssm_prefer_u(
     max_cache_len: int, device: torch.device
 ) -> bool:
@@ -1924,7 +1925,7 @@ def gated_delta_rule_replayssm_prefer_u(
 
     if not 3 <= max_cache_len <= MAX_WINDOW:
         return False
-    return get_compute_capability(device)[0] == 10
+    return get_compute_capability(device) in ((10, 0), (10, 3))
 
 
 @flashinfer_api(trace=gdn_replayssm_commit_trace)
