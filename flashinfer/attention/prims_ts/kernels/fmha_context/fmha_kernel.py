@@ -3479,7 +3479,7 @@ class FmhaTs:
         lse_output: cute.Tensor | None = None,
         attention_sinks: cute.Tensor | None = None,
         softmax_stats: cute.Tensor | None = None,
-        stats_scale: Float32 | None = None,
+        stats_scale: Float32 | cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3939,7 +3939,7 @@ class FmhaTs:
         attention_sinks: cute.Tensor | None = None,
         softmax_stats: cute.Tensor | None = None,
         dense_tail_capacity: cutlass.Constexpr[int] = 0,
-        stats_scale: Float32 | None = None,
+        stats_scale: Float32 | cute.Tensor | None = None,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
@@ -3972,6 +3972,8 @@ class FmhaTs:
             scale_softmax_log2 = softmax_scale_operand[0] * Float32(1.4426950408889634)
         else:
             scale_softmax_log2 = softmax_scale_operand
+        if cutlass.const_expr(isinstance(stats_scale, cute.Tensor)):
+            stats_scale = stats_scale[0]
         if cutlass.const_expr(
             isinstance(output_scale, cute.Tensor) and not cfg.vc_attention
         ):

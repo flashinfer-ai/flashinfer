@@ -37,6 +37,8 @@ def partial_max_tensor(acc_lse, softmax_stats):
 def store_softmax_stats(softmax_stats, row, raw_maximum, denominator, softmax_scale):
     """Publish actual natural-log max and unscaled exp-sum from one owner."""
     if cutlass.const_expr(softmax_stats is not None):
+        if cutlass.const_expr(isinstance(softmax_scale, cute.Tensor)):
+            softmax_scale = softmax_scale[0]
         maximum = raw_maximum * softmax_scale
         if denominator == Float32(0.0):
             maximum = Float32(-Float32.inf)
@@ -59,6 +61,8 @@ def store_reduced_softmax_stats(
     Inactive split slots are deliberately never read.
     """
     if cutlass.const_expr(softmax_stats is not None):
+        if cutlass.const_expr(isinstance(softmax_scale, cute.Tensor)):
+            softmax_scale = softmax_scale[0]
         scale_log2 = softmax_scale * Float32(1.4426950408889634)
         partial_rows = Int64(cute.cosize(acc_lse.layout))
         max_ptr = row_lse.iterator.raw_ptr() + partial_rows

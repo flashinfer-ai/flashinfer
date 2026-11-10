@@ -1872,6 +1872,7 @@ def _get_compiled_decode(
             direct_q1_inputs: tuple,
             runtime_max_kv_len: cutlass.Int32,
             softmax_stats: cute.Tensor | None,
+            stats_scale: cutlass.Float32 | cute.Tensor | None,
             stream: cuda_drv.CUstream,
             static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
             static_num_qo_heads: cutlass.Constexpr[int],
@@ -1931,6 +1932,11 @@ def _get_compiled_decode(
                 runtime_q_capacity_rows=Int32(partial_o.shape[-2]),
                 softmax_stats_iter=(
                     softmax_stats.iterator if softmax_stats is not None else None
+                ),
+                softmax_scale=(
+                    stats_scale.iterator
+                    if isinstance(stats_scale, cute.Tensor)
+                    else stats_scale
                 ),
             )
 
@@ -2166,7 +2172,15 @@ def _get_compiled_decode(
             compiled_reducer = build_and_load_attention_kernel(
                 "decode",
                 "reducer",
-                replace(compile_spec, scale_types=(False, False)),
+                replace(
+                    compile_spec,
+                    scale_types=(
+                        compile_spec.scale_types[0]
+                        if cfg.store_softmax_stats
+                        else False,
+                        False,
+                    ),
+                ),
                 _COMPILE_OPTIONS,
                 lambda: cute.compile(
                     reduction_tensor_adapter,
@@ -2182,6 +2196,9 @@ def _get_compiled_decode(
                     direct_q1_fake,
                     Int32(0),
                     softmax_stats_fake,
+                    fake_scale(compile_spec.scale_types[0])
+                    if cfg.store_softmax_stats
+                    else None,
                     stream_fake,
                     cfg,
                     num_qo_heads,
@@ -2542,6 +2559,7 @@ def _launch_decode(
             None
             if softmax_stats is None
             else softmax_stats.view(-1, softmax_stats.shape[-2], 2),
+            runtime.softmax_scale if softmax_stats is not None else None,
         )
     return runtime.out
 
@@ -2982,6 +3000,7 @@ class PrimsTSBatchDecodePlan:
                 None
                 if softmax_stats is None
                 else softmax_stats.view(-1, softmax_stats.shape[-2], 2),
+                softmax_scale if softmax_stats is not None else None,
             )
         return out
 

@@ -382,7 +382,7 @@ def _build_decode_gen_schedule(
     sage_scales_ptr: cute.Pointer | None = None,
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
-    stats_scale: Float32 | None = None,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -2634,7 +2634,7 @@ def _run_decode_gen_active(
     requested_splits=None,
     g_max_q_len: Int32 = 1,
     g_softmax_stats: cute.Pointer | None = None,
-    stats_scale: Float32 | None = None,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2763,7 +2763,9 @@ def _run_decode_gen_active(
         split_kv_counter_ptr=g_split_kv_counter,
         attention_sinks_ptr=g_attention_sinks,
         softmax_stats_ptr=g_softmax_stats,
-        stats_scale=stats_scale,
+        stats_scale=(
+            Float32(1.0) if isinstance(stats_scale, cute.Pointer) else stats_scale
+        ),
         seqlens_kv=runtime_seqlens_kv,
         cu_seqlens_q=g_cu_seqlens_q,
         max_seq_len_kv=runtime_max_seq_len_kv,
@@ -2906,9 +2908,10 @@ def _run_decode_gen_active(
     # Scales are first consumed by the task bodies. Bind their device values
     # after the producer acquire so resource initialization can overlap it.
     if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Pointer)):
-        scale_softmax_log2 = cute.make_tensor(
+        resolved_softmax_scale = cute.make_tensor(
             softmax_scale_operand, cute.make_layout(1)
-        )[0] * Float32(math.log2(math.e))
+        )[0]
+        scale_softmax_log2 = resolved_softmax_scale * Float32(math.log2(math.e))
         for resource in task_manager.resources:
             if cutlass.const_expr(
                 isinstance(
@@ -2923,6 +2926,10 @@ def _run_decode_gen_active(
                 )
             ):
                 resource.scale_softmax_log2 = scale_softmax_log2
+            if cutlass.const_expr(
+                cfg.store_softmax_stats and isinstance(resource, TmemCorrResource)
+            ):
+                resource.stats_scale = resolved_softmax_scale
     if cutlass.const_expr(isinstance(output_scale, cute.Pointer)):
         resolved_output_scale = cute.make_tensor(output_scale, cute.make_layout(1))[0]
         for resource in task_manager.resources:
@@ -3029,7 +3036,7 @@ def _run_decode_gen_runtime_prefix(
     requested_splits=None,
     g_max_q_len: Int32 = 1,
     g_softmax_stats: cute.Pointer | None = None,
-    stats_scale: Float32 | None = None,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -3234,7 +3241,7 @@ def decode_gen_kernel(
     requested_splits=None,
     g_max_q_len: Int32 = 1,
     g_softmax_stats: cute.Pointer | None = None,
-    stats_scale: Float32 | None = None,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     if cutlass.const_expr(not cfg.fixed_seqlen):

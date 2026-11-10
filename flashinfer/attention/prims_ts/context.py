@@ -205,7 +205,6 @@ class _ContextPlanState:
     lse_mode: str = "none"
     use_attention_sinks: bool = False
     sage: Optional[SagePreparedScales] = None
-    softmax_scale: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -245,7 +244,6 @@ class _PagedContextPlanState:
     policy: tuple[tuple[str, object], ...]
     lse_mode: str = "none"
     use_attention_sinks: bool = False
-    softmax_scale: Optional[float] = None
 
 
 _ContextScheduler = Literal[
@@ -2198,7 +2196,7 @@ def _get_compiled_context(
         max_q_len: cutlass.Int32,
         runtime_max_seq_len_k: cutlass.Int32,
         static_vc_repair_tiles: cutlass.Constexpr[int],
-        stats_scale: cutlass.Float32 | None,
+        stats_scale: cutlass.Float32 | cute.Tensor | None,
     ) -> None:
         """Adapt torch TVM-FFI tensors to the FmhaTs host entry point."""
 
@@ -2559,7 +2557,7 @@ def _get_compiled_paged_context(
         static_max_active_clusters: cutlass.Constexpr[int],
         max_q_len: cutlass.Int32,
         runtime_max_kv_len: cutlass.Int32,
-        stats_scale: cutlass.Float32 | None,
+        stats_scale: cutlass.Float32 | cute.Tensor | None,
     ) -> None:
         fmha(
             q,
@@ -3153,17 +3151,20 @@ class BatchPrefillTSWrapper:
 
         store_softmax_stats adds caller-owned FP32 (m, s) merge statistics,
         independent of the optional LSE output. Plain attention only is supported;
-        statistics cannot be combined with VC, Sage, or attention sinks.
+        statistics cannot be combined with VC, Sage, MXFP8, or attention sinks.
         """
 
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(use_attention_sinks, bool):
             raise TypeError("use_attention_sinks must be a bool")
         if store_softmax_stats and (
-            vc_config is not None or sage is not None or use_attention_sinks
+            vc_config is not None
+            or sage is not None
+            or q_dtype == torch.float8_e8m0fnu
+            or use_attention_sinks
         ):
             raise NotImplementedError(
-                "softmax statistics do not support VC, Sage, or attention sinks"
+                "softmax statistics do not support VC, Sage, MXFP8, or attention sinks"
             )
         if out_dtype is not None:
             resolved_out_dtype = out_dtype

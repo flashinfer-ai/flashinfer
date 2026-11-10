@@ -172,7 +172,7 @@ def _reduce_exact_splits_body(
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
     g_softmax_stats: cute.Pointer | None = None,
-    stats_scale: Float32 = 1.0,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Fold every split in one 512-thread CTA over one 8 KiB output slice.
 
@@ -344,6 +344,7 @@ def _reduce_exact_splits_body(
             active_splits_kv=active_splits_kv,
             stats_scale=stats_scale,
             lse_ptr=lse_ptr,
+            requested_splits=requested_splits,
         )
 
 
@@ -361,7 +362,7 @@ def decode_gen_separate_reduction_kernel(
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
     g_softmax_stats: cute.Pointer | None = None,
-    stats_scale: Float32 = 1.0,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Run the 512-thread exact-split reference schedule."""
 
@@ -430,7 +431,8 @@ def _store_parallel_reduction_output(
     logical_output_row_idx: Int32 = 0,
     rows_per_split: Int32 = 0,
     active_splits_kv: Int32 = 0,
-    stats_scale: Float32 = 1.0,
+    stats_scale: Float32 | cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Merge the optional sink and store one normalized output fragment.
 
@@ -451,6 +453,8 @@ def _store_parallel_reduction_output(
     )
     if cutlass.const_expr(cfg.store_softmax_stats):
         if reduce_col_idx == Int32(0):
+            if cutlass.const_expr(isinstance(stats_scale, cute.Pointer)):
+                stats_scale = cute.make_tensor(stats_scale, cute.make_layout(1))[0]
             # Only the final row owner merges the optional max/sum states.
             # The original LSE/O recurrence and cluster communication stay unchanged;
             # statistics-disabled kernels allocate no additional state.
@@ -462,6 +466,7 @@ def _store_parallel_reduction_output(
                     logical_output_row_idx,
                     rows_per_split,
                     cfg,
+                    requested_splits=requested_splits,
                 )
                 partial_max = (
                     g_partial_stats + workspace_row * Int64(3) + Int64(1)
@@ -479,6 +484,7 @@ def _store_parallel_reduction_output(
                         logical_output_row_idx,
                         rows_per_split,
                         cfg,
+                        requested_splits=requested_splits,
                     )
                     partial_ptr = g_partial_stats + workspace_row * Int64(3)
                     partial_max = (partial_ptr + Int64(1)).load()
@@ -579,7 +585,7 @@ def decode_gen_parallel_separate_reduction_kernel(
     requested_splits=None,
     compact_schedule: cutlass.Constexpr[bool] = False,
     g_softmax_stats: cute.Pointer | None = None,
-    stats_scale: Float32 = 1.0,
+    stats_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Reduce split partials with a compact or clustered constexpr schedule.
 
@@ -897,6 +903,7 @@ def decode_gen_parallel_separate_reduction_kernel(
                 active_splits_kv=active_splits_kv,
                 stats_scale=stats_scale,
                 lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
             )
         return
 
@@ -1061,6 +1068,7 @@ def decode_gen_parallel_separate_reduction_kernel(
             active_splits_kv=active_splits_kv,
             stats_scale=stats_scale,
             lse_ptr=lse_ptr,
+            requested_splits=requested_splits,
         )
 
     # Keep every peer CTA alive until rank zero has finished its DSMEM reads.
@@ -1084,6 +1092,7 @@ def fmha_decode_separate_reduction_launch(
     requested_splits=None,
     runtime_q_capacity_rows: Int32 = 0,
     softmax_stats_iter: cute.Pointer | None = None,
+    softmax_scale: Float32 | cute.Pointer | None = None,
 ) -> None:
     """Launch the standalone reducer after the main split-KV decode kernel.
 
