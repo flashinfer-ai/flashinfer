@@ -175,7 +175,7 @@ def rank_grouped_fp8(
         )
         est = (
             est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes)
+            + exposed_epilogue_cycles(c, rows, nodes, chain.pair)
             + zero_fill_cycles(c, rows, K, fam, IN_FMT)
         )
         return (

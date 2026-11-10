@@ -154,17 +154,12 @@ def tiles_term(cfg: Knobs, rows: int) -> float:
     return expected_token_tiles(rows, cfg.tile_n) / max(1, math.ceil(rows / cfg.tile_n))
 
 
-def exposed_epilogue_cycles(cfg: Knobs, rows: int, nodes: int) -> float:
+def exposed_epilogue_cycles(
+    cfg: Knobs, rows: int, nodes: int, pair: bool = False
+) -> float:
     """The chain work of a CTA's last tile, which no mainloop overlaps (the earlier tiles' epilogues run behind the next tile's
     mainloop through the accumulator stages): a thread's chains times the chain's node cycles. The grouped body computes a
     row's outputs per thread, the tile's columns split between its epilogue warpgroups (the gated chain pairs two accumulator
-<<<<<<< HEAD
-    columns per output); the swapped body computes a weight row's live token columns per thread, ``min(rows, tile)`` of them
-    (the chain of a dead column is skipped). At a few rows per expert this term separates the bodies: the grouped body's
-    epilogue is the tile's width wide whatever the live rows."""
-    if cfg.swap_ab:
-        chains = min(rows, cfg.tile_n)
-=======
     columns per output); the swapped body computes a weight row's token columns per thread, the whole token tile of them: the
     quantizing classes' chains run for every column of the tile, and the tile is what the MMA issues whatever the live
     rows, so the dead columns of a wide tile at a few live rows are priced as work (a class whose guards skip the dead
@@ -175,7 +170,6 @@ def exposed_epilogue_cycles(cfg: Knobs, rows: int, nodes: int) -> float:
         chains = cfg.tile_n * cfg.tile_m / 128
         if pair and cfg.tile_m < 128:
             chains /= 2
->>>>>>> 00d693ac5 (perf(batch_invariant): the swapped records' exposed epilogue is priced at the token tile)
     else:
         chains = cfg.tile_n / _EPI_WARPGROUPS
     return chains * nodes * CHAIN_NODE_CYCLES
@@ -274,7 +268,7 @@ def rank_grouped(
         # spill over their token tile under the load, the last tile's exposed epilogue chain, the token box's zero-fill
         est = (
             est * pair_term(c, rows) * tiles_term(c, rows)
-            + exposed_epilogue_cycles(c, rows, nodes)
+            + exposed_epilogue_cycles(c, rows, nodes, chain.pair)
             + zero_fill_cycles(c, rows, K, fam)
         )
         # three significant digits: records the estimate cannot separate (at the HBM floor every token tile reads the same
