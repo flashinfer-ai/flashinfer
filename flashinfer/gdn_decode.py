@@ -1982,7 +1982,8 @@ def gated_delta_rule_replayssm_commit(
         commit a root-to-node path that is not a contiguous prefix. Rows must
         lie in [0, T) and must not repeat within a request. Default ``None``
         replays rows ``0..accept_lens[i]-1`` and compiles a variant with no
-        gather.
+        gather. Must be None with ``u_cache``: verify does not produce ``u``
+        for a tree draft, and the u fold has no gather.
     track_state_indices : torch.Tensor, optional
         Contiguous int32 ``[B]`` destinations for an additional checkpoint.
         Live track slots must be in range, mutually distinct, and disjoint

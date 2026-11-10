@@ -1331,7 +1331,8 @@ def test_replayssm_u_verify_validation(invalid):
 
 @requires_sm100
 @pytest.mark.parametrize(
-    "invalid", ["with_rawv", "with_beta", "backend", "shape", "long_window"]
+    "invalid",
+    ["with_rawv", "with_beta", "with_paths", "backend", "shape", "long_window"],
 )
 def test_replayssm_u_commit_validation(invalid):
     from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
@@ -1346,6 +1347,13 @@ def test_replayssm_u_commit_validation(invalid):
         args["rawv_cache"] = rawv
     if invalid == "with_beta":
         args["beta_cache"] = beta
+    if invalid == "with_paths":
+        # The u fold has no gather, so a tree path would be silently ignored.
+        batch = args["state_indices"].shape[0]
+        steps = args["rawk_cache"].shape[3]
+        args["accept_paths"] = torch.arange(
+            steps, dtype=torch.int32, device=args["state_indices"].device
+        ).repeat(batch, 1)
     if invalid == "backend":
         args["backend"] = "simt"
     if invalid == "shape":

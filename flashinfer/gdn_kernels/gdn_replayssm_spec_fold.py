@@ -524,6 +524,12 @@ def commit_gdn_replayssm_fold_all_layers(
             raise ValueError("u_cache replaces rawv_cache and beta_cache")
         if backend != "auto":
             raise ValueError("backend selection applies only to raw windows")
+        # The u fold replays rows 0..accept_lens-1 with no gather. Verify
+        # already refuses to emit u for a tree draft (verify_parents with
+        # replayssm_u), so a u window never describes one; reject the pair
+        # here too instead of silently committing the wrong rows.
+        if accept_paths is not None:
+            raise ValueError("accept_paths is not supported with u_cache")
         if target.major != 10:
             raise ValueError("u_cache commit requires SM100/SM103")
         if max_cache_len > U_MAX_WINDOW:
