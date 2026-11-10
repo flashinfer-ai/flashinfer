@@ -1997,8 +1997,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 cur_tile_dim0_offset = cur_tile_coord[0] * self.mma_inst_shape_mnk[0]
                 cur_tile_dim1_offset = cur_tile_coord[1] * self.mma_inst_shape_mnk[1]
 
+                tile_has_rows = cutlass.Boolean(True)
                 if cutlass.const_expr(self.gated):
                     expert_idx = cur_tile_coord[2]
+                    # Cluster padding tiles may alias real rows through the
+                    # degenerate tile mode of a single-tile M extent.
+                    tile_has_rows = (
+                        cur_tile_coord[0] * self.cta_tile_shape_mnk[0]
+                        < tile_sched_params.masked_m[expert_idx]
+                    )
                     gate_scale = cutlass.Float32(1.0)
                     if cutlass.const_expr(alpha is not None):
                         gate_scale = alpha[expert_idx]
@@ -2155,11 +2162,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             c_pipeline.producer_acquire()
                     else:
                         if warp_idx == self.epilog_warp_id[0]:
-                            cute.copy(
-                                tma_atom_c,
-                                bSG_sC[(None, c_buffer)],
-                                bSG_gC[(None, subtile_idx)],
-                            )
+                            if tile_has_rows:
+                                cute.copy(
+                                    tma_atom_c,
+                                    bSG_sC[(None, c_buffer)],
+                                    bSG_gC[(None, subtile_idx)],
+                                )
                             # Fence and barrier to make sure shared memory store is visible to TMA store
                             c_pipeline.producer_commit()
 

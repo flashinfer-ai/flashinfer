@@ -117,6 +117,50 @@ def test_gated_activation(
         )
 
 
+@pytest.mark.parametrize("l,m", [(1, 128), (2, 128), (2, 384)])
+@pytest.mark.parametrize("mma_tiler_mn", [(128, 128), (128, 256)])
+@pytest.mark.parametrize("cluster_shape_mn", [(2, 1), (4, 1), (1, 2)])
+def test_gated_activation_cluster_matches_single_cta(
+    l, m, mma_tiler_mn, cluster_shape_mn
+):
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    n, k = 512, 512
+    a, sfa, _ = _nvfp4_operand(l, m, k, device)
+    b, sfb, _ = _nvfp4_operand(l, n, k, device)
+    masked_m = torch.randint(1, m + 1, (l,), dtype=torch.int32, device=device)
+    masked_m[0] = m
+    kwargs = dict(
+        mma_tiler_mn=mma_tiler_mn,
+        alpha=torch.full((l,), 1e-2, device=device),
+        alpha_dtype="float32",
+        activation_type=ActivationType.Swiglu,
+        a_per_token_scale=torch.rand(l, m, device=device) + 0.5,
+    )
+    outs = []
+    for cluster in [(1, 1), cluster_shape_mn]:
+        out = torch.full(
+            (l, m, n // 2), float("nan"), dtype=torch.bfloat16, device=device
+        )
+        grouped_gemm_nt_masked(
+            (a, sfa),
+            (b, sfb),
+            out.permute(1, 2, 0),
+            masked_m,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=SF_VEC,
+            cluster_shape_mn=cluster,
+            **kwargs,
+        )
+        outs.append(out)
+    for i in range(l):
+        rows = masked_m[i].item()
+        torch.testing.assert_close(outs[1][i, :rows], outs[0][i, :rows], atol=0, rtol=0)
+
+
 def _run_invalid(**overrides):
     device = torch.device("cuda")
     l, m, n, k = 2, 128, 256, 256
