@@ -4891,6 +4891,11 @@ def fast_decode_plan(
     cuDNN uses the regular planner to refresh its KV lengths and block table;
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
+
+    Outside CUDA graphs, ``indptr``, ``indices`` and ``last_page_len`` become the
+    wrapper's buffers without copying, so they must already be on the wrapper's
+    device; a ``ValueError`` is raised otherwise. Use
+    :meth:`BatchDecodeWithPagedKVCacheWrapper.plan` to plan with host metadata.
     """
     batch_size = len(last_page_len)
     wants_cudnn = self._backend == "cudnn"
