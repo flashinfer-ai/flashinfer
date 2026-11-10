@@ -832,6 +832,8 @@ def test_cute_dsl_bf16_moe_bad_inputs():
         interleave_up_gate_sm90,
         sm90_contiguous_gather_grouped_gemm_act_fusion,
     )
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import DEFAULT_SM90_MOE_TACTIC
 
     t, k, e = 8, 256, 4
     x = torch.randn(t, k, device="cuda", dtype=torch.bfloat16)
@@ -903,13 +905,31 @@ def test_cute_dsl_bf16_moe_bad_inputs():
     w1_k = torch.randn(e, 128, 100, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="cannot implement"):
         sm90_contiguous_gather_grouped_gemm_act_fusion(x_k, w1_k, *args, **kw)
+    # Operands must be 16-byte aligned (a contiguous view 2 bytes in).
+    x_off = torch.empty(t * k + 1, device="cuda", dtype=torch.bfloat16)[1:].view(t, k)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        sm90_contiguous_gather_grouped_gemm_act_fusion(x_off, w1, *args, **kw)
+    # The fused pipeline rejects non-float32 routing weights before any launch.
+    w2 = torch.randn(e, k, 64, device="cuda", dtype=torch.bfloat16)
+    ids = torch.zeros(t, 1, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="token_final_scales must be float32"):
+        cute_dsl_fused_moe_bf16(
+            x,
+            ids,
+            ids.bfloat16(),
+            w1,
+            w2,
+            num_experts=e,
+            top_k=1,
+            tactic=DEFAULT_SM90_MOE_TACTIC,
+        )
 
 
 @cute_dsl_available
 @sm90_required
 def test_cute_dsl_bf16_moe_gemm2_bad_inputs():
-    """GEMM2 wrapper rejects output rows that are not a multiple of 16 B before
-    any kernel launch."""
+    """GEMM2 wrapper rejects output rows that are not a multiple of 16 B and
+    misaligned operands before any kernel launch."""
     from flashinfer.fused_moe.cute_dsl.sm90_contiguous_grouped_gemm_finalize_fusion import (
         sm90_contiguous_grouped_gemm_finalize_fusion,
     )
@@ -935,6 +955,23 @@ def test_cute_dsl_bf16_moe_gemm2_bad_inputs():
             i32(1),
             scales,
             out,
+            topk=topk,
+            tile_shape_mn=(128, 128),
+        )
+    # Operands must be 16-byte aligned (a contiguous view 2 bytes in).
+    w2_ok = torch.randn(e, 128, k, device="cuda", dtype=torch.bfloat16)
+    out_off = torch.empty(num_tokens * 128 + 1, device="cuda", dtype=torch.bfloat16)
+    out_off = out_off[1:].view(num_tokens, 128)
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        sm90_contiguous_grouped_gemm_finalize_fusion(
+            a,
+            w2_ok,
+            i32(1),
+            i32(1),
+            i32(128),
+            i32(1),
+            scales,
+            out_off,
             topk=topk,
             tile_shape_mn=(128, 128),
         )
@@ -1409,7 +1446,12 @@ def test_sm90_moe_runner_rejects_bad_activation_config():
     def make(**kwargs):
         return CuteDslFusedMoESm90Runner(_moe_core_impl, 4, 2, 4, **kwargs)
 
-    for bad in (ActivationType.Geglu, ActivationType.Silu, ActivationType.Gelu):
+    for bad in (
+        ActivationType.Geglu,
+        ActivationType.Silu,
+        ActivationType.Gelu,
+        ActivationType.ClampedRelu2,
+    ):
         with pytest.raises(ValueError, match="Unsupported activation_type"):
             make(activation_type=bad.value)
     for bad_alpha in (float("nan"), float("inf"), 1e39):

@@ -554,40 +554,67 @@ kernel_cake_tinygemm2_wgmma_82819f8de5efaf517448(const __grid_constant__ CUtenso
                     mbarrier_arrive_expect_tx(full_addr + ((int)((unsigned int)st_1 % 5)) * 8, 40960);
                     int kb = (st_1 / 4 * 16 + st_1 % 4) * 64;
                     unsigned int dst = sw_addr + (unsigned int)(st_1 % 5 * 40960);
-                    tma_2d_gmem2smem(dst + 0, (&W), kb, m0, full_addr + ((int)((unsigned int)st_1 % 5)) * 8);
-                    tma_2d_gmem2smem(dst + 8192, (&W), kb + 256, m0, full_addr + ((int)((unsigned int)st_1 % 5)) * 8);
-                    tma_2d_gmem2smem(dst + 16384, (&W), kb + 512, m0, full_addr + ((int)((unsigned int)st_1 % 5)) * 8);
-                    tma_2d_gmem2smem(dst + 24576, (&W), kb + 768, m0, full_addr + ((int)((unsigned int)st_1 % 5)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst + 0), "l"((&W)), "r"(kb), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 5)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst + 8192), "l"((&W)), "r"(kb + 256), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 5)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst + 16384), "l"((&W)), "r"(kb + 512), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 5)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst + 24576), "l"((&W)), "r"(kb + 768), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 5)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    int kbx = (st_1 / 4 * 16 + st_1 % 4) * 64;
+                    unsigned int dstx = sx_addr + (unsigned int)(st_1 % 5 * 40960);
+                    tma_2d_gmem2smem(dstx + 0, (&X), kbx, n0, full_addr + ((int)((unsigned int)st_1 % 5)) * 8);
+                    tma_2d_gmem2smem(dstx + 2048, (&X), kbx + 256, n0, full_addr + ((int)((unsigned int)st_1 % 5)) * 8);
+                    tma_2d_gmem2smem(dstx + 4096, (&X), kbx + 512, n0, full_addr + ((int)((unsigned int)st_1 % 5)) * 8);
+                    tma_2d_gmem2smem(dstx + 6144, (&X), kbx + 768, n0, full_addr + ((int)((unsigned int)st_1 % 5)) * 8);
                 }
-            }
-            if (elect_sync()) {
                 #pragma unroll 1
-                for (int st_2 = 0; st_2 < pre; st_2++) {
-                    int kbx = (st_2 / 4 * 16 + st_2 % 4) * 64;
-                    unsigned int dstx = sx_addr + (unsigned int)(st_2 % 5 * 40960);
-                    tma_2d_gmem2smem(dstx + 0, (&X), kbx, n0, full_addr + ((int)((unsigned int)st_2 % 5)) * 8);
-                    tma_2d_gmem2smem(dstx + 2048, (&X), kbx + 256, n0, full_addr + ((int)((unsigned int)st_2 % 5)) * 8);
-                    tma_2d_gmem2smem(dstx + 4096, (&X), kbx + 512, n0, full_addr + ((int)((unsigned int)st_2 % 5)) * 8);
-                    tma_2d_gmem2smem(dstx + 6144, (&X), kbx + 768, n0, full_addr + ((int)((unsigned int)st_2 % 5)) * 8);
-                }
-                #pragma unroll 1
-                for (int st_3 = pre; st_3 < nstages; st_3++) {
-                    int _stage_empty = (int)((unsigned int)st_3 % 5);
-                    int _parity_empty = (int)((unsigned int)st_3 / 5 % 2) ^ 1;
+                for (int st_2 = pre; st_2 < nstages; st_2++) {
+                    int _stage_empty = (int)((unsigned int)st_2 % 5);
+                    int _parity_empty = (int)((unsigned int)st_2 / 5 % 2) ^ 1;
                     mbarrier_wait(empty_addr + (_stage_empty) * 8, _parity_empty);
-                    mbarrier_arrive_expect_tx(full_addr + ((int)((unsigned int)st_3 % 5)) * 8, 40960);
-                    int kb_1 = (st_3 / 4 * 16 + st_3 % 4) * 64;
-                    unsigned int dst_1 = sw_addr + (unsigned int)(st_3 % 5 * 40960);
-                    tma_2d_gmem2smem(dst_1 + 0, (&W), kb_1, m0, full_addr + ((int)((unsigned int)st_3 % 5)) * 8);
-                    tma_2d_gmem2smem(dst_1 + 8192, (&W), kb_1 + 256, m0, full_addr + ((int)((unsigned int)st_3 % 5)) * 8);
-                    tma_2d_gmem2smem(dst_1 + 16384, (&W), kb_1 + 512, m0, full_addr + ((int)((unsigned int)st_3 % 5)) * 8);
-                    tma_2d_gmem2smem(dst_1 + 24576, (&W), kb_1 + 768, m0, full_addr + ((int)((unsigned int)st_3 % 5)) * 8);
-                    int kbx_1 = (st_3 / 4 * 16 + st_3 % 4) * 64;
-                    unsigned int dstx_1 = sx_addr + (unsigned int)(st_3 % 5 * 40960);
-                    tma_2d_gmem2smem(dstx_1 + 0, (&X), kbx_1, n0, full_addr + ((int)((unsigned int)st_3 % 5)) * 8);
-                    tma_2d_gmem2smem(dstx_1 + 2048, (&X), kbx_1 + 256, n0, full_addr + ((int)((unsigned int)st_3 % 5)) * 8);
-                    tma_2d_gmem2smem(dstx_1 + 4096, (&X), kbx_1 + 512, n0, full_addr + ((int)((unsigned int)st_3 % 5)) * 8);
-                    tma_2d_gmem2smem(dstx_1 + 6144, (&X), kbx_1 + 768, n0, full_addr + ((int)((unsigned int)st_3 % 5)) * 8);
+                    mbarrier_arrive_expect_tx(full_addr + ((int)((unsigned int)st_2 % 5)) * 8, 40960);
+                    int kb_1 = (st_2 / 4 * 16 + st_2 % 4) * 64;
+                    unsigned int dst_1 = sw_addr + (unsigned int)(st_2 % 5 * 40960);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_1 + 0), "l"((&W)), "r"(kb_1), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_2 % 5)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_1 + 8192), "l"((&W)), "r"(kb_1 + 256), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_2 % 5)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_1 + 16384), "l"((&W)), "r"(kb_1 + 512), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_2 % 5)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_1 + 24576), "l"((&W)), "r"(kb_1 + 768), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_2 % 5)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                    int kbx_1 = (st_2 / 4 * 16 + st_2 % 4) * 64;
+                    unsigned int dstx_1 = sx_addr + (unsigned int)(st_2 % 5 * 40960);
+                    tma_2d_gmem2smem(dstx_1 + 0, (&X), kbx_1, n0, full_addr + ((int)((unsigned int)st_2 % 5)) * 8);
+                    tma_2d_gmem2smem(dstx_1 + 2048, (&X), kbx_1 + 256, n0, full_addr + ((int)((unsigned int)st_2 % 5)) * 8);
+                    tma_2d_gmem2smem(dstx_1 + 4096, (&X), kbx_1 + 512, n0, full_addr + ((int)((unsigned int)st_2 % 5)) * 8);
+                    tma_2d_gmem2smem(dstx_1 + 6144, (&X), kbx_1 + 768, n0, full_addr + ((int)((unsigned int)st_2 % 5)) * 8);
                 }
             }
         }

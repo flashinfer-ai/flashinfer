@@ -1699,7 +1699,7 @@ kernel_cake_fmha_decode_fp8_56920e5612bc123d66c9(const __grid_constant__ CUtenso
                     int n_block_p = split_start_block_p + cta_n_blocks_p - 1 - group_base_p - safe_group_block_p;
                     int page_i_p = lane % pages_per_block_p;
                     int page_base_p = n_block_p * pages_per_block_p;
-                    int pg_id_slot_p = group_block_p * 8 + page_i_p;
+                    int pg_id_slot_p = group_block_p % 4 * 8 + group_block_p / 4 * pages_per_block_p + page_i_p;
                     mbarrier_wait(pg_empty_addr + (pg_slot_p) * 8, _phase_pg_empty);
                     int pg_stage_addr_p = smem_pg_addr + (unsigned int)(pg_slot_p * 256);
                     asm volatile(

@@ -64,13 +64,18 @@ def sm107_candidates(
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
-    Inference uses 16 candidates (32 with the ikr axis):
+    Inference uses 32 candidates (64 with the ikr axis). The first 16 retain:
 
     - tile N 128 vs 256 (K fixed at the kind's 2x-mode depth),
     - uniform (2,1) grouped/grid-stride launch vs mixed-CGA (4,1)+(2,1)
       phase-interleave/atomic launch,
     - epi flag batches (1,4) vs (2,4),
     - FC2 bulk TMA (2 stages) on/off.
+
+    The remaining candidates use uniform clusters (2,1) or (4,1) with
+    phase-interleave/atomic launches and epi flag batches (2,4): N64 at the
+    kind's base and doubled K depths, plus N128/N256 at the base K depth.
+    FC2 bulk stores use one stage for N64 and two for the wider tiles.
 
     Default GenPhase candidates use cluster (4, 1) and require FC2 bulk stores.
     MXFP8 E4M3 and mixed FP4/FP8 additionally include the N64 decode tile,
@@ -80,7 +85,7 @@ def sm107_candidates(
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
-    tile_k = 256 if quant_kind == "nvfp4" else 128
+    tile_k = 256 if quant_kind in ("nvfp4", "mxfp4") else 128
     launches = (
         # (cluster, fallback, schedule_policy, work_id_mode)
         ((2, 1), None, ("grouped", None), "grid_stride"),
@@ -113,6 +118,36 @@ def sm107_candidates(
                                 "fc2_use_bulk": fc2_bulk,
                                 "fc2_tma_stages": 2 if fc2_bulk else None,
                                 "epi_flag_batches": epi,
+                                "token_in_flag_batch": 1,
+                                "token_back_mode": "epi_warps",
+                                "reduce_topk_in_kernel": ikr,
+                            }
+                        )
+    if kernel_variant == "inference":
+        # Preserve the original prefix for callers using --max-candidates.
+        for tile_n, depth in (
+            (64, tile_k),
+            (64, 2 * tile_k),
+            (128, tile_k),
+            (256, tile_k),
+        ):
+            for cluster in ((2, 1), (4, 1)):
+                for fc2_bulk in (False, True):
+                    for ikr in (
+                        (False, True) if allow_in_kernel_fc2_reduce else (False,)
+                    ):
+                        out.append(
+                            {
+                                "mma_tiler_mnk": (256, tile_n, depth),
+                                "cluster_shape_mn": cluster,
+                                "fallback_cluster_shape_mn": None,
+                                "schedule_policy": ("phase_interleave", None),
+                                "work_id_mode": "atomic_counter",
+                                "fc2_use_bulk": fc2_bulk,
+                                "fc2_tma_stages": (1 if tile_n == 64 else 2)
+                                if fc2_bulk
+                                else None,
+                                "epi_flag_batches": (2, 4),
                                 "token_in_flag_batch": 1,
                                 "token_back_mode": "epi_warps",
                                 "reduce_topk_in_kernel": ikr,
@@ -270,7 +305,7 @@ def _sweep_sm107_block_scaled_mega_moe(
         num_tokens,
         process_group=process_group,
     )
-    tolerance = 0.06 if cfg.quant_kind == "nvfp4" else 0.02
+    tolerance = 0.06 if cfg.quant_kind in ("nvfp4", "mxfp4") else 0.02
     scores = []
     errors = []
     for knobs in candidates:

@@ -19,6 +19,8 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
 
 # ---------------------------------------------------------------------------
 # accumulator layout helpers (WGMMA C fragment -> (M, N) view)
@@ -403,6 +405,14 @@ class MsaProxyScore:
         # dead (-inf) range [t_lim, nkt), same stride
         n_dead = (nkt - t_lim - byy + nkchunk - 1) // nkchunk
         if n_dead < 0:
+            n_dead = cutlass.Int32(0)
+
+        # A query tile starting at or past the sequence's end is pulled back onto
+        # rows an earlier tile already scores. Skip it: in a batch padded to
+        # max_seqlen_q (decodes beside a prefill chunk) every short sequence
+        # would otherwise repeat its whole traversal once per padded tile.
+        if mt > 0 and mt * self.blk_m >= sqb:
+            n_comp = cutlass.Int32(0)
             n_dead = cutlass.Int32(0)
 
         # ---------------- shared memory ----------------
@@ -812,15 +822,22 @@ class MsaProxyScore:
                     gO[tidx] = -cutlass.Float32.inf
 
 
-def select_split_k(n_mtiles, hq, batch_size, nkt):
+def select_split_k(n_mtiles, hq, batch_size, nkt, total_q=None):
     """Pick the split-K fan-in from the grid this call would otherwise launch.
 
     ``n_mtiles`` is the caller's actual query-tile count. Deriving it here from
     total_q // batch_size priced a ragged batch off the mean: with lengths
     [128, 128, 128, 4096] the mean picks a fan-in for a one-tile grid while the
     real grid has 32, which over-splits work that was already wide enough.
+
+    Query tiles past a sequence's end exit at once, so only the live ones are
+    priced: at most ``ceil(total_q / 128) + batch_size - 1`` of them. Pricing the
+    padded grid under-splits a few decodes beside a long prefill chunk.
     """
-    base_ctas = n_mtiles * hq * batch_size
+    live = n_mtiles * batch_size
+    if total_q is not None:
+        live = min(live, (total_q + 127) // 128 + batch_size - 1)
+    base_ctas = max(1, live) * hq
     best_cost = 0x7FFFFFFF
     best_nk = 1
     for cand in [
@@ -926,7 +943,7 @@ def run(
     # priced off the same count, so it is computed before the choice is made.
     sq_max = int(max_seqlen_q) if max_seqlen_q is not None else total_q // batch_size
     n_mtiles = (sq_max + 127) // 128
-    nkchunk = select_split_k(n_mtiles, hq, batch_size, nkt)
+    nkchunk = select_split_k(n_mtiles, hq, batch_size, nkt, total_q)
     # Derived inside the kernel object while shapes were static; with dynamic
     # shapes these are the only compile-time selections left, so the driver
     # computes them and they alone key the cache.
@@ -938,6 +955,7 @@ def run(
     fold = 1 if n_mtiles * 16 >= nkt else 0
 
     key = (hq, k.shape[2], k.shape[3], use_tma_q, fold, use_fp32_acc)
+    key += (q.dtype, k.dtype, max_score.dtype)
     op = _CACHE.get(key)
     if op is None:
         kern = MsaProxyScore(
@@ -973,16 +991,19 @@ def run(
                 prefix_lens, assumed_align=4, enable_tvm_ffi=True
             ).mark_layout_dynamic(leading_dim=0),
         )
-        op = cute.compile(
-            kern,
-            _kf_stream(),
-            *args,
-            cutlass.Int32(total_q),
-            cutlass.Int32(nkt),
-            cutlass.Int32(batch_size),
-            cutlass.Int32(nkchunk),
-            cutlass.Int32(n_mtiles),
-            options="--enable-tvm-ffi",
+        sizes = (total_q, nkt, batch_size, nkchunk, n_mtiles)
+        op = build_and_load_cute_dsl_kernel(
+            "msa_proxy_score_prefill_sm90",
+            f"hq{hq}_pg{k.shape[2]}_d{k.shape[3]}_tmaq{int(use_tma_q)}_fold{fold}"
+            f"_f32acc{int(use_fp32_acc)}_{q.dtype}_{k.dtype}_{max_score.dtype}",
+            lambda: cute.compile(
+                kern,
+                _kf_stream(),
+                *args,
+                *map(cutlass.Int32, sizes),
+                options="--enable-tvm-ffi",
+            ),
+            (__file__,),
         )
         _CACHE[key] = op
     op(

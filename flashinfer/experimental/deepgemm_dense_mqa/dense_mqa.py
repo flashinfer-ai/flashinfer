@@ -25,12 +25,13 @@ heads, 2 for 64 heads). The one-shot ``fp8_mqa_logits`` mirrors DeepGEMM's
 logits program (the ``q1`` and ``<tier>`` routes), or ONE logits launch that
 computes the schedule in-kernel (the ``:short`` routes: the fused single-query
 chain ``q1:short``, the warp-scan classes ``q128:short`` / ``le32:short`` and
-the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). On sm_100a
-the stage buckets of ``fp8:q128:short`` (``K <= 4096``) and
-``fp8:full:le32:short`` (``K <= 32768``) launch the warp-scan text with a
+the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). The
+stage buckets of ``fp8:q128:short`` (``K <= 4096``, sm_100a and sm_103a) and
+``fp8:full:le32:short`` (``K <= 32768``, sm_100a) launch the warp-scan text with a
 four-stage TMEM accumulator ring (identical logits and schedule words); on
 sm_103a the stage bucket of ``fp8:qle2048:short`` (``Q <= 136``,
-``K <= 8448``) launches the fused tiered text with that ring. A class
+``K <= 8448``) launches the fused tiered text with that ring (on sm_103a the
+route binds the ``source_consumer_release`` build of that text). A class
 is named by its query-BLOCK ceiling and served while the KV length is within
 the catalog policy's bound for that class (``fused_*_max_kv``); above the
 bound the two-launch route of the same query count serves the call. The FP4
@@ -79,6 +80,16 @@ partial kind or a ``:short`` route a program of its own that no route's
 ``stages`` name -- with the same host call, logits and schedule words as the
 record's program; the route name, its admission and its metadata buffer are the
 record's.
+
+A route record may carry ``variants`` (``{variant: [[stage, program], ...]}``):
+the stages a call asking for that variant launches in place of the record's
+own stages and its ``stage_buckets`` (:func:`route_stages` with ``variant``).
+The ``"raw"`` variant of a 32-head FP8 route launches, per stage and
+architecture, the raw-store twin of the record's program -- the same text
+without the cleaner, so each row's window cells are the cleaned program's bits
+and the cells outside the windows of its query block are left unwritten -- or
+the record's own program where no twin is catalogued; ``clean_logits=False``
+selects it (:class:`DenseMqaPlan`, :func:`fp8_mqa_logits`).
 """
 
 from __future__ import annotations
@@ -88,12 +99,17 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v13"
+CATALOG_SCHEMA = "dense_mqa.v14"
+# The route variant a ``clean_logits=False`` call launches where the route record catalogues it.
+RAW_VARIANT = "raw"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
 BLOCK_KV = 256
 HEAD_DIM = 128
+# The most FP32 logits one launch of a 32-head FP8 program writes: its stores form 32-bit element offsets, so
+# fp8_mqa_logits launches a longer prefill chunk per range of query rows.
+MAX_LAUNCH_LOGITS = 1 << 32
 # Query ceiling of the single-launch fused Q <= 128 route (``fp8:qle128:short``): the ``le128`` tier's token ceiling
 # (32 scan lanes x BLOCK_Q); its KV bound is the catalog policy ``fused_qle128_max_kv``.
 FUSED_QLE128_MAX_Q = 128
@@ -193,11 +209,15 @@ def stage_programs(stage, arches):
     return dict(by_arch)
 
 
-def route_stages(record, arch, keys, queries=None):
+def route_stages(record, arch, keys, queries=None, variant=None):
     """The stages a route record launches on ``arch`` for the KV length ``keys`` (``kv.shape[0]``) and the query
-    count ``queries``: the first ``stage_buckets[arch]`` entry with ``keys <= kv_max`` and, where the entry spells
-    ``max_queries``, ``queries <= max_queries`` (``[[stage, program], ...]``, one program name per stage), else the
-    record's ``stages``.  An entry with ``max_queries`` never matches when ``queries`` is not given."""
+    count ``queries``: the record's ``variants[variant]`` where ``variant`` is given and the record catalogues it
+    (its stages replace the record's own and its buckets); else the first ``stage_buckets[arch]`` entry with
+    ``keys <= kv_max`` and, where the entry spells ``max_queries``, ``queries <= max_queries`` (``[[stage, program],
+    ...]``, one program name per stage), else the record's ``stages``.  An entry with ``max_queries`` never matches
+    when ``queries`` is not given."""
+    if variant is not None and variant in record.get("variants", {}):
+        return record["variants"][variant]
     for bucket in record.get("stage_buckets", {}).get(arch, ()):
         bound = bucket.get("max_queries")
         if keys <= int(bucket["kv_max"]) and (
@@ -209,13 +229,14 @@ def route_stages(record, arch, keys, queries=None):
 
 def program_names(route=None, arch=None):
     """Names of the catalogued programs: all of them, those a route may launch on ``arch`` (stage order, then
-    its ``stage_buckets`` programs for ``arch``, then the sequence; a plan's ``program_names`` are the ones it
-    launches), or -- without ``arch`` -- the sorted union over the architectures."""
+    its ``stage_buckets`` programs for ``arch``, then its ``variants`` programs, then the sequence; a plan's
+    ``program_names`` are the ones it launches), or -- without ``arch`` -- the sorted union over the architectures."""
     catalog = _catalog()
     if route is None:
         return sorted(catalog["programs"])
     record = catalog["routes"].get(route) or catalog["paged_routes"][route]
     buckets = record.get("stage_buckets", {})
+    variants = record.get("variants", {})
     if arch is None:
         names = sorted(
             {
@@ -229,11 +250,22 @@ def program_names(route=None, arch=None):
                 for entry in entries
                 for _stage, program in entry["stages"]
             }
+            | {
+                program
+                for stages in variants.values()
+                for stage in stages
+                for program in stage_programs(stage, catalog["arches"]).values()
+            }
         )
     else:
         names = [stage_program(stage, arch) for stage in record["stages"]]
         for entry in buckets.get(arch, ()):
             for _stage, program in entry["stages"]:
+                if program not in names:
+                    names.append(program)
+        for stages in variants.values():
+            for stage in stages:
+                program = stage_program(stage, arch)
                 if program not in names:
                     names.append(program)
     if record.get("sequence"):
@@ -469,7 +501,11 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     a class bound may be a per-architecture map -- the FP4 ``fused_scan32_max_kv`` /
     ``fused_scan1024_max_kv`` are ``{"sm_100a": 1048576, "sm_103a": 1048832}`` /
     ``{"sm_100a": 65536, "sm_103a": 65792}`` -- where the logical name applies the most
-    permissive value and :func:`served_route` the device's own).
+    permissive value and :func:`served_route` the device's own; the FP8 32-block class
+    and the FP4 32- and 1024-block classes also carry a per-architecture small-Q band,
+    ``fused_scan<ceiling>_small_q_max_queries`` / ``fused_scan<ceiling>_small_q_max_kv``,
+    that raises the class's bound for a query count up to the band's query bound,
+    :func:`_scan_class_bound`).
     The logical name needs one rule: every architecture must share the tier's
     precedence (``ValueError`` otherwise -- pass the device to :func:`served_route`).
     """
@@ -497,17 +533,36 @@ def _scan_bound(value, arch):
     return int(value)
 
 
+def _scan_class_bound(bounds, ceiling, queries, arch=None):
+    """The KV bound of the scan class ``ceiling`` for a call of ``queries`` on ``arch``: ``fused_scan<ceiling>_max_kv``,
+    raised to ``fused_scan<ceiling>_small_q_max_kv[arch]`` for a query count up to
+    ``fused_scan<ceiling>_small_q_max_queries[arch]`` where the class publishes that per-architecture small-Q band (each
+    band measured on its device; a query bound below every query count of the class -- 1 for a 32-block class, 128 for
+    the 1024-block class -- where an architecture has none).  ``arch=None`` reads the most permissive architecture (the
+    logical route name)."""
+    bound = _scan_bound(bounds[f"fused_scan{ceiling}_max_kv"], arch)
+    band_queries = bounds.get(f"fused_scan{ceiling}_small_q_max_queries")
+    if band_queries is None:
+        return bound
+    band_kv = bounds[f"fused_scan{ceiling}_small_q_max_kv"]
+    for name in sorted(band_queries) if arch is None else (arch,):
+        if queries <= int(band_queries[name]):
+            bound = max(bound, int(band_kv[name]))
+    return bound
+
+
 def _fused_scan_class(queries, keys, bounds, arch=None):
     """The in-kernel scan class that serves a 32-head call, or 0: the SMALLEST
     query-block ceiling of ``bounds["fused_scan_ceilings"]`` covering ``ceil(Q / 4)``
-    when ``K <= bounds["fused_scan<ceiling>_max_kv"]``. The class is fixed by the
+    when ``K`` is within the class's bound for the query count (``fused_scan<ceiling>_max_kv``
+    or its small-Q band, :func:`_scan_class_bound`). The class is fixed by the
     query count and only its own KV bound is consulted; above it the call takes
     the two-launch route, never a larger class."""
     blocks = (queries + BLOCK_Q - 1) // BLOCK_Q
     for ceiling in bounds["fused_scan_ceilings"]:
         ceiling = int(ceiling)
         if blocks <= ceiling:
-            if keys <= _scan_bound(bounds[f"fused_scan{ceiling}_max_kv"], arch):
+            if keys <= _scan_class_bound(bounds, ceiling, queries, arch):
                 return ceiling
             return 0
     return 0
@@ -1044,7 +1099,11 @@ class DenseMqaPlan:
     reusable across streams because output and metadata are mutable. Output is
     FP32 with physical row stride logits_stride(K) = align8(K + 256); consume
     output[:, :K] (``logical_output``). On the 32-head routes every cell of the
-    output is written by each submission (``clean_logits == "fused"``); the
+    output is written by each submission (``clean_logits == "fused"``) unless
+    the plan is made with ``clean_logits=False``: then a route that catalogues
+    a ``"raw"`` variant launches its raw-store twins, which write each row's
+    window with the same bits and leave the cells outside the windows of its
+    query block unspecified (``plan.variant`` is ``"raw"``); the
     64-head routes are single-stage and store raw tiles only (cells outside the
     windows are unspecified): the grid-stride and one-split routes have no
     metadata buffer (``metadata`` must be None, ``plan.metadata`` is None, the
@@ -1074,7 +1133,13 @@ class DenseMqaPlan:
         metadata=None,
         sm_count=None,
         enforce_admission=True,
+        clean_logits=None,
     ):
+        """``clean_logits``: ``None`` launches the route's own programs; ``False``
+        its ``"raw"`` variant where the route record catalogues one (every cell
+        outside the windows is then unspecified; the route's own programs
+        otherwise); ``True`` requires a route whose programs write ``-inf``
+        outside the windows (``clean_logits == "fused"``) and launches them."""
         import torch
 
         arch, num_sms = _resolve_device(q, sm_count)
@@ -1205,6 +1270,18 @@ class DenseMqaPlan:
             else _export_route(precision, queries, keys, num_heads)
         )
         self.route = _catalog()["routes"][self.route_name]
+        if clean_logits and self.route.get("clean_logits") != "fused":
+            raise ValueError(
+                f"clean_logits=True is not available on route {self.route_name} (the program stores raw tiles, "
+                "DeepGEMM clean_logits=False semantics); pass clean_logits=False as the engine does"
+            )
+        self.variant = (
+            RAW_VARIANT
+            if clean_logits is False
+            and RAW_VARIANT in self.route.get("variants", {})
+            and not self.route.get("sequence")
+            else None
+        )
         self.config = dict(
             precision=precision,
             num_heads=num_heads,
@@ -1215,6 +1292,16 @@ class DenseMqaPlan:
         )
         stride = logits_stride(keys)
         padded_rows = (queries + bq - 1) // bq * bq
+        if (
+            precision == "fp8"
+            and num_heads == NUM_HEADS
+            and padded_rows * stride > MAX_LAUNCH_LOGITS
+        ):
+            raise ValueError(
+                f"the {NUM_HEADS}-head FP8 programs address at most {MAX_LAUNCH_LOGITS} logits per launch "
+                f"(Q = {queries}, logits_stride = {stride}); split the queries into row ranges "
+                "(fp8_mqa_logits does)"
+            )
         if output is None:
             rows = padded_rows if precision == "fp4" else queries
             output = torch.empty((rows, stride), dtype=torch.float32, device=q.device)[
@@ -1283,7 +1370,7 @@ class DenseMqaPlan:
         if sequence:
             selections = [(None, sequence)]
         else:
-            stages = route_stages(self.route, arch, keys, queries)
+            stages = route_stages(self.route, arch, keys, queries, self.variant)
             selections = [(stage[0], stage_program(stage, arch)) for stage in stages]
         self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:
@@ -1329,10 +1416,14 @@ def fp8_mqa_logits(
     FP32 scales [K])``, FP32 ``weights [Q, H]``, int32 ``ks`` / ``ke [Q]``.
     Returns the FP32 ``[Q, K]`` view of a freshly allocated
     ``[Q, logits_stride(K)]`` buffer (``logits_stride(K) = align8(K + 256)``, no
-    padding rows). On a ``"fused"`` route every cell is written (``-inf``
-    outside each row's window) and the ``clean_logits`` flag is accepted for
-    signature parity without changing the result.
+    padding rows). With ``clean_logits=True`` every cell is written (``-inf``
+    outside each row's window); with ``clean_logits=False`` (DeepGEMM's
+    default) only each row's window is defined: a route that catalogues a
+    ``"raw"`` variant launches its raw-store twins, which skip the cleanup and
+    write the window cells with the same bits.
     ``max_seqlen_k`` must be 0 (no narrowing of the returned view).
+    A 32-head call whose ``[Q, logits_stride(K)]`` logits pass ``MAX_LAUNCH_LOGITS`` elements runs one
+    launch per range of query rows.
     ``sm_count`` is the CTA budget (default: the device's SM count). Rows below
     the query block (``Q < BLOCK_Q``) are padded here where the route's program
     needs a whole block, and a KV-scale buffer whose storage is shorter than
@@ -1361,17 +1452,6 @@ def fp8_mqa_logits(
     if tuple(weights.shape) != (queries, num_heads):
         raise ValueError("weights must be [Q, H]")
     keys = int(kv_values.shape[0]) if kv_values.ndim == 2 else 0
-    if (
-        clean_logits
-        and route_record(
-            "fp8", queries, keys, num_heads, arch=device_arch(q.device)
-        ).get("clean_logits")
-        != "fused"
-    ):
-        raise ValueError(
-            "clean_logits=True is not available on this route (the program stores raw tiles, DeepGEMM "
-            "clean_logits=False semantics); pass clean_logits=False as the engine does"
-        )
     if kv_scales.ndim == 1 and (
         kv_scales.untyped_storage().nbytes() - kv_scales.storage_offset() * 4
     ) // 4 < align4(keys):
@@ -1391,7 +1471,39 @@ def fp8_mqa_logits(
         )
         w_storage[:queries] = weights
         q, weights = q_storage, w_storage
+    stride = logits_stride(keys)
+    if (
+        num_heads == NUM_HEADS
+        and (queries + bq - 1) // bq * bq * stride > MAX_LAUNCH_LOGITS
+    ):
+        # One launch per range of whole query blocks; a short last range ends at Q and starts one block earlier.
+        rows = MAX_LAUNCH_LOGITS // stride // bq * bq
+        output = torch.empty((queries, stride), dtype=torch.float32, device=q.device)
+        for start in range(0, queries, rows):
+            start = min(start, queries - bq)
+            stop = min(queries, start + rows)
+            DenseMqaPlan(
+                "fp8",
+                q[start:stop],
+                kv_values,
+                weights[start:stop],
+                ks[start:stop],
+                ke[start:stop],
+                kv_scales=kv_scales,
+                output=output[start:stop],
+                sm_count=sm_count,
+                clean_logits=bool(clean_logits),
+            ).run()
+        return output[:, :keys]
     plan = DenseMqaPlan(
-        "fp8", q, kv_values, weights, ks, ke, kv_scales=kv_scales, sm_count=sm_count
+        "fp8",
+        q,
+        kv_values,
+        weights,
+        ks,
+        ke,
+        kv_scales=kv_scales,
+        sm_count=sm_count,
+        clean_logits=bool(clean_logits),
     )
     return plan.run()

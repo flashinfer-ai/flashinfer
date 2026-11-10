@@ -1430,6 +1430,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        batch_invariant: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -1526,6 +1528,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             warmups of such wrappers use their selected graph-mode route.
             ``workspace_size`` is unavailable for XQA-selected shapes.
 
+        batch_invariant : bool
+            Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
+            whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
+            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
+            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
+            (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
+            (of the order of 10 us per request).
+
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
@@ -1544,6 +1556,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
         )
+        self._batch_invariant = None
+        if batch_invariant:
+            from .attention.batch_invariant.wrappers import BatchInvariantAttention
+
+            self._batch_invariant = BatchInvariantAttention(
+                float_workspace_buffer,
+                kv_layout,
+                "decode",
+                backend,
+                jit_args,
+                use_cuda_graph=use_cuda_graph,
+            )
+
         _check_kv_layout(kv_layout)
 
         if backend in ("cute-dsl", "cudnn") and jit_args is not None:
@@ -1745,8 +1770,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         otherwise, ``"fa2"`` for the CUDA-core decode kernel. An explicit backend
         reports itself; a tensor-core ``auto`` wrapper reports ``"auto"`` before its
         first :meth:`plan`. An auto-selected XQA MTP plan reports ``"xqa"``;
-        unsupported per-call options can still use the fallback.
+        unsupported per-call options can still use the fallback. A wrapper built with
+        ``batch_invariant=True`` reports ``"batch_invariant"``.
         """
+        if self._batch_invariant is not None:
+            return "batch_invariant"
         if getattr(self, "_use_xqa_mtp_decode", False):
             return "xqa"
         if self._cudnn_auto:
@@ -1778,6 +1806,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
+        if self._batch_invariant is not None:
+            self._batch_invariant.reset_workspace(float_workspace_buffer)
         self._cudnn_prepared = None
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
@@ -1891,6 +1921,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if self._batch_invariant is not None:
+            return self._batch_invariant.workspace_bytes(
+                None,
+                indptr,
+                last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                window_left,
+                q_len_per_req,
+            ), 0
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2316,6 +2358,59 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
         )
+
+        if self._batch_invariant is not None:
+            # the class's own checks run in the delegate; the arguments it does not take are refused there, before the plan
+            self._batch_invariant.refuse(
+                window_right=window_right, seq_lens=seq_lens, block_tables=block_tables
+            )
+            if is_causal is not None and is_causal != (q_len_per_req > 1):
+                from .batch_invariant.support import unsupported
+
+                raise unsupported(
+                    self._batch_invariant.CLASS,
+                    f"is_causal={is_causal} with q_len_per_req={q_len_per_req}",
+                    "the bottom-right causal mask (is_causal follows q_len_per_req > 1)",
+                )
+            self._batch_invariant.plan(
+                qo_indptr=None,
+                kv_indptr=indptr,
+                kv_indices=indices,
+                kv_last_page_len=last_page_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                head_dim_vo=None,
+                page_size=page_size,
+                causal=True,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                pos_encoding_mode=pos_encoding_mode,
+                q_data_type=q_data_type if q_data_type is not None else data_type,
+                kv_data_type=kv_data_type if kv_data_type is not None else data_type,
+                o_data_type=o_data_type,
+                sm_scale=sm_scale,
+                q_len_per_req=q_len_per_req,
+                non_blocking=non_blocking,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                use_token_head_sf=use_token_head_sf,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+            )
+            self._batch_size = len(indptr) - 1
+            self._num_qo_heads = num_qo_heads
+            self._num_kv_heads = num_kv_heads
+            self._cached_q_data_type = q_data_type
+            self._cached_kv_data_type = kv_data_type
+            self._window_left = window_left
+            self._q_len_per_req = q_len_per_req
+            self._sm_scale = sm_scale
+            self._pos_encoding_mode = pos_encoding_mode
+            self._logits_soft_cap = logits_soft_cap
+            self._rope_scale = rope_scale
+            self._rope_theta = rope_theta
+            return
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
         indptr = indptr.contiguous()
@@ -3095,6 +3190,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
     ) -> torch.Tensor:
         r"""Warning: this function is deprecated, please use :meth:`run` instead."""
+        if self._batch_invariant is not None:
+            self._batch_invariant.validate_forward_options(
+                sm_scale=sm_scale,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                window_left=window_left,
+            )
+            return self.run(
+                q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+            )
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
@@ -3273,6 +3380,35 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._batch_invariant is not None:
+            self._batch_invariant.refuse(positional_arguments=args or None)
+            if q_len_per_req is not None:
+                warnings.warn(
+                    "Passing `q_len_per_req` to BatchDecodeWithPagedKVCacheWrapper.run() "
+                    "is deprecated; pass it to plan() instead. Scheduled for removal "
+                    "in a future release.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            if q_len_per_req is not None and q_len_per_req != self._q_len_per_req:
+                raise ValueError(
+                    f"q_len_per_req={q_len_per_req} at run() but plan() used "
+                    f"{self._q_len_per_req}; re-plan with the matching q_len_per_req."
+                )
+            return self._batch_invariant.run(
+                q,
+                k_cache,
+                v_cache,
+                out=out,
+                return_lse=return_lse,
+                lse=lse,
+                window_left=window_left,
+                scales=(q_scale, k_scale, v_scale),
+                sinks=sinks,
+                kv_cache_sf=kv_cache_sf,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                enable_pdl=enable_pdl,
+            )
 
         if getattr(self, "_use_token_head_sf", False):
             # FP8 token-head scale uses the standard KV layout (last dim == head_dim);
@@ -3903,6 +4039,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: this function is deprecated, please use :meth:`run_return_lse` instead."""
+        if self._batch_invariant is not None:
+            return self.run_return_lse(
+                q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+            )
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
@@ -4314,6 +4454,7 @@ def trtllm_batch_decode_with_kv_cache(
     request_order: Optional[torch.Tensor] = None,
     request_order_plan: Optional[Any] = None,
     sparse_top_k: int = 0,
+    length_aware_schedule: bool = False,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -4556,6 +4697,15 @@ def trtllm_batch_decode_with_kv_cache(
         65535. A sliding window, attention sinks and head dim 512 (MLA's, see
         :func:`trtllm_batch_decode_with_kv_cache_mla`) are not supported. ``0``
         (default) disables it.
+
+    length_aware_schedule : bool = False
+        ``cake`` backend: run the length-aware stream-K program where one serves
+        the call (BF16 Q/KV/O, head dimension 128, 16-token HND pages, 128
+        requests of one query token, 32 query heads over 4 KV heads).  It sizes
+        each request's work by its own ``seq_lens`` entry instead of
+        ``max_seq_len``, which helps a batch whose lengths differ widely; a
+        batch of equal lengths gives the default program's output.  Other calls
+        and backends ignore it.  ``False`` (default) keeps the default program.
 
     Returns
     -------
@@ -5090,9 +5240,15 @@ def trtllm_batch_decode_with_kv_cache(
         if backend == "cake":
             from .cake_fmha import (
                 CakeFmhaAlignedDecodeModule,
+                CakeFmhaAlignedHd256DecodeModule,
+                CakeFmhaAlignedHd64DecodeModule,
+                CakeFmhaAlignedMtpQ32DecodeModule,
                 CakeFmhaDecodeProgramModule,
                 _resolve_cake_fmha_decode_module,
                 _run_cake_fmha_aligned_decode,
+                _run_cake_fmha_aligned_hd256_decode,
+                _run_cake_fmha_aligned_hd64_decode,
+                _run_cake_fmha_aligned_mtp_q32_decode,
                 _run_cake_fmha_decode_program,
                 select_cake_fmha_decode_route,
             )
@@ -5131,6 +5287,7 @@ def trtllm_batch_decode_with_kv_cache(
                 lse=lse,
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
                 enable_pdl=enable_pdl,
+                length_aware_schedule=length_aware_schedule,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
@@ -5142,6 +5299,63 @@ def trtllm_batch_decode_with_kv_cache(
                 # query dtype without LSE, so ``out`` is the whole result; it
                 # needs no workspace or counter buffer and ignores enable_pdl.
                 _run_cake_fmha_aligned_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
+            if isinstance(cake_module, CakeFmhaAlignedHd64DecodeModule):
+                # Aligned hd64 q1 decode: the generated grouped program (one
+                # persistent CTA per (request, KV head) tile) launched with the
+                # kernel's host parameters positionally plus the grid.  The
+                # route admits only BF16 output in the query dtype without LSE,
+                # so ``out`` is the whole result; it needs no workspace or
+                # counter buffer and ignores enable_pdl.
+                _run_cake_fmha_aligned_hd64_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
+            if isinstance(cake_module, CakeFmhaAlignedHd256DecodeModule):
+                # Aligned hd256 q1 decode: one of the generated grouped programs
+                # (the persistent program, or a cluster of 2 / 4 CTAs per
+                # (request, KV head) tile) launched with the kernel's host
+                # parameters positionally plus the grid.  The route admits only
+                # BF16 output in the query dtype without LSE, so ``out`` is the
+                # whole result; it needs no workspace or counter buffer and
+                # ignores enable_pdl.
+                _run_cake_fmha_aligned_hd256_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
+            if isinstance(cake_module, CakeFmhaAlignedMtpQ32DecodeModule):
+                # Aligned speculative decode (1 to 4 query tokens per request):
+                # the generated grouped program (a cluster of 2 CTAs per
+                # (request, KV head) tile, whose 32-row query tile holds every
+                # token of the KV head's query heads) launched with the kernel's
+                # host parameters positionally plus the grid.  The route admits
+                # only BF16 output in the query dtype without LSE, so ``out`` is
+                # the whole result; it needs no workspace or counter buffer and
+                # ignores enable_pdl.
+                _run_cake_fmha_aligned_mtp_q32_decode(
                     cake_module,
                     query=query,
                     key_cache=k_cache,

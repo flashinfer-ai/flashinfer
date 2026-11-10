@@ -1346,6 +1346,43 @@ class TestExpressiveness:
         )
         assert any(isinstance(c, CuteDslConfig) for c in cfg.backend)
 
+    @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+    def test_cutedsl_mixed_layout_candidates(self, activation):
+        kwargs = dict(
+            routing=RoutingConfig(num_experts=8, top_k=2),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            experts=ExpertConfig(intermediate_size=128),
+            activation=activation,
+            backend=BackendOptions((CuteDslConfig(), CuteDslConfig(swap_ab=True))),
+        )
+        if activation.is_gated:
+            with pytest.raises(ValueError, match="separate gated weight views"):
+                MoEConfig(**kwargs)
+        else:
+            assert len(MoEConfig(**kwargs).backend) == 2
+
+    @pytest.mark.parametrize("swap_ab", (False, True))
+    def test_cutedsl_weight_interleave_on_cpu(self, swap_ab):
+        from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
+
+        rows = torch.arange(256, dtype=torch.int32)
+        weight = rows.to(torch.uint8).view(1, 256, 1).expand(2, 256, 4).clone()
+        scales = rows.float().view(1, 256, 1).expand(2, 256, 2).clone()
+        group_size = 16 if swap_ab else 64
+        order = torch.tensor(
+            [
+                row
+                for start in range(0, 128, group_size)
+                for half in (0, 128)
+                for row in range(start + half, start + half + group_size)
+            ]
+        )
+        actual_weight, actual_scales = interleave_cute_dsl_moe_weights(
+            weight, scales, swap_ab=swap_ab
+        )
+        torch.testing.assert_close(actual_weight, weight[:, order], atol=0, rtol=0)
+        torch.testing.assert_close(actual_scales, scales[:, order], atol=0, rtol=0)
+
     def test_expert_parallel(self):
         """Config with expert parallelism (EP)."""
         cfg = MoEConfig(
@@ -1427,11 +1464,10 @@ class TestMoERunnerSupport:
         assert CutlassBf16Runner.supported_activation_classes == cutlass
         assert CutlassW4A16Runner.supported_activation_classes == cutlass
         cute_dsl = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
-        cute_dsl_mxfp8_act = (SwiGLU, GeGLUTanh, ReLU2)
         assert CuteDslRunner.supported_activation_classes_by_quant == {
             (QuantFormat.NVFP4, QuantFormat.NVFP4): cute_dsl,
-            (QuantFormat.MXFP4, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
-            (QuantFormat.MXFP8, QuantFormat.MXFP8): cute_dsl_mxfp8_act,
+            (QuantFormat.MXFP4, QuantFormat.MXFP8): cute_dsl,
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): cute_dsl,
             (QuantFormat.NVFP4, QuantFormat.BF16): cute_dsl,
         }
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
@@ -1605,6 +1641,17 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match="requires fused finalize"):
             runner.check_support()
 
+    @pytest.mark.parametrize("weight_format", (QuantFormat.MXFP4, QuantFormat.MXFP8))
+    def test_cute_dsl_mxfp_situ_supports_unfused_finalize(self, weight_format):
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(weight=weight_format, activation=QuantFormat.MXFP8),
+            activation=SiTU(),
+            backend=BackendOptions(candidates=(CuteDslConfig(swap_ab=True),)),
+            finalize=MoEFinalizeConfig(use_fused_finalize=False),
+        )
+        assert runner.check_support() is None
+
     def test_cute_dsl_rejects_gated_rows_for_non_gated_activation(self):
         """A ReLU2 config paired with a default-prepared (SwiGLU) view.
 
@@ -1632,10 +1679,24 @@ class TestMoERunnerSupport:
         with pytest.raises(ValueError, match="GEMM1 rows"):
             runner.pack_inputs(act, weights)
 
-    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(self):
+    @pytest.mark.parametrize(
+        "swap_ab,group_size,valid",
+        (
+            (False, None, True),
+            (False, 64, True),
+            (False, 16, False),
+            (True, None, False),
+            (True, 64, False),
+            (True, 16, True),
+        ),
+    )
+    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(
+        self, swap_ab, group_size, valid
+    ):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
-            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            backend=BackendOptions((CuteDslConfig(swap_ab=swap_ab),)),
         )
         runner._built = True
         runner._inner = SimpleNamespace(top_k=2)
@@ -1652,12 +1713,18 @@ class TestMoERunnerSupport:
                 "w2_alpha": torch.ones(32),
             },
         )
+        if group_size is not None:
+            weights.get_view("cute_dsl")["gated_weight_group_size"] = group_size
         act = MoEActivationPack(
             hidden_states_q=torch.empty(4, 128, dtype=torch.float8_e4m3fn),
             hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
             topk_ids=torch.zeros(4, 2, dtype=torch.int32),
             topk_weights=torch.ones(4, 2, dtype=torch.float32),
         )
+        if not valid:
+            with pytest.raises(ValueError, match="gated_weight_group_size"):
+                runner.pack_inputs(act, weights)
+            return
         packed = runner.pack_inputs(act, weights)
         assert packed[0].shape == (4, 128)
         assert packed[1].shape == (4, 4)
@@ -2250,7 +2317,7 @@ class TestBuiltInRunnerLifecycle:
         assert len(events) == 1
         assert runner._built
         assert runner.tuning_config is tuning_config
-        assert hash(runner) == hash(runner.get_cache_key_extras([]))
+        assert hash(runner) == hash((runner.get_cache_key_extras([]), 0))
 
 
 # ---------------------------------------------------------------------------
@@ -2642,6 +2709,7 @@ def _make_packs_and_config(
     max_tokens: int | None = None,
     activation=None,
     quant: QuantConfig = _NVFP4_NVFP4,
+    swap_ab: bool = False,
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for a given shape.
 
@@ -2666,6 +2734,7 @@ def _make_packs_and_config(
         num_experts=num_experts,
         num_local_experts=local_num_experts,
         top_k=top_k,
+        **({} if isinstance(activation, ReLU2) else {"swap_ab": swap_ab}),
     )
 
     w4a16 = quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
@@ -2689,6 +2758,8 @@ def _make_packs_and_config(
             "w2_alpha": tensors["w2_alpha"],
         },
     )
+    if activation.is_gated and swap_ab:
+        weight_pack.get_view("cute_dsl")["gated_weight_group_size"] = 16
     # CuteDSL W4A16 is NVFP4×BF16; TRTLLM W4A16 is MXFP4×BF16, so this helper
     # only prepares the TRTLLM view for pairs that runner actually accepts.
     if quant.pair != (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -2714,7 +2785,9 @@ def _make_packs_and_config(
             local_num_experts=local_num_experts,
         ),
         activation=activation,
-        backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+        backend=BackendOptions(
+            candidates=(CuteDslConfig(swap_ab=swap_ab), TrtllmFp4Config())
+        ),
         execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
     )
     return act_pack, weight_pack, config, tensors
@@ -2768,6 +2841,8 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
 
 
 @cute_dsl_sm100_required
+@pytest.mark.usefixtures("observe_swap_ab_mma_plans")
+@pytest.mark.parametrize("swap_ab", [False, True])
 @pytest.mark.parametrize(
     "quant",
     (
@@ -2784,7 +2859,9 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
         ReLU2(),
     ),
 )
-def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
+def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swap_ab):
+    if swap_ab and get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("swap_ab requires SM100 or SM103")
     if (
         get_compute_capability(torch.device("cuda")) == (10, 7)
         and quant.activation is QuantFormat.NVFP4
@@ -2805,9 +2882,10 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
         8,
         activation=activation,
         quant=quant,
+        swap_ab=swap_ab,
         **shape,
     )
-    if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+    if swap_ab or quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
         config = dataclasses.replace(
             config,
             finalize=dataclasses.replace(config.finalize, use_fused_finalize=False),
@@ -2818,14 +2896,55 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
         raise ValueError(f"Unsupported test quantization pair {quant.pair!r}")
     config = dataclasses.replace(
         config,
-        backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        backend=BackendOptions(candidates=(CuteDslConfig(swap_ab=swap_ab),)),
     )
     layer = MoELayer(config)
     runner = layer.runners[0]
     layer._select_winner = lambda *_: (runner, -1)
     actual = layer(act_pack, weight_pack)
+    if swap_ab and quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+        from tests.moe.test_helpers.cute_dsl_moe_swap_ab_reference import (
+            assert_cute_dsl_moe_bits,
+            cute_dsl_moe_reference,
+        )
+
+        activation_options = {"activation_type": activation.type}
+        if isinstance(activation, SwiGLU):
+            activation_options.update(
+                swiglu_alpha=activation.alpha,
+                swiglu_beta=activation.beta,
+                swiglu_limit=activation.limit,
+            )
+        elif isinstance(activation, SiTU):
+            activation_options.update(
+                activation_type=ActivationType.Swiglu,
+                situ_beta=activation.gate_scale,
+                situ_linear_beta=activation.linear_scale,
+            )
+        elif isinstance(activation, (GeGLUTanh, ReLU2)):
+            pass
+        else:
+            raise ValueError(f"Unsupported test activation {activation!r}")
+        reference = cute_dsl_moe_reference(
+            x=act_pack.hidden_states_q,
+            x_sf=act_pack.hidden_states_scale,
+            token_selected_experts=act_pack.topk_ids,
+            token_final_scales=act_pack.topk_weights,
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            local_expert_offset=config.experts.local_expert_offset,
+            swap_ab=True,
+            **activation_options,
+        )
+        assert_cute_dsl_moe_bits(actual, reference)
+        return
     if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
-        from tests.test_helpers.w4a16_reference import (
+        from tests.moe_ep.test_helpers.w4a16_reference import (
             assert_w4a16_bits,
             split_w4a16_reference_from_tensors,
         )
@@ -2853,6 +2972,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
                 token_final_scales=act_pack.topk_weights,
                 local_expert_offset=config.experts.local_expert_offset,
                 wrong_formula=wrong_formula,
+                swap_ab=swap_ab,
                 **activation_options,
             )
 
@@ -4716,7 +4836,6 @@ _DIMENSIONS = [
     ("top_k", dict(top_k=4)),
     ("num_experts", dict(num_experts=128)),
     ("local_num_experts", dict(local_num_experts=32)),
-    ("local_expert_offset", dict(local_expert_offset=8)),
     ("activation", dict(activation=GeGLU())),
 ]
 

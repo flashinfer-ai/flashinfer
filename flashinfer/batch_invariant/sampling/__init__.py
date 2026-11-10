@@ -1,0 +1,17 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""The batch-invariant sampling classes: the row log-sum-exp class ``lse.row`` behind
+``flashinfer.sampling.softmax(..., batch_invariant=True)`` and ``flashinfer.sampling.log_probs`` (``api``). Light imports
+only: the CuTe-DSL kernel modules are imported on first use.
+
+The kernels' compiled-object cache modules are registered here (the kernel modules are their roots: an edit to a kernel
+module, or to anything it imports within the mode's directories, invalidates its objects and nothing else's)."""
+
+from .. import jit as _jit
+
+_jit.MODULE_ROOTS.setdefault(
+    "batch_invariant_sampling_lse", ("batch_invariant/sampling/kernel.py",)
+)
+_jit.MODULE_ROOTS.setdefault(
+    "batch_invariant_sampling_mufu", ("batch_invariant/sampling/mufu_device.py",)
+)
