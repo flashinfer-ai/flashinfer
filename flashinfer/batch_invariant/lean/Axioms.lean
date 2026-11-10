@@ -11,7 +11,7 @@ Every declaration of the `BIKernels.*` modules is checked:
   except the named theorems in `decidedTheorems` below, which are decided by `native_decide` and therefore depend on
   `Lean.ofReduceBool` as well: the axiom that `Lean.reduceBool c = true` implies `c = true`, i.e. it trusts the
   compiled evaluator (Lean's code generator and interpreter) for the evaluation of these closed Boolean terms. Every
-  other generated conformance case (`BIKernels.Cases`) uses kernel `decide` and needs no such trust.
+  other generated conformance case (`BIKernels.Cases.*`) uses kernel `decide` and needs no such trust.
 
 The claim the policy enforces is therefore "Lean's standard axioms, plus `Lean.ofReduceBool` for the named
 exhaustive table checks", never "standard axioms only". -/

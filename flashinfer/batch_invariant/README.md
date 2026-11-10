@@ -63,11 +63,13 @@ lowering trace and the GPU configuration-agreement tests establish. What Lean ca
 configuration space selects compute the same per-element function; the GPU configuration-agreement tests check it bit
 for bit. A second hardware hypothesis of the block-scaled classes: the block-scaled step gives the same bits with its two operands exchanged, which the swapped decode records (`swap_ab`: the weights as the kernel's A, the tokens as its B) rely on; the dispatcher takes those records up to 64 rows and the dense records above, so the rows of a 64-row and a 65-row call are compared bit for bit in `test_batch_invariance_along_rows` of the mxfp8 and fp4 suites (M = 63, 64, 65 among the row counts), and every swapped record against the dense one in `test_swapped_decode_records_compute_the_class`, on each part. A third, of the block-scale fp8 class's promotion: the packed `fma.rn.f32x2` folds two elements per instruction and each of its lanes is the same correctly rounded fma as the scalar `fma.rn.f32`; the exact-model tests of `tests/gemm/test_batch_invariant_gemm_fp8_blockscale.py` discharge it bit for bit, the kernel's output against the exact CPU promotion (correctly rounded scalar fmas over the device block partials), on each part.
 
-`Cases.lean` is generated from the Python specification and engine (`python -m flashinfer.batch_invariant.lean_cases`):
+`Cases.lean` and the family modules it imports (`lean/BIKernels/Cases/GEMM.lean`, `Attention1.lean`, ...: one module per
+kernel family, a family larger than the generator's per-file budget as numbered parts chained by import) are generated
+from the Python specification and engine (`python -m flashinfer.batch_invariant.lean_cases`):
 the Lean model reproduces the Python S-expressions node for node, re-derives the dispatchers' shape rules and checks
 every record of a configuration space and every dispatcher pick against the class's constraints. The device-free test
-`tests/batch_invariant/test_lean.py` byte-compares the committed file; its `lake` steps run when the toolchain is
-installed.
+`tests/batch_invariant/test_lean.py` byte-compares the committed modules and fails on a stale or missing one; its `lake`
+steps run when the toolchain is installed.
 
 Trust statement: **Lean's standard axioms (`propext`, `Classical.choice`, `Quot.sound`), plus `Lean.ofReduceBool` for the
 named exhaustive checks listed in `lean/Axioms.lean`** (the configuration-space and dispatcher-membership checks over
