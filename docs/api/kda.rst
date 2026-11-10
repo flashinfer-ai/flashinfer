@@ -370,11 +370,18 @@ form reads the selected pool rows directly and writes no state back, so it
 needs no layout change. In frozen mode the packed ``cu_seqlens`` form below
 requires ``correction_cache`` and ``kg_cache`` and raises without them.
 
-For a serving pool whose calls are not eligible for the fast path (for example
-``HV=64``), use the packed ``[1, B, ...]`` form with one token per sequence and
-``cu_seqlens = [0, 1, ..., B]`` to let the decode kernel access the selected
-slots directly. Keep fast-path-eligible calls in the batched form: passing
-``cu_seqlens`` opts out of the fast path, and the packed form is then slower.
+For a serving pool whose calls would otherwise gather and scatter (for example
+``HV=64`` on the CuTe DSL backend), use the packed ``[1, B, ...]`` form with one
+token per sequence and ``cu_seqlens = [0, 1, ..., B]`` to let the decode kernel
+access the selected slots directly. Keep calls that already index the pool in
+the batched form. Passing ``cu_seqlens`` opts out of the fast path, and under
+``auto`` it also keeps a call on CuTe DSL that Cake would otherwise serve, so
+the packed form removes no copy there.
+
+When ``B * H >= 128`` the CuTe DSL kernel is compiled for 32-byte-aligned
+tensor data. Fresh CUDA allocations satisfy this; a view that starts at an
+offset into a larger buffer may not, even if it is contiguous.
+
 For example, given contiguous BF16 CUDA tensors
 ``q, k, v, g`` of shape ``[B, 1, H, 128]``, ``beta`` of shape ``[B, 1, H]``,
 a contiguous BF16 ``state_pool`` of shape ``[num_slots, H, 128, 128]``, and
