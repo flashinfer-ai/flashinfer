@@ -417,6 +417,8 @@ class BatchInvariantMoeRunner(MoERunner):
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int) -> Tuple[list, list]:
+        """The dispatcher's ranked records of the two GEMMs at ``T`` tokens (``rank_grouped`` memoises its arguments, all
+        scalars of the configuration and the part: a forward without a tactic pays the ranking once per token count)."""
         from .schedule import TOP_K, active_experts, rank_grouped, rows_per_expert
 
         cfg = self.config
