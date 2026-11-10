@@ -3,12 +3,12 @@
 """Compile 64-column canonical weight staging for small-M W4A16."""
 
 
-def _compile(m, n, k, enable_pdl, tactic):
+def _kernel_spec(m, n, k, enable_pdl, tactic):
+    """(module, kernel name, compile function, key files) of one kernel."""
     import cutlass
     import cutlass.cute as cute
 
     from ....cute_dsl import fp4_common
-    from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from . import kernel, n64_staged_kernel, staged_kernel
 
     tk, warps, splits, stages = tactic
@@ -41,11 +41,11 @@ def _compile(m, n, k, enable_pdl, tactic):
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     op = n64_staged_kernel.NativeN64Bf16Fp4Kernel(splits, warps, enable_pdl, tk, stages)
     name = f"m{m}_n{n}_k{k}_p{int(enable_pdl)}_tk{tk}_w{warps}_s{splits}_st{stages}"
-    return build_and_load_cute_dsl_kernel(
+    return (
         "native_n64_bf16_fp4_sm12x",
         name,
         lambda: cute.compile(op, *operands, stream, options="--enable-tvm-ffi"),
-        extra_key_files=(
+        (
             __file__,
             n64_staged_kernel.__file__,
             staged_kernel.__file__,
