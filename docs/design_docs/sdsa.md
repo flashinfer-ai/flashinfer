@@ -360,6 +360,8 @@ The decode call rejects calls outside these limits:
 
 - groups of equal size that cover the tokens, with an entry in `query_rows`
   for each token;
+- distinct output rows: other than -1, no two tokens share a `query_rows` entry,
+  and no two groups share a `group_unions` entry;
 - a block table that covers `num_keys`;
 - union rows of at least `min(group * K, 128 * ceil(num_keys / 128))` columns,
   and mask rows of at least as many bits;

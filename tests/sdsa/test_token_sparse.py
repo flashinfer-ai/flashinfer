@@ -148,5 +148,7 @@ def test_group_union_masks_match_reference_and_replay(
 
 
 def test_union_key_limit_examples() -> None:
+    if torch.cuda.get_device_properties(0).shared_memory_per_block_optin != 227 * 1024:
+        pytest.skip("The examples are for 227 KiB of shared memory")
     results = doctest.testmod(flashinfer.sdsa.token_sparse)
     assert results.attempted and not results.failed
