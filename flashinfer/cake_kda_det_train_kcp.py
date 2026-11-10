@@ -113,7 +113,9 @@ def cake_kda_det_train_kcp_partition(
         layouts); ``fragments`` gives an explicit ragged layout instead, and ``cut_points`` (per document the
         ``2 * world_size + 1`` cut offsets) applies to ``layout="zigzag_per_document"`` only.
     fragments : optional
-        Explicit ragged layout: per-rank lists of document fragments.
+        Explicit ragged layout: ``fragments[rank] = [(doc, off, len), ...]``, or a flat
+        ``[(doc, off, len, rank), ...]`` list. ``doc`` is the document index, ``off`` its
+        token offset within that document, ``len`` the token count, and ``rank`` the owner.
     cut_points : optional
         Per-document ``2 * world_size + 1`` cut offsets for ``layout="zigzag_per_document"``.
 
