@@ -278,6 +278,30 @@ def union_masks_kernel(
         cute.arch.barrier(barrier_id=1 + team, number_of_threads=THREADS)
 
 
+def union_key_limit(group: int, top_k: int, device=None) -> int:
+    """The most keys :func:`group_union_masks` takes for groups of ``group`` rows and
+    ``top_k`` keys each: its key bitmap and mask rows must fit in shared memory.
+
+    >>> union_key_limit(4, 2048)  # 227 KiB of shared memory, as on SM100
+    1441792
+    >>> union_key_limit(8, 2048)
+    1310720
+    >>> union_key_limit(32, 2048)
+    1179648
+    >>> union_key_limit(32, 512)
+    1310720
+    """
+    optin = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    rounds = 1  # the key bitmap's sizes, as in group_union_masks
+    while True:
+        bigger = rounds * 2 if rounds < 64 else rounds + 8
+        words = CTA * bigger
+        stage = ROWS * min(group * top_k // 32, words)
+        if 4 * (words + words // TILE_WORDS + stage + CTA // 32) > optin:
+            return rounds * CTA * 32
+        rounds = bigger
+
+
 @flashinfer_api(trace=group_union_masks_trace)
 def group_union_masks(
     positions: torch.Tensor,
@@ -330,14 +354,14 @@ def group_union_masks(
     group = rows // max(groups, 1)
     key_tiles = (num_keys + TILE - 1) // TILE
     columns = min(group * top_k, TILE * key_tiles)  # the most keys a union holds
-    # Shared memory, in int32 words: the key bitmap (a bit per key below num_keys,
-    # in a power of two of whole scan rounds of CTA words, so few sizes compile),
-    # its counts per key tile, a mask staging row per team, and the scan's sums.
+    # The key bitmap: a bit per key below num_keys, in whole scan rounds of CTA words.
+    # A power of two of rounds, so few sizes compile. Past 64 rounds (2**20 keys), a
+    # multiple of 8: a power of two would not fit in shared memory.
     rounds = -(-TILE_WORDS * key_tiles // CTA)
-    words = CTA << max(rounds - 1, 0).bit_length()
-    stage = ROWS * min(group * top_k // 32, words)
-    shared = 4 * (words + words // TILE_WORDS + stage + CTA // 32)
-    device = torch.cuda.get_device_properties(positions.device)
+    rounds = (
+        1 << max(rounds - 1, 0).bit_length() if rounds <= 64 else -(-rounds // 8) * 8
+    )
+    words = CTA * rounds
     if top_k % PASS:
         raise ValueError(
             f"The key lists must be a multiple of {PASS} long, got {top_k}"
@@ -350,7 +374,7 @@ def group_union_masks(
         raise ValueError("The block table must cover num_keys")
     if min(union.shape[1], 32 * mask.shape[1]) < columns:
         raise ValueError("union and mask rows must hold every group's union")
-    if shared > device.shared_memory_per_block_optin:
+    if num_keys > union_key_limit(group, top_k, positions.device):
         raise ValueError("A group's key bitmap and mask rows exceed shared memory")
     args = (
         positions,

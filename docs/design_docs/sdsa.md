@@ -263,6 +263,7 @@ it in two ways:
 | `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K, uses_shared_paged_kv_idx=False)` | Each query token attends to the K and V rows in its own lists. |
 | `flashinfer.sdsa.token_sparse.token_sparse_kv_indices(positions, requests, block_table, *, block_tables, seq_lens, requests_per_token)` | Make `block_tables` and `seq_lens` from the key positions of each token, in one launch. |
 | `flashinfer.sdsa.token_sparse.group_union_masks(positions, query_rows, group_unions, requests, block_table, *, union, union_sizes, mask, num_keys)` | Make the union of keys of each group of tokens, and the mask of each token over that union, in one launch. |
+| `flashinfer.sdsa.token_sparse.union_key_limit(group, top_k, device=None)` | The most keys (`num_keys`) that `group_union_masks` takes for groups of `group` tokens. |
 
 ### Layout
 
@@ -360,8 +361,10 @@ The decode call rejects calls outside these limits:
   for each token;
 - a block table that covers `num_keys`;
 - union and mask rows that hold the union of every group;
-- a key bitmap and mask rows that fit in shared memory. The bitmap has a bit for
-  each key below `num_keys`.
+- `num_keys` at most `union_key_limit(group, K)`, so that a key bitmap with a bit
+  for each key below `num_keys`, and the mask rows, fit in shared memory. On
+  SM100 with `K` 2048, that is 1,441,792 keys for groups of up to 4 tokens and
+  1,179,648 for 32.
 
 ### How the trtllm-gen dispatch runs it
 
@@ -421,7 +424,8 @@ and every replay.
   - `token_sparse_kv_indices`: `K` 512 and 2048, and 1 to 77 tokens with 1 to 4
     requests per token. Rows after the output stay as they are.
   - `group_union_masks`: `K` 512 and 2048, and groups of 1, 4 and 16 tokens of
-    two requests, one with 5000 keys and one with 600000. It covers short lists,
+    two requests, one with 5000 keys and one with 600000 or `union_key_limit`
+    keys. It covers short lists,
     tokens without a mask row, a group without a union row, and rows in reverse
     order. Nothing is written after a union or after the words of a mask row.
     The replay uses new keys.

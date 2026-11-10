@@ -1,12 +1,18 @@
 """SDSA (Simplified DSA) token-sparse attention inputs from key positions:
 token_sparse_kv_indices's K/V index lists, group_union_masks's unions and masks."""
 
+import doctest
 from functools import partial
 
 import pytest
 import torch
 
-from flashinfer.sdsa.token_sparse import group_union_masks, token_sparse_kv_indices
+import flashinfer.sdsa.token_sparse
+from flashinfer.sdsa.token_sparse import (
+    group_union_masks,
+    token_sparse_kv_indices,
+    union_key_limit,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
@@ -56,19 +62,23 @@ def test_token_sparse_kv_indices_match_reference_and_replay(
         graph.replay()
 
 
+@pytest.mark.parametrize("at_limit", [False, True])
 @pytest.mark.parametrize("top_k", [512, 2048])
 @pytest.mark.parametrize("group", [1, 4, 16])
 @torch.inference_mode()
-def test_group_union_masks_match_reference_and_replay(group: int, top_k: int) -> None:
+def test_group_union_masks_match_reference_and_replay(
+    group: int, top_k: int, at_limit: bool
+) -> None:
     """Two requests of 128 tokens each: request 0 has 5000 keys; request 1 has
-    600000, past the 2**19 keys of a narrower block table. Short rows end in
-    -1s; padding rows (mask row -1) end each request's tokens, and the last
-    group is all padding (union row -1). Mask and union rows run in reverse
-    order. Nothing is written past a union or a mask row's words. Row 0 has a key
-    at num_keys, which counts as -1."""
+    600000, past the 2**19 keys of a narrower block table, or union_key_limit,
+    past 2**20. Short rows end in -1s; padding rows (mask row -1) end each
+    request's tokens, and the last group is all padding (union row -1). Mask and
+    union rows run in reverse order. Nothing is written past a union or a mask
+    row's words. Row 0 has a key at num_keys, which counts as -1."""
     torch.manual_seed(group)
     rows = 256
-    contexts, width = [5000, 600000], 600000 // 64 + 1
+    long = union_key_limit(group, top_k) if at_limit else 600000
+    contexts, width = [5000, long], long // 64 + 1
     tables = torch.randperm(2 * width, device="cuda").int().view(2, width)
     request = torch.arange(rows, device="cuda") // 128
     lattice = torch.tensor(contexts, device="cuda")[request, None] // 4096
@@ -135,3 +145,8 @@ def test_group_union_masks_match_reference_and_replay(group: int, top_k: int) ->
     positions.copy_(keys)
     graph.replay()
     check()
+
+
+def test_union_key_limit_examples() -> None:
+    results = doctest.testmod(flashinfer.sdsa.token_sparse)
+    assert results.attempted and not results.failed
