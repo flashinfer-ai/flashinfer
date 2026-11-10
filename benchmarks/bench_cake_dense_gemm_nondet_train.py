@@ -26,11 +26,17 @@ rows).  Arms per row:
   router and weight-gradient prepare entries, its production plan).
 * ``atomic``: the non-deterministic package (``flashinfer.cake_dense_gemm_nondet_train``, prepared): this
   package's program where its planner takes the row, else the deterministic program (``atomic_program`` says
-  which).  On a delegated row (every forward and input gradient, the rows the planners leave) the arm shows that
-  the dispatch costs nothing.
+  which).  On a delegated row (a row the planners leave to the deterministic program) the arm shows that the
+  dispatch costs nothing.
 * ``atomic_p1``: the control of the split lever, on the rows the ``atomic`` arm runs this package's program with
   more than one split: the same program at one split (K1: the planner's tile width, ``splits=1``; router: one unit
   per tile).
+* ``atomic_shim``: the package path -- the public entry point of the row's operation through the
+  ``flashinfer.cake_dense_gemm_nondet_train`` module (``..._projection_forward`` / ``..._projection_dgrad`` /
+  ``..._projection_wgrad``, the generic ``..._projection`` for the MLA head batch, ``..._router_forward`` /
+  ``..._router_dgrad`` / ``..._router_wgrad``): what a caller times, with the convenience caches, the device's
+  rule tables and the arena workspace (warmed on the stream a CUDA graph captures on before it is timed).
+  ``--no-shim`` skips it.
 * ``cublas``: ``torch.matmul`` / ``torch.mm`` / ``torch.bmm`` (cuBLAS heuristic) on the same views; the FP32-output
   gradient rows with ``out_dtype=torch.float32`` (BF16 inputs, FP32 accumulation; a torch without it falls back to a
   BF16 GEMM + cast, marked ``cublas_note``); the router rows as SGEMM with TF32 off.
@@ -55,7 +61,15 @@ modes -- ``eager`` (the launch called per iteration) and ``graph`` (the launch c
 replayed).  ``--groups`` paired groups per row (5; 9 with ``--groups 9``), the arm order rotated per group and
 reversed every other group; per arm and mode the median of the group medians and the 5th / 95th percentiles of all
 iterations.  Per mode the ratios ``atomic / det`` of each group, their median, the wins and a one-sided sign test;
-``accept`` (the row ships its program) = every group wins and the median ratio is below 0.99, in eager and in graph.
+``accept`` (the row ships its program) = every group wins and the median ratio is below ``ACCEPT_RATIO`` (0.97: at
+least 3 % faster), in eager and in graph.  Every timing call records whether CUPTI timed it: a row whose call fell
+back to CUDA events counts it in ``cupti.fallbacks`` and the header's ``cupti_used`` is false.
+
+Rows carry their ``class`` (:func:`row_class`): ``large`` (a projection whose in and out features both exceed
+1024), ``small-output`` (a projection with at most 1024 out features: its forward and input gradient, and its weight
+gradient, whose smaller side is then at most 1024), ``batched`` (the MLA head batch) and ``router``.  Before timing,
+every arm runs ``--bit-runs`` times (5) into a NaN-poisoned output and the row records whether all runs gave the
+same bits (``bits_repeat``).
 
 Options: ``--accuracy`` (each arm against an FP64 reference of the same operands, the family's budgets, the worst of
 ``--acc-reruns`` launches into a NaN-poisoned output; router forward top-8 agreement), ``--memory`` (retained and peak
@@ -69,14 +83,19 @@ the whole device), ``--host-overhead`` (host time per prepared call), ``--exclus
 is flagged ``contended``).  The JSON header records the device, the library versions (torch, CUDA, driver, cuBLAS,
 cuBLASLt, CUPTI), the SHA-256 of both packages' host sources and manifests, and the image identity
 (``--image-*`` / ``CAKE_IMAGE_*``).  ``--markdown`` writes the two-baseline table (deterministic Cake, non-Cake SOTA,
-this package) with absolute latencies per row and mode.
+this package) with absolute latencies per row and mode, the plain cuBLAS heuristic (``torch.matmul``) and the
+package path next to them, then the per-class summary (per class, operation and mode: rows, rows on this package's
+program, accepted rows, geometric-mean speedups of this package over the deterministic package, cuBLAS and the
+non-Cake SOTA, the package path's time over the prepared launch's, rows whose outputs repeat bit for bit).  The CSV
+has one line per row and mode with the row's family, class, operation, K (in features; MLA: the per-head input
+width), N (out features; MLA: the per-head output width), batch, T, output dtype, architecture and SM count.
 
 Usage::
 
     python benchmarks/bench_cake_dense_gemm_nondet_train.py [--rows indexer_hw_wgrad_bf16_t16231 ...]
         [--families proj,mla,router] [--ops fwd,dgrad,wgrad] [--T 16231] [--only-atomic] [--steps 20]
-        [--groups 5] [--modes eager,graph] [--accuracy] [--memory] [--composite] [--resident] [--exclusive]
-        [--json out.json] [--csv out.csv] [--markdown out.md]
+        [--groups 5] [--modes eager,graph] [--bit-runs 5] [--no-shim] [--accuracy] [--memory] [--composite]
+        [--resident] [--exclusive] [--json out.json] [--csv out.csv] [--markdown out.md]
 """
 
 import argparse
@@ -91,6 +110,7 @@ import subprocess
 import sys
 import time
 import traceback
+import warnings
 from pathlib import Path
 
 import torch
@@ -103,6 +123,7 @@ from flashinfer.experimental.cake.cake_dense_gemm_det_train import (  # noqa: E4
 from flashinfer.experimental.cake.cake_dense_gemm_nondet_train import (  # noqa: E402
     cake_backend,
 )
+import flashinfer.cake_dense_gemm_nondet_train as shim  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -161,7 +182,14 @@ ROUTER_N = 256
 OPS = ("fwd", "dgrad", "wgrad")
 FAMILIES = ("proj", "mla", "router")
 SEED = 758
-ACCEPT_RATIO = 0.99
+# The acceptance bar of a row: this package's program replaces the deterministic one only where it is at least 3 %
+# faster (every paired group faster and the median ratio below 0.97, in eager and in graph).  The bar itself is set on
+# the package time of each customer shape (every operation of the shape through the public entry points); this
+# per-operation ratio is its proxy, and a row accepted here is checked again on the shape's package time.
+ACCEPT_RATIO = 0.97
+# The widest output of the small-output class (``row_class``)
+SMALL_OUTPUT_FEATURES = 1024
+CLASSES = ("large", "small-output", "batched", "router")
 
 
 def row_table(T_override=None):
@@ -198,6 +226,28 @@ def row_table(T_override=None):
 
 def k1_family(spec):
     return spec["family"] in ("proj", "mla")
+
+
+def row_class(spec):
+    """The class of a row in the per-class summary: ``router`` (the FP32 router), ``batched`` (the MLA head batch),
+    ``small-output`` (a projection with at most ``SMALL_OUTPUT_FEATURES`` out features or, for any operation, a
+    smaller side of at most that: the forward and input gradient of such a layer, and its weight gradient) and
+    ``large`` (a projection whose in and out features both exceed it)."""
+    if spec["family"] == "router":
+        return "router"
+    if spec["family"] == "mla":
+        return "batched"
+    small = min(spec["K"], spec["N"]) <= SMALL_OUTPUT_FEATURES
+    return "small-output" if small else "large"
+
+
+def row_dims(spec):
+    """``(K, N, batch)`` of a row for the CSV: in features, out features and the batch (MLA: the per-head input and
+    output widths and the head count; else a batch of one)."""
+    if spec["family"] == "mla":
+        r = MLA_ROWS[spec["row"]]
+        return r["D_in"], r["D_out"], r["H"]
+    return spec["K"], spec["N"], 1
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +405,57 @@ def convenience_atomic(spec, inp, out):
     )
 
 
+def shim_arm(spec, inp, out):
+    """The public entry point of the row's operation through the ``flashinfer.cake_dense_gemm_nondet_train`` module
+    (the package path a caller takes: the convenience caches, the device's rule tables, the arena workspace)."""
+    op = spec["op"]
+    if spec["family"] == "router":
+        if op == "fwd":
+            return lambda: shim.cake_dense_gemm_nondet_train_router_forward(
+                inp["X"], inp["W"], out
+            )
+        if op == "dgrad":
+            return lambda: shim.cake_dense_gemm_nondet_train_router_dgrad(
+                inp["G"], inp["W"], out
+            )
+        return lambda: shim.cake_dense_gemm_nondet_train_router_wgrad(
+            inp["G"], inp["X"], out
+        )
+    if spec["family"] == "proj":
+        if op == "fwd":
+            return lambda: shim.cake_dense_gemm_nondet_train_projection_forward(
+                inp["X"], inp["W"], out
+            )
+        if op == "dgrad":
+            return lambda: shim.cake_dense_gemm_nondet_train_projection_dgrad(
+                inp["G"], inp["W"], out
+            )
+        return lambda: shim.cake_dense_gemm_nondet_train_projection_wgrad(
+            inp["G"], inp["X"], out
+        )
+    return lambda: shim.cake_dense_gemm_nondet_train_projection(inp["A"], inp["B"], out)
+
+
+def capture_stream():
+    """The stream ``torch.cuda.graph`` captures on when given none (created here on first use, as it would be)."""
+    if torch.cuda.graph.default_capture_stream is None:
+        torch.cuda.graph.default_capture_stream = torch.cuda.Stream()
+    return torch.cuda.graph.default_capture_stream
+
+
+def warm_on(stream, fn):
+    """One call of ``fn`` on ``stream`` (a convenience-path call plans and binds its launch and arena per stream: a
+    graph captured on ``stream`` then replays the bound launch)."""
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn()
+    torch.cuda.current_stream().wait_stream(stream)
+
+
 def is_atomic(prepared):
     """Whether a prepared launch runs this package's program (else the deterministic package's)."""
+    if isinstance(prepared, cake_backend.CakeDenseGemmNondetProgramLaunch):
+        return prepared.own
     return isinstance(
         prepared,
         (
@@ -369,6 +468,14 @@ def is_atomic(prepared):
 def plan_record(prepared):
     """The plan facts of a prepared launch (and the rule-table key and value of this package's program, so a
     per-row verdict can be written into ``K1_SPLIT_RULES`` / ``ROUTER_RULES``)."""
+    if isinstance(prepared, cake_backend.CakeDenseGemmNondetProgramLaunch):
+        # a row of a program table: the table and the program it names (the entry point's launch geometry)
+        return dict(
+            template=prepared.template,
+            grid=None,
+            table=prepared.table,
+            reproducible=True,
+        )
     record = dict(template=prepared.template, grid=list(prepared.grid))
     if isinstance(prepared, cake_backend.CakeDenseGemmNondetProjectionLaunch):
         p = prepared.plan
@@ -381,6 +488,7 @@ def plan_record(prepared):
             out_t=p.out_t,
             tiles=p.tiles,
             swapped=p.swapped,
+            reproducible=p.reproducible,
             ws_bytes=4 * p.ws_f32_elems + 4 * p.counters_u32,
             rule_key=[
                 prepared.arch,
@@ -906,11 +1014,18 @@ def event_ms(fn, steps, flush):
 # ---------------------------------------------------------------------------
 
 
+# Timing calls and the calls whose timer fell back from CUPTI to CUDA events (``bench_gpu_time`` warns and times
+# with events when CUPTI is unavailable), and the first fallback's message
+TIMER = dict(calls=0, fallbacks=0, note=None)
+CUPTI_FALLBACK = "Falling back to CUDA events"
+
+
 def timed(fn, steps, graph):
-    """Per-iteration GPU times (ms): CUPTI span, cold L2, eager or captured in a CUDA graph."""
-    return [
-        float(t)
-        for t in bench_gpu_time(
+    """Per-iteration GPU times (ms): CUPTI span, cold L2, eager or captured in a CUDA graph.  A call that the timer
+    could not time with CUPTI is counted in ``TIMER``; other warnings pass through."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        times = bench_gpu_time(
             fn,
             dry_run_iters=3,
             repeat_iters=steps,
@@ -918,7 +1033,15 @@ def timed(fn, steps, graph):
             cold_l2_cache=True,
             use_cuda_graph=graph,
         )
-    ]
+    TIMER["calls"] += 1
+    fallbacks = [str(w.message) for w in caught if CUPTI_FALLBACK in str(w.message)]
+    if fallbacks:
+        TIMER["fallbacks"] += 1
+        TIMER["note"] = TIMER["note"] or fallbacks[0][:300]
+    for w in caught:
+        if CUPTI_FALLBACK not in str(w.message):
+            warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+    return [float(t) for t in times]
 
 
 def percentile(values, q):
@@ -961,8 +1084,8 @@ def paired_groups(arms, groups, steps, modes):
 
 
 def summarize(medians, samples, errors):
-    """Per mode: per arm the median of the group medians and p5 / p95; ``atomic`` against ``det`` and
-    ``atomic_p1`` against ``det``: per-group ratios, median, wins, sign test, accept."""
+    """Per mode: per arm the median of the group medians and p5 / p95; ``atomic``, ``atomic_p1`` and
+    ``atomic_shim`` against ``det``: per-group ratios, median, wins, sign test, accept."""
     out = {}
     for mode, per_arm in medians.items():
         rec = dict(ms={}, p5_ms={}, p95_ms={}, groups_ms={}, errors={})
@@ -974,7 +1097,7 @@ def summarize(medians, samples, errors):
             rec["p5_ms"][name] = percentile(samples[mode][name], 0.05)
             rec["p95_ms"][name] = percentile(samples[mode][name], 0.95)
             rec["groups_ms"][name] = values
-        for arm in ("atomic", "atomic_p1"):
+        for arm in ("atomic", "atomic_p1", "atomic_shim"):
             if arm in rec["ms"] and "det" in rec["ms"]:
                 ratios = [
                     a / d for a, d in zip(per_arm[arm], per_arm["det"], strict=True)
@@ -1056,6 +1179,36 @@ def worst_accuracy(spec, inp, fn, out, reruns, ref):
             worst["finite"] = worst["finite"] and rec["finite"]
     worst["reruns"] = max(1, reruns)
     return worst
+
+
+BITS_VIEW = {torch.bfloat16: torch.int16, torch.float32: torch.int32}
+
+
+def bits_repeat(arms, outs, runs):
+    """Per arm: whether ``runs`` launches, each into its output poisoned with NaN, all give the bits of the first
+    (``equal``; compared as integers, so an element left unwritten counts as a difference), how many runs differ and
+    the largest difference from the first run."""
+    record = {}
+    for name, fn in arms.items():
+        out = outs[name]
+        first, differ, worst = None, 0, 0.0
+        for _ in range(runs):
+            out.fill_(float("nan"))
+            fn()
+            torch.cuda.synchronize()
+            if first is None:
+                first = out.clone()
+                continue
+            view = BITS_VIEW[out.dtype]
+            if not torch.equal(out.view(view), first.view(view)):
+                differ += 1
+                diff = (out.double() - first.double()).abs().nan_to_num(math.inf)
+                worst = max(worst, float(diff.max()))
+        record[name] = dict(
+            runs=runs, equal=differ == 0, differing_runs=differ, max_abs_diff=worst
+        )
+        del first
+    return record
 
 
 def memory_of(make):
@@ -1176,6 +1329,12 @@ def build_arms(spec, inp, args, libs, entry):
                 entry["atomic_p1_plan"] = plan_record(q)
         except (NotImplementedError, ValueError) as exc:
             entry["atomic_p1_unavailable"] = f"{type(exc).__name__}: {exc}"
+    if not args.no_shim:
+        shim_out = fresh_out(inp["out"])
+        arms["atomic_shim"], outs["atomic_shim"] = (
+            shim_arm(spec, inp, shim_out),
+            shim_out,
+        )
     cub_out = fresh_out(inp["out"])
     run, note = torch_arm(spec, inp, cub_out)
     arms["cublas"], outs["cublas"] = run, cub_out
@@ -1289,6 +1448,8 @@ def composite(spec, args, libs):
 
 def measure_row(label, spec, args, libs, resident, uuid):
     entry = dict(row=label, spec=spec)
+    entry["class"] = row_class(spec)
+    calls, fallbacks = TIMER["calls"], TIMER["fallbacks"]
     try:
         _measure_row(entry, spec, args, libs, resident, uuid)
     except Exception as exc:  # a failing row is recorded, not hidden
@@ -1298,6 +1459,11 @@ def measure_row(label, spec, args, libs, resident, uuid):
     finally:
         cake_backend.cake_dense_gemm_nondet_train_convenience_cache_clear()
         torch.cuda.empty_cache()
+    entry["cupti"] = dict(
+        timed_calls=TIMER["calls"] - calls,
+        fallbacks=TIMER["fallbacks"] - fallbacks,
+        note=TIMER["note"] if TIMER["fallbacks"] > fallbacks else None,
+    )
     return entry
 
 
@@ -1352,6 +1518,8 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
         entry["cublaslt_sweep"] = dict(
             unsupported=libs.get("lt_error", "skipped (--no-lt)")
         )
+    if args.bit_runs >= 2:
+        entry["bits_repeat"] = bits_repeat(arms, outs, args.bit_runs)
     eligible = None
     if router:
         entry["sota_budget"] = router_budget(spec, inp, arms, outs, ref)
@@ -1390,6 +1558,10 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
             name: host_us_per_call(prepared[name].launch, args.steps)
             for name in prepared
         }
+    if "atomic_shim" in arms and "graph" in args.modes:
+        # the package path plans and binds per stream: bind it on the stream the timer's graph captures on
+        warm_on(capture_stream(), arms["atomic_shim"])
+        torch.cuda.synchronize()
     medians, samples, errors = paired_groups(arms, args.groups, args.steps, args.modes)
     entry["modes"] = summarize(medians, samples, errors)
     _add_sota(spec, entry["modes"], eligible)
@@ -1433,7 +1605,7 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
     if args.exclusive:
         entry["foreign_after"] = exclusive_check(args, uuid)
         entry["contended"] = bool(entry.get("foreign_before") or entry["foreign_after"])
-    line = f"{entry['row']:34s}"
+    line = f"{entry['row']:34s} {entry['class']:12s}"
     for mode in args.modes:
         rec = entry["modes"][mode]
         ms = rec["ms"]
@@ -1442,10 +1614,13 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
             f" | {mode} det {ms.get('det', float('nan')) * 1e3:8.1f}us "
             f"atomic {ms.get('atomic', float('nan')) * 1e3:8.1f}us "
             f"x{r.get('median', float('nan')):.3f} {r.get('wins', 0)}/{r.get('groups', 0)}"
+            + (f" shim {ms['atomic_shim'] * 1e3:8.1f}us" if "atomic_shim" in ms else "")
             + (f" sota[{rec['sota_arm']}] {rec['sota_ms'] * 1e3:8.1f}us" if rec.get("sota_ms") else "")
         )  # fmt: skip
+    repeats = entry.get("bits_repeat", {}).get("atomic", {}).get("equal")
     line += (
         f" | {'atomic' if entry['atomic_program'] else 'det'} {entry['atomic_plan']['template']}"
+        + ("" if repeats is None else (" bits-repeat" if repeats else " bits-vary"))
         + (" ACCEPT" if entry["accept"] else "")
     )
     print(line, flush=True)
@@ -1456,21 +1631,46 @@ def _measure_row(entry, spec, args, libs, resident, uuid):
 # ---------------------------------------------------------------------------
 
 CSV_FIELDS = (
-    "row", "mode", "atomic_program", "accept", "det_template", "atomic_template", "atomic_splits", "atomic_units",
-    "det_ms", "atomic_ms", "atomic_p1_ms", "cublas_ms", "cublaslt_ms", "bf16x9_ms", "cublaslt_bf16x9_ms", "sota_arm",
-    "sota_ms",
+    "row", "family", "class", "op", "K", "N", "batch", "T", "dtype", "arch", "sm_count",
+    "mode", "atomic_program", "accept", "det_template", "atomic_template", "atomic_splits", "atomic_units",
+    "atomic_reproducible",
+    "det_ms", "atomic_ms", "atomic_p1_ms", "atomic_shim_ms", "cublas_ms", "cublaslt_ms", "bf16x9_ms",
+    "cublaslt_bf16x9_ms", "sota_arm", "sota_ms",
     "det_p5_ms", "det_p95_ms", "atomic_p5_ms", "atomic_p95_ms", "atomic_over_det_median", "atomic_wins", "groups",
-    "sign_test_p", "atomic_p1_over_det_median", "det_over_atomic", "sota_over_atomic", "contended", "error",
+    "sign_test_p", "atomic_p1_over_det_median", "atomic_shim_over_det_median", "atomic_shim_over_atomic",
+    "det_over_atomic", "cublas_over_atomic", "sota_over_atomic",
+    "bit_runs", "det_bits_repeat", "atomic_bits_repeat", "atomic_shim_bits_repeat", "cublas_bits_repeat",
+    "cupti_fallbacks", "contended", "error",
 )  # fmt: skip
 
 
-def csv_rows(entry, modes):
+def csv_rows(entry, modes, header=None):
+    """The CSV lines of a row, one per mode (``header``: the run's ``arch`` and ``sm_count``)."""
+    header = header or {}
+    spec = entry["spec"]
+    K, N, batch = row_dims(spec)
+    bits = entry.get("bits_repeat", {})
     for mode in modes:
         rec = entry.get("modes", {}).get(mode, {})
         ms = rec.get("ms", {})
         r = rec.get("atomic_over_det", {})
         row = dict(
             row=entry["row"],
+            family=spec["family"],
+            op=spec["op"],
+            K=K,
+            N=N,
+            batch=batch,
+            T=spec["T"],
+            dtype=spec["out_dtype"],
+            arch=header.get("arch", ""),
+            sm_count=header.get("sm_count", ""),
+            atomic_reproducible=entry.get("atomic_plan", {}).get("reproducible", ""),
+            atomic_shim_over_det_median=rec.get("atomic_shim_over_det", {}).get(
+                "median", ""
+            ),
+            bit_runs=next(iter(bits.values()), {}).get("runs", ""),
+            cupti_fallbacks=entry.get("cupti", {}).get("fallbacks", ""),
             mode=mode,
             atomic_program=entry.get("atomic_program", ""),
             accept=entry.get("accept", ""),
@@ -1490,15 +1690,24 @@ def csv_rows(entry, modes):
             contended=entry.get("contended", ""),
             error=entry.get("error", ""),
         )
-        for name in ("det", "atomic", "atomic_p1", *ROUTER_SOTA_ARMS):
+        row["class"] = entry.get("class", row_class(spec))
+        for name in ("det", "atomic", "atomic_p1", "atomic_shim", *ROUTER_SOTA_ARMS):
             row[f"{name}_ms"] = ms.get(name, "")
         for name in ("det", "atomic"):
             row[f"{name}_p5_ms"] = rec.get("p5_ms", {}).get(name, "")
             row[f"{name}_p95_ms"] = rec.get("p95_ms", {}).get(name, "")
+        for name in ("det", "atomic", "atomic_shim", "cublas"):
+            row[f"{name}_bits_repeat"] = bits.get(name, {}).get("equal", "")
         if ms.get("atomic"):
-            row["det_over_atomic"] = ms["det"] / ms["atomic"] if ms.get("det") else ""
+            for name in ("det", "cublas"):
+                row[f"{name}_over_atomic"] = (
+                    ms[name] / ms["atomic"] if ms.get(name) else ""
+                )
             row["sota_over_atomic"] = (
                 rec["sota_ms"] / ms["atomic"] if rec.get("sota_ms") else ""
+            )
+            row["atomic_shim_over_atomic"] = (
+                ms["atomic_shim"] / ms["atomic"] if ms.get("atomic_shim") else ""
             )
         yield row
 
@@ -1523,27 +1732,126 @@ def _shape(spec):
     return f"{named}{spec['K']}->{spec['N']} T={spec['T']}"
 
 
-def _md_line(gpu, workload, operation, rec, reason):
+def _md_line(gpu, klass, workload, operation, rec, reason):
     ms = rec["ms"]
     sota = rec.get("sota_arm")
     sota_cell = f"{_us(rec, sota)} ({sota})" if sota else _us(rec, "", reason)
     det_x = ms["det"] / ms["atomic"] if "det" in ms and "atomic" in ms else None
     sota_x = rec["sota_ms"] / ms["atomic"] if sota and "atomic" in ms else None
+    timed_shim = "atomic_shim" in ms or "atomic_shim" in rec.get("errors", {})
+    shim_cell = _us(rec, "atomic_shim") if timed_shim else "not timed"
     return (
-        f"| {gpu} | {workload} | {operation} | {_us(rec, 'det')} | {sota_cell} | {_us(rec, 'atomic')} | "
+        f"| {gpu} | {klass} | {workload} | {operation} | {_us(rec, 'det')} | {_us(rec, 'cublas')} | {sota_cell} | "
+        f"{_us(rec, 'atomic')} | {shim_cell} | "
         f"{'' if det_x is None else f'{det_x:.3f}'} | {'' if sota_x is None else f'{sota_x:.3f}'} |"
     )
 
 
+def _geomean(values):
+    values = [v for v in values if v is not None and math.isfinite(v) and v > 0]
+    if not values:
+        return None
+    return math.exp(sum(math.log(v) for v in values) / len(values))
+
+
+def class_summary(rows, modes):
+    """Per class, operation and timing mode (in ``CLASSES`` / ``OPS`` order): the rows timed, the rows whose
+    ``atomic`` arm runs this package's program, the accepted rows, the rows whose ``atomic`` outputs repeated bit for
+    bit (of those checked), and over the rows the geometric mean of ``det / atomic`` (with its smallest and largest),
+    ``cublas / atomic``, ``sota / atomic`` and ``atomic_shim / atomic`` (the package path over the prepared launch)."""
+    groups = {}
+    for entry in rows:
+        if "modes" not in entry:
+            continue
+        bits = entry.get("bits_repeat", {}).get("atomic")
+        for mode in modes:
+            rec = entry["modes"].get(mode)
+            if not rec:
+                continue
+            key = (entry["class"], entry["spec"]["op"], mode)
+            g = groups.setdefault(
+                key,
+                dict(rows=0, atomic_program=0, accepted=0, bits_checked=0, bits_repeat=0, ratios={}),
+            )  # fmt: skip
+            g["rows"] += 1
+            g["atomic_program"] += bool(entry.get("atomic_program"))
+            g["accepted"] += bool(entry.get("accept"))
+            if bits is not None:
+                g["bits_checked"] += 1
+                g["bits_repeat"] += bool(bits["equal"])
+            ms = rec["ms"]
+            if not ms.get("atomic"):
+                continue
+            for name, base in (
+                ("det", ms.get("det")),
+                ("cublas", ms.get("cublas")),
+                ("sota", rec.get("sota_ms")),
+            ):
+                if base:
+                    g["ratios"].setdefault(name, []).append(base / ms["atomic"])
+            if ms.get("atomic_shim"):
+                g["ratios"].setdefault("shim", []).append(
+                    ms["atomic_shim"] / ms["atomic"]
+                )
+    order = {name: i for i, name in enumerate(CLASSES)}
+    out = []
+    for key in sorted(
+        groups,
+        key=lambda k: (order.get(k[0], len(order)), OPS.index(k[1]), modes.index(k[2])),
+    ):
+        g = groups.pop(key)
+        ratios = g.pop("ratios")
+        det = ratios.get("det", [])
+        out.append(
+            {"class": key[0], "op": key[1], "mode": key[2], **g}
+            | dict(
+                det_over_atomic_geomean=_geomean(det),
+                det_over_atomic_min=min(det) if det else None,
+                det_over_atomic_max=max(det) if det else None,
+                cublas_over_atomic_geomean=_geomean(ratios.get("cublas", [])),
+                sota_over_atomic_geomean=_geomean(ratios.get("sota", [])),
+                shim_over_atomic_geomean=_geomean(ratios.get("shim", [])),
+            )
+        )
+    return out
+
+
+def _x(value):
+    return "" if value is None else f"{value:.3f}"
+
+
+def class_summary_markdown(summary):
+    lines = [
+        "| class | operation | mode | rows | rows on this package's program | accepted rows | rows whose outputs "
+        "repeat bit for bit | speedup vs deterministic Cake: geomean [min, max] | speedup vs cuBLAS (torch.matmul): "
+        "geomean | speedup vs non-Cake SOTA: geomean | public entry point / prepared launch: geomean |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for g in summary:
+        span = (
+            f" [{_x(g['det_over_atomic_min'])}, {_x(g['det_over_atomic_max'])}]"
+            if g["det_over_atomic_geomean"] is not None
+            else ""
+        )
+        lines.append(
+            f"| {g['class']} | {g['op']} | {g['mode']} | {g['rows']} | {g['atomic_program']} | {g['accepted']} | "
+            f"{g['bits_repeat']} of {g['bits_checked']} | {_x(g['det_over_atomic_geomean'])}{span} | "
+            f"{_x(g['cublas_over_atomic_geomean'])} | {_x(g['sota_over_atomic_geomean'])} | "
+            f"{_x(g['shim_over_atomic_geomean'])} |"
+        )
+    return lines
+
+
 def markdown(results, modes):
     """The two-baseline table: one line per row, timed operation and timing mode (latency = median of the group
-    medians, [p5, p95] of all iterations), then the caption."""
+    medians, [p5, p95] of all iterations), then the caption, then the per-class summary and its caption."""
     gpu = f"{results['device']} / {results['arch']}"
     lines = [
-        "| GPU / architecture | workload / shape / dtype / mode | operation | deterministic Cake latency | "
-        "non-Cake SOTA latency | new non-deterministic Cake latency | speedup vs deterministic Cake | "
+        "| GPU / architecture | class | workload / shape / dtype / mode | operation | deterministic Cake latency | "
+        "cuBLAS (torch.matmul) latency | non-Cake SOTA latency | new non-deterministic Cake latency | "
+        "new non-deterministic Cake latency, public entry point | speedup vs deterministic Cake | "
         "speedup vs non-Cake SOTA |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for entry in results["rows"]:
         if "modes" not in entry:
@@ -1559,7 +1867,9 @@ def markdown(results, modes):
             rec = entry["modes"].get(mode)
             if rec:
                 workload = f"{_shape(spec)}, {spec['out_dtype']} out, {mode}{program}"
-                lines.append(_md_line(gpu, workload, spec["op"], rec, reason))
+                lines.append(
+                    _md_line(gpu, entry["class"], workload, spec["op"], rec, reason)
+                )
         for mode in modes:
             rec = entry.get("composite", {}).get(mode)
             if rec:
@@ -1567,7 +1877,14 @@ def markdown(results, modes):
                     f"{_shape(spec)}, {spec['out_dtype']} weight gradient, {mode}"
                 )
                 lines.append(
-                    _md_line(gpu, workload, "2 x fwd + dgrad + wgrad", rec, reason)
+                    _md_line(
+                        gpu,
+                        entry["class"],
+                        workload,
+                        "2 x fwd + dgrad + wgrad",
+                        rec,
+                        reason,
+                    )
                 )
     v = results["versions"]
     image = results["image"]
@@ -1584,10 +1901,35 @@ def markdown(results, modes):
         "sweep with FP32 inputs and CUBLAS_COMPUTE_32F, cuBLAS FP32 with CUBLAS_FP32_EMULATED_BF16X9_MATH and "
         "the cuBLASLt sweep in CUBLAS_COMPUTE_32F_EMULATED_16BFX9 among those that meet the router budget (FP64 "
         "relative Frobenius error <= 2e-6, forward top-8 equal), "
-        "named in each cell. "
-        "Speedups = baseline latency / new latency (above 1 = faster)."
+        "named in each cell. cuBLAS (torch.matmul): the cuBLAS heuristic alone. The public entry point column times "
+        "the operation's entry point of flashinfer.cake_dense_gemm_nondet_train (the package path: convenience "
+        "caches, the device's rule tables, the arena workspace); the other Cake columns time prepared launches. "
+        "Speedups = baseline latency / new latency (above 1 = faster). "
+        + _cupti_sentence(results)
+    )
+    summary = results.get("class_summary") or class_summary(results["rows"], modes)
+    lines.append("")
+    lines.extend(class_summary_markdown(summary))
+    lines.append("")
+    lines.append(
+        f"Per-class summary on {results['device']} ({results['arch']}, {results['sm_count']} SMs): speedup = "
+        "baseline latency / the new prepared launch's latency, geometric mean over the rows of the class and "
+        "operation (smallest, largest); outputs repeat bit for bit = the rows whose new prepared launch gave the "
+        f"same bits in all {results.get('bit_runs')} runs into a NaN-poisoned output, of the rows checked; public "
+        "entry point / prepared launch above 1 = the package path is slower. A row is accepted when every paired "
+        f"group is faster than the deterministic package and the median ratio is below {ACCEPT_RATIO}, in every mode."
     )
     return "\n".join(lines) + "\n"
+
+
+def _cupti_sentence(results):
+    cupti = results.get("cupti", {})
+    if not cupti.get("fallbacks"):
+        return f"CUPTI timed all {cupti.get('timed_calls', 0)} timing calls."
+    return (
+        f"{cupti['fallbacks']} of {cupti['timed_calls']} timing calls fell back to CUDA events "
+        f"({cupti.get('note')})."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1707,6 +2049,17 @@ def main():
     parser.add_argument("--modes", default="eager,graph")
     parser.add_argument("--no-p1", action="store_true", help="skip the atomic_p1 arm")
     parser.add_argument(
+        "--no-shim",
+        action="store_true",
+        help="skip the atomic_shim arm (the public entry point, the package path)",
+    )
+    parser.add_argument(
+        "--bit-runs",
+        type=int,
+        default=5,
+        help="runs per arm of the bit-repeat check (< 2: no check)",
+    )
+    parser.add_argument(
         "--no-lt", action="store_true", help="skip the cuBLASLt sweep arm"
     )
     parser.add_argument(
@@ -1816,6 +2169,7 @@ def main():
         lt_algos=args.lt_algos,
         modes=list(args.modes),
         accept_rule=f"all groups atomic < det and median ratio < {ACCEPT_RATIO}, every mode",
+        bit_runs=args.bit_runs,
         timer=(
             "flashinfer.testing.bench_gpu_time(enable_cupti=True, cold_l2_cache=True, use_cuda_graph=<graph>); "
             "resident: CUDA events"
@@ -1830,6 +2184,14 @@ def main():
     for label, spec in rows.items():
         results["rows"].append(measure_row(label, spec, args, libs, resident, uuid))
     results["wall_s"] = time.time() - started
+    results["cupti"] = dict(
+        timed_calls=TIMER["calls"], fallbacks=TIMER["fallbacks"], note=TIMER["note"]
+    )
+    results["cupti_used"] = TIMER["calls"] > 0 and TIMER["fallbacks"] == 0
+    results["class_summary"] = class_summary(results["rows"], args.modes)
+    for line in class_summary_markdown(results["class_summary"]):
+        print(line)
+    print(_cupti_sentence(results), flush=True)
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(results, indent=1, default=str) + "\n")
@@ -1840,7 +2202,7 @@ def main():
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
             writer.writeheader()
             for entry in results["rows"]:
-                for row in csv_rows(entry, args.modes):
+                for row in csv_rows(entry, args.modes, results):
                     writer.writerow(row)
         print(f"wrote {args.csv}")
     if args.markdown:

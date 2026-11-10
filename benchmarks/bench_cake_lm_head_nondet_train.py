@@ -43,6 +43,13 @@ rounds.  ``speedup`` is ``det / nondet`` of the medians (above 1: the non-determ
 ``--dx-slice-policy`` selects the non-deterministic package's dX slice rule (``cake_backend.set_dx_slice_policy``):
 ``det`` (the package default, the deterministic package's slice counts) or ``measured`` (the form-aware B200 rule).
 
+``--det-memory-mode`` selects the deterministic mode's memory form in its public entries (``step``, ``ckpt``, the
+memory and sanity records): ``fast`` (the default; ``memory_mode="fast"``, the form of the non-deterministic mode's
+default and of the explicit ``fwd`` / ``bwd`` pair) or ``auto`` (``memory_mode=None``, the deterministic default,
+which switches a call of two or more chunks to a budget form, when one fits, where the fast form's predicted step peak
+would exceed the logits-materializing head's bytes less a 2 % margin; a one-chunk call keeps the fast form).
+The report records it (``env.det_memory_mode``).
+
 Example::
 
     python benchmarks/bench_cake_lm_head_nondet_train.py --rows t16231_c4096_ce t16231_c4096_logprob --json out.json
@@ -51,6 +58,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import functools
 import gc
 import json
 import statistics
@@ -66,7 +74,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from flashinfer import cake_lm_head_det_train as det_public  # noqa: E402
 from flashinfer import cake_lm_head_nondet_train as public  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
     DEFAULT_H,
     DEFAULT_V,
     make_inputs,
@@ -94,6 +102,9 @@ for _T in (1, 4095, 4097):
 
 MODES = {"det": True, "nondet": False}
 PHASES = ("fwd", "bwd", "step", "ckpt")
+# ``--det-memory-mode`` -> the deterministic public entries' ``memory_mode``
+DET_MEMORY_MODES = {"fast": "fast", "auto": None}
+_DET_MEMORY_MODE: dict[str, Optional[str]] = {"memory_mode": "fast"}
 SEED_BASE = 761
 ROUNDS = 5
 STEPS = 10
@@ -118,11 +129,13 @@ def _backend(deterministic: bool):
 
 
 def _entries(deterministic: bool):
-    """The public ``(loss, logprob)`` entries of a mode."""
+    """The public ``(loss, logprob)`` entries of a mode (the deterministic ones with ``--det-memory-mode``'s
+    ``memory_mode``)."""
     if deterministic:
+        memory = dict(memory_mode=_DET_MEMORY_MODE["memory_mode"])
         return (
-            det_public.cake_lm_head_det_train_loss,
-            det_public.cake_lm_head_det_train_logprob,
+            functools.partial(det_public.cake_lm_head_det_train_loss, **memory),
+            functools.partial(det_public.cake_lm_head_det_train_logprob, **memory),
         )
     return (
         public.cake_lm_head_nondet_train_loss,
@@ -328,8 +341,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         default="det",
         help="the non-deterministic package's dX slice rule",
     )
+    parser.add_argument(
+        "--det-memory-mode",
+        choices=tuple(DET_MEMORY_MODES),
+        default="fast",
+        help="the deterministic public entries' memory form: fast, or auto (the deterministic default)",
+    )
     parser.add_argument("--json", type=Path, default=None)
     args = parser.parse_args(argv)
+    _DET_MEMORY_MODE["memory_mode"] = DET_MEMORY_MODES[args.det_memory_mode]
     from flashinfer.experimental.cake.cake_lm_head_nondet_train import (
         cake_backend as nd_backend,
     )
@@ -346,12 +366,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             torch=torch.__version__,
             cuda=torch.version.cuda,
             dx_slice_policy=args.dx_slice_policy,
+            det_memory_mode=args.det_memory_mode,
         ),
         rows=[],
     )
     print(
         f"{props.name} sm_{props.major}{props.minor} {props.multi_processor_count} SMs; det / nondet "
-        f"(dX slice policy {args.dx_slice_policy})"
+        f"(dX slice policy {args.dx_slice_policy}, det memory mode {args.det_memory_mode})"
     )
     for name in args.rows:
         result = bench_row(name, W, args)

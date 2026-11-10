@@ -22,19 +22,25 @@ On the CPU (no program is loaded): the registry's accumulate stages (``<stage>_a
 against the exact set this release ships (``SHIPPED_ACC_STAGES``, which the README and
 rst feature matrices state too) and against the stages they are builds of (their twins),
 the ``build.json`` entries, the accumulate plans against the overwrite plans over the
-owner rows at every SM count, the fused / composed route choice (the 256-wide k tile, an
-ordered tail, a stage without an accumulate build, a build that cannot load by the
-loader's static rule, the alignment), the checks of ``out``, the alerts (only before an
-order-varying launch, whatever the route), the signatures, the facade's handoff (no
-deterministic route) and the autograd flag's refusals.  On a GPU: the fused route
-against its bitwise oracles and the fp64 reference, on forced forms and on the benchmark
-rows as planned, the composed route against ``out.add_``, empty groups, padding,
-``sum_m == 0``, short groups, concurrent streams, graph replay, allocations, the version
-counter, the autograd flag and the alert of an order-varying accumulate under torch's
-deterministic mode.  A fused case the shipped set promises fails unless the
-call is fused; it skips (``"cannot load"`` in the reason) only where the build's library
-cannot load in this environment (neither prebuilt nor a JIT toolkit at its ``min_cuda``),
-where the call composes instead.
+owner rows at every SM count, the fused / composed route choice (the 256-wide k tile, a
+two-launch tail-reduce tail, a stage without an accumulate build, a build that cannot
+load by the loader's static rule, the alignment; the ordered and the unordered
+one-launch tail both fuse), the refusal of an architecture listed in both tail lists or
+in neither where no ``tail_reduce`` stage serves it, the checks of ``out``, the dormant
+alert (only before an order-varying launch, whatever the route: a split tail planned
+under ``unordered_tail_archs``, which the shipped constants leave empty, so no shipped
+plan varies), the signatures, the facade's handoff (no deterministic route) and the
+autograd flag's refusals.  On a GPU: the fused route against its bitwise oracles
+(``out0.add_(dW32)`` on the groups with rows, split ordered tails included) and the
+fp64 reference, on forced forms and on the benchmark rows as planned, bitwise run to run
+with the stream's tail slots garbage-filled before every launch, the composed route
+against ``out.add_``, empty groups, padding, ``sum_m == 0``, short groups, concurrent
+streams and graph replay (bitwise an isolated eager launch), allocations, the version
+counter, the autograd flag, and a fused split-tail backward under torch's deterministic
+mode (no alert, the bits of the mode-off run).  A fused case the shipped set promises
+fails unless the call is fused; it skips (``"cannot load"`` in the reason) only where the
+build's library cannot load in this environment (neither prebuilt nor a JIT toolkit at
+its ``min_cuda``), where the call composes instead.
 
 ``python -m tests.experimental.test_cake_moe_grouped_gemm_nondet_train_acc sanitize`` (from the
 repository root) runs one small launch of every accumulate build the device serves, with
@@ -67,16 +73,17 @@ PROGRAMS = base.PROGRAMS
 HOST_PLAN_CONSTANTS = base.HOST_PLAN_CONSTANTS
 DTYPE_NAMES = base.DTYPE_NAMES
 ACC = cb.ACC_SUFFIX
-# The stages with an accumulate build: the planner-reachable 512-wide k tile forms.
-TWIN_FORMS = ("main_halves", "main_wave_halves", "main_halves_k256t")
+# The stages with an accumulate build: the planner-reachable 512-wide k tile forms and
+# the queue walk (``cake_backend.wgrad_queue_walk``).
+TWIN_FORMS = ("main_halves", "main_wave_halves", "main_halves_k256t", cb.QUEUE_STAGE)
 # The accumulate builds this release ships, route -> architecture -> stages: fp32 ``out``
 # only (a bf16 ``out`` composes: the bf16 overwrite and a same-dtype ``add_``).  The
 # registry serves exactly these (``test_acc_bindings_are_the_shipped_set``), and the README
 # and rst feature matrices state the same (``test_docs_list_the_shipped_acc_builds``).
 SHIPPED_ACC_STAGES = {
     "cake_moe_grouped_gemm_wgrad_f32_k512": {
-        "sm_100a": ("main_halves_acc", "main_wave_halves_acc"),
-        "sm_103a": ("main_halves_acc", "main_wave_halves_acc"),
+        "sm_100a": ("main_halves_acc", "main_wave_halves_acc", "main_halves_queue_acc"),
+        "sm_103a": ("main_halves_acc", "main_wave_halves_acc", "main_halves_queue_acc"),
         "sm_107a": ("main_halves_acc", "main_halves_k256t_acc"),
     },
 }
@@ -185,6 +192,26 @@ def _force_k512(monkeypatch, arch):
     monkeypatch.setitem(HOST_PLAN_CONSTANTS["k512_min_rows_per_group"], arch, 1)
 
 
+def _tail_lists(arch, *, ordered, unordered):
+    """``ordered_tail_archs`` and ``unordered_tail_archs`` of ``HOST_PLAN_CONSTANTS``
+    with ``arch`` listed in the first exactly when ``ordered`` and in the second exactly
+    when ``unordered`` (the other architectures keep their entries)."""
+    lists = {}
+    for key, listed in (
+        ("ordered_tail_archs", ordered),
+        ("unordered_tail_archs", unordered),
+    ):
+        others = [a for a in HOST_PLAN_CONSTANTS[key] if a != arch]
+        lists[key] = others + [arch] if listed else others
+    return lists
+
+
+def _set_tail_lists(monkeypatch, arch, *, ordered, unordered):
+    """Put ``_tail_lists`` into ``HOST_PLAN_CONSTANTS`` (the preparation's constants)."""
+    for key, value in _tail_lists(arch, ordered=ordered, unordered=unordered).items():
+        monkeypatch.setitem(HOST_PLAN_CONSTANTS, key, value)
+
+
 def _prepare_pair(g, x, offs, out, num_groups=None):
     """The overwrite and the accumulate preparation of the same call (no launch)."""
     ovw = cb._prepare_wgrad(g, x, offs, out, None, num_groups)
@@ -195,7 +222,7 @@ def _prepare_pair(g, x, offs, out, num_groups=None):
 def _assert_twin_launch(ovw, acc, arch):
     """``acc`` is ``ovw`` in accumulate mode: the same route and plan apart from the
     accumulate keys, and the binding of its route; a fused launch is one launch with no
-    tail-reduce stage."""
+    tail-reduce stage, planned with the ordered one-launch tail (shipped constants)."""
     assert ovw.plan["accumulate"] == "off" and "accumulate_reason" not in ovw.plan
     assert acc.record_name == ovw.record_name
     assert _plan_without(acc.plan, "accumulate", "accumulate_reason") == _plan_without(
@@ -218,8 +245,30 @@ def _assert_twin_launch(ovw, acc, arch):
         assert acc.stages == () and acc.add_from is None and not acc.zero_fill
         return
     if mode == "fused":
+        # The fused accumulate binds the twin's accumulate stage, or the queue walk's where a
+        # ``queue_walk`` rule names the fused accumulate (``wgrad_queue_walk``).
+        queue_acc = cb.QUEUE_STAGE + ACC
+        if acc.stages == (queue_acc,) and stage != cb.QUEUE_STAGE:
+            e = acc.out.shape[0]
+            assert stage in cb.QUEUE_SELECTED_STAGES, (stage, arch)
+            assert cb.wgrad_queue_walk(
+                stage, "accumulate", arch, cb.sm_count(acc.out.device), e
+            ), (stage, arch, e)
+            stage = cb.QUEUE_STAGE
+        elif stage in cb.QUEUE_SELECTED_STAGES:
+            assert not (
+                cb.wgrad_queue_walk(
+                    stage,
+                    "accumulate",
+                    arch,
+                    cb.sm_count(acc.out.device),
+                    acc.out.shape[0],
+                )
+                and cake_jit.stage_served(acc.record_name, queue_acc, arch)
+            ), (stage, arch, acc.stages)
         assert acc.stages == (stage + ACC,) and len(acc.launches) == 1
-        assert acc.plan["tail_reduce_grid"] is None and acc.plan["unordered_tail"]
+        assert acc.plan["tail_reduce_grid"] is None and acc.plan["launches"] == 1
+        assert acc.plan["ordered_tail"] and not acc.plan["unordered_tail"], acc.plan
         assert acc.add_from is None and acc.bump_version
     else:
         assert acc.stages == ovw.stages
@@ -239,7 +288,8 @@ def _assert_twin_launch(ovw, acc, arch):
 def test_acc_bindings_are_the_shipped_set():
     """The registry serves exactly the accumulate builds of ``SHIPPED_ACC_STAGES``: the
     fp32 512-wide k tile route serves ``main_halves_acc`` on sm_100a / sm_103a / sm_107a,
-    ``main_wave_halves_acc`` on sm_100a / sm_103a and ``main_halves_k256t_acc`` on sm_107a;
+    ``main_wave_halves_acc`` and ``main_halves_queue_acc`` on sm_100a / sm_103a and
+    ``main_halves_k256t_acc`` on sm_107a;
     the bf16 routes serve none (a bf16 ``out`` composes).  A render that lost or added an
     accumulate stage fails here."""
     assert sorted(_acc_bindings()) == sorted(_shipped_bindings())
@@ -294,6 +344,7 @@ def test_docs_list_the_shipped_acc_builds():
         "main_halves_acc": "planned",
         "main_wave_halves_acc": "wave",
         "main_halves_k256t_acc": "k256t",
+        "main_halves_queue_acc": "queue",
     }
     cells = re.split(r"\s{2,}", rest.strip())
     assert len(cells) == len(cake_jit.ARCHES), line
@@ -421,29 +472,182 @@ def test_k256_tile_and_forced_forms_compose(arch, monkeypatch):
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
-def test_ordered_tail_never_fuses(arch):
-    """An architecture whose 512-wide k tile does not take the unordered tail (dropped
-    from ``unordered_tail_archs``) would sum its split tail with an overwriting tail-reduce
-    stage, so its accumulate call composes (``"tail"``) although the stage's accumulate
-    build is served and loadable; with the unordered tail the same stage is fused."""
+def test_two_launch_tail_never_fuses(arch):
+    """An architecture whose 512-wide k tile takes neither one-launch tail (dropped from
+    both ``ordered_tail_archs`` and ``unordered_tail_archs``) would sum its split tail
+    with a second, overwriting tail-reduce launch, so its accumulate call composes
+    (``"tail"``) although the stage's accumulate build is served and loadable; with the
+    ordered one-launch tail (the shipped constants) the same stage is fused, and so it is
+    with the unordered one (the architecture listed in ``unordered_tail_archs`` only)."""
     (route,) = SHIPPED_ACC_STAGES
-    ordered = dict(
-        HOST_PLAN_CONSTANTS,
-        unordered_tail_archs=[
-            a for a in HOST_PLAN_CONSTANTS["unordered_tail_archs"] if a != arch
-        ],
+    assert arch in HOST_PLAN_CONSTANTS["ordered_tail_archs"]
+    assert arch not in HOST_PLAN_CONSTANTS["unordered_tail_archs"]
+    two_launch = dict(
+        HOST_PLAN_CONSTANTS, **_tail_lists(arch, ordered=False, unordered=False)
+    )
+    unordered = dict(
+        HOST_PLAN_CONSTANTS, **_tail_lists(arch, ordered=False, unordered=True)
     )
     for stage in SHIPPED_ACC_STAGES[route][arch]:
         twin = stage[: -len(ACC)]
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(cb, "acc_library_loadable", lambda *args: True)
             assert cb.wgrad_accumulate_mode(
-                route, twin, 512, arch, constants=ordered
-            ) == (
-                "composed",
-                "tail",
-            )
+                route, twin, 512, arch, constants=two_launch
+            ) == ("composed", "tail")
             assert cb.wgrad_accumulate_mode(route, twin, 512, arch) == ("fused", None)
+            assert cb.wgrad_accumulate_mode(
+                route, twin, 512, arch, constants=unordered
+            ) == ("fused", None)
+
+
+def test_plan_wgrad_takes_one_tail_form():
+    """``plan_wgrad`` refuses both one-launch tails at once (``ValueError``) and records
+    the form it plans: the ordered and the unordered one-launch tail plan the same split
+    (one launch, no reduce grid, ``tail_splits`` slots per tail tile) and differ only in
+    their form keys; neither form plans the two-launch tail (no slots)."""
+    sizes = base.K512_E3
+    n, k = base.CHANGED_SHAPES[0]
+    common = dict(
+        sum_m=sum(sizes),
+        num_groups=len(sizes),
+        n=n,
+        k=k,
+        tile_k=512,
+        sm_count=148,
+        reduce_threads=256,
+        k256_tail=False,
+        constants=HOST_PLAN_CONSTANTS,
+    )
+    with pytest.raises(ValueError, match="not both"):
+        cb.plan_wgrad(**common, unordered_tail=True, ordered_tail=True)
+    ordered = cb.plan_wgrad(**common, ordered_tail=True)
+    unordered = cb.plan_wgrad(**common, unordered_tail=True)
+    two_launch = cb.plan_wgrad(**common)
+    assert ordered["ordered_tail"] and not ordered["unordered_tail"], ordered
+    assert unordered["unordered_tail"] and not unordered["ordered_tail"], unordered
+    forms = ("ordered_tail", "unordered_tail")
+    assert _plan_without(ordered, *forms) == _plan_without(unordered, *forms)
+    splits = ordered["tail_splits"]
+    assert splits > 1 and ordered["launches"] == 1, ordered
+    assert ordered["tail_reduce_grid"] is None, ordered
+    slot = int(HOST_PLAN_CONSTANTS["cluster_m"]) * ordered["tail_tile_k"]
+    assert ordered["tail_sum_elems"] == ordered["num_tail"] * splits * slot, ordered
+    assert not two_launch["ordered_tail"] and not two_launch["unordered_tail"]
+    assert two_launch["tail_sum_elems"] == 0 and two_launch["tail_ticket_words"] == 0
+
+
+def _prepare_calls(g, x, offs, out):
+    """The weight-gradient preparations of one call, overwrite and accumulate, through
+    ``_prepare_wgrad`` and the public preparation."""
+    return [
+        lambda: cb._prepare_wgrad(g, x, offs, out, None, None),
+        lambda: cb._prepare_wgrad(g, x, offs, out, None, None, accumulate=True),
+        lambda: prepare_wgrad(g, x, offs, out=out),
+        lambda: prepare_wgrad(g, x, offs, out=out, accumulate=True),
+    ]
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_preparation_refuses_an_architecture_in_both_tail_lists(arch, monkeypatch):
+    """An architecture listed in both ``ordered_tail_archs`` and ``unordered_tail_archs``
+    is refused by the weight-gradient preparation of a 512-wide k tile shape
+    (``ValueError`` naming both lists, before anything is bound), overwrite and
+    accumulate, into a bf16 and an fp32 ``out``."""
+    _fake_device(monkeypatch, arch, 148 if arch != "sm_107a" else 212, checks=False)
+    bound = []
+    monkeypatch.setattr(cb, "_bind", lambda *args, **kwargs: bound.append(args))
+    _set_tail_lists(monkeypatch, arch, ordered=True, unordered=True)
+    sizes = base.K512_E3
+    for n, k in base.CHANGED_SHAPES:
+        tile_k = cb.select_wgrad_tile(
+            k, arch, sum(sizes), len(sizes), HOST_PLAN_CONSTANTS
+        )
+        assert tile_k == 512, (n, k, tile_k)
+        for out_dtype in (torch.bfloat16, torch.float32):
+            g, x, offs, out = _meta_operands(sizes, n, k, out_dtype)
+            for call in _prepare_calls(g, x, offs, out):
+                with pytest.raises(ValueError, match="listed in both"):
+                    call()
+    assert bound == []
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_preparation_refuses_a_two_launch_tail_without_a_tail_reduce_stage(
+    arch, monkeypatch
+):
+    """An architecture listed in neither ``ordered_tail_archs`` nor
+    ``unordered_tail_archs`` takes the two-launch tail on the 512-wide k tile, whose
+    routes serve no ``tail_reduce`` stage: the preparation of a ``main_halves`` weight
+    gradient refuses it (``ValueError`` naming the route, before anything is bound),
+    overwrite and accumulate, into a bf16 and an fp32 ``out``."""
+    _fake_device(monkeypatch, arch, 148 if arch != "sm_107a" else 212, checks=False)
+    bound = []
+    monkeypatch.setattr(cb, "_bind", lambda *args, **kwargs: bound.append(args))
+    assert base._force_form(monkeypatch, "main_halves", arch)
+    _set_tail_lists(monkeypatch, arch, ordered=False, unordered=False)
+    sizes = base.K512_E3
+    n, k = 512, base._form_ks("main_halves")[0]
+    tile_k = cb.select_wgrad_tile(k, arch, sum(sizes), len(sizes), HOST_PLAN_CONSTANTS)
+    assert tile_k == 512, (k, tile_k)
+    for out_dtype in (torch.bfloat16, torch.float32):
+        route = cake_jit.record_name(
+            "wgrad", out_dtype=DTYPE_NAMES[out_dtype], tile_k=512
+        )
+        assert not cake_jit.stage_served(route, "tail_reduce", arch), route
+        stage, _wave = cb.select_wgrad_stage(
+            route,
+            k,
+            512,
+            arch,
+            HOST_PLAN_CONSTANTS,
+            sum_m=sum(sizes),
+            num_groups=len(sizes),
+        )
+        assert stage == "main_halves", stage
+        g, x, offs, out = _meta_operands(sizes, n, k, out_dtype)
+        for call in _prepare_calls(g, x, offs, out):
+            with pytest.raises(ValueError, match="serves no tail_reduce stage"):
+                call()
+    assert bound == []
+
+
+def test_preparation_refuses_a_one_launch_build_planned_as_two_launches(monkeypatch):
+    """sm_107a's ``main_halves_k256t`` binds a one-launch split-tail build, while its
+    two-launch tail would be summed by the 256-wide k tile's route, which does serve a
+    ``tail_reduce`` stage: with sm_107a in neither tail list the preparation still
+    refuses it (``ValueError`` naming the one-launch build, before anything is bound),
+    overwrite and accumulate, into a bf16 and an fp32 ``out``."""
+    arch = "sm_107a"
+    _fake_device(monkeypatch, arch, 212, checks=False)
+    bound = []
+    monkeypatch.setattr(cb, "_bind", lambda *args, **kwargs: bound.append(args))
+    assert base._force_form(monkeypatch, "main_halves_k256t", arch)
+    _set_tail_lists(monkeypatch, arch, ordered=False, unordered=False)
+    sizes = base.K512_E3
+    n, k = 512, base._form_ks("main_halves_k256t")[0]
+    for out_dtype in (torch.bfloat16, torch.float32):
+        dtype = DTYPE_NAMES[out_dtype]
+        route = cake_jit.record_name("wgrad", out_dtype=dtype, tile_k=512)
+        reduce_route = cake_jit.record_name(
+            "wgrad", out_dtype=dtype, tile_k=cb.K256_TAIL_TILE_K
+        )
+        assert cake_jit.stage_served(reduce_route, "tail_reduce", arch), reduce_route
+        stage, _wave = cb.select_wgrad_stage(
+            route,
+            k,
+            512,
+            arch,
+            HOST_PLAN_CONSTANTS,
+            sum_m=sum(sizes),
+            num_groups=len(sizes),
+        )
+        assert stage == "main_halves_k256t", stage
+        g, x, offs, out = _meta_operands(sizes, n, k, out_dtype)
+        for call in _prepare_calls(g, x, offs, out):
+            with pytest.raises(ValueError, match="binds a one-launch split-tail build"):
+                call()
+    assert bound == []
 
 
 def test_misaligned_out_composes_with_one_warning(monkeypatch):
@@ -579,14 +783,47 @@ def test_acc_library_loadable_is_the_loader_rule(name, stage, arch, monkeypatch)
         monkeypatch.setattr(cb, "_jit_cuda_version", lambda toolkit=toolkit: toolkit)
         assert cb.acc_library_loadable(name, stage, arch) is want, (prebuilt, toolkit)
     with pytest.MonkeyPatch.context() as mp:
-
-        def no_jit(name):
-            raise RuntimeError(
-                f"{name} is not prebuilt and flashinfer's JIT is not available"
-            )
-
-        mp.setattr(cb, "_jit_toolchain", no_jit)
+        # FlashInfer's JIT is not importable (a prebuilt-only or vendored copy): the real
+        # ``cake_build._jit_toolchain`` path, whose error names a manifest library.
+        mp.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+        mp.setitem(sys.modules, "flashinfer.jit.core", None)
         assert toolkit_of_process.__wrapped__() is None
+
+
+def test_jit_toolkit_needs_nvcc_and_the_jit_enabled(tmp_path, monkeypatch):
+    """FlashInfer's JIT toolkit counts only where it can build: with ``FLASHINFER_DISABLE_JIT``
+    set, without ``bin/nvcc`` under FlashInfer's CUDA path (where its version query falls
+    back to PyTorch's CUDA version), or when that path cannot be resolved (an ``OSError``),
+    ``_jit_cuda_version`` is None and an accumulate build that is not prebuilt cannot load
+    (the call composes, ``"min_cuda"``)."""
+    cpp_ext = pytest.importorskip("flashinfer.jit.cpp_ext")
+    toolkit = cb._jit_cuda_version.__wrapped__
+    monkeypatch.setattr(
+        cpp_ext, "get_cuda_version", lambda: types.SimpleNamespace(major=99, minor=0)
+    )
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: str(tmp_path))
+    monkeypatch.setattr(cb, "_jit_cuda_version", toolkit)
+    monkeypatch.setattr(cb, "prebuilt_path", lambda lib: _Path(False))
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    shipped = _shipped_bindings()
+    assert toolkit() is None  # no bin/nvcc
+    assert not any(cb.acc_library_loadable(*binding) for binding in shipped)
+    nvcc = tmp_path / "bin" / "nvcc"
+    nvcc.parent.mkdir()
+    nvcc.write_text("")
+    assert toolkit() == (99, 0)
+    assert all(cb.acc_library_loadable(*binding) for binding in shipped)
+    monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    assert toolkit() is None
+    assert not any(cb.acc_library_loadable(*binding) for binding in shipped)
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT")
+
+    def no_which():
+        raise FileNotFoundError("which")
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", no_which)
+    assert toolkit() is None
+    assert not any(cb.acc_library_loadable(*binding) for binding in shipped)
 
 
 def _reject_cases(sizes, n, k):
@@ -717,6 +954,49 @@ def test_accumulate_refuses_unsafe_outputs_on_both_routes(route, monkeypatch):
             )
 
 
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_out_span_is_bounded_by_32_bit_addressing(accumulate, monkeypatch):
+    """The kernels address ``out`` with 32-bit element offsets over its whole span, so the
+    preparation bounds ``1 + sum((size - 1) * stride)``, not ``E`` times the expert stride: a
+    one-group ``out`` with an expert stride of 0 and a row pitch of ``2 K`` whose span passes
+    the limit is refused (``ValueError``, before any program is bound), as the overwrite and
+    as the fused accumulate; at the limit it is accepted, unless its expert stride (which the
+    binding takes as a 32-bit value but adds nothing to a one-group span) passes the limit."""
+    arch = "sm_100a"
+    _fake_device(monkeypatch, arch, 148)
+    _force_k512(monkeypatch, arch)
+    bound = []
+    real = cb._bind
+
+    def record(*args, **kwargs):
+        bound.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cb, "_bind", record)
+    n, k = 256, 512
+    g, x, offs, _ = _cpu_operands([128], n, k, torch.float32)
+    out = torch.zeros(n * 2 * k).as_strided((1, n, k), (0, 2 * k, 1))
+    span = (n - 1) * 2 * k + k
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "int32_elems", span - 1)
+    with pytest.raises(ValueError, match="exceeds the 32-bit element addressing"):
+        cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+            g, x, offs, out=out, accumulate=accumulate
+        )
+    assert bound == []
+    monkeypatch.setitem(HOST_PLAN_CONSTANTS, "int32_elems", span)
+    wide = out.as_strided(out.shape, (span + 1, 2 * k, 1))
+    with pytest.raises(ValueError, match="exceeds the 32-bit element addressing"):
+        cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+            g, x, offs, out=wide, accumulate=accumulate
+        )
+    assert bound == []
+    launch = cb.cake_moe_grouped_gemm_nondet_train_prepare_wgrad(
+        g, x, offs, out=out, accumulate=accumulate
+    )
+    assert launch.out is out
+    assert launch.plan["accumulate"] == ("fused" if accumulate else "off")
+
+
 def test_sum_m_zero_accumulates_nothing(monkeypatch):
     """No row: the accumulate preparation binds nothing, keeps no scratch and does not
     zero ``out`` (the overwrite zero-fills)."""
@@ -734,16 +1014,37 @@ def test_order_varying_follows_the_plan(arch, sm_count, monkeypatch):
     """A prepared weight gradient is ``order_varying`` (it alerts under torch's
     deterministic mode) exactly when its plan adds an unordered split tail
     (``unordered_tail`` and ``tail_splits > 1``) and it has a program to launch, in
-    overwrite and accumulate mode alike (fused or composed): the ``CHANGED_SHAPES`` on
-    ``K512_E3`` split their tail at every SM count; the 256-wide k tile (ordered tail
-    reduce) and no rows never vary."""
+    overwrite and accumulate mode alike (fused or composed).  Under the shipped
+    constants the ``CHANGED_SHAPES`` on ``K512_E3`` split their ordered one-launch tail
+    at every SM count and none of them varies; with the architecture listed in
+    ``unordered_tail_archs`` instead of ``ordered_tail_archs`` (an override: no such
+    build ships) the same calls plan the same split, unordered, and every one varies.
+    The 256-wide k tile (two-launch ordered tail reduce) and no rows never vary."""
     _fake_device(monkeypatch, arch, sm_count, checks=False)
+    shipped = {}
     for n, k in base.CHANGED_SHAPES:
         for out_dtype in (torch.bfloat16, torch.float32):
             g, x, offs, out = _meta_operands(base.K512_E3, n, k, out_dtype)
-            for launch in _prepare_pair(g, x, offs, out):
-                assert launch.plan["unordered_tail"] and launch.plan["tail_splits"] > 1
-                assert launch.order_varying, (n, k, out_dtype, launch.plan)
+            for mode, launch in zip(
+                ("overwrite", "accumulate"), _prepare_pair(g, x, offs, out), strict=True
+            ):
+                plan = launch.plan
+                assert plan["ordered_tail"] and not plan["unordered_tail"], plan
+                assert plan["tail_splits"] > 1, (n, k, out_dtype, mode, plan)
+                assert not launch.order_varying, (n, k, out_dtype, mode, plan)
+                shipped[n, k, out_dtype, mode] = plan
+    with pytest.MonkeyPatch.context() as mp:
+        _set_tail_lists(mp, arch, ordered=False, unordered=True)
+        forms = ("ordered_tail", "unordered_tail")
+        for (n, k, out_dtype, mode), want in shipped.items():
+            g, x, offs, out = _meta_operands(base.K512_E3, n, k, out_dtype)
+            launch = cb._prepare_wgrad(
+                g, x, offs, out, None, None, accumulate=mode == "accumulate"
+            )
+            plan = launch.plan
+            assert plan["unordered_tail"] and not plan["ordered_tail"], plan
+            assert _plan_without(plan, *forms) == _plan_without(want, *forms), mode
+            assert launch.order_varying, (n, k, out_dtype, mode, plan)
     for sizes, (n, k) in (
         (base.K256_WAVE_SIZES, base.K256_WAVE_SHAPE),
         ([0, 0], base.CHANGED_SHAPES[0]),
@@ -775,9 +1076,11 @@ def _recorded_acc_launch(monkeypatch, plan):
 def test_accumulate_alerts_only_before_an_order_varying_launch(monkeypatch):
     """Under torch's deterministic mode the accumulate entry points check ``out`` first
     and never alert while preparing (CPU operands: the ``out`` and device checks); an
-    accumulate launch with an unordered split tail alerts at ``launch()`` before it runs
-    anything (strict: ``RuntimeError``, ``out`` untouched; ``warn_only``: a
-    ``UserWarning``, then it adds); one with a fixed order adds without an alert."""
+    accumulate launch with an unordered split tail (the dormant alert: only an
+    architecture listed in ``unordered_tail_archs`` plans one) alerts at ``launch()``
+    before it runs anything (strict: ``RuntimeError``, ``out`` untouched; ``warn_only``:
+    a ``UserWarning``, then it adds); one with a fixed order (an unsplit tail, or a split
+    tail the ordered one-launch tail finishes) adds without an alert."""
     g, x, offs, _ = _cpu_operands([2, 2], 256, 64, torch.float32)
     with base._torch_deterministic():
         with pytest.raises(ValueError, match="pass the"):
@@ -810,15 +1113,17 @@ def test_accumulate_alerts_only_before_an_order_varying_launch(monkeypatch):
         alerts[0].message
     )
     assert log == ["launch"] and torch.equal(split.out, torch.ones(4))
-    unsplit, log = _recorded_acc_launch(
-        monkeypatch, {"unordered_tail": True, "tail_splits": 1}
-    )
-    assert not unsplit.order_varying
-    with base._torch_deterministic(), warnings.catch_warnings(record=True) as rec:
-        warnings.simplefilter("always")
-        unsplit.launch()
-    assert [w for w in rec if w.category is UserWarning] == []
-    assert log == ["launch"] and torch.equal(unsplit.out, torch.ones(4))
+    for plan in (
+        {"unordered_tail": True, "tail_splits": 1},
+        {"unordered_tail": False, "ordered_tail": True, "tail_splits": 2},
+    ):
+        fixed, log = _recorded_acc_launch(monkeypatch, plan)
+        assert not fixed.order_varying, plan
+        with base._torch_deterministic(), warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            fixed.launch()
+        assert [w for w in rec if w.category is UserWarning] == [], plan
+        assert log == ["launch"] and torch.equal(fixed.out, torch.ones(4)), plan
 
 
 def test_accumulate_keywords_and_signatures():
@@ -932,7 +1237,7 @@ def test_build_manifest_lists_the_acc_libraries(tmp_path):
         assert binding["specializations"].get("WGRAD_OUT") == 32, (name, stage)
         assert floor == (13, 4), (library, entry["min_cuda"])
         found.add(library)
-    assert len(found) == len(_shipped_bindings()) == 6
+    assert len(found) == len(_shipped_bindings()) == 8
 
 
 def test_fuse_flag_refusals_on_the_host():
@@ -1122,6 +1427,21 @@ def _assert_bitwise(out, want, what=""):
     )
 
 
+@contextlib.contextmanager
+def _deterministic_mode(warn_only):
+    """``torch.use_deterministic_algorithms(True, warn_only=warn_only)`` inside the block,
+    the previous setting restored after it."""
+    saved = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    torch.use_deterministic_algorithms(True, warn_only=warn_only)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
+
+
 def _rms(t):
     return float(t.double().pow(2).mean().sqrt().clamp_min(1e-30))
 
@@ -1142,7 +1462,7 @@ def _acc_route(device, form, out_dtype, monkeypatch):
     if not cb.acc_library_loadable(name, form + ACC, arch):
         pytest.skip(
             f"the {form}{ACC} library cannot load here (not prebuilt, and FlashInfer's JIT "
-            "toolkit is below its build.json min_cuda): the call composes"
+            "cannot build it at its build.json min_cuda): the call composes"
         )
     return arch, "fused"
 
@@ -1253,7 +1573,11 @@ def _overwrites(g, x, offs, out_dtype):
 
 
 def _fused_oracle(out0, dw32):
-    """The whole-tile bits of the fused (fp32) accumulate (README numerical contract)."""
+    """The bits of the fused (fp32) accumulate on the groups with rows, every tile (whole,
+    or split and finished by the ordered one-launch tail): one fp32 add of the overwrite
+    of the same plan into ``out0`` (README numerical contract).  Compare it on the groups
+    with rows only: on an empty group ``add_`` turns a -0.0 of ``out0`` into +0.0, while
+    the fused build leaves ``out[e]`` untouched."""
     return out0.clone().add_(dw32)
 
 
@@ -1403,10 +1727,14 @@ def test_fused_accumulate_matches_its_oracles(form, out_dtype, kind, monkeypatch
 
 @pytest.mark.parametrize("out_dtype", FUSED_DTYPES)
 @pytest.mark.parametrize("form", TWIN_FORMS)
-def test_fused_split_tail_matches_the_reference(form, out_dtype, monkeypatch):
-    """The fused route with a split unordered tail: every repeat (reset by ``copy_``) is
-    within the budget of the fp64 ``out0 + dW``, no tile update lost, empty groups bitwise
-    untouched, the stream's tail sums and tickets at rest."""
+def test_fused_split_tail_matches_its_oracles(form, out_dtype, monkeypatch):
+    """The fused route with a split tail (the ordered one-launch tail: not
+    ``order_varying``): every repeat (reset by ``copy_``, the stream's tail slots
+    garbage-filled first) is bitwise ``out0.add_(dW32)`` with the overwrite of the same
+    plan on the groups with rows, split tail tiles included, and leaves the empty groups
+    bitwise untouched, so every repeat has the same bits; the result is within the
+    budget of the fp64 ``out0 + dW`` with no tile update lost, and the stream's tail
+    tickets rest at zero."""
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
     _require_fused(device, form, out_dtype, monkeypatch)
@@ -1420,19 +1748,23 @@ def test_fused_split_tail_matches_the_reference(form, out_dtype, monkeypatch):
     out = out0.clone()
     launch = prepare_wgrad(g, x, offs, out=out, accumulate=True)
     plan = launch.plan
-    assert plan["accumulate"] == "fused" and plan["tail_splits"] > 1, plan
-    expected = _expected(out0, g, x, sizes)
-    mask = _special_mask(out0, sizes)
-    for _ in range(base.REPEATS):
+    assert plan["accumulate"] == "fused" and launch.stages == (form + ACC,), plan
+    assert plan["ordered_tail"] and plan["tail_splits"] > 1, plan
+    assert not launch.order_varying, plan
+    oracle = _fused_oracle(out0, dw32)
+    rows = torch.tensor([r > 0 for r in sizes], device=device)
+    for repeat in range(base.REPEATS):
         out.copy_(out0)
+        assert base._poison_tail_sums(device), "no kept tail slots on this stream"
         launch.launch()
         torch.cuda.synchronize()
-        _assert_within_budget(out, expected, mask)
-        _assert_no_lost_update(out, out0, dw32, sizes)
-        for group, rows in enumerate(sizes):
-            if not rows:
+        base._assert_same_bits(out[rows], oracle[rows], f"{form} repeat {repeat}")
+        for group, count in enumerate(sizes):
+            if not count:
                 assert torch.equal(_bits(out[group]), _bits(out0[group])), group
-    base._assert_tail_at_rest(device)
+        base._assert_tail_at_rest(device)
+    _assert_within_budget(out, _expected(out0, g, x, sizes), _special_mask(out0, sizes))
+    _assert_no_lost_update(out, out0, dw32, sizes)
 
 
 # (case, out dtype) of the composed route: the 256-wide k tile, the forced ``main`` /
@@ -1542,10 +1874,11 @@ def test_fused_accumulate_on_the_benchmark_rows(label, sizes, proj, monkeypatch)
     """Every benchmark weight-gradient row (E4 balanced / skewed / one-empty at two token
     counts, E8 / E16 / E32 at 131072 rows) of both projections into an fp32 ``out``, as the
     planner plans it (no forced form): the call is fused (``plan["accumulate"] ==
-    "fused"``, a shipped half-release accumulate build), within the fp64 budget of
-    ``out0 + dW``, no tile update lost, an empty group bitwise untouched, and bitwise
-    ``out0.add_(dW32)`` (the overwrite of the same plan) on every tile outside the split
-    tail: at most ``num_tail`` tiles differ, none when the tail is not split."""
+    "fused"``, a shipped half-release accumulate build, with the ordered one-launch
+    tail), within the fp64 budget of ``out0 + dW``, no tile update lost, an empty group
+    bitwise untouched, and bitwise ``out0.add_(dW32)`` (the overwrite of the same plan)
+    on every tile of the groups with rows, split tail tiles included (the stream's tail
+    slots garbage-filled before the launch, its tickets at rest after it)."""
     out_dtype = torch.float32
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
@@ -1568,17 +1901,22 @@ def test_fused_accumulate_on_the_benchmark_rows(label, sizes, proj, monkeypatch)
         assert plan["accumulate_reason"] == "min_cuda", plan
         pytest.skip(f"the {twin}{ACC} library cannot load here: the call composes")
     assert plan["accumulate"] == "fused" and launch.stages == (twin + ACC,), plan
+    assert plan["ordered_tail"] and not launch.order_varying, plan
+    split = plan["tail_splits"] > 1
+    # The overwrite of the same plan launched on this stream: it kept slots iff split.
+    assert base._poison_tail_sums(device) == split, plan
     launch.launch()
     torch.cuda.synchronize()
     for group, rows in enumerate(sizes):
         if not rows:
             assert torch.equal(_bits(out[group]), _bits(out0[group])), group
     tiles = _differing_tiles(out, _fused_oracle(out0, dw32), plan["tail_tile_k"], sizes)
-    allowed = plan["num_tail"] if plan["tail_splits"] > 1 else 0
-    assert len(tiles) <= allowed, (
+    assert not tiles, (
         f"{len(tiles)} tiles differ from out0.add_(dW32) (split tail: {plan['num_tail']} "
         f"tiles, {plan['tail_splits']} splits), e.g. {tiles[:4]}"
     )
+    if split:
+        base._assert_tail_at_rest(device)
     _assert_no_lost_update(out, out0, dw32, sizes)
     del dw32
     mask = _special_mask(out0, sizes)
@@ -1633,9 +1971,11 @@ def test_composed_bf16_accumulate_on_the_benchmark_rows(
 @pytest.mark.parametrize("form", TWIN_FORMS)
 def test_fused_leaves_empty_groups_untouched(form, out_dtype, sizes, monkeypatch):
     """Empty groups placed where the k512 order puts them (the tail: planned walk engaged,
-    split tail, the k256-tail halves) keep their bits on the fused route: random bits,
-    -0.0, a NaN payload and a subnormal, compared as integers; the groups with rows are
-    within the budget."""
+    split tail where a candidate shape splits it, the k256-tail halves) keep their bits
+    on the fused route: random bits, -0.0, a NaN payload and a subnormal, compared as
+    integers; the groups with rows are bitwise ``out0.add_(dW32)`` at every repeat (the
+    stream's tail slots garbage-filled before each; the tickets at rest after a split
+    tail) and within the budget."""
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
     _require_fused(device, form, out_dtype, monkeypatch)
@@ -1651,17 +1991,27 @@ def test_fused_leaves_empty_groups_untouched(form, out_dtype, sizes, monkeypatch
     out0 = _out0("randn", dw32, sizes, out_dtype, gen)
     out = out0.clone()
     launch = prepare_wgrad(g, x, offs, out=out, accumulate=True)
-    assert launch.plan["accumulate"] == "fused"
-    for _ in range(2):
+    plan = launch.plan
+    assert plan["accumulate"] == "fused" and plan["ordered_tail"], plan
+    assert not launch.order_varying, plan
+    split = plan["tail_splits"] > 1
+    oracle = _fused_oracle(out0, dw32)
+    rows = torch.tensor([r > 0 for r in sizes], device=device)
+    for repeat in range(2):
         out.copy_(out0)
+        # The overwrite of this plan launched on this stream: it kept slots iff split.
+        assert base._poison_tail_sums(device) == split, plan
         launch.launch()
         torch.cuda.synchronize()
-        for group, rows in enumerate(sizes):
-            if not rows:
+        for group, count in enumerate(sizes):
+            if not count:
                 assert torch.equal(_bits(out[group]), _bits(out0[group])), group
-        _assert_within_budget(
-            out, _expected(out0, g, x, sizes), _special_mask(out0, sizes)
+        base._assert_same_bits(
+            out[rows], oracle[rows], f"{form} {sizes} repeat {repeat}"
         )
+        if split:
+            base._assert_tail_at_rest(device)
+    _assert_within_budget(out, _expected(out0, g, x, sizes), _special_mask(out0, sizes))
     print(
         f"EMPTY form={form} sizes={sizes} n={n} k={k} splits={launch.plan['tail_splits']}"
     )
@@ -1728,14 +2078,20 @@ SHORT_ACC_CASES = [("short", None)] + [
 )
 def test_short_groups_accumulate_their_own_rows(groups, form, out_dtype, monkeypatch):
     """#6570 in accumulate mode: groups shorter than one k-step, alone or beside long ones
-    with a split tail, over ``SMALL_GROUP_LAUNCHES`` launches of one prepared call (each
-    reset by ``copy_``, the descriptor slots filled with garbage first): every 128 x 128
-    block of ``out - out0`` is the group's own ``dW``."""
+    with a split ordered tail, over ``SMALL_GROUP_LAUNCHES`` launches of one prepared
+    call (each reset by ``copy_``, the descriptor slots filled with garbage first and the
+    stream's tail slots before every launch): every 128 x 128 block of ``out - out0`` is
+    the group's own ``dW``, and every launch has the bits of the first."""
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
     launch, out0, sizes, g, x, _ = _short_accumulate(
         device, groups, form, out_dtype, monkeypatch, seed=39
     )
+    plan = launch.plan
+    assert not launch.order_varying, plan
+    split = plan["ordered_tail"] and plan["tail_splits"] > 1
+    if groups == "mixed":
+        assert split, plan
     launch.workspaces[0].fill_(0xFF)
     e, n, k = out0.shape
     ref = torch.stack(
@@ -1744,10 +2100,13 @@ def test_short_groups_accumulate_their_own_rows(groups, form, out_dtype, monkeyp
     blocks = ref.view(e, n // 128, 128, k // 128, 128)
     scale = blocks.abs().amax(dim=(2, 4), keepdim=True)
     tol = 2.0**-6 if out_dtype == torch.float32 else 2.0**-4
-    wrong = []
+    wrong, changed, poisoned = [], [], 0
+    first = None
     for call in range(base.SMALL_GROUP_LAUNCHES):
         launch.out.copy_(out0)
-        out = launch.launch().float() - out0.float()
+        poisoned += base._poison_tail_sums(device)
+        got = launch.launch()
+        out = got.float() - out0.float()
         bad = (
             ((out.view_as(blocks) - blocks).abs() > scale * tol + 2.0**-6)
             .any(dim=4)
@@ -1755,8 +2114,17 @@ def test_short_groups_accumulate_their_own_rows(groups, form, out_dtype, monkeyp
         )
         if bool(bad.any()):
             wrong.append((call, bad.nonzero()[:4].tolist()))
+        if first is None:
+            first = got.clone()
+        elif not torch.equal(_bits(got), _bits(first)):
+            changed.append(call)
     assert not wrong, f"{len(wrong)} launches have wrong blocks: {wrong[:3]}"
-    if launch.plan["tail_splits"] > 1 and launch.plan["unordered_tail"]:
+    assert not changed, (
+        f"{len(changed)} launches differ from the first in some bit: {changed[:8]}"
+    )
+    if split:
+        # Every launch after the first found the stream's kept slots to poison.
+        assert poisoned == base.SMALL_GROUP_LAUNCHES - 1, poisoned
         torch.cuda.synchronize()
         base._assert_tail_at_rest(device)
 
@@ -1765,10 +2133,12 @@ def test_short_groups_accumulate_their_own_rows(groups, form, out_dtype, monkeyp
 @pytest.mark.parametrize("form", TWIN_FORMS)
 def test_accumulate_on_two_concurrent_streams(form, out_dtype, monkeypatch):
     """Two prepared accumulates (fused where the release ships the form's accumulate build
-    for the dtype, else composed) of the mixed short / long groups (split tail) into
-    separate outputs, launched interleaved on two streams while a kernel stays resident on
-    a third and copies and GEMMs run on a fourth: every result is within the budget of
-    ``out0 + dW``, each stream keeps its own tail sums and tickets, and both rest at zero."""
+    for the dtype, else composed) of the mixed short / long groups (split ordered tail)
+    into separate outputs, launched interleaved on two streams (each stream's tail slots
+    garbage-filled before every launch) while a kernel stays resident on a third and
+    copies and GEMMs run on a fourth: every result has the bits of an isolated launch on
+    the quiet current stream, which is within the budget of ``out0 + dW``; each stream
+    keeps its own tail slots and tickets, and the tickets rest at zero."""
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
     launch, out0, sizes, g, x, offs = _short_accumulate(
@@ -1777,7 +2147,16 @@ def test_accumulate_on_two_concurrent_streams(form, out_dtype, monkeypatch):
     second = prepare_wgrad(g, x, offs, out=out0.clone(), accumulate=True)
     launches = [launch, second]
     assert second.stages == launch.stages
-    ref = _expected(out0, g, x, sizes)
+    for item in launches:
+        plan = item.plan
+        assert plan["ordered_tail"] and plan["tail_splits"] > 1, plan
+        assert not item.order_varying, plan
+    launch.out.copy_(out0)
+    isolated = launch.launch().clone()
+    torch.cuda.synchronize()
+    _assert_within_budget(
+        isolated, _expected(out0, g, x, sizes), _special_mask(out0, sizes)
+    )
     streams = [torch.cuda.Stream(device) for _ in range(4)]
     main = torch.cuda.current_stream(device)
     for stream in streams:
@@ -1791,6 +2170,7 @@ def test_accumulate_on_two_concurrent_streams(form, out_dtype, monkeypatch):
     results = [[], []]
     for _ in range(8):
         for index in range(2):
+            base._poison_tail_sums(device, streams[index])
             with torch.cuda.stream(streams[index]):
                 launches[index].out.copy_(out0)
                 results[index].append(launches[index].launch().clone())
@@ -1800,19 +2180,23 @@ def test_accumulate_on_two_concurrent_streams(form, out_dtype, monkeypatch):
     for stream in streams:
         main.wait_stream(stream)
     torch.cuda.synchronize()
-    mask = _special_mask(out0, sizes)
     for index in range(2):
-        for out in results[index]:
-            _assert_within_budget(out, ref, mask)
+        for call, out in enumerate(results[index]):
+            base._assert_same_bits(out, isolated, f"stream {index} launch {call}")
     for stream in streams[:2]:
         base._assert_tail_at_rest(device, stream)
+    kept = [cb.stream_workspace("tail_sums", device, stream) for stream in streams[:2]]
+    assert kept[0].data_ptr() != kept[1].data_ptr(), "two streams share tail slots"
 
 
 @pytest.mark.parametrize("route", ["fused", "composed"])
 def test_graph_replay_accumulates_at_every_replay(route, monkeypatch):
-    """A captured accumulate launch adds at every replay: two replays without a reset give
-    ``out0 + 2 dW``, also after new group boundaries are written into ``offs`` (the same
-    ``sum_m``); the composed route's add is captured with its kernel."""
+    """A captured accumulate launch adds at every replay: two replays without a reset
+    have the bits of two eager launches of the same prepared call from ``out0`` (the
+    fused route on a split ordered tail, the eager stream's tail slots garbage-filled
+    first) and are within the budget of ``out0 + 2 dW``, also after new group boundaries
+    are written into ``offs`` (the same ``sum_m``) and after the first ones are written
+    back; the composed route's add is captured with its kernel."""
     out_dtype = torch.float32
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
@@ -1832,7 +2216,10 @@ def test_graph_replay_accumulates_at_every_replay(route, monkeypatch):
     out0 = torch.randn(len(sizes), n, k, generator=gen, device=device)
     out = out0.clone()
     launch = prepare_wgrad(g, x, offs, out=out, accumulate=True)
-    assert launch.plan["accumulate"] == route
+    plan = launch.plan
+    assert plan["accumulate"] == route and not launch.order_varying, plan
+    if route == "fused":
+        assert plan["ordered_tail"] and plan["tail_splits"] > 1, plan
     side = torch.cuda.Stream(device)
     side.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(side):
@@ -1842,13 +2229,22 @@ def test_graph_replay_accumulates_at_every_replay(route, monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         launch.launch()
-    for layout in (sizes, second, sizes):
+    for index, layout in enumerate((sizes, second, sizes)):
         offs.copy_(base._offs(layout, device))
         out.copy_(out0)
         graph.replay()
         graph.replay()
         torch.cuda.synchronize()
-        _assert_within_budget(out, _expected(out0, g, x, layout, times=2))
+        replayed = out.clone()
+        out.copy_(out0)
+        for _ in range(2):
+            base._poison_tail_sums(device)
+            launch.launch()
+        torch.cuda.synchronize()
+        base._assert_same_bits(
+            replayed, out, f"{route} layout {index}: replay vs eager"
+        )
+        _assert_within_budget(replayed, _expected(out0, g, x, layout, times=2))
 
 
 @pytest.mark.parametrize("route", ["fused", "composed"])
@@ -2148,65 +2544,70 @@ def test_autograd_flag_errors_and_side_effects(monkeypatch):
 
 
 @pytest.mark.parametrize("form", TWIN_FORMS)
-def test_autograd_fuse_alerts_before_an_order_varying_accumulate(form, monkeypatch):
-    """With ``fuse_wgrad_accumulation=True`` on a shape whose ``form`` splits its tail,
-    the backward under torch's strict deterministic mode raises the non-determinism
-    alert immediately before the accumulate launch: ``main_grad`` is untouched and no
-    placeholder flag is set; with ``warn_only`` it warns and then adds, within the budget
-    of the fp64 sum."""
+def test_autograd_fuse_never_alerts_on_a_split_tail(form, monkeypatch):
+    """With ``fuse_wgrad_accumulation=True`` on a shape whose ``form`` splits its tail
+    (the ordered one-launch tail, fused: not ``order_varying``), the forward and the
+    backward under torch's strict and ``warn_only`` deterministic modes raise no alert
+    and warn nothing, set the placeholder flag and leave ``main_grad`` and ``x.grad``
+    with the bits of the run with the mode off (the stream's tail slots garbage-filled
+    before every backward); that ``main_grad`` is bitwise the composed add
+    (``mg0.add_(dW32)``) on the groups with rows, keeps ``mg0``'s bits on the empty
+    groups and is within the budget of the fp64 sum."""
     base._require_program("fwd")
     base._require_program("dgrad")
     device = base._require_program("wgrad", torch.float32)
     base._fresh_stream_workspaces(monkeypatch)
-    _acc_route(device, form, torch.float32, monkeypatch)
+    _arch, route = _acc_route(device, form, torch.float32, monkeypatch)
+    assert route == "fused", (form, route)
     case = _split_case(device, form)
-    if case is None:
-        pytest.skip(f"no candidate shape splits the {form} tail on this device")
+    assert case is not None, f"no candidate shape splits the {form} tail"
     sizes, n, k = case
     x0, w0, g, offs = base._inputs(sizes, n, k, device, seed=58)
-    mg0 = torch.randn(w0.shape, device=device)
+    gen = torch.Generator(device=device).manual_seed(59)
+    mg0 = torch.randn(w0.shape, generator=gen, device=device)
+    # The backward prepares this accumulate (same operands, same plan).
+    planned = prepare_wgrad(g, x0, offs, out=mg0.clone(), accumulate=True)
+    plan = planned.plan
+    assert plan["accumulate"] == "fused" and planned.stages == (form + ACC,), plan
+    assert plan["ordered_tail"] and plan["tail_splits"] > 1, plan
+    assert not planned.order_varying, plan
     gemm = _fused_gemm(offs)
 
-    def leaves():
+    def run(mode):
         x = x0.clone().requires_grad_(True)
         w = w0.clone().requires_grad_(True)
         w.main_grad = mg0.clone()
         w.grad_added_to_main_grad = False
-        return x, w
-
-    x, w = leaves()
-    y = gemm(x, w)
-    with (
-        base._torch_deterministic(),
-        pytest.raises(RuntimeError, match="CakeMoEGroupedGemmNondetFunction.backward"),
-    ):
-        y.backward(g)
-    torch.cuda.synchronize()
-    assert torch.equal(w.main_grad, mg0) and w.grad_added_to_main_grad is False
-    x, w = leaves()
-    y = gemm(x, w)
-    saved = (
-        torch.are_deterministic_algorithms_enabled(),
-        torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    try:
-        with warnings.catch_warnings(record=True) as rec:
+        with mode, warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
+            y = gemm(x, w)
+            base._poison_tail_sums(device)
             y.backward(g)
-    finally:
-        torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
-    torch.cuda.synchronize()
-    assert any(
-        "CakeMoEGroupedGemmNondetFunction.backward" in str(r.message) for r in rec
+        torch.cuda.synchronize()
+        alerts = [r for r in rec if r.category is UserWarning]
+        assert alerts == [], [str(r.message) for r in alerts]
+        assert w.grad_added_to_main_grad is True and w.grad is not None
+        return w.main_grad, x.grad
+
+    want = run(contextlib.nullcontext())
+    for warn_only in (False, True):
+        main_grad, dx = run(_deterministic_mode(warn_only))
+        base._assert_same_bits(main_grad, want[0], f"main_grad warn_only={warn_only}")
+        base._assert_same_bits(dx, want[1], f"x.grad warn_only={warn_only}")
+    rows = torch.tensor([r > 0 for r in sizes], device=device)
+    composed = _composed_main_grad(mg0, (g,), x0, offs)
+    base._assert_same_bits(
+        want[0][rows], composed[rows], "main_grad vs the composed add"
     )
-    assert w.grad_added_to_main_grad is True
+    for group, count in enumerate(sizes):
+        if not count:
+            assert torch.equal(_bits(want[0][group]), _bits(mg0[group])), group
     dw = base._reference("wgrad", g, x0, sizes).double()
     expected = (
         (mg0.double() + dw).float(),
         (mg0.double().abs() + dw.abs()).float(),
     )
-    _assert_within_budget(w.main_grad, expected)
+    _assert_within_budget(want[0], expected)
 
 
 # ---------------------------------------------------------------------------
@@ -2256,6 +2657,7 @@ def _sanitize():
                     out = out0.clone()
                     launch = prepare_wgrad(g, x, offs, out=out, accumulate=True)
                     assert launch.plan["accumulate"] == "fused", launch.plan
+                    assert (launch.plan["tail_splits"] > 1) == split, launch.plan
                     launch.launch()
                     torch.cuda.synchronize()
                     _assert_within_budget(

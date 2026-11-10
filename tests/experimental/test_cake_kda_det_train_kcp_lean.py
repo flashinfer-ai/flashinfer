@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 The lean local arena of the KCP backward (``CakeKDADetKcpWorkspace(local_arena="lean")``, opt-in; ``"replay"`` is the
-default): this route's ``LOCAL_LAYOUT_BWD_LEAN`` layout registered on the existing backend's arenas (3460 B per
-internal token-head; ``kcp_dav``'s ``dAqk`` to a dead sink, the tail stages once per chunk range on per-pass buffers;
+default): this route's ``LOCAL_LAYOUT_BWD_LEAN`` layout registered on the existing backend's arenas (3332 B per
+internal token-head; no ``kcp_dav``, the tail stages once per chunk range on per-pass buffers;
 two tail passes unless ``lean_passes`` says otherwise) against the ``"replay"`` arena (4488 B).  Host rows: the
 layout's bytes, lifetimes and per-pass packing, the single-rank layouts and bytes unchanged (with and without the
 registered layout, line for line), the registration rules, the fused-gradient records the layout relies on, every logical name of every launched
 record bound (the tail ranges' item bounds from the arena's tail-count table) and the byte prediction.  GPU rows: bitwise out / saved set / gradients against the replay arena on the unit rows
 (H 1-64, P > 1, ragged packs, both boundary modes, checkpointed autograd, recompute handles, graph replay, the overlap
-schedule) with the arena NaN-filled and the sink / per-pass buffers NaN-filled before every write, the workspace
+schedule) with the arena NaN-filled and the per-pass buffers NaN-filled before every write, the workspace
 bytes equal to ``cake_kda_det_train_kcp_workspace_bytes``, no allocation or blocking in steady calls, and the multi-GPU rows (W = 2 / 4 /
 8) in the launch forms of ``test_cake_kda_det_train_kcp_shared_ws.py``.
 """
@@ -53,14 +53,14 @@ from tests.experimental.test_cake_kda_det_train_kcp_shared_ws import (
     _same,
     _schedule,
 )
-from tests.test_helpers.cake_host_sync import (
+from tests.experimental.test_helpers.cake_host_sync import (
     allocator_counts,
     census,
     nonblocking,
     summary,
 )
-from tests.test_helpers.cake_kda_train_kcp_saved import written_tensors
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers.cake_kda_train_kcp_saved import written_tensors
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")
@@ -111,11 +111,12 @@ def _whole(regions) -> int:
 def test_lean_layout_bytes_lifetimes_and_packing() -> None:
     """``KCP_LEAN_MODE`` on the host for every architecture, contract head count and several geometries: the layout
     checker accepts every pass count (no two occupants overlap in bytes and lifetime), the whole-sequence part is
-    3460 B per internal token-head with no state block and no whole ``dAqk``, the sink and ``aqk_int`` are disjoint
-    bytes of one slot, the per-pass set is sized for one range and lies in the bytes of qg / kg, w and kb / dv1 (or an
-    overflow slot after them), the gate buffers only where the gate epilogue launches; the chosen passes give the
-    smallest arena, below the replay arena, and the default two passes; on the proxy geometry the smallest arena is
-    exactly 3460 B per internal token-head at four passes (sm_100a) / three (sm_103a, sm_107a)."""
+    3332 B per internal token-head with no state block, no whole ``dAqk``, no ``dv1`` and no sink, ``kb`` beside ``u``
+    under the ``dh`` tape, ``aqk_int`` live through the adjoint walks (step 5) in a slot of its own, the per-pass set
+    sized for one range in the bytes of qg / kg, w and aqk_int (or an overflow slot after them), the gate buffers only
+    where the gate epilogue launches; the chosen passes give the smallest arena, below the replay arena, and the
+    default two passes; on the proxy geometry the smallest arena is exactly 3332 B per internal token-head at four
+    passes (sm_100a) / three (sm_103a, sm_107a)."""
     seen = 0
     for arch, sm in ARCH_SMS.items():
         for H in CONTRACT_HEADS:
@@ -130,11 +131,17 @@ def test_lean_layout_bytes_lifetimes_and_packing() -> None:
                     by = {r.name: r for r in regions}
                     names = set(by)
                     assert not names & {"seg_b", "seg_m", "hseg", "dseg", "dhseg"}
-                    assert _whole(regions) == 3460 * unit, (arch, H, N, b)
-                    sink, aqk = by["dAqk_sink"], by["aqk_int"]
-                    assert sink.slot == aqk.slot == by["u"].slot == by["dh"].slot
-                    assert sink.offset + sink.nbytes <= aqk.offset
-                    assert by["kb"].offset == by["dv1"].offset
+                    assert _whole(regions) == 3332 * unit, (arch, H, N, b)
+                    assert not names & {"dAqk_sink", "dv1"}
+                    u, kb, dh, aqk = by["u"], by["kb"], by["dh"], by["aqk_int"]
+                    assert u.slot == kb.slot == dh.slot != aqk.slot
+                    assert u.offset + u.nbytes <= kb.offset < dh.offset + dh.nbytes
+                    assert (kb.lifetime, u.lifetime, dh.lifetime) == (
+                        (1, 2),
+                        (2, 3),
+                        (5, 6),
+                    )
+                    assert aqk.lifetime == (1, 5) and aqk.offset > by["w"].offset
                     R_b = 64 * -(-p.NC_pad // b)
                     for name in PASS_BUFFERS:
                         if name in _GATE and p.gate_fused:
@@ -166,7 +173,7 @@ def test_lean_layout_bytes_lifetimes_and_packing() -> None:
                     backward=False, fwd_layout="fwd_kcp"
                 )
                 if lengths is PROXY_PACK:
-                    assert p.NC_pad == 268 and max(fwd, min(sizes)) == 3460 * unit, (
+                    assert p.NC_pad == 268 and max(fwd, min(sizes)) == 3332 * unit, (
                         arch,
                         H,
                     )
@@ -414,9 +421,11 @@ def test_lean_layout_rests_on_the_davq_records() -> None:
 @pytest.mark.parametrize(
     "H,arch", [(64, "sm_100a"), (64, "sm_103a"), (64, "sm_107a"), (4, "sm_100a")]
 )
-def test_lean_stage_values_cover_the_records(H, arch) -> None:
+def test_lean_stage_values_cover_the_records(H, arch, monkeypatch) -> None:
     """The kernel backend's value dicts of a backward on the lean layout (an arena of meta tensors): every logical
-    name of every launched record bound; ``kcp_dav`` writes the sink and reads ``aqk_int`` beside it; the tail stages
+    name of every launched record bound; the ``dav`` stage launches nothing (the lean layout serves only plans whose
+    fused gradient stores every dAqk row, so ``kcp_dav`` has no reader: ``kcp_dav_needed``), the test knob
+    ``kcp_dav="always"`` included (it applies to the replay layout only); the tail stages
     launch once per range of ``ceil(NC_pad / passes)`` chunks with the whole-sequence rows offset by the range's
     first chunk, the chunk tables sliced, ``num_seqs = 0`` and the item bound the tail-count table's entry of the
     range's real chunk count (their sum: the context's ``NC``), on the per-pass buffers of the layout and the plan's
@@ -515,9 +524,19 @@ def test_lean_stage_values_cover_the_records(H, arch) -> None:
             .values()
         )
         assert not logical - set(values), (record, sorted(logical - set(values)))
-    dav = launches[head - 1]
-    assert dav[1] == "kcp_dav" and dav[3]["dAqk"] is views.dAqk_sink
-    assert dav[3]["aqk_int"] is views.aqk_int and dav[3]["dv1"] is views.dv1
+    assert not kp.kcp_dav_needed(plan) and call.scratch["kcp_dav"] == "skipped"
+    assert [r for _, r, _, _ in launches[:head]].count("kcp_dav") == 0
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    always = types.SimpleNamespace(
+        **{
+            **vars(call),
+            "scratch": {"views": views},
+            "opts": cake_kcp._options({"_kcp_test_knobs": {"kcp_dav": "always"}}),
+        }
+    )
+    before = len(launches)
+    backend.stage("dav", always)
+    assert always.scratch["kcp_dav"] == "skipped" and len(launches) == before
     stages = [s for s in cake_kcp.TAIL_STAGES if plan.dispatched(s, kp.LOCAL_PATH_BWD)]
     assert plan.dispatched("gate_epilogue", kp.LOCAL_PATH_BWD) == (arch == "sm_100a")
     body = launches[head:]
@@ -908,8 +927,9 @@ def test_gpu_lean_pass_variants_are_bitwise_the_replay_arena(
 
 
 def _nan_stage(monkeypatch, log: list) -> None:
-    """Wrap the kernel backend's stages: after ``kcp_dav`` fill the sink with NaN, before each tail range's fused
-    gradient fill every per-pass buffer with NaN (each must be written before it is read)."""
+    """Wrap the kernel backend's stages: before each tail range's fused gradient fill every per-pass buffer with NaN
+    (each must be written before it is read); log the ``dav`` stage's record (the lean layout launches no
+    ``kcp_dav``)."""
     real = cake_kcp.KernelBackend.stage
 
     def stage(self, name, call, **extra):
@@ -920,19 +940,17 @@ def _nan_stage(monkeypatch, log: list) -> None:
                     getattr(views, n).fill_(float("nan"))
                     log.append(n)
         real(self, name, call, **extra)
-        if name == "dav" and hasattr(views, "dAqk_sink"):
-            views.dAqk_sink.fill_(float("nan"))
-            log.append("dAqk_sink")
+        if name == "dav":
+            log.append("dav_" + str(call.scratch.get("kcp_dav")))
 
     monkeypatch.setattr(cake_kcp.KernelBackend, "stage", stage)
 
 
 @pytest.mark.parametrize("H", (4, 16, 64))
-def test_gpu_lean_nan_arena_and_sink_rows(device, H, monkeypatch) -> None:
+def test_gpu_lean_nan_arena_rows(device, H, monkeypatch) -> None:
     """The lean layout's dead and per-pass bytes carry nothing: the arena NaN-filled before every forward and
-    backward, the sink NaN-filled right after ``kcp_dav`` writes it, every per-pass buffer NaN-filled before each
-    tail range's fused gradient; saved and replay-mode backwards give bitwise the replay arena's gradients (no NaN
-    reaches a result)."""
+    backward, every per-pass buffer NaN-filled before each tail range's fused gradient, no ``kcp_dav`` launch; saved
+    and replay-mode backwards give bitwise the replay arena's gradients (no NaN reaches a result)."""
     packs = PACKS + (PROXY_PACK,) if H == 64 else PACKS
     ctxs, ops = _packs_on(device, H, packs)
 
@@ -954,7 +972,8 @@ def test_gpu_lean_nan_arena_and_sink_rows(device, H, monkeypatch) -> None:
     ws = _ws()
     ws.reserve(ctxs, H)
     got = run([ws] * len(ctxs), _poison)
-    assert "dAqk_sink" in log and "dAqk" in log and "dq_f" in log, sorted(set(log))
+    assert "dAqk" in log and "dq_f" in log, sorted(set(log))
+    assert "dav_skipped" in log and "dav_launched" not in log, sorted(set(log))
     for i in range(len(ctxs)):
         assert _same(got[i], ref[i]), (H, i)
         for g in got[i][2] + got[i][3]:

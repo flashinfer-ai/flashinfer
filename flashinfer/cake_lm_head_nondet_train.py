@@ -18,16 +18,26 @@ SM107): the chunked LM-head projection with a cross-entropy or policy
 objective, its per-row log-probabilities, and the log-probabilities / KL over
 a ragged candidate support.  The same computation, arguments and precision
 boundaries as the deterministic module ``flashinfer.cake_lm_head_det_train``.
-Each K slice of a sliced dX GEMM is added straight into the FP32 ``dX``
-accumulator by an unordered FP32 reduction, so ``dX`` is not bitwise
-reproducible run to run (``loss``, ``logp`` and ``dW`` keep their fixed
-order).  Two row skips of this backend also differ from the deterministic
+A sliced dX GEMM stores each K slice into an FP32 slab, and a slab sum adds the
+slices in slice order and stores the sum into the FP32 ``dX`` accumulator: one
+fixed order, so ``dX`` repeats bit for bit run to run, and its bits may differ
+from the deterministic module's by the rounding of that sum (``loss``,
+``logp`` and ``dW`` keep their fixed order).  Even so, the module makes no
+run-to-run bitwise promise for the gradients; the deterministic module makes
+it.  Two row skips of this backend also differ from the deterministic
 module: zero-weight policy rows and log-probability rows with a zero ``dlogp``
 leave the gradient GEMMs, so ``loss`` / ``dW`` bits may differ from the
 deterministic module's within the accuracy budgets, and a non-finite value in
-a zero-weight row does not reach ``loss`` / ``dX`` / ``dW``.  The backend
-README lists the output differences ("Zero-weight policy rows" and
-"Zero-gradient rows of the log-probability backward").
+a zero-weight row does not reach ``loss`` / ``dX`` / ``dW``.  By default a
+one-row cross-entropy loss call at ``H = 6144`` (BF16 contiguous ``W``, one
+chunk, compacted rows, no explicit ``gemm_tuning``, a registered program; the
+conditions of ``cake_backend.set_one_pass_rows``) runs the backend's one-pass
+programs: its ``loss`` / ``logp`` / ``dW`` are fixed order and bitwise
+reproducible run to run, but are not the deterministic module's bits (within
+the accuracy budgets).  Any other one-row call runs the chunked path.  The
+backend README lists the output differences ("Zero-weight policy rows",
+"Zero-gradient rows of the log-probability backward" and the
+``set_one_pass_rows`` switch).
 
 Entries: :func:`cake_lm_head_nondet_train_loss`,
 :func:`cake_lm_head_nondet_train_logprob`,
@@ -37,9 +47,10 @@ Entries: :func:`cake_lm_head_nondet_train_loss`,
 no entry takes a ``deterministic`` keyword (passing one is a ``TypeError``).
 Under ``torch.use_deterministic_algorithms(True)`` the backend raises
 PyTorch's alert right before a K-sliced dX reduction (a ``RuntimeError``;
-with ``warn_only=True`` a ``UserWarning``, and the call runs on); a call
-whose launches all keep one order does not alert.  Nothing falls back to the
-deterministic module: its entries are
+with ``warn_only=True`` a ``UserWarning``, and the call runs on); the alert
+is part of this module's contract, as it makes no run-to-run bitwise promise
+for the gradients.  A call without a K-sliced dX reduction does not alert.
+Nothing falls back to the deterministic module: its entries are
 ``flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_*``.
 
 A stable API (``@flashinfer_api``; no ``ExperimentalWarning``) of thin
@@ -50,12 +61,15 @@ experimental backend package
 use.  The ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variables are this wrapper's A/B
 knobs (``flashinfer/_cake_lm_head_train_knobs.py``, shared with the
 deterministic module): a switch keyword left at ``None`` falls back to its
-variable, and the resolved value is passed down.  The two binding-cache
+variable, and the resolved value is passed down (except ``hidden_count``
+with ``memory_mode="keep_logits"``; see
+:func:`cake_lm_head_nondet_train_logprob`).  The two binding-cache
 variables are read once, when this module is imported, and applied to the
 backend's cache on first use (the first call of any entry).
 """
 
 import functools
+import os
 import struct
 from types import ModuleType
 from typing import Any, Dict, Optional, Union
@@ -107,6 +121,16 @@ def _cake_support() -> ModuleType:
     return cake_support
 
 
+_KEEP_LOGITS = "keep_logits"
+
+
+def _kept_hidden_count() -> Optional[bool]:
+    # ``hidden_count`` of a ``memory_mode="keep_logits"`` call that leaves it
+    # at ``None``: ``False`` when the variable is "0", else ``None`` (the
+    # backend's kept-logits form, ``set_kept_logits_form``, decides).
+    return False if os.environ.get(_knobs.HIDDEN_COUNT_ENV, "1") == "0" else None
+
+
 @flashinfer_api
 def cake_lm_head_nondet_train_loss(
     X: torch.Tensor,
@@ -132,25 +156,25 @@ def cake_lm_head_nondet_train_loss(
     check_num_valid_rows: bool = False,
 ):
     r"""Differentiable chunked LM-head projection + loss with a memory-bounded
-    backward and an unordered dX reduction, SM100 / SM103 / SM107 only.
+    backward and a slab-summed dX reduction, SM100 / SM103 / SM107 only.
 
     See :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_loss`
     for the computation, the arguments, the switches and their
     ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` fallbacks, ``memory_mode``,
     ``num_valid_rows`` and the outputs, except as the module docstring notes
-    (the dX reduction and the zero-weight row split).
+    (the dX reduction, the zero-weight row split and the one-pass call).
 
     Notes
     -----
     The same precision boundaries (BF16 logits and ``dlogits``, FP32 loss
-    arithmetic, FP32 ``dX`` / ``dW`` accumulation, one final cast each).  Each
-    K slice of a sliced dX GEMM is added straight into the FP32 ``dX``
-    accumulator by an unordered FP32 reduction (no slabs), so ``dX`` is not
-    bitwise reproducible run to run; ``loss``, ``logp`` and ``dW`` keep their
-    fixed order.  ``dx_finalize`` then selects only the compacted ``dX``
-    output's one-pass scatter (there are no slabs to add).  The gradient
-    placement is the backend's own process setting
-    (``cake_backend.set_gradient_placement`` of
+    arithmetic, FP32 ``dX`` / ``dW`` accumulation, one final cast each).  A
+    sliced dX GEMM stores each K slice into an FP32 slab, and a slab sum adds
+    the slices in slice order and stores the sum into the FP32 ``dX``
+    accumulator, so ``dX`` repeats bit for bit run to run; ``loss``, ``logp``
+    and ``dW`` keep their fixed order.  ``dx_finalize`` then selects only the
+    compacted ``dX`` output's one-pass scatter (each chunk's slab sum has
+    already added its slices).  The gradient placement is the backend's own
+    process setting (``cake_backend.set_gradient_placement`` of
     ``flashinfer.experimental.cake.cake_lm_head_nondet_train``, default
     ``"auto"``, the deterministic backend's rule).
 
@@ -255,24 +279,30 @@ def cake_lm_head_nondet_train_logprob(
     temperature: Union[None, float, torch.Tensor] = None,
     check_temperature: bool = False,
 ) -> torch.Tensor:
-    r"""Differentiable chunked selected-token log-probability with an
-    unordered dX reduction, SM100 / SM103 / SM107 only.
+    r"""Differentiable chunked selected-token log-probability with a
+    slab-summed dX reduction, SM100 / SM103 / SM107 only.
 
     See :func:`flashinfer.cake_lm_head_det_train.cake_lm_head_det_train_logprob`
     for the computation and the arguments (``memory_mode="keep_logits"``,
     ``temperature`` and ``check_temperature`` included), except as the module
     docstring notes (the dX reduction and the zero-gradient row skip).
-    The backward adds each K slice of a sliced dX GEMM into the FP32 ``dX``
-    accumulator by an unordered FP32 reduction (``logp`` keeps its fixed
+    The backward sums the K slices of a sliced dX GEMM in slice order and
+    stores the sum into the FP32 ``dX`` accumulator (``logp`` keeps its fixed
     order); torch's deterministic mode raises PyTorch's alert before that
     reduction, as for :func:`cake_lm_head_nondet_train_loss`.  With a
     temperature the backend runs the same temperature forms (``logp`` the
     deterministic entry's bits, ``dW`` too when no valid row has a zero
-    ``dlogp``; ``dX`` the same products, a sliced chunk's in the unordered
-    reduction).  The zero-gradient row skip runs the dX / dW GEMMs of the rows
+    ``dlogp``, except a folded short tail and a call of the
+    vocabulary-major backward, by default 2 to 4 chunks: another ``dW``
+    grouping within the accuracy budgets; ``dX`` the same products, a sliced
+    chunk's summed in slice order).  The zero-gradient row skip runs the dX / dW GEMMs of the rows
     with a nonzero ``dlogp`` only, with or without a temperature.  ``None``
     and a Python number whose FP32 value is 1.0 run the call without a
-    temperature; a ``bool`` is a ``ValueError``.
+    temperature; a ``bool`` is a ``ValueError``.  With
+    ``memory_mode="keep_logits"`` a ``hidden_count`` left at ``None`` is
+    passed down as ``None`` (the backend's kept-logits form decides, see
+    its ``set_kept_logits_form``) unless
+    ``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT`` is ``"0"`` (``False``).
     """
     if backend != "cake":
         raise ValueError(
@@ -322,6 +352,10 @@ def cake_lm_head_nondet_train_logprob(
             check_temperature=check_temperature,
         )
     if opt_in:
+        if hidden_count is None and memory_mode == _KEEP_LOGITS:
+            # the kept logits keep the backend's kept-logits form for the count
+            # (None: the form's default) unless the variable turns it off
+            knobs["hidden_count"] = _kept_hidden_count()
         return _cake_backend_opt_in().cake_lm_head_nondet_train_logprob(
             X,
             W,

@@ -41,7 +41,14 @@ equal, and ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta`` are bitwise those of
 the deterministic package; ``dg`` differs from it by FP32 rounding on the ``S1``
 rows.  No launch is unordered, so no entry raises an alert or a warning under
 ``torch.use_deterministic_algorithms(True)`` (also with ``warn_only=True``); the
-entries never read that setting and never run the deterministic package.  The
+entries never read that setting and never run the deterministic package.  These
+bitwise statements hold for the light saved set (``saved_rows="none"``, and
+``"auto"`` / ``"tape"`` wherever the checkpoint hand-off does not engage) and for
+the hand-off's tape set (``"tape"``).  A saved set that keeps a rows set of
+``saved_rows`` (:func:`cake_kda_nondet_kcp`; ``"auto"`` keeps the ``"wy"`` set
+where the hand-off engages) skips the backward's intra program (with ``"wy"``
+also its WY program): the forward's rows stand in for the backward's recompute,
+so its gradients are held to the light path's FP64 error budget, not bitwise.  The
 context holds no mode; a saved set is read by the backward of this package only.
 
 Every rank holds its own token fragments (``[T_r, H, 128]`` operands, local
@@ -56,10 +63,16 @@ Backward: the adjoint offsets ``d_f`` (the reverse walk from zero) and, unless
 the forward's transfer was kept, ``M_f^T`` again go to the owners (``b1``), the
 owner walks each chain backwards (``X <- M_f^T X + d_f``) and returns every
 crossing-out fragment's ``dS_out`` (``b2``); the local adjoint recurrence runs
-from it.  One compute stream; the collectives are asynchronous on the caller's
+from it.  One compute stream (the forward's summary pair may fork onto a side
+stream and join back before the next launch, see "Summary walk streams" below;
+so may the saved-mode backward's dm-form K3 where :func:`_k3_stream` admits it,
+see "Backward K3 stream");
+the collectives are asynchronous on the caller's
 process group and waited at their first consumer.  Shipped schedule (adopted in an
 earlier revision): ``wait_first`` -- no merge
-or tape walk is issued while a collective is in flight, and the tape walks of a
+or tape walk is issued while a collective is in flight (but the saved-mode
+backward's ``P = 1`` K1 tape replay, issued under b1 where :func:`_tape_order`
+admits it, see "Backward tape order"), and the tape walks of a
 phase are one fused launch from the carry plane; the earlier ``overlap`` form
 (the document-start tape walk under ``c1``, the document-last adjoint tape walk
 under ``b2``: the two R7 overlaps) and the separate walks stay selectable through
@@ -84,6 +97,24 @@ rows; at most :data:`GRAPH_CACHE_MAX` keys); :func:`graph_cache_clear` releases
 them and must run before ``torch.distributed.destroy_process_group()``.
 ``exchange="ring"``, ``debug_sequence`` and calls without a caller-owned
 workspace are never captured.
+
+Rank agreement: the ranks of ``ctx.group`` must agree on the partition (and the
+context's ``conv_kernel_size``), the head count ``H`` and the inputs that set
+the count, order or split sizes of the collectives -- the resolved exchange,
+the resolved ``save_transfer``, the boundary mode (saved set or replay),
+``debug_sequence``, whether a recompute handle is passed -- and on the gate
+and in-kernel Q / K L2 norm modes (``cake_kcp_plan.RANK_CHECK_FIELDS``).  The
+first call of each such key on a context all-gathers a 16-byte BLAKE2b digest
+of them right before its first collective (``all_gather_into_tensor`` of
+``int64[2]`` per rank, on the compute stream) and asserts on the device that
+every rank's digest is rank 0's: a disagreement trips a device-side assert at
+that call instead of hanging in, or exchanging wrong bytes through, the state
+exchange.  No host synchronization (one pinned non-blocking copy, a device
+assert); later calls of the key issue nothing, nor do one rank, a CUDA-graph
+capture or replay, or a recompute with a handle.  Rank-local inputs stay out
+of the digest: the SM count and the plan rule (the segment count ``P``), the
+walk geometry and form, the cache-config bracket, the checkpoint hand-off
+decision, the graph mode, the workspace, the schedule knobs.
 
 Shipped walk-launch geometry (adopted in an earlier revision;
 ``WALK_GEOMETRY_DEFAULT = "lpt_tape_one_cta_per_sm"``): the offset walk lists of
@@ -118,6 +149,68 @@ The rule's inputs are static per ``(ctx, H)``, so
 the form of each ``(program, walk list)`` is decided once per table set
 (``_Tables.walk_form``) and looked up on every later launch: the eager call
 carries no per-launch list scheduling.
+
+Summary walk streams (``WALK_STREAMS_DEFAULT = "auto"``): the forward's
+summary pair -- K1 ``_offset`` and K3 over the offset walk list, into the c1
+send tiles at ``P = 1`` and the staging planes at ``P > 1`` (also in the
+replay forward of a replay-mode backward and in a checkpoint recompute's stage
+walks) -- reads the same local operands, writes disjoint tiles and feeds the
+next launch only, so K3 may run on a per-device side stream beside K1: an
+event recorded on the call's stream forks the side stream, an event recorded
+on the side stream joins it back before the next launch (:func:`_offset_pair`;
+capturable, bitwise the one-stream form).  The rule :func:`walk_streams`
+decides per pair from host-known inputs (the chains, the head count and the
+SM count, once per table set: ``_Tables.walk_streams``): two streams when K1
+alone fills a wave of its ``2 N`` slots (``len(chains) * H >= 2 N``), one
+stream below.  The first pair of a table set over its list on a
+device runs on one stream (it uploads the launches' device tables); the
+previous host path (``host_trim=0``) keeps one stream.  The test knob
+``walk_streams`` (``"one"`` / ``"two"``) forces a form for the A/B record;
+``LAST_CALL[kind]["walk_streams"]`` records ``(decided form, form run,
+n_walk)`` per pair.
+
+Backward tape order (shipped ``BWD_TAPE_ORDER_DEFAULT = "under_b1"``; private
+test knob ``bwd_tape_order``): the saved-mode backward issues its ``P = 1`` K1
+tape replay after the b1 exchange and before its wait, so it runs while b1 is
+in flight.  Nothing between the two places reads the tapes where ``kcp_dav``
+does not run (below), so the rule :func:`_tape_order` admits it on every
+backward that skips ``kcp_dav`` (which reads ``v_new``) and meets its other
+conditions; every other backward runs ``"first"`` (the replay right after the
+local rows, before ``kcp_dav``), the order the knob value ``"first"`` forces
+for the A/B record;
+``LAST_CALL["bwd"]["bwd_tape_order"]`` records the order run and
+``["bwd_tape_order_refusal"]`` why.  The collectives and the rank-agreement
+check keep their order, so the gradients are bitwise those of ``"first"``.
+
+Output backward: the adjoint walks' records are their forms' ``fuse_dv1``
+builds, which form ``dv1 = Aqk^T dO`` in FP32 inside the step from the
+internal ``Aqk`` rows (``aqk_int``), so ``kcp_dav``'s ``dv1`` has no reader.
+The backward launches ``kcp_dav`` only where its ``dAqk`` has one: where the
+existing backend's plan dispatches its ``dav`` stage on the replay path
+(:func:`cake_kcp_plan.kcp_dav_needed`; the serial route below 16 heads,
+H 9-15), whose fused gradient stores no ``dAqk``.  Everywhere else that fused
+gradient stores every ``dAqk`` row GLM intra reads, and the ``dav`` stage
+launches nothing (counted in the call's launches and ``sequence`` like the
+gate epilogue a plan fuses away).  ``LAST_CALL["bwd"]["kcp_dav"]`` records
+``"launched"`` or ``"skipped"``; the private test knob ``kcp_dav``
+(``"auto"`` shipped, ``"always"``: launch it on every backward of the replay
+layout, the coverage record) changes no output or gradient bit.
+
+Backward K3 stream (shipped ``BWD_K3_STREAM_DEFAULT = "side"``; private test
+knob ``bwd_k3_stream``): the saved-mode backward issues its ``P = 1`` dm-form
+K3 (the maps ``M_f`` it re-sends in b1 when the saved set keeps no c1 receive
+tensor, e.g. a recompute handle's ``"states"`` tier) on the summary pair's
+side stream right after the last writer of its operands, beside the K1 tape
+replay, ``kcp_dav`` and K2 ``_offset`` on the call's stream, and joins it back
+before the b1 issue.  The rule :func:`_k3_stream` admits it with the a2a
+exchange, the kernel backend on a CUDA device, the trimmed host path and two
+streams by :func:`walk_streams` on the K3 list; the first K3 of a table set
+over its list on a device runs on the call's stream (it uploads the launch's
+device tables), and every other backward runs ``"main"`` (K3 on the call's
+stream after K2 ``_offset``), the stream the knob value ``"main"`` forces for
+the A/B record.  ``LAST_CALL["bwd"]["bwd_k3_stream"]`` /
+``["bwd_k3_stream_refusal"]`` record the stream run and why.  The same
+launches on the same inputs: the gradients are bitwise those of ``"main"``.
 
 The bracket is host-side runtime state, so it is never issued inside a CUDA
 stream capture (``cudaDeviceSetCacheConfig`` would invalidate the capture,
@@ -277,10 +370,15 @@ local arena (``local_arena="lean"`` is refused in this mode).  The raw records o
 the single-rank package are copies of the deterministic package's raw programs
 and its raw plan selects no ``S1`` pair, so every output, the raw gate's
 gradient and the per-rank partial sums are bitwise those of the deterministic
-package's raw KCP route, with the in-kernel Q / K L2 norm (below: the l2n GLM
-intra program and ``param_finalize_l2n``, the deterministic ``param_finalize``)
-and without it.  The checkpoint hand-off does not engage in raw mode
-(:func:`cake_kda_nondet_kcp`).
+package's raw KCP route (with the default saved set, as above), with the
+in-kernel Q / K L2 norm (below: the l2n GLM intra program and
+``param_finalize_l2n``, the deterministic ``param_finalize``) and without it.  The checkpoint hand-off engages in raw mode as with the
+activated gate (:func:`cake_kda_nondet_kcp`): the forward's raw intra program
+writes the tape set, the backward's raw prep, gradient programs and
+``param_finalize`` read it.  On the devices of the mode's entry of
+:data:`KCP_HANDOFF_VERIFIED_MODES` every output, the raw gate's gradient and
+the per-rank partial sums are bitwise those of ``checkpoint_handoff="off"``;
+``"on"`` on another device has no such evidence.
 
 In-kernel Q / K L2 norm (FlashInfer issue #7817; keyword-only
 ``use_qk_l2norm_in_kernel=False`` on the three entry points, the workspace and
@@ -291,8 +389,9 @@ not normalized), and the GLM intra programs fuse the FP32 pullback
 ``dx = r * (dx_hat - y * dot(dx_hat, y))``, ``y = x * r``, into the final BF16
 ``dq`` / ``dk`` store.  The normalization is token-local: the halo, the
 context, the KCP programs, every collective and its byte count are those of
-the flag-off route.  The saved set keeps the raw ``q`` / ``k`` (the caller's
-tensors, as without the flag) plus the FP32 rstd ``CakeKDANondetKcpSaved.qk_rstd``
+the flag-off route.  The raw ``q`` / ``k`` are not members of the saved set
+(the autograd node keeps the caller's tensors, as without the flag); the saved
+set adds the FP32 rstd ``CakeKDANondetKcpSaved.qk_rstd``
 ``[2, T_r, H]`` (plane 0 q, plane 1 k; empty on a rank without tokens); the
 normalized q / k are never saved: the backward rebuilds them bitwise from the
 raw rows and the rstd into a per-call buffer, and a checkpoint recompute
@@ -326,8 +425,20 @@ static layout tables), so every rank raises the same error and message.  The
 single-rank package's records of the mode are copies of the deterministic
 package's programs and its plan selects no ``S1`` pair in the mode, so every
 output, the saved rstd and every gradient are bitwise those of the
-deterministic package's KCP route in the same mode.  The checkpoint hand-off
-does not engage with the flag (:func:`cake_kda_nondet_kcp`).
+deterministic package's KCP route in the same mode (with the default saved set,
+as above).  The checkpoint hand-off
+engages with the flag as without it, in both gate modes
+(:func:`cake_kda_nondet_kcp`): the tape set is the same five buffers (the
+saved set keeps its rstd as before) and the hand-off's backward, which skips
+the intra program, rebuilds the normalized rows from the raw rows and the
+saved rstd before its prep where that intra program was their writer (the
+fused form's ``qk_l2norm_intra_first`` plans: the separate normalization record
+from the saved rstd, the same ``bf16(x * r)``; elsewhere the prep's ``_l2n``
+twin normalizes as in the light backward).  On the devices of the mode's
+entry of :data:`KCP_HANDOFF_VERIFIED_MODES` every output and gradient is
+bitwise that of ``checkpoint_handoff="off"``; ``"on"`` on another device has
+no such evidence (the forward's and the replay's intra records of the mode
+differ per architecture).
 
 
 P > 1 staging: the K1 ``_offset`` / K2 ``_offset`` / K3 passes of the segmented rank write two
@@ -339,6 +450,7 @@ for K4's states (c1 / b1 pairs, ``tile_stride`` 2) and the carry plane; under ``
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import dataclasses
 import functools
@@ -373,7 +485,7 @@ TRANSFER_WALKS = (
     "bf16x3_hw64",
     "tf32_hilo",
     "bf16x3",
-)  # K3 program family: the shipped BF16x3 half-width walk first (the others only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
+)  # K3 program family: the shipped BF16x3 half-width walk first (the others only via _kcp_test_knobs)
 KCP_SAVED_VERSION = 2  # saved set {tables, S_in [, c1 receive tensor, M_seg, carry plane] -- the optional members travel as flags}; version 1 also held the token-row Aqk / Akk
 # Host / plan knobs (test knob class: reachable only through _kcp_test_knobs):
 SCHEDULES = (
@@ -453,6 +565,29 @@ HOST_TRIMS = (0, 1)
 HOST_TRIM_DEFAULT = (
     1  # shipped: the trimmed host path; 0 = the previous path, via _kcp_test_knobs only
 )
+# Package-kept default workspace: 1 (shipped) = a workspace=None call runs on a workspace the package keeps per key
+# (its host objects stay between calls, its device storage is allocated at the call's start and freed at its end:
+# _default_acquire / _default_release); 0 = a new workspace per call (the previous form), via _kcp_test_knobs only
+# (the A/B record).  The same kernels with the same arguments but data pointers in the same order: bitwise.
+DEFAULT_WS_VALUES = (0, 1)
+DEFAULT_WS_DEFAULT = 1
+# Kept-set pool: 1 (shipped) = the kept set of a checkpoint pass of a workspace=None call (the hand-off's tape set or
+# rows set, :func:`_tape_alloc`) comes from a package-private CUDA memory pool per device (:func:`_kept_pool`), each
+# tensor's leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`), so the set that lives from a
+# recompute to the node's backward never splits a block the caching allocator's default pool frees and reallocates
+# around it (the arena of a workspace=None call); a caller-held workspace's arena is not freed per call, so its calls
+# keep the default pool; 0 = the default pool everywhere (the previous form), via _kcp_test_knobs only (the A/B
+# record).  Placement only, the same kernels with the same arguments but data pointers: bitwise.
+KEPT_POOLS = (0, 1)
+KEPT_POOL_DEFAULT = 1
+# Forward prologue (fwd_prologue): "trim2" (shipped) = "trim" plus the intra record's table rule once per plan and
+# path (:func:`_intra_writes_tables_kept`) and no second capability check of a default call's in-kernel Q / K L2 norm
+# on the device the first one checked; "trim" = the forward's operand checks once per operand signature
+# (:func:`_operands_kept`), the same checks, launches and arguments; "base" = the previous host prologue (every
+# check on every call); "base" / "trim" via _kcp_test_knobs only (the A/B record).  Host side only: bitwise by
+# construction.
+FWD_PROLOGUES = ("base", "trim", "trim2")
+FWD_PROLOGUE_DEFAULT = "trim2"
 # Fused carry merges (test knob): "carry" launches the two forward carry
 # families carry_start + carry_in of a rank as ONE K4 launch (chain family "carry_both") and the two adjoint families
 # dcarry_end + dcarry_cross as one ("dcarry_both") -- the same m / c / y pools, the start (end) chains keep x0_index = -1
@@ -487,18 +622,53 @@ FWD_O_FUSE_DEFAULT = 1
 # tape CTAs).
 WALK_FORMS = ("auto", "full", "split")
 WALK_FORM_DEFAULT = "auto"
+# Walk streams of the forward's summary pair (K1 ``_offset`` + K3 over the offset walk list, :func:`_offset_pair`): "auto"
+# (shipped) = the rule :func:`walk_streams` per pair (two streams once K1 fills a wave, one stream below); "one" / "two" force
+# a form, _kcp_test_knobs only (the A/B record).  The two kernels read the same operands and write disjoint tiles, so
+# the form never changes a bit.
+WALK_STREAMS = ("auto", "one", "two")
+WALK_STREAMS_DEFAULT = "auto"
+# Place of the saved-mode backward's K1 tape replay at P = 1 (:func:`_backward`): "under_b1" (shipped) = after the b1
+# exchange is issued and before its wait, so the replay runs while b1 is in flight; "first" = right after the local
+# rows, before kcp_dav, forced through _kcp_test_knobs only (the A/B record).  "under_b1" runs where :func:`_tape_order`
+# admits it (never where kcp_dav runs: it reads the replay's v_new) and every other backward runs "first" and records
+# why.  The same kernels on the same inputs and the same collectives: no output or gradient bit changes.
+BWD_TAPE_ORDERS = ("first", "under_b1")
+BWD_TAPE_ORDER_DEFAULT = "under_b1"
+# Stream of the saved-mode backward's dm-form K3 at P = 1 (:func:`_backward`): "side" (shipped) = on the summary pair's
+# side stream (:func:`_pair_streams`) from right after the last writer of its operands, beside the K1 tape replay,
+# kcp_dav and K2 _offset, joined back before the b1 issue; "main" = on the call's stream after K2 _offset, forced
+# through _kcp_test_knobs only (the A/B record).  "side" runs where :func:`_k3_stream` admits it (the walk_streams rule
+# on the K3 list among the conditions; the table set's first K3 over its list on a device runs "main") and every other
+# backward runs "main" and records why.  The same kernels on the same inputs and the same collectives: no output or
+# gradient bit changes.
+BWD_K3_STREAMS = ("main", "side")
+BWD_K3_STREAM_DEFAULT = "side"
+# The backward's kcp_dav launch: "auto" (shipped) = only where cake_kcp_plan.kcp_dav_needed (the existing backend's plan
+# dispatches its dav stage: its fused gradient stores no dAqk); "always" = on every backward of the replay layout,
+# _kcp_test_knobs only (the coverage record: kcp_dav's outputs have no reader where "auto" skips it, so every output
+# and gradient bit is the same).
+KCP_DAV_MODES = ("auto", "always")
+KCP_DAV_DEFAULT = "auto"
 P2_KNOBS = {  # knob -> admitted values
     "schedule": SCHEDULES,
     "fused_walks": (0, 1),
     "cols_rule": COLS_RULES,
     "walk_geometry": WALK_GEOMETRIES,
     "walk_form": WALK_FORMS,
+    "walk_streams": WALK_STREAMS,
+    "bwd_tape_order": BWD_TAPE_ORDERS,
+    "bwd_k3_stream": BWD_K3_STREAMS,
+    "kcp_dav": KCP_DAV_MODES,
     "graph": GRAPH_MODES,
     "graph_cap": GRAPH_CAPS,
     "host_trim": HOST_TRIMS,
     "merge_fuse": MERGE_FUSES,
     "saved_carry": SAVED_CARRIES,
     "fwd_o_fuse": FWD_O_FUSES,
+    "default_ws": DEFAULT_WS_VALUES,
+    "kept_pool": KEPT_POOLS,
+    "fwd_prologue": FWD_PROLOGUES,
 }
 # Shipped defaults of the schedule / fused-walk pair (adopted together, the keep
 # rule): the "wait_first" schedule with the fused tape walks (one launch per phase).  "overlap" / fused_walks=0 stay
@@ -551,8 +721,9 @@ TAIL_COUNTS_ATTR = "_kcp_tail_counts"  # a lean arena's int32 table 0..L-1 (cake
 # arena was sized for (``CakeKDANondetWorkspace.fwd_layout``), on a backward arena :data:`LOCAL_LAYOUT_FWD`
 LOCAL_LAYOUT_FWD_ONLY = cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY
 # The KCP-owned local records (:mod:`.cake_kcp_jit`), by the stage name the launch sequences use: the output program
-# over the K1 ``h`` / ``v_new`` tapes and the ``dA_qk`` / ``dv1`` program whose ``dv1`` K2 reads (the forms the
-# existing backend's output and dA / dv programs had before its fused recurrences took them over).
+# over the K1 ``h`` / ``v_new`` tapes and the ``dA_qk`` / ``dv1`` program (the forms the existing backend's output and
+# dA / dv programs had before its fused recurrences took them over), launched only where its ``dA_qk`` has a reader
+# (:func:`cake_kcp_plan.kcp_dav_needed`; K2 forms its own ``dv1``).
 KCP_LOCAL_RECORDS = {"fwd_o": "kcp_fwd_o", "dav": "kcp_dav"}
 # The WY records the KCP launches directly where the plan fuses the WY representation into a state recurrence the
 # KCP does not run (its recurrences are the K1 / K2 walks): the forward's program and the replay's.
@@ -561,6 +732,10 @@ WY_DIRECT_RECORDS = {"wy_fwd": "wy_fwd", "wy": "wy_bwd_replay"}
 # reader and the pullback after GLM intra.  The fallback form launches them on every problem; a plan that does not
 # dispatch one is refused (:meth:`KernelBackend.stage`), never skipped as an optional stage the plan fuses away.
 L2N_FALLBACK_STAGES = ("qk_l2norm", "qk_apply", "qk_pullback")
+# The record of the separate normalization from a saved rstd that the checkpoint hand-off's backward launches on its
+# own grid rule (``stage("qk_apply", direct=True)``) where the fused form's plan dispatches none: the backward's intra
+# program, which the hand-off skips, is the replay's first q / k reader there (:func:`_handoff_l2n_rows`)
+L2N_DIRECT_RECORDS = {"qk_apply": "qk_l2norm_apply"}
 SCRATCH_TABLES_ATTR = "_kcp_scratch_tables"  # the arena attribute holding the table set the intra record writes
 # The last member of this package's keys in a context's table sets (``ctx._table_sets``): a context holds no mode and
 # serves both packages, whose table sets are objects of their own modules (the deterministic package's keys have three
@@ -722,6 +897,139 @@ def _operands(
     return q, k, v, g, beta, T, H, batched
 
 
+# The passed operand checks of the trimmed forward prologue (fwd_prologue="trim", :func:`_operands_kept`): key ->
+# the FP32 lower bound of the raw gate (``None`` with the activated gate), least recently used key first, at most
+# OPERANDS_OK_KEYS keys.  Host values only: no tensor is kept.
+_OPERANDS_OK: collections.OrderedDict[tuple, float | None] = collections.OrderedDict()
+OPERANDS_OK_KEYS = 64
+OPERANDS_OK_STATS = {"hit": 0, "miss": 0, "kept": 0, "uncached": 0}
+_NOT_KEPT = object()
+
+
+def _tensor_sig(x: torch.Tensor) -> tuple:
+    """Everything the operand checks read of ``x``: its type, shape, strides, dtype, device and the 16-byte
+    alignment of its address (contiguity and element count follow from the shape and the strides).  The device is
+    the full ``torch.device`` (type and index): ``get_device()`` alone is ``-1`` for CPU and meta tensors alike."""
+    return (
+        type(x),
+        x.shape,
+        x.stride(),
+        x.dtype,
+        x.device,
+        x.data_ptr() & 15,
+    )
+
+
+def _operands_key(
+    q, k, v, g, beta, ctx, dtypes, gate, l2n, A_log, dt_bias, lower_bound
+) -> tuple | None:
+    """The key of a forward's operand checks (:func:`_operands_kept`): the gate and L2-norm modes, the storage
+    dtypes the checks compare, the context's ``T_r`` and device, :func:`_tensor_sig` of every operand and gate
+    parameter, the lower bound (type and value) and the check functions themselves (a replaced function is checked
+    again).  ``None``: the call is not keyed (the activated gate with a gate parameter, which the checks refuse)."""
+    if gate == "raw":
+        params = (
+            _tensor_sig(A_log),
+            _tensor_sig(dt_bias),
+            type(lower_bound),
+            lower_bound,
+        )
+    elif A_log is None and dt_bias is None and lower_bound is None:
+        params = None
+    else:
+        return None
+    return (
+        gate,
+        bool(l2n),
+        dtypes["q"],
+        dtypes["k"],
+        dtypes["v"],
+        dtypes["g"],
+        dtypes["beta"],
+        int(ctx.T_r),
+        ctx.device,
+        _tensor_sig(q),
+        _tensor_sig(k),
+        _tensor_sig(v),
+        _tensor_sig(g),
+        _tensor_sig(beta),
+        params,
+        _operands,
+        _check,
+        _check_qk_view,
+        _squeeze_batch,
+        cake_backend._check_raw,
+        getattr(cake_backend, "_check_qk_raw", None),
+        cake_backend._gate_params,
+        cake_backend._GateParams,
+    )
+
+
+def _unbatched(x: torch.Tensor, rank: int) -> torch.Tensor:
+    return x.squeeze(0) if x.dim() == rank + 1 else x
+
+
+def _operands_kept(
+    q, k, v, g, beta, ctx, *, dtypes, gate, l2n, A_log, dt_bias, lower_bound
+):
+    """:func:`_operands` and ``cake_backend._gate_params`` of a forward under the trimmed prologue
+    (``fwd_prologue="trim"``): the same checks, run once per :func:`_operands_key`; a call whose key passed them
+    before takes its operands without the batch axis and its gate parameters without checking again (the checks
+    read nothing the key does not hold).  A key is kept only where the checks returned the caller's tensors (less a
+    batch axis of 1): a view the checks re-stride is checked on every call.  Returns ``_operands``'s tuple and the
+    gate parameters."""
+    try:
+        key = _operands_key(
+            q, k, v, g, beta, ctx, dtypes, gate, l2n, A_log, dt_bias, lower_bound
+        )
+        hash(key)  # an unhashable lower bound: no key, the checks below raise
+    except Exception:  # noqa: BLE001 - a value the key cannot read: the checks below raise or pass as on every call
+        key = None
+    lb = _NOT_KEPT if key is None else _OPERANDS_OK.pop(key, _NOT_KEPT)
+    if lb is not _NOT_KEPT:
+        _OPERANDS_OK[key] = lb  # back as the most recently used key
+        OPERANDS_OK_STATS["hit"] += 1
+        batched = q.dim() == 4
+        q, k, v, g = (_unbatched(x, 3) for x in (q, k, v, g))
+        beta = _unbatched(beta, 2)
+        T, H = int(v.shape[0]), int(v.shape[1])
+        gp = (
+            None
+            if gate == "g"
+            else cake_backend._GateParams(
+                A_log, dt_bias.view(H * D), tuple(dt_bias.shape), lb
+            )
+        )
+        return (q, k, v, g, beta, T, H, batched), gp
+    OPERANDS_OK_STATS["miss"] += 1
+    if key is None:
+        OPERANDS_OK_STATS["uncached"] += 1
+    ins = (q, k, v, g, beta)
+    res = _operands(q, k, v, g, beta, ctx, dtypes=dtypes, gate=gate, qk_l2norm=l2n)
+    gp = cake_backend._gate_params(
+        gate, A_log, dt_bias, lower_bound, res[6], res[0].device
+    )
+    if key is None:
+        return res, gp
+    for x, y in zip(ins, res[:5], strict=True):
+        # the caller's tensor, less a batch axis of 1: the same strides (a re-strided length-1 axis is not)
+        if y.stride() != (x.stride()[1:] if x.dim() == y.dim() + 1 else x.stride()):
+            OPERANDS_OK_STATS["uncached"] += 1
+            return res, gp
+    _OPERANDS_OK[key] = None if gp is None else gp.lower_bound
+    try:  # noqa: SIM105 - the module keeps its stdlib imports as they are
+        _OPERANDS_OK.move_to_end(key)
+    except KeyError:  # taken by another thread meanwhile
+        pass
+    OPERANDS_OK_STATS["kept"] += 1
+    while len(_OPERANDS_OK) > OPERANDS_OK_KEYS:
+        try:
+            _OPERANDS_OK.popitem(last=False)
+        except KeyError:  # emptied by another thread meanwhile
+            break
+    return res, gp
+
+
 def _ranked(x: torch.Tensor, batched: bool) -> torch.Tensor:
     return x.unsqueeze(0) if batched else x
 
@@ -854,6 +1162,50 @@ def _walk_form_of(call: Any, programs: Any, name: str, args: dict[str, Any]) -> 
     )
 
 
+def walk_streams(
+    chains: Sequence[int],
+    num_heads: int,
+    sm_count: int,
+    *,
+    knob: str = WALK_STREAMS_DEFAULT,
+) -> str:
+    """The stream form of one summary pair (K1 ``_offset`` and K3 over the same walk list, :func:`_offset_pair`):
+    ``"two"`` (K3 on a side stream beside K1) or ``"one"`` (K3 after K1 on the call's stream).  ``chains`` are the
+    chunk counts of the listed segments, ``knob`` the ``walk_streams`` test knob (``"one"`` / ``"two"`` force a form).
+
+    Both programs run two CTAs per SM: K1 launches ``c1 = len(chains) * num_heads`` CTAs, K3 ``2 * c1``.  With
+    ``N = sm_count``, two streams only when K1 alone fills at least one wave of its ``2 N`` slots (``c1 >= 2 N``),
+    one stream below.  The layer A/B (W4, 16384 tokens per rank) sets the bound: two streams on its interior ranks'
+    pair at ``c1 = 512`` (8 walks at H 64) make the layer's forward faster on sm_100a, sm_103a and sm_107a, while on
+    the pair at ``c1 = 256`` (16 walks at H 16, one pair per forward) they make it slower on sm_100a and sm_103a
+    (152 SMs) and no faster on sm_107a (212 SMs).  An empty list is ``"one"`` (no launch)."""
+    if knob not in WALK_STREAMS:
+        raise ValueError(f"walk_streams must be one of {WALK_STREAMS}, got {knob!r}")
+    if knob != "auto":
+        return knob
+    if not len(chains):
+        return "one"
+    return "two" if len(chains) * int(num_heads) >= 2 * int(sm_count) else "one"
+
+
+_PAIR_STREAMS: dict[
+    int, tuple[Any, Any, Any]
+] = {}  # device index -> (side stream, fork event, join event)
+
+
+def _pair_streams(device_index: int) -> tuple[Any, Any, Any]:
+    """The side stream of the summary pair on device ``device_index`` and its fork / join events: created once per
+    device and process (at the first two-stream decision, an eager call) and reused by every later pair."""
+    hit = _PAIR_STREAMS.get(device_index)
+    if hit is None:
+        hit = _PAIR_STREAMS[device_index] = (
+            torch.cuda.Stream(device=device_index),
+            torch.cuda.Event(),
+            torch.cuda.Event(),
+        )
+    return hit
+
+
 class KcpPreconditionError(RuntimeError):
     """The SPEC-3 probe found the backward's ``gk`` / ``kg`` / ``qg`` / ``w`` / ``u`` rows different from the forward's
     on a real token row and the call's ``spec3_probe="assert"`` asked for an error (the design note §6.4).  The requirement of
@@ -877,6 +1229,19 @@ class _Block:
     stride: int
 
 
+# The context's four chunk tables in the local stages' values (the existing backend's vocabulary; the KCP's segment
+# table is a K1-K4 argument, not a local one)
+_CHUNK_TABLES = cake_backend.TABLE_NAMES[:4]
+
+
+def _chunk_tables(values: dict[str, Any], ctx: Any) -> None:
+    """Add the context's four chunk tables to a call's local stage values: per call, never in a cached template
+    (a template kept on an arena would keep the table upload of a dead context alive)."""
+    tables = ctx.tables
+    for name in _CHUNK_TABLES:
+        values[name] = tables[name]
+
+
 TEMPLATE_CACHE_ATTR = "_kcp_local_templates"  # the arena attribute holding the trimmed path's begin_call templates
 # {(id(table set), backward): (weakref.ref(table set), template)}; the views belong to that arena, so the cache dies with it
 
@@ -894,12 +1259,13 @@ class KernelBackend(Backend):
     (the output from the K1 ``h`` / ``v_new`` tapes) on the arena's forward layout (``fwd``; a forward-only arena's
     ``fwd_kcp``, :data:`LOCAL_LAYOUT_FWD_ONLY`), with the records the plan selects
     on the forward path without a saved set (:data:`LOCAL_PATH_FWD`).  A backward call runs on the ``replay`` layout
-    (on a lean arena the lean layout :data:`LOCAL_LAYOUT_BWD_LEAN`: ``kcp_dav``'s ``dA_qk`` to its sink, the tail
-    stages once per chunk range, :func:`_tail_pass_values`)
+    (on a lean arena the lean layout :data:`LOCAL_LAYOUT_BWD_LEAN`: no ``kcp_dav``, the tail stages once per chunk
+    range, :func:`_tail_pass_values`)
     with the records of the replay path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows
     and the internal ``dout`` copy ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk``
-    rows), the replay's WY program, then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk`` and the intra-chunk
-    ``dv1`` K2 reads) and after K2 the fused gradient, GLM intra and the gate epilogue (on the rows of the
+    rows), the replay's WY program, then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk``, only where the
+    plan dispatches its ``dav`` stage: :func:`cake_kcp_plan.kcp_dav_needed`; K2 forms ``dv1`` from ``aqk_int``
+    itself) and after K2 the fused gradient, GLM intra and the gate epilogue (on the rows of the
     single-rank package's ``cake_jit.S1_RECORDS`` its ``S1`` pair: the GLM intra program also reads the operand
     ``q`` and the FP32 ``dq_f`` rows the fused gradient wrote, both in the call's value dict).  Where the plan fuses the WY
     representation into a state recurrence the KCP does not run, the WY program is launched directly
@@ -907,7 +1273,10 @@ class KernelBackend(Backend):
     writes its tables into a scratch set on the arena (:data:`SCRATCH_TABLES_ATTR`); every other program reads the
     context's CPU-built tables.  The saved set carries no token-row ``Aqk`` / ``Akk`` (:class:`CakeKDANondetKcpSaved`): the
     backward recomputes the internal rows in both modes, so the two modes run the same programs on the same operands.
-    The K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``dv1``) rows and
+    The exception is a saved set that keeps a rows set of ``saved_rows`` (:attr:`CakeKDANondetKcpSaved.rows`): its
+    backward binds the forward's internal rows after the prep and runs no intra program (with ``"wy"`` no WY program
+    either; :func:`_bwd_kept_rows`).
+    The K1 / K2 / K3 walks read the layout's ``w`` / ``kg`` / ``u`` / ``gk`` (``qg`` / ``do_int`` / ``aqk_int``) rows and
     write its ``h`` / ``v_new`` (``dh`` / ``dv2``) tapes.
 
     SPEC-3 (debug probe, once per backend on the first saved-mode backward whose call's ``spec3_probe`` keyword is
@@ -1012,12 +1381,14 @@ class KernelBackend(Backend):
                 )
                 cache[key] = hit
             values: dict[str, Any] = dict(hit[1])
+            _chunk_tables(values, ctx)
             values.update(call.ops)
             values["scale"] = call.scale
             call.local_values = values
             call.scratch["views"] = views
             return
         values = self._local_template(views, ctx, p, call.backward, tail)
+        _chunk_tables(values, ctx)
         values.update(call.ops)
         values["scale"] = call.scale
         call.local_values = values
@@ -1031,16 +1402,13 @@ class KernelBackend(Backend):
         backward: bool,
         tail: tuple[int, torch.Tensor] | None = None,
     ) -> dict[str, Any]:
-        """The values of ``begin_call`` that do not depend on the call: the arena views of the layout, the context's
-        four chunk tables (the existing backend's vocabulary; the KCP's segment table is a K1-K4 argument, not a
-        local one), the plan scalars of the existing backend's logical vocabulary and the ``h2d`` / ``dh2d`` views;
-        on the lean layout (``tail`` = its passes and the arena's tail-count table) the per-range values of the
-        tail stages (:func:`_tail_pass_values`) under ``"_kcp_tail"``.
-        The operands and ``scale`` are added per call (the trimmed host path caches this part per (arena, table set,
-        direction))."""
+        """The values of ``begin_call`` that do not depend on the call: the arena views of the layout, the plan
+        scalars of the existing backend's logical vocabulary and the ``h2d`` / ``dh2d`` views; on the lean layout
+        (``tail`` = its passes and the arena's tail-count table) the per-range values of the tail stages
+        (:func:`_tail_pass_values`) under ``"_kcp_tail"``.  The context's four chunk tables (:func:`_chunk_tables`),
+        the operands and ``scale`` are added per call (the trimmed host path caches this part per (arena, table set,
+        direction), so a kept template never keeps a context's table upload alive)."""
         values: dict[str, Any] = dict(vars(views))
-        for name in cake_backend.TABLE_NAMES[:4]:
-            values[name] = ctx.tables[name]
         values.update(
             num_seqs=p.N,
             num_chunks_pad=p.NC_pad,
@@ -1092,9 +1460,24 @@ class KernelBackend(Backend):
                     {**values, **overrides, **extra},
                 )
             return
+        if extra.pop("direct", False):
+            # the record of L2N_DIRECT_RECORDS on its own grid rule, outside the plan's selection (the checkpoint
+            # hand-off's separate normalization from the saved rstd, _handoff_l2n_rows)
+            record = L2N_DIRECT_RECORDS[name]
+            grid = cake_jit.launch_grid(
+                record,
+                num_chunks_pad=p.NC_pad,
+                num_seqs=p.N,
+                num_heads=p.H,
+                sm_count=p.sm_count,
+                num_tokens=call.T_r,
+            )
+            self._launch(call, record, grid, {**values, **extra})
+            return
         if name == "bwd_prep":
             # both backward modes run the replay prep (the GLM prep's rows, the internal dout copy K2 and dav read);
-            # the saved set carries no token rows: the intra program recomputes the internal rows in both modes.
+            # the saved set carries no token rows: the intra program recomputes the internal rows in both modes,
+            # except after a saved set with a rows set of saved_rows (_bwd_kept_rows binds its rows after this prep).
             # Mirror point (pending): the deterministic package's launch map of the replay prep's saved-rstd twin (the
             # saved-mode backward of the in-kernel Q / K L2 norm, which reads the saved rstd) is not in that package
             # yet; it is copied here verbatim once it ships there.  Until then the prep launches the plan's record,
@@ -1115,14 +1498,27 @@ class KernelBackend(Backend):
             # program wrote them already
             extra.setdefault("write_int", 1)
             extra.setdefault("write_prep", 0 if call.backward else 1)
-            if cake_kcp_plan.intra_writes_tables(p, path):
+            if (
+                _intra_writes_tables_kept(p, path)
+                if not call.backward
+                and getattr(call.opts, "fwd_prologue", None) == "trim2"
+                else cake_kcp_plan.intra_writes_tables(p, path)
+            ):
                 extra.update(
                     cu_seqlens=call.ctx.cu_seqlens_local, **_scratch_tables(local)
                 )
         elif name in KCP_LOCAL_RECORDS:
-            if name == "dav" and hasattr(views, "dAqk_sink"):
-                # the lean layout: the fused gradient stores every dAqk row the tail reads, kcp_dav's go to the sink
-                extra["dAqk"] = views.dAqk_sink
+            if name == "dav":
+                # kcp_dav only where its dAqk has a reader: the plan dispatches its dav stage, so its fused gradient
+                # stores no dAqk (cake_kcp_plan.kcp_dav_needed); the adjoint walks form dv1 themselves.  Elsewhere
+                # nothing launches (the knob kcp_dav="always" launches it anyway on the replay layout: its outputs have
+                # no reader there; the lean layout serves no plan that dispatches dav)
+                launch = cake_kcp_plan.kcp_dav_needed(p) or (
+                    call.opts.kcp_dav == "always" and not _lean_passes(local)
+                )
+                call.scratch["kcp_dav"] = "launched" if launch else "skipped"
+                if not launch:
+                    return
             self.programs().run_record(
                 KCP_LOCAL_RECORDS[name],
                 {**values, **extra},
@@ -1448,7 +1844,7 @@ class KernelBackend(Backend):
             v.qg,
             v.w,
             v.do_int,
-            v.dv1,
+            v.aqk_int,
             v.gk,
             call.H,
             seg_table,
@@ -1570,7 +1966,8 @@ def merge_cols_per_cta(ncols: int, n_chains: int, rule: str) -> int | None:
     return None
 
 
-# Kernel parameter names of the frozen ABIs (K1 a217181fa, K2 a217181fa, K3 0637ec9f4, K4 eaa97cf5e): the logical
+# Kernel parameter names of the frozen ABIs (K1 a217181fa, K2 a217181fa with its fuse_dv1 builds' aqk_tma (the
+# internal Aqk rows) at the fifth parameter, where the earlier builds read dv1, K3 0637ec9f4, K4 eaa97cf5e): the logical
 # vocabulary of the registry records when the FI-rendered provider launches by name.
 ABI_PARAMS = {
     "fwdh_offset": (
@@ -1599,7 +1996,7 @@ ABI_PARAMS = {
         "qg_tma",
         "w_tma",
         "do_tma",
-        "dv1",
+        "aqk_tma",
         "gk",
         "num_heads",
         "seq_chunk_start",
@@ -2254,6 +2651,24 @@ def _scratch_tables(local: Any) -> dict[str, torch.Tensor]:
     return tables
 
 
+def _intra_writes_tables_kept(plan: Any, path: str) -> bool:
+    """:func:`cake_kcp_plan.intra_writes_tables` of ``(plan, path)`` once per plan, path and rule function (the
+    forward prologue ``"trim2"``): kept in the plan's own memo (``cake_backend.Plan._memo``: a value derived from the
+    frozen plan's fields and the registry), with the registry object it was computed against, so a replaced rule
+    function or a replaced ``cake_jit.MODULES`` is computed again; a plan without that memo is computed every time."""
+    rule = cake_kcp_plan.intra_writes_tables
+    memo = getattr(type(plan), "_memo", None)
+    if memo is None:
+        return rule(plan, path)
+    registry = cake_jit.MODULES
+    kept = memo(
+        plan,
+        ("kcp_intra_writes_tables", path, rule),
+        lambda: (registry, bool(rule(plan, path))),
+    )
+    return kept[1] if kept[0] is registry else rule(plan, path)
+
+
 # (record, arch) -> [cake_jit.load, cake_jit.MODULES, fetch, grid axes, FFI entry or None] of _launch_record_trim
 _LAUNCH_PLANS: dict[tuple[str, str], list[Any]] = {}
 
@@ -2680,10 +3095,13 @@ _BACKEND: Backend = KernelBackend()
 
 def set_backend(backend: Backend | None) -> Backend:
     """Install ``backend`` as the dispatch table of every following call (``None``: the shipped
-    :class:`KernelBackend`); returns the previous one."""
+    :class:`KernelBackend`); returns the previous one.  Drops the workspaces the package keeps for ``workspace=None``
+    calls (:func:`default_workspace_cache_clear`): their key holds the backend's ``id``, which a new backend can
+    reuse once the old one is gone."""
     global _BACKEND
     previous = _BACKEND
     _BACKEND = KernelBackend() if backend is None else backend
+    default_workspace_cache_clear()
     return previous
 
 
@@ -3631,6 +4049,28 @@ class _Tables:
             )
         return form
 
+    def walk_streams(
+        self, walk: Sequence[int], H: int, sm_count: int, knob: str
+    ) -> str:
+        """The stream form (``"one"`` / ``"two"``) of the summary pair over the segments ``walk``
+        (:func:`walk_streams` on the chunk counts of its listed segments, the head count ``H``, the device's SM count
+        and the ``walk_streams`` knob): evaluated once per ``(walk list, H, SM count, knob)`` of this table set and
+        looked up on every later pair (keyed by value, like :meth:`walk_form`)."""
+        key = (tuple(walk), int(H), int(sm_count), str(knob))
+        cache = self.__dict__.setdefault("_walk_streams", {})
+        form = cache.get(key)
+        if form is None:
+            if len(cache) >= self.ID_CACHE_MAX:
+                cache.clear()
+            seg = self.hp.seg_chunk_start
+            form = cache[key] = walk_streams(
+                [int(seg[s + 1]) - int(seg[s]) for s in walk],
+                int(H),
+                int(sm_count),
+                knob=str(knob),
+            )
+        return form
+
     def pool_sizes(self, backward: bool) -> dict[str, int]:
         names = cake_kcp_plan.FWD_POOLS + (cake_kcp_plan.BWD_POOLS if backward else ())
         return {
@@ -3667,6 +4107,32 @@ class _Tables:
         }
 
 
+def _table_set(
+    sets: dict,
+    key: tuple,
+    ctx: Any,
+    H: int,
+    fused_walks: int,
+    walk_geometry: str,
+    on_context: bool,
+) -> _Tables:
+    """The table set ``sets[key]`` of ``(ctx, H)``, built and stored on its first use (:meth:`CakeKDANondetKcpWorkspace.tables`;
+    ``on_context``: ``sets`` is the context's ``_table_sets``, else a workspace's own cache)."""
+    tb = sets.get(key)
+    if tb is None:
+        tb = _Tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
+        tb.on_context = on_context
+        # the absent-pool slot table: the set's own copy on the shipped path; the upload="blocking" /
+        # table_cache="workspace" knobs keep the previous process cache of cake_kcp_jit
+        tb.own_absent = (
+            getattr(ctx, "upload", cake_kcp_plan.UPLOAD_DEFAULT) == "async"
+            and getattr(ctx, "table_cache", cake_kcp_plan.TABLE_CACHE_DEFAULT)
+            == "context"
+        )
+        sets[key] = tb
+    return tb
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Workspace (the design note §7.4): transient buffers only; saved-set tensors are fresh per call (SPEC-4)
 
@@ -3688,7 +4154,7 @@ class CakeKDANondetKcpWorkspace:
     local arena takes the KCP forward layout (:data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head); a
     backward workspace sizes every pool and the existing backend's layouts (``local_arena="replay"``, the default,
     :data:`cake_kcp_plan.LOCAL_ARENAS`) or, under ``local_arena="lean"`` (opt-in), the KCP forward layout and the
-    lean backward layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, 3460 B per internal token-head; the tail stages per chunk
+    lean backward layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, 3332 B per internal token-head; the tail stages per chunk
     range) with its tail-count table (:data:`TAIL_COUNTS_ATTR`), the existing backend's layouts on the rows the lean
     layout does not serve (H 9-15).  ``lean_passes`` sizes a lean arena for that many tail passes (``None``:
     :data:`cake_kcp_plan.LEAN_PASSES_DEFAULT`, two; fewer passes launch fewer tail kernels for more bytes;
@@ -3785,8 +4251,9 @@ class CakeKDANondetKcpWorkspace:
                 'CakeKDANondetKcpWorkspace: use_qk_l2norm_in_kernel=True runs on the replay local arena; local_arena="lean" '
                 "is not supported with the in-kernel Q/K L2 norm yet"
             )
-        # the architectures whose check of the mode passed (_require_l2n)
+        # the architectures whose check of the mode passed, and the indexed CUDA devices of those (_require_l2n)
         self._l2n_ok: set[str | None] = set()
+        self._l2n_dev_ok: set[torch.device] = set()
         self._require_l2n(
             device if device is not None else getattr(ctx, "device", None)
         )
@@ -3816,6 +4283,10 @@ class CakeKDANondetKcpWorkspace:
         # the per-call workspace of a workspace=None call (_prepare): its "eye" pool is the device's shared identity
         # tile (_identity_tile); a workspace a caller holds fills its own once
         self._shared_eye = False
+        # a package-kept default workspace (_default_acquire): its key, and its pools whose storage _park freed, by
+        # name -> (tensor, bytes); empty on every other workspace
+        self._default_key: tuple | None = None
+        self._parked: dict[str, tuple[torch.Tensor, int]] = {}
         if ctx is not None:
             if H is None:
                 raise ValueError("CakeKDANondetKcpWorkspace: H is required with ctx")
@@ -3842,19 +4313,9 @@ class CakeKDANondetKcpWorkspace:
             != "context"
         ):  # a duck-typed context, or the table_cache="workspace" knob: the previous per-workspace cache
             sets, key = self._tables, (ctx, *key)
-        tb = sets.get(key)
-        if tb is None:
-            tb = _Tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
-            tb.on_context = sets is not self._tables
-            # the absent-pool slot table: the set's own copy on the shipped path; the upload="blocking" /
-            # table_cache="workspace" knobs keep the previous process cache of cake_kcp_jit
-            tb.own_absent = (
-                getattr(ctx, "upload", cake_kcp_plan.UPLOAD_DEFAULT) == "async"
-                and getattr(ctx, "table_cache", cake_kcp_plan.TABLE_CACHE_DEFAULT)
-                == "context"
-            )
-            sets[key] = tb
-        return tb
+        return _table_set(
+            sets, key, ctx, H, fused_walks, walk_geometry, sets is not self._tables
+        )
 
     def ensure(
         self,
@@ -3978,13 +4439,20 @@ class CakeKDANondetKcpWorkspace:
         """With the flag on, refuse the mode where the single-rank programs of the workspace's form cannot run on
         ``device``'s architecture (:func:`cake_kcp_plan.require_qk_l2norm`, rank-independent inputs only, so every
         rank raises alike before any arena, plan or collective); a passed architecture is kept, so later calls
-        check nothing again.  Nothing with the flag off."""
-        if not self.qk_l2norm:
+        check nothing again, and so is a passed indexed CUDA device, whose architecture is not looked up again.
+        Nothing with the flag off."""
+        if not self.qk_l2norm or device in self._l2n_dev_ok:
             return
         arch = cake_kcp_plan.qk_l2norm_arch(device)
         if arch not in self._l2n_ok:
             cake_kcp_plan.require_qk_l2norm(self.l2n, self.gate, arch)
             self._l2n_ok.add(arch)
+        if (
+            isinstance(device, torch.device)
+            and device.type == "cuda"
+            and device.index is not None
+        ):
+            self._l2n_dev_ok.add(device)
 
     def _check_device(self, device: torch.device) -> None:
         if self.device is None:
@@ -4085,6 +4553,84 @@ class CakeKDANondetKcpWorkspace:
             for t in _table_tensors(tb):
                 add(t)
         return list(out.values())
+
+    def _park(self) -> None:
+        """The end of a call on a package-kept default workspace (:func:`_default_release`): every pool storage
+        with bytes (a :data:`cake_kcp_plan.SHARED_POOLS` pair once; never the shared identity tile ``eye``) and the
+        local arena go back to the caching allocator on the call's stream (``untyped_storage().resize_(0)``, as
+        when the tensors of a dropped per-call workspace die), while the tensors, the arena object, its layout
+        views and launch templates, the ``[:n]`` views and the ``ensure`` records stay: they follow the storage
+        when it is allocated again.  The parked pools are kept by name with their bytes (:meth:`_unpark`); a pool
+        the call left parked keeps its entry.  The arena's scratch table set (:func:`_scratch_tables`, KiB on the
+        rows whose intra record writes the chunk tables) stays allocated, as on a workspace a caller holds."""
+        live: dict[int, torch.Tensor] = {}
+        for name, t in self._pools.items():
+            if name == "eye":
+                continue
+            st = t.untyped_storage()
+            ptr = st.data_ptr()
+            if ptr:
+                self._parked[name] = (t, st.nbytes())
+                live.setdefault(ptr, t)
+        for t in live.values():
+            t.untyped_storage().resize_(0)
+        if self.local is not None:
+            self.local.arena.untyped_storage().resize_(0)
+
+    def _unpark(self, name: str) -> None:
+        """Allocate the storage of parked pool ``name`` again, its bytes at :meth:`_park`, from the caching
+        allocator on the stream of the workspace's calls (``untyped_storage().resize_(n)`` from 0 bytes copies
+        nothing).  Nothing when the other pool of its :data:`cake_kcp_plan.SHARED_POOLS` pair allocated the shared
+        storage already: a storage is resized once per call, never while it holds bytes (that would copy them into a
+        new block in the middle of the call).  A first reader on another stream (a side stream of the call; none
+        today, the summary pair's side launch reads pools bound before its fork): the block is allocated on the
+        call's stream, which may have freed it after the reader's stream forked, so the reader's stream then waits
+        for the call stream's queued work (one ``wait_stream``, no host wait) before it writes the block."""
+        t, n = self._parked.pop(name)
+        st = t.untyped_storage()
+        have = st.nbytes()
+        if have == n:
+            return
+        if have:
+            raise RuntimeError(
+                f"CakeKDANondetKcpWorkspace: parked pool {name!r} holds {have} B, expected 0 or {n} B"
+            )
+        last = self._stream
+        if last is None or _raw_stream(self.device.index) == last[0]:
+            st.resize_(n)
+        else:  # a reader on another stream (a side stream of the call): the block belongs to the call's stream
+            with torch.cuda.stream(last[1]):
+                st.resize_(n)
+            # the block's earlier users on the call's stream run before the reader's stream writes it
+            torch.cuda.current_stream(self.device.index).wait_stream(last[1])
+
+    def _unpark_all(self, backward: bool) -> None:
+        """:meth:`_unpark` every parked pool but the lazily allocated ones of the direction (the ring's hop pools
+        :data:`cake_kcp_plan.LAZY_POOLS`; on a forward-only workspace also :data:`cake_kcp_plan.FWD_LAZY_POOLS`),
+        right before the call's first collective (:meth:`CakeKDANondetKcpCall.exchange_ready`): the lazy ones are
+        allocated by their first reader only (:meth:`pool`), so a call never holds a lazy pool it does not read,
+        whatever an earlier call of the key read."""
+        lazy = cake_kcp_plan.LAZY_POOLS + (
+            () if backward else cake_kcp_plan.FWD_LAZY_POOLS
+        )
+        for name in [n for n in self._parked if n not in lazy]:
+            self._unpark(name)
+
+    def _unpark_arena(self) -> None:
+        """Allocate the local arena's storage again (its ``bytes``) on the current stream, before any view of it is
+        bound; nothing while it holds its bytes."""
+        local = self.local
+        if local is None:
+            return
+        st = local.arena.untyped_storage()
+        have = st.nbytes()
+        if have == local.bytes:
+            return
+        if have:
+            raise RuntimeError(
+                f"CakeKDANondetKcpWorkspace: the parked local arena holds {have} B, expected 0 or {local.bytes} B"
+            )
+        st.resize_(local.bytes)
 
     def _local_plan(self, key: tuple[int, int, int], device: torch.device) -> Any:
         """The existing backend's plan of ``(S, num_docs, H)`` on ``device`` (its architecture cached per device
@@ -4232,6 +4778,10 @@ class CakeKDANondetKcpWorkspace:
         self._fast.clear()
         if mt is not None and mt.numel() >= n:
             self._pools[name] = mt  # the pair's storage is already large enough
+            # a default workspace: the name follows its mate's storage, parked or not
+            self._parked.pop(name, None)
+            if mate in self._parked:
+                self._parked[name] = self._parked[mate]
             return True
         # the pools carry no contents across calls: release the superseded storage (these locals, the dict entries and
         # the cached views) before the successor is allocated, so the two never coexist
@@ -4239,6 +4789,7 @@ class CakeKDANondetKcpWorkspace:
         del cur, mt
         for m in (name, mate):
             if m is not None and self._pools.pop(m, None) is not None:
+                self._parked.pop(m, None)  # a replaced pool is never allocated again
                 for key in [k for k in self._slices if k[0] == m]:
                     del self._slices[key]
         if name == "eye" and self._shared_eye and n == TILE:
@@ -4277,6 +4828,9 @@ class CakeKDANondetKcpWorkspace:
                     self._drop_stale_slices()
                 if fwd_lazy:
                     _graph_release(self)
+        if self._parked and name in self._parked:
+            # a package-kept default workspace: the storage of a parked pool is allocated at its first read
+            self._unpark(name)
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
@@ -4337,8 +4891,9 @@ class CakeKDANondetKcpSaved:
     output), the owner's c1 receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``), the
     forward's carry plane ``carry`` (``P > 1``: the backward's tape replay reads it and skips the K1 offset re-walk +
     carry merges; ``None`` at ``P = 1`` and under the test knob ``saved_carry=0``) and the scalars of the call.  The
-    int32 tables are rebuilt from ``ctx`` (droppable, §16 item 3).  No token-row ``Aqk`` / ``Akk``: the backward
-    recomputes the internal rows it reads in both modes (version 2; version 1 held them).  A forward under the
+    int32 tables are rebuilt from ``ctx`` (droppable, §16 item 3).  No token-row ``Aqk`` / ``Akk``: by default the
+    backward recomputes the internal rows it reads in both modes (version 2; version 1 held them; a rows set of
+    ``saved_rows`` below keeps the internal rows).  A forward under the
     checkpoint hand-off (:func:`cake_kda_nondet_kcp` ``checkpoint_handoff``) also keeps its tape set (``h``, ``v_new``,
     ``w``, ``aqk_int``, ``akk_int``; :attr:`tape`) and no carry plane: its backward reads the set and runs no intra
     program, WY program or K1 tape walk; ``flags()`` then carries one more flag.  ``gate`` (``"g"`` or ``"raw"``)
@@ -4349,8 +4904,14 @@ class CakeKDANondetKcpSaved:
     plane 1 k; empty on a rank without tokens), the last of :meth:`tensors`, recorded in :meth:`meta` only in the
     mode: a flag-off set has exactly the tensors, flags and meta it had before the mode existed, and the version
     stays.  The raw q / k are not members (the autograd node keeps the caller's tensors, as without the flag); a
-    backward in the other mode is refused.  A forward with the flag keeps no tape set (the checkpoint hand-off does
-    not engage in the mode)."""
+    backward in the other mode is refused.  A forward with the flag or in raw gate mode keeps the same tape set when
+    the checkpoint hand-off engages (the rstd stays the last tensor).  ``saved_rows`` (``None``, ``"intra"`` or
+    ``"wy"``): the rows set of :data:`cake_kcp_plan.KCP_SAVED_ROWS` a forward with ``saved_rows`` keeps beside the
+    light set (:func:`cake_kda_nondet_kcp` ``saved_rows``; :attr:`rows`): ``aqk_int`` / ``akk_int`` (``"intra"``),
+    also ``w`` / ``u`` (``"wy"``), with the carry plane and without ``h`` / ``v_new``.  Its backward runs no intra
+    program (and with ``"wy"`` no WY program) and still replays the K1 tape.  The rows travel after the optional
+    members in that order (no extra flag), recorded in :meth:`meta` only when kept: a set without rows has exactly
+    the tensors, flags and meta it had before, and the version stays."""
 
     version: int
     S_in: torch.Tensor
@@ -4379,6 +4940,10 @@ class CakeKDANondetKcpSaved:
     w: torch.Tensor | None = None
     aqk_int: torch.Tensor | None = None
     akk_int: torch.Tensor | None = None
+    # the rows set kept beside the light set (cake_kcp_plan.KCP_SAVED_ROWS: None, "intra" or "wy"; never with h):
+    # aqk_int / akk_int above, and with "wy" w above and u, the WY program's u rows BF16 [R, H, 128]
+    u: torch.Tensor | None = None
+    saved_rows: str | None = None
     gate: str = "g"  # the forward's gate mode ("raw": use_gate_in_kernel=True)
     # the raw mode's FP32 lower bound (None in "g" mode)
     lower_bound: float | None = None
@@ -4396,9 +4961,19 @@ class CakeKDANondetKcpSaved:
             return None
         return {n: getattr(self, n) for n in self._TAPE}
 
+    @property
+    def rows(self) -> dict[str, torch.Tensor] | None:
+        """The kept rows set by buffer name (:data:`cake_kcp_plan.KCP_SAVED_ROWS` of :attr:`saved_rows`), ``None``
+        without one."""
+        if self.saved_rows is None:
+            return None
+        return {
+            n: getattr(self, n) for n in cake_kcp_plan.KCP_SAVED_ROWS[self.saved_rows]
+        }
+
     def tensors(self) -> tuple[torch.Tensor, ...]:
-        """``S_in``, the optional members present, then the tape set when present (in :attr:`_TAPE` order), then the
-        rstd in the in-kernel Q / K L2 norm mode."""
+        """``S_in``, the optional members present, then the tape set when present (in :attr:`_TAPE` order) or the
+        kept rows (in :data:`cake_kcp_plan.KCP_SAVED_ROWS` order), then the rstd in the in-kernel Q / K L2 norm mode."""
         out = [self.S_in]
         for name in self._OPTIONAL:
             t = getattr(self, name)
@@ -4407,6 +4982,8 @@ class CakeKDANondetKcpSaved:
         if self.h is not None:
             for name in self._TAPE:
                 out.append(getattr(self, name))
+        elif self.saved_rows is not None:
+            out.extend(self.rows.values())
         if self.qk_l2norm:  # the rstd last, in the mode only
             out.append(self.qk_rstd)
         return tuple(out)
@@ -4436,6 +5013,9 @@ class CakeKDANondetKcpSaved:
         }
         if self.qk_l2norm:  # in the mode only: a flag-off set's meta is unchanged
             meta["qk_l2norm"] = True
+        # kept rows only: a set without rows has the same meta
+        if self.saved_rows is not None:
+            meta["saved_rows"] = self.saved_rows
         return meta
 
     @classmethod
@@ -4460,6 +5040,13 @@ class CakeKDANondetKcpSaved:
         }
         if len(flags) > n_opt and flags[n_opt]:  # the tape set, whole
             opt.update({n: next(it) for n in cls._TAPE})
+        rows = meta.get("saved_rows")
+        if rows is not None:  # the kept rows, whole
+            if rows not in ("intra", "wy"):
+                raise ValueError(
+                    f"CakeKDANondetKcpSaved: saved_rows {rows!r}, expected 'intra' or 'wy'"
+                )
+            opt.update({n: next(it) for n in cake_kcp_plan.KCP_SAVED_ROWS[rows]})
         if meta.get("qk_l2norm"):
             opt["qk_rstd"] = next(it)
         return cls(S_in=S_in, ctx=ctx, **opt, **meta)
@@ -4498,8 +5085,24 @@ class CakeKDANondetKcpOptions:
     trimmed host path of the eager call -- the same launches in the same order, bitwise; ``0`` = the previous host path;
     ``_kcp_test_knobs`` only), ``saved_carry`` (``1`` shipped: the forward of a ``P > 1`` rank keeps its carry plane in
     the saved set and the saved-mode backward reads it; ``0`` = that backward re-walks the forward carries -- the same
-    remaining launches, bitwise; ``_kcp_test_knobs`` only), ``precision_mode`` (K3's static program; set only through
-    ``_kcp_test_knobs``)."""
+    remaining launches, bitwise; ``_kcp_test_knobs`` only), ``default_ws`` (``1`` shipped: a ``workspace=None`` call
+    runs on a workspace the package keeps, whose device storage lives for the call alone, :func:`_default_acquire`;
+    ``0`` = a new workspace per call, the same launches, bitwise; ``_kcp_test_knobs`` only), ``kept_pool`` (``1``
+    shipped: a checkpoint pass's kept set of a ``workspace=None`` call comes from the package-private pool of its
+    device, :func:`_kept_pool`; ``0`` =
+    the caching allocator's default pool, the same launches, bitwise; ``_kcp_test_knobs`` only), ``bwd_tape_order``
+    (``"under_b1"`` shipped: the saved-mode backward's K1 tape replay after the b1 issue where :func:`_tape_order`
+    admits it, else before ``kcp_dav``; ``"first"`` = before ``kcp_dav`` in every backward, the same launches,
+    bitwise; ``_kcp_test_knobs`` only), ``bwd_k3_stream`` (``"side"`` shipped: the backward's dm-form K3 on the side
+    stream beside the K1 tape replay, ``kcp_dav`` and K2 ``_offset`` where :func:`_k3_stream` admits it, else on the
+    call's stream; ``"main"`` = on the call's stream in every backward, the same launches, bitwise; ``_kcp_test_knobs``
+    only), ``kcp_dav`` (``"auto"`` shipped: the backward launches ``kcp_dav`` only where
+    :func:`cake_kcp_plan.kcp_dav_needed`; ``"always"`` = on every backward of the replay layout, the same bits;
+    ``_kcp_test_knobs`` only), ``fwd_prologue`` (``"trim2"`` shipped: ``"trim"`` with the intra record's table rule
+    once per plan and path and one capability check of a default call's in-kernel Q / K L2 norm per device;
+    ``"trim"`` = the forward's operand checks once per operand signature; ``"base"`` = every check on every call --
+    the same checks and launches, bitwise; :data:`FWD_PROLOGUES`; ``_kcp_test_knobs`` only), ``precision_mode``
+    (K3's static program; set only through ``_kcp_test_knobs``)."""
 
     save_transfer: bool | None = (
         None  # None = resolve: SAVE_TRANSFER_DEFAULT (True) for a2a / auto, False for the ring; explicit False = the recompute form
@@ -4520,12 +5123,19 @@ class CakeKDANondetKcpOptions:
     cols_rule: str = "fixed"  # D1: "by_chains" = c8 up to COLS_RULE_CHAINS state chains, c16 beyond; _kcp_test_knobs only
     walk_geometry: str = WALK_GEOMETRY_DEFAULT  # walk geometry: shipped "lpt_tape_one_cta_per_sm"; "shipped" (the earlier geometry) and the other WALK_GEOMETRIES via _kcp_test_knobs only
     walk_form: str = WALK_FORM_DEFAULT  # the record form of the K1 / K2 and fused forward walk launches: "auto" (shipped) = the registry's rule per launch; "full" / "split" via _kcp_test_knobs only
+    walk_streams: str = WALK_STREAMS_DEFAULT  # the stream form of the forward's summary pair: "auto" (shipped) = the walk_streams rule per pair; "one" / "two" via _kcp_test_knobs only
+    bwd_tape_order: str = BWD_TAPE_ORDER_DEFAULT  # the saved-mode backward's K1 tape replay: "under_b1" (shipped) after the b1 issue where _tape_order admits it, else before kcp_dav; "first" (always before kcp_dav) via _kcp_test_knobs only
+    bwd_k3_stream: str = BWD_K3_STREAM_DEFAULT  # the saved-mode backward's dm-form K3: "side" (shipped) on the side stream where _k3_stream admits it, else on the call's stream; "main" (always the call's stream) via _kcp_test_knobs only
+    kcp_dav: str = KCP_DAV_DEFAULT  # the backward's kcp_dav: "auto" (shipped) only where cake_kcp_plan.kcp_dav_needed; "always" on every backward of the replay layout (the same bits), via _kcp_test_knobs only
     graph: str = GRAPH_DEFAULT  # graph replay: public keyword; "replay" captures a call once per validity key and replays it (eager on a key miss); also reachable through _kcp_test_knobs for the A/B record
     graph_cap: str = GRAPH_CAP_DEFAULT  # the cache-config form of a captured call ("node_attr" shipped | "none" the previous form of record | "capture_pref" rejected | "node_attr_post"); _kcp_test_knobs only
     host_trim: int = HOST_TRIM_DEFAULT  # shipped 1 = the trimmed host path of the eager call (same launches, bitwise); 0 = the previous path, _kcp_test_knobs only
     merge_fuse: str = MERGE_FUSE_DEFAULT  # "carry" = carry_start + carry_in (dcarry_end + dcarry_cross) in one K4 launch; _kcp_test_knobs only
     saved_carry: int = SAVED_CARRY_DEFAULT  # shipped 1 = the forward's carry plane stays in the saved set and the saved-mode backward skips the P > 1 re-walk + carry merges; 0 = the re-walk, _kcp_test_knobs only
     fwd_o_fuse: int = FWD_O_FUSE_DEFAULT  # shipped 1 = the forward that keeps no tape runs kcp_fwdh_o (out, no tape) in place of the tape walk(s) + fwd_o; 0 = the tape walk(s) + fwd_o, _kcp_test_knobs only
+    default_ws: int = DEFAULT_WS_DEFAULT  # shipped 1 = a workspace=None call runs on a package-kept workspace (host objects kept, device storage per call); 0 = a new workspace per call, _kcp_test_knobs only
+    kept_pool: int = KEPT_POOL_DEFAULT  # shipped 1 = a checkpoint pass's kept set of a workspace=None call comes from the package-private pool of its device (_kept_pool); 0 = the default pool, _kcp_test_knobs only
+    fwd_prologue: str = FWD_PROLOGUE_DEFAULT  # "trim2" shipped = "trim" with less host work before the first launch; "trim" = the operand checks once per operand signature; "base" = the previous host prologue; the same checks and launches (FWD_PROLOGUES), _kcp_test_knobs only
 
     def check(self) -> CakeKDANondetKcpOptions:
         if self.exchange not in EXCHANGES:
@@ -4650,7 +5260,15 @@ def _validate_options(kwargs: dict[str, Any]) -> CakeKDANondetKcpOptions:
             if key in raw:
                 p2[key] = (
                     int(raw.pop(key))
-                    if key in ("fused_walks", "host_trim", "saved_carry", "fwd_o_fuse")
+                    if key
+                    in (
+                        "fused_walks",
+                        "host_trim",
+                        "saved_carry",
+                        "fwd_o_fuse",
+                        "default_ws",
+                        "kept_pool",
+                    )
                     else str(raw.pop(key))
                 )
     if (
@@ -4781,6 +5399,9 @@ class CakeKDANondetKcpCall:
             "merges": 0,
             "stages": 0,
         }
+        # the asynchronous collective works issued and not yet waited: a package-kept default workspace frees its
+        # storage at the call's end only with none left (_default_release)
+        self.unwaited = 0
         self.sequence: list[str] = []
         self.merge_log: list[
             tuple[str, int, int, int | None]
@@ -4803,6 +5424,8 @@ class CakeKDANondetKcpCall:
         self.l2n = False
         self.l2n_mode = "off"
         self.l2n_values: dict[str, Any] | None = None
+        # whether the call carries a recompute handle (set by _fwd_handle): a field of the rank-agreement digest
+        self.with_handle = False
         self.exchange = _exchange_scheme(tb, opts)
         self.precision_mode = int(opts.precision_mode)
         self.transfer_walk = str(opts.transfer_walk)
@@ -4831,6 +5454,15 @@ class CakeKDANondetKcpCall:
         self.walk_form_log: list[
             tuple[str, str, int]
         ] = []  # (program, form, n_walk) per K1 / K2 walk launch
+        # "auto": the walk_streams rule per summary pair; "one" / "two" forced
+        self.walk_streams = str(opts.walk_streams)
+        self.walk_streams_log: list[
+            tuple[str, str, int]
+        ] = []  # (decided form, form run, n_walk) per summary pair (_offset_pair)
+        # "first": the saved-mode backward's K1 tape replay before kcp_dav; "under_b1": after the b1 issue (_tape_order)
+        self.bwd_tape_order = str(opts.bwd_tape_order)
+        # "main": the backward's dm-form K3 on the call's stream; "side": on the side stream (_k3_stream)
+        self.bwd_k3_stream = str(opts.bwd_k3_stream)
         self.merge_fuse = str(opts.merge_fuse)  # fused carry merges
         self.saved_carry = int(
             opts.saved_carry
@@ -4981,7 +5613,7 @@ class CakeKDANondetKcpCall:
                 )
             recv.copy_(send)
             return None
-        return dist.all_to_all_single(
+        work = dist.all_to_all_single(
             recv,
             send,
             output_split_sizes=recv_splits,
@@ -4989,11 +5621,26 @@ class CakeKDANondetKcpCall:
             group=self.group,
             async_op=True,
         )
+        if work is not None:
+            self.unwaited += 1
+        return work
 
-    @staticmethod
-    def wait(work) -> None:
+    def wait(self, work) -> None:
         if work is not None:
             work.wait()
+            self.unwaited -= 1
+
+    def exchange_ready(self) -> None:
+        """Right before the call's first collective (c1 / ring hop 1 of a forward, b1 / ring hop 1 of a saved-mode
+        backward; with the rank-agreement check): a package-kept default workspace allocates every pool it has not
+        allocated yet but the lazily allocated ones (:meth:`CakeKDANondetKcpWorkspace._unpark_all`), so the first
+        launch does not wait for the pools it does not read and no kept pool is first allocated once the call's
+        c1 / b1 exchange or first ring hop is issued (an allocator miss there would run ``cudaMalloc`` or an
+        out-of-memory retry inside the exchange, and a raise there would leave the peers waiting in it); the lazily
+        allocated ones are allocated by their first reader, before that exchange.  Nothing on any other workspace.
+        The drivers call it through :func:`_exchange_ready`."""
+        if self.ws._parked:
+            self.ws._unpark_all(self.backward)
 
     def _sequence(self, tag: str, kind: str = "a2a") -> None:
         self.sequence.append(f"{kind}:{tag}")
@@ -5042,6 +5689,9 @@ def _record(kind: str, call: CakeKDANondetKcpCall) -> None:
         "walk_forms": list(
             call.walk_form_log
         ),  # (record, form, n_walk) per K1 / K2 walk launch: the registry's rule or the walk_form knob
+        "walk_streams": list(
+            call.walk_streams_log
+        ),  # (decided form, form run, n_walk) per summary pair: the walk_streams rule or knob, and the streams it ran on
         # the host path of this call (1 trimmed = shipped / 0 previous; same launches)
         "host_trim": call.host_trim,
         "merge_fuse": call.merge_fuse,  # the fused carry merges (test knob)
@@ -5059,6 +5709,9 @@ def _record(kind: str, call: CakeKDANondetKcpCall) -> None:
         "recompute_handle": call.scratch.get(
             "recompute_handle"
         ),  # None without a handle; "capture" (the original forward stored its entry) / "replay" (it bound one)
+        "rank_check": call.scratch.get(
+            "rank_check"
+        ),  # the hex digest of the one-time rank-agreement check this call issued (_rank_check), None otherwise; not in n_collectives / sequence
         "checkpoint_handoff": call.scratch.get(
             "checkpoint_handoff"
         ),  # None without the hand-off; "save" (the forward kept its tape set) / "bound" (the backward read one)
@@ -5068,7 +5721,28 @@ def _record(kind: str, call: CakeKDANondetKcpCall) -> None:
         "saved_bytes": call.scratch.get(
             "saved_bytes"
         ),  # bytes of the forward's saved set (CakeKDANondetKcpSaved.bytes: no int32 tables), None without one
+        # the rows set of saved_rows the forward kept / the backward read ("intra" / "wy"; None without one) and its
+        # bytes (cake_kda_nondet_train_kcp_handoff_bytes(..., saved_rows=...)): the set actually kept, not the request
+        "saved_rows": call.scratch.get("saved_rows"),
+        "saved_rows_bytes": call.scratch.get("saved_rows_bytes"),
+        # whether the forward's kept set (the tape set or a rows set) came from the package-private pool of its device
+        # (_kept_pool); None without a kept set
+        "kept_pool": call.scratch.get("kept_pool"),
+        # the place of a backward's K1 tape replay ("first" / "under_b1": the order run, _tape_order; None on a forward)
+        # and why a backward under the knob value "under_b1" ran "first" (None otherwise)
+        "bwd_tape_order": call.scratch.get("bwd_tape_order"),
+        "bwd_tape_order_refusal": call.scratch.get("bwd_tape_order_refusal"),
+        # the stream of a backward's dm-form K3 ("main" / "side": the stream run, _k3_stream; None on a forward) and why
+        # a backward under the knob value "side" ran it on the call's stream (None otherwise)
+        "bwd_k3_stream": call.scratch.get("bwd_k3_stream"),
+        "bwd_k3_stream_refusal": call.scratch.get("bwd_k3_stream_refusal"),
+        # a backward's kcp_dav: "launched" / "skipped" (cake_kcp_plan.kcp_dav_needed or the knob kcp_dav="always");
+        # None on a forward or a backward without a local stage
+        "kcp_dav": call.scratch.get("kcp_dav"),
         "save_transfer": call.opts.save_transfer,
+        # a workspace=None call's package-kept workspace: "hit" (a kept one), "miss" (a new one the package keeps),
+        # "bypass" (a new one per call: _default_acquire); None with a caller's workspace
+        "default_ws": call.scratch.get("default_ws"),
         "graph": call.opts.graph,
         "graph_event": "eager",
         "graph_key": None,
@@ -5097,6 +5771,108 @@ def _record(kind: str, call: CakeKDANondetKcpCall) -> None:
     handoff = call.scratch.get("checkpoint_handoff")
     if handoff is not None:
         HANDOFF_STATS[handoff] += 1
+    rows = call.scratch.get("saved_rows")
+    if rows is not None:  # a rows set is no hand-off tape set: its own counters
+        SAVED_ROWS_STATS[("bound_" if call.backward else "save_") + rows] += 1
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Rank agreement: the one-time check of a call key's collective-relevant metadata across ``ctx.group``
+#
+# The ranks of a group must agree on the partition, ``H`` and the options that set the count, order and split sizes of
+# the collectives (``cake_kcp_plan.RANK_CHECK_FIELDS``); a disagreement used to hang in, or exchange wrong bytes through,
+# the first exchange.  The first call of each (context, key) on a group of more than one rank all-gathers the 16-byte
+# digest of that metadata (``cake_kcp_plan.kcp_rank_digest``) right before its first collective, on the compute
+# stream, and asserts on the device that every rank's digest equals rank 0's.  No host synchronization: the digest
+# goes up in one pinned non-blocking copy, the gather is a ``all_gather_into_tensor`` of ``int64[2]`` per rank, the
+# comparison a device-side ``torch._assert_async``.  Later calls of the key issue nothing.  Never inside a CUDA-graph
+# capture (the first call of a graph key runs eagerly, so the key is checked before its capture; replays run no host
+# code), never in a recompute with a handle (it exchanges nothing; its original forward checked the key) and never on
+# one rank.  The check is not one of the exchange's collectives: ``n_collectives`` / ``sequence`` stay those of
+# c1 / c2 / b1 / b2 / the ring hops; ``LAST_CALL[kind]["rank_check"]`` and :data:`RANK_CHECK_STATS` count it.
+
+RANK_CHECK_STATS: dict[str, int] = {
+    "issued": 0
+}  # rank-agreement checks this process issued (one per (context, key))
+_RANK_CHECK_MSG = (
+    "cake_kda_nondet_train_kcp: the ranks of ctx.group disagree on the partition, the head count or an option that "
+    "sets the collectives (rank-agreement check of the call's first collective)"
+)
+
+
+class _RankChecks:
+    """The rank-agreement state of one context: its partition digest (hashed once) and the call keys checked, each
+    with its digest.  Kept weakly per context (:data:`_RANK_CHECKS`): it dies with the context."""
+
+    __slots__ = ("partition", "done")
+
+    def __init__(self, ctx: Any) -> None:
+        self.partition = cake_kcp_plan.kcp_partition_digest(ctx.partition)
+        self.done: dict[tuple, bytes] = {}
+
+
+_RANK_CHECKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _rank_check_fields(call: CakeKDANondetKcpCall, boundary: str) -> dict[str, Any]:
+    """The call's fields of the rank-agreement digest (``cake_kcp_plan.RANK_CHECK_FIELDS``, in that order).
+    ``boundary``: ``"saved"`` (a forward that keeps a saved set, a backward that reads one) or ``"replay"`` (a
+    forward that keeps none, a replay-mode backward)."""
+    return {
+        "H": int(call.H),
+        "exchange": str(call.exchange),
+        "save_transfer": bool(call.opts.save_transfer),
+        "boundary": str(boundary),
+        "debug_sequence": bool(call.opts.debug_sequence),
+        "recompute_handle": bool(call.with_handle),
+        "gate": str(call.gate),
+        "qk_l2norm": bool(call.l2n),
+    }
+
+
+def _rank_check(call: CakeKDANondetKcpCall, boundary: str) -> None:
+    """The one-time rank-agreement check of the call's key (see above), issued right before the call's first
+    collective; nothing on one rank, without an initialized process group, inside a CUDA-graph capture (the key stays
+    unchecked) or for a key this context has checked.  Records the digest (hex) as ``call.scratch["rank_check"]``."""
+    if not (dist.is_available() and dist.is_initialized()) or call.world == 1:
+        return
+    ctx = call.ctx
+    fields = _rank_check_fields(call, boundary)
+    key = tuple(fields.values())
+    checks = _RANK_CHECKS.get(ctx)
+    if checks is not None and key in checks.done:
+        return
+    if _capturing():
+        return
+    if checks is None:
+        checks = _RANK_CHECKS[ctx] = _RankChecks(ctx)
+    digest = cake_kcp_plan.kcp_rank_digest(
+        checks.partition, int(ctx.conv_kernel_size), fields
+    )
+    words = (
+        int.from_bytes(digest[:8], "little", signed=True),
+        int.from_bytes(digest[8:], "little", signed=True),
+    )
+    # one pinned non-blocking copy on the current stream (a plain tensor off CUDA); the gather and the assert are
+    # ordered after it on the same stream
+    mine = cake_kcp_plan._upload_tables(
+        {"digest": (words, torch.int64, (2,))}, call.device
+    )[0]["digest"]
+    every = torch.empty((call.world * 2,), dtype=torch.int64, device=mine.device)
+    dist.all_gather_into_tensor(every, mine, group=call.group)
+    rows = every.view(call.world, 2)
+    torch._assert_async((rows == rows[0]).all(), _RANK_CHECK_MSG)
+    checks.done[key] = digest
+    call.scratch["rank_check"] = digest.hex()
+    RANK_CHECK_STATS["issued"] += 1
+
+
+def _exchange_ready(call: Any) -> None:
+    """:meth:`CakeKDANondetKcpCall.exchange_ready` of a package call, right before the call's first collective (and
+    its rank-agreement check, :func:`_rank_check`); nothing on a test's driver call (a duck-typed call, which keeps
+    no default workspace and whose method log is compared with the deterministic package's drivers)."""
+    if isinstance(call, CakeKDANondetKcpCall):
+        call.exchange_ready()
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -5242,12 +6018,15 @@ def _ring_p2p(
         return []
     ops = [dist.P2POp(dist.isend, t, peer, group=call.group) for t, peer in sends]
     ops += [dist.P2POp(dist.irecv, t, peer, group=call.group) for t, peer in recvs]
-    return dist.batch_isend_irecv(ops) if ops else []
+    works = dist.batch_isend_irecv(ops) if ops else []
+    call.unwaited += len(works)
+    return works
 
 
-def _ring_wait(works) -> None:
+def _ring_wait(call: CakeKDANondetKcpCall, works) -> None:
     for w in works:
         w.wait()
+    call.unwaited -= len(works)
 
 
 def _ring_chain(
@@ -5331,7 +6110,7 @@ def _ring_forward(call: CakeKDANondetKcpCall) -> None:
         )
         if h == 1 and call.schedule == "overlap":
             _ring_start_walk(call)  # document starts: under hop 1 (R7)
-        _ring_wait(works)
+        _ring_wait(call, works)
         for f in receivers:
             _ring_scatter(
                 call,
@@ -5427,7 +6206,7 @@ def _ring_backward(call: CakeKDANondetKcpCall) -> None:
         )
         if h == 1 and call.schedule == "overlap":
             _ring_end_walk(call)  # document ends: under hop 1 (R7)
-        _ring_wait(works)
+        _ring_wait(call, works)
         for f in receivers:
             _ring_scatter(
                 call,
@@ -5448,19 +6227,11 @@ def _summaries(call: CakeKDANondetKcpCall) -> None:
     composes the crossing-out fragments' segments (forward family -> ``B_f``, adjoint family -> ``M_f^T``)."""
     tb = call.tb
     if tb.P == 1:
-        call.walk(
-            "kcp_fwdh_offset",
+        _offset_pair(
+            call,
             tb.walk_offset,
-            h0=None,
-            out=call.indexed("c1_send", tb.out_index, tb.c1_b_tiles),
-        )
-        call.walk(
-            "kcp_transfer_walk",
-            tb.walk_offset,
-            out=call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
-            init_mode=0,
-            use_u=0,
-            write_transposed=0,
+            call.indexed("c1_send", tb.out_index, tb.c1_b_tiles),
+            call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
         )
         return
     _stage_walks(call)
@@ -5475,19 +6246,79 @@ def _summaries(call: CakeKDANondetKcpCall) -> None:
 def _stage_walks(call: CakeKDANondetKcpCall) -> None:
     """``P > 1``: the K1 ``_offset`` / K3 walks of every segment into the staging planes ``stage_b`` / ``stage_m``."""
     tb = call.tb
-    call.walk(
-        "kcp_fwdh_offset",
+    _offset_pair(
+        call,
         tb.walk_offset,
-        h0=None,
-        out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+        call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+        call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
     )
-    call.walk(
-        "kcp_transfer_walk",
-        tb.walk_offset,
-        out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
-        init_mode=0,
-        use_u=0,
-        write_transposed=0,
+
+
+def _offset_pair(
+    call: CakeKDANondetKcpCall, walk: Sequence[int], out_b: Indexed, out_m: Indexed
+) -> None:
+    """The summary pair over ``walk``: K1 ``_offset`` (the walk from zero into ``out_b``) and K3 (the transfer into
+    ``out_m``), in this issue order.  The two read the same local operands and write disjoint tiles, and the next
+    launch reads both, so they may run concurrently: on two streams (:func:`walk_streams`, the call's
+    ``walk_streams`` knob) K1 goes on the call's stream and K3 on the device's side stream
+    (:func:`_pair_streams`) between a fork (an event recorded on the call's stream, waited by the side stream) and
+    a join (an event recorded on the side stream, waited by the call's stream) -- every launch after the pair, the
+    ``c1`` collective included, is ordered after both.  The fork / join are stream-ordered event operations, so a
+    CUDA-graph capture of the call captures them as graph dependencies.
+
+    Allocator: the side stream allocates nothing.  Its operands -- the arena views, the pools ``out_m`` addresses
+    (built here, before the fork, on the call's stream) and the table set's device tables -- are owned by the
+    workspace, the call or the table set and stay alive past the join, which the call's stream waits for before any
+    later launch; a block allocated on the call's stream is reused by the caching allocator only on that stream, so
+    no reuse can overtake the side stream's work.  The device tables of a launch are uploaded on the current stream
+    at its table set's first launch (never under a capture), so the first pair of a table set over ``walk`` on a
+    device runs on one stream (its K3 would otherwise read a table K1 uploads after the fork); once both launches
+    have been issued, their tables are resident and later pairs take the decided form.  Two streams run only on the
+    trimmed host path (``host_trim=1``) of the kernel backend on a CUDA device; the previous host path and other
+    backends keep one stream.  ``call.walk_streams_log`` records ``(decided form, form run, n_walk)``."""
+    if len(walk) == 0:
+        return
+    k3_args = {"out": out_m, "init_mode": 0, "use_u": 0, "write_transposed": 0}
+    if not isinstance(
+        call, CakeKDANondetKcpCall
+    ):  # a test's driver call: the two launches in order
+        call.walk("kcp_fwdh_offset", walk, h0=None, out=out_b)
+        call.walk("kcp_transfer_walk", walk, **k3_args)
+        return
+    decided, streams, seen, key = "one", None, None, None
+    if call.device.type == "cuda" and isinstance(call.backend, KernelBackend):
+        index = (
+            call.device.index
+            if call.device.index is not None
+            else torch.cuda.current_device()
+        )
+        decided = call.tb.walk_streams(
+            walk, call.H, cake_jit.sm_count(index), call.walk_streams
+        )
+        if decided == "two" and call.host_trim:
+            seen = call.tb.__dict__.setdefault("_pair_seen", set())
+            key = (id(walk), index)  # the table set's own list object
+            pair = _pair_streams(index)  # created in the eager first pair of the key
+            streams = pair if key in seen else None
+    if streams is None:
+        call.walk("kcp_fwdh_offset", walk, h0=None, out=out_b)
+        call.walk("kcp_transfer_walk", walk, **k3_args)
+        if seen is not None:
+            seen.add(key)  # both launches issued: their device tables are resident
+    else:
+        side, fork, join = streams
+        main = torch.cuda.current_stream(call.device)
+        fork.record(main)
+        side.wait_event(fork)
+        try:
+            call.walk("kcp_fwdh_offset", walk, h0=None, out=out_b)
+            with torch.cuda.stream(side):
+                call.walk("kcp_transfer_walk", walk, **k3_args)
+        finally:  # the join also on an error: a capture never ends with the side stream unjoined
+            join.record(side)
+            main.wait_event(join)
+    call.walk_streams_log.append(
+        (decided, "one" if streams is None else "two", len(walk))
     )
 
 
@@ -5555,8 +6386,9 @@ def _adj_tapes(
 
 
 def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
-    """The shapes of the checkpoint hand-off's tape set of this call (:data:`cake_kcp_plan.KCP_HANDOFF_BUFFERS`, BF16):
-    the local arena's ``h`` / ``v_new`` / ``w`` / ``aqk_int`` / ``akk_int`` buffers of the context's plan."""
+    """The shapes of the buffers a saved set may keep of this call (BF16): the checkpoint hand-off's tape set
+    (:data:`cake_kcp_plan.KCP_HANDOFF_BUFFERS`: the local arena's ``h`` / ``v_new`` / ``w`` / ``aqk_int`` / ``akk_int``
+    buffers of the context's plan) and ``u`` (the WY program's u rows, of the ``"wy"`` rows set)."""
     ctx, H = call.ctx, call.H
     NC_pad, R = int(ctx.NC_pad), int(ctx.R)
     return {
@@ -5565,16 +6397,136 @@ def _tape_shapes(call: CakeKDANondetKcpCall) -> dict[str, tuple[int, ...]]:
         "w": (R, H, D),
         "aqk_int": (R, H, BT),
         "akk_int": (R, H, BT),
+        "u": (R, H, D),
     }
 
 
-def _tape_alloc(call: CakeKDANondetKcpCall) -> dict[str, torch.Tensor]:
-    """Fresh per-call tensors of the tape set (every element a launch of the forward reads is written by one of the
-    forward's own launches; :data:`_HANDOFF_POISON` NaN-fills them first, for the tests)."""
-    tape = {
-        n: _alloc(shape, torch.bfloat16, call.device)
-        for n, shape in _tape_shapes(call).items()
-    }
+# The package-private pools of the checkpoint passes' kept sets (the knob kept_pool, shipped 1): one torch.cuda.MemPool
+# per device index, made at the first kept set of a checkpoint pass on that device and kept until
+# default_workspace_cache_clear() drops it.  A recompute
+# keeps its set from inside the call -- whose workspace=None arena is allocated at the call's start and freed at its end
+# (_default_acquire / _default_release) -- to the node's backward, which then allocates the larger backward arena.  In
+# the caching allocator's default pool the set lands in the remainder of the block the forward arena was cut from, so
+# that block cannot serve the backward arena and the reserved memory grows by up to an arena per call (measured on
+# GB300, CP4, H = 64, 65536 tokens per pack: +5.0 GiB steady with the gate, +10.1 GiB with the raw gate, the allocated
+# peak +0.8 GiB).  In its own pool the set reuses its own blocks: the pool holds the largest set kept at a time (the wy
+# rows: 768 B per internal token-head, about 0.8 GiB per rank at 16384 tokens and H = 64), which the default pool's
+# other allocations cannot use and torch.cuda.empty_cache() does not release while the pool lives (after
+# default_workspace_cache_clear() it does).  The row count of a set changes from pack to pack (each document's rows are padded to
+# whole chunks), and a block cut for one pack's rows does not fit a slightly larger set; so each kept tensor's block is
+# cut for its leading extent rounded up to 16 steps per power of two (:func:`_kept_extent`, at most 1/16 more), so packs
+# of nearby sizes take the same blocks (_kept_tensors).  A caller-held workspace's arena stays allocated between calls,
+# so nothing is freed and reallocated around its kept set: its calls keep the default pool, whose blocks the set then
+# shares with the step's other allocations.  A saving forward outside a checkpoint (saved_rows="intra" / "wy" on a
+# plain autograd call) keeps its rows in the default pool: they live until each layer's backward, and their blocks then
+# serve the next step's other allocations.
+# Host time: the kept sets are allocated where the GPU waits for the host (a recompute's first launches follow the
+# call's host work with nothing queued), so _tape_alloc makes the begin / end / release calls of use_mem_pool itself
+# (no generator, no second capture check) and rounds a tensor only when its rows exceed the largest extent rounded so
+# far for its name and trailing shape (_KEPT_EXTENTS) or the previous tensor of that key is still alive (_KEPT_LAST):
+# otherwise the freed block of that extent serves the exact shape.  Measured on GB300 (alloc, 5-tensor tape set /
+# 2-tensor rows set): default pool 7.3 / 3.0 us, use_mem_pool + rounding + resize_ 19.9 / 11.2 us, this 9.0 / 4.4 us.
+_MEM_POOL = getattr(torch.cuda, "MemPool", None)
+_USE_MEM_POOL = getattr(torch.cuda, "use_mem_pool", None)
+_POOL_BEGIN = getattr(torch._C, "_cuda_beginAllocateCurrentThreadToPool", None)
+_POOL_END = getattr(torch._C, "_cuda_endAllocateToPool", None)
+_POOL_RELEASE = getattr(torch._C, "_cuda_releasePool", None)
+_KEPT_POOLS: dict[int, Any] = {}
+# per (device index, buffer name, trailing shape): the largest leading extent rounded so far in the device's pool
+_KEPT_EXTENTS: dict[tuple, int] = {}
+# per the same key: a weak reference to the last tensor allocated (a live one keeps its block)
+_KEPT_LAST: dict[tuple, Any] = {}
+
+
+def _kept_extent(n: int) -> int:
+    """The leading extent a kept tensor of ``n`` rows (token rows; chunks for the ``h`` tape) is allocated with in the
+    package-private pool: ``n`` rounded up to a multiple of ``2 ** (bit_length(n) - 5)`` (16 steps per power of two,
+    at most 1/16 more), so the sets of packs of nearby sizes take the same blocks."""
+    step = 1 << max(n.bit_length() - 5, 0)
+    return -(-n // step) * step
+
+
+def _kept_pool(call: CakeKDANondetKcpCall) -> Any:
+    """The pool the kept set of ``call`` comes from: the package-private pool of its device (:data:`_KEPT_POOLS`)
+    when the knob ``kept_pool`` is 1, the call has no caller-held workspace (``scratch["default_ws"]`` set: a
+    ``workspace=None`` call), this thread runs a checkpoint pass (:func:`_checkpoint_pass`) outside a CUDA-graph
+    capture and the torch has ``torch.cuda.MemPool``; ``None`` (the caching allocator's default pool) otherwise.
+    Placement only: the launches and their arguments but the data pointers are the same."""
+    if (
+        not call.opts.kept_pool
+        or _MEM_POOL is None
+        or _USE_MEM_POOL is None
+        or call.device.type != "cuda"
+        or call.scratch.get("default_ws") is None
+    ):
+        return None
+    if torch.cuda.is_current_stream_capturing() or _checkpoint_pass() is None:
+        return None
+    index = call.device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    pool = _KEPT_POOLS.get(index)
+    if pool is None:
+        pool = _KEPT_POOLS.setdefault(index, _MEM_POOL())
+    return pool
+
+
+def _kept_tensors(
+    index: int,
+    names: tuple[str, ...],
+    shapes: dict[str, tuple[int, ...]],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """The kept tensors ``names`` of ``shapes``, allocated while the pool of device ``index`` is active: the exact
+    shape when its rows fit the largest extent rounded so far for the key (:data:`_KEPT_EXTENTS`) and the key's
+    previous tensor is freed (:data:`_KEPT_LAST`), so the freed block of that extent serves it; else the leading
+    extent rounded up (:func:`_kept_extent`) and resized in place to the rows (the storage keeps the rounded size; a
+    contiguous base tensor, not a ``[:n]`` view of a temporary base, which costs about 4 us of host time)."""
+    tape = {}
+    for n in names:
+        shape = shapes[n]
+        rows, *rest = shape
+        key = (index, n, *rest)
+        last = _KEPT_LAST.get(key)
+        if rows <= _KEPT_EXTENTS.get(key, -1) and (last is None or last() is None):
+            t = _alloc(shape, torch.bfloat16, device)
+        else:
+            extent = _kept_extent(rows)
+            if extent > _KEPT_EXTENTS.get(key, -1):
+                _KEPT_EXTENTS[key] = extent
+            t = _alloc((extent, *rest), torch.bfloat16, device).resize_(shape)
+        _KEPT_LAST[key] = weakref.ref(t)
+        tape[n] = t
+    return tape
+
+
+def _tape_alloc(
+    call: CakeKDANondetKcpCall,
+    names: tuple[str, ...] = cake_kcp_plan.KCP_HANDOFF_BUFFERS,
+) -> dict[str, torch.Tensor]:
+    """Fresh per-call tensors of the buffers ``names`` (the tape set by default, or a rows set of
+    :data:`cake_kcp_plan.KCP_SAVED_ROWS`; every element a launch of the forward reads is written by one of the
+    forward's own launches; :data:`_HANDOFF_POISON` NaN-fills them first, for the tests), from the pool
+    :func:`_kept_pool` picks (``scratch["kept_pool"]``: whether it was the package-private one)."""
+    shapes = _tape_shapes(call)
+    pool = _kept_pool(call)
+    call.scratch["kept_pool"] = pool is not None
+    if pool is None:
+        tape = {n: _alloc(shapes[n], torch.bfloat16, call.device) for n in names}
+    else:
+        index = call.device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        if _POOL_BEGIN is None or _POOL_END is None or _POOL_RELEASE is None:
+            with _USE_MEM_POOL(pool, call.device):
+                tape = _kept_tensors(index, names, shapes, call.device)
+        else:  # the calls use_mem_pool makes; _kept_pool returns no pool under a capture
+            _POOL_BEGIN(index, pool.id)
+            try:
+                tape = _kept_tensors(index, names, shapes, call.device)
+            finally:
+                _POOL_END(index, pool.id)
+                _POOL_RELEASE(index, pool.id)
     if _HANDOFF_POISON:
         for t in tape.values():
             t.fill_(float("nan"))
@@ -5582,19 +6534,27 @@ def _tape_alloc(call: CakeKDANondetKcpCall) -> dict[str, torch.Tensor]:
 
 
 def _bind_tape(call: CakeKDANondetKcpCall, tape: dict[str, torch.Tensor]) -> None:
-    """Point the call's local stages and walks at the tape set: the value dict (``h`` and its ``h2d`` view, ``v_new``,
-    ``w``, ``aqk_int``, ``akk_int``), a copy of the layout's view namespace (the arena's cached one stays untouched)
-    and, on a lean arena, the tail ranges' per-pass row views rebuilt over the bound buffers.  Every other buffer stays
-    the arena's.  The launch list is unchanged; only these five destinations / sources move."""
+    """Point the call's local stages and walks at kept buffers -- the checkpoint hand-off's tape set (``h`` and its
+    ``h2d`` view, ``v_new``, ``w``, ``aqk_int``, ``akk_int``) or a rows set of ``saved_rows``
+    (:data:`cake_kcp_plan.KCP_SAVED_ROWS`: ``aqk_int`` / ``akk_int``, also ``w`` / ``u``): the value dict, a copy of
+    the layout's view namespace (the arena's cached one stays untouched) and, on a lean arena, the tail ranges' per-pass
+    row views rebuilt over the bound buffers.  Every other buffer stays the arena's.  The launch list is unchanged;
+    only these destinations / sources move.  Their bytes go to ``scratch["checkpoint_handoff_bytes"]`` (the tape set)
+    or ``scratch["saved_rows_bytes"]`` (a rows set)."""
     values = call.local_values
     if values is None:
-        raise ValueError("the checkpoint hand-off needs the local stage values")
+        raise ValueError(
+            "kept rows (the checkpoint hand-off's or saved_rows') need the local stage values"
+        )
     views = types.SimpleNamespace(**{**vars(call.scratch["views"]), **tape})
-    call.scratch["checkpoint_handoff_bytes"] = sum(
-        t.numel() * t.element_size() for t in tape.values()
-    )
+    nbytes = sum(t.numel() * t.element_size() for t in tape.values())
+    if "h" in tape:
+        call.scratch["checkpoint_handoff_bytes"] = nbytes
+    else:
+        call.scratch["saved_rows_bytes"] = nbytes
     values.update(tape)
-    values["h2d"] = tape["h"].view(-1, D)
+    if "h" in tape:
+        values["h2d"] = tape["h"].view(-1, D)
     if values.get("_kcp_tail"):
         values["_kcp_tail"] = _tail_pass_values(
             views, call.ctx, call.local.plan, *_lean_tail(call.local)
@@ -5640,8 +6600,9 @@ def _forward(
     replay: bool,
     bound: dict[str, torch.Tensor] | None = None,
     tape: dict[str, torch.Tensor] | None = None,
+    rows: str | None = None,
     alloc_out: bool = False,
-) -> None:
+) -> dict[str, torch.Tensor] | None:
     """The design note §3.5.  ``save``: the saved set is kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive
     tensor and ``M_seg``); ``replay``: the forward of a replay-mode backward (no ``fwd_o``, nothing kept).
     ``bound``: the received tensors a recompute handle stored (``S_in``; under ``save_transfer`` also ``c1_recv``):
@@ -5653,6 +6614,13 @@ def _forward(
     and the internal ``Aqk`` / ``Akk`` rows into these tensors instead of the arena's slots (:func:`_bind_tape`) and
     read them there; the carry plane stays in the workspace pool (only the backward's tape replay, which the set
     replaces, reads a saved plane).
+    ``rows``: the rows set of ``saved_rows`` a saving forward keeps (``"intra"`` / ``"wy"``,
+    :data:`cake_kcp_plan.KCP_SAVED_ROWS`; never with ``tape``), returned as fresh per-call tensors (``None`` without):
+    the intra program writes the internal ``Aqk`` / ``Akk`` rows into two of them (bound in the value dict before its
+    launch: the program reads no other row of them), and with ``"wy"`` the WY program writes ``w`` / ``u`` into two
+    more (allocated after the intra launch, so only the first two allocations precede the first launch); the view
+    namespace is copied once, after the intra launch (:func:`_bind_tape`).  The fused walk, the carry plane and
+    every other launch and collective stay those of the light forward.
     ``schedule="wait_first"`` (the shipped default since an earlier revision): ``c1 -> wait -> fwd merge -> c2 -> wait -> carry merges -> tape walk(s)``
     -- no merge or walk is issued while a collective is in flight (the R7 overlap of the document-start walk under c1
     is dropped); the merges read only ``c1_recv`` / the staging planes and the tapes read no collective buffer, so
@@ -5669,13 +6637,24 @@ def _forward(
     if tape is not None:
         _bind_tape(call, tape)
         call.scratch["checkpoint_handoff"] = "save"
+    kept = None
     if replay:  # the replay's prep (the GLM prep's rows, the internal dout copy), then the internal Aqk / Akk rows
         _fwd_buffers(call, save=save, replay=replay, bound=bound, tape=tape)
         _bwd_rows(call, None)
     else:  # the intra program writes the GLM prep's rows itself (write_prep = 1); no token-row copies are saved
         if call.l2n:
             _qk_l2norm_stage(call)
+        # a rows set: the intra program's destinations, in the value dict only, before its launch
+        if rows is not None:
+            kept = _tape_alloc(call, ("aqk_int", "akk_int"))
+            call.local_values.update(kept)
         call.stage("fwd_intra")
+        # a rows set: the WY program's destinations, then every later launch reads the kept rows
+        if rows is not None:
+            if rows == "wy":
+                kept.update(_tape_alloc(call, ("w", "u")))
+            _bind_tape(call, kept)
+            call.scratch["saved_rows"] = rows
         call.stage("wy_fwd")
         # the two local stages read neither the KCP buffers nor ``out`` (their records bind no ``out``, and the
         # buffers are K1-K4 / collective operands; the hand-off's tape set they write is bound above): allocated
@@ -5693,6 +6672,11 @@ def _forward(
     ):  # the stage walks only: the carry merges below read stage_b / stage_m
         _stage_walks(call)
     carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
+    if bound is None:
+        # the call's first collective (c1 / ring hop 1) follows: a kept default workspace's remaining pools, then the
+        # one-time rank-agreement check of its key (a replay-mode backward's forward checks the backward's key here)
+        _exchange_ready(call)
+        _rank_check(call, "replay" if (replay or not save) else "saved")
     if (
         bound is not None
     ):  # S_in is bound: no exchange; the overlap schedule's launches of the exchange window, in its order
@@ -5734,15 +6718,25 @@ def _forward(
     _fwd_tapes(call, out=call.out, carry=carry, wait_first=wait_first)
     if not replay and not fuse_o:
         call.stage("fwd_o")
+    return kept
 
 
-def _bwd_rows(call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None) -> None:
+def _bwd_rows(
+    call: CakeKDANondetKcpCall,
+    saved: CakeKDANondetKcpSaved | None,
+    rows: dict[str, torch.Tensor] | None = None,
+) -> None:
     """The backward's local rows before its walks (``saved=None``: the replay mode): the prep (the GLM prep's rows,
     the internal ``dout`` copy), the intra program (the internal ``Aqk`` / ``Akk`` rows the WY, dav and gradient
     programs read) and the WY program.  In-kernel Q / K L2 norm: the fallback form's separate normalization first;
     in the fused form the plan's first q / k reader first (its intra program where the existing backend runs that
     before the prep, :func:`cake_kcp_plan.qk_l2norm_intra_first`: the prep then reads the normalized rows; the two
-    programs read none of each other's rows)."""
+    programs read none of each other's rows).  The outputs :func:`_bwd_body` deferred are allocated right after the
+    first of the two (:func:`_late_grads`).  ``rows``: the saved set's kept rows (:attr:`CakeKDANondetKcpSaved.rows`):
+    :func:`_bwd_kept_rows` instead."""
+    if rows is not None:
+        _bwd_kept_rows(call, rows)
+        return
     if call.l2n:
         _qk_l2norm_stage(call)
     if (
@@ -5751,11 +6745,39 @@ def _bwd_rows(call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None) -
         and cake_kcp_plan.qk_l2norm_intra_first(call.local.plan)
     ):
         call.stage("fwd_intra")
+        _late_grads(call)
         call.stage("bwd_prep", saved=saved)
     else:
         call.stage("bwd_prep", saved=saved)
+        _late_grads(call)
         call.stage("fwd_intra")
     call.stage("wy")
+
+
+def _bwd_kept_rows(call: CakeKDANondetKcpCall, rows: dict[str, torch.Tensor]) -> None:
+    """The backward's local rows from a saved set that keeps a rows set of ``saved_rows`` (``"intra"``: ``aqk_int`` /
+    ``akk_int``; ``"wy"``: also ``w`` / ``u``): no intra program.  In-kernel Q / K L2 norm: the normalized rows first
+    where the skipped intra program wrote them (:func:`_handoff_l2n_rows`, as the checkpoint hand-off).  Then the prep
+    (the GLM prep's rows, the internal ``dout`` copy and the ``v_new`` pad rows, as in the light backward) and the
+    kept rows bound for every later launch (:func:`_bind_tape`) -- before the WY program, which reads ``akk_int``, and
+    after the prep, which binds none of them -- then the WY program unless ``w`` / ``u`` are kept.  The K1 tape replay
+    and the rest of the backward run as in the light backward.  The outputs :func:`_bwd_body` deferred are allocated
+    right after the first launch (:func:`_late_grads`).  The arena's scratch table set is made as the skipped intra
+    program would make it (:func:`_scratch_tables`), so the workspace after the backward is the light path's."""
+    p = call.local.plan
+    if call.l2n:
+        _handoff_l2n_rows(call)
+        if call.l2n_mode == "fused" and cake_kcp_plan.qk_l2norm_intra_first(p):
+            # after the separate normalization, this backward's first launch
+            _late_grads(call)
+    call.stage("bwd_prep", saved=None)
+    _late_grads(call)
+    _bind_tape(call, rows)
+    call.scratch["saved_rows"] = "wy" if "u" in rows else "intra"
+    if cake_kcp_plan.intra_writes_tables(p, LOCAL_PATH_BWD):
+        _scratch_tables(call.local)
+    if "u" not in rows:
+        call.stage("wy")
 
 
 def _qk_l2norm_stage(call: CakeKDANondetKcpCall) -> None:
@@ -5767,6 +6789,179 @@ def _qk_l2norm_stage(call: CakeKDANondetKcpCall) -> None:
         call.stage("qk_apply" if read else "qk_l2norm")
 
 
+def _handoff_l2n_rows(call: CakeKDANondetKcpCall) -> None:
+    """The normalized token-layout q / k rows of a checkpoint hand-off backward with the in-kernel Q / K L2 norm, before
+    its prep (the hand-off skips the backward's intra program).  The fallback form: its separate normalization from
+    the saved rstd, as the light backward.  The fused form, where the replay's first q / k reader is its intra program
+    (:func:`cake_kcp_plan.qk_l2norm_intra_first`; the prep then reads the rows it wrote): the separate normalization
+    record (:data:`L2N_DIRECT_RECORDS`) from the saved rstd into the same rows -- the intra program's ``_l2n`` twin
+    with ``read_rstd = 1`` and that record both store ``bf16(x * r)`` (one FP32 product of the raw element and the
+    saved rstd, rounded to nearest), so the rows are bitwise the ones the light backward's intra program writes.
+    Nothing where the prep is the first reader: the prep's ``_l2n`` twin normalizes from the saved rstd as in the
+    light backward."""
+    if call.l2n_mode == "fallback":
+        _qk_l2norm_stage(call)
+    elif cake_kcp_plan.qk_l2norm_intra_first(call.local.plan):
+        call.stage("qk_apply", direct=True)
+
+
+def _tape_order(
+    call: CakeKDANondetKcpCall,
+    *,
+    replay: bool,
+    tape: dict[str, torch.Tensor] | None,
+    rows: dict[str, torch.Tensor] | None,
+) -> str:
+    """The place of this backward's K1 tape replay (``bwd_tape_order``, :data:`BWD_TAPE_ORDERS`, shipped
+    ``"under_b1"``): ``"under_b1"`` where the knob asks for it and the backward admits it, else ``"first"``; recorded in
+    ``scratch["bwd_tape_order"]`` with the refusal in ``scratch["bwd_tape_order_refusal"]`` (``None`` when the order
+    is the knob's): ``"replay"`` (a replay-mode backward: its forward replay walks the tapes before c1),
+    ``"handoff"`` (the checkpoint hand-off's tape set: no K1 tape replay), ``"segments"`` (``P > 1``: the replay
+    walks from the carry plane), ``"ring"``, ``"schedule"`` (the overlap schedule), ``"backend"`` (not the kernel
+    backend, whose ``dav`` stage skips ``kcp_dav``), ``"no_local"`` (no local stages or no tokens: nothing to move),
+    ``"lean"`` (a lean arena, unless a kept ``u`` of ``saved_rows="wy"`` stands in for the arena's ``u``: the order
+    is recorded on the replay layout only) and ``"dav"`` (``kcp_dav`` runs: the plan dispatches its ``dav``
+    stage (:func:`cake_kcp_plan.kcp_dav_needed`) or the knob ``kcp_dav="always"`` asks for it, and it reads the
+    replay's ``v_new``).  Between the old and the new place run the ``dav`` stage (which launches nothing there), K2
+    ``_offset`` (it reads ``aqk_int`` / ``do_int`` and the prep's rows and writes b1 send tiles) and the dm-form K3
+    (b1 send tiles), the rank-agreement check and the b1 issue: none writes a buffer the replay reads or reads its
+    ``h`` / ``v_new``.  Every input is rank-local and the order moves no collective, so ranks may decide
+    differently."""
+    order, reason = "first", None
+    if call.bwd_tape_order == "under_b1":
+        local = call.local
+        if replay:
+            reason = "replay"
+        elif tape is not None:
+            reason = "handoff"
+        elif call.tb.P > 1:
+            reason = "segments"
+        elif call.exchange == "ring":
+            reason = "ring"
+        elif call.schedule != "wait_first":
+            reason = "schedule"
+        elif not isinstance(call.backend, KernelBackend):
+            reason = "backend"
+        elif local is None or call.T_r == 0:
+            reason = "no_local"
+        elif _lean_passes(local) and (rows is None or "u" not in rows):
+            reason = "lean"
+        elif cake_kcp_plan.kcp_dav_needed(local.plan) or call.opts.kcp_dav == "always":
+            reason = "dav"
+        else:
+            order = "under_b1"
+    call.scratch["bwd_tape_order"] = order
+    call.scratch["bwd_tape_order_refusal"] = reason
+    return order
+
+
+def _tape_replay_p0(call: CakeKDANondetKcpCall) -> None:
+    """The saved-mode backward's K1 tape replay of the first segments of its fragments from the saved ``S_in`` (at
+    ``P = 1`` the whole replay)."""
+    tb = call.tb
+    # the trimmed arm passes the table set's own sublists (a fresh comprehension per call would miss the
+    # identity-keyed device-table cache on every call: one blocking host-to-device copy per backward)
+    p0 = tb.walk_all_p0 if call.host_trim else [s for s in tb.walk_all if s % tb.P == 0]
+    call.walk(
+        "kcp_fwdh_tape",
+        p0,
+        h0=call.indexed("S_in", tb.h0_index, tb.s_in_tiles),
+        out=None,
+    )
+
+
+def _k3_stream(call: CakeKDANondetKcpCall, *, form: str) -> tuple[str, tuple | None]:
+    """The stream of this backward's dm-form K3 (``bwd_k3_stream``, :data:`BWD_K3_STREAMS`, shipped ``"side"``) and, where
+    the table set's first K3 over its list on this device runs on the call's stream, the key that marks that launch
+    issued (else ``None``): ``"side"`` where the knob asks for it and the backward admits it, else ``"main"``; recorded
+    in ``scratch["bwd_k3_stream"]`` with the refusal in ``scratch["bwd_k3_stream_refusal"]`` (``None`` when the
+    stream is the knob's): ``"form"`` (no dm-form K3: the saved set keeps the c1 receive tensor, or the replay mode),
+    ``"segments"`` (``P > 1``: the maps come from the staging plane's merge), ``"ring"``, ``"no_walk"`` (no fragment
+    of this rank sends its map in b1), ``"backend"`` (not the kernel backend on a CUDA device), ``"host_trim"`` (the
+    previous host path), ``"rule"`` (:func:`walk_streams` of the K3 list, H and the device's SM count keeps one
+    stream; the test knob ``walk_streams`` forces a form) and ``"first_launch"`` (the table set's first K3 over the
+    list on the device, which uploads the launch's device tables, runs on the call's stream as in
+    :func:`_offset_pair`).  K3 reads ``w`` / ``kg`` / ``gk`` (``use_u=0``) and writes the M halves of its b1 send
+    tiles; between the fork and the join the call's stream runs the K1 tape replay (writes ``h`` / ``v_new``),
+    ``kcp_dav`` (``dAqk`` / ``dv1``) and K2 ``_offset`` (the d halves of the same tiles): none writes a row K3 reads
+    or touches the bytes it writes.  Every input is rank-local and no collective moves, so ranks may decide
+    differently."""
+    stream, reason, mark = "main", None, None
+    if call.bwd_k3_stream == "side":
+        tb = call.tb
+        if form != "dm":
+            reason = "form"
+        elif tb.P > 1:
+            reason = "segments"
+        elif call.exchange == "ring":
+            reason = "ring"
+        elif not len(tb.walk_m_b1):
+            reason = "no_walk"
+        elif call.device.type != "cuda" or not isinstance(call.backend, KernelBackend):
+            reason = "backend"
+        elif not call.host_trim:
+            reason = "host_trim"
+        else:
+            index = (
+                call.device.index
+                if call.device.index is not None
+                else torch.cuda.current_device()
+            )
+            decided = tb.walk_streams(
+                tb.walk_m_b1, call.H, cake_jit.sm_count(index), call.walk_streams
+            )
+            key = (id(tb.walk_m_b1), index)  # the table set's own list object
+            if decided != "two":
+                reason = "rule"
+            else:
+                _pair_streams(
+                    index
+                )  # created in an eager call (the first K3 of the key), as by _offset_pair
+                if key not in tb.__dict__.get("_k3_side_seen", ()):
+                    reason, mark = "first_launch", key
+                else:
+                    stream = "side"
+    call.scratch["bwd_k3_stream"] = stream
+    call.scratch["bwd_k3_stream_refusal"] = reason
+    return stream, mark
+
+
+def _k3_side_fork(call: CakeKDANondetKcpCall) -> tuple[Any, Any]:
+    """Issue the backward's dm-form K3 (``M_f`` into the M halves of the b1 send tiles) on the device's side stream
+    (:func:`_pair_streams`, the summary pair's stream and events): the pool view it writes is built on the call's
+    stream first (a parked pool is allocated there, never on the side stream), an event recorded on the call's stream
+    forks the side stream and the join event is recorded on the side stream right after the launch (also on an
+    error).  Returns ``(the call's stream, the join event)``; :func:`_backward` makes the call's stream wait for the
+    join before the b1 issue (in a ``finally``).  The side stream allocates nothing: its operands are owned by the
+    workspace, the saved set or the table set and outlive the join (the allocator argument of :func:`_offset_pair`);
+    no other pair forks between this fork and that join (the backward's summary pairs run in its replay forward,
+    before it)."""
+    tb = call.tb
+    out = call.indexed("b1_send", tb.m_b1_index, tb.b1_m_tiles)
+    index = (
+        call.device.index
+        if call.device.index is not None
+        else torch.cuda.current_device()
+    )
+    side, fork, join = _pair_streams(index)
+    main = torch.cuda.current_stream(call.device)
+    fork.record(main)
+    side.wait_event(fork)
+    try:
+        with torch.cuda.stream(side):
+            call.walk(
+                "kcp_transfer_walk",
+                tb.walk_m_b1,
+                out=out,
+                init_mode=0,
+                use_u=0,
+                write_transposed=1,
+            )
+    finally:
+        join.record(side)
+    return main, join
+
+
 def _backward(call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None) -> None:
     """The design note §6.5.  ``saved=None`` is the replay mode (the forward sequence without ``fwd_o`` recomputes
     ``S_in``, the tapes and the owner's c1 receive tensor); otherwise the tapes come from K1 ``_tape`` over the saved
@@ -5776,12 +6971,28 @@ def _backward(call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None) -
     checkpoint hand-off's tape set (:attr:`CakeKDANondetKcpSaved.tape`) skips the intra program, WY, the K1 tape replay and the
     ``P > 1`` re-walk / carry merges: the forward's tape set stands in for their outputs (``w`` from the forward's WY
     program instead of the replay's; the hand-off rows check every gradient bitwise against the light path); every
-    collective is the same."""
+    collective is the same.  The same holds in raw gate mode (the raw prep, gradient programs and ``param_finalize``
+    read the set) and with the in-kernel Q / K L2 norm, whose normalized rows the backward rebuilds before its prep
+    where the skipped intra program wrote them (:func:`_handoff_l2n_rows`).  A saved set with a rows set of
+    ``saved_rows`` (:attr:`CakeKDANondetKcpSaved.rows`) takes the light path without the intra program (and, with
+    ``"wy"``, without the WY program) (:func:`_bwd_kept_rows`): the K1 tape replay, the carry plane and every
+    collective stay; the gradients are within the light path's FP64 error budget (not bitwise: the forward's rows
+    stand in for the backward's recompute).  ``bwd_tape_order="under_b1"`` (shipped, where :func:`_tape_order` admits
+    it; else ``"first"``): the ``P = 1`` K1 tape replay runs after the b1 issue and before its wait (only where
+    ``kcp_dav``, its one earlier reader of ``v_new``, does not run); the launches, the collectives and the gradients
+    are the same.  ``bwd_k3_stream="side"`` (shipped, where :func:`_k3_stream` admits it; else ``"main"``): the
+    ``P = 1`` dm-form K3 runs on the side stream from right after the last writer of its operands, beside the K1 tape
+    replay, ``kcp_dav`` and K2 ``_offset``, joined back before the b1 issue; the same launches, collectives and
+    gradients."""
     tb = call.tb
     wait_first = call.schedule == "wait_first"
     replay = saved is None
-    # the checkpoint hand-off's tape set (None without one)
+    # the checkpoint hand-off's tape set (None without one: a rows set of saved_rows is not one)
     tape = None if replay else saved.tape
+    # the kept rows of saved_rows (None without them): the light path below, without the intra / WY programs
+    rows = None if replay else saved.rows
+    # the K1 tape replay's place (bwd_tape_order): "under_b1" moves it behind the b1 issue below
+    under_b1 = _tape_order(call, replay=replay, tape=tape, rows=rows) == "under_b1"
     if replay:
         _forward(call, save=False, replay=True)
         m_source = "c1"
@@ -5797,7 +7008,10 @@ def _backward(call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None) -
         # the checkpoint hand-off: the replay prep (its v_new pad-row writes stay in the arena's dead slot), then the
         # forward's tape set bound for every later launch -- no intra program, no WY program, no K1 tape replay, no
         # P > 1 offset re-walk or carry merges (they feed the tape replay only); K3 still writes stage_m where the
-        # saved set has no M_seg (the owner's map merge tmap_m reads it; K3 reads no u under use_u=0)
+        # saved set has no M_seg (the owner's map merge tmap_m reads it; K3 reads no u under use_u=0).  In-kernel
+        # Q / K L2 norm: the normalized rows first where the skipped intra program wrote them (_handoff_l2n_rows)
+        if call.l2n:
+            _handoff_l2n_rows(call)
         call.stage("bwd_prep", saved=None)
         _bind_tape(call, tape)
         call.scratch["checkpoint_handoff"] = "bound"
@@ -5816,7 +7030,7 @@ def _backward(call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None) -
                 write_transposed=0,
             )
     elif not replay:
-        _bwd_rows(call, saved)
+        _bwd_rows(call, saved, rows)
         plane = (
             saved.carry if tb.P > 1 else None
         )  # the forward's carry plane (shipped; None under saved_carry=0): no K1 offset re-walk, no carry merges
@@ -5863,79 +7077,93 @@ def _backward(call: CakeKDANondetKcpCall, saved: CakeKDANondetKcpSaved | None) -
                 h0=call.indexed("carry", tb.h0_index_fused, tb.carry_tiles),
                 out=None,
             )
-        else:
-            # the trimmed arm passes the table set's own sublists (a fresh comprehension per call would miss the
-            # identity-keyed device-table cache on every call: one blocking host-to-device copy per backward)
+        elif tb.P > 1:  # the P = 1 replay runs below, after the dm-form K3's fork
             trim = bool(call.host_trim)
-            p0 = tb.walk_all_p0 if trim else [s for s in tb.walk_all if s % tb.P == 0]
+            _tape_replay_p0(call)
+            rest = (
+                tb.walk_all_rest if trim else [s for s in tb.walk_all if s % tb.P != 0]
+            )
             call.walk(
                 "kcp_fwdh_tape",
-                p0,
-                h0=call.indexed("S_in", tb.h0_index, tb.s_in_tiles),
+                rest,
+                h0=call.indexed("carry", tb.carry_index, tb.carry_tiles),
                 out=None,
             )
-            if tb.P > 1:
-                rest = (
-                    tb.walk_all_rest
-                    if trim
-                    else [s for s in tb.walk_all if s % tb.P != 0]
-                )
-                call.walk(
-                    "kcp_fwdh_tape",
-                    rest,
-                    h0=call.indexed("carry", tb.carry_index, tb.carry_tiles),
-                    out=None,
-                )
         if plane is not None:
             del call.bufs[
                 "carry"
             ]  # the saved plane is never written: dcarry_* publish into the workspace pool
-    call.stage("dav")
     ring = call.exchange == "ring"
     form = (
         "dm" if (m_source == "b1" or ring) else "d"
     )  # the ring's adjoint step needs M_f on the fragment's own rank
-    if tb.P == 1:
-        call.walk(
-            "kcp_dhu_offset",
-            tb.walk_in,
-            dht=None,
-            out=call.indexed("b1_send", tb.in_index, tb.b1_d_tiles[form]),
-        )
-        if (
-            form == "dm"
-        ):  # the maps travel with the offsets: M_f (untransposed) beside d_f
+    # the dm-form K3's stream (bwd_k3_stream): "side" issues it here, after the last writer of w / kg / gk (the WY
+    # program, or the prep / the bound set where the WY rows come from the saved set), on the side stream, and the
+    # call's stream waits for it before the b1 issue below; mark: the first launch's key (main stream, then marked)
+    k3_side, mark = _k3_stream(call, form=form)
+    k3 = _k3_side_fork(call) if k3_side == "side" else None
+    try:
+        if not replay and tape is None and tb.P == 1 and not under_b1:
+            _tape_replay_p0(call)  # "under_b1": after the b1 issue below
+        call.stage("dav")
+        if tb.P == 1:
             call.walk(
-                "kcp_transfer_walk",
-                tb.walk_m_b1,
-                out=call.indexed("b1_send", tb.m_b1_index, tb.b1_m_tiles),
-                init_mode=0,
-                use_u=0,
-                write_transposed=1,
+                "kcp_dhu_offset",
+                tb.walk_in,
+                dht=None,
+                out=call.indexed("b1_send", tb.in_index, tb.b1_d_tiles[form]),
             )
-    else:
-        call.walk(
-            "kcp_dhu_offset",
-            tb.walk_all,
-            dht=None,
-            out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
-        )
-        call.merge(
-            f"tmap_d_{form}"
-        )  # d_f of the crossing-in fragments (adjoint family)
-        if form == "dm":
+            if (
+                form == "dm" and k3 is None
+            ):  # the maps travel with the offsets: M_f (untransposed) beside d_f
+                call.walk(
+                    "kcp_transfer_walk",
+                    tb.walk_m_b1,
+                    out=call.indexed("b1_send", tb.m_b1_index, tb.b1_m_tiles),
+                    init_mode=0,
+                    use_u=0,
+                    write_transposed=1,
+                )
+                if (
+                    mark is not None
+                ):  # its device tables are resident: later calls may take the side stream
+                    tb.__dict__.setdefault("_k3_side_seen", set()).add(mark)
+        else:
+            call.walk(
+                "kcp_dhu_offset",
+                tb.walk_all,
+                dht=None,
+                out=call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+            )
             call.merge(
-                "tmap_m"
-            )  # M_f of the fragments whose map travels (forward family)
+                f"tmap_d_{form}"
+            )  # d_f of the crossing-in fragments (adjoint family)
+            if form == "dm":
+                call.merge(
+                    "tmap_m"
+                )  # M_f of the fragments whose map travels (forward family)
+    finally:  # the join also on an error: a capture never ends with the side stream unjoined
+        if k3 is not None:
+            k3[0].wait_event(k3[1])
     dcarry = (
         call.indexed("carry", tb.dcarry_index, tb.carry_tiles) if tb.P > 1 else None
     )
+    if not replay:
+        # b1 / ring hop 1 is the saved-mode backward's first collective: a kept default workspace's remaining pools,
+        # then the one-time rank-agreement check of its key (the replay forward above checked a replay-mode
+        # backward's key before its c1)
+        _exchange_ready(call)
+        _rank_check(call, "saved")
     if ring:  # SPEC-2: adjoint hops from the document end; b2_recv filled as b2 would (bitwise)
         _ring_backward(
             call
         )  # dcarry_end + the document-end tape walk run under hop 1 (overlap schedule only)
     else:
         wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_elems(f"b1_{form}"))
+        if under_b1:
+            # the K1 tape replay while b1 is in flight: it reads no collective buffer, and its h / v_new tapes are
+            # first read by the fused gradient (_tape_order admits this order only where kcp_dav does not run)
+            _tape_replay_p0(call)
         call.wait(wb1)
         call.merge(
             "adj_b1" if m_source == "b1" else "adj_c1"
@@ -6282,6 +7510,12 @@ def _l2n_key_flags(l2n: bool) -> tuple[Any, ...]:
     return ("qk_l2norm",) if l2n else ()
 
 
+def _rows_key_flags(rows: str | None) -> tuple[Any, ...]:
+    """The rows set of ``saved_rows`` in a graph validity key: ``("saved_rows", rows)`` when one is kept (a forward
+    that keeps it) or read (a backward of a saved set with it), nothing otherwise (the key is unchanged)."""
+    return () if rows is None else ("saved_rows", rows)
+
+
 def _l2n_key_saved(saved: CakeKDANondetKcpSaved | None) -> tuple[Any, ...]:
     """A backward's saved ``qk_rstd`` in its graph validity key (nothing for a flag-off saved set)."""
     return (saved.qk_rstd,) if saved is not None and saved.qk_l2norm else ()
@@ -6331,11 +7565,14 @@ def _call_workspace(
     l2n: bool,
     device: torch.device | str | None,
 ) -> CakeKDANondetKcpWorkspace:
-    """The workspace of a call: without one (``None``) a default workspace of the call's modes, the backend's state
-    dtype and local stages (with the flag on, its construction checks the mode on ``device``'s architecture; its
-    "eye" pool is the device's shared identity tile, :func:`_identity_tile`); otherwise ``workspace``, which must be
-    a :class:`CakeKDANondetKcpWorkspace` of the call's gate and in-kernel Q / K L2 norm modes and the backend's state dtype
-    (``TypeError`` / ``ValueError``; a workspace of the deterministic package: ``ValueError`` naming the mode)."""
+    """The workspace of a call: without one (``None``) a new default workspace of the call's modes, the backend's
+    state dtype and local stages (with the flag on, its construction checks the mode on ``device``'s architecture;
+    its "eye" pool is the device's shared identity tile, :func:`_identity_tile`) -- the first workspace of a key the
+    package then keeps (:func:`_default_acquire`: later calls of the key reuse its host objects and allocate the
+    same device bytes per call through the caching allocator; the package keeps host objects only), or a bypassed
+    call's own; otherwise ``workspace``, which must be a :class:`CakeKDANondetKcpWorkspace` of the call's gate and
+    in-kernel Q / K L2 norm modes and the backend's state dtype (``TypeError`` / ``ValueError``; a workspace of the
+    deterministic package: ``ValueError`` naming the mode)."""
     if workspace is None:
         workspace = CakeKDANondetKcpWorkspace(
             device=device,
@@ -6366,6 +7603,236 @@ def _call_workspace(
             f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}"
         )
     return workspace
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# The package-kept default workspace of ``workspace=None`` calls (the knob ``default_ws``, shipped 1)
+#
+# A call without a workspace runs on a workspace the package keeps per key: the device, the current raw stream, the
+# backend, its state dtype and local stages, the save, gate and in-kernel Q / K L2 norm modes, the direction,
+# inference mode, the local plan key (T_r, n_frag, H), the table knobs and the elements of every pool of the call's
+# table set (the lazily allocated ones included, :func:`_pool_sig`), so every byte it allocates is the call's own.
+# Its host objects stay between calls: the pool tensors, the local arena object with its layout views and launch
+# templates, the ``[:n]`` views, the ``ensure`` records and the passed mode checks.  Its device storage lives for the
+# call alone: the arena is allocated at the start of the call, each pool at its first reader and the rest of the
+# pools the call needs right before its first collective, so none is first allocated once c1 / b1 / ring hop 1 is issued
+# (``untyped_storage().resize_(n)`` of the parked storages, the same bytes from the same caching allocator on the same
+# stream as a new workspace's ``torch.empty``), the lazily allocated pools at their first reader only, and everything
+# is freed at the call's end (:meth:`CakeKDANondetKcpWorkspace._park`), so between calls only the shared identity tile
+# and, on the rows whose intra record writes the chunk tables, a KiB-scale scratch table buffer per kept workspace
+# stay allocated.  The kernels, their records, grids, launch order and every argument but the data pointers are a
+# new workspace's: bitwise.  A kept workspace is checked out exclusively (the backward and a checkpoint recompute run
+# on the autograd thread): one ``list.pop`` takes it, one ``list.append`` returns it, each atomic (this module imports
+# no locking module); a call on another stream takes its own, so no stream waits for another.  Bypassed (a new
+# workspace per call, as with ``default_ws=0``): a CUDA-graph capture (its allocations belong to the graph's pool),
+# a non-CUDA device and a context without the context-held table cache (whose table sets would hold the context).
+# A call that raises never returns its workspace: its storage dies by reference counting, as a per-call
+# workspace's does.
+
+DEFAULT_WS_KEYS = 16  # keys whose workspaces are kept (the least recently used key goes first); 0 = bypass every call
+DEFAULT_WS_PER_KEY = 2  # workspaces kept per key (concurrent calls of a key: the forward and a checkpoint recompute)
+_DEFAULT_WS: collections.OrderedDict[tuple, list[CakeKDANondetKcpWorkspace]] = (
+    collections.OrderedDict()
+)
+# hit (a kept workspace), miss (a new one, kept after the call), bypass (a new one per call), drop (a workspace not
+# kept: its key full, or evicted meanwhile), evict (kept workspaces dropped with their least recently used key: calls
+# that cycle through more than DEFAULT_WS_KEYS keys, such as a new stream per step -- the stream is in the key --
+# miss every time), unwaited (not kept: the call left a collective unwaited, _default_release)
+DEFAULT_WS_STATS: dict[str, int] = {
+    "hit": 0,
+    "miss": 0,
+    "bypass": 0,
+    "drop": 0,
+    "evict": 0,
+    "unwaited": 0,
+}
+# the passed checks of the in-kernel Q / K L2 norm of default calls: (gate, device) -> the functions of the plan module
+# that ran it (kept by identity, so a replaced function is checked again; a passed check is kept like a held
+# workspace's)
+_L2N_DEFAULT_OK: dict[tuple[str, torch.device], tuple[Any, ...]] = {}
+
+
+def _default_l2n_check(gate: str, device: Any) -> None:
+    """The capability refusal of the in-kernel Q / K L2 norm that a default workspace's construction runs
+    (:meth:`CakeKDANondetKcpWorkspace._require_l2n` of the fused form, rank-independent inputs only), once per
+    (gate, device) while :func:`cake_kcp_plan.qk_l2norm_arch`, :func:`cake_kcp_plan.require_qk_l2norm` and
+    :func:`cake_kcp_plan.qk_l2norm_missing` are the functions that passed it; a device without an index (or not a
+    ``torch.device``) is checked on every call."""
+    fns = (
+        cake_kcp_plan.qk_l2norm_arch,
+        cake_kcp_plan.require_qk_l2norm,
+        cake_kcp_plan.qk_l2norm_missing,
+    )
+    key = None
+    if isinstance(device, torch.device) and (
+        device.type != "cuda" or device.index is not None
+    ):
+        key = (gate, device)
+        kept = _L2N_DEFAULT_OK.get(key)
+        if kept is not None and all(map(operator.is_, kept, fns)):
+            return
+    cake_kcp_plan.require_qk_l2norm(
+        cake_kcp_plan.qk_l2norm_mode(True, None), gate, fns[0](device)
+    )
+    if key is not None:
+        _L2N_DEFAULT_OK[key] = fns
+
+
+def _pool_sig(tb: _Tables, backward: bool) -> tuple[int, ...]:
+    """The elements of every pool of ``tb`` on a ``backward`` / forward-only workspace, the lazily allocated ones
+    included (:meth:`_Tables.pool_sizes`), in the default workspace's key: with the local plan key they fix every
+    byte a default workspace allocates.  Kept on the table set per direction."""
+    kept = tb.__dict__.setdefault("_kcp_pool_sig", {})
+    sig = kept.get(backward)
+    if sig is None:
+        sig = kept[backward] = tuple(tb.pool_sizes(backward).values())
+    return sig
+
+
+def _default_key(
+    ctx: Any,
+    H: int,
+    device: torch.device,
+    backend: Any,
+    save_mode: str,
+    gate: str,
+    l2n: bool,
+    backward: bool,
+    opts: CakeKDANondetKcpOptions,
+) -> tuple | None:
+    """The key of a default call's kept workspace, ``None`` for a bypassed call (module comment above)."""
+    if (
+        device.type != "cuda"
+        or getattr(ctx, "_table_sets", None) is None
+        or getattr(ctx, "table_cache", cake_kcp_plan.TABLE_CACHE_DEFAULT) != "context"
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    fused_walks, walk_geometry = int(opts.fused_walks), str(opts.walk_geometry)
+    tb = _table_set(
+        ctx._table_sets,
+        (int(H), fused_walks, walk_geometry, TABLE_SET_TAG),
+        ctx,
+        H,
+        fused_walks,
+        walk_geometry,
+        True,
+    )
+    return (
+        index,
+        _raw_stream(index),
+        id(backend),
+        backend.dtypes["state"],
+        bool(backend.local_stages),
+        save_mode,
+        gate,
+        bool(l2n),
+        bool(backward),
+        torch.is_inference_mode_enabled(),
+        int(ctx.T_r),
+        int(ctx.n_frag),
+        int(H),
+        fused_walks,
+        walk_geometry,
+        _pool_sig(tb, backward),
+    )
+
+
+def _default_acquire(
+    ctx: Any,
+    H: int,
+    device: torch.device,
+    backend: Any,
+    save_mode: str,
+    gate: str,
+    l2n: bool,
+    backward: bool,
+    opts: CakeKDANondetKcpOptions,
+) -> tuple[CakeKDANondetKcpWorkspace, str]:
+    """The workspace of a ``workspace=None`` call and how it was found (``"hit"`` / ``"miss"`` / ``"bypass"``,
+    :data:`DEFAULT_WS_STATS`): a kept workspace of the call's key, checked out, with its local arena allocated
+    (:meth:`CakeKDANondetKcpWorkspace._unpark_arena`; each pool is allocated at its first reader,
+    :meth:`CakeKDANondetKcpWorkspace.pool`, and the rest of the call's pools right before its first collective,
+    :meth:`CakeKDANondetKcpCall.exchange_ready`), or a new one (:func:`_call_workspace`), which the package keeps
+    after the call unless the call is bypassed."""
+    key = _default_key(ctx, H, device, backend, save_mode, gate, l2n, backward, opts)
+    if key is None:
+        DEFAULT_WS_STATS["bypass"] += 1
+        return _call_workspace(None, backend, save_mode, gate, l2n, device), "bypass"
+    free = _DEFAULT_WS.get(key)
+    try:  # atomic: two calls of a key never take the same workspace
+        ws = free.pop() if free else None
+    except IndexError:  # another thread took the last one meanwhile
+        ws = None
+    if ws is None:
+        DEFAULT_WS_STATS["miss"] += 1
+        ws = _call_workspace(None, backend, save_mode, gate, l2n, device)
+        ws._default_key = key
+        return ws, "miss"
+    DEFAULT_WS_STATS["hit"] += 1
+    ws._unpark_arena()
+    return ws, "hit"
+
+
+def _default_release(call: CakeKDANondetKcpCall) -> None:
+    """The end of a successful call on a package-kept default workspace (nothing on any other): its device storage
+    goes back to the caching allocator on the call's stream (:meth:`CakeKDANondetKcpWorkspace._park`) and the
+    workspace is kept for the next call of its key (at most :data:`DEFAULT_WS_PER_KEY` per key and
+    :data:`DEFAULT_WS_KEYS` keys, the least recently used key dropped).  Runs after the call's last launch and
+    ``end_call``, on the success path only -- never in a ``finally``: ``resize_(0)`` frees a block whatever still
+    references its tensor, so every collective the call issued must have been waited.  Each is, at its first
+    consumer inside the call (c1 / c2 / b1 / b2, the ring hops), so the block is reused only after the collective in
+    stream order, as when a per-call workspace's tensors die; a call that left a collective unwaited
+    (``call.unwaited``) does not keep its workspace, whose storage then dies by reference counting (a collective
+    holding a tensor keeps its block alive), and neither does a call that raised."""
+    ws = call.ws
+    key = ws._default_key
+    if key is None:
+        return
+    if call.unwaited:
+        DEFAULT_WS_STATS["unwaited"] += 1
+        return
+    ws._park()
+    free = _DEFAULT_WS.setdefault(key, [])
+    try:
+        _DEFAULT_WS.move_to_end(key)  # the most recently used key last
+    except KeyError:  # evicted by another thread meanwhile: not kept
+        DEFAULT_WS_STATS["drop"] += 1
+        return
+    if len(free) < DEFAULT_WS_PER_KEY:
+        free.append(ws)
+    else:
+        DEFAULT_WS_STATS["drop"] += 1
+    while len(_DEFAULT_WS) > DEFAULT_WS_KEYS:
+        try:
+            DEFAULT_WS_STATS["evict"] += len(_DEFAULT_WS.popitem(last=False)[1])
+        except KeyError:  # emptied by another thread meanwhile
+            break
+
+
+def default_workspace_cache_clear() -> int:
+    """Drop every workspace the package keeps for ``workspace=None`` calls, the kept checks of their in-kernel
+    Q / K L2 norm and the package-private pools their checkpoint passes keep the kept set in (:data:`_KEPT_POOLS`);
+    returns the number of workspaces dropped.  The workspaces hold no device memory between calls but their scratch
+    table buffers (KiB, on the rows whose intra record writes the chunk tables), which go back to the caching
+    allocator; the next call of each key builds a new workspace.  A pool keeps its blocks (about one kept set per
+    device) reserved between calls and ``torch.cuda.empty_cache()`` does not release the blocks of a live pool:
+    after the pools are dropped it does (a kept set alive at that moment keeps its blocks until it is freed), and
+    the next checkpoint pass of a ``workspace=None`` call makes a new pool.  ``DEFAULT_WS_STATS`` is left as it is.
+    :func:`set_backend` calls it.  One ``popitem`` per key, each atomic, so a release on another thread meanwhile
+    never breaks the loop."""
+    n = 0
+    while True:
+        try:
+            n += len(_DEFAULT_WS.popitem(last=False)[1])
+        except KeyError:  # empty
+            break
+    _L2N_DEFAULT_OK.clear()
+    _KEPT_POOLS.clear()
+    _KEPT_EXTENTS.clear()
+    _KEPT_LAST.clear()
+    return n
 
 
 def _prepare(
@@ -6415,31 +7882,75 @@ def _prepare(
         raise NotImplementedError(
             "spec3_probe is not supported with use_qk_l2norm_in_kernel=True"
         )
+    # workspace=None: the package-kept default workspace of the call's key (_default_acquire), unless the knob
+    # default_ws=0 (or DEFAULT_WS_KEYS = 0) asks for a new workspace per call
+    default = workspace is None
+    kept = default and bool(opts.default_ws) and DEFAULT_WS_KEYS > 0
     if l2n:
         # the workspace's checks and the capability refusal before the operand checks, on rank-independent inputs
         # only (the context's device model, the workspace's modes): a rank with misaligned or no tokens raises as
-        # the others do (the flag-off order is unchanged)
+        # the others do (the flag-off order is unchanged); a kept default workspace's: the check its construction
+        # runs (_default_l2n_check)
         ctx_dev = getattr(ctx, "device", None)
-        workspace = _call_workspace(workspace, backend, save_mode, gate, l2n, ctx_dev)
-        workspace._require_l2n(ctx_dev)
-    q, k, v, g, beta, T, H, batched = _operands(
-        q, k, v, g, beta, ctx, dtypes=backend.dtypes, gate=gate, qk_l2norm=l2n
-    )
-    device = q.device
-    gp = cake_backend._gate_params(gate, A_log, dt_bias, lower_bound, H, device)
+        if kept:
+            _default_l2n_check(gate, ctx_dev)
+        else:
+            workspace = _call_workspace(
+                workspace, backend, save_mode, gate, l2n, ctx_dev
+            )
+            workspace._require_l2n(ctx_dev)
+    trim2 = not backward and dout is None and opts.fwd_prologue == "trim2"
+    if not backward and dout is None and opts.fwd_prologue != "base":
+        # the trimmed forward prologue: the same checks, once per operand signature
+        (q, k, v, g, beta, T, H, batched), gp = _operands_kept(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            dtypes=backend.dtypes,
+            gate=gate,
+            l2n=l2n,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+        )
+        device = q.device
+    else:
+        q, k, v, g, beta, T, H, batched = _operands(
+            q, k, v, g, beta, ctx, dtypes=backend.dtypes, gate=gate, qk_l2norm=l2n
+        )
+        device = q.device
+        gp = cake_backend._gate_params(gate, A_log, dt_bias, lower_bound, H, device)
     if dout is not None:
         dout = _squeeze_batch(dout, "dout", 3)
         _check(dout, "dout", (T, H, D), backend.dtypes["dout"], device)
-    if not l2n:
-        workspace = _call_workspace(workspace, backend, save_mode, gate, l2n, device)
     # the in-kernel Q / K L2 norm's capability on this device, before the workspace binds anything: rank-independent
     # inputs only, so a rank without tokens raises as the others do (cake_kcp_plan.require_qk_l2norm; checked above
     # on the context's device, nothing again on the same architecture)
-    workspace._require_l2n(device)
+    if kept:
+        # fwd_prologue="trim2": nothing again on the device the check above passed on (the same key, the same result)
+        if l2n and not (trim2 and device == ctx_dev):
+            _default_l2n_check(gate, device)
+    else:
+        if not l2n:
+            workspace = _call_workspace(
+                workspace, backend, save_mode, gate, l2n, device
+            )
+        workspace._require_l2n(device)
     wait_ready = getattr(ctx, "wait_ready", None)
     # a context prepared on another stream: order its uploads on this one (enqueue only)
     if wait_ready is not None:
         wait_ready()
+    found = None
+    if kept:
+        workspace, found = _default_acquire(
+            ctx, H, device, backend, save_mode, gate, l2n, backward, opts
+        )
+    elif default:
+        DEFAULT_WS_STATS["bypass"] += 1
+        found = "bypass"
     tb = workspace.ensure(
         ctx,
         H,
@@ -6468,6 +7979,7 @@ def _prepare(
     )
     call.gate, call.gate_params = gate, gp
     call.l2n, call.l2n_mode = l2n, workspace.l2n
+    call.scratch["default_ws"] = found
     backend.begin_call(call)
     return call, batched
 
@@ -6491,6 +8003,7 @@ def cake_kda_nondet_train_kcp_forward(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    saved_rows: str = cake_kcp_plan.KCP_SAVED_ROWS_DEFAULT,
     **options: Any,
 ) -> tuple[torch.Tensor, CakeKDANondetKcpSaved | None]:
     """The KCP forward of this rank's fragments (the KCP contract §3.2): ``out`` like ``v`` (fresh) and the saved set
@@ -6511,7 +8024,17 @@ def cake_kda_nondet_train_kcp_forward(
     rows (strided views allowed under the rule of :func:`_check_qk_view`, never copied), normalized in the local
     stages per token and 128-channel head with eps ``1e-6`` (``v`` is not); the saved set adds the FP32
     ``qk_rstd`` ``[2, T_r, H]``.  The workspace must be of the same mode (:attr:`CakeKDANondetKcpWorkspace.qk_l2norm`).  With
-    ``False`` (the default) nothing changes."""
+    ``False`` (the default) nothing changes.
+
+    ``saved_rows`` (keyword-only; :data:`KCP_SAVED_ROWS_MODES`, another value raises ``ValueError``): ``"auto"`` (the
+    default), ``"tape"`` and ``"none"`` keep the light saved set, as before; ``"intra"`` keeps the forward's internal ``Aqk`` /
+    ``Akk`` rows (``aqk_int`` / ``akk_int``, BF16 ``[R, H, 64]``) and ``"wy"`` also its WY rows ``w`` / ``u`` (BF16
+    ``[R, H, 128]``) in the saved set (:attr:`CakeKDANondetKcpSaved.rows`), so the backward runs no intra program
+    (and with ``"wy"`` no WY program).  A saving forward of a rank with tokens keeps them; the forward launches the
+    same programs and collectives (its rows go to fresh tensors instead of the arena), and the saved set grows by
+    ``cake_kda_nondet_train_kcp_saved_bytes(..., saved_rows=...)`` (256 / 768 B per internal token-head).  The
+    gradients stay within the light path's FP64 error budget, not bitwise those of the light set.  Refused with the
+    SPEC-3 probe.  ``LAST_CALL["fwd"]["saved_rows"]`` reports the set kept."""
     if boundary_mode not in BOUNDARY_MODES:
         raise ValueError(
             f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
@@ -6520,6 +8043,9 @@ def cake_kda_nondet_train_kcp_forward(
     gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
     l2n = cake_kcp_plan.check_qk_l2norm(use_qk_l2norm_in_kernel)
     save = bool(save_for_backward) and boundary_mode == "saved"
+    rows = _saved_rows_request(saved_rows, opts)
+    if not save:
+        rows = None
     entry = (
         _graph_entry(
             "fwd",
@@ -6528,7 +8054,13 @@ def cake_kda_nondet_train_kcp_forward(
             opts,
             scale,
             (q, k, v, g, beta, *_gate_key_tensors(gate_args)),
-            (save, save_mode, *_gate_key_flags(gate_args), *_l2n_key_flags(l2n)),
+            (
+                save,
+                save_mode,
+                *_gate_key_flags(gate_args),
+                *_l2n_key_flags(l2n),
+                *_rows_key_flags(rows),
+            ),
         )
         if opts.graph != "off"
         else None
@@ -6557,7 +8089,7 @@ def cake_kda_nondet_train_kcp_forward(
             "fwd",
             entry,
             call,
-            lambda: _fwd_body(call, save=save, save_mode=save_mode, ctx=ctx),
+            lambda: _fwd_body(call, save=save, save_mode=save_mode, ctx=ctx, rows=rows),
         )
         if res is not None:
             entry.result = (res[0], res[1], batched)
@@ -6577,11 +8109,12 @@ def cake_kda_nondet_train_kcp_forward(
             **gate_args,
             use_qk_l2norm_in_kernel=l2n,
         )
-    out, saved = _fwd_body(call, save=save, save_mode=save_mode, ctx=ctx)
+    out, saved = _fwd_body(call, save=save, save_mode=save_mode, ctx=ctx, rows=rows)
     _record("fwd", call)
     if opts.graph != "off":
         _graph_eager("fwd", entry)
     call.backend.end_call(call)
+    _default_release(call)
     return _ranked(out, batched), saved
 
 
@@ -6593,19 +8126,29 @@ def _fwd_body(
     ctx: Any,
     bound: dict[str, torch.Tensor] | None = None,
     tape: bool = False,
+    rows: str | None = None,
 ) -> tuple[torch.Tensor, CakeKDANondetKcpSaved | None]:
     """The forward's allocations and launches (eagerly or inside a capture): ``out`` and the saved set.  ``bound``:
     the tensors of a recompute handle's entry (:func:`_forward`); the saved set then holds them.  ``tape``: the
     checkpoint hand-off's decision (:func:`_handoff_decide`): a saving call of a rank with tokens and local stages
-    keeps its tape set (:func:`_tape_alloc`) in the saved set instead of the carry plane.  In-kernel Q / K L2 norm:
-    the rstd the fused intra program writes, kept by a saving forward (:func:`_qk_l2norm_begin`)."""
+    keeps its tape set (:func:`_tape_alloc`) in the saved set instead of the carry plane.  ``rows``: the rows set of
+    ``saved_rows`` to keep (``None``, ``"intra"`` or ``"wy"``; never with ``tape``): a saving call of a rank with
+    tokens and local stages keeps it beside the light set (the carry plane stays; :func:`_forward`); the saved set
+    records the set actually kept (``saved_rows``).  In-kernel Q / K L2 norm: the rstd the fused intra program writes,
+    kept by a saving forward (:func:`_qk_l2norm_begin`)."""
     rstd = _qk_l2norm_begin(call, save=save) if call.l2n else None
-    kept = (
-        _tape_alloc(call)
-        if tape and save and call.local_values is not None and call.T_r > 0
-        else None
+    local_ok = save and call.local_values is not None and call.T_r > 0
+    kept = _tape_alloc(call) if tape and local_ok else None
+    keep_rows = rows if rows is not None and kept is None and local_ok else None
+    kept_rows = _forward(
+        call,
+        save=save,
+        replay=False,
+        bound=bound,
+        tape=kept,
+        rows=keep_rows,
+        alloc_out=True,
     )
-    _forward(call, save=save, replay=False, bound=bound, tape=kept, alloc_out=True)
     if call.l2n:
         call.l2n_values = None
     saved = None
@@ -6623,6 +8166,8 @@ def _fwd_body(
             if (tb.P > 1 and call.saved_carry == 1 and kept is None)
             else None,
             **(kept or {}),
+            **(kept_rows or {}),
+            saved_rows=keep_rows,
             T_r=call.T_r,
             H=call.H,
             n_frag=tb.n_frag,
@@ -6731,9 +8276,35 @@ def _check_saved(saved: CakeKDANondetKcpSaved, call: CakeKDANondetKcpCall) -> No
             call.state_dtype,
             call.device,
         )
-    present = [n for n in CakeKDANondetKcpSaved._TAPE if getattr(saved, n) is not None]
-    if present:
-        if len(present) != len(CakeKDANondetKcpSaved._TAPE):
+    kept_names = (*CakeKDANondetKcpSaved._TAPE, "u")
+    present = [n for n in kept_names if getattr(saved, n) is not None]
+    # a kept rows set: exactly its members, the carry plane allowed
+    if saved.saved_rows is not None:
+        if saved.saved_rows not in ("intra", "wy"):
+            raise ValueError(
+                f"saved: saved_rows {saved.saved_rows!r}, expected 'intra' or 'wy'"
+            )
+        if opts.spec3_probe != "off":
+            raise ValueError(
+                "saved: a rows set of saved_rows is refused with spec3_probe (the probe needs the backward's own "
+                "intra and WY programs)"
+            )
+        want = list(cake_kcp_plan.KCP_SAVED_ROWS[saved.saved_rows])
+        if present != [n for n in kept_names if n in want]:
+            raise ValueError(
+                f"saved: the {saved.saved_rows!r} rows set is {want}, got {present}"
+            )
+        if call.local is None or call.T_r == 0:
+            raise ValueError(
+                "saved: a rows set needs the local stages of a rank with tokens"
+            )
+        shapes = _tape_shapes(call)
+        for n in want:
+            _check(
+                getattr(saved, n), f"saved.{n}", shapes[n], torch.bfloat16, call.device
+            )
+    elif present:
+        if present != list(CakeKDANondetKcpSaved._TAPE):
             raise ValueError(
                 f"saved: the checkpoint hand-off's tape set comes whole, got {present}"
             )
@@ -6743,8 +8314,11 @@ def _check_saved(saved: CakeKDANondetKcpSaved, call: CakeKDANondetKcpCall) -> No
             raise ValueError(
                 "saved: a tape set needs the local stages of a rank with tokens"
             )
-        for n, shape in _tape_shapes(call).items():
-            _check(getattr(saved, n), f"saved.{n}", shape, torch.bfloat16, call.device)
+        shapes = _tape_shapes(call)
+        for n in CakeKDANondetKcpSaved._TAPE:
+            _check(
+                getattr(saved, n), f"saved.{n}", shapes[n], torch.bfloat16, call.device
+            )
 
 
 @_with_option_signature
@@ -6782,7 +8356,13 @@ def cake_kda_nondet_train_kcp_backward(
     ``lower_bound`` (its FP32 value), is refused with ``ValueError``, as is a workspace of the other mode.  The raw
     mode runs the deterministic package's raw records: every output, the raw gate's gradient and the parameter
     partial sums are bitwise those of ``cake_kda_det_train_kcp_backward`` on the same rank, with
-    ``use_qk_l2norm_in_kernel=True`` too (the deterministic ``param_finalize``, as ``param_finalize_l2n``).
+    ``use_qk_l2norm_in_kernel=True`` too (the deterministic ``param_finalize``, as ``param_finalize_l2n``), for
+    ``saved=None`` and a saved set without a rows set of ``saved_rows``.
+
+    A saved set with a rows set of ``saved_rows`` (:attr:`CakeKDANondetKcpSaved.rows`, from
+    :func:`cake_kda_nondet_train_kcp_forward` ``saved_rows="intra"`` / ``"wy"``): the backward binds the forward's
+    internal rows and runs no intra program (with ``"wy"`` no WY program either), in every gate and Q / K L2 norm mode;
+    the gradients are held to the light path's FP64 error budget, not bitwise those of the light set.
 
     ``use_qk_l2norm_in_kernel=True`` (the forward's; issue #7817): the same seven / five tensors, ``dq`` / ``dk`` the
     gradients of the raw ``q`` / ``k`` (contiguous, ranked like ``q``), the FP32 pullback fused into their final BF16
@@ -6806,9 +8386,10 @@ def cake_kda_nondet_train_kcp_backward(
                 saved.M_seg,
                 saved.carry,
                 *(saved.tape or {}).values(),
+                *(saved.rows or {}).values(),
                 *_l2n_key_saved(saved),
             )
-        )  # the validity key sees every saved tensor (the carry plane of saved_carry=1, a tape set, the rstd)
+        )  # the validity key sees every saved tensor (the carry plane of saved_carry=1, a tape set, kept rows, the rstd)
         entry = _graph_entry(
             "bwd",
             ctx,
@@ -6821,6 +8402,7 @@ def cake_kda_nondet_train_kcp_backward(
                 saved is not None,
                 *_gate_key_flags(gate_args),
                 *_l2n_key_flags(l2n),
+                *_rows_key_flags(None if saved is None else saved.saved_rows),
             ),
         )
     if entry is not None and entry.graph is not None:
@@ -6885,6 +8467,7 @@ def cake_kda_nondet_train_kcp_backward(
     if opts.graph != "off":
         _graph_eager("bwd", entry)
     call.backend.end_call(call)
+    _default_release(call)
     return _shaped_grads(grads, batched, g, gate_args, detach=False)
 
 
@@ -6930,10 +8513,31 @@ def _bwd_body(
     launches nothing and returns zero parameter gradients.  In-kernel Q / K L2 norm: the saved set's rstd or, in
     replay mode, a fresh one, and the normalized q / k (:func:`_qk_l2norm_begin`), in the arena where the replay
     layout's ``v_new`` / ``dv2`` ride on the outputs' bytes (:func:`_l2n_row_hosts`; dq / dk are then the two halves
-    of one tensor); the outputs are the same."""
+    of one tensor); the outputs are the same.  A flag-on saved-mode backward of the fused form allocates the outputs
+    and scratch its first local stage binds none of (:func:`_l2n_late_grads`) once that stage is launched
+    (:func:`_late_grads`): the host work before the first launch is not hidden behind queued device work.  A saved
+    set with the checkpoint hand-off's tape set defers nothing (its backward runs no :func:`_bwd_rows`); one with a
+    rows set of ``saved_rows`` defers as the light set."""
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
     hosts = _l2n_row_hosts(call) if call.l2n else {}
+    # a saved set with the checkpoint hand-off's tape set runs no _bwd_rows (whose first stage allocates the deferred
+    # outputs): its backward allocates every output here; a rows set of saved_rows (no tape) defers as the light set
+    # (_bwd_kept_rows allocates them right after its first launch)
+    late = (
+        _l2n_late_grads(call, hosts)
+        if call.l2n and saved is not None and saved.tape is None
+        else frozenset()
+    )
+    # (name, shape, dtype) of the outputs allocated after the first local stage's launch
+    pending: list[tuple[str, tuple[int, ...], torch.dtype]] = []
+
+    def grad(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+        if name in late:
+            pending.append((name, shape, dtype))
+        else:
+            call.grads[name] = _alloc(shape, dtype, call.device)
+
     # the moved arena buffer -> the output tensor whose bytes carry it
     moved: dict[str, torch.Tensor] = {}
     if "dv2" in hosts:
@@ -6942,35 +8546,116 @@ def _bwd_body(
     else:
         dq = _alloc((T, H, D), dt["dq"], call.device)
         dk = _alloc((T, H, D), dt["dk"], call.device)
-    call.grads = {"dq": dq, "dk": dk, "dv": _alloc((T, H, D), dt["dv"], call.device)}
+    call.grads = {"dq": dq, "dk": dk}
+    grad("dv", (T, H, D), dt["dv"])
     if call.gate == "raw":
         names: tuple[str, ...] = _RAW_GRADS
-        call.grads["dg_raw"] = _alloc((T, H, D), dt["dg_raw"], call.device)
-        call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
+        grad("dg_raw", (T, H, D), dt["dg_raw"])
+        grad("dbeta", (T, H), dt["dbeta"])
         if call.local is not None and T > 0:
             nc_pad = int(call.local.plan.NC_pad)
             for name in ("dA_part", "db_part"):
-                call.grads[name] = _alloc((nc_pad, H, D, 2), dt["dA_log"], call.device)
+                grad(name, (nc_pad, H, D, 2), dt["dA_log"])
             # param_finalize's per-call scratch: the second-stage partials and the per-head ticket
-            fin = cake_backend._raw_finalize_scratch(nc_pad, H, call.device)
-            call.grads["part2"] = fin["part2"]
-            call.grads["ticket"] = fin["ticket"]
-            call.scratch["seg_cap"] = int(fin["seg_cap"])
-            call.grads["dA_log"] = _alloc((H,), dt["dA_log"], call.device)
-            call.grads["ddt_bias"] = _alloc((H * D,), dt["ddt_bias"], call.device)
+            if "part2" in late and "ticket" in late:
+                call.scratch["late_finalize"] = nc_pad
+            else:
+                _finalize_scratch(call, nc_pad)
+            grad("dA_log", (H,), dt["dA_log"])
+            grad("ddt_bias", (H * D,), dt["ddt_bias"])
         else:  # no local stage runs on this rank: its tokens contribute nothing
             call.grads["dA_log"] = _zeros((H,), dt["dA_log"], call.device)
             call.grads["ddt_bias"] = _zeros((H * D,), dt["ddt_bias"], call.device)
     else:
         names = ("dq", "dk", "dv", "dbeta", "dg")
-        call.grads["dg"] = _alloc((T, H, D), dt["dg"], call.device)
-        call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
+        grad("dg", (T, H, D), dt["dg"])
+        grad("dbeta", (T, H), dt["dbeta"])
+    if pending or "late_finalize" in call.scratch:
+        call.scratch["late_grads"] = pending
     if "v_new" in hosts:
         moved["v_new"] = call.grads[hosts["v_new"][0]]
     if call.l2n:
         _qk_l2norm_begin(call, None if saved is None else saved.qk_rstd, hosts=moved)
     _backward(call, saved)
+    _late_grads(call)  # nothing left once the first local stage ran
     return tuple(call.grads[n] for n in names)
+
+
+def _finalize_scratch(call: CakeKDANondetKcpCall, nc_pad: int) -> None:
+    """``param_finalize``'s per-call scratch (``cake_backend._raw_finalize_scratch``) into the call."""
+    fin = cake_backend._raw_finalize_scratch(nc_pad, call.H, call.device)
+    call.grads["part2"] = fin["part2"]
+    call.grads["ticket"] = fin["ticket"]
+    call.scratch["seg_cap"] = int(fin["seg_cap"])
+
+
+def _late_grads(call: CakeKDANondetKcpCall) -> None:
+    """Allocate the outputs and scratch :func:`_bwd_body` deferred (:func:`_l2n_late_grads`); nothing when none is
+    pending.  :func:`_bwd_rows` calls it right after the backward's first local stage."""
+    pending = call.scratch.pop("late_grads", None)
+    if pending is None:
+        return
+    for name, shape, dtype in pending:
+        call.grads[name] = _alloc(shape, dtype, call.device)
+    nc_pad = call.scratch.pop("late_finalize", None)
+    if nc_pad is not None:
+        _finalize_scratch(call, nc_pad)
+
+
+# The outputs and scratch a flag-on backward may allocate after its first local stage (:func:`_l2n_late_grads`)
+_L2N_LATE_GRADS = (
+    "dv",
+    "dbeta",
+    "dg",
+    "dg_raw",
+    "dA_part",
+    "db_part",
+    "part2",
+    "ticket",
+    "dA_log",
+    "ddt_bias",
+)
+# The logical names the first local stage of a fused flag-on backward binds, per plan: {id(plan): (a weak reference
+# to it, the registry it read, the names or None)}
+_L2N_FIRST_BOUND: dict[int, tuple[Any, Any, frozenset[str] | None]] = {}
+
+
+def _l2n_late_grads(
+    call: CakeKDANondetKcpCall, hosts: dict[str, tuple[str, ...]]
+) -> frozenset[str]:
+    """The outputs and scratch of :data:`_L2N_LATE_GRADS` a flag-on saved-mode backward allocates once its first
+    local stage is launched: those the record of that stage (the plan's first q / k reader of the fused form,
+    :func:`cake_kcp_plan.qk_l2norm_intra_first`) binds none of, and that carry no moved arena buffer
+    (:func:`_l2n_row_hosts`: the first reader writes ``qn`` / ``kn`` into those buffers' arena bytes and may bind the
+    buffers).  Nothing deferred for the fallback form, a rank without local stages or tokens, another backend, a
+    first stage without a plan record, or the SPEC-3 probe (its forward rows run before the prep)."""
+    if (
+        call.l2n_mode != "fused"
+        or call.local is None
+        or call.T_r == 0
+        or not isinstance(call.backend, KernelBackend)
+        or call.opts.spec3_probe != "off"
+    ):
+        return frozenset()
+    p = call.local.plan
+    kept = _L2N_FIRST_BOUND.get(id(p))
+    if kept is None or kept[0]() is not p or kept[1] is not cake_jit.MODULES:
+        for stale in [k for k, v in _L2N_FIRST_BOUND.items() if v[0]() is None]:
+            del _L2N_FIRST_BOUND[stale]
+        stage = "fwd_intra" if cake_kcp_plan.qk_l2norm_intra_first(p) else "bwd_prep"
+        bound: frozenset[str] | None = None
+        if stage not in KCP_LOCAL_RECORDS and p.dispatched(stage, LOCAL_PATH_BWD):
+            record = p.record(stage, LOCAL_PATH_BWD)
+            bound = frozenset(cake_jit.MODULES[record]["logical"].values())
+        kept = (weakref.ref(p), cake_jit.MODULES, bound)
+        _L2N_FIRST_BOUND[id(p)] = kept
+    bound = kept[2]
+    if bound is None:
+        return frozenset()
+    carriers = {out for outs in hosts.values() for out in outs}
+    return frozenset(
+        name for name in _L2N_LATE_GRADS if name not in bound and name not in carriers
+    )
 
 
 # The in-kernel Q / K L2 norm's backward keeps its token-layout normalized rows in the local arena where it can (issue
@@ -7149,7 +8834,10 @@ def _l2n_bwd_rows(
                 continue
             arena = getattr(views, buf)
             rows[out] = arena[:T]
-            there = host.view(-1).view(arena.dtype)[: arena.numel()].view(arena.shape)
+            # the buffer's contiguous shape on the host's leading bytes (the host is a fresh contiguous output)
+            if host.dtype != arena.dtype:
+                host = host.view(arena.dtype)
+            there = host.as_strided(arena.shape, _contiguous_strides(arena.shape))
             setattr(moved, buf, there)
             call.local_values[buf] = there
         call.scratch["views"] = moved
@@ -7160,6 +8848,16 @@ def _l2n_bwd_rows(
         if out not in rows:
             rows[out] = _alloc((T, H, D), dt["q" if out == "qn" else "k"], call.device)
     return rows["qn"], rows["kn"]
+
+
+@functools.lru_cache(maxsize=64)
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The row-major strides of ``shape`` (elements)."""
+    strides, step = [], 1
+    for n in reversed(shape):
+        strides.append(step)
+        step *= max(int(n), 1)
+    return tuple(reversed(strides))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -7212,8 +8910,10 @@ class CakeKDANondetKcpRecomputeHandle:
 
     The forward state exchange is a collective.  Every rank of ``ctx.group`` must pass a handle for the same call, or
     no rank passes one, and every rank creates it at the same checkpoint nesting level.  A mismatch pairs one rank's
-    recompute exchange with another rank's backward exchange: the ranks hang or exchange wrong data.  No check is
-    made across ranks.  Never share one handle between two KDA calls (also not in nested regions).  Never call
+    recompute exchange with another rank's backward exchange: the ranks hang or exchange wrong data.  Whether a call
+    carries a handle is a field of the rank-agreement digest, so a rank that passes one while another does not trips
+    a device-side assert at the first original forward of that key (module docstring, "Rank agreement"); the nesting
+    level is not checked.  Never share one handle between two KDA calls (also not in nested regions).  Never call
     :meth:`clear` on a handle, or reuse it, while a backward that needs its entry is pending."""
 
     __slots__ = ("entries",)
@@ -7442,13 +9142,15 @@ def _fwd_handle(
     opts,
     handle,
     tape=False,
+    rows: str | None = None,
     gate_args: dict[str, Any] | None = None,
     l2n: bool = False,
 ) -> tuple[torch.Tensor, CakeKDANondetKcpSaved]:
     """The forward of a call with a handle (eager, saved mode): the original forward exchanges and stores the
     handle's entry; the recompute binds it (:func:`_forward`).  ``tape``: the checkpoint hand-off keeps the tape set
-    too (:func:`_fwd_body`).  ``gate_args``: the entry point's gate keywords; ``l2n``: its
-    ``use_qk_l2norm_in_kernel``."""
+    too (:func:`_fwd_body`); ``rows``: the rows set of ``saved_rows`` it keeps instead (:func:`cake_kda_nondet_kcp`'s
+    decision; the recompute binds the handle's entry and keeps the rows of its own launches).  ``gate_args``: the
+    entry point's gate keywords; ``l2n``: its ``use_qk_l2norm_in_kernel``."""
     keep = "transfer" if opts.save_transfer else "states"
     entry = _handle_lookup(handle)
     call, batched = _prepare(
@@ -7466,12 +9168,13 @@ def _fwd_handle(
         **(gate_args or {}),
         use_qk_l2norm_in_kernel=l2n,
     )
+    call.with_handle = True  # a field of the rank-agreement digest (the recompute binds and exchanges nothing)
     fingerprint = _handle_fingerprint(
         call, save_mode=save_mode, keep=keep, **_gate_modes(call), **_l2n_modes(call)
     )
     bound = None if entry is None else _handle_bind(entry, call, fingerprint, keep)
     out, saved = _fwd_body(
-        call, save=True, save_mode=save_mode, ctx=ctx, bound=bound, tape=tape
+        call, save=True, save_mode=save_mode, ctx=ctx, bound=bound, tape=tape, rows=rows
     )
     if entry is None:
         stored: dict[str, Any] = {"S_in": saved.S_in}
@@ -7483,6 +9186,7 @@ def _fwd_handle(
     call.scratch["recompute_handle"] = "capture" if entry is None else "replay"
     _record("fwd", call)
     call.backend.end_call(call)
+    _default_release(call)
     return _ranked(out, batched), saved
 
 
@@ -7510,24 +9214,37 @@ def _fwd_handle(
 # recorded it.  For every other call the non-reentrant original forward and the reentrant recompute read the dynamic
 # state -- no CUDA-graph capture, torch.compile tracing or Python dispatch mode (a selective-checkpoint policy, a debug
 # mode) -- and the remaining keys (_handoff_refusal: the kernel backend with local stages; "auto" also the device's key
-# in cake_kcp_plan.kcp_handoff_auto_refusal).  The original forward records its decision on its checkpoint frame
+# in cake_kcp_plan.kcp_handoff_auto_refusal, verified in the call's gate and Q / K L2 norm mode, and the key's own work
+# bound of KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY; with the Q / K L2 norm
+# the records of L2N_DIRECT_RECORDS for the device's architecture, _handoff_l2n_direct, else "backend").  The original
+# forward records its decision on its checkpoint frame
 # (_HANDOFF_DECISIONS) and the recompute of that frame replays it in call order without reading its own state: the
 # two passes save the same tensors (or torch raises CheckpointError) whatever capture, compile, dispatch-mode or
 # backend state either pass runs under.  A frame the hooks do not expose keeps the light set in both passes.  A rank
 # without tokens keeps no set.  The choice is rank-local: the collectives are the same in count, order and bytes either
 # way, so ranks may differ without a hang.  The package reads no environment variable; a benchmark selects the mode
 # through the keyword.
+#
+# Rows form (cake_kda_nondet_kcp(..., saved_rows="intra" / "wy")): the same decision, recorded and replayed alike, keeps
+# that rows set of cake_kcp_plan.KCP_SAVED_ROWS instead of the tape set -- the forward's internal Aqk / Akk rows (and
+# its WY rows w / u), with the carry plane and the fused forward walk; the backward skips the intra (and WY) program
+# and still replays the K1 tape.  It counts in SAVED_ROWS_STATS, never as a hand-off "save" / "bound".  saved_rows="auto"
+# (the default) keeps the "wy" rows form (cake_kcp_plan.KCP_HANDOFF_AUTO_ROWS) where the hand-off engages; the tape set
+# is the form of saved_rows="tape"; saved_rows="none" asks for no decision at all.
 
 KCP_HANDOFF_MODES = cake_kcp_plan.KCP_HANDOFF_MODES
 KCP_HANDOFF_DEFAULT = cake_kcp_plan.KCP_HANDOFF_DEFAULT
 KCP_HANDOFF_VERIFIED = cake_kcp_plan.KCP_HANDOFF_VERIFIED
+KCP_HANDOFF_VERIFIED_MODES = cake_kcp_plan.KCP_HANDOFF_VERIFIED_MODES
 KCP_HANDOFF_HEADS = cake_kcp_plan.KCP_HANDOFF_HEADS
 KCP_HANDOFF_MIN_HEAD_TOKENS = cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS
+KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY = cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY
 cake_kda_nondet_train_kcp_handoff_bytes = (
     cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes
 )
 # calls recorded with a kept ("save") / read ("bound") tape set, and the requests refused by the static keys, by reason
-# in _handoff_refusal's order (boundary, graph, spec3, backend, device, then "auto"'s heads / work / unverified):
+# in _handoff_refusal's order (boundary, graph, spec3, backend, device, then "auto"'s heads / work / unverified, then
+# "backend" for an L2 norm call whose device lacks a record of L2N_DIRECT_RECORDS):
 # counted once per checkpointed call, where the decision is made -- the original forward / the reentrant recompute,
 # neither under a capture, tracing or a dispatch mode.  A request the call's arguments refuse (_handoff_static) reads no
 # frame: it counts in an original forward when torch's checkpoint hooks expose their frames
@@ -7544,8 +9261,22 @@ HANDOFF_STATS: dict[str, int] = {
     "refused_work": 0,
     "refused_unverified": 0,
 }
-# tests only: NaN-fill the tape set before the forward's launches, so a byte the forward does not write and the
-# backward reads shows in the gradients
+# the rows sets of saved_rows (cake_kcp_plan.KCP_SAVED_ROWS; never the hand-off's tape set, so never in HANDOFF_STATS):
+# forwards that kept one ("save_intra" / "save_wy") and backwards that read one ("bound_intra" / "bound_wy"), counted
+# once per eager call and once per graph capture (_record; a graph replay is not counted); "refused_hooks": requests
+# of cake_kda_nondet_kcp outside a checkpoint pass that a caller's saved-tensor hooks refused (the call keeps the
+# light set)
+SAVED_ROWS_STATS: dict[str, int] = {
+    "save_intra": 0,
+    "save_wy": 0,
+    "bound_intra": 0,
+    "bound_wy": 0,
+    "refused_hooks": 0,
+}
+KCP_SAVED_ROWS_MODES = cake_kcp_plan.KCP_SAVED_ROWS_MODES
+KCP_SAVED_ROWS_DEFAULT = cake_kcp_plan.KCP_SAVED_ROWS_DEFAULT
+# tests only: NaN-fill the tape set (and a rows set of saved_rows) before the forward's launches, so a byte the forward
+# does not write and the backward reads shows in the gradients
 _HANDOFF_POISON = False
 # the torch binding of the saved-tensor hook stack and the pack hooks of torch.utils.checkpoint's original forward
 # and recompute (the graph task id binding is _GRAPH_TASK_ID_BINDING above)
@@ -7563,6 +9294,55 @@ _HANDOFF_DECISIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 def cake_kda_nondet_train_kcp_handoff_stats() -> dict[str, int]:
     """A copy of :data:`HANDOFF_STATS`."""
     return dict(HANDOFF_STATS)
+
+
+def _saved_rows_request(saved_rows: Any, opts: CakeKDANondetKcpOptions) -> str | None:
+    """The rows set an entry's ``saved_rows`` names: ``"intra"`` / ``"wy"``, else ``None`` (``"none"``, and
+    ``"auto"`` / ``"tape"``, whose rule :func:`cake_kda_nondet_kcp` applies with the hand-off's decision: a
+    functional forward keeps no rows under them).
+    ``ValueError`` for a value outside :data:`KCP_SAVED_ROWS_MODES`, and for ``"intra"`` / ``"wy"`` with the SPEC-3
+    probe (its reference reruns the forward's programs before the backward's prep, which a rows set skips)."""
+    rows = cake_kcp_plan.check_saved_rows(saved_rows)
+    if rows in ("auto", "none", "tape"):
+        return None
+    if opts.spec3_probe != "off":
+        raise ValueError(
+            f"saved_rows={rows!r} is refused with spec3_probe={opts.spec3_probe!r}: the probe needs the backward's "
+            "own intra and WY programs"
+        )
+    return rows
+
+
+def _saved_rows_plain(rows: str, *inputs: Any) -> str | None:
+    """Whether a call of :func:`cake_kda_nondet_kcp` that the checkpoint hand-off did not engage keeps the rows set
+    ``rows`` (``"intra"`` / ``"wy"``): ``rows`` when the call builds an autograd node outside a checkpoint pass --
+    grad mode on, one of ``inputs`` (the call's ``q, k, v, g, beta, A_log, dt_bias``; ``None`` where absent) requires
+    grad, no default saved-tensor hooks and outside a backward's graph task; ``None`` (the light set) otherwise.
+    Under torch.utils.checkpoint's hooks and in a reentrant recompute (a checkpoint pass whose hand-off was refused or
+    ``"off"``) both passes then keep the light set, as the hand-off's decision does.  Under a caller's saved-tensor
+    hooks (``save_on_cpu``, an offload) the rows would add their bytes to every pack / unpack: the light set, counted
+    in :data:`SAVED_ROWS_STATS` ``"refused_hooks"``.  A missing or unusable binding keeps the light set.  Rank-local:
+    the rows move no collective."""
+    if not torch.is_grad_enabled():
+        return None
+    for t in inputs:  # an input that requires grad (a loop: no generator per call)
+        if isinstance(t, torch.Tensor) and t.requires_grad:
+            break
+    else:
+        return None
+    if _TOP_HOOKS is None:
+        return None
+    try:
+        pack = _handoff_top_pack()
+        module = None if pack is None else getattr(pack, "__module__", None)
+    except Exception:  # noqa: BLE001 - an unusable binding: the light set
+        return None
+    if pack is None:
+        # outside any backward; a reentrant recompute (inside one) keeps rows only through the hand-off's decision
+        return rows if _handoff_task() == -1 else None
+    if module != _CHECKPOINT_MODULE:
+        SAVED_ROWS_STATS["refused_hooks"] += 1
+    return None
 
 
 def _handoff_mode(checkpoint_handoff: str) -> str:
@@ -7671,6 +9451,25 @@ def _handoff_toolkit(arch: str) -> str | None:
         return None
 
 
+@functools.cache
+def _handoff_l2n_direct(arch: str) -> bool:
+    """Whether every record of :data:`L2N_DIRECT_RECORDS` -- the separate normalization from the saved rstd that a
+    hand-off backward with the in-kernel Q / K L2 norm launches outside the plan's selection (:func:`_handoff_l2n_rows`)
+    -- is delivered for ``arch`` with a library in the single-rank ``build.json``.  The fused form's capability check
+    (:func:`cake_kcp_plan.qk_l2norm_missing`) does not cover it (a record of the fallback form); a rank whose plan
+    launches it without the library would raise before ``b1`` while the other ranks wait there.  Read from the
+    registry and the manifest only, so the ranks of one device kind decide alike."""
+    try:
+        libraries = _single_rank.module("cake_build").libraries_by_name()
+        return all(
+            arch in cake_jit.MODULES[name]["arches"]
+            and cake_jit.library_name(name, arch) in libraries
+            for name in L2N_DIRECT_RECORDS.values()
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # the device keys of _handoff_key by CUDA device index (each part is fixed for the process)
 _HANDOFF_KEYS: dict[int, tuple[str, int, str | None]] = {}
 # the refusals _handoff_refusal places before the backend's (the call's option keys)
@@ -7707,6 +9506,13 @@ def _handoff_phase(*inputs: Any) -> str | None:
             break
     else:
         return None
+    return _checkpoint_pass()
+
+
+def _checkpoint_pass() -> str | None:
+    """The checkpoint pass of this thread from its innermost default saved-tensor hooks and graph task alone
+    (:func:`_handoff_phase` without its grad-mode and input checks): ``"original"``, ``"recompute"``,
+    ``"reentrant"`` or ``None``."""
     if _TOP_HOOKS is None:
         return None
     try:
@@ -7775,11 +9581,15 @@ def _handoff_refusal(
     boundary_mode: str,
     v: torch.Tensor,
     ctx: Any,
+    kind: tuple[str, bool] = ("g", False),
 ) -> str | None:
     """Why a request the phase admitted keeps the light set (``None``: the forward keeps its tape set), in the order
     boundary, graph, spec3, backend, device, then under ``"auto"`` :func:`cake_kcp_plan.kcp_handoff_auto_refusal` of
-    this device's key, the head count and the partition's total and world size: :func:`_handoff_static` with the
-    installed backend (:func:`_handoff_backend`) after the option keys and the device's key last."""
+    this device's key, the head count, the partition's total and world size and the call's ``kind`` (its gate mode
+    and ``use_qk_l2norm_in_kernel``): :func:`_handoff_static` with the installed backend (:func:`_handoff_backend`)
+    after the option keys and the device's key last.  A call with the in-kernel Q / K L2 norm that would keep the set
+    is refused as ``"backend"`` last, in both modes, where the device's architecture lacks a record of
+    :data:`L2N_DIRECT_RECORDS` (:func:`_handoff_l2n_direct`)."""
     reason = _handoff_static(mode, opts, boundary_mode, v, ctx)
     if reason in _HANDOFF_OPTION_REASONS:
         return reason
@@ -7787,12 +9597,20 @@ def _handoff_refusal(
     if backend is not None:
         return backend
     if reason is None and mode == "auto":
-        return cake_kcp_plan.kcp_handoff_auto_refusal(
+        reason = cake_kcp_plan.kcp_handoff_auto_refusal(
             _handoff_key(v.device),
             int(v.shape[-2]),
             ctx.partition.total,
             ctx.world_size,
+            gate=kind[0],
+            l2n=kind[1],
         )
+    if (
+        reason is None
+        and kind[1]
+        and not _handoff_l2n_direct(_handoff_key(v.device)[0])
+    ):
+        return "backend"
     return reason
 
 
@@ -7810,14 +9628,19 @@ def _handoff_replayed() -> bool:
 
 
 def _handoff_decide(
-    mode: str, opts: CakeKDANondetKcpOptions, boundary_mode: str, ctx: Any, *inputs: Any
+    mode: str,
+    opts: CakeKDANondetKcpOptions,
+    boundary_mode: str,
+    ctx: Any,
+    *inputs: Any,
+    kind: tuple[str, bool] = ("g", False),
 ) -> bool:
     """Whether this call keeps its tape set, decided once per checkpointed call (see the rule above): no outside a
     checkpoint pass; no in every pass when the call's arguments refuse it (:func:`_handoff_static`; nothing recorded
     or replayed, the refusal counted where a decision is made); otherwise in a non-reentrant recompute the original
     forward's decision (:func:`_handoff_replayed`), in the original forward and the reentrant recompute the dynamic
-    state and :func:`_handoff_refusal` (``inputs`` = ``q, k, v, g, beta``), the original forward recording the result
-    on its frame."""
+    state and :func:`_handoff_refusal` (``inputs`` = ``q, k, v, g, beta``; ``kind`` = the call's gate mode and
+    ``use_qk_l2norm_in_kernel``), the original forward recording the result on its frame."""
     if mode == "off":
         return False
     phase = _handoff_phase(*inputs)
@@ -7849,7 +9672,7 @@ def _handoff_decide(
     if _handoff_blocked() or _handoff_dispatch_modes():
         keep = False
     else:
-        reason = _handoff_refusal(mode, opts, boundary_mode, inputs[2], ctx)
+        reason = _handoff_refusal(mode, opts, boundary_mode, inputs[2], ctx, kind)
         if reason is not None:
             HANDOFF_STATS["refused_" + reason] += 1
         keep = reason is None
@@ -7859,10 +9682,23 @@ def _handoff_decide(
 
 
 def _fwd_tape(
-    q, k, v, g, beta, ctx, *, scale, save_mode, workspace, opts
+    q,
+    k,
+    v,
+    g,
+    beta,
+    ctx,
+    *,
+    scale,
+    save_mode,
+    workspace,
+    opts,
+    gate_args: dict[str, Any] | None = None,
+    l2n: bool = False,
 ) -> tuple[torch.Tensor, CakeKDANondetKcpSaved]:
     """The forward of a checkpoint hand-off call without a handle (eager, saved mode): :func:`cake_kda_nondet_train_kcp_forward`'s
-    eager path that keeps the tape set (:func:`_fwd_body` ``tape``)."""
+    eager path that keeps the tape set (:func:`_fwd_body` ``tape``).  ``gate_args``: the entry point's gate keywords
+    (the raw gate mode's included); ``l2n``: its ``use_qk_l2norm_in_kernel``."""
     call, batched = _prepare(
         q,
         k,
@@ -7875,10 +9711,13 @@ def _fwd_tape(
         workspace=workspace,
         options=opts,
         backward=False,
+        **(gate_args or {}),
+        use_qk_l2norm_in_kernel=l2n,
     )
     out, saved = _fwd_body(call, save=True, save_mode=save_mode, ctx=ctx, tape=True)
     _record("fwd", call)
     call.backend.end_call(call)
+    _default_release(call)
     return _ranked(out, batched), saved
 
 
@@ -7901,9 +9740,12 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
     KCP saved set, which records the mode and ``lower_bound``, and returns the gradients of the raw gate, ``A_log``
     and ``dt_bias`` (the parameter gradients: this rank's partial sums, :func:`cake_kda_nondet_train_kcp_backward`).  In-kernel Q / K
     L2 norm (``use_qk_l2norm_in_kernel``): the node keeps the caller's raw ``q`` / ``k`` (strided views stay views)
-    and the saved set with its ``qk_rstd``, and returns the gradients of the raw ``q`` / ``k``.  The checkpoint
-    hand-off engages with neither mode (:func:`cake_kda_nondet_kcp` never decides one), so ``handoff=True`` with
-    ``use_gate_in_kernel=True`` or ``use_qk_l2norm_in_kernel=True`` raises ``ValueError`` before any work."""
+    and the saved set with its ``qk_rstd``, and returns the gradients of the raw ``q`` / ``k``.  ``handoff=True``
+    keeps the tape set in either mode and in both together, with or without a handle: the forward runs the mode's
+    records into the set and the backward reads it (:func:`_backward`).  ``saved_rows``: :func:`cake_kda_nondet_kcp`'s
+    rows decision (``None``, ``"intra"`` or ``"wy"``; never with ``handoff=True``): the forward keeps that rows set
+    (:func:`cake_kda_nondet_train_kcp_forward` ``saved_rows``, :func:`_fwd_handle` ``rows``) and the backward reads
+    it from the saved set.  The backward returns one ``None`` per non-tensor argument, ``saved_rows`` included."""
 
     @staticmethod
     def forward(
@@ -7926,22 +9768,13 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
         dt_bias=None,
         lower_bound=None,
         use_qk_l2norm_in_kernel=False,
+        saved_rows=None,
     ):
-        if handoff and use_qk_l2norm_in_kernel:
-            # the hand-off's tape set keeps no qk_rstd and its forward normalizes nothing: cake_kda_nondet_kcp never
-            # decides a hand-off with the in-kernel Q / K L2 norm
-            raise ValueError(
-                "the checkpoint hand-off (handoff=True) does not engage with use_qk_l2norm_in_kernel=True"
-            )
-        if handoff and use_gate_in_kernel:
-            # the hand-off's forward takes the activated gate and keeps no raw-gate set: cake_kda_nondet_kcp never decides
-            # a hand-off in the raw gate mode
-            raise ValueError(
-                "the checkpoint hand-off (handoff=True) does not engage with use_gate_in_kernel=True"
-            )
         gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
         # the checkpoint hand-off: cake_kda_nondet_kcp's decision, made once per checkpointed call (both passes alike)
         tape = bool(handoff)
+        # the rows set of saved_rows: cake_kda_nondet_kcp's decision (None, "intra" or "wy"; never with the tape set)
+        rows = saved_rows
         if handle is None and tape:
             out, saved = _fwd_tape(
                 q,
@@ -7954,6 +9787,8 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
                 save_mode=save_mode,
                 workspace=workspace,
                 opts=_options(options),
+                gate_args=gate_args,
+                l2n=use_qk_l2norm_in_kernel,
             )
         elif handle is None:
             out, saved = cake_kda_nondet_train_kcp_forward(
@@ -7970,6 +9805,7 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
                 workspace=workspace,
                 **gate_args,
                 use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                **({} if rows is None else {"saved_rows": rows}),
                 **options,
             )
         else:
@@ -7988,6 +9824,7 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
                 opts=opts,
                 handle=handle,
                 tape=tape,
+                rows=rows,
                 gate_args=gate_args,
                 l2n=use_qk_l2norm_in_kernel,
             )
@@ -8054,6 +9891,7 @@ class CakeKDANondetKcpFunction(torch.autograd.Function):
             ddt_bias,
             None,  # lower_bound
             None,  # use_qk_l2norm_in_kernel
+            None,  # saved_rows
         )
 
 
@@ -8073,6 +9911,7 @@ def cake_kda_nondet_kcp(
     recompute_handle: Any = None,
     checkpoint_keep: str | None = None,
     checkpoint_handoff: str = KCP_HANDOFF_DEFAULT,
+    saved_rows: str = KCP_SAVED_ROWS_DEFAULT,
     use_gate_in_kernel: bool = False,
     A_log: torch.Tensor | None = None,
     dt_bias: torch.Tensor | None = None,
@@ -8088,15 +9927,17 @@ def cake_kda_nondet_kcp(
     (the gradients through its own tokens); sum them over ``ctx.group`` as for any parameter replicated across the
     context-parallel ranks, or with :func:`cake_kda_nondet_train_kcp_reduce_gate_param_grads` for a bitwise reproducible sum.  A recompute
     handle's entry records the gate mode and ``lower_bound``: a recompute in another mode never binds it.  The
-    checkpoint hand-off below does not engage in raw gate mode (its tape set is verified on the explicit gate only):
-    the call keeps the light set under every ``checkpoint_handoff`` value, records no decision and counts nothing.
+    checkpoint hand-off below engages in raw gate mode as with the activated gate (the same tape set, rule and
+    decision; the forward's raw intra program writes the set, the backward's raw prep, gradient programs and
+    ``param_finalize`` read it).
 
     ``use_qk_l2norm_in_kernel=True`` (keyword-only, issue #7817, as :func:`cake_kda_nondet_train_kcp_forward`): ``q`` / ``k`` are
     the raw rows (strided views allowed, never copied) and the gradients are those of the raw ``q`` / ``k``; the
     node keeps the raw rows and the saved set with its FP32 ``qk_rstd``.  A recompute handle's fingerprint records
     the mode (its entry does not change).  With ``False`` (the default) nothing changes.  The checkpoint hand-off
-    below does not engage with the flag either (as in raw gate mode; its tape set is verified without the norm): the
-    call keeps the light set under every ``checkpoint_handoff`` value, records no decision and counts nothing.
+    below engages with the flag as without it, also in raw gate mode: the same tape set (the saved set keeps its
+    ``qk_rstd`` as before) and the same rule; its backward rebuilds the normalized rows from the raw rows and the
+    saved rstd before its prep where the intra program it skips was their first writer.
 
     ``checkpoint_handoff`` (keyword-only; ``"auto"`` default, ``"on"``, ``"off"``): under ``torch.utils.checkpoint``
     the forward keeps its tape set (``h``, ``v_new``, ``w`` and the internal ``Aqk`` / ``Akk`` rows,
@@ -8104,9 +9945,12 @@ def cake_kda_nondet_kcp(
     reentrant: in the recompute only (its first pass runs under no_grad) -- and the backward reads it instead of
     re-running the intra program, WY, the K1 tape walk and the ``P > 1`` re-walk.  The collectives are unchanged, and
     on the devices of :data:`KCP_HANDOFF_VERIFIED` the outputs and gradients are bitwise those of ``"off"`` (the
-    hand-off rows); ``"on"`` elsewhere has no such evidence.  ``"auto"`` engages where
-    :func:`cake_kcp_plan.kcp_handoff_auto_refusal` admits the call (a verified device, ``H`` in
-    :data:`KCP_HANDOFF_HEADS` and ``H * (total tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS``), ``"on"``
+    hand-off rows; in raw gate mode and with the in-kernel Q / K L2 norm on the devices of that mode's entry of
+    :data:`KCP_HANDOFF_VERIFIED_MODES`, there also the raw gate's gradient, the ``A_log`` / ``dt_bias`` partial sums
+    and the gradients of the raw ``q`` / ``k``); ``"on"`` elsewhere has no such evidence.  ``"auto"`` engages where
+    :func:`cake_kcp_plan.kcp_handoff_auto_refusal` admits the call (a device verified in the call's mode, ``H`` in
+    :data:`KCP_HANDOFF_HEADS` and ``H * (total tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS`` and, for a
+    device with its own bound, ``>= KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY[key]``), ``"on"``
     wherever the call supports it, ``"off"`` never.  Outside a checkpoint pass, with ``graph="replay"``,
     ``spec3_probe``, ``boundary_mode="replay"``, inside a CUDA-graph capture, under ``torch.compile`` tracing or a
     Python dispatch mode (a selective-checkpoint policy) the call keeps the light set.  The non-reentrant original
@@ -8118,6 +9962,44 @@ def cake_kda_nondet_kcp(
     backward (and inside the original forward call), so the checkpoint peak per engaged call rises by at most
     :func:`cake_kda_nondet_train_kcp_handoff_bytes` (the saved set is ``cake_kda_nondet_train_kcp_saved_bytes(..., checkpoint_handoff=True)``: no carry
     plane); ``"off"`` keeps the light set.
+
+    ``saved_rows`` (keyword-only; ``"auto"`` default, ``"none"``, ``"intra"``, ``"wy"``, ``"tape"``; another value
+    raises ``ValueError``): which of the forward's rows the saved set keeps (:func:`cake_kda_nondet_train_kcp_forward`
+    ``saved_rows``: ``"intra"`` the internal ``Aqk`` / ``Akk`` rows, ``"wy"`` also ``w`` / ``u``; the backward then
+    skips its intra program, and with ``"wy"`` its WY program, and still replays the K1 tape).  Decided here, in the
+    caller's frame, once per call; the gradients stay within the light path's FP64 error budget::
+
+        saved_rows       where                                            kept beside the light set
+        "auto"           a checkpoint pass the hand-off engages on        the "wy" rows set (KCP_HANDOFF_AUTO_ROWS)
+                                                                          instead of the tape set
+        "auto"           anywhere else                                    nothing
+        "tape"           a checkpoint pass the hand-off engages on        the tape set (the hand-off's rule above)
+        "tape"           anywhere else                                    nothing
+        "none"           everywhere                                       nothing; "on" raises ValueError on every call,
+                                                                          in a checkpoint pass or not
+        "intra" / "wy"   a checkpoint pass the hand-off engages on        that rows set instead of the tape set
+        "intra" / "wy"   a checkpoint pass the hand-off refuses           nothing
+                         (checkpoint_handoff="off" included)
+        "intra" / "wy"   no checkpoint pass, grad on, an input that       that rows set
+                         requires grad, no saved-tensor hooks, not
+                         inside a backward
+        "intra" / "wy"   under a caller's saved-tensor hooks              nothing (SAVED_ROWS_STATS["refused_hooks"])
+        any              no grad, no input requires grad,                 nothing
+                         boundary_mode="replay", or a rank without
+                         tokens
+
+    An input is any of ``q``, ``k``, ``v``, ``g``, ``beta``, ``A_log`` and ``dt_bias``.  Outside a checkpoint pass
+    ``checkpoint_handoff="off"`` does not stop the rows.  Inside a checkpoint pass the rows follow the hand-off's
+    decision (recorded by the original forward and replayed by the recompute, with the same refusals), so both passes
+    save the same tensors; the rows form keeps the carry plane and the forward's fused walk
+    (``cake_kda_nondet_train_kcp_handoff_bytes(..., saved_rows=...)``: 256 / 768 B per internal token-head), and it
+    counts in :data:`SAVED_ROWS_STATS`, never in :data:`HANDOFF_STATS` ``"save"`` / ``"bound"``.  Outside a
+    checkpoint the rows live until the node's backward: ``768 * R * H`` bytes per layer for ``"wy"`` (about 792 MiB
+    at 16384 tokens per rank, H 64, CP4: R = 16896), linear in the tokens.  ``"intra"`` / ``"wy"`` are refused with
+    ``spec3_probe``.  The rows are rank-local: the collectives are the same in count, order and bytes.  Under
+    ``"auto"`` an engaged hand-off keeps the ``"wy"`` rows form (the hand-off's admission, refusals and counters of
+    :data:`SAVED_ROWS_STATS`): on GB300 at CP4 H64 it is faster than the tape set and keeps 528 MiB less per layer;
+    ``"tape"`` keeps the tape set there.  Outside a checkpoint ``"auto"`` keeps no rows.
 
     ``recompute_handle`` (keyword-only; ``None`` = unchanged): a :class:`CakeKDANondetKcpRecomputeHandle` (any object with an
     ``entries`` dict) makes torch's checkpoint recompute of this call run without the forward state exchange -- the
@@ -8131,7 +10013,9 @@ def cake_kda_nondet_kcp(
     CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and ``boundary_mode="replay"``.  Retains
     ``recompute_handle.nbytes()`` (``cake_kda_nondet_train_kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)``) while
     the handle lives.  The exchange is a collective: every rank of ``ctx.group`` passes a handle for the same call or
-    none, at the same checkpoint nesting level; a mismatch hangs or corrupts data (no check across ranks)."""
+    none, at the same checkpoint nesting level.  The rank-agreement check compares the handle's presence (with the
+    tier's ``save_transfer``) at the first original forward of each key and trips a device-side assert on a mismatch;
+    a mismatch of the nesting level is not checked and hangs or corrupts data."""
     opts = _options(options)  # validate on the caller's frame
     if boundary_mode not in BOUNDARY_MODES:
         raise ValueError(
@@ -8139,14 +10023,32 @@ def cake_kda_nondet_kcp(
         )
     l2n = cake_kcp_plan.check_qk_l2norm(use_qk_l2norm_in_kernel)
     # the checkpoint hand-off, decided in the caller's frame once per checkpointed call (the recompute replays the
-    # original forward's decision); a raw gate call and a call with the in-kernel Q / K L2 norm keep the light set in
-    # both passes alike (their own keywords decide that: no frame record, no recompute cursor)
+    # original forward's decision), in every gate and Q / K L2 norm mode alike
     mode = _handoff_mode(checkpoint_handoff)
-    handoff = (
-        use_gate_in_kernel is not True
-        and not l2n
-        and _handoff_decide(mode, opts, boundary_mode, ctx, q, k, v, g, beta)
-    )
+    request = _saved_rows_request(saved_rows, opts)
+    kind = ("raw" if use_gate_in_kernel is True else "g", l2n)
+    rows = None
+    if saved_rows == "none":  # no rows in any pass: the hand-off is not asked
+        if mode == "on":
+            raise ValueError(
+                "saved_rows='none' keeps no rows in any pass: it contradicts checkpoint_handoff='on'"
+            )
+        handoff = False
+    else:
+        handoff = _handoff_decide(
+            mode, opts, boundary_mode, ctx, q, k, v, g, beta, kind=kind
+        )
+        if request is None and handoff and saved_rows == "auto":
+            # "auto": the hand-off engaged keeps its rows form (KCP_HANDOFF_AUTO_ROWS) instead of the tape set
+            request = cake_kcp_plan.KCP_HANDOFF_AUTO_ROWS
+        if request is not None:
+            # the rows form of the hand-off where it engaged, else the plain rule (the light set in a checkpoint pass)
+            rows = (
+                request
+                if handoff
+                else _saved_rows_plain(request, q, k, v, g, beta, A_log, dt_bias)
+            )
+            handoff = False
     if recompute_handle is None:
         if checkpoint_keep is not None:
             raise ValueError(
@@ -8173,6 +10075,7 @@ def cake_kda_nondet_kcp(
             dt_bias,
             lower_bound,
             l2n,
+            rows,
         )
     opts = _handle_options(opts, checkpoint_keep, options.get("save_transfer"))
     _handle_refusals(opts, boundary_mode, recompute_handle)
@@ -8195,6 +10098,7 @@ def cake_kda_nondet_kcp(
         dt_bias,
         lower_bound,
         l2n,
+        rows,
     )
 
 
@@ -8288,10 +10192,13 @@ __all__ = [
     "set_kernel_node_carveout",
     "GRAPH_STATS",
     "CACHE_CONFIG_STATS",
+    "RANK_CHECK_STATS",
     "CHECKPOINT_KEEPS",
     "HANDLE_KEY",
     "CakeKDANondetKcpRecomputeHandle",
     "graph_cache_clear",
+    "DEFAULT_WS_STATS",
+    "default_workspace_cache_clear",
     "KCP_PROGRAMS",
     "KCP_SAVED_VERSION",
     "LAST_CALL",
@@ -8316,11 +10223,16 @@ __all__ = [
     "cake_kda_nondet_train_kcp_saved_bytes",
     "cake_kda_nondet_train_kcp_workspace_bytes",
     "HANDOFF_STATS",
+    "SAVED_ROWS_STATS",
+    "KCP_SAVED_ROWS_DEFAULT",
+    "KCP_SAVED_ROWS_MODES",
     "KCP_HANDOFF_DEFAULT",
     "KCP_HANDOFF_HEADS",
     "KCP_HANDOFF_MIN_HEAD_TOKENS",
+    "KCP_HANDOFF_MIN_HEAD_TOKENS_BY_KEY",
     "KCP_HANDOFF_MODES",
     "KCP_HANDOFF_VERIFIED",
+    "KCP_HANDOFF_VERIFIED_MODES",
     "cake_kda_nondet_train_kcp_handoff_stats",
     "cake_kda_nondet_train_kcp_handoff_bytes",
     "cake_kda_nondet_train_kcp_reduce_gate_param_grads",

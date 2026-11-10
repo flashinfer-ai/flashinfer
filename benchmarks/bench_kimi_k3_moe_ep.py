@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import statistics
+import time
 
 import torch
 import torch.distributed as dist
@@ -27,19 +28,36 @@ from tests.moe_ep.test_sm100_kimi_k3 import (
 )
 
 
-def _measure(layer, tensors, workspace, *, warmups, samples, replays, world):
+def _measure(
+    layer,
+    tensors,
+    workspace,
+    *,
+    warmups,
+    samples,
+    replays,
+    world,
+    execution_mode="cuda_graph",
+    output_mode="caller",
+):
     layer.warmup(tensors, workspace=workspace)
-    output = torch.empty_like(tensors.hidden_states)
+    output = (
+        torch.empty_like(tensors.hidden_states) if output_mode == "caller" else None
+    )
     caller = replace(tensors, output=output)
     for _ in range(warmups):
         layer(caller, workspace=workspace)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        layer(caller, workspace=workspace)
+    graph = None
+    if execution_mode == "cuda_graph":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = layer(caller, workspace=workspace)
     try:
-        graph.replay()
+        if graph is not None:
+            graph.replay()
         torch.cuda.synchronize()
         elapsed = []
+        host_elapsed = []
         for _ in range(samples):
             if world > 1:
                 dist.barrier()
@@ -48,8 +66,13 @@ def _measure(layer, tensors, workspace, *, warmups, samples, replays, world):
                 torch.cuda.Event(enable_timing=True),
             )
             start.record()
+            begin = time.perf_counter_ns()
             for _ in range(replays):
-                graph.replay()
+                if graph is None:
+                    output = layer(caller, workspace=workspace)
+                else:
+                    graph.replay()
+            host_elapsed.append((time.perf_counter_ns() - begin) / 1000 / replays)
             end.record()
             end.synchronize()
             elapsed.append(start.elapsed_time(end) * 1000 / replays)
@@ -69,6 +92,8 @@ def _measure(layer, tensors, workspace, *, warmups, samples, replays, world):
             "max_us": max(elapsed),
             "samples_us": elapsed,
             "rank_samples_us": rank_samples,
+            "local_host_enqueue_median_us": statistics.median(host_elapsed),
+            "local_host_enqueue_samples_us": host_elapsed,
         }
     finally:
         graph = None
@@ -89,6 +114,10 @@ def main():
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--replays", type=int, default=10)
+    parser.add_argument(
+        "--execution-mode", choices=["cuda_graph", "eager"], default="cuda_graph"
+    )
+    parser.add_argument("--output-mode", choices=["caller", "owned"], default="caller")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.current_tile is not None and (
@@ -112,10 +141,12 @@ def main():
         "api": "flashinfer.moe_ep.MoEEpMegaLayer",
         "provider": args.provider,
         "current_tile": args.current_tile,
-        "measurement": "warm graph forward, CUDA events, slowest EP rank per sample",
+        "measurement": "warm forward, CUDA events, slowest EP rank per sample",
+        "execution_mode": args.execution_mode,
+        "output_mode": args.output_mode,
         "weights": "deterministic packed sparse layout-test weights",
         "routing": "16 valid routes per token, spread across EP ranks",
-        "input": "BF16; includes input quantization, routing, compute and combine into caller output",
+        "input": "BF16; includes input quantization, routing, compute and combine",
         "gpu": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -207,6 +238,8 @@ def main():
                                 samples=args.samples,
                                 replays=args.replays,
                                 world=world,
+                                execution_mode=args.execution_mode,
+                                output_mode=args.output_mode,
                             )
                             sample = replace(
                                 tensors,

@@ -34,9 +34,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#ifndef NUM_CTAS
-#error "NUM_CTAS is a downstream specialization of this program; define it on the compile line"
-#endif
+#define NUM_CTAS 152
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -325,6 +323,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
     const int smem_sfa_addr = smem + 218112;
     unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 223744);
     const int smem_sfb_addr = smem + 223744;
+    uint8_t* smem_a_k128 = reinterpret_cast<uint8_t*>(smem_raw + 26624);
+    const int smem_a_k128_addr = smem + 26624;
+    uint8_t* smem_b_k128 = reinterpret_cast<uint8_t*>(smem_raw + 37888);
+    const int smem_b_k128_addr = smem + 37888;
     float* amax_reduction = reinterpret_cast<float*>(smem_raw + 229376);
     const int amax_reduction_addr = smem + 229376;
     unsigned int* task_infos = reinterpret_cast<unsigned int*>(smem_raw + 229632);
@@ -449,7 +451,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
 
     __syncwarp();
 
-    // TMEM alloc (64 columns, 40 used)
+    // TMEM alloc (64 columns, 48 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 230424);
     if (warp == 3) {
         int _tmem_hold = smem + 230424;
@@ -464,8 +466,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
 
     const unsigned int taddr = tmem_addr_storage[0];
     const unsigned int tmem_accum = taddr;
-    const unsigned int tmem_scale_a = taddr + 32;
-    const unsigned int tmem_scale_b = taddr + 36;
+    const unsigned int tmem_scales = taddr + 32;
 
     // ---- Role: dispatch ----
     if (warp <= 3) {
@@ -753,31 +754,33 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                         pending = (unsigned long long)0;
                     }
                 }
-                #pragma unroll 2
-                for (int k = 0; k < task[7] / 128; k++) {
+                unsigned int fc1k_trips = ((task[0] == 1) ? task[7] / 256 : task[7] / 128);
+                #pragma unroll 1
+                for (int k2 = 0; k2 < fc1k_trips; k2++) {
                     if (task[0] == 2) {
-                        unsigned long long k_mask = (unsigned long long)3 << (unsigned long long)(k * 2);
-                        if ((pending & k_mask) != 0) {
+                        unsigned long long k_mask = (unsigned long long)3 << (unsigned long long)(k2 * 2);
+                        if ((pending & k_mask) != 0ull) {
                             unsigned long long _wait_acquire_mask_0;
                             do {
                             asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_wait_acquire_mask_0) : "l"((reinterpret_cast<unsigned long long*>(PrivateMasks) + (task[4]))) : "memory");
-                            } while (((_wait_acquire_mask_0 ^ static_cast<unsigned long long>((unsigned long long)63)) & static_cast<unsigned long long>(k_mask)) != 0);
+                            } while (((_wait_acquire_mask_0 ^ static_cast<unsigned long long>((unsigned long long)63ll)) & static_cast<unsigned long long>(k_mask)) != 0);
                             unsigned long long observed = _wait_acquire_mask_0;
-                            pending = observed ^ 63;
+                            pending = observed ^ 63ull;
                         }
                     }
                     mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
                     if (elect_sync()) {
                         if (task[0] == 1) {
-                            tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 1024, (&A), k * 128, (unsigned int)cta_rank * 8, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
+                            tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 2048, (&A), k2 * 256, (unsigned int)cta_rank * 8, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
+                            tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 2048 + 1024, (&A), k2 * 256 + 128, (unsigned int)cta_rank * 8, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         } else {
                             asm volatile("fence.proxy.async.global;" ::: "memory");
-                            tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 1024, (&A2), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
-                            tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF2), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
+                            tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 2048, (&A2), k2 * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
+                            tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 1024, (&PrivateSF2), task[4] * 128, k2, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         }
                         if (cta_rank == 0) {
                             if (task[0] == 1) {
-                                mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 2048);
+                                mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 4096);
                             } else {
                                 mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 3072);
                             }
@@ -789,7 +792,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     }
                     __syncwarp();
                     a_stage += 1;
-                    if (a_stage == 11) { a_stage = 0; _phase_empty ^= 1; }
+                    if (a_stage == 5) { a_stage = 0; _phase_empty ^= 1; }
                 }
             }
         }
@@ -835,6 +838,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
             __syncwarp();
             unsigned int task_1[8];
             unsigned int b_stage = 0;
+            unsigned int direct_sf_pair[2];
             unsigned int _phase_empty_1 = 1;
             #pragma unroll 1
             for (int task_iteration_1 = 0; task_iteration_1 < 8879; task_iteration_1++) {
@@ -859,32 +863,54 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                         direct_sf_next = smem_xsf[lane * 40];
                     }
                 }
-                #pragma unroll 2
-                for (int k_1 = 0; k_1 < task_1[7] / 128; k_1++) {
+                unsigned int direct_sf_next1 = 0;
+                if (task_1[0] == 1) {
+                    if (lane < 4) {
+                        direct_sf_next1 = smem_xsf[lane * 40 + 1];
+                    }
+                }
+                unsigned int fc1k_trips_1 = ((task_1[0] == 1) ? task_1[7] / 256 : task_1[7] / 128);
+                #pragma unroll 1
+                for (int k2_1 = 0; k2_1 < fc1k_trips_1; k2_1++) {
                     mbarrier_wait(empty_addr + (b_stage) * 8, _phase_empty_1);
                     if (task_1[0] == 1) {
                         unsigned int direct_sf = direct_sf_next;
+                        unsigned int direct_sf1 = direct_sf_next1;
                         unsigned int direct_zero = 0;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_sfa_addr + b_stage * 512 + (unsigned int)lane * 16), "r"(direct_sf), "r"(direct_zero), "r"(direct_zero), "r"(direct_zero) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_sfa_addr + b_stage * 1024 + (unsigned int)lane * 16), "r"(direct_sf), "r"(direct_zero), "r"(direct_zero), "r"(direct_zero) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_sfa_addr + b_stage * 1024 + 512 + (unsigned int)lane * 16), "r"(direct_sf1), "r"(direct_zero), "r"(direct_zero), "r"(direct_zero) : "memory");
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         __syncwarp();
                         if (lane < 4) {
-                            if ((unsigned int)k_1 + 1 < task_1[7] / 128) {
-                                direct_sf_next = smem_xsf[lane * 40 + k_1 + 1];
+                            if ((unsigned int)k2_1 * 2 + 2 < task_1[7] / 128) {
+                                asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&direct_sf_pair[0])), "=r"(*reinterpret_cast<uint32_t*>(&direct_sf_pair[(0) + 1]))
+                                    : "r"(smem_xsf_addr + (unsigned int)(lane * 160 + k2_1 * 8 + 8)));
+                                direct_sf_next = direct_sf_pair[0];
+                                direct_sf_next1 = direct_sf_pair[1];
                             }
                         }
                     }
-                    unsigned int sf_k_offset = task_1[1] * (task_1[7] / 128) + (unsigned int)k_1;
+                    unsigned int sf_k_offset = task_1[1] * (task_1[7] / 128) + (unsigned int)k2_1 * 2;
+                    if (task_1[0] != 1) {
+                        sf_k_offset = task_1[1] * (task_1[7] / 128) + (unsigned int)k2_1;
+                    }
                     if (elect_sync()) {
                         if (task_1[0] == 1) {
-                            tma_3d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B1), k_1 * 128, n_offset, task_1[1], ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
-                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 512, (&SFB1), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            tma_3d_gmem2smem_cta2(smem_b_addr + b_stage * 32768, (&B1), k2_1 * 256, n_offset, task_1[1], ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 1024, (&SFB1), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            tma_3d_gmem2smem_cta2(smem_b_addr + b_stage * 32768 + 16384, (&B1), k2_1 * 256 + 128, n_offset, task_1[1], ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 1024 + 512, (&SFB1), n_offset, sf_k_offset + 1, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
                         } else {
-                            tma_2d_gmem2smem_cta2(smem_b_addr + b_stage * 16384, (&B2), k_1 * 128, task_1[1] * task_1[6] + n_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
-                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 512, (&SFB2), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            tma_2d_gmem2smem_cta2(smem_b_addr + b_stage * 32768, (&B2), k2_1 * 128, task_1[1] * task_1[6] + n_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
+                            tma_2d_gmem2smem_cta2(smem_sfb_addr + b_stage * 1024, (&SFB2), n_offset, sf_k_offset, ((full_addr + (b_stage) * 8) & 0xFEFFFFFF));
                         }
                         if (cta_rank == 0) {
-                            mbarrier_arrive_expect_tx(full_addr + (b_stage) * 8, 17408);
+                            if (task_1[0] == 1) {
+                                mbarrier_arrive_expect_tx(full_addr + (b_stage) * 8, 34816);
+                            } else {
+                                mbarrier_arrive_expect_tx(full_addr + (b_stage) * 8, 17408);
+                            }
                         } else {
                             asm volatile(
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
@@ -893,7 +919,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     }
                     __syncwarp();
                     b_stage += 1;
-                    if (b_stage == 11) { b_stage = 0; _phase_empty_1 ^= 1; }
+                    if (b_stage == 5) { b_stage = 0; _phase_empty_1 ^= 1; }
                 }
             }
         }
@@ -932,38 +958,44 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     int _stage_tmem_empty = (int)((unsigned int)task_iteration_2 % 2);
                     int _parity_tmem_empty = (int)((unsigned int)task_iteration_2 / 2 % 2) ^ 1;
                     mbarrier_wait(tmem_empty_addr + (_stage_tmem_empty) * 8, _parity_tmem_empty);
-                    #pragma unroll 2
-                    for (int k_2 = 0; k_2 < task_2[7] / 128; k_2++) {
+                    unsigned int fc1k_trips_2 = ((task_2[0] == 1) ? task_2[7] / 256 : task_2[7] / 128);
+                    #pragma unroll 1
+                    for (int k2_2 = 0; k2_2 < fc1k_trips_2; k2_2++) {
                         mbarrier_wait(full_addr + (mma_stage) * 8, _phase_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        int init_flag = ((k_2 == 0) ? 1 : 0);
-                        uint32_t _elected_0 = elect_sync();
-                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_scale_a, make_sf_cp_desc_lo_sbo128((((smem_sfa_addr) >> 4) + (mma_stage) * 32)), _elected_0);
-                        tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_scale_b, make_sf_cp_desc_lo_sbo128((((smem_sfb_addr) >> 4) + (mma_stage) * 32)), _elected_0);
-                        int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage) * 1024;
-                        int _smem_desc_lo_2 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage) * 64;
-                        {
-                            uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x40004040 << 32);
-                            uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x40004040 << 32);
+                        #pragma unroll
+                        for (unsigned int half = 0; half < 2; half++) {
+                            int init_flag = (((unsigned int)k2_2 * 2 + half == 0) ? 1 : 0);
+                            if (task_2[0] == 1 || half == 0) {
+                                uint32_t _elected_0 = elect_sync();
+                                tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_scales + half * 8, make_sf_cp_desc_lo_sbo128((((smem_sfa_addr) >> 4) + (mma_stage) * 64 + (half) * 32)), _elected_0);
+                                tcgen05_cp_32x128b_warpx4_cta2_leader(tmem_scales + (4 + half * 8), make_sf_cp_desc_lo_sbo128((((smem_sfb_addr) >> 4) + (mma_stage) * 64 + (half) * 32)), _elected_0);
+                                int _smem_desc_lo_1 = (((smem_b_k128_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + half) * 1024;
+                                int _smem_desc_lo_2 = (((smem_a_k128_addr) >> 4) & 0x3FFF) + (mma_stage * 2 + half) * 64;
+                                {
+                                    uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x40004040 << 32);
+                                    uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x40004040 << 32);
 
-                            tcgen05_mma_mxf8_bs_cta2_leader((tmem_accum + (accum_stage * 16)), a_desc + 0, b_desc + 0,
-                                (((0x10840280U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(aligned_m_1) >> 3) << 17)) | ((0) << 29) | ((0) << 4)), tmem_scale_b, tmem_scale_a, ((init_flag) ? 0 : 1), _elected_0);
-                            tcgen05_mma_mxf8_bs_cta2_leader((tmem_accum + (accum_stage * 16)), a_desc + 2, b_desc + 2,
-                                (((0x10840280U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(aligned_m_1) >> 3) << 17)) | ((1) << 29) | ((1) << 4)), tmem_scale_b, tmem_scale_a, 1, _elected_0);
-                            tcgen05_mma_mxf8_bs_cta2_leader((tmem_accum + (accum_stage * 16)), a_desc + 4, b_desc + 4,
-                                (((0x10840280U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(aligned_m_1) >> 3) << 17)) | ((2) << 29) | ((2) << 4)), tmem_scale_b, tmem_scale_a, 1, _elected_0);
-                            tcgen05_mma_mxf8_bs_cta2_leader((tmem_accum + (accum_stage * 16)), a_desc + 6, b_desc + 6,
-                                (((0x10840280U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(aligned_m_1) >> 3) << 17)) | ((3) << 29) | ((3) << 4)), tmem_scale_b, tmem_scale_a, 1, _elected_0);
+                                    tcgen05_mma_mxf8_bs_cta2_leader((tmem_accum + (accum_stage * 16)), a_desc + 0, b_desc + 0,
+                                        (((0x10840280U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(aligned_m_1) >> 3) << 17)) | ((0) << 29) | ((0) << 4)), tmem_scales + (4 + half * 8), tmem_scales + half * 8, ((init_flag) ? 0 : 1), _elected_0);
+                                    tcgen05_mma_mxf8_bs_cta2_leader((tmem_accum + (accum_stage * 16)), a_desc + 2, b_desc + 2,
+                                        (((0x10840280U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(aligned_m_1) >> 3) << 17)) | ((1) << 29) | ((1) << 4)), tmem_scales + (4 + half * 8), tmem_scales + half * 8, 1, _elected_0);
+                                    tcgen05_mma_mxf8_bs_cta2_leader((tmem_accum + (accum_stage * 16)), a_desc + 4, b_desc + 4,
+                                        (((0x10840280U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(aligned_m_1) >> 3) << 17)) | ((2) << 29) | ((2) << 4)), tmem_scales + (4 + half * 8), tmem_scales + half * 8, 1, _elected_0);
+                                    tcgen05_mma_mxf8_bs_cta2_leader((tmem_accum + (accum_stage * 16)), a_desc + 6, b_desc + 6,
+                                        (((0x10840280U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(aligned_m_1) >> 3) << 17)) | ((3) << 29) | ((3) << 4)), tmem_scales + (4 + half * 8), tmem_scales + half * 8, 1, _elected_0);
+                                }
+                            }
                         }
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
                         elect_commit_cg2_multicast(empty_addr + (mma_stage) * 8, (uint16_t)(3));
-                        if ((unsigned int)k_2 == task_2[7] / 128 - 1) {
+                        if ((unsigned int)k2_2 == fc1k_trips_2 - 1) {
                             elect_commit_cg2_multicast(tmem_full_addr + (accum_stage) * 8, (uint16_t)(3));
                         }
                         __syncwarp();
                         mma_stage += 1;
-                        if (mma_stage == 11) { mma_stage = 0; _phase_full ^= 1; }
+                        if (mma_stage == 5) { mma_stage = 0; _phase_full ^= 1; }
                     }
                     completed_tasks += 1;
                     accum_cursor += 1;
@@ -1064,30 +1096,80 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                 }
                 __syncwarp();
                 unsigned int direct_active = 0;
-                unsigned int _warp_vote_0_1 = __ballot_sync(0xFFFFFFFF, counts[0] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_0_1);
-                unsigned int _warp_vote_1_1 = __ballot_sync(0xFFFFFFFF, counts[1] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_1_1);
-                unsigned int _warp_vote_2_1 = __ballot_sync(0xFFFFFFFF, counts[2] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_2_1);
-                unsigned int _warp_vote_3_1 = __ballot_sync(0xFFFFFFFF, counts[3] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_3_1);
-                unsigned int _warp_vote_4_1 = __ballot_sync(0xFFFFFFFF, counts[4] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_4_1);
-                unsigned int _warp_vote_5_1 = __ballot_sync(0xFFFFFFFF, counts[5] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_5_1);
-                unsigned int _warp_vote_6_1 = __ballot_sync(0xFFFFFFFF, counts[6] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_6_1);
-                unsigned int _warp_vote_7_1 = __ballot_sync(0xFFFFFFFF, counts[7] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_7_1);
-                unsigned int _warp_vote_8_1 = __ballot_sync(0xFFFFFFFF, counts[8] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_8_1);
-                unsigned int _warp_vote_9_1 = __ballot_sync(0xFFFFFFFF, counts[9] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_9_1);
-                unsigned int _warp_vote_10_1 = __ballot_sync(0xFFFFFFFF, counts[10] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_10_1);
-                unsigned int _warp_vote_11_1 = __ballot_sync(0xFFFFFFFF, counts[11] > 0);
-                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_11_1);
+                unsigned int direct_word_mask = 0;
+                unsigned int direct_word_base = 0;
+                unsigned int direct_mask_k_0 = __ballot_sync(0xFFFFFFFF, counts[0] > 0);
+                if (lane == 0) {
+                    direct_word_mask = direct_mask_k_0;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_0);
+                unsigned int direct_mask_k_1 = __ballot_sync(0xFFFFFFFF, counts[1] > 0);
+                if (lane == 1) {
+                    direct_word_mask = direct_mask_k_1;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_1);
+                unsigned int direct_mask_k_2 = __ballot_sync(0xFFFFFFFF, counts[2] > 0);
+                if (lane == 2) {
+                    direct_word_mask = direct_mask_k_2;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_2);
+                unsigned int direct_mask_k_3 = __ballot_sync(0xFFFFFFFF, counts[3] > 0);
+                if (lane == 3) {
+                    direct_word_mask = direct_mask_k_3;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_3);
+                unsigned int direct_mask_k_4 = __ballot_sync(0xFFFFFFFF, counts[4] > 0);
+                if (lane == 4) {
+                    direct_word_mask = direct_mask_k_4;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_4);
+                unsigned int direct_mask_k_5 = __ballot_sync(0xFFFFFFFF, counts[5] > 0);
+                if (lane == 5) {
+                    direct_word_mask = direct_mask_k_5;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_5);
+                unsigned int direct_mask_k_6 = __ballot_sync(0xFFFFFFFF, counts[6] > 0);
+                if (lane == 6) {
+                    direct_word_mask = direct_mask_k_6;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_6);
+                unsigned int direct_mask_k_7 = __ballot_sync(0xFFFFFFFF, counts[7] > 0);
+                if (lane == 7) {
+                    direct_word_mask = direct_mask_k_7;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_7);
+                unsigned int direct_mask_k_8 = __ballot_sync(0xFFFFFFFF, counts[8] > 0);
+                if (lane == 8) {
+                    direct_word_mask = direct_mask_k_8;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_8);
+                unsigned int direct_mask_k_9 = __ballot_sync(0xFFFFFFFF, counts[9] > 0);
+                if (lane == 9) {
+                    direct_word_mask = direct_mask_k_9;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_9);
+                unsigned int direct_mask_k_10 = __ballot_sync(0xFFFFFFFF, counts[10] > 0);
+                if (lane == 10) {
+                    direct_word_mask = direct_mask_k_10;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_10);
+                unsigned int direct_mask_k_11 = __ballot_sync(0xFFFFFFFF, counts[11] > 0);
+                if (lane == 11) {
+                    direct_word_mask = direct_mask_k_11;
+                    direct_word_base = direct_active;
+                }
+                direct_active += (unsigned int)(unsigned int)__popc(direct_mask_k_11);
                 unsigned int direct_fc1 = direct_active * 3;
                 unsigned int direct_total = direct_fc1 + direct_active * 20;
                 #pragma unroll 1
@@ -1109,163 +1191,58 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     unsigned int direct_n = direct_j % direct_per;
                     unsigned int direct_expert = 0;
                     unsigned int direct_valid = 4;
-                    unsigned int direct_base = 0;
-                    unsigned int direct_mask_0 = __ballot_sync(0xFFFFFFFF, counts[0] > 0);
-                    uint32_t _rank_in_mask_12 = (uint32_t)__popc(direct_mask_0 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_0 = __ballot_sync(0xFFFFFFFF, counts[0] > 0 && direct_base + _rank_in_mask_12 == direct_a);
-                    if (direct_hit_0 != 0) {
-                        int _find_first_set_13 = __ffs(direct_hit_0);
-                        unsigned int direct_lane_0 = _find_first_set_13 - 1;
-                        direct_expert = direct_lane_0;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, counts[0], direct_lane_0);
-                            direct_valid = _shfl_sync_14;
+                    unsigned int direct_wsel = __ballot_sync(0xFFFFFFFF, lane < 12 && (direct_word_base <= direct_a && direct_a < direct_word_base + (unsigned int)(unsigned int)__popc(direct_word_mask)));
+                    int _find_first_set_0 = __ffs(direct_wsel);
+                    unsigned int direct_w = _find_first_set_0 - 1;
+                    unsigned int direct_mask = __shfl_sync(0xFFFFFFFF, direct_word_mask, direct_w);
+                    unsigned int _shfl_sync_1 = __shfl_sync(0xFFFFFFFF, direct_word_base, direct_w);
+                    unsigned int direct_rank = direct_a - _shfl_sync_1;
+                    uint32_t _rank_in_mask_2 = (uint32_t)__popc(direct_mask & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit = __ballot_sync(0xFFFFFFFF, (direct_mask >> (unsigned int)lane & 1) != 0 && _rank_in_mask_2 == direct_rank);
+                    int _find_first_set_3 = __ffs(direct_hit);
+                    unsigned int direct_lane = _find_first_set_3 - 1;
+                    direct_expert = direct_w * 32 + direct_lane;
+                    if (direct_phase == 2) {
+                        unsigned int direct_count = 0;
+                        if (direct_w == 0) {
+                            direct_count = counts[0];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_0);
-                    unsigned int direct_mask_1 = __ballot_sync(0xFFFFFFFF, counts[1] > 0);
-                    uint32_t _rank_in_mask_15 = (uint32_t)__popc(direct_mask_1 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_1 = __ballot_sync(0xFFFFFFFF, counts[1] > 0 && direct_base + _rank_in_mask_15 == direct_a);
-                    if (direct_hit_1 != 0) {
-                        int _find_first_set_16 = __ffs(direct_hit_1);
-                        unsigned int direct_lane_1 = _find_first_set_16 - 1;
-                        direct_expert = 32 + direct_lane_1;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_17 = __shfl_sync(0xFFFFFFFF, counts[1], direct_lane_1);
-                            direct_valid = _shfl_sync_17;
+                        if (direct_w == 1) {
+                            direct_count = counts[1];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_1);
-                    unsigned int direct_mask_2 = __ballot_sync(0xFFFFFFFF, counts[2] > 0);
-                    uint32_t _rank_in_mask_18 = (uint32_t)__popc(direct_mask_2 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_2 = __ballot_sync(0xFFFFFFFF, counts[2] > 0 && direct_base + _rank_in_mask_18 == direct_a);
-                    if (direct_hit_2 != 0) {
-                        int _find_first_set_19 = __ffs(direct_hit_2);
-                        unsigned int direct_lane_2 = _find_first_set_19 - 1;
-                        direct_expert = 64 + direct_lane_2;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_20 = __shfl_sync(0xFFFFFFFF, counts[2], direct_lane_2);
-                            direct_valid = _shfl_sync_20;
+                        if (direct_w == 2) {
+                            direct_count = counts[2];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_2);
-                    unsigned int direct_mask_3 = __ballot_sync(0xFFFFFFFF, counts[3] > 0);
-                    uint32_t _rank_in_mask_21 = (uint32_t)__popc(direct_mask_3 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_3 = __ballot_sync(0xFFFFFFFF, counts[3] > 0 && direct_base + _rank_in_mask_21 == direct_a);
-                    if (direct_hit_3 != 0) {
-                        int _find_first_set_22 = __ffs(direct_hit_3);
-                        unsigned int direct_lane_3 = _find_first_set_22 - 1;
-                        direct_expert = 96 + direct_lane_3;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_23 = __shfl_sync(0xFFFFFFFF, counts[3], direct_lane_3);
-                            direct_valid = _shfl_sync_23;
+                        if (direct_w == 3) {
+                            direct_count = counts[3];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_3);
-                    unsigned int direct_mask_4 = __ballot_sync(0xFFFFFFFF, counts[4] > 0);
-                    uint32_t _rank_in_mask_24 = (uint32_t)__popc(direct_mask_4 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_4 = __ballot_sync(0xFFFFFFFF, counts[4] > 0 && direct_base + _rank_in_mask_24 == direct_a);
-                    if (direct_hit_4 != 0) {
-                        int _find_first_set_25 = __ffs(direct_hit_4);
-                        unsigned int direct_lane_4 = _find_first_set_25 - 1;
-                        direct_expert = 128 + direct_lane_4;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_26 = __shfl_sync(0xFFFFFFFF, counts[4], direct_lane_4);
-                            direct_valid = _shfl_sync_26;
+                        if (direct_w == 4) {
+                            direct_count = counts[4];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_4);
-                    unsigned int direct_mask_5 = __ballot_sync(0xFFFFFFFF, counts[5] > 0);
-                    uint32_t _rank_in_mask_27 = (uint32_t)__popc(direct_mask_5 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_5 = __ballot_sync(0xFFFFFFFF, counts[5] > 0 && direct_base + _rank_in_mask_27 == direct_a);
-                    if (direct_hit_5 != 0) {
-                        int _find_first_set_28 = __ffs(direct_hit_5);
-                        unsigned int direct_lane_5 = _find_first_set_28 - 1;
-                        direct_expert = 160 + direct_lane_5;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_29 = __shfl_sync(0xFFFFFFFF, counts[5], direct_lane_5);
-                            direct_valid = _shfl_sync_29;
+                        if (direct_w == 5) {
+                            direct_count = counts[5];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_5);
-                    unsigned int direct_mask_6 = __ballot_sync(0xFFFFFFFF, counts[6] > 0);
-                    uint32_t _rank_in_mask_30 = (uint32_t)__popc(direct_mask_6 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_6 = __ballot_sync(0xFFFFFFFF, counts[6] > 0 && direct_base + _rank_in_mask_30 == direct_a);
-                    if (direct_hit_6 != 0) {
-                        int _find_first_set_31 = __ffs(direct_hit_6);
-                        unsigned int direct_lane_6 = _find_first_set_31 - 1;
-                        direct_expert = 192 + direct_lane_6;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_32 = __shfl_sync(0xFFFFFFFF, counts[6], direct_lane_6);
-                            direct_valid = _shfl_sync_32;
+                        if (direct_w == 6) {
+                            direct_count = counts[6];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_6);
-                    unsigned int direct_mask_7 = __ballot_sync(0xFFFFFFFF, counts[7] > 0);
-                    uint32_t _rank_in_mask_33 = (uint32_t)__popc(direct_mask_7 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_7 = __ballot_sync(0xFFFFFFFF, counts[7] > 0 && direct_base + _rank_in_mask_33 == direct_a);
-                    if (direct_hit_7 != 0) {
-                        int _find_first_set_34 = __ffs(direct_hit_7);
-                        unsigned int direct_lane_7 = _find_first_set_34 - 1;
-                        direct_expert = 224 + direct_lane_7;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_35 = __shfl_sync(0xFFFFFFFF, counts[7], direct_lane_7);
-                            direct_valid = _shfl_sync_35;
+                        if (direct_w == 7) {
+                            direct_count = counts[7];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_7);
-                    unsigned int direct_mask_8 = __ballot_sync(0xFFFFFFFF, counts[8] > 0);
-                    uint32_t _rank_in_mask_36 = (uint32_t)__popc(direct_mask_8 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_8 = __ballot_sync(0xFFFFFFFF, counts[8] > 0 && direct_base + _rank_in_mask_36 == direct_a);
-                    if (direct_hit_8 != 0) {
-                        int _find_first_set_37 = __ffs(direct_hit_8);
-                        unsigned int direct_lane_8 = _find_first_set_37 - 1;
-                        direct_expert = 256 + direct_lane_8;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_38 = __shfl_sync(0xFFFFFFFF, counts[8], direct_lane_8);
-                            direct_valid = _shfl_sync_38;
+                        if (direct_w == 8) {
+                            direct_count = counts[8];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_8);
-                    unsigned int direct_mask_9 = __ballot_sync(0xFFFFFFFF, counts[9] > 0);
-                    uint32_t _rank_in_mask_39 = (uint32_t)__popc(direct_mask_9 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_9 = __ballot_sync(0xFFFFFFFF, counts[9] > 0 && direct_base + _rank_in_mask_39 == direct_a);
-                    if (direct_hit_9 != 0) {
-                        int _find_first_set_40 = __ffs(direct_hit_9);
-                        unsigned int direct_lane_9 = _find_first_set_40 - 1;
-                        direct_expert = 288 + direct_lane_9;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_41 = __shfl_sync(0xFFFFFFFF, counts[9], direct_lane_9);
-                            direct_valid = _shfl_sync_41;
+                        if (direct_w == 9) {
+                            direct_count = counts[9];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_9);
-                    unsigned int direct_mask_10 = __ballot_sync(0xFFFFFFFF, counts[10] > 0);
-                    uint32_t _rank_in_mask_42 = (uint32_t)__popc(direct_mask_10 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_10 = __ballot_sync(0xFFFFFFFF, counts[10] > 0 && direct_base + _rank_in_mask_42 == direct_a);
-                    if (direct_hit_10 != 0) {
-                        int _find_first_set_43 = __ffs(direct_hit_10);
-                        unsigned int direct_lane_10 = _find_first_set_43 - 1;
-                        direct_expert = 320 + direct_lane_10;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_44 = __shfl_sync(0xFFFFFFFF, counts[10], direct_lane_10);
-                            direct_valid = _shfl_sync_44;
+                        if (direct_w == 10) {
+                            direct_count = counts[10];
                         }
-                    }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_10);
-                    unsigned int direct_mask_11 = __ballot_sync(0xFFFFFFFF, counts[11] > 0);
-                    uint32_t _rank_in_mask_45 = (uint32_t)__popc(direct_mask_11 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_hit_11 = __ballot_sync(0xFFFFFFFF, counts[11] > 0 && direct_base + _rank_in_mask_45 == direct_a);
-                    if (direct_hit_11 != 0) {
-                        int _find_first_set_46 = __ffs(direct_hit_11);
-                        unsigned int direct_lane_11 = _find_first_set_46 - 1;
-                        direct_expert = 352 + direct_lane_11;
-                        if (direct_phase == 2) {
-                            unsigned int _shfl_sync_47 = __shfl_sync(0xFFFFFFFF, counts[11], direct_lane_11);
-                            direct_valid = _shfl_sync_47;
+                        if (direct_w == 11) {
+                            direct_count = counts[11];
                         }
+                        unsigned int _shfl_sync_4 = __shfl_sync(0xFFFFFFFF, direct_count, direct_lane);
+                        direct_valid = _shfl_sync_4;
                     }
-                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_11);
                     task_3[0] = direct_phase;
                     task_3[1] = direct_expert;
                     task_3[2] = 0;
@@ -1286,20 +1263,20 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
                             :: "r"(task_full_addr + (schedule_stage) * 8), "r"(lane), "r"((uint32_t)(32)) : "memory");
-                        uint32_t _mbar_peer_48;
+                        uint32_t _mbar_peer_5;
                         asm(
                             "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(_mbar_peer_48) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                            : "=r"(_mbar_peer_5) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                         asm volatile(
                             "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                            :: "r"(destination), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_48) : "memory");
-                        uint32_t _mbar_peer_49;
+                            :: "r"(destination), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_5) : "memory");
+                        uint32_t _mbar_peer_6;
                         asm(
                             "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(_mbar_peer_49) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                            : "=r"(_mbar_peer_6) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                         asm volatile(
                             "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                            :: "r"(destination + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_49) : "memory");
+                            :: "r"(destination + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_6) : "memory");
                     }
                     __syncwarp();
                     schedule_stage += 1;
@@ -1326,20 +1303,20 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                         "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                         "}"
                         :: "r"(task_full_addr + (schedule_stage) * 8), "r"(lane), "r"((uint32_t)(32)) : "memory");
-                    uint32_t _mbar_peer_50;
+                    uint32_t _mbar_peer_7;
                     asm(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mbar_peer_50) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                        : "=r"(_mbar_peer_7) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                        :: "r"(destination_1), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_50) : "memory");
-                    uint32_t _mbar_peer_51;
+                        :: "r"(destination_1), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_7) : "memory");
+                    uint32_t _mbar_peer_8;
                     asm(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mbar_peer_51) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                        : "=r"(_mbar_peer_8) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                        :: "r"(destination_1 + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_51) : "memory");
+                        :: "r"(destination_1 + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_8) : "memory");
                 }
                 __syncwarp();
             }
@@ -1411,14 +1388,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                             pre_weight = direct_rw_5;
                         }
                     }
-                    unsigned int direct_mask = __ballot_sync(0xFFFFFFFF, direct_routed != 0);
-                    uint32_t direct_rank = (uint32_t)__popc(direct_mask & ((1u << (unsigned int)lane) - 1u));
-                    uint32_t _rank_in_mask_0 = (uint32_t)__popc(direct_mask ^ 15 & ((1u << (unsigned int)lane) - 1u));
-                    unsigned int direct_rest = (unsigned int)(unsigned int)__popc(direct_mask) + _rank_in_mask_0;
+                    unsigned int direct_mask_1 = __ballot_sync(0xFFFFFFFF, direct_routed != 0);
+                    uint32_t direct_rank_1 = (uint32_t)__popc(direct_mask_1 & ((1u << (unsigned int)lane) - 1u));
+                    uint32_t _rank_in_mask_0 = (uint32_t)__popc(direct_mask_1 ^ 15 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_rest = (unsigned int)(unsigned int)__popc(direct_mask_1) + _rank_in_mask_0;
                     if (lane < 4) {
                         pre_perm = direct_rest;
                         if (direct_routed != 0) {
-                            pre_perm = direct_rank;
+                            pre_perm = direct_rank_1;
                         }
                     }
                 }
@@ -1657,7 +1634,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                         }
                     }
                     __syncwarp();
-                    if (warp == 8) {
+                    if (warp == 9) {
                         if (elect_sync()) {
                             asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(PrivateCounters) + (1159))), "r"(static_cast<unsigned int>(1)) : "memory");
                         }
@@ -1757,7 +1734,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
                                 : "r"(read_address));
-                            unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560 + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
+                            unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560ull + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
                             reinterpret_cast<int4*>(PublicExpertOutput + dst_index)[0] = reinterpret_cast<int4*>(packed)[0];
                         }
                     }
@@ -1925,7 +1902,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     unsigned int row_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 0);
                     if ((routed & 1) != 0) {
                         {
-                            const uint4* _vptr_24 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_24 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120ull + lane_off) + 0);
                             uint4* _vdst_24 = reinterpret_cast<uint4*>(&values[0]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1936,7 +1913,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     unsigned int row_1_1 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 1);
                     if ((routed >> 1 & 1) != 0) {
                         {
-                            const uint4* _vptr_25 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_1_1 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_25 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_1_1 * 5120ull + lane_off) + 0);
                             uint4* _vdst_25 = reinterpret_cast<uint4*>(&values[4]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1947,7 +1924,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     unsigned int row_2_1 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 2);
                     if ((routed >> 2 & 1) != 0) {
                         {
-                            const uint4* _vptr_26 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_2_1 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_26 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_2_1 * 5120ull + lane_off) + 0);
                             uint4* _vdst_26 = reinterpret_cast<uint4*>(&values[8]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1958,7 +1935,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     unsigned int row_3 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 3);
                     if ((routed >> 3 & 1) != 0) {
                         {
-                            const uint4* _vptr_27 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_3 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_27 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_3 * 5120ull + lane_off) + 0);
                             uint4* _vdst_27 = reinterpret_cast<uint4*>(&values[12]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1969,7 +1946,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     unsigned int row_4 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 4);
                     if ((routed >> 4 & 1) != 0) {
                         {
-                            const uint4* _vptr_28 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_4 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_28 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_4 * 5120ull + lane_off) + 0);
                             uint4* _vdst_28 = reinterpret_cast<uint4*>(&values[16]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1980,7 +1957,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     unsigned int row_5 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 5);
                     if ((routed >> 5 & 1) != 0) {
                         {
-                            const uint4* _vptr_29 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_5 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_29 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_5 * 5120ull + lane_off) + 0);
                             uint4* _vdst_29 = reinterpret_cast<uint4*>(&values[20]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -2276,7 +2253,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     store_values[1] = __as_u32(__float22bfloat162_rn(make_float2(reduced[2], reduced[3])));
                     store_values[2] = __as_u32(__float22bfloat162_rn(make_float2(reduced[4], reduced[5])));
                     store_values[3] = __as_u32(__float22bfloat162_rn(make_float2(reduced[6], reduced[7])));
-                    reinterpret_cast<int4*>(y + ((unsigned long long)token * 5120 + lane_off))[0] = reinterpret_cast<int4*>(store_values)[0];
+                    reinterpret_cast<int4*>(y + ((unsigned long long)token * 5120ull + lane_off))[0] = reinterpret_cast<int4*>(store_values)[0];
                 }
             }
         }

@@ -17,7 +17,7 @@ Names of the Cake context-parallel (KCP) packed KDA training package (non-determ
 
 The KCP entry points live in ``flashinfer.cake_kda_nondet_train_kcp`` and the package in
 ``flashinfer.experimental.cake.cake_kda_nondet_train_kcp``.  The shared check of #8928
-(``tests.test_helpers.cake_mode_names.assert_cake_mode_module``) covers the facade: every public name states the mode
+(``tests.cake.test_helpers.cake_mode_names.assert_cake_mode_module``) covers the facade: every public name states the mode
 (``nondet``) right after the op, no entry takes a ``deterministic`` keyword, the facade, the ``flashinfer`` top level,
 the package and its modules ``cake_kcp`` / ``cake_kcp_plan`` bind each object under one name only (the backend object
 each facade entry calls included), and the names before this scheme fail at import with no alias: the module
@@ -36,7 +36,7 @@ import pytest
 
 import flashinfer
 import flashinfer.cake_kda_nondet_train_kcp as kcp_api
-from tests.test_helpers.cake_mode_names import (
+from tests.cake.test_helpers.cake_mode_names import (
     assert_cake_mode_module,
     assert_mode_names,
     assert_no_deterministic_keyword,

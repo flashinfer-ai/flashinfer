@@ -792,7 +792,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
             unsigned int task[8];
             unsigned int a_stage = 0;
             unsigned int mask_pf_done = 0;
-            unsigned int group_block = 4294967295;
+            unsigned int group_block = 4294967295ll;
             unsigned int group_token_offset = 0;
             unsigned int group_ready = 0;
             unsigned int _phase_empty = 1;
@@ -867,7 +867,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                 } else if (group_ready != 0) {
                     pending = (unsigned long long)0;
                 }
-                group_block = 4294967295;
+                group_block = 4294967295ll;
                 if (task[0] == 2) {
                     group_block = task[4];
                 }
@@ -900,13 +900,13 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                     for (int k = 0; k < task[7] / 128; k++) {
                         if (task[0] == 2) {
                             unsigned long long k_mask = (unsigned long long)3 << (unsigned long long)(k * 2);
-                            if ((pending & k_mask) != 0) {
+                            if ((pending & k_mask) != 0ull) {
                                 unsigned long long _wait_acquire_mask_0_1;
                                 do {
                                 asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_wait_acquire_mask_0_1) : "l"((reinterpret_cast<unsigned long long*>(PrivateMasks) + (task[4]))) : "memory");
-                                } while (((_wait_acquire_mask_0_1 ^ static_cast<unsigned long long>((unsigned long long)63)) & static_cast<unsigned long long>(k_mask)) != 0);
+                                } while (((_wait_acquire_mask_0_1 ^ static_cast<unsigned long long>((unsigned long long)63ll)) & static_cast<unsigned long long>(k_mask)) != 0);
                                 unsigned long long observed = _wait_acquire_mask_0_1;
-                                pending = observed ^ 63;
+                                pending = observed ^ 63ull;
                             }
                         }
                         mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
@@ -933,7 +933,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                     }
                 }
                 group_ready = 0;
-                if (pending == 0) {
+                if (pending == 0ull) {
                     group_ready = 1;
                 }
             }
@@ -1457,7 +1457,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                         unsigned int _shfl_sync_15 = __shfl_sync(0xFFFFFFFF, claimed_0, 0);
                         claimed = _shfl_sync_15;
                         if (claimed >= state[0] * 3) {
-                            state[1] = 4294967295;
+                            state[1] = 4294967295ll;
                             state[2] = state[0];
                         } else {
                             phase = 1;
@@ -2208,7 +2208,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
                                     : "r"(read_address));
-                                unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560 + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
+                                unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560ull + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
                                 reinterpret_cast<int4*>(PublicExpertOutput + dst_index)[0] = reinterpret_cast<int4*>(packed)[0];
                             }
                         }
@@ -2277,7 +2277,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                             asm volatile(
                                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1], %2, [%3], %4;"
-                                :: "r"(combine_smem_addr + (epi_warp_2 * 6 + i_5) * 2560), "l"(expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280))), "r"((unsigned)(2560)), "r"(combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8),
+                                :: "r"(combine_smem_addr + (epi_warp_2 * 6 + i_5) * 2560), "l"(expert_output + ((unsigned long long)row_3 * 5120ull + (unsigned long long)(chunk * 1280))), "r"((unsigned)(2560)), "r"(combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8),
                                    "l"(0x12F0000000000000ULL) : "memory");
                             mbarrier_arrive_expect_tx(combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8, 2560);
                         } else {
@@ -2400,7 +2400,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                 __syncwarp();
                 if (elect_sync()) {
                     {
-                        void* _cpbulk_dst_25 = reinterpret_cast<void*>(y + ((unsigned long long)token * 5120 + (unsigned long long)(chunk * 1280)));
+                        void* _cpbulk_dst_25 = reinterpret_cast<void*>(y + ((unsigned long long)token * 5120ull + (unsigned long long)(chunk * 1280)));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_25), "r"(combine_smem_addr + (48 + epi_warp_2) * 2560), "r"((uint32_t)(2560))

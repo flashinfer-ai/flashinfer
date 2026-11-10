@@ -112,11 +112,11 @@ kernel_cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168(float* __restrict__ spar
     float qvl[1];
     int g0 = (int)bid;
     if (p_k <= 16) {
-        long long sl_row_a = (long long)g0 * 4;
+        long long sl_row_a = (long long)g0 * 4ll;
         int sl_i_a0 = ((nf4 > tid_2) ? tid_2 : nf4 - 1);
         int sl_plane_a0 = sl_i_a0 / 24;
         int sl_within_a0 = sl_i_a0 - sl_plane_a0 * 24;
-        long long sl_src_a0 = ((long long)sl_plane_a0 * tp64 + sl_row_a) * 24 + (long long)(sl_within_a0 * 4);
+        long long sl_src_a0 = ((long long)sl_plane_a0 * tp64 + sl_row_a) * 24ll + (long long)(sl_within_a0 * 4);
         {
             float4 _v4 = *reinterpret_cast<const float4*>(spart + sl_src_a0 + 0);
             vbuf[0 + 0] = _v4.x;
@@ -127,7 +127,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168(float* __restrict__ spar
         int sl_i_a1 = ((nf4 > tid_2 + 128) ? tid_2 + 128 : nf4 - 1);
         int sl_plane_a1 = sl_i_a1 / 24;
         int sl_within_a1 = sl_i_a1 - sl_plane_a1 * 24;
-        long long sl_src_a1 = ((long long)sl_plane_a1 * tp64 + sl_row_a) * 24 + (long long)(sl_within_a1 * 4);
+        long long sl_src_a1 = ((long long)sl_plane_a1 * tp64 + sl_row_a) * 24ll + (long long)(sl_within_a1 * 4);
         {
             float4 _v4 = *reinterpret_cast<const float4*>(spart + sl_src_a1 + 0);
             vbuf[4 + 0] = _v4.x;
@@ -138,7 +138,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168(float* __restrict__ spar
         int sl_i_a2 = ((nf4 > tid_2 + 256) ? tid_2 + 256 : nf4 - 1);
         int sl_plane_a2 = sl_i_a2 / 24;
         int sl_within_a2 = sl_i_a2 - sl_plane_a2 * 24;
-        long long sl_src_a2 = ((long long)sl_plane_a2 * tp64 + sl_row_a) * 24 + (long long)(sl_within_a2 * 4);
+        long long sl_src_a2 = ((long long)sl_plane_a2 * tp64 + sl_row_a) * 24ll + (long long)(sl_within_a2 * 4);
         {
             float4 _v4 = *reinterpret_cast<const float4*>(spart + sl_src_a2 + 0);
             vbuf[8 + 0] = _v4.x;
@@ -205,7 +205,7 @@ kernel_cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168(float* __restrict__ spar
                 for (int j_4 = 0; j_4 < 1; j_4++) {
                     long long plane = k64 + tcr[j_4];
                     float _add_5;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(s_acc[j_4]), "f"(spart[plane * 24 + n64]));
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_5) : "f"(s_acc[j_4]), "f"(spart[plane * 24ll + n64]));
                     s_acc[j_4] = _add_5;
                 }
             }
@@ -739,16 +739,16 @@ kernel_cake_mhc_det_train_fwd_coef__st16_w4_tree__h7168(float* __restrict__ spar
             int tok = tokr[j_6];
             long long tc64 = tcr[j_6];
             if (tok < T) {
-                long long row = tc64 * 64;
+                long long row = tc64 * 64ll;
                 if (lane_0 == 0) {
                     *(reinterpret_cast<float*>(stats + row) + (0)) = rr[j_6];
                 }
                 if (lane_0 < 24) {
-                    *(reinterpret_cast<float*>(stats + (row + 1 + lane64)) + (0)) = zz[j_6];
-                    *(reinterpret_cast<float*>(stats + (row + 25 + lane64)) + (0)) = cc[j_6];
+                    *(reinterpret_cast<float*>(stats + (row + 1ll + lane64)) + (0)) = zz[j_6];
+                    *(reinterpret_cast<float*>(stats + (row + 25ll + lane64)) + (0)) = cc[j_6];
                 }
                 if (lane_0 < 15) {
-                    *(reinterpret_cast<float*>(stats + (row + 49 + lane64)) + (0)) = 0.0f;
+                    *(reinterpret_cast<float*>(stats + (row + 49ll + lane64)) + (0)) = 0.0f;
                 }
             }
         }

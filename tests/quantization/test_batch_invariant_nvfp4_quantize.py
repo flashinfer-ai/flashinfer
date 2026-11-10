@@ -26,7 +26,7 @@ from flashinfer.batch_invariant.quantization.nvfp4_api import (
     nvfp4_quantize_batch_invariant,
     nvfp4_quantize_rows,
 )
-from tests.test_helpers.batch_invariant_quant import (
+from tests.quantization.test_helpers.batch_invariant_quant import (
     FI_LAYOUTS,
     adversarial_inputs,
     same_bits,

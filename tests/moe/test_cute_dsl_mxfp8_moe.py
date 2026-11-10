@@ -149,7 +149,7 @@ def _run_kernel(
         use_fused_finalize=not swap_ab,
     )
     if swap_ab:
-        from tests.test_helpers.cute_dsl_moe_swap_ab_reference import (
+        from tests.moe.test_helpers.cute_dsl_moe_swap_ab_reference import (
             assert_cute_dsl_moe_bits,
             cute_dsl_moe_reference,
         )

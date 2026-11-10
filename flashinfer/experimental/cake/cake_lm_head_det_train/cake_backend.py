@@ -468,12 +468,24 @@ DX_SLICED_STAGE = "gemm_dx_s"
 # operations in the same order as ``gemm_dw_acc`` followed by ``scale_cast_*``, so the weight gradient is bitwise
 # identical; the flat ``scale_cast`` pass over ``dW`` disappears.  Selected by ``fuse_dw_cast`` (default on).
 DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
+
+
+def _dw_cast_f32(stage: str) -> bool:
+    """Whether the stage that writes the final ``dW`` (:attr:`Plan.dw_cast_stage`) writes it in FP32: the flat FP32
+    cast or the fused FP32 cast in every form (the 2-D blocked ``_gn`` raster included)."""
+    return stage == "scale_cast_f32" or stage.startswith("gemm_dw_cast_f32")
+
+
 # TMA-epilogue form of the deferred BF16 dW cast (``gemm_dw_cast_bf16_tma``): the old FP32 sum is read and the
 # BF16 tile is stored as TMA sub-tiles.  It runs the cast of the LAST chunk of a call of >= 2 chunks whose last
 # chunk has 1 .. DW_CAST_TMA_MAX_ROWS[arch] rows (:func:`dw_cast_tma_rule`); the per-element (old + acc) * g
 # and its round-to-nearest order are the shipped form's, so dW is bitwise the same.  A one-chunk call has no old
 # sum to read and keeps the shipped form.
-DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792}
+DW_CAST_TMA_MAX_ROWS: dict[str, int] = {
+    "sm_100a": 1792,
+    "sm_103a": 1792,
+    "sm_107a": 1792,
+}
 # Its form under the zero-gradient row skip (:data:`DCNT_BASES`): the same TMA cast with the K steps bounded by the
 # last chunk's device count of live rows, so a counted plan keeps the rule's cast (a record without it: the shipped
 # cast's counted form).
@@ -590,17 +602,21 @@ RASTER_RULE_MIN_ROWS = 2049
 RASTER_WIDE_GROUPS = {
     "sm_100a": (16, 32),
     "sm_103a": (16, 32),
-}  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture
+    "sm_107a": (32, 32),
+}  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture (sm_107a: the logits slot keeps
+#    the record's group_m 32)
 DW_LONG_CHUNK_GROUP_M = 16  # weight-gradient group_m of the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
 DW_LONG_CHUNK_GROUPS = {
     "sm_100a": DW_LONG_CHUNK_GROUP_M,
     "sm_103a": DW_LONG_CHUNK_GROUP_M,
+    "sm_107a": DW_LONG_CHUNK_GROUP_M,
 }  # the same height on every supported architecture (the kernel source keeps a per-architecture table; the export mirrors it)
 DW_LONG_CHUNK_MIN_ROWS = 4097
 LOGITS_LONG_RASTER_GROUPS = {
     "sm_100a": 16,
     "sm_103a": 16,
 }  # logits group_m of the GLM-class chunks of >= LOGITS_LONG_RASTER_MIN_ROWS rows below RASTER_RULE_MIN_HIDDEN, per architecture
+#    (sm_107a is not listed: its chunks keep the record's logits group_m 32)
 LOGITS_LONG_RASTER_MIN_ROWS = (
     3841  # 30 row tiles of 128 + 1: the first chunk size with 31 row tiles
 )
@@ -608,10 +624,12 @@ DX_LONG_CHUNK_STAGES = {
     "sm_100a": 3,
     "sm_103a": 3,
 }  # operand-ring depth of the 512-wide dX tile at the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
+#    (sm_107a is not listed: its long chunks keep the table ring depth DX_WIDE_TILE_STAGES)
 DX_WIDE_TILE_STAGES = 4  # the 512-wide dX tile's table ring depth (an explicit ``stages`` of 4 pins the default form)
 DW_BLOCK_GROUPS = {
     "sm_100a": 12,
     "sm_103a": 12,
+    "sm_107a": 12,
 }  # column tiles per raster block of the weight-gradient accumulate / fp32 fused cast at the C 4096 chunk, per architecture
 DW_BLOCK_MIN_ROWS = RASTER_RULE_MIN_ROWS  # 2049
 DW_BLOCK_MAX_ROWS = (
@@ -640,15 +658,19 @@ DX_K_SLICES_MAX = 4
 DX_SPLIT_ARCHES = (
     "sm_100a",
     "sm_103a",
+    "sm_107a",
 )
 DX_SPLIT_LONG_RING_ARCHES = (
     "sm_103a",
-)  # architectures whose long-chunk ring (``_st3``) also takes the split (on sm_100a it ran slower at the power limit)
+    "sm_107a",
+)  # architectures whose long-chunk ring (``_st3``) also takes the split (on sm_100a it ran slower at the power limit; on
+#    sm_107a only an explicit ``stages`` pin selects the ring)
 DX_SPLIT_WHOLE_ARCHES: tuple[str, ...] = (
     "sm_103a",
 )  # whole-tile chunks below RASTER_RULE_MIN_HIDDEN split in every call
 DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES: tuple[str, ...] = (
     "sm_100a",
+    "sm_107a",
 )  # ... only in a call of fewer than DW_STREAM_MIN_CHUNKS chunks
 DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
 # Swapped dX tile (``_swab``): dX^T = W^T dz^T, W's 128 hidden columns of a CTA on the MMA's M and the chunk's
@@ -656,7 +678,7 @@ DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
 # of whole 512-token tiles of a cross-entropy loss call of >= DW_STREAM_MIN_CHUNKS chunks (:func:`dx_swab_rule`), ahead
 # of the split-tail rule and of the H >= RASTER_RULE_MIN_HIDDEN base form.  Bitwise: the same bf16 products summed
 # over the same K slices in the same K order.
-DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a",)
+DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a", "sm_107a")
 _TUNING_KNOBS = {
     "logits": ("group_m",),
     "dx": ("k_slices", "tile_n", "stages", "split", "swap_ab"),
@@ -4865,6 +4887,36 @@ def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape) -> torch.T
     return flat[offset : offset + needed].view(dtype).view(shape)
 
 
+# the workspace regions (:func:`workspace_layout`) a template runner takes from a call's hidden valid-row count
+# (:class:`_HiddenCount`) instead of allocating them: region -> the count's chunk-0 buffer
+CHUNK_VIEW_REGIONS = {"logits": "logits", "stats": "stats_buf", "x_c": "x_c"}
+
+
+def _chunk_view_layout(layout: dict) -> dict:
+    """``layout`` (:func:`workspace_layout`) without the regions of :data:`CHUNK_VIEW_REGIONS`: every other region in
+    the same order and alignment from offset 0 of one smaller allocation, ``"total"`` its size."""
+    out: dict = {}
+    offset = 0
+    for name, region in layout.items():
+        if name == "total" or name in CHUNK_VIEW_REGIONS:
+            continue
+        out[name] = (offset, region[1])
+        offset += _align(region[1])
+    out["total"] = offset
+    return out
+
+
+def _chunk_view(hidden: "_HiddenCount", name: str, shape) -> torch.Tensor:
+    """Region ``name`` of :data:`CHUNK_VIEW_REGIONS` as the leading ``shape[0]`` rows of the hidden valid-row count's
+    chunk-0 buffer (``min(chunk, T)`` rows, at least a runner's ``min(chunk, rows)`` for ``rows <= T``)."""
+    view = getattr(hidden, CHUNK_VIEW_REGIONS[name])[: shape[0]]
+    if tuple(view.shape) != tuple(shape):
+        raise ValueError(
+            f"the hidden valid-row count's {name} buffer {tuple(view.shape)} cannot hold the region {tuple(shape)}"
+        )
+    return view
+
+
 # ---------------------------------------------------------------------------
 # Launch binding
 # ---------------------------------------------------------------------------
@@ -6248,6 +6300,9 @@ class LmHeadDetLossRunner:
     engine: Optional[ReferenceEngine] = field(default=None, repr=False)
     dw_stream: str = "auto"
     _tma_prepared: bool = False
+    # built only to template a remembered binding on a hidden valid-row count's chunk-0 buffers
+    # (``prepare_lm_head_det_loss(_chunk_views=...)``): those buffers hold the count's chunk 0, so it never launches
+    _template_only: bool = False
 
     @property
     def problem(self) -> Problem:
@@ -6314,6 +6369,11 @@ class LmHeadDetLossRunner:
         self._tma_prepared = True
 
     def _run(self, keys: tuple) -> None:
+        if self._template_only:
+            raise RuntimeError(
+                "this runner only templates a remembered binding (its chunk buffers are a hidden valid-row count's); "
+                "it never launches"
+            )
         if self.backend == "cake":
             self.prepare_tma()
 
@@ -6380,7 +6440,7 @@ class _TemperatureRunner(LmHeadDetLossRunner):
     side-stream placement of the temperature forms (:func:`_run_keys_temperature`)."""
 
     def _run(self, keys: tuple) -> None:
-        if self.backend != "cake":
+        if self.backend != "cake" or self._template_only:
             super()._run(keys)
             return
         self.prepare_tma()
@@ -6547,6 +6607,7 @@ def prepare_lm_head_det_loss(
     logprob_keep: bool = False,
     dcnt: Optional[torch.Tensor] = None,
     dx_slices_cap: Optional[int] = None,
+    _chunk_views: Optional["_HiddenCount"] = None,
 ) -> LmHeadDetLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -6618,9 +6679,21 @@ def prepare_lm_head_det_loss(
     the plan's rule-picked dX slice count per chunk stays at or below it
     (:func:`make_plan`), so the K-slice workspace never exceeds the one of the
     call without the split.
+
+    ``_chunk_views`` (private; the call's hidden valid-row count, ``cake``
+    backend): a runner built only to template a remembered binding
+    (:meth:`_Binding.from_runner`) for a call that missed the binding cache --
+    its logits, statistics and gather regions are views of the count's chunk-0
+    buffers (:data:`CHUNK_VIEW_REGIONS`) and the other regions one smaller
+    allocation (:func:`_chunk_view_layout`), so preparing it beside those
+    buffers allocates no second chunk buffer; it never launches.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if _chunk_views is not None and (backend != "cake" or workspace_buffer is not None):
+        raise ValueError(
+            "_chunk_views templates a cake-backend runner on its own workspace"
+        )
     if entry != "logprob" and (logprob_dz or logprob_lbl or logprob_keep):
         raise ValueError(
             "logprob_dz / logprob_lbl / logprob_keep select logits GEMM arms of the log-probability entry"
@@ -6760,15 +6833,22 @@ def prepare_lm_head_det_loss(
         hidden=H,
         compact=plan.compact,
     )
+    # a template on the hidden valid-row count's chunk-0 buffers: the other regions in one smaller allocation
+    carved = layout if _chunk_views is None else _chunk_view_layout(layout)
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
-            layout["total"], dtype=torch.uint8, device=device
+            carved["total"], dtype=torch.uint8, device=device
         )
     flat = workspace_buffer.view(-1).view(torch.uint8)
-    if flat.numel() < layout["total"]:
+    if flat.numel() < carved["total"]:
         raise ValueError(
-            f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
+            f"workspace_buffer needs {carved['total']} bytes, got {flat.numel()}"
         )
+
+    def carve(name, dtype, shape):
+        if _chunk_views is not None and name in CHUNK_VIEW_REGIONS:
+            return _chunk_view(_chunk_views, name, shape)
+        return _carve(flat, carved, name, dtype, shape)
 
     def output(given, name, shape, dtype):
         _check_output(given, name, shape, dtype)
@@ -6784,12 +6864,12 @@ def prepare_lm_head_det_loss(
         labels=_prepare_labels(labels, geometry, row_index),
     )
     rows = layout["logits"][1] // (V * 2)
-    t["logits"] = _carve(flat, layout, "logits", torch.bfloat16, (rows, V))
-    t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
-    t["d"] = _carve(flat, layout, "d", torch.float32, (rows,))
-    t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
-    t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
-    t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
+    t["logits"] = carve("logits", torch.bfloat16, (rows, V))
+    t["stats"] = carve("stats", torch.float32, (rows, plan.num_tiles, 2))
+    t["d"] = carve("d", torch.float32, (rows,))
+    t["term"] = carve("term", torch.float32, (rows,))
+    t["loss_acc"] = carve("loss_acc", torch.float64, (1,))
+    t["grad_scale"] = carve("grad_scale", torch.float32, (1,))
     t["unit_scale"] = torch.ones(
         (1,), dtype=torch.float32, device=device
     )  # the log-probability entry's cast scale
@@ -6797,13 +6877,11 @@ def prepare_lm_head_det_loss(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = _carve(
-            flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
-        )
+        t["dx_ws"] = carve("dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
     if plan.compact:
         t["row_index"] = row_index
-        t["x_c"] = _carve(
-            flat, layout, "x_c", torch.bfloat16, (rows, H)
+        t["x_c"] = carve(
+            "x_c", torch.bfloat16, (rows, H)
         )  # the chunk's valid X rows, gathered per chunk
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
@@ -6845,18 +6923,12 @@ def prepare_lm_head_det_loss(
             dw_out,
             "dw_out",
             (V, H),
-            torch.float32
-            if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
-            else torch.bfloat16,
+            torch.float32 if _dw_cast_f32(plan.dw_cast_stage) else torch.bfloat16,
         )
     if layout.get("workspace"):
-        t["workspace"] = _carve(
-            flat, layout, "workspace", torch.uint8, (layout["workspace"][1],)
-        )
+        t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
     if layout.get("tma_descriptor_workspace"):
-        t["tma_descriptor_workspace"] = _carve(
-            flat,
-            layout,
+        t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",
             torch.uint8,
             (layout["tma_descriptor_workspace"][1],),
@@ -6918,6 +6990,7 @@ def prepare_lm_head_det_loss(
         memory=memory,
         engine=engine,
         dw_stream=stream_mode,
+        _template_only=_chunk_views is not None,
     )
 
 
@@ -6954,6 +7027,7 @@ def prepare_lm_head_det_loss_temperature(
     logprob_lbl: Optional[bool] = None,
     temperature: Optional[torch.Tensor] = None,
     dcnt: Optional[torch.Tensor] = None,
+    _chunk_views: Optional["_HiddenCount"] = None,
 ) -> LmHeadDetLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -7019,9 +7093,16 @@ def prepare_lm_head_det_loss_temperature(
     :func:`make_plan_temperature` whose forms the record registers: the counted ``dz`` temperature form
     (:func:`zero_dlogp_temperature_dz_counted`), else the mixed plan (the uncounted ``dz`` temperature form), each
     with the counted dW forms, and the forms without the count otherwise.
+
+    ``_chunk_views`` (private): a template runner on the hidden valid-row count's chunk-0 buffers, as in
+    :func:`prepare_lm_head_det_loss`; it never launches.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if _chunk_views is not None and (backend != "cake" or workspace_buffer is not None):
+        raise ValueError(
+            "_chunk_views templates a cake-backend runner on its own workspace"
+        )
     if entry != "logprob" and (logprob_dz or logprob_lbl):
         raise ValueError(
             "logprob_dz / logprob_lbl select logits GEMM arms of the log-probability entry"
@@ -7196,15 +7277,22 @@ def prepare_lm_head_det_loss_temperature(
         hidden=H,
         compact=plan.compact,
     )
+    # a template on the hidden valid-row count's chunk-0 buffers: the other regions in one smaller allocation
+    carved = layout if _chunk_views is None else _chunk_view_layout(layout)
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
-            layout["total"], dtype=torch.uint8, device=device
+            carved["total"], dtype=torch.uint8, device=device
         )
     flat = workspace_buffer.view(-1).view(torch.uint8)
-    if flat.numel() < layout["total"]:
+    if flat.numel() < carved["total"]:
         raise ValueError(
-            f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
+            f"workspace_buffer needs {carved['total']} bytes, got {flat.numel()}"
         )
+
+    def carve(name, dtype, shape):
+        if _chunk_views is not None and name in CHUNK_VIEW_REGIONS:
+            return _chunk_view(_chunk_views, name, shape)
+        return _carve(flat, carved, name, dtype, shape)
 
     def output(given, name, shape, dtype):
         _check_output(given, name, shape, dtype)
@@ -7220,12 +7308,12 @@ def prepare_lm_head_det_loss_temperature(
         labels=_prepare_labels(labels, geometry, row_index),
     )
     rows = layout["logits"][1] // (V * 2)
-    t["logits"] = _carve(flat, layout, "logits", torch.bfloat16, (rows, V))
-    t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
-    t["d"] = _carve(flat, layout, "d", torch.float32, (rows,))
-    t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
-    t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
-    t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
+    t["logits"] = carve("logits", torch.bfloat16, (rows, V))
+    t["stats"] = carve("stats", torch.float32, (rows, plan.num_tiles, 2))
+    t["d"] = carve("d", torch.float32, (rows,))
+    t["term"] = carve("term", torch.float32, (rows,))
+    t["loss_acc"] = carve("loss_acc", torch.float64, (1,))
+    t["grad_scale"] = carve("grad_scale", torch.float32, (1,))
     t["unit_scale"] = torch.ones(
         (1,), dtype=torch.float32, device=device
     )  # the log-probability entry's cast scale
@@ -7233,13 +7321,11 @@ def prepare_lm_head_det_loss_temperature(
         (16,), dtype=torch.float32, device=device
     )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = _carve(
-            flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
-        )
+        t["dx_ws"] = carve("dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
     if plan.compact:
         t["row_index"] = row_index
-        t["x_c"] = _carve(
-            flat, layout, "x_c", torch.bfloat16, (rows, H)
+        t["x_c"] = carve(
+            "x_c", torch.bfloat16, (rows, H)
         )  # the chunk's valid X rows, gathered per chunk
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
@@ -7285,18 +7371,12 @@ def prepare_lm_head_det_loss_temperature(
             dw_out,
             "dw_out",
             (V, H),
-            torch.float32
-            if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
-            else torch.bfloat16,
+            torch.float32 if _dw_cast_f32(plan.dw_cast_stage) else torch.bfloat16,
         )
     if layout.get("workspace"):
-        t["workspace"] = _carve(
-            flat, layout, "workspace", torch.uint8, (layout["workspace"][1],)
-        )
+        t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
     if layout.get("tma_descriptor_workspace"):
-        t["tma_descriptor_workspace"] = _carve(
-            flat,
-            layout,
+        t["tma_descriptor_workspace"] = carve(
             "tma_descriptor_workspace",
             torch.uint8,
             (layout["tma_descriptor_workspace"][1],),
@@ -7373,6 +7453,7 @@ def prepare_lm_head_det_loss_temperature(
         memory=memory,
         engine=engine,
         dw_stream=stream_mode,
+        _template_only=_chunk_views is not None,
     )
 
 
@@ -8521,6 +8602,35 @@ def _kept_result(result: ForwardResult, logits: Optional[tuple]) -> KeptForwardR
     )
 
 
+def _zero_accumulator(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """An FP32 zero accumulator of ``shape`` without its storage: a stride-0 view of one zero element.  A call that
+    launches no gradient GEMM (:func:`_empty_forward`) returns it as ``dw_acc``, so no FP32 ``[V, H]`` buffer lives
+    from the forward to the backward."""
+    return torch.zeros((), dtype=torch.float32, device=device).expand(shape)
+
+
+def _is_zero_accumulator(acc: torch.Tensor) -> bool:
+    """``acc`` is a :func:`_zero_accumulator` (every stride 0, at least one element)."""
+    return acc.numel() > 0 and all(s == 0 for s in acc.stride())
+
+
+def _zero_gradient(
+    acc: torch.Tensor, grad: Optional[torch.Tensor], out_dtype: torch.dtype
+) -> torch.Tensor:
+    """``cast(g * 0)`` of a :func:`_zero_accumulator` in a new ``out_dtype`` tensor of its shape, without reading or
+    materializing the FP32 accumulator: the bits :func:`scale_cast` gives for a zero FP32 accumulator (``+0``, ``-0``
+    for a negative ``g``, NaN for a non-finite one).  The product is formed in FP32 and cast once, as there, so a
+    finite ``g`` beyond the BF16 range still gives a signed zero."""
+    if out_dtype not in GRAD_WEIGHT_DTYPES:
+        raise ValueError("the cast produces bfloat16 or float32")
+    zero = torch.zeros((), dtype=torch.float32, device=acc.device)
+    if grad is not None:
+        zero = zero * grad.detach().reshape(()).to(
+            device=acc.device, dtype=torch.float32
+        )
+    return torch.empty(acc.shape, dtype=out_dtype, device=acc.device).copy_(zero)
+
+
 def _empty_forward(
     problem: Problem,
     X: torch.Tensor,
@@ -8531,11 +8641,15 @@ def _empty_forward(
     row_valid: Optional[torch.Tensor] = None,
     fuse_dw_cast: Optional[bool] = None,
     dx_finalize: Optional[bool] = None,
+    backend: str = "cake",
 ) -> ForwardResult:
     """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty).
 
     ``fuse_dw_cast`` / ``dx_finalize`` are the call's switches (``None`` = the documented default), so the memory
-    report records the form the caller asked for, as a launched call's would."""
+    report records the form the caller asked for, as a launched call's would.  ``backend``: the call's, kept on the
+    result for :meth:`ForwardResult.backward`.  The loss entry's ``dw_acc`` is a zero accumulator without ``[V, H]``
+    storage (:func:`_zero_accumulator`): the backward forms the zero weight gradient in the output dtype, and the
+    memory report counts the accumulator's one FP32 element."""
     device = X.device
     T = int(problem.num_rows)
     memory = memory_report(
@@ -8552,6 +8666,9 @@ def _empty_forward(
         fuse_dw_cast=fuse_dw_cast,
         dx_finalize=dx_finalize,
     )
+    if problem.entry == "loss" and "dW_acc" in memory["accumulators"]:
+        memory["accumulators"]["dW_acc"] = 4  # the zero accumulator's one element
+        memory["accumulator_bytes"] = sum(memory["accumulators"].values())
     zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
         return ForwardResult(
@@ -8560,12 +8677,11 @@ def _empty_forward(
             dx_acc=torch.zeros((0, problem.hidden), dtype=torch.float32, device=device)
             if need_dx
             else None,
-            dw_acc=torch.zeros(
-                (problem.vocab, problem.hidden), dtype=torch.float32, device=device
-            )
+            dw_acc=_zero_accumulator((problem.vocab, problem.hidden), device)
             if need_dw
             else None,
             memory=memory,
+            backend=backend,
             row_index=row_index,
             row_valid=row_valid,
             num_rows=T,
@@ -8749,6 +8865,7 @@ def forward_loss(
             need_dw=need_dw,
             fuse_dw_cast=fuse_dw_cast,
             dx_finalize=dx_finalize,
+            backend=backend,
         )
     fused_dx = bool(
         need_dx and _resolve_dx_finalize(dx_finalize)
@@ -8830,56 +8947,9 @@ def forward_loss(
     zero_pass = bool(zero_rows and return_logp)
     zero_first = zero_pass and zero_order
     chunk0_alive = zero_first and hc is not None
-    # Ahead of a loop that keeps the FP32 weight-gradient accumulator (``pass_arena``, :func:`zero_weight_memory`): the
-    # accumulator is allocated first and the pass's chunk buffers are views of it (:func:`_arena_views`; the loop writes
-    # it before reading it), so the reserved peak stays within the plain call's.
-    arena = (
-        torch.empty(
-            (problem.vocab, problem.hidden), dtype=torch.float32, device=X.device
-        )
-        if zero_arena and zero_first and backend == "cake"
-        else None
-    )
-    zero_logp = (
-        _zero_weight_logp(
-            problem,
-            X,
-            W,
-            labels,
-            zero_index,
-            backend=backend,
-            gemm_tuning=tuning,
-            arena=arena,
-        )
-        if zero_first
-        else None
-    )
-    if (
+    no_loop = (
         row_index is not None and row_index.numel() == 0
-    ):  # every row ignored (or of zero weight)
-        hc = None
-        result = _empty_forward(
-            problem,
-            X,
-            need_dx=need_dx,
-            need_dw=need_dw,
-            row_index=row_index,
-            row_valid=row_valid,
-            fuse_dw_cast=fuse_dw_cast,
-            dx_finalize=fused_dx,
-        )
-        if exact:
-            # the plain path's reduction of the zero-weight rows' terms (their weights): its bits on either backend
-            result.loss = _zero_weight_exact_loss(
-                problem, None, row_index, zero_index, loss_weights, backend=backend
-            ).reshape(())
-        if zero_pass and not zero_first:
-            zero_logp = _zero_weight_logp(
-                problem, X, W, labels, zero_index, backend=backend, gemm_tuning=tuning
-            )
-        return _with_zero_weight_rows(
-            result, zero_index, zero_logp, chunk0_alive=chunk0_alive, exact=exact
-        )
+    )  # every row ignored (or of zero weight)
     valid_count = None if row_index is None else int(row_index.numel())
     common = dict(
         objective=objective,
@@ -8896,22 +8966,95 @@ def forward_loss(
     cache = BINDING_CACHE
     key = None
     binding = None
-    if backend == "cake" and cache.enabled:
-        key = forward_binding_key(
+    # the pass arena below (the loop's FP32 weight-gradient accumulator, allocated ahead of the logp-only pass)
+    with_arena = bool(zero_arena and zero_first and backend == "cake")
+    if backend == "cake" and not no_loop:
+        if cache.enabled:
+            key = forward_binding_key(
+                X,
+                W,
+                labels,
+                entry="loss",
+                valid_rows=valid_count,
+                fuse_dw_cast=fuse,
+                gemm_tuning=tuning,
+                dx_finalize=fused_dx,
+                hidden_count=hc is not None,
+                **common,
+            )
+            if dx_cap is not None:  # the split's capped dX slice counts
+                key += ("dx_slices_cap", int(dx_cap))
+            binding = cache.lookup(key)
+        if binding is None and with_arena:
+            # a call that misses the cache prepares its binding (below) before the arena exists, so the runner's
+            # workspace and the arena never coexist
+            runner = prepare_lm_head_det_loss(
+                X,
+                W,
+                labels,
+                entry="loss",
+                backend=backend,
+                compact_rows=False if row_index is None else row_index,
+                fuse_dw_cast=fuse,
+                gemm_tuning=tuning,
+                dx_finalize=fused_dx,
+                dw_stream=stream_mode,
+                dx_slices_cap=dx_cap,
+                **common,
+            )
+            binding = _Binding.from_runner(runner, hc)
+            del runner
+            if key is not None:
+                cache.remember(key, binding)
+    # Ahead of a loop that keeps the FP32 weight-gradient accumulator (``pass_arena``, :func:`zero_weight_memory`): the
+    # accumulator is allocated first and the pass's chunk buffers are views of it (:func:`_arena_views`; the loop writes
+    # it before reading it), so the reserved peak stays within the plain call's.
+    arena = (
+        torch.empty(
+            (problem.vocab, problem.hidden), dtype=torch.float32, device=X.device
+        )
+        if with_arena
+        else None
+    )
+    zero_logp = (
+        _zero_weight_logp(
+            problem,
             X,
             W,
             labels,
-            entry="loss",
-            valid_rows=valid_count,
-            fuse_dw_cast=fuse,
+            zero_index,
+            backend=backend,
             gemm_tuning=tuning,
-            dx_finalize=fused_dx,
-            hidden_count=hc is not None,
-            **common,
+            arena=arena,
         )
-        if dx_cap is not None:
-            key += ("dx_slices_cap", int(dx_cap))  # the split's capped dX slice counts
-        binding = cache.lookup(key)
+        if zero_first
+        else None
+    )
+    if no_loop:
+        hc = None
+        result = _empty_forward(
+            problem,
+            X,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            row_index=row_index,
+            row_valid=row_valid,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=fused_dx,
+            backend=backend,
+        )
+        if exact:
+            # the plain path's reduction of the zero-weight rows' terms (their weights): its bits on either backend
+            result.loss = _zero_weight_exact_loss(
+                problem, None, row_index, zero_index, loss_weights, backend=backend
+            ).reshape(())
+        if zero_pass and not zero_first:
+            zero_logp = _zero_weight_logp(
+                problem, X, W, labels, zero_index, backend=backend, gemm_tuning=tuning
+            )
+        return _with_zero_weight_rows(
+            result, zero_index, zero_logp, chunk0_alive=chunk0_alive, exact=exact
+        )
     if binding is not None:
         memory = binding.memory
     else:
@@ -9616,6 +9759,9 @@ def backward_loss(
             backend=backend,
             gemm_tuning=gemm_tuning,
         )
+    elif dw_acc is not None and _is_zero_accumulator(dw_acc):
+        # a call without a gradient GEMM (:func:`_empty_forward`): no FP32 accumulator to read
+        dw = _zero_gradient(dw_acc, grad, grad_weight_dtype)
     else:
         dw = (
             None
@@ -9640,6 +9786,7 @@ def forward_logprob(
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     logprob_lbl: Optional[bool] = None,
+    keep: Optional[Callable[[Optional[torch.Tensor]], bool]] = None,
 ) -> ForwardResult:
     """Forward of the log-probability entry: ``logp`` (FP32 ``[T]``, 0 on ignored rows) plus the saved statistic
     ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back,
@@ -9647,9 +9794,15 @@ def forward_logprob(
     :func:`hidden_count_default`) and ``gemm_tuning`` (default :func:`gemm_tuning_default`) as in
     :func:`forward_loss`; ``logprob_lbl`` (default :func:`logprob_lbl_default`) writes only the row statistics and
     the label column's logit from the logits GEMM (bitwise the same ``lse`` / ``logp``).  This forward has no
-    weight gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``."""
+    weight gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``.  ``keep`` (the opt-in module's
+    one-chunk kept logits: its rule's predicate on the valid-row index; ``cake`` backend): a call that counts its valid
+    rows on the host and that ``keep`` accepts on this count's index runs :func:`forward_logprob_keep`'s binding
+    instead (a :class:`KeptForwardResult`, bitwise the same ``logp`` / ``lse``); the decision follows the count with no
+    other work between them, and either form runs on that one count."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if keep is not None and backend != "cake":
+        raise ValueError("the kept logits (logprob_keep) run on the cake backend")
     problem = validate_lm_head_det_inputs(
         X,
         W,
@@ -9680,6 +9833,18 @@ def forward_logprob(
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _empty_forward(
             problem, X, need_dx=False, need_dw=False, row_index=row_index
+        )
+    if keep is not None and hc is None and keep(row_index):
+        return _forward_keep_bound(
+            problem,
+            X,
+            W,
+            labels,
+            row_index,
+            None,
+            chunk_size=chunk_size,
+            backend=backend,
+            tuning=tuning,
         )
     logp, lse, memory = _forward_logprob_rows(
         problem,
@@ -9763,10 +9928,13 @@ def _forward_logprob_rows(
         compact_rows=False if row_index is None else row_index,
         gemm_tuning=tuning,
         logprob_lbl=lbl,
+        _chunk_views=hc,
     )
     if hc is not None or (arena is not None and backend == "cake"):
         # the hidden valid-row count: chunk 0's logits already sit in the prologue's buffers, so the first call launches
-        # through the templated binding too (the runner's own workspace is never written); the same with an arena
+        # through the templated binding too -- a template whose chunk buffers are views of the prologue's
+        # (``_chunk_views``: no second chunk buffer beside them); the same with an arena (the runner's own workspace is
+        # never written)
         binding = _Binding.from_runner(runner, hc)
         del runner
         if key is not None:
@@ -9994,6 +10162,8 @@ def backward_logprob(
     dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
+    # the runner's chunk workspace is not needed by the dX finalize: dropped before its output is allocated
+    del runner
     return finish_dx(dx), dw
 
 
@@ -10143,10 +10313,12 @@ def forward_logprob_temperature(
         gemm_tuning=tuning,
         logprob_lbl=lbl,
         temperature=tau_rows,
+        _chunk_views=hc,
     )
     if hc is not None:
         # the hidden valid-row count: chunk 0's logits already sit in the prologue's buffers, so the first call launches
-        # through the templated binding too (the runner's own workspace is never written)
+        # through the templated binding too -- a template whose chunk buffers are views of the prologue's
+        # (``_chunk_views``: no second chunk buffer beside them)
         binding = _TemperatureBinding.from_runner(runner, hc)
         del runner
         if key is not None:
@@ -10491,6 +10663,8 @@ def backward_logprob_temperature(
     dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _TemperatureBinding.from_runner(runner))
+    # the runner's chunk workspace is not needed by the dX finalize: dropped before its output is allocated
+    del runner
     return finish_dx(dx), dw
 
 
@@ -10504,12 +10678,16 @@ def forward_logprob_keep(
     compact_rows: Optional[bool] = None,
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    row_index: Any = _RECOUNT,
 ) -> KeptForwardResult:
     """:func:`forward_logprob` that keeps every chunk's BF16 logits for the backward (``cake`` backend): the logits
     GEMM is the plain ``gemm_logits`` (the whole ``z_c``, not the label-column arm), chunk 0's logits stay in the
     chunk buffer and the later chunks' go to one ``[T_v - rows_0, V]`` buffer, ``2 * T_v * V`` bytes in all
     (:attr:`KeptForwardResult.logits`).  Pass them to :func:`backward_logprob_keep`, which forms ``dz`` from them
-    instead of recomputing the logits.  Bitwise the same ``logp`` / ``lse`` as :func:`forward_logprob`."""
+    instead of recomputing the logits.  Bitwise the same ``logp`` / ``lse`` as :func:`forward_logprob`.
+    ``row_index``: the caller's valid-row index of a compacted call (the ascending int64 rows whose label is ``>= 0``,
+    ``None`` when every row is valid; the opt-in module forms it on the device from ``num_valid_rows``) -- the call
+    then counts nothing (no host synchronization, no hidden count); the default counts the valid rows itself."""
     if backend != "cake":
         raise ValueError("the kept logits (logprob_keep) run on the cake backend")
     problem = validate_lm_head_det_inputs(
@@ -10526,20 +10704,27 @@ def forward_logprob_keep(
             _empty_forward(problem, X, need_dx=False, need_dw=False), None
         )
     compact = _resolve_compact(compact_rows)
-    hc = _hidden_count(
-        problem,
-        X,
-        W,
-        labels,
-        backend=backend,
-        compact=compact,
-        stats=True,
-        hidden_count=_resolve_hidden_count(hidden_count),
-    )
-    if hc is not None:
-        row_index = hc.row_index()
-    else:
-        row_index = valid_row_index(labels) if compact else None
+    hc = None
+    if row_index is _RECOUNT:
+        hc = _hidden_count(
+            problem,
+            X,
+            W,
+            labels,
+            backend=backend,
+            compact=compact,
+            stats=True,
+            hidden_count=_resolve_hidden_count(hidden_count),
+        )
+        if hc is not None:
+            row_index = hc.row_index()
+        else:
+            row_index = valid_row_index(labels) if compact else None
+    elif row_index is not None:
+        if not compact:
+            raise ValueError("a valid-row index belongs to a compacted forward")
+        if isinstance(row_index, torch.Tensor):
+            row_index = row_index.contiguous()  # the dX finalize reads a dense index
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _kept_result(
             _empty_forward(
@@ -10547,6 +10732,34 @@ def forward_logprob_keep(
             ),
             None,
         )
+    return _forward_keep_bound(
+        problem,
+        X,
+        W,
+        labels,
+        row_index,
+        hc,
+        chunk_size=chunk_size,
+        backend=backend,
+        tuning=tuning,
+    )
+
+
+def _forward_keep_bound(
+    problem: Problem,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    row_index: Optional[torch.Tensor],
+    hc: Optional[_HiddenCount],
+    *,
+    chunk_size: int,
+    backend: str,
+    tuning: dict[str, dict[str, Any]],
+) -> KeptForwardResult:
+    """:func:`forward_logprob_keep`'s body after its count (``row_index`` non-empty, or ``None``): the kept binding from
+    the cache or a new one, launched; also the kept form of :func:`forward_logprob` under its ``keep``."""
+    T = problem.num_rows
     cache = BINDING_CACHE
     key = None
     binding: Optional[_KeptBinding] = None
@@ -10743,7 +10956,8 @@ def backward_logprob_keep(
 # included) the checkpointed forward computes the loss only while the recomputation in the backward forms the
 # accumulators (one gradient pass per step instead of two).  CPU offload or other saved-tensor hooks innermost and a
 # torch whose checkpoint lacks the hook structure read below keep the fused forward.  The log-probability entry forms
-# no gradient in its forward and is unchanged.  ``"forward"``: every call with an input that requires a gradient forms
+# no gradient in its forward; under ``"auto"`` its checkpoint recomputation takes the checkpointed call's row results
+# (:class:`_LogprobKept`).  ``"forward"``: every call with an input that requires a gradient forms
 # them in its forward, also when no backward follows.  The outputs are the same bits either way (the same kernels on
 # the same operands, in the same order).
 GRADIENT_PLACEMENTS = ("auto", "forward")
@@ -11045,6 +11259,99 @@ def _hand_over(ctx, ckpt: _CheckpointPass, handed, result):
             handed[0].handed[(ckpt.graph, handed[1])] = state
 
 
+# The log-probability entries inside a non-reentrant ``torch.utils.checkpoint`` (gradient placement ``"auto"``): the
+# checkpointed forward keeps its call's row results -- ``logp``, the FP32 row statistic ``lse``, the valid-row index
+# and the compact temperature, O(T) bytes -- in the checkpoint frame, and the recomputation in the backward takes them
+# instead of running the logits GEMMs again: it returns a copy of the same ``logp`` and saves the same row results, so
+# the backward reads the bits the plain call's backward reads.  A recomputed call takes them only when it repeats its
+# checkpointed call (paired per frame and graph by call order) on the same input tensors (the same objects, unchanged
+# since: version counters) under the same options; otherwise, under the placement ``"forward"``, or after the kept
+# ``logp`` was modified in place, it runs the forward.
+class _LogprobKept(NamedTuple):
+    """A checkpointed log-probability call's row results, kept for its recomputation."""
+
+    key: tuple  # the call's options and its inputs' metadata and version counters
+    refs: tuple  # weak references to the call's input tensors (None for an absent one)
+    # an alias of the returned logp (its version counter tells an in-place change)
+    logp: torch.Tensor
+    logp_version: int
+    saved: tuple  # the tensors the forward saves past X, W and labels
+    extra: Any = None  # a non-tensor the backward reads (the scalar temperature)
+
+
+class _LogprobCalls:
+    """The log-probability entry calls of one checkpoint frame: per call of the checkpointed forward (in order) its kept
+    row results (``None``: kept none) and per graph the recomputation's call count."""
+
+    __slots__ = ("calls", "recomputed", "__weakref__")
+
+    def __init__(self) -> None:
+        self.calls: list = []
+        self.recomputed: dict = {}
+
+
+_LOGPROB_CHECKPOINT_CALLS: "weakref.WeakKeyDictionary[Any, _LogprobCalls]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _logprob_call_key(inputs: tuple, options: tuple) -> tuple:
+    """What a recomputed log-probability call must match to take its checkpointed call's row results."""
+    meta = tuple(None if t is None else (_meta_key(t), t._version) for t in inputs)
+    return meta + (repr(options),)
+
+
+def _logprob_checkpoint_keep(
+    ctx, ckpt: _CheckpointPass, key: tuple, inputs: tuple, logp, saved, extra=None
+) -> None:
+    """Record a log-probability call of the checkpointed forward, with its row results when a backward can follow
+    (placement ``"auto"``, an input requiring a gradient)."""
+    if ckpt.frame is None:
+        return
+    kept = None
+    if gradient_placement() == "auto" and any(ctx.needs_input_grad[:2]):
+        kept = _LogprobKept(
+            key,
+            tuple(None if t is None else weakref.ref(t) for t in inputs),
+            logp.detach(),
+            logp._version,
+            tuple(_detached(t) for t in saved),
+            extra,
+        )
+    with _CHECKPOINT_LOCK:
+        calls = _LOGPROB_CHECKPOINT_CALLS.get(ckpt.frame)
+        if calls is None:
+            calls = _LOGPROB_CHECKPOINT_CALLS[ckpt.frame] = _LogprobCalls()
+        calls.calls.append(kept)
+
+
+def _logprob_checkpoint_take(
+    ckpt: _CheckpointPass, key: tuple, inputs: tuple
+) -> Optional[_LogprobKept]:
+    """The kept row results of the checkpointed call a call of the recomputation repeats (``None``: run the
+    forward)."""
+    if ckpt.frame is None:
+        return None
+    with _CHECKPOINT_LOCK:
+        calls = _LOGPROB_CHECKPOINT_CALLS.get(ckpt.frame)
+        if calls is None:
+            return None
+        index = calls.recomputed.get(ckpt.graph, 0)
+        calls.recomputed[ckpt.graph] = index + 1
+        kept = calls.calls[index] if index < len(calls.calls) else None
+    if (
+        kept is None
+        or kept.key != key
+        or kept.logp._version != kept.logp_version
+        or any(
+            (ref is None) != (t is None) or (ref is not None and ref() is not t)
+            for ref, t in zip(kept.refs, inputs, strict=True)
+        )
+    ):
+        return None
+    return kept
+
+
 def _split_state(ctx, inputs, forward):
     """The gradient state of a call with ``ctx.split`` in its backward (after its inputs were unpacked, which ran the
     recomputation): the recomputed call's result, else ``forward`` (the fused forward) on the inputs."""
@@ -11126,12 +11433,8 @@ def _loss_backward_split(ctx, grad_loss):
         dw = (
             None
             if state.dw_acc is None
-            else torch.zeros(
-                state.dw_acc.shape,
-                dtype=ctx.grad_weight_dtype,
-                device=state.dw_acc.device,
-            )
-        )
+            else _zero_gradient(state.dw_acc, grad_loss, ctx.grad_weight_dtype)
+        )  # cast(g * 0), as ForwardResult.backward forms it
         return dx, dw
     return backward_loss(
         state.dx_acc,
@@ -11303,12 +11606,8 @@ class CakeLMHeadDetLossFunction(torch.autograd.Function):
             dw = (
                 None
                 if ctx.dw_acc is None
-                else torch.zeros(
-                    ctx.dw_acc.shape,
-                    dtype=ctx.grad_weight_dtype,
-                    device=ctx.dw_acc.device,
-                )
-            )
+                else _zero_gradient(ctx.dw_acc, grad_loss, ctx.grad_weight_dtype)
+            )  # cast(g * 0), as ForwardResult.backward forms it
             return (dx, dw) + none[2:]
         dz_last, x_last, x_src, x_idx = ctx.saved_tensors
         dx, dw = backward_loss(
@@ -11376,20 +11675,36 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
         hidden = _resolve_hidden_count(hidden_count)
         tuning = _resolve_gemm_tuning(gemm_tuning)
         dz_arm = _resolve_logprob_dz(logprob_dz)
-        result = forward_logprob(
-            X,
-            W,
-            labels,
-            chunk_size=chunk_size,
-            backend=backend,
-            compact_rows=compact,
-            hidden_count=hidden,
-            gemm_tuning=tuning,
-            logprob_lbl=_resolve_logprob_lbl(logprob_lbl),
-        )
+        lbl_arm = _resolve_logprob_lbl(logprob_lbl)
+        ckpt = _checkpoint_pass() if _TOP_SAVED_HOOKS(False) is not None else None
+        if ckpt is not None:
+            inputs = (X, W, labels)
+            key = _logprob_call_key(
+                inputs,
+                (chunk_size, backend, compact, hidden, _tuning_key(tuning), lbl_arm),
+            )
+            kept = None if ckpt.first else _logprob_checkpoint_take(ckpt, key, inputs)
         ctx.set_materialize_grads(False)
+        if ckpt is not None and kept is not None:
+            # the recomputation of a checkpointed call: its row results, no logits GEMM (see _LogprobKept)
+            logp, (lse, row_index) = kept.logp.clone(), kept.saved
+        else:
+            result = forward_logprob(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                backend=backend,
+                compact_rows=compact,
+                hidden_count=hidden,
+                gemm_tuning=tuning,
+                logprob_lbl=lbl_arm,
+            )
+            logp, lse, row_index = result.logp, result.lse, result.row_index
+            if ckpt is not None and ckpt.first:
+                _logprob_checkpoint_keep(ctx, ckpt, key, inputs, logp, (lse, row_index))
         # the valid-row index rides along: the backward plans its chunks without counting the rows again
-        ctx.save_for_backward(X, W, labels, result.lse, result.row_index)
+        ctx.save_for_backward(X, W, labels, lse, row_index)
         ctx.chunk_size, ctx.backend, ctx.compact = (
             chunk_size,
             backend,
@@ -11401,34 +11716,41 @@ class CakeLMHeadDetLogprobFunction(torch.autograd.Function):
         ctx.hidden_count = hidden
         ctx.gemm_tuning = tuning
         ctx.logprob_dz = dz_arm
-        return result.logp
+        return logp
 
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
             return (None,) * 13
-        X, W, labels, lse, row_index = ctx.saved_tensors
-        need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
-        dx, dw = backward_logprob(
-            X,
-            W,
-            labels,
-            lse,
-            dlogp,
-            chunk_size=ctx.chunk_size,
-            need_dx=need_dx,
-            need_dw=need_dw,
-            backend=ctx.backend,
-            compact_rows=ctx.compact,
-            fuse_dw_cast=ctx.fuse_dw_cast,
-            dx_finalize=ctx.dx_finalize,
-            dw_stream=ctx.dw_stream,
-            hidden_count=ctx.hidden_count,
-            gemm_tuning=ctx.gemm_tuning,
-            logprob_dz=ctx.logprob_dz,
-            row_index=row_index,
-        )
+        dx, dw = _logprob_backward(ctx, dlogp, ctx.saved_tensors)
         return (dx, dw) + (None,) * 11
+
+
+def _logprob_backward(ctx, dlogp, saved) -> tuple:
+    """``(dX, dW)`` of :class:`CakeLMHeadDetLogprobFunction`'s backward from its saved tensors ``saved`` (``X``,
+    ``W``, ``labels``, ``lse``, ``row_index``), unpacked once by the caller (a subclass that reads them first, the
+    package's opt-in automatic form among them; a second unpack inside a non-reentrant checkpoint raises)."""
+    X, W, labels, lse, row_index = saved
+    need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
+    return backward_logprob(
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        chunk_size=ctx.chunk_size,
+        need_dx=need_dx,
+        need_dw=need_dw,
+        backend=ctx.backend,
+        compact_rows=ctx.compact,
+        fuse_dw_cast=ctx.fuse_dw_cast,
+        dx_finalize=ctx.dx_finalize,
+        dw_stream=ctx.dw_stream,
+        hidden_count=ctx.hidden_count,
+        gemm_tuning=ctx.gemm_tuning,
+        logprob_dz=ctx.logprob_dz,
+        row_index=row_index,
+    )
 
 
 class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
@@ -11482,43 +11804,71 @@ class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
         hidden = _resolve_hidden_count(hidden_count)
         tuning = _resolve_gemm_tuning(gemm_tuning)
         dz_arm = _resolve_logprob_dz(logprob_dz)
-        # the temperature is validated once, before any launch (both arms' explicit switches are known here)
-        tau = _resolve_temperature(
-            temperature,
-            int(X.shape[0]) if X.ndim else 0,
-            X.device,
-            check=bool(check_temperature),
-        )
-        _check_temperature_arms(tau is not None, logprob_lbl, logprob_dz)
-        result = forward_logprob_temperature(
-            X,
-            W,
-            labels,
-            chunk_size=chunk_size,
-            backend=backend,
-            compact_rows=compact,
-            hidden_count=hidden,
-            gemm_tuning=tuning,
-            logprob_lbl=_resolve_logprob_lbl(logprob_lbl),
-            temperature=tau,
-        )
+        lbl_arm = _resolve_logprob_lbl(logprob_lbl)
+        ckpt = _checkpoint_pass() if _TOP_SAVED_HOOKS(False) is not None else None
+        if ckpt is not None:
+            tau_in = temperature if isinstance(temperature, torch.Tensor) else None
+            inputs = (X, W, labels, tau_in)
+            key = _logprob_call_key(
+                inputs,
+                (
+                    chunk_size,
+                    backend,
+                    compact,
+                    hidden,
+                    _tuning_key(tuning),
+                    lbl_arm,
+                    logprob_dz,
+                    None if tau_in is not None else temperature,
+                    bool(check_temperature),
+                ),
+            )
+            kept = None if ckpt.first else _logprob_checkpoint_take(ckpt, key, inputs)
         ctx.set_materialize_grads(False)
+        if ckpt is not None and kept is not None:
+            # the recomputation of a checkpointed call: its row results, no logits GEMM (see _LogprobKept)
+            logp, saved, temperature_scalar = kept.logp.clone(), kept.saved, kept.extra
+        else:
+            # the temperature is validated once, before any launch (both arms' explicit switches are known here)
+            tau = _resolve_temperature(
+                temperature,
+                int(X.shape[0]) if X.ndim else 0,
+                X.device,
+                check=bool(check_temperature),
+            )
+            _check_temperature_arms(tau is not None, logprob_lbl, logprob_dz)
+            result = forward_logprob_temperature(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                backend=backend,
+                compact_rows=compact,
+                hidden_count=hidden,
+                gemm_tuning=tuning,
+                logprob_lbl=lbl_arm,
+                temperature=tau,
+            )
+            logp = result.logp
+            saved = (
+                result.lse,
+                result.row_index,
+                result.temperature_rows,
+                tau.value if tau is not None and tau.kind == "tensor" else None,
+            )
+            temperature_scalar = (
+                tau.value if tau is not None and tau.kind == "scalar" else None
+            )
+            if ckpt is not None and ckpt.first:
+                _logprob_checkpoint_keep(
+                    ctx, ckpt, key, inputs, logp, saved, temperature_scalar
+                )
         # the valid-row index rides along: the backward plans its chunks without counting the rows again; so does the
         # compact temperature the forward's kernels read (no second gather) and the resolved temperature itself -- the
         # caller's per-token [T] tensor (saved, not copied) or the scalar -- which the zero-gradient row skip gathers
         # in its own row order
-        ctx.save_for_backward(
-            X,
-            W,
-            labels,
-            result.lse,
-            result.row_index,
-            result.temperature_rows,
-            tau.value if tau is not None and tau.kind == "tensor" else None,
-        )
-        ctx.temperature_scalar = (
-            tau.value if tau is not None and tau.kind == "scalar" else None
-        )
+        ctx.save_for_backward(X, W, labels, *saved)
+        ctx.temperature_scalar = temperature_scalar
         ctx.chunk_size, ctx.backend, ctx.compact = (
             chunk_size,
             backend,
@@ -11530,49 +11880,59 @@ class CakeLMHeadDetLogprobTemperatureFunction(torch.autograd.Function):
         ctx.hidden_count = hidden
         ctx.gemm_tuning = tuning
         ctx.logprob_dz = dz_arm
-        return result.logp
+        return logp
 
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
             return (None,) * 15
-        X, W, labels, lse, row_index, tau_rows, tau_tokens = ctx.saved_tensors
-        # the forward's resolved temperature (None: the forward ran without one)
-        tau = (
-            _Temperature("tensor", tau_tokens)
-            if tau_tokens is not None
-            else _Temperature("scalar", ctx.temperature_scalar)
-            if ctx.temperature_scalar is not None
-            else None
-        )
-        need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
-        dx, dw = backward_logprob_temperature(
-            X,
-            W,
-            labels,
-            lse,
-            dlogp,
-            chunk_size=ctx.chunk_size,
-            need_dx=need_dx,
-            need_dw=need_dw,
-            backend=ctx.backend,
-            compact_rows=ctx.compact,
-            fuse_dw_cast=ctx.fuse_dw_cast,
-            dx_finalize=ctx.dx_finalize,
-            dw_stream=ctx.dw_stream,
-            hidden_count=ctx.hidden_count,
-            gemm_tuning=ctx.gemm_tuning,
-            logprob_dz=ctx.logprob_dz,
-            row_index=row_index,
-            temperature=tau if tau_rows is not None else None,
-            temperature_rows=tau_rows,
-        )
+        dx, dw = _logprob_temperature_backward(ctx, dlogp, ctx.saved_tensors)
         return (dx, dw) + (None,) * 13
+
+
+def _logprob_temperature_backward(ctx, dlogp, saved) -> tuple:
+    """``(dX, dW)`` of :class:`CakeLMHeadDetLogprobTemperatureFunction`'s backward from its saved tensors ``saved``
+    (``X``, ``W``, ``labels``, ``lse``, ``row_index``, ``tau_rows``, ``tau_tokens``), unpacked once by the caller (as
+    :func:`_logprob_backward`)."""
+    X, W, labels, lse, row_index, tau_rows, tau_tokens = saved
+    # the forward's resolved temperature (None: the forward ran without one)
+    tau = (
+        _Temperature("tensor", tau_tokens)
+        if tau_tokens is not None
+        else _Temperature("scalar", ctx.temperature_scalar)
+        if ctx.temperature_scalar is not None
+        else None
+    )
+    need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
+    return backward_logprob_temperature(
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        chunk_size=ctx.chunk_size,
+        need_dx=need_dx,
+        need_dw=need_dw,
+        backend=ctx.backend,
+        compact_rows=ctx.compact,
+        fuse_dw_cast=ctx.fuse_dw_cast,
+        dx_finalize=ctx.dx_finalize,
+        dw_stream=ctx.dw_stream,
+        hidden_count=ctx.hidden_count,
+        gemm_tuning=ctx.gemm_tuning,
+        logprob_dz=ctx.logprob_dz,
+        row_index=row_index,
+        temperature=tau if tau_rows is not None else None,
+        temperature_rows=tau_rows,
+    )
 
 
 class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
     """Entry (b) with the kept logits (:func:`cake_lm_head_det_train_logprob_keep`): the forward saves the row statistic
-    and the kept logits; the first backward forms ``dz`` from them, a later one (a retained graph) recomputes."""
+    and the kept logits; the first backward forms ``dz`` from them, a later one (a retained graph) recomputes.
+    ``row_index`` (optional, last): the caller's valid-row index (:func:`forward_logprob_keep`; the opt-in module's
+    ``num_valid_rows``); omitted, the forward counts the valid rows itself.  The backward returns one gradient slot per
+    input either way (PyTorch drops trailing ``None`` slots past the inputs given)."""
 
     @staticmethod
     def forward(
@@ -11588,6 +11948,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
         hidden_count,
         gemm_tuning,
         logprob_dz,
+        row_index=_RECOUNT,
     ):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
@@ -11604,6 +11965,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
                     hidden_count,
                     gemm_tuning,
                     logprob_dz,
+                    row_index,
                 )
         compact = _resolve_compact(compact_rows)
         hidden = _resolve_hidden_count(hidden_count)
@@ -11616,6 +11978,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
             compact_rows=compact,
             hidden_count=hidden,
             gemm_tuning=tuning,
+            row_index=row_index,
         )
         ctx.set_materialize_grads(False)
         # the kept logits are saved tensors too, so a non-reentrant checkpoint drops them with the rest; ``row_grad``
@@ -11640,7 +12003,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 11
+            return (None,) * 12
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         X, W, labels, lse, row_index, *kept = ctx.saved_tensors
         common = dict(
@@ -11670,7 +12033,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
                 logprob_dz=ctx.logprob_dz,
                 **common,
             )
-        return (dx, dw) + (None,) * 9
+        return (dx, dw) + (None,) * 10
 
 
 def cake_lm_head_det_train_loss(

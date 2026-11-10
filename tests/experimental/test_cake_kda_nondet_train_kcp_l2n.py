@@ -27,7 +27,8 @@ the same partition); the values the call binds for every local stage (the existi
 ``read_rstd`` / ``write_rstd``), the stage order of both forms, the fallback form's stages never skipped, and the
 capability check (the existing backend's selection of every stage of the form over a fixed problem grid, the records'
 architectures and exports, the first readers, the layouts' slot views); the refusal before the operand checks; the
-checkpoint hand-off, which takes no decision with the flag on; and, while the existing backend lacks the mode's
+checkpoint hand-off, decided with the call's mode and reaching the hand-off's forward with the flag on and in raw gate
+mode, and its saved bytes there; and, while the existing backend lacks the mode's
 programs, the ``NotImplementedError`` of every flag-on call, workspace and byte query before any workspace sizing,
 plan or collective, with the same message on a rank with tokens and on one without, also in spawned CPU groups of 2
 and 4 ranks (gloo, through a ``file://`` store), a rank with a misaligned view too.  Once it has them: every record
@@ -40,8 +41,9 @@ GPU rows (one process per rank; ``W = 1`` in the pytest process, ``W > 1`` spawn
 process per Slurm task as in ``test_cake_kda_nondet_train_kcp_dist.py``): flag-off identity on one device; then every rank
 runs the flag-on KCP forward / backward in every mode on raw q / k (normalized rows times ``2^e`` per token and head,
 ``e`` in ``[-6, 6]``, plus zero and subnormal rows) and must be bitwise repeatable (saved == replay, repeat, autograd ==
-explicit, checkpoint == direct, a recompute handle of both tiers == plain checkpoint, checkpoint with
-``checkpoint_handoff="on"`` == plain checkpoint with no hand-off decision taken, save_transfer, ring == a2a, graph
+explicit, checkpoint == direct, a recompute handle of both tiers == plain checkpoint -- its recompute issuing no
+collective (the call's counter and sequence, and no torch.distributed call in the recompute phase) --, checkpoint with
+``checkpoint_handoff="on"`` (engaged) == plain checkpoint, save_transfer, ring == a2a, graph
 replay == eager, ``workspace=None``, packed strided q / k == contiguous), run the flag-off route's collectives and
 local stages, keep the FP32 rstd ``[2, T_r, H]`` (empty on a rank without tokens, which runs no local stage); every
 output, gradient, partial sum and the saved rstd are bitwise those of the deterministic package's KCP route with the
@@ -82,6 +84,9 @@ from tests.experimental.test_cake_kda_det_train_kcp_dist import (
     _partition as _det_partition,
 )
 from tests.experimental.test_cake_kda_nondet_train_kcp_dist import (
+    _Counter,
+    _bwd_sequence_first_main,
+    _handle_recompute_flags,
     _init_group,
     _local_slices,
     _partition,
@@ -90,13 +95,14 @@ from tests.experimental.test_cake_kda_nondet_train_kcp_dist import (
     _requested,
     _to_global,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (
+from tests.experimental.test_cake_kda_nondet_train_kcp_handoff import _handoff_delta
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
     LOWER_BOUND,
     error_metrics,
     kda_exact_forward,
     make_inputs,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_kcp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp")
 cake_kcp_plan = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_plan")
@@ -559,10 +565,10 @@ L2N_ENTRIES = (
 
 def test_l2n_keyword_is_keyword_only_and_off_by_default() -> None:
     """``use_qk_l2norm_in_kernel`` is a keyword-only ``bool = False`` of the three entry points, ``CakeKDANondetKcpWorkspace``
-    and the two byte queries, and the autograd Function's last argument; it is an entry keyword, not an option:
-    ``CakeKDANondetKcpOptions`` (every field of which keys the graph cache and the handle fingerprint) has no such field and
-    neither ``**options`` nor the private test knobs accept it.  The workspace's form knob is keyword-only, ``None``
-    by default."""
+    and the two byte queries, and the autograd Function's last argument but ``saved_rows``; it is an entry keyword,
+    not an option: ``CakeKDANondetKcpOptions`` (every field of which keys the graph cache and the handle fingerprint)
+    has no such field and neither ``**options`` nor the private test knobs accept it.  The workspace's form knob is
+    keyword-only, ``None`` by default."""
     for module, name in L2N_ENTRIES:
         p = inspect.signature(getattr(module, name)).parameters[
             "use_qk_l2norm_in_kernel"
@@ -582,8 +588,10 @@ def test_l2n_keyword_is_keyword_only_and_off_by_default() -> None:
         is cake_kcp_plan.cake_kda_nondet_train_kcp_workspace_bytes
     )
     params = inspect.signature(cake_kcp.CakeKDANondetKcpFunction.forward).parameters
-    assert list(params)[-1] == "use_qk_l2norm_in_kernel"
+    # the last argument but saved_rows (the rows decision of cake_kda_nondet_kcp), which follows it
+    assert list(params)[-2:] == ["use_qk_l2norm_in_kernel", "saved_rows"]
     assert params["use_qk_l2norm_in_kernel"].default is False
+    assert params["saved_rows"].default is None
     fields = {f.name for f in dataclasses.fields(cake_kcp.CakeKDANondetKcpOptions)}
     assert not any("l2n" in f or "l2norm" in f for f in fields), fields
     assert "use_qk_l2norm_in_kernel" not in cake_kcp._OPTION_KEYS
@@ -902,6 +910,116 @@ def test_l2n_saved_set_round_trip_and_checks(capable) -> None:
     assert tuple(zback.qk_rstd.shape) == (2, 0, H)
     assert zback.meta()["qk_l2norm"] is True
     cake_kcp._check_saved(z, _prepared(zctx, zops, H, backward=True, **L2N))
+
+
+def test_rows_saved_set_checks(capable) -> None:
+    """The backward's checks of a kept rows set (``saved_rows`` "intra" / "wy"), with the in-kernel norm off
+    and on: it accepts exactly the set's members (BF16 ``aqk_int`` / ``akk_int`` ``[R, H, 64]``, ``w`` / ``u``
+    ``[R, H, 128]``) beside the carry plane and the rstd, on a rank with tokens and local stages; it refuses a
+    partial set, a member of the other set (``w`` or ``u`` beside the intra rows), the tape's ``h`` / ``v_new``
+    beside the rows, a ``u`` without rows, a wrong shape or dtype, a set name outside the two, a rows set under the
+    SPEC-3 probe, and a rank without local stages or without tokens.  The CPU binds no local arena: ``call.local``
+    stands in for it (the check reads only its presence)."""
+    H = 4
+    ctx = _cpu_ctx()
+    ops = _cpu_ops(ctx, H)
+    T, R = int(ctx.T_r), int(ctx.R)
+    fwd = _prepared(ctx, ops, H, backward=False)
+
+    def member(n: str, *, dtype=torch.bfloat16, extra: int = 0) -> torch.Tensor:
+        width = cake_kcp.BT if n in ("aqk_int", "akk_int") else D
+        return torch.zeros(R, H, width + extra, dtype=dtype)
+
+    names = cake_kcp_plan.KCP_SAVED_ROWS
+    for kw in (OFF, L2N):
+        mode = {"qk_rstd": torch.rand(2, T, H), "qk_l2norm": True} if kw is L2N else {}
+        bwd = _prepared(ctx, ops, H, backward=True, **kw)
+        assert bwd.local is None  # the CPU binds no local arena
+        bwd.local = object()
+        for rows in ("intra", "wy"):
+            kept = {n: member(n) for n in names[rows]}
+            saved = _cpu_saved(fwd, saved_rows=rows, **kept, **mode)
+            assert saved.carry is not None or bwd.tb.P == 1  # the carry plane stays
+            cake_kcp._check_saved(saved, bwd)
+            bad_sets = [
+                {n: kept[n] for n in names[rows][:-1]},  # partial
+                {
+                    **kept,
+                    "h": torch.zeros(int(ctx.NC_pad), H, D, D, dtype=torch.bfloat16),
+                },
+                {**kept, "v_new": member("v_new")},
+            ]
+            if rows == "intra":
+                # a member of the other set: w or u beside the intra rows
+                bad_sets.append({**kept, "u": member("u")})
+                bad_sets.append({**kept, "w": member("w")})
+            for bad in bad_sets:
+                with pytest.raises(ValueError, match="rows set is"):
+                    cake_kcp._check_saved(
+                        _cpu_saved(fwd, saved_rows=rows, **bad, **mode), bwd
+                    )
+            for n in names[rows]:
+                for wrong in (member(n, extra=1), member(n, dtype=torch.float16)):
+                    with pytest.raises(ValueError, match=f"saved.{n}"):
+                        cake_kcp._check_saved(
+                            _cpu_saved(
+                                fwd, saved_rows=rows, **{**kept, n: wrong}, **mode
+                            ),
+                            bwd,
+                        )
+        with pytest.raises(ValueError, match="saved_rows"):
+            cake_kcp._check_saved(_cpu_saved(fwd, saved_rows="tape", **mode), bwd)
+        # a u without a rows set: neither a rows set nor the whole tape set
+        with pytest.raises(ValueError, match="tape set comes whole"):
+            cake_kcp._check_saved(_cpu_saved(fwd, u=member("u"), **mode), bwd)
+        # the SPEC-3 probe needs the backward's own intra and WY programs
+        probe = _prepared(ctx, ops, H, backward=True, **kw)
+        probe.local = object()
+        probe.opts = dataclasses.replace(probe.opts, spec3_probe="record")
+        for rows in ("intra", "wy"):
+            with pytest.raises(ValueError, match="spec3_probe"):
+                cake_kcp._check_saved(
+                    _cpu_saved(
+                        fwd,
+                        saved_rows=rows,
+                        **{n: member(n) for n in names[rows]},
+                        **mode,
+                    ),
+                    probe,
+                )
+        bwd.local = None
+        with pytest.raises(ValueError, match="local stages"):
+            cake_kcp._check_saved(
+                _cpu_saved(
+                    fwd,
+                    saved_rows="intra",
+                    **{n: member(n) for n in names["intra"]},
+                    **mode,
+                ),
+                bwd,
+            )
+        # a rank without tokens (its local stages stand in): refused too
+        zctx = _cpu_zero_ctx()
+        zops = _cpu_ops(zctx, H)
+        zmode = (
+            {"qk_rstd": torch.empty(2, 0, H, dtype=torch.float32), "qk_l2norm": True}
+            if kw is L2N
+            else {}
+        )
+        zfwd = _prepared(zctx, zops, H, backward=False, **kw)
+        zbwd = _prepared(zctx, zops, H, backward=True, **kw)
+        assert int(zctx.T_r) == 0
+        zbwd.local = object()
+        with pytest.raises(ValueError, match="rank with tokens"):
+            cake_kcp._check_saved(
+                _cpu_saved(
+                    zfwd,
+                    saved_rows="intra",
+                    **{n: member(n) for n in names["intra"]},
+                    **zmode,
+                ),
+                zbwd,
+            )
 
 
 # --------------------------------------------------------------------------- CPU rows: the strided-input rule
@@ -1416,18 +1534,23 @@ def test_l2n_byte_queries_equal_the_deterministic_package(gate) -> None:
     assert compared == 6 * 2 * 3 + 3 * 2 * 2
 
 
-def test_l2n_checkpoint_handoff_takes_no_decision(capable) -> None:
-    """With the flag on, :func:`cake_kcp.cake_kda_nondet_kcp` asks for no checkpoint hand-off decision under any
-    ``checkpoint_handoff`` value (with or without a recompute handle): the call keeps the light set, as in raw gate
-    mode.  The same calls with the flag off ask for one each (the check is not vacuous)."""
+def test_l2n_checkpoint_handoff_decides_in_every_mode(capable) -> None:
+    """:func:`cake_kcp.cake_kda_nondet_kcp` asks for the checkpoint hand-off decision under every ``checkpoint_handoff``
+    value (with or without a recompute handle) with the flag on and off, in both gate modes, and passes the call's
+    mode (its gate mode and ``use_qk_l2norm_in_kernel``: ``"auto"``'s verified devices of that mode)."""
     H = 4
     ctx = _cpu_ctx()
     ops = _cpu_ops(ctx, H)
     args = _args(ops, ctx)
+    raw = torch.zeros(H, dtype=torch.float32)
+    gates = {
+        "g": {},
+        "raw": dict(use_gate_in_kernel=True, A_log=raw, dt_bias=raw, lower_bound=-5.0),
+    }
     decided: list = []
 
-    def decide(mode, *_a, **_k):
-        decided.append(mode)
+    def decide(mode, *_a, kind=None, **_k):
+        decided.append((mode, kind))
         return False
 
     def stop(*_a, **_k):
@@ -1435,80 +1558,29 @@ def test_l2n_checkpoint_handoff_takes_no_decision(capable) -> None:
 
     modes = cake_kcp.KCP_HANDOFF_MODES
     assert set(modes) == {"auto", "on", "off"}
+    want = []
     with pytest.MonkeyPatch.context() as m:
         m.setattr(cake_kcp, "_handoff_decide", decide)
-        m.setattr(cake_kcp, "cake_kda_nondet_train_kcp_forward", stop)
-        m.setattr(cake_kcp, "_fwd_body", stop)
-        for kw in (L2N, OFF):
-            for mode in modes:
-                for handle in (None, cake_kcp.CakeKDANondetKcpRecomputeHandle()):
-                    with pytest.raises(_Stop):
-                        cake_kcp.cake_kda_nondet_kcp(
-                            *args, recompute_handle=handle, checkpoint_handoff=mode, **kw
-                        )  # fmt: skip
-            if kw is L2N:
-                assert decided == [], decided
-    assert decided == [mode for mode in modes for _ in range(2)]
-
-
-def test_l2n_handoff_is_refused_by_the_node_and_the_saved_bytes() -> None:
-    """The hand-off does not engage with the flag on, also where the decision is the caller's: the autograd node
-    (:class:`cake_kcp.CakeKDANondetKcpFunction` applied directly with ``handoff=True``) raises ``ValueError`` before any
-    forward, with or without a recompute handle, and the saved-bytes query raises ``ValueError`` for
-    ``checkpoint_handoff=True`` on a rank with tokens and on one without, before the capability check.  The same
-    calls with the flag off reach the hand-off's forward and its bytes (the refusals are not vacuous)."""
-    H = 4
-    ctx = _cpu_ctx()
-    args = _args(_cpu_ops(ctx, H), ctx)
-    # scale, save_mode, boundary_mode, workspace, options
-    head = (None, "light", "saved", None, {})
-    # use_gate_in_kernel, A_log, dt_bias, lower_bound
-    gate = (False, None, None, None)
-    reached: list = []
-
-    def stop(*_a, **_k):
-        reached.append(_a)
-        raise _Stop
-
-    def refused(*_a, **_k):
-        raise AssertionError("the capability check ran before the refusal")
-
-    refusal = "does not engage with use_qk_l2norm_in_kernel=True"
-    apply = cake_kcp.CakeKDANondetKcpFunction.apply
-    with pytest.MonkeyPatch.context() as m:
-        for name in (
-            "_fwd_tape",
-            "_fwd_handle",
-            "cake_kda_nondet_train_kcp_forward",
-            "_fwd_body",
-        ):
+        for name in ("cake_kda_nondet_train_kcp_forward", "_fwd_handle", "_fwd_body"):
             m.setattr(cake_kcp, name, stop)
-        for handle in (None, cake_kcp.CakeKDANondetKcpRecomputeHandle()):
-            with pytest.raises(ValueError, match=refusal):
-                apply(*args, *head, handle, True, *gate, True)
-            assert reached == [], handle
-        with pytest.raises(_Stop):
-            apply(*args, *head, None, True, *gate, False)
-        assert len(reached) == 1
-    saved_bytes = cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes
-    ctxs = [_cpu_ctx(rank=0), _cpu_zero_ctx(1)]
-    assert int(ctxs[0].T_r) > 0 and int(ctxs[1].T_r) == 0
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(cake_kcp_plan, "require_qk_l2norm", refused)
-        for c in ctxs:
-            with pytest.raises(ValueError, match="checkpoint_handoff=True"):
-                saved_bytes(c, H=H, checkpoint_handoff=True, **L2N)
-            hb = cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes(c, H=H)
-            light = saved_bytes(c, H=H, saved_carry=False)
-            assert saved_bytes(c, H=H, checkpoint_handoff=True, **OFF) == light + hb
+        for gate, gk in gates.items():
+            for kw in (L2N, OFF):
+                for mode in modes:
+                    for handle in (None, cake_kcp.CakeKDANondetKcpRecomputeHandle()):
+                        with pytest.raises(_Stop):
+                            cake_kcp.cake_kda_nondet_kcp(
+                                *args, recompute_handle=handle, checkpoint_handoff=mode, **gk, **kw
+                            )  # fmt: skip
+                        want.append((mode, (gate, kw["use_qk_l2norm_in_kernel"])))
+    assert decided == want, decided
 
 
-def test_raw_gate_handoff_is_refused_by_the_node_and_the_saved_bytes() -> None:
-    """Nor does the hand-off engage in the raw gate mode, where the decision is the caller's: the autograd node
-    applied directly with ``handoff=True`` and ``use_gate_in_kernel=True`` raises ``ValueError`` before any forward,
-    with or without a recompute handle, and the saved-bytes query raises ``ValueError`` for
-    ``checkpoint_handoff=True`` with ``use_gate_in_kernel=True`` on a rank with tokens and on one without.  The same
-    calls with the activated gate reach the hand-off's forward and its bytes (the refusals are not vacuous)."""
+def test_handoff_reaches_the_tape_forward_in_every_mode() -> None:
+    """The autograd node applied with ``handoff=True`` runs the hand-off's forward with the call's gate keywords and
+    ``use_qk_l2norm_in_kernel`` in every mode: without a handle :func:`cake_kcp._fwd_tape`, with one
+    :func:`cake_kcp._fwd_handle` with ``tape=True``; the saved-bytes query with ``checkpoint_handoff=True`` adds the
+    tape set's bytes (no carry plane) in raw gate mode and with the flag (beside its rstd), on a rank with tokens and
+    on one without."""
     H = 4
     ctx = _cpu_ctx()
     args = _args(_cpu_ops(ctx, H), ctx)
@@ -1516,40 +1588,62 @@ def test_raw_gate_handoff_is_refused_by_the_node_and_the_saved_bytes() -> None:
     head = (None, "light", "saved", None, {})
     reached: list = []
 
-    def stop(*_a, **_k):
-        reached.append(_a)
-        raise _Stop
+    def stop(name):
+        def record(*_a, **kw):
+            reached.append((name, kw))
+            raise _Stop
 
-    refusal = "does not engage with use_gate_in_kernel=True"
+        return record
+
     apply = cake_kcp.CakeKDANondetKcpFunction.apply
     raw = torch.zeros(H, dtype=torch.float32)
+    gates = {"g": (False, None, None, None), "raw": (True, raw, raw, -5.0)}
     with pytest.MonkeyPatch.context() as m:
-        for name in (
-            "_fwd_tape",
-            "_fwd_handle",
-            "cake_kda_nondet_train_kcp_forward",
-            "_fwd_body",
-        ):
-            m.setattr(cake_kcp, name, stop)
-        for handle in (None, cake_kcp.CakeKDANondetKcpRecomputeHandle()):
-            # use_gate_in_kernel, A_log, dt_bias, lower_bound; use_qk_l2norm_in_kernel off
-            with pytest.raises(ValueError, match=refusal):
-                apply(*args, *head, handle, True, True, raw, raw, -5.0, False)
-            assert reached == [], handle
-        with pytest.raises(_Stop):
-            apply(*args, *head, None, True, False, None, None, None, False)
-        assert len(reached) == 1
+        for name in ("_fwd_tape", "_fwd_handle"):
+            m.setattr(cake_kcp, name, stop(name))
+        for name in ("cake_kda_nondet_train_kcp_forward", "_fwd_body"):
+            m.setattr(cake_kcp, name, stop(name))
+        for gate, gk in gates.items():
+            for l2n in (True, False):
+                for handle in (None, cake_kcp.CakeKDANondetKcpRecomputeHandle()):
+                    reached.clear()
+                    with pytest.raises(_Stop):
+                        apply(*args, *head, handle, True, *gk, l2n)
+                    assert len(reached) == 1, reached
+                    name, kw = reached[0]
+                    if handle is None:
+                        assert name == "_fwd_tape", name
+                    else:
+                        assert name == "_fwd_handle" and kw["tape"] is True, reached
+                    assert kw["l2n"] is l2n
+                    assert kw["gate_args"]["use_gate_in_kernel"] is (gate == "raw")
+                    if gate == "raw":
+                        assert kw["gate_args"]["A_log"] is raw
+                        assert kw["gate_args"]["lower_bound"] == -5.0
     saved_bytes = cake_kcp_plan.cake_kda_nondet_train_kcp_saved_bytes
     ctxs = [_cpu_ctx(rank=0), _cpu_zero_ctx(1)]
     assert int(ctxs[0].T_r) > 0 and int(ctxs[1].T_r) == 0
-    for c in ctxs:
-        with pytest.raises(ValueError, match="use_gate_in_kernel=True"):
-            saved_bytes(c, H=H, checkpoint_handoff=True, use_gate_in_kernel=True)
-        hb = cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes(c, H=H)
-        light = saved_bytes(c, H=H, saved_carry=False)
-        assert saved_bytes(c, H=H, checkpoint_handoff=True) == light + hb
-        # the light set of the raw mode is the activated gate's (the bytes do not depend on the mode)
-        assert saved_bytes(c, H=H, saved_carry=False, use_gate_in_kernel=True) == light
+    with pytest.MonkeyPatch.context() as m:
+        # the capability check passes (nothing launches on the CPU)
+        m.setattr(cake_kcp_plan, "qk_l2norm_missing", lambda *a, **k: None)
+        for c in ctxs:
+            hb = cake_kcp_plan.cake_kda_nondet_train_kcp_handoff_bytes(
+                c, H=H, saved_rows="tape"
+            )
+            for raw_gate in (False, True):
+                for kw in (L2N, OFF):
+                    mode_kw = {
+                        **kw,
+                        "use_gate_in_kernel": raw_gate,
+                        "saved_rows": "tape",
+                    }
+                    light = saved_bytes(c, H=H, saved_carry=False, **mode_kw)
+                    assert (
+                        saved_bytes(c, H=H, checkpoint_handoff=True, **mode_kw)
+                        == light + hb
+                    )
+                    rstd = 8 * int(c.T_r) * H if kw is L2N else 0
+                    assert light == saved_bytes(c, H=H, saved_carry=False) + rstd
 
 
 # --------------------------------------------------------------------------- CPU rows: the values and the stage order
@@ -2341,7 +2435,10 @@ def test_l2n_refusal_is_rank_symmetric(W, layout) -> None:
 class _DriveCall(types.SimpleNamespace):
     """A call for the real :func:`cake_kcp._forward` / :func:`cake_kcp._backward`: its local stages run the kernel
     backend's ``stage`` (the fake arena records their launches); every KCP walk (with its program, ``walk:<program>``),
-    merge, collective and buffer method is recorded by name in ``kcp`` and launches nothing."""
+    merge, collective and buffer method is recorded by name in ``kcp`` and launches nothing.  One rank: the drivers'
+    rank-agreement check (``cake_kcp._rank_check``) issues nothing."""
+
+    world = 1
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -2477,9 +2574,9 @@ def test_l2n_local_stage_values_cover_the_records(
         )
         grads.update(part2=fin["part2"], ticket=fin["ticket"])
         fin_scratch["seg_cap"] = int(fin["seg_cap"])
-    # no checkpoint hand-off's tape set (``tape``): the light set
+    # no checkpoint hand-off's tape set (``tape``) and no rows set of saved_rows (``rows``): the light set
     saved = types.SimpleNamespace(
-        S_in=torch.zeros(1), c1_recv=None, M_seg=None, carry=None, tape=None
+        S_in=torch.zeros(1), c1_recv=None, M_seg=None, carry=None, tape=None, rows=None
     )
     saved_rstd = torch.zeros(2, T, H)
 
@@ -2706,7 +2803,12 @@ def _drive_local(
         kcp._qk_l2norm_begin(call, rstd, save=kind == "fwd_save")
     if backward:
         saved = types.SimpleNamespace(
-            S_in=torch.zeros(1), c1_recv=None, M_seg=None, carry=None, tape=None
+            S_in=torch.zeros(1),
+            c1_recv=None,
+            M_seg=None,
+            carry=None,
+            tape=None,
+            rows=None,
         )
         kcp._backward(call, saved if kind == "bwd_saved" else None)
     else:
@@ -2941,7 +3043,8 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
         saved = None
         if kind == "bwd_saved":
             saved = types.SimpleNamespace(
-                S_in=torch.zeros(1), c1_recv=None, M_seg=None, carry=None, tape=None, qk_rstd=torch.zeros(2, T, H)
+                S_in=torch.zeros(1), c1_recv=None, M_seg=None, carry=None, tape=None, rows=None,
+                qk_rstd=torch.zeros(2, T, H),
             )  # fmt: skip
         tb = cake_kcp._Tables(ctx, H, fused_walks=opts.fused_walks)
         call = _DriveCall(
@@ -3056,8 +3159,28 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
 # --------------------------------------------------------------------------- GPU helpers
 
 
+# the integer dtype of each element width: a floating-point tensor's bit patterns are its same-width integer view
+_BIT_DTYPES = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def _bit_pattern(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s bit patterns as a tensor of the same shape: the same-width integer view of a floating-point tensor,
+    integer and bool tensors as they are (no tensor here is complex).  Equality of the patterns tells ``+0`` from
+    ``-0`` and holds for a NaN of the same payload, as a value compare does not."""
+    if t.dtype.is_complex:
+        raise TypeError(f"no bit-pattern compare for {t.dtype}")
+    if t.dtype.is_floating_point:
+        return t.view(_BIT_DTYPES[t.element_size()])
+    return t
+
+
 def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
-    return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b)
+    """Same shape, same dtype and the same bit pattern in every element."""
+    return (
+        a.shape == b.shape
+        and a.dtype == b.dtype
+        and torch.equal(_bit_pattern(a), _bit_pattern(b))
+    )
 
 
 def _same(x: dict, y: dict, names) -> bool:
@@ -3266,8 +3389,9 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
     """On one device, the omitted keyword and an explicit ``False`` give bitwise the same outputs and gradients, the
     same saved-set tensors (member, shape, strides, dtype, in order), flags and meta, and the same launch inventory
     (sequence and counters); with ``ND_KCP_L2N_FLAG_OFF_CAPTURE`` / ``_BASELINE`` the omitted form's record (suffix
-    ``.gpu.json``) and its outputs (``.gpu.pt``) are written on the base or compared with it, from inputs made on one
-    CPU thread (:func:`_snapshot_threads`)."""
+    ``.gpu.json``; the backward's launches in the ``"first"`` / ``"main"`` order, :func:`_bwd_sequence_first_main`)
+    and its outputs (``.gpu.pt``) are written on the base or compared with it, from inputs made on one CPU thread
+    (:func:`_snapshot_threads`)."""
     _skip_unless_runnable(1, gate=None)
     capture, baseline = os.environ.get(ENV_CAPTURE), os.environ.get(ENV_BASELINE)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -3302,6 +3426,8 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
                     "fwd": _jsonable({x: rec_f.get(x) for x in RECORD_KEYS}),
                     "bwd": _jsonable({x: rec_b.get(x) for x in RECORD_KEYS}),
                 },
+                # the backward's launches in the "first" / "main" order, the base's (the snapshot's form)
+                "bwd_first_main": _bwd_sequence_first_main(rec_b),
             }
             del ws, saved
         a, b = got["omitted"], got["explicit"]
@@ -3311,7 +3437,12 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
         # the saved set's meta keys of the base of this change (the golden file, captured by executing the base)
         assert sorted(a["record"]["saved"]["meta"]) == _golden()["saved_meta_keys"]
         key = f"s{'_'.join(map(str, lengths))}-h{H}"
-        record[key] = a["record"]
+        # the snapshot holds the backward's launches in the "first" / "main" order: the base issues its K1 tape
+        # replay before kcp_dav and its dm-form K3 on the call's stream in every backward
+        record[key] = {
+            **a["record"],
+            "bwd": {**a["record"]["bwd"], "sequence": a["bwd_first_main"]},
+        }
         tensors_of[key] = {n: t.detach().cpu() for n, t in a["tensors"].items()}
     snap = json.loads(json.dumps(record))
     if capture:
@@ -3456,9 +3587,14 @@ def _run_rank(
         res = {"out": out, **dict(zip(grad_names, grads, strict=True))}
         return res, saved_d, (rec_f, rec_b)
 
+    handle_runs: dict = {}
+
     def autograd_pass(
         ckpt: bool = False, handle=None, keep="states", workspace=ws, handoff="auto"
     ):
+        """With a handle (under the checkpoint) also records in ``handle_runs[keep]`` the original forward's and the
+        recompute's LAST_CALL records, the backward's, and the torch.distributed calls per phase (``_Counter``; the
+        recompute phase from the checkpoint's ``context_fn``)."""
         srcs = (q, k, v, g, beta) + ((GK["A_log"], GK["dt_bias"]) if raw_gate else ())
         leaves = [x.detach().clone().requires_grad_(True) for x in srcs]
         n = len(srcs)
@@ -3468,16 +3604,37 @@ def _run_rank(
             h = a[n] if len(a) > n else None
             return cake_kcp.cake_kda_nondet_kcp(
                 *a[:5], ctx, None, "light", "saved", workspace, recompute_handle=h,
-                checkpoint_keep=keep if h is not None else None, checkpoint_handoff=handoff, **gk, **L2N
+                checkpoint_keep=keep if h is not None else None, checkpoint_handoff=handoff, saved_rows="tape",
+                **gk, **L2N
             )  # fmt: skip
 
         extra = (handle,) if handle is not None else ()
-        out = (
-            checkpoint(fn, *leaves, *extra, use_reentrant=False)
-            if ckpt
-            else fn(*leaves, *extra)
-        )
-        out.backward(dout)
+        if handle is not None and ckpt:
+            with _Counter() as cc:
+                out = checkpoint(
+                    fn,
+                    *leaves,
+                    *extra,
+                    use_reentrant=False,
+                    context_fn=lambda: (contextlib.nullcontext(), cc.recompute_cm()),
+                )
+                orig = cake_kcp.LAST_CALL.pop("fwd", None)
+                cc.phase = "bwd"
+                out.backward(dout)
+                rep = cake_kcp.LAST_CALL.pop("fwd", None)
+            handle_runs[keep] = (
+                orig,
+                rep,
+                dict(cake_kcp.LAST_CALL["bwd"]),
+                cc.record(),
+            )
+        else:
+            out = (
+                checkpoint(fn, *leaves, *extra, use_reentrant=False)
+                if ckpt
+                else fn(*leaves, *extra)
+            )
+            out.backward(dout)
         leaf_names = ("dq", "dk", "dv", "dg", "dbeta") + (
             PARAM_GRADS if raw_gate else ()
         )
@@ -3534,20 +3691,26 @@ def _run_rank(
             handle=cake_kcp.CakeKDANondetKcpRecomputeHandle(),
             keep="transfer",
         ),
-        # the checkpoint hand-off never engages with the flag on, even when forced on: the light set, no decision
+        # the checkpoint hand-off forced on: the set kept by both passes and read by the backward (a rank with tokens)
         "handoff_on_eq_ckpt": autograd_pass(ckpt=True, handoff="on"),
-        "ws_none_eq": autograd_pass(workspace=None),
     }
-    flags["handoff_never_engages"] = (
-        cake_kcp.cake_kda_nondet_train_kcp_handoff_stats() == handoff_stats
-        and cake_kcp.LAST_CALL["bwd"].get("checkpoint_handoff") is None
-    )
+    handoff_on_bwd = cake_kcp.LAST_CALL["bwd"].get("checkpoint_handoff")
+    runs["ws_none_eq"] = autograd_pass(workspace=None)
+    # the counters: the three checkpointed "auto" calls (no handle, the "states" and the "transfer" handle) decided by
+    # the mode's rule, the forced one engaged
+    flags["handoff_counts"] = _handoff_delta(
+        handoff_stats, ctx, H, gate, True, T, auto_calls=3
+    ) and handoff_on_bwd == ("bound" if T > 0 else None)
     qp, kp, _buf = _packed_qk(q, k)
     runs["packed_strided_eq"] = saved_pass(qq=qp, kk=kp)[0]
     flags.update({name: _same(res, r, tensors) for name, r in runs.items()})
+    flags.update(_handle_recompute_flags(handle_runs, W))
     # the deterministic package's KCP route with the flag on (saved and replay mode): every output, gradient and
     # partial sum and the saved rstd bitwise (element counts gathered below), the same local libraries with the same
-    # grids in the same order (the mode's own records among them on a rank with tokens), the same launch sequence
+    # grids in the same order (the mode's own records among them on a rank with tokens), the same launch sequence (the
+    # backward's in the deterministic package's order: _bwd_sequence_first_main puts back the K1 tape replay this
+    # package issues under b1 and the dm-form K3 it issues on the side stream; neither is a local launch, nor is
+    # kcp_dav, so the local libraries keep their order)
     det_launch: dict = {"fwd": [], "bwd": []}
     ws_det = det_kcp.CakeKDADetKcpWorkspace(use_gate_in_kernel=raw_gate, **L2N)
     det_res, saved_d, (rec_fd, rec_bd) = det_pass(ws_det, launches=det_launch)
@@ -3559,7 +3722,7 @@ def _run_rank(
     flags["det_replay_eq"] = all(e == t for e, t in counts["replay"].values())
     flags["det_sequence_eq"] = (
         rec_f["sequence"] == rec_fd["sequence"]
-        and rec_b["sequence"] == rec_bd["sequence"]
+        and _bwd_sequence_first_main(rec_b) == rec_bd["sequence"]
     )
     flags["det_local_launches_eq"] = _libraries(cake_jit, nd_launch) == _libraries(
         det_jit, det_launch

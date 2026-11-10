@@ -76,11 +76,12 @@ Public fields (defaults are the shipped behaviour)::
     use_qk_l2norm_in_kernel  False | True   per-token L2 norm of every 128-channel Q / K head inside the recurrence
                                             programs (q_hat = bf16(q * r), r = 1 / sqrt(sum q^2 + 1e-6), FTZ off; the
                                             FLA keyword of chunk_gated_delta_rule): q / k stay the raw operands, the
-                                            saved set gains the FP32 r of q and k ([2, T_r, H_qk]) and the gradient is
+                                            saved set gains the FP32 r of q and k ([2, T_r, H_qk]; save_mode="full"
+                                            also the normalized rows q_hat / k_hat) and the gradient is
                                             the exact derivative at the stored point; the backward needs the same value
     test_knobs      None | dict             private levers (schedule, fused_walks, cols_rule, debug_sequence,
-                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh, walk_pair, fused_o) and the names of the
-                                            test-only values above;
+                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh, walk_pair, fused_o,
+                                            full_qk) and the names of the test-only values above;
                                             keyword argument only, never an environment variable
 """
 
@@ -163,6 +164,14 @@ TEST_KNOBS: dict[str, tuple[Any, ...] | None] = {
     # 1 (shipped) = a forward whose h / v_new tapes have no reader runs the output walk kcp_fwdh_out (#2 with #5 folded
     # in, no tape written) wherever the registry ships its records (cake_kcp._fuse_o); 0 = the tape walk, then #5
     "fused_o": (0, 1),
+    # 1 (shipped) = a forward whose akk / g_cum have no reader (not a replay-mode or hand-off forward, no saved set
+    # that keeps them) runs the forward form of #1_l2n, fwd_prep_l2n_fwd (no akk / g_cum stores), wherever the
+    # registry ships its record (cake_kcp._prep_backward_tapes); 0 = the full fwd_prep_l2n
+    "prep_form": (0, 1),
+    # save_mode="full" with use_qk_l2norm_in_kernel: "saved" (shipped) = the saved set keeps the normalized rows qn / kn
+    # #1_l2n wrote (fresh tensors), so the backward binds them and launches no qk_apply; "apply" = the saved set keeps
+    # the FP32 r only and the backward rebuilds qn / kn with qk_apply (the same bits: qk_apply is #1_l2n's row rule)
+    "full_qk": ("saved", "apply"),
 }
 TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "schedule": SCHEDULE_DEFAULT,
@@ -177,6 +186,8 @@ TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "record_qk": False,
     "walk_pair": None,
     "fused_o": 1,
+    "prep_form": 1,
+    "full_qk": "saved",
 }
 
 
