@@ -42,7 +42,7 @@ enum Sm120Offset : int {
 
 // Every CTA of the grid must be resident at once (CTAs wait on each other's flags), so the grid is
 // the device's full occupancy and the launch is cooperative.
-constexpr int kTile24Rows = 7;  // routed rows per local expert from which items cover 24 tokens
+constexpr int kTile16Rows = 3;  // routed rows per local expert from which items cover 16 tokens
 
 template <int kTileN>
 static int sm120_grid_size(int dev) {
@@ -171,13 +171,13 @@ void megamoe_sm120_mxfp4_fused(
   cudaStream_t stream = get_stream(y.device());
   // Work-item width (tokens_per_item: 8, 16, 24 or 32; 0 = default). Default: by the routed rows
   // each local expert averages, T * TOPK / EL (the rows a rank receives, spread over its experts),
-  // 24 tokens (three MMAs per weight fragment) from 7 rows, else 8. Measured with cold L2 (decode
-  // reads every layer's weights from DRAM) on RTX 6000D and RTX PRO 6000, EP4 / EP8,
-  // DeepSeek-V4-Flash, DeepSeek-V4.1-Flash and GLM-5.3-Flash (top-6 / top-8): the two tie at 6-7
-  // rows; 24 is 2-14% faster above, 8 is 1-6% faster below. 16 never beat 24 and 32 matched it
-  // within 2%.
+  // 16 tokens (two MMAs per weight fragment) from 3 rows, else 8. Measured with cold L2 (decode
+  // reads every layer's weights from DRAM) on RTX 6000D, EP4 / EP8, DeepSeek-V4-Flash,
+  // DeepSeek-V4.1-Flash and GLM-5.3-Flash (top-6 / top-8), 16-128 tokens per rank: 16 matches 8
+  // below 3 rows and is up to 12% faster above; 24 and 32 load more activation fragments per
+  // weight fragment and are 0-6% slower than 16 (one point 1% faster: V4.1-Flash EP8, 128 tokens).
   const int width = tokens_per_item ? static_cast<int>(tokens_per_item)
-                                    : (a.T * a.TOPK >= kTile24Rows * a.EL ? 24 : 8);
+                                    : (a.T * a.TOPK >= kTile16Rows * a.EL ? 16 : 8);
   switch (width) {
     case 8:
       sm120_launch<8>(a, dev, stream);

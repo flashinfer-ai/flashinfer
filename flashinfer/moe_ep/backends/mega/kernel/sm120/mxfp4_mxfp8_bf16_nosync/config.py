@@ -50,9 +50,9 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     every rank must use the same value.
 
     ``tokens_per_item`` is the number of tokens one work item multiplies per weight load (8,
-    16, 24 or 32). ``None`` picks 24 when this rank's routed rows per local expert
-    (``tokens * top_k / local_experts``) reach 7, else 8 (measured crossover with cold L2 on
-    RTX 6000D and RTX PRO 6000). Set it explicitly after sweeping a deployment's shapes.
+    16, 24 or 32). ``None`` picks 16 when this rank's routed rows per local expert
+    (``tokens * top_k / local_experts``) reach 3, else 8 (measured with cold L2 on RTX 6000D).
+    Set it explicitly after sweeping a deployment's shapes.
     """
 
     intermediate_size: int
