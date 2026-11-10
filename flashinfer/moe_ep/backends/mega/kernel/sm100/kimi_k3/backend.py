@@ -204,6 +204,13 @@ class KimiK3MegaKernelBackend(MegaKernelBackend):
                 raise MoEEpConfigError(f"{name} must be {alignment}-byte aligned")
         if x.device.index != torch.cuda.current_device():
             raise MoEEpConfigError("hidden_states must be on the current CUDA device")
+        # The layer checks caller-output shape, dtype and device. Staging must
+        # also establish Kimi's layout requirements before prepared execution.
+        if t.output is not None and (
+            not t.output.is_contiguous()
+            or (t.output.numel() and t.output.data_ptr() % 16)
+        ):
+            raise MoEEpConfigError("Kimi output must be contiguous and 16-byte aligned")
 
     def stage_inputs(
         self, t: MoEEpTensors, workspace: Any, *, quantize_input: bool
@@ -221,3 +228,8 @@ class KimiK3MegaKernelBackend(MegaKernelBackend):
         self, workspace: Any, transformed_weights: Any, *, output: torch.Tensor | None
     ) -> torch.Tensor:
         return workspace.compute(transformed_weights, output=output)
+
+    def _compute_prepared(
+        self, workspace: Any, transformed_weights: Any, *, output: torch.Tensor | None
+    ) -> torch.Tensor:
+        return workspace._compute(transformed_weights, output=output)
