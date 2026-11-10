@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from threading import Barrier
 
 import pytest
 import torch
@@ -34,6 +36,51 @@ from tests.utils.test_helpers.sampling import (
 
 # H100 CI peak GPU memory: 39.5 GiB.
 pytestmark = pytest.mark.gpu_exclusive
+
+
+@pytest.mark.parametrize("use_default_generator", [False, True])
+def test_get_seed_and_offset_threaded_reservations(use_default_generator):
+    device = torch.device("cuda", torch.cuda.current_device())
+    increments = (1, 4, 5, 13)
+    calls_per_thread = 256
+    start = Barrier(len(increments))
+
+    # Preserve the process-default generator for the remaining sampling tests.
+    with torch.random.fork_rng(devices=[device.index]):
+        generator = (
+            torch.cuda.default_generators[device.index]
+            if use_default_generator
+            else torch.Generator(device=device)
+        )
+        generator.manual_seed(1234)
+        generator.set_offset(128)
+
+        def reserve(increment):
+            start.wait(timeout=10)
+            ranges = []
+            for _ in range(calls_per_thread):
+                seed, offset = flashinfer.sampling.get_seed_and_offset(
+                    increment,
+                    None if use_default_generator else generator,
+                    device,
+                )
+                assert seed == 1234
+                ranges.append((offset, (increment + 3) // 4 * 4))
+            return ranges
+
+        with ThreadPoolExecutor(max_workers=len(increments)) as executor:
+            ranges = [
+                item
+                for group in executor.map(reserve, increments, timeout=30)
+                for item in group
+            ]
+
+        # Every reservation owns one disjoint range, with no lost advancement.
+        next_offset = 128
+        for offset, length in sorted(ranges):
+            assert offset == next_offset
+            next_offset += length
+        assert generator.get_offset() == next_offset
 
 
 def normal_distribution(std):
