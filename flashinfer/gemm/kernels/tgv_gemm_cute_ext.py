@@ -45,9 +45,10 @@ Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 GEMM:
   bar_tmem_alloc    160 arrivals (32 MMA + 128 EPILOG); two-phase:
                       phase 0→1 = MMA finished alloc_tmem
                       phase 1→0 = EPILOG finished tcgen05.ld (safe to dealloc)
-                    Both 1-CTA and 2-CTA: the handshake is within-CTA only —
-                    2-CTA dealloc is per-CTA (each CTA owns its physical TMEM
-                    half; the cluster-shared accumulator is just a view).
+                    The handshake is within-CTA only. In 2-CTA mode, alloc,
+                    relinquish and dealloc are cta_group::2 collectives (one
+                    warp in each CTA of the pair); a cluster barrier at
+                    kernel exit keeps both CTAs resident until both finish.
 
 A 1-element Int32 SMEM slot (tmem_base_ptr) is written by alloc_tmem and read
 by retrieve_tmem_ptr in MMA + EPILOG.
@@ -595,9 +596,12 @@ class TgvGemmCuteExtKernel:
             )
 
         if cutlass.const_expr(self.use_2cta):
-            # Neither CTA may exit while its peer still has peer-redirected
-            # arrives, multicast commits or a TMEM dealloc targeting it;
-            # otherwise CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT under PDL.
+            # Cluster exit barrier (sgl-project/sglang#32907). Neither CTA may
+            # exit while its peer still has peer-redirected arrives, multicast
+            # commits or the cta_group::2 TMEM dealloc targeting it; otherwise
+            # CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT under PDL. Keep this
+            # after dealloc_tmem in both CTAs: the dealloc may block on the
+            # peer's, so a barrier between them on one side only can hang.
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
 
@@ -866,9 +870,10 @@ class TgvGemmCuteExtKernel:
 
         # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
         # bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld is observable
-        # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
-        # cross-CTA handshake) because each CTA owns its own physical TMEM
-        # half; the cluster-shared accumulator is just a logical view.
+        # (post fence_view_async_tmem_load). Each CTA waits only for its own
+        # EPILOG. In 2-CTA mode the dealloc pairs with the peer MMA warp's
+        # (cta_group::2 collective); the exit barrier in kernel() keeps the
+        # peer resident until both are issued.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
