@@ -16,6 +16,12 @@ vectorised CPU, the CuTe-DSL primitives inside the kernels):
 * ``sigmoid_term``, ``softmax_reduction``, ``routing_weights``: the router;
 * ``combine_reduction`` / ``combine_elem``: the weighted fold over the k slots.
 
+A NaN logit is a row rule outside the term algebra, like the fill rule of :func:`select_topk`: the row maximum skips
+it, its softmax term is ``+0`` (it contributes nothing to the normalisation, where a ``-inf`` logit's term is the
+clamped ``exp``), and its selection score is NaN, so it is never selected. The backends implement the rule through
+``where_nan``; the symbolic algebra returns the finite branch (its terms and the Lean statements are over non-NaN
+inputs), so the rule moves no fingerprint.
+
 The per-element GEMM folds are the dense bf16 class's (:mod:`flashinfer.gemm.batch_invariant.spec`, the opaque
 ``mma16`` K-step); the grouped GEMM is a placement of that class, not a new one. The quantized classes
 (docs/moe_quant_scoping.md) are outside this module.
@@ -285,9 +291,10 @@ def softmax_reduction(E: int, leaf_z: Callable[[Any, int], Any]) -> Reduction:
 
 def softmax_terms(fp: Any, logits: Sequence[Any], E: int) -> Tuple[List[Any], Any]:
     """``m``, ``z_e`` and ``S`` for one token: ``z_e = exp(add(l_e, neg(m)))``, ``S`` the canonical
-    pairwise tree. Returns ``(z, S)`` with ``z`` a list over experts."""
+    pairwise tree. Returns ``(z, S)`` with ``z`` a list over experts. A NaN logit is skipped by the row maximum and
+    its term is ``+0`` (the module's NaN rule: the backends' ``where_nan``)."""
     m = fp.rowmax(*logits)
-    z = [exp_term(fp, fp.add(l, fp.neg(m))) for l in logits]
+    z = [fp.where_nan(l, 0.0, exp_term(fp, fp.add(l, fp.neg(m)))) for l in logits]
     S = softmax_reduction(E, lambda fp_, e: z[e]).canonical(fp)
     return z, S
 
@@ -301,7 +308,8 @@ def per_expert_scores(
     """``(selection_score_e, weight_e)`` for every expert. softmax: selection on the logit itself,
     weight ``p_e = div(z_e, S)``; sigmoid: ``s_e = sigmoid(l_e)``, selection on ``add(s_e, bias_e)``
     (or ``s_e``), weight ``s_e``; logit: selection on the logit itself, weight the logit (``TOPK``) or
-    ``sigmoid(l_e)`` (``TOPK_SIGMOID``)."""
+    ``sigmoid(l_e)`` (``TOPK_SIGMOID``). A NaN logit's selection score is NaN under every method (the sigmoid methods
+    select it through ``where_nan``: the declared exp of a NaN is the clamp's value, not a NaN)."""
     E = len(logits)
     if method.score == "softmax":
         z, S = softmax_terms(fp, logits, E)
@@ -320,6 +328,8 @@ def per_expert_scores(
         q = [fp.add(s_e, b_e) for s_e, b_e in zip(s, bias, strict=True)]
     else:
         q = list(s)
+    nan = float("nan")
+    q = [fp.where_nan(l, nan, q_e) for l, q_e in zip(logits, q, strict=True)]
     return q, s
 
 

@@ -10,13 +10,14 @@ execute. The GEMM accumulators themselves come from the device (the opaque ``mma
 
 from __future__ import annotations
 
+import functools
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
 from ...batch_invariant.fp_interface import exact as fp32
 from . import spec as S
-from .mterm import frexpe_f32, frexpm_f32
+from .mterm import frexpe_f32, frexpm_f32, rowmax_f32
 
 
 class ExactF32:
@@ -39,7 +40,13 @@ class ExactF32:
     fmin = staticmethod(fp32.fmin)
     fmax = staticmethod(fp32.fmax)
     exp2i = staticmethod(fp32.exp2i)
-    rowmax = staticmethod(fp32.rowmax)
+    rowmax = staticmethod(
+        rowmax_f32
+    )  # the MoE rule: a NaN logit is skipped (the device's max.f32)
+
+    @staticmethod
+    def where_nan(x: float, a: float, b: float) -> float:
+        return a if x != x else b
 
     @staticmethod
     def cvt_out(a: float, fmt: str) -> float:
@@ -130,7 +137,12 @@ class TorchF32:
 
     @staticmethod
     def rowmax(*vals: torch.Tensor) -> torch.Tensor:
-        return torch.stack(list(vals), dim=0).amax(dim=0)
+        # torch.fmax takes the other operand against a NaN, as the device's max.f32 and rowmax_f32 do
+        return functools.reduce(torch.fmax, vals)
+
+    @staticmethod
+    def where_nan(x: torch.Tensor, a: float, b: torch.Tensor) -> torch.Tensor:
+        return torch.where(torch.isnan(x), torch.tensor(a, dtype=torch.float32), b)
 
     @staticmethod
     def cvt_out(a: torch.Tensor, fmt: str) -> torch.Tensor:

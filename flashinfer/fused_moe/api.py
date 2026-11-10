@@ -3304,8 +3304,10 @@ class BatchInvariantBf16Config:
     its argument below, so a masked expert keeps a positive score of the smallest magnitudes; while ``top_k`` unmasked
     experts exist it is never selected and the weights are exactly those of the row without it, otherwise masked experts
     fill the remaining slots (in index order; by their bias for the biased methods) with such weights, and a fully masked
-    row is not a defined routing. An expert whose selection score is NaN is never selected; when fewer than ``top_k``
-    experts of a row have a non-NaN score (NaN logits), each remaining slot takes the lowest expert index the row has not
+    row is not a defined routing. A NaN logit is never selected and contributes nothing to the normalisation: the row
+    maximum skips it, its softmax term is ``+0`` (not the clamped ``exp`` of a ``-inf`` logit) and its selection score is
+    NaN under every method, so the other experts' weights are the row's with the NaN experts absent; when fewer than
+    ``top_k`` experts of a row have a non-NaN score, each remaining slot takes the lowest expert index the row has not
     taken, with a NaN weight: the row's output is NaN and every id stays in range. A pre-routed expert id outside
     ``[0, num_experts)`` is a dropped slot: neither gathered nor computed, it contributes ``+0`` to its token's combine
     whatever its weight (a token whose slots are all dropped gives a zero row); nothing is validated on the host.
