@@ -5,3 +5,5 @@ pygments>=2.13.0,<3.0.0
 pytest-timeout
 rich>=13
 safetensors>=0.6
+scipy
+triton-windows>=3.8.0.post28; sys_platform == "win32"
