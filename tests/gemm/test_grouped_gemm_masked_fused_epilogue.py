@@ -467,7 +467,7 @@ def test_nvfp4_output_matches_separate_quantize(
         out_q.permute(1, 2, 0),
         "float4_e2m1fn",
         out_scale=out_sf,
-        global_scale=global_scale,
+        out_global_scale=global_scale,
         **kwargs,
     )
 
@@ -516,7 +516,7 @@ def test_nvfp4_output_cluster_stays_in_bounds(mma_tiler_mn, cluster_shape_mn, ga
             out_q.permute(1, 2, 0),
             "float4_e2m1fn",
             out_scale=sf_buf[:sf_bytes],
-            global_scale=global_scale,
+            out_global_scale=global_scale,
             **dict(kwargs, mma_tiler_mn=tiler, cluster_shape_mn=cluster),
         )
         outs.append((out_q, sf_buf))
@@ -531,8 +531,8 @@ def test_nvfp4_output_cluster_stays_in_bounds(mma_tiler_mn, cluster_shape_mn, ga
         assert torch.equal(out_sf[i, :rows], ref_sf[i, :rows])
 
 
-def test_nvfp4_output_accepts_unaligned_global_scale():
-    """``global_scale`` may be a slice of a larger per-expert table."""
+def test_nvfp4_output_accepts_unaligned_out_global_scale():
+    """``out_global_scale`` may be a slice of a larger per-expert table."""
     _skip_unless_sm100()
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -548,7 +548,7 @@ def test_nvfp4_output_accepts_unaligned_global_scale():
             out_q.permute(1, 2, 0),
             "float4_e2m1fn",
             out_scale=out_sf,
-            global_scale=global_scale,
+            out_global_scale=global_scale,
             **kwargs,
         )
         outs.append((out_q, out_sf))
@@ -579,7 +579,7 @@ def test_nvfp4_output_cuda_graph():
             out_q.permute(1, 2, 0),
             "float4_e2m1fn",
             out_scale=out_sf,
-            global_scale=global_scale,
+            out_global_scale=global_scale,
             **kwargs,
         )
 
@@ -607,7 +607,7 @@ def _run_invalid_nvfp4(out_shape=(2, 128, 128), out_dtype=torch.uint8, **overrid
     args = dict(
         c_dtype="float4_e2m1fn",
         out_scale=torch.empty(l * m * n // 16, dtype=torch.uint8, device=device),
-        global_scale=torch.ones(l, device=device),
+        out_global_scale=torch.ones(l, device=device),
     )
     args.update(overrides)
     out = torch.empty(out_shape, dtype=out_dtype, device=device).permute(1, 2, 0)
@@ -627,7 +627,7 @@ def _run_invalid_nvfp4(out_shape=(2, 128, 128), out_dtype=torch.uint8, **overrid
     "overrides,error",
     [
         ({"out_scale": None}, ValueError),
-        ({"global_scale": torch.ones(1)}, ValueError),
+        ({"out_global_scale": torch.ones(1)}, ValueError),
         ({"out_scale": torch.empty(100, dtype=torch.uint8)}, ValueError),
         ({"out_shape": (2, 128, 256)}, ValueError),
         ({"is_swap_ab": True}, NotImplementedError),

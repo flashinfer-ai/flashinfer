@@ -942,7 +942,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         alpha_up_tensor: Optional[cute.Tensor] = None,
         a_per_token_scale_tensor: Optional[cute.Tensor] = None,
         out_scale_tensor: Optional[cute.Tensor] = None,
-        global_scale_tensor: Optional[cute.Tensor] = None,
+        out_global_scale_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -979,9 +979,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             Float4E2M1FN. Viewed as packed Uint32 words in the swizzled
             ``(l, rm, rk, 32, 4, 4)`` layout consumed as SFA by a following GEMM.
         :type out_scale_tensor: cute.Tensor
-        :param global_scale_tensor: (l,) NVFP4 global quantization scale of C,
+        :param out_global_scale_tensor: (l,) NVFP4 global quantization scale of C,
             required when C is Float4E2M1FN.
-        :type global_scale_tensor: cute.Tensor
+        :type out_global_scale_tensor: cute.Tensor
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
         # Setup static attributes before smem/grid/tma computation
@@ -996,10 +996,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.quantize_output = self.c_dtype == cutlass.Float4E2M1FN
         if cutlass.const_expr(
             self.quantize_output
-            and (out_scale_tensor is None or global_scale_tensor is None)
+            and (out_scale_tensor is None or out_global_scale_tensor is None)
         ):
             raise ValueError(
-                "NVFP4 output requires out_scale_tensor and global_scale_tensor"
+                "NVFP4 output requires out_scale_tensor and out_global_scale_tensor"
             )
         if cutlass.const_expr(
             self.quantize_output and (self.is_combine_fusion or self.is_swap_ab)
@@ -1254,7 +1254,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             alpha_up_tensor,
             a_per_token_scale_tensor,
             out_scale_tensor,
-            global_scale_tensor,
+            out_global_scale_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1300,7 +1300,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         alpha_up: Optional[cute.Tensor],
         a_per_token_scale: Optional[cute.Tensor],
         out_scale: Optional[cute.Tensor],
-        global_scale: Optional[cute.Tensor],
+        out_global_scale: Optional[cute.Tensor],
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2082,7 +2082,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                 if cutlass.const_expr(self.quantize_output):
                     out_scale_expert = cur_tile_coord[2]
-                    out_global_scale = global_scale[out_scale_expert]
+                    expert_global_scale = out_global_scale[out_scale_expert]
                     out_alpha = cutlass.Float32(1.0)
                     if cutlass.const_expr(alpha is not None and not self.gated):
                         out_alpha = alpha[out_scale_expert]
@@ -2148,7 +2148,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         else:
                             tCompute.store(tTR_rAcc.load() * out_alpha)
                         if cutlass.const_expr(self.quantize_output):
-                            packed_sf = self.quantize_nvfp4(tCompute, out_global_scale)
+                            packed_sf = self.quantize_nvfp4(
+                                tCompute, expert_global_scale
+                            )
                             if sf_tile_in_range:
                                 out_scale[sf_word_base + subtile_idx * 128] = packed_sf
                         acc_vec = tiled_copy_r2s.retile(tCompute).load()
@@ -3312,7 +3314,7 @@ class MaskedBatchedMatmulCuteDSL:
         alpha_up_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
         out_scale_ptr: Optional[cute.Pointer],
-        global_scale_ptr: Optional[cute.Pointer],
+        out_global_scale_ptr: Optional[cute.Pointer],
         current_stream: cuda.CUstream,
     ):
         a_tensor = cute.make_tensor(
@@ -3469,9 +3471,9 @@ class MaskedBatchedMatmulCuteDSL:
             if cutlass.const_expr(out_scale_ptr is not None)
             else None
         )
-        global_scale_tensor = (
-            cute.make_tensor(global_scale_ptr, layout=cute.make_layout((self._l,)))
-            if cutlass.const_expr(global_scale_ptr is not None)
+        out_global_scale_tensor = (
+            cute.make_tensor(out_global_scale_ptr, layout=cute.make_layout((self._l,)))
+            if cutlass.const_expr(out_global_scale_ptr is not None)
             else None
         )
 
@@ -3507,7 +3509,7 @@ class MaskedBatchedMatmulCuteDSL:
             alpha_up_tensor,
             a_per_token_scale_tensor,
             out_scale_tensor,
-            global_scale_tensor,
+            out_global_scale_tensor,
         )
 
 
@@ -3565,7 +3567,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 alpha_up_data_ptr,
                 a_per_token_scale_data_ptr,
                 out_scale_data_ptr,
-                global_scale_data_ptr,
+                out_global_scale_data_ptr,
             ) = [16 for _ in range(18)]
 
             if not enable_dst_signals:
@@ -3588,7 +3590,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 a_per_token_scale_data_ptr = None
             if not quantize_output:
                 out_scale_data_ptr = None
-                global_scale_data_ptr = None
+                out_global_scale_data_ptr = None
 
         else:
             (
@@ -3609,7 +3611,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 alpha_up_tensor_gpu,
                 a_per_token_scale_tensor_gpu,
                 out_scale_tensor_gpu,
-                global_scale_tensor_gpu,
+                out_global_scale_tensor_gpu,
             ) = input_tensors
 
             assert enable_dst_signals == (dst_signals_tensor_gpu is not None)
@@ -3629,12 +3631,12 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 else None
             )
             assert quantize_output == (out_scale_tensor_gpu is not None)
-            assert quantize_output == (global_scale_tensor_gpu is not None)
+            assert quantize_output == (out_global_scale_tensor_gpu is not None)
             out_scale_data_ptr = (
                 out_scale_tensor_gpu.data_ptr() if quantize_output else None
             )
-            global_scale_data_ptr = (
-                global_scale_tensor_gpu.data_ptr() if quantize_output else None
+            out_global_scale_data_ptr = (
+                out_global_scale_tensor_gpu.data_ptr() if quantize_output else None
             )
 
             (
@@ -3835,15 +3837,15 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             if out_scale_data_ptr is not None
             else None
         )
-        global_scale_ptr = (
+        out_global_scale_ptr = (
             make_ptr(
                 cutlass.Float32,
-                global_scale_data_ptr,
+                out_global_scale_data_ptr,
                 cute.AddressSpace.gmem,
                 # Read one scalar per expert, so a slice of a larger table works.
                 assumed_align=4,
             )
-            if global_scale_data_ptr is not None
+            if out_global_scale_data_ptr is not None
             else None
         )
 
@@ -3865,7 +3867,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             alpha_up_ptr,
             a_per_token_scale_ptr,
             out_scale_ptr,
-            global_scale_ptr,
+            out_global_scale_ptr,
         ]
 
     kernel = cute.compile(
@@ -3916,13 +3918,13 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         alpha_up_tensor_gpu: Optional[torch.Tensor] = None,
         a_per_token_scale_tensor_gpu: Optional[torch.Tensor] = None,
         out_scale_tensor_gpu: Optional[torch.Tensor] = None,
-        global_scale_tensor_gpu: Optional[torch.Tensor] = None,
+        out_global_scale_tensor_gpu: Optional[torch.Tensor] = None,
     ):
         if c_tensor_gpu is None:
             if quantize_output:
                 raise ValueError(
                     "NVFP4 output requires c_tensor_gpu, out_scale_tensor_gpu "
-                    "and global_scale_tensor_gpu"
+                    "and out_global_scale_tensor_gpu"
                 )
             c_tensor_gpu = torch.empty(
                 (l, m, n // 2 if activation_type is not None else n),
@@ -3954,7 +3956,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                     alpha_up_tensor_gpu,
                     a_per_token_scale_tensor_gpu,
                     out_scale_tensor_gpu,
-                    global_scale_tensor_gpu,
+                    out_global_scale_tensor_gpu,
                 ]
             ),
             current_stream,
@@ -4073,7 +4075,7 @@ def _validate_nvfp4_output(
     *,
     out,
     out_scale,
-    global_scale,
+    out_global_scale,
     masked_m,
     m,
     n_out,
@@ -4097,8 +4099,10 @@ def _validate_nvfp4_output(
             f"fast-math recipe, but {', '.join(enabled)} is set; unset it or "
             "quantize the output with a separate kernel"
         )
-    if out_scale is None or global_scale is None:
-        raise ValueError("c_dtype='float4_e2m1fn' requires out_scale and global_scale")
+    if out_scale is None or out_global_scale is None:
+        raise ValueError(
+            "c_dtype='float4_e2m1fn' requires out_scale and out_global_scale"
+        )
     if n_out % 64 != 0:
         raise ValueError(
             f"NVFP4 output requires a multiple of 64 output columns, got {n_out}"
@@ -4131,13 +4135,13 @@ def _validate_nvfp4_output(
             f"({l * rm * rk * 512} elements)"
         )
     if (
-        tuple(global_scale.shape) != (l,)
-        or global_scale.dtype != torch.float32
-        or not global_scale.is_contiguous()
-        or global_scale.device != masked_m.device
+        tuple(out_global_scale.shape) != (l,)
+        or out_global_scale.dtype != torch.float32
+        or not out_global_scale.is_contiguous()
+        or out_global_scale.device != masked_m.device
     ):
         raise ValueError(
-            f"global_scale must be a contiguous float32 tensor of shape {(l,)}"
+            f"out_global_scale must be a contiguous float32 tensor of shape {(l,)}"
         )
 
 
@@ -4169,7 +4173,7 @@ def _grouped_gemm_nt_masked_sm100(
     alpha_up: Optional[torch.Tensor] = None,
     a_per_token_scale: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
-    global_scale: Optional[torch.Tensor] = None,
+    out_global_scale: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     **kwargs,
 ):
@@ -4251,7 +4255,7 @@ def _grouped_gemm_nt_masked_sm100(
         ``False``.
     activation_type, swiglu_alpha, swiglu_beta, swiglu_limit, alpha_up, a_per_token_scale
         Fused gated activation; see ``grouped_gemm_nt_masked``.
-    out_scale, global_scale, nvfp4_4over6
+    out_scale, out_global_scale, nvfp4_4over6
         NVFP4 output (``c_dtype="float4_e2m1fn"``); see ``grouped_gemm_nt_masked``.
     **kwargs
         Additional keyword arguments.  Currently recognized:
@@ -4313,10 +4317,12 @@ def _grouped_gemm_nt_masked_sm100(
                 f"{feature} does not support: " + ", ".join(unsupported)
             )
     if not quantize_output and (
-        out_scale is not None or global_scale is not None or nvfp4_4over6 is not _UNSET
+        out_scale is not None
+        or out_global_scale is not None
+        or nvfp4_4over6 is not _UNSET
     ):
         raise ValueError(
-            "out_scale, global_scale and nvfp4_4over6 require c_dtype='float4_e2m1fn'"
+            "out_scale, out_global_scale and nvfp4_4over6 require c_dtype='float4_e2m1fn'"
         )
 
     if is_swap_ab:
@@ -4416,7 +4422,7 @@ def _grouped_gemm_nt_masked_sm100(
         _validate_nvfp4_output(
             out=out,
             out_scale=out_scale,
-            global_scale=global_scale,
+            out_global_scale=out_global_scale,
             masked_m=masked_m,
             m=m,
             n_out=n // 2 if activation_type is not None else n,
@@ -4493,7 +4499,7 @@ def _grouped_gemm_nt_masked_sm100(
         alpha_up_tensor_gpu=alpha_up,
         a_per_token_scale_tensor_gpu=a_per_token_scale,
         out_scale_tensor_gpu=out_scale,
-        global_scale_tensor_gpu=global_scale,
+        out_global_scale_tensor_gpu=out_global_scale,
     )
 
 

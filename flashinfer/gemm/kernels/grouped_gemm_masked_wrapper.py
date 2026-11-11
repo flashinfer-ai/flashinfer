@@ -80,7 +80,7 @@ def grouped_gemm_nt_masked(
     alpha_up: Optional[torch.Tensor] = None,
     a_per_token_scale: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
-    global_scale: Optional[torch.Tensor] = None,
+    out_global_scale: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     **kwargs,
 ):
@@ -211,7 +211,7 @@ def grouped_gemm_nt_masked(
         with or without ``activation_type``.  Raises ``ValueError`` when 4over6 is enabled
         (see ``nvfp4_4over6``) or ``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH``
         is set, since the epilogue does not implement those recipes.
-    global_scale : Optional[torch.Tensor]
+    out_global_scale : Optional[torch.Tensor]
         Required when ``c_dtype="float4_e2m1fn"``.  Contiguous ``float32``
         tensor of shape ``(l,)`` with the per-batch NVFP4 global scale, as the
         ``a_global_sf`` argument of ``scaled_fp4_grouped_quantize``.
@@ -316,7 +316,7 @@ def grouped_gemm_nt_masked(
                 ("alpha_up", alpha_up, None),
                 ("a_per_token_scale", a_per_token_scale, None),
                 ("out_scale", out_scale, None),
-                ("global_scale", global_scale, None),
+                ("out_global_scale", out_global_scale, None),
                 ("nvfp4_4over6", nvfp4_4over6, _UNSET),
             )
             if value is not default
@@ -389,7 +389,7 @@ def grouped_gemm_nt_masked(
             alpha_up=alpha_up,
             a_per_token_scale=a_per_token_scale,
             out_scale=out_scale,
-            global_scale=global_scale,
+            out_global_scale=out_global_scale,
             nvfp4_4over6=nvfp4_4over6,
             **kwargs,
         )

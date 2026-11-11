@@ -105,7 +105,7 @@ def bench(args, tokens: int, b, sfb) -> dict:
             c_dtype="float4_e2m1fn",
             activation_type=ActivationType.Swiglu,
             out_scale=half_sf,
-            global_scale=global_scale,
+            out_global_scale=global_scale,
             nvfp4_4over6=None,
         )
 
