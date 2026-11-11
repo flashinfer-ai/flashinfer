@@ -204,6 +204,7 @@ def recurrent_kda(
         "cake",
         "small-bh",
         "cudnn",
+        "vibecuda",
     ] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
@@ -409,7 +410,7 @@ def recurrent_kda(
             must be divisible by 32, except that the SM100-family exact-N16
             frozen route also accepts multiples of 16. SGLang normally uses
             64 or a larger cache-page-aligned multiple.
-        backend (Literal["auto", "cute-dsl", "cute-dsl-persistent", "tirx", "ptx", "cake", "small-bh", "cudnn"]):
+        backend (Literal["auto", "cute-dsl", "cute-dsl-persistent", "tirx", "ptx", "cake", "small-bh", "cudnn", "vibecuda"]):
             Implementation backend. ``"cute-dsl-persistent"`` explicitly selects
             the SM100/SM103 persistent prefill kernel with token-strided BF16
             Q/K/V and contiguous G/beta, D128, heads divisible by eight,
@@ -458,6 +459,11 @@ def recurrent_kda(
             selected slots of ``initial_state`` in place. ``output_final_state``
             returns that pool, not a gathered per-sequence copy. State-pool calls
             are not automatically selected for cuDNN.
+            ``"vibecuda"`` selects the experimental SM100a/SM103a JIT-only
+            recurrent-KDA prefill backend in
+            ``flashinfer.experimental.kda_vibecuda`` (M128 slab, split-seq
+            affine prefix, device-planned persistent M128, head-family fam2,
+            and fused-N16 schedules).
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -479,9 +485,11 @@ def recurrent_kda(
         "cake",
         "small-bh",
         "cudnn",
+        "vibecuda",
     ):
         raise ValueError(
-            "backend must be 'auto', 'cute-dsl', 'cute-dsl-persistent', 'tirx', 'ptx', 'cake', 'small-bh', or 'cudnn', "
+            "backend must be 'auto', 'cute-dsl', 'cute-dsl-persistent', 'tirx', "
+            "'ptx', 'cake', 'small-bh', 'cudnn', or 'vibecuda', "
             f"got {backend!r}"
         )
     if backend == "cute-dsl-persistent":
@@ -690,7 +698,7 @@ def recurrent_kda(
         # gated_delta_rule_mtp flag): outputs only, no state writes,
         # optional slot-indexed correction/kg caches. Handled ahead of the
         # prefill routing — none of the prefill-only features apply.
-        if backend == "small-bh":
+        if backend in ("small-bh", "vibecuda"):
             raise ValueError(
                 f"backend={backend!r} has no frozen-state kernels; "
                 "disable_state_update=True requires the CuTe-DSL backends"
@@ -795,6 +803,108 @@ def recurrent_kda(
             k.ndim == 4 and _kda_prefill._supports_strided_qkv(k)
         ):
             k = k.contiguous()
+    if backend == "vibecuda":
+        from .api_logging import warn_experimental_backend_once
+        from .experimental.kda_vibecuda import (
+            _run_vibecuda_kda_prefill,
+            _try_run_fast_vibecuda_kda_prefill,
+            _vibecuda_kda_prefill_is_eligible,
+        )
+
+        warn_experimental_backend_once("recurrent_kda", "vibecuda")
+        if checkpoint_state_indices is not None:
+            raise ValueError(
+                "backend='vibecuda' does not support this recurrent_kda prefill contract"
+            )
+        fast_out = _try_run_fast_vibecuda_kda_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            seq_order=seq_order,
+            prefill_workspace=prefill_workspace,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
+        if fast_out is not None:
+            return fast_out
+        if not is_plain_prefill:
+            raise ValueError(
+                "backend='vibecuda' does not support decode or single-token "
+                "recurrent_kda calls; it covers ordinary multi-token prefill only"
+            )
+        if isinstance(q, torch.Tensor) and q.is_cuda:
+            cc = get_compute_capability(q.device)
+            if cc not in _kda_prefill._FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
+                raise RuntimeError(
+                    "The VibeCUDA recurrent KDA prefill backend supports only "
+                    f"compute capabilities 10.0 and 10.3, got {cc}"
+                )
+        if not _vibecuda_kda_prefill_is_eligible(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        ):
+            raise ValueError(
+                "backend='vibecuda' does not support this recurrent_kda prefill contract"
+            )
+        assert A_log is not None
+        assert dt_bias is not None
+        assert lower_bound is not None
+        return _run_vibecuda_kda_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            seq_order=seq_order,
+            prefill_workspace=prefill_workspace,
+        )
     if backend in ("auto", "small-bh"):
         small_bh_available = (
             is_cute_dsl_available()
