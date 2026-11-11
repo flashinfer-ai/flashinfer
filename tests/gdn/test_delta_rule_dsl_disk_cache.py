@@ -83,10 +83,27 @@ def test_disk_cache_only_with_tvm_ffi(monkeypatch, options, uses_disk):
     assert any(f.endswith("delta_rule_sm120.py") for f in key_files)
 
 
+def test_disk_module_follows_the_kernel_class_hierarchy():
+    """Subclasses outside delta_rule_dsl key on their sources, in their own module."""
+    from flashinfer.gdn_kernels.blackwell import gdn_cp_prefill
+
+    module, files = ccc._disk_module(
+        object.__new__(gdn_cp_prefill.CPDeltaRuleFixupSm100)
+    )
+    assert module == ccc._DISK_CACHE_MODULE + "_blackwell"
+    assert gdn_cp_prefill.__file__ in files
+    assert any(f.endswith("delta_rule_cp_sm120.py") for f in files)
+    base_module, base_files = ccc._disk_module(_Kernel(64))
+    assert base_module == ccc._DISK_CACHE_MODULE
+    assert gdn_cp_prefill.__file__ not in base_files
+
+
 def _use_tmp_jit_dir(monkeypatch, tmp_path):
     """Point the CuTe-DSL disk cache and its locks at ``tmp_path``."""
     monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
     monkeypatch.setattr(cute_dsl_core, "get_tmpdir", lambda: tmp_path)
+    # JitSpecCuteDsl names the module after the arch; keep these tests GPU-free.
+    monkeypatch.setattr(cute_dsl_core, "_get_compile_arch", lambda: "sm121a")
 
 
 def test_disabled_disk_cache_compiles_without_artifacts(monkeypatch, tmp_path):

@@ -2,6 +2,7 @@ import functools
 import glob
 import hashlib
 import os
+import sys
 import tempfile
 import warnings
 from collections.abc import Hashable
@@ -204,9 +205,31 @@ def _disk_kernel_name(func, cache_key) -> str | None:
     return f"{type(func).__name__}_{digest}"
 
 
-def _key_source_files() -> tuple[str, ...]:
-    """The ``delta_rule_dsl`` sources whose content keys the disk cache."""
-    return tuple(sorted(glob.glob(os.path.join(os.path.dirname(__file__), "*.py"))))
+def _key_source_dirs(func) -> tuple[str, ...]:
+    """``delta_rule_dsl`` plus the directory of every FlashInfer class in the MRO.
+
+    Subclasses such as the Blackwell CP kernels live outside ``delta_rule_dsl``.
+    """
+    dirs = {os.path.dirname(os.path.abspath(__file__))}
+    for cls in type(func).__mro__:
+        path = getattr(sys.modules.get(cls.__module__), "__file__", None)
+        if path and cls.__module__.startswith("flashinfer."):
+            dirs.add(os.path.dirname(os.path.abspath(path)))
+    return tuple(sorted(dirs))
+
+
+def _disk_module(func) -> tuple[str, tuple[str, ...]]:
+    """Disk-cache module name and key files for ``func``.
+
+    Each set of source directories gets its own module, so families keyed on
+    different sources never wipe each other's artifacts.
+    """
+    dirs = _key_source_dirs(func)
+    here = os.path.dirname(os.path.abspath(__file__))
+    extra = [os.path.basename(d) for d in dirs if d != here]
+    module = "_".join([_DISK_CACHE_MODULE, *extra])
+    files = tuple(sorted(f for d in dirs for f in glob.glob(os.path.join(d, "*.py"))))
+    return module, files
 
 
 def cached_compile(func, *args, compile_options=None, **kwargs):
@@ -231,8 +254,9 @@ def cached_compile(func, *args, compile_options=None, **kwargs):
     ):
         from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
+        module, key_files = _disk_module(func)
         compiled_fn = build_and_load_cute_dsl_kernel(
-            _DISK_CACHE_MODULE, kernel_name, compile_fn, _key_source_files()
+            module, kernel_name, compile_fn, key_files
         )
     else:
         compiled_fn = compile_fn()
