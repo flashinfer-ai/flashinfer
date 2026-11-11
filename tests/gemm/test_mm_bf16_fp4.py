@@ -538,6 +538,9 @@ def test_cute_dsl_autotune_split_k_makespan_gate(monkeypatch):
     ]
     assert occ2_only_splits2 == [2]
 
+    # One-to-two-wave grid (90 tiles on 48 SMs): the old gate admitted every occ=2 split here.
+    assert valid_split_k_configs(16, 5760, 4096, 48) == []
+
     # Once a grid spans >= 4 waves (tiles > 3 * slots), splitting cannot reduce
     # makespan by >= 25%, so prefill buckets never admit split-K tactics.
     for sm_count in (48, 84, 170, 188):
