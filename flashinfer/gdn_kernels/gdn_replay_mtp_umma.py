@@ -695,7 +695,7 @@ class GdnReplayMtpUmma:
                 s_gram[(16 + grp) * 16 + gc + 1] = accx[1]
                 s_gram[(24 + grp) * 16 + gc] = accx[2]
                 s_gram[(24 + grp) * 16 + gc + 1] = accx[3]
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                U.bar_sync_ua(1, 128)
                 # X tile (fp16, SW128) and x_ready from these warps' own rows: they hold the
                 # same rows as the ring-row warps and have nothing in flight, so the readout
                 # can start once the X x X Gram is done instead of after the ring rows
@@ -784,7 +784,7 @@ class GdnReplayMtpUmma:
             else:
                 wr0 = wo  # ring rows grp / grp + 8, issued when the cursors landed
                 wr1 = wr1_e
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                U.bar_sync_ua(1, 128)
                 # norm of this lane's X row (for the k̂ ring append below)
                 rn_b = cute.math.rsqrt(s_gram[(16 + xr_b) * 16 + xr_b] + Float32(_EPS))
                 rn_b = _sel(xr_b >= T, rn_b * scale, rn_b, Float32)
@@ -836,7 +836,7 @@ class GdnReplayMtpUmma:
                                 kw4[2],
                                 kw4[3],
                             )
-            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            U.bar_sync_ua(1, 128)
 
             # -------- after the ring tiles: C tile (warps mt == 1), window weights, g-ring
             # appends, Kt (flush rows)
@@ -910,7 +910,7 @@ class GdnReplayMtpUmma:
                         if P > 0:
                             egp = cute.math.exp(gp_w, fastmath=True)
                         s_coef[wh * _COEF + _CO_EGP] = egp
-            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            U.bar_sync_ua(1, 128)
 
             tbase = tmem_addr[0]
             ctx = dict(
