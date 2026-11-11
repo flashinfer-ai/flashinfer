@@ -70,6 +70,14 @@ MXFP8 GEMM
     mm_mxfp8
     bmm_mxfp8
 
+MXFP8 x MXFP4 GEMM (MXFP4 weight, MXFP8 activation)
+----------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_mxfp8_mxfp4
+
 FP8 GEMM
 --------
 

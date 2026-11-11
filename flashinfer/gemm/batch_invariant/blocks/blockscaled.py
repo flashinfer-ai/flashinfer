@@ -1400,11 +1400,6 @@ class BlockScaledGemm:
     ):
         st = self.st
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        alpha = None
-        if cutlass.const_expr(self.scaled):
-            alpha = alpha_t[
-                0
-            ]  # the scaled chain's alpha: the caller's scalar, read once per CTA
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -1514,8 +1509,13 @@ class BlockScaledGemm:
         )
         pipeline_init_arrive(cluster_shape_mn=sync_shape, is_relaxed=True)
         if cutlass.const_expr(self.enable_pdl):
-            # the preceding grid's writes (the operands) are complete and visible
+            # the preceding grid's writes (the operands, the scalar alpha) are complete and visible
             cute.arch.griddepcontrol_wait()
+        alpha = None
+        if cutlass.const_expr(self.scaled):
+            alpha = alpha_t[
+                0
+            ]  # the scaled chain's alpha: the caller's scalar, read once per CTA after the dependency wait
 
         # --- operand staging: smem rings (A, B swizzled; SFA, SFB plain), multicast masks, global tiles, partitions
         sA = smem.allocate_tensor(

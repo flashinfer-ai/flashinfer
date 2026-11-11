@@ -722,6 +722,67 @@ def test_pdl_variant_is_a_placement(M, N, K):
 
 
 @needs_device
+def test_default_alpha_is_visible_to_a_call_on_another_stream():
+    """``alpha=None`` takes the device's cached 1.0, filled and synchronised at its first use: a call on an independent
+    stream right after that first use (which queued behind other work) reads the filled scalar, not the allocation's
+    stale bytes."""
+    from flashinfer.gemm.batch_invariant import api as bi_api
+
+    M, N, K = 64, 2048, 4096
+    a, sfa = adv_mx8(M, K, 41)
+    b, sfb = weight(N, K, 42)
+    ref = bits(mm(a, b, sfa, sfb, alpha_t(1.0))).clone()
+    torch.cuda.synchronize()
+    bi_api._ONES.pop(
+        torch.cuda.current_device(), None
+    )  # the next ``alpha=None`` call is the first use again
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    busy = torch.randn(4096, 4096, device="cuda")
+    with torch.cuda.stream(s1):
+        for _ in range(8):
+            busy = torch.mm(
+                busy, busy
+            )  # keeps s1 busy: the cached scalar's fill queues behind this work
+        first = mm(a, b, sfa, sfb, None)
+    with torch.cuda.stream(
+        s2
+    ):  # independent of s1 (no wait): must still see the filled scalar
+        second = mm(a, b, sfa, sfb, None)
+    torch.cuda.synchronize()
+    assert torch.equal(bits(first), ref)
+    assert torch.equal(bits(second), ref)
+
+
+@needs_device
+def test_pdl_reads_alpha_after_the_dependency_wait():
+    """Under ``enable_pdl`` every input the preceding grid may have written is read after the dependency wait, the scalar
+    alpha included: a chain whose alpha is an element of the preceding dependent-launch GEMM's fp32 output (zeroed before
+    each chain, so an early read would see 0) gives the bits of the plain launch on the completed inputs."""
+    M, N, K = 64, 2048, 4096
+    a, sfa = adv_mx8(M, K, 51)
+    b, sfb = weight(N, K, 52)
+    a2, sfa2 = adv_mx8(M, K, 53)
+    b2, sfb2 = weight(N, K, 54)
+    alpha0 = alpha_t(2.0**-6)
+    prod = mm(a, b, sfa, sfb, alpha0, out_dtype=torch.float32, enable_pdl=False)
+    torch.cuda.synchronize()
+    alpha_ref = prod[0, :1].clone()
+    assert alpha_ref.item() != 0.0
+    ref = bits(mm(a2, b2, sfa2, sfb2, alpha_ref, enable_pdl=False)).clone()
+    out1 = torch.empty(M, N, dtype=torch.float32, device="cuda")
+    for _ in range(4):
+        out1.zero_()
+        mm(
+            a, b, sfa, sfb, alpha0, out_dtype=torch.float32, out=out1, enable_pdl=True
+        )  # writes alpha's element last
+        out2 = mm(
+            a2, b2, sfa2, sfb2, out1[0, :1], enable_pdl=True
+        )  # its alpha is the preceding grid's output
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out2), ref)
+
+
+@needs_device
 def test_batch_invariance_along_rows():
     """R2: a row's bits do not depend on the number of rows (the dispatcher's M-dependent picks included: the swapped decode
     records at small M, the dense tiles above), its position or the other rows; the parts' picks agree."""

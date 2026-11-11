@@ -1330,7 +1330,8 @@ def _alpha_tensor(
     alpha: Optional[torch.Tensor], device: torch.device, cls: str
 ) -> torch.Tensor:
     """The chain's ``alpha`` as a 1-element fp32 tensor on the operands' device: the caller's (checked), or the cached 1.0 of
-    the device when none is given (a fresh one under graph capture, where a cached fill would read 0 eagerly)."""
+    the device when none is given (filled and synchronised once, so a reader on another stream never precedes the fill; a
+    fresh one under graph capture, where a cached fill would read 0 eagerly)."""
     if alpha is None:
         key = device.index if device.index is not None else torch.cuda.current_device()
         if key in _ONES:
@@ -1338,7 +1339,10 @@ def _alpha_tensor(
         if torch.cuda.is_current_stream_capturing():
             # under graph capture the fill runs only on replay: a cached copy made here would read 0 eagerly
             return torch.ones(1, dtype=torch.float32, device=device)
-        alpha = _ONES[key] = torch.ones(1, dtype=torch.float32, device=device)
+        alpha = torch.ones(1, dtype=torch.float32, device=device)
+        # later calls on any stream read the cached scalar: its fill completes before the cache publishes it
+        torch.cuda.current_stream(device).synchronize()
+        _ONES[key] = alpha
         return alpha
     if not isinstance(alpha, torch.Tensor) or alpha.dtype != torch.float32:
         raise unsupported(
