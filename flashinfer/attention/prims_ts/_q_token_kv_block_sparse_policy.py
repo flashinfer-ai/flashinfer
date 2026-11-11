@@ -52,11 +52,14 @@ def select_sparse_launch(
     route_kv_tokens: int,
     multi_processor_count: int,
     split_kv: bool = True,
+    prefer_keeps_mma_ab: bool = False,
 ) -> SparseLaunch:
     """Choose the smallest fitting dense Q recipe, then useful one-wave splits.
 
     G is already fixed by the caller. This function never changes it, queries
     the device, reads tensors, or applies a batch/context tuning table.
+    ``prefer_keeps_mma_ab`` takes the one-instance Keeps recipe for wide-head
+    FP8 groups even when the Swaps recipe would split KV.
     """
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
@@ -120,11 +123,12 @@ def select_sparse_launch(
     candidate = recipe(minimum_q)
     instances = 1 if head_dim > 128 and candidate.variant == "keeps_mma_ab" else 2
     splits = fanout(instances)
-    # Other wide-head FP8 groups may use Swaps only when split-KV is active.
+    # Other wide-head FP8 groups may use Swaps only when split-KV is active,
+    # unless the caller prefers Keeps (the NVFP4-fed FP8 Keeps recipe).
     if (
         head_dim in (192, 256)
         and q_dtype_key == "float8_e4m3fn"
-        and splits == 1
+        and (splits == 1 or prefer_keeps_mma_ab)
         and candidate.tile_size_q < 64
     ):
         candidate = recipe(64)

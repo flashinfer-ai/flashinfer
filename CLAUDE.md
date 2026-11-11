@@ -442,7 +442,10 @@ separate from effective MMA dtypes (`qk_dtype`, `pv_dtype`). Transformed
 FP8/NVFP4 K/V uses Q's compute dtype; BF16 Q/K with FP8 V uses FP8 PV without
 that transform. Kernel predicates, P packing, and attention-sink scaling must
 follow effective compute precision; TMA descriptors and raw allocations must
-follow storage precision. The public plan accepts separate `k_data_type` and
+follow storage precision. The QToken NVFP4-fed Keeps profile
+(`use_nvfp4_kv_source`) is the one exception: its `k_dtype`/`v_dtype` name the FP8
+or BF16 rings MMA consumes, and the NVFP4 storage configuration is
+`nvfp4_raw_cfg`. The public plan accepts separate `k_data_type` and
 `v_data_type`, with `kv_data_type` retained as a common-KV compatibility alias.
 
 ## Code Linting

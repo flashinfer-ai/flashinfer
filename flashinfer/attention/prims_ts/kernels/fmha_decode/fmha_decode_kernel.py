@@ -94,6 +94,10 @@ from .fmha_decode_resources import (
     TmemSoftmaxOrderResource,
     TmemTransformedKvResource,
 )
+from .fmha_decode_resources.tmem_transformed_kv import (
+    SmemKvFromNvfp4Resource,
+    SmemNvfp4RawKvResource,
+)
 from .fmha_decode_resources.helpers_common import (
     split_kv_grid_coord,
     UniformQueryOffsets,
@@ -130,6 +134,7 @@ from .fmha_decode_tasks import (
     create_scheduler_task,
     create_softmax0_task,
     create_softmax1_task,
+    create_nvfp4_keeps_transform_task,
     create_transform_kv_task,
 )
 from .reduction import (  # noqa: F401
@@ -501,7 +506,7 @@ def _build_decode_gen_schedule(
         Agent.Thread, cfg.page_offsets_num_warps * WARP_SIZE
     )
     load_grp = pipeline.CooperativeGroup(Agent.Thread, cfg.load_num_warps * WARP_SIZE)
-    if cfg.use_transform_kv:
+    if cfg.use_transform_kv or cfg.use_nvfp4_kv_source:
         transform_kv_grp = pipeline.CooperativeGroup(
             Agent.Thread, cfg.transform_kv_num_warps * WARP_SIZE
         )
@@ -678,7 +683,7 @@ def _build_decode_gen_schedule(
 
     def _make_raw_kv_cfg(num_stages: int, tile_bytes: int) -> PipelineConfig:
         """Create a per-operand raw pipeline with its actual TMA byte count."""
-        num_bytes = tile_bytes + cfg.smem_kv_sf_tile_bytes
+        num_bytes = tile_bytes + cfg.smem_kv_sf_tile_transaction_bytes
         bytes_per_load_warp = (
             num_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
         )
@@ -722,6 +727,37 @@ def _build_decode_gen_schedule(
     smem_k1_cfg = _make_raw_kv_cfg(split_k1_stages, cfg.smem_k_tile_bytes)
     smem_v0_cfg = _make_raw_kv_cfg(split_v0_stages, cfg.smem_v_tile_bytes)
     smem_v1_cfg = _make_raw_kv_cfg(split_v1_stages, cfg.smem_v_tile_bytes)
+    smem_kv_raw_cfg = None
+    if cfg.use_nvfp4_kv_source:
+        # The loader fills a raw interleaved-NVFP4 ring for TransformKvTask,
+        # which in turn produces the FP8 or BF16 K and V rings MMA consumes.
+        assert use_one_inst_qkv and cfg.transformed_kv_stages > 0
+        # The raw-ring TMA descriptor exists only for gather4 fragment rows.
+        assert cfg.nvfp4_raw_cfg.uses_nvfp4_gather4_kv
+        raw_tile_bytes = cfg.nvfp4_raw_cfg.smem_kv_tile_bytes
+        smem_kv_raw_cfg = PipelineConfig(
+            num_stages=cfg.kv_stages,
+            num_bytes=raw_tile_bytes,
+            producer_group=tma_producer,
+            consumer_group=transform_kv_grp,
+            pipeline_type=PipelineType.TmaAsync,
+            cta_layout_vmnk=cta_layout,
+            producer_signaling_threads=tma_producer_signaling,
+            num_bytes_per_warp_per_cta=(
+                raw_tile_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
+            ),
+            advance_on_wait=True,
+        )
+        smem_k0_cfg, smem_v0_cfg = (
+            PipelineConfig.create_async_umma_pipeline_cfg(
+                num_stages=cfg.transformed_kv_stages,
+                producer_group=transform_kv_grp,
+                consumer_group=umma_hw,
+                cta_layout_vmnk=cta_layout,
+                advance_on_wait=True,
+            )
+            for _ in range(2)
+        )
 
     def _make_page_offsets_cfg(num_stages: int | None = None) -> PipelineConfig:
         """Create the async page-offsets pipeline for the selected stage count."""
@@ -937,11 +973,21 @@ def _build_decode_gen_schedule(
             ),
             name="schedule_token_throttle",
         )
+    # Static-length routes and runtime query-major planes stage memberships in
+    # SMEM (a bounded prefix with a GMEM fallback for the latter); runtime
+    # page-major rows are read from immutable GMEM on demand.
+    cache_memberships_in_smem = cfg.fixed_seqlen or cfg.query_major_memberships
     membership_lifetime = None
-    if use_clc_dynamic and cfg.uses_q_token_kv_block_sparse_page_membership:
+    if (
+        use_clc_dynamic
+        and cfg.uses_q_token_kv_block_sparse_page_membership
+        and cache_memberships_in_smem
+    ):
         # Page IDs are consumed by Load, but membership bytes are consumed by
         # Softmax. Do not overwrite the next work item's membership row until
-        # every score stream has finished reading the current one.
+        # every score stream has finished reading the current one. Rows read
+        # from GMEM need no lifetime, so the page-offset producer may start
+        # the next work item early.
         membership_lifetime = SparseMembershipLifetimeResource(
             name="sparseMembershipLifetime",
             pipeline_config=PipelineConfig(
@@ -988,7 +1034,7 @@ def _build_decode_gen_schedule(
             stage_page_ids_per_tile=stage_page_ids_per_tile,
             # Runtime query planes use a bounded prefix cache with a GMEM
             # fallback, so its allocation never specializes sequence lengths.
-            cache_memberships_in_smem=(cfg.fixed_seqlen or cfg.query_major_memberships),
+            cache_memberships_in_smem=cache_memberships_in_smem,
             page_idx_kv=page_idx_kv,
             page_table_stride=page_table_stride,
             num_heads_kv=num_heads_kv,
@@ -1082,7 +1128,48 @@ def _build_decode_gen_schedule(
     smem_k1 = None
     smem_v0 = None
     smem_v1 = None
-    if use_per_inst_kv_resources:
+    smem_kv_raw = None
+    if cfg.use_nvfp4_kv_source:
+        smem_kv_raw = SmemNvfp4RawKvResource(
+            pipeline_config=smem_kv_raw_cfg,
+            cfg=cfg.nvfp4_raw_cfg,
+            uses_register_capture=cfg.uses_nvfp4_raw_register_capture,
+            tma_desc_k=tma_desc_k,
+            tma_desc_v=tma_desc_v,
+            page_offsets_kv=smem_page_offsets,
+            seqlens_kv=kv_seqlens,
+            max_seq_len_kv=max_seq_len_kv,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            q_group_idx=q_group_idx,
+            seq_len_q=seq_len_q,
+            name="smemKvRaw",
+        )
+        nvfp4_ring_kwargs = dict(
+            cfg=cfg,
+            raw_src=smem_kv_raw,
+            page_offsets_kv=smem_page_offsets,
+            seqlens_kv=kv_seqlens,
+            max_seq_len_kv=max_seq_len_kv,
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            q_group_idx=q_group_idx,
+            seq_len_q=seq_len_q,
+            inst_id=0,
+        )
+        smem_k0 = SmemKvFromNvfp4Resource(
+            pipeline_config=smem_k0_cfg,
+            kv_kind=KV_KIND_K,
+            name="smemK0",
+            **nvfp4_ring_kwargs,
+        )
+        smem_v0 = SmemKvFromNvfp4Resource(
+            pipeline_config=smem_v0_cfg,
+            kv_kind=KV_KIND_V,
+            name="smemV0",
+            **nvfp4_ring_kwargs,
+        )
+    elif use_per_inst_kv_resources:
         smem_k0 = SmemKvTileResource(
             pipeline_config=smem_k0_cfg,
             cfg=cfg,
@@ -1525,6 +1612,8 @@ def _build_decode_gen_schedule(
     if sparse_softmax_metadata0 is not None:
         smem_resources.append(sparse_softmax_metadata0)
         smem_resources.append(sparse_softmax_metadata1)
+    if smem_kv_raw is not None:
+        smem_resources.append(smem_kv_raw)
     if use_one_inst_qkv:
         smem_resources.append(smem_k0)
         smem_resources.append(smem_v0)
@@ -1604,6 +1693,10 @@ def _build_decode_gen_schedule(
         assert smem_page_offsets is not None
         smem_page_offsets.cache_memberships_in_smem = False
         smem_page_offsets._init_placeholder_state()
+        if membership_lifetime is not None:
+            # Nothing in SMEM needs protecting once memberships stay in GMEM.
+            smem_resources.remove(membership_lifetime)
+            membership_lifetime = None
         smem_allocator, clc_response_alloc = allocate_smem()
     launch_smem_bytes = smem_bytes(smem_allocator)
     if launch_smem_bytes > smem_capacity_bytes:
@@ -1661,7 +1754,22 @@ def _build_decode_gen_schedule(
         if cfg.use_sage_attention
         else {}
     )
-    if use_one_inst_qkv:
+    if cfg.use_nvfp4_kv_source:
+        load_tasks = (
+            create_load_task(
+                smem_q,
+                smem_kv_raw,
+                work_queue,
+                schedule_token_throttle,
+                cfg,
+                domain=load_domain,
+                domain_bias=0,
+                warp_idx=cfg.clc_load_warp_idx if use_clc_dynamic else None,
+                smem_page_offsets=smem_page_offsets,
+                **task_runtime_kwargs,
+            ),
+        )
+    elif use_one_inst_qkv:
         load_tasks = (
             create_load_task_one_inst_qkv(
                 smem_q,
@@ -1766,7 +1874,7 @@ def _build_decode_gen_schedule(
         else:
             page_offsets_task_fn = (
                 create_page_offsets_task_one_inst_qkv
-                if use_one_inst_qkv
+                if use_one_inst_qkv and not cfg.use_nvfp4_kv_source
                 else create_page_offsets_task
             )
             page_offsets_task = page_offsets_task_fn(
@@ -1834,7 +1942,18 @@ def _build_decode_gen_schedule(
             **task_runtime_kwargs,
         )
     transform_kv_task = None
-    if cfg.use_transform_kv:
+    if cfg.use_nvfp4_kv_source:
+        transform_kv_task = create_nvfp4_keeps_transform_task(
+            smem_kv_raw,
+            smem_k0,
+            smem_v0,
+            work_queue,
+            cfg,
+            domain=load_domain,
+            domain_bias=0,
+            **task_runtime_kwargs,
+        )
+    elif cfg.use_transform_kv:
         transform_kv_task = create_transform_kv_task(
             smem_kv,
             smem_k0,
@@ -1968,8 +2087,8 @@ def _build_decode_gen_schedule(
     if use_one_inst_qkv:
         resource_dependency_graph = {
             smem_q: [],
-            smem_k0: smem_kv_deps,
-            smem_v0: smem_kv_deps,
+            smem_k0: [smem_kv_raw] if smem_kv_raw is not None else smem_kv_deps,
+            smem_v0: [smem_kv_raw] if smem_kv_raw is not None else smem_kv_deps,
             tmem_s0: [smem_k0, smem_q],
             smem_p0: [tmem_s0],
             tmem_softmax_local0: [tmem_s0],
@@ -2102,6 +2221,8 @@ def _build_decode_gen_schedule(
         }
     if transformed_kv is not None and not use_per_inst_kv_resources:
         resource_dependency_graph[transformed_kv] = [smem_kv]
+    if smem_kv_raw is not None:
+        resource_dependency_graph[smem_kv_raw] = list(smem_kv_deps)
     if sparse_softmax_metadata0 is not None:
         resource_dependency_graph[smem_p0].append(sparse_softmax_metadata0)
         resource_dependency_graph[tmem_softmax_local0].append(sparse_softmax_metadata0)
@@ -2170,7 +2291,13 @@ def _build_decode_gen_schedule(
             dma_consumer_release_labels[(transformed_kv, tmem_s1)] = {"k_desc_1"}
             dma_consumer_release_labels[(transformed_kv, tmem_o)].add("v_desc_1")
     if smem_page_offsets is not None:
-        if use_one_inst_qkv:
+        if smem_kv_raw is not None:
+            dma_consumer_release_labels[(smem_page_offsets, smem_kv_raw)] = (
+                {"read_offsets"}
+                if _can_hold_native_page_window(cfg, smem_page_offsets)
+                else {"read_offsets_k0", "read_offsets_v0"}
+            )
+        elif use_one_inst_qkv:
             if _can_hold_native_page_window(cfg, smem_page_offsets):
                 # One consumer stage remains live across the complete K/V
                 # cadence, so both DMA edges share its final release label.
@@ -3546,7 +3673,10 @@ def fmha_decode_launch(
     q_seq = max_q_len if not cfg.fixed_seqlen else Int32(cfg.max_seq_len_q)
     if cutlass.const_expr(cfg.use_paged_kv):
         kv_tma_d = d
-        if cutlass.const_expr(
+        if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv or cfg.use_nvfp4_kv_source):
+            # Interleaved rows hold the packed payload and then its scales.
+            kv_tma_d = Int32(cfg.nvfp4_interleaved_row_bytes)
+        elif cutlass.const_expr(
             cfg.use_nvfp4_kv and not cfg.store_transformed_kv_in_tmem
         ):
             kv_tma_d = d // Int32(2)
@@ -3559,7 +3689,9 @@ def fmha_decode_launch(
             v_tma_page_stride = v_page_stride
             v_tma_head_stride = v_head_stride
             v_tma_token_stride = v_token_stride
-            if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+            if cutlass.const_expr(
+                cfg.store_transformed_kv_in_tmem and not cfg.use_nvfp4_interleaved_kv
+            ):
                 # B4X16_P64 tensor-map strides are expressed in logical FP4
                 # lanes while the native cache reports packed-byte strides.
                 k_tma_page_stride = k_page_stride * Int64(2)
@@ -3673,7 +3805,13 @@ def fmha_decode_launch(
     tma_swizzle_v = cuda.TensorMapSwizzle.s128b
     if cutlass.const_expr(cfg.v_dtype_bytes == 1 and cfg.headdim == 64):
         tma_swizzle_v = cuda.TensorMapSwizzle.s64b
-    if cutlass.const_expr(cfg.use_nvfp4_kv):
+    if cutlass.const_expr(cfg.use_nvfp4_interleaved_kv):
+        # One plain-byte copy per fragment: complete rows, no swizzle.
+        tma_box0_k = cfg.nvfp4_interleaved_row_bytes
+        tma_box0_v = cfg.nvfp4_interleaved_row_bytes
+        tma_swizzle_k = cuda.TensorMapSwizzle.none
+        tma_swizzle_v = cuda.TensorMapSwizzle.none
+    elif cutlass.const_expr(cfg.use_nvfp4_kv):
         if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
             # Unpacking TMA consumes 128 logical FP4 lanes and materializes
             # one s128b-swizzled byte per lane in the raw SMEM stage.
@@ -3771,7 +3909,9 @@ def fmha_decode_launch(
         k_box_dims = (tma_box0_k, tma_kv_tokens, 1, 1)
         v_box_dims = (tma_box0_v, tma_kv_tokens, 1, 1)
         kv_stride_order = (0, 1, 2, 3)
-    if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
+    if cutlass.const_expr(
+        cfg.store_transformed_kv_in_tmem and not cfg.use_nvfp4_interleaved_kv
+    ):
         tma_desc_k = create_tensor_map_tiled_from_view(
             k_tma,
             box_dims=k_box_dims,
@@ -3801,6 +3941,34 @@ def fmha_decode_launch(
             stride_order=kv_stride_order,
             swizzle=tma_swizzle_v,
         )
+    kv_src_cfg = cfg.nvfp4_raw_cfg if cfg.use_nvfp4_kv_source else cfg
+    if cutlass.const_expr(kv_src_cfg.uses_nvfp4_gather4_kv):
+        # Compact HND rows make every page fragment one contiguous row of a
+        # flat 2-D map (D256 four-token fragments: 576 bytes; 32-bit words keep
+        # the box within 256 elements). gather4 copies take four row
+        # coordinates each.
+        frag_bytes = cfg.num_tokens_per_page * cfg.nvfp4_interleaved_row_bytes
+        frag_rows = Int32(
+            num_physical_kv_pages
+            * Int64(cfg.effective_storage_tokens_per_page // cfg.num_tokens_per_page)
+            * Int64(cfg.flat_native_kv_num_heads)
+        )
+        tma_desc_k = create_tensor_map_tiled(
+            global_address=k_iter.toint(),
+            dtype=Int32,
+            global_dims=[frag_bytes // 4, frag_rows],
+            global_strides=[frag_bytes // 16],
+            box_dims=[frag_bytes // 4, 1],
+            swizzle=cuda.TensorMapSwizzle.none,
+        )
+        tma_desc_v = create_tensor_map_tiled(
+            global_address=v_iter.toint(),
+            dtype=Int32,
+            global_dims=[frag_bytes // 4, frag_rows],
+            global_strides=[frag_bytes // 16],
+            box_dims=[frag_bytes // 4, 1],
+            swizzle=cuda.TensorMapSwizzle.none,
+        )
 
     # NVFP4 scale factors are staged into SMEM by the same SmemKv TMA pipeline
     # as the packed K/V. The SF tensor is logically
@@ -3812,7 +3980,7 @@ def fmha_decode_launch(
     # This reshape is a pure reinterpretation of the same contiguous bytes.
     tma_desc_k_sf = tma_desc_k
     tma_desc_v_sf = tma_desc_v
-    if cutlass.const_expr(cfg.use_nvfp4_kv):
+    if cutlass.const_expr(cfg.uses_nvfp4_scale_tensors):
         sf_per_token = cfg.headdim // 16
         sf_r = cfg.sf_tma_reshape_factor
         sf_inner = sf_per_token * sf_r

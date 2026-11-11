@@ -314,7 +314,22 @@ Equal Q/K/V D192 uses the same sparse dtype contract, with native
 head-dimension staging. FP8 uses 128-wide K/V stages; Q staging rounds to
 256 elements internally, with the last 64 supplied by TMA zero fill. The D192
 BF16/FP8 paths and bounded packed-Q loads are additionally tested on GB300/SM103
-with CUDA graphs and allocation-boundary checks. Decode's
+with CUDA graphs and allocation-boundary checks.
+
+D256 also accepts packed NVFP4 K/V (`torch.uint8`) with BF16 or FP8 E4M3 Q
+and BF16 output, in two layouts: interleaved rows `[pages, Hkv, page_size,
+D/2 + D/16]` (each token's E2M1 payload, then its E4M3 block scales), or
+`[.., D/2]` payloads with `kv_scale_factors=(K_SF, V_SF)`. BF16 Q runs exact
+BF16 MMA operands; FP8 Q runs E4M3-rounded FP8 MMA operands. The
+TMEM-transformed SwapsMmaAb recipe serves both layouts (BF16 Q with
+interleaved rows needs a CUDA 13.2+ toolkit). Groups of more than 32 Q rows
+per KV head, and FP8-Q groups of G >= 5, run the KeepsMmaAb recipe of Q's
+dtype instead, fed by a task that converts NVFP4 into its E4M3 or exact BF16
+K/V tiles. That recipe loads four page fragments per TMA gather4 copy, so it
+needs interleaved rows in a contiguous cache with storage subpages (the
+storage page is larger than the sparse fragment), whole groups of four
+fragments per KV tile and fragments of at most 1024 bytes. Groups wider than
+32 Q rows have no other NVFP4 recipe and raise a `ValueError` otherwise. Decode's
 native logical HND cache views can use strided NHD/interleaved physical storage.
 The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM

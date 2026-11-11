@@ -111,6 +111,63 @@ MASK_TYPES = ("dense", "causal")
 # Every correction lane reduces one packed 16-byte partial-O vector.  The
 # default four-warp correction group therefore owns a 2-KiB reducer slice.
 SPLIT_REDUCTION_VECTOR_BYTES_PER_THREAD = 16
+# A gather4 copy moves one interleaved NVFP4 page fragment per row as 32-bit
+# words; a TMA box dimension holds at most 256 elements.
+NVFP4_GATHER4_MAX_FRAGMENT_BYTES = 256 * 4
+
+
+def nvfp4_interleaved_kv_profile(
+    *, tile_size_q: int, q_dtype_bytes: int, keeps_source: bool
+) -> dict[str, int | bool]:
+    """Config overrides of the QToken recipes that read interleaved NVFP4 rows.
+
+    ``keeps_source`` selects the KeepsMmaAb recipe of Q's dtype
+    (``q_dtype_bytes``: 1 for FP8, 2 for BF16) fed by TransformKvTask;
+    otherwise the TMEM-transformed SwapsMmaAb recipe keeps its resolved stage
+    counts (a 32-fragment interleaved raw stage is exactly as large as the
+    separate payload plus scale stages). Both run two transform warp groups
+    (warps 16-23). Ring depths are in stages: ``transformed_kv_stages`` per
+    K/V operand ring (one D256 FP8 or one D128 BF16 slice), ``kv_stages`` of
+    the raw NVFP4 ring, both measured on GB300 at 16 Q heads per KV head.
+    """
+    transform = dict(transform_kv_warp_idx=16, transform_kv_num_warps=8)
+    if not keeps_source:
+        # Swaps: interleaved V has no cross-warp shuffles, so the transform
+        # scales with a second group; the four loader warps move to 4-7.
+        return dict(
+            use_nvfp4_interleaved_kv=True,
+            load_warp_idx=4,
+            clc_load_warp_idx=4,
+            **transform,
+        )
+    if q_dtype_bytes == 1:
+        # FP8 Q64: with every SM streaming, raw bytes in flight bound the load
+        # rate; one 32 KB FP8 stage per operand suffices because converting a
+        # tile is shorter than the Softmax it overlaps, leaving room for six
+        # 18 KB raw stages. Q128 doubles MMA and Softmax per tile, so one FP8
+        # stage would stall the transform behind PV; its 32 KB Q stage leaves
+        # two FP8 and two raw stages.
+        transformed_kv_stages, kv_stages = (2, 2) if tile_size_q == 128 else (1, 6)
+    else:
+        # BF16 stages are D128 slices, two per tile. Q64 keeps a full tile per
+        # operand with three raw stages. Q128's 64 KB Q stage leaves room for
+        # a full tile per operand only with one raw stage, which the transform
+        # reads into registers and returns before converting
+        # (FmhaDecodeConfig.uses_nvfp4_raw_register_capture).
+        transformed_kv_stages, kv_stages = (2, 1) if tile_size_q == 128 else (2, 3)
+    return dict(
+        use_nvfp4_kv_source=True,
+        transformed_kv_stages=transformed_kv_stages,
+        kv_stages=kv_stages,
+        q_stages=1,
+        # Warp group 2 hosts the raw-ring loader instead of its padding task.
+        load_warp_idx=8,
+        clc_load_warp_idx=8,
+        load_num_warps=4,
+        wg2_padding_num_warps=0,
+        **transform,
+    )
+
 
 _GROUPED_KEEPS_MAIN_PROFILE: _GroupedKeepsProfileKey = (
     Float16,
@@ -763,6 +820,21 @@ class FmhaDecodeConfig:
     # Store the transformed NVFP4 K/V operand ring in TMEM. The supported
     # FP8-Q Swaps profile defaults to this path; other mixed modes use SMEM.
     store_transformed_kv_in_tmem: bool = False
+    # Packed NVFP4 K/V rows interleave each token's E2M1 payload (D/2 bytes)
+    # with its own E4M3 block scales (D/16 bytes) instead of separate scale
+    # tensors. One TMA then stages a full-head-dim fragment with its scales,
+    # and the transform reads packed bytes directly.
+    use_nvfp4_interleaved_kv: bool = False
+    # An FP8 or BF16 Q/K/V KeepsMmaAb profile whose K/V are not loaded from a
+    # cache of that dtype: the loader stages interleaved NVFP4 rows (see
+    # ``use_nvfp4_interleaved_kv``) into a raw ring and TransformKvTask writes the
+    # E4M3 or exact BF16 tiles, in the TMA layout of that dtype, into the K/V
+    # rings MMA consumes. Here ``k_dtype``/``v_dtype`` name the ring operands;
+    # the NVFP4 storage precision, its TMA descriptors and raw allocations
+    # come from ``nvfp4_raw_cfg``.
+    # ``transformed_kv_stages`` sets that ring depth per operand (in head-dim
+    # stages) and ``kv_stages`` the raw ring depth.
+    use_nvfp4_kv_source: bool = False
 
     # ------------------------------------------------------------------
     # TMEM column counts
@@ -970,8 +1042,15 @@ class FmhaDecodeConfig:
     # warps.
     @property
     def uses_task_register_reallocation(self) -> bool:
+        """Whether warp groups rebalance registers with ``setmaxnreg`` grants.
+
+        Profiles with heavy producer or Softmax state give each role its own
+        grant instead of an even split of the CTA pool across all warps.
+        """
         if (
             self.use_transform_kv
+            # The NVFP4 source adds eight transform warps in every scheduler mode.
+            or self.use_nvfp4_kv_source
             or (self.use_keeps_mma_ab and self.tile_size_q == 128)
             # Persistent grouped masks keep additional routing/softmax state
             # live. Reuse the same CTA-pool budgets to give it register headroom.
@@ -1076,8 +1155,27 @@ class FmhaDecodeConfig:
 
     @property
     def transform_kv_task_num_registers(self) -> int | None:
+        """TransformKvTask's per-thread register grant, or None without one.
+
+        The grants must fit the CTA pool together with the other roles'
+        grants; Softmax takes what remains (see ``softmax_task_num_registers``).
+        """
+        if self.use_nvfp4_kv_source:
+            # One (token, half) row at a time: four payload words, two scale
+            # words and eight outputs (BF16: four scale pairs and four outputs
+            # per word). BF16 register capture also holds 18 words per thread
+            # (two units of eight payload words and one scale word) until the
+            # last destination commit. 48 keeps the 24-warp budget with the
+            # Keeps recipe's Softmax grant.
+            return 48
         if not self.use_transform_kv:
             return None
+        if self.store_transformed_kv_in_tmem and self.use_q_token_kv_block_sparse_route:
+            # The TMEM transform keeps one stage slice of unpacked words and
+            # scales live (~64 registers). A 184-register grant left sparse
+            # Softmax with only 40 registers and forced score spills. Two
+            # transform groups each hold only half a stage.
+            return 104 if self.transform_kv_num_warps == 4 else 72
         if self.num_insts_kv == 1 or self.store_transformed_kv_in_tmem:
             return 184
         if self.headdim == 64:
@@ -1201,14 +1299,104 @@ class FmhaDecodeConfig:
     @property
     def smem_k_tile_bytes(self) -> int:
         """TMA transaction bytes for one raw K tile, before NVFP4 expansion."""
+        if self.use_nvfp4_interleaved_kv:
+            return self.tile_size_kv * self.nvfp4_interleaved_row_bytes
         bits = 4 if self.k_dtype == Float4E2M1FN else self.k_dtype_bytes * 8
         return self.tile_size_kv * self.head_dim_kv_stage * bits // 8
 
     @property
     def smem_v_tile_bytes(self) -> int:
         """TMA transaction bytes for one raw V tile, before NVFP4 expansion."""
+        if self.use_nvfp4_interleaved_kv:
+            return self.tile_size_kv * self.nvfp4_interleaved_row_bytes
         bits = 4 if self.v_dtype == Float4E2M1FN else self.v_dtype_bytes * 8
         return self.tile_size_kv * self.head_dim_kv_stage * bits // 8
+
+    @property
+    def uses_nvfp4_scale_tensors(self) -> bool:
+        """Whether NVFP4 block scales come from separate K/V scale tensors."""
+        return self.use_nvfp4_kv and not self.use_nvfp4_interleaved_kv
+
+    @property
+    def nvfp4_interleaved_row_bytes(self) -> int:
+        """Bytes of one interleaved NVFP4 token row: payload, then scales."""
+        return self.headdim // 2 + self.headdim // 16
+
+    @property
+    def uses_nvfp4_raw_register_capture(self) -> bool:
+        """Whether the NVFP4-fed BF16 transform reads raw tiles via registers.
+
+        With a single raw stage, TransformKvTask copies its share of each raw
+        tile into registers and releases the stage before waiting for its BF16
+        destination, so loading the next tile overlaps the conversion.
+        """
+        return (
+            self.use_nvfp4_kv_source and self.k_dtype_bytes == 2 and self.kv_stages == 1
+        )
+
+    @property
+    def nvfp4_raw_cfg(self) -> "FmhaDecodeConfig":
+        """The raw-ring view of an ``use_nvfp4_kv_source`` profile.
+
+        Identical geometry, but NVFP4 interleaved K/V dtypes: the shared K/V
+        loader and its staging resource use it to stage NVFP4 rows.
+        """
+        assert self.use_nvfp4_kv_source
+        return replace(
+            self,
+            k_dtype=Float4E2M1FN,
+            v_dtype=Float4E2M1FN,
+            use_nvfp4_interleaved_kv=True,
+            use_nvfp4_kv_source=False,
+        )
+
+    @property
+    def uses_nvfp4_gather4_kv(self) -> bool:
+        """Whether interleaved NVFP4 fragments load four at a time (TMA gather4).
+
+        Needs flat compact-HND locators: each fragment is then one contiguous
+        row of a 2-D map, and gather4 takes four arbitrary row coordinates.
+
+        Only NVFP4 gains from this. Its fragments land in an unswizzled raw
+        ring that the K/V transform re-lays out for the MMA, so a TMA row can
+        span a whole fragment (all of its tokens), and one gather4 fetches
+        four selected fragments where tiled copies need four instructions.
+        FP8/BF16 K/V tiles are loaded directly in the SW128 MMA operand
+        layout, one token per 128-byte TMA row, so gather4 there would still
+        fetch four token rows per instruction, the same as a tiled copy of
+        one 4-token fragment.
+        """
+        return (
+            self.use_nvfp4_interleaved_kv
+            and self.use_flat_native_kv_tma
+            and (self.tile_size_kv // self.num_tokens_per_page) % 4 == 0
+            and self.num_tokens_per_page * self.nvfp4_interleaved_row_bytes
+            <= NVFP4_GATHER4_MAX_FRAGMENT_BYTES
+        )
+
+    @property
+    def nvfp4_interleaved_fragment_bytes(self) -> int:
+        """SMEM slot of one interleaved page fragment.
+
+        Separate copies need a 128-byte-aligned destination each; a gather4
+        copy writes four fragments back to back (four 576-byte D256
+        four-token fragments: 2304 B, itself aligned).
+        """
+        live = self.num_tokens_per_page * self.nvfp4_interleaved_row_bytes
+        if self.uses_nvfp4_gather4_kv:
+            return live
+        return (live + 127) // 128 * 128
+
+    @property
+    def num_raw_kv_head_dim_stages(self) -> int:
+        """Raw K/V loads per tile; interleaved NVFP4 stages the whole row once.
+
+        The NVFP4-fed Keeps profile loads the same raw rows, whatever its
+        transformed head-dim staging (one D256 FP8 or two D128 BF16 stages).
+        """
+        if self.use_nvfp4_interleaved_kv or self.use_nvfp4_kv_source:
+            return 1
+        return self.num_head_dim_stages_kv
 
     @property
     def smem_k_storage_tile_bytes(self) -> int:
@@ -1228,7 +1416,7 @@ class FmhaDecodeConfig:
     @property
     def smem_kv_sf_bytes_per_token(self) -> int:
         """SMEM bytes for one complete K or V scale row of a token."""
-        if self.use_nvfp4_kv:
+        if self.uses_nvfp4_scale_tensors:
             # Packed K/V still uses head_dim_kv_stage-column stages (two for
             # H256, four for H512). Each stage's SF copy takes the complete
             # D/16-byte row, because one stage's slice (8 B) is below TMA's
@@ -1238,9 +1426,59 @@ class FmhaDecodeConfig:
         return 0
 
     @property
+    def smem_kv_sf_fragment_bytes(self) -> int:
+        """SMEM slot bytes for one page fragment's NVFP4 scale rows.
+
+        Paged loads issue one scale TMA per page fragment, and tensor TMA
+        destinations must be 128-byte aligned. Sparse four-token D256
+        fragments carry only 64 live bytes, so each starts a 128-byte slot.
+        Fragments of at least 128 bytes stay dense.
+        """
+        live_bytes = self.num_tokens_per_page * self.smem_kv_sf_bytes_per_token
+        if not self.use_paged_kv or live_bytes % 128 == 0:
+            return live_bytes
+        return (live_bytes + 127) // 128 * 128
+
+    @property
     def smem_kv_sf_tile_bytes(self) -> int:
-        """SMEM bytes for one staged K or V NVFP4 scale-factor tile."""
+        """SMEM allocation bytes for one staged K or V NVFP4 scale tile."""
+        if not self.use_paged_kv:
+            return self.smem_kv_sf_tile_transaction_bytes
+        return (
+            self.tile_size_kv // self.num_tokens_per_page
+        ) * self.smem_kv_sf_fragment_bytes
+
+    @property
+    def smem_kv_sf_tile_transaction_bytes(self) -> int:
+        """Live TMA bytes of one staged K or V NVFP4 scale tile."""
         return self.tile_size_kv * self.smem_kv_sf_bytes_per_token
+
+    def nvfp4_interleaved_row_offset(self, token):
+        """Byte offset of tile token ``token``'s interleaved NVFP4 row in a raw stage.
+
+        ``token`` may be a Python or DSL integer. Raw stages hold page
+        fragments of ``num_tokens_per_page`` rows (D/2 payload bytes, then
+        D/16 scale bytes) in ``nvfp4_interleaved_fragment_bytes`` slots.
+        """
+        return (
+            token // self.num_tokens_per_page
+        ) * self.nvfp4_interleaved_fragment_bytes + (
+            token % self.num_tokens_per_page
+        ) * self.nvfp4_interleaved_row_bytes
+
+    def smem_kv_sf_row_offset(self, row):
+        """Byte offset of tile token ``row``'s scale row in one SF stage.
+
+        ``row`` may be a Python or DSL integer. Rows are token-major inside
+        each page fragment; padded slots only change the fragment base.
+        """
+        if self.smem_kv_sf_fragment_bytes == (
+            self.num_tokens_per_page * self.smem_kv_sf_bytes_per_token
+        ):
+            return row * self.smem_kv_sf_bytes_per_token
+        return (row // self.num_tokens_per_page) * self.smem_kv_sf_fragment_bytes + (
+            row % self.num_tokens_per_page
+        ) * self.smem_kv_sf_bytes_per_token
 
     @property
     def sf_tma_reshape_factor(self) -> int:
@@ -1534,6 +1772,17 @@ class FmhaDecodeConfig:
         return self.k_dtype == self.v_dtype == Float4E2M1FN
 
     @property
+    def uses_tmem_transformed_kv_q_dtype(self) -> bool:
+        """Whether Q's compute dtype has a TMEM-staged NVFP4 transform.
+
+        FP8 Q stores E4M3 products. BF16 Q stores exact BF16 products; it is
+        qualified on the QToken sparse route.
+        """
+        return self.use_fp8_q or (
+            self.q_dtype == BFloat16 and self.use_q_token_kv_block_sparse_route
+        )
+
+    @property
     def use_fp8_kv(self) -> bool:
         """Whether the raw KV cache uses FP8 E4M3 storage."""
         return self.k_dtype == self.v_dtype == Float8E4M3FN
@@ -1729,8 +1978,13 @@ class FmhaDecodeConfig:
         """Return physical K or V elements in one staged SMEM tile.
 
         When using nvfp4 KV with TmemTransformedKvResource, TMA uses ``B4X16_P64`` format.
-        It adds 4 padding bits to each 4-bit e2m1 value.
+        It adds 4 padding bits to each 4-bit e2m1 value. Interleaved NVFP4
+        stages packed full-head-dim rows in 128-byte-aligned fragment slots.
         """
+        if self.use_nvfp4_interleaved_kv:
+            return (
+                self.tile_size_kv // self.num_tokens_per_page
+            ) * self.nvfp4_interleaved_fragment_bytes
         if self.store_transformed_kv_in_tmem and self.use_nvfp4_kv:
             return self.tile_size_kv * self.head_dim_kv_stage
         return self.smem_kv_tile_bytes // self.kv_dtype_bytes
@@ -3652,7 +3906,7 @@ def _finalize_static_decode_config(
         "store_transformed_kv_in_tmem",
         (
             cfg.use_nvfp4_kv
-            and cfg.use_fp8_q
+            and cfg.uses_tmem_transformed_kv_q_dtype
             and not cfg.use_keeps_mma_ab
             and cfg.head_dim_kv_stage == 128
             and cfg.tile_size_kv == 128
@@ -3764,19 +4018,20 @@ def _append_padding_warp_roles(cfg: FmhaDecodeConfig, roles: list[_WarpRole]) ->
         preferred_wg = role.preferred_warp_idx // 4
         preferred_wg_end = (role.preferred_warp_idx + role.num_warps - 1) // 4
         if preferred_wg != preferred_wg_end:
-            # A producer-only LoadTask may occupy complete consecutive warp
-            # groups. Keeping each group full preserves warpgroup register
-            # reallocation participation and needs no cross-group padding.
+            # A producer-only load or K/V transform task may occupy complete
+            # consecutive warp groups. Keeping each group full preserves
+            # warpgroup register reallocation participation and needs no
+            # cross-group padding.
             spans_complete_wgs = (
-                role.name == "load"
+                role.name in ("load", "transform_kv")
                 and role.preferred_warp_idx % 4 == 0
                 and role.num_warps % 4 == 0
             )
             if not spans_complete_wgs:
                 raise ValueError(
                     f"{role.name} spans warp groups {preferred_wg} and "
-                    f"{preferred_wg_end}; only a complete-group load task may "
-                    "span warp groups"
+                    f"{preferred_wg_end}; only complete-group producer tasks "
+                    "may span warp groups"
                 )
         if preferred_wg < 0 or preferred_wg_end >= MAX_WARP_GROUPS:
             raise ValueError(
@@ -3849,7 +4104,7 @@ def _active_warp_roles(cfg: FmhaDecodeConfig) -> list[_WarpRole]:
                 cfg.softmax1_num_warps,
             )
         )
-    if cfg.use_transform_kv:
+    if cfg.use_transform_kv or cfg.use_nvfp4_kv_source:
         roles.append(
             _WarpRole(
                 "transform_kv",
@@ -5395,18 +5650,20 @@ def _validate_profile_support(
             )
     if cfg.store_transformed_kv_in_tmem and not (
         cfg.use_nvfp4_kv
-        and cfg.use_fp8_q
+        and cfg.uses_tmem_transformed_kv_q_dtype
         and not cfg.use_keeps_mma_ab
         and cfg.head_dim_kv_stage == 128
         and cfg.tile_size_kv == 128
-        and cfg.transform_kv_num_warps == 4
+        and cfg.transform_kv_num_warps in (4, 8)
+        and cfg.transform_kv_warp_idx % 4 == 0
         and cfg.transformed_kv_stages > 0
         and cfg.tmem_total_cols <= TMEM_MAX_ALLOCATION_COLUMNS
     ):
         raise ValueError(
-            "store_transformed_kv_in_tmem requires FP8 Q, NVFP4 K/V, "
+            "store_transformed_kv_in_tmem requires FP8 Q (or BF16 Q on the "
+            "QToken sparse route), NVFP4 K/V, "
             "SwapsMmaAb, 128-wide K/V head-dimension stages and KV tiles, "
-            "and a four-warp TransformKvTask"
+            "and a TransformKvTask of one or two complete warp groups"
         )
     if use_keeps_mma_ab:
         if cfg.use_transform_kv:
