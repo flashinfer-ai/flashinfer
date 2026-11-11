@@ -7846,6 +7846,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                             q.shape[1], self.device
                         ),
+                        "maybe_k_cache_sf": k_sf,
+                        "maybe_v_cache_sf": v_sf,
                     },
                     args,
                 )
