@@ -31,16 +31,21 @@ def _swizzle_sf(sf: torch.Tensor) -> torch.Tensor:
 
 
 def _nvfp4_operand(l: int, rows: int, k: int, device):
-    """Random NVFP4 operand as (packed (rows, k/2, l), SF, dequantized (l, rows, k))."""
-    codes = torch.randint(0, 16, (l, rows, k), dtype=torch.uint8, device=device)
+    """Random NVFP4 operand as (packed (rows, k/2, l), SF, dequantized (l, rows, k)).
+
+    SF rows are padded to a multiple of 128, as the swizzled layout requires.
+    """
+    rows_pad = (rows + 127) // 128 * 128
+    codes = torch.randint(0, 16, (l, rows_pad, k), dtype=torch.uint8, device=device)
     packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
     lut = torch.tensor(E2M1_VALUES, device=device)
     lut = torch.cat([lut, -lut])
-    sf = (torch.rand(l, rows, k // SF_VEC, device=device) * 1.5 + 0.25).to(
+    sf = (torch.rand(l, rows_pad, k // SF_VEC, device=device) * 1.5 + 0.25).to(
         torch.float8_e4m3fn
     )
     dequant = lut[codes.long()] * sf.float().repeat_interleave(SF_VEC, dim=-1)
-    return packed.permute(1, 2, 0), _swizzle_sf(sf), dequant
+    packed = packed[:, :rows].contiguous()
+    return packed.permute(1, 2, 0), _swizzle_sf(sf), dequant[:, :rows]
 
 
 def _swiglu_reference(acc, gate_scale, up_scale, alpha, beta, limit):
@@ -376,11 +381,14 @@ def _nvfp4_case(l, m, n, k, gated, mma_tiler_mn, device):
     return (a, sfa, b, sfb, masked_m), kwargs
 
 
-@pytest.mark.parametrize("l,m", [(2, 256), (5, 128)])
+@pytest.mark.parametrize("l,m", [(2, 256), (5, 128), (3, 192)])
 @pytest.mark.parametrize("n,k", [(512, 1024), (1536, 512)])
 @pytest.mark.parametrize("mma_tiler_mn", [(128, 128), (128, 256)])
 @pytest.mark.parametrize("gated", [False, True])
-def test_nvfp4_output_matches_separate_quantize(l, m, n, k, mma_tiler_mn, gated):
+@pytest.mark.parametrize("out_scale_view", [False, True], ids=["flat", "6d"])
+def test_nvfp4_output_matches_separate_quantize(
+    l, m, n, k, mma_tiler_mn, gated, out_scale_view
+):
     _skip_unless_sm100()
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -401,11 +409,16 @@ def test_nvfp4_output_matches_separate_quantize(l, m, n, k, mma_tiler_mn, gated)
     ref_q, ref_sf = scaled_fp4_grouped_quantize(out_bf16, masked_m, global_scale)
 
     out_q = torch.zeros(l, m, n_out // 2, dtype=torch.uint8, device=device)
-    out_sf = torch.zeros(
-        l * ((m + 127) // 128) * 128 * (n_out // SF_VEC),
-        dtype=torch.float8_e4m3fn,
-        device=device,
-    )
+    if out_scale_view:
+        # The permuted (32, 4, rm, 4, rk, l) view the NVFP4 quantizers return.
+        out_sf = torch.zeros_like(ref_sf)
+        assert out_sf.dim() == 6 and not out_sf.is_contiguous()
+    else:
+        out_sf = torch.zeros(
+            l * ((m + 127) // 128) * 128 * (n_out // SF_VEC),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
     _run_gemm(
         *operands,
         out_q.permute(1, 2, 0),
