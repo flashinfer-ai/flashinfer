@@ -125,6 +125,11 @@ No additional statistics scratch is required for prefill.
 Statistics-enabled softmax centers raw scores before scaling and retains FP32
 probability sums instead of the optional packed-FP16 exponent/sum path. The
 statistics-disabled exponent policy is unchanged.
+Statistics retain the exact running maximum while skipping O rescaling only
+when the maximum is unchanged or there is no prior contribution. Low-level
+`FmhaTs` callers must select `corr_skip_threshold_log2=0` before exporting
+statistics; positive lazy-update thresholds are rejected. The independent
+`enable_skip_correction` switch does not change the statistics contract.
 
 Dense contiguous statistics retain valid-query empty-KV chunks and write zero
 output with `(-inf, 0)` statistics. Physical packed K/V storage must contain at

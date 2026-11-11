@@ -139,6 +139,7 @@ Entry points:
   - FmhaTs                   -- class with @cute.jit __call__ and kernel
 """
 
+import math
 import warnings
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -846,6 +847,8 @@ def build_context_task_manager(
         ``(TaskManager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc,
         peer_dealloc_mbar_alloc, work_queue, clc_response_alloc)``.
     """
+    if softmax_stats is not None and cfg.corr_skip_threshold_log2 > 0:
+        raise ValueError("softmax statistics require corr_skip_threshold_log2=0")
     if cfg.use_paged_kv:
         if cfg.num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
             raise ValueError(
@@ -3107,7 +3110,13 @@ class FmhaTs:
         Number of GQA head repeats (default: 1). Head-paired mode requires
         grouped-query attention with an even repeat count.
     enable_skip_correction : bool, optional
-        Enable skip-correction for softmax rescaling (default: True).
+        Skip O rescaling when the maximum is unchanged or no prior keys were
+        visible (default: True). Independent of lazy maximum updates below.
+    corr_skip_threshold_log2 : float, optional
+        Defer maximum updates up to this base-2 logit increase, in [0, 8]. Zero
+        keeps exact maxima and is required when exporting softmax statistics.
+        None retains the default threshold of 8 when correction skipping is
+        enabled, or 0 otherwise. VC-Attention requires zero.
     uses_ldtm_stat : bool, optional
         Use ``tcgen05.ld.red.max`` (LDTM.STAT) to fuse the per-chunk row_max
         into the TMEM S load on the non-masked path (default: False). The
@@ -3169,6 +3178,7 @@ class FmhaTs:
         vc_attention: str | None = None,
         use_blackwell_tma_oob_workaround: bool = False,
         sage_scale_layout: _SageScaleLayout | None = None,
+        corr_skip_threshold_log2: float | None = None,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -3288,11 +3298,22 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
-        # VC-Attention skips no correction. The skip keeps a stale row max,
-        # under which a larger score codes past VC_EXPCAST_CODE_BIAS and out of
-        # the E4M3 range. The exact per-tile max keeps every code at or below it.
-        if enable_skip_correction and not cfg.vc_attention:
-            cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
+        # VC-Attention cannot defer maximum updates: a larger score relative
+        # to a stale maximum can code past VC_EXPCAST_CODE_BIAS and out of the
+        # E4M3 range. The exact per-tile max keeps every code at or below it.
+        if corr_skip_threshold_log2 is None:
+            corr_skip_threshold_log2 = (
+                _CORR_SKIP_THRESHOLD_LOG2
+                if enable_skip_correction and not cfg.vc_attention
+                else 0.0
+            )
+        if not math.isfinite(corr_skip_threshold_log2) or not (
+            0 <= corr_skip_threshold_log2 <= _CORR_SKIP_THRESHOLD_LOG2
+        ):
+            raise ValueError("corr_skip_threshold_log2 must be finite and in [0, 8]")
+        if cfg.vc_attention and corr_skip_threshold_log2 > 0:
+            raise ValueError("VC-Attention requires corr_skip_threshold_log2=0")
+        cfg.corr_skip_threshold_log2 = corr_skip_threshold_log2
         cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
         cfg.kv_ring_stages = kv_ring_stages

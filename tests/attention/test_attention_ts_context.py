@@ -48,6 +48,7 @@ from flashinfer.attention.prims_ts import (
 )
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
     FmhaTs,
+    build_context_task_manager,
     build_fmha_task_manager,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
@@ -1566,9 +1567,15 @@ def test_attention_ts_context_stats_centering_preserves_finite_mask():
     assert "not self.store_softmax_stats" in ast.unparse(packed_branch.test)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("dtype", [BFloat16, Float8E4M3FN])
-@pytest.mark.parametrize("page_size", [None, 32])
+@pytest.mark.parametrize(
+    "enabled,dtype,page_size",
+    [
+        (True, Float16, None),
+        (True, BFloat16, 32),
+        (True, Float8E4M3FN, None),
+        (False, Float8E4M3FN, 32),
+    ],
+)
 def test_attention_ts_context_stats_factory_keeps_exact_maximum(
     monkeypatch, enabled, dtype, page_size
 ):
@@ -1591,7 +1598,7 @@ def test_attention_ts_context_stats_factory_keeps_exact_maximum(
         page_size=page_size,
         store_softmax_stats=enabled,
     )
-    assert kernel.cfg.enable_skip_correction is (not enabled)
+    assert kernel.cfg.enable_skip_correction
     assert kernel.cfg.corr_skip_threshold_log2 == (0.0 if enabled else 8.0)
     if dtype == Float8E4M3FN:
         assert kernel.cfg.pv_p_scale == (448.0 if enabled else 1.0)
@@ -1619,6 +1626,41 @@ def test_attention_ts_context_stats_factory_keeps_exact_maximum(
             if name == "_make_context_scheduler_probe"
             else "compile_spec.store_softmax_stats"
         )
+
+
+@pytest.mark.parametrize(
+    "skip,threshold,expected",
+    [(False, None, 0.0), (True, None, 8.0), (True, 0.0, 0.0), (False, 2.0, 2.0)],
+)
+def test_attention_ts_context_correction_and_anchor_policies_are_independent(
+    skip, threshold, expected
+):
+    kernel = FmhaTs(enable_skip_correction=skip, corr_skip_threshold_log2=threshold)
+    assert kernel.cfg.enable_skip_correction is skip
+    assert kernel.cfg.corr_skip_threshold_log2 == expected
+    if expected > 0:
+        # Both low-level builders must reject lazy anchors before constructing
+        # resources, including callers bypassing the outer plan/run API.
+        for builder in (build_fmha_task_manager, build_context_task_manager):
+            arguments = {
+                name: None
+                for name, parameter in inspect.signature(builder).parameters.items()
+                if parameter.default is inspect.Parameter.empty
+            }
+            arguments.update(cfg=kernel.cfg, num_kv_tiles=2, softmax_stats=object())
+            with pytest.raises(ValueError, match="corr_skip_threshold_log2=0"):
+                builder(**arguments)
+
+
+@pytest.mark.parametrize("threshold", [-1.0, 8.01, math.inf, math.nan])
+def test_attention_ts_context_rejects_invalid_anchor_threshold(threshold):
+    with pytest.raises(ValueError, match="finite and in"):
+        FmhaTs(corr_skip_threshold_log2=threshold)
+
+
+def test_attention_ts_context_rejects_lazy_vc_anchor():
+    with pytest.raises(ValueError, match="VC-Attention requires"):
+        FmhaTs(vc_attention="means", corr_skip_threshold_log2=1.0)
 
 
 def test_attention_ts_context_stats_one_shot_keyword_binds_current_api():
