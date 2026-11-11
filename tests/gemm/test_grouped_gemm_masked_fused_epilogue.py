@@ -465,6 +465,31 @@ def test_nvfp4_output_cluster_stays_in_bounds(cluster_shape_mn, gated):
         assert torch.equal(out_sf[i, :rows], ref_sf[i, :rows])
 
 
+def test_nvfp4_output_accepts_unaligned_global_scale():
+    """``global_scale`` may be a slice of a larger per-expert table."""
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    l, m, n, k = 2, 128, 256, 256
+    operands, kwargs = _nvfp4_case(l, m, n, k, False, (128, 128), device)
+    table = torch.full((16,), 100.0, device=device)
+    outs = []
+    for global_scale in (table[:l], table[1 : 1 + l]):
+        out_q = torch.zeros(l, m, n // 2, dtype=torch.uint8, device=device)
+        out_sf = torch.zeros(l * m * n // SF_VEC, dtype=torch.uint8, device=device)
+        _run_gemm(
+            *operands,
+            out_q.permute(1, 2, 0),
+            "float4_e2m1fn",
+            out_scale=out_sf,
+            global_scale=global_scale,
+            **kwargs,
+        )
+        outs.append((out_q, out_sf))
+    assert torch.equal(outs[0][0], outs[1][0])
+    assert torch.equal(outs[0][1], outs[1][1])
+
+
 def test_nvfp4_output_cuda_graph():
     _skip_unless_sm100()
     torch.manual_seed(0)
