@@ -14,12 +14,26 @@ from pathlib import Path
 CHECKS_DIR: Path = Path(__file__).resolve().parent
 REPO_ROOT: Path = CHECKS_DIR.parents[1]
 
+
+def find_agent_guide(root: Path) -> Path:
+    """Read the canonical guide, including the old AGENTS.md forwarding shim."""
+    agents = root / "AGENTS.md"
+    claude = root / "CLAUDE.md"
+    if claude.is_file() and (
+        not agents.is_file()
+        or "instructions live in [CLAUDE.md](./CLAUDE.md)"
+        in agents.read_text("utf-8", "replace")
+    ):
+        return claude
+    return agents
+
+
 FLASHINFER_ROOT: Path = Path(os.environ.get("FLASHINFER_SRC", REPO_ROOT))
 FLASHINFER_PKG: Path = FLASHINFER_ROOT / "flashinfer"
 DOCS_DIR: Path = FLASHINFER_ROOT / "docs"
 DOCS_API_DIR: Path = DOCS_DIR / "api"
 CSRC_DIR: Path = FLASHINFER_ROOT / "csrc"
-AGENTS_MD: Path = FLASHINFER_ROOT / "AGENTS.md"
+AGENT_GUIDE_MD: Path = find_agent_guide(FLASHINFER_ROOT)
 SKILLS_DIR: Path = FLASHINFER_ROOT / ".claude" / "skills"
 
 OUTPUT_DIR: Path = Path(
@@ -36,7 +50,7 @@ __all__ = (
     "DOCS_DIR",
     "DOCS_API_DIR",
     "CSRC_DIR",
-    "AGENTS_MD",
+    "AGENT_GUIDE_MD",
     "SKILLS_DIR",
     "OUTPUT_DIR",
 )

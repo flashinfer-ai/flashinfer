@@ -7,13 +7,13 @@ and documentation. Pure static analysis: grep / AST / filesystem, no GPU,
 no imports of flashinfer.
 
 Checks:
-  env_vars_consistency        — AGENTS.md FLASHINFER_* env var table vs
+  env_vars_consistency        — agent guide FLASHINFER_* env var table vs
                                 real os.environ/getenv reads in code.
-  supported_arch_consistency  — AGENTS.md "Supported GPU Architectures"
+  supported_arch_consistency  — agent guide "Supported GPU Architectures"
                                 line vs `is_sm*_supported()` predicates and
                                 `supported_major_versions=[...]` lists in
                                 the JIT layer.
-  quickref_paths_exist        — every file path mentioned in AGENTS.md
+  quickref_paths_exist        — every file path mentioned in agent guide
                                 code blocks / tables really exists in repo.
   skill_refs_exist            — file paths inside .claude/skills/*/SKILL.md
                                 still exist in the codebase.
@@ -39,7 +39,7 @@ from .register_checks import (
     get_check,
 )
 from .configure_checks import (
-    AGENTS_MD,
+    AGENT_GUIDE_MD,
     CSRC_DIR,
     DOCS_DIR,
     FLASHINFER_PKG,
@@ -103,7 +103,7 @@ _ENV_VAR_EXCLUSIONS = {
 # Accessor functions whose first argument is an env var name.  The in-tree
 # wrappers have to be listed explicitly: a variable read only through
 # ``env_flag_enabled("X")`` never spells ``os.environ`` anywhere, so without
-# them the checker silently stops protecting that AGENTS.md row.  The
+# them the checker silently stops protecting that agent guide row.  The
 # alternation is deliberately unanchored, which is also what lets it match
 # aliased imports (``env_flag_enabled as _env_flag_enabled`` in
 # flashinfer/quantization/kernels/nvfp4_quantize.py) and ``std::getenv``.
@@ -187,16 +187,16 @@ def collect_env_vars_in_code() -> set[str]:
     return set(collect_env_var_reads_in_code())
 
 
-def collect_env_vars_in_agents_md() -> set[str]:
-    if not AGENTS_MD.exists():
+def collect_env_vars_in_agent_guide() -> set[str]:
+    if not AGENT_GUIDE_MD.exists():
         return set()
-    text = AGENTS_MD.read_text("utf-8", "replace")
+    text = AGENT_GUIDE_MD.read_text("utf-8", "replace")
     return set(_ENV_VAR_DOCREF_RE.findall(text)) - _ENV_VAR_EXCLUSIONS
 
 
 def check_env_vars_consistency() -> list[Finding]:
     code_reads = collect_env_var_reads_in_code()
-    doc = collect_env_vars_in_agents_md()
+    doc = collect_env_vars_in_agent_guide()
     out: list[Finding] = []
     missing_in_doc = sorted(set(code_reads) - doc)
     for v in missing_in_doc:
@@ -217,7 +217,7 @@ def check_env_vars_consistency() -> list[Finding]:
 # supported_arch_consistency
 # ---------------------------------------------------------------------------
 
-# Single canonical sentence in AGENTS.md:
+# Single canonical sentence in agent guide:
 #   "FlashInfer supports NVIDIA SM75, SM80, SM86, SM89, SM90, SM103, SM110,
 #    SM120, and SM121."
 _AGENTS_ARCH_LINE_RE = re.compile(
@@ -229,9 +229,9 @@ _IS_SM_PREDICATE_RE = re.compile(r"def\s+(is_sm(\d+)([a-z])?_supported)\s*\(")
 
 
 def collect_arches_doc() -> set[int]:
-    if not AGENTS_MD.exists():
+    if not AGENT_GUIDE_MD.exists():
         return set()
-    text = AGENTS_MD.read_text("utf-8", "replace")
+    text = AGENT_GUIDE_MD.read_text("utf-8", "replace")
     m = _AGENTS_ARCH_LINE_RE.search(text)
     if not m:
         return set()
@@ -281,7 +281,7 @@ def check_supported_arch() -> list[Finding]:
         out.append(
             Finding(
                 check=SUPPORTED_ARCH,
-                location="AGENTS.md",
+                location=AGENT_GUIDE_MD.name,
                 message="Could not find 'FlashInfer supports NVIDIA ...' arch line",
             )
         )
@@ -295,7 +295,7 @@ def check_supported_arch() -> list[Finding]:
                     check=SUPPORTED_ARCH,
                     location=f"flashinfer/utils.py (is_sm{cap}*_supported)",
                     message=f"SM{cap} has is_sm{cap}*_supported() predicate but is "
-                    f"not in AGENTS.md supported-arch list",
+                    f"not in {AGENT_GUIDE_MD.name} supported-arch list",
                 )
             )
     # Every major in supported_major_versions[] should be reflected by at least
@@ -308,7 +308,7 @@ def check_supported_arch() -> list[Finding]:
                     check=SUPPORTED_ARCH,
                     location="flashinfer/jit/* (supported_major_versions)",
                     message=f"Major SM{mj}x referenced in supported_major_versions=[] "
-                    f"but no SM{mj}? appears in AGENTS.md arch list",
+                    f"but no SM{mj}? appears in {AGENT_GUIDE_MD.name} arch list",
                 )
             )
     return out
@@ -377,7 +377,7 @@ _PLACEHOLDER_PATH_TOKENS = (
 )
 
 # Paths that are documented to be generated/created at build time, not present
-# in a clean checkout. AGENTS.md explicitly calls these out as build artifacts.
+# in a clean checkout. agent guide explicitly calls these out as build artifacts.
 _BUILD_ARTIFACT_PATHS = {
     "flashinfer/_build_meta.py",  # generated from version.txt
     "flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt",  # generated in slim wheels
@@ -435,9 +435,9 @@ def iter_markdown_paths(text: str) -> list[str]:
 
 
 def check_quickref_paths_exist() -> list[Finding]:
-    if not AGENTS_MD.exists():
+    if not AGENT_GUIDE_MD.exists():
         return []
-    text = AGENTS_MD.read_text("utf-8", "replace")
+    text = AGENT_GUIDE_MD.read_text("utf-8", "replace")
     out: list[Finding] = []
     seen: set[str] = set()
     for path, line in iter_markdown_path_locations(text):
@@ -465,8 +465,8 @@ def check_quickref_paths_exist() -> list[Finding]:
         out.append(
             Finding(
                 check=QUICKREF_PATHS,
-                location=f"AGENTS.md:{line}",
-                file="AGENTS.md",
+                location=f"{AGENT_GUIDE_MD.name}:{line}",
+                file=AGENT_GUIDE_MD.name,
                 line=line,
                 message=f"Referenced path does not exist: `{path}`",
             )
@@ -701,7 +701,7 @@ def main(argv: list[str]) -> int:
     lines = [
         "# FlashInfer Cross-Source Consistency Check",
         "",
-        "Static comparison between code, AGENTS.md, and `.claude/skills/` content.",
+        "Static comparison between code, agent guide, and `.claude/skills/` content.",
         "",
         "## Summary",
         "",
