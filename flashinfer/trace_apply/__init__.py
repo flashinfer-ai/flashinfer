@@ -54,11 +54,7 @@ from flashinfer.trace_apply.packages import (
 
 # Internal: called only by the flashinfer package import.
 from flashinfer.trace_apply.packages import _load_packages_from_env  # noqa: F401
-from flashinfer.trace_apply.setup import (
-    SetupBoundCallable,
-    SetupStateError,
-    StaleSetupError,
-)
+from flashinfer.trace_apply.setup import SetupBoundCallable, SetupStateError
 
 
 def stats() -> dict:
@@ -77,7 +73,6 @@ __all__ = [
     "SealedPackageError",
     "SetupBoundCallable",
     "SetupStateError",
-    "StaleSetupError",
     "clear_preloaded",
     "disable_apply",
     "enable_apply",

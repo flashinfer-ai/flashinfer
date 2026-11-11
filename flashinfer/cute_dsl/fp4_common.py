@@ -32,8 +32,6 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 
-from .utils import mbarrier_wait_acquire_cluster
-
 
 # =============================================================================
 # Constants
@@ -1429,7 +1427,8 @@ def cluster_reduce(
             peer_cta_rank_in_cluster=lane_idx,
         )
 
-    mbarrier_wait_acquire_cluster(mbar_ptr, Int32(0))
+    # Wait for all cluster writes
+    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
 
     # Reduce across all values
     num_total = warps_per_row * cluster_n

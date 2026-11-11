@@ -16,8 +16,6 @@ limitations under the License.
 
 import os
 import platform
-import shlex
-import shutil
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -31,12 +29,7 @@ from .core import (
     sm90a_nvcc_flags,
     sm89_nvcc_flags,
 )
-from .cpp_ext import (
-    get_cuda_path,
-    host_compiler_is_gcc,
-    is_cuda_version_at_least,
-    is_windows,
-)
+from .cpp_ext import host_compiler_is_gcc, is_cuda_version_at_least
 from .cubin_loader import (
     get_artifact,
     get_meta_hash,
@@ -49,7 +42,6 @@ from .trtllm_gen_metainfo import (
     RUBIN_CUBIN_ARCHS,
     write_filtered_metainfo,
 )
-from .windows_header_overlay import get_windows_header_overlay
 
 
 def _should_enable_sm90_moe_prebuilt_d_descriptor() -> bool:
@@ -63,45 +55,6 @@ def _should_enable_sm90_moe_prebuilt_d_descriptor() -> bool:
         properties = torch.cuda.get_device_properties(torch.cuda.current_device())
         # H20 and H20-3e expose 78 SMs, unlike H100 and H200.
         return properties.multi_processor_count == 78
-    except Exception:  # noqa: BLE001 - an unknown device must use the generic path
-        return False
-
-
-_SM90_MOE_H100_PREBUILT_D_MODULE = "fused_moe_90_h100_prebuilt_d"
-
-
-def _should_enable_sm90_moe_h100_prebuilt_d_descriptor() -> bool:
-    """Return whether to use the H100-specific prebuilt-D JIT variant.
-
-    Only the measured H100 SXM 80GB (HBM3, 132 SMs) qualifies; other H100
-    variants keep the generic module. Select the variant when its AOT artifact
-    is installed or the required JIT commands can be found; otherwise keep
-    the generic module available to AOT-only deployments.
-    """
-    if os.environ.get("FLASHINFER_DISABLE_JIT"):
-        return False
-
-    try:
-        import torch
-
-        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
-        if not (
-            properties.major == 9
-            and properties.name == "NVIDIA H100 80GB HBM3"
-            and properties.multi_processor_count == 132
-        ):
-            return False
-        if jit_env.get_aot_artifacts(_SM90_MOE_H100_PREBUILT_D_MODULE):
-            return True
-        # Ninja uses CXX (or c++) for the host sources and link step.
-        cxx = shlex.split(os.environ.get("CXX", "c++"))
-        if not cxx or shutil.which(cxx[0]) is None:
-            return False
-        # Ninja also needs the CUDA toolkit root for headers and libraries,
-        # even when the compiler executable is overridden separately.
-        cuda_path = get_cuda_path()
-        nvcc = os.environ.get("FLASHINFER_NVCC") or str(Path(cuda_path) / "bin/nvcc")
-        return shutil.which(nvcc) is not None and shutil.which("ninja") is not None
     except Exception:  # noqa: BLE001 - an unknown device must use the generic path
         return False
 
@@ -208,16 +161,7 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
 
-def gen_cutlass_fused_moe_sm90_module(
-    use_fast_build: bool = False, *, enable_prebuilt_d: bool = True
-) -> JitSpec:
-    """Generate the SM90 cutlass fused MoE JitSpec.
-
-    With ``enable_prebuilt_d`` (the default), an H20 (which takes precedence)
-    or a measured H100 SXM selects its prebuilt-D module variant; every other
-    device gets the generic module. ``False`` always returns the generic module,
-    so AOT builds do not depend on the build host's GPU.
-    """
+def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm90a_nvcc_flags + [
         "-DCOMPILE_HOPPER_TMA_GEMMS",
         "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
@@ -230,13 +174,9 @@ def gen_cutlass_fused_moe_sm90_module(
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
     ]
     module_name = None
-    if enable_prebuilt_d:
-        if _should_enable_sm90_moe_prebuilt_d_descriptor():
-            nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
-            module_name = "fused_moe_90_h20_prebuilt_d"
-        elif _should_enable_sm90_moe_h100_prebuilt_d_descriptor():
-            nvcc_flags.append("-DFLASHINFER_SM90_MOE_H100_PREBUILT_D_DESCRIPTOR=1")
-            module_name = _SM90_MOE_H100_PREBUILT_D_MODULE
+    if _should_enable_sm90_moe_prebuilt_d_descriptor():
+        nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
+        module_name = "fused_moe_90_h20_prebuilt_d"
     return gen_cutlass_fused_moe_module(
         nvcc_flags, "90", use_fast_build, module_name=module_name
     )
@@ -432,26 +372,15 @@ def trtllm_gen_fused_moe_build_inputs(
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
-    canonical_export_path = jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path
     # Per-module export-header root: the Blackwell and Rubin variants must not
-    # share generated headers, or the last generated module can skew the other
-    # module's ABI during AOT builds.
+    # share this symlink, or an AOT build (all modules generated, then compiled)
+    # lets the last gen_* call's target win and skews the other module's ABI.
     gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
-    if is_windows:
-        verify_symlinked_headers(canonical_export_path, BMM_EXPORT_HEADERS, checksum)
-        windows_header_overlay = get_windows_header_overlay(
-            canonical_export_path,
-            module_name,
-            BMM_EXPORT_HEADERS,
-            ("flashinfer", "trtllm", "batched_gemm", "trtllmGen_bmm_export"),
-        )
-    else:
-        symlink_path = (
-            gen_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
-        )
-        ensure_symlink(symlink_path, canonical_export_path)
-        verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
-        windows_header_overlay = None
+    symlink_path = (
+        gen_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
+    )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
+    verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
 
     # flashinferMetaInfo.h is generated by trtllm_gen_metainfo.py, which filters
     # the manifest to only include architectures the module can actually reach.
@@ -514,9 +443,6 @@ def trtllm_gen_fused_moe_build_inputs(
         *nvcc_flags,
     ]
     include_paths: List[Union[str, Path]] = [
-        # On Windows the export headers come from a patched overlay instead of
-        # a symlink (see windows_header_overlay.py); it must come first.
-        *([windows_header_overlay] if windows_header_overlay is not None else []),
         # gen_root supplies both the export-header symlink and the
         # arch-filtered flashinferMetaInfo.h; the artifact's own include/
         # dir is deliberately not on the path so the unfiltered manifest
@@ -698,4 +624,25 @@ def gen_alphamoe_nvfp4_sm100_module() -> JitSpec:
         ],
         extra_cuda_cflags=_alphamoe_nvfp4_sm100_nvcc_flags(),
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+    )
+
+
+def gen_w4a16_mxfp4_latent_moe_sm90_module() -> JitSpec:
+    """SM90 W4A16 latent-MoE routed-expert block (mxfp4-g32 weights, bf16
+    activations), fixed geometry E_local=56 / top_k=16 / L=3584 / I=3072.
+
+    Built lazily, and only when the guard in
+    flashinfer/fused_moe/w4a16_mxfp4_moe.py admits a call; no existing
+    module is affected.  ``--ftz=false`` is part of the kernel's numeric
+    contract (the ue8m0 scale decode keeps the zero-exponent case normal),
+    so it is pinned after the default fast-math flag.
+    """
+    return gen_jit_spec(
+        "fused_moe_w4a16_mxfp4_latent_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "fused_moe_w4a16_mxfp4_latent_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "flashinfer_fused_moe_w4a16_mxfp4_latent_sm90_binding.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags + ["-O3", "--ftz=false", "-lineinfo"],
     )

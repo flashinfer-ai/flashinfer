@@ -1118,7 +1118,6 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
                 num_experts=self.num_total_experts,
                 persistent=self.topk_reduce_persistent,
                 num_sms=self.topk_reduce_num_sms,
-                batch_invariant=getattr(self, "batch_invariant", False),
             )
             if cutlass.const_expr(self.topk_reduce_persistent):
                 reduce(
@@ -1131,7 +1130,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
                     num_tokens_dev=num_valid_tokens,
                     topk_indices=(
                         topk_idx
-                        if cutlass.const_expr(not self.combine_format.is_quantized or getattr(self, "batch_invariant", False))
+                        if cutlass.const_expr(not self.combine_format.is_quantized)
                         else None
                     ),
                 )
@@ -1144,7 +1143,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
                     stream,
                     topk_indices=(
                         topk_idx
-                        if cutlass.const_expr(not self.combine_format.is_quantized or getattr(self, "batch_invariant", False))
+                        if cutlass.const_expr(not self.combine_format.is_quantized)
                         else None
                     ),
                 )

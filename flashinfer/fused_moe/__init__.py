@@ -48,7 +48,6 @@ from .api import (  # noqa: F401
     CudnnGroupedGemmNvfp4Config,
     CuteDslConfig,
     BatchInvariantBf16Config,
-    BatchInvariantFp8PerTensorConfig,
     FrostLowLatencyConfig,
     PrimsTsConfig,
     CutlassBf16Config,
@@ -180,7 +179,6 @@ from .core import (
     reorder_rows_for_gated_act_gemm,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
-    split_fp4_moe_weights_by_locality_domain,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_channel_scale_moe,
@@ -234,6 +232,10 @@ from .kimi_k3_fused_router import (  # noqa: F401
 
 from .hash_topk import (  # noqa: F401
     hash_topk as hash_topk,
+)
+
+from .w4a16_mxfp4_moe import (  # noqa: F401
+    w4a16_mxfp4_latent_routed_moe as w4a16_mxfp4_latent_routed_moe,
 )
 
 from .trtllm_gen_routing import (  # noqa: F401
@@ -375,7 +377,6 @@ __all__ = [
     "CudnnGroupedGemmNvfp4Runner",
     "CuteDslConfig",
     "BatchInvariantBf16Config",
-    "BatchInvariantFp8PerTensorConfig",
     "FrostLowLatencyConfig",
     "CutlassBf16Config",
     "CutlassBf16Runner",
@@ -492,7 +493,6 @@ __all__ = [
     "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",
-    "split_fp4_moe_weights_by_locality_domain",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_block_scale_routed_moe",
     "trtllm_fp8_per_channel_scale_moe",

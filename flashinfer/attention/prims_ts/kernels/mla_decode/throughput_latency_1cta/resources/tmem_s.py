@@ -120,7 +120,6 @@ class TmemSResource(MlaResource):
     p_ref: Optional[MemoryResource] = None
     global_ref: Optional[MemoryResource] = None
     cache_seqs: object = None
-    kv_bounds: object = None
     page_offsets: object = None
     head_idx: object = None
     batch_idx: object = None
@@ -621,14 +620,11 @@ class TmemSResource(MlaResource):
         should_apply_dense_mask = (
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
-        needs_row_prefix_mask = cutlass.const_expr(
-            cfg.use_kv_bounds
-            or (
-                cfg.mask_type == MaskType.CAUSAL.value
-                and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
-            )
+        needs_row_causal_mask = cutlass.const_expr(
+            cfg.mask_type == MaskType.CAUSAL.value
+            and (not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1)
         )
-        if cutlass.const_expr(needs_row_prefix_mask):
+        if cutlass.const_expr(needs_row_causal_mask):
             min_seq_len_kv = runtime_seq_len_kv_for_query_row(
                 cfg,
                 self.cache_seqs,
@@ -636,7 +632,6 @@ class TmemSResource(MlaResource):
                 cta_idx_q,
                 Int32(0),
                 self.cu_seqlens_q,
-                self.kv_bounds,
             )
             should_apply_dense_mask = should_apply_dense_mask or (
                 next_tile_offset_k > min_seq_len_kv
@@ -653,8 +648,8 @@ class TmemSResource(MlaResource):
             else:
                 should_apply_dense_mask = True
         if should_apply_dense_mask:
-            # Each row's causal or explicit prefix can be narrower than the
-            # shared CTA domain used by the producer and split reduction.
+            # The CTA domain follows the latest logical query row in the flat
+            # tile. Earlier rows can have a narrower bottom-right causal limit.
             warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
             lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
             if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
@@ -664,7 +659,7 @@ class TmemSResource(MlaResource):
                     local_row_idx = warp_grp_thread_idx % Int32(64)
                     local_col_base = (warp_grp_thread_idx // Int32(64)) * Int32(64)
                 row_seq_len_kv = seq_len_kv
-                if cutlass.const_expr(needs_row_prefix_mask):
+                if cutlass.const_expr(needs_row_causal_mask):
                     row_seq_len_kv = runtime_seq_len_kv_for_query_row(
                         cfg,
                         self.cache_seqs,
@@ -672,7 +667,6 @@ class TmemSResource(MlaResource):
                         cta_idx_q,
                         local_row_idx,
                         self.cu_seqlens_q,
-                        self.kv_bounds,
                     )
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
@@ -702,7 +696,7 @@ class TmemSResource(MlaResource):
                     row_in_tile_1 = row_in_tile_0 + Int32(1)
                     seq_len_kv_0 = seq_len_kv
                     seq_len_kv_1 = seq_len_kv
-                    if cutlass.const_expr(needs_row_prefix_mask):
+                    if cutlass.const_expr(needs_row_causal_mask):
                         seq_len_kv_0 = runtime_seq_len_kv_for_query_row(
                             cfg,
                             self.cache_seqs,
@@ -710,7 +704,6 @@ class TmemSResource(MlaResource):
                             cta_idx_q,
                             row_in_tile_0,
                             self.cu_seqlens_q,
-                            self.kv_bounds,
                         )
                         seq_len_kv_1 = runtime_seq_len_kv_for_query_row(
                             cfg,
@@ -719,7 +712,6 @@ class TmemSResource(MlaResource):
                             cta_idx_q,
                             row_in_tile_1,
                             self.cu_seqlens_q,
-                            self.kv_bounds,
                         )
                     s_base = repeat_idx * 4
                     s_second_panel_base = q_repeats * 4 + s_base

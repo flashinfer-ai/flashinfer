@@ -291,11 +291,7 @@ class TmemOResource(DecodeGenResourceBase):
                     # the next pair once the K steps have covered 64 tokens.
                     k_steps_per_block = 64 // mma_k_step
                     block_pair_desc_units = (
-                        2
-                        * 64
-                        * cfg.headdim
-                        * cfg.pv_dtype_bytes
-                        // SMEM_DESC_UNIT_BYTES
+                        2 * 64 * cfg.headdim * cfg.v_dtype_bytes // SMEM_DESC_UNIT_BYTES
                     )
                     iter_v_desc = v_desc + Int32(
                         (k_step // k_steps_per_block) * block_pair_desc_units
@@ -425,15 +421,8 @@ class TmemOResource(DecodeGenResourceBase):
                         # slice, including the 16-bit 128-token jump across
                         # split SMEM rows.
                         if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
-                            # TMEM packs 4 / pv_dtype_bytes tokens per column.
                             v_operand = prims.make_tmem_ptr(
-                                v_desc
-                                + Int32(
-                                    (ki + 1)
-                                    * _mma_k_step_pv(cfg)
-                                    * cfg.pv_dtype_bytes
-                                    // 4
-                                ),
+                                v_desc + Int32((ki + 1) * _mma_k_step_pv(cfg) // 4),
                                 Int32,
                             )
                         else:
@@ -514,15 +503,8 @@ class TmemOResource(DecodeGenResourceBase):
                         # Advance V and P to the next MMA-K slice inside the
                         # staged head-dim tile.
                         if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
-                            # TMEM packs 4 / pv_dtype_bytes tokens per column.
                             v_operand = prims.make_tmem_ptr(
-                                v_desc
-                                + Int32(
-                                    (ki + 1)
-                                    * _mma_k_step_pv(cfg)
-                                    * cfg.pv_dtype_bytes
-                                    // 4
-                                ),
+                                v_desc + Int32((ki + 1) * _mma_k_step_pv(cfg) // 4),
                                 Int32,
                             )
                         else:

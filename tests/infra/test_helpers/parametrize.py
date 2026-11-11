@@ -87,20 +87,16 @@ def pairwise_product_cases(
             for right_axis in range(left_axis + 1, len(axis_values))
         }
 
-    # Build each candidate's pair set once; the greedy loop below rescans every
-    # candidate per pick, and rebuilding these sets dominated collection time.
-    candidates = [
-        (candidate, covered_pairs(candidate)) for candidate in sorted(candidate_indices)
-    ]
+    candidates = sorted(candidate_indices)
     selected = []
     while required_pairs:
-        best_index = max(
-            range(len(candidates)),
-            key=lambda index: len(candidates[index][1] & required_pairs),
+        best = max(
+            candidates,
+            key=lambda candidate: len(covered_pairs(candidate) & required_pairs),
         )
-        best, best_pairs = candidates.pop(best_index)
         selected.append(best)
-        required_pairs.difference_update(best_pairs)
+        required_pairs.difference_update(covered_pairs(best))
+        candidates.remove(best)
 
     return tuple(
         tuple(axis_values[axis][value] for axis, value in enumerate(candidate))

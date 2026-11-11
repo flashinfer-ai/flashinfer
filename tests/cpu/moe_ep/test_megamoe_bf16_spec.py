@@ -350,14 +350,6 @@ def test_public_fingerprint_registry_and_default_options(arch, cc):
         "apply_routing_weights_before_fc2",
         "gate_up_clamp",
         "arch",
-        "activation",
-        "swiglu_alpha",
-        "swiglu_beta",
-        "situ_beta",
-        "situ_linear_beta",
-        "per_token_scale",
-        "combine_dtype",
-        "output_mode",
     } == set(info.optional)
     assert class_name("megamoe_bf16") == "megamoe.bf16"
     assert fingerprint("megamoe_bf16", **SHAPE, arch=arch) == spec_fingerprint(
