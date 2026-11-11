@@ -48,11 +48,13 @@ NUM_WAVES = 300
 
 @pytest.fixture(autouse=True)
 def _require_sm100_family():
+    """Skip unless the GPU is SM100 or SM103, where trtllm-gen fused MoE runs."""
     if get_compute_capability(torch.device("cuda"))[0] != 10:
         pytest.skip("trtllm-gen fused MoE is only exercised on SM100 and SM103.")
 
 
 def _rand_fp8(shape, gen):
+    """Return a random FP8 E4M3 tensor of ``shape``, filled one expert at a time."""
     out = torch.empty(shape, dtype=torch.float8_e4m3fn, device="cuda")
     for e in range(shape[0]):  # one expert at a time keeps the bf16 temporary small
         # How often the race shows up depends on where buffers land in memory. The extra
@@ -66,6 +68,8 @@ def _rand_fp8(shape, gen):
 
 
 def _make_layer(gen):
+    """Return random block-FP8 expert weights and their per-block scales for one layer."""
+
     def scale(*shape):
         return 0.02 * (1 + torch.rand(*shape, generator=gen, device="cuda"))
 
@@ -77,6 +81,7 @@ def _make_layer(gen):
 
 
 def _make_inputs(num_tokens, gen):
+    """Return FP8 hidden states, their scales and packed top-k routing for one call."""
     x = (
         torch.randn(num_tokens, HIDDEN, generator=gen, device="cuda")
         .clamp_(-4, 4)
@@ -98,6 +103,7 @@ def _make_inputs(num_tokens, gen):
 
 
 def _run(layer, inputs, workspace, out, enable_pdl):
+    """Run one routed block-FP8 MoE call into ``out`` with the given PDL setting."""
     trtllm_fp8_block_scale_routed_moe(
         topk_ids=inputs["topk"],
         routing_bias=None,
@@ -126,6 +132,11 @@ def _run(layer, inputs, workspace, out, enable_pdl):
 
 
 def test_routed_fp8_block_scale_moe_pdl_back_to_back():
+    """Back-to-back PDL calls must match PDL-off references bit for bit.
+
+    References run one at a time with PDL off. Each wave then runs every call back to
+    back on one stream with PDL on, refilling the workspace with 0xFF before each call.
+    """
     gen = torch.Generator("cuda").manual_seed(0)
     layers = [_make_layer(gen) for _ in range(NUM_LAYERS)]
     calls = [
