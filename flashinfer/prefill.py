@@ -2481,6 +2481,600 @@ def _eagle_verify_fp8kv_sm90_dispatch(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Specialized SM90 kernel for multi-token (spec/MTP verify) DECODE attention
+# with an fp8 (e4m3) query over an fp8 (e4m3) paged KV cache
+# (csrc/gqa_decode_fp8_paged_sm90.cu, flashinfer/jit/gqa_decode_fp8_paged_sm90.py).
+#
+# The stock fa2 paged modules have no fp8-Q contract on SM90 (fp8 Q is a
+# SM120-only fa2 form). ``plan(..., q_data_type=float8_e4m3fn,
+# kv_data_type=float8_e4m3fn, o_data_type=bfloat16)`` with ``backend="fa2"``
+# on an SM90 device therefore plans the underlying stock path for the exact
+# bf16-dequantised query (bf16 holds every e4m3 value exactly) and, when the
+# plan matches the geometry below, prepares this kernel. ``run()`` then
+# dispatches it; every other fp8-Q call — and every call while
+# ``FLASHINFER_DISABLE_GQA_DECODE_FP8_PAGED_SM90=1`` (read at plan and run
+# time) — dequantises Q and takes the stock fa2 path untouched.
+#
+# Supported contract (fails closed to the dequant + stock path otherwise):
+# 8 query heads / 1 KV head / head_dim 128 per rank, page size 16, NHD,
+# causal, UNIFORM q_len == 6 per request (the kernel's compile-time MTP
+# verify width; kv_len >= 6 per request), fp8e4m3 Q and KV, bf16 out, no
+# custom mask / sliding window / soft cap / RoPE-on-the-fly / LSE / sinks,
+# per-sequence float32 descale tensors (or identity), default sm_scale
+# (1/sqrt(128)), and the measured envelope (batch <= 128, kv_len <= 262144).
+#
+# PRECISION (part of the API contract, stated in the dispatch docstring):
+# the kernel accumulates the P.V product in fp16 on power-of-two prescaled
+# operands (exact for every finite e4m3 value, range-bounded by the split
+# tiling) and merges splits in fp32 — the in-class arithmetic of an
+# fp8-Q/fp8-KV contract. It is deterministic (atomics-free, bit-stable); the
+# measured record (bit-determinism rerun, fresh-seed matched-ratio,
+# magnitude perturbations) accompanies the change.
+#
+# All allocation and compilation happen at plan time, outside CUDA-graph
+# capture; run() only launches on the current stream (re-queried per call),
+# so plan/capture/replay works like any other fa2 plan.
+# ---------------------------------------------------------------------------
+_GQA_DEC_FP8Q_SM90_DISABLE_ENV = "FLASHINFER_DISABLE_GQA_DECODE_FP8_PAGED_SM90"
+_GQA_DEC_FP8Q_SM90_NUM_QO_HEADS = 8
+_GQA_DEC_FP8Q_SM90_NUM_KV_HEADS = 1
+_GQA_DEC_FP8Q_SM90_HEAD_DIM = 128
+_GQA_DEC_FP8Q_SM90_PAGE_SIZE = 16
+_GQA_DEC_FP8Q_SM90_Q_LEN = 6  # compile-time verify width of the kernel
+_GQA_DEC_FP8Q_SM90_SM_SCALE = 0.08838834764831845  # 1/sqrt(128), folded in
+_GQA_DEC_FP8Q_SM90_COMPUTE_CAPABILITY = (9, 0)
+# Measured envelope of the serve contract the kernel was validated on; the
+# dispatcher fails closed (dequant + stock path) outside it.
+_GQA_DEC_FP8Q_SM90_MAX_BATCH = 128
+_GQA_DEC_FP8Q_SM90_MAX_KV_LEN = 262144
+
+_gqa_dec_fp8q_sm90_counters: Dict[str, int] = {
+    "plans_seen": 0,  # fp8-Q fa2 SM90 plans that reached the hook
+    "plans_disabled": 0,  # disable switch set at plan time
+    "plans_ineligible": 0,  # fp8-Q route, but geometry/envelope differs
+    "plans_prepared": 0,  # module loaded + workspace ready for this wrapper
+    "build_failed": 0,  # JIT build/load failed (falls back, logged once)
+    "workspace_allocs": 0,  # plan-time workspace (re)allocations
+    "runs_dispatched": 0,  # specialized kernel launched
+    "runs_dispatched_capturing": 0,  # ... of which during CUDA-graph capture
+    "runs_disabled": 0,  # disable switch set at run time
+    "runs_ineligible": 0,  # prepared plan, but a run-time argument differs
+    "runs_autotune_bail": 0,  # autotuner measurement window: stock path
+    "runs_capture_unready": 0,  # capturing without a loaded module: fallback
+    "runs_dequant_fallback": 0,  # fp8-Q call served by dequant + stock fa2
+}
+_gqa_dec_fp8q_sm90_module: Any = None
+_gqa_dec_fp8q_sm90_module_error: Optional[str] = None
+_gqa_dec_fp8q_sm90_announced = False
+
+
+def _gqa_dec_fp8q_sm90_disabled() -> bool:
+    return os.environ.get(_GQA_DEC_FP8Q_SM90_DISABLE_ENV, "") not in ("", "0")
+
+
+def _gqa_dec_fp8q_sm90_stats() -> Dict[str, Any]:
+    """Introspection for benchmarks and tests: per-process plan/run census and
+    build state of the specialized SM90 fp8-Q decode kernel (one JIT module,
+    two kernels, no per-shape variants)."""
+    stats: Dict[str, Any] = dict(_gqa_dec_fp8q_sm90_counters)
+    stats["module_loaded"] = _gqa_dec_fp8q_sm90_module is not None
+    stats["module_error"] = _gqa_dec_fp8q_sm90_module_error
+    return stats
+
+
+def _reset_gqa_dec_fp8q_sm90_stats() -> None:
+    global _gqa_dec_fp8q_sm90_announced
+    for key in _gqa_dec_fp8q_sm90_counters:
+        _gqa_dec_fp8q_sm90_counters[key] = 0
+    _gqa_dec_fp8q_sm90_announced = False
+
+
+def _get_gqa_dec_fp8q_sm90_module() -> Any:
+    """JIT-build (once per process) and return the module, or None if the
+    build failed (counted and logged once; callers take the dequant + stock
+    fa2 path)."""
+    global _gqa_dec_fp8q_sm90_module, _gqa_dec_fp8q_sm90_module_error
+    if _gqa_dec_fp8q_sm90_module is not None:
+        return _gqa_dec_fp8q_sm90_module
+    if _gqa_dec_fp8q_sm90_module_error is not None:
+        return None
+    try:
+        from .jit.gqa_decode_fp8_paged_sm90 import (
+            gen_gqa_decode_fp8_paged_sm90_module,
+        )
+
+        _gqa_dec_fp8q_sm90_module = (
+            gen_gqa_decode_fp8_paged_sm90_module().build_and_load()
+        )
+    except Exception as exc:  # build or load failure: stock path, say why
+        _gqa_dec_fp8q_sm90_module_error = f"{type(exc).__name__}: {exc}"[:800]
+        _gqa_dec_fp8q_sm90_counters["build_failed"] += 1
+        logger.warning_once(
+            "gqa_decode_fp8_paged_sm90: JIT build failed (%s); fp8-Q calls are "
+            "served by exact dequantisation into the stock fa2 kernel",
+            _gqa_dec_fp8q_sm90_module_error,
+        )
+        return None
+    return _gqa_dec_fp8q_sm90_module
+
+
+def _gqa_dec_fp8q_sm90_plan_eligibility(
+    kv_layout: str,
+    causal: bool,
+    has_custom_mask: bool,
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    window_left: int,
+    logits_soft_cap: float,
+    sm_scale: Optional[float],
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    batch_size: int,
+    total_q: int,
+) -> Optional[str]:
+    """Plan-time geometry guard for an fp8-Q fa2 SM90 plan (the route itself
+    was established by plan()'s dtype interception). Returns None when the
+    plan describes the supported contract, else a reason string (logged once;
+    the dequant + stock path serves the plan)."""
+    if kv_layout != "NHD":
+        return f"kv_layout={kv_layout}"
+    if not causal:
+        return "causal=False"
+    if has_custom_mask:
+        return "custom_mask"
+    if pos_encoding_mode != "NONE":
+        return f"pos_encoding_mode={pos_encoding_mode}"
+    if use_fp16_qk_reduction:
+        return "use_fp16_qk_reduction"
+    if window_left is not None and window_left >= 0:
+        return f"window_left={window_left}"
+    if logits_soft_cap is not None and logits_soft_cap != 0.0:
+        return f"logits_soft_cap={logits_soft_cap}"
+    if sm_scale is not None and not (
+        abs(float(sm_scale) - _GQA_DEC_FP8Q_SM90_SM_SCALE) < 1e-8
+    ):
+        return f"sm_scale={sm_scale}"
+    if num_qo_heads != _GQA_DEC_FP8Q_SM90_NUM_QO_HEADS:
+        return f"num_qo_heads={num_qo_heads}"
+    if num_kv_heads != _GQA_DEC_FP8Q_SM90_NUM_KV_HEADS:
+        return f"num_kv_heads={num_kv_heads}"
+    if head_dim_qk != _GQA_DEC_FP8Q_SM90_HEAD_DIM:
+        return f"head_dim_qk={head_dim_qk}"
+    if head_dim_vo != _GQA_DEC_FP8Q_SM90_HEAD_DIM:
+        return f"head_dim_vo={head_dim_vo}"
+    if page_size != _GQA_DEC_FP8Q_SM90_PAGE_SIZE:
+        return f"page_size={page_size}"
+    if not (1 <= batch_size <= _GQA_DEC_FP8Q_SM90_MAX_BATCH):
+        return f"batch_size={batch_size}"
+    if total_q != batch_size * _GQA_DEC_FP8Q_SM90_Q_LEN:
+        return f"total_q={total_q} != batch_size * {_GQA_DEC_FP8Q_SM90_Q_LEN}"
+    return None
+
+
+def _gqa_dec_fp8q_sm90_prepare(
+    wrapper: Any,
+    causal: bool,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    page_size: int,
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    window_left: int,
+    logits_soft_cap: float,
+    sm_scale: Optional[float],
+    batch_size: int,
+    total_num_rows: int,
+    qo_indptr_host: torch.Tensor,
+    kv_lens_arr_host: torch.Tensor,
+    paged_kv_indptr_host: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    has_custom_mask: bool,
+    prefix_len_ptr: Optional[torch.Tensor],
+    token_pos_in_items_len: int,
+) -> None:
+    """Plan-time half of the dispatch: decide eligibility, JIT-build the
+    module (first time in the process), build the dense block table and
+    device kv-length vector, and size the caller-owned split workspace.
+    Everything that allocates or compiles happens here, outside CUDA-graph
+    capture; run() only launches."""
+    counters = _gqa_dec_fp8q_sm90_counters
+    wrapper._gqa_dec_fp8q_sm90_state = None
+    wrapper._gqa_dec_fp8q_sm90_row_seq = None
+    counters["plans_seen"] += 1
+    if _gqa_dec_fp8q_sm90_disabled():
+        counters["plans_disabled"] += 1
+        logger.info_once(
+            "gqa_decode_fp8_paged_sm90: disabled by %s=%s; fp8-Q calls are "
+            "served by exact dequantisation into the stock fa2 kernel",
+            _GQA_DEC_FP8Q_SM90_DISABLE_ENV,
+            os.environ.get(_GQA_DEC_FP8Q_SM90_DISABLE_ENV, ""),
+        )
+        return
+    try:
+        reason = _gqa_dec_fp8q_sm90_plan_eligibility(
+            wrapper._kv_layout,
+            causal,
+            has_custom_mask,
+            pos_encoding_mode,
+            use_fp16_qk_reduction,
+            window_left,
+            logits_soft_cap,
+            sm_scale,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo,
+            page_size,
+            batch_size,
+            total_num_rows,
+        )
+        if reason is None:
+            if prefix_len_ptr is not None:
+                reason = "prefix_len_ptr"
+            elif token_pos_in_items_len:
+                reason = f"token_pos_in_items_len={token_pos_in_items_len}"
+            elif getattr(wrapper, "_jit_module", None) is not None:
+                reason = "jit_module"
+        if reason is None:
+            # the kernel's compile-time verify width: every request carries
+            # exactly 6 query rows, the last 6 positions of its sequence
+            q_lens = (
+                qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
+            )
+            kv_lens = kv_lens_arr_host[:batch_size]
+            if int(qo_indptr_host[batch_size]) != total_num_rows:
+                reason = "qo_indptr/total_num_rows mismatch"
+            elif bool((q_lens != _GQA_DEC_FP8Q_SM90_Q_LEN).any()):
+                reason = "non-uniform q_len (kernel verify width is 6)"
+            elif bool(
+                (kv_lens.to(torch.int64) < _GQA_DEC_FP8Q_SM90_Q_LEN).any()
+            ):
+                reason = "kv_len < q_len (not a verify-decode batch)"
+            elif int(kv_lens.max()) > _GQA_DEC_FP8Q_SM90_MAX_KV_LEN:
+                reason = f"kv_len={int(kv_lens.max())} above measured envelope"
+            elif int(kv_lens.min()) < 1:
+                reason = "kv_len < 1"
+    except Exception as exc:  # a guard failure must never break the stock path
+        reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
+    if reason is not None:
+        counters["plans_ineligible"] += 1
+        logger.info_once(
+            "gqa_decode_fp8_paged_sm90: not dispatched for this plan (%s); "
+            "fp8-Q calls are served by exact dequantisation into the stock "
+            "fa2 kernel",
+            reason,
+        )
+        return
+    if (
+        hasattr(torch.cuda, "is_current_stream_capturing")
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        # never compile or allocate inside a capture; the stock path is baked
+        counters["runs_capture_unready"] += 1
+        return
+    module = _get_gqa_dec_fp8q_sm90_module()
+    if module is None:
+        return
+    device = wrapper.device
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+
+    bufs = getattr(wrapper, "_gqa_dec_fp8q_sm90_bufs", None)
+    if bufs is None:
+        bufs = {}
+        wrapper._gqa_dec_fp8q_sm90_bufs = bufs
+
+    def _buf(name, numel, dtype):
+        t = bufs.get(name)
+        if t is None or t.numel() < numel or t.device != device:
+            # grows monotonically; with CUDA graphs the shapes are fixed per
+            # wrapper, so this happens exactly once per wrapper (pre-capture)
+            t = torch.empty(numel, dtype=dtype, device=device)
+            bufs[name] = t
+            counters["workspace_allocs"] += 1
+        return t
+
+    nb = 0
+    if batch_size:
+        nb = int(
+            (
+                paged_kv_indptr_host[1 : batch_size + 1]
+                - paged_kv_indptr_host[:batch_size]
+            ).max()
+        )
+    nb = max(nb, 1)
+    bt = bufs.get("block_table")
+    if bt is None or bt.shape[0] < batch_size or bt.shape[1] != nb or bt.device != device:
+        bt = torch.empty((batch_size, nb), dtype=torch.int32, device=device)
+        bufs["block_table"] = bt
+        counters["workspace_allocs"] += 1
+    block_table = _build_block_tables_from_paged_kv_indices(
+        paged_kv_indptr_host,
+        paged_kv_indices,
+        batch_size,
+        device,
+        out=bt[:batch_size],
+    )
+
+    ws_bytes = int(module.plan_workspace_bytes(batch_size, nb))
+    workspace = _buf("workspace", ws_bytes, torch.uint8)
+
+    seq_lens_buf = _buf("seq_lens", batch_size, torch.int32)
+    seq_lens_dev = seq_lens_buf[:batch_size]
+    seq_lens_dev.copy_(
+        kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True
+    )
+
+    unit_descale = _buf("unit_descale", batch_size, torch.float32)[:batch_size]
+    unit_descale.fill_(1.0)
+    # row -> request map, for per-sequence descale tensors on the dequant
+    # fallback path (built here so the fallback never allocates in run())
+    wrapper._gqa_dec_fp8q_sm90_row_seq = torch.repeat_interleave(
+        torch.arange(batch_size, device=device), _GQA_DEC_FP8Q_SM90_Q_LEN
+    )
+
+    wrapper._gqa_dec_fp8q_sm90_state = SimpleNamespace(
+        batch_size=batch_size,
+        total_q=int(total_num_rows),
+        block_table=block_table,
+        seq_lens=seq_lens_dev,
+        unit_descale=unit_descale,
+        workspace=workspace,
+        ws_bytes=ws_bytes,
+        device_index=device_index,
+    )
+    counters["plans_prepared"] += 1
+
+
+def _gqa_dec_fp8q_sm90_descale_arg(
+    scale: Any, state: Any, name: str
+) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+    """Map a run-time q/k/v scale argument onto the kernel's per-sequence
+    float32 descale vector: None / 1.0 -> the plan-time unit vector; a
+    contiguous float32 CUDA vector with one value per sequence (shape [B] or
+    [B, num_kv_heads]) -> itself. Anything else is a reason to fall back."""
+    if scale is None:
+        return state.unit_descale, None
+    if isinstance(scale, (int, float)) and not isinstance(scale, bool):
+        if float(scale) == 1.0:
+            return state.unit_descale, None
+        return None, f"{name}={scale}"
+    if isinstance(scale, torch.Tensor):
+        if scale.dtype != torch.float32:
+            return None, f"{name} dtype {scale.dtype}"
+        if scale.numel() != state.batch_size or not scale.is_contiguous():
+            return None, f"{name} shape {tuple(scale.shape)}"
+        if scale.device != state.block_table.device:
+            return None, f"{name} device {scale.device}"
+        return scale.view(-1), None
+    return None, f"{name} type {type(scale).__name__}"
+
+
+def _gqa_dec_fp8q_sm90_run_eligibility(
+    wrapper: Any,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out: Optional[torch.Tensor],
+    return_lse: bool,
+    window_left: Optional[int],
+    sinks: Optional[torch.Tensor],
+    kv_cache_sf: Any,
+    skip_softmax_threshold_scale_factor: Optional[float],
+    extra_args: tuple,
+) -> Optional[str]:
+    """Run-time guard for a prepared wrapper. Semantics first, then
+    shapes/dtypes/strides, device last; no device synchronisation anywhere."""
+    state = wrapper._gqa_dec_fp8q_sm90_state
+    if extra_args:
+        return "custom run args"
+    if return_lse:
+        return "return_lse"
+    if sinks is not None:
+        return "sinks"
+    if kv_cache_sf is not None:
+        return "kv_cache_sf"
+    if skip_softmax_threshold_scale_factor is not None:
+        return "skip_softmax_threshold_scale_factor"
+    if window_left is not None and window_left >= 0:
+        return f"window_left={window_left}"
+    expected_shape = (
+        state.total_q,
+        _GQA_DEC_FP8Q_SM90_NUM_QO_HEADS,
+        _GQA_DEC_FP8Q_SM90_HEAD_DIM,
+    )
+    if q.dtype != torch.float8_e4m3fn or tuple(q.shape) != expected_shape:
+        return f"q shape/dtype {tuple(q.shape)} {q.dtype}"
+    if not q.is_contiguous():
+        return "q not contiguous"
+    if out is not None:
+        if out.dtype != torch.bfloat16 or tuple(out.shape) != expected_shape:
+            return f"out shape/dtype {tuple(out.shape)} {out.dtype}"
+        if not out.is_contiguous():
+            return "out not contiguous"
+    for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
+        if cache.dtype != torch.float8_e4m3fn:
+            return f"{name} dtype {cache.dtype}"
+        if cache.dim() != 4:
+            return f"{name} dim {cache.dim()}"
+        if (
+            cache.shape[1] != _GQA_DEC_FP8Q_SM90_PAGE_SIZE
+            or cache.shape[2] != _GQA_DEC_FP8Q_SM90_NUM_KV_HEADS
+            or cache.shape[3] != _GQA_DEC_FP8Q_SM90_HEAD_DIM
+        ):
+            return f"{name} shape {tuple(cache.shape)}"
+        # one 2048-byte line per page: the kernel derives page addresses from
+        # the page id alone, so assert the strides it assumes
+        if (
+            cache.stride(3) != 1
+            or cache.stride(2) != _GQA_DEC_FP8Q_SM90_HEAD_DIM
+            or cache.stride(1) != _GQA_DEC_FP8Q_SM90_HEAD_DIM
+            or cache.stride(0)
+            != _GQA_DEC_FP8Q_SM90_PAGE_SIZE * _GQA_DEC_FP8Q_SM90_HEAD_DIM
+        ):
+            return f"{name} strides {tuple(cache.stride())}"
+    device = q.device
+    if device.type != "cuda" or (
+        device.index is not None and device.index != state.device_index
+    ):
+        return f"device {device}"
+    for name, tensor in (
+        ("k_cache", k_cache),
+        ("v_cache", v_cache),
+        ("block_table", state.block_table),
+        ("seq_lens", state.seq_lens),
+        ("workspace", state.workspace),
+    ):
+        if tensor.device != device:
+            return f"{name} device {tensor.device}"
+    if out is not None and out.device != device:
+        return f"out device {out.device}"
+    return None
+
+
+def _gqa_dec_fp8q_sm90_dispatch(
+    wrapper: Any,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out: Optional[torch.Tensor],
+    q_scale: Any,
+    k_scale: Any,
+    v_scale: Any,
+    return_lse: bool,
+    window_left: Optional[int],
+    sinks: Optional[torch.Tensor],
+    kv_cache_sf: Any,
+    skip_softmax_threshold_scale_factor: Optional[float],
+    extra_args: tuple,
+) -> Optional[torch.Tensor]:
+    """Run-time half: launch the specialized kernel and return its output, or
+    return None (nothing launched) so the caller dequantises Q and runs the
+    stock fa2 kernel. Capture-safe: no sync, no compilation; the only
+    allocation is the output tensor when the caller did not pass one (the
+    stock path allocates it in the same place)."""
+    global _gqa_dec_fp8q_sm90_announced
+    state = getattr(wrapper, "_gqa_dec_fp8q_sm90_state", None)
+    if state is None:
+        return None
+    counters = _gqa_dec_fp8q_sm90_counters
+    if _gqa_dec_fp8q_sm90_disabled():
+        counters["runs_disabled"] += 1
+        logger.info_once(
+            "gqa_decode_fp8_paged_sm90: disabled by %s=%s; fp8-Q calls are "
+            "served by exact dequantisation into the stock fa2 kernel",
+            _GQA_DEC_FP8Q_SM90_DISABLE_ENV,
+            os.environ.get(_GQA_DEC_FP8Q_SM90_DISABLE_ENV, ""),
+        )
+        return None
+    try:
+        from .autotuner.autotuner import is_in_profile_measurement
+
+        if is_in_profile_measurement():
+            # never shadow a tactic the autotuner is timing
+            counters["runs_autotune_bail"] += 1
+            return None
+    except Exception:
+        pass
+    try:
+        reason = _gqa_dec_fp8q_sm90_run_eligibility(
+            wrapper,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            return_lse,
+            window_left,
+            sinks,
+            kv_cache_sf,
+            skip_softmax_threshold_scale_factor,
+            extra_args,
+        )
+        qds = kds = vds = None
+        if reason is None:
+            qds, reason = _gqa_dec_fp8q_sm90_descale_arg(q_scale, state, "q_scale")
+        if reason is None:
+            kds, reason = _gqa_dec_fp8q_sm90_descale_arg(k_scale, state, "k_scale")
+        if reason is None:
+            vds, reason = _gqa_dec_fp8q_sm90_descale_arg(v_scale, state, "v_scale")
+    except Exception as exc:  # a guard failure must never break the stock path
+        reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
+    if reason is not None:
+        counters["runs_ineligible"] += 1
+        logger.info_once(
+            "gqa_decode_fp8_paged_sm90: not dispatched for this call (%s); "
+            "the dequant + stock fa2 path serves it",
+            reason,
+        )
+        return None
+    module = _gqa_dec_fp8q_sm90_module
+    capturing = bool(
+        hasattr(torch.cuda, "is_current_stream_capturing")
+        and torch.cuda.is_current_stream_capturing()
+    )
+    if module is None:
+        # prepare() loads the module before it sets the state; this only
+        # happens if the module was dropped behind our back
+        counters["runs_capture_unready" if capturing else "runs_ineligible"] += 1
+        return None
+    if out is None:
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    module.run(
+        q,
+        k_cache,
+        v_cache,
+        state.block_table,
+        state.seq_lens,
+        qds,
+        kds,
+        vds,
+        out,
+        state.workspace,
+    )
+    counters["runs_dispatched"] += 1
+    if capturing:
+        counters["runs_dispatched_capturing"] += 1
+    if not _gqa_dec_fp8q_sm90_announced:
+        # one line per process so a measurement can name the kernel behind
+        # its numbers (normal operation, hence INFO)
+        _gqa_dec_fp8q_sm90_announced = True
+        logger.info(
+            "gqa_decode_fp8_paged_sm90: serving the fp8-Q paged verify-decode "
+            "attention (batch_size=%d, total_q=%d, cuda_graph=%s)",
+            state.batch_size,
+            state.total_q,
+            wrapper.is_cuda_graph_enabled,
+        )
+    return out
+
+
+def _gqa_dec_fp8q_sm90_dequant_q(
+    wrapper: Any, q: torch.Tensor, q_scale: Any
+) -> Tuple[torch.Tensor, Any]:
+    """Exact dequantisation of an fp8 (e4m3) query for the stock fa2 path
+    (bf16 holds every e4m3 value exactly). A scalar q_scale is left for the
+    stock path to fold into sm_scale; a per-sequence descale tensor is applied
+    here (via the plan-time row->request map) and consumed."""
+    _gqa_dec_fp8q_sm90_counters["runs_dequant_fallback"] += 1
+    if isinstance(q_scale, torch.Tensor):
+        row_seq = getattr(wrapper, "_gqa_dec_fp8q_sm90_row_seq", None)
+        if row_seq is None or row_seq.numel() != q.shape[0]:
+            raise ValueError(
+                "gqa_decode_fp8_paged_sm90: a per-sequence q_scale tensor "
+                "requires the plan-time row->request map; re-plan this wrapper"
+            )
+        scale_rows = q_scale.reshape(-1)[row_seq].view(-1, 1, 1)
+        return (q.to(torch.float32) * scale_rows).to(torch.bfloat16), None
+    return q.to(torch.bfloat16), q_scale
+
+
 def _build_block_tables_from_paged_kv_indices(
     paged_kv_indptr_host: torch.Tensor,
     paged_kv_indices: torch.Tensor,
@@ -3419,6 +4013,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._block_tables = None
         # specialized SM90 fp8-KV verify kernel: set by plan() when eligible
         self._eagle_verify_fp8kv_sm90_state = None
+        self._gqa_dec_fp8q_sm90_requested = False
+        self._gqa_dec_fp8q_sm90_state = None
+        self._gqa_dec_fp8q_sm90_row_seq = None
         self._eagle_verify_fp8kv_sm90_workspace = None
         self._cudnn_block_tables: Optional[torch.Tensor] = None
         self._cudnn_q_lens_buffer: Optional[torch.Tensor] = None
@@ -4059,6 +4656,28 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+        # gqa_decode_fp8_paged_sm90: fp8 Q on the SM90 fa2 paged route. The
+        # stock fa2 modules have no fp8-Q contract on SM90, so the underlying
+        # plan is made for the exact bf16-dequantised query (bf16 holds every
+        # e4m3 value exactly); run() dispatches the specialized verify-decode
+        # kernel at the supported contract and otherwise dequantises Q into
+        # this stock plan (see the dispatcher section above
+        # _build_block_tables_from_paged_kv_indices).
+        self._gqa_dec_fp8q_sm90_requested = False
+        if (
+            q_data_type == torch.float8_e4m3fn
+            and kv_data_type == torch.float8_e4m3fn
+            and o_data_type == torch.bfloat16
+            and self._requested_backend == "fa2"
+            and self._jit_module is None
+            and self._batch_invariant is None
+            and not use_token_head_sf
+            and self.device.type == "cuda"
+            and tuple(get_compute_capability(self.device))
+            == _GQA_DEC_FP8Q_SM90_COMPUTE_CAPABILITY
+        ):
+            self._gqa_dec_fp8q_sm90_requested = True
+            q_data_type = torch.bfloat16
         if self._batch_invariant is not None:
             self._batch_invariant.refuse(
                 prefix_len_ptr=prefix_len_ptr,
@@ -4229,8 +4848,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         _validate_paged_query_lengths(planned_backend, seq_lens_q, qo_indptr_host)
 
-        # Reset the specialized kernel only after checking backend compatibility.
+        # Reset the specialized kernels only after checking backend compatibility.
         self._eagle_verify_fp8kv_sm90_state = None
+        self._gqa_dec_fp8q_sm90_state = None
+        self._gqa_dec_fp8q_sm90_row_seq = None
         self._head_dim_qk = head_dim_qk
         self._head_dim_vo = head_dim_vo
 
@@ -4724,6 +5345,38 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         else 0
                     ),
                 )
+                # specialized SM90 fp8-Q verify-decode kernel: eligibility,
+                # JIT build, block table and workspace are settled here,
+                # outside the hot path (and outside any CUDA-graph capture)
+                if (
+                    getattr(self, "_gqa_dec_fp8q_sm90_requested", False)
+                    and kv_lens_arr_host is not None
+                ):
+                    _gqa_dec_fp8q_sm90_prepare(
+                        self,
+                        causal,
+                        num_qo_heads,
+                        num_kv_heads,
+                        head_dim_qk,
+                        head_dim_vo,
+                        page_size,
+                        pos_encoding_mode,
+                        use_fp16_qk_reduction,
+                        window_left,
+                        logits_soft_cap,
+                        sm_scale,
+                        batch_size,
+                        total_num_rows,
+                        qo_indptr_host,
+                        kv_lens_arr_host,
+                        paged_kv_indptr_host,
+                        paged_kv_indices,
+                        custom_mask is not None
+                        or packed_custom_mask is not None
+                        or self._custom_mask_buf is not None,
+                        prefix_len_ptr,
+                        token_pos_in_items_len,
+                    )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -5201,6 +5854,47 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 use_fp16_softmax=use_fp16_softmax,
                 uses_spcompress=uses_spcompress,
             )
+        if getattr(self, "_gqa_dec_fp8q_sm90_requested", False) and is_float8(q):
+            # fp8 Q on the SM90 fa2 paged route: the specialized verify-decode
+            # kernel at the supported contract, exact dequantisation into the
+            # stock fa2 plan otherwise (including under
+            # FLASHINFER_DISABLE_GQA_DECODE_FP8_PAGED_SM90). The specialized
+            # kernel accumulates P.V in fp16 on power-of-two prescaled e4m3
+            # operands (exact per element, range-bounded by the split tiling);
+            # see the dispatcher section's precision note.
+            res = _gqa_dec_fp8q_sm90_dispatch(
+                self,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                q_scale,
+                k_scale,
+                v_scale,
+                return_lse,
+                window_left,
+                sinks,
+                kv_cache_sf,
+                skip_softmax_threshold_scale_factor,
+                args,
+            )
+            if res is not None:
+                return res
+            if isinstance(k_scale, torch.Tensor) or isinstance(v_scale, torch.Tensor):
+                # the stock fa2 path folds scalar k_scale into sm_scale and
+                # applies scalar v_scale to the output; it has no
+                # per-sequence KV-descale ABI, so a tensor here cannot be
+                # served once the specialized kernel is not dispatched
+                raise NotImplementedError(
+                    "per-sequence k_scale/v_scale tensors are only served by "
+                    "the specialized SM90 fp8-Q verify-decode kernel; this "
+                    "call fell back to the stock fa2 path (disabled via "
+                    f"{_GQA_DEC_FP8Q_SM90_DISABLE_ENV} or outside its "
+                    "allowlist), which takes scalar or None k_scale/v_scale. "
+                    "Pass scalars (unit descales may simply be omitted) or "
+                    "re-enable the specialized kernel."
+                )
+            q, q_scale = _gqa_dec_fp8q_sm90_dequant_q(self, q, q_scale)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
