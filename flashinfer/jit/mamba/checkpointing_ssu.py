@@ -90,6 +90,7 @@ def get_checkpointing_ssu_uri(
     enable_pdl: bool = False,
     enable_two_kernel: bool = True,
 ) -> str:
+    """Return the JIT cache URI for one checkpointing SSU specialization."""
     s = _filename_safe_dtype_map
     uri = (
         f"checkpointing_ssu_"
@@ -128,6 +129,7 @@ def gen_checkpointing_ssu_module(
     enable_two_kernel: bool = True,
     extra_cuda_cflags: list = None,
 ) -> JitSpec:
+    """Generate the JIT specification for one checkpointing SSU specialization."""
     uri = get_checkpointing_ssu_uri(
         state_dtype,
         input_dtype,

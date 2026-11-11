@@ -72,6 +72,7 @@ def _get_module(
     enable_pdl: bool = False,
     enable_two_kernel: bool = True,
 ):
+    """Return the cached JIT module for this checkpointing SSU specialization."""
     return gen_checkpointing_ssu_module(
         state_dtype,
         input_dtype,
@@ -360,6 +361,7 @@ class CheckpointingSSURunner(TunableRunner):
 
     @staticmethod
     def _two_kernel_supported(inputs: list[Any]) -> bool:
+        """Return whether inputs can use the PDL-backed two-kernel split."""
         state = inputs[0]  # state
         x = inputs[1]  # x
         cb_scaled = inputs[19]  # cb_scaled
@@ -483,9 +485,13 @@ class CheckpointingSSURunner(TunableRunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> None:
+        """Prepare the JIT module or launch the selected checkpointing SSU tactic."""
         del kwargs
         if do_preparation:
-            _get_module(*self._module_base_args)
+            _get_module(
+                *self._module_base_args,
+                enable_two_kernel=device_support_pdl(inputs[1].device),
+            )
             return
 
         if tactic == -1:
