@@ -4520,7 +4520,8 @@ def trtllm_batch_decode_with_kv_cache(
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
 
     out_dtype : Optional[Union[torch.dtype, str]] = None
-        output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
+        output dtype, if not provided, will use the type of ``out`` when given, otherwise the type of ``query``.
+        For nvfp4, use string ``nvfp4``.
 
     o_sf_scale : Optional[float] = None
         scale for nvfp4 output tensor scale factor.

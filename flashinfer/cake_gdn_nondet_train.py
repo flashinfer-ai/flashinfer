@@ -166,7 +166,13 @@ def is_cake_gdn_nondet_train_supported(
     (``sm_100a``, ``sm_103a`` or ``sm_107a``); ``False`` without CUDA or for a device that is not CUDA.
 
     The package's loader is imported first: a package that does not import raises, it is not reported as
-    "not supported"."""
+    "not supported".
+
+    Parameters
+    ----------
+    device : torch.device, str, int, optional
+        Device to query; ``None`` selects the current CUDA device.
+    """
     from .experimental.cake.cake_gdn_nondet_train import (  # noqa: PLC0415 - imported on first use
         cake_backend,
     )
