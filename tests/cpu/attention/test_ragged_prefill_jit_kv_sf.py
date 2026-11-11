@@ -16,7 +16,7 @@ class _CapturingModule:
         self.calls.append(args)
 
 
-def _custom_jit_wrapper(additional_tensor_names, total_tokens):
+def _custom_jit_wrapper(additional_tensor_names, total_tokens, scalar_names=()):
     wrapper = BatchPrefillWithRaggedKVCacheWrapper.__new__(
         BatchPrefillWithRaggedKVCacheWrapper
     )
@@ -26,6 +26,7 @@ def _custom_jit_wrapper(additional_tensor_names, total_tokens):
         _batch_invariant=None,
         _jit_module=object(),
         _jit_additional_tensor_names=list(additional_tensor_names),
+        _jit_additional_scalar_names=list(scalar_names),
         _cached_module=module,
         _cached_q_data_type=torch.float16,
         _cached_kv_data_type=torch.float8_e4m3fn,
@@ -89,7 +90,7 @@ def test_custom_jit_ragged_run_keeps_positional_args_after_kv_cache_sf():
     # the scale tensors filled from kv_cache_sf.
     names = ["maybe_k_cache_sf", "user_bias", "maybe_v_cache_sf", "user_gate"]
     q, k, v = _qkv()
-    wrapper, module = _custom_jit_wrapper(names, q.shape[0])
+    wrapper, module = _custom_jit_wrapper(names, q.shape[0], ["user_scalar"])
     k_sf = torch.ones(q.shape[0], k.shape[1])
     v_sf = torch.ones(q.shape[0], k.shape[1])
     bias, gate, scalar = torch.zeros(3), torch.ones(3), 0.5
@@ -124,7 +125,7 @@ def test_custom_jit_ragged_run_positional_scales_without_kv_cache_sf():
     # was forwarded here) keep working when kv_cache_sf is omitted.
     names = ["maybe_k_cache_sf", "user_bias", "maybe_v_cache_sf"]
     q, k, v = _qkv()
-    wrapper, module = _custom_jit_wrapper(names, q.shape[0])
+    wrapper, module = _custom_jit_wrapper(names, q.shape[0], ["user_scalar"])
     k_sf = torch.ones(q.shape[0], k.shape[1])
     v_sf = torch.ones(q.shape[0], k.shape[1])
     bias, scalar = torch.zeros(3), 0.5
@@ -145,7 +146,7 @@ def test_custom_jit_ragged_run_positional_scales_with_kv_cache_sf(packed):
     # shift the positional args that follow them.
     names = ["maybe_k_cache_sf", "user_bias", "maybe_v_cache_sf"]
     q, k, v = _qkv()
-    wrapper, module = _custom_jit_wrapper(names, q.shape[0])
+    wrapper, module = _custom_jit_wrapper(names, q.shape[0], ["user_scalar"])
     k_sf = torch.ones(q.shape[0], k.shape[1])
     v_sf = torch.full((q.shape[0], k.shape[1]), 2.0)
     if packed:
@@ -164,3 +165,23 @@ def test_custom_jit_ragged_run_positional_scales_with_kv_cache_sf(packed):
     assert len(forwarded) == 4
     assert torch.equal(forwarded[0], k_sf) and torch.equal(forwarded[2], v_sf)
     assert forwarded[1] is bias and forwarded[3] == scalar
+
+
+@pytest.mark.cpu_only
+def test_custom_jit_ragged_run_keeps_user_tensor_aliasing_a_scale():
+    # A user tensor that is the same view as a scale from kv_cache_sf is still a
+    # user arg in the new layout and must not be dropped.
+    names = ["maybe_k_cache_sf", "user_scale", "maybe_v_cache_sf"]
+    q, k, v = _qkv()
+    wrapper, module = _custom_jit_wrapper(names, q.shape[0], ["user_scalar"])
+    k_sf = torch.ones(q.shape[0], k.shape[1])
+    v_sf = torch.full((q.shape[0], k.shape[1]), 2.0)
+    scalar = 0.5
+
+    wrapper.run(q, k, v, k_sf, scalar, kv_cache_sf=(k_sf, v_sf), enable_pdl=False)
+
+    (run_args,) = module.calls
+    forwarded = run_args[_NUM_FIXED_RUN_ARGS:]
+    expected = (k_sf, k_sf, v_sf, scalar)
+    assert len(forwarded) == len(expected)
+    assert all(a is b for a, b in zip(forwarded, expected, strict=True))
