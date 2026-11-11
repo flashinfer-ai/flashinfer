@@ -1394,6 +1394,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         tSKcSK = sk_thr_mma.partition_C(cSK)
         cV = cute.make_identity_tensor((d, blk_kv))
         tKVcV = kv_thr_mma.partition_A(cV)
+        tKVcK = kv_thr_mma.partition_B(cV)  # K operand: (d_k, tok)
 
         # ── KK GEMM (WG0 only) ────────────────────────────────────────────────
         k_pipeline.consumer_wait(k_consumer_state)
@@ -1488,6 +1489,15 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             self.sk_epi(tSKrSK, tSKcSK, sAlpha, alpha_stage)
             for i in cutlass.range_constexpr(cute.size(tSKrV)):
                 tSKrV[i] = tSKrV[i] - self.dtype(tSKrSK[i])
+        # The V and K tiles of a final block are not clipped at the sequence
+        # end: rows from B on are the next sequence's first tokens. The masks
+        # of T and QK zero those columns, but 0 * NaN is NaN in the NewV and
+        # O2 GEMMs, so select zeros here instead of relying on the products.
+        if cutlass.const_expr(is_final_block):
+            for i in cutlass.range_constexpr(cute.size(tSKrV)):
+                _, tok = tSKcSK[i]
+                if tok >= B:
+                    tSKrV[i] = self.dtype(0.0)
 
         # ── NewV = (V - SK) @ T^T  (ordered: WG0 first) ──────────────────────
         tNewVrA = SM80.make_acc_into_op(tSKrV, newv_tiled_mma, self.dtype)
@@ -1538,6 +1548,13 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
 
         # KV += NewV @ K
         cute.copy(kv_tiled_copy_B, tKVsK[None, None, None, k_stage], tKVrK_cv)
+        # kv_decay_v zeroes the NewV columns from B on, but those columns
+        # still multiply the next sequence's K rows (see V - SK above).
+        if cutlass.const_expr(is_final_block):
+            for i in cutlass.range_constexpr(cute.size(tKVrK)):
+                _, tok = tKVcK[i]
+                if tok >= B:
+                    tKVrK[i] = self.dtype(0.0)
         cute.gemm(kv_tiled_mma, tKVrKV, tOrNewV, tKVrK, tKVrKV)
         # Fence before every stage release. A release is one mbarrier arrive
         # per warp (lane 0), and it does not wait for this warp's ldmatrix
