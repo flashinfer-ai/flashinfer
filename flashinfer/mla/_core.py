@@ -2847,6 +2847,7 @@ class _MLADecodeDispatchCache:
     """
 
     def __init__(self, max_entries: int = 4096) -> None:
+        """Initialize a bounded LRU cache of ``(runner_name, tactic)`` decisions."""
         self.max_entries = max_entries
         self._entries: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._lock = threading.Lock()
@@ -2854,6 +2855,7 @@ class _MLADecodeDispatchCache:
         self.misses = 0
 
     def lookup(self, key: tuple, token: tuple) -> Optional[Tuple[str, Any]]:
+        """Return the cached ``(runner_name, tactic)`` if ``token`` still matches."""
         with self._lock:
             entry = self._entries.get(key)
             if entry is None or entry[0] != token:
@@ -2864,6 +2866,7 @@ class _MLADecodeDispatchCache:
             return entry[1]
 
     def insert(self, key: tuple, token: tuple, decision: Tuple[str, Any]) -> None:
+        """Store ``decision`` under ``(key, token)`` and evict LRU entries past capacity."""
         with self._lock:
             self._entries[key] = (token, decision)
             self._entries.move_to_end(key)
@@ -2871,12 +2874,14 @@ class _MLADecodeDispatchCache:
                 self._entries.popitem(last=False)
 
     def clear(self) -> None:
+        """Remove all cached entries and reset hit and miss counters."""
         with self._lock:
             self._entries.clear()
             self.hits = 0
             self.misses = 0
 
     def __len__(self) -> int:
+        """Return the current number of cached dispatch entries."""
         return len(self._entries)
 
 
@@ -4258,6 +4263,7 @@ def _mla_with_kv_cache_impl(
             )
 
         def _make_runner(name: str) -> TunableRunner:
+            """Construct the named MLA decode backend runner for this call's tensors."""
             if name == "trtllm-gen":
                 # The TRT adapter lowers tensor scales once before profiling/launch.
                 return _BatchMLAPagedAttentionTrtllmGenBackend.from_functional(

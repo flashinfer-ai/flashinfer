@@ -32,6 +32,7 @@ _WORKSPACE_SIZE = 128 * 1024 * 1024
 
 @pytest.fixture(autouse=True)
 def _blackwell_and_clean_cache():
+    """Skip on non-SM100 GPUs and clear autotuner and dispatch caches around each test."""
     cc = get_compute_capability(torch.device("cuda"))
     if cc[0] != 10:
         pytest.skip(f"Requires SM100 (Blackwell), got SM{cc[0]}{cc[1]}")
@@ -42,6 +43,7 @@ def _blackwell_and_clean_cache():
 
 
 def _make_inputs(batch_size: int, seed: int = 0):
+    """Allocate deterministic BF16 query, paged KV cache, block tables, and workspace."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     num_pages = batch_size * _PAGES_PER_SEQ
     query = torch.randn(
@@ -60,6 +62,7 @@ def _make_inputs(batch_size: int, seed: int = 0):
 
 
 def _seq_lens(batch_size: int, max_seq_len: int, seed: int = 1) -> torch.Tensor:
+    """Sample per-request sequence lengths whose maximum equals ``max_seq_len``."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     seq_lens = torch.randint(
         max(1, max_seq_len // 2),
@@ -83,6 +86,7 @@ def _decode(
     backend="auto",
     return_lse=False,
 ):
+    """Invoke ``trtllm_batch_decode_with_kv_cache_mla`` with test geometry defaults."""
     return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
         query=query,
         kv_cache=kv_cache.unsqueeze(1),
@@ -101,6 +105,7 @@ def _decode(
 
 
 def _uncached(*args, **kwargs):
+    """Run ``_decode`` inside ``autotune(False)`` to bypass the dispatch cache."""
     # Any autotune() context makes AutoTuner.selection_cache_token() return
     # None, so this call takes the full runner-construction + choose_one path.
     with autotune(False):
@@ -111,6 +116,7 @@ def _uncached(*args, **kwargs):
 @pytest.mark.parametrize("batch_size", [1, 32])
 @pytest.mark.parametrize("max_seq_len", [1500, 4095])
 def test_cached_decode_is_bitwise_identical(backend, batch_size, max_seq_len):
+    """Verify cache misses and hits match the uncached decode path bitwise."""
     query, kv_cache, block_tables, workspace = _make_inputs(batch_size)
     seq_lens = _seq_lens(batch_size, max_seq_len)
     args = (query, kv_cache, block_tables, seq_lens, workspace, max_seq_len)
@@ -128,6 +134,7 @@ def test_cached_decode_is_bitwise_identical(backend, batch_size, max_seq_len):
 
 
 def test_cached_decode_with_lse_is_bitwise_identical():
+    """Verify both attention output and LSE match bitwise on a dispatch cache hit."""
     batch_size, max_seq_len = 32, 1500
     query, kv_cache, block_tables, workspace = _make_inputs(batch_size)
     seq_lens = _seq_lens(batch_size, max_seq_len)
@@ -142,6 +149,7 @@ def test_cached_decode_with_lse_is_bitwise_identical():
 
 
 def test_growing_max_seq_len_reuses_entries_and_stays_exact():
+    """Verify step-by-step ``max_seq_len`` growth reuses bucketed entries accurately."""
     batch_size = 32
     query, kv_cache, block_tables, workspace = _make_inputs(batch_size)
     for step, max_seq_len in enumerate(range(3840, 4096)):
@@ -158,6 +166,7 @@ def test_growing_max_seq_len_reuses_entries_and_stays_exact():
 
 
 def test_cache_holds_no_tensors():
+    """Verify cached entries retain no strong references to KV cache or workspace tensors."""
     batch_size, max_seq_len = 8, 2048
     query, kv_cache, block_tables, workspace = _make_inputs(batch_size)
     seq_lens = _seq_lens(batch_size, max_seq_len)
@@ -175,6 +184,7 @@ def test_cache_holds_no_tensors():
 
 
 def test_cache_bypassed_while_tuning():
+    """Verify ``autotune(True)`` does not populate the dispatch cache."""
     batch_size, max_seq_len = 4, 2048
     query, kv_cache, block_tables, workspace = _make_inputs(batch_size)
     seq_lens = _seq_lens(batch_size, max_seq_len)
@@ -184,6 +194,7 @@ def test_cache_bypassed_while_tuning():
 
 
 def test_cache_invalidated_when_tuner_state_changes():
+    """Verify cache entries are invalidated when autotuner caches clear or add profiles."""
     batch_size, max_seq_len = 4, 2048
     query, kv_cache, block_tables, workspace = _make_inputs(batch_size)
     seq_lens = _seq_lens(batch_size, max_seq_len)
@@ -210,6 +221,7 @@ def test_cache_invalidated_when_tuner_state_changes():
 
 
 def test_cache_is_lru_bounded(monkeypatch):
+    """Verify inserting past ``max_entries`` evicts older entries down to the bound."""
     monkeypatch.setattr(mla_core._MLA_DECODE_DISPATCH_CACHE, "max_entries", 2)
     max_seq_len = 2048
     for batch_size in (1, 2, 4):
@@ -220,6 +232,7 @@ def test_cache_is_lru_bounded(monkeypatch):
 
 
 def test_explicit_trtllm_gen_does_not_use_cache():
+    """Verify explicit ``backend='trtllm-gen'`` bypasses the cache and matches ``auto``."""
     batch_size, max_seq_len = 4, 2048
     query, kv_cache, block_tables, workspace = _make_inputs(batch_size)
     seq_lens = _seq_lens(batch_size, max_seq_len)
