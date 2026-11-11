@@ -1,6 +1,7 @@
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 #include <flashinfer/attention/sparse_mla_sm120/execution/prefill_launch.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/kernels/cute_prefill/prefill_fp8.cuh>
 
 #include "attention_dispatch.h"
 
@@ -23,14 +24,72 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
       return launch(std::integral_constant<ModelType, ModelType::DSV4_1_INLINE>{});
     return launch(std::integral_constant<ModelType, ModelType::DSV4_1>{});
   }
-  PrefillColdParams cold{p.sm_scale,          m.tokens,
-                         m.page_stride_bytes, m.extra_page_stride_bytes,
-                         m.lse_stride,        m.topk,
-                         m.extra_topk,        p.attn_sink,
-                         p.topk_length,       p.extra_topk_length,
-                         p.extra_kv,          p.extra_indices,
-                         m.extra_page_size,   m.page_size};
+  // The CuTe kernel requires flat inline FP8 rows and FP8 QK arithmetic.
+  if (mt == ModelType::DSV4_1_INLINE && !m.extra_fp4 && m.heads % 32 == 0 &&
+      plan.numeric == execution::NumericRoute::FP8 &&
+      m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes &&
+      (!m.extra_topk ||
+       m.extra_page_stride_bytes == size_t(m.extra_page_size) * m.extra_row_stride_bytes) &&
+      m.indices_stride == size_t(m.topk) &&
+      (!m.extra_topk || m.extra_indices_stride == size_t(m.extra_topk))) {
+    using namespace cute_prefill::integrated;
+    Params a{};
+    a.q = p.q;
+    a.kv = p.kv;
+    a.extra_kv = p.extra_kv;
+    a.indices = p.indices;
+    a.extra_indices = p.extra_indices;
+    a.lengths = p.topk_length;
+    a.extra_lengths = p.extra_topk_length;
+    a.positions = p.mega.positions;
+    a.cos_sin = p.mega.cos_sin;
+    a.sink = p.attn_sink;
+    a.output = p.mega.output;
+    a.scales = p.mega.scales;
+    a.bf16_output = p.output;
+    a.lse = p.out_lse;
+    a.tokens = m.tokens;
+    a.heads = m.heads;
+    a.topk = m.topk;
+    a.extra_topk = m.extra_topk;
+    a.kv_stride = m.row_stride_bytes;
+    a.extra_stride = m.extra_row_stride_bytes;
+    a.sm_scale = p.sm_scale;
+    a.lse_stride = m.lse_stride;
+    a.lse_scale = p.lse_scale;
+    auto launch = [&](auto fused, auto full_head_tiles) -> PrefillLaunchResult {
+      constexpr bool Mega = decltype(fused)::value;
+      constexpr bool FullHeadTiles = decltype(full_head_tiles)::value;
+      static bool configured[32] = {};
+      auto status = configure_dynamic_smem_per_device(prefill<Mega, 32, FullHeadTiles>,
+                                                      sizeof(Shared), configured);
+      if (!status.supported || status.error != cudaSuccess) return status;
+      prefill<Mega, 32, FullHeadTiles>
+          <<<m.tokens*((m.heads + 31) / 32), 384, sizeof(Shared), stream>>>(a);
+      return {cudaGetLastError(), "CuTe sparse prefill"};
+    };
+    // Serving retains full heads on each device. Narrow heads use the legacy route.
+    return p.mega.output ? launch(std::true_type{}, std::true_type{})
+                         : launch(std::false_type{}, std::true_type{});
+  }
+  PrefillColdParams cold{p.sm_scale,
+                         m.tokens,
+                         m.page_stride_bytes,
+                         m.extra_page_stride_bytes,
+                         m.lse_stride,
+                         m.topk,
+                         m.extra_topk,
+                         p.attn_sink,
+                         p.topk_length,
+                         p.extra_topk_length,
+                         p.extra_kv,
+                         p.extra_indices,
+                         m.extra_page_size,
+                         m.page_size,
+                         {},
+                         {}};
   cold.lse_scale = p.lse_scale;
+  cold.mega = p.mega;
   if (cache_format_info(mt).inline_scale) {
     cold.kv_stride_bytes = m.row_stride_bytes;
     // Inline-scale extra sections address flat rows at their row pitch.

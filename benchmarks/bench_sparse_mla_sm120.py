@@ -28,6 +28,10 @@
 
 """Microbenchmark for sparse-MLA paged attention on SM120.
 
+``--mega`` selects fused Q RoPE, attention, inverse RoPE and FP8 output for
+DSv4.1 prefill. Unsupported rows remain in the report as NaN. Without it,
+timings cover attention alone. Compare checkout reports outside this script.
+
 Sweeps representative shapes:
 
 * DSv4   (d_qk=512, page_block_size=64, 584 B/token)
@@ -313,7 +317,12 @@ def bench_sparse_mla_sm120_dsv4_dual(
 
 
 def bench_sparse_mla_sm120_dsv3_2(
-    num_heads, num_tokens, with_sink=False, seed=0, kv_scale_format="arbitrary_fp32"
+    num_heads,
+    num_tokens,
+    with_sink=False,
+    seed=0,
+    kv_scale_format="arbitrary_fp32",
+    prefill_impl="auto",
 ):
     """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv3.2.
 
@@ -372,6 +381,7 @@ def bench_sparse_mla_sm120_dsv3_2(
             output,
             sm_scale,
             attn_sink=attn_sink,
+            prefill_impl=prefill_impl,
         )
 
     fn()
@@ -438,6 +448,8 @@ def bench_sparse_mla_sm120_dsv41(
     inline=False,
     compute_precision="default",
     seed=0,
+    mega=False,
+    prefill_impl="auto",
 ):
     """Returns (median_us, kv_bw_gbps) for DeepSeek-V4.1 on 64-token pages.
 
@@ -447,6 +459,10 @@ def bench_sparse_mla_sm120_dsv41(
     ``compute_precision`` is the wrapper's (``"bf16"`` runs the full-BF16 route).
     Pools exceed L2, and every call starts with a flushed L2.
     """
+    if mega and (num_tokens <= 64 or num_heads % 32 or compute_precision == "bf16"):
+        return float("nan"), float("nan")
+    if prefill_impl == "swapab":
+        return float("nan"), float("nan")  # No DSv4.1 swapAB instantiation.
     device = torch.device("cuda")
     torch.manual_seed(seed)
     main_pages, extra_pages = 16384, 8192  # 553 MB main; 302 / 151 MB extra
@@ -471,6 +487,7 @@ def bench_sparse_mla_sm120_dsv41(
         else None
     )
     wrapper = flashinfer.mla.SparseMLASm120Wrapper(
+        backend="sparse" if mega else "auto",
         kv_scale_format="ue8m0_g32_inline" if inline else "ue8m0_g32",
         extra_kv_fp4=extra_fp4,
         compute_precision=compute_precision,
@@ -479,9 +496,23 @@ def bench_sparse_mla_sm120_dsv41(
     output = torch.empty(
         num_tokens, num_heads, 512, device=device, dtype=torch.bfloat16
     )
+    if mega:
+        positions = torch.arange(num_tokens, device=device, dtype=torch.int32)
+        inv_freq = 10000.0 ** (-torch.arange(32, device=device).float() / 32)
+        angles = positions.float()[:, None] * inv_freq
+        cos_sin = torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+        output = torch.empty_like(output, dtype=torch.float8_e4m3fn)
+        scales = torch.empty(
+            num_tokens, num_heads, 16, device=device, dtype=torch.uint8
+        )
+        run = functools.partial(
+            wrapper.run_mega, positions=positions, cos_sin=cos_sin, output_scales=scales
+        )
+    else:
+        run = wrapper.run
 
     def fn():
-        wrapper.run(
+        run(
             q,
             main,
             indices,
@@ -489,6 +520,7 @@ def bench_sparse_mla_sm120_dsv41(
             512**-0.5,
             extra_kv_cache=extra,
             extra_indices=extra_indices,
+            prefill_impl=prefill_impl,
         )
 
     fn()
@@ -507,8 +539,25 @@ def bench_sparse_mla_sm120_dsv41(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mega", action="store_true", help="Select fused DSv4.1 prefill"
+    )
+    parser.add_argument(
+        "--prefill-impl", choices=("auto", "mg", "swapab"), default="auto"
+    )
+    parser.add_argument(
+        "--compute-precision", choices=("default", "fp8", "bf16"), default="default"
+    )
+    args = parser.parse_args()
+
     if not is_sm120a_supported(torch.device("cuda")):
         raise SystemExit("Sparse-MLA SM120 requires sm120a.")
+
+    if args.mega:
+        print("NaN = unsupported mega row (non-DSv4.1, decode, H<32, or BF16).")
 
     # (num_heads, topk, num_tokens). T <= 64 hits decode; T > 64 hits prefill.
     decode_configs = [
@@ -601,7 +650,9 @@ if __name__ == "__main__":
     print(header)
     print("-" * len(header))
     for h, k, t in decode_configs:
-        lat_us, kvbw, tfl = bench_sparse_mla_sm120(h, k, t)
+        lat_us, kvbw, tfl = (
+            (float("nan"),) * 3 if args.mega else bench_sparse_mla_sm120(h, k, t)
+        )
         print(f"{h:>10}  {k:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}")
 
     print()
@@ -609,7 +660,9 @@ if __name__ == "__main__":
     print(header)
     print("-" * len(header))
     for h, k, t in prefill_configs:
-        lat_us, kvbw, tfl = bench_sparse_mla_sm120(h, k, t)
+        lat_us, kvbw, tfl = (
+            (float("nan"),) * 3 if args.mega else bench_sparse_mla_sm120(h, k, t)
+        )
         print(f"{h:>10}  {k:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}")
 
     print()
@@ -617,8 +670,12 @@ if __name__ == "__main__":
     print(dual_header)
     print("-" * len(dual_header))
     for h, k_extra, t, extra_pbs, extra_len in dual_prefill_configs:
-        lat_us, kvbw, tfl = bench_sparse_mla_sm120_dsv4_dual(
-            h, k_extra, t, extra_pbs, extra_topk_length=extra_len
+        lat_us, kvbw, tfl = (
+            (float("nan"),) * 3
+            if args.mega
+            else bench_sparse_mla_sm120_dsv4_dual(
+                h, k_extra, t, extra_pbs, extra_topk_length=extra_len
+            )
         )
         extra_len_label = "full" if extra_len is None else str(extra_len)
         print(
@@ -636,7 +693,9 @@ if __name__ == "__main__":
     print(header)
     print("-" * len(header))
     for h, t in dsv3_2_configs:
-        lat_us, kvbw, tfl = bench_sparse_mla_sm120_dsv3_2(h, t)
+        lat_us, kvbw, tfl = (
+            (float("nan"),) * 3 if args.mega else bench_sparse_mla_sm120_dsv3_2(h, t)
+        )
         print(
             f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
         )
@@ -651,7 +710,13 @@ if __name__ == "__main__":
         print(header)
         print("-" * len(header))
         for h, t in dsv3_2_prefill_configs:
-            lat_us, kvbw, tfl = bench_sparse_mla_sm120_dsv3_2(h, t, kv_scale_format=fmt)
+            lat_us, kvbw, tfl = (
+                (float("nan"),) * 3
+                if args.mega
+                else bench_sparse_mla_sm120_dsv3_2(
+                    h, t, kv_scale_format=fmt, prefill_impl=args.prefill_impl
+                )
+            )
             print(
                 f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
             )
@@ -670,10 +735,25 @@ if __name__ == "__main__":
         for t in (1, 4, 16, 64, 1024):
             for h in (8, 16, 32, 64):
                 footer_us, _ = bench_sparse_mla_sm120_dsv41(
-                    h, t, topk, extra_topk, extra_fp4=bool(extra_topk)
+                    h,
+                    t,
+                    topk,
+                    extra_topk,
+                    extra_fp4=bool(extra_topk),
+                    mega=args.mega,
+                    prefill_impl=args.prefill_impl,
+                    compute_precision=args.compute_precision,
                 )
                 inline_us, _ = bench_sparse_mla_sm120_dsv41(
-                    h, t, topk, extra_topk, extra_fp4=bool(extra_topk), inline=True
+                    h,
+                    t,
+                    topk,
+                    extra_topk,
+                    extra_fp4=bool(extra_topk),
+                    inline=True,
+                    mega=args.mega,
+                    prefill_impl=args.prefill_impl,
+                    compute_precision=args.compute_precision,
                 )
                 print(
                     f"{h:>10}  {t:>11}  {label:>10}  {footer_us:>12.1f}  "

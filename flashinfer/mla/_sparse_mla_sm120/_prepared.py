@@ -363,6 +363,7 @@ def wrapper_run(
     prefill_impl=None,
     return_lse=False,
     lse_scale=1.0,
+    mega=None,
 ):
     from ._execution import check_inline_scale_caches
     from ._execution import resolve_model_type as _resolve_model_type
@@ -461,6 +462,27 @@ def wrapper_run(
     )
     wrapper._prepared_calls[key] = current
     result_lse = out_lse[:t, :h] if out_lse is not None else current.lse
+    if mega is not None:
+        module = get_sparse_mla_sm120_module()
+        module.execute_attention_rope_fp8(
+            current.plan,
+            q,
+            cache,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            result_lse,
+            scale,
+            topk_length,
+            attn_sink,
+            extra_kv_cache,
+            extra_indices,
+            extra_topk_length,
+            lse_scale,
+            *mega,
+        )
+        return result_lse if return_lse else None
     current.execute(
         q,
         cache,

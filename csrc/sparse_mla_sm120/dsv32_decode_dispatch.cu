@@ -84,7 +84,7 @@ static bool launch_decode_dsv3_2_impl(
   const size_t merge_smem_bytes = (size_t)num_splits * sizeof(float);
   merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(
       mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, num_splits, q_heads, h_blocks * HPB,
-      stride_out_lse, lse_scale);
+      stride_out_lse, lse_scale, {});
   DSV32_CUDA_CHECK(cudaGetLastError());
   return true;
 }
