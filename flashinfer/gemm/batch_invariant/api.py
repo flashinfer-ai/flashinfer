@@ -42,13 +42,14 @@ Every unsupported input raises :class:`flashinfer.batch_invariant.BatchInvariant
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
 from typing import Dict, Optional, Tuple
 
 import torch
 
-from ...batch_invariant.support import check_device, unsupported
+from ...batch_invariant.support import check_device, register_self_served, unsupported
 from .generator import Knobs
 from .schedule import chunks_for, default_config, fp4_class_for, mx_class_for
 from .spec import (
@@ -81,6 +82,9 @@ CLASS_FP4 = "gemm.fp4"
 #: The class family of :func:`flashinfer.mm_mxfp8_mxfp4` (the pair's only dense kernel, so both values of ``batch_invariant``
 #: run it): ``gemm.mxfp4w8a.*`` on SM100 / SM103 and ``gemm.mxfp4w8a.*64`` on SM107 (`schedule.mx_class_for`).
 CLASS_MXW48 = "gemm.mxfp4w8a"
+register_self_served(
+    CLASS_MXW48, "mm_mxfp8_mxfp4"
+)  # both flag values run the class: its errors advise no fallback
 #: The compute capabilities the classes are stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 MM_BF16_ARCHS = ((10, 0), (10, 3), (10, 7))
 BMM_FP8_ARCHS = MM_BF16_ARCHS
@@ -1118,6 +1122,15 @@ def mm_mxfp8_batch_invariant(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _knob_set(in_fmt: str, cta_chunks: bool) -> frozenset:
+    """The enumerated knob product of a format (what the dispatcher and the tuner draw from), for the membership check
+    of a caller's configuration."""
+    from .generator import knob_product
+
+    return frozenset(knob_product(cta_chunks=cta_chunks, in_fmt=in_fmt))
+
+
 def _run_mx(
     a: torch.Tensor,
     b_nk: torch.Tensor,
@@ -1147,7 +1160,11 @@ def _run_mx(
     from .blocks.operands import can_implement
     from .fixup import MAX_GRID_Y, get_fixup
 
-    if not can_implement(config, M, N, K, "k", C, in_fmt):
+    # membership in the enumerated space = the knob product (the grid size is a launch parameter, not a record) and the
+    # body's acceptance of the record at the shape
+    if dataclasses.replace(config, grid_clusters=0) not in _knob_set(
+        in_fmt, C > 1
+    ) or not can_implement(config, M, N, K, "k", C, in_fmt):
         raise unsupported(
             cls,
             f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with {C} chunks",

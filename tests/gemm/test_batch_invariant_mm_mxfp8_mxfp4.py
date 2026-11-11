@@ -721,6 +721,71 @@ def test_pdl_variant_is_a_placement(M, N, K):
         assert torch.equal(bits(out), ref)
 
 
+def test_fingerprint_refuses_what_the_operator_refuses():
+    """The receipt exists for the weights the operator accepts: K a multiple of the class's granule (128 on the SM100 class,
+    32 on SM107), N a multiple of 8."""
+    with pytest.raises(ValueError, match="multiple of 128"):
+        bi.fingerprint(
+            "mm_mxfp8_mxfp4",
+            N=4096,
+            K=4096 + 64,
+            out_dtype=torch.bfloat16,
+            arch="sm_100",
+        )
+    with pytest.raises(ValueError, match="multiple of 32"):
+        bi.fingerprint(
+            "mm_mxfp8_mxfp4",
+            N=4096,
+            K=4096 + 16,
+            out_dtype=torch.bfloat16,
+            arch="sm_107",
+        )
+    with pytest.raises(ValueError, match="multiple of 8"):
+        bi.fingerprint(
+            "mm_mxfp8_mxfp4", N=4092, K=4096, out_dtype=torch.bfloat16, arch="sm_100"
+        )
+    assert bi.fingerprint(
+        "mm_mxfp8_mxfp4", N=4096, K=4096 + 64, out_dtype=torch.bfloat16, arch="sm_107"
+    )
+
+
+def test_unsupported_errors_advise_no_fallback():
+    """The operator runs the class under both values of ``batch_invariant``, so its errors state the contract and never
+    advise calling without the flag (the mode's other classes do)."""
+    a = torch.zeros(8, 256, dtype=torch.float8_e4m3fn)
+    b = torch.zeros(128, 64, dtype=torch.uint8)
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
+        flashinfer.mm_mxfp8_mxfp4(
+            a, b, torch.zeros(1, dtype=torch.uint8), torch.zeros(1, dtype=torch.uint8)
+        )
+    msg = str(e.value)
+    assert "mm_mxfp8_mxfp4" in msg and "both values of batch_invariant" in msg
+    assert (
+        "regular backends" not in msg and "call without batch_invariant=True" not in msg
+    )
+
+
+@needs_device
+def test_forced_configuration_must_be_a_member_of_the_enumerated_space():
+    """``config=`` takes a record of the enumerated space: a well-formed record outside the knob product (a swizzle no
+    record carries) is refused with the membership error even where the body could run it; the grid size is a launch
+    parameter, so a member at another grid size runs and gives the class's bits."""
+    from flashinfer.gemm.batch_invariant.generator import SWIZZLES
+
+    M, N, K = 64, 2048, 4096
+    a, sfa = adv_mx8(M, K, 61)
+    b, sfb = weight(N, K, 62)
+    alpha = alpha_t(0.37)
+    fmt = device_fmt()
+    space = enumerate_space(M, N, K, b_major="k", in_fmt=fmt)
+    ref = bits(mm(a, b, sfa, sfb, alpha, config=space[0], in_fmt=fmt)).clone()
+    outside = dataclasses.replace(space[0], swizzle_size=max(SWIZZLES) * 2)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
+        mm(a, b, sfa, sfb, alpha, config=outside, in_fmt=fmt)
+    sized = dataclasses.replace(space[0], grid_clusters=4)
+    assert torch.equal(bits(mm(a, b, sfa, sfb, alpha, config=sized, in_fmt=fmt)), ref)
+
+
 @needs_device
 def test_default_alpha_is_visible_to_a_call_on_another_stream():
     """``alpha=None`` takes the device's cached 1.0, filled and synchronised at its first use: a call on an independent

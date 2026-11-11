@@ -154,9 +154,18 @@ def _mm_mxfp4w8a_fingerprint(
     N: int, K: int, out_dtype: Union[torch.dtype, str], arch=None
 ) -> str:
     from ..gemm.batch_invariant.schedule import chunks_for, mx_class_for
-    from ..gemm.batch_invariant.spec import spec_fingerprint
+    from ..gemm.batch_invariant.spec import k_granule, spec_fingerprint
 
     fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "mm_mxfp8_mxfp4"))
+    gran = k_granule(fmt)
+    if K % gran:  # the operator's contract: the class exists for these weights only
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): K {K} must be a multiple of {gran} for the {fmt} class"
+        )
+    if N % 8:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} must be a multiple of 8"
+        )
     return spec_fingerprint(
         K, _out_fmt(out_dtype, "mm_mxfp8_mxfp4"), chunks_for(N, K, fmt), fmt
     )
