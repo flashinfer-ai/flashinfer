@@ -83,6 +83,14 @@ if not _USE_CUDA_NORM:
         # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
 
+# SM90 serve-shape RMSNorm fast path (guard + kernels); None disables it.
+try:
+    from .kernels.rmsnorm_serve_sm90 import (
+        try_rmsnorm_serve_sm90 as _try_rmsnorm_serve_sm90,
+    )
+except (ImportError, AttributeError):
+    _try_rmsnorm_serve_sm90 = None
+
 try:
     from .kernels.gated_residual_rmsnorm import (
         gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
@@ -1279,6 +1287,16 @@ def _rmsnorm_impl(
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
+    # SM90 serve-shape fast path: 2D bf16 at the measured decode-serve
+    # envelope (see kernels/rmsnorm_serve_sm90.py for the guard).  A False
+    # return falls through to the stock dispatch unchanged;
+    # FLASHINFER_SM90_SERVE_RMSNORM=0 is the kill switch.
+    if (
+        _try_rmsnorm_serve_sm90 is not None
+        and input.dim() == 2
+        and _try_rmsnorm_serve_sm90(out, input, weight, eps)
+    ):
+        return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
