@@ -35,6 +35,7 @@ alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
+cute_dsl_fused_moe_topk2_e3_h768.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
@@ -1583,6 +1584,51 @@ with contextlib.suppress(Exception):
         top_k=8,
         scoring_func="softmax",
         renormalize=True,
+    )
+
+# ── CuTe-DSL NVFP4 routing weights before FC2 ──────────────────────────────
+# This call reuses ClampedRelu2's runtime clamp tensor and rounds each
+# activation stage to BF16 before quantizing the weighted GEMM2 input.
+with contextlib.suppress(Exception):
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    from flashinfer.tllm_enums import ActivationType
+
+    _pre_T, _pre_H, _pre_I, _pre_E, _pre_K = 17, 768, 4096, 3, 2
+
+    def _pre_sf(rows, width):
+        scales = (
+            torch.ones((_pre_E * rows, width // 16), device=device)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
+        return convert_sf_to_mma_layout(scales, rows, width, num_groups=_pre_E)
+
+    _pre_output = flashinfer.cute_dsl_fused_moe(
+        x=torch.zeros((_pre_T, _pre_H // 2), dtype=torch.uint8, device=device),
+        x_sf=torch.ones((_pre_T, _pre_H // 16), device=device)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8),
+        token_selected_experts=(
+            torch.arange(_pre_T * _pre_K, device=device).reshape(_pre_T, _pre_K)
+            % _pre_E
+        ).int(),
+        token_final_scales=torch.full((_pre_T, _pre_K), 0.5, device=device),
+        w1_weight=torch.zeros(
+            (_pre_E, _pre_I, _pre_H // 2), dtype=torch.uint8, device=device
+        ),
+        w1_weight_sf=_pre_sf(_pre_I, _pre_H),
+        w1_alpha=torch.ones(_pre_E, device=device),
+        fc2_input_scale=torch.ones(1, device=device),
+        w2_weight=torch.zeros(
+            (_pre_E, _pre_H, _pre_I // 2), dtype=torch.uint8, device=device
+        ),
+        w2_weight_sf=_pre_sf(_pre_H, _pre_I),
+        w2_alpha=torch.ones(_pre_E, device=device),
+        num_experts=_pre_E,
+        top_k=_pre_K,
+        activation_type=ActivationType.ClampedRelu2.value,
+        clamped_relu2_limit=torch.tensor([16.0], device=device),
+        routing_weights_before_fc2=True,
     )
 
 # ── SM90 CuTe-DSL fused MoE (Qwen3-30B-A3B: E=128, topk=8, h=2048, i=768) ───
