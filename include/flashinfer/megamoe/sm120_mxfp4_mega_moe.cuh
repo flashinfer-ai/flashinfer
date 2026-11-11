@@ -316,6 +316,73 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
   // lanes 0..15 prefetch row lane of the block kPfAhead bytes ahead, one 128-byte line (an
   // iteration's K256) per iteration
   const char* pf = reinterpret_cast<const char*>(W) + size_t(nb0 * 16 + (lane & 15)) * (K / 2);
+  // 8-token items (one MMA per weight fragment) leave the loop waiting on DRAM: the next step's
+  // weights and scales are loaded into a second buffer while this step's MMAs run. The buffer takes
+  // the kernel to ~168 registers, one CTA per SM (the grid follows the occupancy). P2P build only:
+  // the GIN build keeps 128 registers, so the second buffer does not fit and the loop got slower
+  // (RTX 6000D, cold L2, DSV4-Flash EP8 auto: +6-7 us at 1-8 tokens per rank; EP4 P2P: -6..-9 us at
+  // 1-16 tokens per rank).
+  if constexpr (NH == 1 && !MEGAMOE_SM120_GIN_DEVICE) {
+    uint4 wq[kNbPerWarp][kUnroll / 2][2], wn[kNbPerWarp][kUnroll / 2][2];
+    uint32_t sfa[kNbPerWarp][(kUnroll + 1) / 2], sfn[kNbPerWarp][(kUnroll + 1) / 2];
+    auto load = [&](int k0, uint4(&q)[kNbPerWarp][kUnroll / 2][2],
+                    uint32_t(&sf)[kNbPerWarp][(kUnroll + 1) / 2]) {
+#pragma unroll
+      for (int p = 0; p < kUnroll / 2; ++p)
+#pragma unroll
+        for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+          for (int r = 0; r < 2; ++r) q[j][p][r] = __ldcs(wp[j][r] + (k0 / 2 + p) * 4);
+#pragma unroll
+      for (int s = 0; s < (kUnroll + 1) / 2; ++s)
+#pragma unroll
+        for (int j = 0; j < kNbPerWarp; ++j) sf[j][s] = __ldg(sp[j] + (k0 / 2 + s) * 16);
+    };
+    if (kc_begin < kc_end) load(kc_begin, wq, sfa);
+    for (int k0 = kc_begin; k0 < kc_end; k0 += kUnroll) {
+      if (kPfAhead > 0 && lane < 16 && k0 * 32 + kPfAhead < K / 2)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(pf + k0 * 32 + kPfAhead));
+      if (k0 + kUnroll < kc_end) load(k0 + kUnroll, wn, sfn);
+      uint32_t wv[kNbPerWarp][kUnroll][2][2];
+#pragma unroll
+      for (int p = 0; p < kUnroll / 2; ++p)
+#pragma unroll
+        for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+          for (int r = 0; r < 2; ++r) {
+            uint32_t v[4] = {wq[j][p][r].x, wq[j][p][r].y, wq[j][p][r].z, wq[j][p][r].w};
+            quad_transpose(v, c);
+#pragma unroll
+            for (int b = 0; b < 4; ++b) wv[j][p * 2 + b / 2][b % 2][r] = v[b];
+          }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        const int kc = k0 + u;
+        const uint32_t sfb = xsrow[0][kc / 2];
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+          const int step = kc * 2 + s;
+          const uint16_t sel = uint16_t(step & 3);
+          const uint2 b = xp[0][step * 4];
+#pragma unroll
+          for (int j = 0; j < kNbPerWarp; ++j) {
+            const uint32_t wg = wv[j][u][s][0], wg8 = wv[j][u][s][1];
+            const uint32_t a[4] = {spread4(wg, 0x4140u), spread4(wg8, 0x4140u),
+                                   spread4(wg, 0x4342u), spread4(wg8, 0x4342u)};
+            mma_w4a8(acc[j][0], a, b.x, b.y, sfa[j][u / 2], sel, sfb, sel);
+          }
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < kNbPerWarp; ++j) {
+#pragma unroll
+        for (int p = 0; p < kUnroll / 2; ++p) wq[j][p][0] = wn[j][p][0], wq[j][p][1] = wn[j][p][1];
+#pragma unroll
+        for (int s = 0; s < (kUnroll + 1) / 2; ++s) sfa[j][s] = sfn[j][s];
+      }
+    }
+    return;
+  }
   for (int k0 = kc_begin; k0 < kc_end; k0 += kUnroll) {
     if (kPfAhead > 0 && lane < 16 && k0 * 32 + kPfAhead < K / 2)
       asm volatile("prefetch.global.L2 [%0];" ::"l"(pf + k0 * 32 + kPfAhead));
