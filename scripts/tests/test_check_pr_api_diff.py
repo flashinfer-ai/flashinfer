@@ -16,6 +16,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import check_pr_api_diff as api_diff  # noqa: E402
+from pr_checks.git_compare import resolve_pr_comparison  # noqa: E402
 
 
 def api_function(signature: str) -> api_diff.ApiFunction:
@@ -90,6 +91,99 @@ def compare_snapshots(
         head = commit_snapshot(repo, head_files, "head")
         with working_directory(repo):
             return api_diff.check(base, head)
+
+
+class PrComparisonTest(unittest.TestCase):
+    @contextmanager
+    def repository(
+        self, *, sync_main: bool, change_pr_api: bool
+    ) -> Iterator[tuple[Path, str, str, str, str]]:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            run_git(repo, "init", "-q", "-b", "main")
+            run_git(repo, "config", "user.name", "API checker test")
+            run_git(repo, "config", "user.email", "api-checker@example.com")
+            source = (
+                "@flashinfer_api\ndef api(*, mode: str = 'old') -> None:\n    pass\n"
+            )
+            files = {
+                "flashinfer/main_api.py": source,
+                "flashinfer/pr_api.py": source,
+            }
+            stale_base = commit_snapshot(repo, files, "initial main")
+            run_git(repo, "checkout", "-q", "-b", "pr")
+            pr_files = {**files, "packaging.txt": "PR packaging fix\n"}
+            if change_pr_api:
+                pr_files["flashinfer/pr_api.py"] = source.replace("'old'", "'new'")
+            commit_snapshot(repo, pr_files, "PR changes")
+            run_git(repo, "checkout", "-q", "main")
+            target = commit_snapshot(
+                repo,
+                {**files, "flashinfer/main_api.py": source.replace("'old'", "'new'")},
+                "unrelated main API change",
+            )
+            run_git(repo, "checkout", "-q", "pr")
+            if sync_main:
+                run_git(repo, "merge", "--no-ff", "main", "-m", "sync main")
+            pr_head = run_git(repo, "rev-parse", "HEAD")
+            run_git(repo, "checkout", "-q", "main")
+            run_git(repo, "merge", "--no-ff", "pr", "-m", "PR test merge")
+            merge = run_git(repo, "rev-parse", "HEAD")
+            yield repo, stale_base, target, pr_head, merge
+
+    def test_main_sync_does_not_introduce_pr_api_findings(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, merge = snapshot
+            with working_directory(repo):
+                self.assertEqual(len(api_diff.check(stale_base, pr_head)), 1)
+                base, head = resolve_pr_comparison(merge, pr_head)
+                self.assertEqual((base, head), (target, pr_head))
+                self.assertEqual(api_diff.check(base, head), [])
+
+    def test_own_api_changes_still_report_with_or_without_main_sync(self) -> None:
+        for sync_main in (False, True):
+            with (
+                self.subTest(sync_main=sync_main),
+                self.repository(sync_main=sync_main, change_pr_api=True) as snapshot,
+            ):
+                repo, _, _, pr_head, merge = snapshot
+                with working_directory(repo):
+                    base, head = resolve_pr_comparison(merge, pr_head)
+                    findings = api_diff.check(base, head)
+                self.assertEqual(
+                    [(f.check, f.path) for f in findings],
+                    [("public_api_signature_changed", "flashinfer/pr_api.py")],
+                )
+
+    def test_reject_non_merge_and_mismatched_head(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, merge = snapshot
+            with working_directory(repo):
+                with self.assertRaisesRegex(RuntimeError, "two-parent PR test merge"):
+                    resolve_pr_comparison(target, pr_head)
+                with self.assertRaisesRegex(RuntimeError, "expected head"):
+                    resolve_pr_comparison(merge, stale_base)
+
+    def test_cli_outputs_one_comparison_for_both_checkers(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, _ = snapshot
+            output = repo / "github-output"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "pr_checks/git_compare.py"),
+                    "--head",
+                    pr_head,
+                    "--github-output",
+                    str(output),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(output.read_text(), f"base={target}\nhead={pr_head}\n")
+            self.assertNotIn(stale_base, result.stdout)
 
 
 class SignatureCompatibilityTest(unittest.TestCase):
