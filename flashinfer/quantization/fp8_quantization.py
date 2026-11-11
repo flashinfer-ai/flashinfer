@@ -1,4 +1,5 @@
 import functools
+import os
 from types import SimpleNamespace
 from typing import Dict, Literal, Optional, Tuple
 
@@ -6,6 +7,7 @@ import torch
 import tvm_ffi
 
 from ..api_logging import flashinfer_api
+from ..cute_dsl.availability import is_cute_dsl_available
 from ..cutile import is_cuda_tile_available
 from ..trace.templates.quantize import (
     mxfp8_grouped_quantize_trace,
@@ -154,6 +156,55 @@ def _per_token_group_quant_8bit_cuda(
         scale_ue8m0,
     )
     return x_q, x_s
+
+
+PER_TOKEN_GROUP_QUANT_CUTE_DSL_DISABLE_ENV = (
+    "FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL"
+)
+
+
+def use_per_token_group_quant_cute_dsl(
+    x: torch.Tensor,
+    group_size: int,
+    dst_dtype: torch.dtype,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+) -> bool:
+    """Whether the CuTe-DSL sm90 fast path handles this call.
+
+    The fast path covers exactly the default form of
+    :func:`per_token_group_quant_8bit` — 2D contiguous bf16 CUDA input,
+    ``group_size=128``, ``float8_e4m3fn`` output, row-major fp32 scales —
+    on sm90 devices with the optional ``nvidia-cutlass-dsl`` runtime
+    installed. The option-bearing forms (``column_major_scales``,
+    ``scale_tma_aligned``, ``scale_ue8m0``), other dtypes, group sizes and
+    architectures stay on the stock paths. Setting the environment variable
+    ``FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL`` to a non-empty
+    value other than ``0`` restores the stock cuTile path unconditionally
+    (checked per call, so it can be flipped at runtime).
+    """
+    if os.environ.get(PER_TOKEN_GROUP_QUANT_CUTE_DSL_DISABLE_ENV, "0") not in (
+        "",
+        "0",
+    ):
+        return False
+    if column_major_scales or scale_tma_aligned or scale_ue8m0:
+        return False
+    if group_size != 128 or dst_dtype != torch.float8_e4m3fn:
+        return False
+    if (
+        x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or not x.is_cuda
+        or not x.is_contiguous()
+        or x.numel() == 0
+        or x.shape[-1] % 128 != 0
+    ):
+        return False
+    if torch.cuda.get_device_capability(x.device)[0] != 9:
+        return False
+    return is_cute_dsl_available()
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -1250,7 +1301,13 @@ def per_token_group_quant_8bit(
         If ``True``, encode scales in the UE8M0 format (Blackwell / sm100+).
     backend : str
         Implementation backend. ``"cutile"`` uses the cuda.tile Python
-        backend. ``"cuda"`` uses a register-resident native CUDA kernel and
+        backend; on sm90, when the optional ``nvidia-cutlass-dsl`` runtime is
+        installed and the call is the default form (2D contiguous bf16 input,
+        ``group_size=128``, ``float8_e4m3fn`` output, row-major scales), it
+        dispatches to a CuTe-DSL fast path with identical semantics (set
+        ``FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL=1`` to restore
+        the stock cuTile kernel; warm the op up once before CUDA graph
+        capture). ``"cuda"`` uses a register-resident native CUDA kernel and
         currently supports ``group_size=128`` with FP16/BF16 input. Both
         backends compute the scale with IEEE float32 division and, for
         ``dst_dtype=torch.int8``, round half up (``floor(x + 0.5)``).
@@ -1265,6 +1322,15 @@ def per_token_group_quant_8bit(
         dst_dtype = torch.float8_e4m3fn
 
     if backend == "cutile":
+        if use_per_token_group_quant_cute_dsl(
+            x, group_size, dst_dtype, column_major_scales, scale_tma_aligned, scale_ue8m0
+        ):
+            from .kernels.cute_dsl.per_token_group_quant_8bit_cute_dsl import (
+                per_token_group_quant_fp8_g128_cute_dsl,
+            )
+
+            return per_token_group_quant_fp8_g128_cute_dsl(x, eps)
+
         from .kernels.cutile.per_token_group_quant_8bit_cutile import (
             per_token_group_quant_8bit_cutile,
         )
