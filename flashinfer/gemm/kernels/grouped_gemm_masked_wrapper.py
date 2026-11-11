@@ -206,10 +206,9 @@ def grouped_gemm_nt_masked(
         per byte, where ``n_out`` is the number of output columns.  The
         epilogue rounds the output to BF16 and quantizes it with the default
         recipe of ``scaled_fp4_grouped_quantize``, giving the same bits as
-        quantizing a BF16 output with that function.  Requires
-        ``mma_tiler_mn[0] == 128``, ``n`` a multiple of ``mma_tiler_mn[1]``
-        and ``n_out`` a multiple of 64.  Works with or without
-        ``activation_type``.  Raises ``ValueError`` when 4over6 is enabled
+        quantizing a BF16 output with that function.  Requires ``n`` a
+        multiple of ``mma_tiler_mn[1]`` and ``n_out`` a multiple of 64.  Works
+        with or without ``activation_type``.  Raises ``ValueError`` when 4over6 is enabled
         (see ``nvfp4_4over6``) or ``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH``
         is set, since the epilogue does not implement those recipes.
     global_scale : Optional[torch.Tensor]
