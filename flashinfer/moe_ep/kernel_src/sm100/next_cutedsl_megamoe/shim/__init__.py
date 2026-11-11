@@ -8,6 +8,7 @@ from .autotune import (
     autotune_sm100_block_scaled_mega_moe,
 )
 from .block_scaled import (
+    _max_active_clusters as max_active_clusters,
     block_scaled_mega_launch_thunk as sm100_block_scaled_mega_launch_thunk,
     block_scaled_mega_moe as sm100_block_scaled_mega_moe,
 )
@@ -62,6 +63,7 @@ __all__ = [
     "default_sm100_genphase_knobs",
     "genphase_live_token_buckets",
     "knob_cache_path",
+    "max_active_clusters",
     "output_error",
     "preprocess_block_scaled_weights",
     "preprocess_genphase_prequantized_weights",

@@ -24,7 +24,7 @@ bugs there. See [Kernel review](#kernel-review).
    present; correct architecture guards; and the code is actually testable.
 4. **Comments & docs.** Flag low-SNR / verbose comments — want concise, explain *why* not
    *what*. Short rationale for a non-obvious hot-path choice is high-SNR and wanted. Keep
-   `CLAUDE.md` / `.claude/skills/` docs in sync when touched.
+   `AGENTS.md` / `.claude/skills/` docs in sync when touched.
 5. **Design deviations.** Flag (don't silently accept or rewrite) coding style that deviates
    from surrounding code. Scale scrutiny by durability: **hard** on perf/kernel-selection
    logic, high-level interfaces, and widely-used ops; **lighter** on disposable model-specific

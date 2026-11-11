@@ -87,6 +87,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.gemm.gemm_svdquant",
     "flashinfer.gemm.kernels.grouped_gemm_masked_wrapper",
     "flashinfer.gemm.routergemm",
+    "flashinfer.gemm.gemm_bf16_fp8",
     "flashinfer.kda",
     "flashinfer.kda_decode",
     "flashinfer.mamba.selective_state_update",
