@@ -181,6 +181,7 @@ def _sm12x_ptx_check(compiled_fn):
 
 
 def _compile_uncached(func, *args, compile_options=None, **kwargs):
+    """Compile ``func`` with CuTe-DSL, running the SM12x PTX check when needed."""
     if not _needs_sm12x_ptx_check(compile_options):
         return cute.compile[compile_options](func, *args, **kwargs)
     with tempfile.TemporaryDirectory(prefix="cutedsl_ptx_check_") as tempdir:
@@ -204,10 +205,16 @@ def _disk_kernel_name(func, cache_key) -> str | None:
 
 
 def _key_source_files() -> tuple[str, ...]:
+    """The ``delta_rule_dsl`` sources whose content keys the disk cache."""
     return tuple(sorted(glob.glob(os.path.join(os.path.dirname(__file__), "*.py"))))
 
 
 def cached_compile(func, *args, compile_options=None, **kwargs):
+    """Return the compiled ``func``, from memory, the disk cache or a fresh compile.
+
+    TVM-FFI compiles are persisted with ``build_and_load_cute_dsl_kernel`` so
+    later processes reload them; other compiles are cached in memory only.
+    """
     cache_key = (func._get_compile_key(), _compile_options_key(compile_options))
     compiled_fn = _in_mem_compile_cache.get(cache_key)
     if compiled_fn is not None:

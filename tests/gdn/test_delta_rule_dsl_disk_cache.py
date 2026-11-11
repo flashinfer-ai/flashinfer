@@ -17,6 +17,7 @@ from flashinfer.utils import is_sm12x_supported, is_sm90a_supported  # noqa: E40
 
 class _Kernel(ccc.KeyedCompileMixin):
     def __init__(self, tile):
+        """Kernel stub keyed on ``tile``."""
         self.tile = tile
         self.manual_cache_key("tile")
 
@@ -26,22 +27,26 @@ SM12X = (cute.EnableTVMFFI(True), cute.GPUArch("sm_121a"))
 
 @pytest.fixture(autouse=True)
 def _clear_mem_cache():
+    """Isolate each test from kernels cached by the others."""
     ccc._in_mem_compile_cache.clear()
     yield
     ccc._in_mem_compile_cache.clear()
 
 
 def _key(kernel):
+    """Compile key as built by cached_compile without compile options."""
     return (kernel._get_compile_key(), None)
 
 
 def test_disk_kernel_name_is_stable_and_specific():
+    """Equal configurations share a name; different ones do not."""
     name = ccc._disk_kernel_name(_Kernel(64), _key(_Kernel(64)))
     assert name == ccc._disk_kernel_name(_Kernel(64), _key(_Kernel(64)))
     assert name != ccc._disk_kernel_name(_Kernel(128), _key(_Kernel(128)))
 
 
 def test_disk_kernel_name_rejects_address_dependent_keys():
+    """Keys whose repr carries an object address are not persisted."""
     assert ccc._disk_kernel_name(_Kernel(64), ((object(),), None)) is None
 
 
@@ -55,9 +60,11 @@ def test_disk_kernel_name_rejects_address_dependent_keys():
     ],
 )
 def test_disk_cache_only_with_tvm_ffi(monkeypatch, options, uses_disk):
+    """Only TVM-FFI compiles go through the disk cache, once per key."""
     calls = []
 
     def fake_build_and_load(module, name, compile_fn, key_files):
+        """Record the call and compile in place."""
         calls.append((module, name, key_files))
         return compile_fn()
 
@@ -77,11 +84,13 @@ def test_disk_cache_only_with_tvm_ffi(monkeypatch, options, uses_disk):
 
 
 def _use_tmp_jit_dir(monkeypatch, tmp_path):
+    """Point the CuTe-DSL disk cache and its locks at ``tmp_path``."""
     monkeypatch.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
     monkeypatch.setattr(cute_dsl_core, "get_tmpdir", lambda: tmp_path)
 
 
 def test_disabled_disk_cache_compiles_without_artifacts(monkeypatch, tmp_path):
+    """FLASHINFER_CUTE_DSL_DISABLE_CACHE=1 compiles but writes nothing."""
     _use_tmp_jit_dir(monkeypatch, tmp_path)
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
     monkeypatch.setattr(ccc, "_compile_uncached", lambda *a, **k: "compiled")
@@ -90,10 +99,12 @@ def test_disabled_disk_cache_compiles_without_artifacts(monkeypatch, tmp_path):
 
 
 def test_failed_compile_or_ptx_check_exports_nothing(monkeypatch, tmp_path):
+    """A failing compile or PTX check propagates and exports nothing."""
     _use_tmp_jit_dir(monkeypatch, tmp_path)
     monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
 
     def reject(*a, **k):
+        """Stand-in for a compile rejected by the SM12x PTX check."""
         raise RuntimeError("unsupported cluster-scoped TMA loads")
 
     monkeypatch.setattr(ccc, "_compile_uncached", reject)
@@ -140,6 +151,7 @@ _PREFILL_SCRIPT = textwrap.dedent(
 
 
 def _delta_rule_dsl_device() -> bool:
+    """Whether the current GPU runs one of the delta-rule DSL paths."""
     if not torch.cuda.is_available():
         return False
     device = torch.device("cuda")
@@ -151,6 +163,7 @@ def _delta_rule_dsl_device() -> bool:
     not _delta_rule_dsl_device(), reason="Requires an SM8x, SM90 or SM12x GPU"
 )
 def test_second_process_reloads_without_compiling(tmp_path):
+    """A second process reloads the exported kernel without compiling, bitwise equal."""
     env = {**os.environ, "FLASHINFER_WORKSPACE_BASE": str(tmp_path / "ws")}
     env.pop("FLASHINFER_CUTE_DSL_DISABLE_CACHE", None)
     script = tmp_path / "prefill.py"
