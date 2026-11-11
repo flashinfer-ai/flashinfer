@@ -39,6 +39,61 @@ from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 DTYPE = torch.bfloat16
 
 
+@pytest.mark.parametrize(
+    "order,cudnn_available,work_items,graph,expected,expected_counts",
+    [
+        ("cudnn,cutlass", True, 131073, False, "cudnn", 0),
+        ("cutlass,cudnn", True, 131072, False, "cutlass", 1),
+        ("cutlass,cudnn", True, 131073, False, "cudnn", 1),
+        ("cudnn,cutlass", False, 131072, False, "cutlass", 1),
+        ("cudnn,cutlass", False, 131073, False, None, 1),
+        ("cutlass", False, 1, True, None, 0),
+        ("cutlass,cudnn", True, 1, True, "cudnn", 0),
+        ("cutlass,cutlass", False, 131073, False, None, 1),
+    ],
+)
+def test_lazy_cutlass_work_count_preserves_eligibility(
+    monkeypatch, order, cudnn_available, work_items, graph, expected, expected_counts
+):
+    import flashinfer.prefill as prefill_mod
+
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", order)
+    monkeypatch.setattr(prefill_mod, "is_sm100a_supported", lambda _: True)
+    monkeypatch.setattr(
+        prefill_mod, "_cudnn_supports_direct_seqlens", lambda _: cudnn_available
+    )
+    counts = []
+
+    def count_work():
+        counts.append(work_items)
+        return work_items
+
+    options = dict(
+        has_custom_mask=False,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        has_multi_item_scoring=False,
+        has_sinks=False,
+        cudnn_indptr_is_int32=True,
+        cuda_graph_enabled=graph,
+        cutlass_indptr_is_int32=True,
+    )
+    args = (torch.device("cuda"), "NHD", 128, 128, DTYPE, DTYPE, DTYPE, 0)
+    assert (
+        prefill_mod._blackwell_ragged_auto_upgrade(
+            *args, cutlass_work_items=work_items, **options
+        )
+        == expected
+    )
+    assert (
+        prefill_mod._blackwell_ragged_auto_upgrade(
+            *args, cutlass_work_items=count_work, **options
+        )
+        == expected
+    )
+    assert len(counts) == expected_counts
+
+
 def _cutlass_upgrade_arch() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -200,10 +255,7 @@ def test_auto_upgrades_on_blackwell(h_qo, h_kv, d_qk, d_vo):
 @pytest.mark.parametrize(
     "tag,plan_kwargs",
     [
-        # fmha_varlen takes no window_left: upgrading would compute full
-        # attention and silently ignore the window.
-        ("sliding_window", {"window_left": 256}),
-        # ... and no logits_soft_cap.
+        # Neither run path receives a logits soft cap.
         ("logits_soft_cap", {"logits_soft_cap": 30.0}),
     ],
 )
@@ -213,6 +265,29 @@ def test_auto_declines_when_semantics_would_be_dropped(tag, plan_kwargs):
         f"auto upgraded to {resolved!r} with {tag} requested; neither the CUTLASS "
         f"nor the cuDNN run path receives it, so the result would be silently wrong"
     )
+
+
+@requires_cutlass_arch
+@pytest.mark.parametrize(
+    "tag,plan_kwargs",
+    [
+        ("sliding_window", {"window_left": 256}),
+    ],
+)
+def test_auto_keeps_window_off_cutlass(tag, plan_kwargs):
+    """cuDNN builds the band into its mask; CUTLASS would ignore it.
+
+    ``fmha_varlen`` receives only ``causal`` and the scales, so a window that
+    reached it would silently compute full attention. cuDNN maps the window onto
+    ``diagonal_band_left_bound``, so it is a legal target.
+    """
+    resolved = _plan_only("auto", 4, 1024, 1024, 64, 8, 128, 128, **plan_kwargs)
+    assert resolved != "cutlass", (
+        f"auto upgraded to cutlass with {tag} requested; fmha_varlen never "
+        f"receives it, so the window would be silently dropped"
+    )
+    expected = "cudnn" if _cudnn_upgrade_available() else "fa2"
+    assert resolved == expected
 
 
 @requires_cutlass_arch
@@ -413,9 +488,11 @@ def test_explicit_cudnn_token_indptr_return_lse():
 
 @requires_cutlass_arch
 def test_auto_is_reresolved_on_replan():
-    """`auto` is decided per plan(), not once per wrapper: a re-plan that adds
-    a sliding window must fall back to fa2 (the upgraded kernels would drop
-    it), and a later re-plan without it must upgrade again."""
+    """`auto` is decided per plan(), not once per wrapper.
+
+    A re-plan that adds a logits soft cap must fall back to fa2 (no upgraded
+    kernel receives it), and a later re-plan without it must upgrade again.
+    """
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace, "NHD", backend="auto"
@@ -425,7 +502,7 @@ def test_auto_is_reresolved_on_replan():
     plan_kwargs = dict(causal=True, q_data_type=DTYPE, kv_data_type=DTYPE)
     wrapper.plan(*plan_args, **plan_kwargs)
     assert wrapper._backend == BLACKWELL_DEFAULT
-    wrapper.plan(*plan_args, window_left=16, **plan_kwargs)
+    wrapper.plan(*plan_args, logits_soft_cap=30.0, **plan_kwargs)
     assert wrapper._backend == "fa2"
     wrapper.plan(*plan_args, **plan_kwargs)
     assert wrapper._backend == BLACKWELL_DEFAULT
@@ -589,16 +666,11 @@ def test_auto_declines_cutlass_under_cuda_graph(monkeypatch):
     assert wrapper._backend == "fa2"
 
 
-@requires_cutlass_arch
-def test_explicit_cutlass_refuses_cuda_graph():
-    """An explicit `backend="cutlass"` says so plainly instead of going stale."""
-    dev = torch.device("cuda")
-    batch, s_q, s_kv = 2, 512, 512
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
-    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
-    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
-
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+def _graph_cutlass_wrapper(qo_indptr, kv_indptr):
+    workspace = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device=qo_indptr.device
+    )
+    return flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace,
         "NHD",
         use_cuda_graph=True,
@@ -606,18 +678,102 @@ def test_explicit_cutlass_refuses_cuda_graph():
         kv_indptr_buf=kv_indptr.clone(),
         backend="cutlass",
     )
-    with pytest.raises(ValueError, match="not CUDA-graph safe"):
-        wrapper.plan(
-            qo_indptr,
-            kv_indptr,
-            32,
-            32,
-            128,
-            head_dim_vo=128,
-            causal=True,
-            q_data_type=DTYPE,
-            kv_data_type=DTYPE,
-        )
+
+
+@requires_cutlass_arch
+def test_explicit_cutlass_plan_once_then_capture_under_cuda_graph():
+    """Plan once, capture, replay: legal with `use_cuda_graph=True` (as in v0.7.0).
+
+    Nothing has been captured when the first plan() runs, so the buffers it
+    allocates are the ones the graph records. Replays over fresh input values
+    must match an eager CUTLASS run and FA2.
+    """
+    dev = torch.device("cuda")
+    h_qo, h_kv, d = 32, 8, 128
+    # Ragged, uneven lengths so the work list is not trivially uniform.
+    qo_indptr = torch.tensor([0, 300, 812], dtype=torch.int32, device=dev)
+    kv_indptr = torch.tensor([0, 400, 1024], dtype=torch.int32, device=dev)
+    nnz_qo, nnz_kv = int(qo_indptr[-1]), int(kv_indptr[-1])
+    plan_args = (qo_indptr, kv_indptr, h_qo, h_kv, d)
+    plan_kwargs = dict(
+        head_dim_vo=d, causal=True, q_data_type=DTYPE, kv_data_type=DTYPE
+    )
+
+    wrapper = _graph_cutlass_wrapper(qo_indptr, kv_indptr)
+    wrapper.plan(*plan_args, **plan_kwargs)
+    assert wrapper._backend == "cutlass"
+
+    q = torch.empty(nnz_qo, h_qo, d, dtype=DTYPE, device=dev)
+    k = torch.empty(nnz_kv, h_kv, d, dtype=DTYPE, device=dev)
+    v = torch.empty(nnz_kv, h_kv, d, dtype=DTYPE, device=dev)
+
+    def fill(seed):
+        g = torch.Generator(device=dev).manual_seed(seed)
+        for t in (q, k, v):
+            t.copy_(torch.randn(t.shape, generator=g, device=dev, dtype=DTYPE))
+
+    # Warm up (JIT load, first launch) on a side stream before capture.
+    fill(0)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        wrapper.run(q, k, v)
+    torch.cuda.current_stream().wait_stream(s)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_static = wrapper.run(q, k, v)
+
+    eager = _new_wrapper("cutlass")
+    eager.plan(*plan_args, **plan_kwargs)
+    ref_fa2 = _new_wrapper("fa2")
+    ref_fa2.plan(*plan_args, **plan_kwargs)
+    for seed in (1, 2):
+        fill(seed)
+        graph.replay()
+        torch.cuda.synchronize()
+        out_eager = eager.run(q, k, v)
+        out_ref = ref_fa2.run(q, k, v)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out_static, out_eager, rtol=0, atol=0)
+        diff = (out_static.float() - out_ref.float()).abs()
+        rel_max = (diff.max() / out_ref.float().abs().max().clamp_min(1e-6)).item()
+        assert rel_max < 2e-2, f"graph replay diverges from fa2: {rel_max:.3e}"
+
+
+@requires_cutlass_arch
+@pytest.mark.parametrize("new_qo_offsets", [(0, 256, 1024), (0, 256, 768)])
+def test_explicit_cutlass_refuses_replan_under_cuda_graph(new_qo_offsets):
+    """Re-planning would strand a captured graph on the previous plan buffers.
+
+    The refusal preserves the original plan's cached state and registered
+    indptr buffers, including when the rejected query total differs.
+    """
+    dev = torch.device("cuda")
+    batch, s_q, s_kv = 2, 512, 512
+    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
+    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
+    plan_kwargs = dict(
+        head_dim_vo=128, causal=True, q_data_type=DTYPE, kv_data_type=DTYPE
+    )
+
+    wrapper = _graph_cutlass_wrapper(qo_indptr, kv_indptr)
+    wrapper.plan(qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    plan_info = wrapper._plan_info
+
+    q = torch.randn(batch * s_q, 32, 128, dtype=DTYPE, device=dev)
+    k = torch.randn(batch * s_kv, 32, 128, dtype=DTYPE, device=dev)
+    v = torch.randn_like(k)
+    out_before = wrapper.run(q, k, v)
+
+    new_qo_indptr = torch.tensor(new_qo_offsets, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="re-planning in CUDA-graph mode"):
+        wrapper.plan(new_qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    assert torch.equal(wrapper._qo_indptr_buf, qo_indptr)
+    assert torch.equal(wrapper._kv_indptr_buf, kv_indptr)
+    assert wrapper._plan_info is plan_info
+    assert wrapper._qo_indptr_last == batch * s_q
+    torch.testing.assert_close(wrapper.run(q, k, v), out_before, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -634,9 +790,11 @@ def _new_wrapper(backend):
 
 @requires_cutlass_arch
 def test_auto_declines_with_wrapper_sinks():
-    """vLLM's metadata builder stashes attention sinks on the wrapper (``_sinks``)
-    for the fa2 route; neither upgraded kernel consumes them, so `auto` must
-    stay on fa2 rather than silently drop the sink."""
+    """vLLM's metadata builder stashes attention sinks on the wrapper (``_sinks``).
+
+    cuDNN consumes them via its SDPA ``sink_token`` input, so `auto` may route
+    there; CUTLASS never receives them and must stay out of the running.
+    """
     wrapper = _new_wrapper("auto")
     wrapper._sinks = torch.zeros(64, dtype=torch.float32, device="cuda")
     _, _, _, qo_indptr, kv_indptr = _inputs(4, 1024, 1024, 64, 8, 128, 128)
@@ -650,7 +808,8 @@ def test_auto_declines_with_wrapper_sinks():
         q_data_type=DTYPE,
         kv_data_type=DTYPE,
     )
-    assert wrapper._backend == "fa2"
+    assert wrapper._backend == ("cudnn" if _cudnn_upgrade_available() else "fa2")
+    assert wrapper._backend != "cutlass"
     del wrapper._sinks
     wrapper.plan(
         qo_indptr,
@@ -666,9 +825,14 @@ def test_auto_declines_with_wrapper_sinks():
 
 
 @requires_cutlass_arch
-def test_upgraded_backends_refuse_sinks_set_after_plan():
-    """Sinks that appear between plan() and run() (the vLLM order) hit an
-    explicit error on the upgraded backends, never a silent drop."""
+def test_cutlass_refuses_sinks_set_after_plan(monkeypatch):
+    """Sinks appearing between plan() and run() (the vLLM order) must not be
+    silently dropped by CUTLASS.
+
+    cuDNN is excluded here because it now consumes sinks at run() and so has
+    nothing to refuse; pinning the order isolates the CUTLASS contract.
+    """
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", "cutlass")
     q, k, v, qo_indptr, kv_indptr = _inputs(4, 512, 512, 64, 8, 128, 128)
     wrapper = _new_wrapper("auto")
     wrapper.plan(
@@ -681,7 +845,7 @@ def test_upgraded_backends_refuse_sinks_set_after_plan():
         q_data_type=DTYPE,
         kv_data_type=DTYPE,
     )
-    assert wrapper._backend in ("cudnn", "cutlass")
+    assert wrapper._backend == "cutlass"
     wrapper._sinks = torch.zeros(64, dtype=torch.float32, device="cuda")
     with pytest.raises(NotImplementedError, match="attention sinks"):
         wrapper.run(q, k, v)
@@ -821,16 +985,24 @@ def _plan_single_token(backend, qo_indptr, kv_indptr, h_qo, h_kv, d):
     return wrapper
 
 
+def _single_token_rows_with_empty(h_qo, h_kv, d, batch=8, seed=99):
+    """Like _single_token_rows, but the third request has no query tokens."""
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d, batch, seed)
+    qo_indptr = qo_indptr.clone()
+    qo_indptr[3:] -= 1  # request 2 contributes zero tokens
+    return q[: batch - 1], k, v, qo_indptr, kv_indptr
+
+
 @requires_cudnn_upgrade
-def test_auto_declines_single_token_gqa_rows():
-    """cuDNN's s_q == 1 kernel packs a kv group's q heads and writes the LSE only
-    for the first of them (cuDNN 9.26/9.27), so `auto` keeps single-token GQA
-    steps off cuDNN; the results, LSE included, match fa2. MHA single-token rows
-    are unaffected and may still take cuDNN."""
+def test_auto_takes_cudnn_for_single_token_gqa_rows():
+    """cuDNN < 9.27 mis-stores a ragged Stats tensor for s_q == 1 GQA (NVBug
+    6783545), but the plan serves the packed LSE through the unragged
+    (b, h, 1, 1) declaration when every request has exactly one token, so
+    `auto` keeps cuDNN for these rows and the LSE matches fa2. MHA likewise."""
     h_qo, h_kv, d = 32, 8, 128
     q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
     w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_kv, d)
-    assert w._backend != "cudnn"
+    assert w._backend == "cudnn"
     out, lse = w.run(q, k, v, return_lse=True)
     wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
     out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
@@ -846,27 +1018,39 @@ def test_auto_declines_single_token_gqa_rows():
 
 
 @requires_cudnn_upgrade
-def test_explicit_cudnn_refuses_single_token_gqa_lse():
+def test_single_token_gqa_with_empty_rows_stays_off_cudnn_lse():
+    """The one single-token GQA shape cuDNN < 9.27 cannot serve with an LSE is
+    a batch mixing zero-length and one-token requests (the unragged (b, h, 1, 1)
+    Stats form is no longer the packed layout). `auto` keeps those steps off
+    cuDNN, and explicit cudnn refuses the LSE while still serving the output."""
+    from flashinfer.cudnn.prefill import _cudnn_single_token_gqa_ragged_stats_broken
+
+    if not _cudnn_single_token_gqa_ragged_stats_broken():
+        pytest.skip("cuDNN >= 9.27 stores the ragged Stats correctly")
     h_qo, h_kv, d = 32, 8, 128
-    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows_with_empty(h_qo, h_kv, d)
+    w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    assert w._backend != "cudnn"
+    out, lse = w.run(q, k, v, return_lse=True)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "auto on single-token GQA + empty")
     w = _plan_single_token("cudnn", qo_indptr, kv_indptr, h_qo, h_kv, d)
-    with pytest.raises(NotImplementedError, match="single-token"):
+    with pytest.raises(NotImplementedError, match="zero-length"):
         w.run(q, k, v, return_lse=True)
     # the output itself is correct, so the no-LSE call is allowed
     out = w.run(q, k, v)
-    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
     out_fa2 = wf.run(q, k, v)
     torch.testing.assert_close(out.float(), out_fa2.float(), atol=2e-2, rtol=2e-2)
 
 
 @requires_cudnn_upgrade
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,  # a build/execute failure is not the known LSE bug
-    reason="cuDNN s_q==1 GQA kernel writes the ragged Stats only for the first head "
-    "of each kv group (cuDNN 9.26/9.27, NVBug 6783545); drop the guards above when this passes",
-)
 def test_cudnn_single_token_gqa_lse_is_correct():
+    """The low-level packed LSE is correct for single-token GQA rows on every
+    supported cuDNN: below 9.27 the ragged Stats store is broken for this
+    kernel (NVBug 6783545), so the packed buffer is bound as the unragged
+    (b, h, 1, 1) Stats form instead (byte-identical when every request has
+    one token); 9.27+ stores the ragged form correctly."""
     from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 
     h_qo, h_kv, d = 32, 8, 128
@@ -894,3 +1078,129 @@ def test_cudnn_single_token_gqa_lse_is_correct():
     _, lse_fa2 = wf.run(q, k, v, return_lse=True)
     assert torch.isfinite(lse).all()
     torch.testing.assert_close(lse, lse_fa2, atol=1e-2, rtol=1e-2)
+
+
+@requires_cudnn_upgrade
+def test_cudnn_auto_plan_does_not_count_cutlass_work(monkeypatch):
+    import flashinfer.prefill as prefill_mod
+
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", "cudnn,cutlass")
+
+    def unexpected_count(*args):
+        raise AssertionError("cuDNN auto plan counted CUTLASS work")
+
+    monkeypatch.setattr(prefill_mod, "_cutlass_plan_work_items", unexpected_count)
+    assert _plan_only("auto", 2, 32, 128, 8, 8, 128, 128) == "cudnn"
+
+
+# ---------------------------------------------------------------------------
+# cuDNN sliding window and attention sinks. FA2 in this wrapper consumes
+# neither (only fmha_v2 reads `_sinks`), so these check against a PyTorch
+# reference written from the definitions rather than against another kernel.
+# ---------------------------------------------------------------------------
+
+
+def _masked_reference(q, k, v, b, s, h_qo, h_kv, d, window_left=None, sinks=None):
+    """Bottom-right causal attention, optionally banded and/or with sinks."""
+    dev = torch.device("cuda")
+    scale = 1.0 / (d**0.5)
+    out = torch.empty(b * s, h_qo, d, dtype=torch.float32, device=dev)
+    group = h_qo // h_kv
+    qi = torch.arange(s, device=dev).unsqueeze(1)
+    kj = torch.arange(s, device=dev).unsqueeze(0)
+    pos = kj - qi
+    mask = pos <= 0
+    if window_left is not None:
+        mask = mask & (pos >= -window_left)
+    for bi in range(b):
+        sl = slice(bi * s, (bi + 1) * s)
+        for h in range(h_qo):
+            sc = (q[sl][:, h].float() @ k[sl][:, h // group].float().T) * scale
+            sc = sc.masked_fill(~mask, float("-inf"))
+            if sinks is not None:
+                sc = torch.cat([sc, sinks[h].float().reshape(1, 1).expand(s, 1)], -1)
+            pr = torch.softmax(sc, -1)
+            if sinks is not None:
+                pr = pr[:, :s]
+            out[sl][:, h] = pr @ v[sl][:, h // group].float()
+    return out
+
+
+@requires_cudnn_upgrade
+@pytest.mark.parametrize("window_left", [16, 64])
+def test_cudnn_sliding_window_matches_reference(window_left):
+    """The band conventions differ by one and the mapping was measured.
+
+    FlashInfer's ``window_left = W`` admits W + 1 keys including the diagonal;
+    cuDNN's ``diagonal_band_left_bound = L`` admits L. Passing W straight
+    through silently drops the oldest key of every window, which this pins.
+    """
+    b, s, h_qo, h_kv, d = 2, 256, 8, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _inputs(b, s, s, h_qo, h_kv, d, d)
+    wrapper = _new_wrapper("cudnn")
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        h_qo,
+        h_kv,
+        d,
+        head_dim_vo=d,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        window_left=window_left,
+    )
+    got = wrapper.run(q, k, v).float()
+    exp = _masked_reference(q, k, v, b, s, h_qo, h_kv, d, window_left=window_left)
+    rel = ((got - exp).abs().max() / exp.abs().max()).item()
+    assert rel < 2e-2, f"window_left={window_left}: relative error {rel:.4f}"
+
+
+@requires_cudnn_upgrade
+def test_cudnn_attention_sinks_match_reference():
+    """A sink adds one logit per head to the softmax denominator only."""
+    b, s, h_qo, h_kv, d = 2, 256, 8, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _inputs(b, s, s, h_qo, h_kv, d, d)
+    sinks = torch.randn(h_qo, dtype=torch.float32, device="cuda")
+    wrapper = _new_wrapper("cudnn")
+    wrapper._sinks = sinks
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        h_qo,
+        h_kv,
+        d,
+        head_dim_vo=d,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    got = wrapper.run(q, k, v).float()
+    exp = _masked_reference(q, k, v, b, s, h_qo, h_kv, d, sinks=sinks)
+    rel = ((got - exp).abs().max() / exp.abs().max()).item()
+    assert rel < 2e-2, f"sinks: relative error {rel:.4f}"
+
+
+@requires_cudnn_upgrade
+def test_cudnn_accepts_scalar_scales():
+    """`run()` advertises float scales; cuDNN's variant pack needs tensors.
+
+    Forwarding the float unchanged failed with "Object does not have the
+    __dlpack__() method", so scalars are normalised on the way in.
+    """
+    b, s, h_qo, h_kv, d = 2, 128, 8, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _inputs(b, s, s, h_qo, h_kv, d, d)
+    wrapper = _new_wrapper("cudnn")
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        h_qo,
+        h_kv,
+        d,
+        head_dim_vo=d,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    out = wrapper.run(q, k, v, q_scale=1.0, k_scale=1.0, v_scale=1.0)
+    assert out.shape == (b * s, h_qo, d)

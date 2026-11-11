@@ -15,10 +15,12 @@ limitations under the License.
 
 Tests for the SM100 / SM103 eight-peer Cake fused norm-combine export.
 
-The CPU tests check the verified module inventory, the token dispatch, the
-workspace layout helper and the argument validation of the public API.  The
-distributed test runs the public API on eight SM100 or eight SM103 GPUs
-against an independent PyTorch reference of the same math."""
+The CPU tests check the token dispatch, the persistent grid rule, the
+generated programs' launch records, the target scope, the workspace layout
+helper and the argument validation of the public API.  The distributed test
+runs the public API on eight SM100 or eight SM103 GPUs against an independent
+PyTorch reference of the same math, over every dispatch band and both
+directions of every band switch on one workspace."""
 
 from __future__ import annotations
 
@@ -36,173 +38,141 @@ from flashinfer.jit import cake_fused_norm_combine as loader
 # attribute path resolves to the function; bind the module object explicitly.
 api = importlib.import_module("flashinfer.comm.cake_fused_norm_combine")
 
-TOKENS_UNDER_TEST = (1, 8, 64, 256, 1024, 2048)
+# Every dispatch band, both sides of every band edge, and the band interiors.
+TOKENS_UNDER_TEST = (
+    1,
+    2,
+    3,
+    4,
+    8,
+    37,
+    38,
+    64,
+    256,
+    479,
+    480,
+    592,
+    593,
+    1024,
+    1772,
+    1773,
+    2048,
+)
 ATOL = 1e-2
 RTOL = 1e-2
 WORKER_TIMEOUT_SECONDS = 20 * 60
 
 
-def test_module_inventory_is_verified_source_only() -> None:
-    assert loader.MODULES
-    assert set(loader.ROUTES) == set(loader.ARCHES) == {"sm_100a", "sm_103a"}
-    assert set(loader.ARCH_BY_CAPABILITY.values()) == set(loader.ARCHES)
-    routed = set()
-    for arch, routes in loader.ROUTES.items():
-        assert set(routes) == {
-            loader.VARIANT_ONE_SHOT,
-            loader.VARIANT_OWNER_REDUCE,
-            loader.VARIANT_PIPELINED,
-        }
-        assert all(loader.MODULES[name]["arch"] == arch for name in routes.values())
-        routed |= set(routes.values())
-    assert routed == set(loader.MODULES)
-    for name, record in loader.MODULES.items():
-        assert name.startswith("cake_") and record["cache_name"].startswith("cake_")
-        assert record["cache_name"].endswith(record["arch"])
-        assert record["kernel_symbol"].startswith("kernel_cake_")
-        assert all(f"/{record['arch']}/" in path for path in record["sources"])
-        assert record["ffi_entry"] == "run"
-        paths = loader.verified_sources(name)
-        assert len(paths) == 2 and all(path.suffix == ".cu" for path in paths)
-        kinds = {kind for kind, _key in record["arg_plan"]}
-        assert kinds == {"buffer", "parameter", "grid"}
-        assert {key for kind, key in record["arg_plan"] if kind == "buffer"} == {
-            "x",
-            "residual",
-            "weight",
-            "norm_out",
-            "residual_out",
-            "collective_out",
-            "workspace",
-        }
-        assert {key for kind, key in record["arg_plan"] if kind == "parameter"} == {
-            "rank",
-            "tokens",
-            "epsilon",
-        }
-        assert record["arg_plan"][-3:] == [
-            ("grid", "grid_x"),
-            ("grid", "grid_y"),
-            ("grid", "grid_z"),
-        ]
-        launch = record["launch"]
-        assert launch["use_pdl"] is True
-        assert tuple(launch["cluster"]) == (1, 1, 1)
-        rule = record["grid_rule"]
-        if rule["kind"] == "per_token":
-            assert launch["cooperative"] is False
-        else:
-            assert rule["kind"] == "co_resident_odd"
-            assert rule["ctas_per_sm"] >= 1 and rule["sm_count"] >= 1
-            assert launch["cooperative"] is loader.WIDE_COOPERATIVE
-    for routes in loader.ROUTES.values():
-        one_shot = loader.MODULES[routes[loader.VARIANT_ONE_SHOT]]
-        owner = loader.MODULES[routes[loader.VARIANT_OWNER_REDUCE]]
-        wide = loader.MODULES[routes[loader.VARIANT_PIPELINED]]
-        # The one-shot half runs both tracks concurrently (two 160-thread
-        # halves); both owner reduces keep the source's 160-thread row.
-        assert tuple(one_shot["launch"]["block"]) == (320, 1, 1)
-        assert tuple(owner["launch"]["block"]) == (160, 1, 1)
-        assert tuple(wide["launch"]["block"]) == (160, 1, 1)
-        assert (
-            one_shot["grid_rule"]["kind"] == owner["grid_rule"]["kind"] == "per_token"
-        )
-        assert wide["grid_rule"]["kind"] == "co_resident_odd"
-
-
-def test_jit_spec_math_flags_follow_the_source_build() -> None:
-    # The source arm compiles the same translation units without fast-math unless
-    # the recorded compile flags say otherwise; the JIT build must not add it,
-    # and every module is compiled for exactly its own architecture.
-    for name, record in loader.MODULES.items():
-        flags = loader.spec(name).extra_cuda_cflags or []
-        fast = any(flag in ("-use_fast_math", "--use_fast_math") for flag in flags)
-        assert fast == ("--use_fast_math" in record["compile_flags"]), name
-        gencode = [flag for flag in flags if flag.startswith("-gencode=")]
-        assert gencode == [
-            f"-gencode=arch=compute_{record['arch'][3:]},code={record['arch']}"
-        ], name
-
-
 @pytest.mark.parametrize(
-    "tokens,expected",
+    "tokens,sm_count,expected",
     [
-        (1, loader.VARIANT_ONE_SHOT),
-        (8, loader.VARIANT_ONE_SHOT),
-        (64, loader.VARIANT_ONE_SHOT),
-        (255, loader.VARIANT_ONE_SHOT),
-        (256, loader.VARIANT_OWNER_REDUCE),
-        (1023, loader.VARIANT_OWNER_REDUCE),
-        (1024, loader.VARIANT_PIPELINED),
-        (2048, loader.VARIANT_PIPELINED),
+        (1, 148, api.VARIANT_PARALLEL_SINGLE),
+        (2, 148, api.VARIANT_PARALLEL),
+        (api.SPLIT_MIN_TOKENS - 1, 148, api.VARIANT_PARALLEL),
+        (api.SPLIT_MIN_TOKENS, 148, api.VARIANT_PARALLEL_SPLIT),
+        (api.STREAM_MIN_TOKENS - 1, 148, api.VARIANT_PARALLEL_SPLIT),
+        (api.STREAM_MIN_TOKENS, 148, api.VARIANT_OWNER_STREAM),
+        (api.PIPELINED_MIN_TOKENS - 1, 148, api.VARIANT_OWNER_STREAM),
+        (api.PIPELINED_MIN_TOKENS, 148, api.VARIANT_OWNER_PIPELINED),
+        # 148 SMs: four CTAs per SM hold 592 tokens in one step; the
+        # three-CTA grid of 443 CTAs covers 1772 tokens in four steps.
+        (592, 148, api.VARIANT_OWNER_PIPELINED),
+        (593, 148, api.VARIANT_OWNER_PIPELINED_EARLY),
+        (1772, 148, api.VARIANT_OWNER_PIPELINED_EARLY),
+        (1773, 148, api.VARIANT_OWNER_PIPELINED),
+        (2048, 148, api.VARIANT_OWNER_PIPELINED),
+        # 152 SMs: 608 tokens in one step, a 455-CTA grid for four steps.
+        (608, 152, api.VARIANT_OWNER_PIPELINED),
+        (609, 152, api.VARIANT_OWNER_PIPELINED_EARLY),
+        (1820, 152, api.VARIANT_OWNER_PIPELINED_EARLY),
+        (1821, 152, api.VARIANT_OWNER_PIPELINED),
     ],
 )
-def test_token_dispatch(tokens: int, expected: str) -> None:
-    assert loader.LARGE_MIN_TOKENS == 256
-    assert loader.WIDE_MIN_TOKENS == 1024
-    assert loader.select_variant(tokens) == expected
-    for arch in loader.ARCHES:
-        assert loader.route_module_name(tokens, arch) == loader.ROUTES[arch][expected]
-    with pytest.raises(ValueError):
-        loader.route_module_name(tokens, "sm_90a")
-    assert api.select_variant(tokens) == expected
+def test_token_dispatch(tokens: int, sm_count: int, expected: str) -> None:
+    assert 1 < api.SPLIT_MIN_TOKENS < api.STREAM_MIN_TOKENS < api.PIPELINED_MIN_TOKENS
+    assert api.select_variant(tokens, sm_count) == expected
+    assert expected in api.VARIANTS
 
 
-@pytest.mark.parametrize("tokens", [0, -1, True])
-def test_token_dispatch_rejects_non_positive_counts(tokens) -> None:
+@pytest.mark.parametrize("tokens,sm_count", [(0, 148), (-1, 148), (True, 148), (8, 0)])
+def test_token_dispatch_rejects_non_positive_counts(tokens, sm_count) -> None:
     with pytest.raises(ValueError):
-        loader.select_variant(tokens)
+        api.select_variant(tokens, sm_count)
 
 
 @pytest.mark.parametrize(
     "tokens,capacity,expected",
     [
-        (1, 1184, 1),
-        (1184, 1184, 1184),
-        (1185, 1184, 1183),
-        (2048, 1184, 1183),
-        (2048, 1185, 1185),
+        (1, 592, 1),
+        (592, 592, 592),
+        (593, 592, 591),
+        (2048, 592, 591),
+        (2048, 148, 147),
+        (2048, 149, 149),
         (2048, 2, 1),
     ],
 )
 def test_persistent_grid_is_every_token_or_the_largest_odd_co_resident_grid(
     tokens: int, capacity: int, expected: int
 ) -> None:
-    assert loader.persistent_grid(tokens, capacity) == expected
+    assert api.persistent_grid(tokens, capacity) == expected
 
 
-def test_wide_route_grid_rule_applies_only_to_the_verified_sm_count() -> None:
-    assert loader.launch_grid_x(2048, {"kind": "per_token"}, sm_count=1) == 2048
-    for routes in loader.ROUTES.values():
-        rule = loader.MODULES[routes[loader.VARIANT_PIPELINED]]["grid_rule"]
-        capacity = rule["ctas_per_sm"] * rule["sm_count"]
-        assert loader.launch_grid_x(
-            2048, rule, sm_count=rule["sm_count"]
-        ) == loader.persistent_grid(2048, capacity)
-        assert loader.launch_grid_x(1, rule, sm_count=rule["sm_count"]) == 1
-        assert loader.launch_grid_x(2048, rule, sm_count=rule["sm_count"] + 1) is None
+def test_grid_rules() -> None:
+    assert api.launch_grid_x(api.VARIANT_PARALLEL_SINGLE, 1, 148) == 1
+    assert api.launch_grid_x(api.VARIANT_PARALLEL, 2, 148) == 2
+    assert api.launch_grid_x(api.VARIANT_PARALLEL_SPLIT, 8, 148) == 64
+    assert api.launch_grid_x(api.VARIANT_OWNER_STREAM, 64, 148) == 64
+    assert api.launch_grid_x(api.VARIANT_OWNER_STREAM, 256, 148) == 147
+    assert api.launch_grid_x(api.VARIANT_OWNER_PIPELINED, 512, 148) == 512
+    assert api.launch_grid_x(api.VARIANT_OWNER_PIPELINED, 2048, 148) == 591
+    assert api.launch_grid_x(api.VARIANT_OWNER_PIPELINED_EARLY, 593, 148) == 443
+    assert api.launch_grid_x(api.VARIANT_OWNER_PIPELINED_EARLY, 1772, 148) == 443
     with pytest.raises(ValueError):
-        loader.launch_grid_x(8, {"kind": "unknown"}, sm_count=1)
+        api.launch_grid_x("unknown", 8, 148)
+    with pytest.raises(ValueError):
+        api.persistent_grid(0, 148)
 
 
-def test_route_scope_is_eight_sm100_or_sm103_peers_with_hidden_2560() -> None:
-    assert loader.arch_for_capability((10, 0)) == "sm_100a"
-    assert loader.arch_for_capability((10, 3)) == "sm_103a"
-    assert loader.arch_for_capability((9, 0)) is None
-    for capability in ((10, 0), (10, 3)):
-        assert loader.route_applies(
-            world_size=8, device_capability=capability, hidden_dim=2560
-        )
-        assert not loader.route_applies(
-            world_size=4, device_capability=capability, hidden_dim=2560
-        )
-        assert not loader.route_applies(
-            world_size=8, device_capability=capability, hidden_dim=4096
-        )
-    for capability in ((9, 0), (12, 0), (12, 1)):
-        assert not loader.route_applies(
-            world_size=8, device_capability=capability, hidden_dim=2560
-        )
+def test_generated_programs_match_the_host_plan() -> None:
+    programs = tuple(getattr(loader, name) for name in api.VARIANTS)
+    assert programs == loader.PROGRAMS
+    host_args = (
+        "x",
+        "residual",
+        "weight",
+        "norm_out",
+        "residual_out",
+        "collective_out",
+        "workspace",
+        "rank",
+        "tokens",
+        "epsilon",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    )
+    for name in api.VARIANTS:
+        program = getattr(loader, name)
+        assert program.targets == ("sm_100a", "sm_103a")
+        assert program.args == host_args
+        assert program.use_pdl
+        assert program.cluster == (1, 1, 1)
+        # Only the persistent programs synchronize grid-wide.
+        assert program.cooperative == (name in api.CTAS_PER_SM)
+        assert program.target_for((10, 0)) == "sm_100a"
+        assert program.target_for((10, 3)) == "sm_103a"
+        for capability in ((9, 0), (10, 7), (12, 0)):
+            assert program.target_for(capability) is None
+
+
+def test_target_scope(monkeypatch) -> None:
+    facts = {0: ((10, 0), 148), 1: ((10, 3), 148), 2: ((9, 0), 132)}
+    monkeypatch.setattr(api, "_device_facts", lambda index: facts[index])
+    assert api.cake_fused_norm_combine_target(torch.device("cuda", 0)) == "sm_100a"
+    assert api.cake_fused_norm_combine_target(torch.device("cuda", 1)) == "sm_103a"
+    with pytest.raises(ValueError, match="10.0"):
+        api.cake_fused_norm_combine_target(torch.device("cuda", 2))
 
 
 def test_workspace_layout_matches_the_kernel_contract() -> None:
@@ -377,6 +347,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
+    sm_count = torch.cuda.get_device_properties(rank).multi_processor_count
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://127.0.0.1:{port}",
@@ -393,6 +364,7 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             device=device,
         )
         epsilon = 1e-6
+        cases = {}
         for tokens in TOKENS_UNDER_TEST:
             generator = torch.Generator(device="cpu").manual_seed(
                 17 + 104729 * rank + tokens
@@ -406,11 +378,6 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             weight = torch.randn(2, 2560, generator=generator, dtype=torch.bfloat16).to(
                 device
             )
-            norm_out = torch.zeros_like(x)
-            residual_out = torch.zeros_like(x)
-            collective_out = torch.zeros(
-                tokens, 2560, dtype=torch.bfloat16, device=device
-            )
             normalized, residual_ref, contribution = _local_reference(
                 x, residual, weight, epsilon
             )
@@ -419,31 +386,40 @@ def _worker(rank: int, world_size: int, port: int) -> None:
             reduced = gathered[0].clone()
             for peer in range(1, world_size):
                 reduced = (reduced.float() + gathered[peer].float()).to(torch.bfloat16)
-            # Two launches on the same workspace exercise the payload rotation.
-            for _launch in range(2):
-                norm_out.zero_()
-                residual_out.zero_()
-                collective_out.zero_()
-                comm.cake_fused_norm_combine(
-                    x,
-                    residual,
-                    weight,
-                    norm_out=norm_out,
-                    residual_out=residual_out,
-                    collective_out=collective_out,
-                    workspace=workspace,
-                    epsilon=epsilon,
-                )
-                torch.cuda.synchronize(device)
-                _assert_close_all_ranks(
-                    norm_out, normalized, label=f"norm_out T={tokens}"
-                )
-                _assert_close_all_ranks(
-                    residual_out, residual_ref, label=f"residual_out T={tokens}"
-                )
-                _assert_close_all_ranks(
-                    collective_out, reduced, label=f"collective_out T={tokens}"
-                )
+            cases[tokens] = (x, residual, weight, normalized, residual_ref, reduced)
+        # Two launches per token count exercise the payload rotation; the
+        # descending pass switches every band in the other direction, so each
+        # program clears what another program left in the shared workspace.
+        order = [tokens for tokens in TOKENS_UNDER_TEST for _launch in range(2)]
+        order += list(reversed(TOKENS_UNDER_TEST))
+        for tokens in order:
+            x, residual, weight, normalized, residual_ref, reduced = cases[tokens]
+            norm_out = torch.zeros_like(x)
+            residual_out = torch.zeros_like(x)
+            collective_out = torch.zeros(
+                tokens, 2560, dtype=torch.bfloat16, device=device
+            )
+            comm.cake_fused_norm_combine(
+                x,
+                residual,
+                weight,
+                norm_out=norm_out,
+                residual_out=residual_out,
+                collective_out=collective_out,
+                workspace=workspace,
+                epsilon=epsilon,
+            )
+            torch.cuda.synchronize(device)
+            variant = api.select_variant(tokens, sm_count)
+            _assert_close_all_ranks(
+                norm_out, normalized, label=f"norm_out T={tokens} {variant}"
+            )
+            _assert_close_all_ranks(
+                residual_out, residual_ref, label=f"residual_out T={tokens} {variant}"
+            )
+            _assert_close_all_ranks(
+                collective_out, reduced, label=f"collective_out T={tokens} {variant}"
+            )
     finally:
         if workspace is not None:
             comm.cake_fused_norm_combine_destroy_workspace(workspace)
@@ -456,7 +432,7 @@ def _exported_eight_gpu_node() -> bool:
     capabilities = {
         tuple(torch.cuda.get_device_capability(index)) for index in range(8)
     }
-    return len(capabilities) == 1 and capabilities.issubset(loader.ARCH_BY_CAPABILITY)
+    return len(capabilities) == 1 and capabilities.issubset(api.SUPPORTED_CAPABILITIES)
 
 
 @pytest.mark.skipif(

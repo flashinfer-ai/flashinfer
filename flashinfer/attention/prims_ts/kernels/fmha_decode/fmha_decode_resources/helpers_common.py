@@ -156,7 +156,14 @@ def _swaps_routed_coordinate(
 
 
 def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family for the QK GEMM."""
+    """Select the tcgen05 MMA kind of the QK GEMM from ``qk_dtype``.
+
+    Int8 accumulates INT32 scores; E4M3 and the 16-bit types accumulate FP32.
+    The INT8 kind exists on SM100 alone, so planning admits Int8 Q/K only on
+    that architecture (``_validate_int8_qk_device``).
+    """
+    if cfg.uses_int32_scores:
+        return prims.Tcgen05MMAKind.INT8
     if cfg.use_fp8_qk:
         return prims.Tcgen05MMAKind.F8F6F4
     return prims.Tcgen05MMAKind.F16
@@ -164,7 +171,7 @@ def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
 
 def _mma_k_step_qk(cfg: FmhaDecodeConfig) -> int:
     """Return the K dimension advanced by one QK-GEMM MMA instruction."""
-    return 32 if cfg.use_fp8_qk else 16
+    return 32 if cfg.qk_dtype_bytes == 1 else 16
 
 
 def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
@@ -176,7 +183,16 @@ def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
 
 def _mma_k_step_pv(cfg: FmhaDecodeConfig) -> int:
     """Return the K dimension advanced by one PV-GEMM MMA instruction."""
-    return 32 if cfg.use_fp8_pv else 16
+    return cfg.pv_mma_k_step
+
+
+def _qk_accumulator_dtype(cfg: FmhaDecodeConfig) -> type:
+    """Return the type the QK GEMM accumulates one score as: Int32 for Int8 Q/K.
+
+    INT32 scores are accumulated on top of ``INT32_SCORE_BIAS``, so the
+    softmax reads every score tile as FP32.
+    """
+    return Int32 if cfg.uses_int32_scores else Float32
 
 
 @cute.jit
@@ -257,6 +273,32 @@ def _keeps_q64_col_base(lane_idx: Int32, half_cols: int) -> Int32:
 
 
 @cute.jit
+def _keeps_spatial_half(
+    cfg: Constexpr[FmhaDecodeConfig], warp_grp_thread_idx: Int32
+) -> Int32:
+    """Return the spatial half a Keeps warp-group thread belongs to.
+
+    KV256 threads ``[0, 64)`` and ``[64, 128)`` own the two spatial KV128
+    partials of one logical Q row (``FmhaDecodeConfig.keeps_spatial_halves``);
+    every other Keeps profile has a single half.
+    """
+    if cutlass.const_expr(cfg.keeps_spatial_halves == 2):
+        return warp_grp_thread_idx >> Int32(6)
+    return Int32(0)
+
+
+@cute.jit
+def _keeps_route_atom(cfg: Constexpr[FmhaDecodeConfig], half: Int32, position) -> Int32:
+    """Return the route atom a Keeps spatial half owns at ``position``.
+
+    The halves interleave over the route's atoms: half ``h`` owns atoms ``h``,
+    ``h + halves``, ... in order, so its ``position``-th atom is ``position *
+    halves + h`` (``FmhaDecodeConfig.keeps_route_atom_owner`` is the inverse).
+    """
+    return position * Int32(cfg.keeps_spatial_halves) + half
+
+
+@cute.jit
 def _keeps_row_idx(cfg: Constexpr[FmhaDecodeConfig], warp_grp_thread_idx: Int32):
     """Map a correction lane to the logical output row it owns."""
     if cutlass.const_expr(cfg.tile_size_kv == 256):
@@ -289,16 +331,18 @@ def _keeps_score_col(
 ) -> Int32:
     """Return the semantic KV column represented by one Keeps score register."""
     if cutlass.const_expr(cfg.tile_size_kv == 256):
-        # A physical thread owns four K32 fragments. The spatial half selects
-        # alternating KV64 blocks; the temporal fragment selects the low/high
-        # K32 sub-block inside that semantic KV64 block.
-        spatial = warp_grp_thread_idx >> Int32(6)
-        fragment = reg_idx // 32
-        semantic_block = Int32(2 * (fragment // 2)) + spatial
+        # A physical thread owns four K32 fragments: ``keeps_fragments_per_atom``
+        # per layout atom of its spatial half (``_keeps_route_atom``), each
+        # fragment one K32 sub-block of that atom.
+        fragment_regs = cfg.softmax_score_fragment_regs
+        fragments_per_atom = cfg.keeps_fragments_per_atom
+        spatial = _keeps_spatial_half(cfg, warp_grp_thread_idx)
+        fragment = reg_idx // fragment_regs
+        semantic_block = _keeps_route_atom(cfg, spatial, fragment // fragments_per_atom)
         return (
-            semantic_block * Int32(64)
-            + Int32((fragment % 2) * 32)
-            + Int32(reg_idx % 32)
+            semantic_block * Int32(cfg.keeps_atom_tokens)
+            + Int32((fragment % fragments_per_atom) * fragment_regs)
+            + Int32(reg_idx % fragment_regs)
         )
     return col_base + Int32(reg_idx)
 
@@ -381,7 +425,7 @@ def _qkv_smem_swizzle(
     cfg: FmhaDecodeConfig,
 ) -> prims.Tcgen05SmemSwizzle:
     """Select the tcgen05 SMEM swizzle for staged Q tiles."""
-    if cfg.use_fp8_q and cfg.headdim == 64:
+    if cfg.q_dtype_bytes == 1 and cfg.headdim == 64:
         return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
     return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 
@@ -390,7 +434,7 @@ def _kv_smem_swizzle(
     cfg: FmhaDecodeConfig,
 ) -> prims.Tcgen05SmemSwizzle:
     """Select the tcgen05 SMEM swizzle for raw staged K/V tiles."""
-    if cfg.use_fp8_kv and cfg.headdim == 64:
+    if cfg.k_dtype.width == 8 and cfg.v_dtype.width == 8 and cfg.headdim == 64:
         return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
     return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 
@@ -412,15 +456,36 @@ def _major_k_stride_bytes(dtype_bytes: int, headdim: int) -> int:
     return 128 * rows_per_swizzle_blk
 
 
-@cute.jit
-def _fp8_log2_quant_scale() -> Float32:
-    """Return log2 scaling used by FP8 probability quantization."""
-    return Float32(8.8073549)
-
-
 def _neg_max_f32() -> Float32:
     """Return the negative sentinel used for running softmax maxima."""
     return Float32(NEG_FLT_MAX)
+
+
+@cute.jit
+def _masked_weighted_sum(terms: tuple) -> Float32:
+    """Return the sum of ``value * weight`` over four ``(uses, value, weight)`` terms.
+
+    A term whose ``uses`` is false contributes zero, whatever its value. The
+    fixed term order makes lanes that share a row agree bitwise.
+    """
+    assert len(terms) == 4
+    (uses0, value0, weight0), (uses1, value1, weight1) = terms[0], terms[1]
+    (uses2, value2, weight2), (uses3, value3, weight3) = terms[2], terms[3]
+    masked0 = Float32(0.0)
+    masked1 = Float32(0.0)
+    masked2 = Float32(0.0)
+    masked3 = Float32(0.0)
+    if uses0:
+        masked0 = value0
+    if uses1:
+        masked1 = value1
+    if uses2:
+        masked2 = value2
+    if uses3:
+        masked3 = value3
+    lanes = ffma2((masked0, masked2), (weight0, weight2), (Float32(0.0), Float32(0.0)))
+    lanes = ffma2((masked1, masked3), (weight1, weight3), lanes)
+    return lanes[0] + lanes[1]
 
 
 def _softmax_tile_idx(
@@ -490,12 +555,26 @@ def _logical_head_batch(
 
 
 @cute.jit
+def split_kv_grid_coord(
+    cfg: Constexpr[FmhaDecodeConfig], coord: cute.Coord
+) -> cute.Coord:
+    """Map compact split/Q/batch launches to capacity-strided task coordinates."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        q_group = Int32(coord[2]) % Int32(cfg.num_q_ctas)
+        batch = Int32(coord[2]) // Int32(cfg.num_q_ctas)
+        return (q_group * Int32(cfg.splits_kv) + Int32(coord[0]), coord[1], batch)
+    return coord
+
+
+@cute.jit
 def _logical_q_group_idx(
     cfg: Constexpr[FmhaDecodeConfig],
     stage_info: StageInfo,
     fallback_q_group_idx: Int32,
 ) -> Int32:
     """Resolve the q-group from the persistent work tile or static launch."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        return Int32(cute.arch.block_idx()[2]) % Int32(cfg.num_q_ctas)
     if cutlass.const_expr(cfg.has_single_q_cta):
         # A split coordinate may still vary in grid X, but every physical CTA
         # maps to logical Q group zero. State this explicitly because the
@@ -516,7 +595,7 @@ def _q_tile_output_row_base(
     """Return the first packed output row owned by a logical Q CTA."""
     if cutlass.const_expr(cfg.uses_nontrivial_grouped_q_layout):
         return q_group_idx * Int32(cfg.q_tma_rows_per_cta)
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )
@@ -528,13 +607,37 @@ def _q_tile_output_row_base(
     return q_group_idx * Int32(cfg.tile_size_q)
 
 
+class UniformQueryOffsets:
+    """Affine offsets for fixed-layout Q, with a runtime token count."""
+
+    def __init__(self, seq_len_q):
+        self.values = (seq_len_q,)
+
+    def __extract_mlir_values__(self):
+        return cutlass.extract_mlir_values(self.values)
+
+    def __new_from_mlir_values__(self, values):
+        return UniformQueryOffsets(cutlass.new_from_mlir_values(self.values, values)[0])
+
+    @property
+    def seq_len_q(self):
+        return self.values[0]
+
+    @cute.jit
+    def __getitem__(self, index):
+        return Int32(index) * Int32(self.seq_len_q)
+
+
 @cute.jit
 def _q_seq_bounds(
     cfg: Constexpr[FmhaDecodeConfig],
-    cu_seqlens_q: cute.Pointer | None,
+    cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None,
     batch_idx: Int32,
 ) -> tuple[Int32, Int32]:
     """Return packed Q token offset/length, or fixed-SQ neutral bounds."""
+    if cutlass.const_expr(isinstance(cu_seqlens_q, UniformQueryOffsets)):
+        length = Int32(cu_seqlens_q.seq_len_q)
+        return Int32(batch_idx) * length, length
     if cutlass.const_expr(cfg.use_variable_seqlens_q):
         q_begin = Int32(cu_seqlens_q[batch_idx])
         q_end = Int32(cu_seqlens_q[batch_idx + Int32(1)])
@@ -547,7 +650,7 @@ def _q_group_token_base(cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32) ->
     """Return the first Q token owned by a logical Q CTA."""
     if cutlass.const_expr(cfg.uses_nontrivial_grouped_q_layout):
         return q_group_idx * Int32(cfg.q_tokens_per_cta)
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )
@@ -573,7 +676,7 @@ def _q_tile_valid_rows_for_seq(
         remaining_tokens = cute.math.max(seq_len_q - token_base, Int32(0))
         valid_tokens = cute.math.min(remaining_tokens, Int32(cfg.q_tokens_per_cta))
         return valid_tokens * Int32(cfg.heads_q_per_kv)
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )
@@ -642,7 +745,7 @@ def _q_physical_output_row_from_token_and_local_head(
         num_heads_q = num_heads_kv * heads_q_per_kv
         global_head_idx = kv_head_idx * heads_q_per_kv + local_head_idx
         return (q_token_offset + q_token_idx) * num_heads_q + global_head_idx
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         heads_q_per_kv = Int32(cfg.heads_q_per_kv)
         num_heads_q = num_heads_kv * heads_q_per_kv
         global_head_idx = kv_head_idx * heads_q_per_kv + local_head_idx
@@ -750,7 +853,7 @@ def _q_row_token_and_local_head(
             q_group_idx * Int32(cfg.q_tokens_per_cta) + token_offset,
             local_head,
         )
-    if cutlass.const_expr(cfg.max_seq_len_q > 1):
+    if cutlass.const_expr(cfg.is_multi_token_q):
         head_ctas_per_token = Int32(
             (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
         )
@@ -817,3 +920,21 @@ class DecodeGenResourceBase(MemoryResource):
     def _init_placeholder_state(self) -> None:
         """Hook for subclasses to install placeholder arrays before tracing."""
         return
+
+
+# Keeps softmax staging reserves bit 5 for the prepared route kind; the low
+# four structural validity bits and bit 4 keep their meaning.
+_SOFTMAX_ROUTE_IS_PROXY_FLAG = 1 << 5
+
+
+@cute.jit
+def _route_is_proxy(route_flags: Int32) -> cutlass.Boolean:
+    """Return whether staged Softmax route flags mark a proxy route.
+
+    Keeps stages the flags as an ``Int32`` word. SWAP forwards them as a
+    bit-preserving ``Uint32`` dataflow token, which the consumer bitcasts
+    before calling.
+    """
+    return cutlass.Boolean(
+        (route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
+    )

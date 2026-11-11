@@ -18,12 +18,13 @@ import ctypes
 import functools
 import math
 from enum import IntEnum
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
 from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
+from ...utils import check_shape_dtype_device, get_compute_capability
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -53,20 +54,37 @@ def _is_finite_fp32(value: float, *, positive: bool = False) -> bool:
 
 SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
-    ActivationType.Situ,
+    ActivationType.GegluTanh,
+    ActivationType.Relu2,
+    ActivationType.ClampedRelu2,
+)
+
+# The SM90 and W4A16 epilogues have no ClampedRelu2 variant.
+SM90_CUTE_DSL_MOE_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
     ActivationType.GegluTanh,
     ActivationType.Relu2,
 )
+W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES = SM90_CUTE_DSL_MOE_ACTIVATION_TYPES
 
 
 def normalize_cute_dsl_moe_activation_type(
     activation_type: Union[int, ActivationType],
+    supported: Tuple[ActivationType, ...] = SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES,
+    backend: Optional[str] = None,
 ) -> Tuple[ActivationType, bool]:
+    """Normalize ``activation_type`` and return it with its gatedness.
+
+    ``supported`` narrows the accepted activations for a backend that
+    implements only a subset; ``backend`` names it in the error message.
+    """
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES:
-        expected = " or ".join(repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES)
+    if activation_type not in supported:
+        expected = " or ".join(repr(t) for t in supported)
+        where = f" for {backend}" if backend else ""
         raise ValueError(
-            f"Unsupported activation_type {activation_type!r}; expected {expected}"
+            f"Unsupported activation_type {activation_type!r}{where}; "
+            f"expected {expected}"
         )
     return activation_type, is_gated_activation(activation_type)
 
@@ -87,41 +105,83 @@ def validate_cute_dsl_moe_swiglu_config(
 
 def validate_cute_dsl_moe_situ_config(
     activation_type: ActivationType,
-    situ_beta: Optional[Union[float, torch.Tensor]],
-    situ_linear_beta: Optional[Union[float, torch.Tensor]],
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
 ) -> None:
     """Validate the optional SiTU variant of the SwiGLU epilogue."""
     if situ_beta is None:
-        if activation_type == ActivationType.Situ:
-            raise ValueError("ActivationType.Situ requires situ_beta")
         if situ_linear_beta is not None:
             raise ValueError("situ_linear_beta requires situ_beta")
         return
-    if activation_type not in (ActivationType.Swiglu, ActivationType.Situ):
-        raise ValueError("SiTU parameters require ActivationType.Situ or Swiglu")
-    runtime = isinstance(situ_beta, torch.Tensor)
-    for name, value in (
-        ("situ_beta", situ_beta),
-        ("situ_linear_beta", situ_linear_beta),
+    if activation_type != ActivationType.Swiglu:
+        raise ValueError("SiTU parameters require ActivationType.Swiglu")
+    if not _is_finite_fp32(situ_beta, positive=True):
+        raise ValueError("situ_beta must be positive and finite in fp32")
+    if situ_linear_beta is not None and not _is_finite_fp32(
+        situ_linear_beta, positive=True
     ):
-        if value is None:
-            continue
-        if isinstance(value, torch.Tensor):
-            if not runtime:
-                raise TypeError("Tensor situ_linear_beta requires tensor situ_beta")
-            if value.dtype != torch.float32 or value.device.type != "cuda":
-                raise TypeError(f"{name} must be a CUDA float32 tensor")
-            if not value.is_contiguous() or value.numel() == 0:
-                raise ValueError(f"{name} must be nonempty and contiguous")
-            # Runtime values are caller-owned device data. Reading them here
-            # would synchronize the host and break CUDA Graph capture.
-        else:
-            if runtime:
-                raise TypeError(
-                    "Tensor situ_beta requires tensor situ_linear_beta or None"
-                )
-            if not _is_finite_fp32(value, positive=True):
-                raise ValueError(f"{name} must be positive and finite in fp32")
+        raise ValueError(
+            "situ_linear_beta must be positive and finite in fp32 when set"
+        )
+
+
+def rubin_moe_cluster_covers_one_tile(
+    tile_size: int,
+    mma_tiler: Tuple[int, int, int],
+    mma_inst_shape: Tuple[int, int, int],
+    cluster_shape_mn: Tuple[int, int],
+) -> bool:
+    """Return whether a Rubin (SM107) MoE GEMM tactic maps one cluster to one
+    ``moe_sort`` routing tile along M.
+
+    ``moe_sort`` writes one metadata entry (expert index, M limit) per
+    ``tile_size``-row routing tile, for ``[0, num_non_exiting_tiles)`` only;
+    both Rubin GEMMs bound their metadata reads by that count. A CTA's routing
+    tile is its M tile coordinate divided by ``atom_cta_m``, the MMA CTA
+    group size along M (2 for the 2-CTA ``mma_inst_shape[0] == 256`` MMA,
+    else 1). With ``mma_tiler[0] == tile_size`` and ``cluster_shape_mn[0] ==
+    atom_cta_m`` every CTA of a cluster resolves to the same routing tile, so
+    the CTAs agree on whether the tile is valid and reach the cluster barrier
+    together: no rounding of the tile count and no initialization of the
+    metadata past the active prefix is needed. A cluster spanning several
+    routing tiles (``cluster_shape_mn[0] > atom_cta_m``) would need both, and
+    is not supported. Cluster N only multicasts A/SFA among CTAs of the same
+    routing tile and does not affect this property.
+    """
+    atom_cta_m = 2 if mma_inst_shape[0] == 256 else 1
+    return mma_tiler[0] == tile_size and cluster_shape_mn[0] == atom_cta_m
+
+
+def validate_cute_dsl_moe_clamped_relu2_config(
+    activation_type: ActivationType,
+    clamped_relu2_limit: Optional[torch.Tensor],
+    device: Optional[torch.device] = None,
+) -> None:
+    """Validate the ClampedRelu2 limit: a (1,) float32 tensor, as in
+    ``cutlass_fused_moe``, required with ClampedRelu2 and rejected otherwise."""
+    if activation_type == ActivationType.ClampedRelu2:
+        if clamped_relu2_limit is None:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires a one-element "
+                "clamped_relu2_limit tensor"
+            )
+        if clamped_relu2_limit.ndim != 1 or clamped_relu2_limit.numel() != 1:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires model-wide "
+                "clamped_relu2_limit with shape (1,), got "
+                f"{tuple(clamped_relu2_limit.shape)}"
+            )
+        check_shape_dtype_device(
+            clamped_relu2_limit,
+            (1,),
+            torch.float32,
+            device,
+            "ClampedRelu2 clamped_relu2_limit",
+        )
+    elif clamped_relu2_limit is not None:
+        raise ValueError(
+            "clamped_relu2_limit is supported only with ActivationType.ClampedRelu2"
+        )
 
 
 def get_max_num_tiles(
@@ -424,11 +484,7 @@ def moe_output_memset(
     )
 
 
-def moe_output_memset_inplace(
-    output: torch.Tensor,
-    *,
-    _prepared_launches: Optional[Dict[str, Any]] = None,
-) -> None:
+def moe_output_memset_inplace(output: torch.Tensor) -> None:
     """
     Zero the active MoE output slice via ``cudaMemsetAsync`` on the current
     CUDA stream.
@@ -485,10 +541,7 @@ def moe_output_memset_inplace(
     func_name = f"flashinfer_moe_output_memset_inplace_{dtype_suffix}"
     func = module[func_name]
 
-    launch_args = (output.data_ptr(), num_tokens, hidden_size)
-    if _prepared_launches is not None:
-        _prepared_launches["memset"] = (func, launch_args)
-    func(*launch_args, _get_cuda_stream_ptr())
+    func(output.data_ptr(), num_tokens, hidden_size, _get_cuda_stream_ptr())
 
 
 # ============================ moe_sort ============================
@@ -525,7 +578,6 @@ def allocate_moe_sort_buffers(
             - out_permuted_idx_to_expanded_idx
             - out_total_num_padded_tokens
             - out_num_non_exiting_tiles
-            - out_expert_counts (scratch used for num_tokens > 1024)
 
     Example:
         >>> # Pre-allocate before CUDA graph capture
@@ -569,9 +621,6 @@ def allocate_moe_sort_buffers(
         "out_num_non_exiting_tiles": torch.empty(
             (1,), dtype=torch.int32, device=device
         ),
-        "out_expert_counts": torch.empty(
-            (2 * num_experts,), dtype=torch.int32, device=device
-        ),
     }
 
 
@@ -591,22 +640,6 @@ def moe_sort(
     out_permuted_idx_to_expanded_idx: Optional[torch.Tensor] = None,
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
-    out_expert_counts: Optional[torch.Tensor] = None,
-    # Dual-tile routing (off when tile_tokens_dim_alt == 0): the routing kernel
-    # pads each routing to tile_tokens_dim or tile_tokens_dim_alt (the coarser
-    # tile, a power-of-two multiple of tile_tokens_dim), taking the coarser
-    # tile when its padded rows are within dual_tile_threshold_permille / 1000
-    # of the base tile's. The base list is always written over the chosen
-    # padding; the alternate list and the two active counts (base count or 0,
-    # alternate count or 0) select which of two grouped-GEMM launches runs.
-    tile_tokens_dim_alt: int = 0,
-    dual_tile_threshold_permille: int = 0,
-    out_alt_tile_idx_to_expert_idx: Optional[torch.Tensor] = None,
-    out_alt_tile_idx_to_mn_limit: Optional[torch.Tensor] = None,
-    out_alt_num_non_exiting_tiles: Optional[torch.Tensor] = None,
-    out_base_active_num_non_exiting_tiles: Optional[torch.Tensor] = None,
-    *,
-    _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[
     torch.Tensor,  # tile_idx_to_expert_idx
     torch.Tensor,  # tile_idx_to_mn_limit
@@ -708,32 +741,13 @@ def moe_sort(
 
     device = token_selected_experts.device
 
-    # Calculate buffer sizes. Dual-tile routing sizes the permuted rows by the
-    # coarser tile (its padding is the larger) and the base list by those rows.
-    if tile_tokens_dim_alt:
-        if (
-            tile_tokens_dim_alt <= tile_tokens_dim
-            or tile_tokens_dim_alt % tile_tokens_dim
-            or tile_tokens_dim_alt & (tile_tokens_dim_alt - 1)
-            or tile_tokens_dim & (tile_tokens_dim - 1)
-        ):
-            raise ValueError(
-                "tile_tokens_dim_alt must be a power-of-two multiple of tile_tokens_dim"
-            )
-        if dual_tile_threshold_permille <= 0:
-            raise ValueError("dual_tile_threshold_permille must be positive")
-        max_num_permuted_tokens = get_max_num_permuted_tokens(
-            num_tokens, top_k, num_local_experts, tile_tokens_dim_alt
-        )
-        max_num_tiles = max_num_permuted_tokens // tile_tokens_dim
-        max_num_alt_tiles = max_num_permuted_tokens // tile_tokens_dim_alt
-    else:
-        max_num_tiles = get_max_num_tiles(
-            num_tokens, top_k, num_local_experts, tile_tokens_dim
-        )
-        max_num_permuted_tokens = get_max_num_permuted_tokens(
-            num_tokens, top_k, num_local_experts, tile_tokens_dim
-        )
+    # Calculate buffer sizes
+    max_num_tiles = get_max_num_tiles(
+        num_tokens, top_k, num_local_experts, tile_tokens_dim
+    )
+    max_num_permuted_tokens = get_max_num_permuted_tokens(
+        num_tokens, top_k, num_local_experts, tile_tokens_dim
+    )
 
     # Ensure inputs are contiguous and correct dtypes
     token_selected_experts = token_selected_experts.contiguous()
@@ -747,8 +761,11 @@ def moe_sort(
     #
     # Entries outside the active prefix are intentionally uninitialized.
     # Routing writes [0, num_non_exiting_tiles), and both GEMMs consume exactly
-    # that count. Rubin multi-CTA tactics, which would require rounded/padded
-    # metadata entries, are rejected before moe_sort.
+    # that count. This also holds for Rubin 2-CTA and cluster_shape_n > 1
+    # tactics, whose clusters cover exactly one routing tile; tactics with a
+    # cluster spanning several routing tiles, which would require
+    # rounded/padded metadata entries, are rejected before moe_sort (see
+    # rubin_moe_cluster_covers_one_tile).
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
     else:
@@ -789,70 +806,18 @@ def moe_sort(
     else:
         num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    dual_ptrs = (0, 0, 0, 0)
-    if tile_tokens_dim_alt:
-        alt_expert_idx = out_alt_tile_idx_to_expert_idx
-        if alt_expert_idx is None:
-            alt_expert_idx = torch.empty(
-                (max_num_alt_tiles,), dtype=torch.int32, device=device
-            )
-        alt_mn_limit = out_alt_tile_idx_to_mn_limit
-        if alt_mn_limit is None:
-            alt_mn_limit = torch.empty(
-                (max_num_alt_tiles,), dtype=torch.int32, device=device
-            )
-        alt_count = out_alt_num_non_exiting_tiles
-        if alt_count is None:
-            alt_count = torch.empty((1,), dtype=torch.int32, device=device)
-        base_active = out_base_active_num_non_exiting_tiles
-        if base_active is None:
-            base_active = torch.empty((1,), dtype=torch.int32, device=device)
-        for name, buf, need in (
-            ("out_alt_tile_idx_to_expert_idx", alt_expert_idx, max_num_alt_tiles),
-            ("out_alt_tile_idx_to_mn_limit", alt_mn_limit, max_num_alt_tiles),
-            ("out_alt_num_non_exiting_tiles", alt_count, 1),
-            ("out_base_active_num_non_exiting_tiles", base_active, 1),
-        ):
-            if buf.dtype != torch.int32 or buf.numel() < need or buf.device != device:
-                raise ValueError(
-                    f"{name} must be int32 with >= {need} elements on {device}"
-                )
-        if (
-            tile_idx_to_expert_idx.numel() < max_num_tiles
-            or tile_idx_to_mn_limit.numel() < max_num_tiles
-            or permuted_idx_to_expanded_idx.numel() < max_num_permuted_tokens
-        ):
-            raise ValueError(
-                "dual-tile routing needs the base list sized by the coarser tile's "
-                f"padded rows ({max_num_tiles} tiles, {max_num_permuted_tokens} rows)"
-            )
-        dual_ptrs = (
-            alt_expert_idx.data_ptr(),
-            alt_mn_limit.data_ptr(),
-            alt_count.data_ptr(),
-            base_active.data_ptr(),
-        )
-
-    # Allocate expert counts buffer for large token counts (>1024).
+    # Expert counts buffer, required by the cooperative and multi-kernel routing
+    # paths. The block, dynamic-block and (SM90+ only) single-cluster kernels
+    # route small batches without it; 1024 tokens on SM90+ and 4 tokens before
+    # SM90 are conservative bounds of those kernels' limits.
     # Required size: 2 * num_experts. The kernel zeros this internally via
     # launchInitExpertCounts before reading, so no Python-side init is needed
     # (matching trt-llm's torch::empty allocation pattern).
-    if num_tokens > 1024:
-        expert_counts = out_expert_counts
-        if expert_counts is None:
-            expert_counts = torch.empty(
-                (2 * num_experts,), dtype=torch.int32, device=device
-            )
-        elif (
-            expert_counts.dtype != torch.int32
-            or expert_counts.device != device
-            or not expert_counts.is_contiguous()
-            or expert_counts.numel() < 2 * num_experts
-        ):
-            raise ValueError(
-                "out_expert_counts must be contiguous int32 on the routing device "
-                "with at least 2 * num_experts elements"
-            )
+    expert_counts_min_tokens = 1024 if get_compute_capability(device)[0] >= 9 else 4
+    if num_tokens > expert_counts_min_tokens:
+        expert_counts = torch.empty(
+            (2 * num_experts,), dtype=torch.int32, device=device
+        )
         expert_counts_ptr = expert_counts.data_ptr()
     else:
         expert_counts_ptr = 0  # Will be set to nullptr in kernel
@@ -864,7 +829,7 @@ def moe_sort(
     # Get PyTorch's current stream for CUDA graph compatibility
     cuda_stream_ptr = _get_cuda_stream_ptr()
 
-    launch_args = (
+    func(
         # Inputs
         token_selected_experts.data_ptr(),
         token_final_scales.data_ptr(),
@@ -884,14 +849,9 @@ def moe_sort(
         num_non_exiting_tiles.data_ptr(),
         # Optional buffer
         expert_counts_ptr,
-        # Dual-tile routing
-        tile_tokens_dim_alt,
-        dual_tile_threshold_permille,
-        *dual_ptrs,
+        # CUDA stream for CUDA graph compatibility
+        cuda_stream_ptr,
     )
-    if _prepared_launches is not None:
-        _prepared_launches["sort"] = (func, launch_args)
-    func(*launch_args, cuda_stream_ptr)
 
     # Return total_num_padded_tokens as tensor for CUDA graph compatibility
     # (avoiding .item() which causes CPU-GPU sync)
@@ -923,6 +883,8 @@ def moe_activation(
 
     This is a generic activation function that supports multiple activation types.
     For convenience, use the specific wrappers like moe_swiglu(), moe_gelu(), etc.
+    Only rows below their tile's ``tile_idx_to_mn_limit``, in the first
+    ``num_non_exiting_tiles`` tiles, are written.
 
     Args:
         input: Input tensor. For GLU activations (Swiglu, Geglu), shape is
@@ -958,6 +920,7 @@ def moe_activation(
         interm_size,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 

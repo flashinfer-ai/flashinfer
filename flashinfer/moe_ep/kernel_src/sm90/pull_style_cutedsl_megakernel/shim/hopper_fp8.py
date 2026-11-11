@@ -33,6 +33,9 @@ from typing import Any, Callable, Dict, Literal, Optional, Tuple  # noqa: F401
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
+from ..src.moe_hopper_fp8.fused_comm_policy import FUSED_COMM_OPTIMIZATION_VERSION
 from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
@@ -102,6 +105,7 @@ def _kind_to_cutlass_dtype(kind: str):
     }[kind]
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class MegaMoEHopperFp8Config:
     """Compile-time / launch-time SM90 FP8 MegaMoE configuration.
@@ -157,7 +161,7 @@ class MegaMoEHopperFp8Config:
     # pre-reduced in fp32 on the expert rank and ONE row per contributing
     # rank crosses the wire (inbox keyed by rank instead of topk slot).
     # Requires token_back_mode="reuse_dispatch_warps" and
-    # apply_topk_in_fc1=True; COLLECTIVE (wire format) like dedup_dispatch.
+    # apply_routing_weights_before_fc2=True; COLLECTIVE like dedup_dispatch.
     grouped_token_back: bool = False
     # Combine wire format: "bf16" (default), or the per-32 e8m0 quantized
     # fp8 wires "32e4m3xe8m0" / "32e5m2xe8m0" (halved return bytes; the
@@ -210,7 +214,7 @@ class MegaMoEHopperFp8Config:
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
     # standalone TopkReduce; Form B (ikr) requires True.
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
 
@@ -308,15 +312,18 @@ class MegaMoEHopperFp8Config:
                     "grouped_token_back and in_kernel_fc2_reduce both "
                     "collapse the combine; enable only one."
                 )
-            if not self.apply_topk_in_fc1:
+            if not self.apply_routing_weights_before_fc2:
                 raise ValueError(
-                    "grouped_token_back requires apply_topk_in_fc1=True "
+                    "grouped_token_back requires "
+                    "apply_routing_weights_before_fc2=True "
                     "(the group pre-reduce is a plain sum)."
                 )
-        if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
+        if self.in_kernel_fc2_reduce and not self.apply_routing_weights_before_fc2:
             # Kernel invariant: the Form B REDG path collapses topk before a
             # separate reducer could apply routing weights.
-            raise ValueError("in_kernel_fc2_reduce requires apply_topk_in_fc1=True.")
+            raise ValueError(
+                "in_kernel_fc2_reduce requires apply_routing_weights_before_fc2=True."
+            )
         if not self.force_static_sched:
             raise ValueError(
                 "The Hopper FP8 v1 kernel only implements "
@@ -515,10 +522,42 @@ class MegaMoEHopperFp8Frontend:
         *,
         num_tokens: Optional[int] = None,
     ) -> None:
+        self.prepare_launch(inputs, num_tokens=num_tokens)
+
+    def prepare_launch(
+        self,
+        inputs: MegaMoEHopperFp8Inputs,
+        *,
+        num_tokens: Optional[int] = None,
+        validated: Optional[tuple[MegaMoEHopperFp8Inputs, tuple]] = None,
+    ) -> None:
+        """Compile and cache complete launch arguments without launching."""
+
+        if validated is None:
+            validated = self.validate_launch(inputs, num_tokens=num_tokens)
+        if validated is None:
+            return None
+        launch_inputs, key = validated
+        mega = self._ensure_mega_compiled(inputs)
+        if mega.launch_key == key:
+            return None
+        mega.launch_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+        mega.launch_key = key
+        mega.launch_output = launch_inputs.output_activation
+
+    def validate_launch(
+        self,
+        inputs: MegaMoEHopperFp8Inputs,
+        *,
+        num_tokens: Optional[int] = None,
+    ) -> Optional[tuple[MegaMoEHopperFp8Inputs, tuple]]:
+        """Validate fixed inputs and build their resource-free launch key."""
+
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return None
-        self._ensure_mega_compiled(inputs)
+        resolved = self._resolve_num_tokens(inputs, num_tokens)
+        return launch_inputs, self._launch_cache_key(inputs, resolved)
 
     def run(
         self,
@@ -641,7 +680,14 @@ class MegaMoEHopperFp8Frontend:
 
     def _mega_compile_key(self) -> tuple:
         c = self.config
+        # This key describes the fully resolved constructor request after
+        # cache/heuristic/explicit-knob selection. The original selector
+        # (for example ``knobs=None`` versus an equivalent explicit dict) is
+        # intentionally not codegen identity. Vendor-internal self-gating may
+        # still make two distinct requests compile equivalently; retaining the
+        # requested values here safely avoids false cache hits.
         return (
+            FUSED_COMM_OPTIMIZATION_VERSION,
             c.kind,
             c.fp8_scale_mode,
             c.fp8_accum_mode,
@@ -667,7 +713,14 @@ class MegaMoEHopperFp8Frontend:
             c.in_kernel_fc2_reduce,
             c.resolved_token_back_mode,
             c.tail_split_pairs,
-            c.apply_topk_in_fc1,
+            c.apply_routing_weights_before_fc2,
+            c.dedup_dispatch,
+            c.grouped_token_back,
+            c.combine_format,
+            c.active_dispatch_warps,
+            c.fc1_store_offload,
+            c.fc1_early_done_publish,
+            c.fold_producer_warps,
             self._gate_up_clamp,
             c.enable_iket,
         )
@@ -713,7 +766,6 @@ class MegaMoEHopperFp8Frontend:
 
         import cutlass.cute as cute
         import cutlass.utils as cutlass_utils
-
         from common.megamoe_constants import Fp8E8M0SfVecSize, SfPaddingBlock
         from moe_hopper_fp8.megamoe_kernel_fp8 import (
             Sm90MegaMoEFp8Kernel,
@@ -771,7 +823,7 @@ class MegaMoEHopperFp8Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
             token_back_mode=c.resolved_token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
@@ -795,19 +847,26 @@ class MegaMoEHopperFp8Frontend:
             device="cuda",
         )
         shared_workspace = sym_zeros((shared_ws_bytes,), torch.uint8)
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace,
-            c.world_size,
-        )
-
+        # Publish ownership immediately after the collective allocation. If
+        # peer-offset discovery or compilation fails on one rank, the shared
+        # autotuner can still release this tensor in all-rank order.
         mega = _CompiledMega(
             compiled=None,
             kernel=kernel,
             local_workspace=local_workspace,
             shared_workspace=shared_workspace,
-            symmetric_base=symmetric_base,
-            peer_offsets_list=peer_offsets_list,
+            symmetric_base=0,
+            peer_offsets_list=(),
         )
+        self._mega = mega
+        self._mega_key = None
+        symmetric_base, peer_offsets_list = _compute_peer_offsets(
+            shared_workspace,
+            c.world_size,
+        )
+
+        mega.symmetric_base = symmetric_base
+        mega.peer_offsets_list = tuple(peer_offsets_list)
         if c.generate_c:
             # Expert-major pool rows (kernel.pool_token_capacity already counts
             # the 128-row padding per local expert); zeroed so pad rows stay 0.
@@ -823,8 +882,7 @@ class MegaMoEHopperFp8Frontend:
 
         mega.compiled = cute.compile(kernel, **compile_kwargs)
         self._mega_key = key
-        self._mega = mega
-        return self._mega
+        return mega
 
     @property
     def fc1_c(self) -> Optional[torch.Tensor]:
@@ -1324,7 +1382,8 @@ class MegaMoEHopperFp8SymmBuffer:
         return cached
 
 
-def get_symm_buffer_for_hopper_fp8_mega_moe(
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
+def resolve_hopper_fp8_mega_moe_config(
     num_total_experts: int,
     num_max_tokens: int,
     num_topk: int,
@@ -1336,11 +1395,6 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     kind: HopperFp8Kind = "fp8_e4m3",
     fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
-    # knobs=None resolves the knob cache (offline-tuned winners) and falls
-    # back to the heuristic table; a dict applies those knobs directly;
-    # "auto" starts from the resolved knobs and re-tunes at the first
-    # compute (backend-driven collective sweep).  Mutually exclusive with
-    # the explicit geometry arguments below.
     knobs: Optional[Any] = None,
     swap_ab: Optional[bool] = None,
     pingpong: Optional[bool] = None,
@@ -1362,7 +1416,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     # None = the heuristic table's per-bucket value (manual geometry: the
     # kernel default / FP8_TAIL_SPLIT override); an explicit bool wins.
@@ -1372,34 +1426,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     num_sched_stages: Optional[int] = None,
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
-) -> MegaMoEHopperFp8SymmBuffer:
-    """Allocate symmetric-heap inputs + combine staging for one SM90 FP8 session.
-
-    Argument order follows the SM100 frontends (problem sizes first).  Pass
-    ``rank`` / ``world_size`` from :func:`init_dist`.
-
-    ``kind`` selects the fp8 element format (``fp8_e4m3`` or ``fp8_e5m2``).
-    ``fp8_scale_mode`` picks the scale ABI (legacy per-tensor E8M0 wire vs
-    blockwise FP32 scales); ``fp8_accum_mode`` picks 1x vs 2x FP8 WGMMA
-    accumulation.
-
-    Launch geometry (``swap_ab`` / ``pingpong`` / ``mma_tiler_mnk`` /
-    ``cluster_shape_mnk``) follows the drop driver's token heuristics
-    (``moe_hopper_fp8/heuristic_config.py``, keyed on ``fp8_scale_mode`` and
-    ``num_max_tokens``) when ALL four are ``None``.  Setting any one of them
-    switches to manual mode: unset knobs fall back to the drop driver's
-    defaults (``swap_ab=False``, ``pingpong=False``, tiler (64, 128, 128)
-    native / (256, 32, 128) swap-AB / (128, 32, 128) swap-AB ping-pong,
-    cluster (1, 1, 1)).
-    ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is
-    a deprecated alias for ``gate_up_clamp``.
-    ``intermediate`` is the post-SwiGLU width, matching the SM100 frontends
-    and SGLang (the kernel's gate+up width is ``2 * intermediate``).
-
-    Expert weights are not allocated here; supply kernel-ready
-    ``(weight, weight_sf, activation_dequant_scale, weight_dequant_scale)``
-    tuples to :func:`hopper_fp8_mega_moe` instead.
-    """
+) -> MegaMoEHopperFp8Config:
+    """Resolve the complete constructor config without GPU work or allocation."""
     if hidden % 64 != 0 or intermediate % 64 != 0:
         raise ValueError(
             "MegaMoE requires hidden and intermediate to be multiples of 64."
@@ -1418,7 +1446,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     )
     knob_overrides: Dict[str, Any] = {}
     if manual_geometry:
-        if isinstance(knobs, dict) and knobs:
+        if knobs is not None:
             raise ValueError(
                 "pass either explicit geometry arguments (swap_ab / pingpong "
                 "/ mma_tiler_mnk / cluster_shape_mnk) or knobs=, not both."
@@ -1468,6 +1496,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
                 num_experts=num_total_experts,
                 topk=num_topk,
                 max_tokens=num_max_tokens,
+                gate_up_clamp=clamp,
             )
         # The table row's scheduler companions (group_hint / tail_split_pairs)
         # were tuned together with its geometry: keep them only while the
@@ -1532,7 +1561,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,
         tail_split_pairs=bool(tail_split_pairs),
@@ -1547,9 +1576,140 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         from .tuner import with_knobs
 
         cfg = with_knobs(cfg, knob_overrides)
+    return cfg
+
+
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
+def get_symm_buffer_for_hopper_fp8_mega_moe(
+    num_total_experts: int,
+    num_max_tokens: int,
+    num_topk: int,
+    hidden: int,
+    intermediate: int,
+    rank: int,
+    world_size: int,
+    *,
+    kind: HopperFp8Kind = "fp8_e4m3",
+    fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
+    fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
+    # knobs=None resolves the knob cache (offline-tuned winners) and falls
+    # back to the heuristic table; a dict applies those knobs directly;
+    # "auto" starts from the resolved knobs and re-tunes at the first
+    # compute (backend-driven collective sweep).  Mutually exclusive with
+    # the explicit geometry arguments below.
+    knobs: Optional[Any] = None,
+    swap_ab: Optional[bool] = None,
+    pingpong: Optional[bool] = None,
+    mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
+    cluster_shape_mnk: Optional[Tuple[int, int, int]] = None,
+    gate_up_clamp: Optional[float] = None,
+    activation_clamp: Optional[float] = None,
+    in_kernel_fc2_reduce: bool = False,
+    token_back_by_dispatch: bool = False,
+    token_back_mode: Optional[
+        Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
+    ] = None,
+    dedup_dispatch: bool = False,
+    grouped_token_back: bool = False,
+    combine_format: str = "bf16",
+    active_dispatch_warps: int = 1,
+    compact_pull_buffer: bool = True,
+    fc1_store_offload: bool = True,
+    fc1_early_done_publish: bool = False,
+    fold_producer_warps: bool = True,
+    generate_c: bool = False,
+    apply_routing_weights_before_fc2: bool = True,
+    load_balance_mode: Literal["static", "atomic_counter"] = "static",
+    group_hint: Optional[int] = None,
+    tail_split_pairs: Optional[bool] = None,
+    clc_bundle_size: Optional[int] = None,
+    num_sched_stages: Optional[int] = None,
+    flag_batch: int = 1,
+    epi_flag_batch: Tuple[int, int] = (2, 4),
+) -> MegaMoEHopperFp8SymmBuffer:
+    """Allocate symmetric-heap inputs + combine staging for one SM90 FP8 session.
+
+    Argument order follows the SM100 frontends (problem sizes first).  Pass
+    ``rank`` / ``world_size`` from :func:`init_dist`.
+
+    ``kind`` selects the fp8 element format (``fp8_e4m3`` or ``fp8_e5m2``).
+    ``fp8_scale_mode`` picks the scale ABI (legacy per-tensor E8M0 wire vs
+    blockwise FP32 scales); ``fp8_accum_mode`` picks 1x vs 2x FP8 WGMMA
+    accumulation.
+
+    Launch geometry (``swap_ab`` / ``pingpong`` / ``mma_tiler_mnk`` /
+    ``cluster_shape_mnk``) follows the drop driver's token heuristics
+    (``moe_hopper_fp8/heuristic_config.py``, keyed on ``fp8_scale_mode`` and
+    ``num_max_tokens``) when ALL four are ``None``.  Setting any one of them
+    switches to manual mode: unset knobs fall back to the drop driver's
+    defaults (``swap_ab=False``, ``pingpong=False``, tiler (64, 128, 128)
+    native / (256, 32, 128) swap-AB / (128, 32, 128) swap-AB ping-pong,
+    cluster (1, 1, 1)).
+    ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is
+    a deprecated alias for ``gate_up_clamp``.
+    ``intermediate`` is the post-SwiGLU width, matching the SM100 frontends
+    and SGLang (the kernel's gate+up width is ``2 * intermediate``).
+
+    Expert weights are not allocated here; supply kernel-ready
+    ``(weight, weight_sf, activation_dequant_scale, weight_dequant_scale)``
+    tuples to :func:`hopper_fp8_mega_moe` instead.
+    """
+    cfg = resolve_hopper_fp8_mega_moe_config(
+        num_total_experts,
+        num_max_tokens,
+        num_topk,
+        hidden,
+        intermediate,
+        rank,
+        world_size,
+        kind=kind,
+        fp8_scale_mode=fp8_scale_mode,
+        fp8_accum_mode=fp8_accum_mode,
+        knobs=knobs,
+        swap_ab=swap_ab,
+        pingpong=pingpong,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mnk=cluster_shape_mnk,
+        gate_up_clamp=gate_up_clamp,
+        activation_clamp=activation_clamp,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        token_back_by_dispatch=token_back_by_dispatch,
+        token_back_mode=token_back_mode,
+        dedup_dispatch=dedup_dispatch,
+        grouped_token_back=grouped_token_back,
+        combine_format=combine_format,
+        active_dispatch_warps=active_dispatch_warps,
+        compact_pull_buffer=compact_pull_buffer,
+        fc1_store_offload=fc1_store_offload,
+        fc1_early_done_publish=fc1_early_done_publish,
+        fold_producer_warps=fold_producer_warps,
+        generate_c=generate_c,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        load_balance_mode=load_balance_mode,
+        group_hint=group_hint,
+        tail_split_pairs=tail_split_pairs,
+        clc_bundle_size=clc_bundle_size,
+        num_sched_stages=num_sched_stages,
+        flag_batch=flag_batch,
+        epi_flag_batch=epi_flag_batch,
+    )
+    return _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(cfg)
+
+
+def _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(
+    cfg: MegaMoEHopperFp8Config,
+) -> MegaMoEHopperFp8SymmBuffer:
+    """Allocate a workspace from one already-resolved immutable config."""
     frontend = MegaMoEHopperFp8Frontend(cfg)
 
     data_dtype = cfg.torch_ab_dtype
+    num_total_experts = cfg.num_total_experts
+    num_max_tokens = cfg.num_tokens_per_rank
+    num_topk = cfg.num_topk
+    hidden = cfg.hidden
+    intermediate = cfg.intermediate
+    rank = cfg.rank
+    world_size = cfg.world_size
 
     sym_roots: list[torch.Tensor] = []
     x, x_root = _sym_zeros_byte_view_1b((num_max_tokens, hidden), data_dtype)
@@ -1595,8 +1755,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         intermediate=intermediate,
         rank=rank,
         world_size=world_size,
-        kind=kind,
-        fp8_scale_mode=fp8_scale_mode,
+        kind=cfg.kind,
+        fp8_scale_mode=cfg.fp8_scale_mode,
         x=x,
         x_sf=x_sf,
         topk_idx=topk_idx,

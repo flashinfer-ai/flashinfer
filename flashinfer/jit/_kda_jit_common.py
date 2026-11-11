@@ -25,14 +25,16 @@ from .core import (
     sm100a_nvcc_flags,
     sm100f_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
 
-KDAJITTarget = Literal["sm100a", "sm100f", "sm103a"]
+KDAJITTarget = Literal["sm100a", "sm100f", "sm103a", "sm107a"]
 
 _NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm100f": sm100f_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
+    "sm107a": sm107a_nvcc_flags,
 }
 
 

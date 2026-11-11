@@ -74,9 +74,9 @@ _STATIC_FORMAT: _StaticFormat = {
     "bytes_per_token": 384,
     "chunk_width": 64,
     "page_size": 64,
-    "heads": (16, 32, 64, 128),
+    "heads": (8, 16, 32, 64, 128),
     "topks": (128, 512),
-    "extra_page_sizes": (2, 64),
+    "extra_page_sizes": (2, 32, 64),
 }
 
 

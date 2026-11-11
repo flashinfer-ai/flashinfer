@@ -1,86 +1,58 @@
 """Prepared v3 full pipeline and grouped FP4 compute surfaces on SM100a/SM103a."""
 
-import functools
 import json
+from collections.abc import Mapping
 from pathlib import Path
-from .preparation import prepare_pipeline_bindings, build_tile_lists
+
+from ..deepgemm_common import UnsupportedDevice, load_catalog
+from .preparation import (
+    PIPELINE_KEY_FIELDS,
+    build_tile_lists,
+    pipeline_route_args,
+    prepare_pipeline_bindings,
+)
+
+LABEL = "Generated MegaMoE v3"
 
 
-_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-
-
-@functools.cache
-def _catalog():
-    return json.loads(Path(__file__).with_name("catalog.json").read_text())
+def catalog():
+    """The family catalog (schema ``mega_moe_v3.v3``): one program per schedule,
+    compiled for every listed architecture; the pipeline programs take their
+    persistent grid from the compile line (``-DNUM_CTAS=<route_num_ctas>``: the
+    physical SM count, or the smaller count a route states)."""
+    return load_catalog(Path(__file__).with_name("catalog.json"), label=LABEL)
 
 
 def device_arch(device):
     """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
-    import torch
-
-    device = torch.device(device)
-    catalogued = sorted(_catalog()["arches"])
-    if device.type != "cuda":
-        raise RuntimeError("Generated MegaMoE v3 requires a CUDA device")
-    capability = tuple(torch.cuda.get_device_capability(device))
-    arch = _ARCHES.get(capability)
-    if arch is None or arch not in catalogued:
-        raise RuntimeError(
-            f"Generated MegaMoE v3 has no exported programs for compute capability "
-            f"{capability}; catalogued architectures: {catalogued}"
-        )
-    return arch
+    return catalog().device_arch(device)
 
 
 def supported_num_sms(arch):
-    """SM counts with catalogued routes for ``arch``."""
-    routes = _catalog()["arches"][arch]["routes"].values()
-    return sorted({route["num_sms"] for route in routes})
+    """SM counts with catalogued routes for ``arch`` (every count a route admits)."""
+    counts = set()
+    for route in catalog().routes(arch).values():
+        counts.update(route_admitted_num_sms(route, arch))
+    return sorted(counts)
 
 
-def _nvcc_flags(arch):
-    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
+def stage_program(stage, arch):
+    """Program name of a route stage on ``arch``: shared, or one of a per-architecture pair."""
+    program = stage["program"]
+    return program if isinstance(program, str) else program[arch]
 
-    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
 
-
-@functools.cache
-def load_program(arch, name):
-    from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec
-
-    record = _catalog()["arches"][arch]["programs"][name]
-    spec = gen_jit_spec(
-        name=name,
-        sources=[
-            env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
-        ],
-        extra_cuda_cflags=[
-            *_nvcc_flags(arch),
-            *record["compile_flags"],
-            "--device-entity-has-hidden-visibility=false",
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
-        use_fast_math=False,
-    )
-    return spec.build_and_load(), {
-        **record,
-        "library_path": str(spec.get_library_path()),
-    }
+def load_program(arch, name, num_ctas):
+    """Build and load program ``name`` for ``arch``; ``NUM_CTAS`` is the route's
+    persistent grid (``route_num_ctas``: the count the route states, else its
+    SM count)."""
+    definitions = catalog().definitions(arch, name, {"NUM_CTAS": int(num_ctas)})
+    return catalog().load_program(arch, name, definitions)
 
 
 def key(surface, args):
     names = (
-        (
-            "num_tokens",
-            "num_experts",
-            "top_k",
-            "hidden",
-            "intermediate",
-            "routed_weight_dtype",
-            "activation_clamp",
-        )
+        PIPELINE_KEY_FIELDS
         if surface == "pipeline"
         else (
             ("num_experts", "per_expert_M", "N", "K")
@@ -93,35 +65,135 @@ def key(surface, args):
     )
 
 
-def _route(arch, surface, args):
-    """Catalogued ``arch`` route for ``surface``/``args``; unknown routes raise."""
+# The shape fields a missing-route error lists per catalogued route.
+_SHAPE_SUMMARY = {
+    "pipeline": ("num_experts", "intermediate", "num_tokens", "routed_weight_dtype")
+}
+
+
+def _shape_summary(surface, fields):
+    names = _SHAPE_SUMMARY.get(surface)
+    if names is None:
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return tuple(fields.get(name) for name in names)
+
+
+def _route(arch, surface, args, *, note=""):
+    """Catalogued route for ``surface``/``args``.
+
+    An unknown route raises a ``RuntimeError`` that names the requested key
+    fields and the shapes the ``arch`` catalog does carry for ``surface``
+    (``_SHAPE_SUMMARY`` fields, every key field for the other surfaces).
+    """
+    routes = catalog().routes(arch)
+    route_key = key(surface, args)
     try:
-        return _catalog()["arches"][arch]["routes"][key(surface, args)]
+        return routes[route_key]
     except KeyError as error:
+        wanted = json.loads(route_key)[1]
+        catalogued = sorted(
+            (
+                _shape_summary(surface, json.loads(k)[1])
+                for k in routes
+                if json.loads(k)[0] == surface
+            ),
+            key=str,
+        )
+        fields = _SHAPE_SUMMARY.get(surface, "key fields")
         raise RuntimeError(
-            f"No exported {arch} {surface} schedule for {args}"
+            f"No exported {arch} {surface} schedule for "
+            + ", ".join(f"{k}={v}" for k, v in wanted.items())
+            + f"{note}; the {arch} catalog lists {len(catalogued)} {surface} "
+            f"route(s) by {fields}: {catalogued}"
         ) from error
 
 
-def _route_arch(route, device):
-    """Architecture of ``device``; it must carry the SM count ``route`` was generated for."""
+def _per_arch(value, arch):
+    """A route field given per architecture (``{arch: value}``) or once."""
+    return value[arch] if isinstance(value, Mapping) else value
+
+
+def route_admitted_num_sms(route, arch):
+    """The physical SM counts ``route`` runs on for ``arch``.
+
+    A route names one count (``n``, or ``{arch: n}`` when it ships for several
+    architectures) or, for a program that takes the count from its compile
+    line, the list of counts it admits (``[n, ...]``).
+    """
+    admitted = _per_arch(route["num_sms"], arch)
+    if isinstance(admitted, (list, tuple)):
+        return tuple(int(n) for n in admitted)
+    return (int(admitted),)
+
+
+def route_grid(route, arch, num_sms):
+    """The launch grid of ``route`` on ``arch`` at ``num_sms`` SMs.
+
+    A route states its grid (``[x, y, z]``, or ``{arch: [x, y, z]}``); a route
+    that admits several SM counts omits it and runs the persistent grid of one
+    CTA per SM.
+    """
+    grid = _per_arch(route.get("grid"), arch)
+    if grid is None:
+        return (int(num_sms), 1, 1)
+    return tuple(int(v) for v in grid)
+
+
+def route_num_ctas(route, arch, num_sms):
+    """The persistent grid of ``route``'s programs on ``arch`` at ``num_sms``
+    SMs: the ``NUM_CTAS`` they are built with and the CTAs they launch.
+
+    A route whose metadata states ``num_ctas`` runs that many co-resident CTAs,
+    fewer than the device's SMs, so a stream's next call becomes resident on
+    the free SMs while the previous call's last CTAs finish; its grid is
+    ``[num_ctas, 1, 1]``. Every other route runs one CTA per SM.
+    """
+    stated = route["metadata"].get("num_ctas")
+    if stated is None:
+        return int(num_sms)
+    num_ctas = int(stated)
+    grid = route_grid(route, arch, num_sms)
+    if not 0 < num_ctas <= int(num_sms) or grid != (num_ctas, 1, 1):
+        raise ValueError(
+            f"The exported {arch} route states num_ctas {stated!r} and grid "
+            f"{list(grid)}; a stated count must be the route's grid and fit the "
+            f"{int(num_sms)}-SM device"
+        )
+    return num_ctas
+
+
+def _device_num_sms(device):
     import torch
 
+    return int(
+        torch.cuda.get_device_properties(torch.device(device)).multi_processor_count
+    )
+
+
+def _route_arch(route, device):
+    """``(arch, num_sms)`` of ``device``: its architecture and physical SM count,
+    which ``route`` must admit."""
     arch = device_arch(device)
-    sms = torch.cuda.get_device_properties(device).multi_processor_count
-    if sms != route["num_sms"]:
-        raise RuntimeError(
-            f"The exported {arch} {route['metadata']['surface']} schedule was generated "
-            f"for {route['num_sms']} physical SMs; this device has {sms}"
+    sms = _device_num_sms(device)
+    if sms not in supported_num_sms(arch):
+        raise UnsupportedDevice(
+            f"{LABEL}: the exported {arch} programs are specialized for "
+            f"{supported_num_sms(arch)} physical SMs; {device} has {sms}"
         )
-    return arch
+    admitted = route_admitted_num_sms(route, arch)
+    if sms not in admitted:
+        raise UnsupportedDevice(
+            f"The exported {arch} {route['metadata']['surface']} schedule was generated "
+            f"for {list(admitted)} physical SMs; this device has {sms}"
+        )
+    return arch, sms
 
 
 class _Stage:
-    def __init__(self, arch, program, bindings):
+    def __init__(self, arch, program, num_ctas, bindings):
         import torch
 
-        module, record = load_program(arch, program)
+        module, record = load_program(arch, program, num_ctas)
         self.bindings = dict(bindings)
         grid = self.bindings.pop("grid")
         self.bindings.update(grid_x=grid[0], grid_y=grid[1], grid_z=grid[2])
@@ -157,23 +229,21 @@ class _Stage:
 
 
 class V3Plan:
-    """Retain operands/workspaces; submit the original reset/repack and compute scope.
+    """Retain operands/workspaces; submit the compute scope of one catalog route.
 
-    A route whose catalog metadata declares ``self_cleaning`` launches exactly one
-    kernel per run(): the kernel zeroes its per-launch workspace words before it
+    Every exported pipeline route is self-cleaning: it launches exactly one
+    kernel per run(), the kernel zeroes its per-launch workspace words before it
     exits and its grid gates are phase-toggling words that no host code resets.
     Such a plan zeroes the caller's counter workspace once, when it is bound
     (never inside run(), so a captured run() holds only the kernel node), and
     rejects reset(). ``self_cleaning`` reports which contract applies.
 
-    Every other route keeps its host resets inside run(): full pipeline model
-    routes zero one original contiguous reset tensor; smoke routes zero their
-    original seven counters. Grouped fused zeroes L1 arrivals. Grouped L2
-    repacks both scale tensors on every invocation before GEMM. run() owns no
-    CUDA graph; callers may capture it after binding. The source comparison's
-    prepared callable has the same workload and is retained by the private
-    fixture. Never time only launch_without_reset for full/fused routes that
-    are not self-cleaning.
+    Grouped fused keeps its host reset inside run(): it zeroes the L1 arrival
+    words before the kernel. Grouped L2 repacks both scale tensors into the
+    group-folded layout once at preparation (and again on ``update_scales()``),
+    so run() launches only the clustered GEMM. run() owns no CUDA graph;
+    callers may capture it after binding. Never time only
+    launch_without_reset for a fused route.
     """
 
     def __init__(
@@ -184,6 +254,7 @@ class V3Plan:
         *,
         reset_storage=None,
         reset_buffers=(),
+        preparation=(),
         owners=(),
     ):
         import torch
@@ -194,27 +265,40 @@ class V3Plan:
             for v in b.values()
             if isinstance(v, torch.Tensor)
         )
-        self.arch = _route_arch(route, t.device)
+        self.arch, self.num_sms = _route_arch(route, t.device)
+        self.num_ctas = route_num_ctas(route, self.arch, self.num_sms)
         self.route, self.outputs = route, outputs
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
         # Declared per architecture by the exported catalog route; absent means
         # the original host-reset lifecycle.
         self.self_cleaning = bool(route["metadata"].get("self_cleaning", False))
-        self.stages = tuple(
-            _Stage(self.arch, s["program"], stage_bindings[s["name"]])
+        stages = {
+            s["name"]: _Stage(
+                self.arch,
+                stage_program(s, self.arch),
+                self.num_ctas,
+                stage_bindings[s["name"]],
+            )
             for s in route["stages"]
+        }
+        self.preparation_stages = tuple(stages[name] for name in preparation)
+        self.stages = tuple(
+            stage for name, stage in stages.items() if name not in preparation
         )
         self.owners = owners
+        if torch.cuda.is_current_stream_capturing() and (
+            self.self_cleaning or self.preparation_stages
+        ):
+            # One-time work (counter zero, scale repack) must not become a
+            # graph node: the kernel keeps the words clean afterwards and the
+            # repacked scales are reused by every later launch.
+            raise RuntimeError(
+                "Binding a MegaMoE plan during CUDA stream capture is "
+                "unsupported; bind (and warm up) before capturing run()"
+            )
         if self.self_cleaning:
-            # One-time zero of the counter workspace, stream-ordered before this
-            # plan's first launch. It must not become a graph node: the kernel
-            # keeps the words clean and the gate phase bits consistent afterwards.
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "Binding a self-cleaning MegaMoE plan during CUDA stream "
-                    "capture is unsupported; bind (and warm up) before capturing run()"
-                )
             self._zero_workspace()
+        self.update_scales()
 
     def _zero_workspace(self):
         if self.reset_storage is not None:
@@ -231,6 +315,12 @@ class V3Plan:
                 "do not reset them on the host"
             )
         self._zero_workspace()
+
+    def update_scales(self):
+        """Re-run the route's preparation stages (grouped L2: the scale repack)
+        after the caller changed the natural-layout scale words in place."""
+        for stage in self.preparation_stages:
+            stage.run()
 
     def launch_without_reset(self):
         for stage in self.stages:
@@ -251,6 +341,7 @@ def bind_prepared(
     *,
     reset_storage=None,
     reset_buffers=(),
+    preparation=(),
     owners=(),
 ):
     """Bind explicit packed tensors to a catalog route with its original lifecycle.
@@ -258,7 +349,16 @@ def bind_prepared(
     ``reset_storage``/``reset_buffers`` are the route's counter words. A
     self-cleaning route zeroes them once here (outside any stream capture) and
     never again; the workspace may already have been used by another plan of
-    the same route as long as no launch is in flight on it.
+    the same route as long as no launch is in flight on it. ``preparation``
+    names the route stages that run at bind time (and on ``update_scales()``)
+    instead of inside run().
+
+    On a route whose metadata states ``w2_dense_k`` the program reads ``B2``
+    at the width ``K2`` names: the bindings must pass ``K2`` as the physical
+    intermediate (the padded image) or as ``w2_dense_k`` (the dense image),
+    with ``B2`` rows of ``K2 / 2`` bytes, and a dense image holds one row past
+    the ``num_experts * hidden`` weight rows (its last K step reads into it);
+    anything else is refused.
     """
     import torch
 
@@ -268,16 +368,36 @@ def bind_prepared(
         for v in b.values()
         if isinstance(v, torch.Tensor)
     )
-    route = _route(device_arch(t.device), surface, args)
+    arch = device_arch(t.device)
+    route = _route(arch, surface, args)
     main = stage_bindings[route["stages"][-1]["name"]]
-    if tuple(main["grid"]) != tuple(route["metadata"]["grid"]):
+    _, num_sms = _route_arch(route, t.device)
+    if tuple(main["grid"]) != route_grid(route, arch, num_sms):
         raise ValueError("No exported scheduling specialization for this prepared grid")
+    w2_dense_k = route["metadata"].get("w2_dense_k")
+    if w2_dense_k is not None:
+        widths = (int(args["intermediate"]), int(w2_dense_k))
+        k2 = int(main["K2"])
+        b2 = main["B2"]
+        if k2 not in widths or 2 * b2.shape[-1] != k2:
+            raise ValueError(
+                f"This route reads B2 at the width K2 names, {widths[0]} (padded) or "
+                f"{widths[1]} (dense); got K2 {k2} with B2 rows of "
+                f"{b2.shape[-1]} bytes"
+            )
+        weight_rows = int(args["num_experts"]) * int(args["hidden"])
+        if k2 == widths[1] and b2.numel() // b2.shape[-1] < weight_rows + 1:
+            raise ValueError(
+                f"This route reads the dense B2 image ({k2} wide) one row past its "
+                f"{weight_rows} weight rows; got {b2.numel() // b2.shape[-1]} rows"
+            )
     return V3Plan(
         route,
         stage_bindings,
         outputs,
         reset_storage=reset_storage,
         reset_buffers=reset_buffers,
+        preparation=preparation,
         owners=owners,
     )
 
@@ -288,19 +408,38 @@ def prepare_pipeline(inputs):
     Required dictionary fields: num_experts/top_k/num_tokens/hidden/intermediate,
     routed_weight_dtype/activation_clamp, x_fp8_packed/x_sf_packed,
     topk_idx(int64)/topk_weights(FP32), w1_fp4/w2_fp4 (or w1_fp8/w2_fp8),
-    and w1_sf/w2_sf (FP32 powers-of-two, granularity32). Gate/up weights are
-    logical halves; preparation applies the selected 8-way interleave and
-    source-schedule scale permutation. No upstream library is imported. The
-    counter workspace is allocated zeroed; a self-cleaning route never zeroes it
-    again, other routes zero it inside every run().
+    and w1_sf/w2_sf (FP32 powers-of-two, granularity32). ``intermediate`` is
+    the model's logical width (a multiple of 32): the route is the one
+    generated for the next multiple of 128, and preparation pads the weights
+    and scales to that physical width with exact zeros when the two differ.
+    Optional ``local_expert_offset`` (default 0) and ``num_global_experts``
+    (default ``num_experts``) describe this rank's window of the global
+    expert space: ``topk_idx`` holds global ids, a slot outside the window
+    routes to no expert like a -1 slot, and the output is the rank's partial
+    sum over its local routes (zero rows for tokens without one). Gate/up
+    weights are logical halves; preparation applies the selected 8-way
+    interleave and source-schedule scale permutation. No upstream library is
+    imported. The counter workspace is allocated zeroed and the self-cleaning
+    kernel never needs it zeroed again.
     """
-    device = inputs["x_fp8_packed"].device
-    route = _route(device_arch(device), "pipeline", inputs)
-    # The persistent grid derives from the SM count the route was generated for.
-    data = prepare_pipeline_bindings(inputs, route["num_sms"])
+    arch = device_arch(inputs["x_fp8_packed"].device)
+    args = pipeline_route_args(inputs)
+    logical = int(inputs["intermediate"])
+    note = (
+        ""
+        if args["intermediate"] == logical
+        else f" (logical intermediate {logical} pads to {args['intermediate']})"
+    )
+    route = _route(arch, "pipeline", args, note=note)
+    # The route must admit the device's SM count; the route's metadata names
+    # the program's source-schedule form and, when it states ``num_ctas``, the
+    # persistent grid (``route_num_ctas``; else one CTA per SM), which the
+    # bindings launch and ``bind_prepared`` checks against the route's grid.
+    _, num_sms = _route_arch(route, inputs["x_fp8_packed"].device)
+    data = prepare_pipeline_bindings(inputs, num_sms, route_metadata=route["metadata"])
     return bind_prepared(
         "pipeline",
-        inputs,
+        args,
         {"pipeline": data["bindings"]},
         data["output"],
         reset_storage=data["reset_storage"],
@@ -312,7 +451,7 @@ def prepare_pipeline(inputs):
 def prepare_grouped_l2(
     A, B, SFA, SFB, per_expert_M, *, out=None, packed_a=None, packed_b=None
 ):
-    """Grouped gran32 E4M3 × packed E2M1 -> BF16; scale repack is timed per call."""
+    """Grouped gran32 E4M3 × packed E2M1 -> BF16; scales are repacked at preparation."""
     import torch
 
     e, n, _ = B.shape
@@ -330,10 +469,12 @@ def prepare_grouped_l2(
     args = dict(
         num_experts=e, per_expert_M=list(per_expert_M), hidden=n, intermediate=k
     )
-    route = _route(device_arch(A.device), "grouped_l2", args)
+    arch = device_arch(A.device)
+    route = _route(arch, "grouped_l2", args)
+    _, num_sms = _route_arch(route, A.device)
     tiles = te.numel()
     main = dict(
-        grid=tuple(route["metadata"]["grid"]),
+        grid=route_grid(route, arch, num_sms),
         A=A.view(torch.uint8),
         B=B.view(torch.uint8),
         SFA=packed_a,
@@ -365,6 +506,7 @@ def prepare_grouped_l2(
         args,
         {"scale_layout": repack, "main": main},
         out,
+        preparation=("scale_layout",),
         owners=(A, B, SFA, SFB, packed_a, packed_b),
     )
 

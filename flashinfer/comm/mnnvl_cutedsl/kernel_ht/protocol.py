@@ -22,9 +22,10 @@ from typing import Any, TypedDict, cast
 import cutlass.cute as cute
 import torch
 import torch.distributed as dist
-from cutlass import BFloat16, Int32, Int64, Uint32
+from cutlass import BFloat16, Float8E4M3FN, Int32, Int64, Uint32
 from cutlass.cute.runtime import make_fake_compact_tensor
 
+from ..dynamic_fp8_epilogue import fake_output_scale, output_scale_arg
 from ..runtime import (
     current_cu_stream,
     make_fake_dynamic_compact_tensor,
@@ -79,6 +80,8 @@ HT_FINALIZE_GB300_TP16_H8192_K10 = HTFinalizeTuning(
 )
 HT_ALL_REDUCE_GB300_TP8_H8192 = HTAllReduceTuning()
 HT_ALL_REDUCE_GB300_TP16_H8192 = HTAllReduceTuning()
+HT_FINALIZE_GB300_TP4_H8192_K10 = HTFinalizeTuning()
+HT_FINALIZE_RUBIN_TP4_H8192_K10 = HTFinalizeTuning()
 
 # K3's TP4/8/16 reduction shards contain 112/56/28 bf16x8 packs.
 # Consumer tiles cover a whole token; partial reduction warps are masked.
@@ -113,6 +116,19 @@ HT_ALL_REDUCE_GB300_TP4_H5120 = HTAllReduceTuning(
     consumer_threads=128, vectors_per_thread=5, reduction_warps=1
 )
 
+# hidden_size=7168, bf16, top_k=16 (Kimi K3), TP4 only. A token is 896
+# bf16x8 packs, or 224 packs per TP4 reduction shard, which is divisible by
+# one 32-thread reduction warp. At TP8 the shard has 112 packs and no legal
+# reduction-warp count divides it, so TP8 remains on BT for large M. Both
+# measured TP4 consumer shapes tile all 896 packs exactly: finalize prefers
+# 448x2, while all-reduce prefers the lower-thread-count 128x7 shape.
+HT_FINALIZE_GB300_TP4_H7168_K16 = HTFinalizeTuning(
+    consumer_threads=448, vectors_per_thread=2, reduction_warps=1
+)
+HT_ALL_REDUCE_GB300_TP4_H7168 = HTAllReduceTuning(
+    consumer_threads=128, vectors_per_thread=7, reduction_warps=1
+)
+
 
 @dataclass(slots=True)
 class HTProtocolState:
@@ -129,6 +145,7 @@ class _PathKwargs(TypedDict):
     top_k: int
     capacity_m: int
     write_residual_output: bool
+    output_dtype: torch.dtype
 
 
 class _HTPath:
@@ -140,12 +157,14 @@ class _HTPath:
         top_k: int,
         capacity_m: int,
         write_residual_output: bool,
+        output_dtype: torch.dtype,
     ) -> None:
         self._compiled = compiled
         self.hidden_size = hidden_size
         self.top_k = top_k
         self.capacity_m = capacity_m
         self.write_residual_output = write_residual_output
+        self.output_dtype = output_dtype
 
     def _outputs(
         self,
@@ -156,7 +175,7 @@ class _HTPath:
         shape = (m, self.hidden_size)
         device = torch.device("cuda", torch.cuda.current_device())
         if norm_output is None:
-            norm_output = torch.empty(shape, dtype=torch.bfloat16, device=device)
+            norm_output = torch.empty(shape, dtype=self.output_dtype, device=device)
         if self.write_residual_output and residual_output is None:
             residual_output = torch.empty(shape, dtype=torch.bfloat16, device=device)
         return norm_output, residual_output
@@ -185,16 +204,16 @@ class FinalizeAllReduceRMSNormHTKernel(_HTPath):
         state: HTProtocolState,
         norm_output: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._validate_m(m)
         norm_output, residual_output = self._outputs(m, norm_output, residual_output)
         local, prenorm = self._state_buffers(state)
         peers = cast(torch.Tensor, state.routed_ready_counters.peer_addresses)
-        shared_arg = shared_output if shared_output is not None else norm_output
-        residual_arg = residual_source if residual_source is not None else norm_output
-        residual_output_arg = (
-            residual_output if residual_output is not None else norm_output
-        )
+        shared_arg = shared_output if shared_output is not None else gamma
+        residual_arg = residual_source if residual_source is not None else gamma
+        residual_output_arg = residual_output if residual_output is not None else gamma
         self._compiled(
             to_cute_dynamic(routed_output.flatten(), 16, divisibility=self.hidden_size),
             to_cute_dynamic(expert_weights.flatten(), 2, divisibility=self.top_k),
@@ -210,6 +229,12 @@ class FinalizeAllReduceRMSNormHTKernel(_HTPath):
                 divisibility=self.hidden_size,
             ),
             to_cute_dynamic(norm_output.flatten(), 16, divisibility=self.hidden_size),
+            to_cute_dynamic(
+                norm_output_bf16.flatten(), 16, divisibility=self.hidden_size
+            )
+            if norm_output_bf16 is not None
+            else None,
+            output_scale_arg(output_scale),
             to_cute(peers, 8),
             to_cute(state.routed_ready_counters.tensor, 4),
             to_cute(state.routed_processed_counters.flatten(), 4),
@@ -232,15 +257,15 @@ class AllReduceRMSNormHTKernel(_HTPath):
         state: HTProtocolState,
         norm_output: torch.Tensor | None = None,
         residual_output: torch.Tensor | None = None,
+        norm_output_bf16: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._validate_m(m)
         norm_output, residual_output = self._outputs(m, norm_output, residual_output)
         local, prenorm = self._state_buffers(state)
         peers = cast(torch.Tensor, state.all_reduce_ready_counters.peer_addresses)
-        residual_arg = residual_source if residual_source is not None else norm_output
-        residual_output_arg = (
-            residual_output if residual_output is not None else norm_output
-        )
+        residual_arg = residual_source if residual_source is not None else gamma
+        residual_output_arg = residual_output if residual_output is not None else gamma
         index_arg = state.all_reduce_processed_counters.view(torch.int32)
         # top_k=0 disables metadata reads, so the aliased placeholders stay unused.
         self._compiled(
@@ -266,6 +291,12 @@ class AllReduceRMSNormHTKernel(_HTPath):
                 divisibility=self.hidden_size,
             ),
             to_cute_dynamic(norm_output.flatten(), 16, divisibility=self.hidden_size),
+            to_cute_dynamic(
+                norm_output_bf16.flatten(), 16, divisibility=self.hidden_size
+            )
+            if norm_output_bf16 is not None
+            else None,
+            output_scale_arg(output_scale),
             to_cute(peers, 8),
             to_cute(state.all_reduce_ready_counters.tensor, 4),
             to_cute(state.all_reduce_processed_counters.flatten(), 4),
@@ -298,6 +329,9 @@ class HTProtocol:
         finalize_tunings: tuple[HTFinalizeTuning, ...],
         all_reduce_tunings: tuple[HTAllReduceTuning, ...],
         group: dist.ProcessGroup,
+        output_dtype: torch.dtype = torch.bfloat16,
+        write_norm_output: bool = False,
+        dynamic_fp8: bool = False,
     ) -> None:
         self.hidden_size = hidden_size
         self.top_k = top_k
@@ -310,6 +344,8 @@ class HTProtocol:
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        self.output_dtype = output_dtype
+        self.write_norm_output = write_norm_output
         if not apply_rms_norm:
             # Not implemented rather than impossible: a dedicated RMS warp
             # group owns the sum-of-squares and its barriers, so removing the
@@ -319,6 +355,7 @@ class HTProtocol:
                 "apply_rms_norm=False is not supported by the "
                 "high-throughput protocol; select the LL or BT protocol"
             )
+        self.dynamic_fp8 = dynamic_fp8
         self.apply_rms_norm = apply_rms_norm
 
         self.finalize_kernels = {
@@ -343,6 +380,7 @@ class HTProtocol:
             "top_k": self.top_k,
             "capacity_m": self.capacity_m,
             "write_residual_output": self.write_residual_output,
+            "output_dtype": self.output_dtype,
         }
 
     def _resolve_ctas(self, persistent_ctas: int | None) -> int:
@@ -385,6 +423,7 @@ class HTProtocol:
             add_residual=self.add_residual,
             write_residual_output=self.write_residual_output,
             enable_pdl=tuning.enable_pdl,
+            dynamic_fp8=self.dynamic_fp8,
         )
         return self._compile(kernel, top_k=self.top_k)
 
@@ -412,6 +451,7 @@ class HTProtocol:
             add_residual=self.add_residual,
             write_residual_output=self.write_residual_output,
             enable_pdl=tuning.enable_pdl,
+            dynamic_fp8=self.dynamic_fp8,
         )
         return self._compile(kernel, top_k=0)
 
@@ -446,8 +486,16 @@ class HTProtocol:
                 BFloat16, alignment=16, divisibility=self.hidden_size
             ),
             make_fake_dynamic_compact_tensor(
-                BFloat16, alignment=16, divisibility=self.hidden_size
+                Float8E4M3FN if self.output_dtype == torch.float8_e4m3fn else BFloat16,
+                alignment=16,
+                divisibility=self.hidden_size,
             ),
+            make_fake_dynamic_compact_tensor(
+                BFloat16, alignment=16, divisibility=self.hidden_size
+            )
+            if self.write_norm_output
+            else None,
+            fake_output_scale(self.output_dtype),
             make_fake_compact_tensor(Int64, (self.tp_size,), assumed_align=8),
             make_fake_compact_tensor(Uint32, (token_slots,), assumed_align=4),
             make_fake_compact_tensor(

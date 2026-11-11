@@ -16,18 +16,18 @@ limitations under the License.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import ctypes
 import math
+from array import array
+from dataclasses import dataclass, field, replace
+from itertools import chain
 from typing import Optional, Sequence
 
 import torch
 import tvm_ffi
 
-from .cake_jit import (
-    MODULES,
-    load_cake_nvfp4_mla_decode_module,
-    select_module,
-)
+from ...utils import get_compute_capability, get_device_sm_count
+from .cake_jit import MODULES, launch_args, launch_grid, load, program_available
 
 # DeepSeek-V4 main-attention decode geometry served by the generated program:
 # MQA over one 512-wide NVFP4 latent row that is both K and V, 64-token pages.
@@ -41,27 +41,117 @@ SF_ROW_BYTES = HEAD_DIM // SF_VEC  # 32 UE4M3 bytes per Q / KV row
 DSV4_Q_LEN = (
     6  # DeepSeek-V4 default: query tokens per request (derived from the query shape)
 )
-CLUSTER_PAIR = (
-    2  # the two v_half CTAs of a row tile form one cluster (multicast page stream)
-)
+CLUSTER_PAIR = 2  # the two CTAs of a row tile form one cluster (multicast page stream)
 ROWS_PER_TILE = 128  # packed query rows (token * H + head) per work item
-V_HALVES = 2  # each work item accumulates 256 of the 512 output dims
+# Rows per piece in the work table.  Historic name: the field was a V-half
+# index when each CTA accumulated 256 of the 512 output dims.  Today both rows
+# of a pair describe one piece; the kernel reads every second row and the two
+# CTAs of the cluster split the 128 query rows of the tile by cluster rank
+# (``ROWS_PER_CTA`` each, all 512 output dims).  Collapsing the pair to one row
+# is a kernel ABI change (row stride 1) and is tracked separately.
+V_HALVES = 2
 ROWS_PER_CTA = (
     ROWS_PER_TILE // CLUSTER_PAIR
 )  # query rows per CTA (row split of a tile across the pair)
 REDUCE_HEADS_PER_CTA = (
-    8  # combine kernel: one warp per head, eight heads per 256-thread CTA
+    16  # combine kernel: two heads per warp, sixteen heads per 256-thread CTA
 )
 LOG2E = 1.4426950408889634
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 # Host work plan ABI shared with the generated program (part of the ABI freeze).
-ITEM_FIELDS = 8  # b, m_tile, v_half, tile_start, tile_end, split, num_splits, flags
+ITEM_FIELDS = 8  # b, m_tile, pair row (historic v_half), tile_start, tile_end, split, num_splits, flags
 FLAG_SEED_SINK = 1  # split 0 folds the attention sink into the online softmax
 FLAG_DIRECT_OUT = 2  # single-split (request, row tile): the CTA writes O / LSE directly
 MAX_SPLITS = 64  # split-KV combine kernel capacity per row
 MIN_TILES_PER_UNIT = 8  # balanced schedule: minimum pipeline tiles per cluster
+# Model cost of one extra piece (item boundary) inside a unit, in pipeline-tile
+# periods: the softmax warps pay the previous item's epilogue and the pipeline
+# refill at every boundary (~2.5 tile periods on both architectures). The
+# balanced partition equalises ``tiles + BOUNDARY_COST_TILES * (pieces - 1)``
+# per unit instead of tiles. Must match the Cake host plan.
+BOUNDARY_COST_TILES = 2.5
 BALANCED_MIN_KV = 8192  # auto schedule: balanced partition from this KV length on
+# Further decode programs (``select_decode_record``), each giving the decode
+# program's outputs bit for bit. The SM100 QK-ahead program pays off when every
+# cluster streams a long range made of at least one long piece.
+QK_AHEAD_RECORD = "decode_qk_ahead"
+QK_AHEAD_MIN_UNIT_TILES = 512  # pipeline tiles of every unit
+QK_AHEAD_MIN_PIECE_TILES = 257  # pipeline tiles of the longest piece of every unit
+# (unit tiles, piece tiles) in place of the two above, keyed by the clusters the
+# device requests (``num_sms // CLUSTER_PAIR``, not the plan's unit count, which
+# the partition may lower): on a 148-SM part the program pays off from shorter
+# ranges.
+QK_AHEAD_MIN_TILES_BY_CLUSTERS = {74: (330, 165)}
+# The short-row program reads its unit range in the kernel setup and frees its
+# tensor memory once the last epilogue has read it; it pays off when every
+# cluster streams a short range.
+SHORT_RECORD = "decode_short"
+SHORT_MAX_UNIT_TILES = {"sm_100a": 32, "sm_103a": 64}  # pipeline tiles of every unit
+# The short-row program with a per-warp epilogue store path: a softmax warp
+# whose 32 query rows are all valid takes the bulk store path in a partially
+# valid CTA too. It runs in place of the short-row program when every request
+# ends in a CTA of at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows.
+SHORT_EPI_RECORD = "decode_short_epi_warp"
+SHORT_EPI_MIN_TAIL_ROWS = 32  # valid query rows of the last CTA of a request
+# The short-row programs that also load the fields of item ``2 * cluster`` in
+# the kernel setup, ahead of the cluster rendezvous, and start the load warp on
+# them when that item is the first of the unit. They run in place of
+# ``SHORT_RECORD`` and ``SHORT_EPI_RECORD`` when every unit holds one item
+# pair: item ``2 * cluster`` is then every unit's first, and it lies in the
+# table, which the setup load requires.
+SHORT_SPEC_RECORD = "decode_short_spec_uh"
+SHORT_EPI_SPEC_RECORD = "decode_short_epi_warp_spec_uh"
+# The SM103 decode with its row-pair max exchange gated by a vote on the
+# exchange barrier. Each piece pays a warm-up worth about ``XV_WARMUP_TILES``
+# tiles of the saving, so it pays off when every cluster streams at least
+# ``XV_MIN_STEADY_TILES`` pipeline tiles past that warm-up of its pieces.
+XV_RECORD = "decode_xv"
+XV_WARMUP_TILES = 48  # pipeline tiles of every piece
+XV_MIN_STEADY_TILES = 307  # pipeline tiles of every unit past the warm-ups
+# The long-row decode programs. On an (architecture, cluster count) of
+# ``REVERSED_PIECE_TARGETS`` a balanced plan that one of them runs holds the
+# pieces of every unit in reverse order (``build_work_plan``): the head piece
+# of the unit's last sequence starts first, so the row tiles of one request
+# read most of their pages at the same time and the re-reads of a page stay in
+# L2. The cluster count is the one the plan requests, ``num_sms //
+# CLUSTER_PAIR``: 76 on a 152-SM device such as GB200 (SM100) or GB300
+# (SM103). The short-row programs stream too few tiles per unit for such
+# re-reads, and every other target keeps the request-major order.
+LONG_DECODE_RECORDS = frozenset({"decode", QK_AHEAD_RECORD, XV_RECORD})
+REVERSED_PIECE_TARGETS = frozenset({("sm_100a", 76), ("sm_103a", 76)})
+# Further combine program (``select_reduce_record``), giving the combine
+# program's outputs bit for bit: it reads the first pair of splits of a row
+# from its top loads, which pays off for rows of more than two splits.
+REDUCE_GENERAL_RECORD = "reduce_general"
+REDUCE_GENERAL_MIN_SPLITS = 3  # KV splits of the plan's most split row
+# The combine program without the per-row split-count load: every row it runs
+# takes two splits, so it reads only the partials the decode just wrote. On an
+# (architecture, cluster count) of ``REDUCE_TWO_SPLITS_TARGETS`` it runs a plan
+# of two splits per row that a short-row decode program runs, when the rows
+# of two splits form one contiguous range of query rows and, where the target
+# names a unit limit, every unit of the plan holds at most that many pipeline
+# tiles; it is launched over that range alone (``split_row_range``), with its
+# row pointers offset to the range's first row. The cluster count is the one
+# the plan requests, ``num_sms // CLUSTER_PAIR``: 74 on B200, 76 on GB200 and
+# GB300. On GB300 the limit is the SM100 short-row limit, so the program runs
+# the plans whose units the short-row rule bounds on SM100 too.
+REDUCE_TWO_SPLITS_RECORD = "reduce_two_splits"
+REDUCE_TWO_SPLITS_TARGETS: dict[tuple[str, int], Optional[int]] = {
+    ("sm_100a", 74): None,
+    ("sm_100a", 76): None,
+    ("sm_103a", 76): SHORT_MAX_UNIT_TILES["sm_100a"],
+}
+SHORT_DECODE_RECORDS = frozenset(
+    {SHORT_RECORD, SHORT_EPI_RECORD, SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD}
+)
+# The two-split combine's bound arguments per caller buffer set and plan shape
+# (``prepare``): its arguments are the data pointers of offset views of the
+# caller's workspace, ``out`` and ``lse``, so a caller that prepares every step
+# into the same buffers binds them once. An entry keeps its buffers' storage
+# alive; the memo is emptied when it holds ``_TWO_SPLIT_BINDINGS_MAX`` entries.
+_TWO_SPLIT_BINDINGS: dict = {}
+_TWO_SPLIT_BINDINGS_MAX = 4
 WORKSPACE_ALIGNMENT = 256
 
 # Keyword names the two stages are bound with (arg plans refer to these names).
@@ -104,22 +194,53 @@ REDUCE_KWARGS = (
 
 
 # ---------------------------------------------------------------------------
+# Device facts (FlashInfer's cached per-device properties)
+# ---------------------------------------------------------------------------
+
+
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
+def _device_arch(device_index: int) -> Optional[str]:
+    """Generated-program architecture of one CUDA device, or None when unsupported."""
+    major, minor = get_compute_capability(torch.device("cuda", device_index))
+    return SUPPORTED_COMPUTE_CAPABILITIES.get((major, minor))
+
+
+def _device_sm_count(device_index: int) -> int:
+    return int(get_device_sm_count(torch.device("cuda", device_index)))
+
+
+# ---------------------------------------------------------------------------
 # NVFP4 (E2M1 + UE4M3 block-16 scales) preparation helper
 # ---------------------------------------------------------------------------
+
+
+# E2M1 magnitude code = number of decision thresholds passed.  The thresholds
+# are the midpoints between consecutive representable magnitudes (0, 0.5, 1,
+# 1.5, 2, 3, 4, 6); a tie rounds to the even code (``cvt.rn.satfinite``), so a
+# midpoint whose lower code is even is exclusive and one whose lower code is
+# odd is inclusive.
+_E2M1_THRESHOLDS = (
+    (0.25, False),
+    (0.75, True),
+    (1.25, False),
+    (1.75, True),
+    (2.5, False),
+    (3.5, True),
+    (5.0, False),
+)
 
 
 def _nearest_e2m1_codes(values):
     """Encode E2M1 with ``cvt.rn.satfinite`` tie-to-even semantics."""
     magnitude = values.abs()
-    codes = torch.zeros_like(magnitude, dtype=torch.uint8)
-    codes[(magnitude > 0.25) & (magnitude < 0.75)] = 1
-    codes[(magnitude >= 0.75) & (magnitude <= 1.25)] = 2
-    codes[(magnitude > 1.25) & (magnitude < 1.75)] = 3
-    codes[(magnitude >= 1.75) & (magnitude <= 2.5)] = 4
-    codes[(magnitude > 2.5) & (magnitude < 3.5)] = 5
-    codes[(magnitude >= 3.5) & (magnitude <= 5.0)] = 6
-    codes[magnitude > 5.0] = 7
-    return codes | (torch.signbit(values).to(torch.uint8) << 3)
+    codes = torch.signbit(values).to(torch.uint8) << 3
+    for threshold, inclusive in _E2M1_THRESHOLDS:
+        passed = magnitude >= threshold if inclusive else magnitude > threshold
+        codes = codes + passed.to(torch.uint8)
+    return codes
 
 
 def quantize_nvfp4(x):
@@ -127,7 +248,8 @@ def quantize_nvfp4(x):
 
     Returns ``(packed_u8[..., D/2], scale_u8[..., D/16])``. The scale of each
     16-element block is ``amax / 6`` rounded to E4M3 and clamped to the
-    positive finite range; scales are returned as the raw UE4M3 bytes.
+    positive finite range; scales are returned as the raw UE4M3 bytes. Both
+    results are freshly materialized dense tensors.
     """
     if x.shape[-1] % (2 * SF_VEC):
         raise ValueError("the last dimension must be a multiple of 32")
@@ -140,7 +262,7 @@ def quantize_nvfp4(x):
     codes = _nearest_e2m1_codes(normalized).reshape(*x32.shape)
     pairs = codes.reshape(*codes.shape[:-1], codes.shape[-1] // 2, 2)
     packed = (pairs[..., 0] & 0x0F) | ((pairs[..., 1] & 0x0F) << 4)
-    return packed.contiguous(), scale.view(torch.uint8).contiguous()
+    return packed, scale.view(torch.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -152,13 +274,16 @@ def quantize_nvfp4(x):
 class WorkPlan:
     """Flat work table of the persistent decode kernel.
 
-    One item is ``(request, m_tile, v_half, tile_start, tile_end, split,
+    One item is ``(request, m_tile, pair_row, tile_start, tile_end, split,
     num_splits, flags)``; cluster ``u`` (``CLUSTER_PAIR`` CTAs) runs items
-    ``unit_first[u] .. unit_first[u + 1]``, always whole (v_half 0, v_half 1)
-    pairs of one piece. Plans split per (request, row tile): a piece with more
-    than one split goes through the BF16 partials and the split-KV combine
-    kernel, a single-split piece keeps ``FLAG_DIRECT_OUT`` and its CTAs write
-    ``O`` / ``LSE`` directly, even when other pieces of the batch are split.
+    ``unit_first[u] .. unit_first[u + 1]``, always whole pairs of rows that
+    describe one piece (the kernel consumes every second row and splits the
+    128 query rows of the tile by cluster rank). Plans split per (request,
+    row tile): a piece with more than one split goes through the BF16 partials
+    and the split-KV combine kernel, a single-split piece keeps
+    ``FLAG_DIRECT_OUT`` and its CTAs write ``O`` / ``LSE`` directly, even when
+    other pieces of the batch are split. ``q_len`` and ``num_heads`` are the
+    query tokens per request and the heads the plan was built for.
     """
 
     schedule: str
@@ -166,6 +291,8 @@ class WorkPlan:
     unit_first: tuple
     max_splits: int
     tiles_per_split: Optional[int]
+    q_len: int
+    num_heads: int
 
     @property
     def num_items(self) -> int:
@@ -240,7 +367,7 @@ def choose_tiles_per_split(
 
 
 def _uniform_plan(kv_lens, *, q_len, num_heads, num_sms, enable_sink, tiles_per_split):
-    """Request-major table, one v_half pair per cluster (all CTAs of a split are adjacent)."""
+    """Request-major table, one pair of rows per cluster (all CTAs of a split are adjacent)."""
     if tiles_per_split is None:
         tiles_per_split = choose_tiles_per_split(
             kv_lens, q_len=q_len, num_heads=num_heads, num_sms=num_sms
@@ -261,9 +388,9 @@ def _uniform_plan(kv_lens, *, q_len, num_heads, num_sms, enable_sink, tiles_per_
             if num_splits == 1:
                 flags |= FLAG_DIRECT_OUT
             for m_tile in range(m_tiles):
-                for v_half in range(V_HALVES):
+                for pair_row in range(V_HALVES):
                     items.append(
-                        (b, m_tile, v_half, start, end, split, num_splits, flags)
+                        (b, m_tile, pair_row, start, end, split, num_splits, flags)
                     )
     return WorkPlan(
         schedule="uniform",
@@ -271,18 +398,81 @@ def _uniform_plan(kv_lens, *, q_len, num_heads, num_sms, enable_sink, tiles_per_
         unit_first=tuple(range(0, len(items) + 1, CLUSTER_PAIR)),
         max_splits=max_splits,
         tiles_per_split=tiles_per_split,
+        q_len=q_len,
+        num_heads=num_heads,
     )
+
+
+def _greedy_unit_bounds(seq_lens, total, max_cost, max_units, boundary_cost):
+    """Left-to-right units of model cost <= ``max_cost`` (each takes >= 1 tile); None if more than ``max_units`` are needed."""
+    bounds = []
+    pos = 0
+    seq_idx = 0
+    seq_pos = 0
+    while pos < total:
+        if len(bounds) == max_units:
+            return None
+        lo = pos
+        cost = 0.0
+        pieces = 0
+        while pos < total:
+            while seq_pos + seq_lens[seq_idx] <= pos:
+                seq_pos += seq_lens[seq_idx]
+                seq_idx += 1
+            avail = seq_pos + seq_lens[seq_idx] - pos
+            piece_cost = boundary_cost if pieces else 0.0
+            room = int(math.floor(max_cost - cost - piece_cost + 1e-9))
+            if pieces == 0:
+                room = max(room, 1)  # progress: a unit takes at least one tile
+            if room <= 0:
+                break
+            take = min(avail, room)
+            cost += piece_cost + take
+            pieces += 1
+            pos += take
+            if take < avail:
+                break  # the unit is full inside this sequence
+        bounds.append((lo, pos))
+    return bounds
+
+
+def cost_balanced_unit_bounds(seq_lens, num_units, boundary_cost=BOUNDARY_COST_TILES):
+    """Contiguous unit ranges over the concatenated sequences minimising the maximum model cost.
+
+    Binary search on the per-unit cost bound; the greedy left-to-right fill is
+    optimal for a monotone cost, and the smallest bound that fits in
+    ``num_units`` units is returned. ``boundary_cost = 0`` reproduces an
+    equal-tiles partition up to the greedy tie-breaking.
+    """
+    total = sum(seq_lens)
+    if total <= 0 or num_units <= 0:
+        raise ValueError("cost_balanced_unit_bounds needs work and at least one unit")
+    lo_c = total / num_units
+    hi_c = float(total) + boundary_cost * len(seq_lens)
+    best = _greedy_unit_bounds(seq_lens, total, hi_c, num_units, boundary_cost)
+    assert best is not None
+    for _ in range(64):
+        if hi_c - lo_c <= 1.0 / 64:
+            break
+        mid = (lo_c + hi_c) / 2
+        trial = _greedy_unit_bounds(seq_lens, total, mid, num_units, boundary_cost)
+        if trial is None:
+            lo_c = mid
+        else:
+            hi_c = mid
+            best = trial
+    return best
 
 
 def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
     """Balanced contiguous partition of the concatenated (row tile, page) work.
 
-    Unit ``u`` of ``U`` receives positions ``[floor(u*W/U), floor((u+1)*W/U))``
-    of the request-major page sequence. Wherever a unit boundary cuts a
-    sequence the sequence becomes two splits; both ``v_half`` items of a piece
-    share ``[start, end)`` and the split index, so the LSE written by the
-    ``v_half == 0`` item applies to both halves of ``O`` in the combine
-    kernel.
+    The request-major tile sequence is cut into at most ``num_units``
+    contiguous ranges of equal model cost ``tiles + BOUNDARY_COST_TILES *
+    (pieces - 1)`` (``cost_balanced_unit_bounds``; fewer units when the optimum
+    does not need them all). Wherever a unit boundary cuts a sequence the
+    sequence becomes two splits; both rows of a piece share ``[start, end)``
+    and the split index.
     """
     m_tiles = _m_tiles(q_len, num_heads)
     sequences = []  # (request, m_tile, tiles)
@@ -297,12 +487,12 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
     longest = max(seq[2] for seq in sequences)
     while num_units > 1 and math.ceil(longest / (total / num_units)) + 1 > MAX_SPLITS:
         num_units //= 2
+    bounds = cost_balanced_unit_bounds([seq[2] for seq in sequences], num_units)
+    num_units = len(bounds)
     pieces: list = [[] for _ in sequences]  # (unit, start, end)
     seq_idx = 0
     seq_pos = 0
-    for u in range(num_units):
-        lo = (u * total) // num_units
-        hi = ((u + 1) * total) // num_units
+    for u, (lo, hi) in enumerate(bounds):
         pos = lo
         while pos < hi:
             while seq_pos + sequences[seq_idx][2] <= pos:
@@ -323,9 +513,9 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
                 flags |= FLAG_SEED_SINK
             if num_splits == 1:
                 flags |= FLAG_DIRECT_OUT
-            for v_half in range(V_HALVES):
+            for pair_row in range(V_HALVES):
                 per_unit[u].append(
-                    (b, m_tile, v_half, start, end, split, num_splits, flags)
+                    (b, m_tile, pair_row, start, end, split, num_splits, flags)
                 )
     items = []
     unit_first = [0]
@@ -338,11 +528,33 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
         unit_first=tuple(unit_first),
         max_splits=max_splits,
         tiles_per_split=None,
+        q_len=q_len,
+        num_heads=num_heads,
     )
 
 
+def _reverse_unit_pieces(plan: WorkPlan) -> WorkPlan:
+    """``plan`` with the pieces of every unit in reverse order.
+
+    Each piece keeps its row pair in order (``check_pairs``); the units, their
+    item multisets and every item's fields stay the same, so the programs
+    ``select_decode_record`` and ``select_reduce_record`` pick do too. Each
+    item is computed on its own, so the order changes no output bit.
+    """
+    items: list = []
+    for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False):
+        for start in range(last - V_HALVES, first - 1, -V_HALVES):
+            items.extend(plan.items[start : start + V_HALVES])
+    return replace(plan, items=tuple(items))
+
+
 def check_pairs(plan: WorkPlan) -> None:
-    """Every unit holds consecutive (v_half 0, v_half 1) items of the same piece."""
+    """Every unit holds consecutive row pairs (rows 0 and 1) of one piece.
+
+    The kernel reads every second row of its unit's range, so a unit must hold
+    an even number of rows and both rows of a pair must describe the same
+    piece; otherwise the odd rows would silently drop work.
+    """
     items, unit_first = plan.items, plan.unit_first
     for u in range(len(unit_first) - 1):
         lo, hi = unit_first[u], unit_first[u + 1]
@@ -367,6 +579,7 @@ def build_work_plan(
     enable_sink: bool = False,
     schedule: str = "auto",
     tiles_per_split: Optional[int] = None,
+    arch: Optional[str] = None,
 ) -> WorkPlan:
     """Build the host work plan for one batch.
 
@@ -374,7 +587,11 @@ def build_work_plan(
     CLUSTER_PAIR`` clusters when the longest request reaches
     ``BALANCED_MIN_KV`` tokens and the uniform split policy otherwise;
     ``"balanced"`` / ``"uniform"`` force one of them. ``tiles_per_split``
-    fixes the uniform split granularity (pages per split).
+    fixes the uniform split granularity (pipeline tiles per split). With
+    ``(arch, num_sms // CLUSTER_PAIR)`` in ``REVERSED_PIECE_TARGETS``, a
+    balanced plan that a program of ``LONG_DECODE_RECORDS`` runs
+    (``select_decode_record``) holds the pieces of every unit in reverse order;
+    otherwise, and without ``arch``, the order is request-major.
     """
     kv_lens = [int(v) for v in kv_lens]
     if q_len < 1 or not kv_lens or min(kv_lens) < q_len:
@@ -405,7 +622,168 @@ def build_work_plan(
             f"work plan needs {plan.max_splits} KV splits; the combine kernel supports {MAX_SPLITS}"
         )
     check_pairs(plan)
+    if (
+        plan.schedule == "balanced"
+        and (arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
+        and select_decode_record(plan, arch, num_sms) in LONG_DECODE_RECORDS
+    ):
+        plan = _reverse_unit_pieces(plan)
     return plan
+
+
+def _delivered(name: str, arch: str) -> bool:
+    """True when the registry delivers record ``name`` for ``arch``."""
+    record = MODULES.get(name)
+    return record is not None and arch in record["arches"]
+
+
+def select_decode_record(
+    plan: WorkPlan, arch: str, num_sms: Optional[int] = None
+) -> str:
+    """Registry record of the decode program that runs ``plan`` on ``arch``.
+
+    A pure host function of the plan, fixed at prepare time, so a captured
+    CUDA graph replays one fixed program. A record runs only where the
+    registry delivers it for ``arch``, and the rules apply in this order:
+    ``QK_AHEAD_RECORD`` (the same kernel with the QK MMAs issued two tiles
+    ahead of PV, delivered for SM100 only) runs a balanced plan when every
+    unit holds at least ``QK_AHEAD_MIN_UNIT_TILES`` pipeline tiles with a
+    piece of at least ``QK_AHEAD_MIN_PIECE_TILES`` (on a device of ``num_sms``
+    SMs, the pair ``QK_AHEAD_MIN_TILES_BY_CLUSTERS`` names for its
+    ``num_sms // CLUSTER_PAIR`` clusters); ``XV_RECORD`` (the
+    decode with its row-pair max exchange gated by a vote, delivered for
+    SM103 only) runs a plan of either schedule when every unit holds at least
+    ``XV_MIN_STEADY_TILES`` pipeline tiles past ``XV_WARMUP_TILES`` tiles of
+    each of its pieces; ``SHORT_RECORD`` runs a plan of either schedule when
+    every unit holds at most ``SHORT_MAX_UNIT_TILES[arch]`` pipeline tiles,
+    and ``SHORT_EPI_RECORD`` (the short-row program with a per-warp epilogue
+    store path) runs such a plan in its place when the last CTA of every
+    request holds at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows;
+    ``SHORT_SPEC_RECORD`` and ``SHORT_EPI_SPEC_RECORD`` (those two programs
+    loading the first item of their unit in the kernel setup) run in place of
+    either when every unit holds one item pair; every other plan runs
+    ``"decode"``. The decode programs' outputs are bitwise identical.
+    """
+    # One item per piece: both rows of a pair share the piece's tile range
+    # (item fields 3 and 4: tile_start, tile_end).
+    units = [
+        [it[4] - it[3] for it in plan.items[first:last:V_HALVES]]
+        for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    ]
+    min_unit, min_piece = QK_AHEAD_MIN_UNIT_TILES, QK_AHEAD_MIN_PIECE_TILES
+    if num_sms is not None:
+        min_unit, min_piece = QK_AHEAD_MIN_TILES_BY_CLUSTERS.get(
+            num_sms // CLUSTER_PAIR, (min_unit, min_piece)
+        )
+    if (
+        _delivered(QK_AHEAD_RECORD, arch)
+        and plan.schedule == "balanced"
+        and all(sum(lens) >= min_unit and max(lens) >= min_piece for lens in units)
+    ):
+        return QK_AHEAD_RECORD
+    if _delivered(XV_RECORD, arch) and all(
+        sum(max(0, tiles - XV_WARMUP_TILES) for tiles in lens) >= XV_MIN_STEADY_TILES
+        for lens in units
+    ):
+        return XV_RECORD
+    limit = SHORT_MAX_UNIT_TILES.get(arch)
+    if (
+        _delivered(SHORT_RECORD, arch)
+        and limit is not None
+        and all(sum(lens) <= limit for lens in units)
+    ):
+        tail_rows = (plan.q_len * plan.num_heads) % ROWS_PER_CTA
+        one_pair = all(
+            last - first == V_HALVES
+            for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+        )
+        if _delivered(SHORT_EPI_RECORD, arch) and tail_rows >= SHORT_EPI_MIN_TAIL_ROWS:
+            if one_pair and _delivered(SHORT_EPI_SPEC_RECORD, arch):
+                return SHORT_EPI_SPEC_RECORD
+            return SHORT_EPI_RECORD
+        if one_pair and _delivered(SHORT_SPEC_RECORD, arch):
+            return SHORT_SPEC_RECORD
+        return SHORT_RECORD
+    return "decode"
+
+
+def split_row_range(row_splits: Sequence[int]) -> Optional[tuple]:
+    """``(first, count)`` of the query rows of more than one split (``row_splits``,
+    ``token_splits``) when they form one contiguous range, else ``None``."""
+    rows = [row for row, splits in enumerate(row_splits) if splits > 1]
+    if not rows or rows[-1] - rows[0] + 1 != len(rows):
+        return None
+    return rows[0], len(rows)
+
+
+def _two_split_rows(row_splits: Sequence[int]) -> Optional[tuple]:
+    """``split_row_range`` of the counts of a plan of at most two splits per
+    row (``select_reduce_record``'s ``max_splits == 2`` plans): the rows of
+    more than one split are the rows of two, found by list scans."""
+    count = row_splits.count(2)
+    if not count:
+        return None
+    first = row_splits.index(2)
+    if row_splits[first : first + count].count(2) != count:
+        return None
+    return first, count
+
+
+def _two_split_unit_ok(plan: WorkPlan, limit: Optional[int]) -> bool:
+    """True when ``limit`` is ``None`` or every unit of ``plan`` holds at most
+    ``limit`` pipeline tiles (the unit sum of ``select_decode_record``: one
+    item per piece, fields 3 and 4)."""
+    return limit is None or all(
+        sum(it[4] - it[3] for it in plan.items[first:last:V_HALVES]) <= limit
+        for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    )
+
+
+def select_reduce_record(
+    plan: WorkPlan,
+    arch: str,
+    *,
+    num_sms: Optional[int] = None,
+    row_splits: Optional[Sequence[int]] = None,
+    decode_record: Optional[str] = None,
+) -> str:
+    """Registry record of the combine program that runs ``plan`` on ``arch``.
+
+    A pure host function of the plan, fixed at prepare time (the combine runs
+    only when the plan splits a row). ``REDUCE_GENERAL_RECORD`` runs a plan
+    whose most split row has at least ``REDUCE_GENERAL_MIN_SPLITS`` KV splits
+    when the registry delivers it for ``arch``; ``REDUCE_TWO_SPLITS_RECORD``
+    runs a plan of two splits per row that a program of
+    ``SHORT_DECODE_RECORDS`` runs (``select_decode_record``) when the registry
+    delivers it for ``arch``, ``(arch, num_sms // CLUSTER_PAIR)`` is in
+    ``REDUCE_TWO_SPLITS_TARGETS``, every unit of the plan holds at most the
+    target's unit limit of pipeline tiles when it names one, and the rows of
+    two splits (``row_splits``, one count per query row) form one contiguous
+    range (``split_row_range``); every other plan runs ``"reduce"``. The
+    combine programs' outputs are bitwise identical. ``decode_record`` is the
+    plan's ``select_decode_record(plan, arch, num_sms)`` when the caller holds
+    it (``prepare``), so it is not selected a second time.
+    """
+    if (
+        _delivered(REDUCE_GENERAL_RECORD, arch)
+        and plan.max_splits >= REDUCE_GENERAL_MIN_SPLITS
+    ):
+        return REDUCE_GENERAL_RECORD
+    if (
+        _delivered(REDUCE_TWO_SPLITS_RECORD, arch)
+        and plan.max_splits == 2
+        and num_sms is not None
+        and row_splits is not None
+        and (arch, num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
+        and (decode_record or select_decode_record(plan, arch, num_sms))
+        in SHORT_DECODE_RECORDS
+        and _two_split_unit_ok(
+            plan, REDUCE_TWO_SPLITS_TARGETS[(arch, num_sms // CLUSTER_PAIR)]
+        )
+        and _two_split_rows(row_splits) is not None
+    ):
+        return REDUCE_TWO_SPLITS_RECORD
+    return "reduce"
 
 
 def work_table_rows(plan: WorkPlan) -> torch.Tensor:
@@ -417,6 +795,27 @@ def work_table_rows(plan: WorkPlan) -> torch.Tensor:
     (``token_splits``).
     """
     return torch.tensor(plan.items, dtype=torch.int32).reshape(-1, ITEM_FIELDS)
+
+
+def _plan_table_words(
+    plan: WorkPlan, layout: dict, *, q_indptr: Sequence[int], row_splits: Sequence[int]
+) -> list:
+    """Int32 words of the ``work_table`` .. ``q_indptr`` workspace span, padding included."""
+    base = layout["work_table"][0]
+    end = layout["q_indptr"][0] + layout["q_indptr"][1]
+    words = [0] * ((end - base) // 4)
+    for name, values in (
+        ("work_table", chain.from_iterable(plan.items)),
+        ("unit_first", plan.unit_first),
+        ("row_splits", row_splits),
+        ("q_indptr", q_indptr),
+    ):
+        offset, nbytes = layout[name]
+        values = list(map(int, values))
+        if len(values) * 4 != nbytes:
+            raise ValueError(f"{name}: {len(values)} words for a {nbytes}-byte region")
+        words[(offset - base) // 4 : (offset - base) // 4 + len(values)] = values
+    return words
 
 
 def token_splits(
@@ -486,32 +885,47 @@ def partial_shapes(plan: WorkPlan, *, total_q: int, num_heads: int) -> tuple:
     )
 
 
+# Order of the workspace regions; the int32 plan tables are adjacent so one
+# host-to-device copy uploads all of them.
+_REGIONS = (
+    "partial_o",
+    "partial_lse",
+    "work_table",
+    "unit_first",
+    "row_splits",
+    "q_indptr",
+    "sinks",
+)
+_TABLE_REGIONS = ("work_table", "unit_first", "row_splits", "q_indptr")
+
+
 def workspace_layout(plan: WorkPlan, *, batch: int, num_heads: int, q_len: int) -> dict:
     """Byte offsets and sizes of every workspace region plus ``"total"``.
 
     Regions: BF16 ``partial_o [max_splits, total_q, H, 512]`` and FP32
     ``partial_lse [total_q, H, max_splits]`` (a 64-row tensor-map dummy and one
     element when the plan has a single split and the kernel writes ``O`` /
-    ``LSE`` directly),
-    int32 ``work_table``, ``unit_first``, ``row_splits``, ``q_indptr`` and
-    FP32 ``sinks [H]``.
+    ``LSE`` directly), int32 ``work_table``, ``unit_first``, ``row_splits``,
+    ``q_indptr`` and FP32 ``sinks [H]``. The partial regions are never
+    initialized by the host: the decode kernel writes every slot the combine
+    kernel reads (``row_splits[token]`` slots per row).
     """
     total_q = batch * q_len
     o_shape, lse_shape = partial_shapes(plan, total_q=total_q, num_heads=num_heads)
-    sizes = (
-        ("partial_o", math.prod(o_shape) * 2),
-        ("partial_lse", math.prod(lse_shape) * 4),
-        ("work_table", plan.num_items * ITEM_FIELDS * 4),
-        ("unit_first", (plan.num_units + 1) * 4),
-        ("row_splits", total_q * 4),
-        ("q_indptr", (batch + 1) * 4),
-        ("sinks", num_heads * 4),
-    )
+    sizes = {
+        "partial_o": math.prod(o_shape) * 2,
+        "partial_lse": math.prod(lse_shape) * 4,
+        "work_table": plan.num_items * ITEM_FIELDS * 4,
+        "unit_first": (plan.num_units + 1) * 4,
+        "row_splits": total_q * 4,
+        "q_indptr": (batch + 1) * 4,
+        "sinks": num_heads * 4,
+    }
     layout: dict = {}
     offset = 0
-    for name, nbytes in sizes:
-        layout[name] = (offset, nbytes)
-        offset += _align(nbytes)
+    for name in _REGIONS:
+        layout[name] = (offset, sizes[name])
+        offset += _align(sizes[name])
     layout["total"] = offset
     return layout
 
@@ -545,7 +959,7 @@ def max_nvfp4_mla_decode_workspace_size(
     """Upper bound of the workspace for any plan with at most ``max_splits`` splits.
 
     Every request contributes at most ``max_splits`` items per (row tile,
-    v_half) pair; the partials dominate (``total_q * H * max_splits * 1 KiB``).
+    pair row); the partials dominate (``total_q * H * max_splits * 1 KiB``).
     """
     total_q = batch * q_len
     max_items = batch * _m_tiles(q_len, num_heads) * V_HALVES * max_splits
@@ -560,9 +974,49 @@ def max_nvfp4_mla_decode_workspace_size(
     )
 
 
+# array typecode of a 32-bit C integer (the table words).
+_INT32_CODE = next(code for code in ("i", "l") if array(code).itemsize == 4)
+
+
+def _table_region(span: torch.Tensor, layout: dict, name: str) -> torch.Tensor:
+    """Int32 region ``name`` of the plan-table span (``work_table`` through
+    ``q_indptr``, viewed as int32 from ``layout["work_table"][0]``), 1-D."""
+    offset, nbytes = layout[name]
+    first = (offset - layout["work_table"][0]) // 4
+    return span[first : first + nbytes // 4]
+
+
+def _as_u8(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` viewed as uint8 (itself when it already is)."""
+    return tensor if tensor.dtype is torch.uint8 else tensor.view(torch.uint8)
+
+
 def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape):
     offset, nbytes = layout[name]
-    return flat[offset : offset + nbytes].view(dtype).view(shape)
+    region = flat[offset : offset + nbytes].view(dtype)
+    # A one-dimensional region already has its shape (no second view).
+    if len(shape) == 1 and region.shape[0] == shape[0]:
+        return region
+    return region.view(shape)
+
+
+def host_tables(
+    plan: WorkPlan, layout: dict, *, q_indptr: Sequence[int], row_splits: Sequence[int]
+) -> torch.Tensor:
+    """One pinned int32 host image of the plan-table region of the workspace.
+
+    Covers ``work_table`` through ``q_indptr`` (adjacent regions; the
+    alignment padding between them is zero) so ``prepare`` uploads every table
+    with a single non-blocking copy into
+    ``workspace[layout["work_table"][0] : q_indptr_end]``.
+    """
+    words = _plan_table_words(plan, layout, q_indptr=q_indptr, row_splits=row_splits)
+    # array packs the words as int32 without torch.tensor's per-element type
+    # inference; one memmove copies them into the pinned image.
+    packed = array(_INT32_CODE, words)
+    image = torch.empty((len(packed),), dtype=torch.int32, pin_memory=True)
+    ctypes.memmove(image.data_ptr(), packed.buffer_info()[0], len(packed) * 4)
+    return image
 
 
 # ---------------------------------------------------------------------------
@@ -578,9 +1032,25 @@ class NVFP4MLADecodeRunner:
     with no CUDA allocation or host synchronization and returns ``out`` (or
     ``(out, lse)`` when prepared with ``return_lse=True``). Prepare a new
     runner when sequence lengths, bindings or input values change.
+    ``host_tables`` keeps the pinned host image of the plan tables alive
+    while its asynchronous upload may still be in flight. ``main_program`` is
+    the library of the decode record ``select_decode_record`` picked for the
+    plan, ``reduce_program`` that of the combine record
+    ``select_reduce_record`` picked (``None`` when the plan splits no row).
+
+    Stream contract: ``prepare_nvfp4_batch_decode_with_kv_cache_mla`` issues
+    the plan-table upload on the stream current at prepare time and
+    ``launch()`` runs on the stream current at launch time, with no event
+    between them (the same contract as the ``plan()`` / ``run()`` wrappers).
+    Launch on the prepare stream, or make the launch stream wait on it
+    (``torch.cuda.Stream.wait_stream``) before the first launch when the
+    two differ; a CUDA graph captured on a side stream after
+    ``torch.cuda.graph``'s synchronize satisfies this already.
     """
 
-    module_name: str
+    arch: str
+    main_program: str
+    reduce_program: Optional[str]
     plan: WorkPlan
     main_kwargs: dict
     reduce_kwargs: Optional[dict]
@@ -591,23 +1061,89 @@ class NVFP4MLADecodeRunner:
     main_arguments: tuple
     reduce_entry: object
     reduce_arguments: tuple
+    host_tables: Optional[torch.Tensor] = None
+    # The launch form of the arguments above, packed once by
+    # bind_decode_payload: (entry, arguments) per program, and the result.
+    launches: tuple = field(default=(), repr=False, compare=False)
+    result: object = field(default=None, repr=False, compare=False)
 
     def launch(self):
         # Tensor maps are encoded by the host binding and passed by value; the
         # split-KV combine runs only when the plan has more than one split.
-        with tvm_ffi.use_torch_stream():
-            self.main_entry(*self.main_arguments)
-            if self.reduce_entry is not None:
-                self.reduce_entry(*self.reduce_arguments)
-        return (self.out, self.lse) if self.return_lse else self.out
+        # Each call's first CUDA tensor stays a torch.Tensor: tvm-ffi runs the
+        # call on the current torch stream of its device, as FlashInfer's
+        # other kernels do; the other tensors were converted once at bind.
+        for entry, arguments in self.launches:
+            entry(*arguments)
+        return self.result
 
     __call__ = launch
 
 
+def _launch_form(arguments: tuple) -> tuple:
+    """``arguments`` with every tensor but the first CUDA one converted once
+    to a ``tvm_ffi.Tensor`` view of the same memory (no per-launch DLPack
+    exchange); the first CUDA tensor stays a ``torch.Tensor`` and carries
+    the launch stream."""
+    packed, carrier = [], False
+    for argument in arguments:
+        if isinstance(argument, torch.Tensor):
+            if carrier or not argument.is_cuda:
+                argument = tvm_ffi.from_dlpack(argument)
+            else:
+                carrier = True
+        packed.append(argument)
+    if not carrier:
+        raise ValueError("a launch needs a CUDA tensor argument")
+    return tuple(packed)
+
+
 def generated_program_available(device: torch.device) -> bool:
-    """True when this checkout registers a generated program for ``device``."""
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
-    return arch is not None and any(r["arch"] == arch for r in MODULES.values())
+    """True when this checkout registers the generated programs for ``device``."""
+    arch = _device_arch(_device_index(device))
+    return arch is not None and program_available(arch)
+
+
+# The registry's host-plan constants of each stage, held by every record of
+# that stage: the values this host side writes into the work table and sizes
+# the partials with.
+_RECORD_CONSTANTS = {
+    "decode": {
+        "item_fields": ITEM_FIELDS,
+        "flag_seed_sink": FLAG_SEED_SINK,
+        "flag_direct_out": FLAG_DIRECT_OUT,
+        "rows_per_tile": ROWS_PER_TILE,
+        "tile_kv": TILE_KV,
+        "page_size": PAGE_SIZE,
+        "grid_rule": {"kind": "units_by_cluster", "ctas": CLUSTER_PAIR},
+    },
+    "reduce": {
+        "max_splits": MAX_SPLITS,
+        "grid_rule": {"kind": "rows_by_heads", "heads_per_cta": REDUCE_HEADS_PER_CTA},
+    },
+}
+
+
+def _check_record(name: str) -> dict:
+    """The registry record ``name``, held to the host plan this module assumes
+    for the record's ``stage`` (its constants and its cluster launch)."""
+    record = MODULES[name]
+    stage = record["stage"]
+    expected = _RECORD_CONSTANTS[stage]
+    actual = {key: record.get(key) for key in expected}
+    if actual != expected:
+        raise RuntimeError(
+            f"the registered {name} record's host plan {actual} differs from "
+            f"this backend's {expected}"
+        )
+    cluster = tuple(int(v) for v in record["launch"]["cluster"])
+    want = (CLUSTER_PAIR, 1, 1) if stage == "decode" else (1, 1, 1)
+    if cluster != want:
+        raise RuntimeError(
+            f"the registered {name} record launches clusters of {cluster}; "
+            f"this backend plans {want}"
+        )
+    return record
 
 
 def bind_decode_payload(
@@ -618,29 +1154,37 @@ def bind_decode_payload(
     out: torch.Tensor,
     lse: torch.Tensor,
     return_lse: bool,
+    host_tables: Optional[torch.Tensor] = None,
+    *,
+    decode_record: str = "decode",
+    reduce_record: str = "reduce",
 ) -> NVFP4MLADecodeRunner:
-    """Bind the prepared buffers to the generated physical argument order."""
-    module_name = select_module(arch)
-    record = MODULES[module_name]
+    """Bind the prepared buffers to the generated programs' argument plans.
 
-    def arguments(kwargs, physical):
-        grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
-        return tuple(
-            grid[name] if kind == "grid" else kwargs[name]
-            for kind, name in physical["arg_plan"]
-        )
-
-    main_module = load_cake_nvfp4_mla_decode_module(module_name, "main")
-    main_entry = getattr(main_module, record["main"]["ffi_entry"])
-    main_arguments = arguments(main_kwargs, record["main"])
+    ``decode_record`` and ``reduce_record`` name the records whose programs
+    run the plan (``select_decode_record``, ``select_reduce_record``).
+    """
+    main_record = _check_record(decode_record)
+    main_program = main_record["library"]
+    main_entry = getattr(load(decode_record, arch), main_record["ffi_entry"])
+    main_arguments = launch_args(main_record, main_kwargs, main_kwargs["grid"])
+    reduce_program = None
     reduce_entry = None
     reduce_arguments = ()
     if reduce_kwargs is not None:
-        reduce_module = load_cake_nvfp4_mla_decode_module(module_name, "reduce")
-        reduce_entry = getattr(reduce_module, record["reduce"]["ffi_entry"])
-        reduce_arguments = arguments(reduce_kwargs, record["reduce"])
+        combine = _check_record(reduce_record)
+        reduce_program = combine["library"]
+        reduce_entry = getattr(load(reduce_record, arch), combine["ffi_entry"])
+        reduce_arguments = launch_args(combine, reduce_kwargs, reduce_kwargs["grid"])
+    launches: tuple[tuple[object, tuple], ...] = (
+        (main_entry, _launch_form(main_arguments)),
+    )
+    if reduce_entry is not None:
+        launches += ((reduce_entry, _launch_form(reduce_arguments)),)
     return NVFP4MLADecodeRunner(
-        module_name,
+        arch,
+        main_program,
+        reduce_program,
         plan,
         main_kwargs,
         reduce_kwargs,
@@ -651,6 +1195,9 @@ def bind_decode_payload(
         main_arguments,
         reduce_entry,
         reduce_arguments,
+        host_tables,
+        launches,
+        (out, lse) if return_lse else out,
     )
 
 
@@ -752,9 +1299,14 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     """Plan and bind one NVFP4 DeepSeek-V4 paged MQA decode batch.
 
     Host planning (one device-to-host copy of ``seq_lens`` unless
-    ``seq_lens_cpu`` is given) and every allocation happen here; the returned
-    runner launches with neither. ``schedule`` / ``tiles_per_split`` expose the
-    host work-plan policy for tests and benchmarks.
+    ``seq_lens_cpu`` is given), the single pinned upload of the plan tables
+    and every allocation happen here; the returned runner launches with
+    neither. The upload is asynchronous on the current stream: launch on
+    this stream, or have the launch stream ``wait_stream`` on it first (see
+    ``NVFP4MLADecodeRunner``). ``schedule`` / ``tiles_per_split`` expose the
+    host work-plan policy for tests and benchmarks. The decode and combine
+    programs are picked here, once per plan (``select_decode_record``,
+    ``select_reduce_record``).
     """
     if backend != "cake":
         raise ValueError("NVFP4 MLA decode supports backend='cake'")
@@ -772,16 +1324,22 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     tensors = [query, query_scale, kv_cache, kv_scale, block_tables, seq_lens]
     tensors += [t for t in (sinks, out, lse, workspace_buffer) if t is not None]
     device = query.device
-    if not all(t.is_cuda and t.device == device for t in tensors):
+    # Every tensor on query's device, and that device a CUDA device.
+    if not query.is_cuda or not all(t.device == device for t in tensors):
         raise ValueError("Expected all tensors on one CUDA device")
+    # The kernels address block_tables rows as ``b * max_pages + p``, the output
+    # rows as ``row * 512`` and read the Q / KV rows through tensor maps whose
+    # leading dimensions must fold densely; the workspace is carved as flat
+    # bytes. Strided views of any of them need a kernel ABI with runtime
+    # strides and are rejected here rather than copied behind the caller's back.
     if not all(t.is_contiguous() for t in tensors):
         raise ValueError("Expected contiguous tensors")
-    capability = torch.cuda.get_device_capability(device)
-    arch = SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
+    device_index = _device_index(device)
+    arch = _device_arch(device_index)
     if arch is None:
+        major, minor = get_compute_capability(torch.device("cuda", device_index))
         raise ValueError(
-            "NVFP4 MLA decode requires compute capability 10.0 or 10.3 "
-            f"(got {capability[0]}.{capability[1]})"
+            f"NVFP4 MLA decode requires compute capability 10.0 or 10.3 (got {major}.{minor})"
         )
     if seq_lens_cpu is None:
         seq_lens_cpu = seq_lens.cpu()
@@ -794,7 +1352,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
             f"every request needs q_len ({q_len}) <= seq_len <= max_pages * {PAGE_SIZE}"
         )
     total_q = batch * q_len
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    num_sms = _device_sm_count(device_index)
     plan = build_work_plan(
         kv_lens,
         num_heads=num_heads,
@@ -803,9 +1361,14 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         enable_sink=sinks is not None,
         schedule=schedule,
         tiles_per_split=tiles_per_split,
+        arch=arch,
     )
+    decode_record = select_decode_record(plan, arch, num_sms)
     layout = workspace_layout(plan, batch=batch, num_heads=num_heads, q_len=q_len)
-    flat = workspace_buffer.view(-1).view(torch.uint8)
+    # A one-dimensional uint8 workspace is already the flat byte view.
+    flat = workspace_buffer
+    if flat.dtype is not torch.uint8 or flat.dim() != 1:
+        flat = flat.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
         raise ValueError(
             f"workspace_buffer needs {layout['total']} bytes for this batch "
@@ -828,39 +1391,41 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     o_shape, lse_shape = partial_shapes(plan, total_q=total_q, num_heads=num_heads)
     partial_o = _carve(flat, layout, "partial_o", torch.bfloat16, o_shape)
     partial_lse = _carve(flat, layout, "partial_lse", torch.float32, lse_shape)
-    work_table = _carve(
-        flat, layout, "work_table", torch.int32, (plan.num_items, ITEM_FIELDS)
+    # The int32 plan tables are adjacent: one int32 view of their span carves
+    # them and takes the single upload below.
+    table_base = layout["work_table"][0]
+    table_end = layout["q_indptr"][0] + layout["q_indptr"][1]
+    table_span = flat[table_base:table_end].view(torch.int32)
+    work_table = _table_region(table_span, layout, "work_table").view(
+        plan.num_items, ITEM_FIELDS
     )
-    unit_first = _carve(flat, layout, "unit_first", torch.int32, (plan.num_units + 1,))
-    row_splits = _carve(flat, layout, "row_splits", torch.int32, (total_q,))
-    q_indptr = _carve(flat, layout, "q_indptr", torch.int32, (batch + 1,))
+    unit_first = _table_region(table_span, layout, "unit_first")
+    q_indptr = _table_region(table_span, layout, "q_indptr")
     sink_buffer = _carve(flat, layout, "sinks", torch.float32, (num_heads,))
-    # Unused partial slots keep finite zeros and -inf LSEs so the combine
-    # kernel weights them by zero. Single-split items keep FLAG_DIRECT_OUT:
-    # their CTAs write final O / LSE directly and the combine kernel skips rows
-    # with row_splits <= 1, so the per-token count is derived from the items
-    # (token_splits resolves it or raises; nothing is defaulted).
-    partial_o.zero_()
-    partial_lse.fill_(float("-inf"))
-    work_table.copy_(work_table_rows(plan))
-    unit_first.copy_(torch.tensor(plan.unit_first, dtype=torch.int32))
+    # The partial regions are not initialized: single-split items keep
+    # FLAG_DIRECT_OUT (their CTAs write final O / LSE directly and the combine
+    # kernel skips rows with row_splits <= 1) and the combine kernel reads
+    # exactly row_splits[token] slots of a row, each written by the decode
+    # kernel. The per-token count is derived from the items (token_splits
+    # resolves it or raises; nothing is defaulted).
     q_indptr_host = list(range(0, total_q + 1, q_len))
     if max_splits > 1:
-        row_splits.copy_(
-            torch.tensor(
-                token_splits(
-                    plan,
-                    q_indptr_host,
-                    q_len=q_len,
-                    num_heads=num_heads,
-                    total_q=total_q,
-                ),
-                dtype=torch.int32,
-            )
+        row_splits_host = token_splits(
+            plan, q_indptr_host, q_len=q_len, num_heads=num_heads, total_q=total_q
         )
     else:
-        row_splits.fill_(1)
-    q_indptr.copy_(torch.tensor(q_indptr_host, dtype=torch.int32))
+        row_splits_host = [1] * total_q
+    reduce_record = select_reduce_record(
+        plan,
+        arch,
+        num_sms=num_sms,
+        row_splits=row_splits_host,
+        decode_record=decode_record,
+    )
+    tables = host_tables(
+        plan, layout, q_indptr=q_indptr_host, row_splits=row_splits_host
+    )
+    table_span.copy_(tables, non_blocking=True)
     if sinks is None:
         sink_buffer.zero_()
     else:
@@ -868,9 +1433,9 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
 
     main_kwargs = dict(
         Q=query.view(total_q * num_heads, ROW_BYTES),
-        QS=query_scale.view(torch.uint8).view(total_q * num_heads, SF_ROW_BYTES),
+        QS=_as_u8(query_scale).view(total_q * num_heads, SF_ROW_BYTES),
         KV=kv_cache.view(num_pages * PAGE_SIZE, ROW_BYTES),
-        KVS=kv_scale.view(torch.uint8).view(num_pages * PAGE_SIZE, SF_ROW_BYTES),
+        KVS=_as_u8(kv_scale).view(num_pages * PAGE_SIZE, SF_ROW_BYTES),
         # Bulk-tensor-store maps of the epilogue: O and the split-major partials
         # viewed as [rows, 512] BF16 (the single-split dummy is already 2-D).
         OT=out.view(rows_total, HEAD_DIM),
@@ -893,23 +1458,203 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         max_pages=max_pages,
         max_splits=max_splits,
         scale_log2=float(sm_scale) * LOG2E,
-        grid=plan.grid,
+        grid=launch_grid(MODULES[decode_record], units=plan.num_units),
     )
     reduce_kwargs = None
     if max_splits > 1:
+        # The two-split combine runs the contiguous range of split rows alone:
+        # one CTA row per range row, every per-row pointer offset to the
+        # range's first row; total_q stays the full count (the split stride).
+        # Every other combine runs all total_q rows. select_reduce_record
+        # picked it only for a contiguous range (split_row_range) of rows of
+        # two splits, so the range is the first such row and their count;
+        # _bind_two_split_plan binds it. The combine's row_splits is carved
+        # here, from its first row on (the decode does not take it).
+        first, rows = 0, total_q
+        if reduce_record == REDUCE_TWO_SPLITS_RECORD:
+            first, rows = row_splits_host.index(2), row_splits_host.count(2)
+            return _bind_two_split_plan(
+                arch,
+                plan,
+                main_kwargs,
+                out,
+                lse,
+                return_lse,
+                tables,
+                decode_record,
+                flat=flat,
+                layout=layout,
+                table_span=table_span,
+                first=first,
+                rows=rows,
+                tensors=tensors,
+            )
+        splits_first = (layout["row_splits"][0] - table_base) // 4 + first
         reduce_kwargs = dict(
-            o=out,
-            lse=lse,
-            partial_o=partial_o,
-            partial_lse=partial_lse,
-            row_splits=row_splits,
+            o=out[first:] if first else out,
+            lse=lse[first:] if first else lse,
+            partial_o=main_kwargs["PO"][first * num_heads :] if first else partial_o,
+            partial_lse=partial_lse[first:] if first else partial_lse,
+            row_splits=table_span[splits_first : splits_first + total_q - first],
             total_q=total_q,
             num_heads=num_heads,
             max_splits=max_splits,
-            grid=(total_q, math.ceil(num_heads / REDUCE_HEADS_PER_CTA), 1),
+            grid=launch_grid(MODULES[reduce_record], total_q=rows, num_heads=num_heads),
         )
     assert tuple(main_kwargs) == MAIN_KWARGS
     assert reduce_kwargs is None or tuple(reduce_kwargs) == REDUCE_KWARGS
     return bind_decode_payload(
-        arch, plan, main_kwargs, reduce_kwargs, out, lse, return_lse
+        arch,
+        plan,
+        main_kwargs,
+        reduce_kwargs,
+        out,
+        lse,
+        return_lse,
+        tables,
+        decode_record=decode_record,
+        reduce_record=reduce_record,
+    )
+
+
+def _bind_two_split_plan(
+    arch: str,
+    plan: WorkPlan,
+    main_kwargs: dict,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    return_lse: bool,
+    tables: torch.Tensor,
+    decode_record: str,
+    *,
+    flat: torch.Tensor,
+    layout: dict,
+    table_span: torch.Tensor,
+    first: int,
+    rows: int,
+    tensors: list,
+) -> NVFP4MLADecodeRunner:
+    """``prepare``'s binding of a plan the two-split combine runs, over the
+    ``rows`` split rows from ``first`` on (every per-row pointer offset to
+    ``first``; ``total_q`` stays the full count, the split stride).
+
+    The combine's arguments are the data pointers of offset views of the
+    workspace, ``out`` and ``lse`` and the plan's scalars, so when ``out`` and
+    ``lse`` are the caller's (among the validated ``tensors``) they are bound
+    once per buffer set and plan shape (``_TWO_SPLIT_BINDINGS``): the same
+    storage pointers, region offsets and scalars bind the same arguments.
+    """
+    combine = MODULES[REDUCE_TWO_SPLITS_RECORD]
+    num_heads, max_splits = main_kwargs["num_heads"], main_kwargs["max_splits"]
+    total_q = main_kwargs["rows_total"] // num_heads
+    table_base = layout["work_table"][0]
+    splits_first = (layout["row_splits"][0] - table_base) // 4 + first
+    key = None
+    if any(t is out for t in tensors) and any(t is lse for t in tensors):
+        key = (
+            flat.data_ptr(),
+            out.data_ptr(),
+            lse.data_ptr(),
+            layout["partial_o"][0],
+            layout["partial_lse"][0],
+            table_base,
+            splits_first,
+            total_q,
+            num_heads,
+            max_splits,
+            first,
+            rows,
+        )
+        bound = _TWO_SPLIT_BINDINGS.get(key)
+        if bound is not None and bound[0] is combine:
+            assert tuple(main_kwargs) == MAIN_KWARGS
+            return _bind_with_bound_combine(
+                arch,
+                plan,
+                main_kwargs,
+                dict(bound[1]),
+                out,
+                lse,
+                return_lse,
+                tables,
+                decode_record,
+                bound[2],
+            )
+    partial_o, partial_lse = main_kwargs["partial_o"], main_kwargs["partial_lse"]
+    reduce_kwargs = dict(
+        o=out[first:] if first else out,
+        lse=lse[first:] if first else lse,
+        partial_o=main_kwargs["PO"][first * num_heads :] if first else partial_o,
+        partial_lse=partial_lse[first:] if first else partial_lse,
+        row_splits=table_span[splits_first : splits_first + total_q - first],
+        total_q=total_q,
+        num_heads=num_heads,
+        max_splits=max_splits,
+        grid=launch_grid(combine, total_q=rows, num_heads=num_heads),
+    )
+    assert tuple(main_kwargs) == MAIN_KWARGS
+    assert tuple(reduce_kwargs) == REDUCE_KWARGS
+    runner = bind_decode_payload(
+        arch,
+        plan,
+        main_kwargs,
+        reduce_kwargs,
+        out,
+        lse,
+        return_lse,
+        tables,
+        decode_record=decode_record,
+        reduce_record=REDUCE_TWO_SPLITS_RECORD,
+    )
+    if key is not None:
+        if len(_TWO_SPLIT_BINDINGS) >= _TWO_SPLIT_BINDINGS_MAX:
+            _TWO_SPLIT_BINDINGS.clear()
+        _TWO_SPLIT_BINDINGS[key] = (
+            combine,
+            dict(reduce_kwargs),
+            (runner.reduce_arguments, runner.launches[1][1]),
+        )
+    return runner
+
+
+def _bind_with_bound_combine(
+    arch: str,
+    plan: WorkPlan,
+    main_kwargs: dict,
+    reduce_kwargs: dict,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    return_lse: bool,
+    tables: torch.Tensor,
+    decode_record: str,
+    reduce_bound: tuple,
+) -> NVFP4MLADecodeRunner:
+    """``bind_decode_payload`` for the two-split combine whose ``(arguments,
+    launch form)`` of ``reduce_kwargs`` are already bound (``reduce_bound``)."""
+    main_record = _check_record(decode_record)
+    combine = _check_record(REDUCE_TWO_SPLITS_RECORD)
+    main_entry = getattr(load(decode_record, arch), main_record["ffi_entry"])
+    reduce_entry = getattr(load(REDUCE_TWO_SPLITS_RECORD, arch), combine["ffi_entry"])
+    main_arguments = launch_args(main_record, main_kwargs, main_kwargs["grid"])
+    reduce_arguments, reduce_launch = reduce_bound
+    return NVFP4MLADecodeRunner(
+        arch,
+        main_record["library"],
+        combine["library"],
+        plan,
+        main_kwargs,
+        reduce_kwargs,
+        out,
+        lse,
+        return_lse,
+        main_entry,
+        main_arguments,
+        reduce_entry,
+        reduce_arguments,
+        tables,
+        (
+            (main_entry, _launch_form(main_arguments)),
+            (reduce_entry, reduce_launch),
+        ),
+        (out, lse) if return_lse else out,
     )

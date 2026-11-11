@@ -21,16 +21,20 @@ minimax_h3_bf16_pre_attention_trace = TraceTemplate(
     op_type="minimax_h3_bf16_pre_attention",
     name_prefix="minimax_h3_bf16_pre_attention",
     description=(
-        "MiniMax-H3 fused BF16 RMSNorm, indexed AdaLN, QKV projection, "
-        "Q/K RMSNorm, partial 3-D RoPE, and destination-major packing."
+        "MiniMax-H3 BF16 RMSNorm, indexed AdaLN, QKV projection, "
+        "Q/K RMSNorm, partial 3-D RoPE, and destination-major packing "
+        "(two launches: activation workspace + persistent GEMM)."
     ),
     axes={
         "num_tokens": Var(description="Local token count M."),
         "hidden_size": Const(value=5376, abbrev="h"),
-        "adaln_rows": Const(value=9, abbrev="ar"),
+        "adaln_rows": Var(
+            description="AdaLN table rows (any count >= 1; column-chunk views allowed)."
+        ),
         "qkv_kinds": Const(value=3, abbrev="qkv"),
         "head_dim": Const(value=128, abbrev="d"),
         "qkv_width": Const(value=21504, abbrev="w"),
+        "rope_cache_rows": Var(description="RoPE cos/sin cache rows S."),
         "rope_dim": Const(value=96, abbrev="rope"),
         "ulysses_degree": Var(description="Ulysses destination count."),
         "heads_per_destination": Var(description="Attention heads per destination."),
@@ -44,7 +48,20 @@ minimax_h3_bf16_pre_attention_trace = TraceTemplate(
         "qkv_weight": Tensor(["qkv_width", "hidden_size"]),
         "q_norm_weight": Tensor(["head_dim"]),
         "k_norm_weight": Tensor(["head_dim"]),
-        "rope_cos_sin": Tensor(["num_tokens", "rope_dim"]),
+        "rope_cos_sin": Tensor(["rope_cache_rows", "rope_dim"]),
+        "rope_positions": Tensor(
+            ["num_tokens"],
+            optional=True,
+            description="int64 cache row per token; absent means the identity.",
+        ),
+        "workspace": Tensor(
+            ["num_tokens", "hidden_size"],
+            optional=True,
+            description=(
+                "BF16 scratch for the normalized, modulated activation "
+                "(mutated); absent means a per-call allocation."
+            ),
+        ),
         "out": Tensor(
             [
                 "ulysses_degree",
@@ -57,6 +74,7 @@ minimax_h3_bf16_pre_attention_trace = TraceTemplate(
         ),
         "ulysses_degree": Scalar("int32"),
         "eps": Scalar("float32", optional=True),
+        "qk_eps": Scalar("float32", optional=True),
     },
     outputs={
         "out": Tensor(
@@ -74,6 +92,8 @@ minimax_h3_bf16_pre_attention_trace = TraceTemplate(
         "ulysses_degree in (1, 2, 4, 8)",
         "qkv_width == ulysses_degree * heads_per_destination * qkv_kinds * head_dim",
         "rope_dim <= head_dim",
+        "adaln_rows >= 1",
+        "rope_cache_rows >= 1",
     ],
     tags=["stage:pre-attention", "dtype:bf16", "status:experimental"],
 )

@@ -49,10 +49,18 @@ def _configuration(batch, heads, page, capacity, sms, capability):
         split_len = max(1 << (max(raw, 1) - 1).bit_length(), 128)
         splits = (capacity + split_len - 1) // split_len
     num_ctas = 2 if batch >= 16 and block_h >= 64 else None
-    # The 64-head/eight-key tile produces NaNs with two CTAs on SM100,
-    # including through native ct.launch. One CTA preserves the same kernel
-    # and correct BF16/FP16 results; larger head/key tiles retain two CTAs.
-    if capability == (10, 0) and block_h == 64 and block_n == 8:
+    # The 64-head/eight-key tile produces NaNs with two CTAs on SM100
+    # (including native ct.launch) and SM107. One CTA preserves the same
+    # kernel and correct BF16/FP16 results; larger head/key tiles retain two CTAs.
+    if capability in ((10, 0), (10, 7)) and block_h == 64 and block_n == 8:
+        num_ctas = 1
+    # Two CTAs produce NaNs on SM120/SM121 for these head/key tiles.
+    # Use one CTA for them while retaining two CTAs for other tiles.
+    if capability in ((12, 0), (12, 1)) and (block_h, block_n) in (
+        (64, 8),
+        (128, 8),
+        (128, 16),
+    ):
         num_ctas = 1
     return (
         block_h,

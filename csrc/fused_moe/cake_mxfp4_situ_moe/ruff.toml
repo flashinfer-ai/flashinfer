@@ -1,0 +1,6 @@
+# The CuTe DSL units under cute/ are generated (rendered from the pinned Cake
+# revision named in the package manifests next to this file) and
+# checksum-attested; lint and format stay off them, as for the other generated
+# CuTe DSL sources in this repository.  Nothing else in this directory is Python.
+extend = "../../../pyproject.toml"
+extend-exclude = ["cute/**/*.py"]

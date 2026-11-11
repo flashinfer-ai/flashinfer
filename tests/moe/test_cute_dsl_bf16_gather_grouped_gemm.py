@@ -472,7 +472,12 @@ def test_cute_dsl_bf16_gather_grouped_gemm_rejects_bad_activation_config():
             cutlass.Float32, (128, 64), topk=2, **kwargs
         )
 
-    for bad in (ActivationType.Geglu, ActivationType.Silu, ActivationType.SwigluStep):
+    for bad in (
+        ActivationType.Geglu,
+        ActivationType.Silu,
+        ActivationType.SwigluStep,
+        ActivationType.ClampedRelu2,
+    ):
         with pytest.raises(ValueError, match="Unsupported activation_type"):
             make(activation_type=bad.value)
     with pytest.raises(ValueError, match="swiglu_alpha must be finite"):
@@ -483,7 +488,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm_rejects_bad_activation_config():
         make(swiglu_limit=0.0)
     with pytest.raises(ValueError, match="requires situ_beta"):
         make(situ_linear_beta=25.0)
-    with pytest.raises(ValueError, match=r"require ActivationType\.Situ or Swiglu"):
+    with pytest.raises(ValueError, match="require ActivationType.Swiglu"):
         make(activation_type=ActivationType.GegluTanh.value, situ_beta=4.0)
     with pytest.raises(ValueError, match="swiglu_limit must be positive"):
         make(swiglu_limit=0.0, situ_linear_beta=25.0)

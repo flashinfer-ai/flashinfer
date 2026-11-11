@@ -413,7 +413,15 @@ def is_valid_bf16_nvfp4(knobs: Dict[str, Any]) -> bool:
     cluster = tuple(knobs.get("cluster_shape_mnk", (2, 1, 1)))
     token_back = knobs.get("token_back_mode", "epi_warps")
     return (
-        tile in ((128, 64, 256), (128, 128, 256), (256, 64, 256), (256, 128, 256))
+        tile
+        in (
+            (128, 32, 256),
+            (128, 64, 256),
+            (128, 128, 256),
+            (256, 32, 256),
+            (256, 64, 256),
+            (256, 128, 256),
+        )
         and (cluster == (2, 1, 1) or (cluster == (1, 1, 1) and tile == (128, 64, 256)))
         and knobs.get("use_2cta_instrs", tile[0] == 256) == (tile[0] == 256)
         and knobs.get("load_balance_mode", "static") in ("static", "atomic_counter")
@@ -538,6 +546,51 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
     return dataclasses.replace(config, **overrides)
 
 
+# Config fields set from the API arguments; a knobs dict must not override them.
+_EXPLICIT_CONFIG_FIELDS = frozenset(
+    {
+        "rank",
+        "world_size",
+        "num_tokens_per_rank",
+        "num_topk",
+        "num_total_experts",
+        "hidden",
+        "intermediate",
+        "kind",
+        "gate_up_clamp",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "activation",
+        "situ_beta",
+        "situ_linear_beta",
+        "apply_routing_weights_before_fc2",
+        "apply_topk_in_fc1",  # Deprecated name
+        "enable_in_kernel_fc2_reduce",
+        "use_custom_finalize",
+        "defer_topk_reduce",  # Deprecated name
+        "use_persistent_finalize_kernel",
+        "combine_dtype",
+        "enable_fc1_activation_per_token_scale",
+    }
+)
+
+
+def reject_explicit_knobs(knobs: Optional[Dict[str, Any]]) -> None:
+    """Raise if ``knobs`` names a config field set through the API arguments."""
+    explicit = sorted(_EXPLICIT_CONFIG_FIELDS.intersection(knobs or ()))
+    if explicit:
+        raise ValueError(
+            f"{explicit} are explicit config fields, not tunable knobs; set them "
+            f"through the API arguments instead of the knobs dict."
+        )
+
+
+def with_checked_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
+    """:func:`with_knobs`, but raise on knobs naming an explicit config field."""
+    reject_explicit_knobs(knobs)
+    return with_knobs(config, knobs)
+
+
 __all__ = [
     "CORRECTNESS_KNOBS",
     "PERF_KNOBS",
@@ -551,5 +604,7 @@ __all__ = [
     "is_valid_bf16_nvfp4",
     "is_valid_bf16_nvfp4_for_config",
     "iter_candidates",
+    "reject_explicit_knobs",
+    "with_checked_knobs",
     "with_knobs",
 ]

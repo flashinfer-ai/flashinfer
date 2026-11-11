@@ -18,8 +18,8 @@ import math
 
 import pytest
 import torch
-from tests.test_helpers.test_helpers import clear_cuda_cache
-from tests.test_helpers.parametrize import (
+from tests.attention.test_helpers.test_helpers import clear_cuda_cache
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
@@ -37,6 +37,10 @@ from flashinfer.utils import (
     is_sm100a_supported,
     is_sm110a_supported,
 )
+
+
+# H100 CI peak GPU memory: 44.4 GiB.
+pytestmark = pytest.mark.gpu_exclusive
 
 
 @pytest.fixture(

@@ -86,15 +86,15 @@ def test_unselected():
     assert properties["pytest_nodeid"] == selected_node
 
 
-def test_plugin_promotes_solo_and_long_running_markers_to_their_sources(
+def test_plugin_promotes_scheduling_markers_to_their_sources(
     tmp_path: Path,
 ) -> None:
-    solo_file = tmp_path / "test_solo.py"
-    solo_file.write_text(
+    node_exclusive_file = tmp_path / "test_node_exclusive.py"
+    node_exclusive_file.write_text(
         """\
 import pytest
 
-@pytest.mark.solo
+@pytest.mark.node_exclusive
 def test_marked():
     pass
 
@@ -118,30 +118,64 @@ def test_same_source():
         encoding="utf-8",
     )
     collection_path = tmp_path / "collection.json"
+    gpu_file = tmp_path / "test_gpu.py"
+    gpu_file.write_text(
+        "import pytest\n"
+        "@pytest.mark.gpu_exclusive\n"
+        "def test_marked(): pass\n"
+        "def test_same_source(): pass\n",
+        encoding="utf-8",
+    )
+    host_file = tmp_path / "test_host.py"
+    host_file.write_text(
+        "import pytest\n"
+        "@pytest.mark.host_memory_heavy\n"
+        "def test_marked(): pass\n"
+        "def test_same_source(): pass\n",
+        encoding="utf-8",
+    )
 
     collected = _pytest(
         tmp_path,
         "--strict-markers",
         "--collect-only",
         f"--flashinfer-collection-json={collection_path}",
-        str(solo_file),
+        str(node_exclusive_file),
         str(long_file),
+        str(gpu_file),
+        str(host_file),
     )
 
     assert collected.returncode == 0, collected.stdout + collected.stderr
     collection = json.loads(collection_path.read_text(encoding="utf-8"))
-    solo_nodes = [
-        node for node in collection["nodes"] if "test_solo.py::" in node["nodeid"]
+    node_exclusive_nodes = [
+        node
+        for node in collection["nodes"]
+        if "test_node_exclusive.py::" in node["nodeid"]
     ]
     long_nodes = [
         node for node in collection["nodes"] if "test_long.py::" in node["nodeid"]
     ]
-    assert len(solo_nodes) == 2
+    assert len(node_exclusive_nodes) == 2
     assert len(long_nodes) == 2
-    assert all(node["solo"] is True for node in solo_nodes)
-    assert all(node["long_running"] is False for node in solo_nodes)
+    assert all(node["node_exclusive"] is True for node in node_exclusive_nodes)
+    assert all(node["long_running"] is False for node in node_exclusive_nodes)
     assert all(node["long_running"] is True for node in long_nodes)
-    assert all(node["solo"] is False for node in long_nodes)
+    assert all(node["node_exclusive"] is False for node in long_nodes)
+    gpu_nodes = [
+        node for node in collection["nodes"] if "test_gpu.py::" in node["nodeid"]
+    ]
+    assert len(gpu_nodes) == 2
+    assert all(node["gpu_exclusive"] for node in gpu_nodes)
+    assert all(not node["node_exclusive"] for node in gpu_nodes)
+    host_nodes = [
+        node for node in collection["nodes"] if "test_host.py::" in node["nodeid"]
+    ]
+    assert len(host_nodes) == 2
+    assert all(node["host_memory_heavy"] for node in host_nodes)
+    assert all(
+        not node["node_exclusive"] and not node["gpu_exclusive"] for node in host_nodes
+    )
     assert "PytestUnknownMarkWarning" not in collected.stdout + collected.stderr
 
 

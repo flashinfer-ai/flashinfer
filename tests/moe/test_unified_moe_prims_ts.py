@@ -18,8 +18,8 @@ Two sections:
 
   * CPU-only configuration and runner-support tests.
 
-  * SM100/SM103 GPU tests that require nvidia-cutlass-dsl: accuracy against
-    the existing unified NVFP4/BF16 references, direct pack_inputs+forward,
+  * SM100/SM103 GPU tests that require nvidia-cutlass-dsl: accuracy across
+    supported quantization and activation pairs, direct pack_inputs+forward,
     and CUDA-graph replay.
 """
 
@@ -49,10 +49,13 @@ from flashinfer.fused_moe.api import (
     ReLU2,
     RoutingConfig,
     RoutingInputMode,
+    SiLU,
     SiTU,
     SwiGLU,
     TrtllmBf16Config,
     TrtllmFp4Config,
+    TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
     _DEFAULT_BACKEND,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
@@ -69,6 +72,7 @@ from tests.moe.test_unified_moe import (
     _make_packs_and_config,
     _nvfp4_check,
 )
+from tests.moe.utils import fp8_per_tensor_global_scale
 
 _NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
 _BF16 = QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)
@@ -113,16 +117,59 @@ def _with_prims_ts_backend(act, weights, config, source_key: str):
     return act, weights, config
 
 
+def _silu_reference(x, w1, w2, topk_ids, routing_weights):
+    out = torch.zeros_like(x, dtype=torch.float32)
+    for expert in range(w1.shape[0]):
+        token, slot = torch.where(topk_ids == expert)
+        if token.numel() == 0:
+            continue
+        fc1 = x[token].float() @ w1[expert].float().T
+        fc2 = torch.nn.functional.silu(fc1) @ w2[expert].float().T
+        out[token] += routing_weights[token, slot, None].float() * fc2
+    return out
+
+
 class TestPrimsTsBackendOptions:
     def test_activation_and_quant_capabilities(self):
         assert PrimsTsRunner.backend_key == "prims_ts"
         assert PrimsTsRunner.supported_quant_variants == (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP4, QuantFormat.BF16),
             (QuantFormat.BF16, QuantFormat.BF16),
+            (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
         )
         assert PrimsTsRunner.supported_activation_classes_by_quant == {
-            (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
-            (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2),
+            (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+                SwiGLU,
+                GeGLU,
+                SiTU,
+                ReLU2,
+                SiLU,
+            ),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8): (
+                SwiGLU,
+                GeGLU,
+                SiTU,
+                ReLU2,
+                SiLU,
+            ),
+            (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
+            (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2, SiLU),
+            (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): (
+                SwiGLU,
+                ReLU2,
+                SiLU,
+            ),
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): (
+                SwiGLU,
+                GeGLU,
+                ReLU2,
+                SiLU,
+            ),
         }
         assert not PrimsTsRunner.supports_fused_shared_experts
 
@@ -149,12 +196,24 @@ class TestPrimsTsBackendOptions:
 
 class TestPrimsTsPrepare:
     def test_prepare_weights_rejects_unsupported_pairs(self):
-        with pytest.raises(ValueError, match="NVFP4×NVFP4 and BF16×BF16"):
+        with pytest.raises(ValueError, match="does not support"):
             PrimsTsConfig.prepare_weights(
                 torch.empty(0),
                 torch.empty(0),
                 quant=QuantConfig(
-                    weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8
+                    weight=QuantFormat.MXINT4, activation=QuantFormat.BF16
+                ),
+                num_local_experts=1,
+                hidden_size=128,
+                intermediate_size=128,
+            )
+        with pytest.raises(ValueError, match="hidden_states_scale_global"):
+            PrimsTsConfig.prepare_weights(
+                torch.empty(0),
+                torch.empty(0),
+                quant=QuantConfig(
+                    weight=QuantFormat.FP8PerTensor,
+                    activation=QuantFormat.FP8PerTensor,
                 ),
                 num_local_experts=1,
                 hidden_size=128,
@@ -162,12 +221,19 @@ class TestPrimsTsPrepare:
             )
 
     def test_prepare_activations_rejects_unsupported_pairs(self):
-        with pytest.raises(ValueError, match="NVFP4×NVFP4 and BF16×BF16"):
+        with pytest.raises(ValueError, match="does not support"):
             PrimsTsConfig.prepare_activations(
                 torch.empty(1, 128, dtype=torch.bfloat16),
                 quant=QuantConfig(
-                    weight=QuantFormat.DeepSeekFp8,
-                    activation=QuantFormat.DeepSeekFp8,
+                    weight=QuantFormat.MXINT4, activation=QuantFormat.BF16
+                ),
+            )
+        with pytest.raises(ValueError, match="hidden_states_scale_global"):
+            PrimsTsConfig.prepare_activations(
+                torch.empty(1, 128, dtype=torch.bfloat16),
+                quant=QuantConfig(
+                    weight=QuantFormat.FP8PerTensor,
+                    activation=QuantFormat.FP8PerTensor,
                 ),
             )
 
@@ -205,6 +271,30 @@ class TestPrimsTsUnifiedValidation:
         with pytest.raises(NotImplementedError, match="SM100/SM103"):
             runner.check_support()
 
+    def test_bf16_rejects_per_token_scale_config(self):
+        runner = self._runner(
+            _config(variant=dataclasses.replace(_BF16, per_token_scale=True))
+        )
+        with pytest.raises(NotImplementedError, match="per-token scale"):
+            runner.check_support()
+
+    @pytest.mark.parametrize("variant", [_BF16, _NVFP4], ids=["bf16", "nvfp4"])
+    def test_pack_rejects_per_token_scale_when_not_configured(self, variant):
+        runner = self._runner(_config(variant=variant))
+        runner._built = True
+        runner._per_token = False
+        hidden = torch.zeros(4, 8, dtype=torch.bfloat16)
+        act = MoEActivationPack(
+            hidden,
+            None,
+            torch.zeros(4, 2, dtype=torch.int32),
+            torch.ones(4, 2, dtype=torch.float32),
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+            per_token_scale=torch.ones(4, dtype=torch.float32),
+        )
+        with pytest.raises(ValueError, match="per_token_scale"):
+            runner.pack_inputs(act, weights=None)
+
     def test_intermediate_size_alignment(self):
         runner = self._runner(_config(experts=ExpertConfig(intermediate_size=64)))
         with pytest.raises(NotImplementedError, match="intermediate_size"):
@@ -222,6 +312,66 @@ class TestPrimsTsUnifiedValidation:
             )
         )
         with pytest.raises(NotImplementedError, match="Sigmoid"):
+            runner.check_support()
+
+    @pytest.mark.parametrize(
+        "method,activation",
+        [
+            (RoutingMethodType.Sigmoid, SwiGLU()),
+            (RoutingMethodType.DeepSeekV3, ReLU2()),
+        ],
+        ids=["sigmoid", "deepseekv3-relu2"],
+    )
+    def test_fp8_per_tensor_rejects_inner_routing_limits(self, method, activation):
+        runner = self._runner(
+            _config(
+                variant=QuantConfig(
+                    weight=QuantFormat.FP8PerTensor,
+                    activation=QuantFormat.FP8PerTensor,
+                ),
+                routing=RoutingConfig(num_experts=32, top_k=2, method=method),
+                activation=activation,
+            )
+        )
+        with pytest.raises(NotImplementedError, match=method.name):
+            runner.check_support()
+
+    def test_fp8_per_tensor_llama4_requires_from_logits(self):
+        runner = self._runner(
+            _config(
+                variant=QuantConfig(
+                    weight=QuantFormat.FP8PerTensor,
+                    activation=QuantFormat.FP8PerTensor,
+                ),
+                routing=RoutingConfig(
+                    num_experts=32, top_k=1, method=RoutingMethodType.Llama4
+                ),
+            )
+        )
+        runner._built = True
+        runner._pair = runner.config.quant.pair
+        hidden = torch.zeros(4, 8, dtype=torch.float8_e4m3fn)
+        act = MoEActivationPack(
+            hidden,
+            None,
+            torch.zeros(4, 1, dtype=torch.int32),
+            torch.ones(4, 1, dtype=torch.float32),
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        )
+        with pytest.raises(NotImplementedError, match="FromLogits"):
+            runner.pack_inputs(act, weights=None)
+
+    def test_deepseek_rejects_nondefault_swiglu(self):
+        runner = self._runner(
+            _config(
+                variant=QuantConfig(
+                    weight=QuantFormat.DeepSeekFp8,
+                    activation=QuantFormat.DeepSeekFp8,
+                ),
+                activation=SwiGLU(alpha=1.5),
+            )
+        )
+        with pytest.raises(NotImplementedError, match="non-default"):
             runner.check_support()
 
     def test_geglu_does_not_forward_prepare_alpha(self):
@@ -453,3 +603,269 @@ class TestPrimsTsUnifiedGpu:
         assert prims_bf16.keys() == trtllm_bf16.keys()
         for key, tensor in prims_bf16.items():
             torch.testing.assert_close(tensor, trtllm_bf16[key])
+
+    @pytest.mark.parametrize(
+        "quant",
+        (
+            _NVFP4,
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            _BF16,
+            QuantConfig(
+                weight=QuantFormat.FP8PerTensor,
+                activation=QuantFormat.FP8PerTensor,
+            ),
+            QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+        ),
+        ids=("nvfp4", "mxfp4-mxfp8", "bf16", "fp8-per-tensor", "mxfp8"),
+    )
+    def test_silu_supported_quant_pairs_end_to_end(self, quant):
+        torch.manual_seed(0)
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_experts, hidden, intermediate, tokens, top_k = 4, 256, 256, 8, 2
+        activation = SiLU()
+        x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16) / 2
+        w1 = (
+            torch.randn(
+                num_experts,
+                intermediate,
+                hidden,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            / hidden**0.5
+        )
+        w2 = (
+            torch.randn(
+                num_experts,
+                hidden,
+                intermediate,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            / intermediate**0.5
+        )
+        routing_weights, topk_ids = torch.topk(
+            torch.softmax(torch.randn(tokens, num_experts, device=device), dim=-1),
+            top_k,
+            dim=-1,
+        )
+        topk_ids = topk_ids.to(torch.int32)
+        routing_weights = routing_weights.to(torch.bfloat16)
+        reference = _silu_reference(x, w1, w2, topk_ids, routing_weights)
+
+        prepare_kwargs: dict = {}
+        if quant.pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            prepare_kwargs = {
+                "hidden_states_scale_global": fp8_per_tensor_global_scale(x),
+                "intermediate_scale_global": torch.tensor(32.0, device=device),
+            }
+        act_kwargs = {
+            key: value
+            for key, value in prepare_kwargs.items()
+            if key == "hidden_states_scale_global"
+        }
+        x_q, x_scale = PrimsTsConfig.prepare_activations(x, quant=quant, **act_kwargs)
+        prims_view = PrimsTsConfig.prepare_weights(
+            w1.clone(),
+            w2.clone(),
+            quant=quant,
+            num_local_experts=num_experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation=activation,
+            device=device,
+            **prepare_kwargs,
+        )
+
+        act = MoEActivationPack(
+            x_q,
+            x_scale,
+            topk_ids,
+            routing_weights,
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        )
+        weights = MoEWeightPack()
+        weights.prepare_for("prims_ts", prims_view)
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=quant,
+            experts=ExpertConfig(intermediate_size=intermediate),
+            activation=activation,
+            backend=BackendOptions((PrimsTsConfig(),)),
+            execution=ExecutionConfig(tune_max_num_tokens=tokens),
+        )
+        layer = MoELayer(config)
+        actual = layer(act, weights)
+
+        assert layer.winner_backend == "prims_ts"
+        if quant == _BF16:
+            _bf16_check(actual, reference, "prims_ts bf16 silu")
+        else:
+            _nvfp4_check(actual, reference, f"prims_ts {quant.pair} silu")
+
+    @pytest.mark.parametrize(
+        "quant",
+        (
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+            QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+            QuantConfig(
+                weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+            ),
+        ),
+    )
+    def test_added_quant_matches_trtllm(self, quant):
+        if quant.pair == (QuantFormat.MXFP4, QuantFormat.BF16) and (
+            get_compute_capability(torch.device("cuda")) == (10, 3)
+        ):
+            pytest.xfail("TRTLLM MXFP4×BF16 is disabled on SM103")
+
+        torch.manual_seed(0)
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_experts, hidden, intermediate, tokens, top_k = 4, 256, 256, 8, 2
+        x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+        w1 = torch.randn(
+            num_experts, intermediate * 2, hidden, device=device, dtype=torch.bfloat16
+        )
+        w2 = torch.randn(
+            num_experts, hidden, intermediate, device=device, dtype=torch.bfloat16
+        )
+        routing_weights, topk_ids = torch.topk(
+            torch.softmax(torch.randn(tokens, num_experts, device=device), dim=-1),
+            top_k,
+            dim=-1,
+        )
+        topk_ids = topk_ids.to(torch.int32)
+        routing_weights = routing_weights.to(torch.bfloat16)
+
+        prepare_kwargs: dict = {}
+        if quant.pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+            prepare_kwargs["hidden_states_scale_global"] = fp8_per_tensor_global_scale(
+                x
+            )
+            prepare_kwargs["intermediate_scale_global"] = torch.tensor(
+                64.0, device=device
+            )
+            trtllm_config = TrtllmFp8PerTensorConfig()
+            trtllm_key = "trtllm_fp8_per_tensor"
+        elif quant.pair[0] is QuantFormat.MXFP4:
+            trtllm_config = TrtllmFp4Config()
+            trtllm_key = "trtllm_fp4_routed"
+        else:
+            trtllm_config = TrtllmFp8BlockConfig()
+            trtllm_key = "trtllm_fp8_block"
+
+        act_kwargs = {
+            key: value
+            for key, value in prepare_kwargs.items()
+            if key == "hidden_states_scale_global"
+        }
+        x_q, x_scale = PrimsTsConfig.prepare_activations(x, quant=quant, **act_kwargs)
+        prims_view = PrimsTsConfig.prepare_weights(
+            w1.clone(),
+            w2.clone(),
+            quant=quant,
+            num_local_experts=num_experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation=SwiGLU(),
+            device=device,
+            **prepare_kwargs,
+        )
+        trtllm_prepare = (
+            dict(
+                hidden_states_scale_global=prepare_kwargs["hidden_states_scale_global"],
+                intermediate_scale_global=prepare_kwargs["intermediate_scale_global"],
+            )
+            if trtllm_key == "trtllm_fp8_per_tensor"
+            else {}
+        )
+        if trtllm_key == "trtllm_fp4_routed":
+            trtllm_view = TrtllmFp4Config.prepare_weights(
+                w1.clone(),
+                w2.clone(),
+                quant=quant,
+                num_local_experts=num_experts,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=SwiGLU(),
+                device=device,
+            )
+        elif trtllm_key == "trtllm_fp8_per_tensor":
+            trtllm_view = TrtllmFp8PerTensorConfig.prepare_weights(
+                w1.clone(),
+                w2.clone(),
+                num_local_experts=num_experts,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=SwiGLU(),
+                device=device,
+                **trtllm_prepare,
+            )
+        else:
+            trtllm_view = TrtllmFp8BlockConfig.prepare_weights(
+                w1.clone(),
+                w2.clone(),
+                quant=quant,
+                num_local_experts=num_experts,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=SwiGLU(),
+                device=device,
+            )
+        if quant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
+            # Both GEMM payloads are shuffled; both block scales stay TRT-LLM.
+            for name in ("gemm1", "gemm2"):
+                assert not torch.equal(
+                    prims_view[f"{name}_weights"].view(torch.uint8),
+                    trtllm_view[f"{name}_weights"].view(torch.uint8),
+                )
+                torch.testing.assert_close(
+                    prims_view[f"{name}_weights_scale"],
+                    trtllm_view[f"{name}_weights_scale"],
+                )
+        else:
+            assert prims_view.keys() == trtllm_view.keys()
+            for key, tensor in prims_view.items():
+                other = trtllm_view[key]
+                assert tensor.dtype == other.dtype and tensor.shape == other.shape
+                # MXFP4 stores UE8M0 bytes in float8_e4m3fn. assert_close
+                # rejects those encodings even when the bytes match. 0-dim
+                # calibration scalars in the per-tensor view cannot be viewed
+                # as uint8.
+                if tensor.ndim == 0:
+                    assert torch.equal(tensor, other)
+                else:
+                    assert torch.equal(
+                        tensor.contiguous().view(torch.uint8),
+                        other.contiguous().view(torch.uint8),
+                    )
+
+        act = MoEActivationPack(
+            x_q,
+            x_scale,
+            topk_ids,
+            routing_weights,
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        )
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=quant,
+            experts=ExpertConfig(intermediate_size=intermediate),
+            activation=SwiGLU(),
+            execution=ExecutionConfig(tune_max_num_tokens=tokens),
+        )
+        prims_weights = MoEWeightPack()
+        prims_weights.prepare_for("prims_ts", prims_view)
+        trtllm_weights = MoEWeightPack()
+        trtllm_weights.prepare_for(trtllm_key, trtllm_view)
+        prims_out = MoELayer(
+            dataclasses.replace(config, backend=BackendOptions((PrimsTsConfig(),)))
+        )(act, prims_weights)
+        trtllm_out = MoELayer(
+            dataclasses.replace(config, backend=BackendOptions((trtllm_config,)))
+        )(act, trtllm_weights)
+        _nvfp4_check(prims_out, trtllm_out.float(), f"prims_ts {quant.pair} vs trtllm")

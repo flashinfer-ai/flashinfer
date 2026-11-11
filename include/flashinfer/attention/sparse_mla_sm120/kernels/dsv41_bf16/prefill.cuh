@@ -12,7 +12,7 @@
 
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16 {
 
-template <bool EXTRA_FP4>
+template <bool EXTRA_FP4, ModelType MT>
 __device__ __forceinline__ void run_bf16_tiles(
     Dsv41Bf16Smem& sm, const uint8_t* __restrict__ KV_cache, const int32_t* __restrict__ indices,
     const uint8_t* __restrict__ extra_KV_cache, const int32_t* __restrict__ extra_indices, int t,
@@ -22,6 +22,7 @@ __device__ __forceinline__ void run_bf16_tiles(
     float (&acc)[Dsv41Bf16Resources::PV_TILES_PER_WARP][4], float (&m)[2], float (&sum)[2]) {
   using R = Dsv41Bf16Resources;
   using Geometry = R::Geometry;
+  using Cache = Dsv41Bf16Cache<MT>;
   const int tidx = threadIdx.x, warp = tidx / R::WARP_THREADS, lane = tidx % R::WARP_THREADS;
   const int gid = lane / 4, tid = lane % 4;
   for (int chunk = lo; chunk < hi; ++chunk) {
@@ -49,14 +50,10 @@ __device__ __forceinline__ void run_bf16_tiles(
           const int index = sm.valid[row];
           valid[item] = index >= 0;
           if (valid[item]) {
-            const int page = power_of_two ? (index >> (__ffs(pbs) - 1)) : (index / pbs);
-            const int slot = index - page * pbs;
-            const uint8_t* base = cache + (size_t)page * stride;
-            const auto data_offset =
-                Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, size_t(slot));
-            data_addr[item] = base + data_offset + (fp4 ? d / 2 : d);
-            const auto scale_offset =
-                Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(fp4, size_t(pbs), slot);
+            size_t slot;
+            const uint8_t* base = Cache::locate(cache, index, pbs, stride, power_of_two, slot);
+            data_addr[item] = base + Cache::data_offset(fp4, slot) + (fp4 ? d / 2 : d);
+            const auto scale_offset = Cache::scale_offset(fp4, pbs, slot);
             constexpr int fp4_scale_shift = []() constexpr {
               int shift = 0;
               for (int group = Dsv41Fp4Layout::SCALE_GROUP; group > 1; group >>= 1) ++shift;
@@ -112,7 +109,7 @@ __device__ __forceinline__ void run_bf16_tiles(
         }
       }
     };
-    if ((pbs & (pbs - 1)) == 0)
+    if (Cache::INLINE || (pbs & (pbs - 1)) == 0)
       gather(true);
     else
       gather(false);
@@ -205,7 +202,9 @@ __device__ __forceinline__ void run_bf16_tiles(
   }
 }
 
-template <int NUM_HEADS, bool EXTRA_FP4>
+// MT selects the cache placement (Dsv41Bf16Cache); for DSV4_1_INLINE the row
+// pitches are params.(extra_)row_stride_bytes.
+template <int NUM_HEADS, bool EXTRA_FP4, ModelType MT = ModelType::DSV4_1>
 __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
     sparse_mla_prefill_dsv41_bf16_kernel(const execution::AttentionParams params) {
   using R = Dsv41Bf16Resources;
@@ -235,11 +234,14 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
   }
   float acc[R::PV_TILES_PER_WARP][4] = {};
   float m[2] = {-1e30f, -1e30f}, sum[2] = {0.f, 0.f};
-  run_bf16_tiles<EXTRA_FP4>(sm, params.kv, params.indices, params.extra_kv, params.extra_indices, t,
-                            0, chunks, len, elen, main_chunks, params.page_size,
-                            params.extra_page_size, params.page_stride_bytes,
-                            params.extra_page_stride_bytes, params.indices_stride_elems,
-                            params.extra_indices_stride_elems, params.sm_scale, acc, m, sum);
+  constexpr bool INLINE = Dsv41Bf16Cache<MT>::INLINE;
+  const size_t main_stride = INLINE ? params.row_stride_bytes : params.page_stride_bytes;
+  const size_t extra_stride =
+      INLINE ? params.extra_row_stride_bytes : params.extra_page_stride_bytes;
+  run_bf16_tiles<EXTRA_FP4, MT>(
+      sm, params.kv, params.indices, params.extra_kv, params.extra_indices, t, 0, chunks, len, elen,
+      main_chunks, params.page_size, params.extra_page_size, main_stride, extra_stride,
+      params.indices_stride_elems, params.extra_indices_stride_elems, params.sm_scale, acc, m, sum);
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
     const int head = hs + gid + h * 8;

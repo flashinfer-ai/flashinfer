@@ -1,4 +1,4 @@
-"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl).
+"""Multi-rank MXFP8 checks and Blackwell standard/GenPhase layer regressions.
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
@@ -32,6 +32,8 @@ import os
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 # This test verifies the mega path only through the cutedsl_megamoe shim public
 # API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
@@ -49,6 +51,196 @@ def _launcher_ranks() -> tuple[int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     return rank, world_size
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "variant,kind,tile_n,cluster_m,capacity,early",
+    [
+        ("genphase", "mxfp8_e4m3", 128, 4, 129, True),
+        ("genphase", "mxfp8_e4m3", 64, 4, 129, True),
+        ("genphase", "mxfp8_e4m3", 64, 2, 129, True),
+        ("genphase", "mxfp8_e4m3", 64, 2, 1024, True),
+        ("inference", "nvfp4", 128, 2, 129, True),
+        ("inference", "nvfp4", 128, 2, 129, False),
+        ("inference", "mxfp8_e4m3", 128, 2, 129, True),
+        ("inference", "mxfp8_e5m2", 128, 2, 129, True),
+    ],
+)
+def test_blackwell_layer_graph_and_weight_formats(
+    variant, kind, tile_n, cluster_m, capacity, early, monkeypatch
+):
+    """Public layer: both input formats, four weight formats and changing routes."""
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    _require_cuda()
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("requires native SM100/103")
+    rank, world = _launcher_ranks()
+    if world not in (1, 2, 4):
+        pytest.skip("qualified at EP1/2/4")
+    if world == 1:
+        monkeypatch.setenv("MEGA_NO_DIST", "1")
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    hidden, intermediate, topk, experts = 384, 192, 3, 8 * world
+    generator = torch.Generator(device="cuda").manual_seed(6447 + rank)
+    x = torch.randn(capacity, hidden, generator=generator, device="cuda").bfloat16()
+    w13 = (
+        torch.randn(8, 2 * intermediate, hidden, generator=generator, device="cuda")
+        / hidden**0.5
+    ).bfloat16()
+    w2 = (
+        torch.randn(8, hidden, intermediate, generator=generator, device="cuda")
+        / intermediate**0.5
+    ).bfloat16()
+
+    def quantize(value):
+        if kind == "nvfp4":
+            return pkg.quantize_nvfp4_block16(value)
+        dtype = torch.float8_e5m2 if kind == "mxfp8_e5m2" else torch.float8_e4m3fn
+        return pkg.quantize_mxfp8_block32(value, dtype)
+
+    qx, sx = quantize(x)
+    q13, s13 = quantize(w13)
+    q2, s2 = quantize(w2)
+    source = MoEWeightPack(w13, w2)
+    packed = MoEWeightPack(q13, q2, s13, s2)
+    byte_packed = MoEWeightPack(q13, q2, s13.view(torch.uint8), s2.view(torch.uint8))
+    ids = (
+        torch.arange(capacity * topk, device="cuda").reshape(capacity, topk) + rank * 7
+    ) % experts
+    scores = torch.full((capacity, topk), 1 / topk, device="cuda")
+    layers = []
+
+    def kernel_config():
+        if kind == "nvfp4":
+            return Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=intermediate,
+                top_k=topk,
+                kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+                apply_routing_weights_before_fc2=early,
+            )
+        kwargs = (
+            dict(
+                kernel_variant="genphase",
+                mma_tiler_mnk=(256, tile_n, 128),
+                cluster_shape_mn=(cluster_m, 1),
+            )
+            if variant == "genphase"
+            else dict(kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next")
+        )
+        return Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=intermediate, top_k=topk, kind=kind, **kwargs
+        )
+
+    def check(ws, weights, output, count):
+        indices, expected = pkg.sampled_reference(ws, *weights, count, sample_size=32)
+        error = torch.tensor(pkg.output_error(output, indices, expected), device="cuda")
+        if world > 1:
+            dist.all_reduce(error, op=dist.ReduceOp.MAX)
+        assert error.item() < 0.02
+        assert torch.count_nonzero(ws.output_activation[count:]) == 0
+
+    try:
+        baseline = None
+        workspace = None
+        for quantize_input in (True, False):
+            for weight_format, weights in (
+                ("bf16", source),
+                ("prequantized", packed),
+                ("byte_scales", byte_packed),
+                ("transformed", source),
+            ):
+                layer = MoEEpLayer(
+                    BootstrapConfig(world_size=world, rank=rank),
+                    FleetParams(
+                        num_experts=experts,
+                        max_tokens_per_rank=capacity,
+                        token_hidden_size=hidden,
+                    ),
+                    weights,
+                    backend=MegaConfig(
+                        megakernel=kernel_config(),
+                        quantize_input=quantize_input,
+                        preprocess_weights=weight_format != "transformed",
+                        transformed_weights=layers[0]._transformed
+                        if weight_format == "transformed"
+                        else None,
+                    ),
+                )
+                layers.append(layer)
+
+                def inputs(count):
+                    return MoEEpTensors(
+                        hidden_states=x[:count] if quantize_input else qx[:count],
+                        scales=None if quantize_input else sx[:count],
+                        topk_ids=ids[:count].clone(),
+                        topk_weights=scores[:count].clone(),
+                    )
+
+                dense = inputs(capacity)
+                layer.warmup(dense)
+                ws = layer._ensure_workspace()
+                if workspace is None:
+                    workspace = ws
+                assert ws is workspace
+                y = layer.forward(dense, return_workspace_view=True).clone()
+                check(ws, layer._transformed, y, capacity)
+                if baseline is None:
+                    baseline = y
+                else:
+                    assert torch.equal(y, baseline)
+                for count in (1, 0, min(65, capacity)):
+                    current = inputs(count)
+                    if count and world > 1 and rank == world - 1:
+                        current.topk_ids.fill_(-1)
+                        current.topk_weights.fill_(float("nan"))
+                    ws._pre_reduced_activation.view(torch.bfloat16).fill_(float("nan"))
+                    y = layer.forward(current, return_workspace_view=True)
+                    check(ws, layer._transformed, y, count)
+
+                current = inputs(min(65, capacity))
+                layer.warmup(current)
+                graph = torch.cuda.CUDAGraph()
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = layer.forward(current, return_workspace_view=True)
+                torch.cuda.current_stream().wait_stream(stream)
+                for state in ("empty", "holes", "restore"):
+                    current.topk_ids.copy_(ids[: current.num_tokens])
+                    if state == "empty":
+                        current.topk_ids.fill_(-1)
+                    elif state == "holes":
+                        current.topk_ids[::2, 1:].fill_(-1)
+                    # Grow eagerly before replaying the smaller graph, which
+                    # must conservatively re-mask its entire capacity tail.
+                    layer.forward(dense)
+                    ws._pre_reduced_activation.view(torch.bfloat16).fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    check(ws, layer._transformed, captured, current.num_tokens)
+                for _ in range(64):
+                    graph.replay()
+                torch.cuda.synchronize()
+                check(ws, layer._transformed, captured, current.num_tokens)
+    finally:
+        for layer in reversed(layers):
+            layer.destroy()
 
 
 def _make_inputs(
@@ -927,7 +1119,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 fc2_weight_sf=_all_gather_stack(fc2_sf),
                 ab_dtype=torch.float8_e4m3fn,
                 gate_up_clamp=problem["gate_up_clamp"],
-                apply_topk_in_fc1=True,
+                apply_routing_weights_before_fc2=True,
             )
             # The topk weight is already folded before the fc1-out round-trip, so
             # the per-topk terms reduce with a plain sum; compare this rank's slice.
@@ -1022,10 +1214,218 @@ def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
 
 
 def test_mxfp8_cutedsl_mega_kernel_is_registered():
+    import torch
+
     from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    kernel = create_mega_kernel(
-        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
+    config = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        finalize_mode=FinalizeMode.PERSISTENT,
+        num_valid_tokens_tensor=torch.zeros(1, dtype=torch.int32),
     )
+    kernel = create_mega_kernel(config)
     assert kernel.kernel_name() == "sm100_mxfp8_mxfp8_bf16_cutedsl"
+    assert config.finalize_mode is FinalizeMode.PERSISTENT
+    with pytest.raises(ValueError, match="requires num_valid_tokens_tensor"):
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+            finalize_mode=FinalizeMode.PERSISTENT,
+        )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_blackwell_genphase_auto_warmup_cache_and_graph(monkeypatch):
+    """Real collective sweep, stable I/O, persisted selection and changing routes."""
+    import dataclasses
+    import tempfile
+    from pathlib import Path
+
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    _require_cuda()
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100/103")
+    rank, world = _launcher_ranks()
+    if world not in (1, 2, 4):
+        pytest.skip("EP1/2/4")
+    if world == 1:
+        monkeypatch.setenv("MEGA_NO_DIST", "1")
+    # Multi-rank CI runs on one node; every process reads the same cache file.
+    path = (
+        Path(tempfile.gettempdir())
+        / f"genphase-auto-{os.environ.get('MASTER_PORT', os.getpid())}-{world}.json"
+    )
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
+    capacity, tokens, hidden, intermediate, topk = 129, 17, 384, 192, 3
+    experts = 8 * world
+    fleet = FleetParams(
+        num_experts=experts,
+        max_tokens_per_rank=capacity,
+        token_hidden_size=hidden,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(717 + rank)
+    weights = MoEWeightPack(
+        (
+            torch.randn(8, 2 * intermediate, hidden, generator=generator, device="cuda")
+            / hidden**0.5
+        ).bfloat16(),
+        (
+            torch.randn(8, hidden, intermediate, generator=generator, device="cuda")
+            / intermediate**0.5
+        ).bfloat16(),
+    )
+    x = torch.randn(tokens, hidden, generator=generator, device="cuda").bfloat16()
+    ids = (
+        torch.arange(tokens * topk, device="cuda").reshape(tokens, topk) + 7 * rank
+    ) % experts
+    inputs = MoEEpTensors(
+        hidden_states=x,
+        topk_ids=ids.clone(),
+        topk_weights=torch.full((tokens, topk), 1 / topk, device="cuda"),
+    )
+    layers = []
+    try:
+
+        def create(knobs):
+            """Build a public layer sharing test weights with the requested knobs."""
+            layer = MoEEpLayer(
+                BootstrapConfig(rank=rank, world_size=world),
+                fleet,
+                weights,
+                backend=MegaConfig(
+                    megakernel=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+                        intermediate, topk, kernel_variant="genphase", knobs=knobs
+                    )
+                ),
+            )
+            layers.append(layer)
+            return layer
+
+        with pytest.warns(UserWarning, match="COLLECTIVE"):
+            layer = create("auto")
+        if rank == 0:
+            path.unlink(missing_ok=True)
+        if world > 1:
+            dist.barrier()
+        ws = layer._ensure_workspace()
+        pointers = [
+            getattr(ws, n).data_ptr()
+            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
+        ]
+        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+            knob_cache,
+        )
+        import time
+
+        record_knobs = knob_cache.record_knobs
+        tune = pkg.autotune_sm100_genphase_mega_moe
+
+        def delayed_record(*args, **kwargs):
+            """Delay rank zero's cache write to expose premature peer returns."""
+            # Expose peers returning before a slow shared-cache write completes.
+            if world > 1:
+                time.sleep(0.25)
+            return record_knobs(*args, **kwargs)
+
+        def tune_and_check_publication(*args, **kwargs):
+            """Require all ranks to observe the cached winner when tuning returns."""
+            winner = tune(*args, **kwargs)
+            resolved = knob_cache.resolve_knobs(
+                ws.config,
+                sm_count=torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count,
+                live_tokens=tokens,
+            )
+            observed = [resolved]
+            if world > 1:
+                observed = [None] * world
+                dist.all_gather_object(observed, resolved)
+            assert all(value == (winner, "cache") for value in observed), (
+                "cache publication incomplete at autotune return",
+                observed,
+            )
+            return winner
+
+        monkeypatch.setattr(knob_cache, "record_knobs", delayed_record)
+        monkeypatch.setattr(
+            pkg, "autotune_sm100_genphase_mega_moe", tune_and_check_publication
+        )
+        layer.warmup(inputs)
+        winner = {
+            k: getattr(ws.config, k)
+            for k in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
+        }
+        assert pointers == [
+            getattr(ws, n).data_ptr()
+            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
+        ]
+        selected = layer.forward(inputs, return_workspace_view=True).clone()
+        cached = create(None)
+        assert cached.live_token_buckets(capacity) == [tokens]
+        handle = cached.create_workspace(capacity, live_tokens=tokens)
+        cached.warmup(inputs, workspace=handle)
+        cached_ws = handle._backend_workspace
+        assert all(getattr(cached_ws.config, k) == v for k, v in winner.items())
+        assert torch.equal(
+            selected,
+            cached.forward(inputs, workspace=handle, return_workspace_view=True),
+        )
+        # Force the other geometry before capture to exercise workspace resizing
+        # even when the heuristic happened to win the empirical sweep.
+        alternative = dict(
+            mma_tiler_mnk=(256, 128, 128),
+            cluster_shape_mn=(4, 1),
+            schedule_policy=("grouped", None),
+        )
+        if ws.config.resolved_mma_tiler_mnk[1] == 128:
+            alternative.update(mma_tiler_mnk=(256, 64, 128), cluster_shape_mn=(2, 1))
+        ws.retune(alternative)
+        assert dataclasses.replace(ws.config, **alternative) == ws.config
+        assert pointers == [
+            getattr(ws, n).data_ptr()
+            for n in ("x", "x_sf", "topk_idx", "topk_weights", "output_activation")
+        ]
+        assert torch.equal(selected, layer.forward(inputs, return_workspace_view=True))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = layer.forward(inputs, return_workspace_view=True)
+        for state in ("empty", "holes", "restored"):
+            inputs.topk_ids.copy_(ids)
+            if state == "empty":
+                inputs.topk_ids.fill_(-1)
+            elif state == "holes":
+                inputs.topk_ids[::2, 1:] = -1
+            for _ in range(65):
+                graph.replay()
+            torch.cuda.synchronize()
+            indices, expected = pkg.sampled_reference(ws, *layer._transformed, tokens)
+            error = torch.tensor(
+                pkg.output_error(output, indices, expected), device="cuda"
+            )
+            if world > 1:
+                dist.all_reduce(error, op=dist.ReduceOp.MAX)
+            assert error.item() < 0.02
+        del graph
+    finally:
+        for layer in reversed(layers):
+            layer.destroy()
+        if rank == 0:
+            path.unlink(missing_ok=True)

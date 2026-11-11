@@ -1,88 +1,183 @@
-"""Prepared per-head FP8 projections with BF16 or dynamic FP8 output on SM100a/SM103a."""
+"""Prepared per-head FP8 projections with BF16 or dynamic FP8 output on SM100a/SM103a.
+
+The schedule a projection runs on is selected here (``route_config`` / ``schedule_key``,
+the dispatcher's own heuristic); the selected program, its launch grid and its
+loaded library come from the package registry :mod:`.cake_jit` (``ROUTES``,
+``MODULES``, ``launch_grid``, ``load``).
+"""
 
 from __future__ import annotations
 
-import functools
-import json
-from pathlib import Path
+from . import cake_jit
 
-
-_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-
-
-@functools.cache
-def _catalog():
-    return json.loads(Path(__file__).with_name("batched_gemm_catalog.json").read_text())
+# SM counts the two pinned BF16 schedules were selected on (B200, GB300). Other
+# devices route BF16 output to the general schedule, which is not exported.
+PINNED_NUM_SMS = (148, 152)
 
 
 def device_arch(device):
-    """Exact generated-program architecture for ``device`` (raises when none is catalogued)."""
+    """Generated-program architecture for ``device`` (raises when none is exported)."""
     import torch
 
     device = torch.device(device)
-    catalogued = sorted(_catalog()["arches"])
     if device.type != "cuda":
         raise RuntimeError("Batched FP8 projection requires a CUDA device")
     capability = tuple(torch.cuda.get_device_capability(device))
-    arch = _ARCHES.get(capability)
-    if arch is None or arch not in catalogued:
+    arch = cake_jit.arch_for_capability(capability)
+    if arch is None:
         raise RuntimeError(
             f"Batched FP8 projection has no exported programs for compute capability "
-            f"{capability}; catalogued architectures: {catalogued}"
+            f"{capability}; exported architectures: {list(cake_jit.ARCHES)}"
         )
     return arch
 
 
 def supported_num_sms(arch):
-    """SM counts with catalogued routes for ``arch``."""
-    routes = _catalog()["arches"][arch]["routes"].values()
-    return sorted({route["config"]["num_sms"] for route in routes})
+    """SM counts on which every exported schedule, including the pinned BF16 ones, is selected."""
+    return PINNED_NUM_SMS
 
 
-def _nvcc_flags(arch):
-    from flashinfer.jit.core import sm100a_nvcc_flags, sm103a_nvcc_flags
+def _source_layout(tokens, num_heads, inner, width, num_sms):
+    """FP8 tile layout the projection selects for ``tokens`` rows.
 
-    return {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}[arch]
-
-
-@functools.cache
-def load_program(arch, name):
-    from flashinfer.jit import env
-    from flashinfer.jit.core import gen_jit_spec
-
-    record = _catalog()["arches"][arch]["programs"][name]
-    spec = gen_jit_spec(
-        name=name,
-        sources=[
-            env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
-        ],
-        extra_cuda_cflags=[
-            *_nvcc_flags(arch),
-            *record["compile_flags"],
-            "--device-entity-has-hidden-visibility=false",
-        ],
-        extra_ldflags=["-lcuda"],
-        extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
-        use_fast_math=False,
-    )
-    return spec.build_and_load(), {
-        **record,
-        "library_path": str(spec.get_library_path()),
-    }
-
-
-def route_key(options):
-    return ":".join(
-        str(options[key])
-        for key in (
-            "tokens",
-            "num_heads",
-            "inner",
-            "width",
-            "num_sms",
-            "num_stages",
-            "epilogue",
+    Mirrors the DeepGEMM SM100 layout heuristic (``get_layout_candidates`` /
+    ``get_layout_info`` / ``compare``) for the three exported FP8 layouts:
+    ``(swap_ab, block_m, block_n, num_stages)``. ``None`` means the heuristic
+    selects another layout and the general 128x128 schedule applies.
+    """
+    if (num_heads, inner, width) != (8, 4096, 1024):
+        return None
+    best_key, best_layout = None, None
+    for swap_ab in (False, True):
+        block_ms = (
+            range(16, 257, 16)
+            if swap_ab
+            else (32 if tokens <= 32 else 64 if tokens <= 64 else 128,)
         )
+        block_ns = (128,) if swap_ab else (16, *range(32, 257, 32))
+        for cluster_m in (1, 2):
+            if swap_ab and cluster_m == 2:
+                continue
+            for cluster_n in (1, 2):
+                cluster_size = cluster_m * cluster_n
+                if (
+                    cluster_size > 2
+                    or (not swap_ab and cluster_n == 2)
+                    or num_sms % cluster_size
+                ):
+                    continue
+                for block_m in block_ms:
+                    if (
+                        block_m // cluster_n % 8
+                        or ((tokens + block_m - 1) // block_m) % cluster_m
+                    ):
+                        continue
+                    for block_n in block_ns:
+                        if (
+                            block_n // cluster_m % 8
+                            or ((width + block_n - 1) // block_n) % cluster_n
+                        ):
+                            continue
+                        sf_cols = ((block_m + 127) // 128 + (block_n + 127) // 128) * 4
+                        if (block_m if swap_ab else block_n) + sf_cols > 512:
+                            continue
+                        store_n = (
+                            128
+                            if swap_ab
+                            else next(
+                                value
+                                for value in (128, 64, 32, 16)
+                                if block_n % value == 0
+                            )
+                        )
+                        if store_n % 32:
+                            continue
+                        blocks = (
+                            ((tokens + block_m - 1) // block_m)
+                            * ((width + block_n - 1) // block_n)
+                            * num_heads
+                        )
+                        waves = (blocks + num_sms - 1) // num_sms
+                        utilization = blocks % num_sms or num_sms
+                        key = (
+                            waves != 1,
+                            -cluster_size,
+                            waves,
+                            -utilization,
+                            block_m + block_n,
+                            block_m * block_n,
+                        )
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best_layout = (
+                                swap_ab,
+                                block_m,
+                                block_n,
+                                cluster_m,
+                                cluster_n,
+                            )
+    if best_layout not in (
+        (False, 128, 256, 2, 1),
+        (True, 16, 128, 1, 2),
+        (True, 64, 128, 1, 2),
+    ):
+        return None
+    swap_ab, block_m, block_n, cluster_m, cluster_n = best_layout
+    smem_cd = (16 * block_n if swap_ab else min(128, block_m) * 128) * 2
+    smem_extra = smem_cd + 32 * 8 * 3 + 2 * 8 * 3 + 8 + 4
+    smem_per_stage = (block_m // cluster_n + block_n // cluster_m) * 128
+    smem_per_stage += (
+        (((block_m + 127) // 128 + (block_n + 127) // 128) * 128) * 128 // 32
+    )
+    stages = min((232448 - smem_extra) // smem_per_stage, 32)
+    return swap_ab, block_m, block_n, stages
+
+
+def route_config(tokens, num_heads, inner, width, num_sms, epilogue, num_stages=5):
+    """Schedule and launch geometry of one projection: route, tile, stages, grid.
+
+    The selection depends on the token count, the SM count and the epilogue
+    only; M, the M tile count and the grid are launch arguments of the
+    selected program, so every token count maps onto one of a few programs.
+    """
+    layout = None
+    if (epilogue, num_stages) == ("fp8", 5):
+        layout = _source_layout(tokens, num_heads, inner, width, num_sms)
+    block_m, block_n = 128, 128
+    geometry = (tokens, num_heads, inner, width, epilogue, num_stages)
+    if num_sms in PINNED_NUM_SMS and geometry == (128, 8, 4096, 1024, "bf16", 5):
+        route, block_m, block_n, num_stages = "bf16_t128", 64, 128, 10
+    elif num_sms in PINNED_NUM_SMS and geometry == (4, 8, 4096, 1024, "bf16", 5):
+        route, block_m, block_n, num_stages = "bf16_t4", 16, 128, 12
+    elif layout is None:
+        route = "general"
+    else:
+        swap_ab, block_m, block_n, num_stages = layout
+        route = "swap_ab" if swap_ab else "n256"
+    grid_m = (tokens + block_m - 1) // block_m
+    launch_ctas = num_sms
+    if route == "swap_ab":
+        # Only the working CTAs are launched, keeping the two-CTA pairing intact.
+        tiles = grid_m * (width // block_n) * num_heads
+        launch_ctas = min(num_sms, tiles + tiles % 2)
+    return dict(
+        route=route,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=128,
+        num_stages=num_stages,
+        num_sms=num_sms,
+        epilogue=epilogue,
+        grid=(launch_ctas, 1, 1),
+        grid_m=grid_m,
+    )
+
+
+def schedule_key(config):
+    """Program key of a route configuration (the ``cake_jit.ROUTES`` key)."""
+    return (
+        f"{config['route']}_bm{config['block_m']}_bn{config['block_n']}"
+        f"_s{config['num_stages']}_{config['epilogue']}"
     )
 
 
@@ -105,11 +200,12 @@ class BatchedGemmPlan:
     """Prepared A[T,H,K] @ B[H,N,K] -> output[T,H,N].
 
     Inputs are E4M3 with positive power-of-two FP32 scales per A token/K128
-    and B N128/K128 block. Scale packing and output/workspace allocation occur
-    during preparation. Operand values may change between runs; prepare a new
-    plan when the input scales change. Dynamic FP8 returns E4M3 values and
-    packed per-32 UE8M0 scale words. BF16 optionally applies runtime alpha.
-    Submit on the current stream; do not concurrently reuse one output.
+    and B N128/K128 block. Scale packing and output allocation occur during
+    preparation. Operand values may change between runs; prepare a new plan
+    when the input scales change. Dynamic FP8 returns E4M3 values and packed
+    per-32 UE8M0 scale words. BF16 optionally applies runtime alpha. Submit
+    on the current stream; do not concurrently reuse one output. The
+    ``descriptor_workspace`` argument is accepted and ignored.
     """
 
     def __init__(
@@ -124,6 +220,10 @@ class BatchedGemmPlan:
         descriptor_workspace=None,
     ):
         import torch
+
+        del (
+            descriptor_workspace
+        )  # accepted for signature stability; tensor maps travel by value
 
         aq, asf = a
         bq, bsf = b
@@ -170,22 +270,21 @@ class BatchedGemmPlan:
             raise ValueError("BF16 output has no output scales")
         epilogue = "fp8" if output_fp8 else "alpha" if alpha is not None else "bf16"
         sms = torch.cuda.get_device_properties(aq.device).multi_processor_count
-        self.options = dict(
-            tokens=tokens,
-            num_heads=heads,
-            inner=inner,
-            width=width,
-            num_sms=sms,
-            num_stages=5,
-            epilogue=epilogue,
-        )
-        try:
-            route = _catalog()["arches"][arch]["routes"][route_key(self.options)]
-        except KeyError as error:
+        self.config = route_config(tokens, heads, inner, width, sms, epilogue)
+        key = schedule_key(self.config)
+        program = cake_jit.ROUTES.get(key)
+        if program is None:
             raise NotImplementedError(
-                f"No exported batched projection schedule for {self.options}"
-            ) from error
-        cfg = route["config"]
+                f"The {self.config['route']} schedule ({key}) selected for T={tokens}, "
+                f"H={heads}, K={inner}, N={width} with {epilogue} output on {sms} SMs "
+                "is not exported"
+            )
+        self.program = program
+        record = cake_jit.MODULES[program]
+        cfg = self.config
+        # The grid is the registry's rule on the device's SM count (the same
+        # arithmetic ``route_config`` reports as ``grid``).
+        grid = cake_jit.launch_grid(record, tokens=tokens, sm_count=sms)
         dtype = torch.float8_e4m3fn if output_fp8 else torch.bfloat16
         if out is None:
             out = torch.empty((tokens, heads, width), dtype=dtype, device=aq.device)
@@ -236,46 +335,16 @@ class BatchedGemmPlan:
             grid_m=cfg["grid_m"],
             sfd_stride=sf_stride,
             alpha=1.0 if alpha is None else float(alpha),
-            grid_x=cfg["grid"][0],
-            grid_y=cfg["grid"][1],
-            grid_z=cfg["grid"][2],
+            grid_x=grid[0],
+            grid_y=grid[1],
+            grid_z=grid[2],
         )
-        module, record = load_program(arch, route["program"])
-        workspace_bytes = record["tma_workspace_bytes"]
-        if workspace_bytes:
-            if descriptor_workspace is None:
-                descriptor_workspace = torch.empty(
-                    workspace_bytes, dtype=torch.uint8, device=aq.device
-                )
-            if (
-                descriptor_workspace.dtype != torch.uint8
-                or descriptor_workspace.device != aq.device
-                or not descriptor_workspace.is_contiguous()
-                or descriptor_workspace.numel() < workspace_bytes
-                or descriptor_workspace.data_ptr() % 128
-            ):
-                raise ValueError(
-                    "Descriptor workspace must be aligned contiguous CUDA uint8 storage"
-                )
-        args = tuple(
-            descriptor_workspace if kind == "workspace" else self.bindings[name]
-            for kind, name in record["arg_plan"]
-        )
-        self._submission = (module[record["ffi_entry"]], args)
-        self._retained = (
-            module,
-            record,
-            a,
-            b,
-            out,
-            output_scales,
-            sf_storage,
-            self.bindings,
-            descriptor_workspace,
-        )
+        module = cake_jit.load(program, arch)
+        args = cake_jit.launch_args(record, self.bindings, grid)
+        self._submission = (getattr(module, record["ffi_entry"]), args)
+        self._retained = (module, a, b, out, output_scales, sf_storage, self.bindings)
         self.values, self.scales = out, output_scales
         self.output = (out, output_scales) if output_fp8 else out
-        self.descriptor_workspace = descriptor_workspace
 
     def run(self):
         import tvm_ffi
