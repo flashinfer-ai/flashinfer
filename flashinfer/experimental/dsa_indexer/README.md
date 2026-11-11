@@ -127,6 +127,11 @@ No measurements from the earlier prefix-based implementation are reused here.
 
 ## Attribution
 
+Co-author: [DarkSharpness](https://github.com/DarkSharpness). The predict
+(threshold-prediction) stage uses DarkSharpness's implementation from
+[SGLang #47469](https://github.com/sgl-project/sglang/pull/47469), carried through
+the vLLM #65920 port.
+
 The sample/filter/select design originates in
 [LiteTopK](https://arxiv.org/abs/2607.11976). The kernel lineage and Apache-2.0
 notices from vLLM and [SGLang #47469](https://github.com/sgl-project/sglang/pull/47469)
