@@ -22,9 +22,7 @@ bool device_supported(int64_t device) {
                     cudaSuccess);
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device),
                     cudaSuccess);
-  // M32S1 uses at most 230912 dynamic plus 1024 static shared-memory bytes.
-  // Keep the device admission guard at least as large as every tactic.
-  return major == 9 && minor == 0 && cluster && smem >= 231936;
+  return major == 9 && minor == 0 && cluster && smem >= 223584;
 }
 
 void run(TensorView q, TensorView kv, TensorView workspace, TensorView table, TensorView lengths,
@@ -74,12 +72,12 @@ void run(TensorView q, TensorView kv, TensorView workspace, TensorView table, Te
   TVM_FFI_ICHECK_EQ(out.stride(0), sq * h * 1024);
   TVM_FFI_ICHECK_EQ(window_left, 512);
   TVM_FFI_ICHECK(std::isfinite(scale) && scale > 0);
-  TVM_FFI_ICHECK(tactic >= 0 && tactic < 7);
+  TVM_FFI_ICHECK(tactic >= 0 && tactic < 6);
   for (auto t : {q, kv, workspace, out}) {
     TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16, 0);
   }
   TVM_FFI_ICHECK(device_supported(q.device().device_id))
-      << "Requires SM90 with cluster launch and 231936 bytes opt-in shared memory";
+      << "Requires SM90 with cluster launch and 223584 bytes opt-in shared memory";
   ffi::CUDADeviceGuard guard(q.device().device_id);
   using namespace flashinfer::mla_swa_sm90;
   Arguments a{static_cast<const cutlass::bfloat16_t*>(q.data_ptr()),
@@ -117,9 +115,6 @@ void run(TensorView q, TensorView kv, TensorView workspace, TensorView table, Te
       break;
     case 5:
       status = launch<mla_swa::M32S1>(a);
-      break;
-    case 6:
-      status = launch<mla_swa::M16S4Global>(a);
       break;
     default:
       status = cudaErrorInvalidValue;

@@ -46,8 +46,7 @@ namespace flashinfer::sparse_mla_sm120 {
 // The ordinary schedule omits minBlocksPerSM: it is smem-bound at 1 block/SM,
 // and an unconstrained register budget avoids the spill forced by that hint.
 // The mixed schedule supplies its own launch bound.
-template <ModelType MT, int NUM_HEADS, typename GatherSchedule = Fp8DecodeGatherSchedule,
-          bool Mega = false>
+template <ModelType MT, int NUM_HEADS, typename GatherSchedule = Fp8DecodeGatherSchedule>
 __global__ void __launch_bounds__(
     (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>::template block_threads<GatherSchedule>()),
     GatherSchedule::MIN_BLOCKS)
@@ -76,8 +75,7 @@ __global__ void __launch_bounds__(
         std::conditional_t<
             MT == ModelType::DSV4, Dsv4PageDivisors,
             std::conditional_t<MT == ModelType::DOTS3_SWA, flashinfer::uint_fastdiv, int>>
-            pages,
-        SparseMlaMegaParams mega = {}) {
+            pages) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>;
   static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || is_dsv41(MT),
@@ -413,10 +411,7 @@ __global__ void __launch_bounds__(
   // Stage 0: Q quantization (math threads only; the helper uses bar:2
   // internally with count=Cfg::MATH_THREADS; rows past valid_h are zero-filled).
   const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
-  const float* mega_cs = nullptr;
-  if constexpr (Mega) mega_cs = mega.cos_sin + size_t(mega.positions[t_idx]) * 64;
-  quantize_q_to_smem<MT, Cfg::MATH_THREADS, Mega ? QRotation::Required : QRotation::None>(
-      sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h, mega_cs);
+  quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[ACC_V_STEPS][NT_PER_WARP_XV][4] = {0};

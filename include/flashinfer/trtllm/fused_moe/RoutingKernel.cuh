@@ -294,24 +294,15 @@ __device__ DataType calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, Dat
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-// The NumBlocks CTAs of one cluster share the expanded indexes and exchange their histograms
-// through distributed shared memory. With NumBlocks == 1 a single CTA (no cluster) does all of it.
-// The CUDA headers declare the cluster intrinsics only for SM90+, so the statements using them are
-// compiled only there, also in branches that if constexpr discards. Below SM90 only the single-CTA
-// permutation of precomputed top-k ids compiles.
 template <typename KernelParams, typename BaseType, int NumThreads, int NumWarps,
           int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false,
-          typename PrecomputedExpertId = int32_t, int NumBlocks = NumBlocksPerCluster>
+          typename PrecomputedExpertId = int32_t>
 __device__ void routingPermutation(KernelParams params,
                                    PackedScoreIdx<BaseType>* smemPackedScoreIdx,
                                    int32_t const warpIdx, uint32_t const clusterBlockRank,
                                    PrecomputedExpertId const* precomputedExpertIds = nullptr) {
   using OutputT = typename KernelParams::OutputT;
   using TypePacked = PackedScoreIdx<BaseType>;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900))
-  static_assert(NumBlocks == 1 && LoadExpertIdxFromGlobal,
-                "Below SM90 only the single-CTA permutation of precomputed top-k ids compiles");
-#endif
 
   // When MaxNumExperts > NumThreads, each thread handles multiple experts. Use ceiling division
   // so non-divisible expert tiers (notably E=896 with 256- or 512-thread cluster blocks) are
@@ -324,9 +315,9 @@ __device__ void routingPermutation(KernelParams params,
   static_assert(ExpertsPerThread * NumThreads >= MaxNumExperts,
                 "Thread-local expert slots must cover MaxNumExperts");
 
-  static constexpr int MaxNumTokensSingleCluster = NumBlocks * NumThreads;
+  static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
   // Number of threads in the cluster.
-  static constexpr int NumThreadsPerCluster = NumThreads * NumBlocks;
+  static constexpr int NumThreadsPerCluster = NumThreads * NumBlocksPerCluster;
   // same as max num tokens
   static constexpr int MaxExpandedIdxPerThread =
       (MaxNumTokensSingleCluster * MaxNumTopExperts + NumThreadsPerCluster - 1) /
@@ -341,8 +332,8 @@ __device__ void routingPermutation(KernelParams params,
   auto expandedIdxSize = params.mNumTokens * params.mTopK;
 
   // number of experts may exceed number of threads — size by MaxNumExperts
-  __shared__ int32_t __align__(128) smemExpertCount[MaxNumExperts];
-  __shared__ int32_t __align__(128) smemExpertOffset[MaxNumExperts];
+  __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
+  __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[MaxNumExperts];
 
   // pre-fill the counts with 0 — each thread handles ExpertsPerThread experts
 #pragma unroll
@@ -376,11 +367,9 @@ __device__ void routingPermutation(KernelParams params,
                               static_cast<int16_t>(params.mPtrTopKPacked[expandedIdx].idx)};
       }
     } else {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
       TypePacked const* remoteSmem = cg::cluster_group::map_shared_rank(
           smemPackedScoreIdx, expandedIdx / (NumWarps * params.mTopK));
       scoreIdx = remoteSmem[expandedIdx % (NumWarps * params.mTopK)];
-#endif
     }
 
     expertIndexes[ii] = scoreIdx.idx;
@@ -425,14 +414,8 @@ __device__ void routingPermutation(KernelParams params,
     }
   }
   // Make local histogram (token counts per expert) available to all threads in the cluster.
-  if constexpr (NumBlocks > 1) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    __cluster_barrier_arrive();
-    __cluster_barrier_wait();
-#endif
-  } else {
-    __syncthreads();
-  }
+  __cluster_barrier_arrive();
+  __cluster_barrier_wait();
 
   //
   // Each thread now represents ExpertsPerThread experts
@@ -450,37 +433,27 @@ __device__ void routingPermutation(KernelParams params,
     blockExpertOffset[e] = 0;
 
     if (expert < params.mNumExperts) {
-      if constexpr (NumBlocks == 1) {
-        count[e] = smemExpertCount[expert];
-      } else {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        // Get the histogram bin from each rank for this expert.
-        int32_t expertCounts[NumBlocks];
+      // Get the histogram bin from each rank for this expert.
+      int32_t expertCounts[NumBlocksPerCluster];
 #pragma unroll
-        for (int rank = 0; rank < NumBlocks; rank++) {
-          int32_t const* remoteSmem = cg::cluster_group::map_shared_rank(smemExpertCount, rank);
-          expertCounts[rank] = rank * NumWarps < params.mNumTokens ? remoteSmem[expert] : 0;
-        }
+      for (int rank = 0; rank < NumBlocksPerCluster; rank++) {
+        int32_t const* remoteSmem = cg::cluster_group::map_shared_rank(smemExpertCount, rank);
+        expertCounts[rank] = rank * NumWarps < params.mNumTokens ? remoteSmem[expert] : 0;
+      }
 
-        // Compute an exclusive prefix sum of the block-local count.
+      // Compute an exclusive prefix sum of the block-local count.
 #pragma unroll
-        for (int rank = 0; rank < NumBlocks; rank++) {
-          if (rank == clusterBlockRank) {
-            blockExpertOffset[e] = count[e];
-          }
-          count[e] += expertCounts[rank];
+      for (int rank = 0; rank < NumBlocksPerCluster; rank++) {
+        if (rank == clusterBlockRank) {
+          blockExpertOffset[e] = count[e];
         }
-#endif
+        count[e] += expertCounts[rank];
       }
     }
   }
 
   // Arrive: we do not access distributed shared memory after this point.
-  if constexpr (NumBlocks > 1) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    __cluster_barrier_arrive();
-#endif
-  }
+  __cluster_barrier_arrive();
 
   // Compute the runtime config for projections
   // Whether or not an expert is local is taken into account when smemExpertCount is computed
@@ -509,7 +482,7 @@ __device__ void routingPermutation(KernelParams params,
         params.mPtrNumTokensPerExpert[expert] = count[e];
       }
       // Strided loop to share this work between blocks.
-      for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocks) {
+      for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocksPerCluster) {
         const int32_t localExpertIdx =
             (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
         params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
@@ -558,11 +531,7 @@ __device__ void routingPermutation(KernelParams params,
   // Wait: we cannot exit while other blocks may be accessing the current block's shared memory.
   // Note: I observed a perf benefit to doing this before the final loop so the compiler can
   // implement break with EXIT.
-  if constexpr (NumBlocks > 1) {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    __cluster_barrier_wait();
-#endif
-  }
+  __cluster_barrier_wait();
 
   // each thread has the same "expanded indexes" assigned to it as above
   // at this point, we know the final offsets of experts and the offsets within
@@ -627,7 +596,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
                 "MaxNumExperts must be a multiple of NumThreadsBlock");
 
   // number of experts is bounded by MaxNumExperts (may exceed thread count)
-  __shared__ int32_t __align__(128) smemExpertCount[MaxNumExperts];
+  __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
 
   // For unrolling.
   uint32_t constexpr NumEltsPerThread = 8;
@@ -729,9 +698,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
                 "MaxNumExperts must be a multiple of NumThreadsBlock");
 
   // number of experts — shared memory sized by MaxNumExperts (may exceed thread count)
-  __shared__ int32_t __align__(128) smemExpertOffset[MaxNumExperts];
-  __shared__ int32_t __align__(128) smemExpertCount[MaxNumExperts];
-  __shared__ int32_t __align__(128) smemExpertTileOffset[MaxNumExperts];
+  __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[MaxNumExperts];
+  __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
+  __shared__ int32_t __attribute((aligned(128))) smemExpertTileOffset[MaxNumExperts];
   // BlockScan uses actual thread count; array overload handles ExpertsPerThread items per thread
   using Scan = cub::BlockScan<int32_t, NumThreadsBlock, cub::BLOCK_SCAN_WARP_SCANS>;
   __shared__ typename Scan::TempStorage tempStorage;
@@ -1045,8 +1014,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   static constexpr int NumThreads = MaxNumExperts;
   static_assert(MaxNumExperts <= 1024, "Coop kernel requires MaxNumExperts <= 1024");
 
-  __shared__ int32_t __align__(128) smemExpertCount[MaxNumExperts];
-  __shared__ int32_t __align__(128) smemExpertOffset[MaxNumExperts];
+  __shared__ int32_t __attribute((aligned(128))) smemExpertCount[MaxNumExperts];
+  __shared__ int32_t __attribute((aligned(128))) smemExpertOffset[MaxNumExperts];
   // needed for the exclusive sum of token offsets
   using Scan = cub::BlockScan<int32_t, NumThreads, cub::BLOCK_SCAN_WARP_SCANS>;
   __shared__ typename Scan::TempStorage tempStorage;

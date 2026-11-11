@@ -126,9 +126,7 @@ def _convert_f32x2_to_e4m3x2_and_back(a, b, *, loc=None, ip=None):
 
 @dsl_user_op
 def _clamp_f32_trt(val, lower, upper, *, loc=None, ip=None):
-    """TRTLLM-gen clamp with NaN-propagating finite bounds."""
-    # `.NaN` propagates a NaN activation instead of selecting a finite bound.
-    # Omitting `.ftz` preserves subnormal inputs.
+    """TRTLLM-gen clamp: ``x < lo ? lo : (x > hi ? hi : x)``."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -139,9 +137,12 @@ def _clamp_f32_trt(val, lower, upper, *, loc=None, ip=None):
             ],
             """
             {
+                .reg .pred p;
                 .reg .f32 tmp;
-                max.NaN.f32 tmp, $1, $2;
-                min.NaN.f32 $0, tmp, $3;
+                setp.lt.f32 p, $1, $2;
+                selp.f32 tmp, $2, $1, p;
+                setp.gt.f32 p, tmp, $3;
+                selp.f32 $0, $3, tmp, p;
             }
             """,
             "=f,f,f,f",
@@ -156,9 +157,7 @@ def _clamp_f32_trt(val, lower, upper, *, loc=None, ip=None):
 
 @dsl_user_op
 def _clamp_upper_f32_trt(val, upper, *, loc=None, ip=None):
-    """TRTLLM-gen upper clamp with NaN propagation."""
-    # `.NaN` propagates a NaN activation instead of selecting the finite bound.
-    # Omitting `.ftz` preserves subnormal inputs.
+    """TRTLLM-gen upper clamp with ternary NaN behavior."""
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -168,7 +167,9 @@ def _clamp_upper_f32_trt(val, upper, *, loc=None, ip=None):
             ],
             """
             {
-                min.NaN.f32 $0, $1, $2;
+                .reg .pred p;
+                setp.gt.f32 p, $1, $2;
+                selp.f32 $0, $2, $1, p;
             }
             """,
             "=f,f,f",
@@ -524,9 +525,7 @@ class GmemCResource(MemoryResource):
                 Float32(-1.4426950408889634) * self.tile_gemm1_alpha * gate_scaled
             )
             sigmoid_gate = cute.math.rcp(Float32(1.0) + cute.math.exp2(neg_gate_log2e))
-            if cutlass.const_expr(self.cfg.has_gemm1_beta):
-                linear = linear + self.tile_gemm1_beta
-            return linear * gate_scaled * sigmoid_gate
+            return (linear + self.tile_gemm1_beta) * gate_scaled * sigmoid_gate
 
         linear_scaled = linear * scale_gate
         if cutlass.const_expr(self.cfg.act_kind == int(ActKind.GEGLU)):
@@ -682,14 +681,12 @@ class GmemCResource(MemoryResource):
             )
             sig0 = cute.math.rcp(denom0, approx=True, ftz=True)
             sig1 = cute.math.rcp(denom1, approx=True, ftz=True)
-            linear_beta0, linear_beta1 = linear0, linear1
-            if cutlass.const_expr(self.cfg.has_gemm1_beta):
-                linear_beta0, linear_beta1 = self._fadd2(
-                    linear0,
-                    linear1,
-                    self.tile_gemm1_beta,
-                    self.tile_gemm1_beta,
-                )
+            linear_beta0, linear_beta1 = self._fadd2(
+                linear0,
+                linear1,
+                self.tile_gemm1_beta,
+                self.tile_gemm1_beta,
+            )
             gated0, gated1 = self._fmul2(gate_scaled0, gate_scaled1, sig0, sig1)
             return self._fmul2(linear_beta0, linear_beta1, gated0, gated1)
 
@@ -3180,11 +3177,10 @@ class GmemCResource(MemoryResource):
         sf_packed2, sf_rounded0, sf_rounded1 = _convert_f32x2_to_e4m3x2_and_back(
             sf0, sf1
         )
-        # The E4M3 round trip yields either zero or a value at least 2^-9, so
-        # no positive scale needs an epsilon floor.  rcp(0) produces infinity
-        # without trapping, and the following selects prevent it from escaping.
-        output_scale0 = cute.math.rcp(sf_rounded0, approx=True, ftz=True)
-        output_scale1 = cute.math.rcp(sf_rounded1, approx=True, ftz=True)
+        sf_for_rcp0 = cute.math.max(sf_rounded0, Float32(1.0e-12))
+        sf_for_rcp1 = cute.math.max(sf_rounded1, Float32(1.0e-12))
+        output_scale0 = cute.math.rcp(sf_for_rcp0, approx=True, ftz=True)
+        output_scale1 = cute.math.rcp(sf_for_rcp1, approx=True, ftz=True)
         if sf_rounded0 == Float32(0.0):
             output_scale0 = Float32(0.0)
         if sf_rounded1 == Float32(0.0):

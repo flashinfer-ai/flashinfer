@@ -38,7 +38,6 @@ from .shim import (
     MegaMoEBf16Mxfp8Inputs,
     MegaMoEBf16Mxfp8SymmBuffer,
     MegaMoEMxfp8Inputs,
-    MegaMoEMxfp8Config,
     MegaMoEMxfp8SymmBuffer,
     MegaMoEBf16Inputs,
     MegaMoEBf16SymmBuffer,
@@ -151,7 +150,6 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
-    "MegaMoEMxfp8Config",
     "_CompiledMega",
     "_compute_peer_offsets",
     "_resolve_per_expert_epilogue",

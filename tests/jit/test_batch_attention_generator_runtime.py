@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from flashinfer.jit.attention.modules import (
-    _uri,
     gen_batch_attention_module,
     gen_customize_batch_attention_module,
 )
@@ -41,7 +40,7 @@ def batch_attention_module(request):
             False,
             False,
         )
-        assert spec.name == _uri(
+        assert spec.name == (
             "batch_attention_with_kv_cache_dtype_q_bf16_dtype_kv_bf16_dtype_o_bf16_"
             "dtype_idx_i32_head_dim_qk_128_head_dim_vo_128_posenc_0_"
             "use_logits_soft_cap_false_use_profiler_false"

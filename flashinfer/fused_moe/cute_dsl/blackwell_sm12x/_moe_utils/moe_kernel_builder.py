@@ -309,8 +309,6 @@ class Sm12xGemmConfig:
         union_smem=False,
         reg_prod=None,
         enable_pdl=False,
-        *,
-        num_math_groups=1,
     ):
         self.mma, self.load_ab, self.load_sf, self.epi = mma, load_ab, load_sf, epi
         self.enable_pdl = enable_pdl
@@ -330,8 +328,7 @@ class Sm12xGemmConfig:
         self.TILE = tuple(tile)
         self.ab_stage = ab_stage
         self.epi_bar_id = epi_bar_id
-        assert num_math_groups >= 1
-        num_math_warps = mma.num_math_warps * num_math_groups
+        num_math_warps = mma.num_math_warps
         self.num_math_warps = num_math_warps
         self.mma_threads = mma.num_math_warps * 32
         assert epi.mma_threads == self.mma_threads, (

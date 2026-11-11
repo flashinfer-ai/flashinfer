@@ -37,11 +37,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from ..cute_dsl.utils import (
-    get_cutlass_dtype,
-    get_num_sm,
-    mbarrier_wait_acquire_cluster,
-)
+from ..cute_dsl.utils import get_cutlass_dtype, get_num_sm
 
 
 # =============================================================================
@@ -897,7 +893,7 @@ def cluster_reduce_multirow(
             peer_cta_rank_in_cluster=lane_idx,
         )
 
-    mbarrier_wait_acquire_cluster(mbar_ptr, Int32(phase))
+    cute.arch.mbarrier_wait(mbar_ptr, phase=phase)
 
     num_total = warps_per_row * cluster_n
     num_iter = cute.ceil_div(num_total, 32)

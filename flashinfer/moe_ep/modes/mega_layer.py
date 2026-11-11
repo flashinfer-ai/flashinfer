@@ -140,16 +140,7 @@ class MoEEpMegaLayer(nn.Module):
         validate_bootstrap_world_size(bootstrap)
 
         if backend.transformed_weights is None:
-            validate_fleet_weights(
-                weights,
-                fleet_params,
-                bootstrap.world_size,
-                **(
-                    {"allow_shared_expert": True}
-                    if getattr(self._kernel, "supports_shared_expert", False)
-                    else {}
-                ),
-            )
+            validate_fleet_weights(weights, fleet_params, bootstrap.world_size)
 
         self._weights: Optional[MoEWeightPack] = (
             weights if backend.transformed_weights is None else None
@@ -566,7 +557,7 @@ class MoEEpMegaLayer(nn.Module):
 
     @staticmethod
     def _input_signature(t: "MoEEpTensors") -> tuple[Any, ...]:
-        signature = (
+        return (
             t.hidden_states.device,
             t.hidden_states.dtype,
             t.hidden_states.ndim,
@@ -580,21 +571,6 @@ class MoEEpMegaLayer(nn.Module):
             t.topk_weights.ndim,
             t.topk_weights.shape[1] if t.topk_weights.ndim > 1 else None,
         )
-
-        if (
-            getattr(t, "shared_hidden_states", None) is not None
-            or getattr(t, "shared_scales", None) is not None
-        ):
-            signature += tuple(
-                None
-                if value is None
-                else (value.device, value.dtype, value.ndim, tuple(value.shape[1:]))
-                for value in (
-                    getattr(t, "shared_hidden_states", None),
-                    getattr(t, "shared_scales", None),
-                )
-            )
-        return signature
 
     def _prepare_inputs(
         self,

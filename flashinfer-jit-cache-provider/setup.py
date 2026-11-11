@@ -17,9 +17,7 @@ setup(
     python_requires=">=3.9",
     packages=[config.package],
     package_dir={config.package: "flashinfer_jit_cache_provider"},
-    package_data={
-        config.package: ["manifest.json", "jit_cache/**/*.so", "jit_cache/**/*.dll"]
-    },
+    package_data={config.package: ["manifest.json", "jit_cache/**/*.so"]},
     include_package_data=False,
     zip_safe=False,
     entry_points={

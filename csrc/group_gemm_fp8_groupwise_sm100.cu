@@ -114,10 +114,7 @@ void CutlassGroupGemmFP8GroupwiseScaledSM100(
                           static_cast<float*>(SFA.data_ptr()), static_cast<float*>(SFB.data_ptr()),
                           static_cast<cutlass_t_out*>(D.data_ptr()),
                           static_cast<int*>(m_indptr.data_ptr()), max_m, n, k, num_groups, stream);
-              TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-                  << "Failed to run cutlass fp8 group gemm groupwise scaled sm100: "
-                  << cudaGetErrorString(status);
-              return true;
+              return status == cudaSuccess;
             });
       });
     });

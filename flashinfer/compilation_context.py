@@ -19,7 +19,6 @@ Global compilation context management for FlashInfer.
 
 import functools
 import os
-import platform
 import torch
 import logging
 
@@ -76,7 +75,7 @@ class CompilationContext:
     COMMON_NVCC_FLAGS = [
         "-DFLASHINFER_ENABLE_FP8_E8M0",
         "-DFLASHINFER_ENABLE_FP4_E2M1",
-    ] + (["-Xcompiler /Zc:preprocessor"] if platform.system() == "Windows" else [])
+    ]
 
     @staticmethod
     def _normalize_cuda_arch(major: int, minor: int) -> tuple[int, str]:

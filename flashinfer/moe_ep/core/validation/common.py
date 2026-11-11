@@ -353,11 +353,7 @@ def validate_mega_arch_sm120() -> None:
 
 
 def validate_fleet_weights(
-    weights: MoEWeightPack,
-    params: FleetParams,
-    world_size: int,
-    *,
-    allow_shared_expert: bool = False,
+    weights: MoEWeightPack, params: FleetParams, world_size: int
 ) -> None:
     """Check canonical weight layout matches EP sizing for this rank."""
     if world_size <= 0:
@@ -374,8 +370,6 @@ def validate_fleet_weights(
             f"layer weights must be MoEWeightPack, got {type(pack).__name__}"
         )
     hidden = params.token_hidden_size
-    if getattr(pack, "shared_expert", None) is not None and not allow_shared_expert:
-        raise MoEEpConfigError("This backend does not support shared-expert weights")
     for name in ("w13", "w2"):
         t = getattr(pack, name)
         if t.ndim < 2:

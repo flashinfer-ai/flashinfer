@@ -83,12 +83,8 @@ def _identity_round_trip_reference(x, topk_ids, world_size, experts_per_rank):
 
 @pytest.mark.gpu_2
 @pytest.mark.parametrize("top_k", [4, 8])
-@pytest.mark.parametrize(
-    "backend,empty_rank",
-    [pytest.param(backend, False, id=backend) for backend in _BACKENDS]
-    + [pytest.param("nvlink_two_sided", True, id="nvlink_two_sided-empty-rank")],
-)
-def test_dispatch_combine_matches_local_reference(backend, top_k, empty_rank):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_dispatch_combine_matches_local_reference(backend, top_k):
     import torch
     import torch.distributed as dist
 
@@ -101,24 +97,14 @@ def test_dispatch_combine_matches_local_reference(backend, top_k, empty_rank):
     max_tokens_per_rank = 32
 
     generator = torch.Generator().manual_seed(1234 + rank)
-    if empty_rank:
-        num_tokens = 0 if rank == 0 else max_tokens_per_rank
-    else:
-        num_tokens = int(
-            torch.randint(1, max_tokens_per_rank + 1, (1,), generator=generator)
-        )
+    num_tokens = int(
+        torch.randint(1, max_tokens_per_rank + 1, (1,), generator=generator)
+    )
     step_max = torch.tensor([num_tokens], device="cuda")
     dist.all_reduce(step_max, op=dist.ReduceOp.MAX)
 
     x = torch.randn(num_tokens, hidden, generator=generator).to("cuda", torch.bfloat16)
     topk_ids, topk_weights = _random_routing(num_tokens, num_experts, top_k, generator)
-    if empty_rank:
-        # Experts 0..3 live on rank 0: it must serve peers despite its empty batch.
-        topk_ids = (
-            torch.arange(top_k, device="cuda", dtype=torch.int32)
-            .expand(num_tokens, -1)
-            .contiguous()
-        )
 
     comm = create_communication(
         BootstrapConfig(world_size=world_size, rank=rank),
@@ -156,7 +142,6 @@ def test_dispatch_combine_matches_local_reference(backend, top_k, empty_rank):
             ).to(torch.bfloat16)
 
             out = comm.combine(expert_output)
-            assert out.shape == (num_tokens, hidden)
 
             reference = x.float() * (topk_weights * (topk_ids.long() + 1).float()).sum(
                 -1, keepdim=True
