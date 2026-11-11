@@ -208,6 +208,8 @@ def _fp8_moe_run_experts(
     ``weights``   : [T, TOP_K] float32 — per-token expert weights (already normalised)
     ``topk_idx``  : [T, TOP_K] int64   — selected global expert indices
     """
+    if token_mask is not None:
+        topk_idx = topk_idx.masked_fill(token_mask[:, None], -1)
     T, H = hidden_states.shape
     E_local, gemm1_out_size, _ = gemm1_weights.shape
     I = gemm1_out_size // 2

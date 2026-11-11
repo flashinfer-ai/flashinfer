@@ -22,6 +22,50 @@ import torch
 pytestmark = pytest.mark.cpu_only
 
 
+def test_fp8_padding_skips_expert_matmuls(monkeypatch):
+    from flashinfer.trace.templates.moe import _fp8_moe_run_experts
+
+    def unexpected_matmul(*args, **kwargs):
+        pytest.fail("Padding must not enter expert matmuls")
+
+    monkeypatch.setattr(torch.Tensor, "matmul", unexpected_matmul)
+    output = _fp8_moe_run_experts(
+        torch.zeros(2, 128),
+        torch.ones(1, 2),
+        torch.zeros(1, 256, 128),
+        torch.ones(1, 2, 1),
+        torch.zeros(1, 128, 128),
+        torch.ones(1, 1, 1),
+        torch.ones(2, 1),
+        torch.zeros(2, 1, dtype=torch.int64),
+        0,
+        1,
+        token_mask=torch.ones(2, dtype=torch.bool),
+    )
+    assert output.isnan().all()
+
+
+def test_fp8_saved_checker_rejects_nonfinite_real_rows():
+    import json
+    from pathlib import Path
+
+    fixture = (
+        Path(__file__).parents[2]
+        / "trace/fi_trace_out"
+        / ("moe_fp8_block_scale_renormalize_routing_topk4_e32_h7168_i2048.json")
+    )
+    namespace = {"torch": torch}
+    exec(json.loads(fixture.read_text())["check"], namespace)
+    check = namespace["_masked_fp8_moe_trace_check"]
+    reference = torch.ones(3, 128)
+    reference[2] = float("nan")
+    actual = torch.ones_like(reference)
+    assert check(reference, actual, max_mismatch_pct=1.0)
+    for value in (float("nan"), float("inf")):
+        actual[0, 0] = value
+        assert not check(reference, actual, max_mismatch_pct=1.0)
+
+
 def _kwargs(kind):
     n, h, inter, experts = 3, 32, 32, 2
     args = dict(
