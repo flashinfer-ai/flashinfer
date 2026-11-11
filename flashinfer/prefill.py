@@ -5987,6 +5987,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             if res is not None:
                 return res
+            if isinstance(k_scale, torch.Tensor) or isinstance(v_scale, torch.Tensor):
+                # the stock fa2 path folds scalar k_scale into sm_scale and
+                # applies scalar v_scale to the output; it has no
+                # per-sequence KV-descale ABI, so a tensor here cannot be
+                # served once the specialized kernel is not dispatched
+                raise NotImplementedError(
+                    "per-sequence k_scale/v_scale tensors are only served by "
+                    "the specialized SM90 fp8-Q kernel; this call fell back "
+                    "to the stock fa2 path (disabled via "
+                    f"{_GQA_CTX_FP8Q_SM90_DISABLE_ENV} or outside its "
+                    "allowlist), which takes scalar or None k_scale/v_scale. "
+                    "Pass scalars (unit descales may simply be omitted) or "
+                    "re-enable the specialized kernel."
+                )
             q, q_scale = _gqa_ctx_fp8q_sm90_dequant_q(self, q, q_scale)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
