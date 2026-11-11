@@ -820,6 +820,14 @@ def main():
         parser.error("tokens, warmup, iters, and repetition must be positive")
     if args.capacity is not None and args.capacity < max(token_list):
         parser.error("--capacity must cover every live token count")
+    if (
+        not args.testlist
+        and args.kernel_variant == "genphase"
+        and (args.knobs == "default" or (args.capacity or max(token_list)) > 1024)
+    ):
+        parser.error(
+            "GenPhase requires heuristic, cache, or explicit knobs and capacity <= 1024"
+        )
     rank, world = (
         int(os.environ.get("RANK", "0")),
         int(os.environ.get("WORLD_SIZE", "1")),

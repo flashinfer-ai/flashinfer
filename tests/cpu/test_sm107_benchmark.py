@@ -199,6 +199,78 @@ def test_invalid_testlist_fails_before_runtime_setup(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "extra",
+    [
+        ["--tokens", "8", "--knobs", "default"],
+        ["--tokens", "8,1025", "--knobs", "heuristic"],
+        ["--tokens", "8", "--capacity", "1025", "--knobs", "heuristic"],
+    ],
+)
+def test_standalone_genphase_rejects_invalid_settings_before_setup(monkeypatch, extra):
+    bench, ep = main_benchmark(monkeypatch)
+    monkeypatch.setattr(
+        sys, "argv", ["benchmark", "--kernel-variant", "genphase", *extra]
+    )
+    with pytest.raises(SystemExit) as exc:
+        bench.main()
+    assert exc.value.code == 2
+    ep.bootstrap_moe_ep_runtime.assert_not_called()
+    bench.torch.cuda.get_device_capability.assert_not_called()
+    bench._local_transformed_weights.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "variant,knobs,tokens,capacity",
+    [
+        ("genphase", "heuristic", "8", 1024),
+        ("genphase", "cache", "8", 1024),
+        (
+            "genphase",
+            '{"cluster_shape_mn": [4, 1], "fc2_use_bulk": true}',
+            "8",
+            1024,
+        ),
+        ("inference", "default", "2048", 2048),
+    ],
+)
+def test_standalone_accepts_supported_policies(
+    tmp_path, monkeypatch, variant, knobs, tokens, capacity
+):
+    bench, ep = main_benchmark(monkeypatch)
+    output = tmp_path / "results.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--mode",
+            "forward",
+            "--kernel-variant",
+            variant,
+            "--knobs",
+            knobs,
+            "--quant-kind",
+            "nvfp4",
+            "--routing",
+            "balanced",
+            "--tokens",
+            tokens,
+            "--capacity",
+            str(capacity),
+            "--output",
+            str(output),
+        ],
+    )
+    call = MagicMock(return_value=({"execution": "graph"}, [1.0, 2.0]))
+    monkeypatch.setattr(bench, "_bench_one", call)
+    bench.main()
+    call.assert_called_once()
+    assert call.call_args.args[2:4] == (int(tokens), capacity)
+    ep.finalize_moe_ep_runtime.assert_called_once()
+    assert len(output.read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize(
     "routing,expected",
     [
         ("both", ["balanced", "power_law"]),
