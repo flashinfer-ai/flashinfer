@@ -242,7 +242,12 @@ class FrostLowLatencyRunner(MoERunner):
         )
 
     def _cache_key_extras(self):
-        return super()._cache_key_extras() + (
+        extras = super()._cache_key_extras()
+        if self._fp4_weight_only and self.config.quant.weight is QuantFormat.NVFP4:
+            from .tc.nvfp4_config import compiler_cuda_major
+
+            extras += ("nvfp4-compiler-cuda", compiler_cuda_major())
+        return extras + (
             # Do not reuse winners selected with the deferred individual-call timer.
             "fp8-grouped-tc-w8-weight-first-v6"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
@@ -252,7 +257,10 @@ class FrostLowLatencyRunner(MoERunner):
             else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
             else (
-                "fp4-route-reuse-load-width-lut-fp16-v8"
+                "nvfp4-grouped-tc-compiler-v6"
+                if self._fp4_weight_only
+                and self.config.quant.weight is QuantFormat.NVFP4
+                else "fp4-route-reuse-load-width-lut-fp16-v8"
                 if self._fp4_weight_only
                 else (
                     "w8a16-grouped-tc-hopper-k256-v22"
@@ -321,6 +329,11 @@ class FrostLowLatencyRunner(MoERunner):
                     for a in (1, 2, 4)
                     for b in columns
                 ]
+            from .tc.nvfp4_config import grouped_nvfp4_tactics
+
+            # Reused routes amortize packed fragment conversion. Retain all
+            # FFMA choices for sparse overlap; untuned dispatch is unchanged.
+            tactics += grouped_nvfp4_tactics(self.config, capability, inputs[0].shape)
             return tactics
         if (
             self.config.quant.weight is QuantFormat.FP8PerTensor

@@ -35,7 +35,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
+PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
 W = 4
 H_QK, HV = 2, 4
 # contiguous layout: 256 tokens per rank
@@ -51,7 +51,7 @@ TENSORS = ("out", "dq", "dk", "dv", "dbeta", "dg")
 
 def _mod(sub: str):
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
@@ -98,9 +98,9 @@ def _local(part, cu: list[int], rank: int, glob: dict[str, torch.Tensor]):
 def _pass(kcp, ctx, ops, **o) -> tuple[dict[str, torch.Tensor], list[str]]:
     """Forward + backward (saved set) of one rank; the published tensors and the forward's launch sequence."""
     args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"])
-    out, saved = kcp.chunk_gdn_det_fwd_kcp(*args, ctx, backend="fake", **o)
+    out, saved = kcp.cake_gdn_det_train_kcp_forward(*args, ctx, backend="fake", **o)
     seq = list(kcp.LAST_CALL["fwd"]["sequence"])
-    dq, dk, dv, dbeta, dg = kcp.chunk_gdn_det_bwd_kcp(
+    dq, dk, dv, dbeta, dg = kcp.cake_gdn_det_train_kcp_backward(
         *args, ctx, ops["dout"], saved=saved, backend="fake", **o
     )
     return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dbeta": dbeta, "dg": dg}, seq
@@ -113,10 +113,10 @@ def _rank(rank: int, init_file: str, cu: list[int], crossing: bool) -> None:
     try:
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
-        part = plan.partition_det_kcp(
+        part = plan.cake_gdn_det_train_kcp_partition(
             torch.tensor(cu, dtype=torch.int64), W, "contiguous"
         )
-        ctx = plan.build_context_det_kcp(
+        ctx = plan.cake_gdn_det_train_kcp_build_context(
             part, dist.group.WORLD, rank, torch.device("cpu")
         )
         assert int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS, int(ctx.n_d_max)
@@ -189,10 +189,10 @@ def _rank_full(rank: int, init_file: str) -> None:
     try:
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
-        part = plan.partition_det_kcp(
+        part = plan.cake_gdn_det_train_kcp_partition(
             torch.tensor(FULL_P2, dtype=torch.int64), W, "contiguous"
         )
-        ctx = plan.build_context_det_kcp(
+        ctx = plan.cake_gdn_det_train_kcp_build_context(
             part, dist.group.WORLD, rank, torch.device("cpu")
         )
         assert int(ctx.N_out) > 0 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
@@ -218,7 +218,7 @@ def _rank_full(rank: int, init_file: str) -> None:
                         "segments": 2,
                         "use_qk_l2norm_in_kernel": l2n,
                     }
-                    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+                    _, saved = kcp.cake_gdn_det_train_kcp_forward(
                         *(ops[n] for n in ("q", "k", "v", "g", "beta")),
                         ctx,
                         backend="fake",

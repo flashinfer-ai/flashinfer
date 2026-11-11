@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake packed KDA chunked training kernels
-(``flashinfer.experimental.cake_kda_det_train``) on three boundaries of a
+(``flashinfer.experimental.cake.cake_kda_det_train``) on three boundaries of a
 training step, against flash-linear-attention's ``chunk_kda`` when it is
 installed:
 
@@ -40,9 +40,9 @@ through the autograd entry, CUDA events) of the forget gate's two forms on the
 same raw operands (BF16 raw gate, FP32 ``A_log`` / ``dt_bias``, lower bound
 -5), interleaved in one process (the arm order alternates per step):
 
-* ``R``: the raw gate mode, ``chunk_kda_det(raw, use_gate_in_kernel=True, ...)``;
-* ``E_T``: a torch FP32 gate with autograd, then ``chunk_kda_det(g)``;
-* ``E_F``: flash-linear-attention's gate with autograd, then ``chunk_kda_det(g)``
+* ``R``: the raw gate mode, ``cake_kda_det(raw, use_gate_in_kernel=True, ...)``;
+* ``E_T``: a torch FP32 gate with autograd, then ``cake_kda_det(g)``;
+* ``E_F``: flash-linear-attention's gate with autograd, then ``cake_kda_det(g)``
   (where it imports).
 
 The ``_strided`` arms (``R_strided``, ``E_T_strided``, ``E_F_strided``) take
@@ -86,9 +86,9 @@ from torch.utils.checkpoint import checkpoint
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flashinfer.experimental.cake_kda_det_train import cake_backend, cake_jit  # noqa: E402
+from flashinfer.experimental.cake.cake_kda_det_train import cake_backend, cake_jit  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     check_fla_gate,
     fla_kda_gate,
@@ -156,23 +156,23 @@ def _time(fn: Callable[[], object]) -> float:
 
 
 def cake_boundaries(
-    inputs: dict, ws: cake_backend.KdaDetWorkspace
+    inputs: dict, ws: cake_backend.CakeKDADetWorkspace
 ) -> dict[str, Callable[[], None]]:
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
 
     def fwd() -> None:
-        cake_backend.chunk_kda_det_fwd(
+        cake_backend.cake_kda_det_train_forward(
             q, k, v, g, beta, cu, save_for_backward=True, workspace=ws
         )
 
-    _, saved = cake_backend.chunk_kda_det_fwd(
+    _, saved = cake_backend.cake_kda_det_train_forward(
         q, k, v, g, beta, cu, save_for_backward=True, workspace=ws
     )
 
     def bwd() -> None:
-        cake_backend.chunk_kda_det_bwd(
+        cake_backend.cake_kda_det_train_backward(
             q, k, v, g, beta, cu, dout, saved=saved, workspace=ws
         )
 
@@ -183,7 +183,7 @@ def cake_boundaries(
 
     def ckpt() -> None:
         o = checkpoint(
-            lambda *a: cake_backend.chunk_kda_det(*a, cu, workspace=ws),
+            lambda *a: cake_backend.cake_kda_det(*a, cu, workspace=ws),
             *leaves,
             use_reentrant=False,
         )
@@ -246,7 +246,7 @@ def run_row(
 ) -> dict:
     lengths = split_docs(seqlen, docs)
     inputs = make_inputs(lengths, heads, device)
-    ws = cake_backend.KdaDetWorkspace.for_problem(seqlen, docs, heads, device)
+    ws = cake_backend.CakeKDADetWorkspace.for_problem(seqlen, docs, heads, device)
     ws.load()
     row = {
         "seqlen": seqlen,
@@ -289,9 +289,9 @@ def _arena_option(kind: str, batch_tokens: int):
     if kind == "default":
         return None
     if kind == "lean4":
-        return cake_backend.KdaDetArena(lean=True, tail_passes=4)
+        return cake_backend.CakeKDADetArena(lean=True, tail_passes=4)
     if kind == "batched":
-        return cake_backend.KdaDetArena(batch_tokens=batch_tokens)
+        return cake_backend.CakeKDADetArena(batch_tokens=batch_tokens)
     raise ValueError(f"unknown arena {kind!r}; one of {ARENAS}")
 
 
@@ -350,7 +350,7 @@ def gate_steps(
 
             def fn(q, k, v, raw, beta, a_log, dt_bias):
                 if form == "R":
-                    return cake_backend.chunk_kda_det(
+                    return cake_backend.cake_kda_det(
                         q,
                         k,
                         v,
@@ -364,7 +364,7 @@ def gate_steps(
                         **kw,
                     )
                 g = gate_fn(raw, a_log, dt_bias).contiguous()
-                return cake_backend.chunk_kda_det(q, k, v, g, beta, cu, **kw)
+                return cake_backend.cake_kda_det(q, k, v, g, beta, cu, **kw)
 
             if ckpt:
                 return checkpoint(

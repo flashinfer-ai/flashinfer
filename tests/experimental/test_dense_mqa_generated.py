@@ -1412,7 +1412,10 @@ def test_dense_route_table_is_catalog_driven():
 def test_fp8_mqa_logits_row_ranges(queries, monkeypatch):
     """A 32-head call whose logits pass ``MAX_LAUNCH_LOGITS`` runs one launch per
     range of query rows (the last range re-anchored to end at Q) with the same bits
-    as one launch, and a plan over that many logits is refused."""
+    as one launch, and a plan over that many logits is refused. With
+    ``clean_logits=True`` every cell matches; with ``clean_logits=False`` only the
+    window cells are defined (a ``"raw"`` route variant leaves the rest unwritten),
+    so only they are compared."""
     _skip_unless_exported()
     keys, heads = 4096, 32
     arch = _runtime.device_arch(torch.device("cuda"))
@@ -1429,14 +1432,44 @@ def test_fp8_mqa_logits_row_ranges(queries, monkeypatch):
     weights = torch.randn(queries, heads, device="cuda")
     ke = torch.arange(keys - queries + 1, keys + 1, device="cuda", dtype=torch.int32)
     ks = torch.clamp(ke - 1000, min=0)
-    whole = fp8_mqa_logits(q, (kv, scales), weights, ks, ke).clone()
+    cols = torch.arange(keys, device="cuda")
+    window = (cols >= ks[:, None]) & (cols < ke[:, None])
+    whole = {
+        clean: fp8_mqa_logits(
+            q, (kv, scales), weights, ks, ke, clean_logits=clean
+        ).clone()
+        for clean in (True, False)
+    }
     # 256 rows of logits per launch: five ranges, the last one short.
     monkeypatch.setattr(
         _runtime, "MAX_LAUNCH_LOGITS", 256 * _runtime.logits_stride(keys)
     )
-    split = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
+    # Raw and cleaned programs write the same window bits, so the window check alone
+    # cannot see whether each range's plan gets the caller's clean_logits.
+    plan_flags = []
+    real_plan = _runtime.DenseMqaPlan
+
+    def recording_plan(*args, **kwargs):
+        plan_flags.append(kwargs.get("clean_logits"))
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(_runtime, "DenseMqaPlan", recording_plan)
+    split = {}
+    for clean in (True, False):
+        plan_flags.clear()
+        split[clean] = fp8_mqa_logits(
+            q, (kv, scales), weights, ks, ke, clean_logits=clean
+        )
+        assert len(plan_flags) > 1 and all(f is clean for f in plan_flags), plan_flags
+    monkeypatch.setattr(_runtime, "DenseMqaPlan", real_plan)
     torch.cuda.synchronize()
-    assert torch.equal(split, whole)
+
+    def bits(t):
+        return t.contiguous().view(torch.int32)
+
+    assert torch.equal(bits(split[True]), bits(whole[True]))
+    assert torch.equal(bits(split[False][window]), bits(whole[False][window]))
+    assert torch.equal(bits(split[False][window]), bits(whole[True][window]))
     with pytest.raises(ValueError, match="row ranges"):
         _runtime.DenseMqaPlan("fp8", q, kv, weights, ks, ke, kv_scales=scales)
 
@@ -1788,8 +1821,8 @@ _RAW_POINTS = {
     "fp8:q128:short": (128, 4096),
     "fp8:full:le32:short": (16, 32768),
     "fp8:partial:le32:short": (3, 8192),
-    "fp8:full:le16": (16, 1048832),
-    "fp8:partial:le16": (3, 1048832),
+    "fp8:full:le16": (16, 1049088),
+    "fp8:partial:le16": (3, 1049088),
     "fp8:full:le128": (128, 131584),
     "fp8:partial:le128": (33, 1048832),
     "fp8:qle128:short": (37, 4137),

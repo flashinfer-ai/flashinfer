@@ -15,7 +15,10 @@
 import pytest
 import torch
 
-from flashinfer.quantization.kernels import nvfp4_kv_materialize_fp8
+from flashinfer.quantization.kernels import (
+    NVFP4KVMaterializer,
+    nvfp4_kv_materialize_fp8,
+)
 from flashinfer.utils import get_compute_capability
 
 
@@ -175,6 +178,39 @@ def test_nvfp4_kv_materialize_fp8_matches_reference(
     )
     torch.cuda.synchronize()
 
+    # NVFP4KVMaterializer.run launches the same kernel without per-call checks,
+    # here into a workspace with surplus pages that must stay untouched.
+    run_out = torch.full(
+        (out_shape[0] + 5, *out_shape[1:]),
+        1.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    run_tables = torch.zeros((batch_size, max_pages), dtype=torch.int32, device="cuda")
+    NVFP4KVMaterializer(
+        num_heads,
+        page_size,
+        head_dim,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    ).run(
+        k_cache,
+        v_cache,
+        k_sf,
+        v_sf,
+        block_tables,
+        seq_lens,
+        torch.tensor(page_starts, dtype=torch.int32, device="cuda"),
+        out=run_out,
+        fp8_block_tables=run_tables,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(run_tables, fp8_tables)
+    written = torch.unique(torch.cat((fp8_tables.flatten(), fp8_tables.new_zeros(1))))
+    assert torch.equal(
+        run_out[written].view(torch.uint8), kv_fp8[written].view(torch.uint8)
+    )
+    assert torch.all(run_out[out_shape[0] :].float() == 1.0)
+
     assert tuple(kv_fp8.shape) == out_shape
     if out is not None:
         assert kv_fp8.data_ptr() == out.data_ptr()
@@ -203,6 +239,50 @@ def test_nvfp4_kv_materialize_fp8_matches_reference(
                     rtol=0,
                     atol=0,
                 )
+
+
+def test_nvfp4_kv_materializer_graph_replays_new_metadata() -> None:
+    num_heads, page_size, head_dim, max_pages = 2, 16, 128, 4
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    k_data, k_scales = _random_cache(8, num_heads, page_size, head_dim, generator)
+    v_data, v_scales = _random_cache(8, num_heads, page_size, head_dim, generator)
+    block_tables = torch.randint(
+        0, 8, (2, max_pages), dtype=torch.int32, device="cuda", generator=generator
+    )
+    seq_lens = torch.tensor([1, page_size], dtype=torch.int32, device="cuda")
+    kv_page_indptr = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
+    inputs = (
+        k_data,
+        v_data,
+        k_scales.view(torch.uint8),
+        _swizzle_v_scales(v_scales).view(torch.uint8),
+        block_tables,
+        seq_lens,
+    )
+    out = torch.full(
+        (12, 2, num_heads, page_size, head_dim),
+        1.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    fp8_tables = torch.zeros((2, max_pages), dtype=torch.int32, device="cuda")
+    materializer = NVFP4KVMaterializer(num_heads, page_size, head_dim)
+    materializer.run(*inputs, kv_page_indptr, out=out, fp8_block_tables=fp8_tables)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        materializer.run(*inputs, kv_page_indptr, out=out, fp8_block_tables=fp8_tables)
+
+    # Replay with more pages than at capture (5 vs 2).
+    seq_lens.copy_(torch.tensor([3, 4 * page_size]))
+    kv_page_indptr.copy_(torch.tensor([0, 1, 5]))
+    graph.replay()
+    expected, expected_tables = nvfp4_kv_materialize_fp8(
+        *inputs, max_pages * page_size, kv_page_indptr=kv_page_indptr, num_pages=5
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(fp8_tables, expected_tables)
+    assert torch.equal(out[:6].view(torch.uint8), expected.view(torch.uint8))
+    assert torch.all(out[6:].float() == 1.0)
 
 
 def test_nvfp4_kv_materialize_fp8_rejects_misaligned_page_stride() -> None:

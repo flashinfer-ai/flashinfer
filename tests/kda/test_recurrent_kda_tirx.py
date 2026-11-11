@@ -21,7 +21,7 @@ import torch
 
 from flashinfer import RecurrentKDAPrefillWorkspace, recurrent_kda
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.kda_prefill import _make_inputs
+from tests.kda.test_helpers.kda_prefill import _make_inputs
 
 pytest.importorskip("tvm")
 pytest.importorskip("tirx_kernels.tirx_lite")

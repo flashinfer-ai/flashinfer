@@ -487,7 +487,22 @@ def _install_kernel_wheels(
     nightly: bool,
     dry_run: bool,
     sm_architectures: tuple[str, ...] = (),
+    mode: str | None = None,
 ) -> None:
+    # Reject invalid jit-cache selections before installing the cubin wheel, so a
+    # bad flag does not first spend a multi-GB download and then fail.
+    if mode is None:
+        mode = "minimal" if sm_architectures else "all"
+    elif sm_architectures and mode != "minimal":
+        raise click.ClickException("--sm cannot be combined with --mode all.")
+    for architecture in sm_architectures:
+        _normalize_jit_cache_provider_tag(architecture)
+    # Only an explicit --cuda-version is checked here: auto-detection may fail on
+    # a host without CUDA, which must not block the architecture-independent
+    # cubin wheel.
+    if cuda_version is not None:
+        _resolve_jit_cache_cuda_version(_parse_cuda_version(cuda_version))
+
     failures = []
     installers = [
         (
@@ -504,7 +519,7 @@ def _install_kernel_wheels(
                 jit_cache_index_url,
                 nightly,
                 dry_run,
-                mode="minimal" if sm_architectures else "all",
+                mode=mode,
                 sm_architectures=sm_architectures,
             ),
         ),
@@ -683,27 +698,79 @@ def download_cubin_cmd():
     _download_cubin()
 
 
-@cli.command("install-cubin-wheel")
-@click.option(
+# Options shared by the kernel-wheel install commands (install-cubin-wheel,
+# install-jit-cache-wheel, download-kernels). Defining each option once keeps
+# their names, help text and order identical across the commands.
+_CUDA_VERSION_OPTION = click.option(
+    "--cuda-version",
+    default=None,
+    help=(
+        "Override CUDA version detection for the jit-cache wheel, e.g. '12.9' "
+        "or 'cu129'. Defaults to the CUDA version of the installed PyTorch."
+    ),
+)
+_FLASHINFER_VERSION_OPTION = click.option(
     "--flashinfer-version",
     default=None,
-    help="Override the FlashInfer version to install a matching cubin wheel for.",
+    help=(
+        "Override the FlashInfer version to install matching wheels for. "
+        "Defaults to the installed flashinfer-python version."
+    ),
 )
-@click.option(
-    "--index-url",
+_MODE_OPTION = click.option(
+    "--mode",
+    type=click.Choice(("all", "minimal")),
     default=None,
-    help="Explicit wheel index URL (overrides the auto-generated FlashInfer index URL).",
+    help=(
+        "jit-cache providers to install: 'all' installs every provider "
+        "declared by the shim; 'minimal' installs only the best compatible "
+        "provider for each --sm target or, without --sm, each visible GPU (no "
+        "baseline provider is added). Defaults to minimal when --sm is given, "
+        "otherwise all."
+    ),
 )
-@click.option(
+_SM_OPTION = click.option(
+    "--sm",
+    "sm_architectures",
+    multiple=True,
+    help=(
+        "CUDA architecture to install a jit-cache provider for, such as sm80, "
+        "sm90a, or sm120f; the best compatible published provider is "
+        "selected. Implies --mode minimal. May be repeated."
+    ),
+)
+_CUBIN_INDEX_URL_HELP = (
+    "Explicit flashinfer-cubin wheel index URL (overrides the FlashInfer index URL)."
+)
+_JIT_CACHE_INDEX_URL_HELP = (
+    "Explicit flashinfer-jit-cache wheel index URL (overrides the CUDA-specific "
+    "FlashInfer index URL)."
+)
+_NIGHTLY_OPTION = click.option(
     "--nightly",
     is_flag=True,
-    help="Install from the nightly wheel index instead of the release index.",
+    help="Install from the nightly wheel indexes instead of the release indexes.",
 )
-@click.option(
+_DRY_RUN_OPTION = click.option(
     "--dry-run",
     is_flag=True,
-    help="Print the pip command without executing it.",
+    help="Print the pip commands without executing them.",
 )
+
+
+@cli.command("install-cubin-wheel")
+@_FLASHINFER_VERSION_OPTION
+# --cubin-index-url matches the download-kernels spelling; --index-url is kept
+# for existing callers.
+@click.option(
+    "--index-url",
+    "--cubin-index-url",
+    "index_url",
+    default=None,
+    help=_CUBIN_INDEX_URL_HELP,
+)
+@_NIGHTLY_OPTION
+@_DRY_RUN_OPTION
 def install_cubin_wheel_cmd(flashinfer_version, index_url, nightly, dry_run):
     """Install the matching flashinfer-cubin wheel."""
     _install_cubin_wheel(flashinfer_version, index_url, nightly, dry_run)
@@ -730,51 +797,21 @@ def clear_cubin_cmd():
 
 
 @cli.command("install-jit-cache-wheel")
-@click.option(
-    "--cuda-version",
-    default=None,
-    help="Override CUDA version detection, e.g. '12.9' or 'cu129'.",
-)
-@click.option(
-    "--flashinfer-version",
-    default=None,
-    help="Override the FlashInfer version to install a matching jit-cache wheel for.",
-)
-@click.option(
-    "--mode",
-    type=click.Choice(("all", "minimal")),
-    default=None,
-    help=(
-        "Install all provider dependencies declared by the shim, or only the "
-        "providers selected by --sm or the visible GPUs. Defaults to minimal "
-        "when --sm is given, otherwise all. Minimal mode does not add a "
-        "baseline provider."
-    ),
-)
-@click.option(
-    "--sm",
-    "sm_architectures",
-    multiple=True,
-    help=(
-        "CUDA architecture to install a provider for, such as sm80, sm90a, "
-        "or sm120f. Implies --mode minimal. May be repeated."
-    ),
-)
+@_CUDA_VERSION_OPTION
+@_FLASHINFER_VERSION_OPTION
+@_MODE_OPTION
+@_SM_OPTION
+# --jit-cache-index-url matches the download-kernels spelling; --index-url is
+# kept for existing callers.
 @click.option(
     "--index-url",
+    "--jit-cache-index-url",
+    "index_url",
     default=None,
-    help="Explicit wheel index URL (overrides the auto-generated FlashInfer index URL).",
+    help=_JIT_CACHE_INDEX_URL_HELP,
 )
-@click.option(
-    "--nightly",
-    is_flag=True,
-    help="Install from the nightly wheel index instead of the release index.",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Print the pip command without executing it.",
-)
+@_NIGHTLY_OPTION
+@_DRY_RUN_OPTION
 def install_jit_cache_wheel_cmd(
     cuda_version,
     flashinfer_version,
@@ -802,55 +839,29 @@ cli.add_command(download_jit_cache_cmd, "download-jit-cache")
 
 
 @cli.command("download-kernels")
-@click.option(
-    "--cuda-version",
-    default=None,
-    help="Override CUDA version detection for the jit-cache wheel, e.g. '12.9' or 'cu129'.",
-)
-@click.option(
-    "--flashinfer-version",
-    default=None,
-    help="Override the FlashInfer version to install matching kernel wheels for.",
-)
-@click.option(
-    "--cubin-index-url",
-    default=None,
-    help="Explicit flashinfer-cubin wheel index URL.",
-)
-@click.option(
-    "--jit-cache-index-url",
-    default=None,
-    help="Explicit flashinfer-jit-cache wheel index URL.",
-)
-@click.option(
-    "--sm",
-    "sm_architectures",
-    multiple=True,
-    help=(
-        "Install only the jit-cache provider compatible with this CUDA "
-        "architecture, such as sm80, sm90a, or sm120f. May be repeated."
-    ),
-)
-@click.option(
-    "--nightly",
-    is_flag=True,
-    help="Install from nightly wheel indexes instead of release indexes.",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Print the pip commands without executing them.",
-)
+@_CUDA_VERSION_OPTION
+@_FLASHINFER_VERSION_OPTION
+@_MODE_OPTION
+@_SM_OPTION
+@click.option("--cubin-index-url", default=None, help=_CUBIN_INDEX_URL_HELP)
+@click.option("--jit-cache-index-url", default=None, help=_JIT_CACHE_INDEX_URL_HELP)
+@_NIGHTLY_OPTION
+@_DRY_RUN_OPTION
 def download_kernels_cmd(
     cuda_version,
     flashinfer_version,
+    mode,
+    sm_architectures,
     cubin_index_url,
     jit_cache_index_url,
-    sm_architectures,
     nightly,
     dry_run,
 ):
-    """Install matching flashinfer-cubin and flashinfer-jit-cache wheels."""
+    """Install matching flashinfer-cubin and flashinfer-jit-cache wheels.
+
+    The flashinfer-cubin wheel covers every architecture; --mode and --sm only
+    select which jit-cache providers are installed.
+    """
     _install_kernel_wheels(
         cuda_version,
         flashinfer_version,
@@ -859,6 +870,7 @@ def download_kernels_cmd(
         nightly,
         dry_run,
         sm_architectures,
+        mode,
     )
 
 
