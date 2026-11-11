@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -96,7 +97,11 @@ def compare_snapshots(
 class PrComparisonTest(unittest.TestCase):
     @contextmanager
     def repository(
-        self, *, sync_main: bool, change_pr_api: bool
+        self,
+        *,
+        sync_main: bool,
+        change_pr_api: bool,
+        add_undocumented_apis: bool = False,
     ) -> Iterator[tuple[Path, str, str, str, str]]:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -110,18 +115,35 @@ class PrComparisonTest(unittest.TestCase):
                 "flashinfer/main_api.py": source,
                 "flashinfer/pr_api.py": source,
             }
+            if add_undocumented_apis:
+                files["docs/api/example.rst"] = (
+                    ".. currentmodule:: flashinfer.main_api\n\n"
+                    ".. autofunction:: api\n\n"
+                    ".. currentmodule:: flashinfer.pr_api\n\n"
+                    ".. autofunction:: api\n"
+                )
             stale_base = commit_snapshot(repo, files, "initial main")
             run_git(repo, "checkout", "-q", "-b", "pr")
             pr_files = {**files, "packaging.txt": "PR packaging fix\n"}
             if change_pr_api:
                 pr_files["flashinfer/pr_api.py"] = source.replace("'old'", "'new'")
+                if add_undocumented_apis:
+                    pr_files["flashinfer/pr_api.py"] += (
+                        "\n@flashinfer_api\ndef pr_added() -> None:\n"
+                        '    """Run the PR operation."""\n    pass\n'
+                    )
             commit_snapshot(repo, pr_files, "PR changes")
             run_git(repo, "checkout", "-q", "main")
-            target = commit_snapshot(
-                repo,
-                {**files, "flashinfer/main_api.py": source.replace("'old'", "'new'")},
-                "unrelated main API change",
-            )
+            main_files = {
+                **files,
+                "flashinfer/main_api.py": source.replace("'old'", "'new'"),
+            }
+            if add_undocumented_apis:
+                main_files["flashinfer/main_api.py"] += (
+                    "\n@flashinfer_api\ndef main_added() -> None:\n"
+                    '    """Run the main operation."""\n    pass\n'
+                )
+            target = commit_snapshot(repo, main_files, "unrelated main API change")
             run_git(repo, "checkout", "-q", "pr")
             if sync_main:
                 run_git(repo, "merge", "--no-ff", "main", "-m", "sync main")
@@ -163,6 +185,57 @@ class PrComparisonTest(unittest.TestCase):
                     resolve_pr_comparison(target, pr_head)
                 with self.assertRaisesRegex(RuntimeError, "expected head"):
                     resolve_pr_comparison(merge, stale_base)
+
+    def test_static_documentation_filters_synced_main_findings(self) -> None:
+        for change_pr_api in (False, True):
+            with (
+                self.subTest(change_pr_api=change_pr_api),
+                self.repository(
+                    sync_main=True,
+                    change_pr_api=change_pr_api,
+                    add_undocumented_apis=True,
+                ) as snapshot,
+            ):
+                repo, stale_base, target, pr_head, merge = snapshot
+                with working_directory(repo):
+                    base, head = resolve_pr_comparison(merge, pr_head)
+                reports = {}
+                for label, comparison_base in (
+                    ("stale", stale_base),
+                    ("aligned", base),
+                ):
+                    report = repo / f"{label}.json"
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPTS_DIR / "check_pr_document.py"),
+                            "--base",
+                            comparison_base,
+                            "--head",
+                            head,
+                            "--report-json",
+                            str(report),
+                        ],
+                        cwd=repo,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    reports[label] = json.loads(report.read_text())
+
+                main_message = (
+                    "flashinfer.main_api.main_added is absent from docs/api/*.rst"
+                )
+                pr_message = "flashinfer.pr_api.pr_added is absent from docs/api/*.rst"
+                self.assertIn(
+                    main_message, [f["message"] for f in reports["stale"]["findings"]]
+                )
+                aligned = reports["aligned"]
+                self.assertEqual((aligned["base"], aligned["head"]), (target, pr_head))
+                self.assertEqual(
+                    [f["message"] for f in aligned["findings"]],
+                    [pr_message] if change_pr_api else [],
+                )
 
     def test_cli_outputs_one_comparison_for_both_checkers(self) -> None:
         with self.repository(sync_main=True, change_pr_api=False) as snapshot:
