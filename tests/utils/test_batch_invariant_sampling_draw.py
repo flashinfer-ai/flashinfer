@@ -22,6 +22,7 @@ import glob
 import os
 import random
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -33,6 +34,7 @@ import torch
 
 import flashinfer
 from flashinfer import batch_invariant as bi
+from flashinfer.batch_invariant.fp_interface import exact as fp32
 from flashinfer.batch_invariant.sampling import draw_reference as DR
 from flashinfer.batch_invariant.sampling import draw_schedule as DS
 from flashinfer.batch_invariant.sampling import draw_spec as D
@@ -53,6 +55,9 @@ _DS = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 NS = [64, 1000, 4096, 4097, 32768]
 N_BIG = 152064
 SM_COUNTS = [148, 152, 204, 224]  # B200 / B300 (SM100 / SM103), Rubin (SM107) parts
+#: ``(N, M)`` at which the SM counts above split the dispatcher's pick (the 148 / 152-SM parts have at least M rows
+#: and take the re-read placement, the 204 / 224-SM parts fewer and take the cluster one).
+SM_SPLIT_ROWS = ((4097, 180), (32768, 200))
 #: The dispatcher's row counts the device tests use (the fixture precompiles their picks).
 MS = (1, 2, 4, 5, 6, 8, 11, 16, 37, 64, 512, 20000)
 _supported = torch.cuda.is_available() and bi.is_supported_device(
@@ -161,10 +166,11 @@ def logits_draw(x, s, o, **kw):
 
 
 def test_fingerprints_are_pinned():
-    """The receipts: the draw's fingerprints are the sandbox's pins byte for byte (the dataflow is the same); one
+    """The receipts: the draw's fingerprints are the sandbox's pins byte for byte (the dataflow is the same; the strings
+    moved once, in the review of 2026-11-11, when the selection rule and the stream's identity entered the hash); one
     class with two weight forms behind the two entries; the input dtype enters nothing (exact widenings)."""
-    assert D.spec_fingerprint(300) == "sample-icdf-48d4cb539bae34fb"
-    assert D.spec_fingerprint(1000) == "sample-icdf-22e55f7a33a8e40e"
+    assert D.spec_fingerprint(300) == "sample-icdf-99fad83ed63e5247"
+    assert D.spec_fingerprint(1000) == "sample-icdf-f2947e7df54776f2"
     assert D.spec_fingerprint(
         300, from_logits=True, in_fmt="bf16"
     ) != D.spec_fingerprint(300)
@@ -172,18 +178,26 @@ def test_fingerprints_are_pinned():
     assert bi.class_name("sampling_from_logits") == "sample.icdf.v1"
     assert (
         bi.fingerprint("sampling_from_probs", N=300, dtype="bf16")
-        == "sample-icdf-48d4cb539bae34fb"
+        == "sample-icdf-99fad83ed63e5247"
     )
     assert bi.fingerprint("sampling_from_probs", N=300, dtype=torch.float32) == (
         bi.fingerprint("sampling_from_probs", N=300, dtype=torch.bfloat16)
     )
     assert bi.fingerprint("sampling_from_probs", N=1000, dtype="f16") == (
-        "sample-icdf-22e55f7a33a8e40e"
+        "sample-icdf-f2947e7df54776f2"
     )
     fl = bi.fingerprint("sampling_from_logits", N=300, dtype="bf16")
     assert fl.startswith("sample-icdf-") and fl != D.spec_fingerprint(300)
     assert fl == D.spec_fingerprint(300, from_logits=True, in_fmt="bf16")
     assert D.spec_fingerprint(301) != D.spec_fingerprint(300)
+    assert (
+        D.SELECT_RULE
+        == "first-present-positive-crossing;else-last-present-positive;invalid-unless-0<S<inf"
+    )
+    assert (
+        D.spec_fingerprint(300, from_logits=True, in_fmt="bf16")
+        == "sample-icdf-9833eeb37db7ac22"
+    )
     with pytest.raises(TypeError):
         bi.fingerprint("sampling_from_probs", N=300)
     with pytest.raises(ValueError):
@@ -301,6 +315,94 @@ def test_model_draw_follows_the_weights_and_degenerate_rows():
     assert DR.draw_row(torch.tensor([1.0, float("inf")]), 2, 0.3)[:2] == (-1, False)
 
 
+# ------------------------------------------------------------------------------ the positivity condition of the rule
+def _masked_row(N: int, seed: int = 1) -> torch.Tensor:
+    """A random f32 weight row with about half of its elements masked to zero (``torch.rand`` of a seeded generator)."""
+    g = torch.Generator().manual_seed(seed)
+    w = torch.rand(N, generator=g)
+    w[torch.rand(N, generator=g) < 0.5] = 0.0
+    return w
+
+
+#: ``(N, seed at offset 0, the zero-weight slot head)``: keys whose fp32 uniform lands between a slot's last inclusive
+#: prefix and the next slot's ``outer`` on ``_masked_row(N)`` where that slot's head has weight zero. The two prefixes
+#: are different ``add`` chains over the same nodes (equal exactly, a rounding apart in binary32), so under the
+#: first-crossing rule without the positivity condition the model and the kernel drew the masked head (found in review,
+#: 2026-11-11, at ~1e-5 per draw on half-masked rows).
+MASKED_HEAD_CASES = [(4096, 116849, 4024), (32768, 79527, 712)]
+
+
+def _tree_prefixes(w: torch.Tensor, N: int):
+    """The model's inclusive prefixes in tree order, with the weights and the presence in that order (``Kp * 256``)."""
+    Kp = C.padded_blocks(N)
+    folds, present, totals = DR.slot_folds(w, N)
+    outer = DR.outer_prefix(*DR.node_tables(totals), Kp)
+
+    def tree(v):
+        return v.view(Kp, 32, 8).permute(1, 0, 2).reshape(-1)
+
+    wt = torch.zeros(Kp * 256, dtype=torch.float32)
+    wt[:N] = w
+    incl = torch.add(outer.reshape(-1, 1).expand(32 * Kp, 8).reshape(-1), tree(folds))
+    return incl, tree(wt), tree(present)
+
+
+def _u_in_gap(lo: float, hi: float, Ssum: float):
+    """An fp32 uniform whose threshold ``mul(u, S)`` lies in ``(lo, hi]`` (``hi / S`` stepped by ulps), or ``None``."""
+    b = S.f32_bits(fp32.to_f32(hi / Ssum))
+    for d in range(-8, 9):
+        u = struct.unpack("<f", struct.pack("<I", b + d))[0]
+        if 0.0 < u <= 1.0 and lo < fp32.mul(u, Ssum) <= hi:
+            return u
+    return None
+
+
+def test_zero_weight_slot_heads_are_never_drawn():
+    """The positivity condition of the rule, on the model: the pinned keys hit a slot-boundary gap whose head has weight
+    zero (the model drew tokens 4024 / 712 of weight zero before the condition); every such gap of the two rows, probed
+    with a threshold inside it, draws a positive weight; the fallback above every prefix is the last positive element."""
+    for N, seed, head in MASKED_HEAD_CASES:
+        w = _masked_row(N)
+        assert float(w[head]) == 0.0
+        Kp = C.padded_blocks(N)
+        incl, w_tree, p_tree = _tree_prefixes(w, N)
+        u = S.uniforms(seed, 0, 0)[0]
+        tok, ok, Ssum, thr = DR.draw_row(w, N, u)
+        assert ok and float(w[tok]) > 0.0 and tok != head, (N, tok)
+        a0 = D.address_of_index(head, Kp)
+        assert float(incl[a0 - 1]) < thr <= float(incl[a0]), (
+            "the pinned key no longer hits the gap"
+        )
+        heads = torch.arange(1, 32 * Kp) * 8
+        heads = heads[
+            p_tree[heads] & (w_tree[heads] == 0) & (incl[heads] > incl[heads - 1])
+        ]
+        assert len(heads) > 20, len(heads)
+        probed = 0
+        for a in heads.tolist():
+            u = _u_in_gap(float(incl[a - 1]), float(incl[a]), Ssum)
+            if u is None:
+                continue
+            tok, ok, _, _ = DR.draw_row(w, N, u)
+            assert ok and float(w[tok]) > 0.0, (N, a, tok)
+            probed += 1
+        assert probed > 10, probed
+    last_pos = torch.tensor([0.0, 2.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert DR.draw_row(last_pos, 9, 1.0)[:2] == (3, True)
+
+
+def test_fingerprint_terms_share_the_row_maximum():
+    """The logits form's terms embed one row-maximum term (built once per row), so the DAG is linear in the vocabulary
+    and the fingerprint computes in seconds at the production vocabularies (it was quadratic: 26 s at 2400, a day at
+    152064)."""
+    N = 2400
+    sp = D.DrawSpec(N, from_logits=True, in_fmt="bf16")
+    assert term.size(sp.total(0)) < 12 * N
+    t0 = time.time()
+    f = D.spec_fingerprint(152064, from_logits=True, in_fmt="bf16")
+    assert f.startswith("sample-icdf-") and time.time() - t0 < 120
+
+
 def test_dispatcher_picks_are_members_of_the_space():
     """R3 membership: every pick of the draw's closed-form dispatcher, over the grid, both element widths and the SM
     counts of the SM100 / SM103 / SM107 parts, is a member of the enumerated space at one row per CTA, never a heavy
@@ -356,6 +458,9 @@ def test_dispatcher_picks_are_members_of_the_space():
                         )
     with pytest.raises(ValueError, match="no configuration"):
         DS.draw_config(C.VOCAB_COVERED + 1, 64, 4, 148)
+    # an fp32 row beyond 2^21 whose lightest member has a 4096-element share: refused (minutes and tens of GB to compile)
+    with pytest.raises(ValueError, match="elements per thread"):
+        DS.draw_config(2**21 + 256, 64, 4, 204)
 
 
 def test_unsupported_inputs_raise_before_any_kernel():
@@ -553,6 +658,22 @@ def _suite_specs(sm):
     t = _cfg_tuple(DS.draw_config(4096, 5, 2, sm))
     specs.append(("bf16", 4096, t, False, False, False, False, False))
     specs.append(("bf16", 4096, t, True, False, False, False, False))
+    # the review round's tests (2026-11-11): the masked rows through the gather (2^16 draws; the 152064 row 2^14),
+    # the chi-square draws (2^20 of a 32-token row), the SM-count test's row counts that split the parts' picks
+    for N, _, _ in MASKED_HEAD_CASES:
+        t = _cfg_tuple(DS.draw_config(N, 1 << 16, 4, sm))
+        specs.append(("f32", N, t, False, False, True, False, _PDL))
+        specs.append(("f32", N, t, True, False, True, False, _PDL))
+    t = _cfg_tuple(DS.draw_config(N_BIG, 1 << 14, 2, sm))
+    specs.append(("bf16", N_BIG, t, False, False, True, False, _PDL))
+    t = _cfg_tuple(DS.draw_config(32, 1 << 20, 4, sm))
+    specs.append(("f32", 32, t, False, False, True, False, _PDL))
+    specs.append(("f32", 32, t, True, False, True, False, _PDL))
+    for N, M in SM_SPLIT_ROWS:
+        for smc in SM_COUNTS:
+            t = _cfg_tuple(DS.draw_config(N, M, 2, smc))
+            specs.append(("bf16", N, t, False, False, False, False, _PDL))
+            specs.append(("bf16", N, t, True, False, False, False, _PDL))
     return list(dict.fromkeys(specs))
 
 
@@ -821,30 +942,33 @@ def test_batch_invariance_and_key_not_slot():
 
 @needs_device
 def test_generator_only_call_shape_and_key_forms():
-    """A call with only a ``generator`` reserves ``(seed, offset)`` exactly as the operator's path does (the same
-    increment: the rows for probabilities, rows x vocabulary for logits), so a fresh generator seeded alike reproduces
-    the draw through the exact model; scalar keys broadcast to the rows; a length-one tensor broadcasts; uint64 keys
-    are read by their bits; a seed without an offset takes the generator's pair (the operator's rule)."""
+    """One output row: a call with only a ``generator`` reserves ``(seed, offset)`` exactly as the operator's path does
+    (the same increment: one for probabilities, the vocabulary for logits), so a fresh generator seeded alike reproduces
+    the draw through the exact model; a scalar key and a length-one tensor are that row's key; a seed without an offset
+    takes the generator's pair (the operator's rule); uint64 keys are read by their bits. Several rows need one key per
+    output row: a key shared by every row (a bare generator, scalars, length-one tensors) is refused, since every row
+    would draw at the same uniform and identical rows would draw identical tokens; per-row tensors are the caller's."""
     N, M = 1000, 6
     p = weights(M, N, torch.float32, seed=4)
     x = logits(M, N, torch.bfloat16)
     dev = torch.device("cuda", torch.cuda.current_device())
     for fn, inp, inc, fl in (
-        (flashinfer.sampling.sampling_from_probs, p, M, False),
-        (flashinfer.sampling.sampling_from_logits, x, M * N, True),
+        (flashinfer.sampling.sampling_from_probs, p, 1, False),
+        (flashinfer.sampling.sampling_from_logits, x, N, True),
     ):
+        one = inp[1:2].clone()
         g = torch.Generator(device="cuda").manual_seed(11)
-        tok = fn(inp, generator=g, batch_invariant=True)
+        tok = fn(one, generator=g, batch_invariant=True)
         g2 = torch.Generator(device="cuda").manual_seed(11)
         seed, offset = flashinfer.sampling.get_seed_and_offset(inc, g2, dev)
-        ref = DR.draw_reference(inp, [seed] * M, [offset] * M, from_logits=fl)
+        ref = DR.draw_reference(one, [seed], [offset], from_logits=fl)
         assert torch.equal(tok.cpu().long(), ref["samples"]) and bool(
             ref["valid"].all()
         )
-        assert torch.equal(fn(inp, seed=seed, offset=offset, batch_invariant=True), tok)
+        assert torch.equal(fn(one, seed=seed, offset=offset, batch_invariant=True), tok)
         assert torch.equal(
             fn(
-                inp,
+                one,
                 seed=torch.tensor([seed], device="cuda"),
                 offset=torch.tensor([offset], device="cuda"),
                 batch_invariant=True,
@@ -852,14 +976,36 @@ def test_generator_only_call_shape_and_key_forms():
             tok,
         )
         g3 = torch.Generator(device="cuda").manual_seed(11)
-        assert torch.equal(fn(inp, seed=5, generator=g3, batch_invariant=True), tok)
+        assert torch.equal(fn(one, seed=5, generator=g3, batch_invariant=True), tok)
         tok2 = fn(
-            inp, generator=g, batch_invariant=True
+            one, generator=g, batch_invariant=True
         )  # the generator advanced: another pair
         seed2, offset2 = flashinfer.sampling.get_seed_and_offset(inc, g2, dev)
         assert (seed2, offset2) != (seed, offset)
-        ref2 = DR.draw_reference(inp, [seed2] * M, [offset2] * M, from_logits=fl)
+        ref2 = DR.draw_reference(one, [seed2], [offset2], from_logits=fl)
         assert torch.equal(tok2.cpu().long(), ref2["samples"])
+        for kw in (
+            dict(generator=torch.Generator(device="cuda").manual_seed(1)),
+            dict(seed=3, offset=4),
+            dict(
+                seed=torch.tensor([3], device="cuda"),
+                offset=torch.tensor([4], device="cuda"),
+            ),
+        ):
+            with pytest.raises(ValueError, match="one key per output row"):
+                fn(inp, batch_invariant=True, **kw)
+        s = torch.full((M,), 3, dtype=torch.int64, device="cuda")
+        o = torch.arange(M, device="cuda")
+        got = fn(inp, seed=s, offset=o, batch_invariant=True)
+        ref = DR.draw_reference(inp, s.tolist(), o.tolist(), from_logits=fl)
+        assert torch.equal(got.cpu().long(), ref["samples"])
+    same = (
+        p[1:2].expand(M, N).contiguous()
+    )  # identical rows with their own keys draw several tokens
+    drawn = flashinfer.sampling.sampling_from_probs(
+        same, seed=s, offset=o, batch_invariant=True
+    )
+    assert len(set(drawn.tolist())) > 1
     big = 2**63 + 5
     su = torch.full((M,), big, dtype=torch.uint64, device="cuda")
     ou = torch.full((M,), 2**64 - 3, dtype=torch.uint64, device="cuda")
@@ -914,6 +1060,22 @@ def test_index_gather():
         ).cpu(),
         DR.draw_reference(x[ids], s.tolist(), o.tolist(), from_logits=True)["samples"],
     )
+    # an index outside the source rows: an invalid output row (token -1, valid False), never row 0's draw
+    bad = torch.tensor(
+        [4, -1, 2, 5, 1, 3], device="cuda"
+    )  # -1 and 5 lie outside the 5 source rows
+    tok, ok = flashinfer.sampling.sampling_from_probs(
+        p, indices=bad, seed=s, offset=o, return_valid=True, batch_invariant=True
+    )
+    ref = DR.draw_reference(p, s.tolist(), o.tolist(), rows=bad.tolist())
+    assert ok.tolist() == [True, False, True, False, True, True]
+    assert torch.equal(tok.cpu(), ref["samples"]) and torch.equal(
+        ok.cpu(), ref["valid"]
+    )
+    got = logits_draw(x, s, o, temperature=temps, indices=bad, return_logprob=True)
+    assert got["valid"].tolist() == [True, False, True, False, True, True]
+    assert int(got["samples"][1]) == -1 and int(got["samples"][3]) == -1
+    assert bool(torch.isnan(got["logp"][[1, 3]]).all())
     with pytest.raises(ValueError, match="one row per CTA"):
         probs_draw(p, s, o, indices=ids, config=C.LSEConfig(32, 2, 4))
 
@@ -971,50 +1133,107 @@ def test_invalid_rows_check_nan_and_validity():
 
 
 @needs_device
-def test_distribution_follows_the_weights():
-    """Many keys over one row: the drawn frequencies follow ``p / S`` (a sanity bound, not a promise), for the weights
-    and for their logarithms through the logits entry."""
-    N, M = 32, 20000
-    p = torch.rand(N, device="cuda")
-    p[3] = 4.0
-    seeds = torch.full((M,), 5, dtype=torch.int64, device="cuda")
-    offs = torch.arange(M, device="cuda")
+def test_masked_rows_never_draw_a_masked_token():
+    """A masked token is never drawn: the pinned keys that hit a slot-boundary gap on the half-masked rows (the kernel
+    drew the zero-weight slot head before the positivity condition), then 2^16 draws of each row through the gather with
+    one key per draw -- every token of positive weight, the first 64 equal to the model -- for the weights and for their
+    logarithms (masked: ``-inf``) through the logits entry; and the review's shape, 40 live tokens of 152064, in bf16."""
+    D_ = 1 << 16
+    idx = torch.zeros(D_, dtype=torch.int64, device="cuda")
+    s = torch.full((D_,), 77, dtype=torch.int64, device="cuda")
+    o = torch.arange(D_, device="cuda")
+    for N, seed, head in MASKED_HEAD_CASES:
+        w = _masked_row(N).cuda()
+        tok = flashinfer.sampling.sampling_from_probs(
+            w.view(1, N), seed=seed, offset=0, batch_invariant=True
+        )
+        ref = DR.draw_reference(w.view(1, N), [seed], [0])
+        assert int(tok[0]) == int(ref["samples"][0]) and int(tok[0]) != head
+        assert float(w[tok[0]]) > 0
+        tok = flashinfer.sampling.sampling_from_probs(
+            w.view(1, N), indices=idx, seed=s, offset=o, batch_invariant=True
+        )
+        assert bool((w[tok] > 0).all()), int((w[tok] == 0).sum())
+        ref = DR.draw_reference(
+            w.view(1, N), s[:64].tolist(), o[:64].tolist(), rows=[0] * 64
+        )
+        assert torch.equal(tok[:64].cpu(), ref["samples"])
+        x = torch.where(w > 0, w.log(), torch.full_like(w, float("-inf")))
+        tok = flashinfer.sampling.sampling_from_logits(
+            x.view(1, N), indices=idx, seed=s, offset=o, batch_invariant=True
+        )
+        assert bool(torch.isfinite(x[tok]).all())
+    live = torch.randperm(N_BIG, generator=torch.Generator().manual_seed(3))[:40]
+    w = torch.zeros(N_BIG)
+    w[live] = torch.rand(40, generator=torch.Generator().manual_seed(4)) + 0.1
+    w = w.to(torch.bfloat16).cuda()
+    D2 = 1 << 14
     tok = flashinfer.sampling.sampling_from_probs(
-        p.expand(M, N).contiguous(), seed=seeds, offset=offs, batch_invariant=True
+        w.view(1, N_BIG),
+        indices=idx[:D2],
+        seed=s[:D2],
+        offset=o[:D2],
+        batch_invariant=True,
     )
-    freq = torch.bincount(tok.long(), minlength=N).float() / M
-    assert float((freq - p / p.sum()).abs().max()) < 0.015 and int(freq.argmax()) == 3
-    tok = flashinfer.sampling.sampling_from_logits(
-        p.log().expand(M, N).contiguous(), seed=seeds, offset=offs, batch_invariant=True
-    )
-    freq = torch.bincount(tok.long(), minlength=N).float() / M
-    assert float((freq - p / p.sum()).abs().max()) < 0.015 and int(freq.argmax()) == 3
+    assert bool((w[tok] > 0).all()) and len(set(tok.tolist())) > 30
+
+
+@needs_device
+def test_vocabulary_beyond_the_share_bound_is_unsupported():
+    """An fp32 row beyond 2^21 has members only above the share bound (a 4096-element crossing pass compiles for minutes
+    with tens of GB): the entry raises the typed error before any kernel."""
+    x = torch.rand(1, 2**21 + 256, device="cuda")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="elements per thread"):
+        flashinfer.sampling.sampling_from_probs(
+            x, seed=1, offset=2, batch_invariant=True
+        )
+
+
+@needs_device
+def test_distribution_follows_the_weights():
+    """2^20 draws of one row through the gather, one key per draw: the token counts follow ``p / S`` by a chi-square
+    statistic over the 32 tokens (``< 100``: P ~ 1e-8 under the null at 31 degrees of freedom; a 5 % relative bias on a
+    token of probability 0.1 alone contributes ~260), for the weights and for their logarithms through the logits entry."""
+    N, D_ = 32, 1 << 20
+    p = torch.rand(N, device="cuda") + 0.05
+    p[3] = 4.0
+    idx = torch.zeros(D_, dtype=torch.int64, device="cuda")
+    seeds = torch.full((D_,), 5, dtype=torch.int64, device="cuda")
+    offs = torch.arange(D_, device="cuda")
+    expect = (p / p.sum()).double() * D_
+    for fn, x in (
+        (flashinfer.sampling.sampling_from_probs, p),
+        (flashinfer.sampling.sampling_from_logits, p.log()),
+    ):
+        tok = fn(
+            x.view(1, N), indices=idx, seed=seeds, offset=offs, batch_invariant=True
+        )
+        counts = torch.bincount(tok.long(), minlength=N).double()
+        chi2 = float(((counts - expect) ** 2 / expect).sum())
+        assert chi2 < 100.0 and int(counts.argmax()) == 3, chi2
 
 
 @needs_device
 def test_sm_count_independence():
-    """The dispatcher's pick depends on the SM count; the bits do not."""
-    N, M = 4097, 37
-    p = weights(M, N, torch.bfloat16)
-    x = logits(M, N, torch.bfloat16)
-    s, o = keys(M, 2)
-    ref_p = sampling_from_probs_batch_invariant(p, seed=s, offset=o)
-    ref_x = sampling_from_logits_batch_invariant(x, seed=s, offset=o)
-    for sm in SM_COUNTS:
-        assert torch.equal(
-            sampling_from_probs_batch_invariant(p, seed=s, offset=o, sm_count=sm), ref_p
-        )
-        assert torch.equal(
-            sampling_from_logits_batch_invariant(x, seed=s, offset=o, sm_count=sm),
-            ref_x,
-        )
-    p = weights(512, 32768, torch.bfloat16, seed=3)
-    s, o = keys(512, 4)
-    ref = sampling_from_probs_batch_invariant(p, seed=s, offset=o)
-    for sm in SM_COUNTS:
-        assert torch.equal(
-            sampling_from_probs_batch_invariant(p, seed=s, offset=o, sm_count=sm), ref
-        )
+    """The dispatcher's pick depends on the SM count -- at the row counts of ``SM_SPLIT_ROWS`` the 148 / 152-SM parts take
+    the re-read placement and the 204 / 224-SM parts the cluster one (asserted: the picks differ) -- and the bits do not."""
+    for N, M in SM_SPLIT_ROWS:
+        picks = {DS.draw_config(N, M, 2, sm) for sm in SM_COUNTS}
+        assert len(picks) >= 2, picks
+        p = weights(M, N, torch.bfloat16)
+        x = logits(M, N, torch.bfloat16)
+        s, o = keys(M, 2)
+        ref_p = sampling_from_probs_batch_invariant(p, seed=s, offset=o)
+        ref_x = sampling_from_logits_batch_invariant(x, seed=s, offset=o)
+        for sm in SM_COUNTS:
+            assert torch.equal(
+                sampling_from_probs_batch_invariant(p, seed=s, offset=o, sm_count=sm),
+                ref_p,
+            )
+            assert torch.equal(
+                sampling_from_logits_batch_invariant(x, seed=s, offset=o, sm_count=sm),
+                ref_x,
+            )
 
 
 @needs_device

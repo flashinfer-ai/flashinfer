@@ -1302,15 +1302,18 @@ def sampling_from_logits(
     batch_invariant : bool
         ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant
         class ``sample.icdf.v1`` over the ``lse.row`` weights of the logits (bf16 / f16 / fp32 logits of
-        shape ``(..., vocabulary)``, any vocabulary up to 2^21 and beyond it where the row's alignment
-        admits a configuration; SM100 / SM103 / SM107). The RNG is the class's slot-free stream:
-        the per-row ``seed`` / ``offset`` tensors as given (a length-one tensor or a scalar broadcasts
-        to the rows), or the pair reserved from ``generator`` exactly as the default path reserves
-        it; the uniform is Philox4x32-10 on the key ``mix64(seed ^ mix64(offset))`` at counter 0,
-        so the same row with the same key draws the same token at any batch position, in any
-        batch -- and the uniforms are not those of the default path for any slot. ``deterministic``
-        is ignored (the class is deterministic by construction); ``check_nan`` is the same host
-        check; ``indices`` is the gather. Anything the class does not cover raises
+        shape ``(..., vocabulary)``, any vocabulary up to 2^21, beyond it only where the row's alignment
+        admits a configuration within the class's share bound; SM100 / SM103 / SM107). The RNG is the
+        class's slot-free stream: the per-row ``seed`` / ``offset`` tensors as given, one key per output
+        row (a request's own pair); a scalar, a length-one tensor or the pair reserved from ``generator``
+        exactly as the default path reserves it serves a single row, and with more rows raises
+        ``ValueError`` (a shared key would draw every row at the same uniform). The uniform is
+        Philox4x32-10 on the key ``mix64(seed ^ mix64(offset))`` at counter 0, so the same row with the
+        same key draws the same token at any batch position, in any batch -- and the uniforms are not
+        those of the default path for any slot. ``deterministic`` is ignored (the class is deterministic
+        by construction); ``check_nan`` is the same host check; ``indices`` is the gather (an index
+        outside the source rows makes its output row invalid: token ``-1``). Anything the class does
+        not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
 
     Returns
@@ -1430,15 +1433,17 @@ def sampling_from_probs(
     batch_invariant : bool
         ``False`` (default): the operator's kernel above, unchanged. ``True``: the batch-invariant
         class ``sample.icdf.v1`` over the given weights (bf16 / f16 / fp32 probabilities or
-        unnormalised weights ``>= 0`` of shape ``(..., vocabulary)``, any vocabulary up to 2^21 and
-        beyond it where the row's alignment admits a configuration; SM100 / SM103 / SM107). The RNG
-        is the class's slot-free stream: the per-row ``seed`` / ``offset`` tensors as given (a
-        length-one tensor or a scalar broadcasts to the rows), or the pair reserved from
-        ``generator`` exactly as the default path reserves it; the uniform is Philox4x32-10 on the
-        key ``mix64(seed ^ mix64(offset))`` at counter 0, so the same row with the same key draws
-        the same token at any batch position, in any batch -- and the uniforms are not those of the
-        default path for any slot. ``deterministic`` is ignored (the class is deterministic by
-        construction); ``check_nan`` is the same host check; ``indices`` is the gather;
+        unnormalised weights ``>= 0`` of shape ``(..., vocabulary)``, any vocabulary up to 2^21, beyond
+        it only where the row's alignment admits a configuration within the class's share bound;
+        SM100 / SM103 / SM107). The RNG is the class's slot-free stream: the per-row ``seed`` /
+        ``offset`` tensors as given, one key per output row (a request's own pair); a scalar, a
+        length-one tensor or the pair reserved from ``generator`` exactly as the default path reserves
+        it serves a single row, and with more rows raises ``ValueError`` (a shared key would draw every
+        row at the same uniform). The uniform is Philox4x32-10 on the key ``mix64(seed ^ mix64(offset))``
+        at counter 0, so the same row with the same key draws the same token at any batch position, in
+        any batch -- and the uniforms are not those of the default path for any slot. ``deterministic``
+        is ignored (the class is deterministic by construction); ``check_nan`` is the same host check;
+        ``indices`` is the gather (an index outside the source rows makes its output row invalid);
         ``return_valid`` returns the class's validity (``False``, and the token ``-1``, where the
         row's weights do not sum to a positive finite number). Anything the class does not cover
         raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of

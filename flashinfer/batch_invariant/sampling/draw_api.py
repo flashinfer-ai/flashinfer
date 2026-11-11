@@ -6,10 +6,11 @@
 ``batch_invariant=True``, :func:`sampling_from_logits_batch_invariant` what :func:`flashinfer.sampling.sampling_from_logits`
 runs: one token per output row by the inverse CDF over the canonical sum tree of the row's weights (the probabilities as
 given, or the ``lse.row`` weights ``e_j = ex2((x_j - m) c)`` of the logits), from the fp32 uniform of the request-keyed
-stream (``stream.py``). The RNG is the class's own: a row's key is ``(seed, offset)`` -- the per-row tensors as given, a
-scalar broadcast to the rows, or the pair FlashInfer reserves from the ``generator`` exactly as the operator's own path
-does -- and the draw index is the Philox counter; the row's slot in the batch enters nothing, so the token is a function
-of (row, seed, offset) alone. The uniforms are not those of the operator's own samplers for any slot (those seed
+stream (``stream.py``). The RNG is the class's own: a row's key is ``(seed, offset)`` -- the per-row tensors as given, one
+key per output row; a scalar, a length-one tensor or the pair FlashInfer reserves from the ``generator`` exactly as the
+operator's own path does serves a single row, and a call with more rows and such a shared key raises ``ValueError``
+(every row would draw at the same uniform: identical rows identical tokens) -- and the draw index is the Philox counter;
+the row's slot in the batch enters nothing, so the token is a function of (row, seed, offset) alone. The uniforms are not those of the operator's own samplers for any slot (those seed
 ``curand_init(seed, slot, offset)``).
 
 :func:`draw` is the generic entry the tests drive (``config=`` to force a member of the enumerated space, ``sm_count=``
@@ -34,7 +35,7 @@ from .api import (
     _rows,
     _temperature,
 )
-from .draw_schedule import draw_config
+from .draw_schedule import SHARE_MAX, draw_config
 from .schedule import VOCAB_COVERED, LSEConfig, device_sm_count, max_vec_elems
 from .stream import MASK64
 
@@ -57,7 +58,7 @@ def _check_input(x: torch.Tensor, name: str) -> int:
         raise unsupported(
             CLASS,
             f"a vocabulary of {N}",
-            f"0 < vocabulary < 2^31 (every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it the row's alignment decides)",
+            f"0 < vocabulary < 2^31 (every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it only where the row's alignment admits a member within {SHARE_MAX} elements per thread)",
         )
     return N
 
@@ -68,8 +69,10 @@ def _signed64(v: int) -> int:
 
 
 def _row_keys(seed, offset, M: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The rows' ``(seed, offset)`` keys as two int64 ``(M,)`` tensors: a tensor of one value or of ``M`` values per
-    row as given (int64, or uint64 by its bits), a scalar broadcast to the rows."""
+    """The rows' ``(seed, offset)`` keys as two int64 ``(M,)`` tensors: a tensor of ``M`` values as given (int64, or
+    uint64 by its bits); a scalar or a length-one tensor broadcasts to the rows -- for a single output row only: with
+    ``M > 1`` a key shared by every row is refused (``ValueError``), since every row would then draw at the same uniform
+    and identical rows would draw identical tokens (the class has no slot to separate them by)."""
 
     def one(v, name):
         if isinstance(v, torch.Tensor):
@@ -79,16 +82,25 @@ def _row_keys(seed, offset, M: int, device) -> Tuple[torch.Tensor, torch.Tensor]
             if t.dtype == torch.uint64:
                 t = t.view(torch.int64)
             t = t.reshape(-1)
-            if t.numel() == 1 and M != 1:
+            shared = t.numel() == 1
+            if shared and M != 1:
                 t = t.expand(M)
             if t.shape != (M,):
                 raise ValueError(
                     f"{name} tensor length must be 1 or {M} (one value per output row); got {tuple(v.shape)}"
                 )
-            return t.contiguous()
-        return torch.full((M,), _signed64(v), dtype=torch.int64, device=device)
+            return t.contiguous(), shared
+        return torch.full((M,), _signed64(v), dtype=torch.int64, device=device), True
 
-    return one(seed, "seed"), one(offset, "offset")
+    s, s_shared = one(seed, "seed")
+    o, o_shared = one(offset, "offset")
+    if M > 1 and s_shared and o_shared:
+        raise ValueError(
+            f"a batch-invariant draw of {M} rows needs one key per output row: pass seed or offset as an int64 tensor of "
+            f"length {M} (a request's own (seed, offset) pair); a key shared by every row (scalars, length-one tensors or a "
+            "bare generator) would give every row the same uniform, so identical rows would draw identical tokens"
+        )
+    return s, o
 
 
 def _resolve_keys(seed, offset, generator, increment: int, M: int, device):
@@ -120,8 +132,9 @@ def draw(
     """One launch of the class: ``{"samples"`` (int32, ``-1`` for an invalid row), ``"valid"`` (bool), and with
     ``return_logprob`` (logits only) ``"logp"`` (fp32: the drawn token's natural log-probability from the same ``m`` and
     ``S``, NaN where invalid)``}``, each of shape ``indices.shape`` or ``x.shape[:-1]``. ``seed`` / ``offset`` are the
-    rows' keys (int64 / uint64 tensors of one value or one per output row, or Python ints broadcast to the rows),
-    ``draw`` the block of the stream the uniform is read from. Bitwise identical for every ``config`` in
+    rows' keys (int64 / uint64 tensors of one value per output row; a single value, as a Python int or a length-one
+    tensor, for one row), ``draw`` the block of the stream the uniform is read from. An index outside the source rows
+    makes its output row invalid (token ``-1``). Bitwise identical for every ``config`` in
     :func:`schedule.all_valid_configs` (at one row per CTA with ``indices``), every batch composition and every
     ``sm_count``."""
     from .draw_kernel import get_compiled_kernel
@@ -156,9 +169,11 @@ def draw(
             config = draw_config(N, M, elem_bytes, sm_count or device_sm_count(dev))
         except (
             ValueError
-        ) as e:  # an empty configuration space: a long odd row beyond VOCAB_COVERED
+        ) as e:  # no member within the share bound: a row beyond VOCAB_COVERED
             raise unsupported(
-                CLASS, str(e), f"vocabularies up to {VOCAB_COVERED}"
+                CLASS,
+                str(e),
+                f"vocabularies up to {VOCAB_COVERED} (beyond it only where a member keeps the share within {SHARE_MAX} elements per thread)",
             ) from None
     else:
         config.validate(N, elem_bytes)
@@ -266,8 +281,10 @@ def sampling_from_probs_batch_invariant(
 
     One token per output row of ``probs`` (unnormalised weights ``>= 0``; bf16 / f16 / fp32, any vocabulary) by the
     inverse CDF over the canonical sum tree of the row, with the fp32 uniform of the request stream keyed by the row's
-    ``(seed, offset)`` at block 0. ``indices[i]`` selects the source row of output ``i``. Returns int32 tokens (the
-    indices' dtype with ``indices``; ``-1`` for a row whose weights do not sum to a positive finite number), and with
+    ``(seed, offset)`` at block 0 -- one key per output row (a scalar, a length-one tensor or the pair reserved from the
+    ``generator`` serves a single row; with more rows such a shared key raises ``ValueError``). ``indices[i]`` selects the
+    source row of output ``i``. Returns int32 tokens (the indices' dtype with ``indices``; ``-1`` for a row whose weights
+    do not sum to a positive finite number, and for an output whose index lies outside the source rows), and with
     ``return_valid`` the bool mask of the valid rows. ``enable_pdl=None`` follows the device. ``config`` / ``sm_count``
     force a configuration / another part's dispatcher pick (members of the enumerated space: the bits never depend on
     them).

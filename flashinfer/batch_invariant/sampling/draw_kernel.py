@@ -8,9 +8,11 @@ sum pass over the given weights (absent elements read ``+0``). During the sum pa
 already moves -- the butterfly partner at every lane step, the exchanged warp and CTA siblings -- and the loader's block
 totals are kept, so every left-sibling node of the tree is at hand. The crossing pass then forms, per slot, ``outer`` (the
 add chain over the set bits of the slot's tree address of those nodes, ascending, from ``+0``), walks the slot's fold and
-finds the first present element with ``add(outer, fold_e) >= t``; the row's token is the minimum tree address over
-threads (an exact integer reduction), or the last present element with a positive weight when none crosses, or ``-1``
-when the row's sum is not a positive finite number. The uniform is the fp32 lane of the request's stream, formed in the
+finds the first present element with a positive weight and ``add(outer, fold_e) >= t`` (the positivity is part of the
+rule: a zero-weight slot head's prefix is another add chain than the previous slot's last, so it could otherwise be the
+first crossing); the row's token is the minimum tree address over threads (an exact integer reduction), or the last
+present element with a positive weight when none crosses, or ``-1`` when the row's sum is not a positive finite number
+or its gather index lies outside the source rows. The uniform is the fp32 lane of the request's stream, formed in the
 kernel from ``(seed, offset)`` of the row (``stream_kernel.py``'s Philox helpers).
 
 The kernel is built on the row kernel's plumbing (``kernel.py``: the loader, the peers, the tiled copies, the
@@ -533,6 +535,10 @@ class DrawRowKernel:
         a = _select(first == Int32(INT_MAX), last, first)
         s_ok = (Float32(0.0) < S) & (Float32(float("inf")) > S)
         valid = s_ok & (a >= Int32(0))
+        if cutlass.const_expr(self.has_indices):
+            valid = (
+                valid & src_ok
+            )  # an index outside the source rows: an invalid output row, not row 0's draw
         slot = a >> 3
         lane_a = slot >> (self.Kp.bit_length() - 1)
         block_a = slot & Int32(self.Kp - 1)
@@ -574,7 +580,7 @@ def _crossing_pass(k, loader, leaf, peers, totals, thr, lane, w, c_rank):
     """Per block of this thread: ``outer`` (the add chain, ascending bit order from ``+0``, of the left-sibling nodes of
     the slot's tree address: the thread's block tree for the register bits, the pairwise nodes over the exchanged warp /
     CTA siblings for those bits, the butterfly partners for the lane bits), then the slot fold; the first present element
-    with ``add(outer, fold) >= thr`` (min tree address) and the last present element with a positive weight (max)."""
+    with a positive weight and ``add(outer, fold) >= thr`` (min tree address) and the last present element with a positive weight (max)."""
     fp = CuteF32
     W, C, kpw, Kp = k.W, k.C, k.kpw, k.Kp
     plan = k.plan_sum
@@ -629,8 +635,9 @@ def _crossing_pass(k, loader, leaf, peers, totals, thr, lane, w, c_rank):
             f = fp.add(outer, running)
             present = pred[e // k.vec, 0, 0]
             a = base + e
-            first = _imin(first, _select(present & (f >= thr), a, Int32(INT_MAX)))
-            last = _imax(last, _select(present & (we > zero), a, Int32(-1)))
+            pos = present & (we > zero)
+            first = _imin(first, _select(pos & (f >= thr), a, Int32(INT_MAX)))
+            last = _imax(last, _select(pos, a, Int32(-1)))
     return first, last
 
 

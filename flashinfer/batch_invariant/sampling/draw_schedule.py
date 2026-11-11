@@ -62,7 +62,9 @@ def draw_config(N: int, M: int, elem_bytes: int, sm_count: int) -> LSEConfig:
     from the B200 search; up to 1024 threads while the share exceeds ``REREAD_SHARE_MAX``, measured on both parts), falling
     back to the two-pass pick for the short rows whose re-read member is not enumerated. No pick has a share above
     ``SHARE_MAX`` elements (where neither regime's candidate is within it, the member with the smallest share). Every pick
-    is a member of ``all_valid_configs`` at one row per CTA, so it never changes bits."""
+    is a member of ``all_valid_configs`` at one row per CTA, so it never changes bits. When even the lightest member of
+    the space exceeds ``SHARE_MAX`` (fp32 rows beyond 2^21: a 4096-element share compiles for minutes with tens of GB)
+    the rule raises ``ValueError`` and the entry reports the vocabulary as unsupported."""
     return _rule(int(N), int(M), int(elem_bytes), int(sm_count))
 
 
@@ -110,8 +112,15 @@ def _rule(N: int, M: int, elem_bytes: int, sm: int) -> LSEConfig:
             return cand
         if two_pass in members and two_pass.elems_per_thread(N) <= SHARE_MAX:
             return two_pass
-    # the member with the fewest elements per thread (never a heavy share), then the fewest CTAs, then the most threads
-    return min(
+    # the member with the fewest elements per thread, then the fewest CTAs, then the most threads -- refused above the
+    # share bound (such a member compiles for minutes with tens of GB: the crossing pass unrolls per element)
+    best = min(
         (_one_row(c) for c in space),
         key=lambda c: (c.elems_per_thread(N), c.cluster, -c.threads_per_row),
     )
+    if best.elems_per_thread(N) > SHARE_MAX:
+        raise ValueError(
+            f"no configuration of the class draws a vocabulary of {N} with {elem_bytes}-byte elements within {SHARE_MAX} "
+            f"elements per thread (the lightest member has {best.elems_per_thread(N)})"
+        )
+    return best

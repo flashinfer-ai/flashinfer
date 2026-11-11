@@ -16,7 +16,8 @@ chained by `add` in ascending bit order from `+0`. Because every operand is a no
 placement-invariant as the tree (`config_invarianceC`); this file pins the declared dataflow, `total_logits_eq_specSum`
 states that the logits form's `S` is the row class's `s` term (the R4 coupling of `sampling_from_logits` with
 `log_probs`), and the generated cases (`SamplingCases.lean`, `draw*`) couple the terms node for node to the Python
-spec's S-expressions.
+spec's S-expressions. `select` states the selection rule over the evaluated row, and `select_pos` that a drawn element has a positive
+weight (a masked token is never drawn).
 -/
 namespace BIK
 namespace Draw
@@ -73,6 +74,71 @@ of the same row, negated maximum and scale, node for node (so `sampling_from_log
 the statistics `log_probs` reports). -/
 theorem total_logits_eq_specSum (N kb : Nat) (row : Nat → Term) (nm c : Term) :
     total N kb (logitWeights row nm c) = Sampling.specSum N kb row nm c := rfl
+
+/-! ### The selection rule
+
+Stated over the evaluated row (binary32 values, not terms): in tree order, element `i` is *present* when it exists,
+*positive* when its weight is `> 0`, and *crosses* when its inclusive prefix is `>= t`. The drawn element is the first
+present positive element that crosses, else the last present positive element; `none` when no present element is
+positive (then `S` is not a positive finite number and the row is invalid). The positivity condition is part of the
+rule (`draw_spec.SELECT_RULE`, named in the fingerprint): the inclusive prefixes are not monotone across slot
+boundaries -- the last prefix of a slot and the `outer` of the next are different `add` chains over the same nodes,
+equal exactly and a rounding apart in binary32 -- so without it a zero-weight slot head could be the first crossing
+and a masked token drawn (found in review, 2026-11-11). -/
+
+/-- The first index in `[0, n)` that is present, positive and crosses; else the last present positive index. -/
+def select (n : Nat) (present pos cross : Nat → Bool) : Option Nat :=
+  match (List.range n).find? (fun i => present i && pos i && cross i) with
+  | some i => some i
+  | none => (List.range n).reverse.find? (fun i => present i && pos i)
+
+/-- **A drawn element has a positive weight**: a masked token (weight `+0`) is never drawn. -/
+theorem select_pos (n : Nat) (present pos cross : Nat → Bool) (i : Nat)
+    (h : select n present pos cross = some i) : pos i = true := by
+  unfold select at h
+  split at h
+  · rename_i j hj
+    cases h
+    have hp := List.find?_some hj
+    simp only [Bool.and_eq_true] at hp
+    exact hp.1.2
+  · have hp := List.find?_some h
+    simp only [Bool.and_eq_true] at hp
+    exact hp.2
+
+/-- A drawn element is present (it exists in the vocabulary). -/
+theorem select_present (n : Nat) (present pos cross : Nat → Bool) (i : Nat)
+    (h : select n present pos cross = some i) : present i = true := by
+  unfold select at h
+  split at h
+  · rename_i j hj
+    cases h
+    have hp := List.find?_some hj
+    simp only [Bool.and_eq_true] at hp
+    exact hp.1.1
+  · have hp := List.find?_some h
+    simp only [Bool.and_eq_true] at hp
+    exact hp.1
+
+/-- A drawn element lies in `[0, n)`. -/
+theorem select_lt (n : Nat) (present pos cross : Nat → Bool) (i : Nat)
+    (h : select n present pos cross = some i) : i < n := by
+  unfold select at h
+  split at h
+  · rename_i j hj
+    cases h
+    exact List.mem_range.mp (List.mem_of_find?_eq_some hj)
+  · exact List.mem_range.mp (List.mem_reverse.mp (List.mem_of_find?_eq_some h))
+
+/-- The rule never selects an absent or zero-weight element even when such an element crosses first: `select` with a
+crossing predicate restricted to positive elements is `select` itself (the restriction is already in the rule). -/
+theorem select_restrict (n : Nat) (present pos cross : Nat → Bool) :
+    select n present pos (fun i => pos i && cross i) = select n present pos cross := by
+  unfold select
+  have : (fun i => present i && pos i && (pos i && cross i)) = (fun i => present i && pos i && cross i) := by
+    funext i
+    cases present i <;> cases pos i <;> cases cross i <;> rfl
+  rw [this]
 
 end Draw
 end BIK

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exact CPU model of ``sample.icdf.v1`` (``draw_spec.py``): per row the weights, the canonical sum ``S``, the stream's
 uniform and the threshold ``t = mul(u, S)``, the node table of the sum tree (torch f32 adds, one rounding each), the
-inclusive prefixes in tree order and the first crossing. Fully on the CPU for the probability input; the logits input
+inclusive prefixes in tree order and the first positive-weight crossing. Fully on the CPU for the probability input; the logits input
 takes its weights from ``lse.row``'s chain (``reference.py``: the device ``ex2`` tables).
 
 Outside every kernel cache closure (no kernel module imports it)."""
@@ -91,7 +91,9 @@ def draw_row(w: torch.Tensor, N: int, u: float) -> Tuple[int, bool, float, float
     w_tree[:N] = w
     w_tree = w_tree.view(Kp, LANES, V).permute(1, 0, 2).reshape(-1)
     incl = torch.add(outer.reshape(-1, 1).expand(LANES * Kp, V).reshape(-1), f_tree)
-    cross = (incl >= t) & p_tree
+    cross = (
+        (incl >= t) & p_tree & (w_tree > 0)
+    )  # the positivity is part of the rule (draw_spec.SELECT_RULE)
     idx = torch.nonzero(cross).reshape(-1)
     if idx.numel():
         a = int(idx[0])
@@ -114,25 +116,40 @@ def draw_reference(
 ) -> Dict[str, torch.Tensor]:
     """The exact model for ``rows`` of ``x`` (probabilities, or logits with ``from_logits``; ``(M, N)``): ``{"samples"
     int64, "valid" bool, "u" f32, "S" f32, "t" f32}`` (``-1`` / False for an invalid row). ``seeds`` / ``offsets`` are
-    the rows' keys (Python ints, as signed or unsigned 64-bit values)."""
+    the rows' keys (Python ints, as signed or unsigned 64-bit values); ``rows`` the source row of each output (one outside
+    ``[0, M)`` is an invalid output row: token ``-1``, as the kernel's gather reports it)."""
     x = x.detach().cpu()
     M, N = x.shape
     rows = list(range(M)) if rows is None else list(rows)
     xf = x.to(torch.float32)
-    cs = _scales(temperature, M) if from_logits else None
+    cs = (
+        _scales(temperature, len(rows)) if from_logits else None
+    )  # per output row, as the kernel reads it
     out: Dict[str, list] = {k: [] for k in ("samples", "valid", "u", "S", "t")}
-    for r in rows:
+    for i, r in enumerate(
+        rows
+    ):  # output i reads source row r with output i's key (and temperature)
+        if not 0 <= r < M:
+            for k, v in (
+                ("samples", -1),
+                ("valid", False),
+                ("u", float("nan")),
+                ("S", float("nan")),
+                ("t", float("nan")),
+            ):
+                out[k].append(v)
+            continue
         if from_logits:
             assert cs is not None
             m = row_max(xf[r])
             z = torch.mul(
                 torch.add(xf[r], torch.tensor(fp32.neg(m), dtype=torch.float32)),
-                torch.tensor(cs[r], dtype=torch.float32),
+                torch.tensor(cs[i], dtype=torch.float32),
             )
             w = ex2_device(z)
         else:
             w = xf[r]
-        u = stream.uniforms(int(seeds[r]), int(offsets[r]), draw)[0]
+        u = stream.uniforms(int(seeds[i]), int(offsets[i]), draw)[0]
         tok, ok, S, t = draw_row(w, N, u)
         out["samples"].append(tok)
         out["valid"].append(ok)

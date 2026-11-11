@@ -13,8 +13,12 @@ which the canonical tree combines (elem fold innermost, block bits, lane bits ou
 ``outer = add-chain over the set bits of its address, ascending, of the left-sibling node`` (the aligned group just below
 the bit: blocks of the same lane for a block bit, whole lanes for a lane bit), from ``+0``; the inclusive prefix of an
 element is ``add(outer, fold_e)`` with ``fold_e`` the slot fold's running value through the element. The drawn token is the
-first present element in tree order with ``add(outer, fold_e) >= t``; if none (rounding at ``u`` near 1), the last present
-element with ``w_j > 0``; if ``S`` is not a positive finite number, the row is invalid (token ``-1``).
+first present element in tree order with ``w_j > 0`` and ``add(outer, fold_e) >= t``; if none (rounding at ``u`` near 1), the
+last present element with ``w_j > 0``; if ``S`` is not a positive finite number, the row is invalid (token ``-1``). The
+positivity condition is part of the rule (``SELECT_RULE``): the inclusive prefixes are not monotone across slot boundaries
+(the last prefix of a slot and the ``outer`` of the next are different ``add`` chains over the same nodes -- equal exactly,
+a rounding apart in binary32), so without it a zero-weight slot head could be the first crossing and a masked token drawn
+(found in review, 2026-11-11, at ~1e-5 per draw on half-masked rows).
 
 Every node is a value every placement already holds (the thread's own block tree, the exchanged warp / CTA siblings, the
 butterfly partners), so the draw adds no reduction and no numerics beyond these declared ``add`` chains, and is as
@@ -30,8 +34,15 @@ from .schedule import LANES, V, padded_blocks
 from .spec import LSESpec, shifted, sum_reduction, weight
 from .sterm import Term, TermAlgebra
 from .sterm import fingerprint_dag as fingerprint
+from .stream import STREAM_NAME, stream_fingerprint
 
 CLASS = "sample.icdf.v1"
+#: The selection rule, named in the fingerprint (a change of the rule is a change of the class): the first present
+#: element in tree order with a positive weight whose inclusive prefix reaches the threshold, else the last present
+#: element with a positive weight; a row whose sum is not a positive finite number is invalid.
+SELECT_RULE = (
+    "first-present-positive-crossing;else-last-present-positive;invalid-unless-0<S<inf"
+)
 
 
 def tree_address(lane: int, block: int, elem: int, Kp: int) -> int:
@@ -86,6 +97,7 @@ class DrawSpec:
             if from_logits
             else None
         )
+        self._nm: dict = {}  # the negated row maximum, one term per row
 
     def weight(self, row: int, i: int) -> Optional[Term]:
         if i >= self.N:
@@ -93,9 +105,12 @@ class DrawSpec:
         a = self.alg
         if self.from_logits:
             assert self.lse is not None
-            return weight(
-                a, shifted(a, a.x(row, i), a.neg(self.lse.m(row)), self.lse.c())
-            )
+            nm = self._nm.get(row)
+            if (
+                nm is None
+            ):  # built once per row: rebuilt per element, the term was quadratic in N (a day at 152064)
+                nm = self._nm[row] = a.neg(self.lse.m(row))
+            return weight(a, shifted(a, a.x(row, i), nm, self.lse.c()))
         return a.x(row, i)
 
     def slot_fold(self, row: int, lane: int, block: int) -> List[Optional[Term]]:
@@ -170,7 +185,8 @@ def spec_fingerprint(
 ) -> str:
     """The draw's specification identifier for vocabulary ``N``: the total, the threshold, and the inclusive prefixes of
     the first element, the last element and the first element of lane 1 (a lane-bit node) of row 0 (``sterm.fingerprint_dag``,
-    linear in the term DAG)."""
+    linear in the term DAG), with the selection rule (``SELECT_RULE``) and the stream's identity (``stream.STREAM_NAME`` and
+    its receipt): a change of the rule or of the uniform's derivation moves the class."""
     sp = DrawSpec(N, from_logits, in_fmt, temperature=temperature)
     i_lane1 = LANES * V if N > LANES * V else N - 1
     parts = [
@@ -179,5 +195,8 @@ def spec_fingerprint(
         fingerprint(sp.prefix_incl(0, 0)),
         fingerprint(sp.prefix_incl(0, N - 1)),
         fingerprint(sp.prefix_incl(0, i_lane1)),
+        SELECT_RULE,
+        STREAM_NAME,
+        stream_fingerprint(),
     ]
     return "sample-icdf-" + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
