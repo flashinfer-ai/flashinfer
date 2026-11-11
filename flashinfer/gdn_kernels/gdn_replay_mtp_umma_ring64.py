@@ -114,11 +114,11 @@ _RN_OFF = (
 ) * 16  # s_rn (16 fp32) sits right after s_gram inside the aliased block
 # CTAs per SM the shared-memory budget allows (233,472 B per SM, 1,024 B reserved per CTA). The dynamic shared memory of a CTA is
 # _SMEM_FIXED + 256 B per u-window row nu: state 32 KB, X tile 4 KB, Gram / K_hist block and C tile (W_RING rows), the coefficient
-# block, barriers. 57,248 B at nu = 32 (the 8 x 8 coefficient tables would need 57,824 B) against the per-CTA budget of
+# block, barriers. 57,244 B at nu = 32 (the 8 x 8 coefficient tables would need 57,820 B) against the per-CTA budget of
 # 4 CTAs/SM of 57,344 B. The launch bound (min_blocks_per_mp) follows it: asking ptxas for more resident CTAs than shared
 # memory can hold only caps the registers (64 at 4 CTAs/SM of 256 threads; setmaxnreg then moves them between the warpgroups:
 # _NREG_CONS / _NREG_OTHER, which assume a launch cap of at most 96 registers per thread).
-_SMEM_FIXED = 32_768 + 4_096 + W_RING * (256 + 32) + 4 * _COEF * 4 + 480
+_SMEM_FIXED = 32_768 + 4_096 + W_RING * (256 + 32) + 4 * _COEF * 4 + 476
 _SMEM_PER_SM = 233_472
 _SMEM_RESERVED_PER_CTA = 1_024
 _SMEM_CTAS_PER_SM = 4
@@ -382,9 +382,6 @@ class GdnReplayMtpUmma:
         x_ready = smem.allocate_array(cutlass.Int64, 1)
         tmem_done = smem.allocate_array(cutlass.Int64, 1)
         tmem_addr = smem.allocate(Int32, 4)
-        sink = smem.allocate(
-            Int32, 4
-        )  # dummy word: _d_build's ordering store before the window release
 
         # TMEM first: the next CTA on this SM is not launched before this one relinquishes
         # its TMEM allocation permit (measured: allocating after the prologue spaced the
@@ -423,7 +420,6 @@ class GdnReplayMtpUmma:
             x_ready=x_ready,
             tmem_done=tmem_done,
             tmem_addr=tmem_addr,
-            sink=sink,
             st_addr=st_addr,
             x_addr=x_addr,
             kt_addr=kt_addr,
@@ -526,7 +522,6 @@ class GdnReplayMtpUmma:
         x_ready = S["x_ready"]
         tmem_done = S["tmem_done"]
         tmem_addr = S["tmem_addr"]
-        sink = S["sink"]
         st_addr = S["st_addr"]
         x_addr = S["x_addr"]
         kt_addr = S["kt_addr"]
@@ -948,7 +943,6 @@ class GdnReplayMtpUmma:
                 mma_done=mma_done,
                 epi_done=epi_done,
                 uw_addr=uw_addr,
-                sink=sink.toint(),
                 u_full=u_full,
                 u_free=u_free,
                 f_mma_a=f_mma_a,
@@ -1516,17 +1510,12 @@ class GdnReplayMtpUmma:
         self._window_bulk(nn0, dst, src_head, base, n1, n2, d2, s2, rowb, mbar)
 
     @cute.jit
-    def _u_release(self, hh, ctx, uv):
+    def _u_release(self, hh, ctx):
         """Head hh's window rows are in registers: release the buffer (the next head's copy is issued by warp 6). The
-        release must come after the rows were actually read: an LDS still queued in the shared-memory pipe when the
-        arrive (a different unit) takes effect lets the bulk copy's rows land first (a launch-to-launch race). Storing
-        a value that depends on all rows to a dummy word forces their data to be back first (a predicate or ALU use
-        would be folded: the rows are known to be < 2^16)."""
+        proxy fence orders this thread's generic-proxy reads of the window before the async-proxy (bulk copy) rewrite
+        that the arrive releases."""
         if hh < self.hpc - 1:
-            dep = uv[0]
-            for u_ in uv[1:]:
-                dep = dep | u_
-            U.sts_u32(ctx["sink"], dep)
+            cute.arch.fence_view_async_shared()
             cute.arch.mbarrier_arrive(ctx["u_free"][0])
 
     @cute.jit
@@ -1602,7 +1591,7 @@ class GdnReplayMtpUmma:
         )  # chunks >= 1: loads, words and TMEM store
         # single-buffered window: release it now (all rows are in registers); warp 6 refills it with the next head's
         # live rows, so their DRAM round trip overlaps this head's D math, the readout wait and the epilogue
-        self._u_release(hh, ctx, uv)
+        self._u_release(hh, ctx)
         words = []
         for c in range(W_CHUNK // 2):
             lo = U.u16_as_f32(uv[2 * c], self.u_bf16) * s_coef[cb + _CO_W + 2 * c]
