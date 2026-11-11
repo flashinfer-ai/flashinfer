@@ -124,14 +124,16 @@ def _is_mxfp4_dtype(dtype: Any) -> bool:
 
 
 def _format_label(dtype: str) -> str:
+    if dtype.startswith("sm90_w_int4_"):
+        return "INT4"
     return "NVFP4" if dtype.startswith("sm90_w_nvfp4_") else "MXFP4"
 
 
 def _requires_hardware_provenance(dtype: Any) -> bool:
-    # NV uses the same strict hardware axes, with its own format/domain hash.
+    # Packed formats share hardware axes, with independent format/domain hashes.
     # Existing MX keys and matching behavior remain unchanged.
     return _is_mxfp4_dtype(dtype) or (
-        isinstance(dtype, str) and dtype.startswith("sm90_w_nvfp4_")
+        isinstance(dtype, str) and dtype.startswith(("sm90_w_nvfp4_", "sm90_w_int4_"))
     )
 
 

@@ -1,7 +1,7 @@
 """Offline tuning for CuTe DSL MegaMoE backends.
 
 ``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
-``sm90_fp8_*`` / ``sm90_mxfp4`` / ``sm90_bf16`` dtypes select the Hopper tuners. BF16 and
+``sm90_fp8_*`` / ``sm90_mxfp4`` / ``sm90_int4`` / ``sm90_bf16`` select Hopper tuners. BF16 and
 mixed BF16/MXFP8 are supported by the SM100 tuner only. MXFP4/MXFP8 is
 wired for SM107.
 
@@ -65,6 +65,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "sm90_fp8_e5m2",
             "sm90_bf16",
             "sm90_mxfp4",
+            "sm90_int4",
             "bf16",
             "bf16_mxfp8_e4m3",
             "bf16_mxfp8_e5m2",
@@ -78,7 +79,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
         ),
         default=None,
-        help="canonical routing workload identity (sm90_mxfp4 only; default: "
+        help="canonical routing workload identity (sm90_mxfp4/sm90_int4; default: "
         "the PR4688 block-permutation workload)",
     )
     parser.add_argument(
@@ -86,7 +87,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("per_tensor", "blockwise", "mxfp4_hybrid"),
         default=None,
         help="scale ABI: per_tensor by default for existing dtypes; fixed to "
-        "mxfp4_hybrid for sm90_mxfp4",
+        "mxfp4_hybrid for sm90_mxfp4/sm90_int4",
     )
     parser.add_argument(
         "--arch",
@@ -247,9 +248,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         args.routing_profile = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION
     if args.fp8_scale_mode is None:
         args.fp8_scale_mode = (
-            "mxfp4_hybrid" if args.dtype == "sm90_mxfp4" else "per_tensor"
+            "mxfp4_hybrid"
+            if args.dtype in ("sm90_mxfp4", "sm90_int4")
+            else "per_tensor"
         )
-    if args.gate_up_clamp is None and args.dtype == "sm90_mxfp4":
+    if args.gate_up_clamp is None and args.dtype in ("sm90_mxfp4", "sm90_int4"):
         args.gate_up_clamp = 10.0
     return args
 
@@ -269,49 +272,49 @@ def _argument_error(args: argparse.Namespace) -> Optional[str]:
             return "--warmup-iters and --timed-iters must be positive"
         if args.max_candidates is not None and args.max_candidates < 1:
             return "--max-candidates must be positive"
-    is_mxfp4 = args.dtype == "sm90_mxfp4"
+    is_packed_sm90 = args.dtype in ("sm90_mxfp4", "sm90_int4")
 
-    if not is_mxfp4:
+    if not is_packed_sm90:
         if args._routing_profile_specified:
-            return "--routing-profile is only wired for --dtype sm90_mxfp4"
+            return "--routing-profile is only wired for --dtype sm90_mxfp4/sm90_int4"
         if args.fp8_scale_mode == "mxfp4_hybrid":
-            return "--fp8-scale-mode mxfp4_hybrid requires --dtype sm90_mxfp4"
+            return "--fp8-scale-mode mxfp4_hybrid requires --dtype sm90_mxfp4/sm90_int4"
         return None
 
     if args.fp8_scale_mode != "mxfp4_hybrid":
-        return "--dtype sm90_mxfp4 fixes --fp8-scale-mode mxfp4_hybrid"
+        return f"--dtype {args.dtype} fixes --fp8-scale-mode mxfp4_hybrid"
     if args.combine_dtype != "bf16":
-        return "--dtype sm90_mxfp4 fixes --combine-dtype bf16"
+        return f"--dtype {args.dtype} fixes --combine-dtype bf16"
     try:
         normalize_sm90_routing_profile(args.routing_profile)
     except ValueError as exc:
         return str(exc)
     if args.seed != 0:
         return (
-            "--dtype sm90_mxfp4 requires --seed 0 to match the tuning "
+            f"--dtype {args.dtype} requires --seed 0 to match the tuning "
             "workload used by the cache"
         )
     if args.live_tokens is not None and any(
         args.live_tokens != max_tokens for max_tokens in args.max_tokens
     ):
         return (
-            "--dtype sm90_mxfp4 requires --live-tokens to equal every "
+            f"--dtype {args.dtype} requires --live-tokens to equal every "
             "--max-tokens value because live tokens are not part of the "
             "persistent cache key; omit --live-tokens for per-bucket tuning"
         )
     if args.allow_nondeterministic:
         return (
-            "--allow-nondeterministic is not applicable to sm90_mxfp4; "
-            "MXFP4 candidates disable in-kernel FC2 reduction"
+            f"--allow-nondeterministic is not applicable to {args.dtype}; "
+            "candidates disable in-kernel FC2 reduction"
         )
     if args.sweep != "default" or args.base_knobs is not None:
         return (
-            "sm90_mxfp4 accepts only --sweep default with no --base-knobs; "
-            "candidates come from hopper_mxfp4_candidates()"
+            f"{args.dtype} accepts only --sweep default with no --base-knobs; "
+            "candidates come from the format's Hopper candidate set"
         )
     if args.skew is not None:
         return (
-            "--skew is not applicable to sm90_mxfp4 offline tuning; its "
+            f"--skew is not applicable to {args.dtype} offline tuning; its "
             "canonical input recipe fixes deterministic balanced routing"
         )
     if args.max_candidates is not None and args.max_candidates <= 0:
@@ -355,12 +358,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.shared_expert:
         print("--shared-expert requires --dtype sm120_mxfp4_mxfp8", file=sys.stderr)
         return 2
-    if args.dtype == "sm90_mxfp4":
+    if args.dtype in ("sm90_mxfp4", "sm90_int4"):
         if args.arch not in ("auto", "sm90"):
-            print("sm90_mxfp4 requires --arch auto or sm90", file=sys.stderr)
+            print(f"{args.dtype} requires --arch auto or sm90", file=sys.stderr)
             return 2
         family = "sm90"
-        backend = "fp8_mxfp4_bf16_pull_cutedsl"
+        backend = f"fp8_{args.dtype.removeprefix('sm90_')}_bf16_pull_cutedsl"
     elif args.dtype.startswith("sm90_"):
         if args.arch not in ("auto", "sm90"):
             print("sm90_* dtypes require --arch auto or sm90", file=sys.stderr)

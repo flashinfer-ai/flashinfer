@@ -68,8 +68,34 @@ when token counts shrink. The returned output aliases the buffer unless copied.
 For CUDA Graph, construct `hopper_int4_mega_launch_thunk(fc1, fc2, buffer)` on
 the capture stream before capture, then capture calls to that thunk.
 
-This entry uses explicit tactics and has no high-level backend or autotuning
-registration. It currently requires `fc1_ready_mode="tile"` and
-`fc2_tail_n8=False`. Adaptation lives in `shim/hopper_int4.py` and
-`shim/int4_{weights,conversion,kernels}.py`; the shared K256 path calls its
-existing conversion and scale-view hooks.
+## Tactic selection and tuning
+
+`get_symm_buffer_for_hopper_int4_mega_moe(..., knobs=None)` looks up the
+INT4 tuning cache, then uses a shape-compatible fallback. A `knobs` dictionary
+selects a complete explicit tactic. INT4 measurements have their own cache
+identity, including the GPU, model shape, routing profile and candidate domain.
+The weight group size remains 128 for every tactic, including K256 tiles.
+
+The high-level backend is
+`Sm90_Fp8_Int4_Bf16_PullCutedsl_MegaMoeConfig(intermediate_size=I, top_k=topk,
+knobs="auto")`. Its first compute collectively measures candidates on all EP
+ranks and retains the winner; rank 0 writes the cache. Complete this first
+compute with a caller output buffer before CUDA Graph capture. For serving,
+prepare the cache offline and use `knobs=None`:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
+    --dtype sm90_int4 --hidden 3072 --intermediate 1024 \
+    --num-experts 256 --topk 8 --max-tokens 128 512 2048 8192
+```
+
+The high-level backend accepts prequantized
+`MoEWeightPack(w13, w2, w13_scale, w2_scale)` with BF16 K128 scales;
+note its argument order differs from `Int4WeightPack` above.
+The low-level `autotune_hopper_int4_mega_moe(y, fc1, fc2, buffer)` is also
+available. Rebuild any CUDA Graph launch thunk after tuning.
+
+Set `FLASHINFER_MOE_EP_KNOB_CACHE` to choose the cache file. Tune with the
+deployment's GPU, EP size, routing profile and token capacities. The supported
+candidate domain currently requires `fc1_ready_mode="tile"` and
+`fc2_tail_n8=False`.
