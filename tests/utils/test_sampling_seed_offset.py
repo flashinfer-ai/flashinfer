@@ -261,6 +261,9 @@ def test_sampling_generator_cuda_graph(monkeypatch, name, use_default_generator,
         generator.manual_seed(seed)
         generator.set_offset(128)
         graph = torch.cuda.CUDAGraph()
+        if not use_default_generator:
+            # PyTorch 2.13 requires explicit generators to be registered before capture.
+            graph.register_generator_state(generator)
         try:
             with torch.cuda.graph(graph):
                 outputs = [
