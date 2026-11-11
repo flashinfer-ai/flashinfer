@@ -123,10 +123,12 @@ _TRITON_IMPLS = ["tma_pd", "tma_pm"]
 
 
 def _pdl_supported() -> bool:
+    """Return whether the current CUDA device supports programmatic launch."""
     return torch.cuda.is_available() and device_support_pdl(torch.device("cuda"))
 
 
 def _skip_without_pdl() -> None:
+    """Skip the calling test when the current device lacks PDL support."""
     if not _pdl_supported():
         pytest.skip("checkpointing_ssu PDL requires a PDL-capable (SM90+) device")
 

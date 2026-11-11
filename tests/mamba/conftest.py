@@ -1055,6 +1055,7 @@ def _triton_supports_current_arch() -> bool:
 
 
 def pytest_collection_modifyitems(config, items):
+    """Skip unsupported Triton tests and prewarm checkpointing SSU variants."""
     if items and not _triton_supports_current_arch():
         import pytest
 
