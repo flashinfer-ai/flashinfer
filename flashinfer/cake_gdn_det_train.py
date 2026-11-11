@@ -145,7 +145,7 @@ def cake_gdn_det(
     lpt : bool, default=True
         Enable longest-processing-time scheduling in the backend plan.
     streams : int, default=2
-        Number of streams used by the backend plan.
+        Number of streams used by the backend plan: ``1`` or ``2``.
     """
     return _pkg().cake_gdn_det(
         q,

@@ -576,7 +576,7 @@ def cake_gdn_det_train_kcp_comm_bytes(
     C : int, default=10240
         Convolution channel count used to size halo traffic.
     **kw
-        Backend options for this query, including the call's save and boundary settings.
+        Backend options for this query: ``save_transfer`` and ``boundary_mode``.
     """
     return _pkg().cake_gdn_det_train_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C, **kw)
 
