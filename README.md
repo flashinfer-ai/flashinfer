@@ -257,7 +257,7 @@ FlashInfer powers inference in:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, pull request guidelines
 (PR template, performance numbers for optimizations), and how CI is triggered. Coding
-agents pick up the same guidance from [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md);
+agents pick up the same guidance from [AGENTS.md](AGENTS.md);
 the review guidance is in [docs/code_review_guidance_human.md](docs/code_review_guidance_human.md).
 
 ## Acknowledgement

@@ -1,8 +1,8 @@
-# CLAUDE.md — flashinfer/experimental/
+# AGENTS.md — flashinfer/experimental/
 
 Agent guidance for code under `flashinfer/experimental/`. The normative
 policy is [README.md](./README.md) in this directory; this file is the
-operational summary. The root `CLAUDE.md` still applies except where relaxed
+operational summary. The root `AGENTS.md` still applies except where relaxed
 below.
 
 ## What lives here
@@ -112,7 +112,7 @@ See README.md for the full worked example and the resulting behavior table.
 - Correctness tests vs. a reference in `tests/experimental/`, validated on
   the intended hardware, plus a runnable example.
 
-## Checklist deltas vs. root CLAUDE.md's "Adding a New Operation"
+## Checklist deltas vs. root AGENTS.md's "Adding a New Operation"
 
 | Step | Experimental status |
 |------|---------------------|
@@ -123,7 +123,7 @@ See README.md for the full worked example and the resulting behavior table.
 | Docs | Must state experimental status, how to opt in, and limitations |
 
 Everything else (JIT module structure, framework separation of
-`include/`/`csrc/`, coding style) follows the root `CLAUDE.md`.
+`include/`/`csrc/`, coding style) follows the root `AGENTS.md`.
 
 ## Graduation / removal
 
