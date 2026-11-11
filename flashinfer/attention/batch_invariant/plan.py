@@ -12,7 +12,9 @@ does not allow. Which of the two kinds a Q tile gets is the planner's choice (it
 count); every choice computes the same bits (R3).
 
 Positions are bottom-right causal: token ``i`` of request ``b`` (``0 <= i < q_len``) sits at
-``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``.
+``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``. Under the non-causal class (``causal=False``) every
+token of the request sees its ``kv_len`` keys: the row block's visible range is ``[0, kv_len)`` whatever its tokens, and the
+unit and group construction is otherwise the same.
 """
 
 from __future__ import annotations
@@ -154,6 +156,7 @@ def build_plan(
     merge: str = "auto",
     small_swap: bool = False,
     swap_max_rows: int = INKERNEL_MAX_ROWS,
+    causal: bool = True,
 ) -> Plan:
     """``split_policy``: ``"auto"`` splits every multi-chunk tile when the fused unit count would leave
     the machine underfilled (``< 2 x SM``) -- and, at head dims whose merged state is not in TMEM (D = 256), every multi-chunk
@@ -164,8 +167,13 @@ def build_plan(
     force one kind (R3: same bits).
     ``merge``: where a split group's chunk fold runs -- ``"auto"`` (in-kernel for groups of at most
     ``INKERNEL_MAX_ROWS`` rows, the fixup kernel otherwise), ``"fixup"`` (always the kernel), ``"inkernel"``
-    (always in-kernel); the same fold in the same order either way (R3: same bits)."""
+    (always in-kernel); the same fold in the same order either way (R3: same bits).
+    ``causal``: the mask mode (a class dimension): ``False`` gives every row block the request's whole key range ``[0, kv_len)``
+    (no window; a request with query tokens and no key has a row without a visible key and is refused)."""
     assert merge in ("auto", "fixup", "inkernel"), merge
+    assert causal or window_left < 0, (
+        "window_left is not a parameter of the non-causal class"
+    )
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
     assert 1 <= g <= q_rows, g
@@ -179,15 +187,23 @@ def build_plan(
         kv_len = kv_lens[b]
         if q_len == 0:
             continue
-        assert kv_len >= q_len, (
-            f"request {b}: kv_len {kv_len} < q_len {q_len} (bottom-right causal needs kv_len >= q_len)"
-        )
+        if causal:
+            assert kv_len >= q_len, (
+                f"request {b}: kv_len {kv_len} < q_len {q_len} (bottom-right causal needs kv_len >= q_len)"
+            )
+        else:
+            assert kv_len >= 1, (
+                f"request {b}: {q_len} query tokens over no key (a non-causal row needs a visible key)"
+            )
         for tok0 in range(0, q_len, tpt):
             ntok = min(tpt, q_len - tok0)
-            p_first = kv_len - q_len + tok0
-            p_last = p_first + ntok - 1
-            L_max = p_last + 1
-            lo_min = max(0, p_first - window_left) if window_left >= 0 else 0
+            if causal:
+                p_first = kv_len - q_len + tok0
+                p_last = p_first + ntok - 1
+                L_max = p_last + 1
+                lo_min = max(0, p_first - window_left) if window_left >= 0 else 0
+            else:
+                L_max, lo_min = kv_len, 0
             chunk_lo, chunk_hi = lo_min // C, -(-L_max // C)
             tile_lo, tile_hi = lo_min // T, -(-L_max // T)
             for h in range(Hkv):

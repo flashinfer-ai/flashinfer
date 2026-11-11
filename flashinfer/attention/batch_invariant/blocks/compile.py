@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the attention kernel: one TVM-FFI object per static tuple ``(D, g, page,
-kv_slots, n_wg, q2)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
+kv_slots, n_wg, q2, ragged, causal)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
 
 Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer-shaped tensors):
 Q as ``(D, Hq, total_q)`` (strides ``(1, D, Hq*D)`` for a packed ``(total_q, Hq, D)`` tensor), K and V as
@@ -32,11 +32,13 @@ def kernel_name(
     n_wg: int = 1,
     q2: bool = False,
     ragged: bool = False,
+    causal: bool = True,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_d{D}_g{g}_p{page}_s{kv_slots}_w{n_wg}"
         + ("_q2" if q2 else "")
         + ("_rg" if ragged else "")
+        + ("" if causal else "_nc")
     )
 
 
@@ -49,8 +51,11 @@ def get_compiled_attention(
     n_wg: int = 1,
     q2: bool = False,
     ragged: bool = False,
+    causal: bool = True,
 ):
-    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged)
+    """``causal``: the mask mode, a compile-time constant of the body (the non-causal kernel is a separate object, ``_nc``; the causal
+    body's code is unchanged)."""
+    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged, causal)
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -116,7 +121,7 @@ def get_compiled_attention(
             i32, (s_nidx,), (1,), assumed_align=4
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        k = AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged)
+        k = AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged, causal)
         return cute.compile(
             k,
             q_fake,

@@ -283,6 +283,7 @@ class _Planned:
         self.window_left: Optional[int] = None
         self.config: Optional[AttnConfig] = None
         self.page: Optional[int] = None
+        self.causal: bool = True  # the mask mode the table was built for (a class dimension; the kernels are compiled per mode)
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
@@ -304,10 +305,16 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    causal: bool = True,
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
-    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
+    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer. ``causal``: the
+    mask mode, a class dimension (``False``: every token sees its request's whole key range; no window)."""
+    if not causal and window_left >= 0:
+        raise ValueError(
+            "window_left is not a parameter of the non-causal class (the whole key range is visible)"
+        )
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
@@ -338,6 +345,7 @@ def plan_attention(
         merge=config.merge,
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
+        causal=causal,
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
     desc = torch.tensor(
@@ -398,6 +406,7 @@ def plan_attention(
     planned.window_left = int(window_left)
     planned.config = config
     planned.page = int(page)
+    planned.causal = bool(causal)
     return planned
 
 
@@ -413,6 +422,7 @@ def workspace_bytes(
     config: Optional[AttnConfig] = None,
     device=None,
     ragged: bool = False,
+    causal: bool = True,
 ) -> int:
     """The float workspace bytes ``plan_attention`` needs for this batch's split-KV partials (0 when the plan has no split
     group); the planner runs on the host, nothing is allocated."""
@@ -442,6 +452,7 @@ def workspace_bytes(
         merge=config.merge,
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
+        causal=causal,
     )
     return plan.ws_rows * ws_row(D) * 4
 
@@ -501,6 +512,10 @@ def run_attention(
     if planned.window_left is not None and int(window_left) != planned.window_left:
         raise ValueError(
             f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
+        )
+    if not planned.causal and int(window_left) >= 0:
+        raise ValueError(
+            "window_left is not a parameter of the non-causal class (the whole key range is visible)"
         )
     if ragged:
         # Packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND.
@@ -624,6 +639,9 @@ def _run_attention_validated(
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"
     )
+    causal = bool(
+        planned.causal
+    )  # the mask mode: a compile-time constant of every kernel (the causal bodies are untouched)
     n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
     if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
         from .swaps.compile import get_compiled_swaps
@@ -631,7 +649,9 @@ def _run_attention_validated(
         from .swaps.operands import arch_smem_cap
 
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
-        kernel = get_compiled_swaps(D, g, page, n_pad, ragged, arch_smem_cap(q.device))
+        kernel = get_compiled_swaps(
+            D, g, page, n_pad, ragged, arch_smem_cap(q.device), causal
+        )
         kernel(
             q_view,
             kv_k,
@@ -655,11 +675,18 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body (same bits)
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, 1, False, ragged
+                D, g, page, config.kv_slots, 1, False, ragged, causal
             )
         else:
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, config.softmax_wgs, config.q2, ragged
+                D,
+                g,
+                page,
+                config.kv_slots,
+                config.softmax_wgs,
+                config.q2,
+                ragged,
+                causal,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -695,7 +722,7 @@ def _run_attention_validated(
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g)(
+        get_fixup(D, g, causal)(
             planned.ws,
             o_view,
             planned.fixup_groups,
@@ -724,8 +751,10 @@ def attention_paged(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     workspace: Optional[torch.Tensor] = None,
+    causal: bool = True,
 ) -> torch.Tensor:
-    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned)."""
+    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned, or with ``causal=False`` the
+    non-causal class: every token sees its request's whole key range)."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -742,6 +771,7 @@ def attention_paged(
         config,
         workspace,
         q.device,
+        causal=causal,
     )
     return run_attention(
         planned,

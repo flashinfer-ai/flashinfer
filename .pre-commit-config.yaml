@@ -58,7 +58,8 @@ repos:
       - id: check-added-large-files
         # Required Frost catalogs; retain other checks.
         # The vendored cuDNN Frontend block API module exceeds the size limit; its bytes are digest-checked by VENDOR_MANIFEST.json.
-        exclude: ^flashinfer/(?:fused_moe/backends/cudnn_frost/artifacts/[^/]+/cudnn_frost_selected_kernels\.json|experimental/qwen_3_5_block/_cudnn_frost/gated_attention_block/api\.py)$
+        # The generated Lean case modules hold whole spec terms as literals; tests/batch_invariant/test_lean.py checks them against the generator.
+        exclude: ^flashinfer/(?:fused_moe/backends/cudnn_frost/artifacts/[^/]+/cudnn_frost_selected_kernels\.json|experimental/qwen_3_5_block/_cudnn_frost/gated_attention_block/api\.py|batch_invariant/lean/BIKernels/Cases/[^/]+\.lean)$
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-symlinks

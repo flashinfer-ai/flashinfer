@@ -11,7 +11,7 @@ Every declaration of the `BIKernels.*` modules is checked:
   except the named theorems in `decidedTheorems` below, which are decided by `native_decide` and therefore depend on
   `Lean.ofReduceBool` as well: the axiom that `Lean.reduceBool c = true` implies `c = true`, i.e. it trusts the
   compiled evaluator (Lean's code generator and interpreter) for the evaluation of these closed Boolean terms. Every
-  other generated conformance case (`BIKernels.Cases`) uses kernel `decide` and needs no such trust.
+  other generated conformance case (`BIKernels.Cases.*`) uses kernel `decide` and needs no such trust.
 
 The claim the policy enforces is therefore "Lean's standard axioms, plus `Lean.ofReduceBool` for the named
 exhaustive table checks", never "standard axioms only". -/
@@ -38,7 +38,7 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mx4_space_decode_ok, ``BIK.gemm_mx4_space_c2_ok,
    ``BIK.gemm_mx4k128_space_ok, ``BIK.gemm_mx4k128_space_c4_ok, ``BIK.gemm_mx4k128_space_c4_cta_twins, ``BIK.gemm_mx4k128_dispatch_in_space,
    ``BIK.gemm_mx4k128_space_decode_ok, ``BIK.gemm_mx4k128_space_c2_ok,
-   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64]
+   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_a10_spec, ``BIK.attn_a11_spec, ``BIK.attn_a12_spec, ``BIK.attn_a13_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64, ``BIK.Attn.output_depends_on_mode]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?

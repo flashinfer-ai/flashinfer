@@ -191,12 +191,17 @@ def fold_row(
     C: cutlass.Constexpr,
     PF: cutlass.Constexpr,
     WS: cutlass.Constexpr,
+    causal: cutlass.Constexpr = True,
 ):
     """Row ``r`` of a split group, output columns ``[d0, d0 + VEC)``: the chunk-order fold of the row's present chunks from the
     init state (``fold_row_state``, the single implementation), then the epilogue to the output row. ``WS`` is the workspace row
-    pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at D = 64 / 128 / 256)."""
+    pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at D = 64 / 128 / 256). ``causal``: the mask mode; a non-causal row's
+    present chunks are those of the whole key range ``[0, kv_len)`` (the fold of a row at the last position with no window)."""
     token = q_tok0 + r // g
     pos = kv_len - q_len + token
+    if cutlass.const_expr(not causal):
+        pos = kv_len - 1
+        window_left = Int32(-1)
     o = cute.make_rmem_tensor(cute.make_layout((VEC,)), Float32)
     m, l = fold_row_state(
         mWs,
@@ -435,8 +440,9 @@ def fold_row_coop(
 
 
 class SplitKVFixup:
-    def __init__(self, D: int, g: int, pdl: bool = PDL):
+    def __init__(self, D: int, g: int, pdl: bool = PDL, causal: bool = True):
         self.D, self.g, self.pdl = D, g, pdl
+        self.causal = causal  # the mask mode (a class dimension; compile-time)
         self.C = chunk_len(D)
         self.WS = ws_row(D)
 
@@ -498,6 +504,9 @@ class SplitKVFixup:
         sA1 = sbuf[0, ri, None]
         sA2 = sbuf[1, ri, None]
         sL = sbuf[2, ri, None]
+        wl = window_left
+        if cutlass.const_expr(not self.causal):
+            wl = Int32(-1)  # no window in the non-causal class
         for grp in cutlass.range(grp0, num_groups, grid_y):
             rows = mGroups[(grp, G_ROWS)]
             # every thread of the block reaches the fold's barriers: a row past the group's rows folds a clamped (valid) row and stores nothing
@@ -510,6 +519,9 @@ class SplitKVFixup:
             q_len = mGroups[(grp, G_QLEN)]
             token = q_tok0 + rr // g
             pos = kv_len - q_len + token
+            if cutlass.const_expr(not self.causal):
+                # the non-causal class: every row's present chunks are the whole key range's (the last position, no window)
+                pos = kv_len - 1
             o = cute.make_rmem_tensor(cute.make_layout((V,)), Float32)
             l = fold_row_coop(
                 mWs,
@@ -523,7 +535,7 @@ class SplitKVFixup:
                 pos,
                 c,
                 nc,
-                window_left,
+                wl,
                 rr,
                 d0,
                 o,
@@ -554,8 +566,10 @@ MAX_GRID_Y = (
 
 
 @functools.cache
-def get_fixup(D: int, g: int):
-    name = jit.sanitize_symbol_name(f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}")
+def get_fixup(D: int, g: int, causal: bool = True):
+    name = jit.sanitize_symbol_name(
+        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}" + ("" if causal else "_nc")
+    )
 
     def compile_fn():
         f32, i32, bf16 = cutlass.Float32, cutlass.Int32, cutlass.BFloat16
@@ -573,7 +587,7 @@ def get_fixup(D: int, g: int):
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            SplitKVFixup(D, g),
+            SplitKVFixup(D, g, causal=causal),
             ws_fake,
             o_fake,
             groups_fake,

@@ -233,14 +233,19 @@ def unit_loop(
     assert len(reg_f) == T and len(reg_s) == kpt, (
         "every key must be owned exactly once by the thread"
     )
+    # the row's visible keys [lo_row, L_row): causal, the bottom-right position's prefix (and the window); non-causal, every
+    # key of the request -- as if every row sat at the last position with no window (the same masking code, a static choice)
     token = q_tok0 + row // g
     pos = kv_len - q_len + token
+    if cutlass.const_expr(not st.causal):
+        pos = kv_len - 1
     L_row = pos + 1
     lo_row = Int32(0)
-    if window_left >= 0:
-        lo_row = pos - window_left
-        if lo_row < 0:
-            lo_row = Int32(0)
+    if cutlass.const_expr(st.causal):
+        if window_left >= 0:
+            lo_row = pos - window_left
+            if lo_row < 0:
+                lo_row = Int32(0)
     neg_inf = Float32(_NEG_INF)
     m = Float32(_NEG_INF)
     N = tile_hi - tile_lo
