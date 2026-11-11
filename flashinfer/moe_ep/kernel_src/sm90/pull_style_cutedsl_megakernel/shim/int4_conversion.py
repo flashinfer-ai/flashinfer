@@ -3,8 +3,9 @@
 """Register lookup for signed INT4 weights with prepared FP8 byte tables.
 
 Prepared nibbles put the sign in bit 2 and the magnitude index in bits 0, 1
-and 3, with code 11 reserved for zero. Each K128 row stores eight positive
-FP8 magnitudes in a uint64. Two PRMT lookups and XOR recover signed values.
+and 3, with code 11 reserved for zero. Each K128 row stores FP8 bytes for
++1..+4 and -5..-8 times its scale. Two PRMT lookups and XOR recover signed
+values; paired rows share one 128-bit table load.
 """
 
 import functools
@@ -25,15 +26,15 @@ def _table_registers(row):
 def _table_lines(row):
     return [
         f"xor.b32 a{row}1, a{row}0, 0x7f7f7f7f;",
-        f"and.b32 b{row}0, b{row}1, 0x00ffffff;",
-        f"or.b32 b{row}1, b{row}1, 0x80808080;",
+        f"and.b32 b{row}0, b{row}1, 0x007f7f7f;",
     ]
 
 
 def _decode_lines(src, lo, hi, out0, out1):
     # PRMT's selector bit 3 replicates the selected byte's sign bit.
     # A's bytes have sign 0; B's negative entries supply 0xff to complement
-    # A, while its positive entries supply 0. Zero-filled tables remain zero.
+    # A, while its positive entries supply 0. Zero-filled payload and tables
+    # give positive zero.
     return [
         f"xor.b32 flip, {src}, 0x88888888;",
         f"prmt.b32 a, a{lo}0, a{lo}1, {src};",
@@ -82,11 +83,14 @@ def _group_asm(count):
     outputs, words = 8 * count, 4 * count
     address_base = outputs + words
     lines = ["{", ".reg .b32 idx, flip, a, b;"]
-    for row in range(4):
+    for pair in range(2):
+        lo, hi = pair * 2, pair * 2 + 1
         lines += [
-            _table_registers(row),
-            f"ld.shared.v2.b32 {{a{row}0,b{row}1}}, [${address_base + row}];",
-            *_table_lines(row),
+            _table_registers(lo),
+            _table_registers(hi),
+            f"ld.shared.v4.b32 {{a{lo}0,b{lo}1,a{hi}0,b{hi}1}}, [${address_base + pair}];",
+            *_table_lines(lo),
+            *_table_lines(hi),
         ]
     for j in range(count):
         for word in range(4):
@@ -127,14 +131,12 @@ def convert_int4_group(
     for pair in cutlass.range_constexpr(2):
         row = cute.filter(vm[(None, pair * 2)])
         assert cute.size(row) in (2, 8)
-        hi = 4 if cute.size(row) == 8 else 1
         values.append(Int32(row.iterator.toint()))
-        values.append(Int32((row.iterator + cute.crd2idx(hi, row.layout)).toint()))
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32()] * (8 * count)),
         [v.ir_value() for v in values],
         _group_asm(count),
-        ",".join(["=r"] * (8 * count) + ["r"] * (4 * count + 4)),
+        ",".join(["=r"] * (8 * count) + ["r"] * (4 * count + 2)),
         has_side_effects=True,
     )
     for j in cutlass.range_constexpr(count):
@@ -165,13 +167,14 @@ def _make_expanded_scale_view(
     tile_m: cutlass.Constexpr,
     k128_blocks: cutlass.Constexpr,
 ):
-    # Consecutive logical M rows occupy consecutive uint64 entries, avoiding
-    # the bank conflicts introduced by the transposed 16-bit scale layout.
+    # Pair M=u and M=u+8 inside each M16 block in one aligned 16-byte
+    # vector. The physical producer layout stays contiguous; this view
+    # restores logical M order for the MMA partition.
     elements_per_m = 64 * k128_blocks
     layout = cute.make_layout(
-        ((8, 8, tile_m // 64), (128, k128_blocks), raw_scales.shape[4]),
+        ((8, (2, 4), tile_m // 64), (128, k128_blocks), raw_scales.shape[4]),
         stride=(
-            (1, 8, elements_per_m),
+            (2, (1, 16), elements_per_m),
             (0, 64),
             (tile_m // 64) * elements_per_m,
         ),

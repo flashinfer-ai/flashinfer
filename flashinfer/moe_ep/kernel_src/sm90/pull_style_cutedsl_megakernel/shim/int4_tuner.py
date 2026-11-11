@@ -15,7 +15,7 @@ from .mxfp4_optimization import (
     normalize_mxfp4_optimization_tactic,
 )
 
-INT4_TUNING_VERSION = "int4_k128_bf16_xor_reglut_linear_m64_v1"
+INT4_TUNING_VERSION = "int4_k128_bf16_xor_reglut_pair_m16_presigned_v2"
 
 
 def normalize_hopper_int4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:

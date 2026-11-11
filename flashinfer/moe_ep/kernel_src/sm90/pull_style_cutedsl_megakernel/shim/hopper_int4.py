@@ -29,7 +29,7 @@ from .hopper_mxfp4 import (
 
 TransformedInt4Weights = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 _INT4_TUNING_DTYPE_ID = (
-    "sm90_w_int4_signed_k128_bf16_xor_reglut_linear_m64_a_fp8_hybrid_fused_v1"
+    "sm90_w_int4_signed_k128_bf16_xor_reglut_pair_m16_presigned_a_fp8_hybrid_fused_v2"
 )
 
 
@@ -76,8 +76,8 @@ class MegaMoEHopperInt4Frontend(MegaMoEHopperMxfp4Frontend):
     def _mega_compile_key(self) -> tuple:
         c = self.config
         return (
-            "sm90_int4_fp8_megamoe_v2",
-            "signed_int4_bf16_k128_xor_reglut_linear_m64",
+            "sm90_int4_fp8_megamoe_v3",
+            "signed_int4_bf16_k128_xor_reglut_pair_m16_presigned_v2",
             ("optimization_policy", c.optimizations.identity()),
             ("compact_pull_buffer", c.compact_pull_buffer),
             ("dispatch_pull", c.dispatch_pull_batch, c.dispatch_pull_rotate),

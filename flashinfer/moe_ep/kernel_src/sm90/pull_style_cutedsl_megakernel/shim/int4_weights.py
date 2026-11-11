@@ -68,10 +68,10 @@ def interleave_int4_weights(payload: "torch.Tensor") -> "torch.Tensor":
 def fold_int4_scales(scales: "torch.Tensor") -> "torch.Tensor":
     """Build UINT64 tables in ``[E,M/64,K/128,8,8]`` storage.
 
-    Each table stores the E4M3 bytes for ``1*scale`` through ``8*scale``.
+    Each table stores positive E4M3 bytes 1..4 and negative bytes 5..8.
     Multiplication rounds to BF16 before the saturating FP8 conversion.
-    Logical M rows are contiguous inside each M64/K128 block, allowing
-    lane-quad broadcasts without shared-memory bank conflicts.
+    Each aligned 16-byte pair holds logical rows u and u+8 within an
+    M16 block. A warp reads eight distinct pairs with lane-quad broadcasts.
     """
     import torch
 
@@ -84,9 +84,14 @@ def fold_int4_scales(scales: "torch.Tensor") -> "torch.Tensor":
     # Clamp after BF16 multiplication: this also saturates BF16 overflow and
     # avoids the NaN result of an out-of-range float8_e4m3fn cast.
     values = (scales.unsqueeze(-1) * magnitudes).clamp(max=448)
-    tables = values.to(torch.float8_e4m3fn).view(torch.uint64).squeeze(-1)
+    fp8_bytes = values.to(torch.float8_e4m3fn).view(torch.uint8)
+    fp8_bytes[..., 4:] |= 0x80
+    tables = fp8_bytes.view(torch.uint64).squeeze(-1)
     return (
-        tables.reshape(e, rows // 64, 8, 8, groups).permute(0, 1, 4, 2, 3).contiguous()
+        tables.reshape(e, rows // 64, 4, 2, 8, groups)
+        .permute(0, 1, 5, 2, 4, 3)
+        .contiguous()
+        .reshape(e, rows // 64, groups, 8, 8)
     )
 
 

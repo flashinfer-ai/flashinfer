@@ -23,15 +23,18 @@ must be multiples of 128; a K256 tactic requires multiples of 256.
 Preprocessing applies gate8/up8 ordering to FC1 and the SM90 INT4 M16/K64
 payload interleave. Prepared nibbles store the sign in bit 2 and the
 `abs(q)-1` index in bits 0, 1 and 3; zero uses code 11. Each scale becomes an
-eight-byte table for `1` through `8`. Two PRMT lookups use sign replication
+eight-byte table for `+1..+4` and `-5..-8`. Two PRMT lookups use sign replication
 and XOR to recover four signed FP8 bytes, reusing each table across the K32
-fragments in a K128 group. Zero-filled metadata decodes to signed zeros.
+fragments in a K128 group. Paired rows share a 128-bit table load. Zero-filled
+payload and metadata decode to positive zero.
 
 Each prepared leg contains `(payload, tables, unit_activation, unit_expert)`:
 `payload` is uint8 `[E,K/2,M]` with storage-K stride 1; `tables` is contiguous
-uint64 `[E,M/64,K/128,8,8]`, with logical row `m` at
-`[e,m//64,k//128,(m%64)//8,m%8]`. The two FP32 unit tensors preserve the shared
-launcher ABI. Prepared weights are specific to this INT4 frontend.
+uint64 `[E,M/64,K/128,8,8]`. Within each M64 block, row `m` has table index
+`p = 16*((m%64)//16) + 2*(m%8) + (m//8)%2`, stored at
+`[e,m//64,k//128,p//8,p%8]`. This pairs rows `u` and `u+8` inside each M16 block.
+The two FP32 unit tensors preserve the shared launcher ABI. Prepared weights
+are specific to this INT4 frontend.
 
 ## Explicit launch
 

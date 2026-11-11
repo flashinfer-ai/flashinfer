@@ -78,7 +78,7 @@ class Sm90PullInt4MegaKernelBackend(Sm90PullMxfp4MegaKernelBackend):
     def _workspace_pool_key_from_config(self, resolved_config: Any) -> Any:
         return (
             self.kernel_name(),
-            "signed_int4_bf16_k128_xor_reglut_linear_m64",
+            "signed_int4_bf16_k128_xor_reglut_pair_m16_presigned_v2",
             torch.cuda.current_device(),
             id(self._ep_comm_group),
             resolved_config,

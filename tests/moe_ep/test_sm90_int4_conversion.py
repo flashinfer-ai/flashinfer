@@ -64,7 +64,10 @@ def test_int4_conversion_all_positive_bf16_scales():
     sf = scales.to(torch.int16).view(torch.bfloat16)
     # Construct tables independently of the production weight-preparation code.
     metadata = (
-        (torch.arange(1, 9, device="cuda").bfloat16() * sf[:, :, None])
+        (
+            torch.tensor([1, 2, 3, 4, -5, -6, -7, -8], device="cuda").bfloat16()
+            * sf[:, :, None]
+        )
         .clamp(-448, 448)
         .to(torch.float8_e4m3fn)
         .view(torch.uint64)
@@ -163,6 +166,8 @@ def test_int4_scale_layout_coordinates(tile_m, tile_k):
         stage * (tile_m * k_blocks)
         + (m // 64) * (64 * k_blocks)
         + (k // 128) * 64
-        + m % 64
+        + (m % 64) // 16 * 16
+        + (m % 8) * 2
+        + (m // 8) % 2
     )
     torch.testing.assert_close(actual, expected.to(torch.int32), rtol=0, atol=0)

@@ -94,7 +94,11 @@ def _check_cache(monkeypatch, cache_path):
         tuning_provenance_sha256=provenance,
     )
     winner = tuner.hopper_int4_candidates(2048, **_SHAPE)[-1]
-    for dtype in (mxfp4._MXFP4_TUNING_DTYPE_ID, nvfp4._NVFP4_TUNING_DTYPE_ID):
+    for dtype in (
+        mxfp4._MXFP4_TUNING_DTYPE_ID,
+        nvfp4._NVFP4_TUNING_DTYPE_ID,
+        "sm90_w_int4_signed_k128_bf16_xor_reglut_linear_m64_a_fp8_hybrid_fused_v1",
+    ):
         assert cache.record_knobs(winner, **{**key, "dtype": dtype}) is not None
     assert cache.lookup_knobs(**key) is None
     assert cache.record_knobs(winner, **key) is not None

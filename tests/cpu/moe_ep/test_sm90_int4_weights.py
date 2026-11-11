@@ -76,7 +76,7 @@ def _pack():
     return weights.Int4WeightPack(w13, s13, w2, s2)
 
 
-def test_scale_tables_rounding_and_linear_row_layout():
+def test_scale_tables_rounding_and_paired_row_layout():
     # Includes FP8 underflow, double-rounding, ties, and saturation.
     values = torch.tensor(
         [2**-20, 2**-12, 2**-9, 0.035888671875, 0.140625, 0.333984375, 1, 56, 60],
@@ -90,15 +90,17 @@ def test_scale_tables_rounding_and_linear_row_layout():
     actual_bytes = actual.view(torch.uint8).reshape(*actual.shape, 8)
     expected_rows = {
         scale: torch.tensor(
-            [_fp8_after_bf16(q * scale) for q in range(1, 9)], dtype=torch.uint8
+            [_fp8_after_bf16(q * scale) for q in (1, 2, 3, 4, -5, -6, -7, -8)],
+            dtype=torch.uint8,
         )
         for scale in values.tolist()
     }
     for expert in range(2):
         for m in range(128):
+            row = (m % 64) // 16 * 16 + (m % 8) * 2 + (m // 8) % 2
             for group in range(3):
                 assert torch.equal(
-                    actual_bytes[expert, m // 64, group, (m % 64) // 8, m % 8],
+                    actual_bytes[expert, m // 64, group, row // 8, row % 8],
                     expected_rows[float(scales[expert, m, group])],
                 )
 
@@ -129,15 +131,17 @@ def test_preprocessing_payload_gate_up_metadata_and_chunking():
         table_bytes = tables.view(torch.uint8).reshape(*tables.shape, 8)
         for m in range(scales.shape[1]):
             expected = (
-                (torch.arange(1, 9).float() * scales[:, m, :, None].float())
+                (
+                    torch.tensor([1, 2, 3, 4, -5, -6, -7, -8]).float()
+                    * scales[:, m, :, None].float()
+                )
                 .bfloat16()
                 .clamp(-448, 448)
                 .to(torch.float8_e4m3fn)
                 .view(torch.uint8)
             )
-            assert torch.equal(
-                table_bytes[:, m // 64, :, (m % 64) // 8, m % 8], expected
-            )
+            row = (m % 64) // 16 * 16 + (m % 8) * 2 + (m // 8) % 2
+            assert torch.equal(table_bytes[:, m // 64, :, row // 8, row % 8], expected)
         assert torch.equal(activation_scale, torch.ones(1))
         assert torch.equal(expert_scale, torch.ones(3))
         for actual, other in zip(prepared[index], one_chunk[index], strict=True):
