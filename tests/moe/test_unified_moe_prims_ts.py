@@ -60,7 +60,7 @@ from flashinfer.fused_moe.api import (
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.prims_ts.utils import is_prims_ts_available
-from flashinfer.tllm_enums import RoutingMethodType
+from flashinfer.tllm_enums import RoutingMethodType, WeightLayout
 from flashinfer.utils import get_compute_capability
 from tests.moe.test_unified_moe import (
     SMALL,
@@ -728,6 +728,118 @@ class TestPrimsTsUnifiedGpu:
             prims_weights,
         )
         assert torch.equal(fp32_out, prims_out)
+
+    def test_mxfp4_mxfp8_fused_finalize_two_cta_fc2_past_hidden(self, monkeypatch):
+        """A two-CTA FC2 tile that ends past the hidden size.
+
+        Hidden size 384 is three 128-row tiles, so the second CTA of the last
+        two-CTA tile covers rows 384..511. The fused epilogue stores only the
+        rows below the hidden size; with unit routing weights it matches the
+        unfused finalize bit for bit. The tactic is pinned because the
+        autotuner need not pick a two-CTA FC2 tile.
+        """
+        from flashinfer.prims_ts.moe import runner as prims_runner
+        from flashinfer.prims_ts.moe.config_mapper import (
+            map_trtllm_mxfp4_mxfp8_moe_tactic,
+            valid_prims_ts_mxfp4_mxfp8_moe_tactics,
+        )
+
+        torch.manual_seed(0)
+        device = torch.device("cuda", torch.cuda.current_device())
+        num_tokens, num_experts, local, offset, top_k = 300, 16, 4, 4, 2
+        hidden, intermediate = 384, 256
+        quant = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+        x = torch.randn(num_tokens, hidden, device=device, dtype=torch.bfloat16)
+        w1 = torch.randn(
+            local, intermediate * 2, hidden, device=device, dtype=torch.bfloat16
+        )
+        w2 = torch.randn(
+            local, hidden, intermediate, device=device, dtype=torch.bfloat16
+        )
+        topk_ids = torch.stack(
+            [
+                torch.randperm(num_experts, device=device)[:top_k]
+                for _ in range(num_tokens)
+            ]
+        ).to(torch.int32)
+
+        x_q, x_scale = PrimsTsConfig.prepare_activations(x, quant=quant)
+        weights = MoEWeightPack()
+        weights.prepare_for(
+            "prims_ts",
+            PrimsTsConfig.prepare_weights(
+                w1,
+                w2,
+                quant=quant,
+                num_local_experts=local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=SwiGLU(),
+                device=device,
+            ),
+        )
+        act = MoEActivationPack(
+            x_q,
+            x_scale,
+            topk_ids,
+            torch.ones(num_tokens, top_k, device=device, dtype=torch.bfloat16),
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+            quant=quant,
+            experts=ExpertConfig(
+                intermediate_size=intermediate,
+                local_expert_offset=offset,
+                local_num_experts=local,
+            ),
+            activation=SwiGLU(),
+            execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
+            backend=BackendOptions((PrimsTsConfig(),)),
+        )
+        runner = _build_direct_runner(PrimsTsRunner, config, device)
+        inputs = runner.pack_inputs(act, weights)
+
+        major, minor = get_compute_capability(device)
+        tactic_kwargs = dict(
+            sm_arch=major * 10 + minor,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_local_experts=local,
+            num_experts=num_experts,
+            weight_layout=int(WeightLayout.BlockMajorK),
+        )
+        two_cta = [
+            tactic
+            for tactic in valid_prims_ts_mxfp4_mxfp8_moe_tactics(**tactic_kwargs)
+            if int(
+                map_trtllm_mxfp4_mxfp8_moe_tactic(
+                    tactic, **tactic_kwargs
+                ).fc2.cfg.kwargs.get("umma_cta_count", 1)
+            )
+            == 2
+        ]
+        assert two_cta
+
+        fused = []
+        apply_fused_finalize = prims_runner.apply_fused_finalize
+
+        def recording_apply(pair, **kwargs):
+            pair = apply_fused_finalize(pair, **kwargs)
+            fused.append(pair.fc2.cfg.build().fused_finalize_top_k)
+            return pair
+
+        def forward(apply):
+            with monkeypatch.context() as patch:
+                patch.setattr(prims_runner, "apply_fused_finalize", apply)
+                return runner.forward(
+                    inputs, tactic=two_cta[0], **runner.launch_kwargs_for(inputs)
+                ).clone()
+
+        fused_out = forward(recording_apply)
+        plain_out = forward(lambda pair, **kwargs: pair)
+        assert fused and all(k == top_k for k in fused)
+        assert torch.equal(fused_out, plain_out)
 
     @pytest.mark.parametrize(
         "quant",
