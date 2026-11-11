@@ -6,6 +6,7 @@ import torch
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
 from flashinfer.gemm import grouped_gemm_nt_masked
 from flashinfer.quantization.fp4_quantization import scaled_fp4_grouped_quantize
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.tllm_enums import ActivationType
 from flashinfer.utils import get_compute_capability
 
@@ -573,3 +574,12 @@ def test_nvfp4_output_rejects_non_default_recipe(monkeypatch, env_var):
     monkeypatch.setenv(env_var, "1")
     with pytest.raises(ValueError, match=env_var):
         _run_invalid_nvfp4()
+
+
+def test_nvfp4_output_4over6_argument_overrides_env(monkeypatch):
+    _skip_unless_sm100()
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    _run_invalid_nvfp4(nvfp4_4over6=None)
+    monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6")
+    with pytest.raises(ValueError, match="4over6"):
+        _run_invalid_nvfp4(nvfp4_4over6=NVFP44Over6Config())
