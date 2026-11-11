@@ -640,6 +640,36 @@ def test_dsv3_fused_routing_rejects_strided_views(backend, strided):
         )
 
 
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk",
+    [
+        pytest.param(256, 8, 4, 8, id="grouped"),
+        pytest.param(256, 1, 1, 1, id="single256"),
+        pytest.param(128, 1, 1, 1, id="single128"),
+    ],
+)
+@pytest.mark.parametrize("with_replay", [False, True])
+def test_zero_tokens_launch_nothing(
+    num_experts, n_group, topk_group, topk, with_replay
+):
+    """Zero tokens used to launch a zero-sized grid: the launch error was never checked and surfaced
+    on the next unrelated CUDA call (TensorRT-LLM #19727, #19988)."""
+    scores = torch.empty(0, num_experts, device="cuda", dtype=torch.bfloat16)
+    bias = torch.zeros(num_experts, device="cuda", dtype=torch.bfloat16)
+    values = torch.empty(0, topk, device="cuda", dtype=torch.bfloat16)
+    indices = torch.empty(0, topk, device="cuda", dtype=torch.int32)
+    replay = (
+        torch.empty(0, topk, device="cuda", dtype=torch.int16) if with_replay else None
+    )
+    fused_topk_deepseek(
+        scores, bias, n_group, topk_group, topk, 1.0, values, indices, True, replay
+    )
+    torch.cuda.synchronize()
+    assert values.shape == (0, topk) and indices.shape == (0, topk)
+    # the next CUDA call must not inherit a launch error
+    assert int(torch.ones(4, device="cuda").sum().item()) == 4
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 16, 64])
 @pytest.mark.parametrize("num_experts", [256, 384])
 @pytest.mark.parametrize("topk", [1, 2, 4, 8])
