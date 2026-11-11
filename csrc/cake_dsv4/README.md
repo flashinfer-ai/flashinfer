@@ -10,9 +10,23 @@ programmatic dependents (they wait for the previous grid before their first
 global read and trigger their own dependents right after); without it, the
 H128 persistent program's `_no_pdl` twin, the same kernel without the two
 `griddepcontrol` instructions, runs on SM103 launches of at least 384 query rows
-and on SM100 calls whose longest request has at least 257 query tokens.
+and on SM100 calls whose longest request has at least 257 query tokens. On SM107
+the FP8 H128 uniform-gather persistent route's `_k64` sibling, the same work
+with every MMA a one-CTA M128 tile at K=64, runs on launches of at least 48
+query rows; SM107 decode launches of at least 160 query rows also take that
+route instead of the lane-gather one when each request holds one query row (at
+most 2 from 256 rows) or, on calls that read a 64-row-page compressed cache
+(compress ratio 4), at most 4 query rows (at most 8 from 256 rows).
 The other BF16 / FP8 programs launch without it, and the NVFP4 family rejects
-it. The TRTLLM-GEN RopeQuant epilogue is not supported.
+it. On SM107 the FP8 low-head prefill route's `_overlap` sibling, the same work
+with the P x V MMAs started on the low half of P and the output drained per V
+block, runs on launches of at most 64 query rows (scaled down with the SM count
+below 216 SMs); routing its `VARIANTS` key to the route's program retires it.
+Its `_vblock` sibling, the same work split into one 128-column V block of the
+output per CTA (four CTAs per query row) with the same output bits, runs before
+it on launches of at most 27 query rows (scaled down with the SM count below
+216 SMs); routing its `VARIANTS` key to the route's or the `_overlap` sibling's
+program retires it. The TRTLLM-GEN RopeQuant epilogue is not supported.
 
 ```python
 from flashinfer.mla import (
@@ -62,7 +76,9 @@ launch. Bindings perform no device allocation.
   (`sparse_indices [T, sparse_topk]`) and separate (`sparse_indices [T, 128]` +
   `extra_sparse_indices [T, topk_c]`, lengths via `sparse_topk_lens` or
   `extra_sparse_topk_lens`) tables are resolved without copies; int32, unit column
-  stride, free row stride.
+  stride, a 16-byte aligned start and, with more than one row, a row stride that
+  is a multiple of 4 (the kernels load index rows 16 bytes at a time; the host
+  rejects other tables).
 * Padded rows: `num_query_tokens = T` is the metadata row count; `query` / `out`
   may carry more rows, rows `>= T` are neither read nor written.
 * Workspace (contiguous, 128-byte aligned): `[0, 1024)` reserved,

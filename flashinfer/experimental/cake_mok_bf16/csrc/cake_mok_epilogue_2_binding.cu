@@ -81,7 +81,7 @@ void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, Te
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 37888u;
+  config.dynamicSmemBytes = 0u;
   config.stream = stream;
   cudaError_t launch_status = cudaLaunchKernelExC(
       &config, reinterpret_cast<const void*>(CAKE_MOK_KERNEL), kargs);

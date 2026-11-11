@@ -10,7 +10,7 @@ from tests.comm.test_ulysses_communicator import (
     requires_cuda,
 )
 
-from tests.test_helpers.ulysses import forbid_ipc_and_jit
+from tests.comm.test_helpers.ulysses import forbid_ipc_and_jit
 
 
 def _exchange_body(rank, world, group, backend):

@@ -853,10 +853,7 @@ class MoERunner(TunableRunner):
             resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
         )
 
-    # Anything the profiled tensor shapes cannot reveal has to be listed here.
-    # One stable tuple feeds both __hash__ (in-memory) and the persisted key,
-    # which excludes runner_hash. Shapes already in the profile are omitted.
-
+    # Persisted key (no runner_hash), so rank-invariant; __hash__ adds the EP offset.
     def _cache_key_extras(self) -> tuple:
         """Return stable tactic inputs absent from profiled tensor shapes."""
         routing = self.config.routing
@@ -875,7 +872,6 @@ class MoERunner(TunableRunner):
             int(routing.top_k),
             int(routing.num_experts),
             int(local_num_experts),
-            int(experts.local_expert_offset),
             int(experts.intermediate_size),
             # S changes tactic enumeration but not profiled tensor shapes.
             int(experts.num_fused_shared_experts),
@@ -895,7 +891,10 @@ class MoERunner(TunableRunner):
         )
 
     def __hash__(self) -> int:
-        return hash(self._cache_key_extras())
+        # In-memory only: EP ranks must share persisted entries (#6082).
+        return hash(
+            (self._cache_key_extras(), int(self.config.experts.local_expert_offset))
+        )
 
     def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         """Optional tactic-pool identity, stable for packed and profiling inputs."""
@@ -7824,22 +7823,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         per_token_scale = None
         if is_fp4:
+            # MXFP4xMXFP8 keeps the compact TRT-LLM UE8M0 row here;
+            # PrimsTsMxfp4Mxfp8MoERunner pads it to the GEMM's row stride.
             hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
-            if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
-                # TRT-LLM stores a compact linear UE8M0 row. The Prims-TS
-                # MXFP8 activation GEMM reads K-blocks rounded up to 16.
-                # Padding happens on every pack_inputs, including the hot
-                # forward path: one allocation, fill, and copy per call, so
-                # the public activation pack can stay the shared TRT-LLM layout.
-                from flashinfer.prims_ts.moe.runner import (
-                    _pad_mxfp8_linear_scale_for_prims,
-                )
-
-                hidden_states_scale = _pad_mxfp8_linear_scale_for_prims(
-                    hidden_states_scale,
-                    num_tokens=num_tokens,
-                    hidden_size=hidden_size,
-                ).view(torch.float8_e4m3fn)
             if is_nvfp4:
                 if self._per_token and act.per_token_scale is None:
                     raise RuntimeError(
@@ -8737,6 +8723,36 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
+def _sm12x_nvfp4_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
+    if isinstance(activation, ReLU2):
+        return {"activation": ActivationType.Relu2}
+    if isinstance(activation, SwiGLU):
+        default = SwiGLU()
+        if activation.alpha != default.alpha or activation.beta != default.beta:
+            raise NotImplementedError(
+                "SM12x NVFP4 supports only default SwiGLU alpha and beta."
+            )
+        return {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": (
+                None if activation.limit == default.limit else activation.limit
+            ),
+        }
+    if isinstance(activation, SiTU):
+        if activation.linear_scale is None or activation.clamp_limit is not None:
+            raise NotImplementedError(
+                "SM12x NVFP4 requires a finite SiTU linear scale and no clamp limit."
+            )
+        return {
+            "activation": ActivationType.Situ,
+            "situ_beta": activation.gate_scale,
+            "situ_linear_beta": activation.linear_scale,
+        }
+    raise NotImplementedError(
+        f"SM12x NVFP4 does not support {type(activation).__name__}."
+    )
+
+
 # SM12x NVFP4 x BF16 runner - shared cuTile NVFP4 weight view, fixed tactic
 # ---------------------------------------------------------------------------
 
@@ -8761,7 +8777,10 @@ class SM12xNvfp4Bf16Runner(MoERunner):
     weight_view_keys = (backend_key, *weight_view_aliases)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        ReLU2,
+    )
     supports_expert_parallelism = False
 
     def __init__(self, config: MoEConfig, device: torch.device):
@@ -8964,28 +8983,28 @@ class SM12xNvfp4Bf16Runner(MoERunner):
 
 
 class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
-    """CuTe-DSL W4A4 over the canonical NVFP4 weights shared with W4A16.
+    """Shape-aware CuTe-DSL W4A4 over canonical weights shared with W4A16.
 
     BF16 hidden states are quantized to NVFP4 inside the op with the per-layer
-    activation global scales of the weight view (default 1). Kernels are
-    specialized per token count, so calls are padded to the layer's hybrid
-    token bucket with expert id -1 rows, which the router drops.
+    activation global scales of the weight view (default 1). Default SwiGLU
+    and ReLU2 select between the monolithic and modular implementations on
+    188-SM devices. Non-default SwiGLU limits, SiTU and explicit PDL requests
+    use the modular operators. Calls retain hybrid token-bucket padding with
+    expert id -1 rows, which the router drops.
     """
 
     backend_key = "sm12x_nvfp4"
     weight_view_keys = (backend_key, "cutile_nvfp4")
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supported_activation_classes = (SwiGLU, SiTU, ReLU2)
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__(config, device)
         self._unit_scale: Optional[torch.Tensor] = None
+        self._native_workspaces: dict[tuple[int, int], tuple[Any, ...]] = {}
 
     def _check_activation_parameters(self) -> None:
-        activation = self.config.activation
-        if isinstance(activation, SwiGLU) and activation != SwiGLU():
-            raise NotImplementedError(
-                "SM12x NVFP4 supports only default SwiGLU alpha, beta and limit."
-            )
+        _sm12x_nvfp4_activation_kwargs(self.config.activation)
 
     def _check_support(self) -> None:
         MoERunner._check_support(self)
@@ -9010,12 +9029,23 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
             raise NotImplementedError(
                 f"SM12x NVFP4 requires intermediate_size % 64 == 0, got {inter}."
             )
+        if self.config.activation.is_gated and inter % 128 and self._requires_native():
+            raise NotImplementedError(
+                "SM12x NVFP4 modular gated activations require "
+                "intermediate_size % 128 == 0."
+            )
         if not self.config.activation.is_gated and inter < 128:
             raise NotImplementedError(
                 f"SM12x NVFP4 ReLU2 requires intermediate_size >= 128, got {inter}."
             )
 
     def _build(self) -> None:
+        from ..utils import get_device_sm_count
+        from .cute_dsl.blackwell_sm12x import (
+            moe_fp4_fc1_act_q1,
+            moe_fp4_fc2_finalize,
+            moe_fp4_q0_route_triton,
+        )
         from .cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
             allocate_workspace,
             run_moe_w4a4,
@@ -9023,6 +9053,154 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
 
         self._run = run_moe_w4a4
         self._allocate_workspace = allocate_workspace
+        self._fc1_module = moe_fp4_fc1_act_q1
+        self._fc2_module = moe_fp4_fc2_finalize
+        self._route_module = moe_fp4_q0_route_triton
+        self._num_sms = get_device_sm_count(self.device)
+
+    def _requires_native(self) -> bool:
+        activation = self.config.activation
+        return (
+            self.config.execution.enable_pdl is True
+            or isinstance(activation, SiTU)
+            or (isinstance(activation, SwiGLU) and activation != SwiGLU())
+        )
+
+    def _use_native(self, x: torch.Tensor, ids: torch.Tensor) -> bool:
+        if self._requires_native():
+            return True
+        activation = self.config.activation
+        inter = self.config.experts.intermediate_size
+        if activation.is_gated and inter % 128:
+            return False
+        if self._num_sms != 188:
+            return False
+        if isinstance(activation, ReLU2):
+            return True
+        experts = self.config.routing.num_experts
+        tile, _ = self._fc1_module.select_tactic(
+            total_rows=ids.numel(),
+            n=inter,
+            k=x.shape[1],
+            num_experts=experts,
+            num_sms=self._num_sms,
+        )
+        return tile[0] != 8 and (inter < 1024 or ids.numel() >= 96 * experts)
+
+    def _native_workspace(self, x: torch.Tensor, ids: torch.Tensor) -> tuple[Any, ...]:
+        key = tuple(x.shape)
+        scratch = self._native_workspaces.get(key)
+        if scratch is not None:
+            return scratch
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"{type(self).__name__} native workspace for token bucket "
+                f"{x.shape[0]} must be allocated before CUDA Graph capture; "
+                "warm this bucket first."
+            )
+        inter = self.config.experts.intermediate_size
+        experts = self.config.routing.num_experts
+        activation = _sm12x_nvfp4_activation_kwargs(self.config.activation)[
+            "activation"
+        ]
+        fc1_tile, gather = self._fc1_module.select_tactic(
+            total_rows=ids.numel(),
+            n=inter,
+            k=x.shape[1],
+            num_experts=experts,
+            num_sms=self._num_sms,
+            activation=activation,
+        )
+        fc2_tile = self._fc2_module.select_tile(
+            total_rows=ids.numel(),
+            n=x.shape[1],
+            k=inter,
+            num_experts=experts,
+            num_sms=self._num_sms,
+        )
+        if self._fc1_module.is_swapab(fc1_tile):
+            workspace = self._route_module.make_nvfp4_route_meta_workspace(
+                ids, experts, tile_m=fc1_tile[0]
+            )
+        elif gather:
+            workspace = self._route_module.make_nvfp4_route_meta_workspace(ids, experts)
+        else:
+            workspace = self._route_module.make_nvfp4_q0_route_workspace(
+                x, ids, experts
+            )
+        work = None
+        if self._fc2_module.is_swapab(fc2_tile):
+            if self._fc1_module.is_swapab(fc1_tile) and fc1_tile[0] == fc2_tile[0]:
+                work = (workspace.worklist, workspace.workcount)
+            else:
+                work = self._route_module.make_nvfp4_worklist_workspace(
+                    ids.numel(), experts, fc2_tile[0], self.device
+                )
+        q = torch.empty(
+            (ids.numel(), inter // 2), dtype=torch.uint8, device=self.device
+        )
+        sf = torch.zeros(
+            self._fc1_module.out_sf_shape(ids.numel(), inter, experts),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        scratch = (workspace, q, sf, fc1_tile, fc2_tile, work)
+        self._native_workspaces[key] = scratch
+        return scratch
+
+    def _forward_native(self, inputs: List[torch.Tensor]) -> None:
+        out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2 = inputs
+        with torch.cuda.device(x.device):
+            workspace, q, sf, fc1_tile, fc2_tile, work = self._native_workspace(x, ids)
+            enable_pdl = self.config.execution.enable_pdl is not False
+            out.zero_()
+            offsets, token_map, route_weights, q, sf = (
+                self._fc1_module.cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
+                    x,
+                    ids,
+                    topk_weights,
+                    w1,
+                    s1,
+                    a1,
+                    g1,
+                    a2,
+                    tile=fc1_tile,
+                    workspace=workspace,
+                    enable_pdl=enable_pdl,
+                    out_q=q,
+                    out_sf=sf,
+                    **_sm12x_nvfp4_activation_kwargs(self.config.activation),
+                )
+            )
+            work_args = {}
+            if work is not None:
+                worklist, workcount = work
+                if worklist is not getattr(workspace, "worklist", None):
+                    self._route_module.build_nvfp4_worklist(
+                        offsets,
+                        worklist,
+                        workcount,
+                        fc2_tile[0],
+                        total_rows=ids.numel(),
+                    )
+                work_args = dict(worklist=worklist, workcount=workcount)
+            self._fc2_module.cute_dsl_sm12x_fc2_finalize_nvfp4(
+                q,
+                sf,
+                w2,
+                s2,
+                offsets,
+                token_map,
+                route_weights,
+                g2,
+                a2,
+                x.shape[0],
+                tile=fc2_tile,
+                tune=False,
+                enable_pdl=enable_pdl,
+                out=out,
+                **work_args,
+            )
 
     def _activation_global_scale(
         self, view: dict[str, torch.Tensor], key: str
@@ -9111,8 +9289,13 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
         if tactic != -1:
             raise ValueError(f"{type(self).__name__} supports only tactic -1.")
         out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2 = inputs
-        workspace = self._workspace(x.shape[0], x.shape[1])
-        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2, out, workspace)
+        if self._use_native(x, ids):
+            self._forward_native(inputs)
+        else:
+            workspace = self._workspace(x.shape[0], x.shape[1])
+            self._run(
+                x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2, out, workspace
+            )
         return out[: getattr(inputs, "num_tokens", out.shape[0])]
 
 
@@ -10724,7 +10907,7 @@ class _GroupedGemmStageRunner(TunableRunner):
         return (*self.parent._cache_key_extras(), "stage", self.stage)
 
     def __hash__(self) -> int:
-        return hash(self.get_cache_key_extras([]))
+        return hash((hash(self.parent), "stage", self.stage))
 
 
 def __getattr__(name: str):

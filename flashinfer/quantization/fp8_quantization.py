@@ -162,6 +162,17 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     return padded_row * padded_column
 
 
+def _check_mxfp8_cuda_capability(device: torch.device) -> None:
+    """Reject pre-SM100 CUDA devices while allowing the CPU host path."""
+    if device.type == "cuda":
+        major, minor = get_compute_capability(device)
+        if major < 10:
+            raise RuntimeError(
+                "mxfp8_quantize with backend='cuda' requires SM100 or newer, "
+                f"got SM{major}{minor}"
+            )
+
+
 @functools.cache
 def get_mxfp8_quantization_sm100_module():
     module = gen_mxfp8_quantization_sm100_module().build_and_load()
@@ -214,6 +225,7 @@ def get_mxfp8_quantization_sm100_module():
             )
             return out_val, out_sf
         else:
+            _check_mxfp8_cuda_capability(input.device)
             if enable_pdl is None:
                 enable_pdl = device_support_pdl(input.device)
             m = input.numel() // input.shape[-1]
@@ -235,6 +247,13 @@ def get_mxfp8_quantization_sm100_module():
                     f"Invalid sf_swizzle_layout value: {sf_swizzle_layout}"
                 )
             out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
+            if input.dtype not in (torch.float16, torch.bfloat16):
+                raise NotImplementedError(
+                    "mxfp8_quantize only supports input tensor with dtypes fp16/bf16."
+                )
+            # A zero-row input would launch a zero-sized CUDA grid.
+            if m == 0:
+                return out_val, out_sf
             module.mxfp8_quantize(
                 input,
                 out_val,
@@ -362,8 +381,10 @@ def mxfp8_quantize(
     is_sf_swizzled_layout: bool = True,
     alignment: int = 32,
     enable_pdl: Optional[bool] = None,
-    backend: Literal["cuda", "cute-dsl"] = "cuda",
+    backend: Literal["auto", "cuda", "cute-dsl"] = "auto",
     sf_swizzle_layout: Optional[SfLayout] = None,
+    *,
+    batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MxFP8 format.
 
@@ -374,9 +395,10 @@ def mxfp8_quantize(
     Parameters
     ----------
     input : torch.Tensor
-        Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
-        The ``"cute-dsl"`` backend additionally supports fp32 input; the
-        ``"cuda"`` backend does not.
+        Input tensor of shape ``[M, K]``. CUDA inputs support fp16/bf16.
+        The ``"cute-dsl"`` backend additionally supports fp32 CUDA inputs;
+        the ``"cuda"`` backend does not. CPU inputs with ``backend="cuda"``
+        require ``torch.float32``.
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.
@@ -385,14 +407,28 @@ def mxfp8_quantize(
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Auto-detected
         from device capability (SM >= 9.0) when ``None``.
-    backend : {"cuda", "cute-dsl"}
+    backend : {"auto", "cuda", "cute-dsl"}
         Backend to use:
 
-        - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
+        - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
+          under ``batch_invariant=True`` (which requires ``"auto"``).
+        - ``"cuda"``: stable JIT-compiled kernel. CUDA inputs require
+          SM100 or newer. CPU inputs use the host implementation and
+          require ``torch.float32``.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``.
+    batch_invariant : bool
+        ``True`` runs the batch-invariant MXFP8 quantization class in place
+        of the backends (requires ``backend="auto"``): a row's bits depend on
+        its values alone, not on the batch it is quantized in, its position,
+        the configuration chosen or the SM count, and the result is
+        deterministic. The dataflow is TransformerEngine's MXFP8 chain,
+        fingerprinted as ``flashinfer.batch_invariant.fingerprint("mxfp8_quantize")``.
+        Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
 
     Returns
     -------
@@ -402,6 +438,12 @@ def mxfp8_quantize(
         shape depends on the chosen layout and ``sf_vec_size`` (fixed at
         ``32`` here).
 
+    Raises
+    ------
+    RuntimeError
+        If ``backend="cuda"`` receives a CUDA tensor on a device older
+        than SM100.
+
     Warnings
     --------
     The ``"cute-dsl"`` backend is **experimental** and not part of the
@@ -410,15 +452,30 @@ def mxfp8_quantize(
     """
     sf_vec_size = 32
 
-    assert input.shape[-1] % sf_vec_size == 0
-    assert backend in ("cuda", "cute-dsl"), (
-        f"backend must be 'cuda' or 'cute-dsl', got '{backend}'"
-    )
-
     if sf_swizzle_layout is None:
         sf_swizzle_layout = (
             SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
         )
+    if batch_invariant:
+        if backend != "auto":
+            raise ValueError(
+                "mxfp8_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
+            )
+        from ..batch_invariant.quantization.mx_api import (
+            mxfp8_quantize_batch_invariant,
+        )
+
+        return mxfp8_quantize_batch_invariant(
+            input, sf_swizzle_layout, alignment, enable_pdl
+        )
+
+    assert input.shape[-1] % sf_vec_size == 0
+    assert backend in ("auto", "cuda", "cute-dsl"), (
+        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
+    )
+    if backend == "auto":
+        backend = "cuda"
 
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
@@ -442,6 +499,7 @@ def mxfp8_quantize(
         )
     else:
         # backend == "cuda"
+        _check_mxfp8_cuda_capability(input.device)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
         x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(

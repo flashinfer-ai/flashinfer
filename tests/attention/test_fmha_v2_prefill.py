@@ -7,7 +7,10 @@ from typing import Optional, Tuple, Union
 import flashinfer
 
 from flashinfer.prefill import fmha_v2_prefill_deepseek, fmha_v2_prefill_sm120
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 from tests.utils_fp8 import to_float8
 from flashinfer.utils import is_sm12x_supported
 

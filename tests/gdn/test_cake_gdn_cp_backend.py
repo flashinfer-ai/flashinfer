@@ -26,7 +26,7 @@ import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_backend as gdn_cp
 from flashinfer.jit import cake_gdn_cp_backend as gdn_cp_jit
 from flashinfer.utils import is_sm100a_supported
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 from .reference_delta_rule import blockwise_delta_rule, delta_rule
 
@@ -493,7 +493,11 @@ def _sm107_plan(
 _ROW_SPLIT_CTAS = {
     "state_fixup_simt_row3_sb2": 43,
     "state_fixup_simt_row5_mb3": 26,
+    "state_fixup_simt_row7_sb2_mb3": 19,
+    "state_fixup_simt_row8_sb2_mb3": 16,
+    "state_fixup_simt_row8_mb3": 16,
     "state_fixup_simt_row10_sb2": 13,
+    "state_fixup_simt_row10_mb3": 13,
 }
 
 
@@ -502,11 +506,14 @@ _ROW_SPLIT_CTAS = {
     [
         # More than 2 CTAs per SM over sequences of one length: 3 CTAs per SM.
         ((1024,) * 8, 8, 212, "state_fixup_simt_row4_mb3"),
-        ((16384,), 14, 216, "state_fixup_simt_row4_mb3"),
-        # 16 states whose 26-CTA row split does not fit 2 CTAs per SM.
+        ((16384,), 15, 216, "state_fixup_simt_row4_mb3"),
+        # 16, 26 and 48 states whose row split does not fit its CTAs per SM.
         ((16384,), 16, 200, "state_fixup_simt_row4_mb3"),
-        # Sequences of one length with 4, 8, 16 or 32 states: the row-split
-        # builds (4 states from 6 CP chunks per sequence on).
+        ((16384,), 26, 200, "state_fixup_simt_row4_mb3"),
+        ((16384,), 48, 200, "state_fixup_simt_row4_mb3"),
+        # Sequences of one length with 4, 8, 14, 16, 22, 24, 26, 32, 36 or 48
+        # states: the row-split builds (4 states from 6 CP chunks per sequence
+        # on).
         ((16384,), 4, 212, "state_fixup_simt_row3_sb2"),
         ((4096,), 4, 212, "state_fixup_simt_row3_sb2"),
         ((16384,), 8, 212, "state_fixup_simt_row3_sb2"),
@@ -515,15 +522,30 @@ _ROW_SPLIT_CTAS = {
         ((16384,), 16, 216, "state_fixup_simt_row5_mb3"),
         ((8192, 8192), 16, 212, "state_fixup_simt_row10_sb2"),
         ((2048,) * 4, 8, 212, "state_fixup_simt_row10_sb2"),
+        ((16384,), 14, 216, "state_fixup_simt_row5_mb3"),
+        ((16384,), 14, 224, "state_fixup_simt_row5_mb3"),
+        ((8192, 8192), 7, 212, "state_fixup_simt_row5_mb3"),
+        ((16384,), 22, 212, "state_fixup_simt_row7_sb2_mb3"),
+        ((8192, 8192), 11, 216, "state_fixup_simt_row7_sb2_mb3"),
+        ((16384,), 24, 212, "state_fixup_simt_row8_sb2_mb3"),
+        ((8192,) * 3, 8, 212, "state_fixup_simt_row8_sb2_mb3"),
+        ((16384,), 26, 212, "state_fixup_simt_row8_mb3"),
+        ((8192, 8192), 13, 216, "state_fixup_simt_row8_mb3"),
+        ((8192,) * 3, 12, 212, "state_fixup_simt_row8_sb2_mb3"),
+        ((16384,), 36, 216, "state_fixup_simt_row8_sb2_mb3"),
+        ((16384,), 48, 212, "state_fixup_simt_row10_mb3"),
+        ((65536,), 48, 216, "state_fixup_simt_row10_mb3"),
         # At most 2 CTAs per SM: the default build.
         ((16384,), 6, 212, "state_fixup_simt_row4"),
         ((16384,), 8, 160, "state_fixup_simt_row4"),
-        ((16384,), 14, 224, "state_fixup_simt_row4"),
+        ((16384,), 12, 224, "state_fixup_simt_row4"),
         ((4096,), 13, 208, "state_fixup_simt_row4"),
         # Unequal sequences keep the default build at any grid: 8 heads over
         # 6144 + 2048 tokens is 512 CTAs, where the 3-CTA build is slower.
         ((6144, 2048), 8, 212, "state_fixup_simt_row4"),
         ((2048, 6144), 16, 212, "state_fixup_simt_row4"),
+        ((6144, 2048), 11, 212, "state_fixup_simt_row4"),
+        ((6144, 2048), 24, 212, "state_fixup_simt_row4"),
         ((0, 64, 0), 64, 148, "state_fixup_simt_row4"),
     ],
 )
@@ -620,6 +642,17 @@ def test_sm107_row_split_fixups_share_the_shipped_abi(
         ("state_fixup_simt_row5_mb3", 16, (6144, 2048), 1024),
         ("state_fixup_simt_row10_sb2", 32, (8192,), 1024),
         ("state_fixup_simt_row10_sb2", 2, (128, 128, 129), 128),
+        # Odd and even chunk counts: a two-buffer build's final state is in
+        # buffer num_chunks & 1, also when its rows divide 128 (8 rows).
+        ("state_fixup_simt_row7_sb2_mb3", 22, (3072,), 1024),
+        ("state_fixup_simt_row7_sb2_mb3", 11, (4096, 4096), 1024),
+        ("state_fixup_simt_row8_sb2_mb3", 24, (3072,), 1024),
+        ("state_fixup_simt_row8_sb2_mb3", 12, (4096, 4096), 1024),
+        ("state_fixup_simt_row8_sb2_mb3", 3, (1000, 1, 2000, 0, 640), 256),
+        ("state_fixup_simt_row8_mb3", 26, (3072,), 1024),
+        ("state_fixup_simt_row8_mb3", 13, (6144, 2048), 1024),
+        ("state_fixup_simt_row10_mb3", 48, (8192,), 1024),
+        ("state_fixup_simt_row10_mb3", 2, (128, 128, 129), 128),
     ],
 )
 def test_sm107_row_split_fixups_match_the_four_row_build_bitwise(

@@ -6094,6 +6094,22 @@ def kernel(
 
 
 @cute.jit
+def _token_major_tma_view(tensor: cute.Tensor) -> cute.Tensor:
+    # The packed batch mode is unused; keep its stride small even for a large
+    # token pitch. Token strides remain Int64 runtime values in the descriptor.
+    batch_stride = cutlass.Int64(tensor.shape[3])
+    if tensor.shape[0] != 1:
+        batch_stride = tensor.stride[0]
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout(
+            (tensor.shape[3], tensor.shape[1], tensor.shape[2], tensor.shape[0]),
+            stride=(1, tensor.stride[1], tensor.stride[2], batch_stride),
+        ),
+    )
+
+
+@cute.jit
 def host(
     q: cute.Tensor,
     k: cute.Tensor,
@@ -6119,35 +6135,13 @@ def host(
     THREADS: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
 ) -> None:
-    packed_batch = q.shape[0]
     num_sequences = cu_seqlens.shape[0] - 1
-    seqlen = q.shape[1]
     heads = q.shape[2]
-    # Token-major activations: memory order [T, H, D] (token stride = D*heads),
-    # so packed [1, T_total, H, D] / batched [B, T, H, D] callers are read
-    # directly with no transpose.
-    # Keep the unused outer stride representable by CuTe IR for packed inputs.
-    # CuTe layouts currently lower strides through signed Int32, so the natural
-    # D*T*H batch stride overflows once a singleton packed token buffer exceeds
-    # that range even though the batch coordinate is always zero.
-    qk_batch_stride = DK
-    v_batch_stride = DV
-    if packed_batch != cutlass.Int32(1):
-        qk_batch_stride = DK * seqlen * heads
-        v_batch_stride = DV * seqlen * heads
-    qk_layout = cute.make_layout(
-        (DK, seqlen, heads, packed_batch),
-        stride=(1, DK * heads, DK, qk_batch_stride),
-    )
-    v_layout = cute.make_layout(
-        (DV, seqlen, heads, packed_batch),
-        stride=(1, DV * heads, DV, v_batch_stride),
-    )
-    q_tma = cute.make_tensor(q.iterator, qk_layout)
-    k_tma = cute.make_tensor(k.iterator, qk_layout)
-    v_tma = cute.make_tensor(v.iterator, v_layout)
-    gate_tma = cute.make_tensor(raw_gate.iterator, qk_layout)
-    out_tma = cute.make_tensor(out.iterator, v_layout)
+    q_tma = _token_major_tma_view(q)
+    k_tma = _token_major_tma_view(k)
+    v_tma = _token_major_tma_view(v)
+    gate_tma = _token_major_tma_view(raw_gate)
+    out_tma = _token_major_tma_view(out)
     raw_f16_tma_box = (RAW_F16_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     raw_f32_tma_box = (RAW_F32_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     o_tma_box = (O_TMA_SWIZZLE_ELEMS, BT, 1, 1)
@@ -6804,30 +6798,24 @@ def host_prep(
     THREADS: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
 ) -> None:
-    seqlen = q.shape[1]
     heads = q.shape[2]
-    # Token-major user activations (see host()).
-    qk_layout = cute.make_layout(
-        (DK, seqlen, heads, 1),
-        stride=(1, DK * heads, DK, DK * seqlen * heads),
-    )
     raw_f16_tma_box = (RAW_F16_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     raw_f32_tma_box = (RAW_F32_TMA_SWIZZLE_ELEMS, BT, 1, 1)
     tma_desc_q = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(q.iterator, qk_layout),
+        _token_major_tma_view(q),
         box_dims=raw_f16_tma_box,
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     tma_desc_k = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(k.iterator, qk_layout),
+        _token_major_tma_view(k),
         box_dims=raw_f16_tma_box,
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     gate_tma_box = raw_f32_tma_box if gate_dtype_is_f32(gate_dtype) else raw_f16_tma_box
     tma_desc_gate = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(raw_gate.iterator, qk_layout),
+        _token_major_tma_view(raw_gate),
         box_dims=gate_tma_box,
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
@@ -8428,6 +8416,19 @@ def tcgen05_chain_load_qstate_output_tmem(
 
 
 @cute.jit
+def zero_chain_v_tail(v_stage, lane, valid_rows, input_dtype: cutlass.Constexpr):
+    """Exclude non-finite packed neighbours before V enters the MMA."""
+    if valid_rows < cutlass.Int32(BT):
+        zero = input_dtype(0.0)
+        zeros = cutlass.Vector.from_elements((zero,) * 8, input_dtype)
+        for row in cutlass.range_constexpr(BT):
+            if (row >= valid_rows) & (lane < DV_HALF // 8):
+                idx = raw_f16_s128_smem_index(row, lane * 8)
+                (v_stage.data_ptr() + idx).store(zeros, alignment=16)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
 def tma_chain_stage_load_inputs(
     tma_desc_kd: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_w: cutlass.GridConstant[cuda.TensorMap],
@@ -8712,8 +8713,10 @@ def kernel_chain_dv2(
     u_input_ready_mbar = cutlass.Array(
         cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
     )
+    # Two slots: warp 12 commits stateq_done before its wait, so one slot can
+    # complete twice before warp 12 polls it.
     update_ready_mbar = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
+        cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
     )
     shared_acc_ready_mbar = cutlass.Array(
         cutlass.Int64, 2, space=cutlass.AddressSpace.smem, alignment=8
@@ -8822,7 +8825,8 @@ def kernel_chain_dv2(
                 prims.mbarrier_init(stateq_done_mbar.subview(stage), 1)
             # CG1 fuses the right-half pack/scale while idle CG0 warps 4-7
             # fuse the left half. Both groups must finish before delta.
-            prims.mbarrier_init(update_ready_mbar, 8)
+            for stage in cutlass.range_constexpr(2):
+                prims.mbarrier_init(update_ready_mbar.subview(stage), 8)
             for stage in cutlass.range_constexpr(K2_QSTATE_STAGE_COUNT):
                 prims.mbarrier_init(qstate_acc_ready_mbar.subview(stage), 1)
             prims.mbarrier_init(final_state_stored_mbar, 8)
@@ -8907,12 +8911,21 @@ def kernel_chain_dv2(
             tma_full * cutlass.Int32(K2_TMA_MBAR_STAGE_COUNT - 1)
             + (cutlass.Int32(1) - tma_full) * num_chunks
         )
+        # The lookahead keeps the partial final V tile in the drain.
+        ready_chunk = num_chunks - tma_tail
         for _tail in cutlass.range(tma_tail, unroll=1):
             tma_transfer_wait(tma_mbar.subview(wait_mbar_slot), tma_phase)
             wait_mbar_slot, wait_wrapped = advance_ring_stage(
                 wait_mbar_slot, 1, K2_TMA_MBAR_STAGE_COUNT
             )
             tma_phase = tma_phase ^ wait_wrapped
+            zero_chain_v_tail(
+                v_raw_smem.subview(ready_stage * V_TILE_ELEMS),
+                lane,
+                seqlen - ready_chunk * cutlass.Int32(BT),
+                input_dtype,
+            )
+            ready_chunk += cutlass.Int32(1)
             raw_ready_arrive(raw_ready_mbar.subview(ready_stage))
             ready_stage, _ = advance_ring_stage(ready_stage, 1, K2_RAW_STAGE_COUNT)
 
@@ -8920,7 +8933,6 @@ def kernel_chain_dv2(
     elif warp_idx == ROLES.super_mma:
         tmem_raw_addr = tmem_ptr_i32.load()
         si_phase12 = cutlass.Int32(0)
-        upd_phase12 = cutlass.Int32(0)
         for chunk in cutlass.range(num_chunks, unroll=1):
             raw_stage = chunk % K2_RAW_STAGE_COUNT
             qstate_stage = chunk % K2_QSTATE_STAGE_COUNT
@@ -8957,7 +8969,7 @@ def kernel_chain_dv2(
                 True,
                 DV_HALF,
             )
-            upd_phase12 = update_ready_wait(update_ready_mbar, upd_phase12)
+            update_ready_wait(update_ready_mbar.subview(chunk % 2), (chunk // 2) % 2)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             xpack_col12 = tcgen05_shared_input_tmem_col_offset(acc_stage)
             tcgen05_chain_issue_qkv_mma(
@@ -8975,7 +8987,6 @@ def kernel_chain_dv2(
         tmem_raw_addr = tmem_ptr_i32.load()
         si_l_phase = cutlass.Int32(0)
         si_phase = cutlass.Int32(0)
-        upd_phase = cutlass.Int32(0)
         for chunk in cutlass.range(num_chunks, unroll=1):
             raw_stage = chunk % K2_RAW_STAGE_COUNT
             raw_phase = (chunk // K2_RAW_STAGE_COUNT) % 2
@@ -9017,7 +9028,7 @@ def kernel_chain_dv2(
             )
 
             xpack_col = tcgen05_shared_input_tmem_col_offset(acc_stage)
-            upd_phase = update_ready_wait(update_ready_mbar, upd_phase)
+            update_ready_wait(update_ready_mbar.subview(chunk % 2), (chunk // 2) % 2)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             tcgen05_chain_issue_delta_half_mma(
                 w_stage_smem, tmem_raw_addr, xpack_col, input_dtype, 0
@@ -9152,7 +9163,7 @@ def kernel_chain_dv2(
                 input_dtype,
             )
             post_scale_lane = cute.arch.lane_idx()
-            update_ready_arrive(update_ready_mbar)
+            update_ready_arrive(update_ready_mbar.subview(0))
             if cutlass.const_expr(state_ckpt is not None):
                 # Peeled chunk 0's checkpoint (stride 1 only).
                 checkpoint_due = ckpt_next == cutlass.Int32(1)
@@ -9232,7 +9243,7 @@ def kernel_chain_dv2(
                 input_dtype,
             )
             post_scale_lane = cute.arch.lane_idx()
-            update_ready_arrive(update_ready_mbar)
+            update_ready_arrive(update_ready_mbar.subview(chunk % 2))
             if cutlass.const_expr(state_ckpt is not None):
                 # Same contract as the engine-side checkpoint; both M=64 TMEM
                 # halves wait their own k_restore parity slot (the same wait
@@ -9339,7 +9350,7 @@ def kernel_chain_dv2(
                     cutlass.Int32(0),
                 )
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-                update_ready_arrive(update_ready_mbar)
+                update_ready_arrive(update_ready_mbar.subview(0))
             for chunk in cutlass.range(1, num_chunks, 1, unroll=1):
                 prev = chunk - cutlass.Int32(1)
                 raw_stage = chunk % K2_RAW_STAGE_COUNT
@@ -9378,7 +9389,7 @@ def kernel_chain_dv2(
                     state_input_ready_l_mbar,
                     0,
                 )
-                update_ready_arrive(update_ready_mbar)
+                update_ready_arrive(update_ready_mbar.subview(chunk % 2))
 
 
 @cute.jit
@@ -9408,7 +9419,6 @@ def host_chain_dv2(
     """DV2 host: identical tensor maps to the base chain host, doubled grid-y."""
 
     num_sequences = cu_seqlens.shape[0] - 1
-    seqlen = v.shape[1]
     heads = v.shape[2]
     ws_rows = ws_kd.shape[2]
     num_chunks_total = ws_qk.shape[2]
@@ -9423,10 +9433,6 @@ def host_chain_dv2(
     tile_layout = cute.make_layout(
         (DK, ws_rows, heads, 1),
         stride=(1, DK, tile_head_stride, DK),
-    )
-    v_layout = cute.make_layout(
-        (DV, seqlen, heads, 1),
-        stride=(1, DV * heads, DV, DV * seqlen * heads),
     )
     diag_layout = cute.make_layout(
         (DIAG_REC_ELEMS, num_chunks_total, heads, 1),
@@ -9466,7 +9472,7 @@ def host_chain_dv2(
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
     tma_desc_v = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(v.iterator, v_layout),
+        _token_major_tma_view(v),
         box_dims=f16_box,
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
@@ -9484,7 +9490,7 @@ def host_chain_dv2(
         swizzle=cuda.TensorMapSwizzle.none,
     )
     tma_desc_o = cuda.create_tensor_map_tiled_from_view(
-        cute.make_tensor(out.iterator, v_layout),
+        _token_major_tma_view(out),
         box_dims=(O_TMA_SWIZZLE_ELEMS, BT, 1, 1),
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
@@ -9718,9 +9724,16 @@ def _unified_fakes(
     ss = cute.sym_int64(divisibility=1)
     sc = cute.sym_int64(divisibility=1)
     sc16 = cute.sym_int64(divisibility=16)
-    fq = F(dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fk = F(dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
-    fv = F(dtype, (1, ss, sh, DV), stride_order=(3, 2, 1, 0), assumed_align=16)
+
+    def qkv_fake(dim):
+        return cute.runtime.make_fake_tensor(
+            dtype,
+            shape=(1, ss, sh, dim),
+            stride=(cute.sym_int64(), cute.sym_int64(divisibility=8), dim, 1),
+            assumed_align=16,
+        )
+
+    fq, fk, fv = qkv_fake(DK), qkv_fake(DK), qkv_fake(DV)
     fgate = F(gate_dtype, (1, ss, sh, DK), stride_order=(3, 2, 1, 0), assumed_align=16)
     fa_log = F(cutlass.Float32, (sh,), stride_order=(0,), assumed_align=16)
     fdt = F(cutlass.Float32, (sh, DK), stride_order=(1, 0), assumed_align=16)

@@ -136,6 +136,11 @@
       "dtype": "float32",
       "optional": true
     },
+    "output_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
     "validate": {
       "shape": null,
       "dtype": "bool",
