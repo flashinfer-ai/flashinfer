@@ -50,6 +50,52 @@ def test_host_timing_separates_return_from_completion(monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_queued_host_timing_enqueues_work_before_each_timed_call(monkeypatch):
+    clock = [0]
+    calls = []
+    pending = [0]
+
+    def run():
+        # Model a call that reads from the device: it waits for queued work.
+        calls.append("run")
+        clock[0] += 2_000_000 + pending[0]
+        pending[0] = 0
+
+    def queue_gpu_work(cycles):
+        assert cycles == 7
+        calls.append("queue")
+        pending[0] = 10_000_000
+
+    def synchronize():
+        calls.append("sync")
+        clock[0] += 3_000_000 + pending[0]
+        pending[0] = 0
+
+    monkeypatch.setattr(_BENCHMARK["time"], "perf_counter_ns", lambda: clock[0])
+    monkeypatch.setattr(_BENCHMARK["torch"].cuda, "synchronize", synchronize)
+    monkeypatch.setitem(_measure_host.__globals__, "_queue_gpu_work", queue_gpu_work)
+    monkeypatch.setitem(_measure_host.__globals__, "_QUEUED_WORK_CALIBRATION_ITERS", 2)
+    result = _measure_host(run, dry_run_iters=2, repeat_iters=3, queued_sleep_cycles=7)
+
+    assert calls == (
+        ["run", "run", "sync"] + ["queue", "sync"] * 2 + ["queue", "run", "sync"] * 3
+    )
+    # Enqueueing is outside the timed region; the wait for it is inside.
+    assert result["host_return_samples_ms"] == [12.0] * 3
+    assert result["completed_call_samples_ms"] == [15.0] * 3
+    assert result["queued_sleep_cycles"] == 7
+    assert result["queued_work_median_ms"] == 13.0
+    assert result["stateful_calls"] == 5
+
+
+@pytest.mark.cpu_only
+def test_host_read_case_set_is_the_issue_7903_shape():
+    (case,) = _BENCHMARK["HOST_READ_CASES"]
+    assert (case.num_heads, case.seq_lens, case.packed) == (32, (16384,), True)
+    assert case not in _BENCHMARK["CASES"]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("inference_mode", [False, True])
 @pytest.mark.parametrize("host_timing", [False, True])
 def test_main_serializes_timings_in_requested_inference_mode(
@@ -111,6 +157,7 @@ def test_main_serializes_timings_in_requested_inference_mode(
     monkeypatch.setitem(namespace, "H12_CASES", namespace["H12_CASES"][:1])
     monkeypatch.setitem(namespace, "_make_case", make_case)
     monkeypatch.setitem(namespace, "_measure", measure)
+    monkeypatch.setitem(namespace, "_queue_gpu_work", lambda cycles: None)
     output = tmp_path / "timings.json"
     argv = [
         "bench_recurrent_kda_prefill.py",
@@ -140,7 +187,8 @@ def test_main_serializes_timings_in_requested_inference_mode(
     assert result["inference_mode"] is inference_mode
     assert result["samples_ms"] == [1.0] * 3
     assert result["median_ms"] == 1.0
-    assert len(calls) == 1 + 6 + 2 + 3 + (5 if host_timing else 0)
+    # Idle and queued host passes each make 2 warmup + 3 timed calls.
+    assert len(calls) == 1 + 6 + 2 + 3 + (10 if host_timing else 0)
     if host_timing:
         assert result["host_timing"] == {
             "host_return_samples_ms": [2.0] * 3,
@@ -151,5 +199,14 @@ def test_main_serializes_timings_in_requested_inference_mode(
             "cold_l2": False,
             "timing_scope": "eager_public_recurrent_kda_with_inplace_state_update",
         }
+        queued = result["host_timing_queued"]
+        assert (
+            queued["queued_sleep_cycles"]
+            == namespace["DEFAULT_HOST_QUEUED_SLEEP_CYCLES"]
+        )
+        assert queued["queued_work_median_ms"] == 3.0
+        assert queued["host_return_samples_ms"] == [2.0] * 3
+        assert queued["stateful_calls"] == 5
     else:
         assert "host_timing" not in result
+        assert "host_timing_queued" not in result
