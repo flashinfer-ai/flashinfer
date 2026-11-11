@@ -64,7 +64,7 @@ gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 sdsa_gather_key_sample_page_size64_dim128.json
-group_union_masks_top_k2048.json
+sdsa_group_union_masks_top_k2048.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -167,7 +167,7 @@ silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
 sdsa_thresholds_from_sample_counters2.json
-token_sparse_kv_indices_top_k2048_lists2.json
+sdsa_token_sparse_kv_indices_top_k2048_lists2.json
 sdsa_top_k_from_candidates_pair2_range2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -3667,7 +3667,7 @@ finally:
         dist.destroy_process_group()
 
 # ── Token-sparse attention inputs: K/V slot lists, group unions and masks ─────
-from flashinfer.token_sparse import group_union_masks, token_sparse_kv_indices
+from flashinfer.sdsa.token_sparse import group_union_masks, token_sparse_kv_indices
 
 token_sparse_kv_indices.fi_trace(
     save_dir=SAVE_DIR,

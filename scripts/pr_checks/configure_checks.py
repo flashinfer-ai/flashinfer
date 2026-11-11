@@ -20,6 +20,20 @@ DOCS_DIR: Path = FLASHINFER_ROOT / "docs"
 DOCS_API_DIR: Path = DOCS_DIR / "api"
 CSRC_DIR: Path = FLASHINFER_ROOT / "csrc"
 AGENTS_MD: Path = FLASHINFER_ROOT / "AGENTS.md"
+# AGENTS.md is a concise entry point; environment variables, the supported
+# architecture list, and detailed path references live in these linked pages.
+AGENT_GUIDANCE_DOCS: tuple[Path, ...] = (
+    AGENTS_MD,
+    *(
+        DOCS_DIR / "development" / name
+        for name in (
+            "backend_notes.md",
+            "environment_variables.md",
+            "jit_and_build.md",
+            "testing.md",
+        )
+    ),
+)
 SKILLS_DIR: Path = FLASHINFER_ROOT / ".claude" / "skills"
 
 OUTPUT_DIR: Path = Path(
@@ -37,6 +51,7 @@ __all__ = (
     "DOCS_API_DIR",
     "CSRC_DIR",
     "AGENTS_MD",
+    "AGENT_GUIDANCE_DOCS",
     "SKILLS_DIR",
     "OUTPUT_DIR",
 )

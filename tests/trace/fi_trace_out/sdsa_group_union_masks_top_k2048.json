@@ -1,9 +1,9 @@
 {
-  "name": "group_union_masks_top_k2048",
+  "name": "sdsa_group_union_masks_top_k2048",
   "description": "Each token group's union of keys as cache slots, and each token's bitmask over it.",
-  "op_type": "group_union_masks",
+  "op_type": "sdsa_group_union_masks",
   "tags": [
-    "fi_api:flashinfer.token_sparse.group_union_masks"
+    "fi_api:flashinfer.sdsa.token_sparse.group_union_masks"
   ],
   "axes": {
     "tokens": {
