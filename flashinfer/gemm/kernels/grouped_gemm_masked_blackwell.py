@@ -4074,7 +4074,6 @@ def _validate_nvfp4_output(
     m,
     n_out,
     l,
-    mma_tiler_mn,
     nvfp4_4over6,
 ) -> None:
     # The epilogue implements only the default recipe; these switches change
@@ -4096,8 +4095,6 @@ def _validate_nvfp4_output(
         )
     if out_scale is None or global_scale is None:
         raise ValueError("c_dtype='float4_e2m1fn' requires out_scale and global_scale")
-    if mma_tiler_mn[0] != 128:
-        raise ValueError("NVFP4 output requires mma_tiler_mn[0] == 128")
     if n_out % 64 != 0:
         raise ValueError(
             f"NVFP4 output requires a multiple of 64 output columns, got {n_out}"
@@ -4420,7 +4417,6 @@ def _grouped_gemm_nt_masked_sm100(
             m=m,
             n_out=n // 2 if activation_type is not None else n,
             l=l,
-            mma_tiler_mn=mma_tiler_mn,
             nvfp4_4over6=nvfp4_4over6,
         )
 
