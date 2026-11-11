@@ -3426,8 +3426,10 @@ class BatchInvariantFp8PerTensorConfig:
     the alpha-scaled fp32 accumulators followed by the ``mul.rn`` by the intermediate multiplier and one saturating RNE
     conversion to e4m3, GEMM2's ``cvt_bf16(mul(acc, alpha2))``, the slot-order fp32 combine. Every output bit is a function of
     the token's own e4m3 row, its ``top_k`` experts and routing weights, the expert bytes and the scales; ``do_finalize=True``
-    only; unsupported inputs raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; never a default
-    candidate (name it in ``BackendOptions``). ``H`` and ``I`` are multiples of 16 (16-byte e4m3 rows).
+    only (the unfinalized triple is refused) and the dense expert set only (an expert-parallel shard,
+    ``local_expert_offset`` / ``local_num_experts``, is refused); unsupported inputs raise
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; never a default candidate (name it in
+    ``BackendOptions``). ``H`` and ``I`` are multiples of 16 (16-byte e4m3 rows).
     """
 
     @classmethod
