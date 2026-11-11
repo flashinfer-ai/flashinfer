@@ -23,16 +23,20 @@
 //
 // Algorithm: a Hopper warpgroup kernel. QK^T runs as fp8 wgmma
 // (m64n64k32 e4m3 x e4m3, fp32 accumulate) over K-major staged Q and K tiles
-// (cp.async multi-stage pipeline through dynamic shared memory); softmax
-// statistics are fp32 online-softmax with a deferred-renormalisation cap; P is
-// quantised once to e4m3 and the P.V product runs as fp8 wgmma
-// (m64n128k32) against a keys-contiguous V^T scratch that a small pass
-// (`vt_build`) builds from the paged V cache (every covered physical page
-// exactly once per call); the fp32 O accumulator is renormalised and rounded
+// (register-resident Q, cp.async two-stage K/V pipeline through dynamic
+// shared memory, BN=96 key tiles); softmax statistics are fp32 online-softmax
+// with a deferred-renormalisation cap; P is quantised once to e4m3 and the
+// P.V product runs as fp8 wgmma (m64n128k32) against a keys-contiguous V^T
+// scratch that a small pass (`vt_build`) builds from the paged V cache (every
+// covered physical page exactly once per call, also emitting the exact
+// long-query tile list); the fp32 O accumulator is renormalised and rounded
 // once to bf16. Short-query (decode-like, q_len <= 16) requests run split-KV
-// with an fp32 partial-state merge (`combine_kernel`); long-query requests run
-// one CTA per 16-token query tile, optionally split over the KV axis for wave
-// balance (plan-time `psplit`, merged by `combine_prefill`).
+// with an fp32 partial-state merge (`combine_kernel`) — packed q_len <= 8
+// rows in a 128-thread kernel, the rest at full width; long-query requests
+// run one CTA per 16-token query tile, optionally split over the KV axis for
+// wave balance (plan-time `psplit`, compiled as a static specialisation, with
+// fp16 partial states merged by `combine_prefill`). A single-request prefill
+// step skips the decode-side kernels entirely.
 //
 // OUTPUT PRECISION (disclosed in the Python dispatcher's docstring): the P.V
 // product accumulates the e4m3-quantised P against the e4m3 V — an in-class
@@ -76,18 +80,25 @@
 #define DIMH 128
 #define PAGE 16
 #define BQ 16
-#define BN 64
+#define BN 96
 #define NWARP 8
 #define NTHREAD (NWARP * 32)
 #define KPITCH 144          /* bytes per key row in Ksh */
-#define KSTAGE 3
-#define VSTAGE 3
+#define KSTAGE 2
+#define VSTAGE 2
 #define VPITCH 16384        /* bytes per V^T stage (16 atoms x 8dim x 128B) */
 #define NSPLIT_MAX 64
-#define MIN_TILES_PER_SPLIT 8
+#define MIN_TILES_PER_SPLIT 6
 
 __device__ __forceinline__ uint32_t sm_u32(const void *p) {
   return (uint32_t)__cvta_generic_to_shared(p);
+}
+
+template <bool WIDE>
+__device__ __forceinline__ const uint8_t *page_addr(
+    const uint8_t *base, int page, uint32_t tail) {
+  if (WIDE) return base + (size_t)(uint32_t)page * 2048 + tail;
+  return base + (uint32_t)page * 2048u + tail;
 }
 
 __device__ __forceinline__ int split_count(int tiles) {
@@ -181,6 +192,24 @@ __device__ __forceinline__ void wgmma_qk(
       : "memory");
 }
 
+/* QK with f16 accumulator: 16 packed registers instead of 32 f32 registers.
+   The result is already paired for the f16x2 softmax and e4m3x2 quantizer. */
+__device__ __forceinline__ void wgmma_qk16(
+    uint32_t (&d)[24], uint64_t desc_a, uint64_t desc_b) {
+  asm volatile(
+      "wgmma.mma_async.sync.aligned.m64n96k32.f16.e4m3.e4m3 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+      "%16,%17,%18,%19,%20,%21,%22,%23},%24,%25,1,1,1;\n"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]),
+        "+r"(d[4]), "+r"(d[5]), "+r"(d[6]), "+r"(d[7]),
+        "+r"(d[8]), "+r"(d[9]), "+r"(d[10]), "+r"(d[11]),
+        "+r"(d[12]), "+r"(d[13]), "+r"(d[14]), "+r"(d[15]),
+        "+r"(d[16]), "+r"(d[17]), "+r"(d[18]), "+r"(d[19]),
+        "+r"(d[20]), "+r"(d[21]), "+r"(d[22]), "+r"(d[23])
+      : "l"(desc_a), "l"(desc_b)
+      : "memory");
+}
+
 __device__ __forceinline__ uint32_t cvt_f8x2_f16x2(unsigned short v) {
   uint32_t r;
   asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(r) : "h"(v));
@@ -196,6 +225,11 @@ __device__ __forceinline__ void cvt16(uint4 in, uint32_t out[8]) {
   }
 }
 
+__device__ __forceinline__ uint32_t pack_h2(float v) {
+  __half2 h = __float2half2_rn(v);
+  return *(const uint32_t *)&h;
+}
+
 __device__ __forceinline__ unsigned short cvt2_e4m3(float hi, float lo) {
   unsigned short r;
   asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(r)
@@ -204,8 +238,24 @@ __device__ __forceinline__ unsigned short cvt2_e4m3(float hi, float lo) {
 }
 
 /* fp8 PV: A = quantised P in registers, B = V^T (K-major, 128B swizzle) */
+__device__ __forceinline__ void wgmma_qk16_r(
+    uint32_t (&d)[24], const uint32_t *a, uint64_t desc_b) {
+  asm volatile(
+      "wgmma.mma_async.sync.aligned.m64n96k32.f16.e4m3.e4m3 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+      "%16,%17,%18,%19,%20,%21,%22,%23},{%24,%25,%26,%27},%28,1,1,1;\n"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]),
+        "+r"(d[4]), "+r"(d[5]), "+r"(d[6]), "+r"(d[7]),
+        "+r"(d[8]), "+r"(d[9]), "+r"(d[10]), "+r"(d[11]),
+        "+r"(d[12]), "+r"(d[13]), "+r"(d[14]), "+r"(d[15]),
+        "+r"(d[16]), "+r"(d[17]), "+r"(d[18]), "+r"(d[19]),
+        "+r"(d[20]), "+r"(d[21]), "+r"(d[22]), "+r"(d[23])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b)
+      : "memory");
+}
+
 __device__ __forceinline__ void wgmma_pv8(
-    float (&d)[16][4], const uint32_t (&a)[4], uint64_t desc_b) {
+    float (&d)[16][4], const uint32_t *a, uint64_t desc_b) {
   asm volatile(
       "wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3 "
       "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
@@ -233,6 +283,27 @@ __device__ __forceinline__ void wgmma_pv8(
       : "memory");
 }
 
+/* Packed-f16 PV accumulation halves the accumulator register footprint and
+   shortens the dependent WGMMA drain. */
+__device__ __forceinline__ void wgmma_pv8_h(
+    uint32_t (&d)[32], const uint32_t *a, uint64_t desc_b) {
+  asm volatile(
+      "wgmma.mma_async.sync.aligned.m64n128k32.f16.e4m3.e4m3 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+      "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31},"
+      "{%32,%33,%34,%35},%36,1,1,1;\n"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]),
+        "+r"(d[4]), "+r"(d[5]), "+r"(d[6]), "+r"(d[7]),
+        "+r"(d[8]), "+r"(d[9]), "+r"(d[10]), "+r"(d[11]),
+        "+r"(d[12]), "+r"(d[13]), "+r"(d[14]), "+r"(d[15]),
+        "+r"(d[16]), "+r"(d[17]), "+r"(d[18]), "+r"(d[19]),
+        "+r"(d[20]), "+r"(d[21]), "+r"(d[22]), "+r"(d[23]),
+        "+r"(d[24]), "+r"(d[25]), "+r"(d[26]), "+r"(d[27]),
+        "+r"(d[28]), "+r"(d[29]), "+r"(d[30]), "+r"(d[31])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(desc_b)
+      : "memory");
+}
+
 /* within-page key that supplies PV slot j (bit permutation k = [s0,s2,s3,s1]) */
 #define VPERM(j) (((j) & 1) | ((((j) >> 2) & 1) << 1) | \
                   ((((j) >> 3) & 1) << 2) | ((((j) >> 1) & 1) << 3))
@@ -241,16 +312,27 @@ __device__ __forceinline__ void wgmma_pv8(
    [128 dim][16 slot] fp8 tile so the PV wgmma can read V as a K-major
    (keys-contiguous) B operand without any in-kernel transpose. */
 extern "C" __global__ __launch_bounds__(128, 8) void vt_build(
-    const uint8_t *__restrict__ vcp, uint8_t *__restrict__ gvt) {
+    const uint8_t *__restrict__ vcp, uint8_t *__restrict__ gvt,
+    const int *__restrict__ cup, int2 *__restrict__ tasks, int B, int npt) {
   /* Every physical cache page is transformed exactly once.  The former
      (NB,B) launch revisited the same page-table address space and created
      many empty CTAs for ragged batches. */
   const int pg = blockIdx.x;
   __shared__ __align__(16) uint8_t buf[2048];
   const int tid = threadIdx.x;
+  if (pg == 0)
+    for (int i = tid; i < npt; i += blockDim.x) tasks[i] = make_int2(-1, 0);
   *(uint4 *)(buf + tid * 16) =
       *(const uint4 *)(vcp + (size_t)pg * 2048 + tid * 16);
   __syncthreads();
+  if (pg == 0 && tid == 0) {
+    int ntask = 0;
+    for (int r = 0; r < B; ++r) {
+      const int qlen = cup[r + 1] - cup[r];
+      const int nt = qlen > BQ ? (qlen + BQ - 1) / BQ : 0;
+      for (int bx = 0; bx < nt; ++bx) tasks[ntask++] = make_int2(r, bx);
+    }
+  }
   uint32_t w[4] = {0u, 0u, 0u, 0u};
 #pragma unroll
   for (int j = 0; j < 16; ++j)
@@ -278,17 +360,19 @@ extern "C" __global__ __launch_bounds__(128, 1) void build_prefill_tasks(
   }
 }
 
-template <int MODE>   /* 0: prefill direct, 1: prefill split, 2: decode split */
-__global__ __launch_bounds__(NTHREAD, 2) void attn_kernel(
+template <int MODE, bool WIDE, int PS = 0> /* 0: direct, 1: split prefill, 2/3: decode */
+__global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
     const uint8_t *__restrict__ qp, const uint8_t *__restrict__ kcp,
     const uint8_t *__restrict__ vcp, const int *__restrict__ btp,
     const int *__restrict__ slp, const int *__restrict__ cup,
     const float *__restrict__ qds, const float *__restrict__ kds,
     const float *__restrict__ vds, __nv_bfloat16 *__restrict__ outp,
     float *__restrict__ po, float2 *__restrict__ pml, int NB, int B,
-    float *__restrict__ po2, float2 *__restrict__ pml2, int TQ, int PSPLIT,
+    __half *__restrict__ po2, float2 *__restrict__ pml2,
+    int TQ, int PSPLIT,
     const int2 *__restrict__ tasks) {
-  constexpr bool SPLIT = (MODE == 2);
+  constexpr bool PACK = (MODE == 3);
+  constexpr bool SPLIT = (MODE >= 2);
   constexpr bool PART = (MODE == 1);
   int r, bx;
   if (SPLIT) {
@@ -305,6 +389,8 @@ __global__ __launch_bounds__(NTHREAD, 2) void attn_kernel(
   int p0;
   if (SPLIT) {
     if (qlen <= 0 || qlen > BQ) return;
+    if (PACK && qlen > 8) return;
+    if (!PACK && qlen <= 8) return;
     p0 = 0;
   } else {
     if (qlen <= BQ) return;
@@ -328,7 +414,8 @@ __global__ __launch_bounds__(NTHREAD, 2) void attn_kernel(
     tb = (nkv * bx) / ns;
     te = (nkv * (bx + 1)) / ns;
   } else if (PART) {
-    const int per = (nkv + PSPLIT - 1) / PSPLIT;
+    const int ps = PS ? PS : PSPLIT;
+    const int per = (nkv + ps - 1) / ps;
     tb = zs * per;
     te = min(nkv, tb + per);
     if (tb >= nkv) te = tb;      /* empty chunk: emit a null partial */
@@ -337,94 +424,73 @@ __global__ __launch_bounds__(NTHREAD, 2) void attn_kernel(
   extern __shared__ __align__(16) char smem[];
   uint8_t *Ksh = (uint8_t *)smem;
   uint8_t *Vsh = (uint8_t *)(smem + KSTAGE * BN * DIMH);
-  uint8_t *Qsh = Vsh + VSTAGE * VPITCH;
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const int h = warp;
+  const int hA = PACK ? 2 * warp : warp;
+  const int hB = PACK ? hA + 1 : warp;
 
   const float scale = 0.08838834764831845f * 1.4426950408889634f *
                       qds[r] * kds[r];
   const float vdsc = vds[r];
 
-  /* ---- stage Q as two K-major 64x128 warpgroup operands ---- */
-  const int rowA = lane >> 2, rowB = rowA + 8;
+  /* ---- load loop-invariant Q into the wgmma A register fragment ---- */
+  const int rowA = lane >> 2, rowB = PACK ? rowA : rowA + 8;
   const int pA = min(p0 + rowA, qlen - 1);
   const int pB = min(p0 + rowB, qlen - 1);
-  const uint8_t *qb = qp + (size_t)q0 * 1024 + h * 128;
-  uint8_t *Qb = Qsh + (warp >> 2) * (64 * DIMH);
-  const int qmA = (warp & 3) * BQ + rowA;
-  const int qmB = (warp & 3) * BQ + rowB;
-  const int qseg = (lane & 3) * 16;
+  const uint8_t *qgA =
+      qp + (size_t)(q0 + pA) * 1024 + hA * 128 + (lane & 3) * 4;
+  const uint8_t *qgB =
+      qp + (size_t)(q0 + pB) * 1024 + hB * 128 + (lane & 3) * 4;
+  uint32_t qa[16];
 #pragma unroll
-  for (int half = 0; half < 2; ++half) {
-    const int col = qseg + half * 64;
-    const int a = qmA * 128 + (col ^ ((qmA & 7) * 16));
-    const int b = qmB * 128 + (col ^ ((qmB & 7) * 16));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                 :: "r"(sm_u32(Qb) + a),
-                    "l"(qb + (size_t)pA * 1024 + col));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                 :: "r"(sm_u32(Qb) + b),
-                    "l"(qb + (size_t)pB * 1024 + col));
+  for (int i = 0; i < 8; ++i) {
+    const int idx = ((i >> 1) << 2) + ((i & 1) << 1);
+    qa[idx + 0] = *(const uint32_t *)(qgA + i * 16);
+    qa[idx + 1] = *(const uint32_t *)(qgB + i * 16);
   }
-  asm volatile("cp.async.commit_group;\n");
   /* ---- loader index setup ---- */
   const int kkey0 = tid >> 3;          /* 0..31 */
   const int koff = (tid & 7) * 16;     /* byte offset in row */
-  const int page_sel = tid >> 7;       /* page 0/1 of each 32-key half */
-  const size_t page_byte = (size_t)(tid & 127) << 4;
+  const int page_sel = PACK ? 0 : tid >> 7;
+  const uint32_t page_byte = (uint32_t)(tid & 127) << 4;
   const int *btrow = btp + (size_t)r * NB;
   /* V^T staging: 16B chunk = one (dim, page) pair of the transposed tile */
   const int vdim = tid & 127;
-  const int vpg = tid >> 7;
+  const int vpg = PACK ? 0 : tid >> 7;
   const int vx = vdim & 7;
   const int vsh0 = (vdim >> 3) * 1024 + vx * 128;
-  const size_t vbyte = (size_t)vdim << 4;
+  const uint32_t vbyte = (uint32_t)vdim << 4;
 
-  float acc[16][4];
+  uint32_t acc[32];
 #pragma unroll
-  for (int i = 0; i < 16; ++i) {
-#pragma unroll
-    for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
-  }
+  for (int i = 0; i < 32; ++i) acc[i] = 0u;
   float mA = -1e30f, mB = -1e30f, lA = 0.f, lB = 0.f;
   const float capd = 8.0f / scale;   /* allow p up to 2^8 before refreshing */
+  /* These packed constants only change when the lagging row maximum moves. */
+  const uint32_t rsc = pack_h2(scale);
+  uint32_t thrA = 0xfc00fc00u, thrB = 0xfc00fc00u;
+  uint32_t rnA = pack_h2(1e4f * scale), rnB = rnA;
 
-  /* ---- prologue: stage K[tb] and K[tb+1] (prefetch distance 2) ---- */
+  /* ---- prologue: stage the first K/V tile (prefetch distance 1) ---- */
   if (te > tb) {
     #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int key = kkey0 + i * 32;
+    for (int i = 0; i < (PACK ? BN / 16 : BN / 32); ++i) {
+      const int key = kkey0 + i * (PACK ? 16 : 32);
       const uint32_t ko = (uint32_t)(key * 128 +
           (((tid & 7) * 16) ^ ((key & 7) * 16)));
-      int pg = btrow[min(tb * 4 + i * 2 + page_sel, npages - 1)];
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+      int pg = btrow[min(tb * (BN / PAGE) + (PACK ? i : i * 2 + page_sel),
+                         npages - 1)];
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
                    ::"r"(sm_u32(Ksh) + ko),
-                     "l"(kcp + (size_t)pg * 2048 + page_byte));
-      const int pgv = btrow[min(tb * 4 + vpg + 2 * i, npages - 1)];
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                     "l"(page_addr<WIDE>(kcp, pg, page_byte)));
+      const int vc = PACK ? i : vpg + 2 * i;
+      const int pgv = btrow[min(tb * (BN / PAGE) + vc, npages - 1)];
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
                    ::"r"(sm_u32(Vsh) + (uint32_t)(vsh0 +
-                       (((vpg + 2 * i) ^ vx) << 4))),
-                     "l"(vcp + (size_t)pgv * 2048 + vbyte));
-    }
-    asm volatile("cp.async.commit_group;\n");
-    int t1 = min(tb + 1, te - 1);
-    #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int key = kkey0 + i * 32;
-      const uint32_t ko = (uint32_t)(key * 128 +
-          (((tid & 7) * 16) ^ ((key & 7) * 16)));
-      int pg1 = btrow[min(t1 * 4 + i * 2 + page_sel, npages - 1)];
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                   ::"r"(sm_u32(Ksh + BN * DIMH) + ko),
-                     "l"(kcp + (size_t)pg1 * 2048 + page_byte));
-      const int pgv = btrow[min(t1 * 4 + vpg + 2 * i, npages - 1)];
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                   ::"r"(sm_u32(Vsh + VPITCH) + (uint32_t)(vsh0 +
-                       (((vpg + 2 * i) ^ vx) << 4))),
-                     "l"(vcp + (size_t)pgv * 2048 + vbyte));
+                       ((vc ^ vx) << 4))),
+                     "l"(page_addr<WIDE>(vcp, pgv, vbyte)));
     }
     asm volatile("cp.async.commit_group;\n");
   }
@@ -434,76 +500,88 @@ __global__ __launch_bounds__(NTHREAD, 2) void attn_kernel(
     const int kv0 = t * BN;
     uint8_t *Kb = Ksh + kbi * (BN * DIMH);
     uint8_t *Vb = Vsh + kbi * VPITCH;
-    int kbw = kbi + 2; if (kbw >= KSTAGE) kbw -= KSTAGE;
+    int kbw = kbi + 1; if (kbw >= KSTAGE) kbw -= KSTAGE;
     kbi = kbi + 1; if (kbi >= KSTAGE) kbi = 0;
 
-    asm volatile("cp.async.wait_group 1;\n");
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    asm volatile("cp.async.wait_group 0;\n");
     __syncthreads();
 
-    /* prefetch: K two tiles ahead, V one tile ahead */
-    {
-      const int tk = min(t + 2, te - 1);
+    /* ---- QK: Hopper FP8 WGMMA, packed f16 accumulator ---- */
+    uint32_t sv[24];
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        const int key = kkey0 + i * 32;
+    for (int j = 0; j < 24; ++j) sv[j] = 0u;
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+    const uint64_t desc_b0 = make_wgmma_desc_sw128(Kb, 1, 8 * 128);
+#pragma unroll
+    for (int kb = 0; kb < 4; ++kb) {
+      wgmma_qk16_r(sv, qa + kb * 4, desc_b0 + 2ull * kb);
+    }
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+
+    /* Issue the next-tile staging inside the QK wgmma shadow.  The block
+       table lookup is a dependent global load feeding the cp.async address,
+       and running it while the four chained QK wgmma are still in flight
+       takes that ~40-instruction burst off the critical path instead of
+       paying it before the GEMM starts. */
+    {
+      const int tk = min(t + 1, te - 1);
+#pragma unroll
+      for (int i = 0; i < (PACK ? BN / 16 : BN / 32); ++i) {
+        const int key = kkey0 + i * (PACK ? 16 : 32);
         const uint32_t ko = (uint32_t)(key * 128 +
             (((tid & 7) * 16) ^ ((key & 7) * 16)));
-        const int pgk = btrow[min(tk * 4 + i * 2 + page_sel, npages - 1)];
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+        const int pgk = btrow[min(tk * (BN / PAGE) +
+                                  (PACK ? i : i * 2 + page_sel),
+                                  npages - 1)];
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
                      ::"r"(sm_u32(Ksh + kbw * (BN * DIMH)) + ko),
-                       "l"(kcp + (size_t)pgk * 2048 + page_byte));
-        const int pgv = btrow[min(tk * 4 + vpg + 2 * i, npages - 1)];
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                       "l"(page_addr<WIDE>(kcp, pgk, page_byte)));
+        const int vc = PACK ? i : vpg + 2 * i;
+        const int pgv = btrow[min(tk * (BN / PAGE) + vc, npages - 1)];
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
                      ::"r"(sm_u32(Vsh + kbw * VPITCH) + (uint32_t)(vsh0 +
-                         (((vpg + 2 * i) ^ vx) << 4))),
-                       "l"(vcp + (size_t)pgv * 2048 + vbyte));
+                         ((vc ^ vx) << 4))),
+                       "l"(page_addr<WIDE>(vcp, pgv, vbyte)));
       }
       asm volatile("cp.async.commit_group;\n");
     }
 
-    /* ---- QK: Hopper FP8 WGMMA, register Q x tiled shared K ---- */
-    float s[8][4];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      s[j][0] = s[j][1] = s[j][2] = s[j][3] = 0.f;
-    }
-    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-#pragma unroll
-    for (int kb = 0; kb < 4; ++kb) {
-      const uint64_t desc_a = make_wgmma_desc_sw128(
-          Qb + kb * 32, 1, 8 * 128);
-      const uint64_t desc_b = make_wgmma_desc_sw128(
-          Kb + kb * 32, 1, 8 * 128);
-      wgmma_qk(s, desc_a, desc_b);
-    }
-    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 
-    /* ---- mask + softmax ---- */
+    /* ---- mask + packed f16x2 softmax ---- */
     const int boundA = base + p0 + rowA;
     const int boundB = base + p0 + rowB;
     const bool domask = (kv0 + BN - 1) > minbound;
-    float lmA = -INFINITY, lmB = -INFINITY;
+    uint32_t mxA = thrA, mxB = thrB;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      int k0 = kv0 + j * 8 + (lane & 3) * 2;
+    for (int j = 0; j < BN / 8; ++j) {
+      const int k0 = kv0 + j * 8 + (lane & 3) * 2;
       if (domask) {
-        if (k0 > boundA) s[j][0] = -INFINITY;
-        if (k0 + 1 > boundA) s[j][1] = -INFINITY;
-        if (k0 > boundB) s[j][2] = -INFINITY;
-        if (k0 + 1 > boundB) s[j][3] = -INFINITY;
+        if (k0 > boundA) sv[2 * j] = (sv[2 * j] & 0xffff0000u) | 0x0000fc00u;
+        if (k0 + 1 > boundA)
+          sv[2 * j] = (sv[2 * j] & 0x0000ffffu) | 0xfc000000u;
+        if (k0 > boundB)
+          sv[2 * j + 1] = (sv[2 * j + 1] & 0xffff0000u) | 0x0000fc00u;
+        if (k0 + 1 > boundB)
+          sv[2 * j + 1] = (sv[2 * j + 1] & 0x0000ffffu) | 0xfc000000u;
       }
-      lmA = fmaxf(lmA, fmaxf(s[j][0], s[j][1]));
-      lmB = fmaxf(lmB, fmaxf(s[j][2], s[j][3]));
+      asm("max.f16x2 %0, %0, %1;\n" : "+r"(mxA) : "r"(sv[2 * j]));
+      asm("max.f16x2 %0, %0, %1;\n" : "+r"(mxB) : "r"(sv[2 * j + 1]));
     }
     /* Lagging reference max: mA/mB are only refreshed when this tile would
        push a probability past 2^PCAP, which keeps p inside f16 range with a
-       wide margin.  Until then both the cross-lane row-max reduction and the
-       64-register accumulator rescale are skipped; the vote keeps the branch
-       warp-uniform so the skip is real. */
-    if (__any_sync(0xffffffffu, (lmA > mA + capd) || (lmB > mB + capd))) {
-      float rmA = lmA, rmB = lmB;
+       wide margin.  The common path compares packed values against the
+       persistent threshold and recovers the exact maximum only on refresh. */
+    if (__any_sync(0xffffffffu, ((mxA ^ thrA) | (mxB ^ thrB)) != 0u)) {
+      uint32_t tmA = 0xfc00fc00u, tmB = 0xfc00fc00u;
+#pragma unroll
+      for (int j = 0; j < BN / 8; ++j) {
+        asm("max.f16x2 %0, %0, %1;\n" : "+r"(tmA) : "r"(sv[2 * j]));
+        asm("max.f16x2 %0, %0, %1;\n" : "+r"(tmB) : "r"(sv[2 * j + 1]));
+      }
+      const float2 fmA = __half22float2(*(__half2 *)&tmA);
+      const float2 fmB = __half22float2(*(__half2 *)&tmB);
+      float rmA = fmaxf(fmA.x, fmA.y), rmB = fmaxf(fmB.x, fmB.y);
       rmA = fmaxf(rmA, __shfl_xor_sync(0xffffffffu, rmA, 1));
       rmA = fmaxf(rmA, __shfl_xor_sync(0xffffffffu, rmA, 2));
       rmB = fmaxf(rmB, __shfl_xor_sync(0xffffffffu, rmB, 1));
@@ -514,48 +592,73 @@ __global__ __launch_bounds__(NTHREAD, 2) void attn_kernel(
       const float cB = exp2f((mB - nmB) * scale);
       mA = nmA; mB = nmB;
       lA *= cA; lB *= cB;
+      const uint32_t pcA = pack_h2(cA), pcB = pack_h2(cB);
 #pragma unroll
       for (int ii = 0; ii < 16; ++ii) {
-        acc[ii][0] *= cA; acc[ii][1] *= cA; acc[ii][2] *= cB; acc[ii][3] *= cB;
+        asm("mul.rn.f16x2 %0, %0, %1;\n" : "+r"(acc[2 * ii]) : "r"(pcA));
+        asm("mul.rn.f16x2 %0, %0, %1;\n" : "+r"(acc[2 * ii + 1]) : "r"(pcB));
       }
+      thrA = pack_h2(fminf(mA + capd, 60000.f));
+      thrB = pack_h2(fminf(mB + capd, 60000.f));
+      rnA = pack_h2(-fmaxf(mA, -1e4f) * scale);
+      rnB = pack_h2(-fmaxf(mB, -1e4f) * scale);
     }
-    const float nA = -mA * scale, nB = -mB * scale;
-    float sA = 0.f, sB = 0.f;
+    uint32_t sumA = 0u, sumB = 0u;
     /* Pack P straight into the fp8 wgmma A fragment.  Accumulator group j
        owns keys 8j+2u, 8j+2u+1 of lane u; the matching A slot is the bit
        permutation s=[k0,k3,k1,k2,k4,k5], which V^T is pre-built to match. */
-    uint32_t pf[2][4];
+    /* The packed P fragments overwrite score registers whose pairs have
+       already been consumed.  This keeps the eight WGMMA-A registers from
+       extending the 128-register live set. */
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      s[j][0] = exp2f(fmaf(s[j][0], scale, nA));
-      s[j][1] = exp2f(fmaf(s[j][1], scale, nA));
-      s[j][2] = exp2f(fmaf(s[j][2], scale, nB));
-      s[j][3] = exp2f(fmaf(s[j][3], scale, nB));
-      sA += s[j][0] + s[j][1];
-      sB += s[j][2] + s[j][3];
-      const unsigned short qa = cvt2_e4m3(s[j][1], s[j][0]);
-      const unsigned short qb = cvt2_e4m3(s[j][3], s[j][2]);
+    for (int j = 0; j < BN / 8; ++j) {
+      uint32_t tA, tB;
+      asm("fma.rn.f16x2 %0, %1, %2, %3;\n"
+          : "=r"(tA) : "r"(sv[2 * j]), "r"(rsc), "r"(rnA));
+      asm("fma.rn.f16x2 %0, %1, %2, %3;\n"
+          : "=r"(tB) : "r"(sv[2 * j + 1]), "r"(rsc), "r"(rnB));
+      asm("ex2.approx.f16x2 %0, %0;\n" : "+r"(tA));
+      asm("ex2.approx.f16x2 %0, %0;\n" : "+r"(tB));
+      asm("add.f16x2 %0, %0, %1;\n" : "+r"(sumA) : "r"(tA));
+      asm("add.f16x2 %0, %0, %1;\n" : "+r"(sumB) : "r"(tB));
+      unsigned short qa, qb;
+      asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(qa) : "r"(tA));
+      asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(qb) : "r"(tB));
       const int c = j >> 2, g = ((j >> 1) & 1) * 2;
       if ((j & 1) == 0) {
-        pf[c][g + 0] = (uint32_t)qa;
-        pf[c][g + 1] = (uint32_t)qb;
+        sv[c * 4 + g + 0] = (uint32_t)qa;
+        sv[c * 4 + g + 1] = (uint32_t)qb;
       } else {
-        pf[c][g + 0] |= (uint32_t)qa << 16;
-        pf[c][g + 1] |= (uint32_t)qb << 16;
+        sv[c * 4 + g + 0] |= (uint32_t)qa << 16;
+        sv[c * 4 + g + 1] |= (uint32_t)qb << 16;
+      }
+      /* Start each complete K32 PV slice while later score pairs are still
+         being transformed.  The final slice is issued after the loop. */
+      if ((j & 3) == 3 && j + 4 < BN / 8) {
+        const int slice = j >> 2;
+        asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+        const uint64_t desc = make_wgmma_desc_sw128(Vb + slice * 32, 1,
+                                                     8 * 128);
+        wgmma_pv8_h(acc, sv + slice * 4, desc);
       }
     }
-    lA += sA;
-    lB += sB;
+    const float2 fsA = __half22float2(*(__half2 *)&sumA);
+    const float2 fsB = __half22float2(*(__half2 *)&sumB);
+    lA += fsA.x + fsA.y;
+    lB += fsB.x + fsB.y;
 
-    /* ---- PV ---- */
+    /* ---- final PV slice; all slices retire in the same group. ---- */
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-#pragma unroll
-    for (int c = 0; c < 2; ++c) {
-      const uint64_t desc = make_wgmma_desc_sw128(Vb + c * 32, 1, 8 * 128);
-      wgmma_pv8(acc, pf[c], desc);
-    }
+    const uint64_t desc1 = make_wgmma_desc_sw128(
+        Vb + (BN / 32 - 1) * 32, 1, 8 * 128);
+    wgmma_pv8_h(acc, sv + (BN / 32 - 1) * 4, desc1);
     asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+    /* Inline PTX operands are compiler-synchronous even though WGMMA is not.
+       Keep all register-A fragments live through the covering wait. */
+    asm volatile("" :: "r"(sv[0]), "r"(sv[1]), "r"(sv[2]), "r"(sv[3]),
+                         "r"(sv[4]), "r"(sv[5]), "r"(sv[6]), "r"(sv[7]),
+                         "r"(sv[8]), "r"(sv[9]), "r"(sv[10]), "r"(sv[11]));
   }
 
   /* Denominator lanes share the same lagging reference max and rescale, so
@@ -568,21 +671,21 @@ __global__ __launch_bounds__(NTHREAD, 2) void attn_kernel(
   /* ---- epilogue ---- */
   if (SPLIT) {
     /* partial results: unnormalised acc + (scaled max, denom) per row/head */
-    float *oA = po + ((((size_t)bx * B + r) * BQ + rowA) * HQ + h) * DIMH + (lane & 3) * 2;
-    float *oB = po + ((((size_t)bx * B + r) * BQ + rowB) * HQ + h) * DIMH + (lane & 3) * 2;
+    float *oA = po + ((((size_t)bx * B + r) * BQ + rowA) * HQ + hA) * DIMH + (lane & 3) * 2;
+    float *oB = po + ((((size_t)bx * B + r) * BQ + rowB) * HQ + hB) * DIMH + (lane & 3) * 2;
 #pragma unroll
     for (int nt = 0; nt < 16; ++nt) {
-      if (rowA < qlen)
-        *(float2 *)(oA + nt * 8) = make_float2(acc[nt][0], acc[nt][1]);
-      if (rowB < qlen)
-        *(float2 *)(oB + nt * 8) = make_float2(acc[nt][2], acc[nt][3]);
+      const float2 aA = __half22float2(*(__half2 *)&acc[2 * nt]);
+      const float2 aB = __half22float2(*(__half2 *)&acc[2 * nt + 1]);
+      if (rowA < qlen) *(float2 *)(oA + nt * 8) = aA;
+      if (rowB < qlen) *(float2 *)(oB + nt * 8) = aB;
     }
     if ((lane & 3) == 0) {
-      size_t mbase = (((size_t)bx * B + r) * BQ) * HQ + h;
+      size_t mbase = (((size_t)bx * B + r) * BQ) * HQ;
       if (rowA < qlen)
-        pml[mbase + (size_t)rowA * HQ] = make_float2(mA * scale, lA);
+        pml[mbase + (size_t)rowA * HQ + hA] = make_float2(mA * scale, lA);
       if (rowB < qlen)
-        pml[mbase + (size_t)rowB * HQ] = make_float2(mB * scale, lB);
+        pml[mbase + (size_t)rowB * HQ + hB] = make_float2(mB * scale, lB);
     }
     return;
   }
@@ -590,83 +693,89 @@ __global__ __launch_bounds__(NTHREAD, 2) void attn_kernel(
     const int gA0 = p0 + rowA, gB0 = p0 + rowB;
     const size_t rowbase = (size_t)zs * TQ + q0;
     if (gA0 < qlen) {
-      float *oA = po2 + ((rowbase + gA0) * HQ + h) * DIMH + (lane & 3) * 2;
+      __half *oA =
+          po2 + ((rowbase + gA0) * HQ + hA) * DIMH + (lane & 3) * 2;
 #pragma unroll
-      for (int nt = 0; nt < 16; ++nt)
-        *(float2 *)(oA + nt * 8) = make_float2(acc[nt][0], acc[nt][1]);
+      for (int nt = 0; nt < 16; ++nt) {
+        *(__half2 *)(oA + nt * 8) = *(__half2 *)&acc[2 * nt];
+      }
       if ((lane & 3) == 0)
-        pml2[(rowbase + gA0) * HQ + h] = make_float2(mA * scale, lA);
+        pml2[(rowbase + gA0) * HQ + hA] = make_float2(mA * scale, lA);
     }
     if (gB0 < qlen) {
-      float *oB = po2 + ((rowbase + gB0) * HQ + h) * DIMH + (lane & 3) * 2;
+      __half *oB =
+          po2 + ((rowbase + gB0) * HQ + hB) * DIMH + (lane & 3) * 2;
 #pragma unroll
-      for (int nt = 0; nt < 16; ++nt)
-        *(float2 *)(oB + nt * 8) = make_float2(acc[nt][2], acc[nt][3]);
+      for (int nt = 0; nt < 16; ++nt) {
+        *(__half2 *)(oB + nt * 8) = *(__half2 *)&acc[2 * nt + 1];
+      }
       if ((lane & 3) == 0)
-        pml2[(rowbase + gB0) * HQ + h] = make_float2(mB * scale, lB);
+        pml2[(rowbase + gB0) * HQ + hB] = make_float2(mB * scale, lB);
     }
     return;
   }
   float iA = (lA > 0.f ? 1.f / lA : 0.f) * vdsc;
   float iB = (lB > 0.f ? 1.f / lB : 0.f) * vdsc;
   const int gA = p0 + rowA, gB = p0 + rowB;
-  __nv_bfloat16 *oA = outp + (size_t)(q0 + gA) * 1024 + h * 128 + (lane & 3) * 2;
-  __nv_bfloat16 *oB = outp + (size_t)(q0 + gB) * 1024 + h * 128 + (lane & 3) * 2;
+  __nv_bfloat16 *oA = outp + (size_t)(q0 + gA) * 1024 + hA * 128 + (lane & 3) * 2;
+  __nv_bfloat16 *oB = outp + (size_t)(q0 + gB) * 1024 + hB * 128 + (lane & 3) * 2;
 #pragma unroll
   for (int nt = 0; nt < 16; ++nt) {
     if (gA < qlen) {
-      __nv_bfloat162 v = __floats2bfloat162_rn(acc[nt][0] * iA, acc[nt][1] * iA);
+      const float2 a = __half22float2(*(__half2 *)&acc[2 * nt]);
+      __nv_bfloat162 v = __floats2bfloat162_rn(a.x * iA, a.y * iA);
       *(__nv_bfloat162 *)(oA + nt * 8) = v;
     }
     if (gB < qlen) {
-      __nv_bfloat162 v = __floats2bfloat162_rn(acc[nt][2] * iB, acc[nt][3] * iB);
+      const float2 a = __half22float2(*(__half2 *)&acc[2 * nt + 1]);
+      __nv_bfloat162 v = __floats2bfloat162_rn(a.x * iB, a.y * iB);
       *(__nv_bfloat162 *)(oB + nt * 8) = v;
     }
   }
 }
 
 /* combine split-KV partials for the long-query (prefill) rows */
-extern "C" __global__ __launch_bounds__(256, 2) void combine_prefill(
-    const float *__restrict__ po2, const float2 *__restrict__ pml2,
+template <int PS>
+__global__ __launch_bounds__(256, 2) void combine_prefill(
+    const __half *__restrict__ po2, const float2 *__restrict__ pml2,
     const int *__restrict__ cup, const float *__restrict__ vds,
-    __nv_bfloat16 *__restrict__ outp, int TQ, int PSPLIT, int B) {
+    __nv_bfloat16 *__restrict__ outp, int TQ, int B,
+    const int2 *__restrict__ tasks) {
   const int tid = threadIdx.x;
   const int h = tid >> 5;
   const int lane = tid & 31;
-  const int row = blockIdx.x;
-  __shared__ int srr;
-  if (tid == 0) {
-    int rr0 = 0;
-    while (rr0 + 1 < B && row >= cup[rr0 + 1]) ++rr0;
-    srr = rr0;
-  }
-  __syncthreads();
-  const int rr = srr;
-  if (cup[rr + 1] - cup[rr] <= BQ) return;   /* decode rows: combine_kernel owns them */
+  const int2 task = tasks[blockIdx.x];
+  if (task.x < 0) return;
+  const int rr = task.x;
+  const int local_row = task.y * BQ + (int)blockIdx.y;
+  if (local_row >= cup[rr + 1] - cup[rr]) return;
+  const int row = cup[rr] + local_row;
   const int d = lane * 4;
   const size_t moff = (size_t)row * HQ + h;
   const size_t mstride = (size_t)TQ * HQ;
-  float2 ml = lane < PSPLIT ? pml2[moff + (size_t)lane * mstride]
+  float2 ml = lane < PS ? pml2[moff + (size_t)lane * mstride]
                              : make_float2(-INFINITY, 0.f);
   float M = ml.x;
-  for (int delta = 16; delta; delta >>= 1)
+  for (int delta = 4; delta; delta >>= 1)
     M = fmaxf(M, __shfl_down_sync(0xffffffffu, M, delta));
   M = __shfl_sync(0xffffffffu, M, 0);
-  float wl = lane < PSPLIT && ml.x > -1e29f ? exp2f(ml.x - M) : 0.f;
+  float wl = lane < PS && ml.x > -1e29f ? exp2f(ml.x - M) : 0.f;
   float den = wl * ml.y;
-  for (int delta = 16; delta; delta >>= 1)
+  for (int delta = 4; delta; delta >>= 1)
     den += __shfl_down_sync(0xffffffffu, den, delta);
   den = __shfl_sync(0xffffffffu, den, 0);
   float num0 = 0.f, num1 = 0.f, num2 = 0.f, num3 = 0.f;
-#pragma unroll 1
-  for (int z = 0; z < PSPLIT; ++z) {
+#pragma unroll
+  for (int z = 0; z < PS; ++z) {
     float w = __shfl_sync(0xffffffffu, wl, z);
-    float4 v = *(const float4 *)(po2 +
+    const __half2 *pv = (const __half2 *)(po2 +
         (moff + (size_t)z * mstride) * DIMH + d);
-    num0 = fmaf(w, v.x, num0);
-    num1 = fmaf(w, v.y, num1);
-    num2 = fmaf(w, v.z, num2);
-    num3 = fmaf(w, v.w, num3);
+    const float2 v01 = __half22float2(pv[0]);
+    const float2 v23 = __half22float2(pv[1]);
+    num0 = fmaf(w, v01.x, num0);
+    num1 = fmaf(w, v01.y, num1);
+    num2 = fmaf(w, v23.x, num2);
+    num3 = fmaf(w, v23.y, num3);
   }
   float inv = lane == 0 ? (den > 0.f ? 1.f / den : 0.f) * vds[rr] : 0.f;
   inv = __shfl_sync(0xffffffffu, inv, 0);
@@ -741,19 +850,20 @@ extern "C" __global__ __launch_bounds__(256, 2) void combine_kernel(
 
 // ---------------------------------------------------------------------------
 // Host side. The launch heuristic below is carried verbatim from the measured
-// kernel (H200 study job 709592); only the workspace ownership moved out of
-// the launcher (plan-time allocation by the Python dispatcher) so that `run`
-// is CUDA-graph capturable.
+// kernel (campaign terminal winner, H200 study re-time job 777319); only the
+// workspace ownership moved out of the launcher (plan-time allocation by the
+// Python dispatcher) so that `run` is CUDA-graph capturable.
 // ---------------------------------------------------------------------------
 
 namespace {
-constexpr size_t kSmemBytes = KSTAGE * BN * DIMH + VSTAGE * VPITCH + 2 * 64 * DIMH;
+constexpr size_t kSmemBytes = KSTAGE * BN * DIMH + VSTAGE * VPITCH;
 }  // namespace
 
 // Plan-time KV-split factor for the long-query (prefill) tiles. Verbatim from
 // the measured launcher: wave-balance the prefill tiles, aim for >= ~8 full
-// waves of CTAs; fp32 partial-state footprint capped at 768 MiB; pure-decode
-// steps never split.
+// waves of CTAs; partial-state footprint capped at 768 MiB (the measured
+// launcher's fp32-denominated cap, kept bit-identical so the split decisions
+// match the measured kernel exactly); pure-decode steps never split.
 int64_t gqa_context_fp8_paged_sm90_plan_psplit(int64_t total_q, int64_t max_seqlen_q,
                                                int64_t batch_size) {
   const int TQ = static_cast<int>(total_q);
@@ -784,12 +894,28 @@ int64_t gqa_context_fp8_paged_sm90_plan_num_tasks(int64_t total_q, int64_t batch
   return npt;
 }
 
-// One-time per-device opt-in to the attention kernel's dynamic shared memory
-// (~88 KiB > the 48 KiB default). Outside CUDA-graph capture, before the
-// first `run` on the device.
+// One-time per-device opt-in to the attention kernels' dynamic shared memory
+// (56 KiB > the 48 KiB default), covering every instantiation `run` can
+// launch: the four modes in both page-addressing widths plus the
+// statically-split prefill specialisations. Outside CUDA-graph capture,
+// before the first `run` on the device.
 void gqa_context_fp8_paged_sm90_init(int64_t device_id) {
   ffi::CUDADeviceGuard device_guard(static_cast<int>(device_id));
-  for (auto* fn : {attn_kernel<0>, attn_kernel<1>, attn_kernel<2>}) {
+  using AttnFn = void (*)(const uint8_t*, const uint8_t*, const uint8_t*, const int*,
+                          const int*, const int*, const float*, const float*, const float*,
+                          __nv_bfloat16*, float*, float2*, int, int, __half*, float2*, int,
+                          int, const int2*);
+  const AttnFn fns[] = {
+      attn_kernel<0, false>,    attn_kernel<1, false>,    attn_kernel<2, false>,
+      attn_kernel<3, false>,    attn_kernel<0, true>,     attn_kernel<1, true>,
+      attn_kernel<2, true>,     attn_kernel<3, true>,     attn_kernel<1, false, 2>,
+      attn_kernel<1, true, 2>,  attn_kernel<1, false, 3>, attn_kernel<1, true, 3>,
+      attn_kernel<1, false, 4>, attn_kernel<1, true, 4>,  attn_kernel<1, false, 5>,
+      attn_kernel<1, true, 5>,  attn_kernel<1, false, 6>, attn_kernel<1, true, 6>,
+      attn_kernel<1, false, 7>, attn_kernel<1, true, 7>,  attn_kernel<1, false, 8>,
+      attn_kernel<1, true, 8>,
+  };
+  for (AttnFn fn : fns) {
     cudaError_t status = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                               static_cast<int>(kSmemBytes));
     TVM_FFI_ICHECK(status == cudaSuccess)
@@ -799,13 +925,15 @@ void gqa_context_fp8_paged_sm90_init(int64_t device_id) {
 }
 
 // Launch the measured kernel sequence on the caller's current stream:
-// vt_build (V^T scratch over the covered pages), build_prefill_tasks (exact
-// long-query tile list), attn_kernel<2> (split-KV decode-like rows), then
-// either attn_kernel<0> (direct prefill tiles) or attn_kernel<1> +
-// combine_prefill (KV-split prefill tiles), and combine_kernel (split-KV
-// merge). No allocation, no sync, no attribute queries: CUDA-graph
-// capturable. All workspace buffers are plan-allocated by the Python
-// dispatcher; psplit comes from `plan_psplit` at plan time.
+// vt_build (V^T scratch over the covered pages + exact long-query tile list),
+// attn_kernel<3>/<2> (split-KV decode-like rows, packed and regular — skipped
+// on a pure single-request prefill step), then either attn_kernel<0> (direct
+// prefill tiles) or the statically-split attn_kernel<1, ·, psplit> +
+// combine_prefill<psplit> (KV-split prefill tiles, fp16 partial states), and
+// combine_kernel (split-KV merge, skipped with the decode kernels). No
+// allocation, no sync, no attribute queries: CUDA-graph capturable. All
+// workspace buffers are plan-allocated by the Python dispatcher; psplit comes
+// from `plan_psplit` at plan time.
 void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView v_cache,
                                     TensorView block_table, TensorView seq_lens,
                                     TensorView cu_seqlens_q, TensorView q_descale,
@@ -873,6 +1001,10 @@ void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView
   TVM_FFI_ICHECK_GE(psplit, 1);
   TVM_FFI_ICHECK_LE(psplit, 8);
   if (psplit > 1) {
+    // The split-prefill partial states are fp16 (po2) / 2xfp32 (pml2) on the
+    // device side; the dispatcher plan-allocates both as fp32 with the same
+    // element counts (ABI kept stable across candidate generations), so the
+    // fp16 payload is over-provisioned 2x by construction.
     TVM_FFI_ICHECK_GE(po2.numel(), (int64_t)psplit * TQ * HQ * DIMH);
     TVM_FFI_ICHECK_GE(pml2.numel(), (int64_t)psplit * TQ * HQ * 2);
   }
@@ -908,31 +1040,66 @@ void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView
   uint8_t* g_vt = static_cast<uint8_t*>(vt.data_ptr());
   float* g_po = static_cast<float*>(po.data_ptr());
   float2* g_pml = reinterpret_cast<float2*>(pml.data_ptr());
-  float* g_po2 = static_cast<float*>(po2.data_ptr());
+  __half* g_po2 = reinterpret_cast<__half*>(po2.data_ptr());
   float2* g_pml2 = reinterpret_cast<float2*>(pml2.data_ptr());
   int2* g_tasks = reinterpret_cast<int2*>(tasks.data_ptr());
   const size_t smem = kSmemBytes;
+  /* page-addressing width follows the physical cache size, as in the
+     measured launcher */
+  const bool wide_pages =
+      (uint64_t)(uint32_t)v_cache.size(0) * 2048ull > 0xffffffffull;
+
+#define LAUNCH_ATTN(MODE, GRID, BLOCK, SHM)                                   \
+  do {                                                                        \
+    if (wide_pages)                                                           \
+      attn_kernel<MODE, true><<<GRID, BLOCK, SHM, s>>>(                       \
+          qd, kd, g_vt, bt, sl, cu, qs, ks, vs, op, g_po, g_pml, NB, B,       \
+          g_po2, g_pml2, TQ, psplit, g_tasks);                                \
+    else                                                                      \
+      attn_kernel<MODE, false><<<GRID, BLOCK, SHM, s>>>(                      \
+          qd, kd, g_vt, bt, sl, cu, qs, ks, vs, op, g_po, g_pml, NB, B,       \
+          g_po2, g_pml2, TQ, psplit, g_tasks);                                \
+  } while (0)
+#define LAUNCH_PART(PVAL)                                                     \
+  do {                                                                        \
+    if (wide_pages)                                                           \
+      attn_kernel<1, true, PVAL><<<dim3(npt, 1, PVAL), NTHREAD, smem, s>>>(   \
+          qd, kd, g_vt, bt, sl, cu, qs, ks, vs, op, g_po, g_pml, NB, B,       \
+          g_po2, g_pml2, TQ, PVAL, g_tasks);                                  \
+    else                                                                      \
+      attn_kernel<1, false, PVAL><<<dim3(npt, 1, PVAL), NTHREAD, smem, s>>>(  \
+          qd, kd, g_vt, bt, sl, cu, qs, ks, vs, op, g_po, g_pml, NB, B,       \
+          g_po2, g_pml2, TQ, PVAL, g_tasks);                                  \
+    combine_prefill<PVAL><<<dim3(npt, BQ), 256, 0, s>>>(                      \
+        g_po2, g_pml2, cu, vs, op, TQ, B, g_tasks);                           \
+  } while (0)
 
   /* One pass over the covered physical pages turns V into the
-     keys-contiguous form the fp8 PV wgmma needs; each page is transformed
-     exactly once. */
-  vt_build<<<(int)vt_pages, 128, 0, s>>>(vd, g_vt);
-  build_prefill_tasks<<<1, 128, 0, s>>>(cu, g_tasks, B, npt);
-  attn_kernel<2><<<dim3(NSPLIT_MAX, B), NTHREAD, smem, s>>>(
-      qd, kd, g_vt, bt, sl, cu, qs, ks, vs, op, g_po, g_pml, NB, B,
-      g_po2, g_pml2, TQ, psplit, g_tasks);
-  if (psplit > 1) {
-    attn_kernel<1><<<dim3(npt, 1, psplit), NTHREAD, smem, s>>>(
-        qd, kd, g_vt, bt, sl, cu, qs, ks, vs, op, g_po, g_pml, NB, B,
-        g_po2, g_pml2, TQ, psplit, g_tasks);
-    combine_prefill<<<TQ, 256, 0, s>>>(g_po2, g_pml2, cu, vs, op,
-                                       TQ, psplit, B);
-  } else {
-    attn_kernel<0><<<dim3(npt), NTHREAD, smem, s>>>(
-        qd, kd, g_vt, bt, sl, cu, qs, ks, vs, op, g_po, g_pml, NB, B,
-        g_po2, g_pml2, TQ, psplit, g_tasks);
+     keys-contiguous form the fp8 PV wgmma needs (each page is transformed
+     exactly once) and writes the exact long-query tile list. */
+  vt_build<<<(int)vt_pages, 128, 0, s>>>(vd, g_vt, cu, g_tasks, B, npt);
+  const bool all_prefill = B == 1 && TQ > BQ;
+  if (!all_prefill) {
+    LAUNCH_ATTN(3, dim3(NSPLIT_MAX, B), 128, smem);
+    LAUNCH_ATTN(2, dim3(NSPLIT_MAX, B), NTHREAD, smem);
   }
-  combine_kernel<<<dim3(BQ, B), 256, 0, s>>>(g_po, g_pml, sl, cu, vs, op, B);
+  if (psplit > 1) {
+    switch (psplit) {
+      case 2: LAUNCH_PART(2); break;
+      case 3: LAUNCH_PART(3); break;
+      case 4: LAUNCH_PART(4); break;
+      case 5: LAUNCH_PART(5); break;
+      case 6: LAUNCH_PART(6); break;
+      case 7: LAUNCH_PART(7); break;
+      default: LAUNCH_PART(8); break;
+    }
+  } else {
+    LAUNCH_ATTN(0, dim3(npt), NTHREAD, smem);
+  }
+  if (!all_prefill)
+    combine_kernel<<<dim3(BQ, B), 256, 0, s>>>(g_po, g_pml, sl, cu, vs, op, B);
+#undef LAUNCH_ATTN
+#undef LAUNCH_PART
   cudaError_t status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "gqa_context_fp8_paged_sm90 launch failed: " << cudaGetErrorString(status);
