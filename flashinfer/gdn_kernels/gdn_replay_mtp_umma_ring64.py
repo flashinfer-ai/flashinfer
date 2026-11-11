@@ -604,7 +604,7 @@ class GdnReplayMtpUmma:
                             Uint32(0),
                             Uint32(0),
                         )
-            cute.arch.sync_threads()
+            U.bar_sync_ua(0, 256)
             # ============================================================ consumers
             cw = warp ^ 2
             ct = cw * 32 + lane  # TMEM lane address / k index for staging
@@ -646,7 +646,7 @@ class GdnReplayMtpUmma:
                 s_gram[(W_RING + grp) * 16 + gc + 1] = accx[1]
                 s_gram[(W_RING + 8 + grp) * 16 + gc] = accx[2]
                 s_gram[(W_RING + 8 + grp) * 16 + gc + 1] = accx[3]
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                U.bar_sync_ua(1, 128)
                 # Everything below needs only the X x X Gram and the gate inputs (one round
                 # trip), so it overlaps warps mt == 0 waiting for the ring rows.
                 cl = ct - 64
@@ -736,7 +736,7 @@ class GdnReplayMtpUmma:
                 wr0c0, wr1c0 = self._ring_k_loads(
                     0, kc_g, k_cache, sidx, kh, base, P, grp, c4
                 )
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                U.bar_sync_ua(1, 128)
                 # X tile (fp16, SW128) from the B fragments: lane = row xr_b, 4 x 16 B of k
                 rn_b = cute.math.rsqrt(
                     s_gram[(W_RING + xr_b) * 16 + xr_b] + Float32(_EPS)
@@ -794,7 +794,7 @@ class GdnReplayMtpUmma:
                                 kw4[2],
                                 kw4[3],
                             )
-            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            U.bar_sync_ua(1, 128)
 
             # -------- after the ring tiles: C tile (warps mt == 1), window weights, g-ring
             # appends, Kt (flush rows)
@@ -830,7 +830,7 @@ class GdnReplayMtpUmma:
                     U.sts_u32(c_addr + cbyte, U.pack_f16x2(c0, c1))
             if is_flush:
                 # the C-tile fill above reads s_gram, whose bytes the K_hist tile reuses
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                U.bar_sync_ua(1, 128)
                 # K_hist tile (fold B operand): thread -> (slot row jr = ct / 8, 16 B chunk c8) of both
                 # K groups; ring rows were just read by the Gram (L1/L2 hits); slots j >= P zeroed.
                 # W_CHUNKS independent W_CHUNK-row tiles, chunk wc at byte offset
@@ -927,7 +927,7 @@ class GdnReplayMtpUmma:
                         if P > 0:
                             egp = cute.math.exp(gpw, fastmath=True)
                         s_coef[wh * _COEF + _CO_EGP] = egp
-            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            U.bar_sync_ua(1, 128)
 
             tbase = tmem_addr[0]
             ctx = dict(
@@ -1050,7 +1050,7 @@ class GdnReplayMtpUmma:
                         for s in cutlass.range_constexpr(2 * HPK):
                             cute.arch.mbarrier_init(f_gdone[s], 128)
                     cute.arch.mbarrier_init_fence()
-            cute.arch.sync_threads()
+            U.bar_sync_ua(0, 256)
 
             if warp == 4:
                 # ============================================================ producer

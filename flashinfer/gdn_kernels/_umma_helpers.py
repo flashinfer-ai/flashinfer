@@ -106,6 +106,20 @@ def fence_before_sync(*, loc=None, ip=None):
     nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC, loc=loc, ip=ip)
 
 
+@dsl_user_op
+def bar_sync_ua(barrier_id: int, number_of_threads: int, *, loc=None, ip=None) -> None:
+    """Named-barrier sync without ``.aligned`` (``barrier.cta.sync``), for a barrier that
+    is completed from more than one instruction site: ``cute.arch.barrier`` emits the
+    ``.aligned`` form, whose single-site promise synccheck reports as divergent threads."""
+    nvvm.barrier_cta_sync(
+        Int32(barrier_id).ir_value(loc=loc, ip=ip),
+        thread_count=Int32(number_of_threads).ir_value(loc=loc, ip=ip),
+        aligned=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
 # ----------------------------------------------------------------------------- UMMA
 def f16_idesc(m: int, n: int, *, a_mn_major: bool = False, b_mn_major: bool = False):
     """kind::f16 instruction descriptor: fp16 A/B, fp32 D, K-major unless told otherwise."""
