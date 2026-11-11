@@ -1,4 +1,9 @@
-# SDSA indexer
+# SDSA (Simplified DSA)
+
+SDSA attends each query token to its Top-K keys. A one-head indexer picks the
+keys, and token-sparse attention attends to them.
+
+## Indexer
 
 DeepSeek Sparse Attention (DSA) attends each query token to its Top-K keys. An
 indexer gives the scores that pick these keys. The DSA indexer has many heads
@@ -18,10 +23,9 @@ module has five parts:
   paged cache and the queries to rows, in one launch.
 
 For decode, a Top-K kernel takes the Top-K from the scores. The Top-K keys feed
-token-sparse attention
-([token_sparse_attention.md](token_sparse_attention.md)).
+token-sparse attention (below).
 
-## Public API
+### Public API
 
 All functions are in `flashinfer.sdsa`.
 
@@ -34,7 +38,7 @@ All functions are in `flashinfer.sdsa`.
 | `thresholds_from_sample(sample_scores, sample_top, *, thresholds, counters)` | Set the threshold of each query row from its sampled Top scores, and zero its counters. |
 | `quantize_write_index_qk_nvfp4(key, slots, query, query_rows, *, key_cache, key_scales, packed_query, query_scales)` | Quantize BF16 or FP16 keys and queries to NVFP4: the keys at their cache slots, the queries at their rows. |
 
-## Layout
+### Layout
 
 A key has 128 values. The keys are in pages of 64 keys.
 
@@ -52,7 +56,7 @@ The pages can be any multiple of 16 bytes apart. So `key_cache` and
 `key_scales` can be views of one cache that holds the keys of a page and then
 their scales.
 
-### Decode scores
+#### Decode scores
 
 The query rows come in groups of 1 to 8 rows, such as a decode token and its
 draft tokens. All rows of a group see the same keys.
@@ -66,7 +70,7 @@ scores:           [rows, max_context] fp32  output: scores[q, k] for k below the
 The scores at or past the length of a group stay as they are.
 `max_context` sizes the grid, and the block table must cover it.
 
-### Selection
+#### Selection
 
 The query rows come in tiles of 128 rows. Each row has its own number of keys.
 
@@ -99,7 +103,7 @@ candidates fit the `capacity` slots, and its candidates and ties reach
 Then the exact Top-`top_k` keys of the row are among its slots. Here, 2 + 2
 reaches 4, so the Top-4 keys are keys 3 and 0 and the two ties.
 
-### Top-K from the selection
+#### Top-K from the selection
 
 ```text
 candidates:  [rows, slots, 2] int32  the select's (key, score bits) pairs
@@ -113,9 +117,9 @@ top_keys:    [rows, top_k] int32     output: the Top-K keys of each row
 any of them. A row of at most `top_k` pairs gets all its keys, then -1. In the
 example, the row's 4 pairs give the keys 0, 2, 3 and 4.
 
-## How it works
+### How it works
 
-### Decode scores
+#### Decode scores
 
 On SM10x, a CuTe-DSL kernel scores the keys. Each CTA streams a run of 128-key
 tiles of one group:
@@ -134,7 +138,7 @@ needs them, so that the pages of each CTA run fit in its shared memory.
 On other GPUs, such as Hopper, a Triton kernel scores BF16 keys. NVFP4 keys need
 SM10x.
 
-### Selection
+#### Selection
 
 The same kernel family selects. The query rows are on the MMA's M (128), and
 the keys on its N (128). Each CTA scores a run of key tiles for one query tile,
@@ -147,7 +151,7 @@ fit: it scores the keys of the tile again, and selects again at the
 finds. So any threshold gives the same exact result. The threshold only sets
 how often the repair runs.
 
-### Top-K from the selection
+#### Top-K from the selection
 
 The select stores scores that keep the order of the row's scores, so the Top-K
 of the stored scores is the Top-K of the scores. A CTA of 256 threads takes a
@@ -167,7 +171,7 @@ For each 64 pairs, a warp gets its positions from ballots, and reserves them
 with one shared-memory atomic. Thus its stores are coalesced. Many equal scores
 need no other path: step 2 then counts all the digits.
 
-### Thresholds from a sample
+#### Thresholds from a sample
 
 A good threshold makes the repair rare:
 
@@ -179,7 +183,7 @@ A good threshold makes the repair rare:
    sampled Top scores, and zeroes its counters. A -1 position or a NaN score
    counts as -inf.
 
-### NVFP4 keys and queries
+#### NVFP4 keys and queries
 
 `quantize_write_index_qk_nvfp4` gives each 16 values of a key or query an E4M3
 scale: their largest magnitude over 6, with a global scale of 1. It writes the
@@ -188,7 +192,7 @@ scale: their largest magnitude over 6, with a global scale of 1. It writes the
 `query_scales`. It skips negative slots and rows. Keys and queries are
 quantized the same way, so their scores stay comparable.
 
-## Limits
+### Limits
 
 - A key has 128 values, and a page has 64 keys.
 - Decode takes 1 to 8 query rows for each request. Selection takes tiles of 128
@@ -200,18 +204,18 @@ quantized the same way, so their scores stay comparable.
 - `gather_key_sample` takes sample rows of whole 128-key tiles.
 - `top_k_from_candidates` takes `top_k` below 65536.
 
-## CUDA graphs
+### CUDA graphs
 
 No kernel synchronizes with the host. Run each one once before capture, because
 the CuTe-DSL kernels compile on first use. Queries, keys, pages, lengths,
 thresholds and ranges can change between replays. Zero the `arrivals` of the
 select once: every call leaves them at zero.
 
-## Tracing
+### Tracing
 
 Each API records a trace template, with the op type `sdsa_<api>`.
 
-## Validation
+### Validation
 
 `tests/sdsa/test_indexer.py` covers:
 
@@ -238,3 +242,196 @@ Each API records a trace template, with the op type `sdsa_<api>`.
   shuffled slots and rows, with negative ones skipped.
 - the checks that reject bad shapes, bad layouts off SM10x, bad counters, and
   CuTe DSL older than 4.7.
+
+## Token-sparse attention
+
+In token-sparse attention, each query token attends only to its own list of
+keys, such as the 2048 keys that the DSA indexer selects for it. FlashInfer runs
+it in two ways:
+
+- `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K, uses_shared_paged_kv_idx=False)`
+  runs MQA decode on
+  the token-sparse kernels of trtllm-gen. `token_sparse_kv_indices` makes its
+  index lists from the key positions of each token.
+- `group_union_masks` lets a dense attention kernel that takes a mask for each
+  query run it: a group of tokens attends to the union of their keys, and a mask
+  limits each token to its own keys.
+
+### Public API
+
+| API | Purpose |
+| --- | --- |
+| `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K, uses_shared_paged_kv_idx=False)` | Each query token attends to the K and V rows in its own lists. |
+| `flashinfer.sdsa.token_sparse.token_sparse_kv_indices(positions, requests, block_table, *, block_tables, seq_lens, requests_per_token)` | Make `block_tables` and `seq_lens` from the key positions of each token, in one launch. |
+| `flashinfer.sdsa.token_sparse.group_union_masks(positions, query_rows, group_unions, requests, block_table, *, union, union_sizes, mask, num_keys)` | Make the union of keys of each group of tokens, and the mask of each token over that union, in one launch. |
+| `flashinfer.sdsa.token_sparse.union_key_limit(group, top_k, device=None)` | The most keys (`num_keys`) that `group_union_masks` takes for groups of `group` tokens. |
+
+### Layout
+
+#### Token-sparse decode
+
+Each query token is its own request, over cache pages of one token. MTP draft
+tokens are requests too.
+
+```text
+query:         [batch, num_qo_heads, head_dim]
+kv_cache:      [rows, 2, 1, 1, head_dim], or K and V as two [rows, 1, 1, head_dim]
+block_tables:  [batch, 2, K] int32   the K rows, then the V rows, of each token
+seq_lens:      [batch] int32         the entries of each list that the token uses
+output:        [batch, num_qo_heads, head_dim]
+```
+
+`seq_lens[b]` is at most `K`, and the kernels read only the first `seq_lens[b]`
+entries. For example, with 2 query tokens and `sparse_top_k=4`:
+
+```python
+block_tables = [[[7, 2, 9, -1], [7, 2, 9, -1]],  # token 0: K rows, V rows
+                [[5, 1, 8,  3], [5, 1, 8,  3]]]  # token 1: K rows, V rows
+seq_lens = [3, 4]  # token 0 uses 3 entries, token 1 uses 4
+```
+
+Token 0 attends to the keys and values in rows 7, 2 and 9. The K list and the
+V list are the same when the K and V of a key are in the same row.
+
+#### Index lists
+
+`token_sparse_kv_indices` reads and writes:
+
+```text
+positions:     [tokens, K] int32         the key positions of each token, valid ones first, then -1
+requests:      [tokens] int32            the block_table row of each token
+block_table:   [requests, blocks] int32  pages of 64 keys
+block_tables:  [tokens * requests_per_token, 2, K] int32, output
+seq_lens:      [tokens * requests_per_token] int32, output
+```
+
+Key `k` of a request is in row `block_table[request, k // 64] * 64 + k % 64`.
+
+#### Group unions and masks
+
+`group_union_masks` reads and writes:
+
+```text
+positions:     [tokens, K] int32    as for token_sparse_kv_indices
+query_rows:    [tokens] int32       the mask row of each token, -1 for none
+group_unions:  [groups] int32       the union row of each group, -1 for none
+requests:      [groups] int32       the block_table row of each group
+block_table:   [requests, blocks] int32
+union:         [unions, columns] int32, output   the union of each group, as cache rows in key order
+union_sizes:   [unions] int32, output            the number of keys in each union
+mask:          [masks, words] int32, output      bit j of word w: the token uses union column 32 * w + j
+```
+
+The tokens make `len(requests)` groups of equal size, which the caller chooses.
+For example, take one group of 2 tokens, where token 0 uses keys 3 and 9, and
+token 1 uses keys 9 and 12. These keys are on the first page of the request,
+which is cache page 5 (rows 320 to 383):
+
+```python
+union[0][:3] = [323, 329, 332]  # the cache rows of keys 3, 9 and 12
+union_sizes = [3]
+mask[0][0] = 0b011  # token 0: union columns 0 and 1
+mask[1][0] = 0b110  # token 1: union columns 1 and 2
+```
+
+The group then runs as one varlen entry of the dense kernel, with the union rows
+as its K and V. This pays when the tokens of a group share many keys, as the
+neighboring prefill tokens of a request do.
+
+### Limits
+
+The decode call rejects calls outside these limits:
+
+- `K` is a multiple of 4, because the kernels copy indices 16 bytes at a time.
+- `batch` is at most 65535, because of the launch grid. There are at most 128
+  query heads.
+- The KV cache has one KV head, because the kernels have no KV-head stride.
+- Each request has one query token: `q_len_per_req` is 1, without
+  `cum_seq_lens_q`.
+- There is no sliding window and there are no attention sinks.
+- The head dim is not 512. Head dim 512 is MLA, which
+  `trtllm_batch_decode_with_kv_cache_mla` runs.
+- `uses_shared_paged_kv_idx` is `False`, and K and V have the same page stride.
+  They can be two halves of one `[K | V]` cache row.
+- The backend is `trtllm-gen` (SM100 and SM103). K and V are BF16 or FP8.
+
+`token_sparse_kv_indices` and `group_union_masks` take `K` as a multiple of
+512, and contiguous int32 tensors on one GPU. `group_union_masks` also needs:
+
+- groups of equal size that cover the tokens, with an entry in `query_rows`
+  for each token;
+- distinct output rows: other than -1, no two tokens share a `query_rows` entry,
+  and no two groups share a `group_unions` entry;
+- a block table that covers `num_keys`;
+- union rows of at least `min(group * K, 128 * ceil(num_keys / 128))` columns,
+  and mask rows of at least as many bits;
+- `num_keys` at most `union_key_limit(group, K, positions.device)`, so that a key bitmap with a bit
+  for each key below `num_keys`, and the mask rows, fit in shared memory. On
+  SM100 with `K` 2048, that is 1,441,792 keys for groups of up to 4 tokens and
+  1,179,648 for 32.
+
+### How the trtllm-gen dispatch runs it
+
+- The call uses the static token-sparse mode of trtllm-gen: one list length `K`
+  for all tokens, and `seq_lens` for the entries that each token uses.
+- `TllmGenFmhaRunnerParams::isMla()` names the MLA shapes. A token-sparse call
+  with other shapes is MQA (`isSparseMqa()`).
+- The call runs the generation kernels with a dense mask. One CTA holds all
+  query heads of its token, because the index lists are per KV head.
+- K and V each have their own base pointer and row stride.
+- When several CTAs share one list, they combine their results in shared memory
+  (the CGA reduction).
+
+### From key positions to kernel inputs
+
+An indexer gives the key positions of each token, and the kernels read cache
+rows. Both helpers change the positions to cache rows through the block table of
+the request, in one launch, without host synchronization.
+
+`token_sparse_kv_indices` writes the lists of each token. A token can also
+become several attention requests (`requests_per_token`), for example one for
+each group of its query heads. Each request gets the same lists.
+
+`group_union_masks` writes the union of each group of tokens and the mask of
+each token. Positions at or past `num_keys` count as -1.
+
+### CUDA graphs
+
+Run each kernel once before capture, because the CuTe-DSL helpers compile on
+first use. The lengths, positions and block tables can change in place between
+replays. The decode kernels leave their split-KV semaphores
+(`multi_ctas_kv_counter_buffer`) at zero, so one zeroed buffer serves every call
+and every replay.
+
+### Tracing
+
+- A decode call with `sparse_top_k` records the `trtllm_batch_decode_token_sparse`
+  template: the `[batch, 2, K]` `block_tables`, `sparse_top_k`,
+  `uses_shared_paged_kv_idx`, and a token-sparse reference.
+- `token_sparse_kv_indices` and `group_union_masks` record the
+  `sdsa_token_sparse_kv_indices` and `sdsa_group_union_masks` templates.
+
+### Validation
+
+- `tests/attention/test_trtllm_gen_token_sparse.py` compares the decode call
+  with an FP32 reference:
+  - `K` 512 and 2048, 7 and 300 query tokens, 2 to 96 query heads, BF16 and FP8;
+  - entries per token 1, 5, 127, 128, 129, `K` - 1 and `K`;
+  - K and V as two halves of one cache row;
+  - the rows outside the lists hold 300, so a wrong read changes the output;
+  - a second run with new lists reuses the split-KV semaphores.
+
+  It also checks that the call rejects several KV heads, a sliding window,
+  attention sinks and head dim 512.
+- `tests/sdsa/test_token_sparse.py` compares both helpers with PyTorch
+  references, without tolerance, eagerly and in a CUDA graph replay:
+  - `token_sparse_kv_indices`: `K` 512 and 2048, and 1 to 77 tokens with 1 to 4
+    requests per token. Rows after the output stay as they are.
+  - `group_union_masks`: `K` 512 and 2048, and groups of 1, 4 and 16 tokens of
+    two requests, one with 5000 keys and one with 600000 or `union_key_limit`
+    keys. It covers short lists,
+    tokens without a mask row, a group without a union row, and rows in reverse
+    order. Nothing is written after a union or after the words of a mask row.
+    The replay uses new keys.
+- `tests/trace/test_trtllm_batch_decode_reference_correctness.py` compares the
+  token-sparse trace reference with the kernel, for two shapes.
