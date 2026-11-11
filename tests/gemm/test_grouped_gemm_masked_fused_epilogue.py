@@ -387,10 +387,16 @@ def test_nvfp4_output_matches_separate_quantize(l, m, n, k, mma_tiler_mn, gated)
     masked_m = operands[4]
     n_out = n // 2 if gated else n
 
-    out_bf16 = torch.empty(l, m, n_out, dtype=torch.bfloat16, device=device)
+    out_bf16 = torch.full(
+        (l, m, n_out), float("nan"), dtype=torch.bfloat16, device=device
+    )
     _run_gemm(*operands, out_bf16.permute(1, 2, 0), "bfloat16", **kwargs)
-    amax = out_bf16.float().abs().amax(dim=(1, 2))
+    # Rows past masked_m are never written, so they must not feed the scale.
+    amax = torch.stack(
+        [out_bf16[i, : masked_m[i]].float().abs().amax() for i in range(l)]
+    )
     global_scale = (448.0 * 6.0 / amax).contiguous()
+    assert torch.isfinite(global_scale).all(), global_scale
     ref_q, ref_sf = scaled_fp4_grouped_quantize(out_bf16, masked_m, global_scale)
 
     out_q = torch.zeros(l, m, n_out // 2, dtype=torch.uint8, device=device)
