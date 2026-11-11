@@ -257,12 +257,13 @@ def cake_kda_nondet_train_backward(
 
     Returns
     -------
-    ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
-    like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
-    the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
-    FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs and path.  ``dq``, ``dk``, ``dv`` and
-    ``dbeta`` are bitwise the deterministic package's and ``dg`` differs from it by FP32 rounding; in raw gate mode
-    and with the in-kernel Q/K L2 norm every gradient is bitwise the deterministic package's.
+    tuple of torch.Tensor
+        ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
+        like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
+        the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
+        FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs and path.  ``dq``, ``dk``, ``dv`` and
+        ``dbeta`` are bitwise the deterministic package's and ``dg`` differs from it by FP32 rounding; in raw gate mode
+        and with the in-kernel Q/K L2 norm every gradient is bitwise the deterministic package's.
     """
     from .experimental.cake.cake_kda_nondet_train import cake_backend
 

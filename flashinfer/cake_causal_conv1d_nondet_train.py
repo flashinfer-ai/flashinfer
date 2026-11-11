@@ -364,11 +364,15 @@ def cake_causal_conv1d_nondet_train_backward(
         FP64 accumulators.
     workspace : torch.Tensor, optional
         Caller-owned buffer from :func:`cake_causal_conv1d_nondet_train_backward_workspace`.
-    dx, dweight, dbias : torch.Tensor, optional
-        Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
-        (FP32 or BF16 each; the parameter's dtype when omitted).  An FP32
-        ``dweight`` must be 16-byte aligned (one 16-byte store per channel;
-        ``ValueError`` otherwise).
+    dx : torch.Tensor, optional
+        Preallocated BF16 output of ``x``'s shape.
+    dweight : torch.Tensor, optional
+        Preallocated ``[C, 4]`` output (FP32 or BF16; the parameter's dtype
+        when omitted).  An FP32 ``dweight`` must be 16-byte aligned (one
+        16-byte store per channel; ``ValueError`` otherwise).
+    dbias : torch.Tensor, optional
+        Preallocated ``[C]`` output (FP32 or BF16; the parameter's dtype
+        when omitted).
     bwd_grid_mult : {1, 2, 3, 4}
         Opt-in finer static partition of the token axis (default 1, the
         default grid): the backward launches ``bwd_grid_mult`` times its

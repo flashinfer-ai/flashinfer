@@ -312,13 +312,14 @@ def cake_kda_det_train_kcp_backward(
 
     Returns
     -------
-    Five tensors in the explicit gate mode (``use_gate_in_kernel=False``): ``(dq, dk, dv, dbeta, dg)`` of this
-    rank's tokens, BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Seven tensors in raw gate mode
-    (``use_gate_in_kernel=True``): ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the
-    rank's raw gate, ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 (``dt_bias``'s shape) this rank's partial sums --
-    the gradients through its own tokens.  Sum them over the context-parallel group like the gradients of any
-    replicated parameter, or with :func:`cake_kda_det_train_kcp_reduce_gate_param_grads` for a bitwise reproducible sum (an NCCL
-    all-reduce does not fix its summation order).
+    tuple of torch.Tensor
+        Five tensors in the explicit gate mode (``use_gate_in_kernel=False``): ``(dq, dk, dv, dbeta, dg)`` of this
+        rank's tokens, BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Seven tensors in raw gate mode
+        (``use_gate_in_kernel=True``): ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the
+        rank's raw gate, ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 (``dt_bias``'s shape) this rank's partial sums --
+        the gradients through its own tokens.  Sum them over the context-parallel group like the gradients of any
+        replicated parameter, or with :func:`cake_kda_det_train_kcp_reduce_gate_param_grads` for a bitwise reproducible sum (an NCCL
+        all-reduce does not fix its summation order).
     """
     from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 
