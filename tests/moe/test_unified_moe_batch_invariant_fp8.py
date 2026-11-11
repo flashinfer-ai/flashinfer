@@ -1495,7 +1495,8 @@ def test_nan_logits_follow_the_shared_route_kernels_rule():
                 assert torch.isnan(out[t]).all(), t
             else:
                 assert not torch.isnan(out[t]).any(), t
-        clean = torch.tensor([t not in keep or keep[t] == k for t in range(T)])
+        # the rows without a NaN: the pre-routed path on the vectorised model's ids and weights gives their bits
+        clean = torch.tensor([t not in keep for t in range(T)])
         idx = clean.nonzero().flatten()
         ref_ids, ref_w = _reference_route(
             logits_c[idx], k, RoutingMethodType.Renormalize
@@ -1503,6 +1504,18 @@ def test_nan_logits_follow_the_shared_route_kernels_rule():
         xq_clean = xq.view(torch.uint8)[idx.cuda()].view(torch.float8_e4m3fn)
         ref = layer(_routed_pack(xq_clean, ref_ids.cuda(), ref_w.cuda()), W)
         assert torch.equal(bits(out[idx.cuda()]), bits(ref))
+        # the boundary row (exactly top_k finite logits): the exact model's selection and weights, pre-routed, give its bits
+        sel, ws = R.route_exact(logits_c[7].tolist(), k, S.SOFTMAX_RENORM)
+        xq7 = xq.view(torch.uint8)[7:8].view(torch.float8_e4m3fn)
+        ref7 = layer(
+            _routed_pack(
+                xq7,
+                torch.tensor([sel], dtype=torch.int32, device="cuda"),
+                torch.tensor([ws], dtype=torch.float32, device="cuda"),
+            ),
+            W,
+        )
+        assert torch.equal(bits(out[7:8]), bits(ref7))
 
 
 @needs_device
