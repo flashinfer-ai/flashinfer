@@ -36,11 +36,12 @@ def _const(dev: torch.device, n: int, value: float) -> torch.Tensor:
     """An fp32 constant tensor (``value`` repeated ``n`` times) the route kernel reads for an absent bias or scale. The
     defaults (``+0`` per expert count, ``1``) are cached per device, so the cache is bounded by the devices and the expert
     counts seen; a cached constant is built on the host and copied with a blocking copy, so its bytes are on the device
-    before the call returns and any stream may read it. Any other value, and every call under CUDA graph capture (a
-    graph-pool allocation whose fill runs only at replay: it serves that capture alone), is a fresh device fill, one more
-    kernel in the caller's stream or graph (a tensor argument avoids it)."""
+    before the call returns and any stream may read it -- a captured call reads it too (no node in the graph). Any other
+    value, and a default first met under CUDA graph capture (a graph-pool allocation whose fill runs only at replay: it
+    serves that capture alone and is not cached), is a fresh device fill, one more kernel in the caller's stream or graph
+    (a tensor argument, or one call outside capture, avoids it)."""
     cacheable = value in _CONST_VALUES and math.copysign(1.0, value) > 0
-    if not cacheable or torch.cuda.is_current_stream_capturing():
+    if not cacheable:
         return torch.full((n,), value, dtype=torch.float32, device=dev)
     key = (
         dev.index if dev.index is not None else torch.cuda.current_device(),
@@ -49,6 +50,8 @@ def _const(dev: torch.device, n: int, value: float) -> torch.Tensor:
     )
     t = _CONST.get(key)
     if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            return torch.full((n,), value, dtype=torch.float32, device=dev)
         t = torch.full((n,), value, dtype=torch.float32).to(dev)
         _CONST[key] = t
     return t

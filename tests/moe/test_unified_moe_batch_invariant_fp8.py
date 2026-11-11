@@ -1519,6 +1519,53 @@ def test_nan_logits_follow_the_shared_route_kernels_rule():
 
 
 @needs_device
+def test_routing_constants_are_read_from_the_cache_under_graph_capture():
+    """The route kernels' absent bias and unit scale are cached device constants (``api._const``): a call under CUDA graph
+    capture reads the cached tensor when it exists (no fill node in the graph), a default first met inside a capture is a
+    fill of that capture and is never cached, and a captured from-logits decode call of the fp8 layer replays the eager
+    call's bits with no fill launch among its kernels."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from flashinfer.fused_moe.batch_invariant import api
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    k, H, I, E = 8, 512, 256, 64
+    x, logits, w1, w2, m_x = _problem(4, k, H, I, E, seed=31, adversarial=True)
+    xq, W, layer = _xq(x, m_x), _weights(w1, w2, m_x), _layer(k, E, I, tune_max=4)
+    pack = _logits_pack(xq, logits)
+    eager = bits(layer(pack, W))  # the constants of this expert count are now cached
+    b0, s0 = api._const(dev, E, 0.0), api._const(dev, 1, 1.0)
+    assert api._const(dev, E, 0.0) is b0 and api._const(dev, 1, 1.0) is s0
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        layer(pack, W)
+        torch.cuda.current_stream().synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            assert api._const(dev, E, 0.0) is b0 and api._const(dev, 1, 1.0) is s0
+            inside = api._const(
+                dev, 3 * E, 0.0
+            )  # first met inside the capture: a fill of this capture alone
+            out = layer(pack, W)
+    torch.cuda.synchronize()
+    assert api._const(dev, 3 * E, 0.0) is not inside
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), eager)
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    fills = [n for n in names if "Fill" in n or "fill" in n]
+    assert len(fills) == 1, (
+        names
+    )  # the one constant first met inside the capture, none for the cached bias and scale
+    assert torch.equal(bits(out), eager)
+
+
+@needs_device
 def test_alternating_inputs_under_programmatic_dependent_launch():
     """Two W8A8 problems run alternately through the op, back to back without host syncs (the kernels' PDL chains overlap
     and every reused intermediate holds the other call's bytes), many times; every output equals the problem's isolated
