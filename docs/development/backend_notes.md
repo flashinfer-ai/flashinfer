@@ -29,8 +29,12 @@ separately.
 
 ## cuDNN query sparse attention
 
-`flashinfer.qsa_forward` accepts packed BF16 QSA block bitmaps;
-`flashinfer.qsa_indexed_forward` accepts existing causal token IDs. Both call
+Both APIs take BF16 Q/K/V. `flashinfer.qsa_forward` selects blocks with a packed
+`uint8` QSA block bitmap; `flashinfer.qsa_indexed_forward` accepts existing
+causal token IDs arranged in non-overlapping four-slot groups (a complete block,
+four `-1` padding slots, or a partial causal tail followed by `-1`). These
+device-value rules are a caller contract and are not checked on the host; see
+the docstrings in `flashinfer/qsa.py`. Both call
 `cudnn.ops`, return BF16 output, FP32 output, and natural-log LSE, and do not
 register autograd. Keep imports lazy and preserve these input/output contracts.
 

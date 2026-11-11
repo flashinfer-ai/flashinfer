@@ -1,8 +1,11 @@
 # Working on FlashInfer
 
-FlashInfer provides GPU kernels for LLM serving. Kernels compile on demand;
-source changes normally take effect on the next call without reinstalling.
-Read any nested `AGENTS.md` before changing that subtree.
+FlashInfer provides GPU kernels for LLM serving. Kernels compile on demand, so
+a new process picks up source changes without reinstalling. A running process
+keeps the modules it already loaded, and an installed `flashinfer-jit-cache`
+artifact is loaded before changed source is considered; uninstall that package
+when validating kernel edits. Read any nested `AGENTS.md` before changing that
+subtree.
 
 ## Common commands
 
@@ -105,19 +108,21 @@ Trigger targeted CI by default:
 - Public: `@flashinfer-bot run tests/<dir-or-file> [tests/...]`
 - Internal: `/bot run tests/<dir-or-file> [tests/...]`
 
-Targets are paths under `tests/`, without `::` selectors. Bare `run` requests
-recommendations. `run all` requests the expensive full suite; declare and
-justify that scope in the PR template. Pushing a commit does not start a new
+Targets are paths under `tests/`, without `::` selectors. Bare `run` asks for a
+scope recommendation: focused or uncertain results are only posted as advice,
+but a full-suite recommendation launches the full suite. `run all` requests the
+expensive full suite; declare and justify that scope in the PR template. Pushing a commit does not start a new
 public CI run; request tests for the final head when needed. See
 [CI command details](docs/design_docs/ci_bot_and_targeted_testing.md).
 
 ## Debugging and detailed references
 
-API logging defaults to off. Set `FLASHINFER_LOGLEVEL=1` for names, `3` for
-inputs/outputs, or `5` for statistics. Tensor dumps require
-`FLASHINFER_LOGLEVEL=10` before import. `FLASHINFER_LOGDEST` selects stdout,
-stderr, or a file. Inputs are logged before execution; statistics are skipped
-during CUDA graph capture. For verbose optimized nvcc builds, set
+API logging defaults to off. Both logging variables are read when FlashInfer is
+imported, so set them before import. Set `FLASHINFER_LOGLEVEL=1` for names, `3`
+for inputs/outputs, `5` for statistics, or `10` for tensor dumps.
+`FLASHINFER_LOGDEST` selects stdout, stderr, or a file. Inputs are logged before
+execution. During CUDA graph capture, level 5 captures a statistics kernel that
+prints on each replay; statistics are skipped only when that kernel cannot run. For verbose optimized nvcc builds, set
 `FLASHINFER_JIT_VERBOSE=1` and `FLASHINFER_JIT_DEBUG=0`: if debug is unset, verbose
 also enables debug builds. Set debug to `1` for symbols, `-O0`, and device
 debugging. See the

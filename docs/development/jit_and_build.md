@@ -186,11 +186,17 @@ Stable public APIs decorated with `@flashinfer_api` need a `trace=` template for
 1. Define/update `TraceTemplate` axes, inputs, outputs, and optional reference in
    `flashinfer/trace/templates/<category>.py`. Wire it with
    `@flashinfer_api(trace=my_trace)` on the function or class `run()` method.
+   When a module gains its first traced stable API, add it to
+   `_TRACE_REGISTRATION_MODULES` in `tests/trace/template_registry.py`; the
+   inventory test fails otherwise, and the generic template tests skip it.
 2. Add a realistic call to `tests/trace/example.py` and update its docstring's
    output-file list.
-3. Regenerate with `rm -rf tests/trace/fi_trace_out && python tests/trace/example.py`,
-   verify expected JSON, run `pytest tests/trace/ -v`, and commit the JSON files
-   alongside the code.
+3. Regenerate into a scratch directory, for example
+   `PYTHONPATH=$PWD FLASHINFER_TRACE_DUMP_DIR=/tmp/fi_trace_new python tests/trace/example.py`,
+   then copy the new or intentionally changed JSON files into
+   `tests/trace/fi_trace_out/`. Do not delete that directory first: examples the
+   current GPU cannot run are skipped, and their committed files would be lost.
+   Run `pytest tests/trace/ -v` and commit the JSON files alongside the code.
 
 For an init shared by Const shapes, list keyword-only defaults in
 `init._trace_init_const_axes` so each definition binds its resolved Const values.

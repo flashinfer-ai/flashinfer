@@ -26,6 +26,9 @@ The default is one worker per visible GPU. H100 PR CI uses
 `--workers-per-gpu 2` (eight workers on four GPUs); other lanes keep the default.
 Locally, use `scripts/task_run_unit_tests.sh --workers-per-gpu 2` for sharing or
 `--workers N` for a total count. Workers share the JIT compilation budget.
+The script prepares a CI container: it installs the Python requirements and the
+local package, and runs `apt-get` when `jq` is missing. Run it in a disposable
+container or environment, not in a development environment you want unchanged.
 
 ### Scheduling and memory
 
@@ -100,8 +103,8 @@ rerun application scripts or require callers to add a `__main__` guard.
 
 ## Architecture guards
 
-Supported GPU families include SM75, SM80, SM86, SM89, SM90, SM100, SM103,
-SM110, SM120, and SM121. Support varies by operation and backend.
+FlashInfer supports NVIDIA SM75, SM80, SM86, SM89, SM90, SM100, SM103, SM110,
+SM120, and SM121. Support varies by operation and backend.
 
 Use `flashinfer.utils.get_compute_capability(device)` for `(major, minor)`
 checks and the feature helpers for architecture-specific kernels:
@@ -136,9 +139,12 @@ def test_hopper_attention():
 ```
 
 APIs decorated with `@backend_requirement` expose
-`is_compute_capability_supported(cc)` and `is_backend_supported(backend, cc)`;
-the latter also accepts just the backend name. Use these checks rather than
-assuming all backends support an architecture. Self-validating modes that
+`is_compute_capability_supported(cc)` and `is_backend_supported(backend, cc)`.
+`cc` is an integer, `major * 10 + minor` (e.g. `90`), not the tuple returned by
+`get_compute_capability`. Without `cc`, `is_backend_supported` only reports
+whether the backend name is registered, not whether it runs on the current GPU;
+pass `cc` in architecture guards. Use these checks rather than assuming all
+backends support an architecture. Self-validating modes that
 replace backend selection, such as `batch_invariant=True` in `mm_bf16`,
 `bmm_fp8`, `mm_mxfp8`, and `mm_fp4`, use the decorator's `bypass=` predicate;
 see the kernel tutorial.
