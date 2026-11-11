@@ -53,14 +53,14 @@ from tests.experimental.test_cake_kda_det_train_kcp_shared_ws import (
     _same,
     _schedule,
 )
-from tests.test_helpers.cake_host_sync import (
+from tests.experimental.test_helpers.cake_host_sync import (
     allocator_counts,
     census,
     nonblocking,
     summary,
 )
-from tests.test_helpers.cake_kda_train_kcp_saved import written_tensors
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers.cake_kda_train_kcp_saved import written_tensors
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")

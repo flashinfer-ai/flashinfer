@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from tests.test_helpers.utils_fp4 import pack_fp4_values, ref_fp4_quant
+from tests.quantization.test_helpers.utils_fp4 import pack_fp4_values, ref_fp4_quant
 from tests.trace.reference_utils import _skip_if_not_sm100
 
 

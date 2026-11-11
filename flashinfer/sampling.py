@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from numbers import Real
+from threading import Lock
 from types import SimpleNamespace
 from typing import Optional, Tuple, Union
 import torch
@@ -49,23 +50,36 @@ from .utils import (
 )
 
 
+_rng_state_lock = Lock()
+
+
 def get_seed_and_offset(
     increment: int,
     generator: Optional[torch.Generator] = None,
     device: Optional[torch.device] = None,
 ) -> Tuple[int, int]:
+    """Reserve a four-aligned RNG range and return its seed and starting offset.
+
+    Reservations through this helper are serialized across host threads. The
+    lock does not coordinate with PyTorch RNG operations or other mutations of
+    the same generator; callers must serialize such mixed use, including when
+    using the default generator.
+    """
     if generator is None:
         generator = get_default_generators(device)
-    # add mutex if multi-trheading needed
-    state = generator.get_state()
-    seed, offset = map(int, state.view(torch.int64))
-    # Reserve this call's range, leaving the generator at the next unused offset.
-    next_offset = offset + (increment + 3) // 4 * 4
-    generator.set_state(
-        torch.tensor(
-            [seed, next_offset], dtype=torch.int64, device=torch.device("cpu")
-        ).view(torch.uint8)
-    )
+    # Serialize FlashInfer reservations: get_state/set_state alone do not
+    # make the read-modify-write atomic. A shared lock avoids retaining
+    # caller-owned generators in a per-generator lock cache.
+    with _rng_state_lock:
+        state = generator.get_state()
+        seed, offset = map(int, state.view(torch.int64))
+        # Reserve this call's range, leaving the generator at the next unused offset.
+        next_offset = offset + (increment + 3) // 4 * 4
+        generator.set_state(
+            torch.tensor(
+                [seed, next_offset], dtype=torch.int64, device=torch.device("cpu")
+            ).view(torch.uint8)
+        )
     return seed, offset
 
 
@@ -1074,7 +1088,7 @@ def log_probs(
     *,
     return_lse: bool = False,
     enable_pdl: Optional[bool] = None,
-    batch_invariant: bool = True,
+    batch_invariant: bool = False,
 ):
     r"""The log-probability of one token per row under ``softmax(logits / temperature)``, with a batch-invariant
     dataflow: the teacher-forced score of a sampled token (a trainer re-scoring a rollout) and the returned
@@ -1109,7 +1123,10 @@ def log_probs(
     enable_pdl : Optional[bool]
         Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
     batch_invariant : bool
-        This entry has no other implementation: ``True`` (the default) is the only accepted value.
+        ``True`` runs the batch-invariant class ``lse.row`` (the pinned contract: the fingerprint and the
+        guarantees above). ``False`` (the default) runs the operator's regular kernel for this entry, which
+        today is the same class: a future release may route it to a faster kernel without the invariance
+        contract, so callers that need the contract pass ``True`` explicitly.
 
     Returns
     -------
@@ -1141,10 +1158,7 @@ def log_probs(
     >>> logp.shape, logp.dtype
     (torch.Size([4]), torch.float32)
     """
-    if not batch_invariant:
-        raise ValueError(
-            "log_probs has only its batch-invariant class; batch_invariant=False selects nothing"
-        )
+    # batch_invariant=False routes to the operator's regular kernel for this entry, which today is the same class
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
     from .batch_invariant.sampling.api import log_probs_batch_invariant
@@ -1160,7 +1174,7 @@ def log_softmax(
     temperature: Optional[Union[torch.Tensor, float]] = None,
     *,
     enable_pdl: Optional[bool] = None,
-    batch_invariant: bool = True,
+    batch_invariant: bool = False,
 ):
     r"""The log-softmax row of ``logits / temperature`` in fp32, with a batch-invariant dataflow: the row every
     deterministic sampling path forms before gathering a token's log-probability (the top-k log-probabilities, the
@@ -1190,7 +1204,10 @@ def log_softmax(
     enable_pdl : Optional[bool]
         Whether to launch with Programmatic Dependent Launch; ``None`` (default) follows the device.
     batch_invariant : bool
-        This entry has no other implementation: ``True`` (the default) is the only accepted value.
+        ``True`` runs the batch-invariant class ``lse.row`` (the pinned contract: the fingerprint and the
+        guarantees above). ``False`` (the default) runs the operator's regular kernel for this entry, which
+        today is the same class: a future release may route it to a faster kernel without the invariance
+        contract, so callers that need the contract pass ``True`` explicitly.
 
     Returns
     -------
@@ -1202,10 +1219,7 @@ def log_softmax(
     flashinfer.batch_invariant.BatchInvariantUnsupportedError
         For inputs outside the class (dtype, device, architecture); the entry never falls back.
     """
-    if not batch_invariant:
-        raise ValueError(
-            "log_softmax has only its batch-invariant class; batch_invariant=False selects nothing"
-        )
+    # batch_invariant=False routes to the operator's regular kernel for this entry, which today is the same class
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
     from .batch_invariant.sampling.api import log_softmax_batch_invariant
@@ -1525,7 +1539,8 @@ def top_p_sampling_from_probs(
 
     Note
     ----
-    This function expects float32 inputs, and the output is int32.
+    This function expects float32 inputs. The output is int32 when ``indices``
+    is omitted; otherwise it has the same dtype as ``indices`` (int32 or int64).
 
     See Also
     --------

@@ -1,7 +1,11 @@
 import Lake
 open Lake DSL
 
-package bikernels
+-- The kernel decides the generated conformance theorems by evaluating `String` equalities of several KB (a list of
+-- characters: the recursion is as deep as the string); the default 8 MB thread stack overflows near 6.4 KB, so the
+-- build runs `lean` with a 64 MB thread stack (an argument outside the trace: it changes no build result).
+package bikernels where
+  weakLeanArgs := #["--tstack=65536"]
 
 @[default_target]
 lean_lib BIKernels
@@ -18,3 +22,6 @@ lean_exe samplingconformance where
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true
+
+lean_exe moeconformance where
+  root := `MoEMain

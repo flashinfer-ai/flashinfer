@@ -205,6 +205,10 @@ def sexpr(t: Term) -> str:
             out = f"(sfa {A[0]} {A[1]})"  # A's block scales of row m at step t
         elif op == "op:sfb_cols":
             out = f"(sfb {A[0]} {A[1]})"  # B's block scales of column n at step t
+        elif op == "op:sfa_blk":
+            out = f"(sfa_blk {A[0]} {A[1]})"  # the fp32 scale of A's row m for K block kb (the block-scale class)
+        elif op == "op:sfb_blk":
+            out = f"(sfb_blk {A[0]} {A[1]})"  # the fp32 scale of B's column block n // 128 for K block kb
         else:
             out = "(" + op + " " + " ".join(map(str, A)) + ")"
         memo[cur.uid] = out

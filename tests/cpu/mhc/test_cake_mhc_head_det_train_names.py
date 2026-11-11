@@ -24,8 +24,8 @@ gone (no module, no alias, no top-level name), the module imports its backend
 on first use only, the registry routes each architecture and hidden size to its
 own libraries (``ROUTES[arch][role][hidden]``, the small-problem libraries of
 ``SMALL_ROUTES``; ``build.json`` builds exactly the records' architectures),
-and the package is wired at its path (test-helper key, package data, ignored
-``aot/``, pre-commit exclude, manifest checker row).
+and the package is wired at its path (test-helper key, package data,
+pre-commit exclude, manifest checker row).
 """
 
 import importlib
@@ -381,10 +381,10 @@ def test_the_registry_routes_each_architecture_and_hidden_size_to_its_library() 
 
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
-    """The test-helper key, the build manifest's package and libraries, the package data, the ignored ``aot/``
-    directory, the pre-commit exclude of the generated sources and the manifest checker's row name the package at
+    """The test-helper key, the build manifest's package and libraries, the package data,
+    the pre-commit exclude of the generated sources and the manifest checker's row name the package at
     its path; no key, package data, exclude, checker row or module file is left at the former path."""
-    from tests.test_helpers.cake_package import PACKAGES
+    from tests.cake.test_helpers.cake_package import PACKAGES
 
     backend = importlib.import_module(BACKEND)
     directory = Path(backend.__file__).resolve().parent
@@ -408,7 +408,6 @@ def test_package_wiring() -> None:
     package_data = data["tool"]["setuptools"]["package-data"]
     assert package_data[BACKEND] == ["csrc/**", "build.json"]
     assert former not in package_data
-    assert "aot/" in (directory / ".gitignore").read_text().split()
     pre_commit = (REPO / ".pre-commit-config.yaml").read_text()
     # pre-commit skips every generated source of the package (a per-package entry or the generic #8928 rule), still
     # checks its Python modules; the former tree holds no sources (the shared exclude may still list its path)

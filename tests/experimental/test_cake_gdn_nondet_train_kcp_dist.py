@@ -78,7 +78,7 @@ sub-group of its ``W`` lowest ranks; the other ranks skip the row).  Environment
 ``KCP_TEST_RESULT_DIR`` (one JSON per row), ``KCP_TEST_MODE`` (``full`` | ``forward``), ``KCP_TEST_REPEATS`` (raises
 ``N_REPEAT`` above 3), ``KCP_TEST_PORT_DIR`` (the Slurm rendezvous port file), ``KCP_TEST_DEBUG_RETAINED``.
 Operands come from the seeded CPU generator (bitwise identical on every rank and host).  The suite imports this package,
-the deterministic package and the causal-convolution package through ``tests/test_helpers/cake_package.py`` and
+the deterministic package and the causal-convolution package through ``tests/cake/test_helpers/cake_package.py`` and
 nothing else from flashinfer (the facade's tests live in ``test_cake_gdn_nondet_train_kcp_api.py``).
 """
 
@@ -107,7 +107,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train_kcp"  # the in-tree path (report metadata)
 
@@ -130,7 +133,7 @@ def _few_cpu_threads():
 
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry: a stale entry fails here, never skips."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_nondet_train_kcp", sub)
 
@@ -138,7 +141,7 @@ def _mod(sub: str | None = None):
 def _det_mod(sub: str | None = None):
     """A module of the deterministic package through the test-helper registry (its entries and its ``LAST_CALL`` for
     the collective comparison)."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_det_train_kcp", sub)
 
@@ -147,7 +150,7 @@ def _conv_mod(sub: str | None = None):
     """The deterministic causal-convolution package (or its ``kcp`` module) through the test-helper registry: the
     entries ``cake_causal_conv1d_det`` / ``is_cake_causal_conv1d_det_train_supported`` and
     ``kcp.cake_causal_conv1d_det_kcp`` that its facades forward to."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_causal_conv1d_det_train", sub)
 
@@ -196,7 +199,9 @@ STAGES = ("int1", "int3", "int4")
 def _reference():
     """The FP64 reference: the FlashInfer test helper (read only), else the session harness on PYTHONPATH."""
     try:
-        from tests.test_helpers import cake_gdn_det_train_kcp_reference as ref  # type: ignore[attr-defined]
+        from tests.experimental.test_helpers import (
+            cake_gdn_det_train_kcp_reference as ref,
+        )  # type: ignore[attr-defined]
 
         return ref
     except ImportError:
@@ -207,8 +212,8 @@ def _inputs():
     """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``): the inputs helper,
     else the reference helper (the same generator, bitwise), else the session harness on PYTHONPATH."""
     for name in (
-        "tests.test_helpers.cake_gdn_det_train_kcp_inputs",
-        "tests.test_helpers.cake_gdn_det_train_kcp_reference",
+        "tests.experimental.test_helpers.cake_gdn_det_train_kcp_inputs",
+        "tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference",
     ):
         try:
             mod = importlib.import_module(name)

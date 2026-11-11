@@ -21,7 +21,7 @@ name, in a ``python -I`` subprocess with ``flashinfer`` blocked (the form of a v
 ``scripts/check_cake_build_manifests.py --vendored-gate``), with its manifest read by its own loader.  The package
 imports only itself, ``torch`` and ``tvm_ffi``: the only ``flashinfer`` import is the JIT fallback of
 ``cake_build.py``, it reads no environment variable (every control is a keyword argument), and the backend test
-files of the package import it through ``tests.test_helpers.cake_package`` only, so a vendoring build runs them
+files of the package import it through ``tests.cake.test_helpers.cake_package`` only, so a vendoring build runs them
 against its own copy.  The facade ``flashinfer.cake_gdn_nondet_train`` is covered by
 ``test_cake_gdn_nondet_train_api.py``.  CPU only: no GPU, no compiled library and no JIT build is needed.
 """
@@ -39,7 +39,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 
@@ -244,7 +244,7 @@ def test_the_package_reads_no_environment_variable() -> None:
 @pytest.mark.parametrize("name", BACKEND_TESTS)
 def test_backend_tests_import_the_package_through_the_alias_helper(name: str) -> None:
     """A backend test file imports nothing from ``flashinfer`` itself: it names its package through
-    ``tests.test_helpers.cake_package``, so a vendoring build that points the helper at its own copy runs it
+    ``tests.cake.test_helpers.cake_package``, so a vendoring build that points the helper at its own copy runs it
     unchanged (the facade's tests live in ``test_cake_gdn_nondet_train_api.py``)."""
     path = TESTS_DIR / name
     if not path.is_file():
@@ -258,6 +258,6 @@ def test_backend_tests_import_the_package_through_the_alias_helper(name: str) ->
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom)
-        and node.module == "tests.test_helpers.cake_package"
+        and node.module == "tests.cake.test_helpers.cake_package"
     ]
-    assert helper, f"{name} does not import tests.test_helpers.cake_package"
+    assert helper, f"{name} does not import tests.cake.test_helpers.cake_package"

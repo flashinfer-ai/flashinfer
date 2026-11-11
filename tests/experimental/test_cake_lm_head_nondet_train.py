@@ -61,7 +61,7 @@ import torch
 import torch.utils.checkpoint
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from tests.test_helpers.cake_lm_head_loss_reference import (
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (
     DEFAULT_H,
     DEFAULT_V,
     error_report,
@@ -71,7 +71,7 @@ from tests.test_helpers.cake_lm_head_loss_reference import (
     reference_unchunked,
     rel_l2,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 # The package under test, named once through ``cake_package``; the deterministic package is the comparison arm.
 pkg = cake_package("cake.cake_lm_head_nondet_train")
@@ -6131,8 +6131,8 @@ import sys
 import torch
 
 sys.path.insert(0, sys.argv[1])
-from tests.test_helpers.cake_lm_head_loss_reference import make_inputs  # noqa: E402
-from tests.test_helpers.cake_package import cake_package  # noqa: E402
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs  # noqa: E402
+from tests.cake.test_helpers.cake_package import cake_package  # noqa: E402
 
 backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
 modes = []
@@ -7590,8 +7590,8 @@ _SELECTIVE_FIRST_CALL_SCRIPT = """
 import functools, sys, torch
 import torch.utils.checkpoint as tuc
 sys.path.insert(0, {root!r})
-from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.cake.test_helpers.cake_package import cake_package
 backend = cake_package("cake.cake_lm_head_nondet_train", {module!r})
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
@@ -13318,8 +13318,8 @@ def test_device_temperature_upstream_gradients(glm_weight):
 _FRESH_PROCESS_TAU_SCRIPT = """
 import sys, torch
 sys.path.insert(0, {root!r})
-from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.cake.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
 W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
 inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05, temperature="hetero")
@@ -13528,8 +13528,8 @@ def test_device_temperature_step_peak(glm_weight, T):
 _TAU_ASSERT_SCRIPT = """
 import sys, torch
 sys.path.insert(0, {root!r})
-from tests.test_helpers.cake_lm_head_loss_reference import make_weight
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import make_weight
+from tests.cake.test_helpers.cake_package import cake_package
 cake_backend = cake_package("cake.cake_lm_head_nondet_train", "cake_backend")
 H, V = {H}, {V}
 labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")
