@@ -723,6 +723,41 @@ def test_dsv3_fused_routing_op(
     validate_values(ground_truth, sorted_vals, tokens_with_different_experts, data_type)
 
 
+@pytest.mark.parametrize("num_experts", [256, 384])
+@pytest.mark.parametrize("data_type", [torch.float32, torch.bfloat16])
+def test_single_group_topk_ignores_stale_intermediate_slots(num_experts, data_type):
+    """Single group with more than 128 experts: each expert warp writes `topk` of its 8 intermediate
+    shared slots and warp 0 reduces all of them. The other slots must not come from whatever the
+    previous kernel left in shared memory (TensorRT-LLM #9792).
+
+    Stale content is not under the test's control (expert 0 and garbage ids were both observed
+    before the fix); the token's true best score + bias is negative and never expert 0, so any
+    stale slot that is read changes the answer."""
+    num_tokens = 2048
+    scores = torch.full(
+        (num_tokens, num_experts), -10.0, device="cuda", dtype=data_type
+    )
+    best = torch.arange(num_tokens, device="cuda") % num_experts
+    best = torch.where(
+        best == 0, torch.full_like(best, 5), best
+    )  # never expert 0, the stale id
+    scores[torch.arange(num_tokens, device="cuda"), best] = 10.0
+    bias = torch.full((num_experts,), -2.0, device="cuda", dtype=data_type)
+    values = torch.empty(num_tokens, 1, device="cuda", dtype=data_type)
+    indices = torch.zeros(num_tokens, 1, device="cuda", dtype=torch.int32)
+    fused_topk_deepseek(
+        scores, bias, 1, 1, 1, 1.0, values, indices, launch_with_pdl=False
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(indices[:, 0], best.to(torch.int32)), (
+        f"{int((indices[:, 0] != best).sum())} of {num_tokens} tokens took a stale slot; "
+        f"ids seen {sorted(set(indices[:, 0].tolist()))[:8]}"
+    )
+    # topk=1 normalises the weight to routed_scaling_factor regardless of the score
+    assert torch.allclose(values.float(), torch.ones(num_tokens, 1, device="cuda"))
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 64])
 @pytest.mark.parametrize("num_experts", [256])
 @pytest.mark.parametrize("topk", [1, 4, 8])
@@ -960,10 +995,8 @@ _ROUTING_CONFIGS = [
     pytest.param(128, 4, 2, 4, id="grouped-general"),
     pytest.param(96, 3, 2, 5, id="grouped-odd"),
     pytest.param(128, 1, 1, 1, id="single128"),
-    # No single-group config with num_experts > 128: the default backend's 384/256-expert
-    # instances reduce NumExpertWarps * 8 intermediate shared slots of which only `topk`
-    # per warp are written, so with the only admissible topk (1) their output depends on
-    # stale shared memory and is not a usable reference.
+    pytest.param(256, 1, 1, 1, id="single256"),
+    pytest.param(384, 1, 1, 1, id="single384"),
 ]
 _ROUTING_DTYPE_PAIRS = [
     pytest.param(torch.float32, torch.float32, id="f32-f32"),
