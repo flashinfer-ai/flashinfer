@@ -114,8 +114,10 @@ and new-token-count compilation. CuTe-DSL reuses kernels across token counts
 with the same 128-row alignment class, at most two variants per device/weight
 shape. Concurrent misses share compilation; warm hits avoid the compile lock.
 
-`validate_indices=True` checks values and synchronizes with the CPU; validate
-new routing data before capture. The default checks metadata only.
+With `skip_check=False`, `validate_indices=True` checks routing values for
+non-empty inputs and synchronizes with the CPU. Validate new routing data before
+capture. The default checks metadata only; `skip_check=True` bypasses both
+metadata and routing-value checks, even when `validate_indices=True`.
 
 ## SM90 FP4 MegaMoE
 
@@ -132,5 +134,7 @@ BF16 Q/K with FP8 V uses FP8 PV without that transform. Kernel predicates,
 P packing, and attention-sink scaling follow compute precision; TMA descriptors
 and allocations follow storage precision.
 
-The public plan accepts `k_data_type` and `v_data_type` separately, retaining
-`kv_data_type` as the common-KV compatibility alias.
+`BatchDecodePagedTSWrapper.plan()` accepts `k_dtype`, `v_dtype`, and the common-KV
+alias `kv_dtype`. `BlockSparseTSWrapper.plan()` instead accepts `k_data_type`,
+`v_data_type`, and the common-KV alias `kv_data_type`. Use the names for the
+specific wrapper.

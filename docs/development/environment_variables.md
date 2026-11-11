@@ -21,12 +21,14 @@ General workflow rules live in [AGENTS.md](../../AGENTS.md).
 
 ## Common controls
 
+Set API logging and tensor-dump controls before importing FlashInfer.
+
 | Variable | Purpose |
 | --- | --- |
-| `FLASHINFER_LOGLEVEL` | API logging: 0 off, 1 names, 3 inputs/outputs, 5 statistics |
+| `FLASHINFER_LOGLEVEL` | API logging: 0 off, 1 names, 3 inputs/outputs, 5 statistics, 10 tensor dumps |
 | `FLASHINFER_LOGDEST` | `stdout`, `stderr`, or an output file |
-| `FLASHINFER_JIT_VERBOSE` | Set to `1` for verbose build output |
-| `FLASHINFER_JIT_DEBUG` | Set to `1` for debug symbols and `-O0` |
+| `FLASHINFER_JIT_VERBOSE` | `1` enables verbose build output; also enables nvcc debug builds if `FLASHINFER_JIT_DEBUG` is unset |
+| `FLASHINFER_JIT_DEBUG` | `1` enables debug symbols, `-O0`, and device debugging; `0` keeps verbose nvcc builds optimized |
 | `FLASHINFER_CUDA_ARCH_LIST` | Compilation targets, e.g. `8.0 9.0a` |
 | `FLASHINFER_NVCC_THREADS` | Threads per nvcc process |
 | `MAX_JOBS` | Parallel Ninja jobs |
@@ -38,7 +40,7 @@ Compilation memory grows with both `MAX_JOBS` and `FLASHINFER_NVCC_THREADS`.
 
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
-| `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
+| `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py`, `flashinfer/jit/cute_dsl_core.py` | Any non-empty value prevents builds through `JitSpec.build_and_load()` after a load miss. nvcc modules require an AOT artifact; an ordinary JIT-cache `.so` is insufficient. CuTe-DSL can load valid disk-cache objects, but its direct compilation paths (disk cache disabled or source hashing failed) bypass this flag. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` extends each CuTe-DSL disk-cache key from the caller's `extra_key_files` to their in-package import closure, so editing an imported helper invalidates the kernel. Changes every key, so the first run after enabling recompiles. Set by CI's persistent compile cache. |
 | `FLASHINFER_JIT_BUILD_LOG` | unset | `flashinfer/jit/core.py` | Path of a JSONL file that gets one record (`toolchain`, `name`, `seconds`) per build made through `JitSpec.build_and_load()` or a bulk `build_jit_specs()` prebuild: nvcc modules (ninja no-ops included), CuTe-DSL kernels and TIRx modules. Triton, cuTile and the cake nvcc/NVRTC side paths are not recorded. Summarize with `scripts/summarize_jit_builds.py`. |
@@ -96,11 +98,11 @@ These complement `FLASHINFER_LOGLEVEL`/`FLASHINFER_LOGDEST` and are all read in 
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `FLASHINFER_DUMP_DIR` | `flashinfer_dumps` | Directory where `@flashinfer_api` writes per-call tensor dumps when logging is enabled. |
+| `FLASHINFER_DUMP_DIR` | `flashinfer_dumps` | Directory where `@flashinfer_api` writes per-call tensor dumps. Set `FLASHINFER_LOGLEVEL=10` before import to enable them; levels 1, 3, and 5 do not dump tensors. |
 | `FLASHINFER_DUMP_INCLUDE` | `""` | Comma-separated allow-list of API names; only matching calls are dumped. Wildcards (`*`) supported. |
 | `FLASHINFER_DUMP_EXCLUDE` | `""` | Comma-separated deny-list of API names; matching calls skip the (expensive) stats / dump path. |
 | `FLASHINFER_DUMP_MAX_COUNT` | `1000` | Hard cap on number of dumped events; once reached, further dumps are dropped with a warning. |
-| `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Hard cap on total dump size in **gigabytes** (GB) written to `FLASHINFER_DUMP_DIR` (parsed as `float`; see `_DUMP_MAX_SIZE_GB` in `flashinfer/api_logging.py`). |
+| `FLASHINFER_DUMP_MAX_SIZE_GB` | `20` | Per-process tensor-size threshold in GiB (parsed as `float`). Before each dump, accumulated tensor bytes plus the new inputs are checked; new outputs and CUDA-graph replay snapshots are not bounded by this check. Actual disk usage can exceed the threshold; use disk quotas or monitoring when a hard limit is needed. |
 | `FLASHINFER_DUMP_SAFETENSORS` | `0` | `1` writes dumps as `.safetensors` (portable / Hugging Face-style); otherwise plain `.pt`. |
 
 ## Trace capture

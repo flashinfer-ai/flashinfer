@@ -88,7 +88,7 @@ coordinator suite covers this contract without GPUs.
 
 ## MXFP8 startup benchmark
 
-Run `benchmarks/bench_mxfp8_startup.py --output-dir /path/to/new/results` on
+Run `python benchmarks/bench_mxfp8_startup.py --output-dir /path/to/new/results` on
 B200/B300 to compare persistence disabled, serial/parallel disk-cache population,
 fresh-process disk hits, and saved tuning winners. The benchmark isolates caches
 and checks results after CUDA graph replay. Default shapes exercise the

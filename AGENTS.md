@@ -114,10 +114,13 @@ public CI run; request tests for the final head when needed. See
 ## Debugging and detailed references
 
 API logging defaults to off. Set `FLASHINFER_LOGLEVEL=1` for names, `3` for
-inputs/outputs, or `5` for statistics; `FLASHINFER_LOGDEST` selects stdout,
+inputs/outputs, or `5` for statistics. Tensor dumps require
+`FLASHINFER_LOGLEVEL=10` before import. `FLASHINFER_LOGDEST` selects stdout,
 stderr, or a file. Inputs are logged before execution; statistics are skipped
-during CUDA graph capture. Use `FLASHINFER_JIT_VERBOSE=1` for build output and
-`FLASHINFER_JIT_DEBUG=1` for debug symbols and `-O0`. See the
+during CUDA graph capture. For verbose optimized nvcc builds, set
+`FLASHINFER_JIT_VERBOSE=1` and `FLASHINFER_JIT_DEBUG=0`: if debug is unset, verbose
+also enables debug builds. Set debug to `1` for symbols, `-O0`, and device
+debugging. See the
 [CUDA debugging guide](.claude/skills/debug-cuda-crash/SKILL.md).
 
 The default cache is `~/.cache/flashinfer/<version>/<arch>/`, with `generated/`

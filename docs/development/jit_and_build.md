@@ -48,14 +48,16 @@ from `csrc/`; render Jinja only for needed specialization and use
 ## Module caching
 
 `@functools.cache` retains loaded modules in Python; the file cache under
-`~/.cache/flashinfer/` retains compiled artifacts. Identities account for
-operation parameters, source hashes, flags, architecture, and version.
-Set `FLASHINFER_WORKSPACE_BASE` to change the cache base; remove
-`~/.cache/flashinfer/` to clear the default cache.
+`~/.cache/flashinfer/` retains compiled artifacts. nvcc freshness relies on
+Ninja dependency/timestamp checks, not source-content hashes. Replacing a source
+with an older timestamp can therefore reuse a stale object. CuTe-DSL uses source
+hashes as described below. Set `FLASHINFER_WORKSPACE_BASE` to change the cache
+base; remove `~/.cache/flashinfer/` to clear the default cache.
 
 ### CuTe-DSL artifacts and invalidation
 
-`build_and_load_cute_dsl_kernel()` wraps `JitSpecCuteDsl`, exporting kernels with
+With caching enabled and hashable sources, `build_and_load_cute_dsl_kernel()`
+wraps `JitSpecCuteDsl`, exporting kernels with
 `export_to_c()` and reloading through
 `cute.runtime.load_module(..., enable_tvm_ffi=True)`. Each
 `cached_ops/<module>_<arch>_cute_dsl/` contains `meta.json` and one `.o` per
@@ -240,7 +242,7 @@ Export framework-independent functions with
 | --- | --- |
 | TVM-FFI | <https://tvm.apache.org/ffi/> |
 | CUTLASS | Prefer local `3rdparty/cutlass/` source; <https://github.com/NVIDIA/cutlass> |
-| CuTe DSL | <https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl.html.md> |
+| CuTe DSL | <https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html> |
 | PTX ISA | <https://docs.nvidia.com/cuda/parallel-thread-execution/index.html.md> |
 
 CuTe DSL comes from `nvidia-cutlass-dsl`, separately from the CUTLASS submodule.
