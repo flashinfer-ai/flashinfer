@@ -46,6 +46,7 @@ SELECT_RULE = (
 
 
 def tree_address(lane: int, block: int, elem: int, Kp: int) -> int:
+    """The tree address of element ``elem`` of slot ``(lane, block)`` for ``Kp`` padded blocks."""
     return (lane * Kp + block) * V + elem
 
 
@@ -57,6 +58,7 @@ def address_of_index(i: int, Kp: int) -> int:
 
 
 def index_of_address(a: int, Kp: int) -> int:
+    """The flat element index of tree address ``a`` (the inverse of :func:`address_of_index`)."""
     slot, elem = divmod(a, V)
     lane, block = divmod(slot, Kp)
     return (block * LANES + lane) * V + elem
@@ -89,6 +91,8 @@ class DrawSpec:
         alg: Optional[TermAlgebra] = None,
         temperature: bool = False,
     ):
+        """The symbolic view of vocabulary ``N``: the weights as given, or the ``lse.row`` weights of the
+        logits with ``from_logits`` (``in_fmt`` and ``temperature`` as the row class takes them)."""
         self.N, self.from_logits, self.in_fmt = N, from_logits, in_fmt
         self.alg = alg or TermAlgebra()
         self.Kp = padded_blocks(N)
@@ -100,6 +104,8 @@ class DrawSpec:
         self._nm: dict = {}  # the negated row maximum, one term per row
 
     def weight(self, row: int, i: int) -> Optional[Term]:
+        """The weight term of element ``i`` of ``row`` (``None`` beyond the vocabulary): the leaf itself, or
+        ``EX2(mul(add(x, neg(m)), c))`` for logits."""
         if i >= self.N:
             return None
         a = self.alg
@@ -128,6 +134,7 @@ class DrawSpec:
         return out
 
     def slot_total(self, row: int, lane: int, block: int) -> Optional[Term]:
+        """The slot fold through its last present element (``None`` for an absent slot)."""
         vals = [v for v in self.slot_fold(row, lane, block) if v is not None]
         return vals[-1] if vals else None
 
@@ -157,6 +164,8 @@ class DrawSpec:
         )
 
     def outer(self, row: int, lane: int, block: int) -> Term:
+        """The ``outer`` prefix of slot ``(lane, block)``: the ``add`` chain from ``+0`` over its left-sibling
+        nodes in ascending bit order."""
         a = self.alg
         acc = a.const(0.0)
         for kind, level, group in prefix_nodes(lane, block, self.Kp):
@@ -166,17 +175,21 @@ class DrawSpec:
         return acc
 
     def prefix_incl(self, row: int, i: int) -> Optional[Term]:
+        """The inclusive prefix of flat element ``i``: ``add(outer, fold_e)`` (``None`` for an absent
+        element)."""
         slot, e = divmod(i, V)
         block, lane = divmod(slot, LANES)
         f = self.slot_fold(row, lane, block)[e]
         return None if f is None else self.alg.add(self.outer(row, lane, block), f)
 
     def total(self, row: int) -> Term:
+        """The total ``S``: the canonical sum tree over the row's weights (``spec.sum_reduction``)."""
         return sum_reduction(self.N, lambda fp, i: self.weight(row, i)).canonical(
             self.alg
         )
 
     def threshold(self, row: int) -> Term:
+        """The threshold ``t = mul(u, S)`` with the uniform as the symbol ``u``."""
         return self.alg.mul(self.alg.sym("u"), self.total(row))
 
 

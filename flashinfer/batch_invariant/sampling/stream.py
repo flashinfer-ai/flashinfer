@@ -80,6 +80,7 @@ def philox4x32_10(
 
 
 def key_words(key64: int) -> Tuple[int, int]:
+    """The two 32-bit Philox key words of a 64-bit key: ``(low, high)``."""
     return key64 & MASK32, (key64 >> 32) & MASK32
 
 
@@ -128,10 +129,12 @@ def uniforms(seed: int, offset: int, draw: int) -> Tuple[float, float]:
 
 
 def f32_bits(x: float) -> int:
+    """The IEEE binary32 bit pattern of ``x`` as an unsigned integer."""
     return struct.unpack("<I", struct.pack("<f", x))[0]
 
 
 def f64_bits(x: float) -> int:
+    """The IEEE binary64 bit pattern of ``x`` as an unsigned integer."""
     return struct.unpack("<Q", struct.pack("<d", x))[0]
 
 

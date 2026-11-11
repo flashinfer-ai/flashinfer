@@ -1282,7 +1282,8 @@ def sampling_from_logits(
 
         The output row index also feeds the Philox subsequence: moving the same seed
         and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        do not make sampling invariant to batch position (the default path; under
+        ``batch_invariant=True`` the key alone decides the stream, see below).
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:
@@ -1409,7 +1410,8 @@ def sampling_from_probs(
 
         The output row index also feeds the Philox subsequence: moving the same seed
         and offset to a different batch slot changes the RNG stream, so per-row seeds
-        do not make sampling invariant to batch position.
+        do not make sampling invariant to batch position (the default path; under
+        ``batch_invariant=True`` the key alone decides the stream, see below).
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. Common approaches include:

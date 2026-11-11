@@ -75,10 +75,12 @@ def _ld_shared_cluster_i32(addr: Int32, *, loc=None, ip=None) -> Int32:
 
 
 def _imin(a, b):
+    """The integer minimum as a select (exact)."""
     return _select(a < b, a, b)
 
 
 def _imax(a, b):
+    """The integer maximum as a select (exact)."""
     return _select(a > b, a, b)
 
 
@@ -106,6 +108,7 @@ class _DrawLoader(_RowLoader):
     (:meth:`stage_from_regs`), after which every block is served from the tile."""
 
     def __init__(self, *args, pad: float = NEG_INF, **kw):
+        """The row loader with the draw's pad value (``-inf`` for logits, ``+0`` for weights)."""
         super().__init__(*args, **kw)
         self.pad = pad
         self.from_smem = False
@@ -128,6 +131,8 @@ class _DrawLoader(_RowLoader):
         self.from_smem = True
 
     def block(self, kk):
+        """The predicate and fragment of block ``kk``: from the smem tile when staged, else the predicated
+        register load over the pad fill."""
         if kk not in self.frags:
             if not self.k.cfg.keep_regs or self.from_smem:
                 self.frags.clear()
@@ -184,6 +189,7 @@ class _DrawPeers(_CutePeers):
         W=1,
         C=1,
     ):
+        """The row kernel's peers with the integer-reduce buffers and the recording state."""
         super().__init__(xbuf, group, warp_id, lane_id, cbuf, cta_rank)
         self.ibuf, self.icbuf, self.W, self.C = ibuf, icbuf, W, C
         self.recording = False
@@ -192,12 +198,14 @@ class _DrawPeers(_CutePeers):
         self.cta_sibs = None
 
     def shuffle_xor(self, key, value, mask):
+        """The engine's butterfly step; during the sum pass the partner's value is recorded per mask."""
         p = super().shuffle_xor(key, value, mask)
         if self.recording and value is not None:
             self.lane_partners[mask] = p
         return p
 
     def exchange(self, step, state):
+        """The engine's warp / CTA exchange; during the sum pass the sibling values are recorded."""
         out = super().exchange(step, state)
         if self.recording:
             keys = [k for k, v in state.items() if v is not None]
@@ -209,6 +217,8 @@ class _DrawPeers(_CutePeers):
         return out
 
     def int_reduce(self, first, last):
+        """The exact integer reduction of the two addresses over lanes, warps and CTAs: ``first`` by
+        minimum, ``last`` by maximum."""
         for mask in (1, 2, 4, 8, 16):
             first = _imin(first, cute.arch.shuffle_sync_bfly(first, offset=mask))
             last = _imax(last, cute.arch.shuffle_sync_bfly(last, offset=mask))
@@ -252,6 +262,8 @@ class DrawRowKernel:
         has_indices: bool,
         return_logprob: bool,
     ):
+        """The kernel object of one Kp bucket and specialisation: the plans, the units, the staging
+        decision and the smem budget."""
         N = Kp * BLOCK
         cfg.validate(N)
         assert not has_indices or cfg.rows_per_cta == 1, (
@@ -301,6 +313,7 @@ class DrawRowKernel:
         self.tile_bytes = tile if self.stage_tile else 0
 
     def _tv_layout(self, vec):
+        """The thread-value layout of the tiled copy for ``vec`` elements per thread."""
         rows = self.rows
         return cute.make_layout(
             ((LANES, rows), (vec, V // vec, 1)),
@@ -308,6 +321,7 @@ class DrawRowKernel:
         )
 
     def _smem_bytes(self) -> int:
+        """The dynamic shared memory: the exchange and integer buffers, and the staged tile when used."""
         b = self.rows * self.n_entries * self.W * LANES * 4 if self.W > 1 else 0
         b += (
             self.rows * 2 * self.W * LANES * 4 if self.W > 1 else 0
@@ -651,6 +665,8 @@ def kernel_name(
     return_logprob: bool,
     enable_pdl: bool,
 ) -> str:
+    """The cache object's name: one per (dtype, Kp bucket, config, input kind, temperature form, gather,
+    log-probability output, pdl)."""
     return jit.sanitize_symbol_name(
         f"draw_{'logits' if from_logits else 'probs'}_{dtype_str}_Kp{Kp}_{cfg.describe()}_{'trow' if temp_rows else 'tconst'}"
         f"{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}_pdl{int(enable_pdl)}"
@@ -687,6 +703,7 @@ def get_compiled_kernel(
 def _compile_bucket(
     dtype_str, Kp, cfg, from_logits, temp_rows, has_indices, return_logprob, enable_pdl
 ):
+    """Compile, or load from the cache, the kernel of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)

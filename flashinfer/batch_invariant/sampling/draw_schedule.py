@@ -70,6 +70,7 @@ def draw_config(N: int, M: int, elem_bytes: int, sm_count: int) -> LSEConfig:
 
 @functools.lru_cache(maxsize=65536)
 def _rule(N: int, M: int, elem_bytes: int, sm: int) -> LSEConfig:
+    """The cached body of :func:`draw_config` (its arguments as plain ints)."""
     space = all_valid_configs(N, elem_bytes)
     if not space:
         raise ValueError(

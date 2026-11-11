@@ -36,7 +36,13 @@ from .api import (
     _temperature,
 )
 from .draw_schedule import SHARE_MAX, draw_config
-from .schedule import VOCAB_COVERED, LSEConfig, device_sm_count, max_vec_elems
+from .schedule import (
+    LOADS_PER_THREAD_MAX,
+    VOCAB_COVERED,
+    LSEConfig,
+    device_sm_count,
+    max_vec_elems,
+)
 from .stream import MASK64
 
 CLASS = "sample.icdf.v1"
@@ -46,6 +52,7 @@ _KEY_DTYPES = (torch.int64, torch.uint64)
 
 
 def _check_input(x: torch.Tensor, name: str) -> int:
+    """The device, dtype, rank and vocabulary checks of an input; returns ``N``."""
     check_device(x.device, CLASS, DRAW_ARCHS)
     if x.dtype not in _DTYPE_STR:
         raise unsupported(CLASS, f"{name} dtype {x.dtype}", f"bf16, f16 or fp32 {name}")
@@ -63,7 +70,19 @@ def _check_input(x: torch.Tensor, name: str) -> int:
     return N
 
 
+def _shared_key_error(M: int) -> ValueError:
+    """The refusal of a key shared by several output rows (the operator takes ``seed`` / ``offset`` both as tensors or both
+    as scalars, so the per-row form is two tensors, at least one with a value per output row)."""
+    return ValueError(
+        f"a batch-invariant draw of {M} rows needs one key per output row: pass seed and offset both as int64 / uint64 "
+        f"tensors, at least one of them with {M} values (a request's own (seed, offset) pair); a key shared by every row "
+        "(scalars, length-one tensors or a bare generator) would give every row the same uniform, so identical rows would "
+        "draw identical tokens"
+    )
+
+
 def _signed64(v: int) -> int:
+    """A Python int reduced to its signed 64-bit value (uint64 keys by their bits)."""
     v = int(v) & MASK64
     return v - (1 << 64) if v >= 1 << 63 else v
 
@@ -95,11 +114,7 @@ def _row_keys(seed, offset, M: int, device) -> Tuple[torch.Tensor, torch.Tensor]
     s, s_shared = one(seed, "seed")
     o, o_shared = one(offset, "offset")
     if M > 1 and s_shared and o_shared:
-        raise ValueError(
-            f"a batch-invariant draw of {M} rows needs one key per output row: pass seed or offset as an int64 tensor of "
-            f"length {M} (a request's own (seed, offset) pair); a key shared by every row (scalars, length-one tensors or a "
-            "bare generator) would give every row the same uniform, so identical rows would draw identical tokens"
-        )
+        raise _shared_key_error(M)
     return s, o
 
 
@@ -110,6 +125,10 @@ def _resolve_keys(seed, offset, generator, increment: int, M: int, device):
     from ...sampling import _validate_and_convert_seed_offset, get_seed_and_offset
 
     if seed is None or offset is None:
+        if (
+            M > 1
+        ):  # the generator's pair would key every row alike: refused before the generator's state is advanced
+            raise _shared_key_error(M)
         seed, offset = get_seed_and_offset(increment, generator, device)
     _validate_and_convert_seed_offset(seed, offset, device, M)
     return _row_keys(seed, offset, M, device)
@@ -177,6 +196,18 @@ def draw(
             ) from None
     else:
         config.validate(N, elem_bytes)
+        loads = config.elems_per_thread(N) // config.vec_elems
+        if config.stage != "regs" and loads > LOADS_PER_THREAD_MAX:
+            raise ValueError(
+                f"config {config.describe()} issues {loads} loads per thread per pass; the enumerated space bounds a "
+                f"re-read or staged member at {LOADS_PER_THREAD_MAX} (such a kernel compiles for minutes)"
+            )
+        loads = config.elems_per_thread(N) // config.vec_elems
+        if config.stage != "regs" and loads > LOADS_PER_THREAD_MAX:
+            raise ValueError(
+                f"config {config.describe()} issues {loads} loads per thread per pass; the enumerated space bounds a "
+                f"re-read or staged member at {LOADS_PER_THREAD_MAX} (such a kernel compiles for minutes)"
+            )
     if indices is not None and config.rows_per_cta != 1:
         raise ValueError("an index gather needs a config with one row per CTA")
     if config.vec_elems > max_vec_elems(N, elem_bytes):
@@ -190,7 +221,7 @@ def draw(
         else _dummy(dev, torch.float32)
     )
     temp_arg = temp_t if temp_t is not None else _dummy(dev, torch.float32)
-    if M > 0:
+    if M > 0 and (indices is None or Msrc > 0):
         kernel = get_compiled_kernel(
             _DTYPE_STR[x.dtype],
             N,
@@ -216,6 +247,13 @@ def draw(
             Msrc,
             N,
         )
+    elif (
+        M > 0
+    ):  # a gather from an empty source: every index lies outside the source rows, nothing is read
+        tok.fill_(-1)
+        valid.zero_()
+        if return_logprob:
+            lp.fill_(float("nan"))
     out = {"samples": tok.view(lead), "valid": valid.to(torch.bool).view(lead)}
     if return_logprob:
         out["logp"] = lp.view(lead)
@@ -234,6 +272,8 @@ def _entry(
     config,
     sm_count,
 ):
+    """The public entries' common body: the operator's key resolution and validation, the draw, the output
+    dtype rule (the indices' dtype with ``indices``)."""
     name = "logits" if from_logits else "probs"
     N = _check_input(x, name)
     if indices is not None:

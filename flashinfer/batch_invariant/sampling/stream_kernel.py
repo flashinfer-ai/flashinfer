@@ -38,6 +38,8 @@ DRAW_MODULE = "batch_invariant_sampling_draw"
 
 
 def _asm2(ty, fmt, cons, a, b):
+    """One inline-PTX instruction of two operands (``op d, a, b``): the bits move as PTX states, beyond the
+    compiler's reach."""
     return llvm.inline_asm(
         ty,
         [a, b],
@@ -50,6 +52,7 @@ def _asm2(ty, fmt, cons, a, b):
 
 
 def _asm1(ty, fmt, cons, a):
+    """One inline-PTX instruction of one operand (``op d, a``)."""
     return llvm.inline_asm(
         ty,
         [a],
@@ -63,6 +66,7 @@ def _asm1(ty, fmt, cons, a):
 
 @dsl_user_op
 def u32_mul_lo(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
+    """``mul.lo.u32``: the low 32 bits of the product."""
     return Int32(
         _asm2(
             T.i32(),
@@ -76,6 +80,7 @@ def u32_mul_lo(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def u32_mul_hi(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
+    """``mul.hi.u32``: the high 32 bits of the product."""
     return Int32(
         _asm2(
             T.i32(),
@@ -89,6 +94,7 @@ def u32_mul_hi(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def u32_xor(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
+    """``xor.b32``."""
     return Int32(
         _asm2(
             T.i32(),
@@ -102,6 +108,7 @@ def u32_xor(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def u32_add(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
+    """``add.u32`` (modulo 2^32)."""
     return Int32(
         _asm2(
             T.i32(),
@@ -115,6 +122,7 @@ def u32_add(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def u64_mul_lo(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
+    """``mul.lo.u64``: the low 64 bits of the product."""
     return Int64(
         _asm2(
             T.i64(),
@@ -128,6 +136,7 @@ def u64_mul_lo(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
 
 @dsl_user_op
 def u64_xor(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
+    """``xor.b64``."""
     return Int64(
         _asm2(
             T.i64(),
@@ -141,6 +150,7 @@ def u64_xor(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
 
 @dsl_user_op
 def u64_add(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
+    """``add.u64`` (modulo 2^64)."""
     return Int64(
         _asm2(
             T.i64(),
@@ -168,6 +178,7 @@ def u64_shr(a: Int64, n: Int32, *, loc=None, ip=None) -> Int64:
 
 @dsl_user_op
 def u64_shl(a: Int64, n: Int32, *, loc=None, ip=None) -> Int64:
+    """``shl.b64``: the logical left shift of a 64-bit word."""
     return Int64(
         _asm2(
             T.i64(),
@@ -181,6 +192,7 @@ def u64_shl(a: Int64, n: Int32, *, loc=None, ip=None) -> Int64:
 
 @dsl_user_op
 def u64_or(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
+    """``or.b64``."""
     return Int64(
         _asm2(
             T.i64(),
@@ -194,6 +206,7 @@ def u64_or(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
 
 @dsl_user_op
 def u64_lo32(a: Int64, *, loc=None, ip=None) -> Int32:
+    """``cvt.u32.u64``: the low 32 bits of a 64-bit word."""
     return Int32(
         _asm1(T.i32(), "cvt.u32.u64 $0, $1;", "=r,l", Int64(a).ir_value(loc=loc, ip=ip))
     )
@@ -201,6 +214,7 @@ def u64_lo32(a: Int64, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def u32_to_u64(a: Int32, *, loc=None, ip=None) -> Int64:
+    """``cvt.u64.u32``: a 32-bit word widened to 64 bits."""
     return Int64(
         _asm1(T.i64(), "cvt.u64.u32 $0, $1;", "=l,r", Int32(a).ir_value(loc=loc, ip=ip))
     )
@@ -234,6 +248,7 @@ def cvt_f64_u64(a: Int64, *, loc=None, ip=None) -> Float64:
 
 @dsl_user_op
 def f64_mul_rn(a: Float64, b: Float64, *, loc=None, ip=None) -> Float64:
+    """``mul.rn.f64``."""
     return Float64(
         _asm2(
             T.f64(),
@@ -252,6 +267,7 @@ def _i32(v: int) -> Int32:
 
 
 def _i64(v: int) -> Int64:
+    """A 64-bit constant as its two's-complement Int64 bit pattern."""
     v &= 0xFFFFFFFFFFFFFFFF
     return Int64(v - (1 << 64) if v >= 1 << 63 else v)
 
@@ -267,6 +283,7 @@ def mix64(v: Int64) -> Int64:
 
 @cute.jit
 def request_key(seed: Int64, offset: Int64) -> Int64:
+    """The row's 64-bit Philox key ``mix64(seed ^ mix64(offset))`` on the device (``stream.request_key``)."""
     return mix64(u64_xor(seed, mix64(offset)))
 
 
@@ -357,6 +374,8 @@ class StreamWordsKernel:
 
 @functools.cache
 def get_stream_words_kernel():
+    """The compiled conformance kernel (built once, cached in the draw's module)."""
+
     def compile_fn():
         # Distinct symbolic sizes per axis: the TVM-FFI entry checks the call's shapes against the compiled ones, so a
         # shared symbol would demand B == draws at every call.

@@ -677,9 +677,26 @@ def _suite_specs(sm):
     return list(dict.fromkeys(specs))
 
 
+def _device_tests_selected(session) -> bool:
+    """Whether a collected test carries the ``needs_device`` marker (otherwise the precompile has nothing to do: a ``-k``
+    run of the device-free tests on a GPU host compiles no kernel)."""
+    reason = needs_device.kwargs["reason"]
+    return any(
+        m.name == "skipif" and m.kwargs.get("reason") == reason
+        for item in session.items
+        for m in item.iter_markers()
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _precompile_draw_kernels():
-    if not _supported or os.environ.get("BI_DRAW_NO_PRECOMPILE") == "1":
+def _precompile_draw_kernels(request):
+    """Precompile the device tests' kernels on device-free workers once per session: a no-op without a supported device,
+    under ``BI_DRAW_NO_PRECOMPILE=1``, and when no device test is selected."""
+    if (
+        not _supported
+        or os.environ.get("BI_DRAW_NO_PRECOMPILE") == "1"
+        or not _device_tests_selected(request.session)
+    ):
         yield
         return
     from flashinfer.compilation_context import CompilationContext
@@ -984,8 +1001,10 @@ def test_generator_only_call_shape_and_key_forms():
         assert (seed2, offset2) != (seed, offset)
         ref2 = DR.draw_reference(one, [seed2], [offset2], from_logits=fl)
         assert torch.equal(tok2.cpu().long(), ref2["samples"])
+        g_bad = torch.Generator(device="cuda").manual_seed(1)
+        state = g_bad.get_state()
         for kw in (
-            dict(generator=torch.Generator(device="cuda").manual_seed(1)),
+            dict(generator=g_bad),
             dict(seed=3, offset=4),
             dict(
                 seed=torch.tensor([3], device="cuda"),
@@ -994,6 +1013,9 @@ def test_generator_only_call_shape_and_key_forms():
         ):
             with pytest.raises(ValueError, match="one key per output row"):
                 fn(inp, batch_invariant=True, **kw)
+        assert torch.equal(g_bad.get_state(), state), (
+            "a refused call must not advance the generator"
+        )
         s = torch.full((M,), 3, dtype=torch.int64, device="cuda")
         o = torch.arange(M, device="cuda")
         got = fn(inp, seed=s, offset=o, batch_invariant=True)
@@ -1076,6 +1098,13 @@ def test_index_gather():
     assert got["valid"].tolist() == [True, False, True, False, True, True]
     assert int(got["samples"][1]) == -1 and int(got["samples"][3]) == -1
     assert bool(torch.isnan(got["logp"][[1, 3]]).all())
+    # a gather from an empty source: every index lies outside the source rows (no launch, nothing is read)
+    tok, ok = flashinfer.sampling.sampling_from_probs(
+        p[:0], indices=ids, seed=s, offset=o, return_valid=True, batch_invariant=True
+    )
+    assert tok.tolist() == [-1] * 6 and not bool(ok.any())
+    got = logits_draw(x[:0], s, o, temperature=temps, indices=ids, return_logprob=True)
+    assert got["samples"].tolist() == [-1] * 6 and bool(torch.isnan(got["logp"]).all())
     with pytest.raises(ValueError, match="one row per CTA"):
         probs_draw(p, s, o, indices=ids, config=C.LSEConfig(32, 2, 4))
 
@@ -1186,6 +1215,13 @@ def test_vocabulary_beyond_the_share_bound_is_unsupported():
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="elements per thread"):
         flashinfer.sampling.sampling_from_probs(
             x, seed=1, offset=2, batch_invariant=True
+        )
+    # an explicit configuration beyond the space's load bound is refused before any compile (8192 loads per thread)
+    with pytest.raises(ValueError, match="loads per thread"):
+        probs_draw(
+            torch.rand(1, N_BIG, device="cuda"),
+            *keys(1),
+            config=C.LSEConfig(32, 1, 1, "reread", 1),
         )
 
 
