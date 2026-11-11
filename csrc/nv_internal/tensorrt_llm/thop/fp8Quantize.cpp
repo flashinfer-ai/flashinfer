@@ -17,6 +17,7 @@
 #include "tensorrt_llm/thop/fp8Quantize.h"
 
 #include <cstdint>
+#include <limits>
 
 #include "cutlass/numeric_types.h"
 #include "tensorrt_llm/thop/utils.h"
@@ -47,6 +48,9 @@ void mxfp8_quantize(TensorView input, TensorView valMxFP8, TensorView scaleFP8SF
   auto const k = inputShape[rank - 1];
   TVM_FFI_ICHECK_EQ(k % SF_VEC_SIZE, 0) << "k must be divisible by SF_VEC_SIZE = 32";
   auto const padded_k = ((k + alignment - 1) / alignment) * alignment;
+
+  TVM_FFI_ICHECK_LE(m, std::numeric_limits<int>::max()) << "m must fit in int";
+  TVM_FFI_ICHECK_LE(k, std::numeric_limits<int>::max()) << "k must fit in int";
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 

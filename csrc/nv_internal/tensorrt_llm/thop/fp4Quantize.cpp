@@ -18,6 +18,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <limits>
 
 #include "flashinfer/fp4_layout.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -61,6 +62,8 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
   }
   auto const k = inputShape[rank - 1];
   TVM_FFI_ICHECK_EQ(k % sfVecSize, 0);
+  TVM_FFI_ICHECK_LE(m, std::numeric_limits<int>::max()) << "m must fit in int";
+  TVM_FFI_ICHECK_LE(k, std::numeric_limits<int>::max()) << "k must fit in int";
   bool useRowWiseGlobalScale = false;
   if (globalScale.has_value()) {
     TVM_FFI_ICHECK(globalScale.value().numel() == 1 || globalScale.value().numel() == m)
@@ -159,6 +162,8 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
   int64_t k = inputShape[2];
 
   TVM_FFI_ICHECK_EQ(k % sfVecSize, 0);
+  TVM_FFI_ICHECK_LE(m, std::numeric_limits<int>::max()) << "m must fit in int";
+  TVM_FFI_ICHECK_LE(k, std::numeric_limits<int>::max()) << "k must fit in int";
 
   bool use_row_wise_global_scale = globalScale.numel() > 1;
   TVM_FFI_ICHECK(globalScale.numel() == 1 || globalScale.numel() == m)
