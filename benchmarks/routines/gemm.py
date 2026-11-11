@@ -169,9 +169,7 @@ def parse_gemm_args(line, parser):
         ],
         help=(
             "Kernel backends to test. Default: cudnn. `batch_invariant` runs the operator with "
-            "batch_invariant=True (backend='auto'): the batch-invariant class of mm_bf16, bmm_fp8, "
-            "gemm_fp8_nt_groupwise, mm_mxfp8 and mm_fp4 (SM100 / SM103 / SM107; see "
-            "flashinfer/batch_invariant/README.md). With --refcheck its output is also checked bit for bit "
+            "batch_invariant=True (backend='auto'). With --refcheck its output is also checked bit for bit "
             "against the same rows computed alone, in a sub-batch and under a permutation."
         ),
     )
@@ -350,8 +348,6 @@ def testGemmFp8NtGroupwise(args):
                 backend=backend,
             )
         elif backend == "batch_invariant":
-            # The batch-invariant class gemm.e4m3.kblock128 (flashinfer/batch_invariant/README.md):
-            # tile_size 128 (scale granularity (1, 128, 128)), k a multiple of 128, mma_sm is a placement.
             return flashinfer.gemm.gemm_fp8_nt_groupwise(
                 a=a_fp8,
                 b=b_fp8,
@@ -782,8 +778,6 @@ def testBmmFp8(args):
 
     def run_backend(backend, input_fp8, mat2_fp8, input_inv_s, mat2_inv_s):
         if backend == "batch_invariant":
-            # The batch-invariant fp8 classes (flashinfer/batch_invariant/README.md): every batch
-            # element is one launch of the class, the two per-tensor scales are multiplied once on the device.
             return flashinfer.gemm.bmm_fp8(
                 A=input_fp8,
                 B=mat2_fp8,
@@ -1535,8 +1529,6 @@ def testMmFp4(args):
         mat2_inv_s_trtllm,
     ):
         if backend == "batch_invariant":
-            # The batch-invariant NVFP4 / MXFP4 classes (flashinfer/batch_invariant/README.md): the
-            # 128x4 scale-factor layout (pass --use_128x4_sf_layout), alpha as given (1.0 for MXFP4).
             return flashinfer.gemm.mm_fp4(
                 a=input_fp4,
                 b=mat2_fp4.T,
@@ -1684,9 +1676,7 @@ def testMmFp4(args):
                         )
 
     if run_refcheck and "batch_invariant" in outputs:
-        # Bitwise: the same rows alone / in a sub-batch / permuted. The sub-batch's A operand is the
-        # quantization of those rows of the bf16 input by the same quantizer (its blocks are row-local,
-        # so the codes and scales of a row do not depend on the rows around it).
+
         def run_rows(rows):
             input_rows = input.index_select(0, rows)
             if use_nvfp4:
@@ -2105,8 +2095,6 @@ def testMmMxfp8(args):
         ], f"Unsupported backend: {backend}"
         input_mxfp8, mat2_mxfp8, input_scale, mat2_scale = inputs
         if backend == "batch_invariant":
-            # The batch-invariant MXFP8 class of the device's architecture (flashinfer/batch_invariant/README.md):
-            # both operands with 128x4 swizzled scales, as prepared above for every non-trtllm backend.
             return flashinfer.gemm.mm_mxfp8(
                 a=input_mxfp8,
                 b=mat2_mxfp8.t(),  # mm_mxfp8 expects b.t()
@@ -2186,8 +2174,6 @@ def testMmMxfp8(args):
     min_cos_sim = 0.98
 
     if run_refcheck and "batch_invariant" in outputs:
-        # Bitwise: the same rows alone / in a sub-batch / permuted. The sub-batch's A operand is the MXFP8
-        # quantization of those rows of the bf16 input by the same quantizer (row-local blocks of 32).
         _, mat2_mxfp8_bi, _, mat2_scale_bi = inputs["batch_invariant"]
 
         def run_rows(rows):
@@ -2363,8 +2349,6 @@ def testMmBf16(args):
                 backend=backend,
             )
         elif backend == "batch_invariant":
-            # The batch-invariant bf16 classes (flashinfer/batch_invariant/README.md): bf16 / fp16 output,
-            # the bias added once to the fully reduced fp32 accumulator.
             return flashinfer.mm_bf16(
                 a=a,
                 b=b,

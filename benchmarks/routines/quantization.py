@@ -161,8 +161,7 @@ def parse_quantization_args(line, parser):
         choices=["cuda", "cute-dsl", "batch_invariant"],
         help=(
             "Backend to test. Default: cuda. `batch_invariant` (mxfp8_quantize, mxfp4_quantize, nvfp4_quantize) "
-            "runs the operator with batch_invariant=True: the batch-invariant quantization classes (SM100 / SM103 / "
-            "SM107; see flashinfer/batch_invariant/README.md). With --refcheck its codes and scales are also "
+            "runs the operator with batch_invariant=True. With --refcheck its codes and scales are also "
             "checked bit for bit against the same rows quantized alone, in a sub-batch and under a permutation."
         ),
     )
@@ -292,7 +291,6 @@ def testMxfp8Quantize(args):
 
     def run_backend(backend, input_tensor):
         if backend == "batch_invariant":
-            # The batch-invariant class mxfp8.quant (flashinfer/batch_invariant/README.md).
             return flashinfer.mxfp8_quantize(
                 input_tensor,
                 is_sf_swizzled_layout=is_sf_swizzled_layout,
@@ -531,7 +529,6 @@ def testMxfp4Quantize(args):
 
     def run_backend(backend, input_tensor):
         if backend == "batch_invariant":
-            # The batch-invariant class mxfp4.quant (flashinfer/batch_invariant/README.md).
             return flashinfer.mxfp4_quantize(
                 input_tensor,
                 backend="auto",
@@ -625,7 +622,7 @@ def testMxfp4Quantize(args):
                         raise
 
     if run_refcheck and "batch_invariant" in outputs:
-        # Bitwise: the codes and the (unswizzled) scales of the same rows alone / in a sub-batch / permuted.
+
         def per_row(x_q, sf, num_rows):
             return (x_q, _unswizzled_sf_rows(sf, num_rows, k, 32, sf_layout_str))
 
@@ -786,8 +783,6 @@ def testNvfp4Quantize(args):
 
     def run_backend(backend, input_tensor, global_sf_tensor):
         if backend == "batch_invariant":
-            # The batch-invariant classes nvfp4.quant / nvfp4.quant.pertoken (flashinfer/batch_invariant/README.md):
-            # TransformerEngine's recipe with every operation correctly rounded -- FlashInfer's exact path.
             return flashinfer.nvfp4_quantize(
                 input_tensor,
                 global_sf_tensor,
@@ -907,9 +902,6 @@ def testNvfp4Quantize(args):
                         )
 
     if run_refcheck and "batch_invariant" in outputs:
-        # Bitwise: the codes, the scales (unswizzled to rows; skipped under do_shuffle, whose host shuffle
-        # is a function of the whole row count) and the per-token scales of the same rows alone / in a
-        # sub-batch / permuted.
         if do_shuffle:
             print(
                 "[INFO] batch-invariance check: the shuffled scale factors are compared through the codes "

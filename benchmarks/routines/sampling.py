@@ -194,8 +194,6 @@ def parse_sampling_args(line, parser):
         default=None,
         help="Number of rows for top_k_page_table_transform and top_k_ragged_transform. Defaults to batch_size.",
     )
-    # log_softmax / log_probs have the batch-invariant class as their only kernel: batch_invariant is their
-    # only backend and their default.
     batch_invariant_only_routines = ["log_softmax", "log_probs"]
     default_backends = (
         ["batch_invariant"]
@@ -212,9 +210,8 @@ def parse_sampling_args(line, parser):
         help=(
             "Kernel backends to test. Default: cuda (batch_invariant for log_softmax and log_probs, their only "
             "backend). `batch_invariant` runs softmax with batch_invariant=True, the batch-invariant class lse.row "
-            "(SM100 / SM103 / SM107; see flashinfer/batch_invariant/README.md), and is the kernel of log_softmax "
-            "and log_probs. With --refcheck its output is also checked bit for bit against the same rows computed "
-            "alone, in a sub-batch and under a permutation."
+            "and is the kernel of log_softmax and log_probs. With --refcheck its output is also checked bit for bit "
+            "against the same rows computed alone, in a sub-batch and under a permutation."
         ),
     )
 
@@ -291,8 +288,6 @@ def testSoftmax(args):
                 logits, temperature=temperature, enable_pdl=args.enable_pdl
             )
         elif backend == "batch_invariant":
-            # The batch-invariant class lse.row (flashinfer/batch_invariant/README.md); the output is in
-            # the input dtype (out_dtype=torch.float32 names another specification, not benchmarked here).
             return flashinfer.sampling.softmax(
                 logits,
                 temperature=temperature,
