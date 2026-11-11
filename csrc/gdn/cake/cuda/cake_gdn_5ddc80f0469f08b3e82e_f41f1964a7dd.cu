@@ -1511,7 +1511,16 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                             long long state_vec_index_init = state_base_init + (long long)(state_col_block_init * 32) + (long long)(state_vec_init * 4);
                             {
                                 uint2 _vld_0;
-                                _vld_0 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init);
+                                const __nv_bfloat16* state_ptr = initial_state + state_vec_index_init;
+                                // BF16 views may start between vector-aligned addresses.
+                                if ((reinterpret_cast<uint64_t>(state_ptr) & 7) == 0) {
+                                    _vld_0 = *reinterpret_cast<const uint2*>(state_ptr);
+                                } else {
+                                    _vld_0.x = static_cast<uint32_t>(__bfloat16_as_ushort(state_ptr[0])) |
+                                               (static_cast<uint32_t>(__bfloat16_as_ushort(state_ptr[1])) << 16);
+                                    _vld_0.y = static_cast<uint32_t>(__bfloat16_as_ushort(state_ptr[2])) |
+                                               (static_cast<uint32_t>(__bfloat16_as_ushort(state_ptr[3])) << 16);
+                                }
                                 uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2497,7 +2506,16 @@ kernel_cake_gdn_5ddc80f0469f08b3e82e(const __grid_constant__ CUtensorMap Q, cons
                         float _vec_load_0[4];
                         {
                             uint2 _vld_13;
-                            _vld_13 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + (long long)empty_state_col);
+                            const __nv_bfloat16* state_ptr = initial_state + empty_initial_base + (long long)empty_state_col;
+                            // BF16 views may start between vector-aligned addresses.
+                            if ((reinterpret_cast<uint64_t>(state_ptr) & 7) == 0) {
+                                _vld_13 = *reinterpret_cast<const uint2*>(state_ptr);
+                            } else {
+                                _vld_13.x = static_cast<uint32_t>(__bfloat16_as_ushort(state_ptr[0])) |
+                                           (static_cast<uint32_t>(__bfloat16_as_ushort(state_ptr[1])) << 16);
+                                _vld_13.y = static_cast<uint32_t>(__bfloat16_as_ushort(state_ptr[2])) |
+                                           (static_cast<uint32_t>(__bfloat16_as_ushort(state_ptr[3])) << 16);
+                            }
                             uint32_t* _vpairs_13 = reinterpret_cast<uint32_t*>(&_vld_13);
                             #pragma unroll
                             for (int _pair = 0; _pair < 2; _pair++) {

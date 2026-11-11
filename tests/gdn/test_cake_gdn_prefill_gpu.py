@@ -714,19 +714,12 @@ def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurr
     )
 
 
-@pytest.mark.parametrize(
-    "state_dtype", (torch.float32, torch.bfloat16), ids=("fp32_state", "bf16_state")
-)
-def test_public_cake_gdn_prefill_short_tiles_initial_state_off_16_bytes_matches_aligned(
-    state_dtype,
-):
-    # On sm_107a these keys run the gate-stream prefetch twin, which asks L2 for
-    # the initial state of each tile that follows another tile on its CTA with
-    # 16-byte aligned bulk prefetches.  An initial state 8 (FP32) or 4 (BF16)
-    # bytes past a 16-byte boundary prefetches the aligned bytes inside it:
-    # output and final state equal the aligned call's bit for bit.
+def _check_initial_state_alignment(state_dtype, offset, with_empty_sequences):
+    # Exercise element-aligned views in the initial load and the empty-sequence
+    # state copy. On sm_107a this also covers aligned bulk prefetches in the
+    # gate-stream twin. Both paths must match the aligned call bit for bit.
     case = _make_case(
-        seq_lens=(128,) * 32,
+        seq_lens=(0, 128) * 16 if with_empty_sequences else (128,) * 32,
         state_dtype=state_dtype,
         num_q_heads=4,
         num_k_heads=4,
@@ -744,9 +737,10 @@ def test_public_cake_gdn_prefill_short_tiles_initial_state_off_16_bytes_matches_
     backing = torch.empty(
         initial_state.numel() + 16, dtype=state_dtype, device=initial_state.device
     )
-    shifted = backing[2 : 2 + initial_state.numel()].view(initial_state.shape)
+    shifted = backing[offset : offset + initial_state.numel()].view(initial_state.shape)
     shifted.copy_(initial_state)
-    assert shifted.is_contiguous() and shifted.data_ptr() % 16 != 0
+    assert shifted.is_contiguous()
+    assert shifted.data_ptr() % 16 == (offset * initial_state.element_size()) % 16
     shifted_case = dict(
         case,
         initial_state=shifted,
@@ -757,6 +751,28 @@ def test_public_cake_gdn_prefill_short_tiles_initial_state_off_16_bytes_matches_
     torch.cuda.synchronize()
     assert torch.equal(out, aligned_out)
     assert torch.equal(state, aligned_state)
+
+
+@pytest.mark.parametrize(
+    "state_dtype", (torch.float32, torch.bfloat16), ids=("fp32_state", "bf16_state")
+)
+def test_public_cake_gdn_prefill_short_tiles_initial_state_off_16_bytes_matches_aligned(
+    state_dtype,
+):
+    _check_initial_state_alignment(state_dtype, 2, False)
+
+
+@pytest.mark.parametrize(
+    "state_dtype", (torch.float32, torch.bfloat16), ids=("fp32_state", "bf16_state")
+)
+@pytest.mark.parametrize("offset", (1, 2, 3, 4, 8))
+@pytest.mark.parametrize("with_empty_sequences", (False, True))
+def test_public_cake_gdn_prefill_initial_state_element_offsets_match_aligned(
+    state_dtype,
+    offset,
+    with_empty_sequences,
+):
+    _check_initial_state_alignment(state_dtype, offset, with_empty_sequences)
 
 
 @pytest.mark.parametrize(
