@@ -1,0 +1,316 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import math
+
+import pytest
+import torch
+
+import flashinfer
+from flashinfer.prefill import (
+    _gqa_ctx_fp8q_sm90_plan_eligibility,
+    _gqa_ctx_fp8q_sm90_stats,
+    _reset_gqa_ctx_fp8q_sm90_stats,
+)
+
+DISABLE_ENV = "FLASHINFER_DISABLE_GQA_CONTEXT_FP8_PAGED_SM90"
+H_QO, H_KV, HEAD_DIM, PAGE = 8, 1, 128, 16
+RTOL, ATOL, MATCHED = 0.04, 0.02, 0.98
+
+
+@pytest.fixture(autouse=True)
+def _clean(monkeypatch):
+    monkeypatch.delenv(DISABLE_ENV, raising=False)
+    _reset_gqa_ctx_fp8q_sm90_stats()
+    yield
+    _reset_gqa_ctx_fp8q_sm90_stats()
+
+
+def _sm90_or_skip():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 required")
+
+
+# --------------------------------------------------------------------------
+# Plan-time geometry guard (GPU-free)
+# --------------------------------------------------------------------------
+
+
+def _plan_kwargs(**overrides):
+    kwargs = dict(
+        kv_layout="NHD",
+        causal=True,
+        has_custom_mask=False,
+        pos_encoding_mode="NONE",
+        use_fp16_qk_reduction=False,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        sm_scale=None,
+        num_qo_heads=H_QO,
+        num_kv_heads=H_KV,
+        head_dim_qk=HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+        page_size=PAGE,
+        batch_size=7,
+        total_q=5379,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_plan_guard_accepts_the_measured_contract():
+    assert _gqa_ctx_fp8q_sm90_plan_eligibility(**_plan_kwargs()) is None
+    assert (
+        _gqa_ctx_fp8q_sm90_plan_eligibility(
+            **_plan_kwargs(sm_scale=1.0 / math.sqrt(HEAD_DIM))
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"kv_layout": "HND"},
+        {"causal": False},
+        {"has_custom_mask": True},
+        {"pos_encoding_mode": "ROPE_LLAMA"},
+        {"use_fp16_qk_reduction": True},
+        {"window_left": 1024},
+        {"logits_soft_cap": 30.0},
+        {"sm_scale": 1.0},
+        {"num_qo_heads": 4},
+        {"num_kv_heads": 2},
+        {"head_dim_qk": 256},
+        {"head_dim_vo": 64},
+        {"page_size": 1},
+        {"batch_size": 0},
+        {"batch_size": 129},
+        {"total_q": 0},
+        {"total_q": 32769},
+    ],
+)
+def test_plan_guard_rejects_other_geometries(overrides):
+    assert _gqa_ctx_fp8q_sm90_plan_eligibility(**_plan_kwargs(**overrides)) is not None
+
+
+def test_stats_report_build_state_and_counters():
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    for key in ("plans_seen", "runs_dispatched", "module_loaded", "module_error"):
+        assert key in stats
+
+
+# --------------------------------------------------------------------------
+# Device tests (SM90): reference equivalence, kill-switch, CUDA graph
+# --------------------------------------------------------------------------
+
+
+def _make_batch(q_lens, kv_lens, device, seed=0):
+    g = torch.Generator(device=device)
+    g.manual_seed(seed)
+    B = len(q_lens)
+    pprs = [(k + PAGE - 1) // PAGE for k in kv_lens]
+    P = sum(pprs)
+    nb = max(pprs)
+    bt = torch.zeros((B, nb), dtype=torch.int32, device=device)
+    s = 0
+    indptr = [0]
+    indices = []
+    for i, ppr in enumerate(pprs):
+        bt[i, :ppr] = torch.arange(s, s + ppr, dtype=torch.int32, device=device)
+        indices.extend(range(s, s + ppr))
+        indptr.append(indptr[-1] + ppr)
+        s += ppr
+
+    def rnd(shape):
+        x = torch.randn(shape, generator=g, device=device, dtype=torch.float32)
+        return (x * 0.5).to(torch.float8_e4m3fn)
+
+    TQ = sum(q_lens)
+    cu = [0]
+    for ln in q_lens:
+        cu.append(cu[-1] + ln)
+    return dict(
+        q=rnd((TQ, H_QO, HEAD_DIM)),
+        k_cache=rnd((P, PAGE, H_KV, HEAD_DIM)),
+        v_cache=rnd((P, PAGE, H_KV, HEAD_DIM)),
+        qo_indptr=torch.tensor(cu, dtype=torch.int32, device=device),
+        kv_indptr=torch.tensor(indptr, dtype=torch.int32, device=device),
+        kv_indices=torch.tensor(indices, dtype=torch.int32, device=device),
+        last_page_len=torch.tensor(
+            [(k - 1) % PAGE + 1 for k in kv_lens], dtype=torch.int32, device=device
+        ),
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        block_table=bt,
+    )
+
+
+def _reference(batch):
+    """fp32 dequant-then-attend chunked-prefill reference (row pos of request
+    r sees kv_len_r - q_len_r + pos + 1 keys)."""
+    device = batch["q"].device
+    q = batch["q"].float()
+    kf = batch["k_cache"].float().reshape(-1, HEAD_DIM)
+    vf = batch["v_cache"].float().reshape(-1, HEAD_DIM)
+    cu = batch["qo_indptr"].tolist()
+    kv_lens = batch["seq_lens"].tolist()
+    bt = batch["block_table"]
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
+    scale = HEAD_DIM**-0.5
+    off = torch.arange(PAGE, device=device)
+    for r in range(len(kv_lens)):
+        q0, q1 = cu[r], cu[r + 1]
+        ql = q1 - q0
+        if ql == 0:
+            continue
+        kvl = kv_lens[r]
+        npages = (kvl + PAGE - 1) // PAGE
+        flat = (bt[r, :npages].long().unsqueeze(1) * PAGE + off).reshape(-1)[:kvl]
+        k = kf[flat]
+        v = vf[flat]
+        sc = torch.einsum("nhd,ld->nhl", q[q0:q1], k) * scale
+        vis = (kvl - ql) + torch.arange(ql, device=device) + 1
+        mask = torch.arange(kvl, device=device).view(1, 1, kvl) >= vis.view(ql, 1, 1)
+        sc = sc.masked_fill(mask, float("-inf"))
+        out[q0:q1] = torch.einsum("nhl,ld->nhd", torch.softmax(sc, -1), v).to(
+            torch.bfloat16
+        )
+    return out
+
+
+def _plan_wrapper(batch, device, use_cuda_graph=False):
+    B = batch["seq_lens"].numel()
+    ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+    kwargs = {}
+    if use_cuda_graph:
+        kwargs = dict(
+            use_cuda_graph=True,
+            qo_indptr_buf=batch["qo_indptr"],
+            paged_kv_indptr_buf=batch["kv_indptr"],
+            paged_kv_indices_buf=batch["kv_indices"],
+            paged_kv_last_page_len_buf=batch["last_page_len"],
+        )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="fa2", **kwargs
+    )
+    wrapper.plan(
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    return wrapper
+
+
+def _matched_ratio(y, ref):
+    yf, rf = y.float(), ref.float()
+    ok = (yf - rf).abs() <= (ATOL + RTOL * rf.abs())
+    return float(ok.float().mean().item())
+
+
+@pytest.mark.parametrize(
+    "q_lens,kv_lens",
+    [
+        ([6, 6, 6, 5, 1, 5, 350], [1500, 658, 76, 341, 341, 863, 2030]),
+        ([256], [4096]),
+        ([5, 90, 120, 7, 61], [584, 727, 120, 75, 1468]),
+    ],
+)
+def test_specialized_matches_reference_and_stock(q_lens, kv_lens, monkeypatch):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch(q_lens, kv_lens, device)
+    wrapper = _plan_wrapper(batch, device)
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 1, stats
+
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 1, stats
+    ref = _reference(batch)
+    assert _matched_ratio(out, ref) >= MATCHED
+
+    # determinism: the kernel is atomics-free and bit-stable
+    out2 = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    assert torch.equal(out, out2)
+
+    # kill-switch: the same call is served by dequant + stock fa2
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    out_stock = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_disabled"] == 1 and stats["runs_dequant_fallback"] == 1, stats
+    assert _matched_ratio(out_stock, ref) >= MATCHED
+    assert _matched_ratio(out, out_stock) >= MATCHED
+
+
+def test_run_guard_falls_back_on_mismatched_arguments():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    # return_lse is outside the contract: dequant fallback serves it
+    out, lse = wrapper.run(
+        batch["q"], (batch["k_cache"], batch["v_cache"]), return_lse=True
+    )
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0
+    assert stats["runs_ineligible"] == 1 and stats["runs_dequant_fallback"] == 1
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_graph_capture_replays_bitwise_equal_to_eager():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([6, 6, 120, 70], [700, 76, 341, 1363], device)
+    wrapper = _plan_wrapper(batch, device, use_cuda_graph=True)
+    q = batch["q"]
+    kv = (batch["k_cache"], batch["v_cache"])
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
+    eager = wrapper.run(q, kv).clone()
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        wrapper.run(q, kv, out=out)  # warmup on the side stream
+    torch.cuda.current_stream().wait_stream(stream)
+    with torch.cuda.graph(graph):
+        wrapper.run(q, kv, out=out)
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dispatched_capturing"] == 1, stats
+
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager)
+
+    # new content through the same buffers replays correctly
+    q.copy_(_make_batch([6, 6, 120, 70], [700, 76, 341, 1363], device, seed=7)["q"])
+    graph.replay()
+    torch.cuda.synchronize()
+    eager2 = wrapper.run(q, kv)
+    assert torch.equal(out, eager2)
