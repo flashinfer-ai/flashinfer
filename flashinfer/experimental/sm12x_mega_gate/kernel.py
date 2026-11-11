@@ -253,6 +253,12 @@ def store_vec4(tensor, offset, vector):
     view.store(vector)
 
 
+@cute.jit
+def replica_hash(token: Int32, ep_rank: Int32) -> Uint32:
+    """DeepGEMM's token hash, with uint32 wraparound before replica selection."""
+    return Uint32(ep_rank) + Uint32(token) * Uint32(DUPLICATE_HASH)
+
+
 def sqrt_softplus(value):
     """``sqrt(softplus(value))`` with the identity above the softplus threshold."""
     softplus = cute.math.log1p(cute.math.exp(value))
@@ -1461,7 +1467,7 @@ class Sm12xMegaGateKernel:
         lane_physical = cute.make_rmem_tensor((self.num_lane_values,), Int32)
         shared_physical = Int32(0)
         if const_expr(self.has_physical_map):
-            token_hash = Uint32(ep_rank) + Uint32(token) * Uint32(DUPLICATE_HASH)
+            token_hash = replica_hash(token, ep_rank)
             for wave in cutlass.range_constexpr(self.num_waves):
                 self.lookup_physical(
                     physical_map,
@@ -1578,9 +1584,7 @@ class Sm12xMegaGateKernel:
                     gate_warp, k, logical_rank, tokens_in_block
                 )
                 if valid:
-                    token_hash = Uint32(ep_rank) + Uint32(
-                        block_token_base + t_local
-                    ) * Uint32(DUPLICATE_HASH)
+                    token_hash = replica_hash(block_token_base + t_local, ep_rank)
                     quad = lane * Int32(EXPERTS_PER_LANE) + wave * Int32(
                         EXPERTS_PER_WAVE
                     )
@@ -1609,9 +1613,9 @@ class Sm12xMegaGateKernel:
                     if gate_warp == Int32(self.slot_selector(slot)):
                         t_local = logical_rank + Int32(slot * self.num_logical_ctas)
                         if t_local < tokens_in_block:
-                            token_hash = Uint32(ep_rank) + Uint32(
-                                block_token_base + t_local
-                            ) * Uint32(DUPLICATE_HASH)
+                            token_hash = replica_hash(
+                                block_token_base + t_local, ep_rank
+                            )
                             shared_physical = self.lookup_shared_physical(
                                 physical_map,
                                 token_hash,

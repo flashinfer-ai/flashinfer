@@ -10,11 +10,10 @@ expert-parallel serving engine calls it) against the unfused two-kernel path
 used on SM12x today: a cuBLAS BF16 GEMM with FP32 logits followed by b12x's
 Triton ``route_topk`` (sqrt-softplus, bias, renormalized top-k; it has no
 physical map, which only favors the baseline). The cuBLAS GEMM alone is
-reported as well. The unfused time is the sum of its two kernels' times, as they
-run back to back in a CUDA graph: timing the pair as one call would also count
-the CPU launch gap before the Triton kernel. Timing uses a cold L2 between
-iterations (every layer has its own gate weight), with CUPTI under ``--cupti``
-(cupti-python >= 13) and CUDA events otherwise. ``--fixed-routing`` flags every
+reported as well. Each path is captured in a CUDA graph, including both stages
+of the unfused path. L2 is flushed before each replay, preserving logits in L2
+between GEMM and top-k. Timing uses CUPTI under ``--cupti`` (cupti-python >= 13)
+and CUDA events otherwise. ``--fixed-routing`` flags every
 token in ``fix_routing_mask`` (hash-routed layers): the fused call then takes
 the given logical experts of each token instead of ranking them (the baseline
 still ranks).
@@ -58,12 +57,13 @@ def make_inputs(num_tokens, hidden, num_experts, device="cuda"):
     return x, weight, bias, mapping, counts
 
 
-def fp32_logits(x, weight):
-    """cuBLAS BF16 GEMM with FP32 output where PyTorch has it, else BF16 output upcast."""
+def make_gemm(x, weight):
+    """Select GEMM once, and label the lower-precision fallback explicitly."""
     try:
-        return torch.mm(x, weight.t(), out_dtype=torch.float32)
+        torch.mm(x, weight.t(), out_dtype=torch.float32)
     except (NotImplementedError, RuntimeError, TypeError):
-        return torch.mm(x, weight.t()).float()
+        return lambda: torch.mm(x, weight.t()).float(), "BF16 output + FP32 cast"
+    return lambda: torch.mm(x, weight.t(), out_dtype=torch.float32), "FP32 output"
 
 
 def load_triton_route_topk():
@@ -81,8 +81,19 @@ def load_triton_route_topk():
 
 
 def median_us(fn, use_cupti):
+    # Capture explicitly so CUDA-event timing also flushes L2 before each
+    # replay; the generic event+graph timer instead needs rotating inputs.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
     times = bench_gpu_time(
-        fn,
+        graph.replay,
         enable_cupti=use_cupti,
         dry_run_time_ms=25,
         repeat_time_ms=100,
@@ -125,7 +136,7 @@ def main():
         f"{props.name} (sm_{props.major}{props.minor}, {props.multi_processor_count} SMs) "
         f"K={args.hidden} E={args.num_experts} top-k={args.num_topk} "
         f"deterministic={args.deterministic} fixed_routing={args.fixed_routing} "
-        f"timer={'CUPTI' if args.cupti else 'CUDA events'}"
+        f"timer={'CUPTI' if args.cupti else 'CUDA events'}; CUDA graph replay, cold L2"
     )
     route_topk = None if args.no_baseline else load_triton_route_topk()
     header = (
@@ -173,7 +184,9 @@ def main():
             f"{fused:>9.2f} {moved / fused / 1e3:>6.0f} {flops / fused / 1e6:>7.1f}"
         )
         if not args.no_baseline:
-            gemm = median_us(lambda: fp32_logits(x, weight), args.cupti)
+            run_gemm, baseline_label = make_gemm(x, weight)
+            print(f"# tokens={num_tokens}: cuBLAS baseline: {baseline_label}")
+            gemm = median_us(run_gemm, args.cupti)
             buffers = (
                 torch.empty((num_tokens, args.num_topk), device="cuda"),
                 torch.empty(
@@ -181,19 +194,19 @@ def main():
                 ),
                 torch.empty((num_tokens, args.num_topk), device="cuda"),
             )
-            logits = fp32_logits(x, weight)
-            top_k = median_us(
-                lambda: route_topk(
+
+            def unfused_router():
+                logits = run_gemm()
+                return route_topk(
                     logits,
                     *buffers,
                     renormalize=True,
                     score_func="sqrtsoftplus",
                     correction_bias=bias,
                     routed_scaling_factor=args.scale,
-                ),
-                args.cupti,
-            )
-            unfused = gemm + top_k
+                )
+
+            unfused = median_us(unfused_router, args.cupti)
             row += f" {gemm:>9.2f} {unfused:>10.2f} {unfused / fused:>7.2f}x"
         print(row)
 

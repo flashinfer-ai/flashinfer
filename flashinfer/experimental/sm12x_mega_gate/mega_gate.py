@@ -244,12 +244,12 @@ class MegaGateSm12xPlan:
         _config=None,
     ):
         """``enable_pdl`` launches with programmatic dependent launch (default: when the
-        device supports it): the weight starts streaming while the previous kernel
-        finishes. ``num_sms`` caps the SMs the kernel uses (default: all), leaving the
-        rest to kernels that run at the same time, such as communication overlapped with
-        the gate: a worker group spins until all of its CTAs have arrived, so every CTA
-        of the grid must find a free SM. ``_config`` (a ``MegaGateConfig``) overrides the
-        heuristic; for tuning and tests."""
+        device supports it): launch and prologue can overlap the previous kernel,
+        but global memory reads wait for it to finish. ``num_sms`` caps the SMs the
+        kernel uses (default: all), leaving the rest to kernels that run at the same time,
+        such as communication overlapped with the gate: a worker group spins until all
+        of its CTAs have arrived, so every CTA of the grid must find a free SM.
+        ``_config`` (a ``MegaGateConfig``) overrides the heuristic; for tuning and tests."""
         import torch
 
         from flashinfer.utils import device_support_pdl
@@ -393,6 +393,8 @@ class MegaGateSm12xPlan:
             if _config is not None
             else select_config(M, K, E, sms, bool(deterministic))
         )
+        if config.num_split_k <= 0 or (K // BLOCK_K) % config.num_split_k:
+            raise ValueError("num_split_k must be positive and divide K / BLOCK_K")
         if config.num_logical_ctas > sms:
             raise ValueError(
                 f"the schedule's {config.num_logical_ctas} CTAs per token block "
@@ -409,6 +411,32 @@ class MegaGateSm12xPlan:
             raise ValueError("out must be a pair of tensors")
         check(out[0], "out[0]", torch.int64, (M, slots))
         check(out[1], "out[1]", torch.float32, (M, slots))
+        # Physical indices, weights and logical indices are separate kernel stores.
+        # Outputs are contiguous; the logical output may have padding between rows.
+        outputs = [("out[0]", out[0]), ("out[1]", out[1])]
+        if unmapped_topk_idx is not None:
+            outputs.append(("unmapped_topk_idx", unmapped_topk_idx))
+        for i, (name, tensor) in enumerate(outputs):
+            if not tensor.numel():
+                continue
+            start = tensor.data_ptr()
+            end = (
+                start + (tensor.shape[0] - 1) * tensor.stride(0) * tensor.element_size()
+            )
+            end += tensor.shape[1] * tensor.element_size()
+            for other_name, other in outputs[:i]:
+                other_start = other.data_ptr()
+                other_end = other_start + other.numel() * other.element_size()
+                if start < other_end and other_start < end:
+                    # Earlier outputs are contiguous. Find the first logical row
+                    # whose end lies after their start, allowing disjoint views.
+                    row_bytes = tensor.shape[1] * tensor.element_size()
+                    stride_bytes = max(
+                        row_bytes, tensor.stride(0) * tensor.element_size()
+                    )
+                    row = max(0, (other_start - start - row_bytes) // stride_bytes + 1)
+                    if row < tensor.shape[0] and start + row * stride_bytes < other_end:
+                        raise ValueError(f"{name} and {other_name} must not overlap")
         scratch_shape = config.scratch_shape(M, E)
         if scratch is None:
             scratch = torch.empty(scratch_shape, dtype=torch.float32, device=device)

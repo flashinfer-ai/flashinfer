@@ -14,6 +14,11 @@ validation, and the schedule invariants (CPU-only).
 """
 
 import functools
+import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import torch
@@ -55,12 +60,17 @@ TOKEN_COUNTS = (
 def _skip_unless_sm120():
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
+    device_index = torch.cuda.current_device()
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability != (12, 0):
+        pytest.skip("SM120 device required")
+    from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported
+
+    if not is_cute_dsl_arch_supported(*capability, native_only=True):
+        pytest.skip("CuTe DSL native SM120 support required")
     from flashinfer.experimental.sm12x_mega_gate import mega_gate as runtime
 
-    try:
-        runtime.device_facts(torch.cuda.current_device())
-    except RuntimeError as error:
-        pytest.skip(str(error))
+    runtime.device_facts(device_index)
 
 
 # ----------------------------------------------------------------- CPU only
@@ -270,6 +280,10 @@ def _check_routing(
         f"top-k beyond ties: {crossing.max().item()}"
     )
 
+    assert torch.all(chosen[:, 1:] - chosen[:, :-1] <= tolerance[:, None]), (
+        "selected experts must be in descending routing-rank order"
+    )
+
     # Weights of the kernel's own selection, from the reference scores.
     picked = scores[active].gather(1, selected)
     expected = picked / (picked.sum(dim=1, keepdim=True) + 1e-20) * SCALE
@@ -458,6 +472,9 @@ def test_v4_flash_shape(num_tokens, physical, with_mask):
         (5120, 384, 6, 1),
         (5120, 512, 8, 2),
         (4096, 1024, 16, 0),
+        (320, 128, 17, 0),
+        (320, 124, 31, 1),
+        (320, 128, 32, 0),
     ],
 )
 @pytest.mark.parametrize("num_tokens", [1, 5, 129, 2048])
@@ -714,7 +731,6 @@ def test_graph_replay_with_changed_inputs_on_a_side_stream():
         plan = prepare_mega_gate(
             x, weight, 6, bias=bias, to_physical_map=mapping, logical_count=counts
         )
-        plan.run()  # warm up: compile and load outside the capture
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
@@ -773,3 +789,195 @@ def test_rejects_misplaced_or_misaligned_buffers():
     shifted = torch.empty(scratch.numel() + 1, device="cuda")[1:].view(scratch.shape)
     with pytest.raises(ValueError, match="16-byte aligned"):
         prepare_mega_gate(x, weight, 6, bias=bias, scratch=shifted)
+
+
+@pytest.mark.parametrize("split", [0, -1, 2, 4])
+def test_rejects_invalid_split_k(split):
+    """A private schedule override must cover every 64-element K block."""
+    _skip_unless_sm120()
+    from dataclasses import replace
+    from flashinfer.experimental.sm12x_mega_gate.mega_gate import MegaGateSm12xPlan
+
+    x, weight, _ = _make_inputs(4, 192, 128)
+    config = replace(heuristics.make_config(16, 1, 128), num_split_k=split)
+    with pytest.raises(ValueError, match="num_split_k"):
+        MegaGateSm12xPlan(x, weight, 2, _config=config)
+
+
+@pytest.mark.parametrize(
+    "pair", ["indices-logical", "weights-logical", "indices-weights"]
+)
+@pytest.mark.parametrize("offset", [0, 8])
+def test_rejects_overlapping_outputs(pair, offset):
+    """Reject exact aliases and partially overlapping views, including mixed dtypes."""
+    _skip_unless_sm120()
+    x, weight, _ = _make_inputs(4, 320, 12)
+    storage = torch.empty(256, dtype=torch.uint8, device="cuda")
+    indices = torch.empty((4, 2), dtype=torch.int64, device="cuda")
+    weights = torch.empty((4, 2), device="cuda")
+    logical = torch.empty_like(indices)
+    if pair == "indices-logical":
+        indices = storage[:64].view(torch.int64).view(4, 2)
+        logical = storage[offset : offset + 64].view(torch.int64).view(4, 2)
+    elif pair == "weights-logical":
+        weights = storage[:32].view(torch.float32).view(4, 2)
+        logical = storage[offset : offset + 64].view(torch.int64).view(4, 2)
+    else:
+        indices = storage[:64].view(torch.int64).view(4, 2)
+        weights = storage[offset : offset + 32].view(torch.float32).view(4, 2)
+    with pytest.raises(ValueError, match="overlap"):
+        prepare_mega_gate(
+            x, weight, 2, out=(indices, weights), unmapped_topk_idx=logical
+        )
+
+
+@pytest.mark.parametrize("offset", [2, 120])
+def test_disjoint_outputs_can_share_storage(offset):
+    """Disjoint output views are safe even when they share one allocation."""
+    _skip_unless_sm120()
+    x, weight, bias = _make_inputs(4, 320, 12)
+    storage = torch.empty(128, dtype=torch.int64, device="cuda")
+    logical = storage.as_strided((4, 2), (32, 1))
+    # The first row gap, or the tail after all logical rows.
+    indices = storage[offset : offset + 8].view(4, 2)
+    plan = prepare_mega_gate(
+        x,
+        weight,
+        2,
+        bias=bias,
+        out=(indices, torch.empty((4, 2), device="cuda")),
+        unmapped_topk_idx=logical,
+    )
+    plan.run()
+    torch.cuda.synchronize()
+    assert torch.equal(indices, logical)
+
+
+def test_first_invocation_capture_and_disk_reload(tmp_path):
+    """Fresh processes capture their first call, on both a cache miss and a disk hit."""
+    _skip_unless_sm120()
+    script = textwrap.dedent("""\
+        import runpy
+        import sys
+        from unittest.mock import patch
+        import torch
+        from flashinfer.jit import cute_dsl_core as cache
+        from flashinfer.mega_gate import prepare_mega_gate
+
+        helpers = runpy.run_path(sys.argv[1])
+        x, weight, bias = helpers['_make_inputs'](7, 320, 12)
+        logical = torch.empty((7, 2), dtype=torch.int64, device='cuda')
+        builds = []
+        loads = []
+        original = cache.build_and_load_cute_dsl_kernel
+        original_load = cache.JitSpecCuteDsl._load_from_disk
+
+        def load(self):
+            loads.append(str(self.object_path))
+            return original_load(self)
+
+        def build(module_name, kernel_name, compile_fn, **kwargs):
+            def compile_once():
+                builds.append(kernel_name)
+                assert sys.argv[2] == 'cold', 'disk-cache reload unexpectedly compiled'
+                return compile_fn()
+            return original(module_name, kernel_name, compile_once, **kwargs)
+
+        with patch.object(cache, 'build_and_load_cute_dsl_kernel', build), \
+             patch.object(cache.JitSpecCuteDsl, '_load_from_disk', load):
+            plan = prepare_mega_gate(x, weight, 2, bias=bias, unmapped_topk_idx=logical,
+                                     enable_pdl=False)
+        assert len(builds) == (1 if sys.argv[2] == 'cold' else 0), builds
+        assert loads and all(__import__('pathlib').Path(p).is_file() for p in loads)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            plan.run()
+        graph.replay()
+        torch.cuda.synchronize()
+        scores, ranking = helpers['_reference_scores'](x, weight, bias)
+        helpers['_check_routing'](*plan.outputs, logical, scores, ranking,
+                                  num_topk=2, num_shared=0, num_experts=12)
+        assert torch.all(plan.score_barriers.view(torch.int64) == 0)
+        """)
+    env = dict(
+        os.environ,
+        FLASHINFER_WORKSPACE_BASE=str(tmp_path),
+        FLASHINFER_CUTE_DSL_DISABLE_CACHE="0",
+    )
+    env.pop("FLASHINFER_DISABLE_JIT", None)
+    for mode in ("cold", "reload"):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(Path(__file__).resolve()), mode],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_replica_selection_wraparound():
+    """Exercise the production hash and physical lookup after uint32 overflow."""
+    _skip_unless_sm120()
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass import Int32
+    from cutlass.cute.runtime import from_dlpack
+    from flashinfer.experimental.sm12x_mega_gate.kernel import (
+        Sm12xMegaGateKernel,
+        replica_hash,
+    )
+
+    gate = Sm12xMegaGateKernel(
+        heuristics.make_config(16, 1, 4),
+        hidden=320,
+        num_experts=4,
+        num_topk=2,
+        num_shared=1,
+        has_bias=False,
+        has_image_bias=False,
+        has_mask=False,
+        has_physical_map=True,
+        has_unmapped=False,
+    )
+
+    @cute.kernel
+    def lookup(mapping: cute.Tensor, output: cute.Tensor, token: Int32, ep_rank: Int32):
+        hashed = replica_hash(token, ep_rank)
+        count = Int32(7)
+        output[0] = gate.lookup_shared_physical(
+            mapping, hashed, Int32(2), count, gate.count_magic(count), Int32(7)
+        )
+
+    @cute.jit
+    def launch(mapping, output, token: Int32, ep_rank: Int32, stream: cuda.CUstream):
+        lookup(mapping, output, token, ep_rank).launch(
+            grid=(1, 1, 1), block=(1, 1, 1), stream=stream
+        )
+
+    mapping = torch.arange(35, dtype=torch.int32, device="cuda")
+    output = torch.empty(1, dtype=torch.int32, device="cuda")
+    tensors = [from_dlpack(t) for t in (mapping, output)]
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    token, ep_rank = 92037, 2**31 - 7
+    compiled = cute.compile(launch, *tensors, Int32(token), Int32(ep_rank), stream)
+    compiled(*tensors, Int32(token), Int32(ep_rank), stream)
+    torch.cuda.synchronize()
+    hashed = ep_rank + token * DUPLICATE_HASH
+    assert hashed >= 2**32
+    assert hashed % 7 != (hashed % 2**32) % 7
+    assert output.item() == 28 + (hashed % 2**32) % 7
+
+
+def test_rejects_single_row_alias_with_zero_stride():
+    """A contiguous single row may legally have a zero row stride."""
+    _skip_unless_sm120()
+    x, weight, _ = _make_inputs(1, 320, 12)
+    indices = torch.empty((1, 2), dtype=torch.int64, device="cuda")
+    logical = indices.as_strided((1, 2), (0, 1))
+    weights = torch.empty((1, 2), device="cuda")
+    with pytest.raises(ValueError, match="overlap"):
+        prepare_mega_gate(
+            x, weight, 2, out=(indices, weights), unmapped_topk_idx=logical
+        )
