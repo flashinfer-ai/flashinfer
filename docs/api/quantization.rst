@@ -123,7 +123,7 @@ three cases, but only one public type:
         that default rather than picking up the environment's value.
 
 The four ``FLASHINFER_NVFP4_4OVER6*`` variables are documented in the
-repository's ``CLAUDE.md``. They remain supported as a compatibility shim but
+repository's ``AGENTS.md``. They remain supported as a compatibility shim but
 are deprecated: being process-wide, they cannot express two models served in
 one process under different recipes. When the shim is retired the default of
 ``nvfp4_4over6=`` becomes ``None`` and no signature changes.
