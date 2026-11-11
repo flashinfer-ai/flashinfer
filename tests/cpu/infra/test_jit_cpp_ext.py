@@ -1,3 +1,5 @@
+import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -302,6 +304,45 @@ def test_asan_interface_header_is_only_included_under_asan():
         i for i, line in enumerate(lines) if line.startswith("#include")
     )
     assert define_idx < first_include
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("asan", [False, True])
+def test_asan_interface_header_follows_host_sanitizer_flag(tmp_path, asan):
+    """Run the host preprocessor over the ASan detection block and the guarded
+    include from memoryUtils.cu: the header must be skipped without
+    ``-fsanitize=address`` and pulled in with it. See #4470."""
+    cxx = shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
+    if cxx is None:
+        pytest.skip("no host C++ compiler on PATH")
+
+    repo_root = Path(__file__).resolve().parents[3]
+    source = (
+        repo_root / "csrc" / "nv_internal" / "cpp" / "common" / "memoryUtils.cu"
+    ).read_text()
+
+    # Everything before the first #include is the TLLM_HAS_ASAN detection block;
+    # append the guarded include as it appears in the file.
+    prelude = source[: source.index("#include")]
+    guarded = re.search(
+        r"^#if defined\(TLLM_HAS_ASAN\)\n#include <sanitizer/asan_interface\.h>\n#endif$",
+        source,
+        re.MULTILINE,
+    )
+    assert guarded is not None
+    probe = tmp_path / "probe.cc"
+    probe.write_text(prelude + guarded.group(0) + "\n")
+
+    stub_dir = tmp_path / "stub" / "sanitizer"
+    stub_dir.mkdir(parents=True)
+    (stub_dir / "asan_interface.h").write_text("int asan_interface_stub_reached;\n")
+
+    cmd = [cxx, "-E", "-P", "-I", str(tmp_path / "stub"), str(probe)]
+    if asan:
+        cmd.insert(1, "-fsanitize=address")
+    out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+    assert ("asan_interface_stub_reached" in out) == asan
 
 
 @pytest.mark.cpu_only
