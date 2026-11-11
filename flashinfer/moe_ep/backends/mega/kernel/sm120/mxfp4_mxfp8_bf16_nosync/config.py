@@ -47,7 +47,12 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     * ``"nic"``: NCCL GIN for every other rank.
 
     ``"auto"`` and ``"nic"`` need NCCL 2.30.7 with the Device API and a GIN-capable network;
-    every rank must use the same value.
+    every rank must use the same value. Which pairs NCCL maps depends on the NICs it may use:
+    with ``NCCL_IB_HCA`` naming a single NIC every pair stayed mapped on an 8x RTX 6000D host
+    with ConnectX-8 PCIe switches, so ``"auto"`` sent the cross-socket pairs over P2P too;
+    naming every NIC the ranks can reach each other through moved them to GIN. That host's
+    GPUs store to two remote PCIe switches at once at ~1.5 GB/s (~50 GB/s to one), so there
+    EP8 needs the second setting (DSV4-Flash, 128 tokens per rank: 11 ms all-P2P, 0.75 ms).
 
     ``tokens_per_item`` is the number of tokens one work item multiplies per weight load (8,
     16, 24 or 32). ``None`` picks 16 when this rank's routed rows per local expert
