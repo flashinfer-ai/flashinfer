@@ -42,7 +42,7 @@ the backend column indicates which kernel the API wraps.
 
 from functools import lru_cache
 import math
-from typing import Dict, Union
+from typing import Dict, Union, cast
 
 import torch
 
@@ -1318,8 +1318,9 @@ def _with_prims_ts_softmax_stats(
         template.name_prefix += "_softmax_stats"
         template.axes["softmax_stats_width"] = Const(abbrev="", value=2)
         template.axes["store_softmax_stats"] = Const(abbrev="", value=1)
+        output = cast(Tensor, template.outputs["output"])
         template.outputs["softmax_stats"] = Tensor(
-            [*template.outputs["output"].dim_names[:-1], "softmax_stats_width"],
+            [*output.dim_names[:-1], "softmax_stats_width"],
             dtype="float32",
             param="softmax_stats",
             description="Scaled natural-log token maximum and unscaled denominator.",
