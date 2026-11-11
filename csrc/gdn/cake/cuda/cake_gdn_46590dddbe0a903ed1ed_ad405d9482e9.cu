@@ -39,6 +39,23 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+// State views guarantee element alignment, not vector alignment.
+static __device__ __forceinline__ uint32_t cake_load_initial_bf16x2(const __nv_bfloat16* ptr) {
+    if ((reinterpret_cast<uint64_t>(ptr) & 3) == 0) {
+        return *reinterpret_cast<const uint32_t*>(ptr);
+    }
+    return static_cast<uint32_t>(__bfloat16_as_ushort(ptr[0])) |
+           (static_cast<uint32_t>(__bfloat16_as_ushort(ptr[1])) << 16);
+}
+
+static __device__ __forceinline__ uint2 cake_load_initial_bf16x4(const __nv_bfloat16* ptr) {
+    if ((reinterpret_cast<uint64_t>(ptr) & 7) == 0) {
+        return *reinterpret_cast<const uint2*>(ptr);
+    }
+    return make_uint2(cake_load_initial_bf16x2(ptr), cake_load_initial_bf16x2(ptr + 2));
+}
+
+
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_TMEM_STATE_OFFSET 0
@@ -1542,7 +1559,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                             long long state_vec_index_init = state_base_init + (long long)(state_vec_init * 4);
                             {
                                 uint2 _vld_0;
-                                _vld_0 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init);
+                                _vld_0 = cake_load_initial_bf16x4(initial_state + state_vec_index_init);
                                 uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1556,7 +1573,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                             long long state_vec_index_init_1 = state_base_init + 32 + (long long)(state_vec_init_1 * 4);
                             {
                                 uint2 _vld_1;
-                                _vld_1 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init_1);
+                                _vld_1 = cake_load_initial_bf16x4(initial_state + state_vec_index_init_1);
                                 uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1570,7 +1587,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                             long long state_vec_index_init_2 = state_base_init + 64 + (long long)(state_vec_init_2 * 4);
                             {
                                 uint2 _vld_2;
-                                _vld_2 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init_2);
+                                _vld_2 = cake_load_initial_bf16x4(initial_state + state_vec_index_init_2);
                                 uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -1584,7 +1601,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                             long long state_vec_index_init_3 = state_base_init + 96 + (long long)(state_vec_init_3 * 4);
                             {
                                 uint2 _vld_3;
-                                _vld_3 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_init_3);
+                                _vld_3 = cake_load_initial_bf16x4(initial_state + state_vec_index_init_3);
                                 uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
                                 #pragma unroll
                                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -2503,7 +2520,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                         long long state_vec_index_ahead = state_base_ahead + (long long)(state_vec_ahead * 4);
                         {
                             uint2 _vld_16;
-                            _vld_16 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_ahead);
+                            _vld_16 = cake_load_initial_bf16x4(initial_state + state_vec_index_ahead);
                             uint32_t* _vpairs_16 = reinterpret_cast<uint32_t*>(&_vld_16);
                             #pragma unroll
                             for (int _pair = 0; _pair < 2; _pair++) {
@@ -2517,7 +2534,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                         long long state_vec_index_ahead_1 = state_base_ahead + 32 + (long long)(state_vec_ahead_1 * 4);
                         {
                             uint2 _vld_17;
-                            _vld_17 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_ahead_1);
+                            _vld_17 = cake_load_initial_bf16x4(initial_state + state_vec_index_ahead_1);
                             uint32_t* _vpairs_17 = reinterpret_cast<uint32_t*>(&_vld_17);
                             #pragma unroll
                             for (int _pair = 0; _pair < 2; _pair++) {
@@ -2531,7 +2548,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                         long long state_vec_index_ahead_2 = state_base_ahead + 64 + (long long)(state_vec_ahead_2 * 4);
                         {
                             uint2 _vld_18;
-                            _vld_18 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_ahead_2);
+                            _vld_18 = cake_load_initial_bf16x4(initial_state + state_vec_index_ahead_2);
                             uint32_t* _vpairs_18 = reinterpret_cast<uint32_t*>(&_vld_18);
                             #pragma unroll
                             for (int _pair = 0; _pair < 2; _pair++) {
@@ -2545,7 +2562,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                         long long state_vec_index_ahead_3 = state_base_ahead + 96 + (long long)(state_vec_ahead_3 * 4);
                         {
                             uint2 _vld_19;
-                            _vld_19 = *reinterpret_cast<const uint2*>(initial_state + state_vec_index_ahead_3);
+                            _vld_19 = cake_load_initial_bf16x4(initial_state + state_vec_index_ahead_3);
                             uint32_t* _vpairs_19 = reinterpret_cast<uint32_t*>(&_vld_19);
                             #pragma unroll
                             for (int _pair = 0; _pair < 2; _pair++) {
@@ -2731,7 +2748,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                         float _vec_load_0[4];
                         {
                             uint2 _vld_20;
-                            _vld_20 = *reinterpret_cast<const uint2*>(initial_state + empty_initial_base + (long long)empty_state_col);
+                            _vld_20 = cake_load_initial_bf16x4(initial_state + empty_initial_base + (long long)empty_state_col);
                             uint32_t* _vpairs_20 = reinterpret_cast<uint32_t*>(&_vld_20);
                             #pragma unroll
                             for (int _pair = 0; _pair < 2; _pair++) {
@@ -3059,7 +3076,7 @@ kernel_cake_gdn_46590dddbe0a903ed1ed(const __grid_constant__ CUtensorMap Q, cons
                 int state_slot_tma = batch_idx_3;
                 long long state_block_offset_tma = (long long)head_idx_4 * 16384;
                 long long initial_state_block_base_tma = (long long)state_slot_tma * initial_state_stride_slot + state_block_offset_tma;
-                if (USE_INITIAL_STATE != 0 && (num_chunks_b_3 > 0 || STORE_FINAL_STATE != 0) && initial_state_block_base_tma % 8 == 0) {
+                if (USE_INITIAL_STATE != 0 && (num_chunks_b_3 > 0 || STORE_FINAL_STATE != 0) && (reinterpret_cast<uint64_t>(initial_state + initial_state_block_base_tma) & 15) == 0) {
                     if (elect_sync()) {
                         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_state + initial_state_block_base_tma), "r"((uint32_t)(32768)) : "memory");
                     }
