@@ -58,7 +58,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
-    - Batch-invariant mode: `--backends batch_invariant` runs `mm_bf16`, `bmm_fp8`, `gemm_fp8_nt_groupwise`, `mm_mxfp8` and `mm_fp4` (with `--use_128x4_sf_layout`) with `batch_invariant=True` -- the batch-invariant classes of `flashinfer.batch_invariant` (SM100 / SM103 / SM107). See [Batch-invariant mode](#batch-invariant-mode).
+    - Batch-invariant mode: `--backends batch_invariant` runs on supported APIs with `batch_invariant=True` [Batch-invariant mode](#batch-invariant-mode).
 - MOE:
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
@@ -282,11 +282,7 @@ The output CSV will contain detailed metrics including:
 `--backends batch_invariant` runs the routine's operator with `batch_invariant=True` (and `backend="auto"`): the
 batch-invariant classes of `flashinfer.batch_invariant`, whose output bits for a row depend only on that row's inputs,
 never on the batch size, the row's position in the batch or the kernel configuration (see
-`flashinfer/batch_invariant/README.md`). It is available for `mm_bf16`, `bmm_fp8`, `gemm_fp8_nt_groupwise`, `mm_mxfp8`,
-`mm_fp4` (with `--use_128x4_sf_layout`), `mxfp8_quantize`, `mxfp4_quantize`, `nvfp4_quantize`, `softmax`, `log_softmax`
-and `log_probs`, on SM100 / SM103 / SM107 only: the classes raise instead of falling back, and the benchmark skips the
-backend with a message where a shape, dtype or device is outside their contract. It can be listed next to a routine's
-other backends, so one run compares it with them.
+`flashinfer/batch_invariant/README.md`). It can be listed next to a routine's other backends, so one run compares it with them.
 
 - `--refcheck` applies the routine's usual check against the torch reference and, for this backend, a bitwise check:
   the same rows computed alone, in a sub-batch and under a permutation of the batch must give the same bits as the whole
@@ -295,8 +291,8 @@ other backends, so one run compares it with them.
   `cuda` / `cute-dsl` backends take the exact path the class computes.
 - `--autotune` makes the GEMM classes profile their top configurations through FlashInfer's autotuner (reported as
   `batch_invariant_autotune`); without it the class's dispatcher picks the configuration.
-- `log_softmax` and `log_probs` have two backends: `cuda` is the operator's regular kernel for the entry
-  (`batch_invariant=False`), today the same class, and `batch_invariant` the pinned contract.
+- `log_softmax` and `log_probs` have the batch-invariant class as their only kernel, so `batch_invariant` is their
+  only backend and their default.
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |
@@ -470,7 +466,7 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--num_speculate_tokens` | Number of speculative tokens for chain speculative sampling. Default: 5                                    |
 | `--max_len`              | Max sequence length for `top_k_page_table_transform` and `top_k_ragged_transform`. Default: 4096           |
 | `--num_rows`             | Number of rows for `top_k_page_table_transform` and `top_k_ragged_transform`. Defaults to batch_size       |
-| `--backends`             | Backend to test: `cuda` (default), `batch_invariant` (`softmax`, `log_softmax`, `log_probs`; see [Batch-invariant mode](#batch-invariant-mode)) |
+| `--backends`             | Backend to test: `cuda` (default) or `batch_invariant` for `softmax`; `batch_invariant` only (and the default) for `log_softmax` and `log_probs`. See [Batch-invariant mode](#batch-invariant-mode) |
 
 ### RoPE Flags
 | Flag                     | Description                                                                                                 |
@@ -588,8 +584,8 @@ Legend:
 | **nvfp4_quantize** |  |  |  |  |  | cuda, cute-dsl, batch_invariant | cuda, cute-dsl, batch_invariant | cuda, cute-dsl |
 | **nvfp4_batched_quantize** |  |  |  |  |  | cuda | cuda |  |
 | **softmax** | cuda | cuda | cuda | cuda | cuda | cuda, batch_invariant | cuda, batch_invariant | cuda |
-| **log_softmax** |  |  |  |  |  | cuda, batch_invariant | cuda, batch_invariant |  |
-| **log_probs** |  |  |  |  |  | cuda, batch_invariant | cuda, batch_invariant |  |
+| **log_softmax** |  |  |  |  |  | batch_invariant | batch_invariant |  |
+| **log_probs** |  |  |  |  |  | batch_invariant | batch_invariant |  |
 | **sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 | **sampling_from_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 | **top_k_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |

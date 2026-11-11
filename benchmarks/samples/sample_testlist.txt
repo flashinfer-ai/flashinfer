@@ -250,9 +250,10 @@
 
 # Batch-invariant softmax / log_softmax / log_probs (batch_invariant=True; SM100 / SM103 / SM107). --refcheck also checks the
 # batch_invariant backend bit for bit against the same rows computed alone, in a sub-batch and under a permutation.
+# log_softmax and log_probs have the batch-invariant class as their only kernel: batch_invariant is their only backend and the default.
 --routine softmax --batch_size 64 --vocab_size 128256 --temperature 1.0 --input_dtype bfloat16 --backends cuda batch_invariant --refcheck -vv --generate_repro_command --case_tag "softmax_batch_invariant"
---routine log_softmax --batch_size 64 --vocab_size 128256 --temperature 1.0 --input_dtype bfloat16 --backends cuda batch_invariant --refcheck -vv --generate_repro_command --case_tag "log_softmax_batch_invariant"
---routine log_probs --batch_size 64 --vocab_size 128256 --temperature 1.0 --input_dtype bfloat16 --backends cuda batch_invariant --refcheck -vv --generate_repro_command --case_tag "log_probs_batch_invariant"
+--routine log_softmax --batch_size 64 --vocab_size 128256 --temperature 1.0 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "log_softmax_batch_invariant"
+--routine log_probs --batch_size 64 --vocab_size 128256 --temperature 1.0 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "log_probs_batch_invariant"
 
 # Sampling from probabilities
 --routine sampling_from_probs --batch_size 32 --vocab_size 32000 -vv --generate_repro_command --case_tag "sampling_from_probs_llama"

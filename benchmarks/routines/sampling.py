@@ -194,22 +194,39 @@ def parse_sampling_args(line, parser):
         default=None,
         help="Number of rows for top_k_page_table_transform and top_k_ragged_transform. Defaults to batch_size.",
     )
+    # log_softmax / log_probs have the batch-invariant class as their only kernel: batch_invariant is their
+    # only backend and their default.
+    batch_invariant_only_routines = ["log_softmax", "log_probs"]
+    default_backends = (
+        ["batch_invariant"]
+        if pre_args.routine in batch_invariant_only_routines
+        else ["cuda"]
+    )
     parser.add_argument(
         "--backends",
         type=str,
         required=False,
         nargs="+",
-        default=["cuda"],
+        default=default_backends,
         choices=["cuda", "batch_invariant"],
         help=(
-            "Kernel backends to test. Default: cuda. `batch_invariant` (softmax, log_softmax, log_probs) runs "
-            "the operator with batch_invariant=True: the batch-invariant class lse.row (SM100 / SM103 / SM107; "
-            "see flashinfer/batch_invariant/README.md). With --refcheck its output is also checked bit for bit "
-            "against the same rows computed alone, in a sub-batch and under a permutation."
+            "Kernel backends to test. Default: cuda (batch_invariant for log_softmax and log_probs, their only "
+            "backend). `batch_invariant` runs softmax with batch_invariant=True, the batch-invariant class lse.row "
+            "(SM100 / SM103 / SM107; see flashinfer/batch_invariant/README.md), and is the kernel of log_softmax "
+            "and log_probs. With --refcheck its output is also checked bit for bit against the same rows computed "
+            "alone, in a sub-batch and under a permutation."
         ),
     )
 
     args = parser.parse_args(line)
+
+    if args.routine in batch_invariant_only_routines and any(
+        backend != "batch_invariant" for backend in args.backends
+    ):
+        parser.error(
+            f"--backends for {args.routine}: batch_invariant is the only backend "
+            "(the batch-invariant class is the routine's only kernel)"
+        )
 
     # Default num_rows to batch_size if not specified
     if args.num_rows is None:
@@ -377,9 +394,8 @@ def testSoftmax(args):
 def _row_logp_routine(args, routine_name, with_token_ids):
     """The shared body of testLogSoftmax / testLogProbs.
 
-    Both entries have the same two backends: `cuda` is the operator's regular kernel for the entry
-    (batch_invariant=False), which today is the batch-invariant class lse.row itself, and `batch_invariant`
-    is the pinned class (batch_invariant=True; flashinfer/batch_invariant/README.md). Outputs are fp32.
+    Both entries have one kernel, the batch-invariant class lse.row (flashinfer/batch_invariant/README.md), so
+    `batch_invariant` is their only backend: the operator runs with batch_invariant=True. Outputs are fp32.
     """
     if args.verbose >= 1:
         print(f"[INFO] Running {routine_name}")
@@ -422,25 +438,24 @@ def _row_logp_routine(args, routine_name, with_token_ids):
             print(f"[VVERBOSE] {token_ids.shape = }")
 
     def run_backend(backend, logits, token_ids):
-        if backend not in ("cuda", "batch_invariant"):
+        if backend != "batch_invariant":
             raise ValueError(f"Unsupported backend: {backend}")
-        batch_invariant = backend == "batch_invariant"
         if with_token_ids:
             return flashinfer.sampling.log_probs(
                 logits,
                 token_ids,
                 temperature=temperature,
                 enable_pdl=args.enable_pdl,
-                batch_invariant=batch_invariant,
+                batch_invariant=True,
             )
         return flashinfer.sampling.log_softmax(
             logits,
             temperature=temperature,
             enable_pdl=args.enable_pdl,
-            batch_invariant=batch_invariant,
+            batch_invariant=True,
         )
 
-    # Both backends run the class today, which raises (never falls back) outside its contract: probe both.
+    # The class raises (never falls back) outside its contract: probe the backend once before timing it.
     backends = probe_backends(backends, run_backend, logits, token_ids)
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -535,10 +550,10 @@ def testLogSoftmax(args):
 
     This test:
     1. Generates random input logits
-    2. Runs flashinfer.sampling.log_softmax (`cuda`: the operator's regular kernel for the entry;
-       `batch_invariant`: the batch-invariant class lse.row)
-    3. Runs reference check (torch.log_softmax in fp32; the batch_invariant backend also bit for bit
-       against the same rows computed alone, in a sub-batch and under a permutation)
+    2. Runs flashinfer.sampling.log_softmax with batch_invariant=True (the batch-invariant class lse.row,
+       the entry's only kernel; `batch_invariant` is the routine's only backend)
+    3. Runs reference check (torch.log_softmax in fp32, and bit for bit against the same rows computed
+       alone, in a sub-batch and under a permutation)
     4. Measures performance metrics (TB/sec)
 
     Args:
@@ -556,10 +571,10 @@ def testLogProbs(args):
 
     This test:
     1. Generates random input logits and one token id per row
-    2. Runs flashinfer.sampling.log_probs (`cuda`: the operator's regular kernel for the entry;
-       `batch_invariant`: the batch-invariant class lse.row)
-    3. Runs reference check (torch.log_softmax in fp32 gathered at the ids; the batch_invariant backend
-       also bit for bit against the same rows computed alone, in a sub-batch and under a permutation)
+    2. Runs flashinfer.sampling.log_probs with batch_invariant=True (the batch-invariant class lse.row,
+       the entry's only kernel; `batch_invariant` is the routine's only backend)
+    3. Runs reference check (torch.log_softmax in fp32 gathered at the ids, and bit for bit against the
+       same rows computed alone, in a sub-batch and under a permutation)
     4. Measures performance metrics (TB/sec)
 
     Args:

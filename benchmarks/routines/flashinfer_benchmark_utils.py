@@ -664,7 +664,6 @@ routine_cc_to_supported_backends = {
         "12.1": ["tinygemm"],
     },
     # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
-    # (their "batch_invariant" backend is probed the same way: the API raises BatchInvariantUnsupportedError off SM100 / SM103 / SM107)
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -933,17 +932,15 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
-    # log_softmax / log_probs: "cuda" is the operator's regular kernel for the entry (batch_invariant=False), which
-    # today is the batch-invariant class itself, so both backends run on the class's architectures only.
     "log_softmax": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda", "batch_invariant"],
-        "10.3": ["cuda", "batch_invariant"],
-        "10.7": ["cuda", "batch_invariant"],
+        "10.0": ["batch_invariant"],
+        "10.3": ["batch_invariant"],
+        "10.7": ["batch_invariant"],
         "12.0": [],
         "12.1": [],
     },
@@ -953,9 +950,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cuda", "batch_invariant"],
-        "10.3": ["cuda", "batch_invariant"],
-        "10.7": ["cuda", "batch_invariant"],
+        "10.0": ["batch_invariant"],
+        "10.3": ["batch_invariant"],
+        "10.7": ["batch_invariant"],
         "12.0": [],
         "12.1": [],
     },
