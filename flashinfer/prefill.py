@@ -10014,8 +10014,10 @@ def trtllm_fmha_v2_prefill(
         Defaults to ``0`` (disabled).
     Returns
     -------
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If :attr:`save_softmax_stats` is ``False``, the attention output tensor.
         If :attr:`save_softmax_stats` is ``True``, a tuple of two tensors:
+
         * The attention output tensor.
         * The softmax statistics tensor (LSE).
     """
