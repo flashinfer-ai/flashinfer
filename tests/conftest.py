@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import traceback
 import types
 from pathlib import Path
@@ -223,6 +225,22 @@ def pytest_configure(config):
         "markers",
         "shard_group(name): keep marked nodes from one source in one pytest batch",
     )
+
+
+def pytest_report_header(config):
+    # Does nothing outside NVIDIA; see "Guardword Hooks" in CONTRIBUTING.md.
+    root = Path(__file__).resolve().parents[1]
+    script = root / "scripts" / "guardword_hooks.py"
+    if not script.is_file():
+        return None
+    result = subprocess.run(
+        [sys.executable, str(script), "ensure"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stderr.splitlines() or None
 
 
 def pytest_collection_modifyitems(config, items):

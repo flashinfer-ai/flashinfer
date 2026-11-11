@@ -65,6 +65,16 @@ def test_json_serializable(report):
     json.dumps(report)
 
 
+@pytest.mark.cpu_only
+def test_guardword_scanner_settings_redacted(monkeypatch):
+    # The scanner's location is internal, and reports go into public issues.
+    monkeypatch.setenv("FLASHINFER_SCAN_REPO_URL", "git@internal.example:scanner.git")
+    monkeypatch.setenv("FLASHINFER_LOGLEVEL", "3")
+    info = collect_env._get_env_vars()
+    assert info["FLASHINFER_SCAN_REPO_URL"] == "<redacted>"
+    assert info["FLASHINFER_LOGLEVEL"] == "3"
+
+
 def _kernel_package_info(monkeypatch, dists):
     monkeypatch.setattr(collect_env, "_installed_distributions", lambda: dists)
     return collect_env._get_kernel_package_info()
