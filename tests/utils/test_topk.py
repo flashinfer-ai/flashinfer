@@ -2255,6 +2255,38 @@ def _race_num_sms():
     return num_sms
 
 
+def test_top_k_multi_cta_reuses_shared_memory_between_rows():
+    """A CTA must finish collecting one row before loading the next into shared memory."""
+    _require_sm80_for_bf16()
+    num_sms = _race_num_sms()
+    num_rows, vocab_size, k = 3 * num_sms, 65536, 4096
+    device = "cuda"
+    generator = torch.Generator(device=device)
+
+    for seed in range(_RACE_REPEATS):
+        generator.manual_seed(seed)
+        logits = torch.randn(
+            num_rows,
+            vocab_size,
+            device=device,
+            generator=generator,
+            dtype=torch.bfloat16,
+        )
+        values, indices = flashinfer.top_k(logits, k)
+        indices = indices.long()
+
+        assert bool(((indices >= 0) & (indices < vocab_size)).all())
+        sorted_indices = indices.sort(dim=-1).values
+        assert bool((sorted_indices[:, 1:] != sorted_indices[:, :-1]).all())
+
+        gathered = logits.float().gather(-1, indices).sort(dim=-1).values
+        expected = torch.topk(logits.float(), k, dim=-1).values.sort(dim=-1).values
+        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            values.float().sort(dim=-1).values, expected, rtol=0, atol=0
+        )
+
+
 def test_top_k_mask_logits_multi_cta_trivial_rows_after_ordinary_row():
     """A k >= vocab row must not clear the group histogram while a peer CTA still reads it
     for the group's previous ordinary row."""
