@@ -631,7 +631,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cudnn"],
         "10.3": ["cudnn"],
-        "10.7": ["cudnn"],
+        "10.7": ["cudnn", "cute-dsl"],
         "12.0": ["cudnn"],
         "12.1": ["cudnn"],
     },
