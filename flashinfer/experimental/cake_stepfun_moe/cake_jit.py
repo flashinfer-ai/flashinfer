@@ -76,7 +76,7 @@ from . import cake_build
 # route (per-stage units and the full routing -> FC1 -> [requant] -> FC2 ->
 # finalize path per family and tile) naming its architectures, token count
 # and ordered stages -- is not part of the runtime registry; it lives with the
-# tests as ``tests/test_helpers/cake_stepfun_moe_routes.json``.
+# tests as ``tests/experimental/test_helpers/cake_stepfun_moe_routes.json``.
 #
 # What to compile (the translation units, the compile flags and the per-entry
 # closure digest) is recorded in ``build.json`` (see ``cake_build``), whose

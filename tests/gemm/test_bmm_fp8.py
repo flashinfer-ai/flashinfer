@@ -275,7 +275,7 @@ def test_bmm_fp8_bias_rejected() -> None:
 
 def test_bmm_fp8_bias_tuning_key() -> None:
     """Unbiased calls keep their tuning key; a biased one adds the bias alignment,
-    which changes the cuBLASLt algo list a tuned tactic indexes."""
+    which changes the cuBLASLt algorithms a tuned tactic can name."""
     input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, bias = _bias_case(torch.bfloat16)
     runner = get_gemm_module().cublas_fp8_gemm_runner()
     out = torch.empty(

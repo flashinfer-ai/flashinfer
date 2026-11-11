@@ -209,3 +209,42 @@ def test_experimental_backend_excluded_from_auto_unless_allowed(monkeypatch):
 
     monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
     assert my_kernel(1) == "risky"  # gate on: heuristic may pick it
+
+
+@pytest.mark.cpu_only
+def test_bypass_skips_backend_selection_and_checks():
+    """A call the ``bypass`` predicate claims runs the function directly: no requirement check, no heuristic, no
+    capability lookup. Every other call keeps the full selection."""
+    calls = []
+
+    def _check_a(x, backend="auto", own_mode=False):
+        calls.append("check_a")
+        return True
+
+    def _common(x, backend="auto", own_mode=False):
+        calls.append("common")
+        return True
+
+    _check_a.is_compute_capability_supported = lambda cc: True
+
+    def _heuristic(backends, *args, **kwargs):
+        calls.append("heuristic")
+        return backends
+
+    @backend_requirement(
+        {"a": _check_a},
+        common_check=_common,
+        heuristic_func=_heuristic,
+        bypass=lambda *args, **kwargs: kwargs.get("own_mode", False),
+    )
+    def my_kernel(x, backend="auto", *, own_mode=False):
+        return "own" if own_mode else my_kernel.suitable_auto_backends[0]
+
+    assert my_kernel(1, own_mode=True) == "own"
+    assert calls == []
+    # also with an explicit backend and skip_check: the predicate decides before either is looked at
+    assert my_kernel(1, backend="b", own_mode=True, skip_check=True) == "own"
+    assert calls == []
+
+    assert my_kernel(1) == "a"
+    assert calls == ["common", "check_a", "heuristic"]

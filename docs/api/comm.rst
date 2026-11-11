@@ -87,11 +87,11 @@ the eight-rank Blackwell carrier), so no separate all-reduce kernel or
 collective runs. The delivered architectures and world sizes are recorded in
 the loader's route tables (``flashinfer.jit.cake_fp8_rowwise_gemm_allreduce``);
 a device or group outside them raises instead of falling back.
-Operands are contiguous CUDA tensors with ``N`` a positive multiple of the
-delivered route's column tile (256 on SM100 / SM103), ``K_l`` a
-positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``, and the
-process's torch symmetric-memory backend being the default ``CUDA`` backend or
-``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
+Operands are contiguous CUDA tensors starting at a 16-byte aligned address
+(``a``, ``w``, ``w_scale`` and a caller-provided ``out``), with ``N`` a positive
+multiple of 256 and at most ``134184960``, ``K_l`` a positive multiple of 128,
+any positive ``M`` with ``M * N <= 2**30``, and the process's torch
+symmetric-memory backend being the default ``CUDA`` backend or ``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
 workspace of a group grows to the largest ``M`` seen; that growth is the only
 collective after the first call.
 
@@ -896,7 +896,13 @@ the fused multiply-add epilogue (``ow256_fma``) and a group of 2 ranks the
 baseline build with the fused multiply-add epilogue (``fma``); on SM103 groups
 of 8 and 4 ranks run ``ow256_fma`` and groups of 2 ranks ``fma``; on SM107 a
 group of 4 ranks runs the build with bulk row stores (``bulk``); the other
-groups of 2 ranks and SM90 run the baseline build.  The ``fma`` builds contract
+groups of 2 ranks run the baseline build; SM90 runs the build whose epilogue
+stages each head in shared memory for three storer warps (``sw3``) on every
+group size, except that under this default a group of 8 ranks on SM90 runs the
+baseline build on rows with a hidden size of at least 6144 and at least 8192
+rows per rank (``cake_qkv_exchange_plan.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``);
+a build named by ``FLASHINFER_QKV_EXCHANGE_PRODUCER_VARIANT`` runs on every
+row.  The ``fma`` builds contract
 the norm and RoPE multiply-adds into single-rounding fused multiply-adds, so
 their stored bits can differ from those of the builds without it; both agree
 within the kernel's accuracy tolerance, and the builds without the fused
@@ -928,7 +934,7 @@ size (``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE``: 8192, 16384 or 32768 rows,
 ``per_dest_k_table=0`` restores the single threshold of 16384 and an explicit
 ``per_dest_large_m`` replaces the table).  On SM103 and SM100 a group of 8 ranks
 runs a call whose destination band is not a multiple of 256 columns while every
-Q / K / V group is (for example hidden 3072) with at least 4096 rows per rank
+Q / K / V group is (for example hidden 3072) with at least 2048 rows per rank
 on the 256-column pair tile across band edges, each tile storing its two heads
 to their own destinations, as one persistent launch
 (``cake_qkv_exchange_plan.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD``;

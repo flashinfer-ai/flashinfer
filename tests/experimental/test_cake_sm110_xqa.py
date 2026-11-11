@@ -22,7 +22,7 @@ prefix the backend synthesizes, the decode counter reset and the retirement of
 the superseded tree routes.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path runs
 it unchanged after pointing that table entry at its package.  The registry and
 rule tests run on CPU; every kernel test skips without an SM110 device.  The
@@ -40,7 +40,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("sm110_xqa")
 backend = cake_package("sm110_xqa", "backend")
