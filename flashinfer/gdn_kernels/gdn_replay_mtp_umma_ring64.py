@@ -1485,25 +1485,29 @@ class GdnReplayMtpUmma:
 
     @cute.jit
     def _window_bulk(self, nn0, dst, src_head, base, n1, n2, d2, s2, rowb, mbar):
-        """The two contiguous window copies (nothing at all while no row is live)."""
+        """The window copies: one, or two when the window wraps the ring (nothing at all while no row is live)."""
         if nn0 > 0:
             U.bulk_g2s(dst, src_head + Int64(base * rowb), n1 * rowb, mbar.toint())
-            U.bulk_g2s(
-                dst + d2 * rowb, src_head + Int64(s2 * rowb), n2 * rowb, mbar.toint()
-            )
+            if n2 > 0:
+                U.bulk_g2s(
+                    dst + d2 * rowb,
+                    src_head + Int64(s2 * rowb),
+                    n2 * rowb,
+                    mbar.toint(),
+                )
 
     def _window_copy_pair(self, ctx_P, base, src_head, dst, rowb, mbar):
         """Live window rows j < min(P, nu) (physical (base + j) mod ring_slots) as at most two contiguous bulk copies (the window
-        wraps the ring at most once); without a wrap the second copy re-copies the last row (same bytes), so
-        the transaction count is (n1 + n2) rows either way and no copy has size 0. P == 0: no rows, the arrival alone
-        completes the barrier and the zero-filled window stays zero. Call under elect_one / from one lane."""
+        wraps the ring at most once); without a wrap there is only the first copy (n2 == 0), so no two copies write
+        the same smem rows. P == 0: no rows, the arrival alone completes the barrier and the zero-filled window stays
+        zero. Call under elect_one / from one lane."""
         nn0 = _sel(ctx_P < self.nu, ctx_P, Int32(self.nu), Int32)
         nn = _sel(nn0 > 0, nn0, Int32(1), Int32)
         wrap = (base + nn) > self.ring_slots
         n1 = _sel(wrap, Int32(self.ring_slots) - base, nn, Int32)
-        n2 = _sel(wrap, nn - n1, Int32(1), Int32)
-        d2 = _sel(wrap, n1, nn - 1, Int32)
-        s2 = _sel(wrap, Int32(0), base + nn - 1, Int32)
+        n2 = _sel(wrap, nn - n1, Int32(0), Int32)
+        d2 = _sel(wrap, n1, Int32(0), Int32)
+        s2 = Int32(0)
         cute.arch.mbarrier_arrive_and_expect_tx(
             mbar, _sel(nn0 > 0, (n1 + n2) * rowb, Int32(0), Int32)
         )
