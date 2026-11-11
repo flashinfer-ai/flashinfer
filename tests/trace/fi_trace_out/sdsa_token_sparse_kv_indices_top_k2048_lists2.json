@@ -1,9 +1,9 @@
 {
-  "name": "token_sparse_kv_indices_top_k2048_lists2",
+  "name": "sdsa_token_sparse_kv_indices_top_k2048_lists2",
   "description": "Token-sparse attention's K/V slot lists from key positions.",
-  "op_type": "token_sparse_kv_indices",
+  "op_type": "sdsa_token_sparse_kv_indices",
   "tags": [
-    "fi_api:flashinfer.token_sparse.token_sparse_kv_indices"
+    "fi_api:flashinfer.sdsa.token_sparse.token_sparse_kv_indices"
   ],
   "axes": {
     "tokens": {

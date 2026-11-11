@@ -1371,8 +1371,9 @@ def chunk_gated_delta_rule(
         implementation on SM8x, SM90, SM100/SM103/SM107, SM110 or SM120, where
         it is supported and low-parallelism heuristics match. SM110 uses the
         SM100 CuTe-DSL implementation, and its ``"auto"`` rule takes CP only
-        for at most 2 parallel states on a longest sequence of at least 4096
-        tokens (see ``max_seqlen``). SM100/SM103/SM107 uses
+        for at most 4 parallel states on a long enough longest sequence: at
+        least 2048 tokens for 1, 3072 for 2-3 and 4096 for 4 (see
+        ``max_seqlen``). SM100/SM103/SM107 uses
         the generated GDN CP-only four-stage implementation for structurally
         supported shapes; other legal configurations retain the CuTe-DSL
         implementation. ``"auto"`` enables conservative routing, ``True``
@@ -1587,7 +1588,7 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM8x (Ampere), SM90 (Hopper), SM100 (Blackwell), SM110 or SM120.
+    - Requires SM8x (Ampere), SM90 (Hopper), SM100/SM103 (Blackwell), SM107, SM110 or SM120.
       SM110 runs the SM100 non-CP and CP CuTe-DSL kernels (not ``cake_gdn``).
       The SM100 CuTe-DSL kernels, which SM110 also uses, require CUDA 13 and
       ``head_size == 128``.
