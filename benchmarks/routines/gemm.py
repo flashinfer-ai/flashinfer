@@ -1124,6 +1124,7 @@ def testBmmMxfp8(args):
     run_refcheck = args.refcheck
     autotune_supported_backends = [
         "cudnn",
+        "cute-dsl",
     ]
     res = []
 
@@ -1133,10 +1134,17 @@ def testBmmMxfp8(args):
         return res
 
     res_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-    if res_dtype not in [torch.bfloat16, torch.float16]:
+    if res_dtype not in [torch.bfloat16, torch.float16, torch.float8_e4m3fn]:
         raise ValueError(
-            f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16 and float16."
+            f"Unsupported res dtype: {res_dtype}. Supported dtypes are bfloat16, float16 "
+            "and (cute-dsl) fp8_e4m3."
         )
+    # fp8_e4m3 output = MXFP8 output: e4m3 data plus a 128x4-swizzled UE8M0 scale per 32 columns
+    mxfp8_out = res_dtype == torch.float8_e4m3fn
+    if mxfp8_out:
+        for cur_backend in [b for b in backends if b != "cute-dsl"]:
+            print(f"[INFO] {cur_backend} backend does not support fp8_e4m3 output")
+            backends.remove(cur_backend)
     ## Done parsing input arguments
 
     if getattr(args, "autotune", False):
@@ -1174,8 +1182,14 @@ def testBmmMxfp8(args):
         print(f"[VVERBOSE] {mat2_scale.shape = }")
         print(f"[VVERBOSE] {mat2_scale.dtype = }")
 
+    out_scale = (
+        torch.empty(batch_size * m * n // 32, device=device, dtype=torch.uint8)
+        if mxfp8_out
+        else None
+    )
+
     def run_backend(backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale):
-        if backend == "cudnn":
+        if backend in ("cudnn", "cute-dsl"):
             return flashinfer.gemm.bmm_mxfp8(
                 A=input_mxfp8,
                 B=mat2_mxfp8,
@@ -1183,9 +1197,18 @@ def testBmmMxfp8(args):
                 B_scale=mat2_scale,
                 dtype=res_dtype,
                 backend=backend,
+                out_scale=out_scale,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
+
+    def dequantized(output):
+        if not mxfp8_out:
+            return output
+        values = output.reshape(batch_size * m, n).view(torch.uint8).cpu()
+        return flashinfer.mxfp8_dequantize_host(values, out_scale.cpu(), True).to(
+            device
+        )
 
     has_reference_output = False
     if run_refcheck:
@@ -1219,9 +1242,11 @@ def testBmmMxfp8(args):
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
-            outputs[cur_backend] = run_backend(
-                cur_backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale
-            ).detach()
+            outputs[cur_backend] = dequantized(
+                run_backend(
+                    cur_backend, input_mxfp8, mat2_mxfp8, input_scale, mat2_scale
+                ).detach()
+            )
         backend_times[cur_backend] = bench_gpu_time(
             fn=run_backend,
             dry_run_iters=args.dry_run_iters,
@@ -1273,6 +1298,7 @@ def testBmmMxfp8(args):
                 m * k * torch.float8_e4m3fn.itemsize
                 + n * k * torch.float8_e4m3fn.itemsize
                 + m * n * res_dtype.itemsize
+                + (m * n // 32 if mxfp8_out else 0)
             ) * batch_size
             tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
