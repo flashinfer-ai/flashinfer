@@ -551,7 +551,8 @@ def cake_rmsnorm_silu_gate_nondet_train_backward(
 
     Returns
     -------
-    ``(grad_x, grad_z, grad_weight)``.
+    tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+        ``(grad_x, grad_z, grad_weight)``.
     """
 
     return _backend().cake_rmsnorm_silu_gate_nondet_train_backward(

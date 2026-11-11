@@ -162,7 +162,8 @@ def cake_mhc_det_train_forward_workspace_bytes(
 
     Returns
     -------
-    The size of the forward workspace in bytes.
+    int
+        The size of the forward workspace in bytes.
     """
 
     return _pkg().cake_mhc_det_train_forward_workspace_bytes(T, device, hidden=hidden)
@@ -197,7 +198,8 @@ def cake_mhc_det_train_backward_workspace_bytes(
 
     Returns
     -------
-    The size of the backward workspace in bytes.
+    int
+        The size of the backward workspace in bytes.
     """
 
     return _pkg().cake_mhc_det_train_backward_workspace_bytes(T, device, hidden=hidden)
@@ -252,9 +254,10 @@ def cake_mhc_det_train_forward_prepare(
 
     Returns
     -------
-    ``(U, stats)``: BF16 ``U[t, d] = BF16(sum_i pre[t, i] X[t, i, d])`` and the
-    FP32 ``[T, 64]`` per-token record ``r | z[24] | pre[4] | post[4] | C[16] | pad[15]``
-    (256 bytes per token) that the finish and backward entry points consume.
+    tuple[torch.Tensor, torch.Tensor]
+        ``(U, stats)``: BF16 ``U[t, d] = BF16(sum_i pre[t, i] X[t, i, d])`` and the
+        FP32 ``[T, 64]`` per-token record ``r | z[24] | pre[4] | post[4] | C[16] | pad[15]``
+        (256 bytes per token) that the finish and backward entry points consume.
     """
 
     return _pkg().cake_mhc_det_train_forward_prepare(
@@ -311,9 +314,10 @@ def cake_mhc_det_train_forward_stats(
 
     Returns
     -------
-    FP32 ``[T, 64]`` ``stats``, bitwise identical to the record
-    :func:`cake_mhc_det_train_forward_prepare` returns for the same inputs on the
-    same device (the same work partition without the ``U`` write).
+    torch.Tensor
+        FP32 ``[T, 64]`` ``stats``, bitwise identical to the record
+        :func:`cake_mhc_det_train_forward_prepare` returns for the same inputs on the
+        same device (the same work partition without the ``U`` write).
     """
 
     return _pkg().cake_mhc_det_train_forward_stats(
@@ -353,7 +357,8 @@ def cake_mhc_det_train_forward_finish(
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, 4, H]``; the FP32 sum is rounded once.
+    torch.Tensor
+        BF16 ``Y`` of shape ``[T, 4, H]``; the FP32 sum is rounded once.
     """
 
     return _pkg().cake_mhc_det_train_forward_finish(X, B, stats, out=out)
@@ -472,11 +477,12 @@ def cake_mhc_det_train_backward_finish(
 
     Returns
     -------
-    ``(dX, dfn, dscale, dbase)``: the BF16 ``dX`` sums the mapping, collapse and
-    residual-mixing contributions in FP32 and rounds once; the FP32 parameter
-    gradients are fixed-order reductions.  With ``T == 0`` nothing is launched:
-    ``dX`` is empty and the parameter gradients are zeroed (``accumulate=False``)
-    or left untouched (``accumulate=True``).
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(dX, dfn, dscale, dbase)``: the BF16 ``dX`` sums the mapping, collapse and
+        residual-mixing contributions in FP32 and rounds once; the FP32 parameter
+        gradients are fixed-order reductions.  With ``T == 0`` nothing is launched:
+        ``dX`` is empty and the parameter gradients are zeroed (``accumulate=False``)
+        or left untouched (``accumulate=True``).
     """
 
     return _pkg().cake_mhc_det_train_backward_finish(
@@ -548,10 +554,11 @@ def cake_mhc_det_train_prepare(
 
     Returns
     -------
-    ``(U, handle)``: BF16 ``U`` of shape ``[T, H]`` and the handle of this
-    prepare node for one :func:`cake_mhc_det_train_finish`.  The backward of the
-    prepare node returns the single-cast ``dX`` and FP32 ``dfn``, ``dscale``,
-    ``dbase``.
+    tuple
+        ``(U, handle)``: BF16 ``U`` of shape ``[T, H]`` and the handle of this
+        prepare node for one :func:`cake_mhc_det_train_finish`.  The backward of the
+        prepare node returns the single-cast ``dX`` and FP32 ``dfn``, ``dscale``,
+        ``dbase``.
     """
 
     return _pkg().cake_mhc_det_train_prepare(
@@ -585,9 +592,10 @@ def cake_mhc_det_train_finish(X: torch.Tensor, B: torch.Tensor, handle) -> torch
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, 4, H]``.  Its backward returns ``dB`` for the
-    branch and no gradient for ``X`` (the residual-mixing contribution is part
-    of the single-cast ``dX`` of the prepare node).
+    torch.Tensor
+        BF16 ``Y`` of shape ``[T, 4, H]``.  Its backward returns ``dB`` for the
+        branch and no gradient for ``X`` (the residual-mixing contribution is part
+        of the single-cast ``dX`` of the prepare node).
     """
 
     return _pkg().cake_mhc_det_train_finish(X, B, handle)

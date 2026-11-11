@@ -162,6 +162,8 @@ def cake_dsa_indexer_det_train_topk(
         aligned with ``indices`` (a selected ``-0.0`` stays ``-0.0``); tail
         slots hold ``-inf``.
 
+    Notes
+    -----
     Identical inputs give identical ids and score bits; the result does not
     depend on the internal query / key partition or on the program the host
     dispatches for the geometry.  The call never materializes a ``[T, Tkv]``

@@ -8172,8 +8172,9 @@ def trtllm_sage_attention_quantize(
 
     Returns
     -------
-    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
-    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
+    tuple of torch.Tensor
+        (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
+        (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
         Quantized Q/K/V followed by their FP32 dequantization scales.
         When ``smooth_k=True``, the FP32 K mean is appended. The first six
         outputs can be passed directly to `trtllm_ragged_attention_deepseek`.

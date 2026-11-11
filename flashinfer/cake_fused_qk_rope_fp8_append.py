@@ -172,7 +172,8 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
 
     Returns
     -------
-    (out_q, q_scale, split_k_flag)
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        (out_q, q_scale, split_k_flag)
         The caller-owned buffers when given, otherwise freshly allocated ones.
     """
     return _backend.cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(

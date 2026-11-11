@@ -184,7 +184,8 @@ def cake_gqa_det(
 
     Returns
     -------
-    ``out`` BF16 ``[T_q, H_q, 256]``, or ``(out, lse)``.
+    Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+        ``out`` BF16 ``[T_q, H_q, 256]``, or ``(out, lse)``.
 
     Notes
     -----
@@ -241,7 +242,8 @@ def cake_gqa_det_train_forward(
 
     Returns
     -------
-    ``(out, lse)``.  A row that sees no key gets ``out = 0`` and ``lse = -inf``.
+    tuple[torch.Tensor, torch.Tensor]
+        ``(out, lse)``.  A row that sees no key gets ``out = 0`` and ``lse = -inf``.
 
     Notes
     -----
@@ -324,7 +326,8 @@ def cake_gqa_det_train_backward(
 
     Returns
     -------
-    ``(dq, dk, dv)``; with ``row_map``, ``dk`` / ``dv`` are ``dk_acc`` / ``dv_acc``.
+    tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ``(dq, dk, dv)``; with ``row_map``, ``dk`` / ``dv`` are ``dk_acc`` / ``dv_acc``.
 
     Notes
     -----
@@ -382,7 +385,8 @@ def cake_gqa_det_train_workspace(
 
     Returns
     -------
-    A ``CakeGQADetWorkspace``.
+    CakeGQADetWorkspace
+        A ``CakeGQADetWorkspace``.
     """
     if budget_bytes is None:
         return _pkg().CakeGQADetWorkspace(device)
@@ -430,8 +434,9 @@ def cake_gqa_det_train_workspace_bytes(
 
     Returns
     -------
-    The bytes of FP32 ``[H_q / 2, rows_pad, 256]`` plus two ``[H_q / 2, rows_pad]``, with
-    ``rows_pad = round_up(2 T_q + 128 B, 128)``, plus the dS^T chunk and the window gradients when asked.
+    int
+        The bytes of FP32 ``[H_q / 2, rows_pad, 256]`` plus two ``[H_q / 2, rows_pad]``, with
+        ``rows_pad = round_up(2 T_q + 128 B, 128)``, plus the dS^T chunk and the window gradients when asked.
     """
     kwargs: dict[str, Any] = {
         "total_k": total_k,

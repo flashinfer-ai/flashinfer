@@ -99,11 +99,12 @@ def cake_mhc_head_nondet_train_forward(
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, H]``.
+    torch.Tensor
+        BF16 ``Y`` of shape ``[T, H]``.
 
-    The launch runs on the current torch stream of ``X``'s device and
-    allocates nothing beyond the default ``out``, so it can be captured in a
-    CUDA graph once its program is loaded (one eager call first).
+        The launch runs on the current torch stream of ``X``'s device and
+        allocates nothing beyond the default ``out``, so it can be captured in a
+        CUDA graph once its program is loaded (one eager call first).
     """
 
     return _pkg().cake_mhc_head_nondet_train_forward(X, out=out)
@@ -139,9 +140,10 @@ def cake_mhc_head_nondet_train_backward(
 
     Returns
     -------
-    BF16 ``dX`` of shape ``[T, 4, H]`` (the caller's tensor when given).
+    torch.Tensor
+        BF16 ``dX`` of shape ``[T, 4, H]`` (the caller's tensor when given).
 
-    The launch runs on the current torch stream of ``dY``'s device.
+        The launch runs on the current torch stream of ``dY``'s device.
     """
 
     return _pkg().cake_mhc_head_nondet_train_backward(dY, dX=dX, accumulate=accumulate)
@@ -159,10 +161,11 @@ def cake_mhc_head_nondet(X: torch.Tensor) -> torch.Tensor:
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, H]``.  Its backward is
-    :func:`cake_mhc_head_nondet_train_backward` (bit for bit torch's gradient of
-    ``X.mean(dim=1)``); the node saves no tensor, so an activation checkpoint
-    around it keeps nothing alive and its backward needs no recomputation.
+    torch.Tensor
+        BF16 ``Y`` of shape ``[T, H]``.  Its backward is
+        :func:`cake_mhc_head_nondet_train_backward` (bit for bit torch's gradient of
+        ``X.mean(dim=1)``); the node saves no tensor, so an activation checkpoint
+        around it keeps nothing alive and its backward needs no recomputation.
     """
 
     return _pkg().cake_mhc_head_nondet(X)

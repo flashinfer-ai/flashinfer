@@ -252,9 +252,10 @@ def cake_rmsnorm_nondet_train_forward(
 
     Returns
     -------
-    ``(y, rstd)`` or ``(y, rstd, h_new)`` when ``residual`` is given.
-    ``rstd`` is the FP32 per-row ``1 / sqrt(mean(h_new^2) + eps)`` the backward
-    needs; no other ``[T, H]`` temporary is produced.
+    tuple[torch.Tensor, ...]
+        ``(y, rstd)`` or ``(y, rstd, h_new)`` when ``residual`` is given.
+        ``rstd`` is the FP32 per-row ``1 / sqrt(mean(h_new^2) + eps)`` the backward
+        needs; no other ``[T, H]`` temporary is produced.
 
     Notes
     -----
@@ -352,8 +353,9 @@ def cake_rmsnorm_nondet_train_backward(
 
     Returns
     -------
-    ``(dx, dw)`` with ``dw`` in FP32; the caller decides whether to cast it.
-    ``T == 0`` launches nothing and returns an empty ``dx`` and a zero ``dw``.
+    tuple[torch.Tensor, torch.Tensor]
+        ``(dx, dw)`` with ``dw`` in FP32; the caller decides whether to cast it.
+        ``T == 0`` launches nothing and returns an empty ``dx`` and a zero ``dw``.
 
     Notes
     -----

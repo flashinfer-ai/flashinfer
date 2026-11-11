@@ -149,6 +149,8 @@ def cake_dsa_indexer_nondet_train_topk(
         aligned with ``indices`` (a selected ``-0.0`` stays ``-0.0``); the
         slots of ``-1`` ids hold ``-inf``.
 
+    Notes
+    -----
     For identical inputs and configuration (same device, SM count and
     arguments) the set of ``(id, score bits)`` pairs of every row, and with it
     the row's number of valid (non ``-1``) slots, repeats bit for bit; the slot
