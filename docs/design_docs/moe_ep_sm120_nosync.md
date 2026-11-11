@@ -165,17 +165,17 @@ The environment variables the tests read are listed in
 
 ## Performance summary
 
-Commit `1207505f`, cold L2, µs per MoE layer, DeepSeek-V4-Flash routed experts
+Commit `3ffd6c87`, all backends from that tree, cold L2, µs per MoE layer, DeepSeek-V4-Flash routed experts
 (H 4096, I 2048, 256 experts, top-6); speedup is cake ÷ this kernel. The full
 tables (three model shapes, cutedsl and DeepEP + CUTLASS columns) are in the PR
 description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
 
 | Host | Config | 1 token / rank | 8 | 32 | 128 |
 | --- | --- | --- | --- | --- | --- |
-| RTX 6000D (Broadcom) | EP4 | 125.8 (2.35×) | 449.3 (1.49×) | 697.0 (1.35×) | 777.8 (1.24×) |
-| RTX 6000D (Broadcom) | EP8, every pair P2P | 142.3 (2.36×) | 309.3 (1.72×) | 399.7 (1.93×) | 543.8 (2.34×) |
-| RTX PRO 6000 | EP4 | 124.6 (2.42×) | 389.1 (1.56×) | 599.4 (1.40×) | 700.5 (1.25×) |
-| RTX PRO 6000 | EP8 `auto` | 174.1 (1.72×) | 369.3 (1.40×) | 435.2 (1.33×) | 706.5 (0.91×) |
+| RTX 6000D (Broadcom) | EP4 | 125.7 (2.35×) | 448.3 (1.49×) | 696.8 (1.35×) | 776.0 (1.24×) |
+| RTX 6000D (Broadcom) | EP8, every pair P2P | 142.8 (2.35×) | 309.8 (1.72×) | 397.9 (1.93×) | 544.3 (2.34×) |
+| RTX PRO 6000 | EP4 | 124.9 (2.41×) | 389.1 (1.56×) | 599.7 (1.40×) | 700.4 (1.25×) |
+| RTX PRO 6000 | EP8 `auto` | 174.1 (1.72×) | 369.6 (1.40×) | 434.2 (1.33×) | 704.5 (0.91×) |
 
 ## Limits and known gaps
 
@@ -184,7 +184,7 @@ description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
   most 128 tokens per rank.
 - When EP8 goes over the NIC across sockets (`"auto"` on the RTX PRO 6000 host
   and on the ConnectX-8-switch RTX 6000D host), cake can be faster at 128 tokens
-  per rank (DeepSeek-V4-Flash on RTX PRO 6000: 0.91×; on the ConnectX-8 host
+  per rank (on RTX PRO 6000: 0.91× for DeepSeek-V4-Flash, 0.85× for GLM-5.3-Flash; on the ConnectX-8 host
   0.87× for DeepSeek-V4-Flash and 0.81× for GLM-5.3-Flash). Phase stamps place
   the extra time in the GIN path: on the ConnectX-8 host in receiving the
   dispatched tokens (the per-token puts queue behind each other), on RTX PRO 6000
