@@ -3,7 +3,7 @@
 """Distributed MoK adapter guards for source lengths; run with torchrun EP4.
 
 Backend suite: the package is imported only through
-:func:`tests.test_helpers.cake_package.cake_package`.
+:func:`tests.cake.test_helpers.cake_package.cake_package`.
 """
 
 import dataclasses
@@ -15,7 +15,7 @@ pytest_plugins = ["tests.experimental._mok_bf16_test_utils"]
 import torch
 import torch.distributed as dist
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kernels = cake_package("cake_mok_bf16", "_kernels")
 native = cake_package("cake_mok_bf16", "workspace")

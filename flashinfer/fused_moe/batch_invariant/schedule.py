@@ -72,11 +72,15 @@ def rows_per_expert(T: int, k: int, E: int) -> int:
     return max(1, -(-(T * k) // active_experts(T, k, E)))
 
 
+@functools.lru_cache(maxsize=None)
+def _grouped_knobs(clusters) -> Tuple[Knobs, ...]:
+    return tuple(knob_product(swizzles=(1,), clusters=clusters))
+
+
 def grouped_knobs(clusters=None) -> List[Knobs]:
-    """Every well-formed dense record at swizzle 1 (the grouped space before the body's acceptance)."""
-    return knob_product(
-        swizzles=(1,), clusters=CLUSTERS if clusters is None else clusters
-    )
+    """Every well-formed dense record at swizzle 1 (the grouped space before the body's acceptance); enumerated once per
+    cluster set."""
+    return list(_grouped_knobs(CLUSTERS if clusters is None else tuple(clusters)))
 
 
 def all_valid_configs(
@@ -91,13 +95,19 @@ def all_valid_configs(
     ]
 
 
-def swapped_knobs() -> List[Knobs]:
-    """The swapped record space of the bf16 classes (:mod:`.blocks.swap_bf16`): the swapped 1-CTA records at the narrow token
-    tiles (128 weight rows x 8 / 16 / 32 tokens), one per tile, no cluster, swizzle 1. Disjoint from the grouped space (the
-    swapped flag); the body reads the same dense rows through a TMA box."""
+@functools.lru_cache(maxsize=None)
+def _swapped_knobs() -> Tuple[Knobs, ...]:
     from .blocks.swap_bf16 import swapped_knobs as _swapped
 
-    return _swapped()
+    return tuple(_swapped())
+
+
+def swapped_knobs() -> List[Knobs]:
+    """The swapped record space of the bf16 classes (:mod:`.blocks.swap_bf16`): the swapped 1-CTA records at the narrow token
+    tiles (a 128-row weight tile x 8 / 16 / 32 tokens, a 64-row one x 16 / 32), one per (weight tile, token tile), no cluster,
+    swizzle 1. Disjoint from the grouped space (the
+    swapped flag); the body reads the same dense rows through a TMA box."""
+    return list(_swapped_knobs())
 
 
 def all_valid_configs_swapped(
@@ -376,7 +386,30 @@ def rank_grouped(
     scheduler (`raster_for`) first among its twins, best first, ties in the spaces' enumeration order. ``chain`` is a legacy
     name or the GEMM's :class:`.blocks.epilogue.GroupedChain` (its term prices the epilogue). As in the dense
     ``rank_topk``, each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the list:
-    distinct records, at most ``k``, never empty for an implementable shape."""
+    distinct records, at most ``k``, never empty for an implementable shape. Memoised on its arguments (all hashable
+    scalars): the runner ranks at every forward without a tactic, once per token count."""
+    return list(
+        _rank_grouped(
+            rows, N, K, E, chain, sm_count, family, k, nominal, n_active, swap, in_fmt
+        )
+    )
+
+
+@functools.lru_cache(maxsize=16384)
+def _rank_grouped(
+    rows: int,
+    N: int,
+    K: int,
+    E: int,
+    chain: Union[str, "GroupedChain"],
+    sm_count: Optional[int],
+    family: Optional[str],
+    k: int,
+    nominal: bool,
+    n_active: Optional[int],
+    swap: Optional[bool],
+    in_fmt: str,
+) -> Tuple[Knobs, ...]:
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import decode_sane
@@ -436,7 +469,7 @@ def rank_grouped(
         if rec not in seen:
             out.append(rec)
             seen.add(rec)
-    return out[:k]
+    return tuple(out[:k])
 
 
 def default_configs(

@@ -26,6 +26,7 @@ __all__ = [
     "fingerprint",
     "frexpe_f32",
     "frexpm_f32",
+    "rowmax_f32",
     "sexpr",
     "size",
     "to_f32",
@@ -96,6 +97,21 @@ class TermAlgebra(_Base):
         unspecified and, where the chains use it, immaterial: docs/moe_scoping.md section 3.1)."""
         return self._mk("rowmax", *vals)
 
+    def where_nan(self, x: Term, a: float, b: Term) -> Term:
+        """The routing's NaN rule (``a`` where the logit ``x`` is NaN, else ``b``): a row rule outside the term algebra,
+        so the symbolic term is ``b`` (the terms and the Lean statements are over non-NaN inputs)."""
+        return b
+
+
+def rowmax_f32(*vals: float) -> float:
+    """``rowmax`` with the device's ``max.f32`` NaN rule: the maximum of the non-NaN values (NaN when there is none);
+    its value does not depend on the association (the sign of a zero maximum never reaches the bits)."""
+    m = float("nan")
+    for v in vals:
+        if v == v and not v <= m:
+            m = v
+    return m
+
 
 def frexpm_f32(x: float) -> float:
     """``frexpm``: the significand field of ``|x|`` under the exponent of 1/2 (bit operations on the binary32 pattern)."""
@@ -163,7 +179,7 @@ def evaluate(
         elif op == "frexpe":
             v = frexpe_f32(memo[A[0].uid])
         elif op == "rowmax":
-            v = fp32.rowmax(*[memo[a.uid] for a in A])
+            v = rowmax_f32(*[memo[a.uid] for a in A])
         elif op.startswith("leaf:"):
             fn = syms.get(op)
             if fn is None:

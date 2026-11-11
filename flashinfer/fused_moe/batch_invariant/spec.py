@@ -16,6 +16,12 @@ vectorised CPU, the CuTe-DSL primitives inside the kernels):
 * ``sigmoid_term``, ``softmax_reduction``, ``routing_weights``: the router;
 * ``combine_reduction`` / ``combine_elem``: the weighted fold over the k slots.
 
+A NaN logit is a row rule outside the term algebra, like the fill rule of :func:`select_topk`: the row maximum skips
+it, its softmax term is ``+0`` (it contributes nothing to the normalisation, where a ``-inf`` logit's term is the
+clamped ``exp``), and its selection score is NaN, so it is never selected. The backends implement the rule through
+``where_nan``; the symbolic algebra returns the finite branch (its terms and the Lean statements are over non-NaN
+inputs), so the rule moves no fingerprint.
+
 The per-element GEMM folds are the dense bf16 class's (:mod:`flashinfer.gemm.batch_invariant.spec`, the opaque
 ``mma16`` K-step); the grouped GEMM is a placement of that class, not a new one. The quantized classes
 (docs/moe_quant_scoping.md) are outside this module.
@@ -184,19 +190,85 @@ DEEPSEEK_V3_GROUPED = SIGMOID_BIAS_RENORM_SCALED.with_groups(
 )  # DeepSeek-V3 with its group-limited selection
 #: The route kernels hold the group scores of at most this many groups per token.
 MAX_GROUPS = 16
+#: The route kernels select, and the plan / gather / combine kernels fold, at most this many slots per token
+#: (``1 <= top_k <= min(num_experts, MAX_TOP_K)``: the bound of every entry point and of the fingerprint).
+MAX_TOP_K = 16
+
+
+def group_shape_error(
+    E: int, top_k: int, n_group: int, topk_group: int
+) -> Optional[str]:
+    """The shape rule of a group-limited selection (``n_group`` groups, ``topk_group`` of them kept) over ``E`` experts
+    for ``top_k`` slots: ``None`` when it holds, else the rule as text (the runner, the fingerprint and the routing entry
+    points raise with it). The kernels hold at most ``MAX_GROUPS`` group scores, a group's score is the sum of its two
+    largest scores (so a group holds at least two experts), and the kept groups hold at least ``top_k`` experts."""
+    if (
+        1 <= topk_group <= n_group <= MAX_GROUPS
+        and E % n_group == 0
+        and E // n_group >= 2
+        and top_k <= topk_group * (E // n_group)
+    ):
+        return None
+    return (
+        f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at least two "
+        "experts, top_k <= topk_group * (num_experts / n_group)"
+    )
+
+
+def group_rule_error(method: RoutingMethod, E: int, top_k: int) -> Optional[str]:
+    """The rule of a method's expert groups over ``E`` experts for ``top_k`` slots, or ``None``: the group-limited stage is a
+    term of the DeepSeekV3 method alone (``SIGMOID_BIAS_RENORM_SCALED``), under :func:`group_shape_error`; an ungrouped method
+    passes. The fingerprint and the routing entry points raise ``ValueError`` with it, the runner its unsupported error."""
+    if not method.grouped:
+        return None
+    if method.with_groups(0, 0) != SIGMOID_BIAS_RENORM_SCALED:
+        return "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
+    return group_shape_error(E, top_k, method.n_group, method.topk_group)
+
+
+def _parse_group_suffix(name: str) -> Tuple[str, int, int]:
+    """``<base>_g<n>x<t>`` -> ``(base, n, t)``; ``(name, 0, 0)`` without the suffix."""
+    base, sep, grp = name.rpartition("_g")
+    if sep and "x" in grp:
+        n, t = grp.split("x", 1)
+        if n.isdigit() and t.isdigit():
+            return base, int(n), int(t)
+    return name, 0, 0
+
+
+def method_named(name: str) -> RoutingMethod:
+    """The method of a name: a table entry, or ``<method>_g<n>x<t>`` -- the named method with the group-limited stage
+    (``RoutingMethod.with_groups``; its shape over the experts and slots is the callers' :func:`group_rule_error`). Any other
+    name, and a group suffix the dataclass could not hold (fewer than two groups, more kept than groups, groups on a method
+    without the sigmoid score), is a ``ValueError``: no public input reaches an assertion."""
+    if dict.__contains__(METHODS, name):
+        return dict.__getitem__(METHODS, name)
+    base, n, t = _parse_group_suffix(name)
+    if n == 0 or not dict.__contains__(METHODS, base):
+        raise ValueError(f"no routing method named {name!r}")
+    m = dict.__getitem__(METHODS, base)
+    if m.score != "sigmoid":
+        raise ValueError(
+            f"routing method {name!r}: the group-limited selection is a sigmoid-routing feature ({base!r} selects on the "
+            f"{m.score})"
+        )
+    if n < 2 or not 1 <= t <= n:
+        raise ValueError(
+            f"routing method {name!r}: a group suffix takes at least two groups and 1 <= topk_group <= n_group"
+        )
+    return m.with_groups(n, t)
 
 
 class _Methods(dict):
     """The named methods; a grouped name ``<method>_g<n>x<t>`` not in the table resolves to the named method with the
-    group-limited stage (``RoutingMethod.with_groups``), so every grouped configuration has a name (the kernels' key)."""
+    group-limited stage (:func:`method_named`), so every grouped configuration has a name (the kernels' key); an unknown
+    name is a ``KeyError`` as for any table, a malformed group suffix on a known method the ``ValueError`` of ``method_named``."""
 
     def __missing__(self, name: str) -> RoutingMethod:
-        base, sep, grp = name.rpartition("_g")
-        if sep and "x" in grp and base in self:
-            n, t = grp.split("x", 1)
-            if n.isdigit() and t.isdigit():
-                return self[base].with_groups(int(n), int(t))
-        raise KeyError(name)
+        base, n, _ = _parse_group_suffix(name)
+        if n == 0 or not dict.__contains__(self, base):
+            raise KeyError(name)
+        return method_named(name)
 
 
 METHODS: Dict[str, RoutingMethod] = _Methods(
@@ -265,9 +337,10 @@ def softmax_reduction(E: int, leaf_z: Callable[[Any, int], Any]) -> Reduction:
 
 def softmax_terms(fp: Any, logits: Sequence[Any], E: int) -> Tuple[List[Any], Any]:
     """``m``, ``z_e`` and ``S`` for one token: ``z_e = exp(add(l_e, neg(m)))``, ``S`` the canonical
-    pairwise tree. Returns ``(z, S)`` with ``z`` a list over experts."""
+    pairwise tree. Returns ``(z, S)`` with ``z`` a list over experts. A NaN logit is skipped by the row maximum and
+    its term is ``+0`` (the module's NaN rule: the backends' ``where_nan``)."""
     m = fp.rowmax(*logits)
-    z = [exp_term(fp, fp.add(l, fp.neg(m))) for l in logits]
+    z = [fp.where_nan(l, 0.0, exp_term(fp, fp.add(l, fp.neg(m)))) for l in logits]
     S = softmax_reduction(E, lambda fp_, e: z[e]).canonical(fp)
     return z, S
 
@@ -281,7 +354,8 @@ def per_expert_scores(
     """``(selection_score_e, weight_e)`` for every expert. softmax: selection on the logit itself,
     weight ``p_e = div(z_e, S)``; sigmoid: ``s_e = sigmoid(l_e)``, selection on ``add(s_e, bias_e)``
     (or ``s_e``), weight ``s_e``; logit: selection on the logit itself, weight the logit (``TOPK``) or
-    ``sigmoid(l_e)`` (``TOPK_SIGMOID``)."""
+    ``sigmoid(l_e)`` (``TOPK_SIGMOID``). A NaN logit's selection score is NaN under every method (the sigmoid methods
+    select it through ``where_nan``: the declared exp of a NaN is the clamp's value, not a NaN)."""
     E = len(logits)
     if method.score == "softmax":
         z, S = softmax_terms(fp, logits, E)
@@ -300,6 +374,8 @@ def per_expert_scores(
         q = [fp.add(s_e, b_e) for s_e, b_e in zip(s, bias, strict=True)]
     else:
         q = list(s)
+    nan = float("nan")
+    q = [fp.where_nan(l, nan, q_e) for l, q_e in zip(logits, q, strict=True)]
     return q, s
 
 
@@ -488,6 +564,13 @@ LOG_COEFFS = (
 LOG_LN2_HI = 0.693359375
 LOG_LN2_LO = -2.12194440e-4
 HUGE = 1.2676506002282294e30  # 2^100: scales a sign or a positive part into a clamp's saturation range (exact)
+# The declared log's subnormal step: a positive x below the smallest normal is scaled by 2^24 (exact) before the bit split
+# and the exponent takes the 24 back; the select is the same clamp form as the recentring, applied twice to reach 1.
+LOG_MIN_NORMAL = 2.0**-126
+LOG_SUB_SCALE = (
+    2.0**24 - 1.0
+)  # add(1, mul(sub, .)) is 2^24 for a subnormal x and 1 otherwise, both exact
+LOG_SUB_EXP = -24.0
 
 #: The gated chains on the (gate, up) accumulator pair and the ungated chains on one accumulator; FlashInfer's
 #: ``ActivationConfig`` scalars are the ``params`` of a chain (binary32 constants of the term: class dimensions).
@@ -546,11 +629,24 @@ def gelu_term(fp: Any, x: Any) -> Any:
 def log_term(fp: Any, x: Any) -> Any:
     """The declared natural log of a positive ``x`` (Cephes logf): ``x = m 2^e`` with ``m`` in [1/2, 1) (``frexpm`` /
     ``frexpe``, exact bit operations), recentred by the exact select ``lt = clamp((sqrt(1/2) - m) 2^100, 0, 1)`` into
-    ``z = m + lt m - 1``, ``e' = e - lt``; ``z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi``. On a positive subnormal
-    ``x`` the split is the raw fields (``frexpm`` / ``frexpe`` do not renormalise), so the chain's value there is the
-    declared term's, not the natural log's; the PowLU chain clamps it by ``gp 2^100``."""
-    m = fp.frexpm(x)
-    ex = fp.frexpe(x)
+    ``z = m + lt m - 1``, ``e' = e - lt``; ``z + (z^3 P(z) + e' ln2_lo - z^2 / 2) + e' ln2_hi``. ``frexpm`` / ``frexpe``
+    read the raw fields, so a positive subnormal ``x`` is first scaled into the normal range by the exact select
+    ``sub = clamp((2^-126 - x) 2^100 2^100, 0, 1)``: ``x' = mul(x, add(1, mul(sub, 2^24 - 1)))`` (``x 2^24``, exact)
+    and the exponent takes ``mul(sub, -24)`` back; the split is then the normalised mantissa and exponent of every
+    positive ``x`` (at ``x = 0`` the PowLU chain's clamp ``gp 2^100`` zeroes the branch whatever the log's value)."""
+    sub = fp.fmax(
+        fp.fmin(
+            fp.mul(
+                fp.mul(fp.add(fp.const(LOG_MIN_NORMAL), fp.neg(x)), fp.const(HUGE)),
+                fp.const(HUGE),
+            ),
+            fp.const(1.0),
+        ),
+        fp.const(0.0),
+    )
+    xn = fp.mul(x, fp.add(fp.const(1.0), fp.mul(sub, fp.const(LOG_SUB_SCALE))))
+    m = fp.frexpm(xn)
+    ex = fp.add(fp.frexpe(xn), fp.mul(sub, fp.const(LOG_SUB_EXP)))
     lt = fp.fmax(
         fp.fmin(
             fp.mul(fp.add(fp.const(LOG_SQRTHF), fp.neg(m)), fp.const(HUGE)),

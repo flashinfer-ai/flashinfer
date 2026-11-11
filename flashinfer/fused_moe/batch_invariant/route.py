@@ -10,8 +10,10 @@ runs the engine's plan with lane shuffles, the top-k selection is k rounds of a 
 through ``CuteF32``. The logit methods select on the logits themselves (the weights the logits or their sigmoid); the
 group-limited methods run the group stage before the selection (two argmax rounds per group, the kept groups chosen on
 warp-uniform scores, the other groups' experts masked out). All arithmetic through ``CuteF32``; comparisons are exact. A
-slot no selectable expert reaches (fewer than ``k`` experts with a non-NaN score) takes the lowest expert index the row has
-not taken, with a NaN weight: the row's output is NaN and every id stays in ``[0, E)``.
+NaN logit is the spec's row rule (:mod:`.spec`): the warp max skips it (``max.f32``), its softmax term is ``+0`` and its
+selection score NaN (a select, no arithmetic), so it is never selected. A slot no selectable expert reaches (fewer than
+``k`` experts with a non-NaN score) takes the lowest expert index the row has not taken, with a NaN weight: the row's
+output is NaN and every id stays in ``[0, E)``.
 """
 
 from __future__ import annotations
@@ -31,6 +33,15 @@ from . import pdl
 
 LANES = 32
 WARPS = 4
+
+
+def _select_f32(cond, a, b):
+    """``a`` where ``cond`` else ``b`` (``arith.select``, one ``selp.f32``: no arithmetic)."""
+    from cutlass._mlir.dialects import arith
+
+    return Float32(
+        arith.select(cond.ir_value(), Float32(a).ir_value(), Float32(b).ir_value())
+    )
 
 
 class _LanePeers(canon.Peers):
@@ -137,10 +148,12 @@ def route_token(
 ):
     """One token's routing by one warp (the class's routing term): the warp-uniform results land in ``out_e[r]`` /
     ``out_w[r]`` for the ``k`` slots. Shared by the route kernel and the fused route + plan kernel: the same traced code,
-    the same bits. An expert whose selection score is NaN is never selected (no comparison holds); when fewer than ``k``
-    experts are selectable, each remaining slot takes the lowest expert index the row has not taken with a NaN weight
-    (the row's output is NaN; every id stays in ``[0, E)``)."""
+    the same bits. A NaN logit is skipped by the row maximum, its softmax term is ``+0`` and its selection score NaN
+    (``spec``'s row rule), so it is never selected (no comparison holds); when fewer than ``k`` experts are selectable,
+    each remaining slot takes the lowest expert index the row has not taken with a NaN weight (the row's output is NaN;
+    every id stays in ``[0, E)``)."""
     neg_inf = CuteF32.const(float("-inf"))
+    nan = CuteF32.const(float("nan"))
     # the lane's experts: logits (absent -> -inf), selection scores q, weights
     logits = []
     for i in cutlass.range_constexpr(P):
@@ -149,6 +162,7 @@ def route_token(
         if e < E:
             v = mL[t, e].to(Float32)
         logits.append(v)
+    isnan = [l != l for l in logits]
     if cutlass.const_expr(meth.score == "sigmoid"):
         wgt = [S.sigmoid_term(CuteF32, l) for l in logits]
         q = []
@@ -160,6 +174,9 @@ def route_token(
                 if e < E:
                     b = mBias[e]
                 qi = CuteF32.add(wgt[i], b)
+            qi = _select_f32(
+                isnan[i], nan, qi
+            )  # the declared exp of a NaN is the clamp's value: the score is set NaN
             if e >= E:
                 qi = neg_inf
             q.append(qi)
@@ -182,6 +199,9 @@ def route_token(
             zi = CuteF32.const(0.0)  # absent: +0 (identity for the all-positive sum)
             if e < E:
                 zi = S.exp_term(CuteF32, CuteF32.add(logits[i], CuteF32.neg(m)))
+            zi = _select_f32(
+                isnan[i], CuteF32.const(0.0), zi
+            )  # a NaN logit: +0, nothing in the sum
             z.append(zi)
         state, start = canon.init_state(
             plan, CuteF32, lambda key: z[key[0] if key else 0]
@@ -196,7 +216,6 @@ def route_token(
         # groups are kept in the same strict order over the warp-uniform group scores (the lowest untaken groups fill when
         # fewer are selectable); an expert outside a kept group leaves the selection with a NaN score
         n_group, topk_group = meth.n_group, meth.topk_group
-        nan = CuteF32.const(float("nan"))
         G = E // Int32(n_group)
         grp = [Int32(lane * P + i) // G for i in range(P)]
         gsc = []

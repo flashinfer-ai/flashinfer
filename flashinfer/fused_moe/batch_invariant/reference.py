@@ -10,13 +10,14 @@ execute. The GEMM accumulators themselves come from the device (the opaque ``mma
 
 from __future__ import annotations
 
+import functools
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 
 from ...batch_invariant.fp_interface import exact as fp32
 from . import spec as S
-from .mterm import frexpe_f32, frexpm_f32
+from .mterm import frexpe_f32, frexpm_f32, rowmax_f32
 
 
 class ExactF32:
@@ -39,7 +40,13 @@ class ExactF32:
     fmin = staticmethod(fp32.fmin)
     fmax = staticmethod(fp32.fmax)
     exp2i = staticmethod(fp32.exp2i)
-    rowmax = staticmethod(fp32.rowmax)
+    rowmax = staticmethod(
+        rowmax_f32
+    )  # the MoE rule: a NaN logit is skipped (the device's max.f32)
+
+    @staticmethod
+    def where_nan(x: float, a: float, b: float) -> float:
+        return a if x != x else b
 
     @staticmethod
     def cvt_out(a: float, fmt: str) -> float:
@@ -57,6 +64,26 @@ class ExactF32:
 
 
 _TORCH_FMT = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
+E5M2_MAX = fp32.E5M2[3]
+
+
+def e5m2_round(a: torch.Tensor) -> torch.Tensor:
+    """Vectorised ``cvt.rn.satfinite.e5m2x2.f32`` as values (``fp32.to_fp8(., "e5m2")``): RNE to e5m2 (2 mantissa bits,
+    subnormals in steps of 2^-16), magnitudes beyond the largest finite value saturate to it, sign kept, NaN stays NaN."""
+    a = a.to(torch.float32)
+    m = a.abs().clamp(
+        max=E5M2_MAX
+    )  # satfinite (also maps +inf to the largest finite value)
+    small = m < 2.0**-14
+    sub = torch.round(m * 2.0**16) * 2.0**-16  # torch.round is half-to-even
+    _, exp = torch.frexp(
+        torch.where(small, torch.ones_like(m), m)
+    )  # m = mant * 2^exp, mant in [0.5, 1)
+    ulp = torch.ldexp(torch.ones_like(m), exp - 3)  # 2^(e-2) with e = exp - 1
+    nrm = torch.round(m / ulp) * ulp
+    v = torch.where(small, sub, nrm)
+    v = torch.where(torch.signbit(a), -v, v)
+    return torch.where(torch.isnan(a), a, v)
 
 
 class TorchF32:
@@ -130,7 +157,12 @@ class TorchF32:
 
     @staticmethod
     def rowmax(*vals: torch.Tensor) -> torch.Tensor:
-        return torch.stack(list(vals), dim=0).amax(dim=0)
+        # torch.fmax takes the other operand against a NaN, as the device's max.f32 and rowmax_f32 do
+        return functools.reduce(torch.fmax, vals)
+
+    @staticmethod
+    def where_nan(x: torch.Tensor, a: float, b: torch.Tensor) -> torch.Tensor:
+        return torch.where(torch.isnan(x), torch.tensor(a, dtype=torch.float32), b)
 
     @staticmethod
     def cvt_out(a: torch.Tensor, fmt: str) -> torch.Tensor:
@@ -139,6 +171,8 @@ class TorchF32:
             from ...batch_invariant.quantization.nvfp4_reference import e4m3_round
 
             return e4m3_round(a)
+        if fmt == "e5m2":
+            return e5m2_round(a)
         return a.to(_TORCH_FMT[fmt])
 
 
@@ -240,10 +274,19 @@ def route_cpu(
 def combine_cpu(
     y: torch.Tensor, dest: torch.Tensor, weights: torch.Tensor, out_fmt: str = "bf16"
 ) -> torch.Tensor:
-    """``out[t] = cvt( fold_r add(acc, mul(f32(y[dest[t, r]]), w[t, r])) )``."""
+    """``out[t] = cvt( fold_r add(acc, mul(f32(y[dest[t, r]]), w[t, r])) )``; a dropped slot (``dest = -1``) is the
+    term ``+0``, whatever its weight (the kernel's rule)."""
     yc, d, w = y.detach().cpu(), dest.detach().cpu().long(), _f32(weights)
     T, k = d.shape
-    leaves = [TorchF32.mul(yc[d[:, r]].float(), w[:, r : r + 1]) for r in range(k)]
+    ok = d >= 0
+    leaves = [
+        torch.where(
+            ok[:, r : r + 1],
+            TorchF32.mul(yc[d[:, r].clamp_min(0)].float(), w[:, r : r + 1]),
+            torch.zeros(1, dtype=torch.float32),
+        )
+        for r in range(k)
+    ]
     acc = S.combine_reduction(k, lambda fp, r: leaves[r]).canonical(TorchF32)
     return TorchF32.cvt_out(acc, out_fmt)
 

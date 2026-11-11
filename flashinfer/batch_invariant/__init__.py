@@ -80,6 +80,16 @@ def _bmm_fp8_fingerprint(
     return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
 
 
+def _gemm_fp8_nt_groupwise_fingerprint(
+    K: int, out_dtype: Union[torch.dtype, str]
+) -> str:
+    from ..gemm.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "gemm_fp8_nt_groupwise"), 1, "e4m3_bs"
+    )
+
+
 def _attention_fingerprint(head_dim: int) -> str:
     from ..attention.batch_invariant.spec import spec_fingerprint
 
@@ -140,29 +150,40 @@ def _mm_fp4_fingerprint(
     )
 
 
-def _moe_bf16_fingerprint(
-    H: int,
-    I: int,
+def _moe_class_terms(
+    op: str,
     top_k: int,
     num_experts: int,
-    method: object = "Renormalize",
-    act: object = "swiglu",
-    params: Sequence[Optional[float]] = (),
-    gated: Optional[bool] = None,
-    n_group: Optional[int] = None,
-    topk_group: Optional[int] = None,
-) -> str:
-    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
-    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, with ``n_group`` /
-    ``topk_group`` for ``DeepSeekV3``'s group-limited selection (``RoutingConfig``'s values; the groups are a parameter of
-    the routing term); ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters), ``"swiglu"`` /
-    ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with
-    ``params`` (and ``gated`` for the names in both tables)."""
+    method: object,
+    act: object,
+    params: Sequence[Optional[float]],
+    gated: Optional[bool],
+    n_group: Optional[int],
+    topk_group: Optional[int],
+):
+    """The MoE classes' shared dimensions resolved to the specification's terms: ``(routing method, chain name, parameters,
+    gating)`` for the bf16 and the fp8 per-tensor fingerprints. ``method`` is a :class:`flashinfer.RoutingMethodType` (or
+    its name) among the ones the classes implement, with ``n_group`` / ``topk_group`` for ``DeepSeekV3``'s group-limited
+    selection (``RoutingConfig``'s values; the groups are a parameter of the routing term), or the classes' own method name
+    (``spec.METHODS``; a grouped one as ``<method>_g<n>x<t>``, the same class as the enum form with the groups) or a
+    ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters),
+    ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS``
+    with ``params`` (and ``gated`` for the names in both tables). The receipt names a class some layer can build: the
+    runners' bounds and group rule apply here as ``ValueError``."""
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
     from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import MAX_E
     from flashinfer.tllm_enums import RoutingMethodType
 
+    if not 1 <= num_experts <= MAX_E:
+        raise ValueError(
+            f"fingerprint({op!r}): num_experts {num_experts} must lie in [1, {MAX_E}]"
+        )
+    if not 1 <= top_k <= min(num_experts, spec.MAX_TOP_K):
+        raise ValueError(
+            f"fingerprint({op!r}): top_k {top_k} must lie in [1, min(num_experts, {spec.MAX_TOP_K})]"
+        )
     if isinstance(method, str) and method in RoutingMethodType.__members__:
         method = RoutingMethodType[method]
     if isinstance(method, RoutingMethodType):
@@ -172,7 +193,7 @@ def _moe_bf16_fingerprint(
             )
         rm = spec.METHOD_OF_FLASHINFER[method]
     elif isinstance(method, str):
-        rm = spec.METHODS[method]
+        rm = spec.method_named(method)
     elif isinstance(method, spec.RoutingMethod):
         rm = method
     else:
@@ -180,11 +201,28 @@ def _moe_bf16_fingerprint(
             f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
         )
     if (n_group or 0) > 1 or (topk_group or 0) > 1:
-        if rm is not spec.SIGMOID_BIAS_RENORM_SCALED:
+        n_group, topk_group = int(n_group or 0), int(topk_group or 0)
+        if rm.grouped and (rm.n_group, rm.topk_group) != (n_group, topk_group):
+            raise ValueError(
+                f"method {rm.name!r} carries the groups {rm.n_group} x {rm.topk_group}; n_group / topk_group give "
+                f"{n_group} x {topk_group}"
+            )
+        if not rm.grouped and rm != spec.SIGMOID_BIAS_RENORM_SCALED:
             raise ValueError(
                 "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
             )
-        rm = rm.with_groups(int(n_group or 0), int(topk_group or 0))
+        if not 1 <= topk_group <= n_group:
+            raise ValueError(
+                f"n_group {n_group}, topk_group {topk_group} over {num_experts} experts for top_k {top_k}: "
+                + str(spec.group_shape_error(num_experts, top_k, n_group, topk_group))
+            )
+        rm = rm.with_groups(n_group, topk_group)
+    # the runner's group rule (the groups a term of DeepSeekV3 alone, the shape rule), as a ValueError here
+    rule = spec.group_rule_error(rm, num_experts, top_k)
+    if rule is not None:
+        raise ValueError(
+            f"n_group {rm.n_group}, topk_group {rm.topk_group} over {num_experts} experts for top_k {top_k}: {rule}"
+        )
     if not isinstance(act, str):
         a = spec.activation_of(act)
         name, params, gated = a.act, a.params, a.gated
@@ -198,6 +236,28 @@ def _moe_bf16_fingerprint(
             gated = act in spec.ACTS
     else:
         raise ValueError(f"no MoE chain named {act!r}")
+    return rm, name, params, gated
+
+
+def _moe_bf16_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: the dimensions of
+    :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and gating)."""
+    from flashinfer.fused_moe.batch_invariant import spec
+
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe", top_k, num_experts, method, act, params, gated, n_group, topk_group
+    )
     return spec.spec_fingerprint(
         H, I, top_k, num_experts, rm, "bf16", name, params, gated
     )
@@ -216,47 +276,21 @@ def _moe_fp8_fingerprint(
     topk_group: Optional[int] = None,
 ) -> str:
     """The fp8 per-tensor MoE classes behind ``MoELayer`` with ``BatchInvariantFp8PerTensorConfig``: the dimensions of
-    :func:`_moe_bf16_fingerprint` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and
-    gating); the scales' values are inputs, not dimensions."""
-    from flashinfer.fused_moe.batch_invariant import spec
+    :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars and gating)
+    under the same bounds; the scales' values are inputs, not dimensions."""
     from flashinfer.fused_moe.batch_invariant.spec_fp8 import spec_fingerprint_fp8
-    from flashinfer.tllm_enums import RoutingMethodType
 
-    if isinstance(method, str) and method in RoutingMethodType.__members__:
-        method = RoutingMethodType[method]
-    if isinstance(method, RoutingMethodType):
-        if method not in spec.METHOD_OF_FLASHINFER:
-            raise ValueError(
-                f"the batch-invariant MoE classes do not implement routing method {method!r}"
-            )
-        rm = spec.METHOD_OF_FLASHINFER[method]
-    elif isinstance(method, str):
-        rm = spec.METHODS[method]
-    elif isinstance(method, spec.RoutingMethod):
-        rm = method
-    else:
-        raise TypeError(
-            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
-        )
-    if (n_group or 0) > 1 or (topk_group or 0) > 1:
-        if rm is not spec.SIGMOID_BIAS_RENORM_SCALED:
-            raise ValueError(
-                "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
-            )
-        rm = rm.with_groups(int(n_group or 0), int(topk_group or 0))
-    if not isinstance(act, str):
-        a = spec.activation_of(act)
-        name, params, gated = a.act, a.params, a.gated
-    elif act == "swiglu":
-        name, gated = "silu", True
-    elif act == "relu2":
-        name, gated = "relu2", False
-    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
-        name = act
-        if gated is None:
-            gated = act in spec.ACTS
-    else:
-        raise ValueError(f"no MoE chain named {act!r}")
+    rm, name, params, gated = _moe_class_terms(
+        "fused_moe_fp8",
+        top_k,
+        num_experts,
+        method,
+        act,
+        params,
+        gated,
+        n_group,
+        topk_group,
+    )
     return spec_fingerprint_fp8(H, I, top_k, num_experts, rm, name, params, gated)
 
 
@@ -275,6 +309,11 @@ CLASSES: Dict[str, ClassInfo] = {
     # dtype (bf16 / fp16) is the chain's conversion; the batch is not a dimension (every element is one launch of the class)
     "bmm_fp8": ClassInfo(
         "gemm.fp8", ("N", "K", "dtype", "out_dtype"), _bmm_fp8_fingerprint
+    ),
+    # the block-scale fp8 class (DeepSeek-style 1x128 / 128x128 fp32 scales applied once per 128-element K block): K and the
+    # output dtype are its dimensions (N enters neither the fold nor a chunk rule: the class has no split variant)
+    "gemm_fp8_nt_groupwise": ClassInfo(
+        "gemm.e4m3.kblock128", ("K", "out_dtype"), _gemm_fp8_nt_groupwise_fingerprint
     ),
     # the architecture is a dimension of the MXFP8 class: the sm_107 instruction folds 64 elements per step, the sm_100 /
     # sm_103 one 32 (gemm.mxfp8.*64 vs gemm.mxfp8.*); `arch` defaults to the current CUDA device's
@@ -329,6 +368,11 @@ def fingerprint(op: str, **dims) -> str:
     output ``out_dtype`` (bf16 / fp16): the 32-wide fp8 step, the chain's ``mul.rn`` by the device product of the two
     per-tensor scales and its conversion are the specification; the scales' values, like the operands, are inputs, and
     the batch is not a dimension (every element is one launch of the class).
+    ``gemm_fp8_nt_groupwise`` takes ``K`` and ``out_dtype`` (bf16 / fp16): the block-scale class ``gemm.e4m3.kblock128``
+    (e4m3 operands, fp32 scales per 1x128 block of A and per 128x128 block of B) folds each 128-element K block with the
+    32-wide fp8 step from +0 and the block partials in block order with ``fma.rn(mul.rn(s_a, s_b), P, acc)``; the scales'
+    values, like the operands, are inputs, and N enters nothing (no split variant).
+
     ``mm_mxfp8`` takes ``N, K`` and ``out_dtype`` (bf16 / fp16), and optionally ``arch`` (an architecture family
     ``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``, a compute capability or a device; the current CUDA device by default):
     the block-scaled step of that architecture's instruction (32 e4m3 elements with one UE8M0 scale per row on SM100 /
@@ -354,6 +398,8 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-bf16-kfold-bias-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
+    >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
+    'gemm-e4m3-kblock128-...'
     >>> fingerprint("mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_107")  # doctest: +SKIP
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
@@ -384,7 +430,8 @@ def fingerprint(op: str, **dims) -> str:
 
 def class_name(op: str) -> str:
     """The consistency class (family) name behind the API ``op`` (``"gemm.bf16"``; ``"gemm.fp8"`` for the two fp8 classes
-    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
+    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.e4m3.kblock128"`` behind ``gemm_fp8_nt_groupwise``;
+    ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
     ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``)."""
     info = CLASSES.get(op)
     if info is None:

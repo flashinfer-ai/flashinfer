@@ -34,7 +34,7 @@ On CPU it also checks the deterministic-only contract: no entry takes a
 nothing for them (no alert, no warning).  The removed names and paths are covered by
 ``test_cake_moe_grouped_gemm_det_train_names.py``.
 The backend tests of the package live in ``test_cake_moe_grouped_gemm_det_train.py``,
-which imports the package only through ``tests.test_helpers.cake_package``.
+which imports the package only through ``tests.cake.test_helpers.cake_package``.
 """
 
 import importlib

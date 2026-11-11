@@ -569,6 +569,6 @@ python test.py
 
 ## Related Documentation
 
-- See CLAUDE.md "API Logging with @flashinfer_api" for technical details
+- See AGENTS.md "API Logging with @flashinfer_api" for technical details
 - See `flashinfer/api_logging.py` for implementation
 - See CUDA documentation for compute-sanitizer and cuda-gdb

@@ -42,7 +42,6 @@ def test_generated_cases_are_current():
         "sigmoid",
         "tanh",
         "erf_pos",
-        "log",
         "gelu_tanh",
         "gelu",
         "combine3",
@@ -77,9 +76,11 @@ def test_generated_cases_are_current():
     }
     for name in theorems:
         assert f"theorem moe_{name} :" in committed
-    # the chains too large for a kernel theorem are conformance lines (the executable), never dropped (the fp8 chains carry
-    # the alpha multiply into every use of the accumulators, so the gated GeGLU-tanh and SiTU ones cross the bound too)
+    # the chains too large for a kernel theorem are conformance lines (the executable), never dropped (the log: its
+    # subnormal step repeats the argument through the mantissa and exponent leaves; the fp8 chains carry the alpha
+    # multiply into every use of the accumulators, so the gated GeGLU-tanh and SiTU ones cross the bound too)
     large = {
+        "log",
         "glu_situ_default",
         "glu_powlu_default",
         "glu_powlu_limit",

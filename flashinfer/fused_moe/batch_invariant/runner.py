@@ -9,8 +9,9 @@ The runner serves the bf16 classes on SM100 / SM103 / SM107, one declared chain 
 It takes every routing input mode: ``FromLogits`` runs the class's own routing kernel
 (the declared ``exp``, the strict selection order; the methods ``Default``, ``Renormalize``, ``RenormalizeNaive``,
 ``Sigmoid``, ``SigmoidRenorm``, ``TopK``, ``Llama4`` at ``top_k = 1``, ``TopKSigmoid`` and ``DeepSeekV3`` with or
-without its expert groups), ``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's
-expert ids and weights; an expert-parallel shard (``ExpertConfig.local_expert_offset`` / ``local_num_experts``) computes the
+without its expert groups; a configuration outside these terms is refused at the from-logits call, not at construction),
+``PackedPrecomputed`` / ``UnpackedPrecomputed`` take the caller's expert ids and weights under any ``RoutingConfig`` (the
+selection is the caller's); an expert-parallel shard (``ExpertConfig.local_expert_offset`` / ``local_num_experts``) computes the
 slots of its local experts and drops the rest (the term ``+0`` in its tokens' folds): a placement of the class on the local
 experts, the rank's partial of the dense output. The combine is the slot-order fp32 fold (never an atomic finalize:
 ``MoEFinalizeConfig.use_fused_finalize`` is ignored); with ``MoEFinalizeConfig(do_finalize=False)`` the combine is left to the caller and the forward returns the
@@ -27,7 +28,11 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from ...autotuner import TuningConfig
-from ...batch_invariant.support import check_device, unsupported
+from ...batch_invariant.support import (
+    BatchInvariantUnsupportedError,
+    check_device,
+    unsupported,
+)
 from ..api import (
     GELU,
     GeGLU,
@@ -99,7 +104,7 @@ def routing_term(routing: Any, cls: str) -> Tuple[Optional[Any], bool]:
     with DeepSeekV3's expert groups attached (``with_groups``: the group-limited selection is a term of that method, its shape
     rule here) and the Llama4 top-1 rule; the flag: expert groups given with another method (no meaning in this module; the
     logits mode refuses them at the call). ``cls``: the class name of the errors. Every class runner derives its term here."""
-    from .spec import MAX_GROUPS, METHOD_OF_FLASHINFER
+    from .spec import METHOD_OF_FLASHINFER, group_shape_error
 
     if routing.method not in METHOD_OF_FLASHINFER:
         # the pre-routed modes never consult the method; the logits mode does (pack_inputs raises there too)
@@ -116,17 +121,12 @@ def routing_term(routing: Any, cls: str) -> Tuple[Optional[Any], bool]:
                 int(routing.topk_group or 0),
             )
             E = routing.num_experts
-            if not (
-                1 <= topk_group <= n_group <= MAX_GROUPS
-                and E % n_group == 0
-                and E // n_group >= 2
-                and routing.top_k <= topk_group * (E // n_group)
-            ):
+            rule = group_shape_error(E, routing.top_k, n_group, topk_group)
+            if rule is not None:
                 raise unsupported(
                     cls,
                     f"n_group {n_group}, topk_group {topk_group} over {E} experts for top_k {routing.top_k}",
-                    f"1 <= topk_group <= n_group <= {MAX_GROUPS}, n_group dividing num_experts into groups of at "
-                    "least two experts, top_k <= topk_group * (num_experts / n_group)",
+                    rule,
                 )
             method = method.with_groups(n_group, topk_group)
         elif grouped:
@@ -239,15 +239,33 @@ class BatchInvariantMoeRunner(MoERunner):
                 "a positive multiple of 8",
             )
         routing = cfg.routing
-        if not 1 <= routing.top_k <= min(routing.num_experts, 16):
+        from .spec import MAX_TOP_K
+
+        if not 1 <= routing.top_k <= min(routing.num_experts, MAX_TOP_K):
             raise unsupported(
-                CLASS, f"top_k {routing.top_k}", "1 <= top_k <= min(num_experts, 16)"
+                CLASS,
+                f"top_k {routing.top_k}",
+                f"1 <= top_k <= min(num_experts, {MAX_TOP_K})",
             )
-        if not 1 <= routing.num_experts <= 1024:
+        from .blocks.scheduler import MAX_E
+
+        if not 1 <= routing.num_experts <= MAX_E:
             raise unsupported(
-                CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
+                CLASS,
+                f"num_experts {routing.num_experts}",
+                f"1 <= num_experts <= {MAX_E}",
             )
-        self._method, self._grouped_other = routing_term(routing, CLASS)
+        self._routing_term(routing, CLASS)
+
+    def _routing_term(self, routing: Any, cls: str) -> None:
+        """``_method`` / ``_grouped_other`` from :func:`routing_term`; a refusal (a group shape or a Llama4 top-k outside the
+        term) is deferred to a from-logits call (``_logits_refusal``), since the pre-routed modes never consult the method:
+        a layer that only ever receives pre-routed ids builds under any ``RoutingConfig``."""
+        self._logits_refusal: Optional[BatchInvariantUnsupportedError] = None
+        try:
+            self._method, self._grouped_other = routing_term(routing, cls)
+        except BatchInvariantUnsupportedError as e:
+            self._method, self._grouped_other, self._logits_refusal = None, False, e
 
     def _build(self) -> None:
         from ...gemm.batch_invariant.api import part_of
@@ -348,6 +366,10 @@ class BatchInvariantMoeRunner(MoERunner):
                     "the groups with DeepSeekV3, or pre-routed ids",
                 )
             if self._method is None:
+                # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
+                refusal = getattr(self, "_logits_refusal", None)
+                if refusal is not None:
+                    raise refusal
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",
@@ -418,6 +440,8 @@ class BatchInvariantMoeRunner(MoERunner):
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int) -> Tuple[list, list]:
+        """The dispatcher's ranked records of the two GEMMs at ``T`` tokens (``rank_grouped`` memoises its arguments, all
+        scalars of the configuration and the part: a forward without a tactic pays the ranking once per token count)."""
         from .schedule import TOP_K, active_experts, rank_grouped, rows_per_expert
 
         cfg = self.config

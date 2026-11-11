@@ -23,6 +23,7 @@ from ...gemm.batch_invariant.api import persistent_clusters, sm_count_of
 from ...gemm.batch_invariant.generator import Knobs
 from . import spec as S
 from .blocks.epilogue import GroupedChain
+from .blocks.scheduler import MAX_E
 
 _CONST: Dict[Tuple[int, int, float], torch.Tensor] = {}
 _CONST_VALUES = (
@@ -122,6 +123,10 @@ class MoEWeights:
                 "the bf16 MoE classes take bf16 expert weights fc1 [E, N1, H], fc2 [E, H, I]"
             )
         E, N1, H = fc1.shape
+        if not 1 <= E <= MAX_E:
+            raise ValueError(
+                f"the bf16 MoE classes take 1 to {MAX_E} experts (the plan's and the grouped GEMMs' tables), got {E}"
+            )
         I = N1 // 2 if gated else N1
         if tuple(fc2.shape) != (E, H, I):
             raise ValueError(
@@ -198,9 +203,9 @@ def grouped_gemm(
     rows ``[off_e, off_e + counts[e])`` of ``a`` belong to expert ``e``). ``a [R >= Tk, K]`` bf16 row-major, ``w [E, N, K]``
     bf16 row-major; ``chain`` ``plain`` -> ``[Tk, N]`` in ``out_dtype`` (bf16 / f16 / f32), ``swiglu`` -> ``[Tk, N / 2]`` bf16
     (``w`` interleaved as :func:`interleave_fc1`), ``relu2`` -> ``[Tk, N]`` bf16 (the ungated chain). The record selects the
-    body: a dense record runs the grouped body, a swapped record (``config.swap_ab``: 128 weight rows x 8 / 16 / 32 tokens,
-    the weights on the MMA's M side, :mod:`.blocks.swap_bf16`) the swapped body on the same dense rows -- a placement, the
-    same bits. ``Tk`` (default: the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the
+    body: a dense record runs the grouped body, a swapped record (``config.swap_ab``: a 128- or 64-row weight tile x 8 / 16 /
+    32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap_bf16`) the swapped body on the same dense rows -- a
+    placement, the same bits. ``Tk`` (default: the rows of ``out``, else of ``a``) is the expanded row count; ``a`` may carry more rows (the
     swapped body's last token box then stays inside the buffer instead of being zero-filled past it). The persistent grid is a
     launch argument: the device's co-resident cluster capacity for the record's cluster size."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
@@ -215,6 +220,10 @@ def grouped_gemm(
         raise TypeError("grouped_gemm takes bf16 a [Tk, K] and w [E, N, K]")
     R, K = a.shape
     E, N, K2 = w.shape
+    if E > MAX_E:
+        raise ValueError(
+            f"grouped_gemm: {E} experts; the group tables hold at most {MAX_E}"
+        )
     if (
         K != K2
         or a.stride(1) != 1
@@ -316,6 +325,10 @@ def grouped_gemm_gather(
         )
     T, K = x.shape
     E, N, K2 = w.shape
+    if E > MAX_E:
+        raise ValueError(
+            f"grouped_gemm_gather: {E} experts; the group tables hold at most {MAX_E}"
+        )
     src = src.reshape(-1)
     if Tk is None:
         Tk = out.shape[0] if out is not None else int(src.shape[0])
@@ -386,6 +399,63 @@ def expert_bucket(E: int) -> int:
     return max(32, S.pow2ceil(E))
 
 
+def _routing_args(
+    name: str,
+    logits: torch.Tensor,
+    top_k: int,
+    method: Union[S.RoutingMethod, str],
+    bias: Optional[torch.Tensor],
+    scaling_factor: Optional[Union[float, torch.Tensor]],
+) -> Tuple[S.RoutingMethod, int, int, torch.Tensor, torch.Tensor]:
+    """The routing entry points' shared validation and constants: ``(method, T, E, bias, scale)`` for :func:`route` and
+    :func:`route_plan` (``name`` prefixes the errors). The bounds (``E <= MAX_E``: the route kernels' widest bucket is the
+    plan's table size; ``1 <= top_k <= min(E, MAX_TOP_K)``), the group rule of a group-limited method
+    (:func:`.spec.group_rule_error`: the groups a term of the DeepSeekV3 method alone, its shape rule), a bias exactly for the
+    methods that select on ``sigmoid(l) + bias`` and a scaling factor exactly for the scaled methods; a method name resolves
+    through :func:`.spec.method_named` (a grouped name as ``<method>_g<n>x<t>``); the absent bias and the unit scale are the
+    cached constants (:func:`_const`), a Python scaling factor other than ``1`` a fill per call, a one-element tensor read as
+    given."""
+    method = S.method_named(method) if isinstance(method, str) else method
+    if logits.dim() != 2 or logits.stride(1) != 1 or logits.dtype not in _IN:
+        raise TypeError(f"{name}: logits must be a row-major f32 or bf16 [T, E]")
+    T, E = logits.shape
+    if E > MAX_E:
+        raise ValueError(
+            f"{name}: {E} experts; the routing kernels score at most {MAX_E} experts"
+        )
+    if not 1 <= top_k <= min(E, S.MAX_TOP_K):
+        raise ValueError(f"{name}: top_k {top_k} must be in [1, min(E, {S.MAX_TOP_K})]")
+    rule = S.group_rule_error(method, E, top_k)
+    if rule is not None:
+        raise ValueError(
+            f"{name}: n_group {method.n_group}, topk_group {method.topk_group} over {E} experts for top_k "
+            f"{top_k}: {rule}"
+        )
+    if (bias is not None) != method.bias:
+        raise ValueError(
+            f"{name}: a bias is given iff the method selects on sigmoid(l) + bias"
+        )
+    if (scaling_factor is not None) != method.scaled:
+        raise ValueError(
+            f"{name}: a scaling factor is given iff the method scales the weights"
+        )
+    dev = logits.device
+    b = (
+        bias.to(device=dev, dtype=torch.float32).contiguous()
+        if bias is not None
+        else _const(dev, E, 0.0)
+    )
+    if tuple(b.shape) != (E,):
+        raise ValueError(f"{name}: bias must be [E] = [{E}]")
+    if scaling_factor is None:
+        s = _const(dev, 1, 1.0)
+    elif isinstance(scaling_factor, torch.Tensor):
+        s = scaling_factor.to(device=dev, dtype=torch.float32).reshape(1)
+    else:
+        s = _const(dev, 1, float(scaling_factor))
+    return method, T, E, b, s
+
+
 def route(
     logits: torch.Tensor,
     top_k: int,
@@ -397,44 +467,17 @@ def route(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(experts [T, k] int32, weights [T, k] f32)`` in slot (rank) order from ``logits [T, E]`` (f32 or bf16): the
     class's routing (:mod:`.spec`: the declared ``exp``, the strict selection order ``(score desc, index asc)`` on exact
-    binary32 scores, the method's weight formula). An expert whose selection score is NaN is never selected; when fewer
-    than ``top_k`` experts of a row have a non-NaN score, each remaining slot takes the lowest expert index the row has
-    not taken, with a NaN weight (the row's output is NaN; every id stays in ``[0, E)``). A Python ``scaling_factor``
-    other than ``1`` costs a fill per call; a one-element tensor is read as given."""
+    binary32 scores, the method's weight formula). A NaN logit is never selected and contributes nothing to the softmax
+    normalisation (its term is ``+0``; the row maximum skips it); when fewer than ``top_k`` experts of a row have a
+    non-NaN score, each remaining slot takes the lowest expert index the row has not taken, with a NaN weight (the row's
+    output is NaN; every id stays in ``[0, E)``). A Python ``scaling_factor`` other than ``1`` costs a fill per call; a
+    one-element tensor is read as given."""
     from .route import get_compiled_route
 
-    method = S.METHODS[method] if isinstance(method, str) else method
-    if logits.dim() != 2 or logits.stride(1) != 1 or logits.dtype not in _IN:
-        raise TypeError("route: logits must be a row-major f32 or bf16 [T, E]")
-    T, E = logits.shape
-    if E > 1024:
-        raise ValueError(
-            f"route: {E} experts; the route kernel scores at most 1024 experts"
-        )
-    if not 1 <= top_k <= min(E, 16):
-        raise ValueError(f"route: top_k {top_k} must be in [1, min(E, 16)]")
-    if (bias is not None) != method.bias:
-        raise ValueError(
-            "route: a bias is given iff the method selects on sigmoid(l) + bias"
-        )
-    if (scaling_factor is not None) != method.scaled:
-        raise ValueError(
-            "route: a scaling factor is given iff the method scales the weights"
-        )
-    dev = logits.device
-    b = (
-        bias.to(device=dev, dtype=torch.float32).contiguous()
-        if bias is not None
-        else _const(dev, E, 0.0)
+    method, T, E, b, s = _routing_args(
+        "route", logits, top_k, method, bias, scaling_factor
     )
-    if tuple(b.shape) != (E,):
-        raise ValueError(f"route: bias must be [E] = [{E}]")
-    if scaling_factor is None:
-        s = _const(dev, 1, 1.0)
-    elif isinstance(scaling_factor, torch.Tensor):
-        s = scaling_factor.to(device=dev, dtype=torch.float32).reshape(1)
-    else:
-        s = _const(dev, 1, float(scaling_factor))
+    dev = logits.device
     if experts is None:
         experts = torch.empty(T, top_k, dtype=torch.int32, device=dev)
     if weights is None:
@@ -471,45 +514,16 @@ def route_plan(
     padded bound's rows with ``-1`` in every padding slot, as the padded two-launch plan gives them. ``dual`` (with ``align = 1``):
     ``(..., dest_pad [T, k] int32, pos_pad [T k] int32)`` follow -- the positions with the groups padded to ``pad_align`` rows and
     the padded position of every dense row, ``permute_plan_dual``'s integers (the block-scaled classes' dense packing)."""
-    from .blocks.scheduler import MAX_E
     from .route_plan import ROUTE_PLAN_MAX_SLOTS, get_compiled_route_plan
 
-    method = S.METHODS[method] if isinstance(method, str) else method
-    if logits.dim() != 2 or logits.stride(1) != 1 or logits.dtype not in _IN:
-        raise TypeError("route_plan: logits must be a row-major f32 or bf16 [T, E]")
-    T, E = logits.shape
-    if E > MAX_E:
-        raise ValueError(
-            f"route_plan: {E} experts; the fused plan holds at most {MAX_E}"
-        )
-    if not 1 <= top_k <= min(E, 16):
-        raise ValueError(f"route_plan: top_k {top_k} must be in [1, min(E, 16)]")
+    method, T, E, b, s = _routing_args(
+        "route_plan", logits, top_k, method, bias, scaling_factor
+    )
+    dev = logits.device
     if T * top_k > ROUTE_PLAN_MAX_SLOTS:
         raise ValueError(
             f"route_plan: {T * top_k} expanded rows; the fused plan holds at most {ROUTE_PLAN_MAX_SLOTS}"
         )
-    if (bias is not None) != method.bias:
-        raise ValueError(
-            "route_plan: a bias is given iff the method selects on sigmoid(l) + bias"
-        )
-    if (scaling_factor is not None) != method.scaled:
-        raise ValueError(
-            "route_plan: a scaling factor is given iff the method scales the weights"
-        )
-    dev = logits.device
-    b = (
-        bias.to(device=dev, dtype=torch.float32).contiguous()
-        if bias is not None
-        else _const(dev, E, 0.0)
-    )
-    if tuple(b.shape) != (E,):
-        raise ValueError(f"route_plan: bias must be [E] = [{E}]")
-    if scaling_factor is None:
-        s = _const(dev, 1, 1.0)
-    elif isinstance(scaling_factor, torch.Tensor):
-        s = scaling_factor.to(device=dev, dtype=torch.float32).reshape(1)
-    else:
-        s = _const(dev, 1, float(scaling_factor))
     if align < 1 or align & (align - 1):
         raise ValueError(f"route_plan: align {align} must be a power of two")
     if dual and (align > 1 or pad_align < 2):
@@ -576,15 +590,23 @@ def permute_plan(
     the valid rows."""
     from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
 
+    if not 1 <= E <= MAX_E:
+        raise ValueError(
+            f"permute_plan: E {E} must lie in [1, {MAX_E}] (the plan kernel's expert tables)"
+        )
     T, k = experts.shape
+    if not 1 <= k <= S.MAX_TOP_K:
+        raise ValueError(
+            f"permute_plan: {k} slots per token; the kernels fold at most {S.MAX_TOP_K}"
+        )
+    flat = experts.reshape(-1)
+    if not flat.is_contiguous() or flat.dtype != torch.int32:
+        raise TypeError("permute_plan: experts must be a contiguous int32 [T, k]")
     n = T * k
     dev = experts.device
     dest = torch.empty(n, dtype=torch.int32, device=dev)
     src = torch.empty(n, dtype=torch.int32, device=dev)
     counts = torch.empty(E, dtype=torch.int32, device=dev)
-    flat = experts.reshape(-1)
-    if not flat.is_contiguous() or flat.dtype != torch.int32:
-        raise TypeError("permute_plan: experts must be a contiguous int32 [T, k]")
     if n == 0:
         counts.zero_()
         return counts, dest.view(T, k), src
@@ -652,6 +674,11 @@ def fused_moe(
         or token_selected_experts.dtype != torch.int32
     ):
         raise TypeError("fused_moe: token_selected_experts must be an int32 [T, k]")
+    if not 1 <= k <= S.MAX_TOP_K:
+        # the bound of the slots per token (a shard's k is the global routing's, so E does not bound it here)
+        raise ValueError(
+            f"fused_moe: {k} slots per token; the plan, gather and combine kernels fold at most {S.MAX_TOP_K}"
+        )
     if (
         tuple(token_final_scales.shape) != (T, k)
         or token_final_scales.dtype != torch.float32
@@ -660,6 +687,10 @@ def fused_moe(
     experts = token_selected_experts.contiguous()
     scales = token_final_scales.contiguous()
     E, I = w.num_experts, w.intermediate_size
+    if E > MAX_E:
+        raise ValueError(
+            f"fused_moe: {E} experts; the plan and the grouped GEMMs hold at most {MAX_E}"
+        )
     if out is None:
         out = torch.empty(T, H, dtype=torch.bfloat16, device=x.device)
     if (
@@ -720,6 +751,66 @@ def fused_moe(
             y=y,
             config1=config1,
             config2=config2,
+        )
+    return out
+
+
+def combine_unfinalized(
+    gemm2_output: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The class's combine over the layer's unfinalized triple (``MoEFinalizeConfig(do_finalize=False)``: ``[gemm2_output,
+    expert_weights, expanded_idx_to_permuted_idx]``): ``out[t] = cvt_bf16(fold_r add(acc, mul(f32(y[map[t, r]]), w[t, r])))``,
+    the fold in slot order from ``+0``, a dropped slot (``map = -1``) the term ``+0`` whatever its weight -- the finalized
+    layer's output bit for bit, through the combine kernel the finalized forward runs. ``gemm2_output [rows, H]`` bf16 (the
+    rows in the class's permutation), ``expert_weights [T, k]`` fp32 or bf16 (a bf16 weight widens exactly: the fold is the
+    same), ``expanded_idx_to_permuted_idx`` int32 of ``T k`` entries (flat or ``[T, k]``), each in ``[0, rows)`` or ``-1``
+    (the triple as the layer returned it; the map is not validated on the host). The receiver of expert-parallel ranks'
+    triples folds the ranks' rows the same way (one row buffer, one map, every token's ``k`` slots)."""
+    from .combine import get_compiled_combine, warps_per_token
+
+    y, w, dest = gemm2_output, expert_weights, expanded_idx_to_permuted_idx
+    if y.dtype != torch.bfloat16 or y.dim() != 2 or y.stride(1) != 1 or y.stride(0) % 8:
+        raise TypeError(
+            "combine_unfinalized: gemm2_output must be a row-major, 16-byte-aligned bf16 [rows, H]"
+        )
+    if w.dim() != 2 or w.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(
+            "combine_unfinalized: expert_weights must be an fp32 or bf16 [T, k]"
+        )
+    T, k = w.shape
+    H = y.shape[1]
+    if dest.dtype != torch.int32 or dest.numel() != T * k:
+        raise TypeError(
+            f"combine_unfinalized: expanded_idx_to_permuted_idx must be an int32 of {T} x {k} entries"
+        )
+    if not 1 <= k <= S.MAX_TOP_K:
+        raise ValueError(
+            f"combine_unfinalized: {k} slots per token; the combine kernel folds at most {S.MAX_TOP_K}"
+        )
+    if out is None:
+        out = torch.empty(T, H, dtype=torch.bfloat16, device=y.device)
+    if (
+        tuple(out.shape) != (T, H)
+        or out.dtype != torch.bfloat16
+        or out.stride(1) != 1
+        or out.stride(0) % 8
+    ):
+        raise ValueError(
+            "combine_unfinalized: out must be a row-major, 16-byte-aligned bf16 [T, H]"
+        )
+    if T:
+        get_compiled_combine(
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(y.device)), False
+        )(
+            y,
+            dest.reshape(T, k).contiguous(),
+            w.to(torch.float32).contiguous(),
+            out,
+            T,
+            H,
         )
     return out
 

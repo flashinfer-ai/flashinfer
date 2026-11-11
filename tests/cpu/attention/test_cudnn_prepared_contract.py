@@ -25,6 +25,71 @@ from flashinfer.cudnn.utils import supports_ordered_cudnn_execution
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", [92300, 92400, 92500, 92700])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("bounded", [False, True])
+@pytest.mark.parametrize("explicit_q", [False, True])
+def test_paged_explicit_lengths_preserve_token_origins_on_cudnn924(
+    monkeypatch, backend, dtype, bounded, explicit_q
+):
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(
+        prefill,
+        "cudnn",
+        SimpleNamespace(__version__="1.32.0", backend_version=lambda: backend),
+    )
+    monkeypatch.setattr(prefill, "_cudnn_supports_bounded_ragged", lambda **kw: True)
+    prefill._cudnn_supports_direct_seqlens.cache_clear()
+    try:
+        q_offsets = torch.tensor([0, 128, 256], dtype=torch.int32)
+        o_offsets = torch.tensor([1, 130, 260], dtype=torch.int32)
+        stats_offsets = torch.tensor([2, 132, 264], dtype=torch.int32)
+        q_lengths = torch.tensor([96, 112], dtype=torch.int32) if explicit_q else None
+        kv_lengths = torch.tensor([4093, 2053], dtype=torch.int32)
+        metadata = prefill._PrefillMetadata(
+            128,
+            4096,
+            True,
+            True,
+            actual_seq_lens_q=q_lengths,
+            actual_seq_lens_kv=kv_lengths,
+            batch_offsets_q=q_offsets,
+            batch_offsets_o=o_offsets,
+            batch_offsets_stats=stats_offsets,
+            block_tables=torch.empty((2, 256), dtype=torch.int32),
+            max_total_num_rows=384,
+            _bounded_paged=bounded,
+        ).resolve_from_plan(dtype, 32, 8, 128, 128, token_strides=(12288, None, None))
+        direct = backend >= 92500 or (backend == 92400 and explicit_q)
+        assert metadata._token_offsets is direct
+        assert metadata.actual_seq_lens_kv is kv_lengths
+        if explicit_q:
+            assert metadata.actual_seq_lens_q is q_lengths
+            assert metadata.cu_seq_lens_q is None
+        elif direct:
+            assert metadata.cu_seq_lens_q is q_offsets
+        for name, offsets, stride in (
+            ("batch_offsets_q", q_offsets, 12288),
+            ("batch_offsets_o", o_offsets, 4096),
+            ("batch_offsets_stats", stats_offsets, 32),
+        ):
+            resolved = getattr(metadata, name)
+            if direct:
+                assert resolved is offsets
+            else:
+                torch.testing.assert_close(resolved, offsets * stride)
+        assert metadata.max_total_num_rows == (384 if direct else None)
+        # The new prepared path must not advertise generic mixed or FP8 support.
+        assert prefill._cudnn_supports_direct_seqlens(dtype, mixed=True) == (
+            backend >= 92500
+        )
+        for fp8 in (torch.float8_e4m3fn, torch.float8_e5m2):
+            assert prefill._cudnn_supports_direct_seqlens(fp8) == (backend >= 92500)
+    finally:
+        prefill._cudnn_supports_direct_seqlens.cache_clear()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "version,backend,native,runtime,expected",
     [
@@ -36,7 +101,10 @@ from flashinfer.cudnn.utils import supports_ordered_cudnn_execution
         ("1.32.0+local", 92700, True, True, True),
         ("1.33.0.dev1", 92700, True, True, True),
         ("unknown", 92700, True, True, False),
-        ("1.32.0", 92600, True, True, False),
+        ("1.32.0", 92300, True, True, False),
+        ("1.32.0", 92400, True, True, True),
+        ("1.32.0", 92500, True, True, True),
+        ("1.32.0", 92600, True, True, True),
         ("1.32.0", 92700, False, True, False),
         ("1.32.0", 92700, True, False, False),
         ("1.32.0", 92700, True, True, True),
@@ -697,6 +765,7 @@ def test_prefill_workspace_reset_clears_preparation_history(monkeypatch, paged):
         else BatchPrefillWithRaggedKVCacheWrapper
     )
     wrapper = cls.__new__(cls)
+    wrapper._batch_invariant = None  # __init__ default without batch_invariant=True
     wrapper._cudnn_prepared = object()
     wrapper._cudnn_prepared_cache = [object(), object()]
     empty = torch.empty

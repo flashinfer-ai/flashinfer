@@ -46,6 +46,7 @@ from .cudnn.prefill import (
     _CUDNN_NATIVE_HN_SUPPORTED,
     _cudnn_single_token_gqa_ragged_stats_broken,
     _cudnn_supports_direct_seqlens,
+    _cudnn_supports_paged_token_offsets,
     _cudnn_supports_paged_auto,
     CudnnPrefillGraph,
     _PrefillMetadata,
@@ -4594,8 +4595,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 previous_cudnn_plan = self._cudnn_plan
                 self._cudnn_plan = None
                 self._cudnn_lse_unservable = False
-                if _CUDNN_GRAPH_AVAILABLE and _cudnn_supports_direct_seqlens(
-                    q_data_type, mixed=True
+                if _CUDNN_GRAPH_AVAILABLE and _cudnn_supports_paged_token_offsets(
+                    q_data_type,
+                    explicit_q=self._seq_lens_q is not None,
+                    explicit_kv=self._seq_lens_kv is not None,
                 ):
                     graph_q, graph_kv = self._cudnn_paged_bounds or (
                         self._max_q_len,
