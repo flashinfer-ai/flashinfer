@@ -9539,6 +9539,17 @@ def _cute_dsl_gemm_fp4_runner(
                     use_tma_store,
                 ) = tactic
 
+            # Non-swapped SM103 direct stores require 32-byte alignment. Use the
+            # same tile's TMA-store variant to support 16-byte-aligned outputs.
+            if (
+                kernel_type == "sm103"
+                and use_tma_store is False
+                and not swap_ab
+                and out.data_ptr() % 32 != 0
+            ):
+                use_tma_store = True
+                tactic = (*tactic[:5], True)
+
             if swap_ab:
                 kernel_m, kernel_n = n, m
                 # Swap A/B: kernel expects both mA and mB with shape (*, K).
