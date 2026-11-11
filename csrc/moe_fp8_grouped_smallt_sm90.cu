@@ -442,7 +442,7 @@ void launch_moe_grouped(const void* X, const void* W13, const float* W13S,
 
 // ---------------------------------------------------------------------------
 // Host side. `launch_moe_small` above is carried verbatim from the measured
-// kernel (H200 study re-time job 782167); the fp16 intermediate moved from a
+// kernel's same-SKU re-time; the fp16 intermediate moved from a
 // per-call torch allocation in the measured entry point to a caller-owned
 // plan-time workspace so that `run` never allocates and is CUDA-graph
 // capturable with a stable workspace pointer.
