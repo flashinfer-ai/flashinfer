@@ -493,6 +493,8 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
             if not args.no_l2_flush:
                 # Retain the allocation through the launch, as Blackwell does.
                 flush_buffer = _l2_flush()
+                if args.eager_completed_wall:
+                    torch.cuda.synchronize()
             starts[i].record()
             wall_start = time.perf_counter_ns() if args.eager_completed_wall else 0
             output = invoke()
@@ -677,6 +679,11 @@ def _testlist(args, world):
         values.update({key: value for key, value in row.items() if key != "world_size"})
         values["tokens"] = str(values["tokens"])
         case = argparse.Namespace(**values)
+        if any(
+            type(getattr(case, name)) is not int
+            for name in ("hidden", "intermediate", "num_experts", "topk", "capacity")
+        ):
+            raise ValueError("testlist dimensions and capacity must be integers")
         if (
             min(
                 case.hidden,
@@ -703,6 +710,12 @@ def _testlist(args, world):
             raise ValueError("invalid kernel variant, format or input policy")
         if case.mode != "forward" or case.knobs not in ("default", "heuristic"):
             raise ValueError("testlists require forward timing and built-in knobs")
+        if case.kernel_variant == "genphase" and (
+            case.knobs != "heuristic" or case.capacity > 1024
+        ):
+            raise ValueError(
+                "GenPhase testlists require heuristic knobs and capacity <= 1024"
+            )
         cases.append(case)
     if not cases:
         raise ValueError(f"no testlist cases for EP{world}")
@@ -817,6 +830,7 @@ def main():
         parser.error(
             "num-experts must divide across ranks and topk must be in [1, num-experts]"
         )
+    cases = _testlist(args, world)
     from flashinfer.moe_ep import (
         BootstrapConfig,
         bootstrap_moe_ep_runtime,
@@ -844,7 +858,6 @@ def main():
         if args.quant_kind == "both"
         else [args.quant_kind]
     )
-    cases = _testlist(args, world)
     environment = _environment()
     try:
         for case in cases:
@@ -868,7 +881,7 @@ def main():
                     torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                     torch_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
                 )
-                for routing in [case.routing] if case.testlist else routings:
+                for routing in routings:
                     for tokens in [int(t) for t in case.tokens.split(",")]:
                         executions = (
                             [("graph", False), ("eager", True)]

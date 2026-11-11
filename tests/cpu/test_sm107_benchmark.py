@@ -86,6 +86,37 @@ def test_testlist_rejects_invalid_contract(tmp_path, change):
         benchmark()._testlist(arguments(testlist=str(path)), 4)
 
 
+@pytest.mark.parametrize(
+    "field", ("hidden", "intermediate", "num_experts", "topk", "capacity")
+)
+@pytest.mark.parametrize("value", (True, 2048.5, None, "2048"))
+def test_testlist_requires_integer_dimensions(tmp_path, field, value):
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps([{**row(), field: value}]))
+    with pytest.raises(ValueError, match="must be integers"):
+        benchmark()._testlist(arguments(testlist=str(path)), 4)
+
+
+@pytest.mark.parametrize("knobs,capacity", [("default", 256), ("heuristic", 1025)])
+def test_testlist_rejects_unsupported_genphase_settings(tmp_path, knobs, capacity):
+    path = tmp_path / "cases.json"
+    path.write_text(
+        json.dumps([{**row(), "kernel_variant": "genphase", "capacity": capacity}])
+    )
+    with pytest.raises(ValueError, match="GenPhase testlists require"):
+        benchmark()._testlist(arguments(testlist=str(path), knobs=knobs), 4)
+
+
+@pytest.mark.parametrize("capacity", [256, 1024])
+def test_testlist_accepts_genphase_heuristics(tmp_path, capacity):
+    path = tmp_path / "cases.json"
+    path.write_text(
+        json.dumps([{**row(), "kernel_variant": "genphase", "capacity": capacity}])
+    )
+    cases = benchmark()._testlist(arguments(testlist=str(path)), 4)
+    assert len(cases) == 1 and cases[0].capacity == capacity
+
+
 def test_duplicate_ids_and_missing_ep_are_rejected(tmp_path):
     path = tmp_path / "cases.json"
     path.write_text(json.dumps([row(), row()]))
@@ -125,3 +156,87 @@ def test_genphase_heuristic_is_not_inference_heuristic():
     pkg.default_knobs.assert_called_once_with(
         256, quant_kind="nvfp4", kernel_variant="genphase"
     )
+
+
+def main_benchmark(monkeypatch):
+    bench = benchmark()
+    ep = MagicMock()
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", ep)
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep.core.runtime", MagicMock())
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe",
+        MagicMock(),
+    )
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    bench.torch.cuda.get_device_capability.return_value = (10, 7)
+    bench.torch.cuda.max_memory_allocated.return_value = 0
+    bench.torch.cuda.max_memory_reserved.return_value = 0
+    monkeypatch.setattr(bench, "_environment", lambda: {})
+    monkeypatch.setattr(bench, "_local_transformed_weights", MagicMock())
+
+    def gather(gathered, local):
+        gathered[:] = [local] * len(gathered)
+
+    bench.dist.all_gather_object.side_effect = gather
+    return bench, ep
+
+
+def test_invalid_testlist_fails_before_runtime_setup(tmp_path, monkeypatch):
+    bench, ep = main_benchmark(monkeypatch)
+    path = tmp_path / "cases.json"
+    path.write_text("[]")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["benchmark", "--testlist", str(path), "--mode", "forward"],
+    )
+    with pytest.raises(ValueError, match="no testlist cases"):
+        bench.main()
+    ep.bootstrap_moe_ep_runtime.assert_not_called()
+    bench.torch.cuda.get_device_capability.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "routing,expected",
+    [
+        ("both", ["balanced", "power_law"]),
+        ("balanced", ["balanced"]),
+        ("power_law", ["power_law"]),
+        ("gaussian", ["gaussian"]),
+    ],
+)
+def test_testlist_executes_selected_routings(tmp_path, monkeypatch, routing, expected):
+    bench, ep = main_benchmark(monkeypatch)
+    path = tmp_path / "cases.json"
+    output = tmp_path / "results.jsonl"
+    path.write_text(json.dumps([row()]))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--testlist",
+            str(path),
+            "--mode",
+            "forward",
+            "--knobs",
+            "heuristic",
+            "--routing",
+            routing,
+            "--output",
+            str(output),
+        ],
+    )
+
+    def run_case(rank, world, tokens, capacity, route, transformed, args, kind):
+        return {"routing": route, "execution": args.execution}, [1.0, 2.0]
+
+    monkeypatch.setattr(bench, "_bench_one", run_case)
+    bench.main()
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [(r["routing"], r["execution"]) for r in records] == [
+        (route, execution) for route in expected for execution in ("graph", "eager")
+    ]
+    ep.finalize_moe_ep_runtime.assert_called_once()
