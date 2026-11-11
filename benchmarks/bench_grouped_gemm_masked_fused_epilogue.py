@@ -8,6 +8,7 @@ activation or the NVFP4 GEMM2 input:
   gemm+act      gemm + ``silu_and_mul_scaled_nvfp4_experts_quantize``
   swiglu        GEMM1 with the fused SwiGLU epilogue, BF16 ``(m, I, l)`` output
   swiglu+quant  swiglu + ``scaled_fp4_grouped_quantize``
+  swiglu-nvfp4  GEMM1 with the fused SwiGLU epilogue and NVFP4 output
 
 Each expert has ``capacity_factor * tokens`` rows, ``rows_per_token * tokens``
 of them valid. Timing uses CUDA graphs with a warm L2: the weights exceed L2
@@ -66,8 +67,10 @@ def bench(args, tokens: int, b, sfb) -> dict:
     global_scale = torch.full((l,), 100.0, device=device)
     full = torch.empty(l, m, 2 * inter, dtype=torch.bfloat16, device=device)
     half = torch.empty(l, m, inter, dtype=torch.bfloat16, device=device)
+    half_fp4 = torch.empty(l, m, inter // 2, dtype=torch.uint8, device=device)
+    half_sf = torch.empty(l * m * inter // SF_VEC, dtype=torch.uint8, device=device)
 
-    def gemm(out, **kwargs):
+    def gemm(out, c_dtype="bfloat16", **kwargs):
         grouped_gemm_nt_masked(
             (a, sfa),
             (b, sfb),
@@ -75,7 +78,7 @@ def bench(args, tokens: int, b, sfb) -> dict:
             masked_m,
             ab_dtype="float4_e2m1fn",
             sf_dtype="float8_e4m3fn",
-            c_dtype="bfloat16",
+            c_dtype=c_dtype,
             sf_vec_size=SF_VEC,
             mma_tiler_mn=(128, args.tile_n),
             alpha=alpha,
@@ -96,11 +99,22 @@ def bench(args, tokens: int, b, sfb) -> dict:
         swiglu()
         scaled_fp4_grouped_quantize(half, masked_m, global_scale, nvfp4_4over6=None)
 
+    def swiglu_nvfp4():
+        gemm(
+            half_fp4,
+            c_dtype="float4_e2m1fn",
+            activation_type=ActivationType.Swiglu,
+            out_scale=half_sf,
+            global_scale=global_scale,
+            nvfp4_4over6=None,
+        )
+
     return {
         "gemm": median_us(lambda: gemm(full)),
         "gemm+act": median_us(gemm_act),
         "swiglu": median_us(swiglu),
         "swiglu+quant": median_us(swiglu_quant),
+        "swiglu-nvfp4": median_us(swiglu_nvfp4),
     }
 
 
@@ -123,21 +137,22 @@ def main():
     b, sfb = nvfp4_operand(
         args.num_experts, 2 * args.intermediate, args.hidden, torch.device("cuda")
     )
-    columns = ["gemm", "gemm+act", "swiglu", "swiglu+quant"]
+    columns = ["gemm", "gemm+act", "swiglu", "swiglu+quant", "swiglu-nvfp4"]
     print(
         "| tokens | rows/expert | "
         + " | ".join(f"{c} (us)" for c in columns)
-        + " | swiglu+quant vs gemm+act |"
+        + " | swiglu+quant vs gemm+act | swiglu-nvfp4 vs swiglu+quant |"
     )
-    print("|" + "---:|" * (len(columns) + 3))
+    print("|" + "---:|" * (len(columns) + 4))
     for tokens in args.tokens:
         t = bench(args, tokens, b, sfb)
         speedup = (1 - t["swiglu+quant"] / t["gemm+act"]) * 100
+        fused_speedup = (1 - t["swiglu-nvfp4"] / t["swiglu+quant"]) * 100
         rows = int(tokens * args.rows_per_token)
         print(
             f"| {tokens} | {rows} | "
             + " | ".join(f"{t[c]:.1f}" for c in columns)
-            + f" | {speedup:.1f}% |"
+            + f" | {speedup:.1f}% | {fused_speedup:.1f}% |"
         )
 
 
