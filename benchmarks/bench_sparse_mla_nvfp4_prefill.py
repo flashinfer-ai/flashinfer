@@ -56,6 +56,9 @@ def _median_us(fn, warmup_ms: int, measure_ms: int) -> float:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mega", action="store_true", help="Fuse Q RoPE and inverse-RoPE/FP8 output"
+    )
     parser.add_argument("--num-tokens", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=128)
     parser.add_argument("--topk", type=int, nargs="+", default=(128, 512))
@@ -81,6 +84,10 @@ def main() -> None:
         raise SystemExit("paired FP8 prefill requires --num-tokens > 64")
     if args.num_heads not in (16, 32, 64, 128):
         raise SystemExit("NVFP4 prefill supports 16/32/64/128 heads")
+    if args.mega and args.num_heads % 32:
+        raise SystemExit(
+            "Unsupported mega benchmark shape: heads must be a multiple of 32"
+        )
     if args.profile_once and len(args.topk) != 1:
         raise SystemExit("--profile-once requires exactly one --topk value")
 
@@ -194,6 +201,93 @@ def main() -> None:
                 1.0,
             )
 
+        if args.mega:
+            from flashinfer.mla import SparseMLASm120Wrapper
+
+            positions = torch.arange(args.num_tokens, device="cuda", dtype=torch.int32)
+            freq = 10000.0 ** (-torch.arange(32, device="cuda").float() / 32)
+            angles = positions.float()[:, None] * freq
+            cs = torch.cat((angles.cos(), angles.sin()), -1).contiguous()
+
+            def fused(cache_format, cache, extra, lse):
+                wrapper = SparseMLASm120Wrapper(
+                    kv_cache_format=cache_format, backend="sparse"
+                )
+                out = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+                sf = torch.empty(*q.shape[:2], 16, device="cuda", dtype=torch.uint8)
+                if cache_format == "nvfp4":
+                    from flashinfer.mla._sparse_mla_sm120._execution import (
+                        get_sparse_mla_sm120_module,
+                    )
+
+                    module = get_sparse_mla_sm120_module()
+                    props = torch.cuda.get_device_properties(q.device)
+                    plan = module.resolve_dsv4_nvfp4(
+                        args.num_tokens,
+                        args.num_heads,
+                        topk,
+                        args.extra_topk,
+                        _PAGE_SIZE,
+                        args.extra_page_size if extra is not None else 0,
+                        cache.stride(0),
+                        extra.stride(0) if extra is not None else 0,
+                        0,
+                        props.multi_processor_count,
+                        props.shared_memory_per_block_optin,
+                        True,
+                        False,
+                        False,
+                        False,
+                        False,
+                    )
+
+                def call():
+                    if cache_format == "nvfp4":
+                        module.dsv4_nvfp4_execute_attention_rope_fp8(
+                            plan,
+                            q,
+                            cache,
+                            indices,
+                            nv_out,
+                            nv_lse,
+                            nv_out,
+                            lse,
+                            sm_scale,
+                            None,
+                            None,
+                            extra,
+                            extra_indices,
+                            None,
+                            1.0,
+                            positions,
+                            cs,
+                            out.view(torch.uint8),
+                            sf,
+                        )
+                        return
+                    wrapper.run_mega(
+                        q,
+                        cache,
+                        indices,
+                        out,
+                        sm_scale,
+                        positions=positions,
+                        cos_sin=cs,
+                        output_scales=sf,
+                        extra_kv_cache=extra,
+                        extra_indices=extra_indices,
+                        out_lse=lse,
+                    )
+
+                return call, out, sf
+
+            run_fp8, fp8_quant, fp8_sf = fused(
+                "fp8", fp8_cache, fp8_extra_cache, fp8_lse
+            )
+            run_nv, nv_quant, nv_sf = fused(
+                "nvfp4", nvfp4_cache, nvfp4_extra_cache, nv_lse
+            )
+
         run_nv()
         torch.cuda.synchronize()
         if args.profile_once:
@@ -212,6 +306,15 @@ def main() -> None:
         run_fp8()
         run_nv()
         torch.cuda.synchronize()
+        if args.mega:
+            fp8_out = (
+                fp8_quant.float().reshape(*q.shape[:2], 16, 32)
+                * torch.exp2(fp8_sf.float() - 127)[..., None]
+            ).reshape_as(q)
+            nv_out = (
+                nv_quant.float().reshape(*q.shape[:2], 16, 32)
+                * torch.exp2(nv_sf.float() - 127)[..., None]
+            ).reshape_as(q)
         delta = (nv_out.float() - fp8_out.float()).abs()
         cosine = torch.nn.functional.cosine_similarity(
             nv_out.float(), fp8_out.float(), dim=-1

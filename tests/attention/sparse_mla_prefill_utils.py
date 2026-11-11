@@ -102,12 +102,14 @@ def fixture(
 ):
     from flashinfer.mla import (
         SparseMLASm120Wrapper,
+        nvfp4_quantize_pack_sparse_mla_cache,
         dsv41_fp8_quantize_pack_sparse_mla_cache,
         dsv41_fp4_quantize_pack_sparse_mla_cache,
     )
     from tests.attention.sparse_mla_test_utils import (
         quantize_kv_dsv4,
         dequantize_kv_dsv4,
+        _dequantize_nvfp4_cache,
         dequantize_kv_dsv4_1,
         dequantize_kv_dsv4_1_fp4,
     )
@@ -155,6 +157,10 @@ def fixture(
                 )
             # The same packer emits FlashMLA/vLLM's inline record ABI.
             cache = pack(kv.squeeze(2), kv_layout="NHD", inline_scale=inline)
+        elif cache_format == "nvfp4":
+            cache = nvfp4_quantize_pack_sparse_mla_cache(kv.squeeze(2), kv_layout="NHD")
+            if keep_decoded:
+                dec = _dequantize_nvfp4_cache(cache)
         else:
             cache = quantize_kv_dsv4(kv)
             if keep_decoded:
@@ -454,3 +460,68 @@ def decode_call(f, impl, mega=True):
     )
     epilogue(f["context"], f["positions"], f["cs"], f["out"], f["scales"])
     return lse
+
+
+def native_prefill_calls(f, module=None):
+    from flashinfer.jit.mla import gen_sparse_mla_sm120_module
+
+    module = module or gen_sparse_mla_sm120_module().build_and_load()
+    q, caches, indices, lengths = f["q"], f["caches"], f["indices"], f["lengths"]
+    device = torch.cuda.get_device_properties(q.device)
+    plan = module.resolve_dsv4_nvfp4(
+        q.shape[0],
+        q.shape[1],
+        indices[0].shape[1],
+        indices[1].shape[1],
+        caches[0].shape[1],
+        caches[1].shape[1],
+        caches[0].stride(0),
+        caches[1].stride(0),
+        0,
+        device.multi_processor_count,
+        device.shared_memory_per_block_optin,
+        True,
+        False,
+        lengths[0] is not None,
+        lengths[1] is not None,
+        f["sink"] is not None,
+    )
+    lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+    mid, mlse = f["context"], f["context"].view(torch.float32)
+
+    def arguments(query):
+        return (
+            plan,
+            query,
+            caches[0],
+            indices[0],
+            mid,
+            mlse,
+            f["context"],
+            lse,
+            512**-0.5,
+            lengths[0],
+            f["sink"],
+            caches[1],
+            indices[1],
+            lengths[1],
+            math.log(2),
+        )
+
+    def mega():
+        module.dsv4_nvfp4_execute_attention_rope_fp8(
+            *arguments(q),
+            f["positions"],
+            f["cs"],
+            f["out"].view(torch.uint8),
+            f["scales"],
+        )
+        return lse
+
+    def baseline():
+        f["prologue"]()
+        module.dsv4_nvfp4_execute_attention(*arguments(f["rotated"]))
+        f["post"]()
+        return lse
+
+    return mega, baseline, lse
