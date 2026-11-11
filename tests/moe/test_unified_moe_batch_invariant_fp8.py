@@ -368,6 +368,111 @@ def test_fingerprint_dimensions_and_classes():
     )
 
 
+def test_expert_and_slot_bounds_at_every_entry_point():
+    """``1 <= num_experts <= MAX_E`` and ``1 <= top_k <= min(num_experts, MAX_TOP_K)`` (the plan's and the grouped GEMMs'
+    tables, the route kernels' selection, the gather and combine kernels' fold) at the fingerprint and at every entry point of
+    the class that takes them, before any kernel: ``fused_moe_fp8``, ``grouped_gemm_fp8``, ``MoEWeightsE4M3.prepare`` /
+    ``BatchInvariantFp8PerTensorConfig.prepare_weights``; the bounds themselves are taken."""
+    from flashinfer.fused_moe.batch_invariant import api_fp8
+    from flashinfer.fused_moe.batch_invariant import spec as S
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import MAX_E
+    from flashinfer.fused_moe.batch_invariant.schedule import grouped_knobs
+
+    assert S.MAX_TOP_K == 16
+    dims = dict(H=2048, I=768, top_k=8, num_experts=128)
+    for kw in (
+        dict(top_k=17),
+        dict(top_k=0),
+        dict(top_k=9, num_experts=8),
+        dict(num_experts=MAX_E + 1),
+        dict(num_experts=0),
+    ):
+        with pytest.raises(ValueError):
+            bi.fingerprint("fused_moe_fp8", **{**dims, **kw})
+    assert bi.fingerprint(
+        "fused_moe_fp8", H=2048, I=768, top_k=16, num_experts=MAX_E
+    ).startswith("moe-")
+    e4m3, bf16 = torch.float8_e4m3fn, torch.bfloat16
+    E = MAX_E + 1
+    w1, w2 = torch.zeros(E, 32, 16, dtype=bf16), torch.zeros(E, 16, 16, dtype=bf16)
+    errors = (ValueError, bi.BatchInvariantUnsupportedError)
+    with pytest.raises(errors):
+        api_fp8.MoEWeightsE4M3.prepare(w1, w2, 1.0, 1.0)
+    with pytest.raises(errors):
+        BatchInvariantFp8PerTensorConfig.prepare_weights(
+            w1, w2, hidden_states_scale_global=1.0, intermediate_scale_global=1.0
+        )
+    xq = torch.zeros(2, 16, dtype=e4m3)
+    one = torch.ones(1)
+    with pytest.raises(ValueError):
+        api_fp8.grouped_gemm_fp8(
+            xq,
+            torch.zeros(E, 16, 16, dtype=e4m3),
+            torch.ones(E),
+            one,
+            one,
+            torch.zeros(E, dtype=torch.int32),
+            grouped_knobs()[0],
+        )
+    w4 = api_fp8.MoEWeightsE4M3.prepare(
+        torch.zeros(4, 32, 16, dtype=bf16), torch.zeros(4, 16, 16, dtype=bf16), 1.0, 1.0
+    )
+    assert w4.num_experts == 4
+    for kk in (17, 0):
+        with pytest.raises(ValueError):
+            api_fp8.fused_moe_fp8(
+                xq, torch.zeros(2, kk, dtype=torch.int32), torch.ones(2, kk), w4
+            )
+
+
+def test_ranking_is_memoised_per_token_count():
+    """``rank_grouped_fp8`` (the dispatcher's enumeration, acceptance and pricing of both fp8 record spaces) is memoised on its
+    scalar arguments (the chain a frozen dataclass): a repeated call is a cache hit returning an equal list, and
+    ``default_configs_fp8`` (the ``fused_moe_fp8`` path without records) hits twice per call; the lists are copies."""
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
+        _rank_grouped_fp8,
+        default_configs_fp8,
+        gemm1_chain,
+        rank_grouped_fp8,
+    )
+
+    _rank_grouped_fp8.cache_clear()
+    args = (7, 1536, 2048, 128, gemm1_chain("silu"), 212, "sm_107", 3)
+    a = rank_grouped_fp8(*args, n_active=56)
+    misses = _rank_grouped_fp8.cache_info().misses
+    b = rank_grouped_fp8(*args, n_active=56)
+    assert b == a and b is not a and len(a) == 3
+    assert _rank_grouped_fp8.cache_info().hits == 1
+    assert _rank_grouped_fp8.cache_info().misses == misses
+    a.clear()
+    assert rank_grouped_fp8(*args, n_active=56) == b
+    c = default_configs_fp8(1, 8, 2048, 768, 128, 212, "sm_107", True)
+    hits = _rank_grouped_fp8.cache_info().hits
+    assert default_configs_fp8(1, 8, 2048, 768, 128, 212, "sm_107", True) == c
+    assert _rank_grouped_fp8.cache_info().hits == hits + 2
+
+
+def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch):
+    """The fp8 swapped body reads the plan's group counts before its PDL wait (the predecessor's predecessor's output,
+    complete under the chain's trigger rule ``pdl.BOX_FORM_TRIGGERS``) and its builder asserts the shipped placement is one
+    of them, as the bf16 swapped body's does."""
+    from flashinfer.fused_moe.batch_invariant import pdl
+    from flashinfer.fused_moe.batch_invariant.blocks.fp8_swap_kernel import (
+        SwappedGroupedGemmFp8,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_fp8 import (
+        gemm1_chain,
+        swapped_knobs_fp8,
+    )
+
+    cfg = swapped_knobs_fp8()[0]
+    assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS
+    SwappedGroupedGemmFp8(cfg, gemm1_chain("silu"))
+    monkeypatch.setattr(pdl, "TRIGGER", "early")
+    with pytest.raises(AssertionError):
+        SwappedGroupedGemmFp8(cfg, gemm1_chain("silu"))
+
+
 def _adversarial_accumulators(limits, n_random: int, seed: int) -> torch.Tensor:
     f32 = torch.float32
     inf = torch.tensor(float("inf"), dtype=f32)
@@ -1216,7 +1321,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     )
     # expert groups with a method other than DeepSeekV3 have no meaning in the module: the layer builds, the logits mode
     # refuses them, pre-routed ids never consult them (the bits of the ungrouped layer on the same ids and weights); the
-    # DeepSeekV3 group shape rule is checked at construction
+    # DeepSeekV3 group shape rule is refused at the from-logits call too (the pre-routed modes never consult the term)
     grouped = MoELayer(
         MoEConfig(
             routing=RoutingConfig(
@@ -1247,23 +1352,24 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         (8, 1, 9),
         (32, 4, 1),
     ):
-        with pytest.raises(errors) as excinfo:
-            MoELayer(
-                MoEConfig(
-                    routing=RoutingConfig(
-                        num_experts=E,
-                        top_k=kk,
-                        method=RoutingMethodType.DeepSeekV3,
-                        n_group=n_group,
-                        topk_group=topk_group,
-                        routed_scaling_factor=1.0,
-                    ),
-                    quant=quant,
-                    experts=experts,
-                    backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)),
+        shaped = MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(
+                    num_experts=E,
+                    top_k=kk,
+                    method=RoutingMethodType.DeepSeekV3,
+                    n_group=n_group,
+                    topk_group=topk_group,
+                    routed_scaling_factor=1.0,
                 ),
-                device=torch.device("cuda"),
-            )
+                quant=quant,
+                experts=experts,
+                backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)),
+            ),
+            device=torch.device("cuda"),
+        )
+        with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+            shaped(_logits_pack(xq, logits), W)
         assert "n_group" in str(excinfo.value) or "top_k" in str(excinfo.value), (
             n_group,
             topk_group,
@@ -1271,6 +1377,132 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         )
     out = layer(_logits_pack(xq[:0], logits[:0]), W)
     assert out.shape == (0, H) and out.dtype == torch.bfloat16
+
+
+@needs_device
+def test_pre_routed_layers_build_under_any_routing_term():
+    """A routing term the from-logits mode has no class for (``DeepSeekV3`` with more groups than the kernels hold,
+    ``Llama4`` with ``top_k > 1``) does not refuse the layer at construction: the pre-routed modes never consult it, so the
+    layer runs pre-routed (unpacked and packed) with the bits of the plain fp8 layer on the same ids and weights, and refuses
+    from logits with the term's limit (the bf16 runner's rule, inherited)."""
+    k, H, I, E = 6, 512, 256, 64
+    x, logits, w1, w2, m_x = _problem(16, k, H, I, E, seed=13, adversarial=True)
+    xq = _xq(x, m_x)
+    W = _weights(w1, w2, m_x)
+    quant = QuantConfig(
+        weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+    )
+    for routing, what, kk in (
+        (
+            RoutingConfig(
+                num_experts=E,
+                top_k=k,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=32,
+                topk_group=4,
+                routed_scaling_factor=1.0,
+            ),
+            "n_group",
+            k,
+        ),
+        (
+            RoutingConfig(num_experts=E, top_k=2, method=RoutingMethodType.Llama4),
+            "Llama4",
+            2,
+        ),
+    ):
+        layer = MoELayer(
+            MoEConfig(
+                routing=routing,
+                quant=quant,
+                experts=ExpertConfig(intermediate_size=I),
+                backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)),
+                execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=16),
+            ),
+            device=torch.device("cuda"),
+        )
+        plain = _layer(kk, E, I, tune_max=16)
+        ids, weights = _reference_route(logits, kk, RoutingMethodType.Renormalize)
+        ids, weights = ids.cuda(), weights.cuda()
+        for packed in (False, True):
+            assert torch.equal(
+                bits(layer(_routed_pack(xq, ids, weights, packed=packed), W)),
+                bits(plain(_routed_pack(xq, ids, weights, packed=packed), W)),
+            ), (what, packed)
+        with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+            layer(_logits_pack(xq, logits), W)
+        assert what in str(excinfo.value), what
+
+
+@needs_device
+def test_packed_weights_round_in_the_combine_kernel():
+    """The packed pre-routed mode's f32 weights enter the fold as their bf16 rounding (the packed word's value), rounded by
+    the combine kernel: the bits equal the unpacked mode on the host-rounded weights, and differ from the unpacked mode on
+    the unrounded f32 weights where the rounding moves a weight."""
+    k, H, I, E = 4, 512, 256, 32
+    x, logits, w1, w2, m_x = _problem(24, k, H, I, E, seed=21, adversarial=True)
+    xq = _xq(x, m_x)
+    W = _weights(w1, w2, m_x)
+    layer = _layer(k, E, I)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda().float()
+    packed = layer(_routed_pack(xq, ids, weights, packed=True), W)
+    rounded = layer(_routed_pack(xq, ids, weights.to(torch.bfloat16).float()), W)
+    assert torch.equal(bits(packed), bits(rounded))
+    assert torch.equal(
+        bits(layer(_routed_pack(xq, ids, weights.to(torch.bfloat16), packed=True), W)),
+        bits(packed),
+    )
+    assert not torch.equal(weights, weights.to(torch.bfloat16).float())
+
+
+@needs_device
+def test_nan_logits_follow_the_shared_route_kernels_rule():
+    """The from-logits path of this backend is the shared route kernel's, its NaN rule included: a NaN logit is never
+    selected (the row maximum skips it, its softmax term is ``+0``, its selection score NaN), a row with fewer than ``top_k``
+    finite logits takes the lowest untaken experts with NaN weights and its output is NaN, a row with exactly ``top_k`` finite
+    logits selects them in the strict order, and the rows without a NaN keep the class's bits (the pre-routed path on the exact
+    CPU model's ids and weights) -- in the fused route + plan form and the two-launch form."""
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec as S
+
+    k, H, I, E = 8, 512, 256, 64
+    keep = {
+        1: 3,
+        5: 0,
+        9: 1,
+        7: k,
+    }  # token -> its finite logits (7: a boundary row, k of them)
+    for T in (12, 40):
+        x, logits, w1, w2, m_x = _problem(T, k, H, I, E, seed=5, adversarial=True)
+        logits = logits.clone()
+        finite = {}
+        for t, m in keep.items():
+            cols = torch.randperm(E, generator=torch.Generator().manual_seed(t))[:m]
+            finite[t] = cols.tolist()
+            mask = torch.ones(E, dtype=torch.bool)
+            mask[cols] = False
+            logits[t, mask.cuda()] = float("nan")
+        xq, W, layer = _xq(x, m_x), _weights(w1, w2, m_x), _layer(k, E, I)
+        out = layer(_logits_pack(xq, logits), W)
+        assert torch.equal(bits(layer(_logits_pack(xq, logits), W)), bits(out))
+        logits_c = logits.cpu()
+        for t, cols in finite.items():
+            sel, ws = R.route_exact(logits_c[t].tolist(), k, S.SOFTMAX_RENORM)
+            order = sorted(cols, key=lambda e: (-float(logits_c[t, e]), e))
+            assert sel[: len(cols)] == order and all(0 <= e < E for e in sel), t
+            if len(cols) < k:
+                assert torch.isnan(out[t]).all(), t
+            else:
+                assert not torch.isnan(out[t]).any(), t
+        clean = torch.tensor([t not in keep or keep[t] == k for t in range(T)])
+        idx = clean.nonzero().flatten()
+        ref_ids, ref_w = _reference_route(
+            logits_c[idx], k, RoutingMethodType.Renormalize
+        )
+        xq_clean = xq.view(torch.uint8)[idx.cuda()].view(torch.float8_e4m3fn)
+        ref = layer(_routed_pack(xq_clean, ref_ids.cuda(), ref_w.cuda()), W)
+        assert torch.equal(bits(out[idx.cuda()]), bits(ref))
 
 
 @needs_device

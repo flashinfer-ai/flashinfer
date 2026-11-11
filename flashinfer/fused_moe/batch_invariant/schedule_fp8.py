@@ -11,6 +11,7 @@ body's acceptance. Numerics-neutral: every record of the space computes the clas
 
 from __future__ import annotations
 
+import functools
 from typing import List, Optional, Tuple
 
 from ...gemm.batch_invariant.generator import Knobs
@@ -126,7 +127,29 @@ def rank_grouped_fp8(
     at the format's element width, rounded to three significant digits; each tile family priced once at the enumeration's raster
     and the grouped scheduler's structural raster first among its twins; each of the best ceil(k/2) records is followed by its
     raster twin, then the rank order fills the list: distinct records, at most ``k``, never empty for an implementable shape.
-    Numerics-neutral: every record of either space computes the class."""
+    Numerics-neutral: every record of either space computes the class. Memoised on its arguments (all hashable scalars; the
+    chain is a frozen dataclass): the runner ranks at every forward without a tactic, once per token count."""
+    return list(
+        _rank_grouped_fp8(
+            rows, N, K, E, chain, sm_count, family, k, nominal, n_active, swap
+        )
+    )
+
+
+@functools.lru_cache(maxsize=16384)
+def _rank_grouped_fp8(
+    rows: int,
+    N: int,
+    K: int,
+    E: int,
+    chain: Fp8Chain,
+    sm_count: Optional[int],
+    family: Optional[str],
+    k: int,
+    nominal: bool,
+    n_active: Optional[int],
+    swap: Optional[bool],
+) -> Tuple[Knobs, ...]:
     import dataclasses
 
     from ...gemm.batch_invariant.heuristic import decode_sane
@@ -193,7 +216,7 @@ def rank_grouped_fp8(
         if rec not in seen:
             out.append(rec)
             seen.add(rec)
-    return out[:k]
+    return tuple(out[:k])
 
 
 def default_configs_fp8(

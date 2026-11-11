@@ -254,6 +254,10 @@ def grouped_gemm_fp8(
         raise TypeError("grouped_gemm_fp8 takes e4m3 a [Tk, K] and w [E, N, K]")
     R, K = a.shape
     E, N, K2 = w.shape
+    if E > MAX_E:
+        raise ValueError(
+            f"grouped_gemm_fp8: {E} experts; the group tables hold at most {MAX_E}"
+        )
     if Tk is None:
         Tk = out.shape[0] if out is not None else R
     if not 0 <= Tk <= R:
@@ -337,11 +341,14 @@ def fused_moe_fp8(
     config2: Optional[Knobs] = None,
     return_intermediates: bool = False,
     plan: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    w_round: bool = False,
 ):
     """The W8A8 MoE FFN for pre-routed tokens: ``xq [T, H]`` e4m3 (the caller's static quantization, ``x = q / m_x``),
     ``token_selected_experts [T, k]`` int32, ``token_final_scales [T, k]`` fp32; ``out[t] = sum_r w[t, r] * y_r`` with the class's
     chains and rounding (:mod:`.spec_fp8`), the ``k`` slots folded in slot order in fp32 and converted once. ``config1`` /
-    ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by default)."""
+    ``config2``: the grouped records (any record of the space gives the same bits; the dispatcher's pick by default).
+    ``w_round``: the f32 weights enter the fold as their bf16 rounding (the pre-routed packed-word convention), by the combine
+    kernel. An id outside ``[0, E)`` is a dropped slot (the term ``+0``), as in the bf16 op."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import get_compiled_gather, warps_per_row
     from .schedule_fp8 import default_configs_fp8
@@ -371,6 +378,10 @@ def fused_moe_fp8(
         or token_final_scales.dtype != torch.float32
     ):
         raise TypeError("fused_moe_fp8: token_final_scales must be a float32 [T, k]")
+    if not 1 <= k <= S.MAX_TOP_K:
+        raise ValueError(
+            f"fused_moe_fp8: {k} slots per token; the plan, gather and combine kernels fold at most {S.MAX_TOP_K}"
+        )
     experts = token_selected_experts.contiguous()
     scales = token_final_scales.contiguous()
     E, I = w.num_experts, w.intermediate_size
@@ -427,7 +438,7 @@ def fused_moe_fp8(
     )  # [Tk, H] bf16
     if T:
         get_compiled_combine(
-            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev))
+            k, "bf16", "bf16", warps_per_token(T, H, sm_count_of(dev)), w_round
         )(y, dest, scales, out, T, H)
     if return_intermediates:
         return out, dict(

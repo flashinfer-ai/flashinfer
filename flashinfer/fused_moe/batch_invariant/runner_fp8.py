@@ -6,9 +6,12 @@
 The surface is TRTLLM-Gen's fp8 per-tensor one: e4m3 activations (quantized by the caller with the static multiplier
 ``hidden_states_scale_global``, no activation scale tensor in the pack), the weights prepared from the bf16 experts with the
 two calibrated multipliers, every routing input mode (``FromLogits`` runs the class's own routing kernel), every typed
-activation of the layer. The combine is the slot-order fp32 fold (``do_finalize=True`` only), the tactics are the ranked fp8
-grouped records (any tactic gives the same bits), and an unsupported configuration raises
-:class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+activation of the layer. The combine is the slot-order fp32 fold (``do_finalize=True`` only: the unfinalized triple is
+refused), the experts are the dense set (an expert-parallel shard is refused: the class's EP form is not part of this
+backend), the tactics are the ranked fp8 grouped records (any tactic gives the same bits), and an unsupported configuration
+raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back. As in the bf16 runner, a
+routing term the from-logits mode has no class for is refused at the from-logits call, not at construction (the pre-routed
+modes never consult it), and a NaN logit follows the shared route kernel's rule.
 """
 
 from __future__ import annotations
@@ -23,9 +26,9 @@ from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
 from .runner import (
     MOE_BF16_ARCHS,
     BatchInvariantMoeRunner,
+    _PackedInputs,
     _configs_from_tactic,
     _tactic,
-    routing_term,
 )
 
 CLASS = "moe.e4m3"
@@ -71,15 +74,22 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
                 "a positive multiple of 16 (16-byte e4m3 rows)",
             )
         routing = cfg.routing
-        if not 1 <= routing.top_k <= min(routing.num_experts, 16):
+        from .blocks.scheduler import MAX_E
+        from .spec import MAX_TOP_K
+
+        if not 1 <= routing.top_k <= min(routing.num_experts, MAX_TOP_K):
             raise unsupported(
-                CLASS, f"top_k {routing.top_k}", "1 <= top_k <= min(num_experts, 16)"
+                CLASS,
+                f"top_k {routing.top_k}",
+                f"1 <= top_k <= min(num_experts, {MAX_TOP_K})",
             )
-        if not 1 <= routing.num_experts <= 1024:
+        if not 1 <= routing.num_experts <= MAX_E:
             raise unsupported(
-                CLASS, f"num_experts {routing.num_experts}", "1 <= num_experts <= 1024"
+                CLASS,
+                f"num_experts {routing.num_experts}",
+                f"1 <= num_experts <= {MAX_E}",
             )
-        self._method, self._grouped_other = routing_term(routing, CLASS)
+        self._routing_term(routing, CLASS)
         if experts.local_expert_offset or (
             experts.local_num_experts not in (None, 0, routing.num_experts)
         ):
@@ -110,6 +120,7 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
 
         cfg = self.config
         plan: List[torch.Tensor] = []
+        w_round = False
         x = act.hidden_states_q
         if x.dtype != torch.float8_e4m3fn or x.ndim != 2:
             raise unsupported(
@@ -162,6 +173,10 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
                     "the groups with DeepSeekV3, or pre-routed ids",
                 )
             if self._method is None:
+                # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
+                refusal = getattr(self, "_logits_refusal", None)
+                if refusal is not None:
+                    raise refusal
                 raise unsupported(
                     CLASS,
                     f"routing method {cfg.routing.method!r} from logits",
@@ -174,9 +189,7 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
                     "a routing bias" if bias is not None else "no routing bias",
                     "a bias exactly for the methods that select on sigmoid(l) + bias",
                 )
-            scale = cfg.routing.routed_scaling_factor if self._method.scaled else None
-            if self._method.scaled and scale is None:
-                scale = 1.0
+            scale = self._scale_tensor() if self._method.scaled else None
             from .blocks.scheduler import MAX_E
             from .route_plan import ROUTE_PLAN_MAX_SLOTS, ROUTE_PLAN_MAX_TOKENS
 
@@ -204,24 +217,29 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
             ids = act.topk_ids.contiguous()
             wts = act.topk_weights
             if mode is RoutingInputMode.PackedPrecomputed:
-                wts = wts.to(
-                    torch.bfloat16
-                )  # the packed word carries the weight as bf16
+                # the packed word carries the weight as bf16: f32 weights are rounded by the combine kernel itself (no host
+                # pass over the slots), bf16 ones widen exactly
+                w_round = wts.dtype != torch.bfloat16
             wts = wts.to(torch.float32).contiguous()
         out = torch.empty(T, x.shape[1], dtype=torch.bfloat16, device=x.device)
-        return [
-            x,
-            ids,
-            wts,
-            w.w1q,
-            w.w2q,
-            w.s_w1,
-            w.s_w2,
-            w.s_x,
-            w.s_inter,
-            w.m_inter,
-            out,
-        ] + plan
+        packed = _PackedInputs(
+            [
+                x,
+                ids,
+                wts,
+                w.w1q,
+                w.w2q,
+                w.s_w1,
+                w.s_w2,
+                w.s_x,
+                w.s_inter,
+                w.m_inter,
+                out,
+            ]
+            + plan
+        )
+        packed.w_round = w_round
+        return packed
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _ranked(self, T: int) -> Tuple[list, list]:
@@ -293,5 +311,15 @@ class BatchInvariantFp8PerTensorRunner(BatchInvariantMoeRunner):
         w = MoEWeightsE4M3(
             w1q, w2q, s_w1, s_w2, s_x, s_inter, m_inter, a.gated, a.act, a.params
         )
-        fused_moe_fp8(x, ids, wts, w, out=out, config1=c1, config2=c2, plan=plan)
+        fused_moe_fp8(
+            x,
+            ids,
+            wts,
+            w,
+            out=out,
+            config1=c1,
+            config2=c2,
+            plan=plan,
+            w_round=getattr(inputs, "w_round", False),
+        )
         return out

@@ -46,6 +46,7 @@ from ....gemm.batch_invariant.blocks.operands import (
     StaticPlan,
 )
 from ....gemm.batch_invariant.generator import TILES_N_NARROW, Knobs, MainloopBlock
+from .. import pdl
 from ..spec_fp8 import w8a8_alpha
 from .epilogue import BAR_EPI_JOIN, GROUP, MoeF32, fragment_offsets
 from .fp8_epilogue import Fp8Chain, _chain_elem
@@ -119,6 +120,13 @@ class SwappedGroupedGemmFp8:
         )
         self.knobs, self.chain = knobs, chain
         self.token_tile, self.weight_tile = knobs.tile_n, knobs.tile_m
+        # the box form reads the group counts before its wait (the kernel body): a placement that triggers before its wait
+        # would let this grid launch before the plan completed (pdl.BOX_FORM_TRIGGERS, as the bf16 swapped body)
+        assert pdl.TRIGGER in pdl.BOX_FORM_TRIGGERS, (
+            "the fp8 swapped box form reads the plan's counts before its PDL wait: it compiles under the trigger placements "
+            f"{pdl.BOX_FORM_TRIGGERS} only",
+            pdl.TRIGGER,
+        )
 
     @cute.jit
     def __call__(
