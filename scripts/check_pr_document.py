@@ -52,6 +52,23 @@ def archive_revision(revision: str, destination: Path) -> None:
             archive.extractall(destination)
 
 
+def normalize_legacy_base_docs(source: Path) -> None:
+    """Expose historical guidance to the current checker in the base archive."""
+    legacy = source / "CLAUDE.md"
+    agents = source / "AGENTS.md"
+    redirect = (
+        "This repository’s agent instructions live in [CLAUDE.md](./CLAUDE.md).\n\n"
+        "Before making changes, read `CLAUDE.md` and follow its guidance for build, "
+        "test, style, and contribution workflows."
+    )
+    # Only the known pre-migration redirect (or an absent file) needs adapting.
+    # Substantive AGENTS.md content must win over a leftover legacy file.
+    if legacy.is_file() and (
+        not agents.exists() or agents.read_text(encoding="utf-8").strip() == redirect
+    ):
+        agents.write_bytes(legacy.read_bytes())
+
+
 def run_checker(source: Path, output: Path, label: str) -> None:
     output.mkdir(parents=True, exist_ok=True)
     env = os.environ | {
@@ -170,6 +187,7 @@ def main() -> int:
         temp_root = Path(temp)
         base_src, head_src = temp_root / "base", temp_root / "head"
         archive_revision(base, base_src)
+        normalize_legacy_base_docs(base_src)
         archive_revision(args.head, head_src)
         base_out, head_out = temp_root / "base-out", temp_root / "head-out"
         run_checker(base_src, base_out, "pr-base")

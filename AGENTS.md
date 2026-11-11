@@ -326,7 +326,7 @@ def test_hopper_attention():
 |---------|--------|----------------|
 | FlashAttention-3 | SM90a | `is_sm90a_supported()` |
 | MLA Attention | SM100a | `is_sm100a_supported()` |
-| FP8 GEMM | SM89+ | `get_compute_capability()[0] >= 9` |
+| FP8 GEMM | SM89+ | `get_compute_capability(device) >= (8, 9)` |
 
 **Note:** `tests/conftest.py` auto-skips tests that trigger OOM, but tests should be written to avoid OOM by using appropriate problem sizes.
 
