@@ -43,6 +43,7 @@ from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
 from flashinfer.gemm.batch_invariant import tuning
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
+    SWAP_K_BLOCK,
     Knobs,
     enumerate_space,
     knob_product,
@@ -1217,6 +1218,8 @@ def test_exact_single_product_step():
             Knobs((256, 128), (2, 1), True, True, "n", 2),
             Knobs((128, 64), (1, 2), False, True, "m", 1),
         ]
+        # the class's own swapped record: the SM107 class stages its swapped records at 256 elements
+        swapped_fmt = dataclasses.replace(swapped, k_block=SWAP_K_BLOCK.get(fmt, 0))
         for ea, eb in (
             (127, 127),
             (127 - 30, 127 + 20),
@@ -1263,7 +1266,7 @@ def test_exact_single_product_step():
                     alpha_t(1.0),
                     out_dtype=torch.float32,
                     in_fmt=fmt,
-                    config=swapped,
+                    config=swapped_fmt,
                 )
                 assert torch.equal(bits(o), bits(outs[0][rows])), (fmt, ea, eb, r0)
 
