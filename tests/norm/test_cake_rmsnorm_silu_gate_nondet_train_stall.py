@@ -93,7 +93,11 @@ every architecture and on sm_107a also before it; grid kind
 the fused backward's grid and block
 schedule, and adds each claimed chunk's weight-gradient terms exactly into
 fixed-point digits of the workspace, so its ``dw`` depends on the rows and
-the SM count only.
+the SM count only.  Packed rows of its last band from
+``LONG_BACKWARD_ROWS_PER_SM`` rows per SM on (2560 on SM100 and SM103, 1536
+on SM107) run its long role (``bwd_bf16_rep_long``: the deterministic
+package's look-ahead program of the same build, the same grid, block
+schedule and bits).
 Beside a long-resident
 one-thread kernel on another stream each call must keep its speed: per token
 count, the median of seven event-timed calls with the side kernel resident is
@@ -108,7 +112,8 @@ fold buffer, 8192 bytes, the 7 64-bit windows of each of the 128 columns,
 7168 bytes, and the run cell, the arrival flag and the 8-entry claim table,
 160 bytes, 15520 bytes rounded up), each CTA of the row-claims backwards
 20736 bytes, each CTA of the fused backward 20736 bytes and each CTA of the
-repeatable backward 26368 bytes, so a side kernel holding every SM with a
+repeatable backward and of its long role 26368 bytes, so a side kernel
+holding every SM with a
 small carveout can
 delay its start until the side kernel exits (no test here asserts that delay;
 documented in :mod:`flashinfer.cake_rmsnorm_silu_gate_nondet_train`).  The
@@ -137,8 +142,11 @@ The token counts give each CTA of a module's one-wave grid (``ctas_per_sm *
 N`` CTAs; blocks of 8 rows of a chunked backward, of 16 rows of a row-claims
 backward) 16, 32 and 160 row blocks, in the first band of a BF16 weight
 gradient whose module ``BACKWARD_BANDS`` routes at those rows (the
-repeatable backward at all three: from 1024 rows per SM); their rows have
-more chunks or blocks than the grid has CTAs.  The same bound holds at the
+repeatable backward at all three: from 1024 rows per SM; its long role where
+those rows reach its ``LONG_BACKWARD_ROWS_PER_SM``: at 160 on every
+architecture and at 32 too on SM107); their rows have
+more chunks or blocks than the grid has CTAs.  So does the long role at the
+first whole tokens one row block past its first rows.  The same bound holds at the
 edges of the bands, every size derived from
 ``BACKWARD_BANDS`` and the device's SM count: in each static multi-chunk
 band (a static backward's band that holds rows with more chunks than its
@@ -238,7 +246,7 @@ import statistics
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_silu_gate_nondet_train")
 loader = cake_package("cake_rmsnorm_silu_gate_nondet_train", "cake_jit")
@@ -726,9 +734,11 @@ def _dw_repeats(name: str) -> bool:
 
 def _rep(name: str) -> bool:
     """Whether the backward module ``name`` is the repeatable backward
-    (``bwd_bf16_rep``): the deterministic package's BF16 backward program,
-    whose ``dx``, ``dz`` and ``dw`` are that package's bits."""
-    return loader.MODULES[name]["role"] == "bwd_bf16_rep"
+    (``bwd_bf16_rep``) or its long role (``bwd_bf16_rep_long``, packed rows
+    from ``LONG_BACKWARD_ROWS_PER_SM`` rows per SM on): the deterministic
+    package's BF16 backward program or its look-ahead program of the same
+    bits, whose ``dx``, ``dz`` and ``dw`` are that package's bits."""
+    return loader.MODULES[name]["role"] in ("bwd_bf16_rep", "bwd_bf16_rep_long")
 
 
 def _fused(name: str) -> bool:
@@ -743,22 +753,30 @@ def _fused(name: str) -> bool:
 # row arithmetic the fused backward runs (the same build of the same row
 # operations: ``dx`` and ``dz`` bit for bit).
 DET_FUSED_DIGEST = "8a6cb16beff15b6ffbfe"
+# The name digest of the deterministic package's look-ahead BF16 backward
+# program (its long role, the same build with the same bits), which the
+# repeatable backward's long role runs.
+DET_LONG_DIGEST = "fef9d1cc2cc267219992"
 
 
 def _det_routes_same_program() -> bool:
     """Whether the deterministic package's BF16 backward on the current device
-    is the program of ``DET_FUSED_DIGEST``; once that package ships another
-    BF16 backward, the ``dx`` and ``dz`` bits of the two packages need not
-    agree."""
+    is the program of ``DET_FUSED_DIGEST`` and its long role, where it routes
+    one, the program of ``DET_LONG_DIGEST`` (the same bits); once that
+    package ships another BF16 backward, the ``dx`` and ``dz`` bits of the
+    two packages need not agree."""
     arch, _sms = _device()
-    return det_loader.ROUTES[arch]["bwd_bf16"].endswith(f"_{DET_FUSED_DIGEST}")
+    routes = det_loader.ROUTES[arch]
+    long = routes.get("bwd_bf16" + det_loader.LONG, f"_{DET_LONG_DIGEST}")
+    same = routes["bwd_bf16"].endswith(f"_{DET_FUSED_DIGEST}")
+    return same and long.endswith(f"_{DET_LONG_DIGEST}")
 
 
 def _backward_with(module: str, dy, x, z, w, dw, workspace):
     """One backward into ``dw`` that runs the module ``module`` whatever its
-    rows (``module_for_rows`` replaced for the call)."""
+    rows and layout (``module_for_rows`` replaced for the call)."""
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(pkg, "module_for_rows", lambda *_args: module)
+        patch.setattr(pkg, "module_for_rows", lambda *_args, **_kwargs: module)
         return backward(dy, x, z, w, EPS, grad_weight=dw, workspace=workspace)
 
 
@@ -940,8 +958,9 @@ def _band_kind(name: str) -> str:
     ``"fused"`` (``bwd_bf16_fused``, of grid kind ``row_claims`` too: the
     deterministic package's row arithmetic and block schedule, whose CTAs
     claim runs of 16-row blocks where the rows have more blocks than the grid
-    has CTAs) or ``"repeatable"`` (``bwd_bf16_rep``, grid kind
-    ``claimed_row_blocks``: the deterministic package's program, the same
+    has CTAs) or ``"repeatable"`` (``bwd_bf16_rep`` and its long role
+    ``bwd_bf16_rep_long``, grid kind ``claimed_row_blocks``: the
+    deterministic package's program and its look-ahead program, the same
     schedule)."""
     record = loader.MODULES[name]
     kind = record["grid_rule"]["kind"]
@@ -986,16 +1005,21 @@ def _claim_tokens(blocks_per_cta: int) -> tuple[int, str, float]:
     bands) that runs the most tokens ``T`` whose ``T * H`` rows give each CTA
     of its own one-wave grid (``backward_ctas``: ``ctas_per_sm`` CTAs per SM)
     at most ``blocks_per_cta`` of its row blocks, rows with more chunks or
-    blocks than that grid has CTAs, and the share of one row block of each of
-    its CTAs in the call alone (``_block_share``); skips where no band's
-    module runs its own such rows."""
+    blocks than that grid has CTAs (or of its long role, which runs these
+    packed rows in its place from ``LONG_BACKWARD_ROWS_PER_SM`` rows per SM
+    on with the same grid), and the share of one row block of each of its
+    CTAs in the call alone (``_block_share``); skips where no band's module
+    runs its own such rows."""
     arch, sms = _device()
     for _first, _last, name in _band_rows(arch, "bwd_bf16", sms):
         if _band_kind(name) == "cluster":
             continue
         wave = loader.backward_ctas(name, loader.INT32_MAX, sms)
         tokens = blocks_per_cta * wave * _rows_per_block(name) // H
-        if loader.module_for_rows(arch, "bwd_bf16", tokens * H, sms) == name:
+        long = loader.ROUTES[arch].get(loader.MODULES[name]["role"] + loader.LONG)
+        got = loader.module_for_rows(arch, "bwd_bf16", tokens * H, sms)
+        if got in (name, long):
+            name = got
             break
     else:
         pytest.skip(
@@ -1261,6 +1285,35 @@ def test_repeatable_backward_band_edges_slow_in_proportion_to_the_sms_held(
         ctas,
         threads,
         dw_dtype,
+    )
+
+
+# The repeatable backward's long role (``bwd_bf16_rep_long``) beside the item 1
+# side kernels, by the same bound: packed rows one row block past its first
+# rows (``LONG_BACKWARD_ROWS_PER_SM * SMs``), as whole tokens of H heads; its
+# CTAs claim 16-row blocks at run time, many a CTA of its one-wave grid.
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+def test_repeatable_backward_long_role_slows_in_proportion_to_the_sms_held(
+    ctas: int, threads: int
+) -> None:
+    arch, sms = _device()
+    name = loader.ROUTES[arch]["bwd_bf16_rep_long"]
+    start = loader.LONG_BACKWARD_ROWS_PER_SM[arch]["bwd_bf16_rep"] * sms
+    tokens = -(-(start + _rows_per_block(name)) // H)
+    rows = tokens * H
+    assert loader.module_for_rows(arch, "bwd_bf16", rows, sms) == name, rows
+    wave = loader.backward_ctas(name, rows, sms)
+    assert wave == loader.backward_ctas(name, loader.INT32_MAX, sms), (rows, wave)
+    assert _work_units(name, rows) > wave, (arch, rows, name, wave)
+    _backward_slows_in_proportion(
+        "repeatable_long",
+        tokens,
+        name,
+        _block_share(name, rows, sms),
+        ctas,
+        threads,
     )
 
 

@@ -30,7 +30,7 @@ and the other names without a mode word) fail at import: no alias, no compat
 module.  The facade imports its backend package on first use, so ``import
 flashinfer`` loads no module of it; the family's ``flashinfer`` top-level names
 are rows of the lazy-export table ``flashinfer._LAZY_EXPORTS``.  The shared
-checks of the mode-in-name rule (``tests/test_helpers/cake_mode_names.py``) run
+checks of the mode-in-name rule (``tests/cake/test_helpers/cake_mode_names.py``) run
 over both namespaces; the checks here add what is particular to this family.
 The JIT library names (``cake_gated_act_mxfp8_<hash>``) are build identities,
 not Python names, and are unchanged.
@@ -50,7 +50,7 @@ import pytest
 import flashinfer
 import flashinfer.cake_gated_act_mxfp8_det_train as facade
 import flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train as backend
-from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
 
 pytestmark = pytest.mark.cpu_only
 

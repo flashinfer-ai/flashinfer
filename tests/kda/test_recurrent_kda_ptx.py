@@ -1,3 +1,4 @@
+# Copyright 2026 Co-developed by KDA (Kernel Design Agents)
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,21 +22,24 @@ import torch
 
 from flashinfer import RecurrentKDAPrefillWorkspace, recurrent_kda
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.kda_prefill import _make_inputs
+from tests.kda.test_helpers.kda_prefill import _make_inputs
 
 pytest.importorskip("tvm_ffi")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or get_compute_capability(torch.device("cuda")) != (10, 3),
-    reason="Requires SM103 and ptxas >= 13.2",
+    reason="Requires SM103",
 )
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _require_ptxas():
-    from flashinfer.kda_kernels.ptx.static_runtime import _ptxas
+    """Require the assembler only when the driver cannot JIT the retained PTX."""
+    from flashinfer.kda_kernels.ptx.static_runtime import _image_kind, _ptxas
 
+    if _image_kind() == "driver_ptx":
+        return
     try:
         _ptxas()
     except RuntimeError as exc:
@@ -200,9 +204,19 @@ def test_ptx_kda_small_norms():
 
 @pytest.mark.parametrize(
     "heads,lengths",
-    [(64, (37, 65)), (64, (1024,) * 8), (96, (1024,) * 8), (64, (256,)), (96, (256,))],
+    [
+        (64, (37, 65)),
+        (64, (256,)),
+        (96, (256,)),
+        *[
+            (h, lens)
+            for h in (64, 96)
+            for lens in ((8192,), (1300, 547, 2048, 963, 271, 3063), (1024,) * 8)
+        ],
+    ],
 )
 def test_ptx_kda_graph_and_stream(heads, lengths):
+    """Replay every supported layout with changed inputs on a nondefault stream."""
     inputs = _inputs(lengths, heads, len(lengths) > 1)
     output = torch.empty_like(inputs["q"])
     initial = inputs["initial_state"].clone()
@@ -409,3 +423,30 @@ def test_ptx_raw_launch_eager_capture_replay(heads):
 def test_ptx_rejects_too_few_total_tokens():
     with pytest.raises(ValueError, match="T>=32"):
         _call(_inputs((2,)))
+
+
+@pytest.mark.parametrize("heads", [64, 96])
+def test_optimized_preparation_preserves_aliased_state(heads):
+    from flashinfer.kda_kernels.ptx.optimized_launch import OptimizedLaunch
+
+    inputs = _inputs((8192,), heads)
+    original = inputs["initial_state"].clone()
+    OptimizedLaunch(
+        **inputs,
+        scale=128**-0.5,
+        out=torch.empty_like(inputs["q"]),
+        final_state=inputs["initial_state"],
+        offsets=[0, 8192],
+    )
+    torch.testing.assert_close(inputs["initial_state"], original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("image_kind", ["driver_ptx", "assembled_cubin"])
+def test_ptx_image_rejects_unsupported_device_before_loading(image_kind, monkeypatch):
+    """Both loader formats reject unsupported hardware before reading an image."""
+    from flashinfer.kda_kernels.ptx import static_runtime
+
+    monkeypatch.setattr(static_runtime, "_image_kind", lambda: image_kind)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    with pytest.raises(RuntimeError, match="targets sm_103a.*sm_100"):
+        static_runtime._kernel_image("no_image_should_be_opened")

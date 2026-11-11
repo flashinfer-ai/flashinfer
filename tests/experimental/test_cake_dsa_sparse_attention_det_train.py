@@ -28,7 +28,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
+from tests.experimental.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
     make_inputs,
     make_nope_inputs,
     reference_fp64,
@@ -36,7 +36,7 @@ from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import 
     rel_l2,
     rel_l2_rows,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_sparse_attention_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_dsa_sparse_attention_det_train", "cake_jit")
@@ -129,11 +129,98 @@ def test_backward_stage_order_is_fixed():
     # the RoPE program's key-range-pass stages (in place of bwd_main on a multi-pass backward), after the others
     assert cake_jit.KEY_PASS_STAGES == ("bwd_compact", "bwd_main_pass")
     rope = cake_jit.registered_stages(cake_jit.PROGRAM)
-    extra = [s for s in rope if s not in cake_jit.STAGES]
+    alternates = set(cake_jit.PACK27_STAGES.values())
+    alternates |= set(cake_jit.ACCUMULATE_STAGES.values())
+    extra = [s for s in rope if s not in cake_jit.STAGES and s not in alternates]
     assert extra in ([], list(cake_jit.KEY_PASS_STAGES)), extra
     assert not set(cake_jit.KEY_PASS_STAGES) & set(
         cake_jit.registered_stages(cake_jit.NOPE_PROGRAM)
     )
+    # the pack27 builds of the row bound and its grid (in place of bwd_bound / bwd_grid on the backwards of
+    # 2 ** 26 <= T * topk < 2 ** 27 pair slots), after every other stage of each program
+    assert cake_jit.PACK27_STAGES == {
+        "bwd_bound": "bwd_bound_pack27",
+        "bwd_grid": "bwd_grid_pack27",
+    }
+    for program in cake_jit.PROGRAMS:
+        registered = cake_jit.registered_stages(program)
+        want = [
+            cake_jit.stage_name(s, program) for s in cake_jit.PACK27_STAGES.values()
+        ]
+        got = [s for s in registered if s in want]
+        assert got in ([], want), (program, got)
+
+
+@pytest.mark.parametrize("program", ["rope", "nope"])
+def test_pack27_stages_replace_the_pack_stages_by_shape(program):
+    """The backward runs the pack27 row bound and grid in place of the pack builds exactly when ``2 ** 26 <= T *
+    topk < 2 ** 27`` (the shapes alone choose: no tensor value, so a captured graph keeps its stages)."""
+    name = cake_jit.PROGRAM if program == "rope" else cake_jit.NOPE_PROGRAM
+    if not all(
+        cake_jit.stage_name(s, name) in cake_jit.registered_stages(name)
+        for s in cake_jit.PACK27_STAGES.values()
+    ):
+        pytest.skip("the registered program has no pack27 stages")
+    order = cake_jit.BACKWARD_STAGES_OF[name]
+    bound, grid = (cake_jit.stage_name(s, name) for s in cake_jit.PACK27_STAGES)
+    swapped = tuple(
+        cake_jit.stage_name(cake_jit.PACK27_STAGES.get(s, s), name)
+        for s in cake_jit.BACKWARD_STAGES
+    )
+    topk = 2048
+    for T, want in (
+        ((1 << 26) // topk - 1, order),
+        ((1 << 26) // topk, swapped),
+        ((1 << 27) // topk - 1, swapped),
+        ((1 << 27) // topk, order),
+    ):
+        got = cake_backend._pack27_order(order, name, T, topk)
+        assert got == want, (T, got)
+        assert (bound in got) == (want == order) and (grid in got) == (want == order)
+
+
+def test_token_order_follows_the_plan_and_architecture_table():
+    """Descending token order exactly for a single key pass of the (plan, arch) pairs of DESCENDING_TOKEN_PLANS (both
+    plans on sm_103a and sm_107a); ascending on sm_100a and for every multi-pass backward."""
+    plans = {(p, a) for p in ("rope", "nope") for a in ("sm_103a", "sm_107a")}
+    assert plans == cake_backend.DESCENDING_TOKEN_PLANS
+    for plan in ("rope", "nope"):
+        for arch in ("sm_100a", "sm_103a", "sm_107a"):
+            down = (plan, arch) in cake_backend.DESCENDING_TOKEN_PLANS
+            want = (99, -1) if down else (0, 1)
+            got = cake_backend.token_order(100, arch, True, plan)
+            assert (got["token_base"], got["token_step"]) == want, (plan, arch)
+            multi = cake_backend.token_order(100, arch, False, plan)
+            assert (multi["token_base"], multi["token_step"]) == (0, 1)
+
+
+def test_nope_pipe_stages_run_on_their_architectures_only():
+    """The pipelined NoPE row bounds replace ``nope_bwd_bound`` / ``nope_bwd_bound_pack27`` on
+    ``cake_jit.NOPE_PIPE_ARCHES`` (the architecture alone chooses) and ship no library on any other architecture."""
+    name = cake_jit.NOPE_PROGRAM
+    registered = cake_jit.registered_stages(name)
+    if not all(s in registered for s in cake_jit.NOPE_PIPE_STAGES.values()):
+        pytest.skip("the registered NoPE program has no pipelined row bound")
+    topk = 2048
+    for T in (4096, (1 << 26) // topk):
+        order = cake_backend._pack27_order(cake_jit.NOPE_BACKWARD_STAGES, name, T, topk)
+        for arch in cake_jit.record(name)["arches"]:
+            got = cake_backend._nope_pipe_order(order, name, arch)
+            if arch in cake_jit.NOPE_PIPE_ARCHES:
+                want = tuple(cake_jit.NOPE_PIPE_STAGES.get(s, s) for s in order)
+                assert got == want and got != order, (T, arch, got)
+            else:
+                assert got == order, (T, arch, got)
+    for stage in cake_jit.NOPE_PIPE_STAGES.values():
+        assert cake_jit.stage_arches(stage, name) == cake_jit.NOPE_PIPE_ARCHES
+        for arch in cake_jit.record(name)["arches"]:
+            if arch in cake_jit.NOPE_PIPE_ARCHES:
+                assert cake_jit.library_name(stage, arch, name).endswith(f"_{arch}")
+            else:
+                with pytest.raises(RuntimeError):
+                    cake_jit.library_name(stage, arch, name)
+    rope = tuple(cake_jit.BACKWARD_STAGES)
+    assert cake_backend._nope_pipe_order(rope, cake_jit.PROGRAM, "sm_100a") == rope
 
 
 # The rows of the A/B whose key row exceeds the L2 formula's one pass, and their pass counts under the
@@ -1829,8 +1916,12 @@ def test_nonfinite_dout_writes_nan_rows(nope, mode, value):
 @pytest.mark.parametrize("form", ["rope", "rope_acc_map", "nope", "nope_acc"])
 def test_autograd_step_does_not_synchronize(form):
     """An autograd step (forward + backward) of the entries makes no pageable host-to-device copy, no synchronizing
-    call, and returns while device work queued before it still runs (``tests/test_helpers/cake_host_sync.py``)."""
-    from tests.test_helpers.cake_host_sync import census, nonblocking, summary
+    call, and returns while device work queued before it still runs (``tests/experimental/test_helpers/cake_host_sync.py``)."""
+    from tests.experimental.test_helpers.cake_host_sync import (
+        census,
+        nonblocking,
+        summary,
+    )
 
     nope = form.startswith("nope")
     _require_program(
@@ -1880,7 +1971,11 @@ def test_autograd_step_does_not_synchronize(form):
 
 
 def test_runner_step_does_not_synchronize_or_allocate():
-    from tests.test_helpers.cake_host_sync import census, nonblocking, summary
+    from tests.experimental.test_helpers.cake_host_sync import (
+        census,
+        nonblocking,
+        summary,
+    )
 
     _require_program(backward=True)
     inp = make_inputs([256], [1024], seed=SEED + 28, topk=256)

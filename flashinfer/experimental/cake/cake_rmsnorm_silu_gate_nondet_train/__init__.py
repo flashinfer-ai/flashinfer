@@ -237,15 +237,21 @@ Host design (the input layout rules are the deterministic package's):
   blocks from the claim counter.  The fused backward (every architecture)
   runs 256-thread CTAs of 16-row blocks and launches ``G = min(blocks, 4 *
   SMs)`` CTAs, which claim the blocks in chunks when there are more blocks
-  than CTAs; so does the repeatable backward (every architecture), whose
-  chunks' rows the row count and ``G`` fix.
+  than CTAs; so do the repeatable backward and its long program (every
+  architecture), whose chunks' rows the row count and ``G`` fix.
   ``cake_jit.BACKWARD_BANDS`` routes the
   backward modules of a role by the rows (``T * H``), the first band that
   holds (small-row bands by a count of rows, the others by rows per SM): the
   small-row backwards, then for a BF16 weight gradient the fused backward
   past them up to a count of rows per SM and the repeatable backward past
   it (on sm_107a the repeatable backward up to 64 rows per SM, the fused
-  backward up to 256 and the repeatable backward past it); for an FP32
+  backward up to 256 and the repeatable backward past it), and in the
+  repeatable backward's place, where ``grad_out``, ``x`` and ``z`` hold
+  packed rows (all three head strides 128 and token strides ``H * 128``,
+  the kernels' own test; a single token's stride, passed as 0, is not) from
+  ``cake_jit.LONG_BACKWARD_ROWS_PER_SM`` rows per SM (2560 on sm_100a and
+  sm_103a, 1536 on sm_107a), its long program (``bwd_bf16_rep_long``, its
+  look-ahead loop: the same bits, grid and workspace); for an FP32
   weight gradient a static
   backward up to at most 4 row blocks a
   CTA (256 rows per SM; on sm_107a over 4 window copies plus occupancy words,
@@ -880,6 +886,24 @@ def _workspace_views(
     return views
 
 
+def _backward_packed(
+    heads: int,
+    dy_tok: int,
+    dy_head: int,
+    x_tok: int,
+    x_head: int,
+    z_tok: int,
+    z_head: int,
+) -> bool:
+    """Whether the backward kernels read ``grad_out``, ``x`` and ``z`` (their
+    token and head strides as ``_kernel_view`` passes them) as packed rows:
+    all three head strides 128 and all three token strides ``heads * 128``,
+    the kernels' own test (a single token's stride, passed as 0, is not)."""
+
+    row = heads * HEAD_DIM
+    return dy_head == x_head == z_head == HEAD_DIM and dy_tok == x_tok == z_tok == row
+
+
 def _backward(
     grad_out: torch.Tensor,
     x: torch.Tensor,
@@ -942,7 +966,8 @@ def _backward(
     zv, z_tok, z_head = _kernel_view(z, "z", shape=shape, device=device)
     sm_count = device_sm_count(_device_index(device))
     role = "bwd_f32" if dw is not None and dw.dtype == torch.float32 else "bwd_bf16"
-    name = module_for_rows(arch, role, rows, sm_count)
+    packed = _backward_packed(heads, dy_tok, dy_head, x_tok, x_head, z_tok, z_head)
+    name = module_for_rows(arch, role, rows, sm_count, packed=packed)
     ctas = backward_ctas(name, rows, sm_count)
     buffers: dict[str, Optional[torch.Tensor]] = {
         "dw_win": None,

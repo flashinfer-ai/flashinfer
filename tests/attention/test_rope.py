@@ -16,8 +16,8 @@ limitations under the License.
 
 import pytest
 import torch
-from tests.test_helpers.rope_reference import *
-from tests.test_helpers.parametrize import (
+from tests.attention.test_helpers.rope_reference import *
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
@@ -373,6 +373,381 @@ def test_rope_cos_sin_cache(
         query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
+
+
+# Rotary dims the vector path cannot take. 16, 48, 80, 40 and 24: half of rotary_dim is not a
+# multiple of the 16-lane vector. 96, 192 and 768: a token's threads span two warps, which matters
+# in place. (64, 20), (128, 24), (128, 40) and (512, 48): the same limit on the dedicated head sizes.
+_ROPE_DIMS_OFF_THE_VECTOR_PATH = [
+    (16, 16),
+    (48, 48),
+    (80, 80),
+    (40, 40),
+    (24, 24),
+    (100, 40),
+    (100, 32),
+    (80, 20),
+    (80, 32),
+    (96, 96),
+    (192, 192),
+    (768, 768),
+    (64, 20),
+    (128, 24),
+    (128, 40),
+    (512, 48),
+]
+
+
+@pytest.mark.parametrize("head_size, rotary_dim", _ROPE_DIMS_OFF_THE_VECTOR_PATH)
+@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("inplace", [True, False])
+def test_rope_cos_sin_cache_any_rotary_dim(
+    head_size, rotary_dim, is_neox_style, dtype, inplace
+):
+    device = "cuda"
+    torch.manual_seed(0)
+    # Enough tokens that some of them straddle a warp boundary.
+    num_tokens, num_q_heads, num_kv_heads = 64, 4, 2
+    rope_ref = RotaryEmbedding(
+        head_size, rotary_dim, num_tokens, 10000, is_neox_style, torch.float32, device
+    )
+    pos_ids = torch.arange(num_tokens, device=device)
+    # One row more than the kernel gets, to catch a write past the last head.
+    query_buffer = torch.randn(
+        num_tokens + 1, num_q_heads * head_size, dtype=dtype, device=device
+    )
+    key_buffer = torch.randn(
+        num_tokens + 1, num_kv_heads * head_size, dtype=dtype, device=device
+    )
+    query, key = query_buffer[:num_tokens], key_buffer[:num_tokens]
+    query_ref, key_ref = rope_ref.forward_native(pos_ids, query, key)
+    query_guard, key_guard = query_buffer[-1].clone(), key_buffer[-1].clone()
+
+    if inplace:
+        flashinfer.apply_rope_with_cos_sin_cache_inplace(
+            pos_ids, query, key, head_size, rope_ref.cos_sin_cache, is_neox_style
+        )
+        query_out, key_out = query, key
+    else:
+        query_in, key_in = query.clone(), key.clone()
+        query_out, key_out = flashinfer.apply_rope_with_cos_sin_cache(
+            pos_ids, query, key, head_size, rope_ref.cos_sin_cache, is_neox_style
+        )
+        assert torch.equal(query, query_in) and torch.equal(key, key_in)
+
+    atol = 8 * torch.finfo(dtype).eps
+    torch.testing.assert_close(query_out.float(), query_ref, atol=atol, rtol=0)
+    torch.testing.assert_close(key_out.float(), key_ref, atol=atol, rtol=0)
+    assert torch.equal(query_buffer[-1], query_guard)
+    assert torch.equal(key_buffer[-1], key_guard)
+
+
+@pytest.mark.parametrize("head_size", [96, 768, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_rope_cos_sin_cache_inplace_token_across_warps(head_size, dtype):
+    device = "cuda"
+    torch.manual_seed(0)
+    num_tokens, num_q_heads, num_kv_heads = 64, 4, 2
+    rope_ref = RotaryEmbedding(
+        head_size, head_size, num_tokens, 10000, True, torch.float32, device
+    )
+    pos_ids = torch.arange(num_tokens, device=device)
+    query = torch.randn(num_tokens, num_q_heads * head_size, dtype=dtype, device=device)
+    key = torch.randn(num_tokens, num_kv_heads * head_size, dtype=dtype, device=device)
+    query_ref, key_ref = rope_ref.forward_native(pos_ids, query, key)
+    atol = 8 * torch.finfo(dtype).eps
+    # A thread can read its partner after another warp stores over it, so only some calls go wrong.
+    for _ in range(31):
+        query_out, key_out = query.clone(), key.clone()
+        flashinfer.apply_rope_with_cos_sin_cache_inplace(
+            pos_ids, query_out, key_out, head_size, rope_ref.cos_sin_cache, True
+        )
+        torch.testing.assert_close(query_out.float(), query_ref, atol=atol, rtol=0)
+        torch.testing.assert_close(key_out.float(), key_ref, atol=atol, rtol=0)
+
+
+@pytest.mark.parametrize("head_size", [64, 96])
+@pytest.mark.parametrize("is_neox_style", [True, False])
+def test_rope_cos_sin_cache_tensor_not_16b_aligned(head_size, is_neox_style):
+    device = "cuda"
+    torch.manual_seed(0)
+    num_tokens, num_q_heads, num_kv_heads = 21, 4, 2
+    rope_ref = RotaryEmbedding(
+        head_size, head_size, num_tokens, 10000, is_neox_style, torch.float32, device
+    )
+    pos_ids = torch.arange(num_tokens, device=device)
+    # Dropping the first element keeps the tensors contiguous but moves them off 16 bytes.
+    query = torch.randn(
+        num_tokens * num_q_heads * head_size + 1, dtype=torch.bfloat16, device=device
+    )[1:].view(num_tokens, -1)
+    key = torch.randn(
+        num_tokens * num_kv_heads * head_size + 1, dtype=torch.bfloat16, device=device
+    )[1:].view(num_tokens, -1)
+    query_ref, key_ref = rope_ref.forward_native(pos_ids, query, key)
+    flashinfer.apply_rope_with_cos_sin_cache_inplace(
+        pos_ids, query, key, head_size, rope_ref.cos_sin_cache, is_neox_style
+    )
+    atol = 8 * torch.finfo(torch.bfloat16).eps
+    torch.testing.assert_close(query.float(), query_ref, atol=atol, rtol=0)
+    torch.testing.assert_close(key.float(), key_ref, atol=atol, rtol=0)
+
+
+@pytest.mark.parametrize("head_size", [64, 96])
+@pytest.mark.parametrize("is_neox_style", [True, False])
+def test_rope_cos_sin_cache_cache_not_16b_aligned(head_size, is_neox_style):
+    device = "cuda"
+    torch.manual_seed(0)
+    num_tokens, num_q_heads, num_kv_heads = 21, 4, 2
+    rope_ref = RotaryEmbedding(
+        head_size, head_size, num_tokens, 10000, is_neox_style, torch.float32, device
+    )
+    cache = rope_ref.cos_sin_cache
+    # One float off the 16-byte boundary, with the same contents.
+    shifted_cache = torch.empty(cache.numel() + 1, dtype=torch.float32, device=device)[
+        1:
+    ].view(cache.shape)
+    shifted_cache.copy_(cache)
+    pos_ids = torch.arange(num_tokens, device=device)
+    query = torch.randn(
+        num_tokens, num_q_heads * head_size, dtype=torch.bfloat16, device=device
+    )
+    key = torch.randn(
+        num_tokens, num_kv_heads * head_size, dtype=torch.bfloat16, device=device
+    )
+    query_ref, key_ref = rope_ref.forward_native(pos_ids, query, key)
+    flashinfer.apply_rope_with_cos_sin_cache_inplace(
+        pos_ids, query, key, head_size, shifted_cache, is_neox_style
+    )
+    atol = 8 * torch.finfo(torch.bfloat16).eps
+    torch.testing.assert_close(query.float(), query_ref, atol=atol, rtol=0)
+    torch.testing.assert_close(key.float(), key_ref, atol=atol, rtol=0)
+
+
+@pytest.mark.parametrize("head_size, rotary_dim", [(64, 25), (96, 25), (96, 0)])
+def test_rope_cos_sin_cache_rejects_bad_rotary_dim(head_size, rotary_dim):
+    device = "cuda"
+    num_tokens = 4
+    pos_ids = torch.arange(num_tokens, device=device)
+    query = torch.zeros(num_tokens, head_size, dtype=torch.bfloat16, device=device)
+    key = torch.zeros(num_tokens, head_size, dtype=torch.bfloat16, device=device)
+    cache = torch.zeros(num_tokens, rotary_dim, dtype=torch.float32, device=device)
+    with pytest.raises(RuntimeError, match="even"):
+        flashinfer.apply_rope_with_cos_sin_cache_inplace(
+            pos_ids, query, key, head_size, cache, True
+        )
+
+
+@pytest.mark.parametrize(
+    "rope_dim, no_rope_dim",
+    [(16, 48), (48, 16), (80, 16), (40, 24), (24, 72), (96, 32), (64, 64)],
+)
+@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("attention_type", ["mla", "gqa"])
+def test_rope_quantize_fp8_any_rope_dim(
+    rope_dim, no_rope_dim, is_neox_style, attention_type
+):
+    device = "cuda"
+    torch.manual_seed(0)
+    num_tokens, num_qo_heads, num_kv_heads, page_size = 37, 4, 2, 16
+    quant_dtype = torch.float8_e4m3fn
+    head_dim = rope_dim + no_rope_dim
+    rope_ref = RotaryEmbedding(
+        head_dim, rope_dim, num_tokens, 10000, is_neox_style, torch.float32, device
+    )
+    pos_ids = torch.arange(num_tokens, device=device)
+    q_in = torch.randn(
+        num_tokens, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_shape = (num_tokens, head_dim)
+    if attention_type == "gqa":
+        k_shape = (num_tokens, num_kv_heads, head_dim)
+    k_in = torch.randn(*k_shape, dtype=torch.bfloat16, device=device)
+    q_ref, k_ref = rope_ref.forward_native(pos_ids, q_in, k_in)
+    # Distinct scales, so a kernel that applies the wrong one fails.
+    quant_scale_q, quant_scale_kv = 2.0, 0.5
+    q_ref = (q_ref * quant_scale_q).to(quant_dtype).float()
+    k_ref = (k_ref * quant_scale_kv).to(quant_dtype).float()
+
+    # rope_quantize_fp8 stores to caller-owned output tensors, with a row to spare.
+    q_out = torch.zeros(num_tokens + 1, num_qo_heads, head_dim, dtype=quant_dtype)
+    k_out = torch.zeros(num_tokens + 1, *k_shape[1:], dtype=quant_dtype)
+    q_out, k_out = q_out.to(device), k_out.to(device)
+    flashinfer.rope.rope_quantize_fp8(
+        q_in[..., :rope_dim],
+        k_in[..., :rope_dim],
+        q_in[..., rope_dim:],
+        k_in[..., rope_dim:],
+        rope_ref.cos_sin_cache,
+        pos_ids,
+        is_neox=is_neox_style,
+        q_rope_out=q_out[:num_tokens, ..., :rope_dim],
+        k_rope_out=k_out[:num_tokens, ..., :rope_dim],
+        q_nope_out=q_out[:num_tokens, ..., rope_dim:],
+        k_nope_out=k_out[:num_tokens, ..., rope_dim:],
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+    )
+    torch.testing.assert_close(q_out[:num_tokens].float(), q_ref, atol=0.5, rtol=0.25)
+    torch.testing.assert_close(k_out[:num_tokens].float(), k_ref, atol=0.5, rtol=0.25)
+    assert not q_out[num_tokens].float().any() and not k_out[num_tokens].float().any()
+
+    # The fused append path stores K into the paged cache. It rejects other sizes up front.
+    if rope_dim % 16 != 0 or no_rope_dim % 16 != 0:
+        return
+    num_pages = (num_tokens + page_size - 1) // page_size
+    page_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    page_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    batch_indices = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    page_iter = positions // page_size
+    entry_idx = positions % page_size
+    # One float off the 16-byte boundary, with the same contents.
+    shifted_cache = torch.empty(
+        rope_ref.cos_sin_cache.numel() + 1, dtype=torch.float32, device=device
+    )[1:].view(rope_ref.cos_sin_cache.shape)
+    shifted_cache.copy_(rope_ref.cos_sin_cache)
+    for cos_sin_cache in (rope_ref.cos_sin_cache, shifted_cache):
+        if attention_type == "mla":
+            kpe_cache = torch.zeros(num_pages, page_size, rope_dim, dtype=quant_dtype)
+            ckv_cache = torch.zeros(
+                num_pages, page_size, no_rope_dim, dtype=quant_dtype
+            )
+            cache = (ckv_cache.to(device), kpe_cache.to(device))
+            v_in = None
+        else:
+            k_cache = torch.zeros(
+                num_pages, page_size, num_kv_heads, head_dim, dtype=quant_dtype
+            )
+            cache = (k_cache.to(device), k_cache.to(device).clone())
+            v_in = torch.randn(*k_shape, dtype=torch.bfloat16, device=device)
+        q_rope_out, q_nope_out = (
+            flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
+                q_in[..., :rope_dim],
+                k_in[..., :rope_dim],
+                q_in[..., rope_dim:],
+                k_in[..., rope_dim:],
+                v_in,
+                cos_sin_cache,
+                pos_ids,
+                cache,
+                page_indices,
+                page_indptr,
+                batch_indices,
+                positions,
+                page_size=page_size,
+                quantize_dtype=quant_dtype,
+                quant_scale_q=quant_scale_q,
+                quant_scale_kv=quant_scale_kv,
+                is_neox=is_neox_style,
+            )
+        )
+        torch.testing.assert_close(
+            torch.cat([q_rope_out, q_nope_out], dim=-1).float(),
+            q_ref,
+            atol=0.5,
+            rtol=0.25,
+        )
+        k_cached = (
+            torch.cat(
+                [
+                    cache[1][page_iter, entry_idx],
+                    cache[0][page_iter, entry_idx],
+                ],
+                dim=-1,
+            )
+            if attention_type == "mla"
+            else cache[0][page_iter, entry_idx]
+        )
+        torch.testing.assert_close(k_cached.float(), k_ref, atol=0.5, rtol=0.25)
+        if attention_type == "gqa":
+            v_ref = (v_in * quant_scale_kv).to(quant_dtype).float()
+            torch.testing.assert_close(
+                cache[1][page_iter, entry_idx].float(), v_ref, atol=0.5, rtol=0.25
+            )
+
+
+def _rope_quantize_by_lane_args(call):
+    """The by_lane template argument of each RopeQuantizeKernel that ``call`` launches."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    try:
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            call()
+            torch.cuda.synchronize()
+    except Exception as ex:  # noqa: BLE001 - profiler unavailable on this host
+        pytest.skip(f"torch.profiler unavailable: {ex}")
+    names = [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    if not names:
+        pytest.skip("torch.profiler captured no device events")
+    # RopeQuantizeKernel<interleave, by_lane, vec_size, bdx, DType, IdType, QuantType>
+    return [
+        name.split("RopeQuantizeKernel<", 1)[1].split(",")[1].strip()
+        for name in names
+        if "RopeQuantizeKernel<" in name
+    ]
+
+
+@pytest.mark.parametrize("num_tokens", [1, 32])
+@pytest.mark.parametrize("is_neox_style", [True, False])
+@pytest.mark.parametrize("attention_type", ["mla", "gqa"])
+def test_rope_quantize_fp8_none_nope_takes_vector_path(
+    num_tokens, is_neox_style, attention_type
+):
+    device = "cuda"
+    torch.manual_seed(0)
+    num_qo_heads, rope_dim = 32, 128
+    quant_dtype = torch.float8_e4m3fn
+    rope_ref = RotaryEmbedding(
+        rope_dim, rope_dim, num_tokens, 10000, is_neox_style, torch.float32, device
+    )
+    pos_ids = torch.arange(num_tokens, device=device)
+    q_rope = torch.randn(
+        num_tokens, num_qo_heads, rope_dim, dtype=torch.bfloat16, device=device
+    )
+    k_shape = (num_tokens, rope_dim)
+    if attention_type == "gqa":
+        k_shape = (num_tokens, 8, rope_dim)
+    k_rope = torch.randn(*k_shape, dtype=torch.bfloat16, device=device)
+    q_ref, k_ref = rope_ref.forward_native(pos_ids, q_rope, k_rope)
+    quant_scale_q, quant_scale_kv = 2.0, 0.5
+    q_ref = (q_ref * quant_scale_q).to(quant_dtype).float()
+    k_ref = (k_ref * quant_scale_kv).to(quant_dtype).float()
+    if num_tokens == 1:
+        # A token stride off 16 bytes, which the kernel never uses with one token.
+        q_rope = q_rope.as_strided(q_rope.shape, (1, rope_dim, 1))
+
+    def run(q):
+        return flashinfer.rope.rope_quantize_fp8(
+            q,
+            k_rope,
+            None,
+            None,
+            rope_ref.cos_sin_cache,
+            pos_ids,
+            is_neox=is_neox_style,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+        )
+
+    q_rope_out, k_rope_out, q_nope_out, k_nope_out = run(q_rope)
+    assert q_nope_out.shape[-1] == 0 and k_nope_out.shape[-1] == 0
+    torch.testing.assert_close(q_rope_out.float(), q_ref, atol=0.5, rtol=0.25)
+    torch.testing.assert_close(k_rope_out.float(), k_ref, atol=0.5, rtol=0.25)
+    # Control: Q one element off 16 bytes takes the element-wise kernel.
+    q_shifted = torch.empty(q_rope.numel() + 1, dtype=q_rope.dtype, device=device)
+    q_shifted = q_shifted[1:].view(q_rope.shape)
+    q_shifted.copy_(q_rope)
+    q_rope_out, k_rope_out, _, _ = run(q_shifted)
+    torch.testing.assert_close(q_rope_out.float(), q_ref, atol=0.5, rtol=0.25)
+    torch.testing.assert_close(k_rope_out.float(), k_ref, atol=0.5, rtol=0.25)
+
+    # None nope tensors become zero-width ones, which no block touches: keep the vector path.
+    assert _rope_quantize_by_lane_args(lambda: run(q_rope)) == ["false"]
+    assert _rope_quantize_by_lane_args(lambda: run(q_shifted)) == ["true"]
 
 
 def _run_rope_variant(kernel, q, k, pos_ids, indptr, offsets, cos_sin_cache, inplace):
@@ -1910,6 +2285,97 @@ def test_rope_quantize_fp8_cutile_rejects_unsupported(unsupported):
     expected = ValueError if unsupported == "bad_backend" else NotImplementedError
     with pytest.raises(expected):
         flashinfer.rope.rope_quantize_fp8(**kwargs)
+
+
+ROPE_BOUND_HEAD_DIM = 64
+
+# Every public RoPE entry point, in-place and out-of-place. ``uses_pos_ids`` picks
+# the ``pos_ids`` signature over the ``indptr``/``offsets`` one.
+ROPE_ENTRY_POINTS = [
+    (flashinfer.apply_rope_inplace, False),
+    (flashinfer.apply_rope_pos_ids_inplace, True),
+    (flashinfer.apply_llama31_rope_inplace, False),
+    (flashinfer.apply_llama31_rope_pos_ids_inplace, True),
+    (flashinfer.apply_rope, False),
+    (flashinfer.apply_rope_pos_ids, True),
+    (flashinfer.apply_llama31_rope, False),
+    (flashinfer.apply_llama31_rope_pos_ids, True),
+]
+ROPE_ENTRY_POINT_IDS = [
+    "apply_rope_inplace",
+    "apply_rope_pos_ids_inplace",
+    "apply_llama31_rope_inplace",
+    "apply_llama31_rope_pos_ids_inplace",
+    "apply_rope",
+    "apply_rope_pos_ids",
+    "apply_llama31_rope",
+    "apply_llama31_rope_pos_ids",
+]
+
+
+def _rope_bound_inputs(
+    device, q_head_dim=ROPE_BOUND_HEAD_DIM, k_head_dim=None, dtype=torch.float16
+):
+    """A single-sequence ragged batch: ``indptr`` has ``batch_size + 1`` entries and
+    ``offsets`` has ``batch_size`` entries."""
+    if k_head_dim is None:
+        k_head_dim = q_head_dim
+    nnz, nheads = 2, 2
+    q = torch.zeros((nnz, nheads, q_head_dim), dtype=dtype, device=device)
+    k = torch.zeros((nnz, nheads, k_head_dim), dtype=dtype, device=device)
+    indptr = torch.tensor([0, nnz], dtype=torch.int32, device=device)
+    offsets = torch.zeros((1,), dtype=torch.int32, device=device)
+    pos_ids = torch.arange(nnz, dtype=torch.int32, device=device)
+    return q, k, indptr, offsets, pos_ids
+
+
+def _call_rope_entry_point(function, uses_pos_ids, rotary_dim, device, **head_dims):
+    q, k, indptr, offsets, pos_ids = _rope_bound_inputs(device, **head_dims)
+    if uses_pos_ids:
+        return function(q, k, pos_ids, rotary_dim=rotary_dim)
+    return function(q, k, indptr, offsets, rotary_dim=rotary_dim)
+
+
+@pytest.mark.parametrize(
+    "function,uses_pos_ids", ROPE_ENTRY_POINTS, ids=ROPE_ENTRY_POINT_IDS
+)
+@pytest.mark.parametrize(
+    "rotary_dim", [2 * ROPE_BOUND_HEAD_DIM, 3 * ROPE_BOUND_HEAD_DIM]
+)
+def test_rope_rotary_dim_exceeds_head_dim_raises(function, uses_pos_ids, rotary_dim):
+    # rotary_dim > head_dim would make the kernel read into the next head, so every
+    # wrapper rejects it before any JIT/kernel work and this runs without a GPU.
+    with pytest.raises(
+        ValueError, match=r"head_dim \(q=\d+, k=\d+\) must be >= rotary_dim \(\d+\)"
+    ):
+        _call_rope_entry_point(function, uses_pos_ids, rotary_dim, "cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU for the kernel")
+@pytest.mark.parametrize(
+    "function,uses_pos_ids", ROPE_ENTRY_POINTS, ids=ROPE_ENTRY_POINT_IDS
+)
+def test_rope_rotary_dim_equal_head_dim_does_not_raise(function, uses_pos_ids):
+    # The out-of-place entry points drive the native launcher, whose own guard must
+    # accept the valid rotary_dim == head_dim case.
+    _call_rope_entry_point(function, uses_pos_ids, ROPE_BOUND_HEAD_DIM, "cuda")
+
+
+@pytest.mark.parametrize(
+    "function,uses_pos_ids", ROPE_ENTRY_POINTS, ids=ROPE_ENTRY_POINT_IDS
+)
+def test_rope_rotary_dim_exceeds_smaller_qk_head_raises(function, uses_pos_ids):
+    # The native layer requires equal q/k head dimensions, but the Python bound
+    # check runs first and names both dimensions in the error.
+    with pytest.raises(ValueError, match=r"head_dim \(q=128, k=64\)"):
+        _call_rope_entry_point(
+            function,
+            uses_pos_ids,
+            rotary_dim=128,
+            device="cpu",
+            q_head_dim=128,
+            k_head_dim=64,
+        )
 
 
 if __name__ == "__main__":

@@ -87,3 +87,78 @@ def select_compatible_cuda_architecture(
     if not candidates:
         return None
     return max(candidates)[1]
+
+
+_NVCC_TARGET_PATTERN = re.compile(r"^(sm|compute)_([0-9]{2,3}[af]?)$")
+_NVCC_GENCODE_FLAGS = ("-gencode", "--generate-code")
+_NVCC_CODE_FLAGS = ("-code", "--gpu-code")
+_NVCC_ARCH_FLAGS = ("-arch", "--gpu-architecture")
+
+
+def cuda_targets_from_nvcc_flags(flags: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Return the ``(SASS, PTX)`` targets that nvcc flags ask a module to embed.
+
+    Understands ``-gencode=arch=...,code=...`` (also ``--generate-code`` and the
+    two-token spelling), ``-code`` / ``--gpu-code`` and ``-arch`` /
+    ``--gpu-architecture``. SASS targets come back normalized like the binary
+    inspection does (``sm89``, ``sm120a``) and PTX targets as ``compute89``.
+    ``-arch=sm_XX`` embeds both, as nvcc documents; ``-arch=native`` and the
+    other non-numeric spellings request nothing statically known and are skipped.
+    """
+    flag_list = list(flags)
+    sass: set[str] = set()
+    ptx: set[str] = set()
+
+    def add_code_list(code_list: str) -> None:
+        for token in code_list.strip("[]'\" ").split(","):
+            match = _NVCC_TARGET_PATTERN.fullmatch(token.strip("[]'\" "))
+            if match is None:
+                continue
+            kind, arch = match.groups()
+            (sass if kind == "sm" else ptx).add(
+                f"sm{arch}" if kind == "sm" else f"compute{arch}"
+            )
+
+    for index, flag in enumerate(flag_list):
+        name, separator, value = flag.partition("=")
+        if name in _NVCC_GENCODE_FLAGS:
+            if not separator:
+                if index + 1 >= len(flag_list):
+                    continue
+                value = flag_list[index + 1]
+            code_match = re.search(r"(?:^|,)code=(.*)$", value)
+            if code_match is not None:
+                add_code_list(code_match.group(1))
+        elif name in _NVCC_CODE_FLAGS and separator:
+            add_code_list(value)
+        elif name in _NVCC_ARCH_FLAGS and separator:
+            match = _NVCC_TARGET_PATTERN.fullmatch(value.strip())
+            if match is None:
+                continue
+            kind, arch = match.groups()
+            ptx.add(f"compute{arch}")
+            if kind == "sm":
+                sass.add(f"sm{arch}")
+    return sorted(sass), sorted(ptx)
+
+
+def provider_flag_issues(flags: Iterable[str], provider: str) -> list[str]:
+    """Describe how a module's nvcc flags break the one-architecture provider rule.
+
+    A provider wheel must contain only SASS its own architecture can run, and no
+    PTX (the release validation inspects the built binaries with ``cuobjdump`` and
+    rejects both). Returns an empty list when the flags request nothing explicit,
+    since the default targets come from the already provider-filtered context.
+    """
+    sass, ptx = cuda_targets_from_nvcc_flags(flags)
+    issues = []
+    incompatible = [
+        target
+        for target in sass
+        if cuda_binary_target_compatibility_score(target, provider) is None
+    ]
+    if incompatible:
+        issues.append(f"emits {', '.join(incompatible)}, which {provider} cannot run")
+    if ptx:
+        issues.append(f"embeds PTX ({', '.join(ptx)}); provider wheels must not")
+    return issues

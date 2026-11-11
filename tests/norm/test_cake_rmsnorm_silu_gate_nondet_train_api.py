@@ -452,6 +452,11 @@ def assert_dw_repeats_within_det(what, dw, first, det, ref, mag, *, varies) -> N
 # operations and block schedule; its weight gradient is summed exactly there
 # and with FP64 atomics here).
 DET_FUSED_DIGEST = "8a6cb16beff15b6ffbfe"
+# The name digest of the deterministic package's look-ahead BF16 backward
+# program (its long role, which it runs on packed rows from its
+# ``min_rows_per_sm`` rows per SM on): the same build with the same bits, the
+# program the repeatable backward's long role runs.
+DET_LONG_DIGEST = "fef9d1cc2cc267219992"
 
 
 def _fused(name: str) -> bool:
@@ -468,21 +473,28 @@ def _fused(name: str) -> bool:
 def _rep(name: str) -> bool:
     """Whether the backward module ``name`` is the repeatable backward
     (``bwd_bf16_rep``, on every architecture; grid kind
-    ``claimed_row_blocks``): the deterministic package's BF16 backward program
-    (``DET_FUSED_DIGEST``) under this package's name, whose CTAs claim 16-row
-    blocks and sum the weight gradient exactly in fixed point, so its ``dx``,
-    ``dz`` and ``dw`` (accumulated too) are the deterministic package's bits
-    on the same inputs and device, and repeat them."""
-    return loader.MODULES[name]["role"] == "bwd_bf16_rep"
+    ``claimed_row_blocks``) or its long role (``bwd_bf16_rep_long``, on
+    packed rows from ``LONG_BACKWARD_ROWS_PER_SM`` rows per SM on): the
+    deterministic package's BF16 backward program (``DET_FUSED_DIGEST``) or
+    its look-ahead program of the same bits (``DET_LONG_DIGEST``) under this
+    package's name, whose CTAs claim 16-row blocks and sum the weight
+    gradient exactly in fixed point, so its ``dx``, ``dz`` and ``dw``
+    (accumulated too) are the deterministic package's bits on the same
+    inputs and device, and repeat them."""
+    return loader.MODULES[name]["role"] in ("bwd_bf16_rep", "bwd_bf16_rep_long")
 
 
 def _det_routes_same_program() -> bool:
     """Whether the deterministic package's BF16 backward on the current
-    device is the program of ``DET_FUSED_DIGEST``; once that package ships
-    another BF16 backward, the ``dx`` and ``dz`` bits of the two packages need
-    not agree."""
+    device is the program of ``DET_FUSED_DIGEST`` and its long role, where it
+    routes one, the program of ``DET_LONG_DIGEST`` (the same bits); once that
+    package ships another BF16 backward, the ``dx`` and ``dz`` bits of the
+    two packages need not agree."""
     arch = loader.device_arch(torch.cuda.current_device())
-    return det_loader.ROUTES[arch]["bwd_bf16"].endswith(f"_{DET_FUSED_DIGEST}")
+    routes = det_loader.ROUTES[arch]
+    long = routes.get("bwd_bf16" + det_loader.LONG, f"_{DET_LONG_DIGEST}")
+    same = routes["bwd_bf16"].endswith(f"_{DET_FUSED_DIGEST}")
+    return same and long.endswith(f"_{DET_LONG_DIGEST}")
 
 
 def assert_det_bits_where_fused(name: str, got, det) -> None:
@@ -950,20 +962,22 @@ def test_no_call_alerts_under_deterministic_algorithms(
     ``warn_only=True``, every call in the bands whose outputs repeat their
     bits runs with no warning and no error: the forward and the backward
     into a BF16 and an FP32 weight gradient at the first rows of each
-    ``BACKWARD_BANDS`` band of this device (``_band_modules``; for a BF16
+    ``BACKWARD_BANDS`` band and of each long role's packed rows of this
+    device (``_band_modules``, ``_long_band_modules``; for a BF16
     weight gradient every band but the fused band, whose backward alerts:
     :func:`test_autograd_backward_alerts_once_deterministic_algorithms_are_enabled`),
     and the autograd backward, with the weight gradient, of
     :func:`cake_rmsnorm_silu_gate_nondet`, of
     :class:`CakeRMSNormSiLUGateNondetFunction` and of a non-reentrant
-    checkpoint at the first rows of the last such BF16 band (a small-row
-    band).  The functional calls launch ``module_for_rows``' modules."""
+    checkpoint at the most rows of those BF16 calls.  The functional calls
+    launch ``module_for_rows``' modules."""
     arch = loader.device_arch(torch.cuda.current_device())
     sms = _sm_count()
     calls = []
     varying = set()
     for role, dtype in (("bwd_bf16", torch.bfloat16), ("bwd_f32", torch.float32)):
-        for band, name, first, _ in _band_modules(arch, role, sms):
+        bands = _band_modules(arch, role, sms) + _long_band_modules(arch, role, sms)
+        for band, name, first, _ in bands:
             if suite._varies(name):
                 varying.add(name)
                 continue
@@ -1358,12 +1372,13 @@ def test_accuracy_matrix_within_the_deterministic_error(
 @requires_device
 @pytest.mark.parametrize(
     "band",
-    [None, "bwd_bf16_fused", "bwd_bf16_rep"],
-    ids=["1031x48", "bwd_bf16_fused", "bwd_bf16_rep"],
+    [None, "bwd_bf16_fused", "bwd_bf16_rep", "bwd_bf16_rep_long"],
+    ids=["1031x48", "bwd_bf16_fused", "bwd_bf16_rep", "bwd_bf16_rep_long"],
 )
 def test_accumulation_within_the_deterministic_error(band, determinism_setting) -> None:
     """Two microbatches of ``T x H`` rows (1031 tokens of 48 heads; for
-    ``band`` the fewest whole tokens of 48 heads in the fused BF16 band,
+    ``band`` the fewest whole tokens of 48 heads in that BF16 band, the
+    fused, the repeatable or the long role's packed rows,
     ``suite._band_shape``, on every architecture; an FP32 weight gradient
     runs its own band there) accumulated into an FP32 and a BF16 buffer: the
     same starting buffer gives the same bits (a BF16 buffer where its band
@@ -1459,8 +1474,8 @@ def test_accumulation_within_the_deterministic_error(band, determinism_setting) 
 @requires_device
 @pytest.mark.parametrize(
     "band",
-    [None, "bwd_bf16_fused", "bwd_bf16_rep"],
-    ids=["257x48", "bwd_bf16_fused", "bwd_bf16_rep"],
+    [None, "bwd_bf16_fused", "bwd_bf16_rep", "bwd_bf16_rep_long"],
+    ids=["257x48", "bwd_bf16_fused", "bwd_bf16_rep", "bwd_bf16_rep_long"],
 )
 def test_compute_grad_weight_false_within_the_deterministic_error(
     band,
@@ -1471,7 +1486,8 @@ def test_compute_grad_weight_false_within_the_deterministic_error(
     ``dz`` are the bits of a backward with the weight gradient, within one
     BF16 ulp of FP64 and within the deterministic package's error budget, at
     257 tokens of 48 heads and, for ``band``, at the fewest whole tokens of 48
-    heads in the fused BF16 band (``suite._band_shape``; a call without the
+    heads in that BF16 band, the fused, the repeatable or the long role's
+    packed rows (``suite._band_shape``; a call without the
     weight gradient takes the BF16 bands; every architecture); where the
     backward is the fused backward they are the deterministic package's
     bits."""
@@ -1514,9 +1530,10 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
     sums, the class words, the arrival ticket and the claim counter) zeroed by
     ``cake_rmsnorm_silu_gate_nondet_train_reset_workspace``, then reused
     without a reset over the backend suite's sequence of shapes, then the
-    first rows of each ``BACKWARD_BANDS`` band of this device none of them
-    runs (``suite._band_shape``; so every banded backward program of the
-    architecture among them, the fused backward too), weight-gradient
+    first rows of each ``BACKWARD_BANDS`` band and of each long role's packed
+    rows of this device none of them runs (``suite._range_shape``; so every
+    banded backward program of the architecture among them, the fused
+    backward and the repeatable backward's long role too), weight-gradient
     dtypes and accumulation: every
     output repeats bit for bit (an accumulated ``dw`` from the same starting
     value too; a BF16 ``dw`` in the fused and the row-claims bands instead
@@ -1559,7 +1576,8 @@ def test_reset_workspace_then_reuse_across_shapes(determinism_setting) -> None:
     }
     for dtype in (torch.bfloat16, torch.float32):
         role = _role_of(dtype)
-        for band, _, first, last in _band_modules(arch, role, sms):
+        bands = _band_modules(arch, role, sms) + _long_band_modules(arch, role, sms)
+        for band, _, first, last in bands:
             if (role, (band, first)) not in ran:
                 T, H = suite._range_shape(first, last)
                 cases.append((T, H, dtype, False))
@@ -1876,6 +1894,20 @@ def _band_modules(
     ]
 
 
+def _long_band_modules(
+    arch: str, role: str, sms: int
+) -> list[tuple[str, str, int, int | None]]:
+    """``(long role, module, first rows, last rows or None)`` of each long
+    role of the backward ``role`` on ``arch`` with ``sms`` SMs
+    (``suite._long_bands``): the routed module of the long role over the
+    packed rows of its band from ``LONG_BACKWARD_ROWS_PER_SM`` rows per SM
+    on."""
+    return [
+        (band, loader.route_module(arch, band), first, last)
+        for band, first, last in suite._long_bands(arch, role, sms)
+    ]
+
+
 def _band_occurrence(
     arch: str, role: str, sms: int, band: str, nth: int = 1
 ) -> tuple[str, int, int | None] | None:
@@ -1891,10 +1923,12 @@ def _band_occurrence(
 
 
 def _band_of(arch: str, role: str, rows: int, sms: int) -> tuple[str, int]:
-    """``(band role, first rows)`` of the ``loader.BACKWARD_BANDS`` band
-    (:func:`_band_modules`) of the backward ``role`` that holds ``rows`` rows
-    on ``arch`` with ``sms`` SMs."""
-    for band, _, first, last in _band_modules(arch, role, sms):
+    """``(band role, first rows)`` of the band that runs ``rows`` packed rows
+    of the backward ``role`` on ``arch`` with ``sms`` SMs: a long role's
+    (:func:`_long_band_modules`) where it holds them, else the
+    ``loader.BACKWARD_BANDS`` band (:func:`_band_modules`) that holds them."""
+    bands = _long_band_modules(arch, role, sms) + _band_modules(arch, role, sms)
+    for band, _, first, last in bands:
         if first <= rows and (last is None or rows <= last):
             return band, first
     raise AssertionError(f"no {role} band of {arch} holds {rows} rows")
@@ -1906,11 +1940,13 @@ def _start_rows(arch: str, name: str, sms: int, packed: bool = True) -> int:
     ``FORWARD_BANDS`` band (``STRIDED_FORWARD_BANDS`` where the rows are not
     ``packed``; one more than the previous band's ``last * SMs``), for a
     backward module the first row of its ``BACKWARD_BANDS`` band
-    (:func:`_band_modules`)."""
+    (:func:`_band_modules`), for a long role's module the first of its
+    packed rows (:func:`_long_band_modules`)."""
     role = loader.MODULES[name]["role"]
     if role.startswith("bwd"):
         call_role = "bwd_f32" if role.startswith("bwd_f32") else "bwd_bf16"
-        for _, module, first, _ in _band_modules(arch, call_role, sms):
+        bands = _band_modules(arch, call_role, sms)
+        for _, module, first, _ in bands + _long_band_modules(arch, call_role, sms):
             if module == name:
                 return first
         raise AssertionError(f"{arch} has no backward band of {role}")
@@ -2539,15 +2575,20 @@ def test_backward_shapes_within_the_deterministic_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Inputs of several shapes and layouts: ``module_for_rows`` runs one of
-    the role's programs (the modules of its bands, :func:`_band_modules`) and
+    the role's programs (the modules of its bands, :func:`_band_modules`, or
+    on packed rows of its long roles, :func:`_long_band_modules`) and
     ``_check_backward`` holds."""
     arch = loader.device_arch(torch.cuda.current_device())
     sms = _sm_count()
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
     x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=24)
     rows = x.numel() // D
-    name = loader.module_for_rows(arch, role, rows, sms)
-    programs = {module for _, module, _, _ in _band_modules(arch, role, sms)}
+    packed = suite._backward_packed(tokens, heads, layout)
+    name = loader.module_for_rows(arch, role, rows, sms, packed=packed)
+    bands = _band_modules(arch, role, sms)
+    if packed:
+        bands += _long_band_modules(arch, role, sms)
+    programs = {module for _, module, _, _ in bands}
     assert name in programs, (name, programs)
     _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch)
 
@@ -2598,7 +2639,9 @@ def test_layouts_in_the_row_claims_and_claimed_backward_bands_within_the_determi
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
     x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=26)
     rows = x.numel() // D
-    name = loader.module_for_rows(arch, role, rows, sms)
+    packed = layout == "contiguous" and tokens > 1
+    assert suite._backward_packed(tokens, heads, layout) == packed, layout
+    name = loader.module_for_rows(arch, role, rows, sms, packed=packed)
     assert name == loader.ROUTES[arch][band], (rows, name)
     ws = nd_workspace(rows, x.device)
     launched = _spy_strides(monkeypatch)
@@ -2612,7 +2655,6 @@ def test_layouts_in_the_row_claims_and_claimed_backward_bands_within_the_determi
         workspace=ws,
     )
     assert [n for n, _ in launched] == [name], launched
-    packed = layout == "contiguous" and tokens > 1
     assert _packed(launched[0][1]) == packed, (layout, launched[0][1])
     assert not bool(ws.any()), "the workspace is not zero"
     _check_backward(x, z, w, dy, dw_dtype, name, monkeypatch)
@@ -2965,10 +3007,12 @@ def test_kernel_view_strides(shape, strides, want) -> None:
 # sm_107a the rows of the block two ahead); and the fused backward (every
 # architecture: thread 0 warms the next block of a claim with a bulk prefetch
 # per tensor where the rows are packed, else each thread its own row), whose
-# bits must not depend on the layout either.  The one-head inputs take one
-# row past the start of each one's band (``_start_rows``); a module that no
-# band of this device runs (a forward module: no ``STRIDED_FORWARD_BANDS``
-# band) skips.
+# bits must not depend on the layout either; so do the repeatable backward
+# and its long role (which runs the packed layouts only; a layout whose rows
+# do not follow one another runs the repeatable backward, the same bits).
+# The one-head inputs take one row past the start of each one's band
+# (``_start_rows``); a module that no band of this device runs (a forward
+# module: no ``STRIDED_FORWARD_BANDS`` band) skips.
 ONE_HEAD_ROUTES = [
     pytest.param("fwd", "fwd_mid", id="fwd_mid"),
     pytest.param("fwd", "fwd_xlong", id="fwd_xlong"),
@@ -2977,6 +3021,7 @@ ONE_HEAD_ROUTES = [
     pytest.param("bwd_f32", "bwd_f32_mid", id="bwd_f32_claimed"),
     pytest.param("bwd_bf16", "bwd_bf16_fused", id="bwd_bf16_fused"),
     pytest.param("bwd_bf16", "bwd_bf16_rep", id="bwd_bf16_rep"),
+    pytest.param("bwd_bf16", "bwd_bf16_rep_long", id="bwd_bf16_rep_long"),
 ]
 
 
@@ -2986,11 +3031,12 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
     role, band, determinism_setting, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One row past the start of the mid and the extra-long forward (their
-    strided bands) and of the row-claims mid, the claimed and the fused
-    backwards: a one-head input of every layout (``ONE_HEAD_LAYOUTS``) launches
-    ``module_for_rows``' module (for the forward, the module of its layout's
-    packing) with head stride 128, passes the packed-rows test exactly when its
-    rows follow one another (or the host copied it), and returns the same
+    strided bands) and of the row-claims mid, the claimed, the fused and the
+    repeatable backwards and the long role's packed rows: a one-head input of
+    every layout (``ONE_HEAD_LAYOUTS``) launches ``module_for_rows``' module
+    (the module of its layout's packing) with head stride 128, passes the
+    packed-rows test exactly when its rows follow one another (or the host
+    copied it), and returns the same
     ``y``, or ``dx``, ``dz`` and ``dw``, bits for every layout launching the
     same module and every repeat (but a BF16 ``dw`` of the fused and the
     row-claims mid backwards, which lies within the budgets of
@@ -3000,14 +3046,16 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
     budget of the deterministic package's on the flat rows, ``dw`` also within
     the weight-gradient budget of the deterministic ``dw``, and the fused
     backward's ``dx`` and ``dz`` are the deterministic package's bits on the
-    flat rows."""
+    flat rows (the repeatable backward's and its long role's ``dw`` too)."""
     arch = loader.device_arch(torch.cuda.current_device())
     name = loader.ROUTES[arch].get(band)
     if name is None:
         pytest.skip(f"{arch} routes no {band} module")
     sms = _sm_count()
     if role != "fwd" and name not in {
-        module for _, module, _, _ in _band_modules(arch, role, sms)
+        module
+        for _, module, _, _ in _band_modules(arch, role, sms)
+        + _long_band_modules(arch, role, sms)
     }:
         pytest.skip(f"no band of {arch} on {sms} SMs runs {band}")
     strided_bands = {b for _, b in loader.STRIDED_FORWARD_BANDS[arch]}
@@ -3041,11 +3089,7 @@ def test_one_head_inputs_give_the_same_bits_for_every_layout(
     wants: dict[str, tuple] = {}
     for layout, (packed, _) in ONE_HEAD_LAYOUTS.items():
         x, z, dy = (_one_head(t, layout) for t in (x0, z0, dy0))
-        module = (
-            loader.module_for_rows(arch, role, rows, sms, packed=packed)
-            if strided
-            else name
-        )
+        module = loader.module_for_rows(arch, role, rows, sms, packed=packed)
         want = wants.get(module)
         launched.clear()
         for _ in range(calls):

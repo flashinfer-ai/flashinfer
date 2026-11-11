@@ -16,7 +16,7 @@ from unittest import mock
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_5_block_cases import PagedCase
+from tests.experimental.test_helpers.qwen_3_5_block_cases import PagedCase
 
 FORMS = ("prefill", "extend", "decode")
 # (d_model, num_qo_heads, num_kv_heads, rope_dim): the two Qwen3.5 shards, the Qwen3.8-27B dense attention layer (24 / 4 at 5120,
@@ -407,7 +407,10 @@ def test_declined_rope_dim_is_typed_before_any_vendored_code(rope_dim, monkeypat
         qwen_3_5_block_support,
     )
     from flashinfer.experimental.qwen_3_5_block import api as impl
-    from tests.test_helpers.qwen_3_5_block_cases import new_kv_cache, random_weights
+    from tests.experimental.test_helpers.qwen_3_5_block_cases import (
+        new_kv_cache,
+        random_weights,
+    )
 
     g = Qwen35BlockGeometry(
         d_model=2560, num_qo_heads=24, num_kv_heads=2, rope_dim=rope_dim

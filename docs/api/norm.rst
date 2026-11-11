@@ -498,7 +498,11 @@ FlashInfer 2e989556, and against the deterministic package in this release
   the workspace and the sum rounded once by the CTA that arrives last.  Its
   ``dx``, ``dz`` and weight gradient are the deterministic package's bits in
   this release, the same for the rows and the SM count, within the same
-  bounds; no call in this band alerts.
+  bounds; no call in this band alerts.  Packed rows (``grad_out``, ``x`` and
+  ``z`` each with head stride 128 and token stride ``H * 128``) run its
+  copy of the deterministic package's look-ahead program, the same build,
+  from 2560 rows per SM on SM100 and SM103 and from 1536 on SM107, with the
+  same bits.
 * The workspace (``cake_rmsnorm_silu_gate_nondet_train_backward_workspace``)
   is a zero-filled ``torch.uint8`` tensor of 29192 bytes on SM100 and SM103
   and 36360 bytes on SM107, whatever the token count (the largest layout of
