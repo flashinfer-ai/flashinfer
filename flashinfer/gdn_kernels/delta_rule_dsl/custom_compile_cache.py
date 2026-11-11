@@ -1,4 +1,6 @@
 import functools
+import glob
+import hashlib
 import os
 import tempfile
 import warnings
@@ -11,6 +13,7 @@ from cutlass.base_dsl.compiler import DumpDir
 
 
 _in_mem_compile_cache: dict = {}
+_DISK_CACHE_MODULE = "gdn_delta_rule_dsl"
 
 
 @lru_cache(maxsize=8)
@@ -177,22 +180,56 @@ def _sm12x_ptx_check(compiled_fn):
         )
 
 
+def _compile_uncached(func, *args, compile_options=None, **kwargs):
+    if not _needs_sm12x_ptx_check(compile_options):
+        return cute.compile[compile_options](func, *args, **kwargs)
+    with tempfile.TemporaryDirectory(prefix="cutedsl_ptx_check_") as tempdir:
+        compile_options = _ptx_check_compile_options(compile_options, tempdir)
+        compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
+        _sm12x_ptx_check(compiled_fn)
+    return compiled_fn
+
+
+def _disk_kernel_name(func, cache_key) -> str | None:
+    """On-disk name: class name + truncated SHA-256 of ``repr(cache_key)``.
+
+    None when the repr carries an object address (it would never hit across
+    processes); this guards that pattern only, not every unstable repr.
+    """
+    key_repr = repr(cache_key)
+    if " at 0x" in key_repr:
+        return None
+    digest = hashlib.sha256(key_repr.encode()).hexdigest()[:24]
+    return f"{type(func).__name__}_{digest}"
+
+
+def _key_source_files() -> tuple[str, ...]:
+    return tuple(sorted(glob.glob(os.path.join(os.path.dirname(__file__), "*.py"))))
+
+
 def cached_compile(func, *args, compile_options=None, **kwargs):
     cache_key = (func._get_compile_key(), _compile_options_key(compile_options))
     compiled_fn = _in_mem_compile_cache.get(cache_key)
+    if compiled_fn is not None:
+        return compiled_fn
 
-    if compiled_fn is None:
-        _needs_ptx_check = _needs_sm12x_ptx_check(compile_options)
-        if not _needs_ptx_check:
-            compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
-        else:
-            with tempfile.TemporaryDirectory(prefix="cutedsl_ptx_check_") as tempdir:
-                compile_options = _ptx_check_compile_options(compile_options, tempdir)
-                compiled_fn = cute.compile[compile_options](func, *args, **kwargs)
-                _sm12x_ptx_check(compiled_fn)
+    def compile_fn():
+        return _compile_uncached(func, *args, compile_options=compile_options, **kwargs)
 
-        _in_mem_compile_cache[cache_key] = compiled_fn
+    # TVM-FFI kernels (SM80/SM90/SM12x paths) are exported and reloaded through
+    # the CuTe-DSL disk cache, so later processes skip the compilation.
+    kernel_name = _disk_kernel_name(func, cache_key)
+    if kernel_name is not None and _has_option_value(
+        compile_options, cute.EnableTVMFFI, True
+    ):
+        from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
+        compiled_fn = build_and_load_cute_dsl_kernel(
+            _DISK_CACHE_MODULE, kernel_name, compile_fn, _key_source_files()
+        )
+    else:
+        compiled_fn = compile_fn()
+    _in_mem_compile_cache[cache_key] = compiled_fn
     return compiled_fn
 
 
