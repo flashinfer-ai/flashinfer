@@ -2523,6 +2523,25 @@ def _paged_kv_host_metadata(indptr, last_page_len, seq_lens, page_size):
     return indptr_host, last_host, lengths
 
 
+def _validate_paged_query_lengths(backend, seq_lens_q, qo_indptr_host):
+    """Do not silently drop an independent Q mask when selecting a provider."""
+    if seq_lens_q is None or backend == "cudnn":
+        return
+    # Other paged providers derive valid query lengths from the physical offsets.
+    # Accept a redundant CPU mask, but never read device metadata back just to
+    # prove equality. This check must precede all accepted-plan state mutations.
+    if seq_lens_q.device.type == "cpu" and torch.equal(
+        seq_lens_q.flatten(), qo_indptr_host[1:] - qo_indptr_host[:-1]
+    ):
+        return
+    raise ValueError(
+        f"Paged backend {backend!r} cannot honor independent seq_lens_q. "
+        "Use backend='cudnn', or omit seq_lens_q when qo_indptr already "
+        "describes the valid query lengths. Non-cuDNN backends only accept "
+        "explicit query lengths on CPU that equal the differences in qo_indptr."
+    )
+
+
 def _blackwell_paged_auto_cudnn(
     device,
     layout,
@@ -3778,6 +3797,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         seq_lens_q: Optional[torch.Tensor]
             A uint32 1D tensor indicating the q sequence length of each prompt. shape: ``[batch_size]``.
             For cuDNN, defaults to the differences in ``qo_indptr``.
+            Other paged backends only accept an explicit CPU tensor equal to
+            those differences; otherwise planning raises ``ValueError`` before
+            changing the accepted plan. No device-to-host copy is made to check
+            this condition. With ``backend="auto"``, this restriction applies
+            whenever the selected backend is not cuDNN.
         block_tables: Optional[torch.Tensor]
             A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
         max_token_per_sequence: Optional[int],
@@ -3927,6 +3951,77 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_vo,
                 )
 
+        batch_size = len(qo_indptr) - 1
+        total_num_rows = int(qo_indptr_host[-1])
+        if max_token_per_sequence is not None:
+            max_q_len = max_token_per_sequence
+        else:
+            max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
+
+        kv_lens_arr_host = None
+        if max_sequence_kv is None:
+            paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
+                _paged_kv_host_metadata(
+                    paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
+                )
+            )
+            max_kv_len = kv_lens_arr_host.max().item()
+        else:
+            max_kv_len = max_sequence_kv
+
+        planned_backend = "fa2" if use_token_head_sf else self._backend
+        # Per-token/head scales pin FA2; resolve auto without modifying plan state.
+        if auto_backend is not None:
+            planned_backend = auto_backend
+            if (
+                planned_backend == "fa2"
+                # A retained FA2 capture also needs its CPU-generated schedule
+                # refreshed, not just the raw page and length buffers. Keep
+                # planning FA2 instead of maintaining a second planner for it.
+                and (not self.is_cuda_graph_enabled or self._plan_info is None)
+                and causal
+                and pos_encoding_mode == "NONE"
+                and not use_fp16_qk_reduction
+                and custom_mask is None
+                and packed_custom_mask is None
+                and not self._variant_owns_mask
+                and (not self.is_cuda_graph_enabled or self._custom_mask_buf is None)
+                and window_left == -1
+                and logits_soft_cap == 0
+                and prefix_len_ptr is None
+                and token_pos_in_items_ptr is None
+                and max_item_len_ptr is None
+                and getattr(self, "_sinks", None) is None
+                and fixed_split_size == -1
+                and not disable_split_kv
+                and (
+                    not self.is_cuda_graph_enabled
+                    or self._qo_indptr_buf.dtype == torch.int32
+                )
+                and _blackwell_paged_auto_cudnn(
+                    self.device,
+                    self._kv_layout,
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    head_dim_qk,
+                    head_dim_vo,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    max_q_len,
+                    max_kv_len,
+                    page_size,
+                    total_num_rows,
+                    qo_indptr_host,
+                    kv_lens_arr_host if kv_lens_arr_host is not None else seq_lens,
+                    seq_lens_q,
+                )
+            ):
+                planned_backend = "cudnn"
+
+        _validate_paged_query_lengths(planned_backend, seq_lens_q, qo_indptr_host)
+
         # Reset the specialized kernel only after checking backend compatibility.
         self._eagle_verify_fp8kv_sm90_state = None
         self._head_dim_qk = head_dim_qk
@@ -4023,72 +4118,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
 
-        self._qo_indptr_last = int(qo_indptr_host[-1])
-        total_num_rows = self._qo_indptr_last
-        if max_token_per_sequence is not None:
-            self._max_q_len = max_token_per_sequence
-        else:
-            self._max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
-
-        kv_lens_arr_host = None
-        if max_sequence_kv is None:
-            paged_kv_indptr_host, paged_kv_last_page_len_host, kv_lens_arr_host = (
-                _paged_kv_host_metadata(
-                    paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
-                )
-            )
-            self._max_kv_len = kv_lens_arr_host.max().item()
-        else:
-            self._max_kv_len = max_sequence_kv
-
-        # Per-token/head scales already pin FA2; preserve that plan-time choice.
-        if auto_backend is not None:
-            self._backend = auto_backend
-            if (
-                self._backend == "fa2"
-                # A retained FA2 capture also needs its CPU-generated schedule
-                # refreshed, not just the raw page and length buffers. Keep
-                # planning FA2 instead of maintaining a second planner for it.
-                and (not self.is_cuda_graph_enabled or self._plan_info is None)
-                and causal
-                and pos_encoding_mode == "NONE"
-                and not use_fp16_qk_reduction
-                and packed_custom_mask is None
-                and not self._variant_owns_mask
-                and (not self.is_cuda_graph_enabled or self._custom_mask_buf is None)
-                and window_left == -1
-                and logits_soft_cap == 0
-                and prefix_len_ptr is None
-                and token_pos_in_items_ptr is None
-                and max_item_len_ptr is None
-                and getattr(self, "_sinks", None) is None
-                and fixed_split_size == -1
-                and not disable_split_kv
-                and (
-                    not self.is_cuda_graph_enabled
-                    or self._qo_indptr_buf.dtype == torch.int32
-                )
-                and _blackwell_paged_auto_cudnn(
-                    self.device,
-                    self._kv_layout,
-                    q_data_type,
-                    kv_data_type,
-                    o_data_type,
-                    head_dim_qk,
-                    head_dim_vo,
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    self._max_q_len,
-                    self._max_kv_len,
-                    page_size,
-                    total_num_rows,
-                    qo_indptr_host,
-                    kv_lens_arr_host if kv_lens_arr_host is not None else seq_lens,
-                    seq_lens_q,
-                )
-            ):
-                self._backend = "cudnn"
+        self._qo_indptr_last = total_num_rows
+        self._max_q_len = max_q_len
+        self._max_kv_len = max_kv_len
+        self._backend = planned_backend
 
         self._cudnn_paged_bounds = None
         if self._requested_backend == "auto" and self._backend == "cudnn":
