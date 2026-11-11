@@ -11,7 +11,7 @@ from tests.attention.sparse_mla_prefill_utils import (
 )
 
 
-@pytest.mark.parametrize("cache_format", ["fp8", "v41_fp8"])
+@pytest.mark.parametrize("cache_format", ["fp8", "v41_fp8", "nvfp4"])
 @pytest.mark.parametrize("tokens,heads", [(128, 16), (128, 64)])
 @pytest.mark.parametrize("empty", [False, True])
 def test_fused_single_cache_and_empty_prefill(cache_format, tokens, heads, empty):
@@ -154,7 +154,7 @@ def test_mega_v41_cache_layouts(inline, mixed, tokens):
         )
 
 
-@pytest.mark.parametrize("cache_format", ["v41_fp8"])
+@pytest.mark.parametrize("cache_format", ["v41_fp8", "nvfp4"])
 @pytest.mark.parametrize("tokens", [128])
 def test_mega_graph_kernel_boundaries(cache_format, tokens, tmp_path):
     import re
