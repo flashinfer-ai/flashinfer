@@ -418,6 +418,46 @@ def test_nvfp4_output_matches_separate_quantize(l, m, n, k, mma_tiler_mn, gated)
         assert torch.equal(out_sf[i, :rows], ref_sf[i, :rows])
 
 
+@pytest.mark.parametrize("cluster_shape_mn", [(2, 1), (4, 1), (1, 2)])
+@pytest.mark.parametrize("gated", [False, True])
+def test_nvfp4_output_cluster_stays_in_bounds(cluster_shape_mn, gated):
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    l, m, n, k = 3, 256, 512, 256
+    operands, kwargs = _nvfp4_case(l, m, n, k, gated, (128, 128), device)
+    masked_m = operands[4]
+    # A full last expert puts cluster padding tiles right past the end of out_scale.
+    masked_m.copy_(torch.tensor([m, 130, m], dtype=torch.int32))
+    n_out = n // 2 if gated else n
+    global_scale = torch.full((l,), 100.0, device=device)
+    sf_bytes = l * m * n_out // SF_VEC
+
+    outs = []
+    for cluster in [(1, 1), cluster_shape_mn]:
+        out_q = torch.zeros(l, m, n_out // 2, dtype=torch.uint8, device=device)
+        sf_buf = torch.full((2 * sf_bytes,), 0xAB, dtype=torch.uint8, device=device)
+        _run_gemm(
+            *operands,
+            out_q.permute(1, 2, 0),
+            "float4_e2m1fn",
+            out_scale=sf_buf[:sf_bytes],
+            global_scale=global_scale,
+            cluster_shape_mn=cluster,
+            **kwargs,
+        )
+        outs.append((out_q, sf_buf))
+    torch.cuda.synchronize()
+
+    (ref_q, ref_buf), (out_q, out_buf) = outs
+    assert (out_buf[sf_bytes:] == 0xAB).all()
+    ref_sf = _unswizzle_sf(ref_buf[:sf_bytes], l, m, n_out // SF_VEC)
+    out_sf = _unswizzle_sf(out_buf[:sf_bytes], l, m, n_out // SF_VEC)
+    for i, rows in enumerate(masked_m.tolist()):
+        assert torch.equal(out_q[i, :rows], ref_q[i, :rows])
+        assert torch.equal(out_sf[i, :rows], ref_sf[i, :rows])
+
+
 def test_nvfp4_output_cuda_graph():
     _skip_unless_sm100()
     torch.manual_seed(0)

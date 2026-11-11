@@ -2094,6 +2094,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         + (epi_tidx % 32) * 4
                         + epi_tidx // 32
                     )
+                    # A cluster can extend past the last M or N tile; the C TMA
+                    # store clips those, the scale store must not land in the
+                    # next expert's scales or past the end of out_scale.
+                    sf_tile_in_range = (cur_tile_coord[0] < self.sfc_rm) & (
+                        cur_tile_coord[1] * (self.cta_tile_shape_mnk_c[1] // 64)
+                        < self.sfc_rk
+                    )
 
                 #
                 # Store accumulator to global memory in subtiles
@@ -2136,9 +2143,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         else:
                             tCompute.store(tTR_rAcc.load() * out_alpha)
                         if cutlass.const_expr(self.quantize_output):
-                            out_scale[sf_word_base + subtile_idx * 128] = (
-                                self.quantize_nvfp4(tCompute, out_global_scale)
-                            )
+                            packed_sf = self.quantize_nvfp4(tCompute, out_global_scale)
+                            if sf_tile_in_range:
+                                out_scale[sf_word_base + subtile_idx * 128] = packed_sf
                         acc_vec = tiled_copy_r2s.retile(tCompute).load()
                     elif cutlass.const_expr(self.is_combine_fusion):
                         # S2R copy: load topk from SMEM into register fragment
