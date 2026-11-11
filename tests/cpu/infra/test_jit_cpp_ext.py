@@ -17,6 +17,10 @@ from flashinfer.utils import (
 from tests.jit.test_helpers import jit_utils
 
 
+# The real reader, which the autouse fixture below stubs out.
+_real_cgroup_cpu_quota = cpp_ext._cgroup_cpu_quota
+
+
 @pytest.fixture(autouse=True)
 def _job_cap_test_env(monkeypatch):
     # The cap warning is logged once per distinct cap; clear that record, and
@@ -164,6 +168,12 @@ def test_debug_jit_does_not_propagate_ndebug(monkeypatch):
 
     assert "-DNDEBUG" not in spec.extra_cflags
     assert "-DNDEBUG" not in spec.extra_cuda_cflags
+
+
+def _write_tree(root, files):
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
 
 
 @pytest.mark.cpu_only
@@ -646,20 +656,59 @@ def test_get_num_workers_none_when_meminfo_unavailable(monkeypatch):
     assert cpp_ext._get_num_workers() is None
 
 
+def _run_ninja_with_output(monkeypatch, tmp_path, stdout):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=stdout)
+
+    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
+    cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
+    return commands[-1]
+
+
+def _cap_warnings(caplog):
+    return [r for r in caplog.records if "Capped ninja parallelism" in r.getMessage()]
+
+
 @pytest.mark.cpu_only
-def test_cap_warning_emitted_once_across_compiles(monkeypatch, caplog):
+def test_cap_warning_emitted_once_across_compiles(monkeypatch, tmp_path, caplog):
     monkeypatch.delenv("MAX_JOBS", raising=False)
     monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
     _set_cpu_count(monkeypatch, 64)
     monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
-    with caplog.at_level(logging.WARNING, logger="flashinfer.jit.cpp_ext"):
-        results = [cpp_ext._get_num_workers() for _ in range(5)]
-    # Every per-operator call returns the cap, but the warning is logged once.
-    assert results == [4, 4, 4, 4, 4]
-    cap_warnings = [
-        r for r in caplog.records if "Capping ninja parallelism" in r.getMessage()
-    ]
-    assert len(cap_warnings) == 1
+    # Default level: the warning must show without any logging setup.
+    with caplog.at_level(logging.WARNING):
+        commands = [
+            _run_ninja_with_output(monkeypatch, tmp_path, "[1/1] nvcc ...\n")
+            for _ in range(5)
+        ]
+    # Every compile runs with the cap, but the warning is logged once.
+    assert all(c[-2:] == ["-j", "4"] for c in commands)
+    assert len(_cap_warnings(caplog)) == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("max_jobs", [None, "6"])
+def test_cap_warning_silent_without_a_capped_build(
+    monkeypatch, tmp_path, caplog, max_jobs
+):
+    # A warm cache (ninja has nothing to build) and an explicit MAX_JOBS log
+    # nothing.
+    if max_jobs is None:
+        monkeypatch.delenv("MAX_JOBS", raising=False)
+        stdout = "ninja: Entering directory `x'\nninja: no work to do.\n"
+    else:
+        monkeypatch.setenv("MAX_JOBS", max_jobs)
+        stdout = "[1/1] nvcc ...\n"
+    monkeypatch.delenv("FLASHINFER_NVCC_THREADS", raising=False)
+    _set_cpu_count(monkeypatch, 64)
+    monkeypatch.setattr(cpp_ext, "_read_mem_available_gb", lambda: 32)
+    with caplog.at_level(logging.WARNING):
+        command = _run_ninja_with_output(monkeypatch, tmp_path, stdout)
+    assert command[-2:] == ["-j", max_jobs or "4"]
+    assert _cap_warnings(caplog) == []
 
 
 @pytest.mark.cpu_only
@@ -737,8 +786,16 @@ def test_get_num_workers_under_cpu_quota(monkeypatch):
 def test_available_memory_uses_cgroup_limit(monkeypatch):
     # Inside a container /proc/meminfo reports host memory; the cgroup limit's
     # headroom is what an OOM kill enforces.
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/meminfo":
+            return io.StringIO("MemAvailable: 67108864 kB\n")  # 64 GiB
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(cpp_ext, "open", fake_open, raising=False)
     monkeypatch.setattr(cpp_ext, "_cgroup_available_memory_bytes", lambda: 16 << 30)
-    assert cpp_ext._read_mem_available_gb() <= 16
+    assert cpp_ext._read_mem_available_gb() == 16
 
 
 @pytest.mark.cpu_only
@@ -758,12 +815,11 @@ def test_available_memory_uses_cgroup_limit(monkeypatch):
         ({}, None),
     ],
 )
-def test_cgroup_cpu_quota_reads_v2_then_v1(monkeypatch, tmp_path, files, expected):
-    monkeypatch.undo()  # the real reader, not the autouse fixture's stub
-    for name, text in files.items():
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_text(text)
-    assert cpp_ext._cgroup_cpu_quota(tmp_path) == expected
+def test_cgroup_cpu_quota_reads_v2_then_v1(tmp_path, files, expected):
+    _write_tree(tmp_path, files)
+    (tmp_path / "self_cgroup").write_text("0::/\n")
+    got = _real_cgroup_cpu_quota(str(tmp_path), str(tmp_path / "self_cgroup"))
+    assert got == expected
 
 
 @pytest.mark.cpu_only
@@ -816,10 +872,81 @@ def test_cgroup_cpu_quota_reads_v2_then_v1(monkeypatch, tmp_path, files, expecte
     ],
 )
 def test_cgroup_available_memory_reads_v2_then_v1(tmp_path, files, expected):
-    for name, text in files.items():
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_text(text)
-    assert cpp_ext._cgroup_available_memory_bytes(tmp_path) == expected
+    _write_tree(tmp_path, files)
+    (tmp_path / "self_cgroup").write_text("0::/\n")
+    got = cpp_ext._cgroup_available_memory_bytes(
+        str(tmp_path), str(tmp_path / "self_cgroup")
+    )
+    assert got == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "own, files, expected",
+    [
+        # A systemd scope or Slurm job: the limit sits on the process's own
+        # cgroup below the mount root, and an ancestor's tighter limit wins.
+        (
+            "0::/a/b\n",
+            {"a/b/memory.max": "4096\n", "a/b/memory.current": "1024\n"},
+            3072,
+        ),
+        (
+            "0::/a/b\n",
+            {
+                "a/b/memory.max": "4096\n",
+                "a/b/memory.current": "1024\n",
+                "a/memory.max": "8192\n",
+                "a/memory.current": "7168\n",
+            },
+            1024,
+        ),
+        ("0::/a/b\n", {"a/b/memory.max": "max\n", "a/memory.max": "max\n"}, None),
+        # Inside a cgroup namespace the own path is "/": the mount root alone.
+        ("0::/\n", {"memory.max": "4096\n", "memory.current": "1024\n"}, 3072),
+        # A path outside the namespace root is not under it, and the root is
+        # not its ancestor: nothing is read.
+        (
+            "0::/../x\n",
+            {
+                "x/memory.max": "4096\n",
+                "x/memory.current": "1024\n",
+                "memory.max": "2048\n",
+                "memory.current": "1024\n",
+            },
+            None,
+        ),
+        # A malformed limit is skipped, not raised.
+        ("0::/a\n", {"a/memory.max": "lots\n", "a/memory.current": "1\n"}, None),
+    ],
+)
+def test_cgroup_available_memory_walks_own_cgroup(tmp_path, own, files, expected):
+    root = tmp_path / "cg"
+    root.mkdir()
+    _write_tree(root, files)
+    (tmp_path / "self_cgroup").write_text(own)
+    got = cpp_ext._cgroup_available_memory_bytes(
+        str(root), str(tmp_path / "self_cgroup")
+    )
+    assert got == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "files, expected",
+    [
+        ({"a/b/cpu.max": "200000 100000\n"}, 2),
+        ({"a/b/cpu.max": "800000 100000\n", "a/cpu.max": "300000 100000\n"}, 3),
+        ({"a/b/cpu.max": "max 100000\n", "a/cpu.max": "max 100000\n"}, None),
+    ],
+)
+def test_cgroup_cpu_quota_walks_own_cgroup(tmp_path, files, expected):
+    root = tmp_path / "cg"
+    root.mkdir()
+    _write_tree(root, files)
+    (tmp_path / "self_cgroup").write_text("0::/a/b\n")
+    got = _real_cgroup_cpu_quota(str(root), str(tmp_path / "self_cgroup"))
+    assert got == expected
 
 
 @pytest.mark.cpu_only

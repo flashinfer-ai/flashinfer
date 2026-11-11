@@ -434,7 +434,7 @@ def _get_mm_fp4_cute_dsl_compile_workers() -> int:
         if mem_cap < workers:
             logger.warning(
                 f"[mm_fp4 cute-dsl] capping tactic precompile workers "
-                f"{workers} -> {mem_cap} (host MemAvailable = "
+                f"{workers} -> {mem_cap} (available memory = "
                 f"{available / (1 << 30):.1f} GiB)."
             )
             workers = mem_cap

@@ -868,9 +868,12 @@ export FLASHINFER_NVCC_THREADS=4              # Threads per nvcc process (--thre
 export MAX_JOBS=4                             # Parallel ninja jobs (nvcc processes)
 export FLASHINFER_CUDA_ARCH_LIST="8.0 9.0a"  # Target architectures
 # Memory note: total compilation memory ≈ MAX_JOBS × FLASHINFER_NVCC_THREADS × per-thread mem.
-# With MAX_JOBS unset, on-demand JIT builds lower ninja's default job count to what
-# available memory (the tighter of MemAvailable and the cgroup limit) allows at
-# max(8, 2 × FLASHINFER_NVCC_THREADS) GiB per job, logging each distinct cap once.
+# With MAX_JOBS unset, JIT builds (on-demand and build_jit_specs prebuilds) lower
+# ninja's default job count to what available memory allows at
+# max(8, 2 × FLASHINFER_NVCC_THREADS) GiB per job: the tighter of MemAvailable and
+# the headroom under the tightest cgroup memory limit on the process's path, and
+# never above ninja's own default under a cgroup CPU quota. Each distinct cap is
+# logged once, when ninja has something to build.
 
 # Behavior
 export FLASHINFER_WORKSPACE_BASE="/scratch"   # Custom cache directory
