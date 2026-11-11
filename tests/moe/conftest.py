@@ -67,7 +67,9 @@ def observe_swap_ab_mma_plans():
         return
     import cutlass.cute as cute
     from flashinfer.fused_moe.cute_dsl.blackwell import moe_swap_ab
-    from tests.test_helpers import cute_dsl_moe_swap_ab_reference as reference_module
+    from tests.moe.test_helpers import (
+        cute_dsl_moe_swap_ab_reference as reference_module,
+    )
 
     configs, selected = {}, {}
     compile_kernel = cute.compile

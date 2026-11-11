@@ -323,14 +323,14 @@ def _get_stream_cache_buf(
     on one stream share the buffer. That is safe only for stateless scratch and
     only if those graphs never replay concurrently.
     """
-    key = (name, device, torch.cuda.current_stream(device).cuda_stream)
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    key = (name, device, torch._C._cuda_getCurrentRawStream(index))
     buf = _stream_cache_buf.get(key)
     if buf is None or buf.size(0) < num_bytes:
         if buf is not None:
             _cache_buf_retired.append(buf)
-        index = torch.device(device).index
-        if index is None:
-            index = torch.cuda.current_device()
         pool = _stream_cache_mem_pools.get(index)
         if pool is None:
             with torch.cuda.device(index):
@@ -1164,6 +1164,15 @@ def get_shuffle_block_size(epilogue_tile_m: int) -> int:
     return shuffle_block_size
 
 
+def _unaligned_rows_message(M: int, alignment: int) -> str:
+    return (
+        f"input_tensor.shape[0]={M} must be a multiple of {alignment}. For the trtllm "
+        "block-scale MoE ops (FP8, FP4, MXINT4), zero-pad the unaligned dimension "
+        "(intermediate_size for FC1, hidden_size for FC2) to a multiple of 128 and "
+        "pass valid_intermediate_size / valid_hidden_size."
+    )
+
+
 def get_shuffle_matrix_a_row_indices(
     input_tensor: torch.Tensor, epilogue_tile_m: int
 ) -> torch.Tensor:
@@ -1183,9 +1192,7 @@ def get_shuffle_matrix_a_row_indices(
     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
     row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
 
-    assert M % shuffle_block_size == 0, (
-        f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
-    )
+    assert M % shuffle_block_size == 0, _unaligned_rows_message(M, shuffle_block_size)
 
     # row_indices[new_row] = old_row
     # so row_indices is an array of size M telling us from which old_row
@@ -1214,7 +1221,7 @@ def get_shuffle_matrix_sf_a_row_indices(
 
     # M, K from the input
     M, K = input_tensor.shape
-    assert M % 128 == 0
+    assert M % 128 == 0, _unaligned_rows_message(M, 128)
     # K % 4 alignment is not required here, downstream block_scale_interleave kernel pads K to a multiple of 4 internally
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
@@ -1388,6 +1395,7 @@ def backend_requirement(
     backend_checks: Dict[str, Callable],
     common_check: Optional[Callable] = None,
     heuristic_func: Optional[Callable] = None,
+    bypass: Optional[Callable[..., bool]] = None,
 ) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
@@ -1418,6 +1426,15 @@ def backend_requirement(
         Should return an ordered list of runnable backends with the most preferred backend first.
         When decorated function is not autotuned, the first backend in the heuristic list will be run.
         When decorated function is autotuned, the backends in the heuristic list will be autotuned over to find the best backend.
+    bypass : callable, optional
+        A predicate over the call's arguments (``bypass(*args, **kwargs) -> bool``). When it returns True the
+        wrapper performs no backend selection or validation and calls the function directly, which then owns
+        the validation of that call. For a mode that replaces the backends altogether, e.g.
+        ``mm_bf16(..., batch_invariant=True)``, which never runs a backend and raises its own typed errors:
+        evaluating every backend's requirement checks and the auto heuristic for it is pure host overhead.
+        The predicate runs on every call, so keep it a cheap keyword lookup. It gets the call's arguments as passed
+        (no defaults applied, positional arguments not bound to names), so key it on a keyword-only parameter: a
+        positional-or-keyword flag passed by position would silently never bypass.
 
     Returns
     -------
@@ -1657,6 +1674,10 @@ def backend_requirement(
             # skip_check is an optional argument that the decorator adds to any API function.
             # It prevents the performance overhead of checking.
             skip_check = kwargs.pop("skip_check", False)
+
+            if bypass is not None and bypass(*args, **kwargs):
+                # A mode the function validates and dispatches itself: no backend selection here.
+                return func(*args, **kwargs)
 
             if not skip_check:
                 # Apply defaults from the function signature for validation

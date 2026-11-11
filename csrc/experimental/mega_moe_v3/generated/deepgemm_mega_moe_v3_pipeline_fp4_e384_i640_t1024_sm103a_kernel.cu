@@ -721,7 +721,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
             asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int task[8];
             unsigned int a_stage = 0;
-            unsigned int group_block = 4294967295;
+            unsigned int group_block = 4294967295ll;
             unsigned int group_token_offset = 0;
             unsigned int group_ready = 0;
             unsigned int _phase_empty = 1;
@@ -796,7 +796,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                 } else if (group_ready != 0) {
                     pending = (unsigned long long)0;
                 }
-                group_block = 4294967295;
+                group_block = 4294967295ll;
                 if (task[0] == 2) {
                     group_block = task[4];
                 }
@@ -809,24 +809,25 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                     } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(32)) >= static_cast<unsigned int>(1));
                     }
                 }
-                unsigned int w2t_subs = ((task[0] == 2) ? 2 : 1);
+                unsigned int w2t_subs = ((task[0] == 2) ? 4 : 1);
                 #pragma unroll 1
                 for (int _sub = 0; _sub < w2t_subs; _sub++) {
                     #pragma unroll 2
                     for (int k = 0; k < task[7] / 128; k++) {
                         if (task[0] == 2) {
                             unsigned long long k_mask = (unsigned long long)3 << (unsigned long long)(k * 2);
-                            if ((pending & k_mask) != 0) {
+                            if ((pending & k_mask) != 0ull) {
                                 unsigned long long _wait_acquire_mask_0_1;
                                 do {
                                 asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_wait_acquire_mask_0_1) : "l"((reinterpret_cast<unsigned long long*>(PrivateMasks) + (task[4]))) : "memory");
-                                } while (((_wait_acquire_mask_0_1 ^ static_cast<unsigned long long>((unsigned long long)1023)) & static_cast<unsigned long long>(k_mask)) != 0);
+                                } while (((_wait_acquire_mask_0_1 ^ static_cast<unsigned long long>((unsigned long long)1023ll)) & static_cast<unsigned long long>(k_mask)) != 0);
                                 unsigned long long observed = _wait_acquire_mask_0_1;
-                                pending = observed ^ 1023;
+                                pending = observed ^ 1023ull;
                             }
                         }
                         mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
                         if (elect_sync()) {
+                            asm volatile("fence.proxy.async.global;" ::: "memory");
                             if (task[0] == 1) {
                                 tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 2048, (&A), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                                 tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF1), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
@@ -848,7 +849,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                     }
                 }
                 group_ready = 0;
-                if (pending == 0) {
+                if (pending == 0ull) {
                     group_ready = 1;
                 }
             }
@@ -918,7 +919,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                 if (task_1[0] == 0) {
                     break;
                 }
-                unsigned int w2t_subs_1 = ((task_1[0] == 2) ? 2 : 1);
+                unsigned int w2t_subs_1 = ((task_1[0] == 2) ? 4 : 1);
                 #pragma unroll 1
                 for (int _sub_1 = 0; _sub_1 < w2t_subs_1; _sub_1++) {
                     unsigned int n_offset = ((task_1[3] + (unsigned int)_sub_1) * 2 + (unsigned int)cta_rank) * 128;
@@ -940,9 +941,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                                        "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                             } else {
                                 asm volatile(
-                                    "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
-                                    " [%0], [%1, {%2, %3}], [%4], %5;"
-                                    :: "r"(smem_b_addr + b_stage * 16384), "l"((&B2)), "r"(k_1 * 128), "r"(task_1[1] * task_1[6] + n_offset),
+                                    "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(smem_b_addr + b_stage * 16384), "l"((&B2)), "r"(0), "r"(task_1[1] * task_1[6] + n_offset), "r"((unsigned int)k_1 * 2),
                                        "r"(((full_addr + (b_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
@@ -1034,7 +1035,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                     if (task_2[0] == 0) {
                         break;
                     }
-                    unsigned int w2t_subs_2 = ((task_2[0] == 2) ? 2 : 1);
+                    unsigned int w2t_subs_2 = ((task_2[0] == 2) ? 4 : 1);
                     #pragma unroll 1
                     for (int _sub_2 = 0; _sub_2 < w2t_subs_2; _sub_2++) {
                         unsigned int accum_stage = (unsigned int)completed_tasks % 2;
@@ -1372,7 +1373,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                         unsigned int _shfl_sync_15 = __shfl_sync(0xFFFFFFFF, claimed_0, 0);
                         claimed = _shfl_sync_15;
                         if (claimed >= state[0] * 5) {
-                            state[1] = 4294967295;
+                            state[1] = 4294967295ll;
                             state[2] = state[0];
                         } else {
                             phase = 1;
@@ -1679,42 +1680,6 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                     schedule_stage += 1;
                     if (schedule_stage == 4) { schedule_stage = 0; _phase_task_empty ^= 1; }
                     pub_count += 1;
-                    if (task_3[0] == 2) {
-                        mbarrier_wait(task_empty_addr + (schedule_stage) * 8, _phase_task_empty);
-                        task_3[3] = task_3[3] + 2;
-                        if (lane < 2) {
-                            unsigned int e24_4 = (pub_count / 4 & 127 | 128) << 24;
-                            uint32_t destination_1;
-                            asm volatile(
-                                "mapa.shared::cluster.u32 %0, %1, %2;"
-                                : "=r"(destination_1) : "r"(task_infos_addr + schedule_stage * 32), "r"(lane));
-                            asm volatile(
-                                "{\n\t"
-                                ".reg .b32 remAddr32;\n\t"
-                                "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
-                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
-                                "}"
-                                :: "r"(task_full_addr + (schedule_stage) * 8), "r"(lane), "r"((uint32_t)(32)) : "memory");
-                            uint32_t _mbar_peer_70;
-                            asm(
-                                "mapa.shared::cluster.u32 %0, %1, %2;"
-                                : "=r"(_mbar_peer_70) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
-                            asm volatile(
-                                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                                :: "r"(destination_1), "r"(task_3[0] | e24_4), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_70) : "memory");
-                            uint32_t _mbar_peer_71;
-                            asm(
-                                "mapa.shared::cluster.u32 %0, %1, %2;"
-                                : "=r"(_mbar_peer_71) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
-                            asm volatile(
-                                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                                :: "r"(destination_1 + 16), "r"(task_3[4] | e24_4), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_71) : "memory");
-                        }
-                        __syncwarp();
-                        schedule_stage += 1;
-                        if (schedule_stage == 4) { schedule_stage = 0; _phase_task_empty ^= 1; }
-                        pub_count += 1;
-                    }
                 }
                 mbarrier_wait(task_empty_addr + (schedule_stage) * 8, _phase_task_empty);
                 task_3[0] = 0;
@@ -1726,11 +1691,11 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                 task_3[6] = 0;
                 task_3[7] = 0;
                 if (lane < 2) {
-                    unsigned int e24_5 = (pub_count / 4 & 127 | 128) << 24;
-                    uint32_t destination_2;
+                    unsigned int e24_4 = (pub_count / 4 & 127 | 128) << 24;
+                    uint32_t destination_1;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(destination_2) : "r"(task_infos_addr + schedule_stage * 32), "r"(lane));
+                        : "=r"(destination_1) : "r"(task_infos_addr + schedule_stage * 32), "r"(lane));
                     asm volatile(
                         "{\n\t"
                         ".reg .b32 remAddr32;\n\t"
@@ -1738,20 +1703,20 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                         "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                         "}"
                         :: "r"(task_full_addr + (schedule_stage) * 8), "r"(lane), "r"((uint32_t)(32)) : "memory");
-                    uint32_t _mbar_peer_72;
+                    uint32_t _mbar_peer_70;
                     asm(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mbar_peer_72) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                        : "=r"(_mbar_peer_70) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                        :: "r"(destination_2), "r"(task_3[0] | e24_5), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_72) : "memory");
-                    uint32_t _mbar_peer_73;
+                        :: "r"(destination_1), "r"(task_3[0] | e24_4), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_70) : "memory");
+                    uint32_t _mbar_peer_71;
                     asm(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mbar_peer_73) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                        : "=r"(_mbar_peer_71) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                        :: "r"(destination_2 + 16), "r"(task_3[4] | e24_5), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_73) : "memory");
+                        :: "r"(destination_1 + 16), "r"(task_3[4] | e24_4), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_71) : "memory");
                 }
                 __syncwarp();
             }
@@ -1770,15 +1735,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                 int _parity_task_full_3 = (int)((unsigned int)task_iteration_3 / 4 % 2);
                 mbarrier_wait(task_full_addr + (_stage_task_full_3) * 8, _parity_task_full_3);
                 unsigned int slot_3 = task_infos_addr + (unsigned int)task_iteration_3 % 4 * 32;
-                unsigned int e24_6 = ((unsigned int)task_iteration_3 / 4 & 127 | 128) << 24;
+                unsigned int e24_5 = ((unsigned int)task_iteration_3 / 4 & 127 | 128) << 24;
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&task_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&task_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&task_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&task_4[(0) + 3]))
                     : "r"(slot_3));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&task_4[4])), "=r"(*reinterpret_cast<uint32_t*>(&task_4[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&task_4[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&task_4[(4) + 3]))
                     : "r"(slot_3 + 16));
-                unsigned int x0_3 = task_4[0] ^ e24_6;
-                unsigned int x4_3 = task_4[4] ^ e24_6;
+                unsigned int x0_3 = task_4[0] ^ e24_5;
+                unsigned int x4_3 = task_4[4] ^ e24_5;
                 int _warp_vote_0_3 = __all_sync(0xFFFFFFFF, (x0_3 | x4_3) < 16777216);
                 if (_warp_vote_0_3 == 0) {
                     while (1) {
@@ -1806,8 +1771,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                         uint32_t word_31;
                         asm volatile("ld.relaxed.cluster.shared::cta.b32 %0, [%1];" : "=r"(word_31) : "r"(static_cast<uint32_t>(slot_3 + 28)));
                         task_4[7] = word_31;
-                        x0_3 = task_4[0] ^ e24_6;
-                        x4_3 = task_4[4] ^ e24_6;
+                        x0_3 = task_4[0] ^ e24_5;
+                        x4_3 = task_4[4] ^ e24_5;
                         int _warp_vote_1_3 = __all_sync(0xFFFFFFFF, (x0_3 | x4_3) < 16777216);
                         if (_warp_vote_1_3 != 0) {
                             break;
@@ -1820,7 +1785,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                 if (task_4[0] == 0) {
                     break;
                 }
-                unsigned int w2t_subs_3 = ((task_4[0] == 2) ? 2 : 1);
+                unsigned int w2t_subs_3 = ((task_4[0] == 2) ? 4 : 1);
                 #pragma unroll 1
                 for (int _sub_3 = 0; _sub_3 < w2t_subs_3; _sub_3++) {
                     unsigned int accum_stage_1 = (unsigned int)epi_uses % 2;
@@ -2154,7 +2119,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
                                     : "r"(read_address));
-                                unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560 + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
+                                unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560ull + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
                                 reinterpret_cast<int4*>(PublicExpertOutput + dst_index)[0] = reinterpret_cast<int4*>(packed)[0];
                             }
                         }
@@ -2196,19 +2161,28 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
             }
             asm volatile("barrier.sync 15, 256;" ::: "memory");
             asm volatile("barrier.sync 1, 384;" ::: "memory");
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             unsigned int epi_warp_2 = warp - 8;
+            unsigned int walk_first = epi_warp_2 * (unsigned int)NUM_CTAS + (unsigned int)bid;
+            unsigned int walk_end = (unsigned int)(num_tokens * 4);
+            unsigned int walk_step = (unsigned int)(NUM_CTAS * 8);
             unsigned int values[4];
             float reduced[40];
             unsigned int store_values[4];
             unsigned int buffers = epi_warp_2 * 6;
+            int next_row = -1;
+            if (lane < 6 && walk_first < walk_end) {
+                next_row = token_to_permuted[walk_first / 4 * 6 + (unsigned int)lane];
+            }
             unsigned int _phase_combine_barriers = 0;
             #pragma unroll 1
-            for (unsigned int token_chunk = epi_warp_2 * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += NUM_CTAS * 8) {
+            for (unsigned int token_chunk = walk_first; token_chunk < walk_end; token_chunk += walk_step) {
                 unsigned int token = token_chunk / 4;
                 unsigned int chunk = token_chunk % 4;
-                int stored_row = -1;
-                if (lane < 6) {
-                    stored_row = token_to_permuted[token * 6 + (unsigned int)lane];
+                int stored_row = next_row;
+                next_row = -1;
+                if (lane < 6 && token_chunk + walk_step < walk_end) {
+                    next_row = token_to_permuted[(token_chunk + walk_step) / 4 * 6 + (unsigned int)lane];
                 }
                 unsigned int routed = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
                 #pragma unroll 1
@@ -2216,7 +2190,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                     unsigned int row_3 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, i_5);
                     if (elect_sync()) {
                         if ((routed >> i_5 & 1) != 0) {
-                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_5) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8);
+                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_5) * 2560, expert_output + ((unsigned long long)row_3 * 5120ull + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8);
                             mbarrier_arrive_expect_tx(combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8, 2560);
                         } else {
                             mbarrier_arrive(combine_barriers_addr + (((buffers + i_5 >= epi_warp_2 * 6 + 6) ? buffers + i_5 - 6 : buffers + i_5)) * 8);
@@ -2338,7 +2312,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t1024_sm103a(int* __restrict_
                 __syncwarp();
                 if (elect_sync()) {
                     {
-                        void* _cpbulk_dst_25 = reinterpret_cast<void*>(y + ((unsigned long long)token * 5120 + (unsigned long long)(chunk * 1280)));
+                        void* _cpbulk_dst_25 = reinterpret_cast<void*>(y + ((unsigned long long)token * 5120ull + (unsigned long long)(chunk * 1280)));
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                             :: "l"(_cpbulk_dst_25), "r"(combine_smem_addr + (48 + epi_warp_2) * 2560), "r"((uint32_t)(2560))

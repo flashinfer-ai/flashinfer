@@ -743,7 +743,7 @@ def _lora_carrier(record: dict, device: torch.device) -> torch.Tensor:
 
 
 class StaleAdapterError(ValueError):
-    """A prepared adapter's source tensor (``lora_b`` / ``lora_scale`` / ``alpha``) moved since its prepare (snapshot
+    """A prepared adapter's source tensor (``lora_b`` / ``lora_scale`` / ``alpha``) moved since its preparation (snapshot
     semantics): re-prepare (``prepare_nvfp4_lora_adapter(..., out=adapter)``) or capture the refold inside the graph."""
 
 

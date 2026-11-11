@@ -29,7 +29,7 @@ typed decline through the public entry -- at ``prepare`` and at the workspace qu
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_8_block_cases import (
+from tests.experimental.test_helpers.qwen_3_8_block_cases import (
     Qsa38ExtendCase,
     Qsa38PagedCase,
     bits,
@@ -315,7 +315,7 @@ def test_chunked_prefill_then_carried_decode_steps_are_one_chain():
     ``q_len`` 1, 1, then 4 with two of four rows accepted and RE-STEPPED over the same positions.  After every chunk and step the two-stage
     oracle holds, the ring holds the stream's last ``cap`` raw keys and the cache's rows for every complete block of the ACCEPTED stream are
     bitwise the from-scratch compress of that stream (the chunks' rows, the rows a step completes and a re-stepped block are one chain)."""
-    from tests.test_helpers.qwen_3_5_block_reference import (
+    from tests.experimental.test_helpers.qwen_3_5_block_reference import (
         gated_attention_block_reference,
     )
 

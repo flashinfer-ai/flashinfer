@@ -324,7 +324,8 @@ class BatchedGemmConfig:
 
     Matches TRTLLM-gen's ``tmemLdstMaxNumRegs`` control. Both the transposed
     ``16x256b`` and non-transposed ``32x32b`` epilogues split a logical
-    fragment into the largest legal loads that do not exceed this cap.
+    fragment into the largest legal loads that do not exceed this cap. The
+    DeepSeek FP8 epilogues are exempt and always issue one full-width load.
     """
 
     mma_k: int = 64
@@ -727,12 +728,21 @@ class BatchedGemmConfig:
     has_gemm1_clamp_limit: int = 0
     """Load a per-expert float32 SwiGLU-OAI clamp-limit pointer in the epilogue."""
 
-    # DeepSeek FP8: per-128-K-chunk FP32 dequant scales loaded into SMEM via
+    # DeepSeek FP8: per-K-tile FP32 dequant scales loaded into SMEM via
     # cp.async and applied as ffma2 in the epilogue, BEFORE the FP32 output cast.
-    # Requires E4M3 MMA
-    # with tile_k=128 and is mutually exclusive with MX/NVFP4 block scaling
-    # and per-token SF.
+    # Requires E4M3 MMA with tile_k=128 (the scale block, 128 or 32, divides
+    # it) and is mutually exclusive with MX/NVFP4 block scaling and per-token SF.
     use_deepseek_fp8: int = 0
+    deepseek_fp8_block_size: int = 128
+    """Side of the square DeepSeek FP8 scale block, in elements. ``128`` or ``32``.
+
+    One FP32 weight scale covers ``block`` rows x ``block`` K elements, and one
+    activation scale covers ``block`` K elements of a token row. The K tile
+    stays 128 wide (the FP8 TMA box) and holds ``128 / block`` sub-blocks: the
+    MMA writes every sub-block to its own accumulator stage and the epilogue
+    drains and scales each one. ``32`` requires the swapAB split-M epilogue
+    (``mma_m=64``), which also keeps ``mma_k`` at 32.
+    """
     load_sfab_regs: int = 48
     use_tma_oob_opt: int = 1
     """Use TMA out-of-bounds predication for partial tiles. ``0``/``1``.
@@ -1034,23 +1044,54 @@ class BatchedGemmConfig:
         return max(1, self.tile_n // max(1, epi_cols_per_call))
 
     @property
-    def num_dsfp8_act_sfs_per_stage(self) -> int:
-        """Number of DeepSeek FP8 activation scales staged per pipeline stage."""
+    def dsfp8_k_subblocks_per_tile(self) -> int:
+        """DeepSeek scale blocks along K inside one ``tile_k`` tile (``1`` at block 128)."""
+        return self.tile_k // self.deepseek_fp8_block_size
+
+    @property
+    def num_dsfp8_act_sfs_per_subblock(self) -> int:
+        """DeepSeek FP8 activation scales staged per K sub-block."""
         token_tile_dim = self.tile_n if self.is_swap_ab else self.tile_m
         return max(token_tile_dim, 32)
+
+    @property
+    def num_dsfp8_act_sfs_per_stage(self) -> int:
+        """DeepSeek FP8 activation scales staged per pipeline stage, ``[sub-block][token]``."""
+        return self.dsfp8_k_subblocks_per_tile * self.num_dsfp8_act_sfs_per_subblock
 
     @property
     def num_bytes_dsfp8_sfab_per_stage(self) -> int:
         """SMEM bytes per DeepSeek SF stage, rounded for cp.async alignment."""
         raw = (
-            self.num_dsfp8_act_sfs_per_stage + 1  # num weight sfs per stage
+            self.num_dsfp8_act_sfs_per_stage + self.num_dsfp8_weight_sfs_per_stage
         ) * 4
         return ((raw + 15) // 16) * 16
 
     @property
-    def num_dsfp8_weight_sfs_per_stage(self) -> int:
-        """Number of DeepSeek FP8 weight scales staged per pipeline stage."""
+    def num_dsfp8_weight_sfs_per_subblock(self) -> int:
+        """DeepSeek FP8 weight scales staged per K sub-block.
+
+        SwapAB stages one scale per ``deepseek_fp8_block_size`` rows of the
+        ``tile_m`` weight tile. The non-swap path keeps one scale per
+        ``tile_n`` weight tile.
+        """
+        if self.is_swap_ab:
+            return self.dsfp8_row_groups_per_tile
         return 1
+
+    @property
+    def num_dsfp8_weight_sfs_per_stage(self) -> int:
+        """DeepSeek FP8 weight scales staged per pipeline stage, ``[sub-block][row group]``."""
+        return self.dsfp8_k_subblocks_per_tile * self.num_dsfp8_weight_sfs_per_subblock
+
+    @property
+    def dsfp8_row_groups_per_tile(self) -> int:
+        """DeepSeek scale groups along the swapAB weight rows of one ``tile_m`` tile.
+
+        Weight dequant scales and the FP32 output scales are both one value
+        per group. ``1`` at block 128.
+        """
+        return self.tile_m // self.deepseek_fp8_block_size
 
     @property
     def uses_fp4_output_quant(self) -> bool:
@@ -1681,6 +1722,12 @@ class BatchedGemmConfig:
         than one instruction under the configured register cap.
         """
         total_regs_per_slice = max(1, self.epi_tile_n // 2)
+        # The DeepSeek epilogue re-reads the accumulator every K block, so one
+        # wide load per slice (as before the cap) keeps the epilogue warps from
+        # falling behind the MMA at epi_tile_n=128; two half loads cost ~25%.
+        if self.use_deepseek_fp8:
+            return max(4, total_regs_per_slice)
+
         width_limit = min(total_regs_per_slice, self.tmem_ldst_max_num_regs)
         num_regs = 1 << (width_limit.bit_length() - 1)
         while total_regs_per_slice % num_regs != 0:
@@ -1859,6 +1906,30 @@ class BatchedGemmConfig:
         if self.uses_16bit_gated_tma_c_scratch:
             return False
         return not self.is_persistent and not self.has_cast_a
+
+    @property
+    def tmem_alloc_blocks_second_cta(self) -> bool:
+        """True when the TMEM allocation leaves no room for a second CTA on the SM.
+
+        ``tcgen05.alloc`` blocks until the requested columns are free, so a
+        second resident CTA could only wait for the first one to finish.
+        """
+        return 2 * self.tmem_alloc_cols > self.tmem_capacity_columns
+
+    @property
+    def smem_single_cta_floor_bytes(self) -> int:
+        """Dynamic-SMEM floor that limits residency to one CTA per SM (0 = none).
+
+        Applied only when :attr:`tmem_alloc_blocks_second_cta` holds.  Requesting
+        more than half of the SM's shared memory makes the hardware block
+        scheduler see the one-CTA limit that TMEM already imposes, instead of
+        placing a second CTA that spins in ``tcgen05.alloc`` next to the running
+        one.  Smaller footprints (16-bit gated FC1 epilogue scratch, narrow
+        tiles) otherwise drop below that threshold on SM100.
+        """
+        if not self.tmem_alloc_blocks_second_cta:
+            return 0
+        return self.smem_capacity_bytes // 2 + 1
 
     @property
     def tmem_alloc_cols(self) -> int:
@@ -3692,10 +3763,18 @@ def validate_config(
             raise ValueError(
                 "use_deepseek_fp8=1 requires E4M3 MMA (dtype_a=dtype_b=E4M3)"
             )
+        block = cfg.deepseek_fp8_block_size
+        if block not in (32, 128):
+            raise ValueError(f"deepseek_fp8_block_size must be 32 or 128, got {block}")
         if cfg.tile_k != 128:
             raise ValueError(
                 "use_deepseek_fp8=1 requires tile_k=128 "
                 f"for DeepSeek scale-factor blocks, got {cfg.tile_k}"
+            )
+        if block != 128 and not cfg.has_deepseek_fp8_two_epilogue:
+            raise ValueError(
+                f"deepseek_fp8_block_size={block} requires the swapAB split-M "
+                "epilogue (batch_mode=BATCH_N, mma_m=64)"
             )
         if cfg.has_gated_epilogue:
             raise ValueError(

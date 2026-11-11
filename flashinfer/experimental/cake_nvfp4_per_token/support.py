@@ -46,6 +46,7 @@ def cake_mm_fp4_requirement(
     backend: str = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
+    batch_invariant: bool = False,  # unused
 ) -> bool:
     """Requirement check of the cake per-token NVFP4 GEMM.
 
