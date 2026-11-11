@@ -293,6 +293,8 @@ def cute_dsl_sm12x_fc1_act_q1_fp8(
             raise ValueError(
                 "gather inputs must be token-major FP8 A and contiguous FP32 SF"
             )
+        if a_q.data_ptr() % 16:
+            raise ValueError("gather activation must be 16-byte aligned")
         m = token_map.numel()
     assert not enable_pdl or (out_q is not None and out_sf is not None), (
         "PDL requires caller-owned out_q and out_sf"

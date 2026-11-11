@@ -606,6 +606,55 @@ def test_fc1_gather_activation_offset_exceeds_int32():
     assert torch.equal(sf, expected_sf)
 
 
+@pytest.mark.parametrize("bm", (8, 32))
+@pytest.mark.parametrize("byte_offset", (1, 16))
+def test_fc1_q1_gather_activation_alignment(bm, byte_offset, monkeypatch):
+    skip_if_not_sm120()
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
+        moe_mxfp8_mxfp4_fc1_act_q1 as entry,
+    )
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    a_q, a_sf, _, _, b_q, b_sf, offsets, mapping, ref = _gather_inputs(
+        bm, 512, counts=[0, 2, 0], tokens=2
+    )
+    storage = torch.empty(
+        a_q.numel() + byte_offset, dtype=torch.uint8, device=a_q.device
+    )
+    shifted = storage[byte_offset:].view(a_q.dtype).view_as(a_q)
+    shifted.view(torch.uint8).copy_(a_q.view(torch.uint8))
+    assert shifted.is_contiguous() and shifted.storage_offset() == byte_offset
+    assert shifted.data_ptr() % 16 == byte_offset % 16
+    epi = entry.EpiMethod.WG_QUANT_SWAP if bm == 8 else entry.EpiMethod.WG_S2R_QUANT
+    kwargs = dict(
+        token_map=mapping, tile=(bm, 128, 128), epi=epi, split_k=1, tune=False
+    )
+    if byte_offset % 16:
+
+        def unexpected_compile(*args, **kwargs):
+            pytest.fail("misaligned gather activation reached kernel compilation")
+
+        monkeypatch.setattr(entry, "compiled_kernel", unexpected_compile)
+        with pytest.raises(
+            ValueError, match="gather activation must be 16-byte aligned"
+        ):
+            entry.cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
+                shifted, a_sf, b_q, b_sf, offsets, **kwargs
+            )
+        return
+    q, sf = entry.cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
+        shifted, a_sf, b_q, b_sf, offsets, **kwargs
+    )
+    q_base, sf_base = entry.cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
+        a_q, a_sf, b_q, b_sf, offsets, **kwargs
+    )
+    assert torch.equal(q.view(torch.uint8), q_base.view(torch.uint8))
+    assert torch.equal(sf, sf_base)
+    ref_q, ref_sf = mxfp8_act_quantize(ref)
+    ref_deq = ref_q.float() * ref_sf.repeat_interleave(128, dim=1)
+    assert calc_diff(_dequant_q1(q, sf, offsets), ref_deq) < 8e-3
+
+
 @pytest.mark.parametrize("invalid", ["dtype", "rank", "stride", "device"])
 def test_fc1_q1_gather_rejects_invalid_map(invalid):
     skip_if_not_sm120()
