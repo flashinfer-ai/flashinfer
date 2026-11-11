@@ -62,6 +62,10 @@
 #endif
 // GIN code is device-pass only: NCCL's device headers do not compile in nvcc's host pass, and the
 // kernel's signature carries no NCCL type
+#if FLASHINFER_MEGAMOE_SM120_GIN
+// the proxy backend's device code names cuda:: types that the host stub pass also sees
+#include <cuda/atomic>
+#endif
 #if FLASHINFER_MEGAMOE_SM120_GIN && defined(__CUDA_ARCH__)
 #define MEGAMOE_SM120_GIN_DEVICE 1
 #include <nccl_device.h>
