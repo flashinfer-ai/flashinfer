@@ -37,6 +37,53 @@ KNOB_KEYS = (
     "reduce_topk_in_kernel",
 )
 
+# Structural choices before expanding the optional in-kernel reduction axis.
+_INFERENCE_CANDIDATE_ORDER = (
+    29,
+    25,
+    19,
+    27,
+    31,
+    21,
+    23,
+    18,
+    17,
+    15,
+    7,
+    22,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    16,
+    20,
+    24,
+    26,
+    28,
+    30,
+)
+
+
+def _unique_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize tuple-valued knobs and retain each choice's first occurrence."""
+    from .knob_cache import _knobs_from_json
+
+    unique: Dict[tuple, Dict[str, Any]] = {}
+    for knobs in candidates:
+        normalized = _knobs_from_json(knobs)
+        unique.setdefault(tuple(sorted(normalized.items())), normalized)
+    return list(unique.values())
+
 
 def is_valid_sm107(knobs: Dict[str, Any], base_config: Any) -> bool:
     """``True`` if ``knobs`` is constructible on ``base_config``'s geometry.
@@ -64,15 +111,16 @@ def sm107_candidates(
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
-    Inference uses 32 candidates (64 with the ikr axis). The first 16 retain:
+    Inference uses 32 candidates (64 with the ikr axis), ordered for callers
+    taking a prefix. The grid includes:
 
-    - tile N 128 vs 256 (K fixed at the kind's 2x-mode depth),
+    - tile N 128 vs 256 at the kind's base K depth,
     - uniform (2,1) grouped/grid-stride launch vs mixed-CGA (4,1)+(2,1)
       phase-interleave/atomic launch,
     - epi flag batches (1,4) vs (2,4),
     - FC2 bulk TMA (2 stages) on/off.
 
-    The remaining candidates use uniform clusters (2,1) or (4,1) with
+    Additional candidates use uniform clusters (2,1) or (4,1) with
     phase-interleave/atomic launches and epi flag batches (2,4): N64 at the
     kind's base and doubled K depths, plus N128/N256 at the base K depth.
     FC2 bulk stores use one stage for N64 and two for the wider tiles.
@@ -124,7 +172,6 @@ def sm107_candidates(
                             }
                         )
     if kernel_variant == "inference":
-        # Preserve the original prefix for callers using --max-candidates.
         for tile_n, depth in (
             (64, tile_k),
             (64, 2 * tile_k),
@@ -179,6 +226,14 @@ def sm107_candidates(
                     "reduce_topk_in_kernel": False,
                 }
             )
+    if kernel_variant == "inference":
+        # Keep each structural choice's reduction variants adjacent.
+        stride = 2 if allow_in_kernel_fc2_reduce else 1
+        out = [
+            candidate
+            for index in _INFERENCE_CANDIDATE_ORDER
+            for candidate in out[index * stride : (index + 1) * stride]
+        ]
     return out
 
 
@@ -254,7 +309,7 @@ def _sweep_sm107_block_scaled_mega_moe(
 
     ensure_not_capturing("SM107 collective autotune sweep")
     cfg = symm_buffer.config
-    candidates = (
+    candidates = _unique_candidates(
         sm107_candidates(cfg.quant_kind, kernel_variant=cfg.kernel_variant)
         if candidates is None
         else candidates
@@ -454,6 +509,7 @@ def autotune_sm107_block_scaled_mega_moe(
     context and ``install_winner=True`` to prepare the winner in this workspace.
     A disabled cache miss returns None. Layer and CLI tuning measure complete
     forwards through the same protocol with a staging-aware execution trial.
+    Supplied candidates retain their order; repeated choices are measured once.
     """
     from .tuning_protocol import RubinTuningProtocol
 
