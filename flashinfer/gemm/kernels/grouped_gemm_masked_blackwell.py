@@ -3840,7 +3840,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 cutlass.Float32,
                 global_scale_data_ptr,
                 cute.AddressSpace.gmem,
-                assumed_align=16,
+                # Read one scalar per expert, so a slice of a larger table works.
+                assumed_align=4,
             )
             if global_scale_data_ptr is not None
             else None
