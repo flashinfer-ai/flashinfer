@@ -960,28 +960,25 @@ class GdnReplayMtpUmma:
         aq = q_g + Int64(cute.crd2idx((brow, t_q, kh, 0), q.layout)) * 2
         return _sel(is_q, aq, ak, Int64)
 
+    @cute.jit
     def _u_window_copy(self, u_cache, u_g, uw_addr, mbar, sidx, hv, base, buf):
         """Bulk-copy logical window slots j = 0..15 (physical (base + j) & 31) of one value
         head's u ring into SMEM buffer ``buf`` as [j][V]. Call under elect_one.
 
         The window's 16 ring slots wrap at most once: two contiguous copies instead of
         sixteen single-row ones (saves ~0.5 us of warp 0's serial issue per head pair).
-        Without a wrap the second copy re-copies row 15 (the same bytes), so the transaction
-        count stays expression-only."""
+        Without a wrap there is only the first copy, so no two copies write the same rows."""
         rowb = V_DIM * 2
         src_head = u_g + Int64(cute.crd2idx((sidx, hv, 0, 0), u_cache.layout)) * 2
         dst = uw_addr + buf * (W_RING * rowb)
         n1 = _sel(
             base + W_RING <= RING_SLOTS, Int32(W_RING), Int32(RING_SLOTS) - base, Int32
         )
-        n2 = _sel(n1 < W_RING, Int32(W_RING) - n1, Int32(1), Int32)
-        d2 = _sel(n1 < W_RING, n1, Int32(W_RING - 1), Int32)
-        s2 = _sel(n1 < W_RING, Int32(0), (base + Int32(W_RING - 1)) & RING_MASK, Int32)
+        n2 = Int32(W_RING) - n1
         cute.arch.mbarrier_arrive_and_expect_tx(mbar, (n1 + n2) * rowb)
         U.bulk_g2s(dst, src_head + Int64(base * rowb), n1 * rowb, mbar.toint())
-        U.bulk_g2s(
-            dst + d2 * rowb, src_head + Int64(s2 * rowb), n2 * rowb, mbar.toint()
-        )
+        if n2 > 0:
+            U.bulk_g2s(dst + n1 * rowb, src_head, n2 * rowb, mbar.toint())
 
     def _d_build(self, hh, dcol, ctx):
         """D row w_j u_j (j < P, fp16 pairs) of head hh into TMEM columns dcol..dcol+7;
