@@ -23,7 +23,11 @@ from flashinfer.mamba.checkpointing_ssu import (
     allocate_checkpointing_ssu_scratch,
     checkpointing_ssu,
 )
-from flashinfer.utils import cvt_rs_supported_arches_text, is_cvt_rs_supported
+from flashinfer.utils import (
+    cvt_rs_supported_arches_text,
+    device_support_pdl,
+    is_cvt_rs_supported,
+)
 
 # Triton reference: the standalone TMA persistent kernel only (the old 4D
 # `checkpointing_state_update` and its merged non-TMA replay copy were removed
@@ -118,12 +122,28 @@ def _seed_ring(x_cache, B_cache, dt_cache, ring_start, slot, x_tok, B_tok, dt_pr
 _TRITON_IMPLS = ["tma_pd", "tma_pm"]
 
 
+def _pdl_supported() -> bool:
+    return torch.cuda.is_available() and device_support_pdl(torch.device("cuda"))
+
+
+def _skip_without_pdl() -> None:
+    if not _pdl_supported():
+        pytest.skip("checkpointing_ssu PDL requires a PDL-capable (SM90+) device")
+
+
+requires_pdl = pytest.mark.skipif(
+    not _pdl_supported(),
+    reason="checkpointing_ssu PDL requires a PDL-capable (SM90+) device",
+)
+
+
 def _two_kernel_scratch(batch, nheads, num_predicted_tokens, max_window, dtype, device):
     """Precompute scratch that routes checkpointing_ssu to the two-kernel split.
 
     Shapes hold for NPREDICTED <= 16 (cumAdt_vec pads to the m16 MMA row count).
     Forces algorithm="two-kernel": test batches sit below the wrapper's auto
     threshold (batch*nheads >= sm_count) and would silently run the monolith."""
+    _skip_without_pdl()
     cb_scaled, cumAdt_vec, cb_old = allocate_checkpointing_ssu_scratch(
         batch, nheads, num_predicted_tokens, max_window, dtype, device
     )
@@ -494,6 +514,7 @@ def test_checkpointing_ssu_heads_per_group(impl):
     )
 
 
+@requires_pdl
 def test_two_kernel_matches_monolithic(tmp_path, request):
     """The two-kernel path (caller passes cb_scaled/cumAdt_vec/cb_old scratch)
     must match the monolithic kernel (no scratch) bit-for-bit on out, state, and
@@ -725,6 +746,9 @@ def test_autotune_runner_key_is_batch_bucket_invariant(monkeypatch):
 
     module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
     monkeypatch.setattr(module, "_sm_count", lambda _device: 148)
+    # This is a CPU-only autotune-key test; simulate a PDL-capable device so
+    # the two-kernel tactic space stays part of the key under test.
+    monkeypatch.setattr(module, "device_support_pdl", lambda _device: True)
 
     def make_inputs(batch):
         inputs, _ = _make_autotune_key_inputs()
@@ -827,6 +851,8 @@ def test_autotune_tactics_sweep_d_split(monkeypatch):
 
     module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
     monkeypatch.setattr(module, "_sm_count", lambda _device: 148)
+    # This test exercises the split tactic space on CPU; simulate PDL support.
+    monkeypatch.setattr(module, "device_support_pdl", lambda _device: True)
     inputs = [None] * 22
     inputs[0] = torch.empty(1, 16, 64, 1, dtype=torch.float32)  # state
     inputs[1] = torch.empty(128, 1, 16, 64, dtype=torch.bfloat16)  # x
@@ -986,6 +1012,7 @@ def test_autotune_quantized_scratch_forwards_monolith(monkeypatch, tmp_path):
     assert forwarded_tactics == [selected_tactic]
 
 
+@requires_pdl
 def test_two_kernel_d_split2():
     """Two-kernel split with d_split=2 must match d_split=1 bit-for-bit.
 
@@ -1075,6 +1102,7 @@ def test_two_kernel_d_split2():
             )
 
 
+@requires_pdl
 def test_persistent_main_matches_monolithic(monkeypatch):
     """Persistent main: with FLASHINFER_SSU_MAIN_CTA_PER_SM=1 the main grid is
     undersized so that ``work_units > occupancy·NUM_SMS`` — the grid genuinely
@@ -1160,6 +1188,7 @@ def test_persistent_main_matches_monolithic(monkeypatch):
             )
 
 
+@requires_pdl
 def test_two_kernel_meta_ring_refill(monkeypatch):
     """Meta-ring REFILL path: with FLASHINFER_SSU_MAIN_CTA_PER_SM=1 the main grid is
     NUM_SMS CTAs and batch is sized so each CTA grid-strides over ~64 work-units —
@@ -1373,6 +1402,7 @@ def _run_two_kernel_state_dtype_case(
 
 
 @pytest.mark.parametrize("philox_rounds", [0, 5])
+@requires_pdl
 def test_two_kernel_f16_state(philox_rounds):
     """f16 STATE + bf16 activations on the two-kernel path vs the monolithic
     reference.  The operand-swap OUT.1 LDSMs the state under a bf16-typed view;
@@ -1387,6 +1417,7 @@ def test_two_kernel_f16_state(philox_rounds):
     _run_two_kernel_state_dtype_case(torch.float16, philox_rounds)
 
 
+@requires_pdl
 def test_two_kernel_f32_state():
     """f32 STATE + bf16 activations on the two-kernel path vs the monolithic
     reference — the wide-A path: OUT.1 loads the state as k-adjacent float2
@@ -1398,6 +1429,7 @@ def test_two_kernel_f32_state():
     _run_two_kernel_state_dtype_case(torch.float32, 0)
 
 
+@requires_pdl
 def test_two_kernel_f32_mixed_batch():
     """Mixed write/no-write batch (per-slot pnat, ~40% writes) on the f32
     two-kernel path vs the monolithic reference.  batch=64 gives the persistent
@@ -1408,6 +1440,7 @@ def test_two_kernel_f32_mixed_batch():
     _run_two_kernel_state_dtype_case(torch.float32, 0, batch=64, k_cases=("mixed",))
 
 
+@requires_pdl
 def test_checkpointing_ssu_pdl_bf16():
     """PDL smoke: bf16 state.  Runs the kernel twice on the same inputs —
     once with enable_pdl=False, once with True — and asserts the outputs and
@@ -1504,6 +1537,7 @@ def test_checkpointing_ssu_pdl_bf16():
     not is_cvt_rs_supported(),
     reason=f"fp8 + Philox SR requires HW cvt.rs on one of: {cvt_rs_supported_arches_text()}",
 )
+@requires_pdl
 def test_checkpointing_ssu_pdl_fp8_philox5():
     """PDL smoke: fp8 e4m3 state + Philox-5 SR.  Same as the bf16 PDL test
     but exercises the int8/fp8 kernel binary (`checkpointing_ssu_kernel_8bit`)
