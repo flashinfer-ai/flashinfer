@@ -2433,6 +2433,7 @@ def _build_trtllm_moe_namespace(module):
         gemm1_clamp_limit: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         assert routing_logits is not None or topk_ids is not None, (
             "either routing_logits or topk_ids must be provided"
@@ -2498,6 +2499,7 @@ def _build_trtllm_moe_namespace(module):
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
+            token_mask=token_mask,
             topk_ids=topk_ids,
             expert_weights=expert_weights,
             hidden_states=hidden_states,
@@ -2582,6 +2584,7 @@ def _build_trtllm_moe_namespace(module):
                 [],
                 [],
                 False,
+                token_mask,
                 workspace_buffer,
                 False,  # query_workspace_size
             )
@@ -2677,6 +2680,7 @@ def _build_trtllm_moe_namespace(module):
         gemm1_clamp_limit: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
@@ -3467,6 +3471,7 @@ def _build_trtllm_moe_namespace(module):
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         # Determine routing mode: compute from logits or use pre-computed
         if routing_logits is None:
@@ -3591,6 +3596,7 @@ def _build_trtllm_moe_namespace(module):
             hidden_states_scale=hidden_states_scale,
             gemm1_lora_delta=gemm1_lora_delta,
             per_token_scale=None,
+            token_mask=token_mask,
         )
         tuning_config = moe_runner._make_tuning_config(
             moe_inputs,
@@ -3685,6 +3691,7 @@ def _build_trtllm_moe_namespace(module):
                 False,
                 valid_hidden_size,
                 valid_intermediate_size,
+                token_mask,
                 workspace_buffer,
                 False,  # query_workspace_size
             )
@@ -3790,6 +3797,7 @@ def _build_trtllm_moe_namespace(module):
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
@@ -3872,7 +3880,10 @@ def _build_trtllm_moe_namespace(module):
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
         routing_metadata: Optional[List[torch.Tensor]] = None,
         routing_metadata_tile_n: int = -1,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
+        if token_mask is not None and routing_metadata is not None:
+            raise ValueError("token_mask cannot be combined with routing_metadata")
         if routing_logits is None:
             assert topk_ids is not None, (
                 "either topk_ids or routing_logits must be provided."
@@ -3995,6 +4006,7 @@ def _build_trtllm_moe_namespace(module):
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
+            token_mask=token_mask,
             topk_ids=topk_ids,
             expert_weights=topk_weights,
             hidden_states=hidden_states,
@@ -4109,6 +4121,7 @@ def _build_trtllm_moe_namespace(module):
                 False,
                 valid_hidden_size,
                 valid_intermediate_size,
+                token_mask,
                 workspace_buffer,
                 False,  # query_workspace_size
                 nvfp4_4over6_code,
@@ -4226,6 +4239,7 @@ def _build_trtllm_moe_namespace(module):
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
         routing_metadata: Optional[List[torch.Tensor]] = None,
         routing_metadata_tile_n: int = -1,
+        token_mask: Optional[torch.Tensor] = None,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
@@ -5256,6 +5270,8 @@ def trtllm_bf16_moe(
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
+    *,
+    token_mask: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""BF16 MoE operation with autotuning support.
 
@@ -5264,6 +5280,10 @@ def trtllm_bf16_moe(
 
     Parameters
     ----------
+    token_mask : Optional[torch.Tensor]
+        Optional contiguous CUDA bool ``[seq_len]`` tensor on the input device.
+        True marks padding rows excluded from expert work; their output is undefined.
+        None processes every row.
     routing_logits : torch.Tensor
         ``[seq_len, num_experts]`` tensor of routing logits.  ``float32`` or
         ``bfloat16``.
@@ -5451,6 +5471,7 @@ def trtllm_bf16_moe(
         gemm1_clamp_limit,
         output,
         workspace_buffer=workspace_buffer,
+        token_mask=token_mask,
     )
 
     if do_finalize:
@@ -6370,6 +6391,7 @@ def trtllm_fp8_block_scale_moe(
     valid_hidden_size: Optional[int] = None,
     valid_intermediate_size: Optional[int] = None,
     *,
+    token_mask: Optional[torch.Tensor] = None,
     gemm1_bias: Optional[torch.Tensor] = None,
     gemm2_bias: Optional[torch.Tensor] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
@@ -6381,6 +6403,13 @@ def trtllm_fp8_block_scale_moe(
     routing_logits : torch.Tensor
         ``[seq_len, num_experts]`` tensor of routing logits, ``float32`` or
         ``bfloat16``.
+    token_mask : Optional[torch.Tensor]
+        Contiguous CUDA bool tensor ``[seq_len]`` on the input device. True
+        marks padding: no experts are selected and no expert work is scheduled
+        for that row. Padded output rows are undefined. None preserves ordinary
+        routing. Fused shared experts require grouped DeepSeek routing.
+        For CUDA graph replay, retain the allocation and update its contents
+        at the same address, ordered before replay on the execution stream.
     routing_bias : Optional[torch.Tensor]
         ``[num_experts]`` tensor of routing bias, ``bfloat16`` or
         ``float32``.  May be ``None``.
@@ -6631,6 +6660,7 @@ def trtllm_fp8_block_scale_moe(
         valid_hidden_size,
         valid_intermediate_size,
         workspace_buffer=workspace_buffer,
+        token_mask=token_mask,
     )
 
     if do_finalize:
@@ -6985,11 +7015,17 @@ def trtllm_fp4_block_scale_moe(
     hidden_states_scale_layout: Optional[SfLayout] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    *,
+    token_mask: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
     Parameters
     ----------
+    token_mask : Optional[torch.Tensor]
+        Optional contiguous CUDA bool ``[seq_len]`` tensor on the input device.
+        True marks padding rows excluded from expert work; their output is undefined.
+        None processes every row.
     routing_logits : torch.Tensor
         ``[seq_len, num_experts]`` tensor of routing logits.  ``float32`` or
         ``bfloat16``.
@@ -7261,6 +7297,7 @@ def trtllm_fp4_block_scale_moe(
         valid_intermediate_size,
         hidden_states_scale_layout,
         workspace_buffer=workspace_buffer,
+        token_mask=token_mask,
         nvfp4_4over6_code=nvfp4_4over6_code_value,
     )
 
@@ -8291,7 +8328,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             None, None, None, None,  # gemm1 lora_delta, alpha, beta, clamp_limit
             output, num_experts, top_k, *experts, method,
             use_shuffled_weight, weight_layout, *launch, native_tactic, activation_type,
-            *ordinary,
+            *ordinary, None,  # token_mask
         )  # fmt: skip
     elif quant_mode == "fp8_per_tensor":
         scale = stub((local_num_experts,), torch.float32)
@@ -8344,7 +8381,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             None,  # gemm2_bias
             output, num_experts, top_k, num_fused_shared_experts, *experts, method,
             use_shuffled_weight, weight_layout, *launch, native_tactic, int(quantization),
-            activation_type, *ordinary, *valid,
+            activation_type, *ordinary, *valid, None,  # token_mask
         )  # fmt: skip
     elif quant_mode in ("nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"):
         # The entry point derives both block-scale vector sizes from scale numel.
@@ -8372,7 +8409,7 @@ def _trtllm_fused_moe_workspace_size_impl(
             None, None, None, None,  # gemm2_bias, output1/output1_gate/output2 scales
             stub((T,), torch.float32) if use_per_token_scale else None,
             num_experts, top_k, num_fused_shared_experts, *experts, method, *launch,
-            activation_type, output, native_tactic, *ordinary, *valid,
+            activation_type, output, native_tactic, *ordinary, *valid, None,  # token_mask
         )  # fmt: skip
     else:  # mxint4
         fn = moe_op.trtllm_mxint4_block_scale_moe

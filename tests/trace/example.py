@@ -133,6 +133,7 @@ moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_routing_topk2_e8_h1024_i512.json
 moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
+moe_fp8_block_scale_renormalize_routing_topk4_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 msa_proxy_score_fp4_h4_kv1.json
 msa_proxy_score_h4_kv1_d128.json
@@ -177,6 +178,8 @@ top_k_varlen_n8192_k1024.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
+trtllm_bf16_moe_token_mask_topk2_e8_h256_i128.json
+moe_fp4_block_scale_token_mask_topk2_e8_h256_i128.json
 trtllm_bf16_routed_moe_topk2_e8_h1024.json
 trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3.json
 trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3_r4o61.json
@@ -265,6 +268,11 @@ from tests.utils_fp8 import to_float8
 
 # Public MoELayer pack schemas, including all four Frost quantization formats.
 generate_moe_layer_traces(SAVE_DIR)
+
+# CPU metadata examples for BF16/FP4 fixed-size inputs with padding.
+from generate_moe_token_mask_traces import generate_moe_token_mask_traces
+
+generate_moe_token_mask_traces(SAVE_DIR)
 
 device = "cuda"
 
@@ -1680,6 +1688,18 @@ with contextlib.suppress(Exception):
         n_group=None,
         topk_group=None,
         routing_method_type=1,
+        **_moe_common,
+    )
+
+# Fixed-size input with interleaved padding; True rows select no experts.
+with contextlib.suppress(Exception):
+    flashinfer.fused_moe.trtllm_fp8_block_scale_moe(
+        *_moe_args,
+        top_k=4,
+        n_group=None,
+        topk_group=None,
+        routing_method_type=1,
+        token_mask=torch.arange(T_moe, device=device) % 2 == 1,
         **_moe_common,
     )
 

@@ -1282,6 +1282,7 @@ class FusedMoeLauncher {
 
   // Optional routing replay output: [num_tokens, top_k] int16 tensor
   Optional<TensorView> routing_replay_out;
+  Optional<TensorView> padding_token_mask;
 
   int64_t intermediate_size_factor{2};
 
@@ -1327,6 +1328,8 @@ class FusedMoeLauncher {
         intermediate_size_factor{2} {}
 
  public:
+  void set_token_mask(Optional<TensorView> const& mask) { padding_token_mask = mask; }
+
   void set_routing_replay_out(const Optional<TensorView>& replay_out) {
     routing_replay_out = replay_out;
   }
@@ -1820,7 +1823,10 @@ class FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl,
+        padding_token_mask.has_value()
+            ? static_cast<bool const*>(padding_token_mask.value().data_ptr())
+            : nullptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -4851,7 +4857,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl,
+        padding_token_mask.has_value()
+            ? static_cast<bool const*>(padding_token_mask.value().data_ptr())
+            : nullptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -5558,7 +5567,10 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
                        mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
                        static_cast<RoutingMethodType>(routing_method_type), routing_stream,
-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
+                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl,
+                       padding_token_mask.has_value()
+                           ? static_cast<bool const*>(padding_token_mask.value().data_ptr())
+                           : nullptr);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -5669,8 +5681,19 @@ Array<Optional<Tensor>> trtllm_bf16_moe(
     bool use_shuffled_weight, int64_t weight_layout, bool do_finalize, bool enable_pdl,
     Array<int64_t> moe_tactic, int64_t activation_type, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
-    Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+    Array<Tensor> da_body_workspace, bool is_da_body_preparation, Optional<TensorView> token_mask,
     Optional<TensorView> workspace_buffer, bool query_workspace_size) {
+  if (token_mask.has_value()) {
+    auto const& mask = token_mask.value();
+    CHECK_INPUT_AND_TYPE(mask, dl_bool);
+    CHECK_DEVICE(mask, hidden_states);
+    CHECK_DIM(1, mask);
+    TVM_FFI_ICHECK_EQ(mask.size(0), hidden_states.size(0))
+        << "token_mask must have shape [num_tokens]";
+    TVM_FFI_ICHECK(routing_logits.has_value() && da_routing_metadata.empty() &&
+                   !is_da_body_preparation)
+        << "token_mask requires ordinary logits-input routing";
+  }
   // Just some basic type validation first and leave more checks to the launcher
   if (routing_logits.has_value()) {
     TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
@@ -5735,6 +5758,7 @@ Array<Optional<Tensor>> trtllm_bf16_moe(
                    weight_layout, activation, static_cast<int64_t>(gemm1_bias_type_enum),
                    norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
+    launcher->set_token_mask(token_mask);
 
     launchers_map[curr_tile_N] = std::move(launcher);
   }
@@ -6106,7 +6130,19 @@ Array<Optional<Tensor>> trtllm_fp8_block_scale_moe(
     int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
     Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
     Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
-    Optional<TensorView> workspace_buffer, bool query_workspace_size) {
+    Optional<TensorView> token_mask, Optional<TensorView> workspace_buffer,
+    bool query_workspace_size) {
+  if (token_mask.has_value()) {
+    auto const& mask = token_mask.value();
+    CHECK_INPUT_AND_TYPE(mask, dl_bool);
+    CHECK_DEVICE(mask, hidden_states);
+    CHECK_DIM(1, mask);
+    TVM_FFI_ICHECK_EQ(mask.size(0), hidden_states.size(0))
+        << "token_mask must have shape [num_tokens]";
+    TVM_FFI_ICHECK(routing_logits.has_value() && da_routing_metadata.empty() &&
+                   !is_da_body_preparation)
+        << "token_mask requires ordinary logits-input routing";
+  }
   auto activation_type = validateAndCastActivationType(act_type);
   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                                              quantization_type, activation_type);
@@ -6226,6 +6262,7 @@ Array<Optional<Tensor>> trtllm_fp8_block_scale_moe(
         gemm1_weights_scale, selected_gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
         gemm2_weights, gemm2_weights_scale, gemm2_bias, expert_indices, expert_weights,
         quantization_type, static_cast<RoutingInputMode>(routing_input_mode));
+    launcher->set_token_mask(token_mask);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
                    weight_layout, activation_type, static_cast<int64_t>(gemm1_bias_type_enum),
                    norm_topk_prob);
@@ -6303,7 +6340,19 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
     Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
-    Optional<TensorView> workspace_buffer, bool query_workspace_size, int64_t nvfp4_4over6_code) {
+    Optional<TensorView> token_mask, Optional<TensorView> workspace_buffer,
+    bool query_workspace_size, int64_t nvfp4_4over6_code) {
+  if (token_mask.has_value()) {
+    auto const& mask = token_mask.value();
+    CHECK_INPUT_AND_TYPE(mask, dl_bool);
+    CHECK_DEVICE(mask, hidden_states);
+    CHECK_DIM(1, mask);
+    TVM_FFI_ICHECK_EQ(mask.size(0), hidden_states.size(0))
+        << "token_mask must have shape [num_tokens]";
+    TVM_FFI_ICHECK(routing_logits.has_value() && da_routing_metadata.empty() &&
+                   !is_da_body_preparation)
+        << "token_mask requires ordinary logits-input routing";
+  }
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
@@ -6436,6 +6485,7 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
                    /*weight_layout=*/0, static_cast<ActivationType>(act_type), mDtypeAct,
                    mDtypeWeights, static_cast<int64_t>(gemm1_bias_type_enum), norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
+    launcher->set_token_mask(token_mask);
 
     launchers_map[curr_tile_N] = std::move(launcher);
   }

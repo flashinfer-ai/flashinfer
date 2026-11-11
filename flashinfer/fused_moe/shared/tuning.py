@@ -216,6 +216,9 @@ def make_moe_tuning_config(
     if moe_inputs.per_token_scale is not None:
         spec["per_token_scale"] = autotuner_initializer_ones
 
+    if moe_inputs.token_mask is not None:
+        spec["token_mask"] = autotuner_initializer_zeros
+
     sorted_inputs = sorted(
         (MoeRunnerInputs.idx(name), name, init) for name, init in spec.items()
     )

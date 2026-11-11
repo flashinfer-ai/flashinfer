@@ -35,6 +35,30 @@ static constexpr int WarpKernelSmemStride = 33;
 // increase. For now, it is a good cut-off point for when the block-wise
 // operations are more efficient end-to-end.
 static constexpr int WarpKernelMaxNumTokens = 4;
+// Similar to excludeMaskedToken in trtllm_fused_moe_routing_custom.cuh, with topk=1 (1 lane mask).
+template <typename KernelParams>
+__device__ __forceinline__ bool excludeMaskedToken(KernelParams const& params, int tokenIdx,
+                                                   int laneIdx) {
+  if (params.mPtrTokenMask == nullptr || !params.mPtrTokenMask[tokenIdx]) {
+    return false;
+  }
+  if (laneIdx == 0) {
+    using OutputT = typename KernelParams::OutputT;
+    if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
+      params.mPtrExpandedIdxToPermutedIdx[tokenIdx] = -1;
+    }
+    if (params.mPtrTopKWeights != nullptr) {
+      params.mPtrTopKWeights[tokenIdx] = OutputT{0.f};
+    }
+    if (params.mPtrTopKPacked != nullptr) {
+      params.mPtrTopKPacked[tokenIdx] = PackedScoreIdx<OutputT>{OutputT{0.f}, -1};
+    }
+    if (params.mPtrRoutingReplayOut != nullptr) {
+      params.mPtrRoutingReplayOut[tokenIdx] = -1;
+    }
+  }
+  return true;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -112,6 +136,9 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     // for each token, we load the scores then use `reduceTopK` for this.
     // each thread works on 4 experts, so a local reduction is done before
     for (int tokenIdx = 0; tokenIdx < params.mNumTokens; ++tokenIdx) {
+      if (excludeMaskedToken(params, tokenIdx, threadIdx.x)) {
+        continue;
+      }
       auto scoreOffset = tokenIdx * params.mNumExperts;
       int32_t warpMaxExpertIdx[MaxNumTopExperts];
       InputT warpMaxScore[MaxNumTopExperts];
@@ -362,6 +389,13 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
     cudaGridDependencySynchronize();
   }
 
+  if (validToken && excludeMaskedToken(params, warpTokenIdx, laneIdx)) {
+    if (laneIdx == 0) {
+      smemPackedScoreIdx[warpIdx] = TypePacked{OutputT{0.f}, -1};
+    }
+    validToken = false;
+  }
+
   if (params.mPtrTopKIds != nullptr) {
     if (validToken) {
       TypePacked packedScore{static_cast<OutputT>(params.mPtrTopKWeights[warpTokenIdx]),
@@ -454,6 +488,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   // in this case, each warp represents a token, and we use a grid-stride loop
   // over all warps/tokens
   for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
+    if (excludeMaskedToken(params, tokenIdx, laneIdx)) {
+      continue;
+    }
     auto scoreOffset = tokenIdx * params.mNumExperts;
     int32_t warpMaxExpertIdx[MaxNumTopExperts];
     InputT warpMaxScore[MaxNumTopExperts];
