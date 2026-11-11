@@ -931,6 +931,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan a batch whose mask this variant owns.
 
@@ -938,8 +939,13 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         two, but every argument that the variant makes meaningless is rejected
         instead of ignored, and the dtypes and head dimensions must match what
         the constructor compiled. Backend-specific planning arguments of the
-        parent (``seq_lens``, ``block_tables``, ``rope_scale``, ...) are absent
+        parent (``block_tables``, ``rope_scale``, ...) are absent
         here: this wrapper is fa2 only and applies no positional encoding.
+
+        ``seq_lens`` is forwarded to the parent, which then takes the kv lengths
+        from it instead of deriving them from the page table. A contiguous int32
+        CPU tensor in pinned memory lets the parent copy them to the device
+        without staging them in pageable memory first.
         """
         self._reject_max_sequence_kv(max_sequence_kv)
         q_data_type, kv_data_type, o_data_type, head_dim_vo = (
@@ -983,6 +989,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             max_sequence_kv=max_sequence_kv,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            seq_lens=seq_lens,
         )
 
     def workspace_size(
@@ -1015,6 +1022,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[int, int]:
         r"""Caller-owned workspace size for a :meth:`plan` with these arguments.
 
@@ -1062,6 +1070,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             max_sequence_kv=max_sequence_kv,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            seq_lens=seq_lens,
         )
 
     # Deliberately narrower than the parent: the range tensor and the two

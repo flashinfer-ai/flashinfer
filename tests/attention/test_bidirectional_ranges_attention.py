@@ -1022,6 +1022,7 @@ def _split_case(
     disable_split_kv=False,
     max_token_per_sequence=None,
     max_sequence_kv=None,
+    seq_lens=None,
     num_qo_heads=8,
     num_kv_heads=2,
     seed=11,
@@ -1077,6 +1078,7 @@ def _split_case(
         max_sequence_kv=max_sequence_kv,
         fixed_split_size=fixed_split_size,
         disable_split_kv=disable_split_kv,
+        seq_lens=seq_lens,
     )
     out, lse = wrapper.run(q, kv_cache, ranges, return_lse=True)
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
@@ -1168,6 +1170,43 @@ def test_plan_forwards_max_token_per_sequence():
         f"{wrapper._max_q_len}, the value derived from qo_indptr"
     )
     assert len(plan_info) == 15
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+    assert torch.isfinite(lse.float()).all()
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_plan_forwards_seq_lens(monkeypatch, pinned):
+    """The kv lengths staged for the device copy are the caller's tensor.
+
+    Without ``seq_lens`` the parent derives the lengths from the page table in
+    pageable memory, so a pinned result shows the caller's tensor got through.
+    """
+    _skip_unless_fa2_jit()
+    import flashinfer.prefill as prefill
+
+    staged = []
+    host_metadata = prefill._paged_kv_host_metadata
+
+    def record(*args, **kwargs):
+        result = host_metadata(*args, **kwargs)
+        staged.append(result[2])
+        return result
+
+    monkeypatch.setattr(prefill, "_paged_kv_host_metadata", record)
+
+    qo_lens, kv_lens = [17, 33], [100, 256]
+    spans = [
+        [(i, (4, 60)) for i in range(4, 17)],
+        [(i, (8, 200)) for i in range(8, 33)],
+    ]
+    seq_lens = None
+    if pinned:
+        seq_lens = torch.tensor(kv_lens, dtype=torch.int32).pin_memory()
+    out, lse, ref, _, _ = _split_case(qo_lens, kv_lens, spans, seq_lens=seq_lens)
+
+    assert staged, "the parent never staged host kv lengths"
+    assert staged[-1].tolist() == kv_lens
+    assert staged[-1].is_pinned() == pinned
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
     assert torch.isfinite(lse.float()).all()
 
