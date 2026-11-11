@@ -802,8 +802,8 @@ __global__ __launch_bounds__(NTH, 2) void reduce_u4(
 
 // ---------------------------------------------------------------------------
 // Host side. The grid/split budget and the two-kernel launch sequence are
-// carried verbatim from the measured kernel (H200 study re-time jobs
-// 781855/781813); only the workspace ownership moved out of the launcher
+// carried verbatim from the measured kernel's
+// same-SKU re-time; only the workspace ownership moved out of the launcher
 // (plan-time allocation by the Python dispatcher — the measured launcher
 // kept a per-stream cudaMallocAsync pool) so that `run` never allocates and
 // is CUDA-graph capturable with a stable workspace pointer.
