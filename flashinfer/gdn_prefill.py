@@ -54,6 +54,7 @@ from .gdn_kernels.delta_rule_dsl.varlen_helper import (
     is_integer_dtype,
     should_use_cp_host,
     should_use_cp_sm80_host,
+    should_use_cp_sm110_host,
     should_use_v32_sm80_host,
 )
 
@@ -1926,14 +1927,23 @@ def chunk_gated_delta_rule(
                 "max_seqlen is smaller than the longest sequence in cu_seqlens_cpu"
             )
     cp_heuristic_matches = (
-        _arch_major in (9, 10, 11, 12)
-        and should_use_cp_host(
+        (
+            _arch_major in (9, 10, 12)
+            and should_use_cp_host(
+                _parallel_work,
+                _sm_count,
+                _device_name,
+                device_capability=_device_capability,
+            )
+        )
+        or should_use_cp_sm80_host(
+            sm8x_max_seqlen,
             _parallel_work,
-            _sm_count,
-            _device_name,
-            device_capability=_device_capability,
-            # Only the SM110 rule reads it: the caller's hint, the host prefix,
-            # or the balanced-batch estimate, never a device readback.
+            _device_capability,
+        )
+        or should_use_cp_sm110_host(
+            _parallel_work,
+            _device_capability,
             max_seq_len=(
                 _cake_gdn_cp_band_max_seqlen(
                     max_seqlen, total_seq_len, num_seqs, cu_seqlens_cpu=cu_seqlens_cpu
@@ -1942,10 +1952,6 @@ def chunk_gated_delta_rule(
                 else None
             ),
         )
-    ) or should_use_cp_sm80_host(
-        sm8x_max_seqlen,
-        _parallel_work,
-        _device_capability,
     )
     cake_cp_domain_matches = bool(
         backend == "cake_gdn"
