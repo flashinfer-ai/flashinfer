@@ -136,6 +136,15 @@ output with `(-inf, 0)` statistics. Physical packed K/V storage must contain at
 least one token. Paged context statistics require positive per-request KV lengths.
 Statistics-disabled empty-request skipping is unchanged.
 
+Packed dense contiguous context uses each request's live KV extent for every
+task's loop domain, including during graph replay. This applies to homogeneous
+FP16, BF16, and E4M3 inputs with FP16/BF16 output and paired QK/V dimensions
+128/128 or 192/128 on supported architectures. Empty statistics rows retain
+one masked tile so the epilogue still writes zero O and `(-inf, 0)` statistics.
+Fixed/uniform-packed inputs, single-instance and two-CTA schedules, causal and
+windowed attention, paged KV, mixed-precision inputs, and VC/Sage/MXFP8 recipes
+retain their existing domain policies.
+
 ## Tensor and metadata layouts
 
 Contiguous inputs:

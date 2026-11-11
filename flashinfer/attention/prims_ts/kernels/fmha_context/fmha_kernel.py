@@ -2658,9 +2658,14 @@ def _causal_domain_kwargs(
     return result
 
 
-def _uses_sm107_dense_mla_runtime_kv_bounds(cfg: FmhaConfig) -> bool:
-    """Bound query-paired SM107 FP8 expanded MLA by each packed KV extent."""
-    if not (
+def _uses_packed_dense_runtime_kv_bounds(cfg: FmhaConfig) -> bool:
+    """Bound ordinary query-paired dense context by each live packed KV extent."""
+    # All task roles share the same paired N/N-1 protocol and int32 offsets.
+    # Uniform packed plans omit live offsets; specialized recipes and other
+    # topologies retain their own domains and tail handling.
+    # These are the public API's paired geometries; symmetric D192/D256 use
+    # one instance, and the public context API does not admit D64.
+    return (
         not cfg.is_causal
         and not cfg.has_variable_window
         and cfg.window_size_left == 0
@@ -2668,18 +2673,18 @@ def _uses_sm107_dense_mla_runtime_kv_bounds(cfg: FmhaConfig) -> bool:
         and not cfg.use_paged_kv
         and cfg.has_varlen
         and not cfg.has_uniform_varlen
+        and cfg.packed_dense_k_mask
         and cfg.num_qkv_instances == 2
         and not cfg.two_cta_umma
-        and cfg.logical_head_dim_qk == 192
+        and cfg.logical_head_dim_qk in (128, 192)
         and cfg.pv_mma_tiler[1] == 128
-        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype == cutlass.Float8E4M3FN
-        and cfg.o_dtype == cutlass.BFloat16
-    ):
-        return False
-    from cutlass.cutlass_dsl import BaseDSL
-
-    arch = BaseDSL._get_dsl().get_arch_enum()
-    return (arch.major, arch.minor) == (10, 7)
+        and cfg.vc_attention is None
+        and not cfg.use_sage_attention
+        and not cfg.use_mxfp8_qk
+        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype
+        and cfg.q_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float8E4M3FN)
+        and cfg.o_dtype in (cutlass.Float16, cutlass.BFloat16)
+    )
 
 
 def _select_fmha_domain_policy(
@@ -2864,9 +2869,9 @@ def _select_fmha_domain_policy(
             softmax0_domain_kwargs=softmax0_domain,
             softmax1_domain_kwargs=softmax1_domain,
         )
-    if _uses_sm107_dense_mla_runtime_kv_bounds(cfg):
-        if cum_seqlen_k is None:
-            raise ValueError("Packed dense MLA domains require runtime KV offsets")
+    if _uses_packed_dense_runtime_kv_bounds(cfg):
+        if cum_seqlen_q is None or cum_seqlen_k is None:
+            raise ValueError("Packed dense domains require runtime Q and KV offsets")
         dense_kwargs: DomainKwargs = {
             "task_class": PackedDenseDomainTask,
             "num_kv_tiles": num_kv_tiles,
