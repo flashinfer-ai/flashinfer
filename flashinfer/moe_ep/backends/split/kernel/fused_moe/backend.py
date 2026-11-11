@@ -39,6 +39,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         self._moe_config = config.moe_config
         self._mxfp8_dispatch = config.mxfp8_dispatch
         self._compute: Optional["MoELayer"] = None
+        self._fixed_tactic = None
         self._global_routing_mode: Optional["RoutingInputMode"] = None
 
     @classmethod
@@ -145,12 +146,11 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             return None
         return ctx.recv_count
 
-    def compute(self, ctx: SplitKernelContext):
+    def _activation_pack(self, ctx: SplitKernelContext):
         expert_tensors = ctx.expert_tensors
         quant = self._moe_config.quant
         per_token_activation = bool(quant.per_token_scale)
         offset = self._moe_config.experts.local_expert_offset
-        dim0, dim1, _ = expert_tensors.shape
 
         fleet_params = ctx.fleet_params
         compute = self._ensure_compute(fleet_params)
@@ -192,8 +192,26 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 num_experts=self._moe_config.routing.num_experts,
             )
 
-        out_2d = compute(act_pack, self._transformed_weights)
-        return reshape_for_combine(out_2d, dim0, dim1)
+        return act_pack
+
+    def tuning_candidates(self, ctx: SplitKernelContext):
+        act = self._activation_pack(ctx)
+        return self._compute._tuning_candidates(act, self._transformed_weights)
+
+    def prepare_tactic(self, ctx: SplitKernelContext, selection):
+        act = self._activation_pack(ctx)
+        self._compute._prepare_tactic(act, self._transformed_weights, selection)
+        self._fixed_tactic = selection
+
+    def compute(self, ctx: SplitKernelContext):
+        act = self._activation_pack(ctx)
+        if self._fixed_tactic is None:
+            out = self._compute(act, self._transformed_weights)
+        else:
+            out = self._compute._run_tactic(
+                act, self._transformed_weights, self._fixed_tactic
+            )
+        return reshape_for_combine(out, *ctx.expert_tensors.shape[:2])
 
     def destroy(self) -> None:
         # The runners keep the last routing tensors they were given (to seed

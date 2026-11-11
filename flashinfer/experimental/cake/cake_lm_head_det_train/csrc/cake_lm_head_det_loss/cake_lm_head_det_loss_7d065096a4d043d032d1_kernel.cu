@@ -47,9 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
-
 #include <math_constants.h>
 
 extern "C" {
@@ -79,10 +76,10 @@ kernel_cake_lm_head_det_loss_7d065096a4d043d032d1(long long* __restrict__ keys, 
             int pos_l = base + lane;
             int first_l = 0;
             if (pos_l < hi) {
-                int row_l = (int)(keys[pos_l] >> 32);
+                int row_l = (int)(keys[pos_l] >> 32ll);
                 if (row_l >= 0 && row_l < V && pos_l < n_keys - split) {
-                    if (pos_l == 0 || (int)(keys[pos_l - 1] >> 32) != row_l) {
-                        if ((int)(keys[pos_l + split] >> 32) == row_l) {
+                    if (pos_l == 0 || (int)(keys[pos_l - 1] >> 32ll) != row_l) {
+                        if ((int)(keys[pos_l + split] >> 32ll) == row_l) {
                             first_l = 1;
                         }
                     }
@@ -96,11 +93,11 @@ kernel_cake_lm_head_det_loss_7d065096a4d043d032d1(long long* __restrict__ keys, 
                 int lane_s = _find_first_set_1 - 1;
                 starts = starts & starts - 1;
                 int seg = base + lane_s;
-                int row = (int)(keys[seg] >> 32);
+                int row = (int)(keys[seg] >> 32ll);
                 int parts = 2;
                 #pragma unroll 1
                 for (int q = 2; q < (n_keys - seg - 1) / split + 1; q++) {
-                    if ((int)(keys[seg + q * split] >> 32) != row) {
+                    if ((int)(keys[seg + q * split] >> 32ll) != row) {
                         break;
                     }
                     parts = q + 1;

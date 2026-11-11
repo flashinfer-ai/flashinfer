@@ -4,7 +4,8 @@
 
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
-proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``). ``README.md``
+proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -79,6 +80,22 @@ def _bmm_fp8_fingerprint(
     return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
 
 
+def _gemm_fp8_nt_groupwise_fingerprint(
+    K: int, out_dtype: Union[torch.dtype, str]
+) -> str:
+    from ..gemm.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "gemm_fp8_nt_groupwise"), 1, "e4m3_bs"
+    )
+
+
+def _attention_fingerprint(head_dim: int) -> str:
+    from ..attention.batch_invariant.spec import spec_fingerprint
+
+    return spec_fingerprint(head_dim)
+
+
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device."""
@@ -141,6 +158,11 @@ CLASSES: Dict[str, ClassInfo] = {
     "bmm_fp8": ClassInfo(
         "gemm.fp8", ("N", "K", "dtype", "out_dtype"), _bmm_fp8_fingerprint
     ),
+    # the block-scale fp8 class (DeepSeek-style 1x128 / 128x128 fp32 scales applied once per 128-element K block): K and the
+    # output dtype are its dimensions (N enters neither the fold nor a chunk rule: the class has no split variant)
+    "gemm_fp8_nt_groupwise": ClassInfo(
+        "gemm.e4m3.kblock128", ("K", "out_dtype"), _gemm_fp8_nt_groupwise_fingerprint
+    ),
     # the architecture is a dimension of the MXFP8 class: the sm_107 instruction folds 64 elements per step, the sm_100 /
     # sm_103 one 32 (gemm.mxfp8.*64 vs gemm.mxfp8.*); `arch` defaults to the current CUDA device's
     "mm_mxfp8": ClassInfo(
@@ -155,6 +177,17 @@ CLASSES: Dict[str, ClassInfo] = {
         ("N", "K", "out_dtype"),
         _mm_fp4_fingerprint,
         ("use_nvfp4", "arch"),
+    ),
+    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
+    ),
+    "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_fingerprint
     ),
 }
 
@@ -175,6 +208,11 @@ def fingerprint(op: str, **dims) -> str:
     output ``out_dtype`` (bf16 / fp16): the 32-wide fp8 step, the chain's ``mul.rn`` by the device product of the two
     per-tensor scales and its conversion are the specification; the scales' values, like the operands, are inputs, and
     the batch is not a dimension (every element is one launch of the class).
+    ``gemm_fp8_nt_groupwise`` takes ``K`` and ``out_dtype`` (bf16 / fp16): the block-scale class ``gemm.e4m3.kblock128``
+    (e4m3 operands, fp32 scales per 1x128 block of A and per 128x128 block of B) folds each 128-element K block with the
+    32-wide fp8 step from +0 and the block partials in block order with ``fma.rn(mul.rn(s_a, s_b), P, acc)``; the scales'
+    values, like the operands, are inputs, and N enters nothing (no split variant).
+
     ``mm_mxfp8`` takes ``N, K`` and ``out_dtype`` (bf16 / fp16), and optionally ``arch`` (an architecture family
     ``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``, a compute capability or a device; the current CUDA device by default):
     the block-scaled step of that architecture's instruction (32 e4m3 elements with one UE8M0 scale per row on SM100 /
@@ -187,12 +225,21 @@ def fingerprint(op: str, **dims) -> str:
     ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
     the specification; the alpha's value and the block scales are inputs.
 
+    The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
+    functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
+    do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
+    ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
+    sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
+    class's no-window sample row and covers windowed calls too.
+
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
     'gemm-bf16-kfold-bias-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
+    >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
+    'gemm-e4m3-kblock128-...'
     >>> fingerprint("mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_107")  # doctest: +SKIP
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
@@ -216,7 +263,8 @@ def fingerprint(op: str, **dims) -> str:
 
 def class_name(op: str) -> str:
     """The consistency class (family) name behind the API ``op`` (``"gemm.bf16"``; ``"gemm.fp8"`` for the two fp8 classes
-    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
+    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.e4m3.kblock128"`` behind ``gemm_fp8_nt_groupwise``;
+    ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
     ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``)."""
     info = CLASSES.get(op)
     if info is None:
@@ -236,7 +284,9 @@ __all__ = [
     "is_supported_device",
 ]
 
-# The quantization classes register themselves here (their module keeps the mode's registry generic).
+# The quantization and sampling classes register themselves here (their modules keep the mode's registry generic).
 from .quantization.classes import register as _register_quantization  # noqa: E402
+from .sampling.classes import register as _register_sampling  # noqa: E402
 
 _register_quantization(CLASSES, ClassInfo)
+_register_sampling(CLASSES, ClassInfo)

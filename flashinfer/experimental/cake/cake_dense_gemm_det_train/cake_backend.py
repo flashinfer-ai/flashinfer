@@ -113,7 +113,7 @@ import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Optional, Protocol, Tuple, Union, cast
 
 import torch
 import tvm_ffi
@@ -231,16 +231,19 @@ ROUTER_RULE_N = 256
 # the inclusive window [T_lo, T_hi], for N = ROUTER_RULE_N.  The window T 16129-16384 holds every token count with the
 # forward's 128 M tiles (505-512 K blocks of the weight gradient).  Each count was measured faster than the default one
 # on GB200 / GB300 (152 SMs) and on B200 / B300 (148 SMs) for the whole router launch (the BF16x3 split, the program and the sum of
-# the partials), alone and while a kernel on another stream holds 8, 16 or 32 SMs (a count that wins alone but loses
-# with fewer free SMs is not listed); other SM counts keep the default.  A different split count is a different K
-# partition: its outputs are bit-exact run to run but not bitwise equal to the default count's.
+# the partials); other SM counts keep the default.  A different split count is a different K partition: its outputs are
+# bit-exact run to run but not bitwise equal to the default count's.
 ROUTER_SPLIT_RULES: dict[
     tuple[str, int, str, int], tuple[tuple[int, int, int], ...]
 ] = {
     ("sm_100a", 148, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_100a", 148, "nn_t", 6144): ((16129, 16384, 3),),
     ("sm_100a", 152, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_100a", 152, "nn_t", 6144): ((16129, 16384, 3),),
     ("sm_103a", 148, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_103a", 148, "nn_t", 6144): ((16129, 16384, 3),),
     ("sm_103a", 152, "nn_t", 5120): ((16129, 16384, 9),),
+    ("sm_103a", 152, "nn_t", 6144): ((16129, 16384, 3),),
 }
 
 
@@ -639,6 +642,7 @@ def instance_key(
     mg: bool = False,
     sw: int = 0,
     form: str = "",
+    kser: int = 0,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -730,7 +734,14 @@ def instance_key(
     raster form (``sk_exact`` / ``sk_first`` / ``sk_sync`` / ``sk_slab`` / ``htail`` / ``cgrp`` / ``batch_group`` /
     ``stt`` / ``ovl`` / ``ovr`` / ``park``) and any pair-program knob off its plain value (``pd`` / ``pro`` / ``lw`` /
     ``mg`` / ``sw`` / a non-default stage count / ``hints`` / ``pf`` / ``sh`` / ``store_hint`` / ``store_ef`` /
-    ``quad_store`` / ``f32_v8``); the OFF form renders byte-identical.
+    ``quad_store`` / ``f32_v8``); the OFF form renders byte-identical.  ``kser`` (field 38 = LAST, symbol ``_ks<P>``
+    directly after ``_sw<n>`` and before ``_pro<n>``; 0 = off) is the serpentine K walk of the pair programs: the load
+    warp walks the K blocks of a whole-K item (every K block of its tile in one item) whose item index lies in an odd
+    block of P items descending, so a wave of P pairs starts on the K end the previous wave left in L2; the MMA warp is
+    unchanged.  The direction is a pure function of the item and P: run-to-run deterministic, another FP32 summation
+    order than ``kser`` 0.  A pair count >= 0 on the plain item walk: no ``cta1``, ``sk_exact`` / ``sk_first`` /
+    ``sk_sync`` / ``stt``, ``mg``, ``batch_group`` or ``form``; every other field is unchanged and the OFF form renders
+    byte-identical.
     [Cake ``instance_key``]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
@@ -1066,7 +1077,7 @@ def instance_key(
         or sk_slab
         or htail
         or cgrp
-        or batch_group
+        or batch_group == 1
         or stt
         or ovl
         or ovr
@@ -1080,22 +1091,40 @@ def instance_key(
         or hints != ("none", "none")
         or pf
         or sh
-        or store_hint != "none"
+        or store_hint not in ("none", "evict_last")
+        or (store_hint != "none" and batch_group <= 1)
         or store_ef
         or quad_store
         or f32_v8
     ):
         # the eight-warp CTA form is written for the kn bf16 row-major 128 x 256 pair tile with the one-slot TMA-store
-        # epilogue, whole tiles and none of the pair programs' pipeline knobs (the kernel's frozen configurations)
+        # epilogue, whole tiles and none of the pair programs' pipeline knobs (the kernel's frozen configurations); the
+        # head-interleaved batch raster (``batch_group`` G > 1) and, with it, the ``evict_last`` store hint are the
+        # kernel's own knobs (the batched MLA programs)
         raise ValueError(
             f"form (the eight-warp CTA form) must be one of {W8_FORMS} on the kn bf16 row-major 128 x 256 pair tile "
-            f"with the one-slot TMA-store epilogue, the default stage count, plain hints and no tail, raster or "
-            f"pipeline knob; got form={form!r}, a_mn={a_mn}, b_mn={b_mn}, out_f32={out_f32}, out_t={out_t}, "
+            f"with the one-slot TMA-store epilogue, the default stage count, plain hints and no tail, raster (but a "
+            f"batch group G > 1) or pipeline knob (but the evict_last store hint with a batch group); got "
+            f"form={form!r}, a_mn={a_mn}, b_mn={b_mn}, out_f32={out_f32}, out_t={out_t}, "
             f"cta1={cta1}, block_n={block_n}, cta_rows={cta_rows}, epi={epi!r}, slots={slots}, b_swz={b_swz}, "
             f"box_rows={box_rows}, stages={stages}, hints={hints}, pd={pd}, pro={pro}, lw={lw}, mg={mg}, sw={sw}, "
             f"sk_exact={bool(sk_exact)}, sk_first={sk_first}, sk_sync={sk_sync}, sk_slab={sk_slab}, htail={htail}, "
             f"cgrp={cgrp}, batch_group={batch_group}, stt={stt}, ovl={ovl}, ovr={ovr}, park={park}, pf={pf}, "
             f"sh={sh}, store_hint={store_hint!r}, store_ef={store_ef}, quad_store={quad_store}, f32_v8={f32_v8}"
+        )
+    kser = int(kser)
+    if kser < 0 or (
+        kser
+        and (
+            cta1 or sk_exact or sk_first or sk_sync or stt or mg or batch_group or form
+        )
+    ):
+        # the serpentine K walk is written for the pair programs' plain item walk (the kernel's refusal)
+        raise ValueError(
+            f"kser (serpentine K walk) is a pair count >= 0 and needs the cluster pair on the plain item walk (no cta1, "
+            f"sk_exact, sk_first, sk_sync, stt, mg, batch_group or form); got kser={kser}, cta1={cta1}, "
+            f"sk_exact={bool(sk_exact)}, sk_first={sk_first}, sk_sync={sk_sync}, stt={stt}, mg={mg}, "
+            f"batch_group={batch_group}, form={form!r}"
         )
     return (
         a_mn,
@@ -1135,6 +1164,7 @@ def instance_key(
         mg,
         sw,
         form,
+        kser,
     )
 
 
@@ -1155,7 +1185,8 @@ def instance_symbol(key: tuple) -> str:
     the pair prologue / cleanup sync form (round 33; absent when 0 - the single-CTA ``_c1`` programs never carry it);
     the round-2 shapes tranche adds ``_skf`` directly after ``_skx`` (``sk_first``) and ``_lw`` between ``_or`` and
     ``_pro`` (``lw``); ``_mg`` directly after ``_lw`` for the whole-tile tile resolve (``mg``); ``_sw<n>`` directly
-    after ``_mg`` for the paced output stores (``sw``, absent when 0); ``_w8r`` / ``_w8rs`` / ``_w8`` directly after
+    after ``_mg`` for the paced output stores (``sw``, absent when 0); ``_ks<P>`` directly after ``_sw<n>`` for the
+    serpentine K walk (``kser``, absent when 0); ``_w8r`` / ``_w8rs`` / ``_w8`` directly after
     ``_pro<n>`` and before the diag tokens for the eight-warp CTA form (``form``, absent when "")).
     [Cake ``instance_symbol``]"""
     (
@@ -1196,6 +1227,7 @@ def instance_symbol(key: tuple) -> str:
         mg,
         sw,
         form,
+        kser,
     ) = key
     cg = 1 if cta1 else CTA_GROUP
     so = {
@@ -1249,6 +1281,7 @@ def instance_symbol(key: tuple) -> str:
         + ("_lw" if lw else "")
         + ("_mg" if mg else "")
         + (f"_sw{sw}" if sw else "")
+        + (f"_ks{kser}" if kser else "")
         + (f"_pro{pro}" if pro else "")
         + (f"_{form}" if form else "")
         + "".join(f"_{d}" for d in diag)
@@ -1260,6 +1293,44 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
     dim, N = latent dim) are computed as the transposed GEMM ``out^T[l] = B[l]^T A[l]^T`` with the
     transposed store.  [Cake ``swap_small_m`` L1164-L1167]"""
     return L > 1 and not transposed_out and M <= 256 and N >= 2 * M
+
+
+#: FlashInfer-only: the architectures on which an unbatched weight gradient with a narrow output (``N <= 64`` columns
+#: against ``4096 <= M <= 8192`` rows, ``K >= 256``) and no measured rule was measured faster swapped (see
+#: :func:`_single_wgrad_swap`).
+_NARROW_N_SWAP_ARCHES = ("sm_100a", "sm_103a")
+
+#: FlashInfer-only: the smallest token count ``K`` at which a keyed unbatched weight gradient runs swapped, by
+#: ``(arch, M, N, out_f32)`` of the generic call (see :func:`_single_wgrad_swap`).  On sm_107a (212 SMs) the 6144 -> 576
+#: bf16 weight gradient ran the swapped plan 0.91x at T 2048 and 4096 and 1.18x to 1.46x from T 6144 to 40961.
+_SINGLE_WGRAD_SWAP_MIN_K = {("sm_107a", 576, 6144, False): 6144}
+
+
+def _single_wgrad_swap(
+    arch: str, M: int, N: int, K: int, a_mn: bool, b_mn: bool, out_f32: bool
+) -> bool:
+    """FlashInfer-only: an unbatched (``L == 1``) call with both operands MN-major and no transposed store is the
+    weight gradient ``G.T @ X`` of :func:`cake_dense_gemm_det_train_projection_wgrad` with ``G = A.T`` (``M`` output
+    rows) and ``X = B`` (``N`` columns).  It runs the swapped ``X.T @ G`` with the transposed store
+
+    * where that entry swaps by a measured rule: ``ROW_RULES`` keys the row in the swapped orientation alone
+      (:func:`_orientation_rules`; the narrow 32- to 128-row, 512-row and 576-row weight gradients) and ``K`` is at
+      least the row's ``_SINGLE_WGRAD_SWAP_MIN_K`` entry, if any.  The plan, its program and its bits are then the
+      weight-gradient entry's;
+    * where no rule keys the row in either orientation, the output is narrow (``N <= 64``: the ``[d_in, d_out]``
+      weight gradient ``X.T @ G`` of a narrow projection), ``4096 <= M <= 8192`` and ``K >= 256``, on
+      ``_NARROW_N_SWAP_ARCHES``: the direct plan pads the ``N`` columns into one 224- / 256-column tile, the swapped
+      plan puts them in a 64-row tile.  Above 8192 rows the swapped plan measured slower at most token counts, and
+      below 256 tokens the call is launch-bound (flat to 2 % slower swapped).
+
+    Every other unbatched call keeps the caller's orientation."""
+    if not (a_mn and b_mn):
+        return False
+    swapped_rule, direct_rule = _orientation_rules(arch, M, N, out_f32)
+    if swapped_rule or direct_rule:
+        min_k = _SINGLE_WGRAD_SWAP_MIN_K.get((arch, M, N, out_f32), 0)
+        return swapped_rule and not direct_rule and min_k <= K
+    return arch in _NARROW_N_SWAP_ARCHES and N <= 64 and 4096 <= M <= 8192 and K >= 256
 
 
 # fmt: off
@@ -1285,15 +1356,25 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # T on GB300; the knobs after it are the row's program where the form yields (the 4096 -> 48 rule carries none: the
 # architecture default program runs there), and the planner drops a rule's form where the plan carries stream-K units,
 # the single-CTA form, another tile or output class, the register epilogue or a caller-forced pipeline knob, and refuses
-# a caller-forced form there.  Seven sm_100a input-gradient rows carry ``form``: 4096 -> 1024 and 5120 -> 1024 the
-# knob-free eight-warp program (``_w8``), 4096 -> 512 and the kv_a 6144 -> 576 the eight-warp program with the early
-# accumulator release and the loader-issued scheduling queries (``_w8rs``), and 5120 -> 512, 4096 -> 64 and 5120 -> 64
+# a caller-forced form there.  Eight sm_100a input-gradient rows carry ``form``: 4096 -> 1024 and 5120 -> 1024 the
+# knob-free eight-warp program (``_w8``), 4096 -> 512, the kv_a 6144 -> 576 and the batched MLA value-projection row
+# (N 512, K 256) the eight-warp program with the early accumulator release and the loader-issued scheduling queries
+# (``_w8rs``), and 5120 -> 512, 4096 -> 64 and 5120 -> 64
 # the one with the early accumulator release (``_w8r``).  Each measured faster than the row's program above the pair
 # spread at both T on GB200, except 4096 -> 64, 5120 -> 64 and the kv_a, where the form measured at least as fast as the
 # row's program there; the knobs after the form are the row's program where the form yields, and the raster group is the
 # row's measured launch parameter.  The two sm_100a 4096 -> 48 input-gradient T-exact keys (T 16231 and 16384, the GB
 # T-exact rules) carry ``w8r`` too: the eight-warp program with the early accumulator release, whole tiles through the
-# one-slot TMA store (the ragged 4096 -> 48 rule keeps its half-tail program at every other T).
+# one-slot TMA store (the ragged 4096 -> 48 rule keeps its half-tail program at every other T).  The batched MLA
+# absorbed-query forward (N 512, K 192) carries ``w8rs`` too.  Both MLA rows add the head-interleaved batch raster
+# (``_bg<G>``): the forward over all 64 heads (``_bg64``), the value-projection row over 8 heads with the evict_last
+# output stores (``_bg8_sol``), raster group 2 for the forward; each measured faster than cuBLASLt's batched kernel at
+# the three T on GB200 and GB300.  sm_103a reads the forward's rule through ``RULE_PARENT``; its value-projection key
+# follows below (raster group 2).  The batched MLA value-projection forward (N 256, K 512) adds the same raster over 8 heads
+# (``_bg8``) to its quad-store register program at the training T alone (T-exact keys at T 16172 / 16231 / 16384, the
+# ragged rule's knobs + ``batch_group``): the same output bits, measured faster than cuBLASLt's batched kernel and the
+# program without the raster at those T on GB200 and GB300 (sm_103a through ``RULE_PARENT``); from T 1 to 4095 the
+# raster measured slower in the sustained frame, so the ragged rule keeps the program without it there.
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1304,6 +1385,9 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 16384, 2048, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
     ('sm_100a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
+    ('sm_100a', False, False, False, False, True, 256, 512, 16172): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b', "batch_group": 8},
+    ('sm_100a', False, False, False, False, True, 256, 512, 16231): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b', "batch_group": 8},
+    ('sm_100a', False, False, False, False, True, 256, 512, 16384): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b', "batch_group": 8},
     ('sm_100a', False, True, False, False, False, 2048, 6144, None): {"group_m": 8, "pro": 0},
     ('sm_100a', False, True, False, False, False, 2048, 16384, None): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True},
     ('sm_100a', False, True, False, False, False, 6144, 32, None): {"slots": 2, "pd": 2},
@@ -1316,7 +1400,12 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, False, False, False, 6144, 576, None): {"form": 'w8rs', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "sk": False},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
-    ('sm_100a', False, True, False, False, True, 512, 256, None): {"cta_rows": 256, "group_m": 4, "batch_group": 4},
+    # the MLA absorbed-query forward (batched 512 -> 192): the eight-warp program with the early accumulator release and
+    # the loader-issued scheduling queries, the head-interleaved raster over all 64 heads, raster group 2
+    ('sm_100a', False, True, False, False, True, 512, 192, None): {"form": 'w8rs', "batch_group": 64, "group_m": 2},
+    # the MLA value-projection input gradient (batched 512 -> 256): the same program with the head-interleaved raster of
+    # 8 heads, the evict_last output stores and 256-byte L2 promotion, raster group 4
+    ('sm_100a', False, True, False, False, True, 512, 256, None): {"form": 'w8rs', "batch_group": 8, "store_hint": "evict_last", "promo": 'l2_256b', "group_m": 4},
     ('sm_100a', False, True, True, False, False, 2048, 4096, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True},
     ('sm_100a', False, True, True, False, False, 2048, 16384, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True, "epi": 'reg', "f32_v8": True, "store_ef": True},
@@ -1373,7 +1462,6 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 2048, 4096, None): {"epi": 'reg', "f32_v8": True, "stages": 9, "store_ef": True, "pro": 15},
     ('sm_107a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
-    ('sm_107a', False, True, False, False, False, 2048, 16384, None): {"cgrp": True, "group_m": 8},
     ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128, "slots": 1, "group_m": 2, "cta1": True},
     ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128, "cta1": True, "group_m": 2, "pd": 2},
     ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b', "pro": 15},
@@ -1458,7 +1546,6 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 5120, 64, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
     ('sm_107a', False, True, True, False, False, 5120, 128, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
     ('sm_107a', False, False, False, False, False, 128, 5120, None): {"block_n": 128, "cta_rows": 128, "hints": ('evict_first', 'none'), "pro": 15},
-    ('sm_107a', True, True, True, False, False, 5120, None, 5120): {"block_n": 256, "cta_rows": 128, "f32_v8": True, "pro": 15, "hints": ('none', 'none'), "epi": 'reg', "b_swz": 128, "pd": 0, "pf": 0},
     ('sm_107a', False, True, True, False, False, 8192, 128, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
     ('sm_107a', True, True, True, True, False, 32, 16231, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 48, 16231, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
@@ -1478,6 +1565,43 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, True, False, 48, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, True, False, 64, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
     ('sm_107a', True, True, True, False, False, 5120, 16384, 512): {"block_n": 224, "cta_rows": 128, "f32_v8": True, "store_ef": True, "pro": 15},
+    # ragged sm_107a weight-gradient keys (every token count without an exact key): the 4096 -> 512 / 4096 -> 1024 fp32
+    # rows carry the rule of their T 16231 keys, the 5120 -> 1024 bf16 row the 224-column tile with the evict-first
+    # B hint and the column-grouped raster
+    ('sm_107a', True, True, True, False, False, 4096, None, 512): {"block_n": 192, "cta_rows": 128, "b_swz": 64, "hints": ('none', 'evict_first'), "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_slab": 2, "pro": 15, "epi": 'reg', "pd": 0, "pf": 0},
+    ('sm_107a', True, True, True, False, False, 4096, None, 1024): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "f32_v8": True, "store_ef": True, "pro": 15},
+    ('sm_107a', True, True, False, False, False, 5120, None, 1024): {"block_n": 224, "cta_rows": 128, "hints": ('none', 'evict_first'), "cgrp": True, "pro": 15},
+    # ---- sm_107a: the 212-SM tranche - ragged rules measured on R200 (212 SMs) at T 16172 - 16384 against the plan the
+    #      row had without them, both in the cold-L2 frame and under sustained back-to-back load; the half-tail and
+    #      column-grouped forward / input-gradient rows keep every output bitwise equal to that plan's; eight of the keys
+    #      apply from a token floor on (``ROW_RULE_MIN_T``) ----
+    # the 12288 -> 4096 input gradient: the half-tail program with the column-grouped raster (faster)
+    ('sm_107a', False, True, False, False, False, 12288, 4096, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 4096 -> 12288 input gradient: the half-tail program with the column-grouped raster (at least as fast)
+    ('sm_107a', False, True, False, False, False, 4096, 12288, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 4096 -> 4096 input gradient: the half-tail program with the column-grouped raster (faster)
+    ('sm_107a', False, True, False, False, False, 4096, 4096, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 5120 -> 5120 input gradient: the column-grouped raster in 12-column-tile groups (at least as fast)
+    ('sm_107a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
+    # the q_b 2048 x 16384 input gradient: the half-tail program with the column-grouped raster in the default groups,
+    # in place of 8-column-tile groups (faster)
+    ('sm_107a', False, True, False, False, False, 2048, 16384, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the shared_down 2048 -> 6144 input gradient: the half-tail program with the column-grouped raster (faster)
+    ('sm_107a', False, True, False, False, False, 2048, 6144, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 4096 -> 12288 forward: the half-tail program with the column-grouped raster (at least as fast)
+    ('sm_107a', False, False, False, False, False, 12288, 4096, None): {"cgrp": True, "htail": True, "pro": 15},
+    # the 12288 -> 4096 weight gradient (direct orientation): the tail tiles split into 3 K parts (faster)
+    ('sm_107a', True, True, False, False, False, 12288, None, 4096): {"sk_parts": 3, "pro": 15},
+    # the 4096 -> 12288 weight gradient (direct orientation): the tail tiles split into 3 K parts, 16-row raster
+    # groups (faster)
+    ('sm_107a', True, True, False, False, False, 4096, None, 12288): {"group_m": 16, "sk_parts": 3, "pro": 15},
+    # the 5120 -> 5120 weight gradient (direct orientation): the synchronised stream-K program with the slab path and
+    # a 26-step collector margin (faster)
+    ('sm_107a', True, True, False, False, False, 5120, None, 5120): {"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2},
+    # the 5120 -> 5120 fp32 weight gradient (direct orientation): the synchronised stream-K program with the slab path,
+    # a 38-step collector margin and the evict-first fp32 v8 register stores, in place of the whole-tile fp32 v8
+    # program (faster)
+    ('sm_107a', True, True, True, False, False, 5120, None, 5120): {"epi": 'reg', "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_sync_m": 38, "sk_slab": 2},
     # ---- sm_100a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB200 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1627,6 +1751,24 @@ ROW_RULES: dict[tuple, dict] = {
     #      in place of the ragged rule's overlapped half-tail program in the same groups), with the per-tile K
     #      partitions of the row's plan without it, measured on GB200 against that plan ----
     ('sm_100a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    # ---- sm_100a: the GB T-exact rules of round 11 - measured T-exact rules moved to neighbouring T: the 16384 -> 6144
+    #      forward at T 16172 / 16384 (round 8's rule), the 12288 -> 4096 forward at T 16172 (the sm_103a round-9 rule:
+    #      the half-tail program with the tall epilogue released by row half and the column-grouped raster in
+    #      8-column-tile groups), the 17408 -> 5120 forward at T 16172 (round 8's rule), the 5120 -> 17408 input gradient
+    #      at T 16172 (round 4's rule) and the 4096 -> 12288 input gradient at T 16231 (round 10's rule), each with the
+    #      per-tile K partitions of the row's plan without it (bitwise equal to that plan), measured on GB200 against
+    #      that plan on two nodes ----
+    ('sm_100a', False, False, False, False, False, 6144, 16384, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_100a', False, False, False, False, False, 6144, 16384, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_100a', False, False, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_100a', False, True, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    ('sm_100a', False, False, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_100a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    # ---- sm_100a: the GB T-exact rule of round 12 - the 4096 -> 12288 weight gradient at T 16231 (the ragged rule's
+    #      exact 16-way stream-K program with the tail-first order, in 2-row raster groups in place of the default 16),
+    #      measured on GB200 against the plan without it on two nodes; the raster changes which four output tiles take
+    #      the stream-K tail, so the outputs of those tiles differ from that plan's (each plan is deterministic) ----
+    ('sm_100a', True, True, False, False, False, 4096, 16231, 12288): {"cta_rows": 256, "pro": 7, "sk_exact": 16, "sk_first": True, "group_m": 2},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1679,6 +1821,8 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 8192, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_103a', False, True, False, False, False, 12288, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, True, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
+    # the batched MLA value-projection input gradient (512 -> 256) on GB300: sm_100a's program, raster group 2
+    ('sm_103a', False, True, False, False, True, 512, 256, None): {"form": 'w8rs', "batch_group": 8, "store_hint": "evict_last", "promo": 'l2_256b', "group_m": 2},
     ('sm_103a', False, True, True, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_103a', False, True, True, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_103a', False, True, True, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
@@ -1775,15 +1919,49 @@ ROW_RULES: dict[tuple, dict] = {
     # ---- sm_103a: the GB T-exact rules of round 9 - the 12288 -> 4096 forward at T 16231 / 16384 (the half-tail
     #      program with the tall epilogue released by row half and the column-grouped raster in 8-column-tile groups,
     #      in place of the ragged rule's overlapped half-tail program in 16-column-tile groups), with the per-tile K
-    #      partitions of the row's plan without them, measured on GB300 against that plan ----
+    #      partitions of the row's plan without them, measured on GB300 against that plan; at T 16384 the key also
+    #      walks K serpentine over blocks of 76 items (``kser`` 76, see the T 16172 keys),
+    #      in 16-column-tile groups at T 16384 ----
     ('sm_103a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
-    ('sm_103a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
     # ---- sm_103a: the GB T-exact rules of round 10 - the 4096 -> 12288 input gradient at T 16231 / 16384 (the sm_100a
     #      key's program: the half-tail program with the tall epilogue released by row half and the column-grouped
     #      raster in 16-column-tile groups, in place of the ragged rule's overlapped half-tail program), with the
-    #      per-tile K partitions of the row's plan without them, measured on GB300 against that plan ----
-    ('sm_103a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
-    ('sm_103a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16},
+    #      per-tile K partitions of the row's plan without them, measured on GB300 against that plan; at T 16231 / 16384
+    #      the key also walks K serpentine over blocks of 76 items (``kser`` 76, see the T 16172 keys) ----
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
+    # ---- sm_103a: the GB T-exact rules of round 11 - measured T-exact rules moved to neighbouring T: the 16384 -> 6144
+    #      forward at T 16172 / 16384 (round 8's rule), the 12288 -> 4096 forward at T 16172 (round 9's rule), the
+    #      17408 -> 5120 forward at T 16172 (round 9's rule), the 5120 -> 17408 input gradient at T 16172 (round 4's
+    #      rule), the 4096 -> 12288 input gradient at T 16172 (round 10's rule) and the 5120 -> 17408 / 17408 -> 5120
+    #      weight gradients at T 16172 (the shapes tranche's rule of their T 16231 / 16384 keys: the half-tail program
+    #      with the bf16 tiles through the one-slot TMA store in 12-row-tile groups), each with the per-tile K partitions
+    #      of the row's plan without it (bitwise equal to that plan), measured on GB300 against that plan on two nodes ----
+    ('sm_103a', False, False, False, False, False, 6144, 16384, 16384): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_103a', False, False, False, False, False, 6144, 16384, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8},
+    # the 12288 -> 4096 forward and the 4096 -> 12288 input gradient at T 16172 also walk K serpentine over blocks
+    # of 76 items (``kser`` 76, the CTA pairs of the 152-SM part; the wave guard drops it on the parts with another
+    # pair count), measured on GB300 against the best library GEMM on two nodes
+    ('sm_103a', False, False, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 8, "kser": 76},
+    ('sm_103a', False, False, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 12},
+    ('sm_103a', False, True, False, False, False, 5120, 17408, 16172): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    # the serpentine K walk over blocks of 76 items (``kser`` 76: see the 12288 -> 4096 forward at T 16172)
+    ('sm_103a', False, True, False, False, False, 4096, 12288, 16172): {"cta_rows": 256, "ovr": True, "htail": True, "cgrp": True, "group_m": 16, "kser": 76},
+    #      (the two weight gradients carry ht_min_tail 16, a FlashInfer-only planner refinement: their 680-tile rows keep
+    #      a tail under 16 tiles whole - 148 SMs, 14 tiles, measured slower as 28 half items than FI main - and plan as
+    #      before on 152 SMs (no half-item fit) and 160 SMs (40 tiles, 80 half items))
+    ('sm_103a', True, True, False, False, False, 5120, 16172, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12, "ht_min_tail": 16},
+    ('sm_103a', True, True, False, False, False, 17408, 16172, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12, "ht_min_tail": 16},
+    # ---- sm_103a: the GB T-exact rules of round 13 - the 17408 -> 5120 fp32 weight gradient at T 16231 / 16384 in
+    #      12-row raster groups (the program the row runs without them: its own 128-row fp32 program is not generated
+    #      on sm_103a, so the registry's knob fallback runs the 256-row tiles through the one-slot TMA store; the rule
+    #      names that program so it plans it directly) and the indexer_q 2048 -> 4096 weight gradient at T 16384 with
+    #      the rule of its T 16172 / 16231 keys (round 3), each with the per-tile K partitions of the row's plan without
+    #      it (bitwise equal to that plan), measured on GB300 against that plan on two nodes ----
+    ('sm_103a', True, True, True, False, False, 17408, 16231, 5120): {"cta_rows": 256, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, True, False, False, 17408, 16384, 5120): {"cta_rows": 256, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, False, False, False, 2048, 16384, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
 }
 # fmt: on
 
@@ -1810,6 +1988,41 @@ ARCH_RULE_DEFAULTS: dict[str, dict] = {
 # always wins (either weight-gradient orientation); sm_100a and sm_107a inherit nothing.
 RULE_PARENT: dict[str, str] = {"sm_103a": "sm_100a"}
 
+# FlashInfer-only token tiers of ragged ``ROW_RULES`` keys of the sm_107a 212-SM tranche (measured at T 16172 - 16384):
+# ``key -> ((bound, rule), ...)`` in ascending ``bound``.  At a token count T (``M`` of a forward / input-gradient key,
+# ``K`` of a weight-gradient key) below a tier's ``bound``, the first such tier's ``rule`` plans the row in place of the
+# key's; the last ``bound`` is the key's floor, from which on the key's own rule applies.  A tier rule is the rule
+# FlashInfer main planned the row with (``{}``: none); the fp32 5120 -> 5120 weight gradient plans with no rule up to
+# T 257.  The counts are the R200 A/B of every plan the tranche changed against FlashInfer main (212 SMs, CUPTI cold
+# L2, 2026-11-08).  An exact (N, K, M) key has no tiers.
+# fmt: off
+ROW_RULE_MIN_T: dict[tuple, tuple[tuple[int, dict], ...]] = {
+    # q_b 2048 x 16384 input gradient: slower at 11, flat at 3, faster at 1 of the 15 measured T 1 - 1025; faster at
+    # 12, flat at 3 of the 15 from 2048 on
+    ('sm_107a', False, True, False, False, False, 2048, 16384, None): ((2048, {"cgrp": True, "group_m": 8}),),
+    # 5120 -> 5120 input gradient: slower at the 10 measured T 1 - 257; faster at 15, flat at 6 of the 21 from 959 on
+    ('sm_107a', False, True, False, False, False, 5120, 5120, None): ((959, {}),),
+    # 5120 -> 5120 fp32 weight gradient: faster at the 10 measured T 1 - 257 with no rule (the plan the rule's
+    # registry fallback ran there); slower at 10, flat at 1 of the 11 measured T 959 - 8192; faster at the 10 from
+    # 16129 on
+    ('sm_107a', True, True, True, False, False, 5120, None, 5120): ((258, {}), (16129, {"block_n": 256, "cta_rows": 128, "f32_v8": True, "pro": 15, "hints": ('none', 'none'), "epi": 'reg', "b_swz": 128, "pd": 0, "pf": 0})),
+    # 12288 -> 4096 weight gradient: slower at 5, flat at 16 of the 21 measured T 1 - 8192; faster at the 10 from
+    # 16129 on
+    ('sm_107a', True, True, False, False, False, 12288, None, 4096): ((16129, {}),),
+    # 4096 -> 12288 weight gradient: slower at 5, flat at 14, faster at 2 of the 21 measured T 1 - 8192; faster at the
+    # 10 from 16129 on
+    ('sm_107a', True, True, False, False, False, 4096, None, 12288): ((16129, {}),),
+    # 12288 -> 4096 input gradient: slower at T 2 and 7, faster at T 1; faster at 26, flat at 2 of the 28 measured T
+    # from 33 on
+    ('sm_107a', False, True, False, False, False, 12288, 4096, None): ((33, {}),),
+    # 4096 -> 12288 forward: slower at T 2 and 7, faster at T 1; faster at 25, flat at 3 of the 28 measured T from 33 on
+    ('sm_107a', False, False, False, False, False, 12288, 4096, None): ((33, {}),),
+    # 5120 -> 5120 weight gradient: slower at 2, flat at 18, faster at 1 of the 21 measured T 1 - 8192; faster at the
+    # 10 from 16129 on
+    ('sm_107a', True, True, False, False, False, 5120, None, 5120): ((16129, {}),),
+}
+# fmt: on
+
 
 def _measured_row_rule(
     arch: str,
@@ -1826,7 +2039,8 @@ def _measured_row_rule(
     ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else the parent architecture's entry
     (``RULE_PARENT``: sm_103a reads the sm_100a table for the rows its lanes did not measure), else empty (the lookup
     of Cake ``row_rule``; FlashInfer-only split so the registry fallback can drop the MEASURED rule alone, see
-    ``cake_dense_gemm_det_train_projection_plan``)."""
+    ``cake_dense_gemm_det_train_projection_plan``).  A ragged key with token tiers (``ROW_RULE_MIN_T``) yields the
+    first tier whose bound exceeds the token count (``M`` of a ragged-M key, ``K`` of a ragged-K key)."""
     ident = (arch, bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t), bool(batched))
     for tail in (
         (int(N), int(K), int(M)),
@@ -1835,6 +2049,10 @@ def _measured_row_rule(
     ):
         rule = ROW_RULES.get(ident + tail)
         if rule is not None:
+            tokens = int(M) if tail[2] is None else int(K)
+            for bound, below in ROW_RULE_MIN_T.get(ident + tail, ()):
+                if tokens < bound:
+                    return dict(below)  # under the key's token floor: the tier's rule
             return dict(rule)
     parent = RULE_PARENT.get(arch)
     if parent is not None:
@@ -2308,6 +2526,10 @@ class CakeDenseGemmDetProjectionPlan:
     # TMA-store tiles only; a program knob that adds the raster's four fast divisors to the launch (``_k1_values``) and
     # changes no plan arithmetic
     form: str = ""
+    # the serpentine K walk (instance_key field 38, ``_ks<P>``): the load warp walks the K blocks of a whole-K item in
+    # an odd block of P items descending (P = ``sm_pairs``: the wave guard keeps the rule's value on devices with P
+    # pairs only) - a program knob, no launch argument, no plan arithmetic (0 = off)
+    kser: int = 0
     # FlashInfer-only: the rule's exact-wave BLOCK_N (224) yielded to the default tile because the device's CTA pairs do
     # not fit its tiles in whole waves and the default tile needs fewer waves (``exact_waves``)
     wave_fallback: bool = False
@@ -2377,6 +2599,238 @@ class CakeDenseGemmDetProjectionPlan:
         # round 27: the stt program stores its last item's slices through OUT16 (the real view) and every other slice
         # through ``out``  [Cake launcher]
         return self.epi == "tma" or self.stt
+
+
+# ---------------------------------------------------------------------------
+# K1 weight-gradient chain plans: one split, several accumulation chains
+# ---------------------------------------------------------------------------
+#
+# The one-split K1 program of several accumulation chains (``chain_det_gemm_nn_n<block_n>_f32_t_c<chains>``): the
+# transposed-store GEMM ``out[l, n, m] = sum_k A[l, k, m] B[l, k, n]`` over the launch's ``[L, K, M]`` /
+# ``[L, K, N]`` MN-major operand views, ``256 x block_n`` tiles walked persistently by at most one CTA pair per two
+# SMs.  Each tile's K blocks are cut into ``chains`` contiguous ranges (the ``j``-th of ``c`` takes blocks
+# ``[j kb / c, (j + 1) kb / c)``), each summed in a TMEM accumulator of its own from an ``init`` MMA; the epilogue
+# adds them once, in chain order, and stores the FP32 result.  No workspace, no atomics and no order that depends
+# on scheduling: a fixed input, plan and device give the same bits on every run.  The bits differ from the
+# deterministic programs' (another summation order), so a row moved onto a chain plan changes its bits across
+# versions and plans; its FP64 error is below the deterministic program's.
+
+#: Token ranges at which an FP32 weight-gradient row runs the chain program on the parts of exactly one SM count,
+#: ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, chains), over_exact), ...)}``, keyed by the row's
+#: ``ROW_RULES`` identity without the reduction length (``(arch, a_mn, b_mn, out_f32, out_t, batched, N, M)``, the
+#: direct orientation of :func:`wgrad_views`).  A token count of a range runs that range's program in place of the
+#: planner's, except a token count with an exact ``ROW_RULES`` key of the row (``(..., N, K, M)``), which keeps its
+#: key unless the range says ``over_exact``.  Every other SM count (the 208-SM parts) keeps the planner's routing.
+# fmt: off
+CHAIN_RANGES_BY_SM: dict[
+    tuple[str, int],
+    dict[tuple[str, bool, bool, bool, bool, bool, int, int], tuple[tuple[int, int, tuple[int, int], bool], ...]],
+] = {
+    ("sm_107a", 212): {
+        ("sm_107a", True, True, True, False, False, 5120, 1024): ((960, 40961, (256, 3), False),),
+        ("sm_107a", True, True, True, False, False, 5120, 512): ((960, 40961, (128, 3), True),),
+    },
+    ("sm_107a", 216): {
+        ("sm_107a", True, True, True, False, False, 5120, 1024): ((960, 40961, (256, 3), False),),
+        ("sm_107a", True, True, True, False, False, 5120, 512): ((960, 40961, (128, 3), True),),
+    },
+}
+# fmt: on
+CHAIN_TEMPLATE_PREFIX = (
+    "chain_det_gemm_"  # the registry templates of the chain programs
+)
+CHAIN_PAIR_ROWS = 256  # rows of a chain program's tile (a CTA pair, 2 x 128)
+CHAIN_BLOCK_K = 64  # K elements per K block
+_CHAIN_INT_MAX = 1 << 30
+
+
+def chain_template(block_n: int, chains: int) -> str:
+    """The registry template of the chain program of ``block_n`` columns and ``chains`` accumulation chains."""
+    return f"{CHAIN_TEMPLATE_PREFIX}nn_n{int(block_n)}_f32_t_c{int(chains)}"
+
+
+def chains_fit(chains: int, K: int) -> bool:
+    """Whether ``chains`` accumulation chains each get at least one 64-element K block of ``K``."""
+    return (
+        int(chains) >= 1 and int(chains) * CHAIN_BLOCK_K <= int(K) + CHAIN_BLOCK_K - 1
+    )
+
+
+@dataclass(frozen=True)
+class ChainGemmPlan:
+    """The host plan of one chain-program launch.  ``M`` / ``N`` / ``K`` / ``transposed_out`` are the caller's (as in
+    :class:`CakeDenseGemmDetProjectionPlan`); the launch runs the transposed-store program over ``launch_m`` (the inner extent of the
+    stored output) and ``launch_n`` (its rows), with the caller's operands exchanged (``swapped``) when the caller's
+    output is not transposed."""
+
+    L: int
+    M: int
+    N: int
+    K: int
+    transposed_out: bool
+    launch_m: int
+    launch_n: int
+    block_n: int
+    chains: int
+    m_tiles: int
+    n_tiles: int
+    sm_pairs: int
+    template: str
+    swapped: bool
+    a_mn: bool = True
+    b_mn: bool = True
+    out_f32: bool = True
+    sk_units: int = 0
+    tail_tiles: int = 0
+    htail_plan: bool = False
+    swap_fallback: bool = False
+    rule_fallback: bool = False
+    knob_fallback: bool = False
+    wave_fallback: bool = False
+
+    @property
+    def k_blocks(self) -> int:
+        return _ceil_div(self.K, CHAIN_BLOCK_K)
+
+    @property
+    def tiles(self) -> int:
+        return self.L * self.m_tiles * self.n_tiles
+
+    @property
+    def num_full(self) -> int:
+        return self.tiles
+
+    @property
+    def chain_bounds(self) -> tuple[int, ...]:
+        """The K-block boundaries of the chains: ``(0, kb / c, 2 kb / c, ..., kb)`` (integer division)."""
+        kb, c = self.k_blocks, self.chains
+        return tuple(j * kb // c for j in range(c + 1))
+
+    @property
+    def grid(self) -> tuple[int, int, int]:
+        return (2 * min(self.tiles, self.sm_pairs), 1, 1)
+
+    @property
+    def ws_f32_elems(self) -> int:
+        return 0
+
+    @property
+    def counters_alloc_u32(self) -> int:
+        """The program binds a counter buffer it does not touch at one split: a small zeroed one."""
+        return 16
+
+
+def chain_plan_of(
+    arch: str, sm_count: int, N: int, K: int, M: int, *, transposed_out: bool
+) -> Optional[tuple[int, int]]:
+    """``(block_n, chains)`` of the FP32 nn weight-gradient row ``(N, K, M)`` (:data:`CHAIN_RANGES_BY_SM`) on a part of
+    exactly ``sm_count`` SMs, or ``None``: outside the ranges, at an exact ``ROW_RULES`` key the range does not
+    override, or at a ``K`` too short for the chains."""
+    part = CHAIN_RANGES_BY_SM.get((arch, int(sm_count)))
+    if not part:
+        return None
+    ident = (arch, True, True, True, bool(transposed_out), False)
+    for lo, hi, (block_n, chains), over_exact in part.get(ident + (int(N), int(M)), ()):
+        if lo <= int(K) <= hi:
+            if not over_exact and ident + (int(N), int(K), int(M)) in ROW_RULES:
+                return None
+            return (int(block_n), int(chains)) if chains_fit(chains, K) else None
+    return None
+
+
+def _chain_route(
+    A3: torch.Tensor,
+    B3: torch.Tensor,
+    O3: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    transposed_out: bool,
+    arch: str,
+    sm_count: int,
+) -> Optional[tuple[ChainGemmPlan, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """The chain plan of a validated binding (:func:`cake_dense_gemm_det_train_projection_plan` with no caller knob), or ``None``
+    (the planner's routing): an FP32 output of a single nn matrix whose row has a range in :data:`CHAIN_RANGES_BY_SM`
+    for this part, a registered program and views the program takes."""
+    if out.dtype != torch.float32 or int(A3.shape[0]) != 1:
+        return None
+    L, M, K = (int(s) for s in A3.shape)
+    N = int(B3.shape[2])
+    try:
+        a_mn, a_desc = operand_view(A3, "A", k_axis=2)
+        b_mn, b_desc = operand_view(B3, "B", k_axis=1)
+    except ValueError:
+        return None
+    if not (a_mn and b_mn):
+        return None
+    choice = chain_plan_of(arch, sm_count, N, K, M, transposed_out=transposed_out)
+    if choice is None:
+        return None
+    block_n, chains = choice
+    template = chain_template(block_n, chains)
+    if template not in KERNELS.get(arch, {}):
+        return None
+    swapped = not transposed_out
+    launch_m, launch_n = (N, M) if swapped else (M, N)
+    ldo, out_l = _out_strides(O3)
+    if (
+        launch_m % 8
+        or launch_n % 8
+        or max(launch_m, launch_n, K) > _CHAIN_INT_MAX
+        or O3.stride(2) != 1
+        or ldo % 8
+        or out_l % 8
+        or ldo < launch_m
+        or out.data_ptr() % 16
+    ):
+        return None
+    plan = ChainGemmPlan(
+        L=L,
+        M=M,
+        N=N,
+        K=K,
+        transposed_out=bool(transposed_out),
+        launch_m=launch_m,
+        launch_n=launch_n,
+        block_n=block_n,
+        chains=chains,
+        m_tiles=_ceil_div(launch_m, CHAIN_PAIR_ROWS),
+        n_tiles=_ceil_div(launch_n, block_n),
+        sm_pairs=max(1, int(sm_count) // 2),
+        template=template,
+        swapped=swapped,
+    )
+    a_launch, b_launch = (b_desc, a_desc) if swapped else (a_desc, b_desc)
+    return plan, a_launch, b_launch, O3
+
+
+def _chain_values(
+    plan: ChainGemmPlan,
+    *,
+    A: Any,
+    B: Any,
+    o_alias: Any,
+    ws: Any,
+    counters: Any,
+    ldo: int,
+    out_l: int,
+    enable_pdl: Any,
+) -> dict[str, Any]:
+    """The keyword arguments of a chain-program launch (:func:`bind_launch` orders them by the program's plan)."""
+    return dict(
+        A=A,
+        B=B,
+        out=o_alias,
+        ws=ws,
+        counters=counters,
+        M=plan.launch_m,
+        N=plan.launch_n,
+        K=plan.K,
+        num_l=plan.L,
+        num_splits=1,
+        ldo=ldo,
+        out_l=out_l,
+        enable_pdl=enable_pdl,
+    )
 
 
 def cake_dense_gemm_det_train_projection_plan(
@@ -2484,7 +2938,15 @@ def cake_dense_gemm_det_train_projection_plan(
     ``store_ef`` / ``quad_store`` / ``f32_v8``) are cleared before the key: the eight-warp programs carry none of them.
     A caller-forced ``form`` is admitted or refused by ``instance_key`` and refused on a plan with stream-K units.  It
     changes no plan arithmetic; the launch adds the raster's four fast divisors (``fd_tiles_l`` / ``fd_tiles_g`` /
-    ``fd_group`` / ``fd_last``), which the ten-warp programs' argument plans do not name.
+    ``fd_group`` / ``fd_last``), which the ten-warp programs' argument plans do not name.  ``kser`` (``_ks<P>``) is the
+    row's serpentine K walk - taken from the rule (the sm_103a T-exact rules of the 12288 -> 4096 forward and the
+    4096 -> 12288 input gradient at T 16172 carry ``kser`` 76) and dropped where the planned program cannot carry it
+    (the single-CTA form, an exact, tail-first or synchronised split, the transposed staging, the whole-tile tile
+    resolve, a batch raster, the eight-warp form) or where the device's CTA pairs are not P (74 pairs of a 148-SM part,
+    80 of a 160-SM part: the reversed blocks would not be the device's waves).  ``kser`` is a rule knob only, not a
+    planner keyword (the registry fallback never names a ``_ks<P>`` program).  It changes neither a launch argument
+    nor the plan arithmetic; the output bits are those of another FP32 summation order than the row's program without
+    it, fixed run to run.
     [Cake K1 kernel host L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -2515,7 +2977,15 @@ def cake_dense_gemm_det_train_projection_plan(
     epilogue default to the TMA store plans the same symbol unmeasured, so the registry does not serve it there and
     the row runs the registry fallback above (as before those programs were generated); a caller-forced ``epi``
     is served, and the fp32-output programs (``_f32_tma<slots>_sks``: the TMA store by default at every K) are
-    served as before."""
+    served as before.
+
+    A fourth FlashInfer-only deviation, the unbatched weight-gradient swap (:func:`_single_wgrad_swap`): an ``L == 1``
+    call with both operands MN-major and no transposed store is the weight gradient ``G.T @ X``; where the rule table
+    keys that row in the swapped orientation alone, the call is planned swapped like the batched small-M swap (and
+    under the same registry fallback), so it runs the plan of :func:`cake_dense_gemm_det_train_projection_wgrad` for
+    the same math instead of padding its few output rows into a tall tile; a row without a rule whose output has at
+    most 64 columns against 4096 to 8192 rows and ``K >= 256`` is planned swapped too on ``_NARROW_N_SWAP_ARCHES`` (its
+    columns go to the 64-row tile of the transposed store instead of one padded 224- / 256-column tile)."""
     _caller_knobs: dict[str, Any] = dict(
         transposed_out=transposed_out,
         sk=sk,
@@ -2589,7 +3059,40 @@ def cake_dense_gemm_det_train_projection_plan(
             "cake_dense_gemm_det_train_projection: out needs unit inner stride, 16-byte aligned rows / batches "
             f"and base; strides {tuple(O3.stride())}"
         )
-    swap_eligible = swap_small_m(L, M, N, transposed_out)
+    if (
+        _use_rules
+        and _fallback
+        and _allow_swap
+        and sk == "auto"
+        and all(
+            v is None
+            for k, v in _caller_knobs.items()
+            if k not in ("transposed_out", "sk", "arch")
+        )
+    ):
+        # the FP32 weight-gradient rows of ``CHAIN_RANGES_BY_SM`` on this part: the chain program
+        chained = _chain_route(
+            A3, B3, O3, out, transposed_out=transposed_out, arch=arch, sm_count=sm_count
+        )
+        if chained is not None:
+            # a ChainGemmPlan carries every CakeDenseGemmDetProjectionPlan field the launch path reads (template, grid, workspace sizes)
+            return cast(
+                "tuple[CakeDenseGemmDetProjectionPlan, torch.Tensor, torch.Tensor, torch.Tensor]",
+                chained,
+            )
+    swap_eligible = swap_small_m(L, M, N, transposed_out) or (
+        L == 1
+        and not transposed_out
+        and _single_wgrad_swap(
+            arch,
+            M,
+            N,
+            K,
+            operand_view(A3, "A", k_axis=2)[0],
+            operand_view(B3, "B", k_axis=1)[0],
+            out.dtype == torch.float32,
+        )
+    )
     swapped = _allow_swap and swap_eligible
     if swapped:
         A3, B3 = B3.transpose(1, 2), A3.transpose(1, 2)
@@ -2646,6 +3149,7 @@ def cake_dense_gemm_det_train_projection_plan(
                 "lw",
                 "mg",
                 "sw",
+                "kser",
             )
         }
     if cta1 is None:
@@ -2776,6 +3280,9 @@ def cake_dense_gemm_det_train_projection_plan(
         # the measured ``_sw<n>`` programs are pair programs: a caller-forced single-CTA form keeps the row's
         # single-CTA program without it (a caller-forced ``sw`` is admitted or refused by ``instance_key``)
         sw = 0
+    # the serpentine K walk of the row's rule (the ``_ks<P>`` programs): a rule knob only, not a planner keyword; the
+    # wave guard before ``instance_key`` drops it from a plan that cannot carry it or from a device with another pair count
+    kser = int(rule.get("kser", 0))
     rule_form = form is None
     if form is None:
         # the eight-warp CTA form of the row's rule (the ``_w8r`` / ``_w8rs`` / ``_w8`` programs): the whole-tile
@@ -2814,10 +3321,14 @@ def cake_dense_gemm_det_train_projection_plan(
         # round 19 (Cake W2): slab path of the synchronised fixup (0 off, 1 early arrival, 2 + bulk slab read, 3 + fp32
         # output as the slab)  [Cake launcher]
         sk_slab = int(rule.get("sk_slab", 0))
+    rule_batch_group = batch_group is None
     if batch_group is None:
         batch_group = rule.get("batch_group", 0)
     # the raster knob only exists for batched rows (one batch entry: identical raster)  [Cake launcher]
     batch_group = int(batch_group) if L > 1 else 0
+    if rule_batch_group and batch_group > 1 and L % batch_group:
+        # a rule's raster group that does not divide this call's batch count yields: the row's program without it
+        batch_group = 0
     if batch_group < 0 or (batch_group > 1 and L % batch_group):
         raise ValueError(
             f"cake_dense_gemm_det_train_projection: batch_group must be 0, 1 or a divisor of the batch size {L}, got {batch_group}"
@@ -2908,7 +3419,13 @@ def cake_dense_gemm_det_train_projection_plan(
     htail_plan = False
     if htail:
         tail_h = pair_tiles % units if pair_tiles > units else pair_tiles
-        htail_plan = bool(tail_h) and 2 * tail_h <= units
+        # FlashInfer-only refinement (like ROW_RULE_MIN_T): a rule's ``ht_min_tail`` keeps a tail of fewer tiles whole
+        # (the ``_ht`` program then runs its whole-tile plan); no field means any tail that fits
+        htail_plan = (
+            bool(tail_h)
+            and 2 * tail_h <= units
+            and tail_h >= int(rule.get("ht_min_tail", 1))
+        )
     if exact_plan is not None:
         num_full, tail_tiles, sk_units, iters_per_unit = exact_plan
     elif sync_plan is not None:
@@ -3078,19 +3595,39 @@ def cake_dense_gemm_det_train_projection_plan(
             or sk_first
             or exact_plan is not None
             or sync_plan is not None
-            or batch_group
+            or batch_group == 1
             or any(_caller_knobs.get(k) is not None for k in _W8_FIXED)
         ):
             form = ""
         else:
             lw, mg, sw, pd, pro, stages = False, False, 0, 0, 0, None
             hints, pf, sh = _PLAIN_HINTS, 0, 0
-            store_hint, store_ef, quad_store, f32_v8 = "none", False, False, False
+            # the batched MLA programs: the head-interleaved raster G > 1 with the rule's evict_last store hint
+            store_hint = (
+                store_hint if batch_group > 1 and store_hint == "evict_last" else "none"
+            )
+            store_ef, quad_store, f32_v8 = False, False, False
     elif form and not whole_tiles:
         raise ValueError(
             f"cake_dense_gemm_det_train_projection: form (the eight-warp CTA form) needs a whole-tile kn bf16 plan on 128 x 256 pair "
             f"tiles under 2**21 cluster tiles (got {sk_units} stream-K units over {num_full + sk_units} cluster tiles)"
         )
+    # The wave guard of ``kser``: the ``_ks<P>`` programs reverse the K walk of the whole-K items in every odd block of
+    # P items, measured with P = the 76 CTA pairs of the 152-SM parts.  A rule's ``kser`` yields where the planned
+    # program cannot carry it (the single-CTA form, an exact / tail-first / synchronised split, the transposed staging,
+    # the whole-tile tile resolve, a batch raster, the eight-warp form) or where the device's pairs are not P.
+    if kser and (
+        cta1
+        or exact_plan is not None
+        or sk_first
+        or sync_plan is not None
+        or stt
+        or mg
+        or batch_group
+        or form
+        or units != kser
+    ):
+        kser = 0
     key = instance_key(
         a_mn=a_mn,
         b_mn=b_mn,
@@ -3130,6 +3667,7 @@ def cake_dense_gemm_det_train_projection_plan(
         mg=mg,
         sw=sw,
         form=form,
+        kser=kser,
     )
     plan = CakeDenseGemmDetProjectionPlan(
         L=L,
@@ -3185,6 +3723,7 @@ def cake_dense_gemm_det_train_projection_plan(
         mg=bool(key[34]),
         sw=int(key[35]),
         form=str(key[36]),
+        kser=int(key[37]),
         wave_fallback=wave_fallback,
     )
     check_stream_k_plan(plan, arch)
@@ -3452,6 +3991,7 @@ def _template_knobs(
     not in the symbol and stay unset; ``_skx`` carries no part count, so ``sk_exact`` takes ``sk_exact_parts`` (the
     row's rule) or the kernel tests' 3 parts on 128-row / 2 on 64-row tiles (``_skf`` = its tail-first order,
     ``_lw`` = the load-warp prelude form, ``_mg`` = the whole-tile tile resolve, ``_sw<n>`` = the paced output stores,
+    ``_ks<P>`` = the serpentine K walk - an ``instance_key`` field the planner reads from the rule only,
     ``_w8r`` / ``_w8rs`` / ``_w8`` = the eight-warp CTA form); a single-CTA program leaves ``pro`` to
     the planner (``instance_key`` refuses a forced one).  ``None`` for a symbol outside the family or carrying a token
     the planner never emits (``_box<rows>``, diagnostics)."""
@@ -3490,6 +4030,7 @@ def _template_knobs(
         mg=False,
         sw=0,
         form="",
+        kser=0,
     )
     for token in tokens[1:]:
         if token in ("f32", "t"):
@@ -3554,6 +4095,8 @@ def _template_knobs(
             knobs["mg"] = True
         elif m := re.fullmatch(r"sw(\d+)", token):
             knobs["sw"] = int(m[1])
+        elif m := re.fullmatch(r"ks(\d+)", token):
+            knobs["kser"] = int(m[1])
         elif m := re.fullmatch(r"pro(\d+)", token):
             knobs["pro"] = int(m[1])
         elif token in W8_FORMS:
@@ -3595,8 +4138,8 @@ def _registry_variants(
         if bool(_template_form(tokens)) != bool(_template_form(wanted)):
             continue  # the eight-warp CTA form is a class of its own (its programs fall back onto each other only)
         knobs = _template_knobs(candidate, sk_exact_parts=sk_exact_parts)
-        if knobs is None or (knobs["batch_group"] and not batched):
-            continue
+        if knobs is None or (knobs["batch_group"] and not batched) or knobs.pop("kser"):
+            continue  # a ``_ks<P>`` program is planned from its rule only (``kser`` is not a planner keyword)
         ranked.append((_template_distance(wanted, tokens), candidate, knobs))
     ranked.sort(key=lambda item: item[:2])
     return tuple(knobs for _, _, knobs in ranked)
@@ -4208,6 +4751,18 @@ def _k1_values(
     :class:`_Slot` markers for a cached launch that rebinds the views on every call and resolves the workspace
     out of its arena; the plan decides which of the operands the instance dereferences.  ``enable_pdl`` is the
     launch's PDL flag (0 or 1), or a :class:`_Slot` a cached launch fills per call."""
+    if isinstance(plan, ChainGemmPlan):
+        return _chain_values(
+            plan,
+            A=A,
+            B=B,
+            o_alias=o_alias,
+            ws=ws,
+            counters=counters,
+            ldo=ldo,
+            out_l=out_l,
+            enable_pdl=enable_pdl,
+        )
     dummy16, dummy32 = _dummy(device, torch.bfloat16), _dummy(device, torch.float32)
     tma_out, out_f32 = plan.tma_out, plan.out_f32
     return dict(
@@ -4372,12 +4927,13 @@ def _k1_swapped(
     *,
     transposed_out: bool,
 ) -> bool:
-    """Did the planner run the swapped GEMM (``B.T @ A.T`` with the transposed store) for these views?  The
-    launcher's small-M swap rule on the caller's dimensions, unless the registry fallback undid the swap
-    (``plan.swap_fallback``)."""
-    A3, B3 = as_batched(A, "A"), as_batched(B, "B")
-    L, M, N = int(A3.shape[0]), int(A3.shape[1]), int(B3.shape[2])
-    return swap_small_m(L, M, N, transposed_out) and not plan.swap_fallback
+    """Did the planner run the swapped GEMM (``B.T @ A.T`` with the transposed store) for these views?  A chain plan
+    records it (``plan.swapped``).  Otherwise a swap (the launcher's batched small-M rule, :func:`swap_small_m`, or the
+    unbatched weight-gradient rule, :func:`_single_wgrad_swap`) turns a call without the transposed store into a plan
+    with it; the registry fallback that undid a swap (``plan.swap_fallback``) planned the caller's orientation."""
+    if isinstance(plan, ChainGemmPlan):
+        return plan.swapped
+    return bool(plan.transposed_out) and not transposed_out
 
 
 def _k1_views(

@@ -5,10 +5,10 @@ Experimental, inference-only low-rank HyperConnection. The public opt-in is
 `bind_hc_sum_weights`. No SGLang installation or model object is required.
 This implementation does not change DeepSeek mHC or the SM12x backend.
 
-Use a source checkout of this revision, or a wheel built with
-`FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=0`. Release wheels built with
-that flag set to 1 omit experimental CUDA sources; HC preparation reports a
-clear error in that installation. Requirements include PyTorch's CUDA
+Wheels built from this revision retain the HC CUDA JIT sources even with
+`FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1`. HC remains JIT-only and
+requires CUDA build tools; a source checkout is also supported.
+Requirements include PyTorch's CUDA
 `bmm(out_dtype=torch.float32)` API (available in PyTorch 2.8), Triton with Gluon,
 and CuTe-DSL >=4.8. The validated environment is PyTorch2.14.1, Triton3.8.0,
 CuTe-DSL4.8.0 and CUDA13.3 on GB300. MIG/green-context partitions and SM100
@@ -117,8 +117,7 @@ faster. The standalone example is `examples/hc_sum_sm100.py`; tests are in
 
 ## Scope and upstream admission
 
-Owner, tracking issue and target release are to be assigned
-at upstream submission; this local implementation has not been published.
+Owner, tracking issue and graduation target remain to be assigned.
 Before graduation: intended-hardware correctness/Graph coverage, matched NCU
 comparison, API/trace and packaging review, and a maintainer-approved stable
 contract. Backend code is JIT-only and is not registered in AOT.

@@ -14,9 +14,42 @@
  * limitations under the License.
  */
 
-#include "cake_dsa_h64_train_device.cuh"
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+#include <cuda.h>
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
 
 #define LAUNCH_MIN_BLOCKS 1
+
+#include <math_constants.h>
 
 extern "C" {
 
@@ -27,6 +60,11 @@ kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* _
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
 
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (declaration order) ===
     int rowi = blockIdx.x * 4 + warp;
@@ -77,46 +115,46 @@ kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* _
                 kv8[6] = _vec_load_0[6];
                 kv8[7] = _vec_load_0[7];
             } else {
-                int sv = -1;
+                int sv_7_0 = -1;
                 if (active > cpos) {
-                    sv = indices[row_base + (long long)cpos];
+                    sv_7_0 = indices[row_base + (long long)cpos];
                 }
-                kv8[0] = sv;
-                int sv_0 = -1;
+                kv8[0] = sv_7_0;
+                int sv_7_1 = -1;
                 if (active > cpos + 1) {
-                    sv_0 = indices[row_base + (long long)(cpos + 1)];
+                    sv_7_1 = indices[row_base + (long long)(cpos + 1)];
                 }
-                kv8[1] = sv_0;
-                int sv_1 = -1;
+                kv8[1] = sv_7_1;
+                int sv_7_2 = -1;
                 if (active > cpos + 2) {
-                    sv_1 = indices[row_base + (long long)(cpos + 2)];
+                    sv_7_2 = indices[row_base + (long long)(cpos + 2)];
                 }
-                kv8[2] = sv_1;
-                int sv_2 = -1;
+                kv8[2] = sv_7_2;
+                int sv_7_3 = -1;
                 if (active > cpos + 3) {
-                    sv_2 = indices[row_base + (long long)(cpos + 3)];
+                    sv_7_3 = indices[row_base + (long long)(cpos + 3)];
                 }
-                kv8[3] = sv_2;
-                int sv_3 = -1;
+                kv8[3] = sv_7_3;
+                int sv_7_4 = -1;
                 if (active > cpos + 4) {
-                    sv_3 = indices[row_base + (long long)(cpos + 4)];
+                    sv_7_4 = indices[row_base + (long long)(cpos + 4)];
                 }
-                kv8[4] = sv_3;
-                int sv_4 = -1;
+                kv8[4] = sv_7_4;
+                int sv_7_5 = -1;
                 if (active > cpos + 5) {
-                    sv_4 = indices[row_base + (long long)(cpos + 5)];
+                    sv_7_5 = indices[row_base + (long long)(cpos + 5)];
                 }
-                kv8[5] = sv_4;
-                int sv_5 = -1;
+                kv8[5] = sv_7_5;
+                int sv_7_6 = -1;
                 if (active > cpos + 6) {
-                    sv_5 = indices[row_base + (long long)(cpos + 6)];
+                    sv_7_6 = indices[row_base + (long long)(cpos + 6)];
                 }
-                kv8[6] = sv_5;
-                int sv_6 = -1;
+                kv8[6] = sv_7_6;
+                int sv_7_7 = -1;
                 if (active > cpos + 7) {
-                    sv_6 = indices[row_base + (long long)(cpos + 7)];
+                    sv_7_7 = indices[row_base + (long long)(cpos + 7)];
                 }
-                kv8[7] = sv_6;
+                kv8[7] = sv_7_7;
             }
             unsigned int hit = 0;
             if (kv8[0] >= pass_lo && kv8[0] < pass_hi) {
@@ -144,11 +182,11 @@ kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* _
                 hit = hit + 1;
             }
             uint32_t incl = hit;
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(1));
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(2));
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(4));
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(8));
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(16));
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl, 1, 32); if (lane >= 1) { incl += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl, 2, 32); if (lane >= 2) { incl += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl, 4, 32); if (lane >= 4) { incl += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl, 8, 32); if (lane >= 8) { incl += peer; } }
+            { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl, 16, 32); if (lane >= 16) { incl += peer; } }
             int wpos = count + (int)(incl - hit);
             if (kv8[0] >= pass_lo && kv8[0] < pass_hi) {
                 key_scratch[out_base + (long long)wpos] = kv8[0];

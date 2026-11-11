@@ -49,11 +49,25 @@ temperature form is reported unsupported.  On the loss rows only
 arms run the same inputs without it.  ``--accuracy`` has no oracle for the
 loss-row objective with a temperature (``cake_logprob`` there is timing only).
 
+Memory form (``--memory-mode default|fast|budget``): the ``memory_mode`` the
+``cake`` / ``cake_logprob`` arms pass (``default``: none, the entries' default
+automatic form).  ``--ignore-frac``: the fraction of ignored rows of every
+row's inputs (default: the inputs' five percent).
+
 Timing: ``flashinfer.testing.bench_gpu_time`` with CUPTI activity tracing and
 a cold L2 between iterations (per-iteration GPU span); medians over
 ``--steps`` iterations.  Memory: the peak allocation above the live tensors
 during the forward and during the backward, and the bytes the forward leaves
-alive for the backward (saved state).  ``--accuracy`` adds the error report of
+alive for the backward (saved state) -- the timed backward retains the graph --
+plus the step peak of a training step whose backward frees the graph (forward
+through backward, outputs and gradients included; the entries release their
+saved state early there) and its ratio to the bytes of a head that
+materializes the BF16 logits of the valid rows, ``B = 2 * T_v * V + 2 * V * H +
+2 * T * H``, from the remembered bindings and with the binding caches cleared
+first (``step_peak_hit_over_b`` / ``step_peak_miss_over_b``: a new valid-row
+count misses the cache, usually every training batch; ``step_peak_over_b`` is
+the larger), and ``step_miss_ms``, the step time with the caches cleared before
+every step.  ``--accuracy`` adds the error report of
 every arm against the chunked FP64 oracle and its ratio to the unchunked
 PyTorch path (the 1.05x gate of the tests).  The JSON carries an ``env`` record
 (torch / flashinfer / liger-kernel / cut-cross-entropy versions, device name
@@ -63,7 +77,7 @@ Usage::
 
     python benchmarks/bench_cake_lm_head_det_train.py [--rows t16231_c4096_ce ...]
         [--arms torch_unchunked,torch_chunked,liger,cce,cake,cake_logprob] [--steps 20] [--accuracy]
-        [--temperature hetero] [--json out.json]
+        [--temperature hetero] [--memory-mode default] [--ignore-frac 0.33] [--json out.json]
 """
 
 import argparse
@@ -91,7 +105,7 @@ from flashinfer.cake_lm_head_det_train import (
 )  # noqa: E402
 from flashinfer.experimental.cake.cake_lm_head_det_train import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
     DEFAULT_H,
     DEFAULT_LOSS_DIV,
     DEFAULT_V,
@@ -240,6 +254,12 @@ class ArmAutograd:
 
     def backward(self, st):
         dX, dW = torch.autograd.grad(st["loss"], (self.X, self.W), retain_graph=True)
+        return dict(dX=dX, dW=dW)
+
+    def free_backward(self, st):
+        """The backward of a training step: it frees the graph (no ``retain_graph``), so the entries that release
+        their saved state early do (the step-peak probe, :func:`_step_peak`)."""
+        dX, dW = torch.autograd.grad(st["loss"], (self.X, self.W))
         return dict(dX=dX, dW=dW)
 
     def outputs(self, st):
@@ -509,6 +529,11 @@ class ArmCake(ArmAutograd):
     name = "cake"
     TEMPERATURE_ENTRIES = ("logprob",)
     program_entry: str | None = None  # the program the arm needs: the row's entry
+    # the ``memory_mode`` the arm passes (``None``: none, the entries' default; ``--memory-mode``)
+    memory_mode: str | None = None
+
+    def _memory_kw(self):
+        return {} if self.memory_mode is None else dict(memory_mode=self.memory_mode)
 
     def __init__(self, inp, *, entry, chunk):
         super().__init__(inp, entry=entry, chunk=chunk)
@@ -526,7 +551,7 @@ class ArmCake(ArmAutograd):
 
     def _logprob(self):
         """``cake_lm_head_det_train_logprob`` of the arm's leaves, with the inputs' temperature when they carry one."""
-        kw = {}
+        kw = self._memory_kw()
         if self.inp.temperature is not None:
             kw["temperature"] = self.inp.temperature
         return cake_lm_head_det_train_logprob(
@@ -554,6 +579,7 @@ class ArmCake(ArmAutograd):
                 )
             ),
             temperature=_temperature_form(self.inp.temperature),
+            memory_mode=self.memory_mode or "default",
             **switches,
         )
 
@@ -573,6 +599,7 @@ class ArmCake(ArmAutograd):
             chunk_size=self.chunk,
             return_logp=True,
             backend="cake",
+            **self._memory_kw(),
         )
         return dict(loss=loss, logp=logp)
 
@@ -633,9 +660,54 @@ ARMS = {
 # ---------------------------------------------------------------------------
 
 
+def _head_bytes(inp):
+    """``B = 2 * T_v * V + 2 * V * H + 2 * T * H``: the bytes of a head that materializes the BF16 logits of the
+    ``T_v`` valid rows, with the BF16 ``dW`` and ``dX``."""
+    T, Hx = int(inp.X.shape[0]), int(inp.X.shape[1])
+    Vw = int(inp.W.shape[0])
+    valid = int(inp.valid.sum())
+    return 2 * valid * Vw + 2 * Vw * Hx + 2 * T * Hx
+
+
+def _step_peak(arm):
+    """The peak allocation above the live tensors of one training step whose backward frees the graph (forward
+    through backward, outputs and gradients included); ``None`` for an arm without such a backward."""
+    free = getattr(arm, "free_backward", None)
+    if free is None:
+        return None
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    st = arm.forward()
+    grads = free(st)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    del grads, st
+    return peak
+
+
+def _clear_binding_caches():
+    """Drop the remembered bindings of both deterministic backend modules (the opt-in module's once it is imported):
+    the next ``cake`` call misses the binding cache, as a training step with a new valid-row count does."""
+    cake_backend.BINDING_CACHE.clear()
+    opt_in = sys.modules.get(
+        "flashinfer.experimental.cake.cake_lm_head_det_train.cake_backend_opt_in"
+    )
+    if opt_in is not None:
+        opt_in.BINDING_CACHE.clear()
+
+
 def measure_perf(arm, steps):
-    """Median forward / backward / step milliseconds, the peak allocation above the live tensors during
-    the forward and during the backward, and the bytes the forward leaves alive for the backward."""
+    """Median forward / backward / step milliseconds (``step_ms`` from the remembered bindings, ``step_miss_ms`` with
+    the binding caches cleared before every step: the miss a new valid-row count takes, usually every training
+    batch; a step's backward frees the graph where the arm has :meth:`ArmAutograd.free_backward`, as a training step
+    does, so the entries that release their saved state early do), the peak allocation above the live tensors during
+    the forward and during the backward (the timed backward, which retains the graph), the bytes the forward leaves
+    alive for the backward, and the step peak of a
+    step whose backward frees the graph (:func:`_step_peak`) from the remembered bindings (``step_peak_hit_*``) and
+    after the caches were cleared (``step_peak_miss_*``), each with its ratio to ``B`` (:func:`_head_bytes`);
+    ``step_peak_gib`` / ``step_peak_over_b``: the larger of the two."""
     saved = [
         arm.forward()
     ]  # the forward state the timed backward consumes; released before the memory probes
@@ -643,11 +715,19 @@ def measure_perf(arm, steps):
     fwd_ms = median_ms(arm.forward, steps)
     bwd_ms = median_ms(lambda: arm.backward(saved[0]), steps)
 
+    step_backward = getattr(arm, "free_backward", arm.backward)
+
     def full():
         s = arm.forward()
-        arm.backward(s)
+        step_backward(s)
 
     step_ms = median_ms(full, steps)
+
+    def full_miss():
+        _clear_binding_caches()
+        full()
+
+    step_miss_ms = median_ms(full_miss, steps)
     saved.clear()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
@@ -663,13 +743,33 @@ def measure_perf(arm, steps):
     torch.cuda.synchronize()
     bwd_peak = torch.cuda.max_memory_allocated() - base_bwd
     del grads, st
+    step_peak_hit = _step_peak(arm)
+    _clear_binding_caches()
+    step_peak_miss = _step_peak(arm)
+    step_peak = None if step_peak_hit is None else max(step_peak_hit, step_peak_miss)
+    head = _head_bytes(arm.inp)
+
+    def over_b(nbytes):
+        return None if nbytes is None else nbytes / head
+
+    def as_gib(nbytes):
+        return None if nbytes is None else gib(nbytes)
+
     return dict(
         fwd_ms=fwd_ms,
         bwd_ms=bwd_ms,
         step_ms=step_ms,
+        step_miss_ms=step_miss_ms,
         fwd_peak_gib=gib(fwd_peak),
         bwd_peak_gib=gib(bwd_peak),
         saved_gib=gib(saved),
+        step_peak_gib=as_gib(step_peak),
+        step_peak_hit_gib=as_gib(step_peak_hit),
+        step_peak_miss_gib=as_gib(step_peak_miss),
+        head_gib=gib(head),
+        step_peak_over_b=over_b(step_peak),
+        step_peak_hit_over_b=over_b(step_peak_hit),
+        step_peak_miss_over_b=over_b(step_peak_miss),
     )
 
 
@@ -727,6 +827,7 @@ def _arm_or_error(cls, inp, entry, chunk):
 
 def _row_inputs(row, args, W):
     T, C, objective, entry = ROWS[row]
+    ignore = {} if args.ignore_frac is None else dict(ignore_frac=args.ignore_frac)
     return (
         make_inputs(
             T,
@@ -736,6 +837,7 @@ def _row_inputs(row, args, W):
             W=W,
             temperature=args.temperature,
             temperature_value=args.temperature_value,
+            **ignore,
         ),
         C,
         entry,
@@ -775,9 +877,17 @@ def run_perf(args, results, W):
             if "error" in perf:
                 print(f"{row:22s} {name:16s} failed: {perf['error']}", flush=True)
             else:
+                step_peak = (
+                    "   n/a"
+                    if perf["step_peak_gib"] is None
+                    else f"hit {perf['step_peak_hit_gib']:6.3f} GiB ({perf['step_peak_hit_over_b']:.4f} B) "
+                    f"miss {perf['step_peak_miss_gib']:6.3f} GiB ({perf['step_peak_miss_over_b']:.4f} B)"
+                )
                 print(
                     f"{row:22s} {name:16s} fwd {fmt(perf['fwd_ms'])} ms  bwd {fmt(perf['bwd_ms'])} ms  step {fmt(perf['step_ms'])} ms  "
-                    f"peak fwd {perf['fwd_peak_gib']:6.2f} GiB  bwd {perf['bwd_peak_gib']:6.2f} GiB  saved {perf['saved_gib']:6.2f} GiB",
+                    f"step miss {fmt(perf['step_miss_ms'])} ms  "
+                    f"peak fwd {perf['fwd_peak_gib']:6.2f} GiB  bwd {perf['bwd_peak_gib']:6.2f} GiB  saved {perf['saved_gib']:6.2f} GiB  "
+                    f"step peak {step_peak}",
                     flush=True,
                 )
             del arm
@@ -865,6 +975,18 @@ def main():
         default=DEFAULT_TEMPERATURE,
         help="value of the scalar / constant temperature forms",
     )
+    parser.add_argument(
+        "--memory-mode",
+        default="default",
+        choices=("default", "fast", "budget"),
+        help="memory_mode of the cake arms (default: none passed, the entries' automatic form)",
+    )
+    parser.add_argument(
+        "--ignore-frac",
+        type=float,
+        default=None,
+        help="fraction of ignored rows of every row's inputs (default: the inputs' 0.05)",
+    )
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--min-steps", type=int, default=5)
     parser.add_argument("--accuracy", action="store_true")
@@ -872,6 +994,9 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
+    if args.ignore_frac is not None and not 0 <= args.ignore_frac <= 1:
+        parser.error("--ignore-frac must be between 0 and 1")
+    ArmCake.memory_mode = None if args.memory_mode == "default" else args.memory_mode
     args.arms = [a for a in args.arms.split(",") if a]
     unknown = sorted(set(args.arms) - set(ARMS))
     if unknown:
@@ -900,6 +1025,8 @@ def main():
         torch=torch.__version__,
         geometry=dict(H=H, V=V, loss_div=LOSS_DIV, seed_base=SEED_BASE),
         temperature=dict(form=args.temperature, value=args.temperature_value),
+        memory_mode=args.memory_mode,
+        ignore_frac=args.ignore_frac,
         program_available=dict(
             loss=cake_backend.generated_program_available(device, entry="loss"),
             logprob=cake_backend.generated_program_available(device, entry="logprob"),

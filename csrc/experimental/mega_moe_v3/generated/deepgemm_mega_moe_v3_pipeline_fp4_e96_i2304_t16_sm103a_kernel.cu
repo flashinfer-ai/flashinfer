@@ -232,7 +232,7 @@ __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes, int local_expert_offset)
+kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes, int local_expert_offset)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -638,18 +638,18 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                 unsigned int public_m = task[4] * 256;
                 unsigned int aligned_m = (task[5] + 15) / 16 * 16;
                 unsigned int token_offset = public_m + (unsigned int)cta_rank * (aligned_m / 2);
-                unsigned long long pending = 68719476735;
+                unsigned long long pending = 68719476735ll;
                 #pragma unroll 2
                 for (int k = 0; k < task[7] / 128; k++) {
                     if (task[0] == 2) {
                         unsigned long long k_mask = (unsigned long long)3 << (unsigned long long)(k * 2);
-                        if ((pending & k_mask) != 0) {
+                        if ((pending & k_mask) != 0ull) {
                             unsigned long long _wait_acquire_mask_0;
                             do {
                             asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_wait_acquire_mask_0) : "l"((reinterpret_cast<unsigned long long*>(PrivateMasks) + (task[4]))) : "memory");
-                            } while (((_wait_acquire_mask_0 ^ static_cast<unsigned long long>((unsigned long long)68719476735)) & static_cast<unsigned long long>(k_mask)) != 0);
+                            } while (((_wait_acquire_mask_0 ^ static_cast<unsigned long long>((unsigned long long)68719476735ll)) & static_cast<unsigned long long>(k_mask)) != 0);
                             unsigned long long observed = _wait_acquire_mask_0;
-                            pending = observed ^ 68719476735;
+                            pending = observed ^ 68719476735ull;
                         }
                     }
                     mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
@@ -657,6 +657,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                         if (task[0] == 1) {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 1024, (&A), k * 128, (unsigned int)cta_rank * 8, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         } else {
+                            asm volatile("fence.proxy.async.global;" ::: "memory");
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 1024, (&A2), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                             tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF2), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         }
@@ -1461,7 +1462,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                                 : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
                                 : "r"(read_address));
-                            unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560 + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
+                            unsigned long long dst_index = (unsigned long long)(pool_m + row_2) * 2560ull + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
                             reinterpret_cast<int4*>(PublicExpertOutput + dst_index)[0] = reinterpret_cast<int4*>(packed)[0];
                         }
                     }
@@ -1516,7 +1517,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     unsigned int row_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 0);
                     if ((routed & 1) != 0) {
                         {
-                            const uint4* _vptr_24 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_24 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120ull + lane_off) + 0);
                             uint4* _vdst_24 = reinterpret_cast<uint4*>(&values[0]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1527,7 +1528,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     unsigned int row_1_1 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 1);
                     if ((routed >> 1 & 1) != 0) {
                         {
-                            const uint4* _vptr_25 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_1_1 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_25 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_1_1 * 5120ull + lane_off) + 0);
                             uint4* _vdst_25 = reinterpret_cast<uint4*>(&values[4]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1538,7 +1539,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     unsigned int row_2_1 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 2);
                     if ((routed >> 2 & 1) != 0) {
                         {
-                            const uint4* _vptr_26 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_2_1 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_26 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_2_1 * 5120ull + lane_off) + 0);
                             uint4* _vdst_26 = reinterpret_cast<uint4*>(&values[8]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1549,7 +1550,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     unsigned int row_3 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 3);
                     if ((routed >> 3 & 1) != 0) {
                         {
-                            const uint4* _vptr_27 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_3 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_27 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_3 * 5120ull + lane_off) + 0);
                             uint4* _vdst_27 = reinterpret_cast<uint4*>(&values[12]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1560,7 +1561,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     unsigned int row_4 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 4);
                     if ((routed >> 4 & 1) != 0) {
                         {
-                            const uint4* _vptr_28 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_4 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_28 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_4 * 5120ull + lane_off) + 0);
                             uint4* _vdst_28 = reinterpret_cast<uint4*>(&values[16]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1571,7 +1572,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     unsigned int row_5 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 5);
                     if ((routed >> 5 & 1) != 0) {
                         {
-                            const uint4* _vptr_29 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_5 * 5120 + lane_off) + 0);
+                            const uint4* _vptr_29 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_5 * 5120ull + lane_off) + 0);
                             uint4* _vdst_29 = reinterpret_cast<uint4*>(&values[20]);
                             #pragma unroll
                             for (int _blk = 0; _blk < 1; _blk++) {
@@ -1867,7 +1868,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     store_values[1] = __as_u32(__float22bfloat162_rn(make_float2(reduced[2], reduced[3])));
                     store_values[2] = __as_u32(__float22bfloat162_rn(make_float2(reduced[4], reduced[5])));
                     store_values[3] = __as_u32(__float22bfloat162_rn(make_float2(reduced[6], reduced[7])));
-                    reinterpret_cast<int4*>(y + ((unsigned long long)token * 5120 + lane_off))[0] = reinterpret_cast<int4*>(store_values)[0];
+                    reinterpret_cast<int4*>(y + ((unsigned long long)token * 5120ull + lane_off))[0] = reinterpret_cast<int4*>(store_values)[0];
                 }
             }
         }
