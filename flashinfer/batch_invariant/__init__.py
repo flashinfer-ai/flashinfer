@@ -11,7 +11,7 @@ next to this file is the contract: the guarantee (R1-R4), the flag semantics, th
 
 from __future__ import annotations
 
-from typing import Callable, Dict, NamedTuple, Union
+from typing import Callable, Dict, NamedTuple, Optional, Sequence, Union
 
 import torch
 
@@ -162,8 +162,107 @@ def _mm_mxfp4w8a_fingerprint(
     )
 
 
+def _moe_bf16_fingerprint(
+    H: int,
+    I: int,
+    top_k: int,
+    num_experts: int,
+    method: object = "Renormalize",
+    act: object = "swiglu",
+    params: Sequence[Optional[float]] = (),
+    gated: Optional[bool] = None,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+) -> str:
+    """The bf16 MoE classes behind ``MoELayer`` with ``BatchInvariantBf16Config``: ``method`` is a
+    :class:`flashinfer.RoutingMethodType` (or its name) among the ones the class implements, with ``n_group`` /
+    ``topk_group`` for ``DeepSeekV3``'s group-limited selection (``RoutingConfig``'s values; the groups are a parameter of
+    the routing term), or the class's own method name (``spec.METHODS``; a grouped one as ``<method>_g<n>x<t>``, the same
+    class as the enum form with the groups) or a ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its
+    scalars are the class's parameters), ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of
+    ``spec.ACTS`` / ``spec.UNGATED_ACTS`` with ``params`` (and ``gated`` for the names in both tables). The receipt names
+    a class some layer can build: the runner's bounds and group rule apply here as ``ValueError``."""
+    # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
+    # modules' closures
+    from flashinfer.fused_moe.batch_invariant import spec
+    from flashinfer.fused_moe.batch_invariant.blocks.scheduler import MAX_E
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    if not 1 <= num_experts <= MAX_E:
+        raise ValueError(
+            f"fingerprint('fused_moe'): num_experts {num_experts} must lie in [1, {MAX_E}]"
+        )
+    if not 1 <= top_k <= min(num_experts, spec.MAX_TOP_K):
+        raise ValueError(
+            f"fingerprint('fused_moe'): top_k {top_k} must lie in [1, min(num_experts, {spec.MAX_TOP_K})]"
+        )
+    if isinstance(method, str) and method in RoutingMethodType.__members__:
+        method = RoutingMethodType[method]
+    if isinstance(method, RoutingMethodType):
+        if method not in spec.METHOD_OF_FLASHINFER:
+            raise ValueError(
+                f"the batch-invariant MoE classes do not implement routing method {method!r}"
+            )
+        rm = spec.METHOD_OF_FLASHINFER[method]
+    elif isinstance(method, str):
+        rm = spec.method_named(method)
+    elif isinstance(method, spec.RoutingMethod):
+        rm = method
+    else:
+        raise TypeError(
+            f"method must be a RoutingMethodType, its name or a RoutingMethod, got {method!r}"
+        )
+    if (n_group or 0) > 1 or (topk_group or 0) > 1:
+        n_group, topk_group = int(n_group or 0), int(topk_group or 0)
+        if rm.grouped and (rm.n_group, rm.topk_group) != (n_group, topk_group):
+            raise ValueError(
+                f"method {rm.name!r} carries the groups {rm.n_group} x {rm.topk_group}; n_group / topk_group give "
+                f"{n_group} x {topk_group}"
+            )
+        if not rm.grouped and rm != spec.SIGMOID_BIAS_RENORM_SCALED:
+            raise ValueError(
+                "expert groups (n_group / topk_group) are a parameter of the DeepSeekV3 routing term"
+            )
+        if not 1 <= topk_group <= n_group:
+            raise ValueError(
+                f"n_group {n_group}, topk_group {topk_group} over {num_experts} experts for top_k {top_k}: "
+                + str(spec.group_shape_error(num_experts, top_k, n_group, topk_group))
+            )
+        rm = rm.with_groups(n_group, topk_group)
+    # the runner's group rule (the groups a term of DeepSeekV3 alone, the shape rule), as a ValueError here
+    rule = spec.group_rule_error(rm, num_experts, top_k)
+    if rule is not None:
+        raise ValueError(
+            f"n_group {rm.n_group}, topk_group {rm.topk_group} over {num_experts} experts for top_k {top_k}: {rule}"
+        )
+    if not isinstance(act, str):
+        a = spec.activation_of(act)
+        name, params, gated = a.act, a.params, a.gated
+    elif act == "swiglu":
+        name, gated = "silu", True
+    elif act == "relu2":
+        name, gated = "relu2", False
+    elif act in spec.ACTS or act in spec.UNGATED_ACTS:
+        name = act
+        if gated is None:
+            gated = act in spec.ACTS
+    else:
+        raise ValueError(f"no MoE chain named {act!r}")
+    return spec.spec_fingerprint(
+        H, I, top_k, num_experts, rm, "bf16", name, params, gated
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
+    # the unified MoE layer with `BatchInvariantBf16Config`: the routing method and the activation (gated SwiGLU / ungated
+    # ReLU^2) are dimensions of the class; the hidden and intermediate sizes fix the two GEMM classes
+    "fused_moe": ClassInfo(
+        "moe.bf16",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_bf16_fingerprint,
+        ("method", "act", "params", "gated", "n_group", "topk_group"),
+    ),
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
     # the fp8 input dtype is a dimension: e4m3 and e5m2 are two classes (gemm.e4m3.*, gemm.e5m2.*) of one API; the output
     # dtype (bf16 / fp16) is the chain's conversion; the batch is not a dimension (every element is one launch of the class)

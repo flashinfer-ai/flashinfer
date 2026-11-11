@@ -79,9 +79,22 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -
         return False
 
 
+def _cudnn_supports_paged_token_offsets(
+    dtype: torch.dtype, *, explicit_q: bool, explicit_kv: bool
+) -> bool:
+    """Paged plans with both explicit lengths need no mixed-form API.
+
+    The wrapper already stages per-request Q and KV lengths in plan(). On
+    cuDNN 9.24, their mask lengths can accompany token-unit physical origins
+    through ragged-offset multipliers. A cumulative/mixed mask still needs
+    9.25, as does FP8. This capability is shared by backend and FROST plans.
+    """
+    return _cudnn_supports_direct_seqlens(dtype, mixed=not (explicit_q and explicit_kv))
+
+
 @functools.cache
 def _cudnn_supports_paged_auto() -> bool:
-    """The qualified paged prefill selection requires FE 1.32 / cuDNN 9.27."""
+    """The qualified paged prefill selection requires FE 1.32 / cuDNN 9.24."""
     if not CUDNN_AVAILABLE:
         return False
     try:
@@ -95,7 +108,7 @@ def _cudnn_supports_paged_auto() -> bool:
         return (
             version >= Version("1.32.0")
             and cudnn_frontend_frost_runtime_available()
-            and cudnn.backend_version() >= 92700
+            and cudnn.backend_version() >= 92400
             and bool(getattr(binder, "supports_paged_packed_split", False))
         )
     except (AttributeError, TypeError, ValueError):
@@ -1251,7 +1264,15 @@ class _PrefillMetadata:
             self.batch_offsets_v = self.batch_offsets_k
         paged = self.block_tables is not None
         direct = (
-            _cudnn_supports_direct_seqlens(q_dtype, mixed=paged)
+            (
+                _cudnn_supports_paged_token_offsets(
+                    q_dtype,
+                    explicit_q=self.actual_seq_lens_q is not None,
+                    explicit_kv=self.actual_seq_lens_kv is not None,
+                )
+                if paged
+                else _cudnn_supports_direct_seqlens(q_dtype)
+            )
             and self.batch_offsets_q is not None
             and (
                 self.actual_seq_lens_kv is not None

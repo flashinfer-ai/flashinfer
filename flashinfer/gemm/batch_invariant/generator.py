@@ -25,7 +25,7 @@ so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ...batch_invariant import canon
 from .spec import (
@@ -444,7 +444,11 @@ class MainloopBlock:
     fixed by the format; its instruction variant by the knobs."""
 
     in_fmt: str = "bf16"
-    k_block_override: int = 0  # `Knobs.k_block`: 0 = the format's default stage
+    k_block_override: int = (
+        0  # `Knobs.k_block` in K elements: 0 = the format's default stage
+    )
+    #: an override of the K-steps per smem stage (``StaticPlan(k_blocks=)``); None: ``inner_radix`` at the K-block above
+    inner_steps: Optional[int] = None
 
     @property
     def step(self) -> int:
@@ -453,7 +457,7 @@ class MainloopBlock:
     @property
     def inner(self) -> int:
         """Instruction K-steps per smem stage (the lowering's inner radix)."""
-        return inner_radix(self.in_fmt, self.k_block_override)
+        return self.inner_steps or inner_radix(self.in_fmt, self.k_block_override)
 
     @property
     def k_block(self) -> int:
