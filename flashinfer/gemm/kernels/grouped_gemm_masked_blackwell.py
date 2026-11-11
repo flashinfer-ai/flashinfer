@@ -3919,7 +3919,11 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         global_scale_tensor_gpu: Optional[torch.Tensor] = None,
     ):
         if c_tensor_gpu is None:
-            # fp4 gemm output is not supported
+            if quantize_output:
+                raise ValueError(
+                    "NVFP4 output requires c_tensor_gpu, out_scale_tensor_gpu "
+                    "and global_scale_tensor_gpu"
+                )
             c_tensor_gpu = torch.empty(
                 (l, m, n // 2 if activation_type is not None else n),
                 dtype=cutlass_to_torch_dtype(c_dtype),

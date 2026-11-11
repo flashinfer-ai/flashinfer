@@ -335,6 +335,49 @@ def test_gated_activation_compiled_kernel_allocates_half_width_output():
     assert torch.equal(out, expected)
 
 
+def test_nvfp4_output_compiled_kernel_requires_output():
+    _skip_unless_sm100()
+    from flashinfer.cute_dsl.blockscaled_gemm import (
+        get_cute_dsl_compiled_masked_gemm_kernel,
+    )
+    from flashinfer.cute_dsl.utils import get_cutlass_dtype, get_num_sm
+
+    device = torch.device("cuda")
+    l, m, n, k = 2, 128, 256, 256
+    a, sfa, _ = _nvfp4_operand(l, m, k, device)
+    b, sfb, _ = _nvfp4_operand(l, n, k, device)
+    major, minor = get_compute_capability(device)
+    tensor_api = get_cute_dsl_compiled_masked_gemm_kernel(
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=get_cutlass_dtype("float4_e2m1fn"),
+        sf_dtype=get_cutlass_dtype("float8_e4m3fn"),
+        c_dtype=get_cutlass_dtype("float4_e2m1fn"),
+        alpha_dtype=None,
+        sf_vec_size=SF_VEC,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sm_count=get_num_sm(device),
+        sm_version=f"sm_{major}{minor}",
+        num_ranks=1,
+        enable_dst_signals=False,
+    )
+    with pytest.raises(ValueError, match="requires c_tensor_gpu"):
+        tensor_api(
+            a_tensor_gpu=a,
+            b_tensor_gpu=b,
+            sfa_tensor_gpu=sfa,
+            sfb_tensor_gpu=sfb,
+            masked_m_tensor_gpu=torch.full((l,), m, dtype=torch.int32, device=device),
+            dst_signals_tensor_gpu=None,
+        )
+
+
 def _unswizzle_sf(sf: torch.Tensor, l: int, rows: int, k_sf: int) -> torch.Tensor:
     """Swizzled E4M3 bytes of any shape -> (l, rows, k_sf) raw bytes."""
     phys = sf.contiguous().view(torch.uint8).reshape(-1)
