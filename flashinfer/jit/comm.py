@@ -316,17 +316,27 @@ def gen_ulysses_lowp_module() -> JitSpec:
     #
     # SM89 (Ada L40S / RTX 4090) uses the same Q_GROUP=32 / K_GROUP=64 tile
     # sizes as SM120 (both are HMMA warp-level per_warp_int8), so the same
-    # source file covers both architectures.  We emit a fat binary with both
-    # gencodes so UlyssesLowpSageLayout.is_supported() returns True on either.
-    from .core import sm120a_nvcc_flags
+    # source file covers both architectures. Only emit requested targets:
+    # each AOT provider must contain binaries compatible with its own arch.
+    # A multi-device JIT context may still request both architectures.
+    from .core import check_cuda_arch, sm89_nvcc_flags, sm120a_nvcc_flags
 
-    sm89_gencode = "-gencode=arch=compute_89,code=sm_89"
+    # Preserve gen_jit_spec's retry when import-time device detection was empty.
+    check_cuda_arch()
+    targets = current_compilation_context.TARGET_CUDA_ARCHS
+    nvcc_flags = []
+    if (8, "9") in targets:
+        nvcc_flags.extend(sm89_nvcc_flags)
+    if targets & {(12, "0"), (12, "0a"), (12, "0f")}:
+        nvcc_flags.extend(sm120a_nvcc_flags)
+    if not nvcc_flags:
+        raise RuntimeError("Ulysses Lowp requires an SM89 or SM120 compilation target.")
     return gen_jit_spec(
         "ulysses_lowp",
         [
             jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp.cu",
         ],
-        extra_cuda_cflags=[sm89_gencode] + sm120a_nvcc_flags,
+        extra_cuda_cflags=nvcc_flags,
     )
 
 
@@ -436,9 +446,10 @@ def gen_cake_alltoall_module(target: CakeAlltoAllTarget) -> JitSpec:
 def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
     """NVLink one-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkOneSidedAlltoAll``.
 
-    Includes the CFT counted-write path, which is compiled in when the CUDA
-    toolkit provides the logical-endpoint API (13.4+) and resolved from the
-    driver at runtime, and the Lamport path for small steps.
+    Includes the fence and sentinel paths, and a CFT counted-write path that
+    ``NVLinkOneSidedAlltoAll`` does not use. The CFT path and the
+    logical-endpoint ops are compiled in when the CUDA toolkit provides the
+    logical-endpoint API (13.4+) and resolved from the driver at runtime.
     """
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     common = nv_internal / "cpp" / "common"
@@ -449,7 +460,7 @@ def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
         "nvlink_one_sided_alltoall",
         [
             jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_lamport.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "nvlink_one_sided_sentinel.cu",
             nv_internal
             / "tensorrt_llm"
             / "kernels"

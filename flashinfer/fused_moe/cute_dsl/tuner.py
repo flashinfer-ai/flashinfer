@@ -1163,6 +1163,10 @@ W4A16_MOE_TACTICS = tuple(get_w4a16_moe_valid_tactics())
 class CuteDslFusedMoEW4A16Runner(TunableRunner):
     """Tunable runner for the BF16-activation, NVFP4-weight MoE pipeline.
 
+    With ``use_fused_finalize=False`` and a fixed ``tactic``, a token's output
+    is bitwise independent of the other tokens in the batch. The fused
+    finalize path is not batch invariant.
+
     Inputs:
         [x, token_selected_experts, token_final_scales,
          w1_weight, w1_weight_sf, w1_alpha,

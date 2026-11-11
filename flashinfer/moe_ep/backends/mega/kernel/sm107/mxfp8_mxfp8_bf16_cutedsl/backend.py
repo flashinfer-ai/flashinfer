@@ -69,6 +69,29 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config = config
 
+    def ep_weight_pack(self, weights):
+        from ..automatic import ep_weight_pack
+
+        return ep_weight_pack(self, weights)
+
+    def ep_selected_config(self, workspace):
+        from ..automatic import ep_selected_config
+
+        return ep_selected_config(self, workspace)
+
+    def ep_prepare_fixed(self, workspace, weights):
+        workspace.prepare(*weights)
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        from ..automatic import ep_force_tune
+
+        ep_force_tune(self, workspace, tensors, weights, output)
+
+    def ep_tuning_contract(self, fleet_params):
+        from ..automatic import ep_tuning_contract
+
+        return ep_tuning_contract(self, fleet_params)
+
     @classmethod
     def create(cls, config):
         if config.kernel_variant == "auto":

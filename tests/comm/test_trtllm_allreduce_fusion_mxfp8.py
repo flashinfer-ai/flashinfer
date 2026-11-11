@@ -1,15 +1,16 @@
 """MXFP8 output of the TRT-LLM allreduce + residual + RMSNorm fusion.
 
-The fused kernel must produce exactly what the unfused sequence produces:
-kARResidualRMSNorm followed by mxfp8_quantize (backend="cute-dsl") on the norm
-output -- same E4M3 bytes, same UE8M0 scale bytes (including the zeroed row /
-column padding of the swizzled 128x4 layout), same residual and norm outputs.
+Quantization must match mxfp8_quantize (backend="cute-dsl") on the fused
+kernel's norm output exactly. Against a separate kARResidualRMSNorm launch,
+allow one norm ulp and isolated adjacent E4M3 codes due to reduction order.
+Residual outputs and written UE8M0 scale bytes must match exactly.
 
 Run as: python tests/comm/test_trtllm_allreduce_fusion_mxfp8.py [world_size]
 """
 
-import socket
 import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 import torch
@@ -51,12 +52,12 @@ def _written_sf_mask(token_num: int, hidden_dim: int, layout: int, numel: int, d
     return mask
 
 
-def _run_worker(world_size, rank, dtype, hidden_dims, port):
+def _run_worker(rank, world_size, dtype, hidden_dims, init_method):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://localhost:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=world_size,
     )
@@ -221,7 +222,7 @@ def _check_case(
         diff = (q_bytes.int() - ref_q_bytes.int()).abs()
         n_bad = (diff != 0).sum().item()
         adjacent = bool((diff <= 1).all())
-        if with_norm_out or not adjacent or n_bad > max(1, q_bytes.numel() // 100000):
+        if not adjacent or n_bad > max(1, q_bytes.numel() // 100000):
             print(f"FAIL quant {tag}: {n_bad}/{q_bytes.numel()} bytes differ")
             ok = False
         else:
@@ -238,13 +239,13 @@ def _check_case(
     return 0 if ok else 1
 
 
-def _run_unified_api_worker(world_size, rank, dtype, port):
+def _run_unified_api_worker(rank, world_size, dtype, init_method):
     """allreduce_fusion() on a TRT-LLM workspace: outputs, return value and validation."""
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://localhost:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=world_size,
     )
@@ -365,25 +366,11 @@ def _run_unified_api_worker(world_size, rank, dtype, port):
         dist.destroy_process_group(group=group)
 
 
-def _get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _multi_process(world_size, target, *args):
-    mp.set_start_method("spawn", force=True)
-    port = _get_open_port()
-    procs = [
-        mp.Process(target=target, args=(world_size, i, *args, port))
-        for i in range(world_size)
-    ]
-    for p in procs:
-        p.start()
-    for p in procs:
-        p.join()
-    for i, p in enumerate(procs):
-        assert p.exitcode == 0, f"Process {i} failed with exit code {p.exitcode}"
+    # All ranks are local: a private file store avoids competing for a TCP port.
+    with TemporaryDirectory(prefix="flashinfer-mxfp8-") as directory:
+        init_method = (Path(directory) / "rendezvous").as_uri()
+        mp.spawn(target, args=(world_size, *args, init_method), nprocs=world_size)
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])

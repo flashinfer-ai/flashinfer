@@ -6,7 +6,7 @@ import torch
 
 from flashinfer import xqa, xqa_mla
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )

@@ -32,8 +32,12 @@ resets and the router-gradient clone remain part of a complete iteration.
 ## Use
 
 The package includes its caller-owned workspace and metadata layer; no separate
-MoK installation or extension is needed. A CUDA toolkit supporting the selected
-device and PyTorch with symmetric-memory multicast support are required.
+MoK installation or extension is needed. PyTorch with symmetric-memory
+multicast support is required. Minimum CUDA toolkit (nvcc) per target, the
+`min_cuda` of every library in `build.json`: 12.8 for SM100a, 12.9 for SM103a
+and 13.4 for SM107a (checked by compiling every SM100a and SM103a library with
+12.8, 12.9, 13.0 and 13.1: each compiles from its floor up, and 12.8 rejects
+`compute_103a`).
 Distributed ranks must share one peer-accessible NVLink domain (peers may span
 hosts of one NVL72 domain).
 
@@ -63,6 +67,14 @@ context = backend.recompute_forward_context(
     config, workspace, schedule, x, shared[0], shared[1], *fwd_routed[:2])
 grads = backend.backward(config, workspace, schedule, context, dy, x, scores,
                          *shared, *bwd_routed)
+
+# BF16 activation checkpointing without storing the context at all.
+backend.prepare(save_context=False)  # compile before CUDA Graph capture
+y, _ = backend.forward(config, workspace, schedule, x, scores, *weights,
+                       save_context=False)
+context = backend.recompute_forward_context(
+    config, workspace, schedule, x, *weights[:2], *weights[3:5])
+grads = backend.backward(config, workspace, schedule, context, dy, x, scores, *weights)
 ```
 
 `weights` contains shared gate/up/down followed by routed gate/up/down; gate
@@ -121,6 +133,21 @@ recomputes the gate/up GEMMs and SwiGLU of exactly that context. Pass the same
 schedule, inputs, weights and limit as the checkpointed forward; the returned
 context is bitwise identical to the forward's and interchangeable with it.
 
+### Context-free forward
+
+With BF16 routed experts, `forward(..., save_context=False)` runs the
+context-free forward of an activation-checkpointed step and returns
+`(y, None)`. Its fused tiles store hidden, which the down projection reads,
+and skip the shared and routed gate/up stores that only backward reads; it
+also allocates no gate/up tensors. `y` is bitwise identical to the context
+forward's `y`. Before `backward`, rebuild the context with
+`recompute_forward_context` (same schedule, inputs, weights and limit);
+backward then returns the same bits as after a context forward. Compile it
+with `prepare(swiglu_limit, save_context=False)` before CUDA Graph capture.
+The MXFP8 forward always saves its context and rejects `save_context=False`.
+The kernels are the `forward_noctx` and `forward_clamped_noctx` roles; they
+take the forward's arguments and launcher.
+
 Local work follows the real source rows: shared-expert GEMMs, their weight
 gradients and both epilogues read only the active prefix rounded up to 256
 rows; peers read only routed rows. Reserved source or schedule capacity adds
@@ -143,7 +170,8 @@ which select the UMMA shared-memory descriptor address mask from
 `__CUDA_ARCH__`: 15 bits on SM107a, 14 bits otherwise) and the scheduler,
 communication and epilogue sources are shared by SM100a, SM103a and SM107a.
 Launchers of the same shape share one TU: the plain fused launcher also
-serves the `_clamped` kernel of its role, and `csrc/cake_mok_count_binding.cu`,
+serves the `_clamped` kernel of its role (and the forward launcher the
+`_noctx` kernels), and `csrc/cake_mok_count_binding.cu`,
 `cake_mok_rows_binding.cu`, `cake_mok_pad_binding.cu`,
 `cake_mok_epilogue_2_binding.cu` and `cake_mok_epilogue_8_binding.cu` serve
 their kernel families; the entry's `nvcc_flags` name the kernel with
@@ -186,6 +214,61 @@ launchers memoise their launch-invariant geometry per distinct launch
 arguments (integers and, for MXFP8, the device); the memo holds no tensors
 and does not change the launch sequence.
 
+## Repeatability
+
+Within the scope below, every output repeats bit for bit:
+
+| Output | Repeats bit for bit |
+| --- | --- |
+| `forward`: `y` | yes; identical with `save_context=False` |
+| `forward`: context | yes |
+| `recompute_forward_context`: context | yes, identical to the forward's |
+| `backward`: `dx` | yes |
+| `backward`: `dscores` | yes |
+| `backward`: six weight gradients | yes |
+
+The context is `x_routed`, `gate_shared`, `gate_routed`, `up_shared`,
+`up_routed`, `hidden_shared` and `hidden_routed` (MXFP8 routed fields as data
+and scales); the recomputed context is bitwise identical to the forward's (see
+Context, memory and recompute). The weight gradients are shared and routed
+gate/up/down, or the six FP32 accumulators with `fp32_wgrad=True`. This holds
+for BF16 and MXFP8 routed experts and for plain and clamped SwiGLU.
+
+Scope: repeated calls with the same inputs (source tokens `x`, expert IDs,
+scores, per-rank source counts, `dy`), the same weights (and the same MXFP8
+prequantized weights), the same `MoKConfig` values other than the
+communication-SM split (minibatch and macrobatch sizes, schedule capacity), the
+same precision, `swiglu_limit` and `fp32_wgrad`, the same EP group (size and
+rank order), the same package build and the same GPU model (compute capability
+and SM count). Results may differ bitwise across GPU architectures, EP sizes,
+minibatch or macrobatch sizes, precisions, package versions and CUDA
+toolkits.
+
+No output bit depends on:
+
+- the communication-SM split: a fixed pair, the `"auto"` rows or the
+  imbalance-aware switch, including ranks running different splits in one
+  step;
+- other kernels resident on other streams that occupy SMs while MoK runs;
+- CUDA Graph replay versus eager launches;
+- on SM107a MXFP8, the choice of the two-macro-batch forward program (see
+  Contract).
+
+Every reduction runs in a fixed order: the top-k combine adds each token's
+slots in slot order, each routed weight-gradient tile has one writer over its
+full reduction, router-score gradient partials are summed in a fixed order and
+later macrobatches are added in macrobatch order. Kernels use atomics only on
+integers, to count rows and claim work, never to add floating-point values.
+
+Checked on GB300 (SM103a) by repeating the checkpointed training step (schedule,
+forward, context recompute, backward) five times and comparing every output
+bitwise on every rank: GLM-5.2 shapes (H 6144, I 2048, 256 experts, top 8) at
+EP4/8/16/64 and GLM-5.3-Flash shapes (H 4096, I 2048, 288 experts, top 8,
+clamped SwiGLU limit 10) at EP8/32; 16,384 tokens per rank, FP32 accumulators,
+BF16 and MXFP8; uniform, ragged (1 to 32,767 tokens, one empty rank) and
+1.5x-hot routing; with a resident side-stream kernel holding up to 16 SMs,
+across communication-SM splits and under CUDA Graph replay.
+
 ## Contract
 
 - Scheduler layouts `(EP, local experts)`: `(1, 4)` and `(4, 4)` diagnostic
@@ -197,11 +280,11 @@ and does not change the launch sequence.
   Scores are already normalized/scaled by the caller.
 - Logical source token counts may differ across ranks and may be zero. Hidden
   and intermediate widths are positive multiples of 256; MXFP8 also requires a
-  hidden width that is a multiple of 512, and its forward and recompute roles
-  need an nvcc of CUDA 13.1 or newer (the 13.0 ptxas rejects
-  `cvt.rn.satfinite.e4m3x2.bf16x2`: "Unexpected instruction types specified for
-  'cvt'"; the backward roles carry a guard and compile with 13.0). Every sm_107a
-  (Rubin) library needs CUDA 13.4, the first nvcc that accepts `compute_107a`.
+  hidden width that is a multiple of 512. Below CUDA 13.1 the MXFP8 forward
+  and recompute roles convert to E4M3 through FP32
+  (`cvt.rn.satfinite.e4m3x2.f32`) instead of `cvt.rn.satfinite.e4m3x2.bf16x2`,
+  which older ptxas rejects. Every sm_107a (Rubin) library needs CUDA 13.4, the
+  first nvcc that accepts `compute_107a`.
   Common physical source capacity is
   aligned for tiles/metadata and is at least 512 rows. Communication-SM counts
   are positive and even, leaving compute SMs available.
@@ -250,23 +333,57 @@ and does not change the launch sequence.
   comm_split_log=True)` on the returned config) prints each split change per
   rank to stderr; the `CAKE_MOK_COMM_SPLIT_LOG` environment variable that used
   to select this no longer exists.
-- Fixed split per device and group size (`fwd_num_comm_sms="auto"` /
-  `bwd_num_comm_sms="auto"`; the factory default stays 40 / 40): `"auto"` takes
-  the measured row of `COMM_SMS` (compute capability, SM count, precision, EP
-  group size) and keeps the factory split where there is none. GB300 (152 SMs)
-  MXFP8 EP8 44 / 36 against 40 / 32, two-node EP8 complete training steps (4
-  GPUs per node), two rounds on the same nodes, hottest-rank step time: hottest
-  rank at 3.0x the mean routed load -2.0 / -2.2 % (full step) and -2.0 / -1.8 %
-  (checkpoint step), at 5.6x -3.1 / -3.2 %, at 7.4x -3.2 / -3.3 %; balanced
-  steps +0.7 / +0.5 % (full) and +0.1 / +0.2 % (checkpoint). The balanced full
-  step sits at the edge of the ~0.6 % spread of identical arms, so the row is
-  opt-in. GB300 EP4 on one node measured no unconditional gain (balanced steps
-  +0.7 ... +1.0 % slower) and has no row; B200 uses the imbalance switch above.
-  Rubin (212 SMs) MXFP8 EP8 60 / 60 against the factory 40 / 40, two-node EP8
-  (one NVLink domain), configurations rotated on one workspace, four rounds,
-  hottest-rank medians, balanced routing forward / backward: 8192 tokens per
-  rank -7.4 / -4.6 %, 27116 -13.3 / -8.7 %, 32768 -18.1 / -2.4 % (round spread
-  at most 1.2 %). Rubin BF16 measured no consistent gain and has no row.
+- Two-macro-batch forward program (sm_107a MXFP8 only): the
+  `forward_mxfp8[_clamped]_multimacro` build streams macro batch 0's
+  unaliased rows to the experts while macro batch 1 combines, instead of
+  after it. Each rank chooses it from the same lagged observation as the
+  split, when its padded schedule rows (`num_tokens`) filled exactly two
+  macro batches; otherwise, before the first observation and at a schedule
+  capacity of at most one macro batch the default build runs (and no
+  observation is queued for this alone). Both builds give bitwise the same
+  outputs, context and gradients for any schedule, so ranks may run different
+  builds in one step and a stale choice costs time only. `comm_split_log`
+  also prints each change of the choice.
+- Fixed split per device and group size: `fwd_num_comm_sms` / `bwd_num_comm_sms`
+  default to `"auto"` in `create_mok_bf16_workspace` (package and
+  `flashinfer.mok` wrapper): the measured `COMM_SMS` row (compute capability, SM
+  count, precision, EP group size), else the factory 40 / 40. Integers fix the
+  split; `"auto"` for only one of the two is an error. With MXFP8 routed experts
+  pass `precision="mxfp8"` for the MXFP8 row (`precision` only selects rows and
+  thresholds). The split changes time, never bits (see Repeatability). GB300
+  (152 SMs): BF16 20 / 24 at EP4/8/16/32/64; MXFP8 44 / 36 at EP8/32/64, none
+  at EP4/16 (no gain measured). Checkpointed training steps captured in CUDA
+  Graphs, 40 / 40 and the row interleaved in one process on the same nodes,
+  slowest-rank median of 12 steps, 16,384 tokens per rank, FP32 accumulators:
+
+  | EP | shape | precision | routing | 40 / 40 (ms) | row (ms) | change |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 4 | GLM-5.2 | BF16 | uniform | 31.95 | 29.83 | -6.6 % |
+  | 8 | GLM-5.2 | BF16 | uniform | 30.89 | 28.50 | -7.7 % |
+  | 8 | GLM-5.3-Flash | BF16 | uniform | 21.17 | 19.31 | -8.8 % |
+  | 16 | GLM-5.2 | BF16 | uniform | 30.81 | 28.19 | -8.5 % |
+  | 32 | GLM-5.3-Flash | BF16 | uniform | 21.11 | 18.84 | -10.7 % |
+  | 32 | GLM-5.3-Flash | BF16 | ragged | 26.83 | 24.25 | -9.6 % |
+  | 32 | GLM-5.3-Flash | BF16 | 1.5x hot rank | 29.51 | 26.52 | -10.2 % |
+  | 64 | GLM-5.2 | BF16 | uniform | 30.91 | 30.12 | -2.6 % |
+  | 64 | GLM-5.2 | BF16 | ragged | 39.66 | 38.29 | -3.5 % |
+  | 64 | GLM-5.2 | BF16 | 1.5x hot rank | 42.52 | 39.70 | -6.6 % |
+  | 8 | GLM-5.2 | MXFP8 | uniform | 21.38 | 21.46 | +0.4 % |
+  | 8 | GLM-5.3-Flash | MXFP8 | uniform | 15.60 | 15.54 | -0.4 % |
+  | 32 | GLM-5.3-Flash | MXFP8 | uniform | 15.35 | 14.80 | -3.6 % |
+  | 32 | GLM-5.3-Flash | MXFP8 | ragged | 20.42 | 20.13 | -1.4 % |
+  | 32 | GLM-5.3-Flash | MXFP8 | 1.5x hot rank | 20.77 | 20.40 | -1.8 % |
+  | 64 | GLM-5.2 | MXFP8 | uniform | 25.71 | 25.25 | -1.8 % |
+  | 64 | GLM-5.2 | MXFP8 | ragged | 36.58 | 35.99 | -1.6 % |
+  | 64 | GLM-5.2 | MXFP8 | 1.5x hot rank | 32.67 | 32.89 | +0.7 % |
+
+  The MXFP8 EP8 row first measured -3.3 ... -1.8 % against 40 / 32 with the
+  hottest rank at 3.0x-7.4x the mean routed load; on balanced steps it is
+  within -0.4 ... +0.4 % of 40 / 40 (five comparisons, EP8, both shapes).
+  Rubin (212 SMs) MXFP8 EP8 60 / 60 against 40 / 40, balanced routing,
+  hottest-rank medians of four rounds, forward / backward at 8192 / 27116 /
+  32768 tokens per rank: -7.4 / -4.6, -13.3 / -8.7, -18.1 / -2.4 % (round
+  spread at most 1.2 %); Rubin BF16 had no consistent gain at EP8.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - Routed weight gradients are summed across macrobatches in BF16 (or in the
@@ -284,7 +401,9 @@ Single-GPU tests:
   an independent BF16-rounding reference (empty experts, multiple ring lengths,
   variable widths, CUDA Graph replay, changed and zero scores), clamped SwiGLU,
   FP32 accumulation, GLM-5.3-Flash local expert counts, recompute versus
-  saved context, every scheduler layout (with the owner-rank load counts
+  saved context, the context-free forward (`y`, combine rows, hidden and
+  routed x against the context forward, and backward after recompute against
+  backward from the saved context, all bitwise), every scheduler layout (with the owner-rank load counts
   against the host reference and the expert layout against a torch reference,
   explicit and launcher-derived), the counter slab, the launch-geometry memo
   and the epilogues.
@@ -300,10 +419,11 @@ Distributed tests (`torchrun --standalone --nproc-per-node=4 -m pytest ...`):
 `test_mok_bf16_distributed.py` (toy), `test_mok_bf16_unequal.py` (unequal and
 empty ranks, graph reuse), `test_mok_bf16_capacity.py` (adapter guards) and
 `test_mok_training_distributed.py` (clamped SwiGLU, recompute versus saved
-context, FP32 accumulation with BF16 and MXFP8 routed experts, and MXFP8
+context, the context-free BF16 forward with recompute versus saved context,
+FP32 accumulation with BF16 and MXFP8 routed experts, and MXFP8
 over unequal ranks; 288 experts at EP8 or EP32). `test_mok_bf16_tolerance.py` checks the tolerance reporter.
 `test_mok_bf16.py`, `test_mok_mxfp8.py` and `test_mok_bf16_capacity.py` import the
-package only through `tests/test_helpers/cake_package.py`; the torchrun suites and
+package only through `tests/cake/test_helpers/cake_package.py`; the torchrun suites and
 `test_mok_bf16_tolerance.py` drive the `examples/mok_*.py` scripts, which use the
 `flashinfer.mok` wrapper;
 `test_mok_bf16_api.py` checks the `flashinfer.mok` wrapper itself (experimental
