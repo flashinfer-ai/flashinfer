@@ -46,6 +46,7 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 from flashinfer.gemm.kernels.epilogue_utils import epilogue_tma_store_with_alpha
 import torch
+from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.cute.runtime import from_dlpack, make_ptr
@@ -156,6 +157,12 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
     :type swizzle_size: int
     :param raster_order: Rasterization order of clusters ('m' or 'n'), defaults to 'm'
     :type raster_order: Literal["m", "n"]
+    :param enable_pdl: Launch with programmatic dependent launch: every warp waits on
+        the preceding grid before its first global read or write, and the CTA signals
+        its dependents when its first warp reaches the kernel tail (the TMA warp,
+        after its last load), so before the output is stored; dependents must still
+        wait before reading the output. Defaults to False.
+    :type enable_pdl: bool
 
     :note: Supported combinations of A/B data types, SF data typs and SF vector size:
         - MXF8: A/B: Float8E5M2/Float8E4M3FN + SF: Float8E8M0FNU + sf_vec_size: 32
@@ -201,8 +208,14 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         prefetch_dist: Union[int, None] = 0,
         swizzle_size: int = 1,
         raster_order: Literal["m", "n"] = "m",
+        enable_pdl: bool = False,
     ):
-        super().__init__(sf_vec_size, (mma_tiler[0], mma_tiler[1]), cluster_shape_mn)
+        super().__init__(
+            sf_vec_size,
+            (mma_tiler[0], mma_tiler[1]),
+            cluster_shape_mn,
+            enable_pdl=enable_pdl,
+        )
 
         self.mma_inst_shape = mma_inst_shape
         self.mma_tiler = mma_tiler
@@ -1241,6 +1254,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.enable_pdl,
         )
         return
 
@@ -1283,7 +1297,6 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
         """
-        alpha_value = alpha[0].to(self.c_dtype)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1514,6 +1527,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         # Cluster wait before tensor memory alloc
         #
         pipeline_init_wait(cluster_shape_mn=cluster_shape_mn)
+
+        # PDL: wait for the preceding grid before any warp reads A, B, SFA, SFB or
+        # alpha, or writes C (same point as the SM100 parent).
+        if cutlass.const_expr(self.enable_pdl):
+            griddepcontrol_wait()
+
+        alpha_value = alpha[0].to(self.c_dtype)
 
         #
         # Construct the scheduler
@@ -1948,6 +1968,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             #
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
+
+        if cutlass.const_expr(self.enable_pdl):
+            griddepcontrol_launch_dependents()
 
     # GPU device kernel
     @cute.kernel

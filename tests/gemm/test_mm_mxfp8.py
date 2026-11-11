@@ -582,7 +582,7 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         out,
         workspace,
     ]
-    runner = make_sm107_runner(torch.bfloat16)
+    runner = make_sm107_runner(True, torch.bfloat16)
     tactics = runner.get_valid_tactics(inputs, None)
     assert tactics
     for tactic in tactics:
@@ -672,6 +672,120 @@ def test_mm_mxfp8_cute_dsl_quantize_pdl_cuda_graph(m, n, k, dtype):
                     rtol=0,
                     atol=0,
                 )
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize(
+    "m,n,k", [(24, 6144, 4096), (129, 4096, 2080), (4096, 6144, 1536)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mm_mxfp8_cute_dsl_sm107_quantize_pdl_cuda_graph(m, n, k, dtype):
+    """The SM107 kernel launched with PDL must consume this replay's quantized
+    values and scales, bitwise equal to its launch without PDL."""
+    _skip_if_unsupported("cute-dsl")
+    from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+
+    if not is_rubin_cute_dsl_available():
+        pytest.skip("The SM107 cute-dsl mm_mxfp8 kernel requires CuTe DSL >= 4.8.")
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=dtype, generator=generator)
+    weight = torch.randn((n, k), device="cuda", dtype=dtype, generator=generator)
+    out = torch.empty((m, n), device="cuda", dtype=dtype)
+    reference = torch.empty_like(out)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    torch.cuda.synchronize()
+    weight_q, weight_sf = mxfp8_quantize(
+        weight,
+        backend="cute-dsl",
+        enable_pdl=False,
+        sf_swizzle_layout=SfLayout.layout_128x4,
+    )
+    torch.cuda.synchronize()
+
+    def quantize(enable_pdl):
+        return mxfp8_quantize(
+            x,
+            backend="cute-dsl",
+            enable_pdl=enable_pdl,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+
+    # Call the SM107 runner directly so neither the runner order nor earlier
+    # autotuning picks another kernel; both launches use the untuned tactic.
+    def gemm(enable_pdl, x_q, x_sf, destination):
+        runner = gemm_base._cute_dsl_gemm_mxfp8_sm107_runner(  # pyright: ignore[reportPrivateUsage]
+            enable_pdl, dtype
+        )
+        runner(
+            [x_q, weight_q.T, x_sf, weight_sf, dtype, destination, workspace],
+            tactic=-1,
+        )
+
+    # Compile both kernels before capture.
+    warmup_q, warmup_sf = quantize(enable_pdl=True)
+    gemm(True, warmup_q, warmup_sf, out)
+    gemm(False, warmup_q, warmup_sf, reference)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_q, graph_sf = quantize(enable_pdl=True)
+        gemm(True, graph_q, graph_sf, out)
+
+    for magnitude in (0.125, 1.0, 8.0, 0.5) * 2:
+        x.normal_(generator=generator).mul_(magnitude)
+        # Isolate the quantizer-to-GEMM dependency from input preparation.
+        torch.cuda.synchronize()
+        reference_q, reference_sf = quantize(enable_pdl=False)
+        torch.cuda.synchronize()
+        gemm(False, reference_q, reference_sf, reference)
+        torch.cuda.synchronize()
+
+        # Unwritten buffers must not retain a valid result from a prior replay.
+        graph_q.view(torch.uint8).zero_()
+        graph_sf.zero_()
+        out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(out).all(), "Output contains NaN/Inf values"
+        for actual, expected in (
+            (graph_q, reference_q),
+            (graph_sf, reference_sf),
+            (out, reference),
+        ):
+            torch.testing.assert_close(
+                actual.view(torch.uint8),
+                expected.view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+
+
+def test_mm_mxfp8_cute_dsl_sm107_runner_set_uses_pdl(monkeypatch):
+    """CPU-only: the SM107 runner set launches the SM107 kernel with PDL, like its
+    other runners, and the autotuner cache key carries the PDL flag."""
+    pytest.importorskip("cutlass")
+    monkeypatch.setattr(gemm_base, "get_device_sm_count", lambda device: 148)
+    m, n, k = 24, 6144, 4096
+    inputs = [
+        torch.empty((m, k), dtype=torch.float8_e4m3fn),
+        torch.empty((n, k), dtype=torch.float8_e4m3fn).T,
+        torch.empty((128 * k // 32,), dtype=torch.uint8),
+        torch.empty((n * k // 32,), dtype=torch.uint8),
+        torch.bfloat16,
+        torch.empty((m, n), dtype=torch.bfloat16),
+        None,
+    ]
+    runners = gemm_base._cute_dsl_mxfp8_runners_sm107(torch.bfloat16, inputs)  # pyright: ignore[reportPrivateUsage]
+    sm107 = [r for r in runners if type(r).__name__ == "CuteDSLMxfp8Sm107GemmRunner"]
+    assert len(sm107) == 1, runners
+    assert sm107[0].get_cache_key_extras(inputs) == ("torch.bfloat16", True)
+
+    no_pdl = gemm_base._cute_dsl_gemm_mxfp8_sm107_runner(False, torch.bfloat16)  # pyright: ignore[reportPrivateUsage]
+    assert no_pdl.get_cache_key_extras(inputs) == ("torch.bfloat16", False)
 
 
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
