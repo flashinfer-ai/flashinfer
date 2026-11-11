@@ -296,7 +296,13 @@ def _get_stream_cache_buf(
     index = device.index
     if index is None:
         index = torch.cuda.current_device()
-    key = (name, device, torch._C._cuda_getCurrentRawStream(index))
+    if torch.compiler.is_dynamo_compiling():
+        # Under torch.compile(dynamic=True) Dynamo can pass a symbolic index, which
+        # the raw binding rejects; the Stream object is traceable and has the same handle.
+        stream = torch.cuda.current_stream(device).cuda_stream
+    else:
+        stream = torch._C._cuda_getCurrentRawStream(index)
+    key = (name, device, stream)
     buf = _stream_cache_buf.get(key)
     if buf is None or buf.size(0) < num_bytes:
         if buf is not None:
