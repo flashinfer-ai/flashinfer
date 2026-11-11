@@ -44,6 +44,19 @@ def gen_mla_swa_sm90_module() -> JitSpec:
     )
 
 
+def gen_sparse_mla_sm90_module() -> JitSpec:
+    """DSA sparse-MLA decode (fp8_ds_mla Page64 cache, precomputed top-k
+    indices), token-major m16n8k16 kernel for SM90."""
+    return gen_jit_spec(
+        "sparse_mla_sm90",
+        [jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm90.cu"],
+        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[9]
+        )
+        + ["-O3"],
+    )
+
+
 def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
     """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
     return gen_sparse_mla_sm120_module()

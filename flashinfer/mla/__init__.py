@@ -24,6 +24,14 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
     }
 )
 
+_SPARSE_MLA_SM90_LAZY_EXPORTS = frozenset(
+    {
+        "get_sparse_mla_sm90_workspace_size_bytes",
+        "is_sparse_mla_sm90_supported",
+        "sparse_mla_decode_sm90",
+    }
+)
+
 _SPARSE_MLA_SM120_LAZY_EXPORTS = frozenset(
     {
         "SparseMLASm120CalibrationReport",
@@ -126,6 +134,12 @@ def __getattr__(name: str):
         value = getattr(prims_ts_mla_decode, name)
         globals()[name] = value
         return value
+    if name in _SPARSE_MLA_SM90_LAZY_EXPORTS:
+        from . import _sparse_mla_sm90
+
+        value = getattr(_sparse_mla_sm90, name)
+        globals()[name] = value
+        return value
     if name in _SPARSE_MLA_SM120_LAZY_EXPORTS:
         from . import _sparse_mla_sm120
 
@@ -183,6 +197,7 @@ def __dir__():
         set(globals())
         | _SWA_LAZY_EXPORTS
         | _PRIMS_TS_LAZY_EXPORTS
+        | _SPARSE_MLA_SM90_LAZY_EXPORTS
         | _SPARSE_MLA_SM120_LAZY_EXPORTS
         | _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS
         | _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS
