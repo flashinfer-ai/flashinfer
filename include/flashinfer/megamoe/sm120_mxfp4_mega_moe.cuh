@@ -151,11 +151,9 @@ struct Args {
   const uint8_t* l1s;       // [EL][2I/16][H/128][16] UE8M0 x4 words of W13
   const uint8_t* l2s;       // [EL][H/16][I/128][16] UE8M0 x4 words of W2
   size_t l1_stride, l2_stride, l1s_stride, l2s_stride;  // bytes per expert
-  const float *gs1, *gs2;      // optional [EL] per-expert FC1 / FC2 output multipliers
-  int* stats;                  // optional [EL] cumulative received-token counts
-  uint8_t* inter;              // [EL][W*TCAP][I] e4m3 (local)
-  uint32_t* inter_s;           // [EL][W*TCAP][I/128]
-  int* ctr;                    // kCtrInts
+  uint8_t* inter;                                       // [EL][W*TCAP][I] e4m3 (local)
+  uint32_t* inter_s;                                    // [EL][W*TCAP][I/128]
+  int* ctr;                                             // kCtrInts
   unsigned long long* stamps;  // optional [grid][16] globaltimer stamps (debug)
   Peers peers;
   Gin gin;
@@ -504,6 +502,9 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
   // row (H + H/32 bytes)
   __shared__ __align__(16) float s_tile[kTileN][kRowsPerItem < 256 ? 256 : kRowsPerItem];
 
+  // Phase stamps for Args::stamps (debug). Kept even with stamps null: without them nvcc 13
+  // allocates the 8-token loop 128 registers with spills instead of 168 (RTX 6000D, cold L2:
+  // 2-11% slower at 1-128 tokens per rank).
   unsigned long long st_[16] = {
       gtime()};  // +8 route-push 9 route-ok 10 map 11 pf 12 flag-sent 13 last FC1 end 14 first FC2
                  // start 15 comb-flag release  // 0 start 1 pushed 2 flags 3 work end 4 comb flags
@@ -780,8 +781,6 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
     if (lane == 0) m.tiles_prefix[0] = 0;
   }
   __syncthreads();
-  if (a.stats && blockIdx.x == 0)
-    for (int el = threadIdx.x; el < EL; el += blockDim.x) a.stats[el] += m.ne[el];
   st_[10] = gtime();
   {  // this CTA's first FC1 item is static (item = blockIdx.x): start pulling its weights into L2
      // now
@@ -899,7 +898,6 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
         // SwiGLU: acc rows g (gate) / g+8 (up) of block nb -> inter col nb*8+g; tokens 2c, 2c+1
         constexpr int kItemInter = kRowsPerItem / 2;  // inter cols per item (multiple of 32)
         constexpr int kGroups = kItemInter / 32;
-        const float g1 = a.gs1 ? a.gs1[el] : 1.f;
 #pragma unroll
         for (int jb = 0; jb < kNbPerWarp; ++jb) {
           const int col = (warp * kNbPerWarp + jb) * 8 + g;  // 0..kItemInter-1 within the item
@@ -907,9 +905,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           for (int th = 0; th < NH; ++th)
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-              const float gate = fminf(acc[jb][th][h] * g1, a.swiglu_limit);
-              const float up =
-                  fminf(fmaxf(acc[jb][th][2 + h] * g1, -a.swiglu_limit), a.swiglu_limit);
+              const float gate = fminf(acc[jb][th][h], a.swiglu_limit);
+              const float up = fminf(fmaxf(acc[jb][th][2 + h], -a.swiglu_limit), a.swiglu_limit);
               s_tile[th * 8 + 2 * c + h][col] = gate / (1.f + __expf(-gate)) * up;
             }
         }
@@ -944,7 +941,6 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           xs[h] = a.inter_s + r * (I / 128);
         }
         item_gemm<NH>(acc, w2_of(a, el), ws2_of(a, el), H / 16, nb0, I, xr, xs, lane);
-        const float g2 = a.gs2 ? a.gs2[el] : 1.f;
 #pragma unroll
         for (int jb = 0; jb < kNbPerWarp; ++jb) {
           const int col = (warp * kNbPerWarp + jb) * 16 + g;  // 0..kRowsPerItem-1 within the item
@@ -952,8 +948,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           for (int th = 0; th < NH; ++th)
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-              s_tile[th * 8 + 2 * c + h][col] = acc[jb][th][h] * g2;
-              s_tile[th * 8 + 2 * c + h][col + 8] = acc[jb][th][2 + h] * g2;
+              s_tile[th * 8 + 2 * c + h][col] = acc[jb][th][h];
+              s_tile[th * 8 + 2 * c + h][col + 8] = acc[jb][th][2 + h];
             }
         }
         __syncthreads();

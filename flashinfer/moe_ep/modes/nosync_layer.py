@@ -97,7 +97,6 @@ class MoEEpNosyncLayer(nn.Module):
         self.base = base
         self.nosync: Optional[nn.Module] = None
         self.last_call_nosync = False
-        self._options = options
         self._group = bootstrap_comm_group(bootstrap)
         self._world = bootstrap.world_size
         self._staged: Optional[nn.Module] = None
@@ -244,9 +243,6 @@ class MoEEpNosyncLayer(nn.Module):
                 "compute_staged() requires a prior stage_inputs() call"
             )
         return self._staged.compute_staged(output=output)
-
-    def warmup(self, *args: Any, **kwargs: Any) -> None:
-        self.base.warmup(*args, **kwargs)
 
     def destroy(self) -> None:
         if self.nosync is not None:

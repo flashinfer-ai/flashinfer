@@ -33,8 +33,7 @@ from ..mxfp4_mxfp8_bf16_cake.cake_staging import (
     quantize_activations_k32,
     validate_forward_inputs,
 )
-from .config import Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig
-from .config import MAX_TOKENS_PER_RANK
+from .config import MAX_TOKENS_PER_RANK, Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig
 from .weights import (
     NosyncMegaWeights,
     preprocess_mega_weights,

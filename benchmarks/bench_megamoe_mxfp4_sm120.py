@@ -25,7 +25,6 @@ SHAPES = {  # hidden, intermediate, experts, top-k
     "flash": (4096, 2048, 256, 6),  # DeepSeek-V4-Flash routed experts
     "flash41": (5120, 2304, 384, 6),  # DeepSeek-V4.1-Flash routed experts
     "glm53flash": (4096, 2048, 288, 8),  # GLM-5.3-Flash routed experts
-    "h3072": (3072, 1280, 384, 8),  # the shape of the SM90 / SM100 MegaMoE tables
 }
 
 

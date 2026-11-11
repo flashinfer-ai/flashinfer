@@ -104,14 +104,9 @@ def buffer_layout(
 @functools.cache
 def kernel_module(fast_math: bool, gin_type: int | None = None) -> Any:
     """The kernel's JIT module: P2P only, or with GIN pairs for one NCCL GIN backend."""
-    from .......jit.megamoe import (
-        gen_megamoe_sm120_mxfp4_gin_module,
-        gen_megamoe_sm120_mxfp4_module,
-    )
+    from .......jit.megamoe import gen_megamoe_sm120_mxfp4_module
 
-    if gin_type is None:
-        return gen_megamoe_sm120_mxfp4_module(fast_math).build_and_load()
-    return gen_megamoe_sm120_mxfp4_gin_module(fast_math, gin_type).build_and_load()
+    return gen_megamoe_sm120_mxfp4_module(fast_math, gin_type).build_and_load()
 
 
 @functools.cache
@@ -225,7 +220,7 @@ class NosyncWorkspace:
             )
         )
         self._gin_session = (session, handle)
-        base, win, dev_comm, gin_type, _, contexts = (
+        base, win, dev_comm, gin_type, contexts = (
             int(v) for v in session.megamoe_sm120_gin_session_info(handle)
         )
         peers = [int(p) for p in session.megamoe_sm120_gin_session_peers(handle)]
@@ -289,9 +284,6 @@ class NosyncWorkspace:
             ],
             num_tokens,
             float(swiglu_limit),
-            None,
-            None,
-            None,
             self.gin,
             tokens_per_item or 0,
         )

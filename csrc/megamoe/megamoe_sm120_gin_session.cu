@@ -15,22 +15,21 @@
  */
 // SM120 MegaMoE NIC transport session: the symmetric buffer as one NCCL window on the caller's
 // communicator (torch ProcessGroupNCCL, borrowed), the load/store (LSA) peer pointer of every rank
-// NCCL maps, and an NCCL device communicator with the GIN resources the kernel uses (one context,
-// kGinSignals signals per context). Host-only: the kernel module is built per GIN backend
-// (megamoe_sm120_mxfp4.cu with FLASHINFER_MEGAMOE_SM120_GIN=1).
+// NCCL maps, and an NCCL device communicator with the GIN resources the kernel uses (the caller's
+// context count, sm120::kGinSignals signals per context). Host-only: the kernel module is built per
+// GIN backend (megamoe_sm120_mxfp4.cu with FLASHINFER_MEGAMOE_SM120_GIN=1).
 #include <cuda_runtime.h>
 #include <nccl.h>
 #include <nccl_device.h>
 
 #include <cstdint>
+#include <flashinfer/megamoe/sm120_mxfp4_mega_moe.cuh>
 #include <vector>
 
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer::megamoe {
 namespace {
-
-constexpr int kGinSignals = 24;  // sm120_mxfp4_mega_moe.cuh: 3 * kMaxWorld
 
 inline void check_nccl(ncclResult_t rc, const char* what) {
   TVM_FFI_ICHECK(rc == ncclSuccess) << what << " failed: " << ncclGetErrorString(rc);
@@ -92,7 +91,7 @@ int64_t megamoe_sm120_gin_session_create(int64_t comm_ptr, int64_t rank, int64_t
     if (s->gin_type != NCCL_GIN_TYPE_NONE) {
       ncclDevCommRequirements_t req = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
       req.ginContextCount = static_cast<int>(gin_contexts);
-      req.ginSignalCount = kGinSignals;
+      req.ginSignalCount = sm120::kGinSignals;
       req.worldGinBarrierCount = 0;
       req.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
       req.ginStrongSignalsRequired = true;
@@ -113,17 +112,12 @@ int64_t megamoe_sm120_gin_session_create(int64_t comm_ptr, int64_t rank, int64_t
   return reinterpret_cast<int64_t>(s);
 }
 
-// [buffer pointer, ncclWindow_t, device ncclDevComm* (0 without GIN), GIN type, NCCL version,
-//  GIN contexts]
+// [buffer pointer, ncclWindow_t, device ncclDevComm* (0 without GIN), GIN type, GIN contexts]
 tvm::ffi::Array<int64_t> megamoe_sm120_gin_session_info(int64_t handle) {
   auto* s = reinterpret_cast<GinSession*>(handle);
-  int version = 0;
-  ncclGetVersion(&version);
   return tvm::ffi::Array<int64_t>{reinterpret_cast<int64_t>(s->base),
                                   reinterpret_cast<int64_t>(s->win),
-                                  reinterpret_cast<int64_t>(s->dev_comm),
-                                  s->gin_type,
-                                  version,
+                                  reinterpret_cast<int64_t>(s->dev_comm), s->gin_type,
                                   s->dev_comm_created ? s->host_dev_comm.ginContextCount : 0};
 }
 

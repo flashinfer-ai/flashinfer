@@ -40,9 +40,11 @@ from typing import Any
 import torch
 
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
-
-FP4_PACKED_DTYPES = (torch.uint8, torch.int8, torch.float4_e2m1fn_x2)
-SCALE_DTYPES = (torch.uint8, torch.float8_e8m0fnu)
+from ..mxfp4_mxfp8_bf16_cake.cake_weights import (
+    FP4_PACKED_DTYPES,
+    SCALE_DTYPES,
+    gate_up_interleave_index,
+)
 
 
 @dataclass(frozen=True)
@@ -51,13 +53,6 @@ class NosyncMegaWeights:
     w2: torch.Tensor  # uint8 [local_E, H, I/2]
     w13_scale: torch.Tensor  # uint8 [local_E, 2I * H / 32]
     w2_scale: torch.Tensor  # uint8 [local_E, H * I / 32]
-
-
-def _w13_rows(intermediate: int, device: torch.device) -> torch.Tensor:
-    """Kernel row -> checkpoint row of ``w13``: per 16-row block, gate rows 8b..8b+7 then up rows 8b..8b+7."""
-    r = torch.arange(2 * intermediate, device=device)
-    blk, w = r // 16, r % 16
-    return torch.where(w < 8, blk * 8 + w, intermediate + blk * 8 + (w - 8))
 
 
 def _scales(sf: torch.Tensor) -> torch.Tensor:
@@ -133,7 +128,7 @@ def preprocess_mega_weights(
     """The kernel's weights: ``fp4`` (another backend's tensors in this layout, see
     :func:`shared_fp4`) or a copy of the packed data, plus the scales."""
     w13, w2, s13, s2 = _checked(weights, hidden_size, intermediate_size)
-    rows = _w13_rows(intermediate_size, w13.device)
+    rows = gate_up_interleave_index(intermediate_size).to(w13.device)
     if fp4 is None:
         fp4 = (w13[:, rows].contiguous(), w2.contiguous())
     return NosyncMegaWeights(
