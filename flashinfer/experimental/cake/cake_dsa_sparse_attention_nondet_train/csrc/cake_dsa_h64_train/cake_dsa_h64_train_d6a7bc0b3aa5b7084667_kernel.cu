@@ -80,21 +80,43 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
 
 
 
+#if __CUDA_ARCH__ == 1070
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
 // suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
 // explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
+#else
+__device__ __forceinline__ void mbarrier_wait_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+#endif
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
+#if __CUDA_ARCH__ == 1070
         "LAB_WAIT:\n\t"
+#else
+        ".reg .u32 WAIT_ADDR;\n\t"
+        "mov.u32 WAIT_ADDR, %0;\n\t"
+        "LAB_WAIT_HINT:\n\t"
+#endif
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+#if __CUDA_ARCH__ == 1070
         " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
+#else
+        " P1, [WAIT_ADDR], %1, %2;\n\t"
+        "@P1 bra.uni DONE_HINT;\n\t"
+        "bra.uni LAB_WAIT_HINT;\n\t"
+        "DONE_HINT:\n\t"
+#endif
         "}\n"
+#if __CUDA_ARCH__ == 1070
         :: "r"(mbar_addr), "r"(phase) : "memory");
+#else
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+#endif
 }
 
 
@@ -172,11 +194,20 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if DKV_NATURAL == 1
+#if __CUDA_ARCH__ == 1030
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#else
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#endif
+#else
 #if __CUDA_ARCH__ == 1000
     asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
     smem = make_warp_uniform(smem);
 #else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 #endif
 
     const int mbar_base = smem;
@@ -329,18 +360,18 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
 
     // ---- Role: gather ----
     if (warp <= 3) {
-#if DKV_NATURAL == 1
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
-#else
 #if __CUDA_ARCH__ == 1070
-        asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 24;");
 #else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
-#endif
 #endif
         { // gather_main
             int pw = warp;
+#if __CUDA_ARCH__ == 1070
             mbarrier_wait(blocks_ready_addr, 0);
+#else
+            mbarrier_wait_hint(blocks_ready_addr, 0, 10000000);
+#endif
             int blocks = blocks_word[0];
             if (elect_sync()) {
                 #pragma unroll 1
@@ -348,7 +379,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                     int slot = i % 2;
                     int _stage_idx_full = (int)((unsigned int)i % 2);
                     int _parity_idx_full = (int)((unsigned int)i / 2 % 2);
+#if __CUDA_ARCH__ == 1070
                     mbarrier_wait(idx_full_addr + (_stage_idx_full) * 8, _parity_idx_full);
+#else
+                    mbarrier_wait_hint(idx_full_addr + (_stage_idx_full) * 8, _parity_idx_full, 10000000);
+#endif
                     int rows[16];
                     rows[0] = tile_idx[slot * 80 + pw * 4];
                     rows[1] = tile_idx[slot * 80 + pw * 4 + 1];
@@ -368,7 +403,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                     rows[15] = tile_idx[slot * 80 + 48 + pw * 4 + 3];
                     mbarrier_arrive(idx_free_addr + ((int)((unsigned int)i % 2)) * 8);
                     int _parity_k_free = (int)((unsigned int)i % 2) ^ 1;
+#if __CUDA_ARCH__ == 1070
                     mbarrier_wait(k_free_addr, _parity_k_free);
+#else
+                    mbarrier_wait_hint(k_free_addr, _parity_k_free, 10000000);
+#endif
                     mbarrier_arrive_expect_tx(k_full_addr, 18432);
                     asm volatile(
                         "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
@@ -526,9 +565,17 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
             int lane_0 = lane;
             int w = warp - 4;
             int lane_base = (tid & 96) << 16;
+#if __CUDA_ARCH__ == 1070
             mbarrier_wait(blocks_ready_addr, 0);
+#else
+            mbarrier_wait_hint(blocks_ready_addr, 0, 10000000);
+#endif
             int blocks_1 = blocks_word[0];
+#if __CUDA_ARCH__ == 1070
             mbarrier_wait(stats_full_addr, 0);
+#else
+            mbarrier_wait_hint(stats_full_addr, 0, 10000000);
+#endif
             int h0 = w * 16 + lane_0 / 4;
             float lse0 = stats[h0];
             float lse1 = stats[h0 + 8];
@@ -544,12 +591,20 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 int slot_1 = i_1 % 2;
                 int _stage_idx_full_1 = (int)((unsigned int)i_1 % 2);
                 int _parity_idx_full_1 = (int)((unsigned int)i_1 / 2 % 2);
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(idx_full_addr + (_stage_idx_full_1) * 8, _parity_idx_full_1);
+#else
+                mbarrier_wait_hint(idx_full_addr + (_stage_idx_full_1) * 8, _parity_idx_full_1, 10000000);
+#endif
                 unsigned int v0 = validity32[slot_1 * 80 + 64];
                 unsigned int v1 = validity32[slot_1 * 80 + 65];
                 mbarrier_arrive(idx_free_addr + ((int)((unsigned int)i_1 % 2)) * 8);
                 int _parity_s_full = (int)((unsigned int)i_1 % 2);
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(s_full_addr, _parity_s_full);
+#else
+                mbarrier_wait_hint(s_full_addr, _parity_s_full, 10000000);
+#endif
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float s[32];
                 asm volatile(
@@ -707,7 +762,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 mbarrier_arrive(s_free_addr);
                 asm volatile("barrier.sync 1, 128;" ::: "memory");
                 int _parity_p_free = (int)((unsigned int)i_1 % 2) ^ 1;
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(p_free_addr, _parity_p_free);
+#else
+                mbarrier_wait_hint(p_free_addr, _parity_p_free, 10000000);
+#endif
                 unsigned int p_bf16[16];
                 #pragma unroll
                 for (int _lp = 0; _lp < 16; _lp++) {
@@ -737,7 +796,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(p_full_addr);
                 int _parity_dp_full = (int)((unsigned int)i_1 % 2);
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(dp_full_addr, _parity_dp_full);
+#else
+                mbarrier_wait_hint(dp_full_addr, _parity_dp_full, 10000000);
+#endif
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float dp[32];
                 asm volatile(
@@ -783,7 +846,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 mbarrier_arrive(dp_free_addr);
                 asm volatile("barrier.sync 1, 128;" ::: "memory");
                 int _parity_ds_free = (int)((unsigned int)i_1 % 2) ^ 1;
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(ds_free_addr, _parity_ds_free);
+#else
+                mbarrier_wait_hint(ds_free_addr, _parity_ds_free, 10000000);
+#endif
                 unsigned int ds_bf16[16];
                 #pragma unroll
                 for (int _lp = 0; _lp < 16; _lp++) {
@@ -813,7 +880,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(ds_full_addr);
             }
+#if __CUDA_ARCH__ == 1070
             mbarrier_wait(dq_done_addr, 0);
+#else
+            mbarrier_wait_hint(dq_done_addr, 0, 10000000);
+#endif
             asm volatile("tcgen05.fence::after_thread_sync;");
             int ctid = w * 32 + lane_0;
             int bidc = blockIdx.x;
@@ -2728,7 +2799,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
             int w2 = (warp - 8) % 4;
             int wg = (warp - 8) / 4;
             int lane_base_1 = (tid & 96) << 16;
+#if __CUDA_ARCH__ == 1070
             mbarrier_wait(blocks_ready_addr, 0);
+#else
+            mbarrier_wait_hint(blocks_ready_addr, 0, 10000000);
+#endif
             int blocks_2 = blocks_word[0];
             int lpos = 32 * w2 + 4 * (lane_0_1 / 4);
             int rpos = 16 * w2 + 2 * (lane_0_1 / 4);
@@ -2743,7 +2818,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 int slot_2 = i_2 % 2;
                 int _stage_idx_full_2 = (int)((unsigned int)i_2 % 2);
                 int _parity_idx_full_2 = (int)((unsigned int)i_2 / 2 % 2);
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(idx_full_addr + (_stage_idx_full_2) * 8, _parity_idx_full_2);
+#else
+                mbarrier_wait_hint(idx_full_addr + (_stage_idx_full_2) * 8, _parity_idx_full_2, 10000000);
+#endif
                 int keys[8];
                 keys[0] = tile_idx[slot_2 * 80 + wg * 32 + 2 * (lane_0_1 % 4)];
                 keys[1] = tile_idx[slot_2 * 80 + wg * 32 + 2 * (lane_0_1 % 4) + 1];
@@ -2792,7 +2871,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 }
 #endif
                 int _parity_dkv_a_full = (int)((unsigned int)i_2 % 2);
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(dkv_a_full_addr, _parity_dkv_a_full);
+#else
+                mbarrier_wait_hint(dkv_a_full_addr, _parity_dkv_a_full, 10000000);
+#endif
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float a0[32];
                 float a1[32];
@@ -2821,7 +2904,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 mbarrier_arrive(dkv_a_drained_addr);
                 float rk[16];
                 int _parity_dkr_full = (int)((unsigned int)i_2 % 2);
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(dkr_full_addr, _parity_dkr_full);
+#else
+                mbarrier_wait_hint(dkr_full_addr, _parity_dkr_full, 10000000);
+#endif
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -3040,7 +3127,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
 #endif
                 }
                 int _parity_dkv_b_full = (int)((unsigned int)i_2 % 2);
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(dkv_b_full_addr, _parity_dkv_b_full);
+#else
+                mbarrier_wait_hint(dkv_b_full_addr, _parity_dkv_b_full, 10000000);
+#endif
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x4.b32"
@@ -3254,18 +3345,42 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
     }
     // ---- Warpgroup: 4 ----
     if (warp >= 16 && warp <= 19) {
+#if DKV_NATURAL == 1
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 104;");
+#else
         asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
+#endif
+#else
+#if __CUDA_ARCH__ == 1070
+        asm volatile("setmaxnreg.inc.sync.aligned.u32 120;");
+#else
+        asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
+#endif
+#endif
         // ---- Role: mma ----
         if (warp == 16) {
             { // mma_main
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(blocks_ready_addr, 0);
+#else
+                mbarrier_wait_hint(blocks_ready_addr, 0, 10000000);
+#endif
                 int blocks_3 = blocks_word[0];
+#if __CUDA_ARCH__ == 1070
                 mbarrier_wait(qdo_full_addr, 0);
+#else
+                mbarrier_wait_hint(qdo_full_addr, 0, 10000000);
+#endif
                 if (elect_sync()) {
                     #pragma unroll 1
                     for (int i_3 = 0; i_3 < blocks_3; i_3++) {
                         if (i_3 == 0) {
+#if __CUDA_ARCH__ == 1070
                             mbarrier_wait(k_full_addr, 0);
+#else
+                            mbarrier_wait_hint(k_full_addr, 0, 10000000);
+#endif
                             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_0 = ((q_k_addr) >> 4) & 0x7FFF;
@@ -3471,7 +3586,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                             tcgen05_commit(s_full_addr);
                         }
                         int _parity_dp_free = (int)((unsigned int)i_3 % 2) ^ 1;
+#if __CUDA_ARCH__ == 1070
                         mbarrier_wait(dp_free_addr, _parity_dp_free);
+#else
+                        mbarrier_wait_hint(dp_free_addr, _parity_dp_free, 10000000);
+#endif
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_2 = ((do_k_addr) >> 4) & 0x7FFF;
@@ -3656,11 +3775,19 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                         :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_tmem + (1048576))), "r"(0) : "memory");
                         tcgen05_commit(dp_full_addr);
                         int _parity_p_full = (int)((unsigned int)i_3 % 2);
+#if __CUDA_ARCH__ == 1070
                         mbarrier_wait(p_full_addr, _parity_p_full);
+#else
+                        mbarrier_wait_hint(p_full_addr, _parity_p_full, 10000000);
+#endif
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         if (i_3 > 0) {
                             int _parity_dkv_b_drained = (int)((unsigned int)(int)(unsigned int)(i_3 - 1) % 2);
+#if __CUDA_ARCH__ == 1070
                             mbarrier_wait(dkv_b_drained_addr, _parity_dkv_b_drained);
+#else
+                            mbarrier_wait_hint(dkv_b_drained_addr, _parity_dkv_b_drained, 10000000);
+#endif
                             asm volatile("tcgen05.fence::after_thread_sync;");
                         }
 #if __CUDA_ARCH__ == 1070
@@ -3744,7 +3871,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                         "}\n"
                         :: "r"(_smem_desc_lo_4), "r"(_mma_b_lo_0), "r"((tmem_tmem + (128))), "r"(0) : "memory");
                         int _parity_ds_full = (int)((unsigned int)i_3 % 2);
+#if __CUDA_ARCH__ == 1070
                         mbarrier_wait(ds_full_addr, _parity_ds_full);
+#else
+                        mbarrier_wait_hint(ds_full_addr, _parity_ds_full, 10000000);
+#endif
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_1 = ((((k_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (0) * 1024;
@@ -4066,7 +4197,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                         :: "r"(_smem_desc_lo_10), "r"(_mma_b_lo_2), "r"(tmem_tmem), "r"(0) : "memory");
                         tcgen05_commit(dkr_full_addr);
                         int _parity_dkv_a_drained = (int)((unsigned int)i_3 % 2);
+#if __CUDA_ARCH__ == 1070
                         mbarrier_wait(dkv_a_drained_addr, _parity_dkv_a_drained);
+#else
+                        mbarrier_wait_hint(dkv_a_drained_addr, _parity_dkv_a_drained, 10000000);
+#endif
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_11 = ((((do_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (2) * 1024;
@@ -4229,11 +4364,23 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                         tcgen05_commit(ds_free_addr);
                         if (blocks_3 > i_3 + 1) {
                             int _parity_dkr_drained = (int)((unsigned int)i_3 % 2);
+#if __CUDA_ARCH__ == 1070
                             mbarrier_wait(dkr_drained_addr, _parity_dkr_drained);
+#else
+                            mbarrier_wait_hint(dkr_drained_addr, _parity_dkr_drained, 10000000);
+#endif
                             int _parity_k_full = (int)((unsigned int)(int)(unsigned int)(i_3 + 1) % 2);
+#if __CUDA_ARCH__ == 1070
                             mbarrier_wait(k_full_addr, _parity_k_full);
+#else
+                            mbarrier_wait_hint(k_full_addr, _parity_k_full, 10000000);
+#endif
                             int _parity_s_free = (int)((unsigned int)(int)(unsigned int)(i_3 + 1) % 2) ^ 1;
+#if __CUDA_ARCH__ == 1070
                             mbarrier_wait(s_free_addr, _parity_s_free);
+#else
+                            mbarrier_wait_hint(s_free_addr, _parity_s_free, 10000000);
+#endif
                             asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_15 = ((q_k_addr) >> 4) & 0x7FFF;
@@ -4577,7 +4724,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                         }
                         int _stage_idx_free = (int)((unsigned int)i_4 % 2);
                         int _parity_idx_free = (int)((unsigned int)i_4 / 2 % 2) ^ 1;
+#if __CUDA_ARCH__ == 1070
                         mbarrier_wait(idx_free_addr + (_stage_idx_free) * 8, _parity_idx_free);
+#else
+                        mbarrier_wait_hint(idx_free_addr + (_stage_idx_free) * 8, _parity_idx_free, 10000000);
+#endif
                         int ok_7_0 = (int)(values[0] >= 0 && values[0] < num_kv);
                         if (ok_7_0 != 0) {
                             mask = mask | 1;

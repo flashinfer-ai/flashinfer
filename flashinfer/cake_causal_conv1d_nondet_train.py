@@ -146,8 +146,19 @@ def _backend():
 
 @flashinfer_api
 def is_cake_causal_conv1d_nondet_train_supported(device: torch.device) -> bool:
-    """Whether ``device`` runs the non-deterministic package's base routes (``fwd`` and ``bwd``; the package's
-    rendered ``build.json`` is required)."""
+    """Whether ``device`` supports the non-deterministic causal Conv1d package.
+
+    Parameters
+    ----------
+    device : torch.device
+        CUDA device to query.
+
+    Returns
+    -------
+    bool
+        ``True`` when ``device`` runs the package's base forward and backward
+        routes and the rendered ``build.json`` is available.
+    """
 
     return _backend().is_cake_causal_conv1d_nondet_train_supported(device)
 
@@ -160,9 +171,25 @@ def cake_causal_conv1d_nondet_train_backward_workspace_bytes(
     *,
     bwd_grid_mult: int = 1,
 ) -> int:
-    """Bytes of the caller-owned backward workspace (accumulators and counters) for ``C`` channels on ``device``:
-    the size depends on ``C``, not on ``S`` or ``bwd_grid_mult`` (which is validated); it must be zero before its
-    first launch."""
+    """Return the backward workspace size in bytes.
+
+    Parameters
+    ----------
+    S : int
+        Packed token count.
+    C : int
+        Channel count.
+    device : torch.device
+        CUDA device that will execute the kernel.
+    bwd_grid_mult : int, default=1
+        Backward grid multiplier to validate for the selected backend.
+
+    Returns
+    -------
+    int
+        Bytes of the caller-owned backward workspace. The size depends on
+        ``C`` and the target device, not on ``S``.
+    """
 
     return _backend().cake_causal_conv1d_nondet_train_backward_workspace_bytes(
         S, C, device, bwd_grid_mult=bwd_grid_mult
@@ -177,9 +204,26 @@ def cake_causal_conv1d_nondet_train_backward_workspace(
     *,
     bwd_grid_mult: int = 1,
 ) -> torch.Tensor:
-    """Allocate a ZEROED backward workspace, kept zero by every launch and the same size for every
-    ``bwd_grid_mult``; reuse it for every later backward call of one stream, never for two launches that may run
-    at once."""
+    """Allocate a zeroed backward workspace tensor.
+
+    Parameters
+    ----------
+    S : int
+        Packed token count.
+    C : int
+        Channel count.
+    device : torch.device
+        CUDA device that will execute the kernel.
+    bwd_grid_mult : int, default=1
+        Backward grid multiplier to validate for the selected backend.
+
+    Returns
+    -------
+    torch.Tensor
+        Zeroed caller-owned workspace for reuse on a single stream. Never share it
+        between two backward launches that may run at once (e.g. two CUDA graphs
+        replayed on different streams).
+    """
 
     return _backend().cake_causal_conv1d_nondet_train_backward_workspace(
         S, C, device, bwd_grid_mult=bwd_grid_mult
@@ -190,8 +234,22 @@ def cake_causal_conv1d_nondet_train_backward_workspace(
 def cake_causal_conv1d_nondet_train_forward_workspace_bytes(
     S: int, C: int, device: torch.device
 ) -> int:
-    """Bytes of the caller-owned forward workspace (zeroed int32 token-chunk counters) for ``C`` channels on
-    ``device`` (the deterministic package's size: the same forward programs)."""
+    """Return the forward workspace size in bytes.
+
+    Parameters
+    ----------
+    S : int
+        Packed token count.
+    C : int
+        Channel count.
+    device : torch.device
+        CUDA device that will execute the kernel.
+
+    Returns
+    -------
+    int
+        Bytes of the zeroed int32 forward workspace.
+    """
 
     return _backend().cake_causal_conv1d_nondet_train_forward_workspace_bytes(
         S, C, device
@@ -202,7 +260,22 @@ def cake_causal_conv1d_nondet_train_forward_workspace_bytes(
 def cake_causal_conv1d_nondet_train_forward_workspace(
     S: int, C: int, device: torch.device
 ) -> torch.Tensor:
-    """Allocate a zeroed int32 forward workspace (left zero by every launch; keep one per stream)."""
+    """Allocate a zeroed forward workspace tensor.
+
+    Parameters
+    ----------
+    S : int
+        Packed token count.
+    C : int
+        Channel count.
+    device : torch.device
+        CUDA device that will execute the kernel.
+
+    Returns
+    -------
+    torch.Tensor
+        Zeroed int32 forward workspace for reuse on a single stream.
+    """
 
     return _backend().cake_causal_conv1d_nondet_train_forward_workspace(S, C, device)
 
@@ -291,11 +364,15 @@ def cake_causal_conv1d_nondet_train_backward(
         FP64 accumulators.
     workspace : torch.Tensor, optional
         Caller-owned buffer from :func:`cake_causal_conv1d_nondet_train_backward_workspace`.
-    dx, dweight, dbias : torch.Tensor, optional
-        Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
-        (FP32 or BF16 each; the parameter's dtype when omitted).  An FP32
-        ``dweight`` must be 16-byte aligned (one 16-byte store per channel;
-        ``ValueError`` otherwise).
+    dx : torch.Tensor, optional
+        Preallocated BF16 output of ``x``'s shape.
+    dweight : torch.Tensor, optional
+        Preallocated ``[C, 4]`` output (FP32 or BF16; the parameter's dtype
+        when omitted).  An FP32 ``dweight`` must be 16-byte aligned (one
+        16-byte store per channel; ``ValueError`` otherwise).
+    dbias : torch.Tensor, optional
+        Preallocated ``[C]`` output (FP32 or BF16; the parameter's dtype
+        when omitted).
     bwd_grid_mult : {1, 2, 3, 4}
         Opt-in finer static partition of the token axis (default 1, the
         default grid): the backward launches ``bwd_grid_mult`` times its

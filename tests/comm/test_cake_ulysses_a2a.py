@@ -1,6 +1,6 @@
 """The Cake Ulysses all-to-all package: its portfolio through the public communicator, and the package route.
 
-The backend assertions import the package only through :func:`tests.test_helpers.cake_package.cake_package`
+The backend assertions import the package only through :func:`tests.cake.test_helpers.cake_package.cake_package`
 (flashinfer-ai/flashinfer#6553); the multi-GPU portfolio runs through the public communicator so the public
 contract (caller-owned outputs, NCCL-equal results) is what is checked.
 """
@@ -24,7 +24,7 @@ from tests.comm.cake_ulysses_a2a_fixture import (
     shapes,
 )
 from tests.comm.test_ulysses_a2a import multi_process_parallel
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_ulysses")
 cake_build = cake_package("cake_ulysses", "cake_build")

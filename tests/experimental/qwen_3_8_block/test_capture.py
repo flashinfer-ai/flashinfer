@@ -8,7 +8,7 @@ the functional decode captured as a plan-cache hit survives the LRU's eviction."
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_8_block_cases import Qsa38PagedCase, bits
+from tests.experimental.test_helpers.qwen_3_8_block_cases import Qsa38PagedCase, bits
 
 pytestmark = [pytest.mark.arch_rubin, pytest.mark.usefixtures("rubin")]
 

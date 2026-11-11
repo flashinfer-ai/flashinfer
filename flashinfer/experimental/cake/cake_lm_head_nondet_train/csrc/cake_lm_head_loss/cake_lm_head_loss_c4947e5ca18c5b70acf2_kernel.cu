@@ -68,20 +68,20 @@ kernel_cake_lm_head_loss_c4947e5ca18c5b70acf2(float* __restrict__ acc, float* __
     float scale = g[0];
     float zero = 0.0f;
     int gstride = gridDim.x;
-    unsigned long long vecs64 = (unsigned long long)row_vecs * 8;
+    unsigned long long vecs64 = (unsigned long long)row_vecs * 8ull;
     for (int r = bid; r < num_rows; r += gstride) {
         int n_incl = scan[r];
         int src = ((n_incl > 0) ? n_incl - 1 : 0);
         int _vec_load_0[1];
         {
-            _vec_load_0[0] = *reinterpret_cast<const int*>(idx_lo + (unsigned long long)src * 2 + 0);
+            _vec_load_0[0] = *reinterpret_cast<const int*>(idx_lo + (unsigned long long)src * 2ull + 0);
         }
         int owner = _vec_load_0[0];
         unsigned long long row_in = (unsigned long long)src * vecs64;
         unsigned long long row_out = (unsigned long long)r * vecs64;
         #pragma unroll 2
         for (int c = tid; c < row_vecs; c += 256) {
-            unsigned long long off = (unsigned long long)c * 8;
+            unsigned long long off = (unsigned long long)c * 8ull;
             float _vec_load_1[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(acc + (row_in + off) + 0);
@@ -92,7 +92,7 @@ kernel_cake_lm_head_loss_c4947e5ca18c5b70acf2(float* __restrict__ acc, float* __
             }
             float _vec_load_2[4];
             {
-                float4 _v4 = *reinterpret_cast<const float4*>(acc + (row_in + off + 4) + 0);
+                float4 _v4 = *reinterpret_cast<const float4*>(acc + (row_in + off + 4ull) + 0);
                 _vec_load_2[0 + 0] = _v4.x;
                 _vec_load_2[0 + 1] = _v4.y;
                 _vec_load_2[0 + 2] = _v4.z;

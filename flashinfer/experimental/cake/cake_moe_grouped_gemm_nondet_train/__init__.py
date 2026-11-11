@@ -27,16 +27,15 @@ limitations under the License.
 # The module is the mode: no entry point takes a ``deterministic`` argument, and
 # nothing here routes to the deterministic package.  The forward pass, the
 # activation gradient and the 256-wide k tile's weight gradient run copies of the
-# deterministic programs, but for the sm_100a activation gradient's L2
-# evict-first twin, this package's own build of the deterministic wide tile (all
-# of them the same bits); the 512-wide k tile's weight gradient adds its split
-# tail in place with unordered fp32 reductions, so its ``dW`` is not bitwise
-# reproducible run to run (``cake_backend``, numerical mode).  Under
-# ``torch.use_deterministic_algorithms(True)`` a launch of such a split tail
-# raises the non-determinism alert immediately before it launches (a
-# ``RuntimeError``, or a ``UserWarning`` under ``warn_only=True``, after which it
-# runs); the fixed-order launches (forward, activation gradient, the 256-wide k
-# tile and an unsplit tail) never alert.
+# deterministic programs (the same bits); the 512-wide k tile's weight gradient
+# finishes its split tail in the same launch: each unit stores its fp32 partial
+# to a slot and the tile's last unit sums the slots in slot order
+# (``cake_backend``, numerical mode).  Every output repeats bit for bit for the
+# same inputs, shapes, device SM count and configuration, and no launch alerts under
+# ``torch.use_deterministic_algorithms(True)``.  The alert stays for an
+# order-varying launch, which only an architecture listed in the host plan's
+# ``unordered_tail_archs`` (empty) plans: a ``RuntimeError``, or a
+# ``UserWarning`` under ``warn_only=True``, after which it runs.
 #
 # The public entry points are the functions of the top-level module
 # ``flashinfer.cake_moe_grouped_gemm_nondet_train`` (stable APIs), which take the
@@ -96,6 +95,9 @@ def cake_moe_grouped_gemm_nondet_train_forward(
 ) -> torch.Tensor:
     """``Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T`` for every group ``e``.
 
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
     Parameters
     ----------
     x : torch.Tensor
@@ -137,13 +139,14 @@ def cake_moe_grouped_gemm_nondet_train_dgrad(
 ) -> torch.Tensor:
     """``dX[offs[e-1]:offs[e]] = G[offs[e-1]:offs[e]] @ W[e]`` for every group ``e``.
 
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
     ``g`` is ``[sum_m, N]`` bfloat16, ``w`` is ``[E, N, K]`` bfloat16 and is
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
     offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  The programs are copies of the deterministic
-    package's, but for the sm_100a evict-first twin, this package's own build of
-    the deterministic wide tile, and all give its bits (no alert under torch's
-    deterministic mode).  See
+    package's and give its bits (no alert under torch's deterministic mode).  See
     ``cake_moe_grouped_gemm_nondet_train_forward`` for the prepared form.
     """
     from .cake_backend import cake_moe_grouped_gemm_nondet_train_prepare_dgrad
@@ -165,17 +168,19 @@ def cake_moe_grouped_gemm_nondet_train_wgrad(
 ) -> torch.Tensor:
     """``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` for every group ``e``.
 
+    The slice lower bound is ``0`` for ``e == 0`` and ``offs[e-1]`` for ``e > 0``.
+    For ``m_indptr`` input, ``offs`` in these formulas means ``m_indptr[1:]``.
+
     ``g`` is ``[sum_m, N]`` bfloat16, ``x`` is ``[sum_m, K]`` bfloat16,
     ``offs`` is ``[E]`` int32 device end offsets (``E = offs.numel()``; pass
     ``num_groups=E`` to hand in ``m_indptr`` ``[E + 1]`` instead) and ``out``
     is ``[E, N, K]`` in ``out_dtype`` (bfloat16 or float32; defaults to the
     dtype of ``out``, else bfloat16).  fp32 accumulation, one rounding at the
     store, exact zeros for empty groups.  With the 512-wide k tile a split tail
-    is added with unordered fp32 reductions, so ``dW`` is not bitwise
-    reproducible run to run, and under
-    ``torch.use_deterministic_algorithms(True)`` such a launch raises the
-    non-determinism alert immediately before it runs (a fixed-order launch does
-    not).  ``N % 256 == 0`` and ``K`` a
+    is summed in slot order in the same launch, so ``dW`` repeats bit for bit
+    for the same inputs, shapes, device SM count and configuration, and no
+    launch alerts under ``torch.use_deterministic_algorithms(True)``.
+    ``N % 256 == 0`` and ``K`` a
     multiple of the selected k tile (256, or 512 when chosen) are required.
     See ``cake_moe_grouped_gemm_nondet_train_forward`` for the prepared form.
 

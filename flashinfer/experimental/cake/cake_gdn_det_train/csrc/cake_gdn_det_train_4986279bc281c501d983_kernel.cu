@@ -385,7 +385,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
             int stT_t = lane_c / 16 * 8 + lane_c % 8;
             int stT_v = lane_c / 8 % 2 * 8;
             float init_row[16];
-            long long in_base = ((long long)seg * (long long)num_v_heads + (long long)hv) * 16384 + (long long)vrow;
+            long long in_base = ((long long)seg * (long long)num_v_heads + (long long)hv) * 16384ll + (long long)vrow;
             if (use_final_state_grad != 0) {
                 #pragma unroll
                 for (int blk = 0; blk < 8; blk++) {
@@ -546,7 +546,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
             if (store_initial_state_grad != 0) {
                 if (is_first != 0) {
                     int _max_3 = ((seq) > (0) ? (seq) : (0));
-                    long long out_base = ((long long)_max_3 * (long long)num_v_heads + (long long)hv) * 16384 + (long long)vrow;
+                    long long out_base = ((long long)_max_3 * (long long)num_v_heads + (long long)hv) * 16384ll + (long long)vrow;
                     #pragma unroll
                     for (int blk3 = 0; blk3 < 8; blk3++) {
                         tmem_ld_x16(&init_row[0], ta_state + (unsigned int)(blk3 * 16));
@@ -1498,7 +1498,7 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
                 }
                 mbarrier_wait(dhs_ready_addr, _phase_dhs_ready_0_1);
                 _phase_dhs_ready_0_1 ^= 1;
-                long long tape_base = ((long long)gc * (long long)num_v_heads + (long long)hv_4) * 16384 + (long long)(row_s * 128 + col_s);
+                long long tape_base = ((long long)gc * (long long)num_v_heads + (long long)hv_4) * 16384ll + (long long)(row_s * 128 + col_s);
                 #pragma unroll
                 for (int half = 0; half < 2; half++) {
                     #pragma unroll
@@ -1524,10 +1524,10 @@ kernel_cake_gdn_det_train_4986279bc281c501d983(const __grid_constant__ CUtensorM
                         : "r"(s_bdvs_addr + (unsigned int)(col_s / 64 * 8192 + ((it3 * 4 + row_s) * 128 + col_s % 64 * 2 ^ ((it3 * 4 + row_s) * 128 + col_s % 64 * 2 >> 7 & 7) << 4))));
                 }
                 mbarrier_arrive(bdv_free_addr);
-                long long dv_base = ((long long)(tok_s + row_s) * (long long)num_v_heads + (long long)hv_4) * 128 + (long long)col_s;
+                long long dv_base = ((long long)(tok_s + row_s) * (long long)num_v_heads + (long long)hv_4) * 128ll + (long long)col_s;
                 #pragma unroll
                 for (int it4 = 0; it4 < 16; it4++) {
-                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(dv2 + (dv_base + (long long)(it4 * 4) * (long long)num_v_heads * 128)), "r"(hold[(it4 * 4) + 0]), "r"(hold[(it4 * 4) + 1]), "r"(hold[(it4 * 4) + 2]), "r"(hold[(it4 * 4) + 3]), "r"((unsigned int)(it4 * 4 + row_s < n_s)) : "memory");
+                    asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(dv2 + (dv_base + (long long)(it4 * 4) * (long long)num_v_heads * 128ll)), "r"(hold[(it4 * 4) + 0]), "r"(hold[(it4 * 4) + 1]), "r"(hold[(it4 * 4) + 2]), "r"(hold[(it4 * 4) + 3]), "r"((unsigned int)(it4 * 4 + row_s < n_s)) : "memory");
                 }
             }
         }

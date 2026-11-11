@@ -15,8 +15,8 @@ limitations under the License.
 
 Deterministic packed GDN (Gated DeltaNet) chunked training forward and
 backward on one rank, no context parallelism (SM100 / SM103 / SM107), the
-Cake backend.  The same inputs, hardware, layout and plan give bitwise the
-same outputs and gradients run to run.
+Cake backend.  With the same inputs, hardware, layout and plan, the outputs
+and gradients repeat bit for bit from run to run.
 
 Mode and dispatch rules: every name here carries the mode word ``det``; no
 entry takes a ``deterministic`` keyword (passing one raises ``TypeError``);
@@ -103,6 +103,49 @@ def cake_gdn_det(
     ``warmup_log2``, ``dhu_scan``, ``prep``, ``lpt``, ``streams``) and its ``save_state`` / ``host_cache``
     switches; see ``flashinfer.experimental.cake.cake_gdn_det_train.cake_gdn_det`` for the contract and the input
     checks (``ValueError`` before the first launch).
+
+    Parameters
+    ----------
+    q, k : torch.Tensor
+        BF16 ``[B, T, H, 128]`` query and key tensors.
+    v : torch.Tensor
+        BF16 ``[B, T, HV, 128]`` values, with ``HV`` a multiple of ``H``.
+    g : torch.Tensor
+        ``[B, T, HV]`` natural-log decay gate, computed in FP32.
+    beta : torch.Tensor
+        FP32 or BF16 ``[B, T, HV]`` delta-rule gate after the sigmoid.
+    scale : float, optional
+        Output scale; ``128 ** -0.5`` when ``None``.
+    initial_state : torch.Tensor, optional
+        FP32 ``[N, HV, 128, 128]`` initial state; zero when omitted.
+    output_final_state : bool, default=False
+        Return the final state in addition to the output.
+    cu_seqlens : torch.Tensor, optional
+        Device document offsets of a packed batch (``B == 1``).
+    cu_seqlens_cpu : torch.Tensor, optional
+        The same offsets on the host; selects the host-table route when given.
+    use_qk_l2norm_in_kernel : bool, default=False
+        Normalize raw query and key rows inside the kernels.
+    scan_config : tuple of int, optional
+        Pin the backend scan configuration.
+    segment_chunks : int, optional
+        Pin the number of chunks per segment.
+    finalize : str, optional
+        Pin the finalize stage of the unfused backward tail.
+    warmup_log2 : float, optional
+        Override the pre-scans' log2 warm-up threshold.
+    save_state : bool, default=True
+        Keep the forward state tape for the backward.
+    host_cache : bool, default=True
+        Cache the host-side plan and tables.
+    dhu_scan : str, optional
+        Pin the backward adjoint scan implementation.
+    prep : str, optional
+        Pin the backend preparation implementation.
+    lpt : bool, default=True
+        Enable longest-processing-time scheduling in the backend plan.
+    streams : int, default=2
+        Number of streams used by the backend plan: ``1`` or ``2``.
     """
     return _pkg().cake_gdn_det(
         q,
@@ -134,7 +177,13 @@ def is_cake_gdn_det_train_supported(
     device: torch.device | str | int | None = None,
 ) -> bool:
     r"""``True`` when ``device`` (default: the current CUDA device) is an exported target of the package
-    (compute capability 10.0, 10.3 or 10.7); ``False`` without CUDA or for a non-CUDA device."""
+    (compute capability 10.0, 10.3 or 10.7); ``False`` without CUDA or for a non-CUDA device.
+
+    Parameters
+    ----------
+    device : torch.device, str, int, optional
+        Device to query; ``None`` selects the current CUDA device.
+    """
     if not torch.cuda.is_available():
         return False
     try:

@@ -44,13 +44,14 @@ Token-Sparse Attention Inputs
 Build cache-slot lists for token-sparse attention.
 Build grouped key unions and masks for masked dense attention.
 
-.. currentmodule:: flashinfer.token_sparse
+.. currentmodule:: flashinfer.sdsa.token_sparse
 
 .. autosummary::
     :toctree: ../generated
 
     token_sparse_kv_indices
     group_union_masks
+    union_key_limit
 
 
 SDSA Indexer

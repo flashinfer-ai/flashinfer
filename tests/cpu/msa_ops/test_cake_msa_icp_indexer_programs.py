@@ -52,7 +52,7 @@ import flashinfer.msa_ops as msa_ops
 from flashinfer.experimental.cake_msa_icp_indexer import cake_backend as cb
 from flashinfer.experimental.cake_msa_icp_indexer import cake_indexer, cake_jit
 from flashinfer.msa_ops import cake_icp_indexer as msa_icp
-from tests.test_helpers import cake_msa_icp_inputs as ref
+from tests.experimental.test_helpers import cake_msa_icp_inputs as ref
 
 FP8 = torch.float8_e4m3fn
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")

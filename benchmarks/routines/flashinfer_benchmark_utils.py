@@ -69,10 +69,14 @@ output_column_dict = {
         "use_routing_scales_on_input",
         "weight_dtype",
         "activation_type",
+        "swiglu_limit",
         "quant_variant",
         "autotune",
         "tactic",
         "refcheck_passed",
+        "relative_l2",
+        "pairwise_relative_l2",
+        "runner_backend_key",
         "fp4_mode",
         "cold_l2_cache",
         "prequantized_median_time",
@@ -210,6 +214,7 @@ output_column_dict = {
         "refcheck",
         "no_cuda_graph",
         "use_cupti",
+        "capture_telemetry",
         "allow_output_mismatch",
         "random_seed",
         "case_tag",
@@ -745,10 +750,11 @@ routine_cc_to_supported_backends = {
         "10.3": ["alphamoe"],
     },
     # MoELayer cross-backend NVFP4: intersection of CuteDSL + TRTLLM FP4 support.
-    # SM100 only (Blackwell); unlisted archs fall through to [] (skipped).
+    # Blackwell and Rubin; backend support checks enforce runtime requirements.
     "unified_nvfp4_moe": {
         "10.0": ["unified"],
         "10.3": ["unified"],
+        "10.7": ["unified"],
     },
     # NORM
     "rmsnorm": {

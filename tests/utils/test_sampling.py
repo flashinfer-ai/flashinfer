@@ -14,19 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from threading import Barrier
 
 import pytest
 import torch
 
 import flashinfer
 from flashinfer.utils import device_support_pdl
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
-from tests.test_helpers.pdl import late_store
-from tests.test_helpers.sampling import (
+from tests.utils.test_helpers.pdl import late_store
+from tests.utils.test_helpers.sampling import (
     required_num_collision_rows,
     required_num_trials,
 )
@@ -34,6 +36,51 @@ from tests.test_helpers.sampling import (
 
 # H100 CI peak GPU memory: 39.5 GiB.
 pytestmark = pytest.mark.gpu_exclusive
+
+
+@pytest.mark.parametrize("use_default_generator", [False, True])
+def test_get_seed_and_offset_threaded_reservations(use_default_generator):
+    device = torch.device("cuda", torch.cuda.current_device())
+    increments = (1, 4, 5, 13)
+    calls_per_thread = 256
+    start = Barrier(len(increments))
+
+    # Preserve the process-default generator for the remaining sampling tests.
+    with torch.random.fork_rng(devices=[device.index]):
+        generator = (
+            torch.cuda.default_generators[device.index]
+            if use_default_generator
+            else torch.Generator(device=device)
+        )
+        generator.manual_seed(1234)
+        generator.set_offset(128)
+
+        def reserve(increment):
+            start.wait(timeout=10)
+            ranges = []
+            for _ in range(calls_per_thread):
+                seed, offset = flashinfer.sampling.get_seed_and_offset(
+                    increment,
+                    None if use_default_generator else generator,
+                    device,
+                )
+                assert seed == 1234
+                ranges.append((offset, (increment + 3) // 4 * 4))
+            return ranges
+
+        with ThreadPoolExecutor(max_workers=len(increments)) as executor:
+            ranges = [
+                item
+                for group in executor.map(reserve, increments, timeout=30)
+                for item in group
+            ]
+
+        # Every reservation owns one disjoint range, with no lost advancement.
+        next_offset = 128
+        for offset, length in sorted(ranges):
+            assert offset == next_offset
+            next_offset += length
+        assert generator.get_offset() == next_offset
 
 
 def normal_distribution(std):
@@ -2319,7 +2366,12 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9, 1.0])
-def test_top_p_renorm_probs(batch_size, vocab_size, p):
+@pytest.mark.parametrize("is_deterministic", [False, True])
+def test_top_p_renorm_probs(batch_size, vocab_size, p, is_deterministic):
+    if is_deterministic and vocab_size < 2048:
+        pytest.skip(
+            "rows narrower than the radix histogram use the ternary search path"
+        )
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
@@ -2333,12 +2385,50 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
         dim=-1, keepdim=True
     )
 
-    renorm_prob = flashinfer.sampling.top_p_renorm_probs(normalized_prob, p)
+    renorm_prob = flashinfer.sampling.top_p_renorm_probs(
+        normalized_prob, p, is_deterministic=is_deterministic
+    )
     torch.testing.assert_close(
         renorm_prob_ground_truth,
         renorm_prob,
         rtol=1e-3,
         atol=1e-3,
+    )
+    if is_deterministic:
+        again = flashinfer.sampling.top_p_renorm_probs(
+            normalized_prob, p, is_deterministic=True
+        )
+        assert torch.equal(renorm_prob, again)
+
+
+@pytest.mark.parametrize("vocab_size", [(1 << 20) - 1, 1 << 20])
+def test_top_p_renorm_probs_deterministic_wide_rows(vocab_size):
+    # Rows below 2^20 elements accumulate split 32-bit histogram words; wider
+    # rows keep 64-bit words. Both must keep the sorted reference's tokens.
+    torch.manual_seed(42)
+    p = 0.9
+    pre_norm_prob = torch.rand(1, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    prob64 = normalized_prob.double()
+    sorted_prob, indices = torch.sort(prob64, descending=False)
+    expected_kept = torch.zeros_like(prob64, dtype=torch.bool)
+    expected_kept.scatter_(1, indices, torch.cumsum(sorted_prob, dim=-1) >= (1 - p))
+
+    renorm_prob = flashinfer.sampling.top_p_renorm_probs(
+        normalized_prob, p, is_deterministic=True
+    )
+    again = flashinfer.sampling.top_p_renorm_probs(
+        normalized_prob, p, is_deterministic=True
+    )
+    assert torch.equal(renorm_prob, again)
+    kept = renorm_prob > 0
+    # Rounding at the cumulative-mass boundary may move a single token.
+    assert (kept != expected_kept).sum().item() <= 1
+    torch.testing.assert_close(
+        renorm_prob[kept].double(),
+        prob64[kept] / prob64[kept].sum(),
+        rtol=1e-3,
+        atol=0,
     )
 
 

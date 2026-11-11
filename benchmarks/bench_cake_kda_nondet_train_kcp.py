@@ -100,8 +100,9 @@ are compared: ``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` (and ``y``, ``dx``,
 rounding on the ranks whose backward runs the ``S1`` pair (its rel-RMS and
 max-abs difference are reported).  With ``nd_off`` or ``--ckpt-handoff on``,
 one ``ckpt`` step of ``nd`` and one of ``nd_off`` are compared too: ``out``,
-``dq``, ``dk``, ``dv``, ``dg``, ``dbeta`` (and the convolution's) must have
-the same bit patterns, and the hand-off must engage as the mode says
+``dq``, ``dk``, ``dv``, ``dg``, ``dbeta`` (and the convolution's; in the raw
+gate mode also the ``dA_log`` / ``ddt_bias`` partials and their cross-rank
+sums) must have the same bit patterns, and the hand-off must engage as the mode says
 (``handoff``: ``"on"`` on every rank with tokens, ``"auto"`` where the
 package's admission rule admits the call, ``"off"`` nowhere; ``nd_off``
 never; the package's hand-off counters of each step are recorded).  With
@@ -132,10 +133,11 @@ architecture, so the agreement step requires every result to have the
 deterministic arm's bit pattern: ``out``, ``dq``, ``dk``, ``dv``, ``dbeta``, the
 raw gate's ``dg`` (and the convolution's), the per-rank ``dA_log`` /
 ``ddt_bias`` partials and their cross-rank sums, with ``--l2n`` and without it.
-The checkpoint hand-off never engages in this mode (with ``nd_off`` or
-``--ckpt-handoff on`` the ``ckpt`` comparison expects no engagement; the
-hand-off byte figures ``saved_handoff`` / ``handoff`` are ``None``), and the
-workspace bytes are those of the raw mode.
+The checkpoint hand-off engages in this mode as in the precomputed gate mode
+(``on``: always; ``auto``: where the package's per-mode admission rule admits
+the device), with every result bitwise equal to ``nd_off``'s, the raw gate's
+``dg`` and the ``dA_log`` / ``ddt_bias`` partials included; the workspace bytes
+are those of the raw mode.
 
 In-kernel Q/K L2 norm (``--l2n``, in either ``--gate`` mode): ``q`` / ``k`` of
 the whole batch are raw BF16 rows of a few magnitudes per token (``raw_qk``,
@@ -147,9 +149,9 @@ single-rank package's entry, ``fla`` and ``fla_cp``
 flash-linear-attention's ``chunk_kda(use_qk_l2norm_in_kernel=True, ...)``.
 This package's in-kernel-norm mode runs the deterministic programs in the same
 order, so the agreement step requires every result to have the deterministic
-arm's bit pattern, ``dg`` included.  The checkpoint hand-off never engages in
-this mode (the hand-off byte figures are ``None``), and the workspace and
-saved-set bytes are those of the mode.
+arm's bit pattern, ``dg`` included.  The checkpoint hand-off engages in
+this mode too (alone or with ``--gate raw``), on the same terms as in the raw
+gate mode, and the workspace and saved-set bytes are those of the mode.
 
 Build order (``--build-order``: ``det-first``, the default, or ``nd-first``): the arm
 of the two built first builds its context first, runs its first call (the
@@ -223,7 +225,7 @@ from flashinfer.experimental.cake.cake_kda_det_train_kcp import (  # noqa: E402
 from flashinfer.experimental.cake.cake_kda_nondet_train_kcp import (  # noqa: E402
     cake_kcp as nd_kcp,
 )
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     D,
     LOWER_BOUND,
     make_inputs,
@@ -865,21 +867,28 @@ def _same_bits(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
 
 
 def _handoff_expected(problem: dict[str, Any], device: torch.device) -> bool:
-    """Whether the ``nd`` arm's mode engages the hand-off on this rank's ``ckpt`` step: never in the raw gate mode
-    or the in-kernel Q/K L2 norm mode, else ``"on"`` yes, ``"off"`` no, ``"auto"`` where the package's admission
-    rule (``kcp_handoff_auto_refusal`` of this device's key, the head count, the batch's total and the world size)
-    admits it."""
-    if problem["gate"] == "raw" or problem["l2n"]:
-        return False
+    """Whether the ``nd`` arm's mode engages the hand-off on this rank's ``ckpt`` step: ``"on"`` yes, ``"off"`` no,
+    ``"auto"`` where the package's admission rule (``kcp_handoff_auto_refusal`` of this device's key, the head count,
+    the batch's total, the world size and the call's gate / in-kernel Q/K L2 norm mode) admits it; with the in-kernel
+    Q/K L2 norm neither where the device's architecture lacks the separate normalization record the hand-off's
+    backward launches (``_handoff_l2n_direct``)."""
     mode = problem["ckpt_handoff"]
-    if mode != "auto":
-        return mode == "on"
+    if mode == "off":
+        return False
+    if problem["l2n"] and not nd_kcp._handoff_l2n_direct(
+        nd_kcp._handoff_key(device)[0]
+    ):
+        return False
+    if mode == "on":
+        return True
     ctx = problem["ctx"]["nd"]
     reason = nd_kcp.cake_kcp_plan.kcp_handoff_auto_refusal(
         nd_kcp._handoff_key(device),
         int(problem["local"]["v"].shape[-2]),
         ctx.partition.total,
         ctx.world_size,
+        gate=problem["gate"],
+        l2n=bool(problem["l2n"]),
     )
     return reason is None
 
@@ -1130,8 +1139,6 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     raw = args.gate == "raw"
     # the gate and in-kernel Q/K L2 norm modes of the workspace and saved-set queries
     modes = {"use_gate_in_kernel": raw, "use_qk_l2norm_in_kernel": args.l2n}
-    # the checkpoint hand-off engages in neither mode: no hand-off figures there
-    handoff_mode = not (raw or args.l2n)
     ctx_det, ctx_nd = problem["ctx"]["det"], problem["ctx"]["nd"]
     nbytes = {
         "det": {
@@ -1146,18 +1153,10 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
                 ctx_nd, H=H, C=C, **modes
             ),
             "saved": cake_kda_nondet_train_kcp_saved_bytes(ctx_nd, H=H, C=C, **modes),
-            "saved_handoff": (
-                cake_kda_nondet_train_kcp_saved_bytes(
-                    ctx_nd, H=H, C=C, checkpoint_handoff=True
-                )
-                if handoff_mode
-                else None
+            "saved_handoff": cake_kda_nondet_train_kcp_saved_bytes(
+                ctx_nd, H=H, C=C, checkpoint_handoff=True, **modes
             ),
-            "handoff": (
-                cake_kda_nondet_train_kcp_handoff_bytes(ctx_nd, H=H)
-                if handoff_mode
-                else None
-            ),
+            "handoff": cake_kda_nondet_train_kcp_handoff_bytes(ctx_nd, H=H),
             "comm": cake_kda_nondet_train_kcp_comm_bytes(ctx_nd, H=H, C=C),
         },
     }

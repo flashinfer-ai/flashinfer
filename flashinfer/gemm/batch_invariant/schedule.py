@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .generator import CLUSTERS, SWIZZLES, Knobs, enumerate_space  # noqa: F401  (re-exported)
-from .spec import MX_MIXED_FMTS, chunk_unit
+from .spec import FP8_BLOCKSCALE_FMTS, MX_MIXED_FMTS, chunk_unit
 
 GemmConfig = Knobs
 
@@ -55,8 +55,11 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
     M, a narrow weight runs the chunked class at every M, large prefills included (the fp32 partial round trip is then
     a bounded fraction of the operand traffic). An empty weight (N = 0) has no split, as the Lean mirror's natural-number
     division gives. The mixed classes raise the count to a lower bound of ``MIXED_SPLIT_MIN_CHUNKS`` for narrow, long weights
-    (``N <= MIXED_SPLIT_MAX_N``, ``K >= MIXED_SPLIT_MIN_K`` in whole runs of that many granules). Mirrored by ``BIK.GEMM.chunksFor``
-    / ``chunksForFp8`` / ... / ``chunksForMxW48`` in Lean (checked by the generated conformance cases)."""
+    (``N <= MIXED_SPLIT_MAX_N``, ``K >= MIXED_SPLIT_MIN_K`` in whole runs of that many granules); the block-scale fp8 class has no
+    split variant. Mirrored by ``BIK.GEMM.chunksFor`` / ``chunksForFp8`` / ... / ``chunksForMxW48`` in Lean (checked by the
+    generated conformance cases)."""
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        return 1  # the block-scale class has no split variant: its block fold already partitions K
     step = chunk_unit(
         in_fmt
     )  # the format's MMA step; for the block-scaled classes also a whole scale-factor atom column

@@ -25,6 +25,7 @@ dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates i
 def decidedTheorems : List Name :=
   [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space,
    ``BIK.gemm_fp8_space_ok, ``BIK.gemm_fp8_space_c4_ok, ``BIK.gemm_fp8_space_c4_cta_twins, ``BIK.gemm_fp8_dispatch_in_space,
+   ``BIK.gemm_fp8bs_space_ok, ``BIK.gemm_fp8bs_dispatch_in_space,
    ``BIK.gemm_mx8_space_ok, ``BIK.gemm_mx8_space_c4_ok, ``BIK.gemm_mx8_space_c4_cta_twins, ``BIK.gemm_mx8_dispatch_in_space,
    ``BIK.gemm_mx8_space_decode_ok, ``BIK.gemm_mx8_space_c2_ok,
    ``BIK.gemm_mx8k64_space_ok, ``BIK.gemm_mx8k64_space_c4_ok, ``BIK.gemm_mx8k64_space_c4_cta_twins, ``BIK.gemm_mx8k64_dispatch_in_space,
