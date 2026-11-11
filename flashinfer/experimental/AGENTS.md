@@ -112,7 +112,7 @@ See README.md for the full worked example and the resulting behavior table.
 - Correctness tests vs. a reference in `tests/experimental/`, validated on
   the intended hardware, plus a runnable example.
 
-## Checklist deltas vs. root AGENTS.md's "Adding a New Operation"
+## Checklist deltas vs. "Adding a new operation" in [docs/development/jit_and_build.md](../../docs/development/jit_and_build.md#adding-a-new-operation)
 
 | Step | Experimental status |
 |------|---------------------|
